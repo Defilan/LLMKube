@@ -37,8 +37,17 @@ import (
 
 // Inference runtime identifiers used by MetalAgentConfig.Runtime.
 const (
-	runtimeOMLX   = "omlx"
-	runtimeOllama = "ollama"
+	runtimeOMLX      = "omlx"
+	runtimeOllama    = "ollama"
+	runtimeVLLMSwift = "vllm-swift"
+)
+
+// Model format identifiers (Model.Spec.Format) the agent recognizes for
+// runtime-compatibility checks. Defined here so validateRuntimeFormat can
+// switch on them without scattering literals (goconst).
+const (
+	formatGGUF = "gguf"
+	formatMLX  = "mlx"
 )
 
 // MetalAgentConfig contains configuration for the Metal agent
@@ -59,6 +68,9 @@ type MetalAgentConfig struct {
 	OMLXPort int
 	// OllamaPort is the port the Ollama daemon listens on (default 11434).
 	OllamaPort int
+	// VLLMSwiftBin is the path to the vllm-swift binary. Only used when
+	// Runtime is "vllm-swift". Empty means auto-detect via $PATH.
+	VLLMSwiftBin string
 
 	// MemoryProvider supplies system memory info. Nil defaults to DarwinMemoryProvider.
 	MemoryProvider MemoryProvider
@@ -92,6 +104,12 @@ type MetalAgentConfig struct {
 	// (DefaultOMLXStartupTimeout). The original 30s constant was too short
 	// for real M-series hardware.
 	OMLXStartupTimeout time.Duration
+
+	// VLLMSwiftStartupTimeout is how long the agent waits for vllm-swift to
+	// respond on /health. Zero means use the executor default
+	// (DefaultVLLMSwiftStartupTimeout). vLLM init + Swift bridge load + weight
+	// load grow with model size; 120s default works for ~30B models on M5 Max.
+	VLLMSwiftStartupTimeout time.Duration
 
 	// ApplePowerEnabled launches the powermetrics-driven sampler that
 	// publishes apple_power_*_watts gauges. Defaults false because
@@ -259,6 +277,16 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 			port,
 			a.logger.With("subsystem", "executor"),
 		)
+	case runtimeVLLMSwift:
+		vllmSwiftExec := NewVLLMSwiftExecutor(
+			a.config.VLLMSwiftBin,
+			a.config.ModelStorePath,
+			a.logger.With("subsystem", "executor"),
+		)
+		if a.config.VLLMSwiftStartupTimeout > 0 {
+			vllmSwiftExec.SetStartupTimeout(a.config.VLLMSwiftStartupTimeout)
+		}
+		a.executor = vllmSwiftExec
 	default:
 		metalExec := NewMetalExecutor(
 			a.config.LlamaServerBin,
@@ -453,20 +481,26 @@ func derefInt32(p *int32) int {
 func (a *MetalAgent) validateRuntimeFormat(model *inferencev1alpha1.Model) error {
 	modelFormat := model.Spec.Format
 	if modelFormat == "" {
-		modelFormat = "gguf"
+		modelFormat = formatGGUF
 	}
 
 	var bad bool
 	var runtimeLabel string
 	switch a.config.Runtime {
 	case runtimeOMLX:
-		bad = modelFormat == "gguf"
+		bad = modelFormat == formatGGUF
 		runtimeLabel = runtimeOMLX
 	case runtimeOllama:
-		bad = modelFormat == "mlx"
+		bad = modelFormat == formatMLX
 		runtimeLabel = runtimeOllama
+	case runtimeVLLMSwift:
+		// vllm-swift accepts MLX directories AND HuggingFace safetensors
+		// directories (the SwiftInferenceEngine reads both). gguf is the
+		// only incompatible format.
+		bad = modelFormat == formatGGUF
+		runtimeLabel = runtimeVLLMSwift
 	default:
-		bad = modelFormat == "mlx"
+		bad = modelFormat == formatMLX
 		runtimeLabel = "llama-server"
 	}
 	if !bad {
