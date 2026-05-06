@@ -54,6 +54,7 @@ type AgentConfig struct {
 	OllamaPort                int
 	VLLMSwiftBin              string
 	Port                      int
+	ClientPort                int
 	LogLevel                  string
 	HostIP                    string
 	MemoryFraction            float64
@@ -181,6 +182,7 @@ func main() {
 	flag.IntVar(&cfg.OllamaPort, "ollama-port", 11434, "Port for Ollama server")
 	flag.StringVar(&cfg.VLLMSwiftBin, "vllm-swift-bin", "", "Path to vllm-swift binary (auto-detected if not set)")
 	flag.IntVar(&cfg.Port, "port", 9090, "Agent metrics/health port")
+	flag.IntVar(&cfg.ClientPort, "client-port", 9999, "Stable host-side OpenAI-compatible proxy port (0 to disable). Forwards to whichever inference child is currently managed; replaces the external vllm-swift-proxy.py utility (#406).")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.HostIP, "host-ip", "", "IP address to register in Kubernetes endpoints (auto-detected if empty)")
 	flag.Float64Var(&cfg.MemoryFraction, "memory-fraction", 0,
@@ -404,6 +406,20 @@ func main() {
 		logger.Infow("received shutdown signal; cleaning up")
 		cancel()
 	}()
+
+	// Start the client proxy (#406): a stable host-side listener that
+	// forwards OpenAI-compatible requests to whichever inference child is
+	// currently managed. Lifetime tied to ctx so it shuts down with the
+	// agent. Failures are non-fatal — a broken proxy shouldn't kill the
+	// whole agent process; we log and continue.
+	if cfg.ClientPort > 0 {
+		clientProxy := agent.NewClientProxy(metalAgent, cfg.ClientPort, logger)
+		go func() {
+			if err := clientProxy.Start(ctx); err != nil {
+				logger.Warnw("client proxy stopped with error", "error", err)
+			}
+		}()
+	}
 
 	// Start the agent
 	logger.Infow("Metal agent started successfully")

@@ -113,14 +113,22 @@ type ProcessExecutor interface {
 }
 
 // DefaultLlamaServerStartupTimeout is how long the agent waits for a freshly
-// spawned llama-server to respond on /health. Was 30s historically; that's
-// fine for sub-30 GB models but breaks for anything larger because llama.cpp's
-// mlock pass + warmup grows roughly linearly with model size. Empirically an
-// 84 GB model (MiniMax M2.7 IQ3_S on M5 Max) takes ~30+ seconds just for
-// mlock; the original timeout would kill the process just before it would
-// have been ready. 120s gives generous headroom for the largest models that
-// fit in 128 GB unified memory while still failing fast on real breakage.
-const DefaultLlamaServerStartupTimeout = 120 * time.Second
+// spawned llama-server to respond on /health. Was 30s, then 120s; 300s is
+// the current floor because:
+//
+// llama.cpp startup time scales with two factors that are roughly independent:
+//  1. mlock pass + warmup, ~linear in model size on disk. A 36 GB Q8 model
+//     takes ~30 s on a warm disk cache, ~2 min on a cold cache.
+//  2. KV cache pre-allocation, ~linear in context size × n_layers × head_dim.
+//     At 256K context for a 35B model that's ~10 GB of KV, which adds
+//     90-120 s on top of the model load on first cold start.
+//
+// 120 s was fine for 64K-128K contexts but broke at 256K cold-start, killing
+// the child right before it would have been ready. 300 s gives headroom for
+// 256K-512K loads on the largest models that fit in 128 GB unified memory
+// while still failing fast (5 min) on real breakage. Subsequent loads are
+// cache-warm and finish in 3-5 seconds regardless of context size.
+const DefaultLlamaServerStartupTimeout = 300 * time.Second
 
 type MetalExecutor struct {
 	llamaServerBin string
