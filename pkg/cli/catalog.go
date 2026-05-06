@@ -17,60 +17,27 @@ limitations under the License.
 package cli
 
 import (
-	_ "embed"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
 
+	"github.com/defilantech/llmkube/catalog"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
-
-	modelcatalog "github.com/defilantech/llmkube/catalog"
 )
 
-type Catalog struct {
-	Version string           `yaml:"version"`
-	Models  map[string]Model `yaml:"models"`
-}
-
-type Model struct {
-	Name         string       `yaml:"name"`
-	Description  string       `yaml:"description"`
-	Size         string       `yaml:"size"`
-	Quantization string       `yaml:"quantization"`
-	Source       string       `yaml:"source"`
-	ContextSize  int          `yaml:"context_size"`
-	GPULayers    int32        `yaml:"gpu_layers"`
-	UseCases     []string     `yaml:"use_cases"`
-	Resources    ResourceSpec `yaml:"resources"`
-	VRAMEstimate string       `yaml:"vram_estimate"`
-	Tags         []string     `yaml:"tags"`
-	Homepage     string       `yaml:"homepage"`
-	Notes        string       `yaml:"notes,omitempty"`
-}
-
-type ResourceSpec struct {
-	CPU       string `yaml:"cpu"`
-	Memory    string `yaml:"memory"`
-	GPUMemory string `yaml:"gpu_memory"`
-}
-
-var catalogInstance *Catalog
+// Type aliases keep the existing pkg/cli call sites working unchanged after
+// the catalog data + loader moved into the top-level catalog package (so
+// pkg/cli/tui can consume the catalog without an import cycle through pkg/cli).
+type (
+	Catalog      = catalog.Catalog
+	Model        = catalog.Model
+	ResourceSpec = catalog.ResourceSpec
+)
 
 func LoadCatalog() (*Catalog, error) {
-	if catalogInstance != nil {
-		return catalogInstance, nil
-	}
-
-	var catalog Catalog
-	if err := yaml.Unmarshal(modelcatalog.CatalogYAML, &catalog); err != nil {
-		return nil, fmt.Errorf("failed to parse catalog: %w", err)
-	}
-
-	catalogInstance = &catalog
-	return catalogInstance, nil
+	return catalog.Load()
 }
 
 func GetModel(modelID string) (*Model, error) {

@@ -17,6 +17,7 @@ limitations under the License.
 package cli
 
 import (
+	"github.com/defilantech/llmkube/pkg/cli/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -49,6 +50,7 @@ built-in observability, SLO enforcement, and edge-native capabilities.`,
 	cmd.AddCommand(NewCacheCommand())
 	cmd.AddCommand(NewInspectCommand())
 	cmd.AddCommand(NewLicenseCommand())
+	cmd.AddCommand(tui.NewCommand())
 
 	return cmd
 }
