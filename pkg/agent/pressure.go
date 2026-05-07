@@ -59,6 +59,13 @@ const (
 // on the up-to-date object metadata; failures are logged and ignored, since
 // observability must never block the watchdog. No-op when EventRecorder is
 // nil, which keeps tests that wire only K8sClient working unchanged.
+//
+// Lock safety: this helper performs apiserver I/O (a Get + an event write)
+// and MUST NOT be called while holding a.mu. Callers in pressure.go drop
+// the lock before invoking it; the existing call sites all live in the
+// post-Unlock section of handleMemoryPressure and the no-lock path in
+// ensureProcess. Future callers must preserve that property or risk
+// stalling the watchdog goroutine on a slow apiserver round-trip.
 func (a *MetalAgent) emitInferenceEvent(
 	ctx context.Context, p *ManagedProcess,
 	eventType, reason, messageFmt string, args ...interface{},
@@ -255,6 +262,13 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 // pressure without action. Type Normal because the agent is behaving as
 // designed; the higher-severity signal is the underlying MemoryPressure
 // condition + level-changed event.
+//
+// Follow-up (#390 review): under sustained Critical+disabled (or below-guard)
+// pressure this fans out N events per watchdog tick across N managed
+// processes. If that ever drowns out level-changed events in operator
+// tooling, gate via a per-IS `lastSkipReason` map (analogous to
+// pressureObserved) so we only emit when the reason changes. Not done in
+// the initial PR because the actual on-cluster volume is still unknown.
 func (a *MetalAgent) emitEvictionSkippedAcrossManaged(
 	ctx context.Context, snapshot map[string]*ManagedProcess,
 	reason, message string,
