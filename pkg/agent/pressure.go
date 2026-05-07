@@ -59,7 +59,10 @@ const (
 // on the up-to-date object metadata; failures are logged and ignored, since
 // observability must never block the watchdog. No-op when EventRecorder is
 // nil, which keeps tests that wire only K8sClient working unchanged.
-func (a *MetalAgent) emitInferenceEvent(ctx context.Context, p *ManagedProcess, eventType, reason, messageFmt string, args ...interface{}) {
+func (a *MetalAgent) emitInferenceEvent(
+	ctx context.Context, p *ManagedProcess,
+	eventType, reason, messageFmt string, args ...interface{},
+) {
 	if a.config.EventRecorder == nil || p == nil {
 		return
 	}
@@ -185,7 +188,9 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		if level == MemoryPressureCritical {
 			evictionsSkippedTotal.WithLabelValues("below_guard").Inc()
 			a.emitEvictionSkippedAcrossManaged(ctx, snapshot, "below_guard",
-				fmt.Sprintf("watchdog at Critical but managed processes hold less than 50%% of system RSS (totalRSS=%s of %s); refusing friendly fire",
+				fmt.Sprintf(
+					"watchdog at Critical but managed processes hold less than 50%% of system RSS "+
+						"(totalRSS=%s of %s); refusing friendly fire",
 					formatMemory(stats.TotalRSS), formatMemory(stats.TotalMemory)))
 		}
 		return
@@ -250,7 +255,10 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 // pressure without action. Type Normal because the agent is behaving as
 // designed; the higher-severity signal is the underlying MemoryPressure
 // condition + level-changed event.
-func (a *MetalAgent) emitEvictionSkippedAcrossManaged(ctx context.Context, snapshot map[string]*ManagedProcess, reason, message string) {
+func (a *MetalAgent) emitEvictionSkippedAcrossManaged(
+	ctx context.Context, snapshot map[string]*ManagedProcess,
+	reason, message string,
+) {
 	for _, p := range snapshot {
 		a.emitInferenceEvent(ctx, p, corev1.EventTypeNormal,
 			EventReasonEvictionSkipped, "%s (skip-reason=%s)", message, reason)
