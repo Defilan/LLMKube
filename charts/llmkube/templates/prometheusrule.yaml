@@ -111,6 +111,8 @@ spec:
             rate(vllm:time_to_first_token_seconds_bucket[5m])
           )
         )
+      labels:
+        latency_kind: ttft
     - record: llmkube:inference:llamacpp_request:p95_5m
       expr: |
         histogram_quantile(0.95,
@@ -123,7 +125,10 @@ spec:
 
     # Inference pod restart rate as a coarse error proxy. Per-request
     # 4xx/5xx counters are tracked in #409 and will replace this once the
-    # upstream metric paths are confirmed for each runtime.
+    # upstream metric paths are confirmed for each runtime. The container
+    # regex below must be extended when new runtimes ship a real container
+    # name (e.g. add `vllm-swift` to the alternation when that backend
+    # graduates from skeletal to a deployable runtime; tracked in #409).
     - record: llmkube:inference:restarts:rate5m
       expr: |
         sum by (service, namespace, runtime) (
