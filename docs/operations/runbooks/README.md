@@ -24,6 +24,10 @@ Every runbook should be testable: an on-call engineer who has never seen the fai
 
 - [`metal-agent-memory-pressure.md`](./metal-agent-memory-pressure.md): the metal-agent watchdog reports Warning or Critical memory pressure and may evict managed inference processes.
 
+### Lifecycle
+
+- [`upgrade-rollback.md`](./upgrade-rollback.md): the supported Helm-based upgrade path for moving an LLMKube install between minor or patch versions, plus the rollback procedure when an upgrade goes wrong.
+
 ### Pending (planned)
 
 These are scheduled to land before the day-one production install. Each maps to a known failure mode worth documenting.
