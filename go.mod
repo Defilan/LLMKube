@@ -2,7 +2,7 @@ module github.com/defilantech/llmkube
 
 go 1.25.0
 
-toolchain go1.25.9
+toolchain go1.25.10
 
 require (
 	github.com/onsi/ginkgo/v2 v2.28.3
