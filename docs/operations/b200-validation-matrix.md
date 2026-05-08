@@ -16,6 +16,7 @@ LLMKube is currently validated on H100, L4, and L40S. This document captures the
 | Rows passing | 0 / 10 |
 | Rows blocked on hardware | 10 / 10 |
 | Concrete deltas already landed | None yet (see "Concrete deltas" below for the queue) |
+| Source-fact-checked | 2026-05-07 against NVIDIA driver/CUDA/MIG docs, gpu-operator + k8s-device-plugin + dcgm-exporter + NCCL release notes, vllm-project/vllm RFC #18153, llama.cpp build docs, DGX OS 7 release notes. Re-verify version floors quarterly; this is a fast-moving stack. |
 
 When a row's status changes, update both this document and the tracking issue's checklist.
 
@@ -67,22 +68,23 @@ These are project changes the LLMKube codebase, Helm chart, or docs need to abso
 
 `charts/llmkube/README.md` should grow a "Tested platforms" section capturing:
 
-- NVIDIA driver: **560.35.03 minimum**, 570.x recommended for DGX OS 7. 550.x explicitly does not support B200; 555.x is preview-only.
+- NVIDIA driver: **R570 minimum** (570.124.06 GA; 570.133.20 required for HGX B200 per the gpu-operator platform-support docs); R570.86+ recommended for DGX OS 7. R550 and earlier do not list B200 in supported hardware. (R555 was the open-kernel-module preview branch and is unrelated to Blackwell GA timing.)
 - CUDA toolkit: **12.8 minimum** (first public `sm_100` codegen, January 2025); 12.9+ recommended; forward target CUDA 13.x.
-- `gpu-operator >= v24.6` (v24.9 / v25.x recommended); `k8s-device-plugin >= v0.15` (v0.17.x preferred).
+- `gpu-operator >= v24.6` (v24.9 / v25.x recommended); **`k8s-device-plugin >= v0.17.2`** (Blackwell-aware product labels); v0.18.0+ preferred for full architecture detection. (v0.15 / v0.16 do not advertise Blackwell architecture labels.)
 - **Fabric Manager package version MUST match the NVIDIA driver exactly.** A mismatch silently degrades NVLink5 to PCIe with no clear error surface. Highest-priority silent-failure mode; deserves its own runbook entry under `docs/operations/runbooks/`.
 
 ### 2. DCGM exporter floor
 
-- Floor: `dcgm-exporter 3.3.7` for basic Blackwell.
-- Recommended: `4.0+` for Blackwell-native counters (NVLink5 per-link, Tensor Core Gen-5 utilization, per-die power split, HBM3e bandwidth, PCIe Gen6 link health).
-- Update the Grafana dashboard from #409 to surface the new counters once 4.0 is in the bundled chart.
+- Floor: `dcgm-exporter` 3.3.x line for basic Blackwell coverage; the 3.3.x line picked up Blackwell counters incrementally.
+- Recommended: **`dcgm-exporter 4.5+`** (current line as of Feb 2026).
+- Verify exact DCGM field IDs (NVLink5 throughput, HBM3e bandwidth, PCIe link health, etc.) against the DCGM field reference at validation time rather than relying on this doc to enumerate them; the named-counter list shifts release-to-release.
+- Update the Grafana dashboard from #409 to surface the verified counters once a known-good `dcgm-exporter` version is bundled in the chart.
 
 ### 3. Runtime image bumps + sm_100 codegen
 
 Audit the default images each runtime backend sets:
 
-- `internal/controller/runtime_vllm.go`: `vllm/vllm-openai:v0.20.0` is likely fine (Blackwell support landed in 0.7.x, FP8 / MXFP4 mature in 0.9+). Confirm at validation time and record the exact tag the matrix passed against.
+- `internal/controller/runtime_vllm.go`: `vllm/vllm-openai:v0.20.0` is on the current line (latest released v0.20.1 as of May 2026). Blackwell support landed incrementally starting around **v0.15.x** per [vllm-project/vllm RFC #18153](https://github.com/vllm-project/vllm/issues/18153) (filed May 2025), maturing through v0.16-v0.18. **Practical floor: v0.18+.** Confirm exact tag at validation time and record it in the matrix row.
 - `internal/controller/runtime_llamacpp.go`: `ghcr.io/ggml-org/llama.cpp:server` must be a build that includes `CMAKE_CUDA_ARCHITECTURES="90;100"`. Pin to a tag verified to ship `sm_100` codegen.
 - `internal/controller/runtime_tgi.go`: `ghcr.io/huggingface/text-generation-inference:latest` should pin to a 3.x tag with rebuilt flash-attn for Blackwell.
 
@@ -99,15 +101,17 @@ Audit the default images each runtime backend sets:
 
 Document in the multi-GPU deployment guide:
 
-- `NCCL >= 2.23` for NVLink5 / NVSwitch5 topology.
-- `NCCL 2.24+` recommended; older versions show small-message all-reduce regressions on Blackwell.
+- **`NCCL >= 2.25.1`** introduced Blackwell support; `2.25.2+` for GB200 MNNVL.
+- **`NCCL 2.27+ / 2.28+` recommended** for NVLSTree tuning and Blackwell perf fixes.
+- `NCCL 2.24` and earlier predate Blackwell support entirely; the previously-circulated "2.23 floor" is incorrect.
 
 ### 6. OFED / OS floors for GPUDirect RDMA on Gen6
 
 For the air-gapped install guide and any future multi-node sharding work:
 
-- DGX OS 7 (Ubuntu 24.04, kernel 6.8+) or non-DGX hosts at kernel 6.5+.
-- `MLNX_OFED 24.10+` or `DOCA-OFED 2.9+` for ConnectX-7 / BlueField-3 GPUDirect RDMA on PCIe Gen6.
+- **DGX OS 7** (Ubuntu 24.04, kernel 6.8) is the supported OS for HGX B200; non-DGX kernel floors should be pinned against NVIDIA's GPUDirect RDMA guide at validation time.
+- **`MLNX_OFED 24.10 LTS`** (final standalone release, Oct 2024) or **`DOCA-OFED`** (the supported forward path; MLNX_OFED has been EOL for new features since Jan 2025). Verify exact `DOCA-OFED` version against its release notes at validation time for ConnectX-7 / BlueField-3 GPUDirect RDMA.
+- PCIe Gen6 + ConnectX-8 GPUDirect RDMA may require additional Linux kernel patches per NVIDIA's GPUDirect RDMA guide.
 
 ## Common silent-failure modes
 
@@ -115,7 +119,7 @@ Each of these gets a runbook entry under `docs/operations/runbooks/` (filed as p
 
 1. **Fabric Manager / driver version mismatch.** NVLink5 degrades to PCIe with no clear error. Detection: NVLink bandwidth scrape from DCGM; alert if reported topology bandwidth diverges from expected.
 2. **Old base image (CUDA 12.4 or earlier) on B200.** Kernels appear to load but fall back or fail at launch. Detection: container logs around model load; capture `cuobjdump --list-elf` for the runtime image.
-3. **NCCL 2.21 or earlier on Blackwell.** Small-message all-reduce regressions. Detection: collective benchmark in row #4 of the matrix.
+3. **NCCL 2.24 or earlier on Blackwell.** Lacks the NVLink5 / NVSwitch5 topology support introduced in NCCL 2.25.1; results in small-message all-reduce regressions on multi-GPU. Detection: collective benchmark in row #4 of the matrix.
 4. **Old OFED on Gen6.** GPUDirect RDMA disabled silently; looks like generic network slowness. Detection: `nvidia-smi topo --matrix` plus an RDMA performance benchmark.
 
 ## What this document is NOT
