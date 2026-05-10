@@ -73,7 +73,12 @@ func inspectPVCCache(
 		defer deleteInspectorPod(context.Background(), clientset, namespace, podName)
 		createdPod = true
 
-		if err := waitForPodRunning(ctx, clientset, namespace, podName, 60*time.Second); err != nil {
+		// 120s accommodates slower storage classes (Longhorn, OpenShift CSI,
+		// remote-attach disks) where PVC binding plus volume attach can exceed
+		// the original 60s. Fast local-path setups still resolve in seconds; the
+		// only effect of the higher ceiling is a longer wait when the inspector
+		// genuinely cannot start, which is acceptable for a one-off CLI command.
+		if err := waitForPodRunning(ctx, clientset, namespace, podName, 120*time.Second); err != nil {
 			return nil, fmt.Errorf("inspector pod failed to start: %w", err)
 		}
 
