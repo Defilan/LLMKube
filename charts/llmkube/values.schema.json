@@ -90,7 +90,12 @@
           "properties": {
             "registry": { "type": "string" },
             "repository": { "type": "string", "minLength": 1 },
-            "tag": { "type": "string" }
+            "tag": { "type": "string" },
+            "defaultFSGroup": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Default fsGroup applied to inference pods when Spec.PodSecurityContext is unset. 102 matches curlimages/curl curl_group GID. Set to 0 to disable on OpenShift."
+            }
           }
         },
         "env": {

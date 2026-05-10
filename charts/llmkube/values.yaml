@@ -79,6 +79,16 @@ controllerManager:
     registry: ""
     repository: docker.io/curlimages/curl
     tag: "8.18.0"
+    # Default fsGroup applied to the rendered PodSecurityContext when the
+    # InferenceService does not provide its own Spec.PodSecurityContext.
+    # 102 matches curlimages/curl curl_group GID and lets the init container
+    # write to a freshly-provisioned PVC on storage classes that initialize
+    # volumes as root:root 0755 (e.g., Longhorn, OpenShift restricted-v2).
+    #
+    # Set to 0 on OpenShift, where the restricted-v2 SCC injects fsGroup
+    # from the namespace's allocated range and rejects pods with explicit
+    # values outside that range.
+    defaultFSGroup: 102
 
   # Additional environment variables
   env: []

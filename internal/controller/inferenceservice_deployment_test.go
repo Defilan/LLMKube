@@ -176,6 +176,7 @@ var _ = Describe("Multi-GPU Deployment Construction", func() {
 				Client:             k8sClient,
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 		})
 
@@ -469,6 +470,7 @@ var _ = Describe("Multi-GPU Deployment Construction", func() {
 				Client:             k8sClient,
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: customImage,
+				DefaultFSGroup:     102,
 			}
 
 			model := &inferencev1alpha1.Model{
@@ -519,6 +521,7 @@ var _ = Describe("Multi-GPU Deployment Construction", func() {
 				Client:             k8sClient,
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 		})
 
@@ -641,6 +644,7 @@ var _ = Describe("Context Size Configuration", func() {
 				Client:             k8sClient,
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -802,6 +806,7 @@ var _ = Describe("Context Size Configuration", func() {
 				Client:             k8sClient,
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -905,6 +910,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1049,6 +1055,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1157,6 +1164,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1389,6 +1397,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1497,6 +1506,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1605,6 +1615,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1713,6 +1724,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1815,6 +1827,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -1920,6 +1933,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2090,6 +2104,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2198,6 +2213,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2291,6 +2307,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2380,6 +2397,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2468,6 +2486,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2556,6 +2575,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2637,6 +2657,7 @@ var _ = Describe("Context Size Configuration", func() {
 			reconciler = &InferenceServiceReconciler{
 				ModelCachePath:     "/tmp/llmkube/models",
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     102,
 			}
 
 			model = &inferencev1alpha1.Model{
@@ -2802,6 +2823,7 @@ var _ = Describe("constructDeployment additional cases", func() {
 			Client:             k8sClient,
 			Scheme:             k8sClient.Scheme(),
 			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
 		}
 	})
 
@@ -2934,6 +2956,7 @@ var _ = Describe("Security Context Configuration", func() {
 			Client:             k8sClient,
 			Scheme:             k8sClient.Scheme(),
 			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
 		}
 
 		model = &inferencev1alpha1.Model{
@@ -3029,6 +3052,37 @@ var _ = Describe("Security Context Configuration", func() {
 			Expect(podSecCtx).NotTo(BeNil())
 			Expect(podSecCtx.FSGroup).NotTo(BeNil())
 			Expect(*podSecCtx.FSGroup).To(Equal(int64(102)))
+			Expect(podSecCtx.SeccompProfile).NotTo(BeNil())
+			Expect(podSecCtx.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
+		})
+
+		It("should omit FSGroup when DefaultFSGroup is 0 (OpenShift compatibility mode)", func() {
+			// Operators on OpenShift set --default-fsgroup=0 so the
+			// restricted-v2 SCC injects fsGroup from the namespace's
+			// allocated range. The rendered PodSecurityContext should
+			// have no FSGroup, leaving the SCC admission controller free
+			// to inject one.
+			openshiftReconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:     0,
+			}
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "secctx-openshift-mode", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "secctx-model",
+					Replicas: &replicas,
+				},
+			}
+
+			deployment := openshiftReconciler.constructDeployment(isvc, model, 1)
+
+			podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+			Expect(podSecCtx).NotTo(BeNil())
+			Expect(podSecCtx.FSGroup).To(BeNil())
 			Expect(podSecCtx.SeccompProfile).NotTo(BeNil())
 			Expect(podSecCtx.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
 		})
@@ -3627,6 +3681,7 @@ var _ = Describe("PersonaPlex Runtime Deployment Construction", func() {
 			Client:             k8sClient,
 			Scheme:             k8sClient.Scheme(),
 			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
 		}
 	})
 
@@ -3718,6 +3773,7 @@ var _ = Describe("Generic Runtime Deployment Construction", func() {
 			Client:             k8sClient,
 			Scheme:             k8sClient.Scheme(),
 			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
 		}
 	})
 
@@ -3908,6 +3964,7 @@ var _ = Describe("constructDeployment Regression Tests", func() {
 			Client:             k8sClient,
 			Scheme:             k8sClient.Scheme(),
 			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
 		}
 	})
 

@@ -50,6 +50,11 @@ type InferenceServiceReconciler struct {
 	ModelCacheAccessMode string
 	CACertConfigMap      string
 	InitContainerImage   string
+	// DefaultFSGroup is applied to the rendered PodSecurityContext when the
+	// user has not supplied one. Values <= 0 disable the default (recommended
+	// on OpenShift, where the restricted-v2 SCC injects fsGroup from the
+	// namespace's allocated range). Set via --default-fsgroup; default 102.
+	DefaultFSGroup int64
 }
 
 func sanitizeDNSName(name string) string {
