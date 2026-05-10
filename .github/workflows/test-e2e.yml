@@ -69,6 +69,9 @@ jobs:
         env:
           KIND_CLUSTER: llmkube-test-e2e
         run: |
+          # /lib/modules is the canonical Longhorn-on-kind extraMount.
+          # /sys must NOT be mounted from host; it breaks kind's systemd init
+          # ("could not find a log line that matches Reached target Multi-User System").
           cat <<EOF > /tmp/kind-longhorn.yaml
           kind: Cluster
           apiVersion: kind.x-k8s.io/v1alpha4
@@ -79,10 +82,6 @@ jobs:
                 - hostPath: /lib/modules
                   containerPath: /lib/modules
                   readOnly: true
-                - hostPath: /dev
-                  containerPath: /dev
-                - hostPath: /sys
-                  containerPath: /sys
           EOF
           kind create cluster --config /tmp/kind-longhorn.yaml
 
