@@ -995,6 +995,14 @@ spec:
 		})
 
 		Context("cache list orphaned entry detection", func() {
+			// Depends on PVC + cache_inspect.go inspector-pod path, both
+			// incompatible with Longhorn RWO. See sibling Context above.
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("test exercises multi-RWO PVC mounts; covered on default kind storage")
+				}
+			})
+
 			It("should detect orphaned cache entries on the PVC", func() {
 				By("getting the PVC name to confirm it exists")
 				cmd := exec.Command("kubectl", "get", "pvc", "llmkube-model-cache",
@@ -1067,6 +1075,14 @@ spec:
 		})
 
 		Context("cache list inspector pod lifecycle", func() {
+			// Explicitly exercises the inspector-pod spawn path that
+			// Longhorn RWO blocks indefinitely. See sibling Context above.
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("test exercises multi-RWO PVC mounts; covered on default kind storage")
+				}
+			})
+
 			It("should create and clean up inspector pod when no existing pods mount the PVC", func() {
 				By("creating a namespace with a PVC but no running pods")
 				inspectorNs := "e2e-cache-inspector"
