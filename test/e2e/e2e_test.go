@@ -940,7 +940,14 @@ spec:
 					g.Expect(output).To(ContainSubstring("active"))
 					g.Expect(output).To(ContainSubstring("cache-test-model"))
 				}
-				Eventually(verifyCacheList, 2*time.Minute).Should(Succeed())
+				// 4-minute Eventually budget (vs 2 previously) so the inner
+				// inspector pod wait (120s in pkg/cli/cache_inspect.go) can
+				// run twice before the test gives up. Slow CSI drivers like
+				// Longhorn-on-kind routinely take 90-120s to attach a fresh
+				// PVC; with a single attempt we'd get one shot per Eventually
+				// retry interval, which the previous 2-minute budget did not
+				// fit.
+				Eventually(verifyCacheList, 4*time.Minute).Should(Succeed())
 			})
 
 			It("should show PVC-derived sizes in cache list output", func() {
