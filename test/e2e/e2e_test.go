@@ -884,6 +884,21 @@ spec:
 		})
 
 		Context("cache list with Model CR and PVC", func() {
+			// All specs in this block exercise cache_inspect.go's transient
+			// inspector pod path. The inspector mounts the same RWO PVC the
+			// InferenceService Deployment also wants. Longhorn's strict RWO
+			// enforcement blocks the second attach indefinitely, so the
+			// inspector pod never reaches Running. Local-path-provisioner
+			// permits the multi-RWO pattern, so this Context runs cleanly on
+			// the default kind storage class. Skip the whole block under
+			// Longhorn; #418/#419 fsGroup regression coverage is provided by
+			// the other specs in the suite which run on Longhorn unchanged.
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("cache list inspector-pod path is incompatible with Longhorn RWO; covered on default kind storage")
+				}
+			})
+
 			It("should show active cache entries with STATUS column after model download", func() {
 				By("applying a Model CR pointing to the test server")
 				cmd := exec.Command("kubectl", "apply", "-f", "-")
@@ -920,20 +935,6 @@ spec:
 `, cacheTestNs))
 				_, err = utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred(), "Failed to apply InferenceService CR")
-
-				// The test fixture serves fake GGUF bytes ("fake-gguf-data"
-				// base64-encoded) which the llama-server main container
-				// cannot parse, so the InferenceService Deployment never
-				// reaches Available. The cache list path under test relies
-				// on cache_inspect.go spawning a transient inspector pod
-				// that mounts the cache PVC, which is fine on local-path
-				// provisioners. Skip this test under Longhorn because the
-				// inspector pod tries to mount the same RWO PVC the
-				// Deployment is also pending against, and Longhorn's RWO
-				// enforcement blocks the second attach indefinitely.
-				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
-					Skip("cache list inspector-pod path needs multi-RWO mounts; covered on default kind storage")
-				}
 
 				By("waiting for the model cache PVC to exist")
 				verifyPVCExists := func(g Gomega) {
