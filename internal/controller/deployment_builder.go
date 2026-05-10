@@ -49,14 +49,28 @@ func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 	return nil
 }
 
+// inferPodSecurityContext returns the user-supplied PodSecurityContext when
+// present, otherwise a default that works with the standard non-root init
+// container image (curlimages/curl, uid=101 gid=102).
+//
+// FSGroup defaults to 102 (curl_group) so the init container can write to a
+// freshly-provisioned PVC. Kubernetes recursively chowns the volume to this
+// GID and adds it to all containers' supplementary groups, which makes the
+// volume writable for the curl init container and readable for the inference
+// container regardless of its primary UID.
+//
+// Operators using a custom init container image (--init-container-image) with
+// a different UID/GID should override Spec.PodSecurityContext.
 func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService) *corev1.PodSecurityContext {
 	if isvc.Spec.PodSecurityContext != nil {
 		return isvc.Spec.PodSecurityContext
 	}
+	fsGroup := int64(102)
 	return &corev1.PodSecurityContext{
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
+		FSGroup: &fsGroup,
 	}
 }
 

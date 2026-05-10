@@ -58,10 +58,13 @@ func sanitizeDNSName(name string) string {
 
 func boolPtr(b bool) *bool { return &b }
 
-// initContainerSecurityContext sets up security context for the model downloader init container.
-// It inherits runAsUser/runAsGroup from podSecurityContext if specified by the user.
-// Users MUST specify runAsUser/runAsGroup in their InferenceService podSecurityContext to avoid
-// permission denied errors on the model volume.
+// initContainerSecurityContext returns the SecurityContext applied to the
+// model downloader init container. It inherits runAsUser/runAsGroup from the
+// pod-level Spec.PodSecurityContext when the user supplied one. The default
+// FSGroup on the pod (see inferPodSecurityContext) is sufficient for the
+// standard curlimages/curl init image; explicit RunAsUser is only needed if
+// the operator overrides --init-container-image with one whose default user
+// differs from curl_user.
 func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *corev1.SecurityContext {
 	sc := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: boolPtr(false),

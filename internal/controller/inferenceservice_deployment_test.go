@@ -3011,6 +3011,54 @@ var _ = Describe("Security Context Configuration", func() {
 		})
 	})
 
+	Context("default pod security context", func() {
+		It("should default FSGroup to 102 to match curlimages/curl curl_group", func() {
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "secctx-default-fsgroup", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "secctx-model",
+					Replicas: &replicas,
+					// No PodSecurityContext set; expect operator default.
+				},
+			}
+
+			deployment := reconciler.constructDeployment(isvc, model, 1)
+
+			podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+			Expect(podSecCtx).NotTo(BeNil())
+			Expect(podSecCtx.FSGroup).NotTo(BeNil())
+			Expect(*podSecCtx.FSGroup).To(Equal(int64(102)))
+			Expect(podSecCtx.SeccompProfile).NotTo(BeNil())
+			Expect(podSecCtx.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
+		})
+
+		It("should preserve user-supplied PodSecurityContext verbatim without merging the default FSGroup", func() {
+			replicas := int32(1)
+			runAsNonRoot := true
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "secctx-no-merge", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "secctx-model",
+					Replicas: &replicas,
+					PodSecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &runAsNonRoot,
+						// Deliberately no FSGroup; the operator must respect the
+						// user's intent and not merge in the default.
+					},
+				},
+			}
+
+			deployment := reconciler.constructDeployment(isvc, model, 1)
+
+			podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+			Expect(podSecCtx).NotTo(BeNil())
+			Expect(podSecCtx.FSGroup).To(BeNil())
+			Expect(podSecCtx.RunAsNonRoot).NotTo(BeNil())
+			Expect(*podSecCtx.RunAsNonRoot).To(BeTrue())
+		})
+	})
+
 	Context("user-specified security context overrides", func() {
 		It("should use user-specified podSecurityContext with fsGroup", func() {
 			replicas := int32(1)
