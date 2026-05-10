@@ -49,15 +49,38 @@ func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 	return nil
 }
 
-func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService) *corev1.PodSecurityContext {
+// inferPodSecurityContext returns the user-supplied PodSecurityContext when
+// present, otherwise a default that works with the standard non-root init
+// container image (curlimages/curl, uid=101 gid=102).
+//
+// defaultFSGroup is the operator-configured default fsGroup (--default-fsgroup
+// flag, default 102 to match curl_group). Kubernetes recursively chowns the
+// volume to this GID and adds it to all containers' supplementary groups,
+// which makes the volume writable for the curl init container and readable
+// for the inference container regardless of its primary UID.
+//
+// defaultFSGroup <= 0 disables the default. This is the recommended setting on
+// OpenShift, where the restricted-v2 SCC injects an appropriate fsGroup from
+// the namespace's allocated range and rejects pods with explicit values
+// outside that range.
+//
+// Operators using a custom init container image (--init-container-image) with
+// a different UID/GID should override Spec.PodSecurityContext or set
+// --default-fsgroup to match the new image's group.
+func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService, defaultFSGroup int64) *corev1.PodSecurityContext {
 	if isvc.Spec.PodSecurityContext != nil {
 		return isvc.Spec.PodSecurityContext
 	}
-	return &corev1.PodSecurityContext{
+	psc := &corev1.PodSecurityContext{
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
 	}
+	if defaultFSGroup > 0 {
+		fsGroup := defaultFSGroup
+		psc.FSGroup = &fsGroup
+	}
+	return psc
 }
 
 func inferContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *corev1.SecurityContext {
@@ -254,7 +277,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 					Annotations: copyMap(isvc.Spec.PodAnnotations),
 				},
 				Spec: corev1.PodSpec{
-					SecurityContext:    inferPodSecurityContext(isvc),
+					SecurityContext:    inferPodSecurityContext(isvc, r.DefaultFSGroup),
 					InitContainers:     storageConfig.initContainers,
 					Containers:         []corev1.Container{container},
 					Volumes:            storageConfig.volumes,

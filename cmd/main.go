@@ -106,6 +106,7 @@ func main() {
 	var modelCacheAccessMode string
 	var caCertConfigMap string
 	var initContainerImage string
+	var defaultFSGroup int64
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -118,6 +119,12 @@ func main() {
 		"Name of the ConfigMap containing a custom CA certificate to trust for model downloads.")
 	flag.StringVar(&initContainerImage, "init-container-image", "docker.io/curlimages/curl:8.18.0",
 		"Container image for the model downloader init container.")
+	flag.Int64Var(&defaultFSGroup, "default-fsgroup", 102,
+		"Default fsGroup for inference pods when Spec.PodSecurityContext is not set. "+
+			"102 matches curlimages/curl curl_group GID and lets the init container "+
+			"write to a freshly-provisioned PVC. Set to 0 to disable on OpenShift, "+
+			"where the restricted-v2 SCC injects fsGroup from the namespace's allocated "+
+			"range and rejects pods with explicit values outside that range.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -251,6 +258,7 @@ func main() {
 		ModelCacheAccessMode: modelCacheAccessMode,
 		CACertConfigMap:      caCertConfigMap,
 		InitContainerImage:   initContainerImage,
+		DefaultFSGroup:       defaultFSGroup,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
 		os.Exit(1)

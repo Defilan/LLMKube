@@ -884,6 +884,21 @@ spec:
 		})
 
 		Context("cache list with Model CR and PVC", func() {
+			// All specs in this block exercise cache_inspect.go's transient
+			// inspector pod path. The inspector mounts the same RWO PVC the
+			// InferenceService Deployment also wants. Longhorn's strict RWO
+			// enforcement blocks the second attach indefinitely, so the
+			// inspector pod never reaches Running. Local-path-provisioner
+			// permits the multi-RWO pattern, so this Context runs cleanly on
+			// the default kind storage class. Skip the whole block under
+			// Longhorn; #418/#419 fsGroup regression coverage is provided by
+			// the other specs in the suite which run on Longhorn unchanged.
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("cache list inspector-pod path is incompatible with Longhorn RWO; covered on default kind storage")
+				}
+			})
+
 			It("should show active cache entries with STATUS column after model download", func() {
 				By("applying a Model CR pointing to the test server")
 				cmd := exec.Command("kubectl", "apply", "-f", "-")
@@ -940,7 +955,14 @@ spec:
 					g.Expect(output).To(ContainSubstring("active"))
 					g.Expect(output).To(ContainSubstring("cache-test-model"))
 				}
-				Eventually(verifyCacheList, 2*time.Minute).Should(Succeed())
+				// 4-minute Eventually budget (vs 2 previously) so the inner
+				// inspector pod wait (120s in pkg/cli/cache_inspect.go) can
+				// run twice before the test gives up. Slow CSI drivers like
+				// Longhorn-on-kind routinely take 90-120s to attach a fresh
+				// PVC; with a single attempt we'd get one shot per Eventually
+				// retry interval, which the previous 2-minute budget did not
+				// fit.
+				Eventually(verifyCacheList, 4*time.Minute).Should(Succeed())
 			})
 
 			It("should show PVC-derived sizes in cache list output", func() {
@@ -973,6 +995,14 @@ spec:
 		})
 
 		Context("cache list orphaned entry detection", func() {
+			// Depends on PVC + cache_inspect.go inspector-pod path, both
+			// incompatible with Longhorn RWO. See sibling Context above.
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("test exercises multi-RWO PVC mounts; covered on default kind storage")
+				}
+			})
+
 			It("should detect orphaned cache entries on the PVC", func() {
 				By("getting the PVC name to confirm it exists")
 				cmd := exec.Command("kubectl", "get", "pvc", "llmkube-model-cache",
@@ -1045,6 +1075,14 @@ spec:
 		})
 
 		Context("cache list inspector pod lifecycle", func() {
+			// Explicitly exercises the inspector-pod spawn path that
+			// Longhorn RWO blocks indefinitely. See sibling Context above.
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("test exercises multi-RWO PVC mounts; covered on default kind storage")
+				}
+			})
+
 			It("should create and clean up inspector pod when no existing pods mount the PVC", func() {
 				By("creating a namespace with a PVC but no running pods")
 				inspectorNs := "e2e-cache-inspector"
