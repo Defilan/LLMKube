@@ -921,6 +921,20 @@ spec:
 				_, err = utils.Run(cmd)
 				Expect(err).NotTo(HaveOccurred(), "Failed to apply InferenceService CR")
 
+				// The test fixture serves fake GGUF bytes ("fake-gguf-data"
+				// base64-encoded) which the llama-server main container
+				// cannot parse, so the InferenceService Deployment never
+				// reaches Available. The cache list path under test relies
+				// on cache_inspect.go spawning a transient inspector pod
+				// that mounts the cache PVC, which is fine on local-path
+				// provisioners. Skip this test under Longhorn because the
+				// inspector pod tries to mount the same RWO PVC the
+				// Deployment is also pending against, and Longhorn's RWO
+				// enforcement blocks the second attach indefinitely.
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("cache list inspector-pod path needs multi-RWO mounts; covered on default kind storage")
+				}
+
 				By("waiting for the model cache PVC to exist")
 				verifyPVCExists := func(g Gomega) {
 					cmd := exec.Command("kubectl", "get", "pvc", "llmkube-model-cache",
@@ -930,22 +944,6 @@ spec:
 					g.Expect(output).To(Equal("llmkube-model-cache"))
 				}
 				Eventually(verifyPVCExists, 2*time.Minute).Should(Succeed())
-
-				// Wait for the InferenceService Deployment to come Available
-				// before invoking cache list. cache_inspect.go reuses an
-				// existing Running pod that has the PVC mounted (via exec)
-				// when one exists, and only spawns a separate inspector pod
-				// otherwise. On Longhorn the PVC is RWO; an inspector pod
-				// trying to mount it while the Deployment pod is still in
-				// ContainerCreating blocks indefinitely on volume attach.
-				// Waiting for the Deployment to be Available avoids that
-				// contention and exercises the "reuse existing pod" code
-				// path, which is the path real users hit anyway.
-				By("waiting for the InferenceService deployment to be available")
-				cmd = exec.Command("kubectl", "wait", "--for=condition=available",
-					"deployment/cache-test-inference", "-n", cacheTestNs, "--timeout=4m")
-				_, err = utils.Run(cmd)
-				Expect(err).NotTo(HaveOccurred(), "InferenceService deployment did not become available")
 
 				By("verifying llmkube cache list shows STATUS column and active entry")
 				verifyCacheList := func(g Gomega) {

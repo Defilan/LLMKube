@@ -108,6 +108,12 @@ jobs:
           kubectl get storageclass
 
       - name: Running Test e2e against Longhorn-backed cluster
+        env:
+          # Tells the e2e suite to skip tests that require multi-RWO
+          # behavior the local-path-provisioner permits but Longhorn does
+          # not (notably the cache-inspect path that spawns a second pod
+          # against the same RWO PVC the Deployment also wants).
+          LLMKUBE_E2E_LONGHORN: "true"
         run: |
           go mod tidy
           make test-e2e
