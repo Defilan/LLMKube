@@ -173,12 +173,15 @@ jobs:
         run: |
           make docker-build IMG="${IMG}"
 
-          # MINC runs MicroShift inside a single privileged container.
-          # Side-load the image via docker save + podman load inside the
-          # MINC container (analogous to 'kind load docker-image').
-          MINC_CTR=$(docker ps --filter "ancestor=quay.io/minc-org/minc" --format "{{.ID}}" | head -1)
+          # MINC runs MicroShift inside a single privileged container
+          # named "microshift". Side-load the image via docker save +
+          # podman load inside it (analogous to 'kind load docker-image').
+          # We filter by container name; ancestor matching is strict on
+          # tag and the MINC image tag includes a version+arch suffix
+          # that changes per release.
+          MINC_CTR=$(docker ps --filter "name=microshift" --format "{{.ID}}" | head -1)
           if [ -z "$MINC_CTR" ]; then
-            echo "ERROR: could not find MINC container; running containers:"
+            echo "ERROR: could not find 'microshift' container; running containers:"
             docker ps
             exit 1
           fi
