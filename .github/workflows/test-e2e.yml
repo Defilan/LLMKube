@@ -195,6 +195,11 @@ jobs:
 
       - name: Install LLMKube via Helm with OpenShift preset
         run: |
+          # modelCache.enabled=false because MicroShift-in-container has no
+          # default storage class; the model-cache PVC would hang Pending and
+          # block --wait. Real OpenShift installs keep the model cache enabled
+          # via their preferred storage class. The thing under test here is
+          # the SCC admission path, not the cache PVC binding.
           kubectl create namespace llmkube-system
           helm install llmkube ./charts/llmkube \
             -n llmkube-system \
@@ -202,6 +207,7 @@ jobs:
             --set controllerManager.image.repository=localhost/llmkube-controller \
             --set controllerManager.image.tag=ci-${{ github.sha }} \
             --set controllerManager.image.pullPolicy=Never \
+            --set modelCache.enabled=false \
             --wait --timeout 5m
           kubectl -n llmkube-system get pods
 
