@@ -117,3 +117,90 @@ jobs:
         run: |
           go mod tidy
           make test-e2e
+
+  test-e2e-openshift:
+    name: Run on Ubuntu (MicroShift, OpenShift SCC)
+    runs-on: ubuntu-latest
+    # Best-effort while the MicroShift-in-CI setup is hardened. The
+    # default kind job above remains the merge gate. This job catches
+    # OpenShift SCC admission regressions (refs #418, #419, #421) and
+    # will be promoted to required once stable.
+    continue-on-error: true
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Start runner-local container registry
+        run: |
+          docker run -d --restart=always -p 5000:5000 --name local-registry registry:2
+          # Wait for the registry to accept traffic before we try to push.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:5000/v2/ >/dev/null; then
+              echo "local registry ready"; break
+            fi
+            sleep 1
+          done
+
+      - name: Install MicroShift
+        uses: container-tools/microshift-action@v0.3
+        with:
+          microshift-version: "4.18"
+
+      - name: Verify MicroShift ready and SCC available
+        run: |
+          kubectl get nodes
+          kubectl get clusterrole | grep -i scc || true
+          kubectl get securitycontextconstraints restricted-v2 -o name
+
+      - name: Configure cri-o to trust runner-local registry
+        run: |
+          sudo mkdir -p /etc/containers/registries.conf.d
+          sudo tee /etc/containers/registries.conf.d/99-llmkube-ci.conf >/dev/null <<EOF
+          [[registry]]
+          location = "localhost:5000"
+          insecure = true
+          EOF
+          sudo systemctl restart crio || sudo systemctl restart microshift
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Build and push controller image to runner-local registry
+        env:
+          IMG: localhost:5000/llmkube-controller:ci-${{ github.sha }}
+        run: |
+          make docker-build IMG="${IMG}"
+          docker push "${IMG}"
+
+      - name: Install LLMKube via Helm with OpenShift preset
+        env:
+          IMG_REPO: localhost:5000/llmkube-controller
+          IMG_TAG: ci-${{ github.sha }}
+        run: |
+          kubectl create namespace llmkube-system
+          helm install llmkube ./charts/llmkube \
+            -n llmkube-system \
+            -f charts/llmkube/values-openshift.yaml \
+            --set controllerManager.image.repository="${IMG_REPO}" \
+            --set controllerManager.image.tag="${IMG_TAG}" \
+            --wait --timeout 5m
+          kubectl -n llmkube-system get pods
+
+      - name: Running Test e2e against MicroShift cluster
+        env:
+          # Tells the e2e suite to skip kind-specific BeforeSuite steps
+          # (docker-build + LoadImageToKindClusterWithName) and to run the
+          # OpenShift-only SCC admission spec. The image is already built
+          # and Helm-deployed via the steps above.
+          LLMKUBE_E2E_OPENSHIFT: "true"
+          # MicroShift ships its own service-serving certs; skip the
+          # cert-manager install that BeforeSuite would otherwise attempt.
+          CERT_MANAGER_INSTALL_SKIP: "true"
+        run: |
+          go mod tidy
+          go test -tags=e2e ./test/e2e/ -v -ginkgo.v

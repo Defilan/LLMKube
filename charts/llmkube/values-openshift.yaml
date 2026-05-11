@@ -1,0 +1,23 @@
+# Helm values preset for OpenShift / MicroShift / OKD deployments.
+#
+# Tuned for clusters using the restricted-v2 SecurityContextConstraint
+# (the default on modern OpenShift). restricted-v2 injects fsGroup from
+# the namespace's openshift.io/sa.scc.supplemental-groups range; if we
+# also set our own fsGroup default the SCC rejects the pod at admission.
+#
+# Usage:
+#
+#   helm install llmkube ./charts/llmkube \
+#     -f charts/llmkube/values-openshift.yaml \
+#     -n llmkube-system --create-namespace
+#
+# CI coverage: this preset is exercised by the test-e2e-openshift job
+# in .github/workflows/test-e2e.yml against a MicroShift cluster, so
+# regressions in the SCC compatibility path are caught at PR time.
+
+controllerManager:
+  initContainer:
+    # 0 disables the operator's default fsGroup so the OpenShift SCC
+    # admission controller is free to inject a value from the namespace's
+    # allocated supplemental-groups range.
+    defaultFSGroup: 0

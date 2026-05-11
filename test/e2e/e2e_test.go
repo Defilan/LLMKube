@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1189,6 +1190,160 @@ spec:
 				Expect(output).To(ContainSubstring("--orphaned"))
 				Expect(output).To(ContainSubstring("orphaned cache entries"))
 			})
+		})
+	})
+
+	Context("OpenShift SCC admission", func() {
+		// Only runs under MicroShift / OpenShift / OKD. The workflow sets
+		// LLMKUBE_E2E_OPENSHIFT=true; on plain kind we skip because the
+		// restricted-v2 SCC and the namespace allocated supplemental-groups
+		// annotation do not exist.
+		BeforeEach(func() {
+			if os.Getenv("LLMKUBE_E2E_OPENSHIFT") != "true" {
+				Skip("requires OpenShift SCC admission controller (set LLMKUBE_E2E_OPENSHIFT=true)")
+			}
+		})
+
+		It("should be admitted on a restricted-v2 namespace with default fsGroup disabled", func() {
+			const sccTestNs = "e2e-openshift-scc"
+
+			By("creating a test namespace and capturing its allocated supplemental-groups range")
+			cmd := exec.Command("kubectl", "create", "ns", sccTestNs)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			defer func() {
+				cmd := exec.Command("kubectl", "delete", "ns", sccTestNs, "--ignore-not-found")
+				_, _ = utils.Run(cmd)
+			}()
+
+			cmd = exec.Command("kubectl", "get", "ns", sccTestNs,
+				"-o", `jsonpath={.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}`)
+			rangeAnnotation, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rangeAnnotation).NotTo(BeEmpty(),
+				"namespace must carry openshift.io/sa.scc.supplemental-groups; SCC admission cannot inject fsGroup otherwise")
+
+			// Parse "1000680000/10000" → (min=1000680000, count=10000).
+			parts := strings.SplitN(rangeAnnotation, "/", 2)
+			Expect(parts).To(HaveLen(2),
+				"supplemental-groups annotation must be in '<min>/<count>' form, got %q", rangeAnnotation)
+			rangeMin, err := strconv.ParseInt(parts[0], 10, 64)
+			Expect(err).NotTo(HaveOccurred())
+			rangeCount, err := strconv.ParseInt(parts[1], 10, 64)
+			Expect(err).NotTo(HaveOccurred())
+			rangeMax := rangeMin + rangeCount - 1
+
+			By("standing up the in-cluster fake-GGUF model server")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-model-files
+  namespace: %s
+binaryData:
+  test-model.gguf: ZmFrZS1nZ3VmLWRhdGE=
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-model-server
+  namespace: %s
+  labels:
+    app: test-model-server
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.29.2-alpine
+      ports:
+        - containerPort: 80
+      volumeMounts:
+        - name: files
+          mountPath: /usr/share/nginx/html
+  volumes:
+    - name: files
+      configMap:
+        name: test-model-files
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-model-server
+  namespace: %s
+spec:
+  selector:
+    app: test-model-server
+  ports:
+    - port: 80
+      targetPort: 80
+`, sccTestNs, sccTestNs, sccTestNs))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			verifyModelServerReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pod", "test-model-server",
+					"-n", sccTestNs, "-o", "jsonpath={.status.phase}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Running"))
+			}
+			Eventually(verifyModelServerReady, 2*time.Minute).Should(Succeed())
+
+			By("applying a Model and InferenceService that exercise the SCC admission path")
+			modelURL := fmt.Sprintf("http://test-model-server.%s.svc.cluster.local/test-model.gguf", sccTestNs)
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: scc-test-model
+  namespace: %s
+spec:
+  source: "%s"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: scc-test-inference
+  namespace: %s
+spec:
+  modelRef: scc-test-model
+`, sccTestNs, modelURL, sccTestNs))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting for the InferenceService Deployment to exist (admission succeeded)")
+			verifyDeploymentExists := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment", "scc-test-inference",
+					"-n", sccTestNs, "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("scc-test-inference"))
+			}
+			Eventually(verifyDeploymentExists, 2*time.Minute).Should(Succeed())
+
+			By("verifying SCC injected an fsGroup in the rendered pod spec")
+			var podFSGroup int64
+			verifyPodFSGroupInRange := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pods",
+					"-n", sccTestNs,
+					"-l", "app=scc-test-inference",
+					"-o", "jsonpath={.items[0].spec.securityContext.fsGroup}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(BeEmpty(),
+					"SCC admission must inject an fsGroup; got empty value, meaning either the pod was not created or fsGroup is unset")
+				fsGroup, err := strconv.ParseInt(output, 10, 64)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(fsGroup).To(BeNumerically(">=", rangeMin),
+					"injected fsGroup %d must be >= namespace range min %d", fsGroup, rangeMin)
+				g.Expect(fsGroup).To(BeNumerically("<=", rangeMax),
+					"injected fsGroup %d must be <= namespace range max %d", fsGroup, rangeMax)
+				podFSGroup = fsGroup
+			}
+			Eventually(verifyPodFSGroupInRange, 2*time.Minute).Should(Succeed())
+
+			_, _ = fmt.Fprintf(GinkgoWriter,
+				"SCC injected fsGroup=%d (namespace range %d-%d) on InferenceService pod\n",
+				podFSGroup, rangeMin, rangeMax)
 		})
 	})
 })
