@@ -53,7 +53,17 @@ var _ = Describe("Manager", Ordered, func() {
 	// Before running the tests, set up the environment by creating the namespace,
 	// enforce the restricted security policy to the namespace, installing CRDs,
 	// and deploying the controller.
+	//
+	// Under MicroShift / OpenShift (LLMKUBE_E2E_OPENSHIFT=true), the workflow
+	// installs LLMKube via Helm before this suite runs and the namespace
+	// already exists with OpenShift SCC labels applied. Skip the kustomize-
+	// shaped deploy steps in that case.
 	BeforeAll(func() {
+		if os.Getenv("LLMKUBE_E2E_OPENSHIFT") == "true" {
+			By("OpenShift mode: namespace, CRDs, and controller already deployed by Helm; skipping kustomize-based setup")
+			return
+		}
+
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
 		_, err := utils.Run(cmd)
@@ -79,6 +89,11 @@ var _ = Describe("Manager", Ordered, func() {
 	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
 	// and deleting the namespace.
 	AfterAll(func() {
+		if os.Getenv("LLMKUBE_E2E_OPENSHIFT") == "true" {
+			By("OpenShift mode: Helm uninstall is handled outside the suite; skipping kustomize-based teardown")
+			return
+		}
+
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
