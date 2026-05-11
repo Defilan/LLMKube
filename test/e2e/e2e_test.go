@@ -1264,6 +1264,11 @@ spec:
 			rangeMax := rangeMin + rangeCount - 1
 
 			By("standing up the in-cluster fake-GGUF model server")
+			// Pod spec is PSA-restricted-compliant so it works on
+			// MicroShift / OpenShift where the namespace enforces PSA
+			// restricted. Uses nginxinc/nginx-unprivileged which runs
+			// as non-root (uid 101) and binds to :8080; we map the
+			// Service back to :80 so the model URL stays familiar.
 			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap
@@ -1281,14 +1286,23 @@ metadata:
   labels:
     app: test-model-server
 spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: nginx
-      image: nginx:1.29.2-alpine
+      image: nginxinc/nginx-unprivileged:1.27-alpine
       ports:
-        - containerPort: 80
+        - containerPort: 8080
       volumeMounts:
         - name: files
           mountPath: /usr/share/nginx/html
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
   volumes:
     - name: files
       configMap:
@@ -1304,7 +1318,7 @@ spec:
     app: test-model-server
   ports:
     - port: 80
-      targetPort: 80
+      targetPort: 8080
 `, sccTestNs, sccTestNs, sccTestNs))
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())

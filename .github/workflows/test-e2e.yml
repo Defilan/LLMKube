@@ -214,16 +214,24 @@ jobs:
       - name: Running Test e2e against MINC-backed MicroShift
         env:
           # Tells the e2e suite to skip kind-specific BeforeSuite steps
-          # (docker-build + LoadImageToKindClusterWithName) and to run
-          # the OpenShift-only SCC admission spec. The image is already
-          # built, side-loaded, and Helm-deployed via the steps above.
+          # (docker-build + LoadImageToKindClusterWithName) and to skip
+          # the Manager BeforeAll's kustomize-based deploy.
           LLMKUBE_E2E_OPENSHIFT: "true"
           # MicroShift ships its own service-serving certs; skip the
           # cert-manager install that BeforeSuite would otherwise attempt.
           CERT_MANAGER_INSTALL_SKIP: "true"
         run: |
           go mod tidy
-          go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+          # Focus the run on just the OpenShift SCC admission Context.
+          # Other Contexts (CR Reconciliation, Cache Inspection, License
+          # Check) deploy fixture pods (nginx, busybox) with kind-shaped
+          # security contexts that PSA's "restricted" profile rejects on
+          # MicroShift. Those reconciliation paths are adequately covered
+          # by the kind and Longhorn jobs above; what we want from the
+          # MicroShift job is signal that the OpenShift SCC admission
+          # path works end-to-end with the Helm preset.
+          go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
+            -ginkgo.focus='OpenShift SCC admission'
 
       - name: Tear down MicroShift cluster
         if: always()
