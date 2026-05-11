@@ -366,33 +366,26 @@ kubectl get pods -n kube-system -l name=nvidia-device-plugin-ds
 </details>
 
 <details>
-<summary><b>OpenShift: init container "Permission denied" or pod admission rejected</b></summary>
+<summary><b>OpenShift / MicroShift / OKD: ship the bundled Helm preset</b></summary>
 
-LLMKube sets secure defaults (`seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false`, `capabilities.drop: ALL`) that satisfy OpenShift's `restricted-v2` SCC. As of v0.7.7 LLMKube also sets a default `fsGroup: 102` on the rendered PodSecurityContext to make freshly-provisioned PVCs writable by the non-root init container on permission-strict storage classes.
+LLMKube is tested in CI against MicroShift to verify the OpenShift SCC admission path end-to-end on every PR. The repo ships a Helm values preset at `charts/llmkube/values-openshift.yaml` that disables the operator's default `fsGroup` so the `restricted-v2` SCC can inject an appropriate value from the namespace's allocated supplemental-groups range.
 
-The `fsGroup: 102` default is incompatible with OpenShift's `restricted-v2` SCC, which uses `MustRunAs` to inject `fsGroup` from the namespace's allocated supplemental-groups range. Pods with an explicit `fsGroup` outside that range are rejected at admission time.
-
-There are two supported ways to deploy LLMKube on OpenShift:
-
-**Option 1 (recommended): disable the default fsGroup operator-wide.**
-
-Set `controllerManager.initContainer.defaultFSGroup: 0` in your Helm values. The controller will skip the default and let the SCC inject the correct value at admission time:
-
-```yaml
-# values-openshift.yaml
-controllerManager:
-  initContainer:
-    defaultFSGroup: 0
-```
+**Recommended install:**
 
 ```bash
-helm upgrade --install llmkube llmkube/llmkube -f values-openshift.yaml -n llmkube-system
+helm install llmkube ./charts/llmkube \
+  -f charts/llmkube/values-openshift.yaml \
+  -n llmkube-system --create-namespace
 ```
 
-**Option 2: override per InferenceService with the namespace's allocated group.**
+That single command produces an LLMKube deployment whose InferenceService pods are admitted cleanly under `restricted-v2`. The same `values-openshift.yaml` works on MicroShift, OKD, OpenShift Container Platform, and any other distribution that runs the SCC admission controller with the standard `MustRunAs` fsGroup strategy.
+
+**Per-InferenceService override (fallback for single-tenant cases).**
+
+If you would rather pin `fsGroup` per workload instead of disabling the default operator-wide:
 
 ```bash
-# Find your namespace's supplemental group range
+# Find your namespace's supplemental-groups range
 oc get namespace <namespace> -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}'
 ```
 
@@ -407,7 +400,7 @@ spec:
     fsGroup: 1000680000  # first value from the command above
 ```
 
-Use Option 1 if you have many InferenceServices on OpenShift; use Option 2 if you have one or two and want explicit control.
+**What the preset does, in one line.** Sets `controllerManager.initContainer.defaultFSGroup: 0` so the SCC admission controller is the authoritative source of `fsGroup`, not the operator's default of 102 (which is correct for non-OpenShift clusters and would be rejected by `restricted-v2`).
 </details>
 
 ---

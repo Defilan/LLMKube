@@ -54,7 +54,11 @@ spec:
         - --model-cache-access-mode={{ .Values.modelCache.accessMode }}
         {{- end }}
         - --init-container-image={{ include "llmkube.initContainerImage" . }}
-        - --default-fsgroup={{ .Values.controllerManager.initContainer.defaultFSGroup | default 102 }}
+        # The default value is set in values.yaml. We do NOT use `| default 102`
+        # here because Go template's default treats 0 as missing, which would
+        # re-replace the OpenShift preset's deliberate 0 with 102 and break
+        # SCC compatibility. Schema in values.schema.json enforces integer >= 0.
+        - --default-fsgroup={{ .Values.controllerManager.initContainer.defaultFSGroup }}
         ports:
         - name: health
           containerPort: 8081
