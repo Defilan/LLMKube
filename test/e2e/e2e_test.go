@@ -926,6 +926,210 @@ spec:
 		})
 	})
 
+	// ModelRouter Cluster covers the runtime data plane: with the
+	// router-proxy and a stub upstream image side-loaded into kind, we
+	// stand up real proxy pods, drive chat completions through them, and
+	// assert that routing, fail-closed enforcement, and credential
+	// injection behave end-to-end. Gated on LLMKUBE_E2E_ROUTER_CLUSTER
+	// because it depends on the BeforeSuite having built and loaded
+	// router-proxy + stub-upstream images, which only the dedicated kind
+	// e2e job opts into today.
+	Context("ModelRouter Cluster", Ordered, func() {
+		const mrcTestNs = "e2e-modelrouter-cluster"
+		const routerName = "e2e-cluster-router"
+		const localStubSvc = "fake-local"
+		const cloudStubSvc = "fake-cloud"
+		// #nosec G101 -- test fixture, not a real credential
+		const stubAPIKey = "stub-cloud-key-for-e2e"
+
+		BeforeAll(func() {
+			if os.Getenv("LLMKUBE_E2E_ROUTER_CLUSTER") != "true" {
+				Skip("LLMKUBE_E2E_ROUTER_CLUSTER not set; " +
+					"cluster routing tests require the router-proxy and " +
+					"stub-upstream images side-loaded into kind")
+			}
+
+			By("creating ModelRouter cluster test namespace")
+			cmd := exec.Command("kubectl", "create", "ns", mrcTestNs)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create cluster test namespace")
+
+			By("deploying fake-local and fake-cloud stub upstreams")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(
+				renderStubUpstream(mrcTestNs, localStubSvc) +
+					renderStubUpstream(mrcTestNs, cloudStubSvc))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to deploy stub upstreams")
+
+			By("waiting for stub upstream Deployments to become Available")
+			for _, name := range []string{localStubSvc, cloudStubSvc} {
+				cmd = exec.Command("kubectl", "rollout", "status",
+					"deployment/"+name, "-n", mrcTestNs, "--timeout=120s")
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(),
+					"stub upstream %s never reached Available", name)
+			}
+
+			By("creating cloud credentials Secret")
+			cmd = exec.Command("kubectl", "create", "secret", "generic", "fake-cloud-key",
+				"-n", mrcTestNs,
+				"--from-literal=ANTHROPIC_API_KEY="+stubAPIKey)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create cloud creds Secret")
+
+			By("applying the cluster-routing ModelRouter")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  backends:
+    - name: local-stub
+      external:
+        provider: openai
+        model: stub-local
+        url: http://%s.%s.svc.cluster.local:8080
+      tier: local
+    - name: cloud-stub
+      external:
+        provider: anthropic
+        model: claude-opus-4-7
+        url: http://%s.%s.svc.cluster.local:8080
+        credentialsSecretRef:
+          name: fake-cloud-key
+      tier: cloud
+  rules:
+    - name: pii-stays-local
+      match:
+        dataClassification: ["pii"]
+      route:
+        backends: ["local-stub"]
+      failClosed: true
+    - name: complex-to-cloud
+      match:
+        taskComplexity: complex
+      route:
+        backends: ["cloud-stub"]
+  defaultRoute: local-stub
+`, routerName, mrcTestNs, localStubSvc, mrcTestNs, cloudStubSvc, mrcTestNs))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply ModelRouter")
+
+			By("waiting for the proxy Deployment to become Available")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "rollout", "status",
+					"deployment/"+routerName+"-router-proxy", "-n", mrcTestNs,
+					"--timeout=10s")
+				_, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+			}, 3*time.Minute, 5*time.Second).Should(Succeed(),
+				"router-proxy Deployment never reached Available")
+		})
+
+		AfterAll(func() {
+			if os.Getenv("LLMKUBE_E2E_ROUTER_CLUSTER") != "true" {
+				return
+			}
+			By("cleaning up the ModelRouter cluster test namespace")
+			cmd := exec.Command("kubectl", "delete", "ns", mrcTestNs, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
+		It("should route default chat completions to the local backend", func() {
+			By("resetting stub upstream recordings")
+			resetStubs(mrcTestNs, localStubSvc, cloudStubSvc)
+
+			By("POSTing a chat completion through the proxy")
+			out := chatCompletion(mrcTestNs, routerName, nil,
+				`{"model":"stub-local","stream":false,"messages":[{"role":"user","content":"hello"}]}`)
+			Expect(out).To(ContainSubstring("stub-response-from-"+localStubSvc),
+				"chat completion did not appear to flow through the local stub")
+
+			By("verifying the local stub received the request and the cloud stub did not")
+			Eventually(func(g Gomega) {
+				localCount := stubRequestCount(g, mrcTestNs, localStubSvc)
+				cloudCount := stubRequestCount(g, mrcTestNs, cloudStubSvc)
+				g.Expect(localCount).To(BeNumerically(">=", 1),
+					"expected local stub to record the request")
+				g.Expect(cloudCount).To(Equal(0),
+					"cloud stub must not see default-route traffic")
+			}, 30*time.Second, time.Second).Should(Succeed())
+		})
+
+		It("should route complex-task requests to the cloud backend with Anthropic-style auth", func() {
+			By("resetting stub upstream recordings")
+			resetStubs(mrcTestNs, localStubSvc, cloudStubSvc)
+
+			By("POSTing with task-complexity=complex")
+			out := chatCompletion(mrcTestNs, routerName,
+				map[string]string{"x-llmkube-task-complexity": "complex"},
+				`{"model":"claude-opus-4-7","stream":false,"messages":[{"role":"user","content":"design a system"}]}`)
+			Expect(out).To(ContainSubstring("stub-response-from-"+cloudStubSvc),
+				"complex-task did not flow through the cloud stub")
+
+			By("verifying the cloud stub received it with x-api-key + anthropic-version headers")
+			Eventually(func(g Gomega) {
+				snap := stubSnapshot(g, mrcTestNs, cloudStubSvc)
+				g.Expect(snap.Requests).NotTo(BeEmpty())
+				last := snap.Requests[len(snap.Requests)-1]
+				g.Expect(last.Headers["X-Api-Key"]).To(ContainElement(stubAPIKey),
+					"x-api-key not injected for Anthropic cloud backend")
+				g.Expect(last.Headers["Anthropic-Version"]).NotTo(BeEmpty(),
+					"anthropic-version not injected for Anthropic cloud backend")
+			}, 30*time.Second, time.Second).Should(Succeed())
+		})
+
+		It("should fail-closed with 503 when a PII request's local backend is unavailable", func() {
+			By("resetting stub upstream recordings")
+			resetStubs(mrcTestNs, localStubSvc, cloudStubSvc)
+
+			By("scaling the local stub Deployment to zero")
+			cmd := exec.Command("kubectl", "scale", "deployment/"+localStubSvc,
+				"-n", mrcTestNs, "--replicas=0")
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "failed to scale local stub to zero")
+
+			By("waiting for local stub endpoints to drain")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "endpoints", localStubSvc,
+					"-n", mrcTestNs, "-o",
+					"jsonpath={.subsets[*].addresses[*].ip}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(output)).To(BeEmpty(),
+					"local stub still has endpoints")
+			}, 60*time.Second, time.Second).Should(Succeed())
+
+			By("POSTing a PII-classified request and expecting HTTP 503")
+			status := chatCompletionStatus(mrcTestNs, routerName,
+				map[string]string{"x-llmkube-classification": "pii"},
+				`{"model":"stub-local","stream":false,"messages":[{"role":"user","content":"ssn 123"}]}`)
+			Expect(status).To(Equal(503),
+				"PII request with local backend down must fail-closed with 503")
+
+			By("verifying the cloud stub received no traffic (no egress on fail-closed)")
+			Consistently(func(g Gomega) {
+				cloudCount := stubRequestCount(g, mrcTestNs, cloudStubSvc)
+				g.Expect(cloudCount).To(Equal(0),
+					"fail-closed must not egress sensitive data to a cloud backend")
+			}, 10*time.Second, 2*time.Second).Should(Succeed())
+
+			By("scaling the local stub back up so subsequent specs can rely on it")
+			cmd = exec.Command("kubectl", "scale", "deployment/"+localStubSvc,
+				"-n", mrcTestNs, "--replicas=1")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "failed to restore local stub replica")
+
+			cmd = exec.Command("kubectl", "rollout", "status",
+				"deployment/"+localStubSvc, "-n", mrcTestNs, "--timeout=60s")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "local stub failed to come back")
+		})
+	})
+
 	Context("License Check", func() {
 		const licenseTestNs = "e2e-license-test"
 		const testLicenseModelServerURL = "http://test-model-server.e2e-license-test.svc.cluster.local/test-model.gguf"
@@ -1718,4 +1922,250 @@ type tokenRequest struct {
 	Status struct {
 		Token string `json:"token"`
 	} `json:"status"`
+}
+
+// renderStubUpstream produces a Deployment+Service manifest pair for a
+// single stub upstream identified by name. Both fake-local and
+// fake-cloud are deployed from the same template with a different
+// --label so introspect responses can tell them apart. The image is
+// side-loaded into kind in BeforeSuite (LLMKUBE_E2E_ROUTER_CLUSTER=true)
+// and pulled with IfNotPresent so the test never hits a registry.
+func renderStubUpstream(ns, name string) string {
+	return fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[2]s
+  namespace: %[1]s
+  labels:
+    app: %[2]s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: %[2]s
+  template:
+    metadata:
+      labels:
+        app: %[2]s
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: stub
+          image: localhost/llmkube-stub-upstream:e2e
+          imagePullPolicy: IfNotPresent
+          args: ["-label=%[2]s", "-listen=:8080"]
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: %[2]s
+  namespace: %[1]s
+spec:
+  selector:
+    app: %[2]s
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+`, ns, name)
+}
+
+// stubIntrospectResponse mirrors the JSON returned by the stub upstream
+// /__introspect__ endpoint. Only the fields we assert on are decoded.
+type stubIntrospectResponse struct {
+	Label    string `json:"label"`
+	Requests []struct {
+		Method   string              `json:"method"`
+		Path     string              `json:"path"`
+		Headers  map[string][]string `json:"headers"`
+		Body     string              `json:"body"`
+		At       string              `json:"at"`
+		Streamed bool                `json:"streamed"`
+	} `json:"requests"`
+}
+
+// runCurlInCluster runs a one-shot curl against an in-cluster URL using
+// kubectl run + delete. Returns (stdout, status code, error). The body
+// of the HTTP response is followed by an `HTTP_STATUS=<code>` line that
+// the parser strips out. Errors here are reserved for orchestration
+// failures (pod scheduling, log fetch) – an HTTP 5xx still returns
+// (logs, code, nil) so callers can assert on the status.
+func runCurlInCluster(ns, url, method string, headers map[string]string, body string) (string, int, error) {
+	curlArgs := []string{
+		"curl", "-sS", "-o", "/tmp/body", "-w", "HTTP_STATUS=%{http_code}\n",
+		"-X", method,
+	}
+	for k, v := range headers {
+		curlArgs = append(curlArgs, "-H", fmt.Sprintf("%s: %s", k, v))
+	}
+	if body != "" {
+		curlArgs = append(curlArgs, "-H", "content-type: application/json",
+			"--data-binary", body)
+	}
+	curlArgs = append(curlArgs, url)
+
+	// The pod runs `curl ... > status_line; cat /tmp/body; status_line` so
+	// the pod logs end with the parseable HTTP_STATUS= sentinel.
+	shellCmd := strings.Join(quoteShell(curlArgs), " ") +
+		" > /tmp/status; cat /tmp/body; echo; cat /tmp/status"
+
+	// Match the curl-metrics pattern used elsewhere in this suite:
+	// kubectl run with --overrides supplying the full container spec
+	// (command/args + securityContext). The pod's logs are then
+	// fetched to retrieve the response body and the parseable
+	// HTTP_STATUS= sentinel.
+	overrides := fmt.Sprintf(`{
+		"spec": {
+			"restartPolicy": "Never",
+			"containers": [{
+				"name": "curl",
+				"image": "docker.io/curlimages/curl:8.18.0",
+				"command": ["/bin/sh", "-c"],
+				"args": [%q],
+				"securityContext": {
+					"allowPrivilegeEscalation": false,
+					"capabilities": {"drop": ["ALL"]},
+					"runAsNonRoot": true,
+					"runAsUser": 1000,
+					"seccompProfile": {"type": "RuntimeDefault"}
+				}
+			}]
+		}
+	}`, shellCmd)
+
+	podName := fmt.Sprintf("e2e-curl-%d", time.Now().UnixNano())
+	runCmd := exec.Command("kubectl", "run", podName,
+		"--restart=Never", "--namespace", ns,
+		"--image=docker.io/curlimages/curl:8.18.0",
+		"--overrides", overrides)
+	if _, err := utils.Run(runCmd); err != nil {
+		return "", 0, fmt.Errorf("kubectl run: %w", err)
+	}
+	defer func() {
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", podName,
+			"-n", ns, "--ignore-not-found", "--wait=false"))
+	}()
+
+	// Poll for terminal phase (Succeeded or Failed); kubectl wait can't
+	// express "either" cleanly so we look at .status.phase directly.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		phaseCmd := exec.Command("kubectl", "get", "pod", podName,
+			"-n", ns, "-o", "jsonpath={.status.phase}")
+		phase, _ := utils.Run(phaseCmd)
+		if phase == "Succeeded" || phase == "Failed" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	logs, err := utils.Run(exec.Command("kubectl", "logs", podName, "-n", ns))
+	if err != nil {
+		return "", 0, fmt.Errorf("kubectl logs: %w", err)
+	}
+	status := 0
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.HasPrefix(line, "HTTP_STATUS=") {
+			status, _ = strconv.Atoi(strings.TrimPrefix(line, "HTTP_STATUS="))
+		}
+	}
+	return logs, status, nil
+}
+
+// quoteShell shell-quotes each arg so the rendered command is safe to
+// run via sh -c. POSIX single quotes block expansion; the only escaping
+// needed is for embedded single quotes.
+func quoteShell(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	return out
+}
+
+// chatCompletion runs a curl pod that POSTs to the router-proxy Service
+// for the given router. Returns the body of the response (best-effort,
+// shape may vary on error). Fails the test if the request couldn't be
+// dispatched at all.
+func chatCompletion(ns, router string, headers map[string]string, body string) string {
+	url := fmt.Sprintf("http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
+		router, ns)
+	out, _, err := runCurlInCluster(ns, url, "POST", headers, body)
+	Expect(err).NotTo(HaveOccurred(), "curl dispatch failed: %s", out)
+	return out
+}
+
+// chatCompletionStatus is the same as chatCompletion but returns just
+// the HTTP status code, used for the fail-closed assertion. Does not
+// fail the test on non-2xx since the test wants to assert on 503.
+func chatCompletionStatus(ns, router string, headers map[string]string, body string) int {
+	url := fmt.Sprintf("http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
+		router, ns)
+	_, status, err := runCurlInCluster(ns, url, "POST", headers, body)
+	Expect(err).NotTo(HaveOccurred(), "curl dispatch failed")
+	return status
+}
+
+// stubSnapshot fetches the introspection payload from a stub upstream by
+// curl-ing /__introspect__ via a transient curl pod inside the cluster.
+// Used by the routing assertions to inspect which upstream received
+// what.
+func stubSnapshot(g Gomega, ns, svc string) stubIntrospectResponse {
+	url := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080/__introspect__", svc, ns)
+	out, _, err := runCurlInCluster(ns, url, "GET", nil, "")
+	g.Expect(err).NotTo(HaveOccurred(), "introspect curl failed: %s", out)
+
+	// runCurlInCluster's logs include a trailing HTTP_STATUS= line; strip
+	// it and any leading non-JSON noise.
+	idx := strings.Index(out, "{")
+	if idx == -1 {
+		g.Expect(idx).NotTo(Equal(-1), "introspect output had no JSON body: %s", out)
+	}
+	end := strings.LastIndex(out, "}")
+	if end == -1 || end < idx {
+		g.Expect(end).NotTo(BeNumerically("<", idx), "introspect output malformed: %s", out)
+	}
+	var snap stubIntrospectResponse
+	g.Expect(json.Unmarshal([]byte(out[idx:end+1]), &snap)).To(Succeed(),
+		"failed to parse introspect payload: %s", out)
+	return snap
+}
+
+// stubRequestCount returns how many recorded requests the stub holds.
+func stubRequestCount(g Gomega, ns, svc string) int {
+	return len(stubSnapshot(g, ns, svc).Requests)
+}
+
+// resetStubs clears the recording buffer on both upstreams between
+// specs so assertions only see traffic from the current case.
+func resetStubs(ns string, svcs ...string) {
+	for _, svc := range svcs {
+		url := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080/__introspect__/reset", svc, ns)
+		_, _, _ = runCurlInCluster(ns, url, "POST", nil, "")
+	}
 }

@@ -241,7 +241,8 @@ func TestProxyFallsThroughToDefault(t *testing.T) {
 
 // TestProxyFailClosedOnLocalDown is the regulated-data gate verified at
 // runtime: when the only local backend is unhealthy, a PII request is
-// refused with 503 rather than falling through to the cloud backend.
+// refused with 503 (fail-closed runtime) and the cloud backend is
+// never touched.
 func TestProxyFailClosedOnLocalDown(t *testing.T) {
 	h := newProxyHarness(t)
 	h.proxy.disp.MarkUnhealthy("local-qwen")
@@ -250,11 +251,30 @@ func TestProxyFailClosedOnLocalDown(t *testing.T) {
 		"x-llmkube-classification": "pii",
 	})
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusBadGateway && resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 502/503", resp.StatusCode)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 fail-closed runtime", resp.StatusCode)
 	}
 	if h.cloudBack.calls.Load() != 0 {
 		t.Errorf("cloud must not receive pii request; calls = %d", h.cloudBack.calls.Load())
+	}
+}
+
+// TestProxyNonFailClosedReturns502OnAllBackendsDown documents the
+// negative case: a non-fail-closed rule with all backends unreachable
+// returns 502 (BadGateway), not 503. This is what distinguishes a
+// generic upstream outage from a policy-level refusal.
+func TestProxyNonFailClosedReturns502OnAllBackendsDown(t *testing.T) {
+	h := newProxyHarness(t)
+	// Disable both backends so the default-route fallback fails too.
+	h.proxy.disp.MarkUnhealthy("local-qwen")
+	h.proxy.disp.MarkUnhealthy("cloud-opus")
+
+	// No classification, no complexity: hits the default route, which
+	// the harness configures with FailClosed=false.
+	resp := h.post(t, map[string]any{"model": "any"}, nil)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (non-fail-closed upstream outage)", resp.StatusCode)
 	}
 }
 

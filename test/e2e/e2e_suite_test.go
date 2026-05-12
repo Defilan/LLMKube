@@ -43,6 +43,19 @@ var (
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
 	projectImage = "example.com/llmkube:v0.0.1"
+
+	// routerProxyImage matches the default image the operator's
+	// ModelRouterReconciler hard-codes (internal/controller/router_deployment_builder.go).
+	// Side-loading exactly this tag means the controller can dispatch
+	// new ModelRouter resources without a per-deploy --router-proxy-image
+	// flag rewrite. Override with the LLMKUBE_E2E_ROUTER_PROXY_IMG env
+	// var when running locally against a different registry/tag.
+	routerProxyImage = "ghcr.io/defilantech/llmkube-router-proxy:dev"
+
+	// stubUpstreamImage is the fake llama.cpp / cloud-provider used in
+	// the ModelRouter cluster Context. Only side-loaded when
+	// LLMKUBE_E2E_ROUTER_CLUSTER=true so unrelated jobs stay fast.
+	stubUpstreamImage = "localhost/llmkube-stub-upstream:e2e"
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
@@ -74,6 +87,32 @@ var _ = BeforeSuite(func() {
 		By("loading the manager(Operator) image on Kind")
 		err = utils.LoadImageToKindClusterWithName(projectImage)
 		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+
+		if os.Getenv("LLMKUBE_E2E_ROUTER_CLUSTER") == "true" {
+			By("building the router-proxy image")
+			cmd = exec.Command("make", "docker-build-router-proxy",
+				fmt.Sprintf("ROUTER_PROXY_IMG=%s", routerProxyImage))
+			_, err = utils.Run(cmd)
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+				"Failed to build the router-proxy image")
+
+			By("loading the router-proxy image on Kind")
+			err = utils.LoadImageToKindClusterWithName(routerProxyImage)
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+				"Failed to load the router-proxy image into Kind")
+
+			By("building the stub-upstream image")
+			cmd = exec.Command("make", "docker-build-stub-upstream",
+				fmt.Sprintf("STUB_UPSTREAM_IMG=%s", stubUpstreamImage))
+			_, err = utils.Run(cmd)
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+				"Failed to build the stub-upstream image")
+
+			By("loading the stub-upstream image on Kind")
+			err = utils.LoadImageToKindClusterWithName(stubUpstreamImage)
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+				"Failed to load the stub-upstream image into Kind")
+		}
 	}
 
 	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.

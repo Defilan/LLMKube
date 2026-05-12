@@ -10,6 +10,13 @@ jobs:
   test-e2e:
     name: Run on Ubuntu (kind, default storage)
     runs-on: ubuntu-latest
+    env:
+      # Tag the router-proxy and stub-upstream images deterministically
+      # so the BeforeSuite can both load them into kind and reference
+      # them by name when patching the operator deploy + spinning up
+      # the fake upstreams.
+      ROUTER_PROXY_IMG: ghcr.io/defilantech/llmkube-router-proxy:dev
+      STUB_UPSTREAM_IMG: localhost/llmkube-stub-upstream:e2e
     steps:
       - name: Clone the code
         uses: actions/checkout@v6
@@ -29,6 +36,13 @@ jobs:
         run: kind version
 
       - name: Running Test e2e
+        env:
+          # Opts the suite into the ModelRouter cluster Context. When
+          # set, BeforeSuite builds and side-loads router-proxy + stub
+          # upstream images into kind in addition to the controller
+          # image. Without this flag the cluster Context is skipped so
+          # the existing kind-only runs stay fast.
+          LLMKUBE_E2E_ROUTER_CLUSTER: "true"
         run: |
           go mod tidy
           make test-e2e
