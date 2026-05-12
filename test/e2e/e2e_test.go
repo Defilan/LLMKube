@@ -872,6 +872,27 @@ spec:
 			Eventually(verifyInvalid, 1*time.Minute).Should(Succeed())
 		})
 
+		It("should accept the shipped sample manifest under server-side validation", func() {
+			// Dogfood the user-facing sample at config/samples/inference_v1alpha1_modelrouter.yaml.
+			// Catches drift between the sample and the actual CRD schema (a recurring
+			// failure mode when CRD fields evolve and samples don't get updated).
+			// We use --dry-run=server because the sample references a Secret and an
+			// InferenceService that this test namespace doesn't contain; we're not
+			// testing those resolutions, just that the YAML passes server-side
+			// admission against the live CRD schema.
+			By("server-side dry-run apply of the sample ModelRouter manifest")
+			// utils.Run rewrites cmd.Dir to the project root, so the path
+			// is repo-relative, not relative to test/e2e.
+			cmd := exec.Command("kubectl", "apply",
+				"-f", "config/samples/inference_v1alpha1_modelrouter.yaml",
+				"-n", mrTestNs,
+				"--dry-run=server",
+				"--validate=true")
+			output, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "sample manifest failed server-side validation: %s", output)
+			Expect(output).To(ContainSubstring("modelrouter.inference.llmkube.dev/coding-router"))
+		})
+
 		It("should clean up ModelRouter resources and child resources on deletion", func() {
 			By("deleting both test ModelRouters")
 			cmd := exec.Command("kubectl", "delete", "modelrouter", "e2e-good-router", "e2e-bad-router",

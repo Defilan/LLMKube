@@ -1,0 +1,113 @@
+# Sample ModelRouter that exposes a single OpenAI-compatible endpoint
+# fronting a local InferenceService and an external Anthropic backend.
+#
+# This sample shows the three things that make ModelRouter useful for
+# regulated-industry enterprise adopters:
+#
+#   1. Per-rule routing by data classification, task complexity, and
+#      capabilities.
+#   2. The fail-closed gate: sensitive-data requests can only ever
+#      reach local backends, regardless of upstream availability.
+#   3. Composition with LiteLLM-style cloud-provider abstraction via a
+#      single Secret per credential.
+#
+# Apply order:
+#   1. Create the InferenceService that local-qwen references.
+#   2. Create the Secret with your Anthropic API key.
+#   3. kubectl apply -f this file.
+#
+# Verify:
+#   kubectl describe modelrouter coding-router
+#   kubectl get configmap coding-router-router-proxy -o yaml
+#   curl -X POST http://coding-router-router-proxy.<ns>.svc.cluster.local:8080/v1/chat/completions \
+#     -H 'Content-Type: application/json' \
+#     -d '{"model":"any","messages":[{"role":"user","content":"hello"}]}'
+---
+# Stub Secret. Replace the placeholder with a real ANTHROPIC_API_KEY before
+# applying, or omit the cloud-opus backend entirely until you have one.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anthropic-key
+type: Opaque
+stringData:
+  ANTHROPIC_API_KEY: "REPLACE_WITH_YOUR_ANTHROPIC_API_KEY"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: coding-router
+spec:
+  backends:
+    # Local InferenceService. The controller resolves this to its
+    # cluster URL automatically. The named InferenceService must exist
+    # in the same namespace.
+    - name: local-qwen
+      tier: local
+      inferenceServiceRef:
+        name: qwen3-coder
+      capabilities:
+        - code
+        - tools
+
+    # External Anthropic backend. The controller looks up the named
+    # Secret and injects ANTHROPIC_API_KEY into the router-proxy pod;
+    # the proxy reads it at request time and adds the right
+    # provider-specific auth header (x-api-key + anthropic-version for
+    # Anthropic).
+    - name: cloud-opus
+      tier: cloud
+      external:
+        provider: anthropic
+        model: claude-opus-4-7
+        url: https://api.anthropic.com
+        credentialsSecretRef:
+          name: anthropic-key
+      capabilities:
+        - code
+        - vision
+        - long-context
+
+  rules:
+    # The regulated-data gate. Any request carrying
+    # x-llmkube-classification: pii (or x-llmkube-classification: phi)
+    # routes ONLY to the local backend, with failClosed=true. If the
+    # local backend is unhealthy or scaled to zero, the router returns
+    # HTTP 503 rather than falling through. Sensitive data never
+    # leaves the cluster.
+    - name: pii-stays-local
+      match:
+        dataClassification: ["pii", "phi"]
+      route:
+        backends: ["local-qwen"]
+      failClosed: true
+
+    # Hard problems get the cloud model first, with the local backend
+    # as fallback. Header: x-llmkube-task-complexity: complex
+    - name: complex-to-cloud
+      match:
+        taskComplexity: complex
+      route:
+        backends: ["cloud-opus", "local-qwen"]
+        strategy: primary-fallback
+
+  # Catch-all when no rule fires. Most traffic should land here.
+  defaultRoute: local-qwen
+
+  policy:
+    classification:
+      # MVP supports header-only mode. The bundled detector (regex +
+      # optional NER) lands with the classifier feature.
+      mode: header-only
+      headerKey: x-llmkube-classification
+      # Override the default sensitive set ({pii, phi}) if your
+      # organization classifies data differently.
+      sensitiveClassifications: ["pii", "phi"]
+    auditLog:
+      sink: stdout
+
+  # Optional: per-ModelRouter overrides for the managed proxy
+  # Deployment. Omit the block entirely to use the controller defaults.
+  proxy:
+    replicas: 1
+    # image: registry.internal/llmkube-router-proxy:v0.8.0

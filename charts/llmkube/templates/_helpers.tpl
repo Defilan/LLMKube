@@ -90,6 +90,24 @@ Supports optional registry prefix.
 {{- end }}
 
 {{/*
+Create the router-proxy image used as the default for ModelRouter-managed
+proxy pods. Per-ModelRouter spec.proxy.image overrides this. Same digest /
+tag resolution rules as the controller image.
+*/}}
+{{- define "llmkube.routerProxyImage" -}}
+{{- $repo := .Values.controllerManager.routerProxy.repository -}}
+{{- if .Values.controllerManager.routerProxy.registry -}}
+{{- $repo = printf "%s/%s" .Values.controllerManager.routerProxy.registry .Values.controllerManager.routerProxy.repository -}}
+{{- end -}}
+{{- if .Values.controllerManager.routerProxy.digest -}}
+{{- printf "%s@%s" $repo .Values.controllerManager.routerProxy.digest -}}
+{{- else -}}
+{{- $tag := .Values.controllerManager.routerProxy.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repo $tag -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Create the namespace
 */}}
 {{- define "llmkube.namespace" -}}

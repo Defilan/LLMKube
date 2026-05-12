@@ -59,6 +59,7 @@ spec:
         # re-replace the OpenShift preset's deliberate 0 with 102 and break
         # SCC compatibility. Schema in values.schema.json enforces integer >= 0.
         - --default-fsgroup={{ .Values.controllerManager.initContainer.defaultFSGroup }}
+        - --router-proxy-image={{ include "llmkube.routerProxyImage" . }}
         ports:
         - name: health
           containerPort: 8081
