@@ -1093,10 +1093,17 @@ spec:
 			Expect(err).NotTo(HaveOccurred(), "failed to scale local stub to zero")
 
 			By("waiting for local stub endpoints to drain")
+			// Query EndpointSlice (v1) rather than the legacy Endpoints
+			// object: kubectl emits a "v1 Endpoints is deprecated" warning
+			// to stderr on k8s 1.33+, and utils.Run combines stdout+stderr,
+			// so the legacy path returns the warning string instead of an
+			// empty payload. EndpointSlice is the modern source of truth
+			// for service backing pods regardless.
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "endpoints", localStubSvc,
-					"-n", mrcTestNs, "-o",
-					"jsonpath={.subsets[*].addresses[*].ip}")
+				cmd := exec.Command("kubectl", "get", "endpointslices",
+					"-n", mrcTestNs,
+					"-l", "kubernetes.io/service-name="+localStubSvc,
+					"-o", "jsonpath={.items[*].endpoints[*].addresses[*]}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(strings.TrimSpace(output)).To(BeEmpty(),
