@@ -19,6 +19,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Test fixture constants. golangci-lint's goconst complains otherwise.
+const (
+	testLocalBackendName = "local-qwen"
+	testMutationMarker   = "MUTATED"
+)
+
 // ptrInt32 and ptrInt64 keep the test fixtures readable.
 func ptrInt32(v int32) *int32 { return &v }
 func ptrInt64(v int64) *int64 { return &v }
@@ -39,7 +45,7 @@ func fullyPopulatedModelRouter() *ModelRouter {
 		Spec: ModelRouterSpec{
 			Backends: []RouterBackend{
 				{
-					Name: "local-qwen",
+					Name: testLocalBackendName,
 					InferenceServiceRef: &corev1.LocalObjectReference{
 						Name: "qwen3-coder",
 					},
@@ -81,7 +87,7 @@ func fullyPopulatedModelRouter() *ModelRouter {
 						DataClassification: []string{"pii", "phi"},
 					},
 					Route: RuleRoute{
-						Backends: []string{"local-qwen"},
+						Backends: []string{testLocalBackendName},
 						Strategy: "primary-fallback",
 					},
 					FailClosed: true,
@@ -96,12 +102,12 @@ func fullyPopulatedModelRouter() *ModelRouter {
 						Models:               []string{"qwen3-*", "claude-*"},
 					},
 					Route: RuleRoute{
-						Backends: []string{"cloud-opus", "local-qwen"},
+						Backends: []string{"cloud-opus", testLocalBackendName},
 						Strategy: "primary-fallback",
 					},
 				},
 			},
-			DefaultRoute: "local-qwen",
+			DefaultRoute: testLocalBackendName,
 			Policy: &RouterPolicy{
 				Budgets: []BudgetSpec{
 					{
@@ -144,7 +150,7 @@ func fullyPopulatedModelRouter() *ModelRouter {
 			Endpoint: "http://coding-router.platform.svc.cluster.local:8080/v1/chat/completions",
 			Backends: []BackendStatus{
 				{
-					Name:    "local-qwen",
+					Name:    testLocalBackendName,
 					Tier:    "local",
 					Address: "http://qwen3-coder.platform.svc.cluster.local:8080",
 					Healthy: true,
@@ -185,11 +191,11 @@ func TestModelRouterDeepCopyIndependence(t *testing.T) {
 	}
 
 	// Mutate slices on the clone.
-	clone.Spec.Backends[0].Capabilities[0] = "MUTATED"
+	clone.Spec.Backends[0].Capabilities[0] = testMutationMarker
 	clone.Spec.Backends = append(clone.Spec.Backends, RouterBackend{Name: "appended"})
-	clone.Spec.Rules[0].Route.Backends[0] = "MUTATED"
-	clone.Status.Backends[0].Name = "MUTATED"
-	clone.Status.Conditions[0].Reason = "MUTATED"
+	clone.Spec.Rules[0].Route.Backends[0] = testMutationMarker
+	clone.Status.Backends[0].Name = testMutationMarker
+	clone.Status.Conditions[0].Reason = testMutationMarker
 
 	if got := orig.Spec.Backends[0].Capabilities[0]; got != "code" {
 		t.Errorf("original Spec.Backends[0].Capabilities[0] = %q; want %q", got, "code")
@@ -197,18 +203,18 @@ func TestModelRouterDeepCopyIndependence(t *testing.T) {
 	if len(orig.Spec.Backends) != 2 {
 		t.Errorf("len(original Spec.Backends) = %d; want 2", len(orig.Spec.Backends))
 	}
-	if got := orig.Spec.Rules[0].Route.Backends[0]; got != "local-qwen" {
-		t.Errorf("original Spec.Rules[0].Route.Backends[0] = %q; want %q", got, "local-qwen")
+	if got := orig.Spec.Rules[0].Route.Backends[0]; got != testLocalBackendName {
+		t.Errorf("original Spec.Rules[0].Route.Backends[0] = %q; want %q", got, testLocalBackendName)
 	}
-	if got := orig.Status.Backends[0].Name; got != "local-qwen" {
-		t.Errorf("original Status.Backends[0].Name = %q; want %q", got, "local-qwen")
+	if got := orig.Status.Backends[0].Name; got != testLocalBackendName {
+		t.Errorf("original Status.Backends[0].Name = %q; want %q", got, testLocalBackendName)
 	}
 	if got := orig.Status.Conditions[0].Reason; got != "OK" {
 		t.Errorf("original Status.Conditions[0].Reason = %q; want %q", got, "OK")
 	}
 
 	// Mutate maps and pointer fields on the clone.
-	clone.Spec.Rules[1].Match.Headers["x-team"] = "MUTATED"
+	clone.Spec.Rules[1].Match.Headers["x-team"] = testMutationMarker
 	*clone.Spec.Backends[0].Weight = 0
 
 	if got := orig.Spec.Rules[1].Match.Headers["x-team"]; got != "research" {
@@ -252,9 +258,9 @@ func TestModelRouterListDeepCopy(t *testing.T) {
 		t.Fatal("ModelRouterList clone differs from original")
 	}
 
-	clone.Items[0].Spec.DefaultRoute = "MUTATED"
-	if got := list.Items[0].Spec.DefaultRoute; got != "local-qwen" {
-		t.Errorf("original Items[0].Spec.DefaultRoute = %q; want %q", got, "local-qwen")
+	clone.Items[0].Spec.DefaultRoute = testMutationMarker
+	if got := list.Items[0].Spec.DefaultRoute; got != testLocalBackendName {
+		t.Errorf("original Items[0].Spec.DefaultRoute = %q; want %q", got, testLocalBackendName)
 	}
 }
 
