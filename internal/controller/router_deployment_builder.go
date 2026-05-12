@@ -177,7 +177,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 // created yet; the proxy reports the backend unhealthy until it is.
 func credentialsEnvFrom(mr *inferencev1alpha1.ModelRouter) []corev1.EnvFromSource {
 	seen := make(map[string]bool)
-	var out []corev1.EnvFromSource
+	out := make([]corev1.EnvFromSource, 0, len(mr.Spec.Backends))
 	for i := range mr.Spec.Backends {
 		b := &mr.Spec.Backends[i]
 		if b.External == nil || b.External.CredentialsSecretRef == nil {
