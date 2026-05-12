@@ -881,8 +881,10 @@ spec:
 			// testing those resolutions, just that the YAML passes server-side
 			// admission against the live CRD schema.
 			By("server-side dry-run apply of the sample ModelRouter manifest")
+			// utils.Run rewrites cmd.Dir to the project root, so the path
+			// is repo-relative, not relative to test/e2e.
 			cmd := exec.Command("kubectl", "apply",
-				"-f", "../../config/samples/inference_v1alpha1_modelrouter.yaml",
+				"-f", "config/samples/inference_v1alpha1_modelrouter.yaml",
 				"-n", mrTestNs,
 				"--dry-run=server",
 				"--validate=true")
