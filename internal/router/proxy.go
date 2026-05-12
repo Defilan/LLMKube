@@ -119,6 +119,22 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	chosen, resp, err := p.dispatchWithFallback(r.Context(), &decision, r.Header, body, "/v1/chat/completions")
 	elapsed := time.Since(start)
 	if err != nil {
+		// Runtime fail-closed: when every backend in a fail-closed
+		// rule's pool is unreachable, return 503 with a clear reason
+		// rather than 502. This is the runtime counterpart to the
+		// controller's static fail-closed validation: we refuse the
+		// request instead of letting it spill onto an unmatched
+		// backend (which dispatchWithFallback never does anyway, but
+		// the status code communicates intent — sensitive data did
+		// not egress because policy said so, not because of a generic
+		// upstream outage).
+		if decision.FailClosed {
+			writeError(w, http.StatusServiceUnavailable,
+				"fail-closed: all rule backends unhealthy: "+err.Error())
+			p.audit(features, decision, nil, http.StatusServiceUnavailable,
+				"fail_closed_runtime", elapsed)
+			return
+		}
 		writeError(w, http.StatusBadGateway, "all backends failed: "+err.Error())
 		p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed)
 		return

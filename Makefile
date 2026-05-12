@@ -203,6 +203,14 @@ docker-push-router-proxy: ## Push the router-proxy image.
 build-router-proxy: fmt vet ## Build router-proxy binary into bin/.
 	go build -o bin/router-proxy ./cmd/router-proxy
 
+# Stub upstream used by the ModelRouter cluster e2e tests to play both
+# the "local InferenceService" and "cloud provider" roles. Image is only
+# built into the kind cluster during the e2e job; not published.
+STUB_UPSTREAM_IMG ?= localhost/llmkube-stub-upstream:e2e
+.PHONY: docker-build-stub-upstream
+docker-build-stub-upstream: ## Build docker image for the e2e stub upstream.
+	$(CONTAINER_TOOL) build -f test/e2e/stubupstream/Dockerfile -t ${STUB_UPSTREAM_IMG} .
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
