@@ -240,6 +240,46 @@ jobs:
           fi
           echo "✅ Custom alert thresholds work correctly"
 
+      - name: Test ModelRouter image flag flows from values.yaml to controller args
+        run: |
+          # Default values: --router-proxy-image should be present and resolve
+          # to the default repository at the chart-shipped tag.
+          helm template llmkube charts/llmkube \
+            --namespace llmkube-system \
+            > /tmp/default-routerproxy.yaml
+
+          if ! grep -q "router-proxy-image=ghcr.io/defilantech/llmkube-router-proxy:" /tmp/default-routerproxy.yaml; then
+            echo "❌ --router-proxy-image flag missing from controller args under default values"
+            exit 1
+          fi
+          echo "✅ default router-proxy image flag renders correctly"
+
+          # User override: setting routerProxy.repository and .tag should
+          # flow through end-to-end into the controller --router-proxy-image flag.
+          helm template llmkube charts/llmkube \
+            --namespace llmkube-system \
+            --set controllerManager.routerProxy.repository=registry.internal/router-proxy \
+            --set controllerManager.routerProxy.tag=v1.2.3 \
+            > /tmp/override-routerproxy.yaml
+
+          if ! grep -q "router-proxy-image=registry.internal/router-proxy:v1.2.3" /tmp/override-routerproxy.yaml; then
+            echo "❌ routerProxy.repository / .tag override did not propagate to controller flag"
+            exit 1
+          fi
+          echo "✅ router-proxy image override renders correctly"
+
+          # Digest override: digest takes precedence over tag.
+          helm template llmkube charts/llmkube \
+            --namespace llmkube-system \
+            --set controllerManager.routerProxy.digest=sha256:abcdef1234567890 \
+            > /tmp/digest-routerproxy.yaml
+
+          if ! grep -q "router-proxy-image=ghcr.io/defilantech/llmkube-router-proxy@sha256:abcdef1234567890" /tmp/digest-routerproxy.yaml; then
+            echo "❌ routerProxy.digest override did not propagate to controller flag"
+            exit 1
+          fi
+          echo "✅ router-proxy digest override renders correctly"
+
   network-policy:
     name: Test NetworkPolicy
     runs-on: ubuntu-latest

@@ -43,6 +43,9 @@ sections:
         slug: concepts/runtime-backends
         file: concepts/runtime-backends.md
         status: stub
+      - label: Model Router
+        slug: concepts/model-router
+        file: concepts/model-router.md
       - label: How LLMKube compares
         slug: concepts/comparison
         file: concepts/comparison.md

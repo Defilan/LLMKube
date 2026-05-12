@@ -93,6 +93,41 @@ controllerManager:
   # Additional environment variables
   env: []
 
+  # Default container image for ModelRouter-managed router-proxy pods.
+  # Per-ModelRouter spec.proxy.image overrides this for individual routers.
+  # The router-proxy is a lightweight HTTP server that fronts
+  # InferenceServices and external provider backends, speaks
+  # OpenAI chat completions, and enforces policy routing.
+  #
+  # IMPORTANT (Phase 1 alpha): the release pipeline does not yet build
+  # and push the router-proxy image alongside the controller image.
+  # The default tag below is "dev" rather than the chart appVersion so
+  # users who never create a ModelRouter resource are unaffected, and
+  # users who do create one know they need to either:
+  #
+  #   1. Build the image locally (`make docker-build-router-proxy`)
+  #      and push it to a registry their cluster can reach, then
+  #      override repository / tag here.
+  #   2. Override `spec.proxy.image` per ModelRouter with their own
+  #      build.
+  #
+  # See https://github.com/defilantech/LLMKube/issues/449 for the
+  # tracking issue on integrating the router-proxy image into the
+  # release flow.
+  routerProxy:
+    # Registry prefix for the router-proxy image (mirrors controller image).
+    # Useful for air-gapped or enterprise proxy registries.
+    registry: ""
+    repository: ghcr.io/defilantech/llmkube-router-proxy
+    pullPolicy: IfNotPresent
+    # Default tag. "dev" is intentional until the release pipeline
+    # ships versioned router-proxy images alongside the controller.
+    tag: "dev"
+    # Image digest (sha256:...) - takes precedence over tag when set.
+    # Use digests for production deployments once the release pipeline
+    # publishes them.
+    digest: ""
+
 # Service account configuration
 serviceAccount:
   # Specifies whether a service account should be created

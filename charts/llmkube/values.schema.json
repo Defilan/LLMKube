@@ -108,6 +108,21 @@
             },
             "additionalProperties": true
           }
+        },
+        "routerProxy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Default container image for ModelRouter-managed router-proxy pods. Per-ModelRouter spec.proxy.image overrides this.",
+          "properties": {
+            "registry": { "type": "string" },
+            "repository": { "type": "string", "minLength": 1 },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"]
+            },
+            "tag": { "type": "string" },
+            "digest": { "type": "string" }
+          }
         }
       }
     },
