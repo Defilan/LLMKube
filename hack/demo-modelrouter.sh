@@ -374,13 +374,28 @@ stop_port_forward() {
 # a definitive routing signal (the upstream JSON's `model` field is set
 # by llama.cpp and reflects the GGUF, not the ModelRouter backend name).
 proxy_last_dispatch() {
-  local pod
+  local pod line backend tier outcome
   pod=$(kdemo get pod -l app="${ROUTER_NAME}-router-proxy" \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) || return 0
   [ -n "$pod" ] || return 0
-  kdemo logs "$pod" --tail=20 2>/dev/null \
-    | grep -F router.dispatch | tail -n 1 \
-    | sed -E 's/.*(backend=[^ ]+).*(backendTier=[^ ]+).*/\1 \2/; t; s/.*(outcome=[^ ]+).*/\1/'
+  line=$(kdemo logs "$pod" --tail=20 2>/dev/null \
+    | grep -F router.dispatch | tail -n 1) || return 0
+  [ -n "$line" ] || return 0
+
+  # awk does the work portably; macOS BSD sed and GNU sed disagree on
+  # the syntax for "match this OR that" branching, so we sidestep it
+  # entirely by extracting the three interesting fields and printing
+  # whichever combination we have (a successful dispatch carries
+  # backend + backendTier; a refused dispatch only carries outcome).
+  backend=$(printf '%s\n' "$line" | awk 'match($0, /backend=[^ ]+/) {print substr($0, RSTART, RLENGTH)}')
+  tier=$(printf    '%s\n' "$line" | awk 'match($0, /backendTier=[^ ]+/) {print substr($0, RSTART, RLENGTH)}')
+  outcome=$(printf '%s\n' "$line" | awk 'match($0, /outcome=[^ ]+/) {print substr($0, RSTART, RLENGTH)}')
+
+  if [ -n "$backend" ]; then
+    printf '%s %s %s\n' "$backend" "$tier" "$outcome"
+  else
+    printf '%s\n' "$outcome"
+  fi
 }
 
 # call_proxy <label> <expected-backend> [header-args...] <prompt>
@@ -414,7 +429,12 @@ call_proxy() {
   # Give the proxy a beat to flush its audit log to stdout before we tail.
   sleep 1
   local audit
-  audit=$(proxy_last_dispatch)
+  # Never let a parse hiccup in the audit tailing kill the matrix
+  # (would terminate the port-forward via the EXIT trap and leave the
+  # user with a half-run demo). The audit string is informational, not
+  # a gate, so swallow errors and substitute "(audit unavailable)".
+  audit=$(proxy_last_dispatch 2>/dev/null || true)
+  [ -n "$audit" ] || audit="(audit unavailable)"
 
   if [ "$status" != "200" ]; then
     printf "${C_WARN}  HTTP %s${C_OFF}  audit: ${C_BOLD}%s${C_OFF}\n" "$status" "$audit"
