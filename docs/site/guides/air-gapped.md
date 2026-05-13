@@ -13,7 +13,7 @@ operator image, the runtime image, the model weights, and a CA
 bundle to the cluster once, then never reach the public internet
 again.
 
-This guide covers each piece end to end against the current `v0.7.8`
+This guide covers each piece end to end against the current `v0.7.7`
 release.
 
 ## Prerequisites
@@ -31,7 +31,7 @@ release.
 
 Three workloads need to land inside the air gap:
 
-1. **The operator** (`ghcr.io/defilantech/llmkube-controller:v0.7.8`)
+1. **The operator** (`ghcr.io/defilantech/llmkube-controller:v0.7.7`)
    reconciles `Model`, `InferenceService`, and `ModelRouter` custom
    resources.
 2. **The runtime images** (`ghcr.io/ggml-org/llama.cpp:server-cuda13`
@@ -40,7 +40,14 @@ Three workloads need to land inside the air gap:
    them.
 3. **The router-proxy** (`ghcr.io/defilantech/llmkube-router-proxy:dev`)
    if you use `ModelRouter`. Only needed when you want the
-   policy-aware routing layer.
+   policy-aware routing layer. The release pipeline does not yet
+   ship versioned router-proxy images alongside the controller, so
+   the chart default is the `dev` tag (see
+   [`#449`](https://github.com/defilantech/LLMKube/issues/449)). If
+   you need a pinned tag in an air-gapped registry, build the image
+   yourself from this commit (`make docker-build-router-proxy
+   ROUTER_PROXY_IMG=registry.internal.corp/defilantech/llmkube-router-proxy:0.7.7`)
+   and use that tag below.
 
 Plus the model weights themselves, which the operator either copies
 from a local source or mounts from a PVC. There is no model-weight
@@ -51,14 +58,14 @@ download from the operator's runtime pods at request time.
 On a connected machine, save the four images you need:
 
 ```bash
-docker pull ghcr.io/defilantech/llmkube-controller:v0.7.8
-docker pull ghcr.io/defilantech/llmkube-router-proxy:v0.7.8
+docker pull ghcr.io/defilantech/llmkube-controller:v0.7.7
+docker pull ghcr.io/defilantech/llmkube-router-proxy:dev
 docker pull ghcr.io/ggml-org/llama.cpp:server-cuda13
 docker pull docker.io/curlimages/curl:8.18.0   # init container
 
 docker save \
-  ghcr.io/defilantech/llmkube-controller:v0.7.8 \
-  ghcr.io/defilantech/llmkube-router-proxy:v0.7.8 \
+  ghcr.io/defilantech/llmkube-controller:v0.7.7 \
+  ghcr.io/defilantech/llmkube-router-proxy:dev \
   ghcr.io/ggml-org/llama.cpp:server-cuda13 \
   docker.io/curlimages/curl:8.18.0 \
   > llmkube-bundle.tar
@@ -70,8 +77,8 @@ private registry:
 ```bash
 docker load < llmkube-bundle.tar
 for img in \
-  ghcr.io/defilantech/llmkube-controller:v0.7.8 \
-  ghcr.io/defilantech/llmkube-router-proxy:v0.7.8 \
+  ghcr.io/defilantech/llmkube-controller:v0.7.7 \
+  ghcr.io/defilantech/llmkube-router-proxy:dev \
   ghcr.io/ggml-org/llama.cpp:server-cuda13 \
   docker.io/curlimages/curl:8.18.0
 do
@@ -97,19 +104,22 @@ overrides pointing at your registry:
 helm install llmkube ./llmkube \
   --namespace llmkube-system --create-namespace \
   --set controllerManager.image.repository=registry.internal.corp/defilantech/llmkube-controller \
-  --set controllerManager.image.tag=v0.7.8 \
+  --set controllerManager.image.tag=v0.7.7 \
   --set controllerManager.routerProxy.repository=registry.internal.corp/defilantech/llmkube-router-proxy \
-  --set controllerManager.routerProxy.tag=v0.7.8 \
-  --set controllerManager.initContainer.image=registry.internal.corp/curlimages/curl:8.18.0
+  --set controllerManager.routerProxy.tag=dev \
+  --set controllerManager.initContainer.repository=registry.internal.corp/curlimages/curl \
+  --set controllerManager.initContainer.tag=8.18.0
 ```
 
-The `initContainer.image` override matters: by default the
-operator's `Model` reconciler schedules an init container that pulls
-model weights via HTTP(S). In an air-gapped environment that
-container still runs (even when reading from a `pvc://` or local
-file source — it sets up the on-disk layout). If your registry
-mirror requires a different image (your own distroless curl, for
-example), point it here.
+The `initContainer.repository` / `initContainer.tag` overrides
+matter: by default the InferenceService Pod schedules an init
+container that pulls model weights via HTTP(S). In an air-gapped
+environment that container still runs (even when reading from a
+`pvc://` or local file source — it sets up the on-disk layout). If
+your registry mirror requires a different image (your own distroless
+curl, for example), point it here. The chart consumes these as two
+separate fields, not a single `image` value (see
+[`_helpers.tpl`](https://github.com/defilantech/LLMKube/blob/main/charts/llmkube/templates/_helpers.tpl)).
 
 ### OpenShift / OKD / MicroShift
 
@@ -121,8 +131,9 @@ helm install llmkube ./llmkube \
   -f ./llmkube/values-openshift.yaml \
   --namespace llmkube-system --create-namespace \
   --set controllerManager.image.repository=registry.internal.corp/defilantech/llmkube-controller \
-  --set controllerManager.image.tag=v0.7.8 \
-  --set controllerManager.initContainer.image=registry.internal.corp/curlimages/curl:8.18.0
+  --set controllerManager.image.tag=v0.7.7 \
+  --set controllerManager.initContainer.repository=registry.internal.corp/curlimages/curl \
+  --set controllerManager.initContainer.tag=8.18.0
 ```
 
 See [`OpenShift install`](./openshift-install) for the full
@@ -134,27 +145,36 @@ Most air-gapped corporate networks intercept TLS with an internal
 CA. The operator's init container needs that CA in its trust store
 to clone the model file over HTTPS from your internal model server.
 
-1. Create a `ConfigMap` in the operator's namespace with one
-   `ca.crt` key:
+The controller binary accepts a `--ca-cert-configmap` flag that
+takes the name of a ConfigMap holding a `ca.crt` key. The Helm
+chart does not yet expose this as a top-level value (tracked
+upstream as a documentation/chart-coverage gap), so you wire it in
+by editing the controller Deployment args directly after install:
+
+1. Create a `ConfigMap` in every namespace where you will deploy
+   `InferenceService` objects (the init container runs in the
+   workload's namespace, not the operator's):
 
    ```bash
-   kubectl -n llmkube-system create configmap corporate-ca \
+   kubectl -n default create configmap corporate-ca \
      --from-file=ca.crt=/path/to/corporate-root-ca.pem
    ```
 
-2. Point the operator at it via the Helm value:
+2. Patch the controller Deployment to pass the flag:
 
    ```bash
-   helm upgrade llmkube ./llmkube \
-     -n llmkube-system \
-     --reuse-values \
-     --set controllerManager.caCertConfigMap=corporate-ca
+   kubectl -n llmkube-system patch deployment llmkube-controller-manager \
+     --type=json \
+     -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--ca-cert-configmap=corporate-ca"}]'
    ```
 
 3. The operator now mounts that ConfigMap into every init container
    it spawns, so model downloads from `https://model-server.internal`
-   succeed without skipping verification. The CA is also picked up
-   by the controller itself for any reconcile-time HTTP calls.
+   succeed without skipping verification.
+
+Repeat step 1 for each application namespace; the operator looks up
+the ConfigMap in the InferenceService's own namespace at reconcile
+time.
 
 ## Step 4: Get model weights into the cluster
 
@@ -318,9 +338,10 @@ access.
 ## Troubleshooting
 
 **Model stuck in `Pending` with `init container exit 23`**
-The init container couldn't reach the source URL. Check the
-`controllerManager.caCertConfigMap` is set if your URL uses
-internal TLS. View the init log:
+The init container couldn't reach the source URL. Confirm the
+`--ca-cert-configmap` flag is set on the controller (see Step 3) if
+your URL uses internal TLS, and that the named ConfigMap exists in
+the InferenceService's namespace. View the init log:
 `kubectl logs <pod> -c model-downloader`.
 
 **Model stuck in `Pending` with `dial tcp ... no route to host`**
@@ -335,12 +356,13 @@ mismatches are the most common cause in fresh air-gapped clusters.
 
 **Operator pod `ImagePullBackOff`**
 `controllerManager.image.repository` is wrong or the registry needs
-auth. Add `imagePullSecrets` in the Helm values:
+auth. Add `imagePullSecrets` in the Helm values (the field is
+top-level, not under `controllerManager`):
 
 ```bash
 helm upgrade llmkube ./llmkube \
   -n llmkube-system --reuse-values \
-  --set 'controllerManager.imagePullSecrets[0].name=internal-registry-creds'
+  --set 'imagePullSecrets[0].name=internal-registry-creds'
 ```
 
 ## SHA256 audit and integrity

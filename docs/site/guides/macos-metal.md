@@ -90,7 +90,7 @@ launchctl list | grep llmkube
 curl -s http://localhost:9090/healthz
 # expected: {"status":"ok"}
 
-tail -f /Users/$(whoami)/Library/Logs/llmkube-metal-agent.log
+tail -f /tmp/llmkube-metal-agent.log
 # leave this tab open; we'll watch it pick up the first InferenceService
 ```
 
@@ -297,10 +297,11 @@ inspect each step before running it.
 ## Troubleshooting
 
 **Agent process not running after install**
-Check `~/Library/Logs/llmkube-metal-agent.log` (or the path
-configured in your launchd plist) for the first-launch error.
-Most common cause: `llama-server` not on PATH or at the configured
-`--llama-server` path.
+Check `/tmp/llmkube-metal-agent.log` (the
+`StandardOutPath`/`StandardErrorPath` configured in the bundled
+launchd plist) for the first-launch error. Most common cause:
+`llama-server` not on PATH or at the configured `--llama-server`
+path.
 
 **Pods can't reach llama-server (remote cluster)**
 The agent registered `localhost`. Confirm `--host-ip` is set in

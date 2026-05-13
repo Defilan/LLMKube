@@ -62,8 +62,9 @@ scheduled.
 
 ## What the preset does
 
-`charts/llmkube/values-openshift.yaml` is fifteen lines of YAML.
-The load-bearing setting is:
+`charts/llmkube/values-openshift.yaml` is a handful of lines of
+YAML, almost all of which are explanatory comments. The
+load-bearing setting is:
 
 ```yaml
 controllerManager:
@@ -126,9 +127,12 @@ helm install llmkube ./llmkube \
 oc -n llmkube-system get pods
 # expect: llmkube-controller-manager-...   1/1   Running
 
-oc -n llmkube-system logs deployment/llmkube-controller-manager \
-  | grep "default-fsgroup"
-# expect: default-fsgroup=0  (sentinel: operator emits no fsGroup)
+# Confirm the preset took: the rendered Deployment passes
+# --default-fsgroup=0 in the manager container's args.
+oc -n llmkube-system get deployment llmkube-controller-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].args}' \
+  | tr ',' '\n' | grep default-fsgroup
+# expect: "--default-fsgroup=0"
 ```
 
 ### 4. Deploy a model
@@ -221,12 +225,15 @@ helm install llmkube ./llmkube \
   -f ./llmkube/values-openshift.yaml \
   -n llmkube-system --create-namespace \
   --set controllerManager.image.repository=registry.internal.corp/defilantech/llmkube-controller \
-  --set controllerManager.image.tag=v0.7.8 \
-  --set controllerManager.initContainer.image=registry.internal.corp/curlimages/curl:8.18.0
+  --set controllerManager.image.tag=v0.7.7 \
+  --set controllerManager.initContainer.repository=registry.internal.corp/curlimages/curl \
+  --set controllerManager.initContainer.tag=8.18.0
 ```
 
 Both presets are additive: the OpenShift values handle SCC, the
-extra `--set` flags handle the private registry.
+extra `--set` flags handle the private registry. Note that the
+init container is configured via `repository` + `tag` separately,
+not a single `image` field.
 
 ## Verification
 
@@ -236,10 +243,11 @@ End-to-end smoke test that exercises the SCC admission path:
 oc create namespace e2e-scc
 oc apply -n e2e-scc -f config/samples/inference_v1alpha1_model.yaml
 oc apply -n e2e-scc -f config/samples/inference_v1alpha1_inferenceservice.yaml
-oc -n e2e-scc wait inferenceservice/sample --for=jsonpath='{.status.phase}'=Ready --timeout=5m
+oc -n e2e-scc wait inferenceservice/phi-3-inference \
+  --for=jsonpath='{.status.phase}'=Ready --timeout=5m
 
 # Confirm the SCC injected an fsGroup from the namespace range
-oc -n e2e-scc get pod -l inference.llmkube.dev/service=sample \
+oc -n e2e-scc get pod -l inference.llmkube.dev/service=phi-3-inference \
   -o jsonpath='{.items[0].spec.securityContext.fsGroup}'
 ```
 
