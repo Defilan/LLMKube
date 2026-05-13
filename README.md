@@ -34,7 +34,7 @@
 
   <p>
     <a href="#quick-start">Quick Start</a> &bull;
-    <a href="#architecture">Architecture</a> &bull;
+    <a href="#composition-modelrouter">ModelRouter</a> &bull;
     <a href="#the-metal-agent">Metal Agent</a> &bull;
     <a href="#how-is-this-different">Why LLMKube?</a> &bull;
     <a href="#performance">Benchmarks</a> &bull;
@@ -50,11 +50,13 @@
 
 You want to run LLMs on your own infrastructure. Maybe it's for data privacy, cost control, air-gapped compliance, or you just don't want to send every request to OpenAI.
 
-So you set up llama.cpp. It works great on one machine. Then you need to scale it, monitor it, manage model versions, handle GPU scheduling across nodes, expose an API, and somehow make your Mac's Metal GPU and your Linux server's NVIDIA cards work together.
+So you set up llama.cpp. It works great on one machine. Then you need to scale it, monitor it, manage model versions, handle GPU scheduling across nodes, expose an API, and somehow make your Mac's Metal GPU and your Linux server's NVIDIA cards work together. And the moment you want any of that traffic to *sometimes* hand off to Claude or GPT, you're building another routing layer.
 
 Suddenly you're building an entire platform instead of shipping your product.
 
-**LLMKube is a Kubernetes operator that turns LLM deployment into a two-line YAML problem.** Define a `Model` and an `InferenceService`, and the operator handles downloading, caching, GPU scheduling, health checks, scaling, and exposing an OpenAI-compatible API.
+**LLMKube is a Kubernetes operator that turns LLM deployment into a two-line YAML problem.** Define a `Model` and an `InferenceService`, and the operator handles downloading, caching, GPU scheduling, health checks, scaling, and exposing an OpenAI-compatible API. Add a `ModelRouter` on top and the same cluster does policy-aware routing between your local models and external providers (Anthropic / OpenAI / LiteLLM) with fail-closed semantics for regulated data.
+
+> **0.7.8 (2026-05-13)** — `ModelRouter` CRD ships: cross-engine routing with per-rule and per-backend timeout budgets, half-open circuit breaker, runtime fail-closed for PII/PHI rules, configurable response-header timeout, cloud-tier connection hygiene. See [Composition: ModelRouter](#composition-modelrouter) below.
 
 ---
 
@@ -206,6 +208,54 @@ Works over LAN, Tailscale, WireGuard, or any routable network. **[Full Metal Age
 
 ---
 
+## Composition: ModelRouter
+
+`Model` and `InferenceService` give you self-hosted inference. `ModelRouter` puts a policy-aware OpenAI-compatible endpoint in front of *both* your local InferenceServices and external providers, with budgets, classifications, and fail-closed semantics enforced at the cluster level instead of in application code.
+
+The motivating use case: an agent running on a local model can selectively hand off specific steps to Claude or GPT without the agent code knowing or caring where the model lives, while platform policy enforces that regulated data never egresses.
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: coding-router
+spec:
+  backends:
+    - name: local-coder
+      inferenceServiceRef: { name: qwen3-coder }
+      tier: local
+      capabilities: [code, tools]
+    - name: cloud-opus
+      external:
+        provider: anthropic
+        model: claude-opus-4-7
+        credentialsSecretRef: { name: anthropic-key }
+      tier: cloud
+  rules:
+    - name: pii-stays-local
+      match: { dataClassification: [pii] }
+      route: { backends: [local-coder] }
+      failClosed: true
+      timeout: 8s
+    - name: complex-to-cloud
+      match: { taskComplexity: complex }
+      route:
+        backends: [cloud-opus, local-coder]
+        strategy: primary-fallback
+      timeout: 90s
+  defaultRoute: local-coder
+```
+
+Three properties worth calling out:
+
+- **Fail-closed for regulated data, both statically and at runtime.** Apply-time validation rejects rules that would route PII / PHI to cloud-tier backends. Runtime enforcement refuses with HTTP 503 if the local pool can't serve the request, never falling through to cloud.
+- **Per-rule and per-backend timeout budgets.** Strict policy tiers fast-fail; lenient tiers stay patient. The proxy applies `context.WithTimeout` per attempt, so a slow primary doesn't eat the fallback's budget. Resolution order: `rule.timeout || backend.timeout || proxy default`.
+- **OpenAI-compatible streaming endpoint.** Plug it into LangGraph, OpenAI Agents SDK, Anthropic SDK, Cline, Aider, or any framework that speaks the OpenAI API. The agent runtime doesn't need to know it's talking to a router.
+
+**[Full ModelRouter concept doc →](docs/site/concepts/model-router.md)** | **[Sample manifest](config/samples/inference_v1alpha1_modelrouter.yaml)**
+
+---
+
 ## How Is This Different?
 
 | | **LLMKube** | **vLLM / TGI** | **Ollama** | **KServe** | **LocalAI** |
@@ -214,6 +264,9 @@ Works over LAN, Tailscale, WireGuard, or any routable network. **[Full Metal Age
 | **Apple Silicon Metal GPU** | Native (Metal Agent) | No | Local only | No | CPU only |
 | **NVIDIA GPU** | Yes | Yes | Limited | Yes | Yes |
 | **Heterogeneous clusters** (NVIDIA + Metal) | Yes | No | No | No | No |
+| **Hybrid local + cloud routing with policy** | `ModelRouter` CRD | No | No | No | No |
+| **Fail-closed for regulated data (PII/PHI)** | Static + runtime, K8s-enforced | No | No | No | No |
+| **Per-rule / per-backend timeout budgets** | Yes (`spec.rules[].timeout`) | No | No | No | No |
 | **OpenAI-compatible API** | Built-in | Yes | Yes | Requires config | Yes |
 | **Model catalog + CLI** | `llmkube deploy llama-3.1-8b` | Manual | `ollama pull` | Manual | Manual |
 | **GPU queue management** | Priority classes, queue position | No | No | No | No |
@@ -223,8 +276,9 @@ Works over LAN, Tailscale, WireGuard, or any routable network. **[Full Metal Age
 **LLMKube is for teams that want Kubernetes-managed LLM inference across heterogeneous hardware.** If you just need to run a model on one machine, Ollama is simpler. If you need maximum throughput on NVIDIA-only clusters, vLLM is faster. LLMKube occupies the space where Kubernetes orchestration, multi-hardware support, and operational simplicity intersect.
 
 **Versus newer adjacent projects:**
-- **KubeAI**: similar Kubernetes-operator scope. KubeAI focuses on autoscaling vLLM/Ollama on NVIDIA. LLMKube adds first-class Apple Silicon Metal support, GGUF + HF runtime mixing, and a model catalog CLI.
-- **llm-d**: distributed inference for very large models on NVIDIA fleets. Different problem space. LLMKube targets heterogeneous on-prem clusters (laptops, edge nodes, single GPUs) where llm-d's distributed-NVIDIA-first design is overkill.
+- **KubeAI**: similar Kubernetes-operator scope. KubeAI focuses on autoscaling vLLM/Ollama on NVIDIA, intra-cluster. LLMKube adds first-class Apple Silicon Metal support, GGUF + HF runtime mixing, a model catalog CLI, and `ModelRouter` for policy-aware *hybrid* routing across local + cloud.
+- **llm-d**: distributed inference for very large models on NVIDIA fleets via Gateway API. Different problem space. LLMKube targets heterogeneous on-prem clusters (laptops, edge nodes, single GPUs) where llm-d's distributed-NVIDIA-first design is overkill.
+- **LiteLLM**: dominant cloud-provider proxy, operates outside Kubernetes policy. LLMKube doesn't replace LiteLLM — `ModelRouter` composes with it: declare a `provider: litellm` backend pointed at a running LiteLLM proxy and the platform-level fail-closed gate sits in front.
 
 ---
 
@@ -262,6 +316,15 @@ Consistent ~53 tok/s across 3-8B models with automatic layer sharding. See [v0.4
 - OpenAI-compatible `/v1/chat/completions` API
 - Multi-replica horizontal scaling
 - License compliance scanning for GGUF models
+
+**Routing & policy ([ModelRouter](#composition-modelrouter)):**
+- `ModelRouter` CRD: one OpenAI-compatible endpoint, multiple backends (local InferenceServices + external Anthropic / OpenAI / Bedrock / LiteLLM)
+- Policy-aware rules: data classification, task complexity, required capabilities, arbitrary header match
+- Fail-closed semantics for regulated data: static (apply-time) + runtime (HTTP 503, no cloud egress)
+- Per-rule and per-backend timeout budgets (`spec.rules[].timeout` / `spec.backends[].timeout`)
+- Half-open circuit breaker with configurable quarantine window
+- Audit log on every request: rule, backend, tier, resolved timeout, outcome
+- Streaming SSE passthrough from day one
 
 **GPU:**
 - NVIDIA CUDA (T4, L4, A100, RTX)
