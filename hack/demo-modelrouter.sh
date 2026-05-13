@@ -382,15 +382,30 @@ proxy_last_dispatch() {
     | grep -F router.dispatch | tail -n 1) || return 0
   [ -n "$line" ] || return 0
 
-  # awk does the work portably; macOS BSD sed and GNU sed disagree on
-  # the syntax for "match this OR that" branching, so we sidestep it
-  # entirely by extracting the three interesting fields and printing
-  # whichever combination we have (a successful dispatch carries
-  # backend + backendTier; a refused dispatch only carries outcome).
+  # The proxy emits structured slog JSON ({"msg":"router.dispatch",
+  # "backend":"local-coder",...}). Parse with jq when the line is
+  # valid JSON; fall back to grep-style regex otherwise so this
+  # function keeps working if the formatter changes.
+  if printf '%s\n' "$line" | jq -e . >/dev/null 2>&1; then
+    local b t o r s
+    b=$(printf '%s\n' "$line" | jq -r '.backend // empty')
+    t=$(printf '%s\n' "$line" | jq -r '.backendTier // empty')
+    o=$(printf '%s\n' "$line" | jq -r '.outcome // empty')
+    r=$(printf '%s\n' "$line" | jq -r '.rule // empty')
+    s=$(printf '%s\n' "$line" | jq -r '.status // empty')
+    if [ -n "$b" ]; then
+      printf 'backend=%s tier=%s rule=%s status=%s outcome=%s\n' "$b" "$t" "$r" "$s" "$o"
+    else
+      printf 'rule=%s status=%s outcome=%s\n' "$r" "$s" "$o"
+    fi
+    return 0
+  fi
+
+  # Plain-text slog fallback (less likely; the proxy ships with JSON).
+  local backend tier outcome
   backend=$(printf '%s\n' "$line" | awk 'match($0, /backend=[^ ]+/) {print substr($0, RSTART, RLENGTH)}')
   tier=$(printf    '%s\n' "$line" | awk 'match($0, /backendTier=[^ ]+/) {print substr($0, RSTART, RLENGTH)}')
   outcome=$(printf '%s\n' "$line" | awk 'match($0, /outcome=[^ ]+/) {print substr($0, RSTART, RLENGTH)}')
-
   if [ -n "$backend" ]; then
     printf '%s %s %s\n' "$backend" "$tier" "$outcome"
   else
@@ -426,8 +441,12 @@ call_proxy() {
   status=$(printf '%s\n' "$response" | awk -F= '/^HTTP_STATUS=/{print $2}')
   content=$(printf '%s\n' "$response" | sed '/^HTTP_STATUS=/d')
 
-  # Give the proxy a beat to flush its audit log to stdout before we tail.
-  sleep 1
+  # Give both the proxy log buffer a beat to flush AND the upstream
+  # llama-server room to settle before the next call. Tight back-to-
+  # back requests against the same backend can land the second one
+  # mid-Metal-context-switch and time out, which looks like a routing
+  # bug on stage.
+  sleep 2
   local audit
   # Never let a parse hiccup in the audit tailing kill the matrix
   # (would terminate the port-forward via the EXIT trap and leave the
