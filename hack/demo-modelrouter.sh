@@ -307,17 +307,32 @@ spec:
       tier: local
       capabilities: [chat, reasoning]
   rules:
-    # Regulated data: strict fast-fail. 8s is the platform-team policy
-    # budget for PII completions; if Gemma can't deliver in 8s we'd
-    # rather refuse the request than have the user wait. The proxy's
-    # per-attempt context.WithTimeout (added in PR #461) enforces it.
-    - name: pii-stays-local
+    # Strict regulated-data tier: 4s is intentionally tight so the
+    # platform demonstrably refuses sensitive completions Gemma can't
+    # deliver in budget. Audience sees "policy enforced, no cloud
+    # egress, no leakage path" instead of "platform happened to be
+    # fast enough this time." The relaxed sibling rule below shows
+    # the happy path for the same classification.
+    - name: pii-strict
+      match:
+        dataClassification: ["pii"]
+        headers:
+          x-llmkube-policy: strict
+      route:
+        backends: ["local-chat"]
+      failClosed: true
+      timeout: 4s
+    # Relaxed regulated-data tier: same fail-closed semantics
+    # (stays local, never egresses) but 30s budget gives Gemma room
+    # to actually answer. Audience sees the same PII payload land
+    # 200 here vs 503 above purely because of policy tier.
+    - name: pii-relaxed
       match:
         dataClassification: ["pii"]
       route:
         backends: ["local-chat"]
       failClosed: true
-      timeout: 8s
+      timeout: 30s
     - name: task-header-to-coder
       match:
         headers:
@@ -342,7 +357,7 @@ spec:
         backends: ["local-coder"]
   defaultRoute: local-chat
 EOF
-  ok "applied ModelRouter/$ROUTER_NAME with 4 rules + defaultRoute=local-chat"
+  ok "applied ModelRouter/$ROUTER_NAME with 5 rules + defaultRoute=local-chat"
 
   sub "waiting up to 2m for the router-proxy Deployment to become Available"
   kdemo rollout status "deployment/${ROUTER_NAME}-router-proxy" --timeout=2m >/dev/null
@@ -545,13 +560,20 @@ run_test_matrix() {
     "A train leaves Chicago at 3pm heading west at 60 mph. Another leaves Denver at 5pm heading east at 40 mph. The cities are 1000 miles apart. Where and when do they meet?"
 
   call_proxy \
-    "4. PII fail-closed (pii-stays-local rule -> local-chat, strict 8s budget per platform policy)" \
+    "4a. PII via STRICT policy tier (4s budget) — expect 503 fail-closed, no egress" \
+    "local-chat" \
+    -H "x-llmkube-classification: pii" \
+    -H "x-llmkube-policy: strict" \
+    "What's the best way to redact a SSN like 123-45-6789 from a string in Python?"
+
+  call_proxy \
+    "4b. SAME PII payload via RELAXED policy tier (30s budget) — expect 200, same fail-closed rules" \
     "local-chat" \
     -H "x-llmkube-classification: pii" \
     "What's the best way to redact a SSN like 123-45-6789 from a string in Python?"
 
   call_proxy \
-    "5. Engineering team header (engineering-team-to-coder rule)" \
+    "5. Engineering team header (engineering-team-to-coder rule, default 120s budget)" \
     "local-coder" \
     -H "x-llmkube-team: engineering" \
     "What is a kubernetes operator and when would I write one?"
@@ -562,7 +584,7 @@ run_test_matrix() {
   sleep 20
 
   call_proxy \
-    "6. PII with local-chat down (expect HTTP 503, no cloud egress)" \
+    "6. PII with local-chat down (relaxed rule, expect HTTP 503, no cloud egress)" \
     "503" \
     -H "x-llmkube-classification: pii" \
     "Same PII prompt as case 4. Routed-to should be empty; status 503."
