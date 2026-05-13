@@ -116,6 +116,21 @@ var _ = Describe("Manager", Ordered, func() {
 	AfterEach(func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
+			// Resolve the controller pod lazily by label selector when the
+			// Manager Context's BeforeAll didn't run (e.g. when a CI lane
+			// focuses on a single Context with -ginkgo.focus). Without
+			// this, AfterEach issues `kubectl logs  -n ...` with an empty
+			// pod name and the diagnostic is lost — that's what masked
+			// the OpenShift SCC admission test failure.
+			if controllerPodName == "" {
+				lookup := exec.Command("kubectl", "get", "pods",
+					"-n", namespace,
+					"-l", "control-plane=controller-manager",
+					"-o", "jsonpath={.items[0].metadata.name}")
+				if name, err := utils.Run(lookup); err == nil {
+					controllerPodName = strings.TrimSpace(name)
+				}
+			}
 			By("Fetching controller manager pod logs")
 			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
 			controllerLogs, err := utils.Run(cmd)
@@ -2081,6 +2096,45 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
+			// Capture richer diagnostics if anything below fails. The
+			// outer AfterEach only knows about the controller namespace;
+			// this nested deferred dump pulls the per-test namespace
+			// state (Model / InferenceService / PVC / pods / events)
+			// which is where the SCC admission story actually lives.
+			defer func() {
+				if !CurrentSpecReport().Failed() {
+					return
+				}
+				for _, args := range [][]string{
+					{"get", "model,inferenceservice,pvc,pods", "-n", sccTestNs, "-o", "wide"},
+					{"describe", "model", "scc-test-model", "-n", sccTestNs},
+					{"describe", "inferenceservice", "scc-test-inference", "-n", sccTestNs},
+					{"describe", "pvc", "-n", sccTestNs},
+					{"get", "events", "-n", sccTestNs, "--sort-by=.lastTimestamp"},
+				} {
+					out, _ := utils.Run(exec.Command("kubectl", args...))
+					_, _ = fmt.Fprintf(GinkgoWriter, "\n--- kubectl %s ---\n%s\n", strings.Join(args, " "), out)
+				}
+			}()
+
+			// MicroShift-via-MINC bootstrap is slower than kind, and the
+			// Model controller's runtime-resolved path still needs the
+			// per-namespace cache PVC to be created before
+			// reconcileDeployment runs. Five minutes matches the
+			// timeout the workflow uses elsewhere (helm install --wait).
+			openshiftEventuallyTimeout := 5 * time.Minute
+
+			By("waiting for the Model to reach Ready (focused signal: the issue isn't admission yet)")
+			verifyModelReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "model", "scc-test-model",
+					"-n", sccTestNs, "-o", "jsonpath={.status.phase}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("Ready"),
+					"Model.status.phase must reach Ready before the InferenceService progresses; got %q", output)
+			}
+			Eventually(verifyModelReady, openshiftEventuallyTimeout).Should(Succeed())
+
 			By("waiting for the InferenceService Deployment to exist (admission succeeded)")
 			verifyDeploymentExists := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "deployment", "scc-test-inference",
@@ -2089,7 +2143,7 @@ spec:
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(Equal("scc-test-inference"))
 			}
-			Eventually(verifyDeploymentExists, 2*time.Minute).Should(Succeed())
+			Eventually(verifyDeploymentExists, openshiftEventuallyTimeout).Should(Succeed())
 
 			By("verifying SCC injected an fsGroup in the rendered pod spec")
 			var podFSGroup int64
@@ -2110,7 +2164,7 @@ spec:
 					"injected fsGroup %d must be <= namespace range max %d", fsGroup, rangeMax)
 				podFSGroup = fsGroup
 			}
-			Eventually(verifyPodFSGroupInRange, 2*time.Minute).Should(Succeed())
+			Eventually(verifyPodFSGroupInRange, openshiftEventuallyTimeout).Should(Succeed())
 
 			_, _ = fmt.Fprintf(GinkgoWriter,
 				"SCC injected fsGroup=%d (namespace range %d-%d) on InferenceService pod\n",
