@@ -346,18 +346,22 @@ start_port_forward() {
   pkill -f "kubectl --context $KIND_CONTEXT.*port-forward.*${ROUTER_NAME}-router-proxy" 2>/dev/null || true
   sleep 1
 
-  # The proxy quarantines a backend permanently on the first
-  # connection failure (no half-open recovery in Phase 1, see
-  # https://github.com/defilantech/LLMKube/issues/453). If we ran the
-  # test matrix before and Gemma had a transient hiccup, local-chat
-  # is still marked unhealthy in the proxy's in-memory map and every
-  # subsequent demo run shows "backend marked unhealthy" instead of
-  # real routing. Roll the pod so health state starts fresh.
-  if kdemo get deployment "${ROUTER_NAME}-router-proxy" >/dev/null 2>&1; then
-    sub "rolling router-proxy pod for fresh backend health state"
-    kdemo rollout restart "deployment/${ROUTER_NAME}-router-proxy" >/dev/null
-    kdemo rollout status "deployment/${ROUTER_NAME}-router-proxy" --timeout=60s >/dev/null
-  fi
+  # This used to `kubectl rollout restart` the proxy Deployment to
+  # clear stale "permanently unhealthy" backend state from a previous
+  # run. That workaround was removed for two reasons:
+  #
+  #   1. The proxy now has a half-open circuit breaker (PR #454):
+  #      quarantine expires after 15s and the next request probes the
+  #      backend. So stale unhealthy state self-heals; no roll needed.
+  #
+  #   2. The ModelRouterReconciler's reconcileRouterDeployment
+  #      overwrites existing.Spec.Template wholesale on every reconcile,
+  #      which strips the `kubectl.kubernetes.io/restartedAt`
+  #      annotation that rollout-restart adds. The controller's next
+  #      reconcile (which fires on every Deployment Update) reverts
+  #      the template, kubelet sees a template change again, and pods
+  #      oscillate between two ReplicaSets. That kills in-flight
+  #      requests mid-test. Tracked as a separate controller issue.
 
   kc -n "$DEMO_NS" port-forward "svc/${ROUTER_NAME}-router-proxy" \
     "$PROXY_PORT:8080" >/dev/null 2>&1 &
