@@ -267,6 +267,10 @@ func routerProxyArgs(mr *inferencev1alpha1.ModelRouter) []string {
 		args = append(args, "--quarantine-duration",
 			mr.Spec.Proxy.QuarantineDuration.Duration.String())
 	}
+	if mr.Spec.Proxy != nil && mr.Spec.Proxy.ResponseHeaderTimeout != nil {
+		args = append(args, "--response-header-timeout",
+			mr.Spec.Proxy.ResponseHeaderTimeout.Duration.String())
+	}
 	return args
 }
 

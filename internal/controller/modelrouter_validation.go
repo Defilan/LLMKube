@@ -13,8 +13,19 @@ package controller
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+)
+
+// Sane bounds for rule and backend timeouts. The lower bound rejects
+// values too short to be meaningful (even local llama-server can't
+// produce first-token in 100ms cold-start); the upper bound rejects
+// values that are more likely a unit typo (eg "30s" vs "30m") than a
+// legitimate request.
+const (
+	minRouterTimeout = 100 * time.Millisecond
+	maxRouterTimeout = 30 * time.Minute
 )
 
 // ModelRouterValidationError describes a single static-validation failure on
@@ -107,8 +118,37 @@ func validateBackends(spec *inferencev1alpha1.ModelRouterSpec) (
 		}
 		nameSet[b.Name] = true
 		byName[b.Name] = b
+
+		errs = append(errs, validateBackendTimeout(b, path)...)
 	}
 	return nameSet, byName, errs
+}
+
+// validateBackendTimeout enforces the same sane bounds as rule.timeout
+// (see validateRuleTimeout). Backend-level timeouts override the proxy
+// default but are themselves overridden by rule-level timeouts at
+// dispatch time.
+func validateBackendTimeout(
+	b *inferencev1alpha1.RouterBackend,
+	path string,
+) []ModelRouterValidationError {
+	if b.Timeout == nil {
+		return nil
+	}
+	d := b.Timeout.Duration
+	if d < minRouterTimeout {
+		return []ModelRouterValidationError{{
+			Field:   path + ".timeout",
+			Message: fmt.Sprintf("must be >= %s; got %s", minRouterTimeout, d),
+		}}
+	}
+	if d > maxRouterTimeout {
+		return []ModelRouterValidationError{{
+			Field:   path + ".timeout",
+			Message: fmt.Sprintf("must be <= %s; got %s (probable unit typo)", maxRouterTimeout, d),
+		}}
+	}
+	return nil
 }
 
 // validateBackendKindExclusivity enforces exactly-one-of(inferenceServiceRef,
@@ -151,8 +191,37 @@ func validateRules(
 		}
 		errs = append(errs, validateRuleRoute(rule, path, nameSet)...)
 		errs = append(errs, validateRuleSensitiveData(rule, path, sensitiveSet, byName)...)
+		errs = append(errs, validateRuleTimeout(rule, path)...)
 	}
 	return ruleNames, errs
+}
+
+// validateRuleTimeout enforces sane bounds on rule.timeout. Too short
+// (<100ms) is almost certainly a config error: even local llama-server
+// can't first-token in under that. Too long (>30m) is a smell for any
+// LLM request and is more likely a unit typo (eg "30s" intended as
+// "30m") than a legitimate ask.
+func validateRuleTimeout(
+	rule *inferencev1alpha1.RouterRule,
+	path string,
+) []ModelRouterValidationError {
+	if rule.Timeout == nil {
+		return nil
+	}
+	d := rule.Timeout.Duration
+	if d < minRouterTimeout {
+		return []ModelRouterValidationError{{
+			Field:   path + ".timeout",
+			Message: fmt.Sprintf("must be >= %s; got %s", minRouterTimeout, d),
+		}}
+	}
+	if d > maxRouterTimeout {
+		return []ModelRouterValidationError{{
+			Field:   path + ".timeout",
+			Message: fmt.Sprintf("must be <= %s; got %s (probable unit typo)", maxRouterTimeout, d),
+		}}
+	}
+	return nil
 }
 
 // validateRuleRoute checks that rule.route.backends references real backends.

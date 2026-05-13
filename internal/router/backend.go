@@ -43,6 +43,17 @@ const defaultQuarantineDuration = 15 * time.Second
 // in Dispatch; see the cloud-tier branch there for why.
 const defaultIdleConnTimeout = 10 * time.Second
 
+// defaultResponseHeaderTimeout caps how long the dispatcher waits for
+// the upstream to begin sending response headers. For non-streaming
+// chat completions, llama.cpp / vLLM / cloud providers emit headers
+// only after the full token stream completes, so this is effectively
+// a max-generation-time cap. 120s covers (a) 70B-class local models
+// doing ~1500-token completions on consumer Metal, (b) Anthropic on
+// long reasoning, (c) Bedrock cold-start. Streaming dispatches send
+// first SSE chunk within ~1s, so the cap is invisible to them.
+// Tunable via --response-header-timeout (see WithResponseHeaderTimeout).
+const defaultResponseHeaderTimeout = 120 * time.Second
+
 // backendHealth is the dispatcher's per-backend state. It implements
 // the half-open part of a circuit breaker: when MarkUnhealthy fires,
 // the backend is skipped until quarantineUntil; the first request
@@ -72,6 +83,12 @@ type Dispatcher struct {
 	// QuarantineDuration option.
 	quarantineDuration time.Duration
 
+	// responseHeaderTimeout is the dispatcher's view of the proxy
+	// default. The actual cap on a given request is the *minimum*
+	// of this and any per-rule / per-backend timeout resolved at
+	// dispatch time. Defaults to defaultResponseHeaderTimeout.
+	responseHeaderTimeout time.Duration
+
 	// nowFn is overridable in tests.
 	nowFn func() time.Time
 }
@@ -92,30 +109,50 @@ func WithNowFunc(fn func() time.Time) DispatcherOption {
 	return func(disp *Dispatcher) { disp.nowFn = fn }
 }
 
+// WithResponseHeaderTimeout sets the upper bound on how long the
+// dispatcher waits for the upstream to begin sending response headers.
+// Wired from cmd/router-proxy's --response-header-timeout flag, which
+// in turn is set by the controller from
+// ModelRouter.spec.proxy.responseHeaderTimeout. Per-rule / per-backend
+// timeouts (see resolveDispatchTimeout in proxy.go) tighten this on a
+// per-request basis but cannot extend it beyond this cap.
+func WithResponseHeaderTimeout(d time.Duration) DispatcherOption {
+	return func(disp *Dispatcher) { disp.responseHeaderTimeout = d }
+}
+
+// ResponseHeaderTimeout returns the dispatcher's proxy-default
+// timeout. Exposed for the proxy handler to use when resolving the
+// effective per-request timeout (rule.timeout || backend.timeout ||
+// dispatcher.ResponseHeaderTimeout()).
+func (d *Dispatcher) ResponseHeaderTimeout() time.Duration {
+	return d.responseHeaderTimeout
+}
+
 // NewDispatcher returns a Dispatcher bound to the given Config. All
 // backends start in a healthy state. The proxy quarantines a backend
 // on 5xx / network error for quarantineDuration, after which the
 // next request is allowed through as a half-open probe.
 func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 	d := &Dispatcher{
-		cfg: cfg,
-		client: &http.Client{
-			// Streaming requests can be long-lived. The per-request
-			// context is the real deadline; this caps idle and connect
-			// phases to prevent leaking goroutines on dead backends.
-			Timeout: 0,
-			Transport: &http.Transport{
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   10,
-				IdleConnTimeout:       defaultIdleConnTimeout,
-				ResponseHeaderTimeout: 30 * time.Second,
-			},
-		},
-		quarantineDuration: defaultQuarantineDuration,
-		nowFn:              time.Now,
+		cfg:                   cfg,
+		quarantineDuration:    defaultQuarantineDuration,
+		responseHeaderTimeout: defaultResponseHeaderTimeout,
+		nowFn:                 time.Now,
 	}
 	for _, opt := range opts {
 		opt(d)
+	}
+	d.client = &http.Client{
+		// Streaming requests can be long-lived. The per-request
+		// context is the real deadline; this caps idle and connect
+		// phases to prevent leaking goroutines on dead backends.
+		Timeout: 0,
+		Transport: &http.Transport{
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       defaultIdleConnTimeout,
+			ResponseHeaderTimeout: d.responseHeaderTimeout,
+		},
 	}
 	for _, b := range cfg.Backends {
 		h := &backendHealth{}

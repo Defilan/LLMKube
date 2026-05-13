@@ -493,6 +493,105 @@ func TestRouterDeploymentBuilderQuarantineDefault(t *testing.T) {
 	}
 }
 
+// TestRouterDeploymentBuilderResponseHeaderTimeoutRendered covers the
+// spec.proxy.responseHeaderTimeout plumbing added for #457.
+func TestRouterDeploymentBuilderResponseHeaderTimeoutRendered(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{
+		ResponseHeaderTimeout: &metav1.Duration{Duration: 90 * time.Second},
+	}
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+	dep := r.newRouterDeployment(mr, "hash")
+
+	args := dep.Spec.Template.Spec.Containers[0].Args
+	var found bool
+	for i, a := range args {
+		if a == "--response-header-timeout" && i+1 < len(args) {
+			found = true
+			if args[i+1] != "1m30s" {
+				t.Errorf("--response-header-timeout value = %q, want 1m30s", args[i+1])
+			}
+		}
+	}
+	if !found {
+		t.Errorf("--response-header-timeout flag not rendered; args = %v", args)
+	}
+}
+
+// TestRouterDeploymentBuilderResponseHeaderTimeoutDefault is the
+// inverse: with spec.proxy.responseHeaderTimeout unset the flag must
+// be omitted so the proxy honors its compiled-in 120s default and
+// future default tweaks land without manifest churn.
+func TestRouterDeploymentBuilderResponseHeaderTimeoutDefault(t *testing.T) {
+	mr := canonicalModelRouter()
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+	dep := r.newRouterDeployment(mr, "hash")
+
+	for _, a := range dep.Spec.Template.Spec.Containers[0].Args {
+		if a == "--response-header-timeout" {
+			t.Errorf("--response-header-timeout must be omitted when unset; args = %v",
+				dep.Spec.Template.Spec.Containers[0].Args)
+		}
+	}
+}
+
+// TestCompileRouterConfigCopiesRuleTimeout pins that
+// ModelRouter.spec.rules[].timeout flows through translateRule into
+// the wire-shape Rule.Timeout the proxy reads. Without this the
+// per-rule override is invisible at dispatch time.
+func TestCompileRouterConfigCopiesRuleTimeout(t *testing.T) {
+	mr := canonicalModelRouter()
+	// Annotate the first rule with a timeout the proxy would honor.
+	mr.Spec.Rules[0].Timeout = &metav1.Duration{Duration: 7 * time.Second}
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Rules[0].Timeout != 7*time.Second {
+		t.Errorf("rule timeout = %v, want 7s", cfg.Rules[0].Timeout)
+	}
+}
+
+// TestCompileRouterConfigCopiesBackendTimeout pins the equivalent for
+// per-backend timeouts.
+func TestCompileRouterConfigCopiesBackendTimeout(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Backends[1].Timeout = &metav1.Duration{Duration: 3 * time.Minute}
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Backends[1].Timeout != 3*time.Minute {
+		t.Errorf("backend timeout = %v, want 3m", cfg.Backends[1].Timeout)
+	}
+}
+
 // TestRouterServiceBuilder confirms ClusterIP default and the
 // canonical selector label.
 func TestRouterServiceBuilder(t *testing.T) {

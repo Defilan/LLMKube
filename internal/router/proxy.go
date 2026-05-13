@@ -228,7 +228,14 @@ func (p *Proxy) enforceFailClosed(f *RequestFeatures, dec *MatchResult) error {
 // dispatchWithFallback walks the backend list in declared order and
 // returns the first successful (non-5xx, non-error) response. On
 // fail-closed routes with all backends unhealthy, the last error
-// propagates back to the handler as HTTP 502.
+// propagates back to the handler as HTTP 502 or 503 (the caller in
+// handleChatCompletions decides the surface based on dec.FailClosed).
+//
+// Per-attempt deadline: resolveDispatchTimeout produces the cap for
+// each backend attempt, with resolution order rule -> backend ->
+// proxy default. The deadline is applied per attempt, not once for
+// the whole loop, so a slow primary that timed out does NOT eat the
+// fallback's budget.
 func (p *Proxy) dispatchWithFallback(
 	ctx context.Context,
 	dec *MatchResult,
@@ -247,8 +254,11 @@ func (p *Proxy) dispatchWithFallback(
 			lastErr = fmt.Errorf("backend %q marked unhealthy", name)
 			continue
 		}
-		resp, err := p.disp.Dispatch(ctx, b, http.MethodPost, path, headers, body)
+		attemptCtx, cancel := context.WithTimeout(ctx,
+			resolveDispatchTimeout(dec, b, p.disp.ResponseHeaderTimeout()))
+		resp, err := p.disp.Dispatch(attemptCtx, b, http.MethodPost, path, headers, body)
 		if err != nil {
+			cancel()
 			lastErr = err
 			continue
 		}
@@ -256,15 +266,54 @@ func (p *Proxy) dispatchWithFallback(
 			// Drain and close so the connection is reusable.
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
+			cancel()
 			lastErr = fmt.Errorf("%s returned %d", name, resp.StatusCode)
 			continue
 		}
+		// Successful response: wrap the body so its Close also
+		// cancels the per-attempt context. The caller's existing
+		// `defer resp.Body.Close()` is enough — no separate cancel
+		// plumbing needed, and streaming dispatches keep the
+		// deadline alive until the client finishes reading.
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 		return b, resp, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no backends attempted")
 	}
 	return nil, nil, lastErr
+}
+
+// cancelOnClose pairs a response body with the cancel func of the
+// per-attempt context. The proxy's caller already does
+// `defer resp.Body.Close()`, so wrapping the body ensures the
+// per-attempt context cancel fires no later than the response is
+// fully consumed (and no sooner — streaming responses need the
+// deadline to outlive the chat completion).
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// resolveDispatchTimeout computes the per-attempt context deadline
+// using the resolution order: rule.Timeout || backend.Timeout ||
+// proxy default. Zero values fall through to the next level. This
+// is the runtime half of #458; the controller already validated
+// bounds at apply time so any non-zero value reaching here is sane.
+func resolveDispatchTimeout(dec *MatchResult, backend *Backend, proxyDefault time.Duration) time.Duration {
+	if dec != nil && dec.Rule != nil && dec.Rule.Timeout > 0 {
+		return dec.Rule.Timeout
+	}
+	if backend != nil && backend.Timeout > 0 {
+		return backend.Timeout
+	}
+	return proxyDefault
 }
 
 // streamResponse copies the upstream response to the client. Returns
@@ -328,6 +377,13 @@ func (p *Proxy) audit(
 	if chosen != nil {
 		attrs = append(attrs, "backend", chosen.Name, "backendTier", chosen.Tier)
 	}
+	// The resolved per-request deadline is informative regardless of
+	// outcome: on success it shows the budget that DID land, on
+	// timeout it shows the budget that DIDN'T suffice. Operators
+	// debugging "why did this rule 504?" can grep audit logs for
+	// `timeoutMs=<expected>` and reconcile vs the CRD spec.
+	attrs = append(attrs, "timeoutMs",
+		resolveDispatchTimeout(&dec, chosen, p.disp.ResponseHeaderTimeout()).Milliseconds())
 	p.logger.Info("router.dispatch", attrs...)
 }
 

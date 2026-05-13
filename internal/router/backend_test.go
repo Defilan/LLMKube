@@ -256,3 +256,37 @@ func TestDispatcherUsesShortIdleConnTimeout(t *testing.T) {
 			defaultIdleConnTimeout)
 	}
 }
+
+// TestDispatcherResponseHeaderTimeoutDefault confirms the 120s
+// default is wired into both the dispatcher field and the underlying
+// transport. Operators reading the audit log expect the
+// `timeoutMs` attribute to reflect this when no per-rule / per-backend
+// override applies.
+func TestDispatcherResponseHeaderTimeoutDefault(t *testing.T) {
+	disp := NewDispatcher(&Config{})
+	if got := disp.ResponseHeaderTimeout(); got != defaultResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout() = %v, want %v", got, defaultResponseHeaderTimeout)
+	}
+	if defaultResponseHeaderTimeout < 60*time.Second {
+		t.Errorf("default = %v; too short for long-form LLM generation", defaultResponseHeaderTimeout)
+	}
+	tr, _ := disp.client.Transport.(*http.Transport)
+	if tr.ResponseHeaderTimeout != defaultResponseHeaderTimeout {
+		t.Errorf("transport ResponseHeaderTimeout = %v, want %v",
+			tr.ResponseHeaderTimeout, defaultResponseHeaderTimeout)
+	}
+}
+
+// TestDispatcherResponseHeaderTimeoutOverride covers the
+// WithResponseHeaderTimeout option used by cmd/router-proxy main.go
+// to thread the --response-header-timeout CLI flag through.
+func TestDispatcherResponseHeaderTimeoutOverride(t *testing.T) {
+	disp := NewDispatcher(&Config{}, WithResponseHeaderTimeout(7*time.Second))
+	if got := disp.ResponseHeaderTimeout(); got != 7*time.Second {
+		t.Errorf("ResponseHeaderTimeout() = %v, want 7s", got)
+	}
+	tr, _ := disp.client.Transport.(*http.Transport)
+	if tr.ResponseHeaderTimeout != 7*time.Second {
+		t.Errorf("transport ResponseHeaderTimeout = %v, want 7s", tr.ResponseHeaderTimeout)
+	}
+}

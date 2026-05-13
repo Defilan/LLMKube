@@ -1263,6 +1263,105 @@ spec:
 				}
 			}, 30*time.Second, time.Second).Should(Succeed())
 		})
+
+		It("should honor a tight rule.timeout and surface deadline as 502/503", func() {
+			// Regression test for #458. The rule's timeout overrides
+			// the proxy's default at dispatch time via context.WithTimeout.
+			// We stand up a slow stub (800ms response delay), point a
+			// dedicated router at it with a 200ms rule timeout, and
+			// assert the proxy gives up well before the stub's delay
+			// elapses.
+			const slowStubSvc = "fake-slow"
+			const timeoutRouterName = "e2e-timeout-router"
+
+			By("deploying a slow stub upstream (-response-delay=800ms)")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(
+				renderStubUpstream(mrcTestNs, slowStubSvc, "-response-delay=800ms"))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "deploy slow stub")
+			defer func() {
+				_, _ = utils.Run(exec.Command("kubectl", "delete",
+					"deployment,service", slowStubSvc,
+					"-n", mrcTestNs, "--ignore-not-found"))
+			}()
+
+			By("waiting for slow stub to become Available")
+			cmd = exec.Command("kubectl", "rollout", "status",
+				"deployment/"+slowStubSvc, "-n", mrcTestNs, "--timeout=60s")
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "slow stub rollout")
+
+			By("applying a ModelRouter with a 200ms rule timeout pointing at the slow stub")
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  backends:
+    - name: slow-local
+      external:
+        provider: openai
+        model: stub
+        url: http://%s.%s.svc.cluster.local:8080
+      tier: local
+  rules:
+    - name: tight-budget
+      match:
+        headers:
+          x-llmkube-task: tight
+      route:
+        backends: ["slow-local"]
+      timeout: 200ms
+  defaultRoute: slow-local
+`, timeoutRouterName, mrcTestNs, slowStubSvc, mrcTestNs))
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "apply timeout router")
+			defer func() {
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "modelrouter",
+					timeoutRouterName, "-n", mrcTestNs, "--ignore-not-found"))
+			}()
+
+			By("waiting for the proxy Deployment of the timeout router to become Available")
+			Eventually(func(g Gomega) {
+				c := exec.Command("kubectl", "rollout", "status",
+					"deployment/"+timeoutRouterName+"-router-proxy",
+					"-n", mrcTestNs, "--timeout=10s")
+				_, e := utils.Run(c)
+				g.Expect(e).NotTo(HaveOccurred())
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("POSTing through the timeout router with the tight header (in-cluster, no port-forward)")
+			// Hit the new router via cluster DNS so we don't have to
+			// stand up a second port-forward. runCurlInCluster spins
+			// up a one-shot curl pod and reports HTTP_STATUS.
+			timeoutURL := fmt.Sprintf(
+				"http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
+				timeoutRouterName, mrcTestNs)
+			_, status, err := runCurlInCluster(mrcTestNs, timeoutURL, "POST",
+				map[string]string{"x-llmkube-task": "tight"},
+				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(status).To(SatisfyAny(Equal(502), Equal(503)),
+				"tight-timeout dispatch should surface 502 or 503; got %d", status)
+
+			By("confirming the proxy audit log recorded the resolved timeoutMs")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "logs",
+					"-l", "app="+timeoutRouterName+"-router-proxy",
+					"-n", mrcTestNs, "--tail=20")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				// The audit log entry for the tight dispatch should
+				// show rule=tight-budget and timeoutMs=200; that's the
+				// definitive proof the per-rule timeout reached the
+				// dispatcher and was applied via context.WithTimeout.
+				g.Expect(out).To(ContainSubstring(`"rule":"tight-budget"`))
+				g.Expect(out).To(ContainSubstring(`"timeoutMs":200`))
+			}, 30*time.Second, time.Second).Should(Succeed())
+		})
 	})
 
 	Context("License Check", func() {
@@ -2065,7 +2164,17 @@ type tokenRequest struct {
 // --label so introspect responses can tell them apart. The image is
 // side-loaded into kind in BeforeSuite (LLMKUBE_E2E_ROUTER_CLUSTER=true)
 // and pulled with IfNotPresent so the test never hits a registry.
-func renderStubUpstream(ns, name string) string {
+//
+// extraArgs lets a caller (eg the per-rule timeout specs) inject
+// additional CLI flags, most usefully `-response-delay=...` to
+// simulate a slow upstream.
+func renderStubUpstream(ns, name string, extraArgs ...string) string {
+	// Build the args list inline so the rendered YAML is a single
+	// flow-style array (avoids whitespace surprises in heredoc YAML).
+	argList := `"-label=` + name + `", "-listen=:8080"`
+	for _, a := range extraArgs {
+		argList += `, "` + a + `"`
+	}
 	return fmt.Sprintf(`apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -2092,7 +2201,7 @@ spec:
         - name: stub
           image: localhost/llmkube-stub-upstream:e2e
           imagePullPolicy: IfNotPresent
-          args: ["-label=%[2]s", "-listen=:8080"]
+          args: [%[3]s]
           ports:
             - containerPort: 8080
           securityContext:
@@ -2127,7 +2236,7 @@ spec:
       port: 8080
       targetPort: 8080
 ---
-`, ns, name)
+`, ns, name, argList)
 }
 
 // stubIntrospectResponse mirrors the JSON returned by the stub upstream

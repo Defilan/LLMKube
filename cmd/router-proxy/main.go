@@ -47,6 +47,13 @@ func main() {
 			"5xx / network error before becoming eligible for a half-open "+
 			"probe. Shorter windows recover faster from transient blips; "+
 			"longer windows reduce probe load on genuinely-down upstreams.")
+	responseHeaderTimeout := flag.Duration("response-header-timeout", 120*time.Second,
+		"Upper bound on how long the dispatcher waits for the upstream to "+
+			"begin sending response headers. For non-streaming chat "+
+			"completions this is effectively a max-generation-time cap. "+
+			"Per-rule and per-backend timeouts in the ModelRouter CRD "+
+			"can tighten this on a per-request basis but cannot extend "+
+			"beyond it.")
 	flag.Parse()
 
 	logger := newLogger(*logFormat)
@@ -64,7 +71,10 @@ func main() {
 	)
 
 	proxy := router.NewProxy(cfg, logger,
-		router.WithDispatcherOptions(router.WithQuarantineDuration(*quarantineDuration)),
+		router.WithDispatcherOptions(
+			router.WithQuarantineDuration(*quarantineDuration),
+			router.WithResponseHeaderTimeout(*responseHeaderTimeout),
+		),
 	)
 	mux := http.NewServeMux()
 	proxy.Mount(mux)

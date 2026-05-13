@@ -118,6 +118,16 @@ type RouterBackend struct {
 	// backend by the router-proxy.
 	// +optional
 	HealthCheck *BackendHealthCheck `json:"healthCheck,omitempty"`
+
+	// Timeout caps how long the proxy waits for this backend to begin
+	// sending response headers. When set it overrides the proxy
+	// default for dispatches that target this backend. Resolution
+	// order at dispatch time: rule.timeout || backend.timeout ||
+	// proxy default (ModelRouter.spec.proxy.responseHeaderTimeout).
+	// Useful when backends in the same router have wildly different
+	// P99 envelopes (in-cluster vLLM vs Anthropic global LB).
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
 }
 
 // ExternalProvider describes an upstream LLM API outside the cluster.
@@ -202,6 +212,16 @@ type RouterRule struct {
 	// matched requests are never served by any other route.
 	// +optional
 	FailClosed bool `json:"failClosed,omitempty"`
+
+	// Timeout caps how long the proxy waits for the upstream to begin
+	// sending response headers on dispatches matched by this rule.
+	// When set it overrides RouterBackend.Timeout and the proxy
+	// default. Resolution order at dispatch time:
+	// rule.timeout || backend.timeout || proxy default.
+	// Useful for tightening regulated-data rules (sub-10s strict
+	// fail-fast) or extending long-reasoning rules (120s+).
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
 }
 
 // RuleMatch declares the conditions under which a rule fires.
@@ -408,6 +428,17 @@ type RouterProxySpec struct {
 	// sub-second to verify recovery without sleeping the full default.
 	// +optional
 	QuarantineDuration *metav1.Duration `json:"quarantineDuration,omitempty"`
+
+	// ResponseHeaderTimeout caps how long the proxy waits for the
+	// upstream to begin sending response headers. For non-streaming
+	// chat completions this is effectively a max-generation-time
+	// cap; for streaming dispatches the first SSE chunk arrives well
+	// inside the window so the cap is invisible. Default 120s when
+	// unset. Per-rule and per-backend timeouts (see RouterRule.Timeout
+	// and RouterBackend.Timeout) tighten this on a per-request basis
+	// but cannot extend it beyond this cap.
+	// +optional
+	ResponseHeaderTimeout *metav1.Duration `json:"responseHeaderTimeout,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the
