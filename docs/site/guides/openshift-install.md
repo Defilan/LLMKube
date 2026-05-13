@@ -293,6 +293,6 @@ and that's the same SCC shape you get on real MicroShift hosts.
 
 ## Reference
 
-- [`charts/llmkube/values-openshift.yaml`](https://github.com/defilantech/LLMKube/blob/main/charts/llmkube/values-openshift.yaml) — the preset itself, fifteen lines
+- [`charts/llmkube/values-openshift.yaml`](https://github.com/defilantech/LLMKube/blob/main/charts/llmkube/values-openshift.yaml) — the preset itself
 - [CRD reference](../concepts/crds) — `Model`, `InferenceService`, `ModelRouter`
 - OpenShift docs: [restricted-v2 SCC](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html)
