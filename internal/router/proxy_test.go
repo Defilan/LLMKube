@@ -383,3 +383,109 @@ func TestExtractFeaturesParsesURL(t *testing.T) {
 		t.Errorf("url parse busted: %q", u.Path)
 	}
 }
+
+// TestResolveDispatchTimeoutPrecedence pins the per-attempt timeout
+// resolution order added for #458: rule.Timeout (strictest) wins over
+// backend.Timeout wins over the proxy default. Zero values fall
+// through so unset fields don't silently shrink the budget.
+func TestResolveDispatchTimeoutPrecedence(t *testing.T) {
+	cases := []struct {
+		name      string
+		ruleTO    time.Duration
+		backendTO time.Duration
+		proxyDef  time.Duration
+		want      time.Duration
+	}{
+		{"rule wins", 5 * time.Second, 30 * time.Second, 120 * time.Second, 5 * time.Second},
+		{"backend wins when rule unset", 0, 30 * time.Second, 120 * time.Second, 30 * time.Second},
+		{"proxy default when both unset", 0, 0, 120 * time.Second, 120 * time.Second},
+		{"rule wins even when shorter than backend", 1 * time.Second, 60 * time.Second, 120 * time.Second, 1 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dec := &MatchResult{Rule: &Rule{Name: "r", Timeout: tc.ruleTO}}
+			backend := &Backend{Name: "b", Timeout: tc.backendTO}
+			got := resolveDispatchTimeout(dec, backend, tc.proxyDef)
+			if got != tc.want {
+				t.Errorf("resolveDispatchTimeout = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveDispatchTimeoutHandlesNilDecisionOrBackend confirms the
+// helper is safe against the corner cases the proxy's dispatch loop
+// can plausibly hit: nil MatchResult (no rule matched) or nil chosen
+// backend (defensive — shouldn't happen but worth pinning).
+func TestResolveDispatchTimeoutHandlesNilDecisionOrBackend(t *testing.T) {
+	want := 100 * time.Second
+	if got := resolveDispatchTimeout(nil, &Backend{}, want); got != want {
+		t.Errorf("nil decision: got %v, want %v", got, want)
+	}
+	if got := resolveDispatchTimeout(&MatchResult{}, nil, want); got != want {
+		t.Errorf("nil backend: got %v, want %v", got, want)
+	}
+	if got := resolveDispatchTimeout(nil, nil, want); got != want {
+		t.Errorf("both nil: got %v, want %v", got, want)
+	}
+}
+
+// TestProxyAppliesRuleTimeoutOnDispatch is the end-to-end version of
+// the resolve test: a rule with a sub-100ms timeout against a fake
+// backend that sleeps 200ms should surface as a context-deadline
+// error, with the proxy returning 502 (non-fail-closed) or 503
+// (fail-closed). We assert the upstream's call count remains 1
+// (the backend WAS reached but the proxy abandoned waiting).
+func TestProxyAppliesRuleTimeoutOnDispatch(t *testing.T) {
+	slow := newFakeBackend(t)
+	slow.srv.Close()
+	// Replace the server with one that sleeps before responding so we
+	// trigger the per-attempt deadline.
+	slow.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		slow.calls.Add(1)
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(slow.srv.Close)
+
+	cfg := &Config{
+		Backends: []Backend{{Name: "slow", Tier: "local", Address: slow.srv.URL}},
+		Rules: []Rule{{
+			Name:    "tight",
+			Match:   RuleMatch{Headers: map[string]string{"x-llmkube-task": "code"}},
+			Route:   RuleRoute{Backends: []string{"slow"}},
+			Timeout: 30 * time.Millisecond,
+		}},
+		DefaultRoute: "slow",
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg: %v", err)
+	}
+	proxy := NewProxy(cfg, slog.Default())
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"any"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-llmkube-task", "code")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	mux.ServeHTTP(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusBadGateway && rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 502 or 503 (deadline-exceeded)", rec.Code)
+	}
+	// The proxy should give up well before the upstream's 200ms sleep
+	// completes. 100ms is generous headroom for test runner overhead.
+	if elapsed > 100*time.Millisecond {
+		t.Errorf("proxy waited %v on a 30ms rule timeout; deadline not applied", elapsed)
+	}
+	// The backend WAS contacted but the proxy abandoned.
+	if slow.calls.Load() != 1 {
+		t.Errorf("backend call count = %d, want 1 (dispatch should reach upstream then time out)",
+			slow.calls.Load())
+	}
+}

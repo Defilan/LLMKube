@@ -64,6 +64,10 @@ func main() {
 	label := flag.String("label", "stub",
 		"identifier returned in chat completion content so tests can tell upstreams apart")
 	listen := flag.String("listen", ":8080", "address to listen on")
+	responseDelay := flag.Duration("response-delay", 0,
+		"artificial delay before writing the chat-completion response. "+
+			"Lets the per-rule / per-backend timeout e2e tests force the "+
+			"proxy's context deadline to fire by simulating a slow upstream.")
 	flag.Parse()
 
 	rec := &recorder{}
@@ -108,6 +112,19 @@ func main() {
 			At:       time.Now().UTC(),
 			Streamed: stream,
 		})
+
+		if *responseDelay > 0 {
+			// Honor the client's deadline if it surrenders first: a
+			// proxy with a tight context deadline will close the conn,
+			// at which point r.Context() is canceled and we abandon
+			// the sleep. This keeps the test deterministic instead of
+			// waiting the full configured delay.
+			select {
+			case <-time.After(*responseDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 
 		if stream {
 			writeStreamed(w, *label)

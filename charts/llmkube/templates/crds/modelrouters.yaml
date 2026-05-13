@@ -204,6 +204,16 @@ spec:
                       - local
                       - cloud
                       type: string
+                    timeout:
+                      description: |-
+                        Timeout caps how long the proxy waits for this backend to begin
+                        sending response headers. When set it overrides the proxy
+                        default for dispatches that target this backend. Resolution
+                        order at dispatch time: rule.timeout || backend.timeout ||
+                        proxy default (ModelRouter.spec.proxy.responseHeaderTimeout).
+                        Useful when backends in the same router have wildly different
+                        P99 envelopes (in-cluster vLLM vs Anthropic global LB).
+                      type: string
                     weight:
                       description: |-
                         Weight is used for the "weighted" routing strategy. Higher values
@@ -499,6 +509,17 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  responseHeaderTimeout:
+                    description: |-
+                      ResponseHeaderTimeout caps how long the proxy waits for the
+                      upstream to begin sending response headers. For non-streaming
+                      chat completions this is effectively a max-generation-time
+                      cap; for streaming dispatches the first SSE chunk arrives well
+                      inside the window so the cap is invisible. Default 120s when
+                      unset. Per-rule and per-backend timeouts (see RouterRule.Timeout
+                      and RouterBackend.Timeout) tighten this on a per-request basis
+                      but cannot extend it beyond this cap.
+                    type: string
                 type: object
               rules:
                 description: |-
@@ -606,6 +627,16 @@ spec:
                       required:
                       - backends
                       type: object
+                    timeout:
+                      description: |-
+                        Timeout caps how long the proxy waits for the upstream to begin
+                        sending response headers on dispatches matched by this rule.
+                        When set it overrides RouterBackend.Timeout and the proxy
+                        default. Resolution order at dispatch time:
+                        rule.timeout || backend.timeout || proxy default.
+                        Useful for tightening regulated-data rules (sub-10s strict
+                        fail-fast) or extending long-reasoning rules (120s+).
+                      type: string
                   required:
                   - name
                   - route

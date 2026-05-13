@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // Config is the on-disk representation read by the router-proxy. The
@@ -85,6 +86,12 @@ type Backend struct {
 	// and injects it into the upstream request as Authorization or
 	// x-api-key, depending on Provider. Empty for local backends.
 	CredentialsEnv string `json:"credentialsEnv,omitempty"`
+
+	// Timeout caps how long the proxy waits for THIS backend to begin
+	// sending response headers. Zero means "use the proxy default".
+	// Compiled from ModelRouter.spec.backends[].timeout. Per-rule
+	// timeouts (see Rule.Timeout) win over this.
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
 // Rule pairs a Match expression with a Route action.
@@ -97,6 +104,15 @@ type Rule struct {
 	// backend in Route.Backends is healthy or eligible. The regulated-
 	// data gate that prevents fallback to cloud on local outage.
 	FailClosed bool `json:"failClosed,omitempty"`
+
+	// Timeout caps how long the proxy waits for the upstream to begin
+	// sending response headers on dispatches matched by this rule.
+	// Zero means "fall back to backend.Timeout, then proxy default".
+	// Compiled from ModelRouter.spec.rules[].timeout. Per-rule timeout
+	// is the strictest level of override (wins over backend + proxy
+	// default) so platform policy (eg PII fail-fast) can't be defeated
+	// by a generous backend-level timeout.
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
 // RuleMatch declares the conditions under which a Rule fires. All declared

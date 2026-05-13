@@ -13,8 +13,10 @@ package controller
 import (
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -312,4 +314,71 @@ func errsContain(errs []ModelRouterValidationError, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestValidateRuleTimeoutBounds enforces the 100ms..30m window the
+// controller applies to spec.rules[].timeout. Too short is almost
+// certainly a config error; too long is almost certainly a unit typo.
+func TestValidateRuleTimeoutBounds(t *testing.T) {
+	cases := []struct {
+		name       string
+		timeout    time.Duration
+		wantErrSub string // empty -> expect no error
+	}{
+		{"too short rejected", 50 * time.Millisecond, "must be >="},
+		{"min boundary accepted", 100 * time.Millisecond, ""},
+		{"reasonable accepted", 5 * time.Second, ""},
+		{"max boundary accepted", 30 * time.Minute, ""},
+		{"too long rejected", 1 * time.Hour, "must be <="},
+		{"unit typo (30 typed as minutes)", 31 * time.Minute, "must be <="},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := validRouter()
+			mr.Spec.Rules[0].Timeout = &metav1.Duration{Duration: tc.timeout}
+			errs := validateModelRouter(mr)
+
+			if tc.wantErrSub == "" {
+				if errsContain(errs, "timeout") {
+					t.Errorf("did not expect a timeout error; got: %s", formatValidationErrors(errs))
+				}
+				return
+			}
+			if !errsContain(errs, tc.wantErrSub) {
+				t.Errorf("want error containing %q; got: %s",
+					tc.wantErrSub, formatValidationErrors(errs))
+			}
+		})
+	}
+}
+
+// TestValidateBackendTimeoutBounds enforces the same window for
+// spec.backends[].timeout. Mirrors TestValidateRuleTimeoutBounds.
+func TestValidateBackendTimeoutBounds(t *testing.T) {
+	cases := []struct {
+		name       string
+		timeout    time.Duration
+		wantErrSub string
+	}{
+		{"too short rejected", 10 * time.Millisecond, "must be >="},
+		{"reasonable accepted", 60 * time.Second, ""},
+		{"too long rejected", 2 * time.Hour, "must be <="},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := validRouter()
+			mr.Spec.Backends[0].Timeout = &metav1.Duration{Duration: tc.timeout}
+			errs := validateModelRouter(mr)
+
+			if tc.wantErrSub == "" {
+				if errsContain(errs, "backends[0].timeout") {
+					t.Errorf("did not expect a backend timeout error; got: %s", formatValidationErrors(errs))
+				}
+				return
+			}
+			if !errsContain(errs, tc.wantErrSub) {
+				t.Errorf("want %q; got: %s", tc.wantErrSub, formatValidationErrors(errs))
+			}
+		})
+	}
 }

@@ -125,6 +125,9 @@ func (r *ModelRouterReconciler) resolveBackend(
 	if b.Weight != nil {
 		wire.Weight = int(*b.Weight)
 	}
+	if b.Timeout != nil {
+		wire.Timeout = b.Timeout.Duration
+	}
 
 	switch {
 	case b.InferenceServiceRef != nil:
@@ -292,6 +295,9 @@ func translateRule(in *inferencev1alpha1.RouterRule) router.Rule {
 			Headers:              copyStringMap(in.Match.Headers),
 			Models:               append([]string(nil), in.Match.Models...),
 		}
+	}
+	if in.Timeout != nil {
+		out.Timeout = in.Timeout.Duration
 	}
 	return out
 }
