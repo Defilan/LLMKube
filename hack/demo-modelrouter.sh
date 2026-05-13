@@ -241,7 +241,13 @@ spec:
   contextSize: 16384
   flashAttention: true
   jinja: true
-  parallelSlots: 1
+  # parallelSlots: 2 lets llama-server handle two concurrent requests.
+  # Real production deployments serve concurrent traffic, and on a
+  # single-slot config a per-rule timeout that aborts mid-generation
+  # leaves llama-server still grinding through the aborted response,
+  # which then queues subsequent requests behind it. With 2 slots the
+  # next request lands on the free slot.
+  parallelSlots: 2
   priority: normal
 ---
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -267,7 +273,13 @@ spec:
   contextSize: 8192
   flashAttention: true
   jinja: true
-  parallelSlots: 1
+  # parallelSlots: 2 lets llama-server handle two concurrent requests.
+  # Real production deployments serve concurrent traffic, and on a
+  # single-slot config a per-rule timeout that aborts mid-generation
+  # leaves llama-server still grinding through the aborted response,
+  # which then queues subsequent requests behind it. With 2 slots the
+  # next request lands on the free slot.
+  parallelSlots: 2
   priority: normal
 EOF
   ok "applied Model + InferenceService for $CODER_NAME and $CHAT_NAME"
@@ -323,16 +335,18 @@ spec:
       failClosed: true
       timeout: 4s
     # Relaxed regulated-data tier: same fail-closed semantics
-    # (stays local, never egresses) but 30s budget gives Gemma room
-    # to actually answer. Audience sees the same PII payload land
-    # 200 here vs 503 above purely because of policy tier.
+    # (stays local, never egresses) but 60s budget gives Gemma room
+    # to actually answer, including when llama-server is still
+    # winding down a previous aborted strict-rule generation.
+    # Audience sees the same PII payload land 200 here vs 503 above
+    # purely because of policy tier.
     - name: pii-relaxed
       match:
         dataClassification: ["pii"]
       route:
         backends: ["local-chat"]
       failClosed: true
-      timeout: 30s
+      timeout: 60s
     - name: task-header-to-coder
       match:
         headers:
@@ -567,7 +581,7 @@ run_test_matrix() {
     "What's the best way to redact a SSN like 123-45-6789 from a string in Python?"
 
   call_proxy \
-    "4b. SAME PII payload via RELAXED policy tier (30s budget) — expect 200, same fail-closed rules" \
+    "4b. SAME PII payload via RELAXED policy tier (60s budget) — expect 200, same fail-closed rules" \
     "local-chat" \
     -H "x-llmkube-classification: pii" \
     "What's the best way to redact a SSN like 123-45-6789 from a string in Python?"
