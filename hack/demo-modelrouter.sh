@@ -40,6 +40,7 @@ CONTROLLER_IMG=${CONTROLLER_IMG:-llmkube:demo}
 ROUTER_PROXY_IMG=${ROUTER_PROXY_IMG:-ghcr.io/defilantech/llmkube-router-proxy:dev}
 BACKUP_FILE=${BACKUP_FILE:-/tmp/llmkube-demo-backup}
 PROXY_PORT=${PROXY_PORT:-18080}
+METAL_AGENT_LOG=${METAL_AGENT_LOG:-$HOME/Library/Logs/llmkube-metal-agent.log}
 
 CODER_NAME=demo-qwen-coder
 CHAT_NAME=demo-gemma-chat
@@ -150,20 +151,45 @@ scale_down_existing() {
   printf "%s\t%s\t%s\n" "$EXISTING_NS" "$EXISTING_ISVC" "$prev" >"$BACKUP_FILE"
   ok "saved prior replicas=$prev to $BACKUP_FILE"
 
+  # Capture the agent log offset so we can detect the "stopped" line
+  # the agent emits AFTER the patch lands. We can't poll K8s status:
+  # the metal-agent stops its managed process correctly on replicas=0
+  # but doesn't patch InferenceService status, so readyReplicas / phase
+  # are stale until the next full reconcile. The host-process kill is
+  # what the demo cares about; the agent log is the authoritative
+  # signal.
+  local log_start_bytes=0
+  if [ -f "$METAL_AGENT_LOG" ]; then
+    log_start_bytes=$(wc -c <"$METAL_AGENT_LOG" 2>/dev/null || echo 0)
+  fi
+
   kc -n "$EXISTING_NS" patch inferenceservice "$EXISTING_ISVC" \
     --type=merge -p '{"spec":{"replicas":0}}' >/dev/null
-  ok "scaled $EXISTING_NS/$EXISTING_ISVC to 0; metal-agent will tear down its llama-server"
+  ok "scaled $EXISTING_NS/$EXISTING_ISVC spec.replicas to 0"
 
-  sub "waiting up to 60s for the daily-driver llama-server to release Metal memory"
+  sub "waiting up to 60s for metal-agent to stop the host llama-server"
   local deadline=$((SECONDS + 60))
+  local stopped=0
   while [ $SECONDS -lt $deadline ]; do
-    local ready
-    ready=$(kc -n "$EXISTING_NS" get inferenceservice "$EXISTING_ISVC" \
-      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
-    [ "${ready:-0}" = "0" ] && break
+    if [ -f "$METAL_AGENT_LOG" ] \
+       && tail -c +$((log_start_bytes + 1)) "$METAL_AGENT_LOG" 2>/dev/null \
+       | grep -q "stopped inference service.*$EXISTING_ISVC"; then
+      stopped=1
+      break
+    fi
+    if ! pgrep -f "llama-server.*$EXISTING_ISVC" >/dev/null 2>&1 \
+       && ! pgrep -f "llama-server.*qwen3-6-35b-a3b-q8-0" >/dev/null 2>&1; then
+      stopped=1
+      break
+    fi
     sleep 2
   done
-  ok "daily-driver readyReplicas=0"
+  if [ $stopped -eq 1 ]; then
+    ok "metal-agent stopped the daily-driver llama-server (host memory released)"
+    warn "Note: InferenceService K8s status may still show readyReplicas=1; metal-agent has a known status-update lag on stop. The host process is gone."
+  else
+    warn "did not see the agent stop the daily-driver within 60s; check $METAL_AGENT_LOG"
+  fi
 }
 
 # ── demo models + ModelRouter ──────────────────────────────────────────────
