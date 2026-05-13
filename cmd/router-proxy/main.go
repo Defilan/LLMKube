@@ -42,6 +42,11 @@ func main() {
 		"Structured log format: json or text.")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second,
 		"How long to wait for in-flight requests on SIGTERM before forcing a close.")
+	quarantineDuration := flag.Duration("quarantine-duration", 15*time.Second,
+		"How long a backend stays in the quarantined (skip) state after a "+
+			"5xx / network error before becoming eligible for a half-open "+
+			"probe. Shorter windows recover faster from transient blips; "+
+			"longer windows reduce probe load on genuinely-down upstreams.")
 	flag.Parse()
 
 	logger := newLogger(*logFormat)
@@ -58,7 +63,9 @@ func main() {
 		"defaultRoute", cfg.DefaultRoute,
 	)
 
-	proxy := router.NewProxy(cfg, logger)
+	proxy := router.NewProxy(cfg, logger,
+		router.WithDispatcherOptions(router.WithQuarantineDuration(*quarantineDuration)),
+	)
 	mux := http.NewServeMux()
 	proxy.Mount(mux)
 

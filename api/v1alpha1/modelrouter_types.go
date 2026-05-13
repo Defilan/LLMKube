@@ -399,6 +399,15 @@ type RouterProxySpec struct {
 	// ImagePullSecrets are passed through to the router-proxy pod spec.
 	// +optional
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+
+	// QuarantineDuration controls how long the proxy keeps a backend in
+	// the "skip" state after a 5xx or network error before allowing a
+	// half-open probe. Default 15s when unset. Shorter windows make the
+	// proxy recover faster from transient blips; longer windows reduce
+	// probe load on genuinely-down upstreams. Tests can shrink this to
+	// sub-second to verify recovery without sleeping the full default.
+	// +optional
+	QuarantineDuration *metav1.Duration `json:"quarantineDuration,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the

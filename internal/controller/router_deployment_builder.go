@@ -126,11 +126,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 							Name:            routerProxyContainerName,
 							Image:           image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args: []string{
-								"--config", routerProxyConfigMountPath + "/" + routerProxyConfigKey,
-								"--listen", fmt.Sprintf(":%d", routerProxyPort),
-								"--log-format", "json",
-							},
+							Args:            routerProxyArgs(mr),
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "http",
@@ -254,6 +250,24 @@ func routerProxyProbe(initialDelay, periodSeconds int32) *corev1.Probe {
 		TimeoutSeconds:      2,
 		FailureThreshold:    3,
 	}
+}
+
+// routerProxyArgs builds the router-proxy container args. Required
+// flags (config / listen / log-format) come first; optional flags
+// driven by ModelRouter.spec.proxy.* only land when the user
+// explicitly set them, so the proxy keeps its compiled-in defaults
+// otherwise.
+func routerProxyArgs(mr *inferencev1alpha1.ModelRouter) []string {
+	args := []string{
+		"--config", routerProxyConfigMountPath + "/" + routerProxyConfigKey,
+		"--listen", fmt.Sprintf(":%d", routerProxyPort),
+		"--log-format", "json",
+	}
+	if mr.Spec.Proxy != nil && mr.Spec.Proxy.QuarantineDuration != nil {
+		args = append(args, "--quarantine-duration",
+			mr.Spec.Proxy.QuarantineDuration.Duration.String())
+	}
+	return args
 }
 
 // routerProxyImage returns the image the reconciler will set on the
