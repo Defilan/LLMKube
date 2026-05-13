@@ -60,6 +60,9 @@ spec:
         # SCC compatibility. Schema in values.schema.json enforces integer >= 0.
         - --default-fsgroup={{ .Values.controllerManager.initContainer.defaultFSGroup }}
         - --router-proxy-image={{ include "llmkube.routerProxyImage" . }}
+        {{- with .Values.controllerManager.routerProxy.defaultLiteLLMURL }}
+        - --default-litellm-url={{ . }}
+        {{- end }}
         ports:
         - name: health
           containerPort: 8081

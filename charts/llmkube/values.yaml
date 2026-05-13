@@ -128,6 +128,17 @@ controllerManager:
     # publishes them.
     digest: ""
 
+    # Cluster-wide default URL for ModelRouter External backends whose
+    # provider=litellm and url is unspecified. Lets platform teams
+    # centralize the LiteLLM proxy endpoint so application teams can
+    # declare `external: {provider: litellm, model: ...}` without
+    # repeating the LiteLLM Service URL on every ModelRouter. Empty
+    # means application teams must include url explicitly.
+    #
+    # Example (in-cluster LiteLLM at the standard port):
+    #   defaultLiteLLMURL: "http://litellm.litellm.svc.cluster.local:4000"
+    defaultLiteLLMURL: ""
+
 # Service account configuration
 serviceAccount:
   # Specifies whether a service account should be created

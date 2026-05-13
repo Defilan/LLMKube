@@ -1141,6 +1141,54 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "local stub failed to come back")
 		})
+
+		It("should default external provider URL for first-party providers", func() {
+			// Apply a sibling ModelRouter that omits url on an Anthropic
+			// external backend. The controller's resolveExternalURL must
+			// fill in https://api.anthropic.com so application teams can
+			// declare provider+model without repeating the upstream URL
+			// on every ModelRouter. Dispatch isn't exercised here (the
+			// test cluster cannot reach the real Anthropic API); the
+			// assertion is that the status surface carries the resolved
+			// address. The matching unit test
+			// (TestCompileRouterConfigDefaultsAnthropicURL) pins the
+			// behavior at the unit boundary; this spec proves the
+			// reconciler actually writes it through to the live cluster.
+			By("applying a ModelRouter with provider=anthropic and no URL")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: e2e-default-url-router
+  namespace: %s
+spec:
+  backends:
+    - name: cloud-anthropic
+      external:
+        provider: anthropic
+        model: claude-opus-4-7
+      tier: cloud
+  defaultRoute: cloud-anthropic
+`, mrcTestNs))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply default-URL ModelRouter")
+
+			defer func() {
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "modelrouter",
+					"e2e-default-url-router", "-n", mrcTestNs, "--ignore-not-found"))
+			}()
+
+			By("waiting for status.backends[*].address to be populated with the provider default")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "modelrouter", "e2e-default-url-router",
+					"-n", mrcTestNs, "-o",
+					"jsonpath={.status.backends[0].address}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("https://api.anthropic.com"),
+					"expected controller to populate the Anthropic default URL")
+			}, 1*time.Minute, time.Second).Should(Succeed())
+		})
 	})
 
 	Context("License Check", func() {

@@ -121,7 +121,8 @@
               "enum": ["Always", "IfNotPresent", "Never"]
             },
             "tag": { "type": "string" },
-            "digest": { "type": "string" }
+            "digest": { "type": "string" },
+            "defaultLiteLLMURL": { "type": "string" }
           }
         }
       }

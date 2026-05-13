@@ -32,6 +32,13 @@ import (
 // routerProxyConfigMountPath and reads <mount>/config.json.
 const routerProxyConfigKey = "config.json"
 
+// Built-in URL defaults for first-party providers. Used by
+// resolveExternalURL when External.URL is empty.
+const (
+	defaultAnthropicURL = "https://api.anthropic.com"
+	defaultOpenAIURL    = "https://api.openai.com"
+)
+
 // compiledConfig captures everything the controller needs after
 // translating a ModelRouter spec into the proxy wire shape: the raw
 // JSON bytes, a content hash that drives pod rollout, and per-backend
@@ -137,8 +144,14 @@ func (r *ModelRouterReconciler) resolveBackend(
 		}
 		wire.Provider = b.External.Provider
 		wire.Model = b.External.Model
-		wire.Address = b.External.URL
-		status.Address = b.External.URL
+		addr, urlMsg := r.resolveExternalURL(b.External)
+		wire.Address = addr
+		status.Address = addr
+		if addr == "" {
+			status.Healthy = false
+			status.Message = urlMsg
+			return wire, status
+		}
 		if b.External.CredentialsSecretRef != nil {
 			// Resolving the well-known env var only when the user
 			// declared a Secret keeps backends like LiteLLM (which
@@ -163,6 +176,35 @@ func (r *ModelRouterReconciler) resolveBackend(
 		status.Message = "no inferenceServiceRef or external provider declared"
 	}
 	return wire, status
+}
+
+// resolveExternalURL applies the per-provider URL default when the user
+// did not specify one. First-party providers have a single published
+// endpoint we can hardcode; LiteLLM has no universal default but
+// operators can configure a cluster-wide one via --default-litellm-url.
+// Returns ("", msg) when no URL is available so the caller can surface
+// the misconfiguration in BackendStatus.Message instead of writing an
+// empty Address into the compiled config (which the proxy would later
+// reject at dispatch time with a less actionable error).
+func (r *ModelRouterReconciler) resolveExternalURL(p *inferencev1alpha1.ExternalProvider) (string, string) {
+	if p.URL != "" {
+		return p.URL, ""
+	}
+	switch p.Provider {
+	case "anthropic":
+		return defaultAnthropicURL, ""
+	case "openai":
+		return defaultOpenAIURL, ""
+	case "litellm":
+		if r.DefaultLiteLLMURL != "" {
+			return r.DefaultLiteLLMURL, ""
+		}
+		return "", "external backend with provider=litellm requires url " +
+			"(or operator-configured --default-litellm-url)"
+	default:
+		return "", fmt.Sprintf("external backend with provider=%q requires url "+
+			"(no built-in default for this provider)", p.Provider)
+	}
 }
 
 // resolveInferenceServiceAddress builds the cluster URL the router-proxy
