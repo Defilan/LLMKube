@@ -12,6 +12,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -288,5 +289,141 @@ func TestDispatcherResponseHeaderTimeoutOverride(t *testing.T) {
 	tr, _ := disp.client.Transport.(*http.Transport)
 	if tr.ResponseHeaderTimeout != 7*time.Second {
 		t.Errorf("transport ResponseHeaderTimeout = %v, want 7s", tr.ResponseHeaderTimeout)
+	}
+}
+
+// TestDispatchContextDeadlineDoesNotQuarantine covers the #462
+// regression: a per-attempt context deadline is a rule-level policy
+// decision, not a backend-health signal. The dispatcher must NOT
+// MarkUnhealthy on context.DeadlineExceeded so a strict rule's
+// timeout doesn't poison a lenient sibling rule targeting the same
+// backend.
+func TestDispatchContextDeadlineDoesNotQuarantine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Sleep longer than any caller's deadline. The dispatcher
+		// should give up via context.WithTimeout but leave us alive.
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "slow-but-alive", Tier: "local", Address: srv.URL,
+	}}}
+	disp := NewDispatcher(cfg)
+
+	// Tight deadline forces context.DeadlineExceeded.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	resp, err := disp.Dispatch(ctx, &cfg.Backends[0],
+		http.MethodPost, "/x", http.Header{}, []byte(`{}`))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("Dispatch should have returned the deadline error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error = %v, want context.DeadlineExceeded chain", err)
+	}
+
+	// The backend must still be reported healthy: another rule with
+	// a generous budget should be free to dispatch right now.
+	if !disp.IsHealthy("slow-but-alive") {
+		t.Error("backend marked unhealthy on deadline-exceeded; sibling rules will starve until quarantine expires")
+	}
+}
+
+// TestDispatchContextCanceledDoesNotQuarantine pins the same
+// invariant for the context.Canceled case (inbound client
+// disconnects mid-dispatch). Same reasoning: the backend didn't
+// fail, the upstream caller went away.
+func TestDispatchContextCanceledDoesNotQuarantine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "cancellable", Tier: "local", Address: srv.URL,
+	}}}
+	disp := NewDispatcher(cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel the moment we send the request.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+	resp, err := disp.Dispatch(ctx, &cfg.Backends[0],
+		http.MethodPost, "/x", http.Header{}, []byte(`{}`))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("Dispatch should have returned the cancel error")
+	}
+
+	if !disp.IsHealthy("cancellable") {
+		t.Error("backend marked unhealthy on context.Canceled; client disconnect is not a backend signal")
+	}
+}
+
+// TestDispatchConnectionFailureStillQuarantines confirms the
+// dispatcher still treats genuine connection failures (closed
+// server, unreachable host) as a backend-health signal and
+// quarantines. Distinguishes the deadline-exception change above
+// from a blanket "never mark unhealthy" regression.
+func TestDispatchConnectionFailureStillQuarantines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	addr := srv.URL
+	srv.Close() // shut it down so the next dial fails
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "dead", Tier: "local", Address: addr,
+	}}}
+	disp := NewDispatcher(cfg)
+
+	resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
+		http.MethodPost, "/x", http.Header{}, []byte(`{}`))
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("Dispatch should have failed against a closed server")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("unexpected deadline error; want a real connect/dial error")
+	}
+	if disp.IsHealthy("dead") {
+		t.Error("backend should be marked unhealthy after a connect failure")
+	}
+}
+
+// TestDispatchUpstream5xxStillQuarantines is the third corner of the
+// triangle: 5xx response must still trigger MarkUnhealthy (was the
+// only quarantine path before the half-open work; still true today).
+func TestDispatchUpstream5xxStillQuarantines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "broken", Tier: "local", Address: srv.URL,
+	}}}
+	disp := NewDispatcher(cfg)
+
+	resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
+		http.MethodPost, "/x", http.Header{}, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Dispatch returned an error on 5xx: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if disp.IsHealthy("broken") {
+		t.Error("backend should be marked unhealthy after a 5xx response")
 	}
 }
