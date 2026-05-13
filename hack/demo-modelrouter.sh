@@ -307,24 +307,33 @@ spec:
       tier: local
       capabilities: [chat, reasoning]
   rules:
+    # Regulated data: strict fast-fail. 8s is the platform-team policy
+    # budget for PII completions; if Gemma can't deliver in 8s we'd
+    # rather refuse the request than have the user wait. The proxy's
+    # per-attempt context.WithTimeout (added in PR #461) enforces it.
     - name: pii-stays-local
       match:
         dataClassification: ["pii"]
       route:
         backends: ["local-chat"]
       failClosed: true
+      timeout: 8s
     - name: task-header-to-coder
       match:
         headers:
           x-llmkube-task: code
       route:
         backends: ["local-coder"]
+    # Complex reasoning: be patient. 90s covers chain-of-thought
+    # generations that legitimately take 30-60s on consumer Metal.
+    # primary-fallback to coder if Gemma stalls past the budget.
     - name: complex-to-chat
       match:
         taskComplexity: complex
       route:
         backends: ["local-chat", "local-coder"]
         strategy: primary-fallback
+      timeout: 90s
     - name: engineering-team-to-coder
       match:
         headers:
@@ -338,6 +347,26 @@ EOF
   sub "waiting up to 2m for the router-proxy Deployment to become Available"
   kdemo rollout status "deployment/${ROUTER_NAME}-router-proxy" --timeout=2m >/dev/null
   ok "router-proxy is Available"
+
+  # If a previous demo run left the proxy pod alive, the controller's
+  # reconciler doesn't trigger a new rollout on a same-spec apply, and
+  # IfNotPresent means kubelet uses whatever image is already in the
+  # pod's runtime. Net effect: rebuilt proxy images don't take effect
+  # until the pod is replaced. Force-delete it here so each run picks
+  # up the freshly side-loaded image.
+  #
+  # NOTE: pod-delete is intentional. `kubectl rollout restart` would
+  # write the kubectl.kubernetes.io/restartedAt annotation onto the
+  # template, which the controller then strips on the next reconcile,
+  # which kubelet then sees as a template change, which rolls again.
+  # That's issue #456. Pod-delete sidesteps the loop entirely: the
+  # Deployment respawns from the existing template, no annotation
+  # churn, no controller fight.
+  sub "force-deleting the proxy pod so the freshly built image takes effect"
+  kdemo delete pod -l "app=${ROUTER_NAME}-router-proxy" \
+    --ignore-not-found --wait=false >/dev/null
+  kdemo rollout status "deployment/${ROUTER_NAME}-router-proxy" --timeout=2m >/dev/null
+  ok "router-proxy running on the current image"
 }
 
 # ── test matrix ────────────────────────────────────────────────────────────
@@ -405,16 +434,24 @@ proxy_last_dispatch() {
   # valid JSON; fall back to grep-style regex otherwise so this
   # function keeps working if the formatter changes.
   if printf '%s\n' "$line" | jq -e . >/dev/null 2>&1; then
-    local b t o r s
-    b=$(printf '%s\n' "$line" | jq -r '.backend // empty')
-    t=$(printf '%s\n' "$line" | jq -r '.backendTier // empty')
-    o=$(printf '%s\n' "$line" | jq -r '.outcome // empty')
-    r=$(printf '%s\n' "$line" | jq -r '.rule // empty')
-    s=$(printf '%s\n' "$line" | jq -r '.status // empty')
+    local b t o r s tm
+    b=$(printf '%s\n' "$line"  | jq -r '.backend     // empty')
+    t=$(printf '%s\n' "$line"  | jq -r '.backendTier // empty')
+    o=$(printf '%s\n' "$line"  | jq -r '.outcome     // empty')
+    r=$(printf '%s\n' "$line"  | jq -r '.rule        // empty')
+    s=$(printf '%s\n' "$line"  | jq -r '.status      // empty')
+    # timeoutMs added in PR #461; older proxy builds (pre-merge demo
+    # runs) won't emit it. jq's // empty gives us a graceful skip.
+    tm=$(printf '%s\n' "$line" | jq -r '.timeoutMs   // empty')
+    local extras=""
+    if [ -n "$tm" ]; then
+      extras=" timeoutMs=${tm}"
+    fi
     if [ -n "$b" ]; then
-      printf 'backend=%s tier=%s rule=%s status=%s outcome=%s\n' "$b" "$t" "$r" "$s" "$o"
+      printf 'backend=%s tier=%s rule=%s status=%s outcome=%s%s\n' \
+        "$b" "$t" "$r" "$s" "$o" "$extras"
     else
-      printf 'rule=%s status=%s outcome=%s\n' "$r" "$s" "$o"
+      printf 'rule=%s status=%s outcome=%s%s\n' "$r" "$s" "$o" "$extras"
     fi
     return 0
   fi
@@ -491,24 +528,24 @@ run_test_matrix() {
   hdr "Test matrix"
 
   call_proxy \
-    "1. Plain chat prompt with no headers (defaultRoute=local-chat / Gemma)" \
+    "1. Plain chat prompt with no headers (defaultRoute=local-chat / Gemma, proxy default 120s budget)" \
     "local-chat" \
     "What is the capital of Norway, and what is it best known for?"
 
   call_proxy \
-    "2. Code task via header (task-header-to-coder rule -> Qwen Coder)" \
+    "2. Code task via header (task-header-to-coder rule -> Qwen Coder, default budget)" \
     "local-coder" \
     -H "x-llmkube-task: code" \
     "Refactor this Python loop into a list comprehension: result = []; for x in data: result.append(x*2)"
 
   call_proxy \
-    "3. Complex reasoning prompt (complex-to-chat rule, primary-fallback to coder)" \
+    "3. Complex reasoning prompt (complex-to-chat rule, primary-fallback to coder, 90s budget)" \
     "local-chat" \
     -H "x-llmkube-task-complexity: complex" \
     "A train leaves Chicago at 3pm heading west at 60 mph. Another leaves Denver at 5pm heading east at 40 mph. The cities are 1000 miles apart. Where and when do they meet?"
 
   call_proxy \
-    "4. PII fail-closed (pii-stays-local rule routes to local-chat)" \
+    "4. PII fail-closed (pii-stays-local rule -> local-chat, strict 8s budget per platform policy)" \
     "local-chat" \
     -H "x-llmkube-classification: pii" \
     "What's the best way to redact a SSN like 123-45-6789 from a string in Python?"
