@@ -31,17 +31,40 @@ type Proxy struct {
 	logger  *slog.Logger
 }
 
+// ProxyOption customizes a Proxy at construction time. The proxy
+// owns the Dispatcher, so options that affect dispatching (eg
+// quarantine duration) are forwarded through.
+type ProxyOption func(*Proxy)
+
+// WithDispatcherOptions threads DispatcherOption values down to the
+// proxy's owned Dispatcher. Used to set --quarantine-duration from
+// the CLI without leaking Dispatcher construction up to callers.
+func WithDispatcherOptions(opts ...DispatcherOption) ProxyOption {
+	return func(p *Proxy) {
+		// Rebuild the dispatcher with the requested options. NewProxy
+		// runs WithDispatcherOptions *after* NewDispatcher already
+		// constructed a default-options dispatcher; rebuilding here
+		// keeps the option API uniform without making callers care
+		// about construction order.
+		p.disp = NewDispatcher(p.cfg, opts...)
+	}
+}
+
 // NewProxy constructs a Proxy from a loaded Config.
-func NewProxy(cfg *Config, logger *slog.Logger) *Proxy {
+func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Proxy{
+	p := &Proxy{
 		cfg:     cfg,
 		matcher: NewMatcher(cfg),
 		disp:    NewDispatcher(cfg),
 		logger:  logger,
 	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 // Mount wires up the OpenAI-compatible endpoints plus /health on the

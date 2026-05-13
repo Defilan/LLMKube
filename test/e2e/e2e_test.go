@@ -992,6 +992,11 @@ metadata:
   name: %s
   namespace: %s
 spec:
+  # 3s quarantine keeps the recovery e2e fast. Default in production
+  # is 15s; the test's "scale back up + verify dispatch works again"
+  # spec waits one window plus headroom for the next probe to land.
+  proxy:
+    quarantineDuration: 3s
   backends:
     - name: local-stub
       external:
@@ -1140,6 +1145,41 @@ spec:
 				"deployment/"+localStubSvc, "-n", mrcTestNs, "--timeout=60s")
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "local stub failed to come back")
+		})
+
+		It("should recover from quarantine once the window expires (half-open probe)", func() {
+			// Regression test for #453. After the previous spec quarantined
+			// local-stub (proxy marked it unhealthy on the connection
+			// failure when it was scaled to 0), dispatch on the default
+			// route stays broken forever in the old code: IsHealthy
+			// permanently returns false because MarkHealthy only fires
+			// inside Dispatch and Dispatch is gated by IsHealthy. The new
+			// half-open circuit breaker (3s quarantine in this test, 15s
+			// in production) makes the backend probeable after the
+			// window expires.
+			By("waiting for the quarantine window to expire")
+			// 3s quarantineDuration + 1s headroom. The next request after
+			// this should hit IsHealthy=true and probe local-stub, which
+			// the previous spec restored to 1 replica.
+			time.Sleep(4 * time.Second)
+
+			By("resetting stub upstream recordings")
+			resetStubs(mrcTestNs, localStubSvc, cloudStubSvc)
+
+			By("POSTing a default-route request; expect 200 from local-stub now that quarantine has lifted")
+			Eventually(func(g Gomega) {
+				out := chatCompletion(mrcTestNs, routerName, nil,
+					`{"model":"stub-local","stream":false,"messages":[{"role":"user","content":"hello"}]}`)
+				g.Expect(out).To(ContainSubstring("stub-response-from-"+localStubSvc),
+					"after quarantine expiry the proxy should successfully probe and dispatch to local-stub")
+			}, 30*time.Second, 2*time.Second).Should(Succeed())
+
+			By("verifying the local stub received the post-recovery request")
+			Eventually(func(g Gomega) {
+				count := stubRequestCount(g, mrcTestNs, localStubSvc)
+				g.Expect(count).To(BeNumerically(">=", 1),
+					"local stub must have recorded the recovery probe request")
+			}, 30*time.Second, time.Second).Should(Succeed())
 		})
 
 		It("should default external provider URL for first-party providers", func() {

@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -444,6 +445,51 @@ func TestRouterDeploymentBuilderRespectsOverrides(t *testing.T) {
 	}
 	if got := dep.Spec.Template.Spec.Containers[0].Image; got != "registry.internal/router-proxy:custom" {
 		t.Errorf("image = %q, want spec.proxy.image override", got)
+	}
+}
+
+// TestRouterDeploymentBuilderQuarantineDuration covers the
+// spec.proxy.quarantineDuration plumbing: the controller has to
+// render the value as a --quarantine-duration flag on the proxy
+// container so the operator-side knob actually reaches the binary.
+func TestRouterDeploymentBuilderQuarantineDuration(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{
+		QuarantineDuration: &metav1.Duration{Duration: 2 * time.Second},
+	}
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+	dep := r.newRouterDeployment(mr, "hash")
+
+	args := dep.Spec.Template.Spec.Containers[0].Args
+	var found bool
+	for i, a := range args {
+		if a == "--quarantine-duration" && i+1 < len(args) {
+			found = true
+			if args[i+1] != "2s" {
+				t.Errorf("--quarantine-duration value = %q, want 2s", args[i+1])
+			}
+		}
+	}
+	if !found {
+		t.Errorf("--quarantine-duration flag not rendered; args = %v", args)
+	}
+}
+
+// TestRouterDeploymentBuilderQuarantineDefault confirms the proxy
+// keeps its compiled-in 15s default when the user did NOT set
+// spec.proxy.quarantineDuration. We explicitly do NOT pass the flag
+// in that case so future default changes (eg moving to 30s) take
+// effect without the user having to redeploy.
+func TestRouterDeploymentBuilderQuarantineDefault(t *testing.T) {
+	mr := canonicalModelRouter()
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+	dep := r.newRouterDeployment(mr, "hash")
+
+	for _, a := range dep.Spec.Template.Spec.Containers[0].Args {
+		if a == "--quarantine-duration" {
+			t.Errorf("--quarantine-duration must be omitted when unset; args = %v",
+				dep.Spec.Template.Spec.Containers[0].Args)
+		}
 	}
 }
 
