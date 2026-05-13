@@ -150,6 +150,33 @@ LLMKube does not replace [LiteLLM](https://github.com/BerriAI/litellm). For orga
 
 LiteLLM handles provider auth, retries, and cost tracking. ModelRouter adds K8s-native policy, fail-closed enforcement, and audit logs.
 
+### Cluster-wide LiteLLM default
+
+Platform teams can centralize the LiteLLM URL via a controller flag so application teams don't have to repeat it on every `ModelRouter`:
+
+```yaml
+# Helm values
+controllerManager:
+  routerProxy:
+    defaultLiteLLMURL: http://litellm.litellm.svc.cluster.local:4000
+```
+
+With that set, application teams can declare LiteLLM-backed routers without `url`:
+
+```yaml
+external:
+  provider: litellm
+  model: openrouter/anthropic/claude-opus-4-7
+```
+
+A per-backend `url` always wins over the cluster default.
+
+## Shape compatibility
+
+The router-proxy forwards the inbound OpenAI chat-completion request body to upstream backends verbatim. For backends that already speak OpenAI (local `InferenceService` pods, LiteLLM, an in-cluster vLLM or oMLX), this is correct. For first-party providers whose native API does not match (Anthropic's `/v1/messages`, Bedrock's per-region shapes, Vertex AI's structured Content payloads), put a LiteLLM proxy in front and reference it via `provider: litellm` — LiteLLM handles the per-provider translation.
+
+When you specify `provider: anthropic` or `provider: openai` without `url`, the controller fills in the published default (`https://api.anthropic.com`, `https://api.openai.com`). This works as-is for OpenAI (which already speaks the OpenAI shape) and for any Anthropic-compatible endpoint that accepts OpenAI requests. Direct calls against `api.anthropic.com` itself require LiteLLM in front; native Anthropic-Messages translation is on the roadmap, not in Phase 1.
+
 ## What's in scope, what isn't
 
 **In scope:**

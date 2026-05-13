@@ -68,6 +68,15 @@ type ModelRouterReconciler struct {
 	// router-proxy. Per-ModelRouter overrides in spec.proxy.image take
 	// precedence. Wired in cmd/main.go from --router-proxy-image.
 	RouterProxyImage string
+
+	// DefaultLiteLLMURL is the cluster-wide default LiteLLM proxy URL
+	// the reconciler injects into External backends whose
+	// provider=litellm and URL is empty. Operators set this once via
+	// --default-litellm-url so application teams can declare
+	// `external: {provider: litellm, model: ...}` without repeating
+	// the LiteLLM Service URL on every ModelRouter. Empty string
+	// means "no default — the user must specify URL explicitly".
+	DefaultLiteLLMURL string
 }
 
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=modelrouters,verbs=get;list;watch;create;update;patch;delete

@@ -108,6 +108,7 @@ func main() {
 	var initContainerImage string
 	var defaultFSGroup int64
 	var routerProxyImage string
+	var defaultLiteLLMURL string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -130,6 +131,12 @@ func main() {
 		"Default container image for ModelRouter-managed router-proxy pods. "+
 			"Empty falls back to the controller's compiled-in default. "+
 			"Per-ModelRouter spec.proxy.image overrides this.")
+	flag.StringVar(&defaultLiteLLMURL, "default-litellm-url", "",
+		"Cluster-wide default URL for External backends with provider=litellm "+
+			"that omit url. Lets operators centralize the LiteLLM proxy "+
+			"endpoint so application teams can declare external backends "+
+			"without repeating the URL on every ModelRouter. Empty means "+
+			"users must specify url explicitly.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -269,9 +276,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.ModelRouterReconciler{
-		Client:           mgr.GetClient(),
-		Scheme:           mgr.GetScheme(),
-		RouterProxyImage: routerProxyImage,
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		RouterProxyImage:  routerProxyImage,
+		DefaultLiteLLMURL: defaultLiteLLMURL,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouter")
 		os.Exit(1)

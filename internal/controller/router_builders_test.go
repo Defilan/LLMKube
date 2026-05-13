@@ -237,6 +237,154 @@ func TestCompileRouterConfigExternalNoSecretSkipsCredentials(t *testing.T) {
 	}
 }
 
+// TestResolveExternalURLProviderDefaults covers the URL-defaulting
+// matrix added for issue #438: first-party providers get their
+// published endpoint when url is omitted, litellm gets the operator-
+// configured cluster default (or a clear error when neither is set),
+// and providers without a built-in default require an explicit url.
+func TestResolveExternalURLProviderDefaults(t *testing.T) {
+	cases := []struct {
+		name       string
+		provider   string
+		url        string
+		litellmDef string
+		wantAddr   string
+		wantMsg    string
+	}{
+		{
+			name:     "explicit url always wins",
+			provider: "anthropic",
+			url:      "https://eu.api.anthropic.com",
+			wantAddr: "https://eu.api.anthropic.com",
+		},
+		{
+			name:     "anthropic default",
+			provider: "anthropic",
+			wantAddr: "https://api.anthropic.com",
+		},
+		{
+			name:     "openai default",
+			provider: "openai",
+			wantAddr: "https://api.openai.com",
+		},
+		{
+			name:       "litellm with operator default",
+			provider:   "litellm",
+			litellmDef: "http://litellm.litellm.svc.cluster.local:4000",
+			wantAddr:   "http://litellm.litellm.svc.cluster.local:4000",
+		},
+		{
+			name:     "litellm without default returns error",
+			provider: "litellm",
+			wantMsg:  "default-litellm-url",
+		},
+		{
+			name:     "bedrock requires explicit url",
+			provider: "bedrock",
+			wantMsg:  "no built-in default",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &ModelRouterReconciler{DefaultLiteLLMURL: tc.litellmDef}
+			gotAddr, gotMsg := r.resolveExternalURL(&inferencev1alpha1.ExternalProvider{
+				Provider: tc.provider,
+				URL:      tc.url,
+			})
+			if gotAddr != tc.wantAddr {
+				t.Errorf("address = %q, want %q", gotAddr, tc.wantAddr)
+			}
+			if tc.wantMsg == "" {
+				if gotMsg != "" {
+					t.Errorf("unexpected message: %q", gotMsg)
+				}
+			} else if !strings.Contains(gotMsg, tc.wantMsg) {
+				t.Errorf("message = %q, want substring %q", gotMsg, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// TestCompileRouterConfigDefaultsAnthropicURL exercises the full
+// compile path with an Anthropic backend missing url: the wire config
+// and BackendStatus.Address must both pick up https://api.anthropic.com.
+func TestCompileRouterConfigDefaultsAnthropicURL(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default-url-router",
+			Namespace: testBuilderNs,
+		},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			Backends: []inferencev1alpha1.RouterBackend{
+				{
+					Name: "cloud-anthropic",
+					External: &inferencev1alpha1.ExternalProvider{
+						Provider: "anthropic",
+						Model:    "claude-opus-4-7",
+					},
+					Tier: "cloud",
+				},
+			},
+			DefaultRoute: "cloud-anthropic",
+		},
+	}
+	r := newRouterReconcilerForTest(t, mr)
+
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := cfg.Backends[0].Address; got != "https://api.anthropic.com" {
+		t.Errorf("wire Address = %q, want https://api.anthropic.com", got)
+	}
+	if got := compiled.Backends[0].Address; got != "https://api.anthropic.com" {
+		t.Errorf("status Address = %q, want https://api.anthropic.com", got)
+	}
+	if !compiled.Backends[0].Healthy {
+		t.Errorf("backend should be Healthy, Message=%q", compiled.Backends[0].Message)
+	}
+}
+
+// TestCompileRouterConfigLiteLLMMissingURLFails confirms a litellm
+// backend without url AND no operator default surfaces a clear
+// Healthy=false status; the controller doesn't silently emit an empty
+// Address that the proxy would later reject with a worse error.
+func TestCompileRouterConfigLiteLLMMissingURLFails(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "litellm-missing-router",
+			Namespace: testBuilderNs,
+		},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			Backends: []inferencev1alpha1.RouterBackend{
+				{
+					Name: "cloud-litellm",
+					External: &inferencev1alpha1.ExternalProvider{
+						Provider: "litellm",
+						Model:    "claude-opus-4-7",
+					},
+					Tier: "cloud",
+				},
+			},
+			DefaultRoute: "cloud-litellm",
+		},
+	}
+	r := newRouterReconcilerForTest(t, mr) // no DefaultLiteLLMURL set
+
+	_, err := r.compileRouterConfig(context.Background(), mr)
+	if err == nil {
+		t.Fatal("expected validation error for empty address")
+	}
+	if !strings.Contains(err.Error(), "address") &&
+		!strings.Contains(err.Error(), "url") {
+		t.Errorf("error %q should mention address/url shape", err.Error())
+	}
+}
+
 // TestRouterDeploymentBuilder pins the deployment shape this PR
 // contracts on for downstream callers (CI smoke tests, future
 // production users).
