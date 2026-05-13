@@ -114,18 +114,18 @@ build_and_load() {
 }
 
 install_crds_and_controller() {
-  hdr "Install CRDs and restart controller"
+  hdr "Install CRDs + RBAC and roll out the controller"
 
-  ( cd "$REPO_ROOT" && make install >/dev/null )
-  ok "CRDs applied (Model, InferenceService, ModelRouter)"
+  # `make deploy` is a superset of `make install`: it applies CRDs,
+  # RBAC (ClusterRole / ClusterRoleBinding / ServiceAccount), and the
+  # controller Deployment. Using deploy here matters because the
+  # ClusterRole evolves with each CRD addition; running only `make
+  # install` leaves the old ClusterRole in place and the controller
+  # informer cache fails to sync any new resources, crashlooping the
+  # pod with "failed to wait for X caches to sync".
+  ( cd "$REPO_ROOT" && make deploy IMG="$CONTROLLER_IMG" >/dev/null )
+  ok "CRDs + RBAC applied and controller deployment reconciled"
 
-  if ! kc -n llmkube-system get deployment llmkube-controller-manager >/dev/null 2>&1; then
-    sub "controller deployment not found; running make deploy"
-    ( cd "$REPO_ROOT" && make deploy IMG="$CONTROLLER_IMG" >/dev/null )
-  fi
-
-  kc -n llmkube-system set image deployment/llmkube-controller-manager \
-    "manager=$CONTROLLER_IMG" >/dev/null
   kc -n llmkube-system patch deployment llmkube-controller-manager \
     --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]' \
     >/dev/null
