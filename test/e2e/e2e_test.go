@@ -1361,6 +1361,23 @@ spec:
 				g.Expect(out).To(ContainSubstring(`"rule":"tight-budget"`))
 				g.Expect(out).To(ContainSubstring(`"timeoutMs":200`))
 			}, 30*time.Second, time.Second).Should(Succeed())
+
+			By("immediately POSTing through the SAME backend with no header (lenient implicit rule) and expecting 200")
+			// Regression test for #462. Before the deadline-doesn't-
+			// quarantine fix, the tight rule's timeout above flipped
+			// the slow-local backend to unhealthy for 15 seconds,
+			// so this very next call (which would otherwise succeed
+			// — the stub's 800ms delay fits inside the proxy's 120s
+			// default for the implicit defaultRoute rule) failed
+			// with `backend "slow-local" marked unhealthy`. After
+			// the fix the backend stays healthy and dispatch
+			// succeeds.
+			_, status, err = runCurlInCluster(mrcTestNs, timeoutURL, "POST",
+				nil, // no x-llmkube-task header -> defaultRoute path
+				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(status).To(Equal(200),
+				"lenient dispatch must not be poisoned by the strict rule's prior deadline; got %d", status)
 		})
 	})
 

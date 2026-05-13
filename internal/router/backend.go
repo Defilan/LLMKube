@@ -13,6 +13,7 @@ package router
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -255,7 +256,20 @@ func (d *Dispatcher) Dispatch(
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		d.MarkUnhealthy(backend.Name)
+		// A per-attempt context deadline (caller's
+		// context.WithTimeout, eg the rule.timeout path from #461)
+		// is a rule-level policy decision, not a backend-health
+		// signal. The upstream may still be perfectly healthy and
+		// capable of serving other rules with longer budgets. Same
+		// for context.Canceled, which fires when an inbound client
+		// disconnects mid-dispatch. Reserve quarantine for genuine
+		// connectivity / 5xx failures so a tight rule's timeout
+		// doesn't poison a lenient sibling rule targeting the same
+		// backend. Closes #462.
+		if !errors.Is(err, context.DeadlineExceeded) &&
+			!errors.Is(err, context.Canceled) {
+			d.MarkUnhealthy(backend.Name)
+		}
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	if resp.StatusCode >= 500 {
