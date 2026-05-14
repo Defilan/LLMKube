@@ -21,7 +21,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -41,7 +40,7 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	configHash string,
 ) error {
 	desired := r.newRouterDeployment(mr, configHash)
-	if err := controllerutil.SetControllerReference(mr, desired, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on router Deployment: %w", err)
 	}
 
@@ -54,12 +53,23 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 		return err
 	}
 
-	// PodTemplate selector is immutable; copy only mutable surface. We
-	// keep the existing ObjectMeta UID/Generation but refresh Spec.
+	// PodTemplate selector is immutable; copy mutable surface while
+	// preserving externally-set annotations and labels (sidecar
+	// injectors, `kubectl rollout restart`'s restartedAt, GitOps sync
+	// labels). Operator-owned keys win on collision; foreign keys
+	// pass through. Fixes #456.
 	existing.Spec.Replicas = desired.Spec.Replicas
-	existing.Spec.Template = desired.Spec.Template
-	existing.Labels = desired.Labels
-	if err := controllerutil.SetControllerReference(mr, existing, r.Scheme); err != nil {
+	existing.Spec.Template.Spec = desired.Spec.Template.Spec
+	existing.Spec.Template.Labels = mergePreservingExternal(
+		existing.Spec.Template.Labels,
+		desired.Spec.Template.Labels,
+	)
+	existing.Spec.Template.Annotations = mergePreservingExternal(
+		existing.Spec.Template.Annotations,
+		desired.Spec.Template.Annotations,
+	)
+	existing.Labels = mergePreservingExternal(existing.Labels, desired.Labels)
+	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Deployment: %w", err)
 	}
 	return r.Update(ctx, existing)

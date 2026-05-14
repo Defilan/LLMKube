@@ -830,6 +830,112 @@ spec:
 			Eventually(verifyDeployment, 1*time.Minute).Should(Succeed())
 		})
 
+		It("should preserve external pod-template annotations across reconciles (#456)", func() {
+			// Regression test for #456: the prior reconciler did a
+			// wholesale `existing.Spec.Template = desired.Spec.Template`,
+			// which stripped every external annotation (sidecar
+			// injectors, `kubectl rollout restart`'s restartedAt,
+			// GitOps tool sync labels) on the very next reconcile.
+			// Visible symptom: ReplicaSets flap, in-flight requests
+			// get truncated.
+			//
+			// This test reuses the `e2e-good-router` proxy Deployment
+			// created by the preceding test, patches its pod template
+			// with two external annotations, forces a reconcile by
+			// bumping the ModelRouter's proxy replicas, and asserts
+			// the external annotations survive.
+
+			const (
+				istioAnnotation     = "sidecar.istio.io/inject"
+				rolloutAnnotation   = "kubectl.kubernetes.io/restartedAt"
+				rolloutAnnotationVS = "2026-05-14T00:00:00Z"
+				proxyDeploymentName = "e2e-good-router-router-proxy"
+			)
+
+			By("verifying the proxy Deployment from the previous test still exists")
+			verifyDeploymentReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment", proxyDeploymentName,
+					"-n", mrTestNs, "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(proxyDeploymentName))
+			}
+			Eventually(verifyDeploymentReady, 30*time.Second).Should(Succeed())
+
+			By("patching the proxy Deployment's pod template with external annotations")
+			// Simulates an Istio sidecar injector + a kubectl rollout
+			// restart adding annotations the operator does not own.
+			patch := fmt.Sprintf(
+				`{"spec":{"template":{"metadata":{"annotations":{%q:%q,%q:%q}}}}}`,
+				istioAnnotation, "true",
+				rolloutAnnotation, rolloutAnnotationVS,
+			)
+			cmd := exec.Command("kubectl", "patch", "deployment", proxyDeploymentName,
+				"-n", mrTestNs, "--type=merge", "-p", patch)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to patch external annotations onto proxy Deployment")
+
+			By("forcing a controller reconcile by bumping ModelRouter spec.proxy.replicas")
+			// The controller watches ModelRouter; updating its spec
+			// guarantees a reconcile cycle that walks through
+			// reconcileRouterDeployment. Without the #456 fix, that
+			// reconcile would strip the annotations we just set.
+			cmd = exec.Command("kubectl", "patch", "modelrouter", "e2e-good-router",
+				"-n", mrTestNs, "--type=merge",
+				"-p", `{"spec":{"proxy":{"replicas":2}}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to bump ModelRouter spec.proxy.replicas")
+
+			By("waiting for the controller to reconcile the replica bump (proves reconcile ran)")
+			verifyReplicasReconciled := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment", proxyDeploymentName,
+					"-n", mrTestNs, "-o", "jsonpath={.spec.replicas}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("2"),
+					"controller must have reconciled the replica bump; spec.replicas = %q", output)
+			}
+			Eventually(verifyReplicasReconciled, 1*time.Minute).Should(Succeed())
+
+			By("verifying the external annotations survived the reconcile")
+			// One Eventually wrapping all assertions: in the rare
+			// case the reconciler observed the spec bump before
+			// observing the Deployment patch, we want to give it a
+			// second pass. The fix is correct either way; this just
+			// avoids flakiness if the test happens to race.
+			verifyAnnotationsSurvived := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment", proxyDeploymentName,
+					"-n", mrTestNs, "-o",
+					fmt.Sprintf(`jsonpath={.spec.template.metadata.annotations.%s}`,
+						strings.ReplaceAll(istioAnnotation, ".", `\.`)))
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal("true"),
+					"sidecar injector annotation %q must survive reconcile (fix #456)", istioAnnotation)
+
+				cmd = exec.Command("kubectl", "get", "deployment", proxyDeploymentName,
+					"-n", mrTestNs, "-o",
+					fmt.Sprintf(`jsonpath={.spec.template.metadata.annotations.%s}`,
+						strings.ReplaceAll(rolloutAnnotation, ".", `\.`)))
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).To(Equal(rolloutAnnotationVS),
+					"kubectl rollout-restart annotation must survive reconcile (fix #456)")
+
+				// Sanity: operator-owned config-hash annotation is
+				// still present. Confirms we didn't accidentally
+				// preserve external keys at the cost of operator keys.
+				cmd = exec.Command("kubectl", "get", "deployment", proxyDeploymentName,
+					"-n", mrTestNs, "-o",
+					`jsonpath={.spec.template.metadata.annotations.inference\.llmkube\.dev/router-config-hash}`)
+				output, err = utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(BeEmpty(),
+					"operator-owned config-hash annotation must still be present after reconcile")
+			}
+			Eventually(verifyAnnotationsSurvived, 30*time.Second).Should(Succeed())
+		})
+
 		It("should report Validated=False for a sensitive-data rule routing to cloud", func() {
 			By("applying a ModelRouter whose fail-closed PII rule points at a cloud backend")
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
