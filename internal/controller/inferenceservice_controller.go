@@ -250,7 +250,23 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		return nil, 0, nil, err
 	}
 
+	// Snapshot externally-set template metadata before the wholesale
+	// Spec replace; restore it afterward so sidecar-injector
+	// annotations, `kubectl rollout restart`'s restartedAt, and GitOps
+	// sync labels survive operator reconciles. Operator-owned keys
+	// still win on collision. Same fix as the router-proxy reconciler
+	// in router_deployment_builder.go; see #456.
+	existingTemplateLabels := existingDeployment.Spec.Template.ObjectMeta.Labels
+	existingTemplateAnnotations := existingDeployment.Spec.Template.ObjectMeta.Annotations
 	existingDeployment.Spec = deployment.Spec
+	existingDeployment.Spec.Template.ObjectMeta.Labels = mergePreservingExternal(
+		existingTemplateLabels,
+		deployment.Spec.Template.ObjectMeta.Labels,
+	)
+	existingDeployment.Spec.Template.ObjectMeta.Annotations = mergePreservingExternal(
+		existingTemplateAnnotations,
+		deployment.Spec.Template.ObjectMeta.Annotations,
+	)
 	// When autoscaling is enabled, let the HPA manage replicas
 	if isvc.Spec.Autoscaling != nil {
 		existingDeployment.Spec.Replicas = nil

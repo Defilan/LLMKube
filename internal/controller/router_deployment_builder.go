@@ -54,11 +54,22 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 		return err
 	}
 
-	// PodTemplate selector is immutable; copy only mutable surface. We
-	// keep the existing ObjectMeta UID/Generation but refresh Spec.
+	// PodTemplate selector is immutable; copy mutable surface while
+	// preserving externally-set annotations and labels (sidecar
+	// injectors, `kubectl rollout restart`'s restartedAt, GitOps sync
+	// labels). Operator-owned keys win on collision; foreign keys
+	// pass through. Fixes #456.
 	existing.Spec.Replicas = desired.Spec.Replicas
-	existing.Spec.Template = desired.Spec.Template
-	existing.Labels = desired.Labels
+	existing.Spec.Template.Spec = desired.Spec.Template.Spec
+	existing.Spec.Template.ObjectMeta.Labels = mergePreservingExternal(
+		existing.Spec.Template.ObjectMeta.Labels,
+		desired.Spec.Template.ObjectMeta.Labels,
+	)
+	existing.Spec.Template.ObjectMeta.Annotations = mergePreservingExternal(
+		existing.Spec.Template.ObjectMeta.Annotations,
+		desired.Spec.Template.ObjectMeta.Annotations,
+	)
+	existing.Labels = mergePreservingExternal(existing.Labels, desired.Labels)
 	if err := controllerutil.SetControllerReference(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Deployment: %w", err)
 	}
