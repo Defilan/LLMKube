@@ -31,7 +31,6 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -230,7 +229,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	r.reconcileVLLMSpecCondition(isvc)
 
 	deployment := r.constructDeployment(isvc, model, desiredReplicas)
-	if err := controllerutil.SetControllerReference(isvc, deployment, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(isvc, deployment, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for Deployment")
 		return nil, 0, nil, err
 	}
@@ -295,7 +294,7 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 	}
 
 	service := r.constructService(isvc)
-	if err := controllerutil.SetControllerReference(isvc, service, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(isvc, service, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for Service")
 		return nil, nil, err
 	}

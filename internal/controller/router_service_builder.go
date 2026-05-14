@@ -19,7 +19,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -34,7 +33,7 @@ func (r *ModelRouterReconciler) reconcileRouterService(
 	mr *inferencev1alpha1.ModelRouter,
 ) error {
 	desired := newRouterService(mr)
-	if err := controllerutil.SetControllerReference(mr, desired, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on router Service: %w", err)
 	}
 
@@ -53,7 +52,7 @@ func (r *ModelRouterReconciler) reconcileRouterService(
 	existing.Spec.Type = desired.Spec.Type
 	existing.Spec.Ports = desired.Spec.Ports
 	existing.Labels = desired.Labels
-	if err := controllerutil.SetControllerReference(mr, existing, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Service: %w", err)
 	}
 	return r.Update(ctx, existing)

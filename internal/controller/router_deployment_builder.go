@@ -21,7 +21,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -41,7 +40,7 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	configHash string,
 ) error {
 	desired := r.newRouterDeployment(mr, configHash)
-	if err := controllerutil.SetControllerReference(mr, desired, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on router Deployment: %w", err)
 	}
 
@@ -70,7 +69,7 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 		desired.Spec.Template.Annotations,
 	)
 	existing.Labels = mergePreservingExternal(existing.Labels, desired.Labels)
-	if err := controllerutil.SetControllerReference(mr, existing, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Deployment: %w", err)
 	}
 	return r.Update(ctx, existing)

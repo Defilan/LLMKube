@@ -21,7 +21,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/router"
@@ -355,7 +354,7 @@ func (r *ModelRouterReconciler) reconcileRouterConfigMap(
 	compiled *compiledConfig,
 ) error {
 	desired := newRouterConfigMap(mr, compiled)
-	if err := controllerutil.SetControllerReference(mr, desired, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on router ConfigMap: %w", err)
 	}
 
@@ -378,7 +377,7 @@ func (r *ModelRouterReconciler) reconcileRouterConfigMap(
 	}
 	existing.Annotations[routerProxyConfigHashAnnotation] = compiled.Hash
 	existing.Labels = desired.Labels
-	if err := controllerutil.SetControllerReference(mr, existing, r.Scheme); err != nil {
+	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router ConfigMap: %w", err)
 	}
 	return r.Update(ctx, existing)
