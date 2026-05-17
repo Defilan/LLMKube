@@ -37,7 +37,7 @@ import (
 const DefaultMLXServerStartupTimeout = 120 * time.Second
 
 // MLXServerExecutor manages a single mlx-server process for the agent's
-// InferenceService. mlx-server (github.com/Defilan/mlx-server) is a native
+// InferenceService. mlx-server (github.com/defilantech/mlx-server) is a native
 // OpenAI-compatible MLX inference server. Unlike the vllm-swift executor's
 // per-spawn ephemeral port, this executor binds a fixed port so clients
 // (e.g. opencode) keep a stable base URL across respawns.

@@ -157,7 +157,9 @@ func resolveVLLMSwiftBin(override string) (string, error) {
 		defaultVLLMSwiftPaths)
 }
 
-// defaultMLXServerPaths is the list of paths to search for the mlx-server binary.
+// defaultMLXServerPaths is the list of paths to search for the mlx-server
+// binary. These are the Homebrew prefixes; `brew install
+// defilantech/tap/mlx-server` installs the shim into one of them.
 var defaultMLXServerPaths = []string{
 	"/opt/homebrew/bin/mlx-server",
 	"/usr/local/bin/mlx-server",
@@ -177,7 +179,8 @@ func resolveMLXServerBin(override string) (string, error) {
 	}
 	return "", fmt.Errorf(
 		"mlx-server binary not found in default paths (%v); "+
-			"pass --mlx-server-bin=/path/to/mlx-server",
+			"install with: brew install defilantech/tap/mlx-server, "+
+			"or pass --mlx-server-bin=/path/to/mlx-server",
 		defaultMLXServerPaths)
 }
 
@@ -312,7 +315,8 @@ func main() {
 		if err != nil {
 			logger.Errorw("mlx-server binary not found",
 				"searchPaths", defaultMLXServerPaths,
-				"installHint", "pass --mlx-server-bin=/path/to/mlx-server",
+				"installHint", "brew install defilantech/tap/mlx-server, "+
+					"or pass --mlx-server-bin=/path/to/mlx-server",
 				"error", err,
 			)
 			os.Exit(1)
