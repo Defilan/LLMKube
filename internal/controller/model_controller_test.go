@@ -369,6 +369,64 @@ var _ = Describe("Model Controller Reconcile", func() {
 		Expect(foundCondition).To(BeTrue(), "expected Available/MetalAgentManaged condition")
 	})
 
+	// Regression for #475: a Metal local-path model that wedged in the copy
+	// path under an older operator keeps stale Degraded/Progressing conditions
+	// after the no-download path marks it Ready. They must be cleared so a
+	// Ready model is not simultaneously reported as Degraded.
+	It("should clear stale Degraded/Progressing conditions on a metal local-path model", func() {
+		modelName := "metal-model-stale-conds"
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "/models/on/the/metal/node/Qwen3.6-35B-A3B-8bit",
+				Format:   "safetensors",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		// Simulate a prior reconcile under an older operator that wedged the
+		// model in the copy path: stale Degraded + Progressing conditions.
+		model.Status.Conditions = []metav1.Condition{
+			{
+				Type: ConditionDegraded, Status: metav1.ConditionTrue, Reason: "CopyFailed",
+				Message: "failed to open local model file", LastTransitionTime: metav1.Now(),
+			},
+			{
+				Type: ConditionProgressing, Status: metav1.ConditionTrue, Reason: "CopyStarted",
+				Message: "Started copying local model", LastTransitionTime: metav1.Now(),
+			},
+		}
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		reconciler := &ModelReconciler{
+			Client:      k8sClient,
+			Scheme:      k8sClient.Scheme(),
+			StoragePath: tempDir,
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+
+		conds := map[string]metav1.ConditionStatus{}
+		for _, c := range updated.Status.Conditions {
+			conds[c.Type] = c.Status
+		}
+		Expect(conds[ConditionAvailable]).To(Equal(metav1.ConditionTrue))
+		Expect(conds[ConditionDegraded]).To(Equal(metav1.ConditionFalse), "stale Degraded must be cleared")
+		Expect(conds[ConditionProgressing]).To(Equal(metav1.ConditionFalse), "stale Progressing must be cleared")
+	})
+
 	It("should copy local model file and set Ready", func() {
 		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
 		Expect(err).NotTo(HaveOccurred())
