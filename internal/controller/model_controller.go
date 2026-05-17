@@ -54,8 +54,9 @@ const (
 	acceleratorMetal      = "metal"
 	DefaultModelCachePath = "/models"
 
-	ConditionAvailable = "Available"
-	ConditionDegraded  = "Degraded"
+	ConditionAvailable   = "Available"
+	ConditionDegraded    = "Degraded"
+	ConditionProgressing = "Progressing"
 
 	ReasonWorkloadResolved = "WorkloadResolved"
 )
@@ -181,7 +182,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if model.Status.Phase != progressPhase {
 		model.Status.Phase = progressPhase
 		model.Status.CacheKey = cacheKey
-		if err := r.updateStatus(ctx, model, "Progressing", metav1.ConditionTrue, progressReason, progressMessage); err != nil {
+		if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue, progressReason, progressMessage); err != nil {
 			return ctrl.Result{}, err
 		}
 		logger.Info(progressMessage, "source", model.Spec.Source, "cacheKey", cacheKey)
@@ -314,7 +315,7 @@ func (r *ModelReconciler) reconcilePVCSource(ctx context.Context, model *inferen
 		logger.Info("PVC not yet bound", "pvc", claimName, "phase", pvc.Status.Phase)
 		model.Status.Phase = "Pending"
 		msg := fmt.Sprintf("PVC %q is %s, waiting for it to be Bound", claimName, pvc.Status.Phase)
-		if statusErr := r.updateStatus(ctx, model, "Progressing", metav1.ConditionTrue, "PVCNotBound", msg); statusErr != nil {
+		if statusErr := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue, "PVCNotBound", msg); statusErr != nil {
 			logger.Error(statusErr, "Failed to update status")
 		}
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -440,6 +441,12 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 	now := metav1.Now()
 	model.Status.LastUpdated = &now
 
+	// A model reaching Ready through this no-download path may still carry
+	// Progressing/Degraded conditions from an earlier copy or download
+	// attempt; clear them so a Ready model is not also reported Degraded.
+	if err := r.clearProgressConditions(ctx, model); err != nil {
+		return err
+	}
 	if err := r.updateStatus(ctx, model, "Available", metav1.ConditionTrue, reason, message); err != nil {
 		return err
 	}
@@ -577,7 +584,27 @@ func (r *ModelReconciler) downloadModel(ctx context.Context, source, dest string
 	return size, nil
 }
 
-//nolint:unparam
+// clearProgressConditions flips any Progressing or Degraded conditions on the
+// model to False. A model that reaches Ready through a no-download path can
+// still carry Progressing/Degraded conditions written by an earlier copy or
+// download attempt (for example a Metal local-path model wedged in Copying
+// under an operator version that predates the no-download path). Leaving them
+// set reports a Ready model as also Degraded, which is contradictory.
+func (r *ModelReconciler) clearProgressConditions(ctx context.Context, model *inferencev1alpha1.Model) error {
+	for _, condType := range []string{ConditionProgressing, ConditionDegraded} {
+		for _, c := range model.Status.Conditions {
+			if c.Type == condType && c.Status != metav1.ConditionFalse {
+				if err := r.updateStatus(ctx, model, condType, metav1.ConditionFalse,
+					"Superseded", "Model reached Ready without a controller-side download"); err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (r *ModelReconciler) updateStatus(ctx context.Context, model *inferencev1alpha1.Model, condType string, status metav1.ConditionStatus, reason, message string) error {
 	condition := metav1.Condition{
 		Type:               condType,
