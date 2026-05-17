@@ -16,9 +16,9 @@ We take security seriously. If you discover a security vulnerability in LLMKube,
 
 ### How to Report
 
-1. **Do NOT open a public GitHub issue** for security vulnerabilities
-2. Email security concerns to: **contact@defilan.com** (or open a private security advisory)
-3. Use GitHub's [private vulnerability reporting](https://github.com/defilantech/LLMKube/security/advisories/new)
+1. **Do NOT open a public GitHub issue** for security vulnerabilities.
+2. **Preferred:** use GitHub's [private vulnerability reporting](https://github.com/defilantech/LLMKube/security/advisories/new). Reports stay private, are tracked in one place, and let us publish an advisory once a fix ships.
+3. **Alternative:** email **contact@defilan.com**.
 
 ### What to Include
 
