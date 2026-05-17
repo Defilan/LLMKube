@@ -139,7 +139,7 @@ var _ = Describe("HPA Autoscaling", func() {
 				Equal(autoscalingv2.PodsMetricSourceType),
 			)
 			Expect(hpa.Spec.Metrics[0].Pods.Metric.Name).To(
-				Equal("llamacpp:requests_processing"),
+				Equal("llamacpp:requests_deferred"),
 			)
 			Expect(hpa.Spec.Metrics[0].Pods.Target.AverageValue.String()).To(
 				Equal("2"),

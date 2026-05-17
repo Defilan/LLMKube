@@ -29,8 +29,13 @@ func (b *LlamaCppBackend) DefaultPort() int32 {
 	return 8080
 }
 
-func (b *LlamaCppBackend) NeedsModelInit() bool     { return true }
-func (b *LlamaCppBackend) DefaultHPAMetric() string { return "llamacpp:requests_processing" }
+func (b *LlamaCppBackend) NeedsModelInit() bool { return true }
+
+// DefaultHPAMetric scales on queue depth rather than requests_processing.
+// requests_processing is bounded by the server slot count (1 by default),
+// so it cannot reach a target above 1; requests_deferred is the unbounded
+// count of requests waiting for a slot and is the honest overload signal.
+func (b *LlamaCppBackend) DefaultHPAMetric() string { return "llamacpp:requests_deferred" }
 
 func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
 	args := []string{
