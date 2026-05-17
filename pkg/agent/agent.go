@@ -44,6 +44,7 @@ const (
 	runtimeOMLX      = "omlx"
 	runtimeOllama    = "ollama"
 	runtimeVLLMSwift = "vllm-swift"
+	runtimeMLXServer = "mlx-server"
 )
 
 // Model format identifiers (Model.Spec.Format) the agent recognizes for
@@ -83,6 +84,12 @@ type MetalAgentConfig struct {
 	// VLLMSwiftBin is the path to the vllm-swift binary. Only used when
 	// Runtime is "vllm-swift". Empty means auto-detect via $PATH.
 	VLLMSwiftBin string
+	// MLXServerBin is the path to the mlx-server binary. Only used when
+	// Runtime is "mlx-server".
+	MLXServerBin string
+	// MLXServerPort is the fixed port the mlx-server process binds.
+	// Only used when Runtime is "mlx-server"; zero defaults to 8080.
+	MLXServerPort int
 
 	// MemoryProvider supplies system memory info. Nil defaults to DarwinMemoryProvider.
 	MemoryProvider MemoryProvider
@@ -122,6 +129,12 @@ type MetalAgentConfig struct {
 	// (DefaultVLLMSwiftStartupTimeout). vLLM init + Swift bridge load + weight
 	// load grow with model size; 120s default works for ~30B models on M5 Max.
 	VLLMSwiftStartupTimeout time.Duration
+
+	// MLXServerStartupTimeout is how long the agent waits for mlx-server to
+	// respond on /health. Zero means use the executor default
+	// (DefaultMLXServerStartupTimeout). MLX weight load grows with model
+	// size; the 120s default works for ~35B models on M5 Max.
+	MLXServerStartupTimeout time.Duration
 
 	// ApplePowerEnabled launches the powermetrics-driven sampler that
 	// publishes apple_power_*_watts gauges. Defaults false because
@@ -309,6 +322,21 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 			vllmSwiftExec.SetStartupTimeout(a.config.VLLMSwiftStartupTimeout)
 		}
 		a.executor = vllmSwiftExec
+	case runtimeMLXServer:
+		port := a.config.MLXServerPort
+		if port == 0 {
+			port = 8080
+		}
+		mlxServerExec := NewMLXServerExecutor(
+			a.config.MLXServerBin,
+			a.config.ModelStorePath,
+			port,
+			a.logger.With("subsystem", "executor"),
+		)
+		if a.config.MLXServerStartupTimeout > 0 {
+			mlxServerExec.SetStartupTimeout(a.config.MLXServerStartupTimeout)
+		}
+		a.executor = mlxServerExec
 	default:
 		metalExec := NewMetalExecutor(
 			a.config.LlamaServerBin,
@@ -521,6 +549,11 @@ func (a *MetalAgent) validateRuntimeFormat(model *inferencev1alpha1.Model) error
 		// only incompatible format.
 		bad = modelFormat == formatGGUF
 		runtimeLabel = runtimeVLLMSwift
+	case runtimeMLXServer:
+		// mlx-server reads MLX directories and HuggingFace safetensors
+		// directories; gguf is the only incompatible format.
+		bad = modelFormat == formatGGUF
+		runtimeLabel = runtimeMLXServer
 	default:
 		bad = modelFormat == formatMLX
 		runtimeLabel = "llama-server"
