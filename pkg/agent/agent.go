@@ -1171,10 +1171,22 @@ func (a *MetalAgent) estimateModelMemory(
 ) (MemoryEstimate, error) {
 	var fileSizeBytes uint64
 
-	// Try to stat the model file on disk
+	// A model with an absolute local-path source is loaded in place by the
+	// host agent (the Metal path) and is never copied into the model store,
+	// so the model-store lookup below would miss it. Size it from the source
+	// path directly.
+	if filepath.IsAbs(model.Spec.Source) {
+		if size, err := localModelSize(model.Spec.Source); err == nil {
+			fileSizeBytes = size
+		}
+	}
+
+	// Try to stat the model file in the model store (downloaded models).
 	filename := filepath.Base(model.Spec.Source)
 	localPath := filepath.Join(a.config.ModelStorePath, model.Name, filename)
-	if info, err := os.Stat(localPath); err == nil {
+	if fileSizeBytes != 0 {
+		// already sized from the local-path source above
+	} else if info, err := os.Stat(localPath); err == nil {
 		fileSizeBytes = uint64(info.Size()) //nolint:gosec // G115: os.FileInfo.Size is non-negative by contract
 	} else if model.Status.Size != "" {
 		// Fall back to parsing the human-readable size from model status
@@ -1203,6 +1215,38 @@ func (a *MetalAgent) estimateModelMemory(
 		CacheTypeK: cacheTypeK,
 		CacheTypeV: cacheTypeV,
 	}), nil
+}
+
+// localModelSize returns the on-disk size of a model at a local path: the
+// file size for a single-file model (e.g. GGUF), or the summed size of the
+// regular files for a model directory (e.g. an MLX safetensors model).
+func localModelSize(path string) (uint64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		return uint64(info.Size()), nil //nolint:gosec // G115: os.FileInfo.Size is non-negative by contract
+	}
+	var total uint64
+	walkErr := filepath.WalkDir(path, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += uint64(fi.Size()) //nolint:gosec // G115: os.FileInfo.Size is non-negative by contract
+		return nil
+	})
+	if walkErr != nil {
+		return 0, walkErr
+	}
+	return total, nil
 }
 
 // computeSpecHash returns a stable hash of the InferenceServiceSpec fields that,

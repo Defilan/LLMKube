@@ -404,8 +404,33 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&inferencev1alpha1.Model{},
 			handler.EnqueueRequestsFromMapFunc(r.findInferenceServicesForModel),
 		).
+		Watches(
+			&corev1.Endpoints{}, //nolint:staticcheck // SA1019: the metal-agent registers v1 Endpoints; EndpointSlice migration is tracked separately
+			handler.EnqueueRequestsFromMapFunc(r.findInferenceServiceForEndpoints),
+		).
 		Named("inferenceservice").
 		Complete(r)
+}
+
+// findInferenceServiceForEndpoints enqueues the InferenceService that a set of
+// Endpoints belongs to. On the Metal path there is no Deployment or Pod, so
+// the Pod watch never fires; the metal-agent signals readiness by creating a
+// v1 Endpoints object named after the InferenceService. Without this watch a
+// Metal service stays Creating until the next periodic resync. Only the
+// agent's own Endpoints are considered: the Deployment path is already
+// covered by the Pod watch.
+func (r *InferenceServiceReconciler) findInferenceServiceForEndpoints(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj.GetLabels()["llmkube.ai/managed-by"] != "metal-agent" {
+		return nil
+	}
+	return []reconcile.Request{
+		{
+			NamespacedName: types.NamespacedName{
+				Name:      obj.GetName(),
+				Namespace: obj.GetNamespace(),
+			},
+		},
+	}
 }
 
 func (r *InferenceServiceReconciler) findInferenceServiceForPod(ctx context.Context, obj client.Object) []reconcile.Request {
