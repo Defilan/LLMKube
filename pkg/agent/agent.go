@@ -90,6 +90,10 @@ type MetalAgentConfig struct {
 	// MLXServerPort is the fixed port the mlx-server process binds.
 	// Only used when Runtime is "mlx-server"; zero defaults to 8080.
 	MLXServerPort int
+	// LlamaServerPort is a fixed port for the llama-server runtime. Only used
+	// when Runtime is "llama-server"; zero allocates an ephemeral port per
+	// process (the historical behavior).
+	LlamaServerPort int
 
 	// MemoryProvider supplies system memory info. Nil defaults to DarwinMemoryProvider.
 	MemoryProvider MemoryProvider
@@ -346,6 +350,7 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		if a.config.LlamaServerStartupTimeout > 0 {
 			metalExec.SetStartupTimeout(a.config.LlamaServerStartupTimeout)
 		}
+		metalExec.SetPort(a.config.LlamaServerPort)
 		a.executor = metalExec
 	}
 

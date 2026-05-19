@@ -52,6 +52,7 @@ type AgentConfig struct {
 	Namespace                 string
 	ModelStorePath            string
 	LlamaServerBin            string
+	LlamaServerPort           int
 	Runtime                   string
 	OMLXBin                   string
 	OMLXPort                  int
@@ -209,6 +210,10 @@ func main() {
 	flag.StringVar(&cfg.Namespace, "namespace", "default", "Kubernetes namespace to watch")
 	flag.StringVar(&cfg.ModelStorePath, "model-store", "/tmp/llmkube-models", "Path to store downloaded models")
 	flag.StringVar(&llamaServerFlag, "llama-server", "", "Path to llama-server binary (auto-detected if not set)")
+	flag.IntVar(&cfg.LlamaServerPort, "llama-server-port", 0,
+		"Fixed port for the llama-server runtime. 0 (default) allocates an "+
+			"ephemeral port per process; set a fixed port for stable native "+
+			"clients (e.g. an OpenAI-compatible tool pointed at localhost).")
 	flag.StringVar(&cfg.Runtime, "runtime", "llama-server",
 		"Inference runtime: llama-server, omlx, ollama, vllm-swift, or mlx-server")
 	flag.StringVar(&cfg.OMLXBin, "omlx-bin", "", "Path to omlx binary (auto-detected if not set)")
@@ -433,6 +438,7 @@ func main() {
 		Namespace:                 cfg.Namespace,
 		ModelStorePath:            cfg.ModelStorePath,
 		LlamaServerBin:            cfg.LlamaServerBin,
+		LlamaServerPort:           cfg.LlamaServerPort,
 		Runtime:                   cfg.Runtime,
 		OMLXBin:                   cfg.OMLXBin,
 		OMLXPort:                  cfg.OMLXPort,
