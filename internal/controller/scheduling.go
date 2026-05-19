@@ -72,6 +72,9 @@ func (r *InferenceServiceReconciler) determinePhase(ctx context.Context, isvc *i
 	if readyReplicas > 0 {
 		return "Progressing", nil
 	}
+	if desiredReplicas == 0 && readyReplicas == 0 {
+		return PhaseStopped, nil
+	}
 	if !isMetal && deployment != nil {
 		schedulingInfo, err := r.getPodSchedulingInfo(ctx, isvc)
 		if err != nil {

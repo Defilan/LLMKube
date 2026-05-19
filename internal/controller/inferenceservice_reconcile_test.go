@@ -296,6 +296,24 @@ var _ = Describe("determinePhase", func() {
 		phase, _ := reconciler.determinePhase(context.Background(), isvc, 0, 1, true, nil)
 		Expect(phase).To(Equal("Creating"))
 	})
+
+	It("should return Stopped when replicas=0 on generic path", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		}
+		phase, info := reconciler.determinePhase(context.Background(), isvc, 0, 0, false, &appsv1.Deployment{})
+		Expect(phase).To(Equal(PhaseStopped))
+		Expect(info).To(BeNil())
+	})
+
+	It("should return Stopped when replicas=0 on Metal path", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		}
+		phase, info := reconciler.determinePhase(context.Background(), isvc, 0, 0, true, nil)
+		Expect(phase).To(Equal(PhaseStopped))
+		Expect(info).To(BeNil())
+	})
 })
 
 var _ = Describe("findInferenceServiceForPod", func() {
