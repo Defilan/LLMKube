@@ -36,6 +36,26 @@ func TestNewMetalExecutor(t *testing.T) {
 	}
 }
 
+func TestMetalExecutorSetPort(t *testing.T) {
+	executor := NewMetalExecutor("/bin/llama-server", "/models", newNopLogger())
+
+	// Default: no fixed port, so StartProcess falls back to an ephemeral one.
+	if executor.fixedPort != 0 {
+		t.Errorf("fixedPort default = %d, want 0", executor.fixedPort)
+	}
+
+	executor.SetPort(8080)
+	if executor.fixedPort != 8080 {
+		t.Errorf("fixedPort after SetPort(8080) = %d, want 8080", executor.fixedPort)
+	}
+
+	// Negative values are coerced back to 0 (ephemeral).
+	executor.SetPort(-1)
+	if executor.fixedPort != 0 {
+		t.Errorf("fixedPort after SetPort(-1) = %d, want 0", executor.fixedPort)
+	}
+}
+
 func TestAllocatePort(t *testing.T) {
 	executor := NewMetalExecutor("/bin/llama-server", "/models", newNopLogger())
 

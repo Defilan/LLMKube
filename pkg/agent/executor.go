@@ -127,6 +127,10 @@ type MetalExecutor struct {
 	modelStorePath string
 	logger         *zap.SugaredLogger
 	startupTimeout time.Duration
+	// fixedPort, when non-zero, is the port every spawned llama-server binds
+	// instead of an ephemeral one. Set via SetPort. A fixed port gives native
+	// OpenAI-compatible clients a stable endpoint across process respawns.
+	fixedPort int
 }
 
 func NewMetalExecutor(llamaServerBin, modelStorePath string, logger *zap.SugaredLogger) *MetalExecutor {
@@ -147,15 +151,30 @@ func (e *MetalExecutor) SetStartupTimeout(d time.Duration) {
 	e.startupTimeout = d
 }
 
+// SetPort fixes the port every spawned llama-server binds. A value <= 0
+// (the default) keeps the historical behavior of allocating an ephemeral
+// port per process. Only one llama-server can use a given fixed port, which
+// matches the one-process-per-agent expectation of the Metal path.
+func (e *MetalExecutor) SetPort(port int) {
+	if port < 0 {
+		port = 0
+	}
+	e.fixedPort = port
+}
+
 func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig) (*ManagedProcess, error) {
 	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure model: %w", err)
 	}
 
-	port, err := e.allocatePort()
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate port: %w", err)
+	port := e.fixedPort
+	if port == 0 {
+		var err error
+		port, err = e.allocatePort()
+		if err != nil {
+			return nil, fmt.Errorf("failed to allocate port: %w", err)
+		}
 	}
 
 	args := buildLlamaServerArgs(modelPath, port, config)
