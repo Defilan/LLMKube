@@ -17,22 +17,35 @@ limitations under the License.
 package controller
 
 import (
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
-// M0/M1 ship the AgenticTaskReconciler as a logging stub: it reads the
-// object and returns without touching status. These smoke tests pin
-// that contract so future M2 evolution either preserves it (until M2
-// merges) or breaks it intentionally with a deliberate test update.
+// The M2 AgenticTaskReconciler is the foreman v0.1 scheduler. Its
+// contract:
+//
+//   empty status.phase           -> Pending (initial normalization)
+//   Pending + no fit             -> requeue with no status mutation
+//   Pending + matching FleetNode -> Scheduled with assignedNode set
+//   Pending + dep Failed         -> cascade-fail (phase=Failed,
+//                                   verdict=INCOMPLETE,
+//                                   condition Failed/UpstreamFailed)
+//   Pending + dep pre-terminal   -> requeue with no status mutation
+//   Scheduled/Running/...        -> no-op (FleetAgent's domain)
+//
+// Each It block creates its own resources and DeferCleanup-removes them
+// so the cluster-scoped FleetNode does not leak across tests.
 
-var _ = Describe("AgenticTaskReconciler (M0 stub)", func() {
+var _ = Describe("AgenticTaskReconciler scheduler", func() {
 	var reconciler *AgenticTaskReconciler
 
 	BeforeEach(func() {
@@ -47,38 +60,195 @@ var _ = Describe("AgenticTaskReconciler (M0 stub)", func() {
 			NamespacedName: types.NamespacedName{Namespace: "default", Name: "no-such-task"},
 		})
 		Expect(err).NotTo(HaveOccurred())
-		// RequeueAfter == 0 covers both "no immediate requeue" and "no
-		// timer requeue" since controller-runtime deprecated the
-		// boolean Requeue field in favor of the zero-RequeueAfter
-		// representation.
 		Expect(res.RequeueAfter).To(BeZero())
 	})
 
-	It("reconciles an existing task without erroring and without mutating status (M0 stub)", func() {
-		task := &foremanv1alpha1.AgenticTask{
-			ObjectMeta: metav1.ObjectMeta{Name: "stub-smoke", Namespace: "default"},
-			Spec: foremanv1alpha1.AgenticTaskSpec{
-				Kind:    foremanv1alpha1.AgenticTaskKindFreeform,
-				Payload: foremanv1alpha1.AgenticTaskPayload{Prompt: "stub-smoke"},
-			},
-		}
+	It("normalizes an empty phase to Pending", func() {
+		task := newTask("normalize-empty")
 		Expect(k8sClient.Create(ctx, task)).To(Succeed())
-		DeferCleanup(func() {
-			_ = k8sClient.Delete(ctx, task)
-		})
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
 
-		_, err := reconciler.Reconcile(ctx, ctrl.Request{
-			NamespacedName: types.NamespacedName{Namespace: "default", Name: "stub-smoke"},
-		})
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
 		Expect(err).NotTo(HaveOccurred())
 
 		var fresh foremanv1alpha1.AgenticTask
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "stub-smoke"}, &fresh)).To(Succeed())
-
-		// M0 stub leaves status untouched. M2 replaces this contract.
-		Expect(string(fresh.Status.Phase)).To(BeEmpty())
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhasePending))
 		Expect(fresh.Status.AssignedNode).To(BeEmpty())
-		Expect(fresh.Status.Verdict).To(BeEquivalentTo(""))
-		Expect(fresh.Status.Result).To(BeNil())
+	})
+
+	It("schedules a Pending task to the first-fit Ready FleetNode", func() {
+		task := newTask("schedule-target")
+		task.Spec.RequiredCapability = foremanv1alpha1.RequiredCapability{
+			Accelerator: foremanv1alpha1.AgenticTaskAccelerator("metal"),
+			MinRAMGB:    32,
+		}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		node := newFleetNode("schedule-target-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator:    foremanv1alpha1.FleetNodeAccelerator("metal"),
+			TotalRAMGB:     128,
+			AvailableRAMGB: 96,
+		})
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(fresh.Status.AssignedNode).To(Equal(node.Name))
+	})
+
+	It("requeues without mutating status when no FleetNode satisfies the capability", func() {
+		task := newTask("no-fit")
+		task.Spec.RequiredCapability = foremanv1alpha1.RequiredCapability{
+			Accelerator: foremanv1alpha1.AgenticTaskAccelerator("metal"),
+			MinRAMGB:    256, // bigger than any node will advertise
+		}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		res, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhasePending))
+		Expect(fresh.Status.AssignedNode).To(BeEmpty())
+	})
+
+	It("cascade-fails a Pending task when its dependency is Failed", func() {
+		dep := newTask("cascade-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseFailed)
+
+		task := newTask("cascade-target")
+		task.Spec.DependsOn = []string{dep.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseFailed))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictIncomplete))
+
+		failedCond := findCondition(fresh.Status.Conditions, "Failed")
+		Expect(failedCond).NotTo(BeNil())
+		Expect(failedCond.Reason).To(Equal("UpstreamFailed"))
+	})
+
+	It("waits with requeue when a dependency is still pre-terminal", func() {
+		dep := newTask("wait-dep") // status stays empty == pre-terminal
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+
+		task := newTask("wait-target")
+		task.Spec.DependsOn = []string{dep.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		res, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhasePending))
+		Expect(fresh.Status.AssignedNode).To(BeEmpty())
+	})
+
+	It("does not touch a task already past Pending (FleetAgent's domain)", func() {
+		task := newTask("hands-off")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhaseRunning)
+
+		// Also set assignedNode to confirm the scheduler doesn't clobber.
+		patch := client.MergeFrom(task.DeepCopy())
+		task.Status.AssignedNode = "some-node"
+		Expect(k8sClient.Status().Patch(ctx, task, patch)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseRunning))
+		Expect(fresh.Status.AssignedNode).To(Equal("some-node"))
 	})
 })
+
+// --- test helpers ---
+
+func newTask(name string) *foremanv1alpha1.AgenticTask {
+	return &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind:    foremanv1alpha1.AgenticTaskKindFreeform,
+			Payload: foremanv1alpha1.AgenticTaskPayload{Prompt: "test"},
+		},
+	}
+}
+
+func newFleetNode(name string) *foremanv1alpha1.FleetNode {
+	return &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: foremanv1alpha1.FleetNodeSpec{
+			NodeName: name,
+			Roles:    []string{"worker"},
+		},
+	}
+}
+
+func setPhase(task *foremanv1alpha1.AgenticTask, phase foremanv1alpha1.AgenticTaskPhase) {
+	GinkgoHelper()
+	patch := client.MergeFrom(task.DeepCopy())
+	task.Status.Phase = phase
+	Expect(k8sClient.Status().Patch(ctx, task, patch)).To(Succeed())
+}
+
+func setNodeReady(node *foremanv1alpha1.FleetNode, cap foremanv1alpha1.FleetNodeCapability) {
+	GinkgoHelper()
+	patch := client.MergeFrom(node.DeepCopy())
+	node.Status.Phase = foremanv1alpha1.FleetNodePhaseReady
+	node.Status.Capability = cap
+	now := metav1.Now()
+	node.Status.LastHeartbeatTime = &now
+	Expect(k8sClient.Status().Patch(ctx, node, patch)).To(Succeed())
+}
+
+func reqFor(obj client.Object) ctrl.Request {
+	return ctrl.Request{NamespacedName: types.NamespacedName{
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+	}}
+}
+
+func nn(obj client.Object) types.NamespacedName {
+	return types.NamespacedName{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+}
+
+func findCondition(conds []metav1.Condition, kind string) *metav1.Condition {
+	for i := range conds {
+		if conds[i].Type == kind {
+			return &conds[i]
+		}
+	}
+	return nil
+}
