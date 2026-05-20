@@ -123,16 +123,17 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return r.scheduleToNode(ctx, &task, nodeName)
 }
 
-// setInitialPending writes phase=Pending the first time we see the task,
-// then requeues so the next reconcile runs the scheduling logic against
-// a Pending phase rather than racing on the same object.
+// setInitialPending writes phase=Pending the first time we see the task.
+// The status patch triggers a fresh reconcile via the controller's
+// For(AgenticTask) watch, so we do not need an explicit requeue (avoiding
+// the deprecated Result.Requeue boolean).
 func (r *AgenticTaskReconciler) setInitialPending(ctx context.Context, task *foremanv1alpha1.AgenticTask) (ctrl.Result, error) {
 	patch := client.MergeFrom(task.DeepCopy())
 	task.Status.Phase = foremanv1alpha1.AgenticTaskPhasePending
 	if err := r.Status().Patch(ctx, task, patch); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{}, nil
 }
 
 // cascadeFailIfDepFailed returns a non-empty message if any dependency is
