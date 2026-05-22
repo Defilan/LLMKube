@@ -18,12 +18,14 @@ home: https://github.com/defilantech/LLMKube
 sources:
   - https://github.com/defilantech/LLMKube
 dependencies:
-  # Foreman v0.8.0 ships in lockstep with llmkube v0.8.0 (the "Foreman
-  # debut" release). The chart depends on the core operator + CRDs the
-  # `inference.llmkube.dev` API group is registered with; pre-0.8.0
-  # cores do not include the chart additions Foreman's RBAC + executor
-  # rely on for the M3 + M4 nodes.
+  # Foreman rides the LLMKube release train. The chart depends on the
+  # core operator + the `inference.llmkube.dev` API group it registers.
+  # >=0.7.10 is the first published LLMKube core that has all of the
+  # InferenceService status fields Foreman's executor depends on.
+  # The "Foreman's debut" v0.8.0 release will arrive once the
+  # Workload planner (M6) lands; the dep does not need to track that
+  # tag explicitly because >=0.7.10 covers every release after.
   - name: llmkube
-    version: ">=0.8.0"
+    version: ">=0.7.10"
     repository: "https://defilantech.github.io/llmkube"
     condition: llmkube.enabled

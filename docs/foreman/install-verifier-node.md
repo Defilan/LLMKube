@@ -27,8 +27,10 @@ order.
 - **New chart pieces** in `charts/foreman/`: operator + agent
   Deployments, RBAC for both, the `foreman-gate-cache` PVC, and a
   `values.yaml` that exposes the M4 install knobs.
-- **New images**: `ghcr.io/defilantech/llmkube-foreman-operator:0.8.0`
-  and `ghcr.io/defilantech/llmkube-foreman-agent:0.8.0`.
+- **New images**: `ghcr.io/defilantech/llmkube-foreman-operator`
+  and `ghcr.io/defilantech/llmkube-foreman-agent`, published at the
+  chart's `.Chart.AppVersion` tag (track the foreman chart release
+  for the current tag).
 
 ## Prerequisites
 
@@ -41,14 +43,15 @@ order.
   kubectl get nodes
   ```
 - `helm` v3.13 or newer.
-- LLMKube core installed at `>=0.8.0`. Foreman's chart depends on
+- LLMKube core installed at `>=0.7.10`. Foreman's chart depends on
   it for the `inference.llmkube.dev` CRDs the operator's RBAC
   references:
   ```sh
+  helm repo add defilantech https://defilantech.github.io/llmkube
+  helm repo update
   helm upgrade --install llmkube \
     defilantech/llmkube \
-    --namespace llmkube-system --create-namespace \
-    --version 0.8.0
+    --namespace llmkube-system --create-namespace
   ```
 
 - **Upgrading from an M3-era cluster?** M4 widens both Foreman CRDs:
@@ -63,21 +66,18 @@ order.
 
 ## Step 1 :: install Foreman
 
-Once **llmkube v0.8.0 has shipped to the chart repo**:
+From the published chart repo (recommended once you have llmkube
+installed via the prerequisite above):
 
 ```sh
-helm repo add defilantech https://defilantech.github.io/llmkube
-helm repo update
-
 helm upgrade --install foreman \
   defilantech/foreman \
   --namespace foreman-system --create-namespace \
-  --version 0.8.0 \
   --set agent.mode=native \
   --set 'agent.roles={worker,verifier}'
 ```
 
-**Before v0.8.0 ships** (or for dev installs from a local checkout):
+For dev installs from a local checkout:
 
 ```sh
 cd /path/to/LLMKube
@@ -89,10 +89,28 @@ helm upgrade --install foreman \
   --set 'agent.roles={worker,verifier}'
 ```
 
-The `llmkube.enabled=false` flag skips the subchart resolution (the
-chart declares `llmkube >=0.8.0` as a dependency, which is the locked
-"ships together" framing; until that's published, install LLMKube
-core separately and disable the subchart).
+The `llmkube.enabled=false` flag skips the subchart resolution. The
+chart declares `llmkube >=0.7.10`; if you have LLMKube core
+installed separately at any current version, that dep is satisfied
+and the local-checkout install Just Works.
+
+## Foreman milestone status
+
+Foreman is shipped in stages alongside the LLMKube release train.
+Track your install against this milestone matrix so you know what to
+expect from a given version:
+
+| LLMKube version | Foreman state                                          |
+|-----------------|--------------------------------------------------------|
+| `<0.7.10`       | Foreman scaffold only (CRDs, no operator / agent)      |
+| `0.7.10+`       | M3 coder + M4 verifier installable; 2-step pipeline    |
+| **0.8.0 (planned)** | M5 reviewer + M6 Workload planner — full v0.1 debut |
+
+The 0.8.0 "Foreman's debut" tag will cut once the M6 Workload
+planner lands; at that point a single `kubectl apply -f workload.yaml`
+will drive the full coder + gate + reviewer pipeline end to end. The
+installs documented here work today against any release `0.7.10+`;
+the workflows the v0.1 vision promises arrive at 0.8.0.
 
 For a gate-only verifier node (the M4 install), nothing else is
 required: the deterministic gate Agent never clones or pushes from
@@ -242,16 +260,16 @@ disable the PVC: `--set agent.gateCache.enabled=false` (gate runs
 will still work, just without the inter-run cache).
 
 **Agent Pod startup info-log "--git-remote-url is unset"** :: not
-an error. Foreman v0.8.0+ logs this as INFO and proceeds; coder
+an error. Foreman v0.7.10+ logs this as INFO and proceeds; coder
 tasks that actually need the URL fail per-task with reason
 `GitRemoteURLNotConfigured`. Deterministic Agents (e.g. the M4
 gate) run fine without it. To suppress the log line on a node that
 will also run coder tasks, set `--set agent.gitRemoteURL=https://github.com/Defilan/LLMKube.git`
 + `--set agent.commitAuthorEmail=...` at install time.
 
-If you are running a pre-v0.8.0 foreman-agent image where this is a
-hard `os.Exit(1)`, upgrade to v0.8.0+. The startup check was relaxed
-in the M4 phase F1 fix.
+If you are running a pre-v0.7.10 foreman-agent image where this is
+a hard `os.Exit(1)`, upgrade. The startup check was relaxed in the
+M4 work that landed in 0.7.10.
 
 ## What this does NOT cover
 
