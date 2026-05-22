@@ -85,6 +85,25 @@ jobs:
             exit 1
           fi
 
+          # Cross-check: release-please-config.json tracks every chart's
+          # Chart.yaml. This catches the class of bug where a new chart
+          # is added but its version field is not wired into release-
+          # please's extra-files, so it silently never bumps. Symptom of
+          # that drift: chart-releaser refuses to publish the chart on
+          # release because the version did not change.
+          for chart_path in charts/*/Chart.yaml; do
+            for field in version appVersion; do
+              if ! jq -e --arg p "$chart_path" --arg f "\$.${field}" \
+                '.packages."."."extra-files"[] | select(.path == $p and .jsonpath == $f)' \
+                release-please-config.json > /dev/null; then
+                echo "❌ release-please-config.json is missing tracking for $chart_path :: \$.${field}"
+                echo "   Add it to .packages.\".\".\"extra-files\" or release-please will not bump this chart."
+                exit 1
+              fi
+            done
+          done
+          echo "✅ release-please tracks every chart's version + appVersion"
+
           echo "✅ All version files consistent at $CHART_VERSION"
 
   release-pr-version-check:
