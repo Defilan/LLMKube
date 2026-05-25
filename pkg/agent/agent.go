@@ -367,6 +367,15 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		a.logger.Infow("cleaned up orphaned endpoints from prior sessions", "count", cleaned)
 	}
 
+	// Startup reconcile: sweep all InferenceServices in the watched namespace
+	// and converge their status against observed reality. The watcher only
+	// fires on CHANGES, so pre-existing zero-replica state from a previous
+	// agent run would otherwise keep stale readyReplicas / phase indefinitely.
+	// See https://github.com/defilantech/LLMKube/issues/506.
+	if err := a.reconcileOnStartup(ctx); err != nil {
+		a.logger.Warnw("startup reconcile failed", "error", err)
+	}
+
 	// Start health server. An unexpected exit here (port binding lost,
 	// listener crashed) is fatal — the management plane is how operators
 	// observe and recover the agent, so running blind is worse than
@@ -967,6 +976,28 @@ func (a *MetalAgent) markStopped(ctx context.Context, isvc *inferencev1alpha1.In
 // scheduleRestart increments the restart counter and re-runs ensureProcess
 // for the named InferenceService. It is called by HealthMonitor when a process
 // becomes unhealthy.
+
+// reconcileOnStartup lists all InferenceServices in the watched namespace and
+// calls ensureProcess for each one. This converges their status against
+// observed reality on agent boot, because the watcher only fires on CHANGES
+// and pre-existing zero-replica state from a previous agent run would
+// otherwise keep stale readyReplicas / phase indefinitely.
+// See https://github.com/defilantech/LLMKube/issues/506.
+func (a *MetalAgent) reconcileOnStartup(ctx context.Context) error {
+	var list inferencev1alpha1.InferenceServiceList
+	if err := a.config.K8sClient.List(ctx, &list, client.InNamespace(a.config.Namespace)); err != nil {
+		return fmt.Errorf("list InferenceServices for startup reconcile: %w", err)
+	}
+	for i := range list.Items {
+		svc := &list.Items[i]
+		if err := a.ensureProcess(ctx, svc); err != nil {
+			a.logger.Warnw("startup reconcile failed for InferenceService",
+				"namespace", svc.Namespace, "name", svc.Name, "error", err)
+		}
+	}
+	return nil
+}
+
 // runWatcherLoop drives a.watcher.Watch in a loop, retrying transient errors
 // with exponential backoff (handles the "CRDs not installed yet" startup
 // race) but bubbling ErrWatchStalled up via fatalErrChan immediately.

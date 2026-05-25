@@ -1061,3 +1061,98 @@ func TestEnsureProcess_InFlightGuard(t *testing.T) {
 		t.Errorf("starting map not cleared after spawn, has %d entries", leftover)
 	}
 }
+
+// TestReconcileOnStartup_CorrectsStaleStatus verifies that reconcileOnStartup
+// patches the status of InferenceServices whose spec.replicas=0 but whose
+// status still shows ReadyReplicas > 0 from a prior agent run. See #506.
+func TestReconcileOnStartup_CorrectsStaleStatus(t *testing.T) {
+	scheme := newTestScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	zero := int32(0)
+	stale := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "stale-service",
+			Namespace:  "default",
+			Generation: 5,
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "any-model",
+			Replicas: &zero,
+		},
+		Status: inferencev1alpha1.InferenceServiceStatus{
+			Phase:           "Ready",
+			ReadyReplicas:   1,
+			DesiredReplicas: 1,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&inferencev1alpha1.InferenceService{}).
+		WithRuntimeObjects(stale).
+		Build()
+
+	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
+	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+
+	if err := agent.reconcileOnStartup(context.Background()); err != nil {
+		t.Fatalf("reconcileOnStartup returned unexpected error: %v", err)
+	}
+
+	got := &inferencev1alpha1.InferenceService{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "stale-service", Namespace: "default"}, got); err != nil {
+		t.Fatalf("fetch InferenceService back: %v", err)
+	}
+
+	if got.Status.Phase != "Stopped" {
+		t.Errorf("status.phase = %q, want Stopped", got.Status.Phase)
+	}
+	if got.Status.ReadyReplicas != 0 {
+		t.Errorf("status.readyReplicas = %d, want 0", got.Status.ReadyReplicas)
+	}
+	if got.Status.DesiredReplicas != 0 {
+		t.Errorf("status.desiredReplicas = %d, want 0", got.Status.DesiredReplicas)
+	}
+}
+
+// TestReconcileOnStartup_SkipsNonZeroReplicas verifies that the startup
+// reconcile does not block on InferenceServices with replicas > 0 that have
+// no running process (they would fail to start without a model, which is
+// expected — the watcher will handle them when the model is ready). Errors
+// are logged but do not abort the sweep.
+func TestReconcileOnStartup_SkipsNonZeroReplicas(t *testing.T) {
+	scheme := newTestScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	one := int32(1)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "non-zero-replicas",
+			Namespace: "default",
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "missing-model",
+			Replicas: &one,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&inferencev1alpha1.InferenceService{}).
+		WithRuntimeObjects(isvc).
+		Build()
+
+	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
+	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+
+	// reconcileOnStartup should not return an error even when a service
+	// fails to reconcile (errors are logged and the sweep continues).
+	err := agent.reconcileOnStartup(context.Background())
+	if err != nil {
+		t.Errorf("reconcileOnStartup returned error %v, want nil (errors are logged, not returned)", err)
+	}
+}
