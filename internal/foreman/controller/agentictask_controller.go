@@ -167,13 +167,13 @@ func (r *AgenticTaskReconciler) setInitialPending(ctx context.Context, task *for
 }
 
 // cascadeFailIfDepFailed returns a non-empty message if any dependency is
-// already Failed; the caller fails the task with that message.
+// already Failed or missing; the caller fails the task with that message.
 func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, error) {
 	for _, depName := range task.Spec.DependsOn {
 		var dep foremanv1alpha1.AgenticTask
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: depName}, &dep); err != nil {
 			if apierrors.IsNotFound(err) {
-				continue
+				return fmt.Sprintf("dependency %q not found; cascade-failing", depName), nil
 			}
 			return "", err
 		}

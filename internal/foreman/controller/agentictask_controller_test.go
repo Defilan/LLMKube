@@ -153,6 +153,28 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(failedCond.Reason).To(Equal("UpstreamFailed"))
 	})
 
+	It("cascade-fails a Pending task when its dependency is not found", func() {
+		// The dependency was created then deleted; the task should not
+		// hang in Pending forever.
+		task := newTask("missing-dep")
+		task.Spec.DependsOn = []string{"nonexistent-dep"}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseFailed))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictIncomplete))
+
+		failedCond := findCondition(fresh.Status.Conditions, "Failed")
+		Expect(failedCond).NotTo(BeNil())
+		Expect(failedCond.Reason).To(Equal("UpstreamFailed"))
+	})
+
 	It("waits with requeue when a dependency is still pre-terminal", func() {
 		dep := newTask("wait-dep") // status stays empty == pre-terminal
 		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
