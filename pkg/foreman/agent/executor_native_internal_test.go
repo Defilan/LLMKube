@@ -90,6 +90,34 @@ func TestBranchNameForTask(t *testing.T) {
 			},
 			want: "foreman/verify-only",
 		},
+		{
+			name: "issue-fix with BranchPrefix overrides the default prefix",
+			task: &foremanv1alpha1.AgenticTask{
+				ObjectMeta: metav1.ObjectMeta{Name: "code-42"},
+				Spec: foremanv1alpha1.AgenticTaskSpec{
+					Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+					Payload: foremanv1alpha1.AgenticTaskPayload{
+						Issue:        42,
+						BranchPrefix: "chore",
+					},
+				},
+			},
+			want: "chore/issue-42",
+		},
+		{
+			name: "issue-fix BranchPrefix empty falls back to repo.BranchPrefix",
+			task: &foremanv1alpha1.AgenticTask{
+				ObjectMeta: metav1.ObjectMeta{Name: "code-7"},
+				Spec: foremanv1alpha1.AgenticTaskSpec{
+					Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+					Payload: foremanv1alpha1.AgenticTaskPayload{
+						Issue:        7,
+						BranchPrefix: "",
+					},
+				},
+			},
+			want: "foreman/issue-7",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

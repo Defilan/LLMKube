@@ -621,7 +621,9 @@ func objRefAsMap(ref corev1.ObjectReference) map[string]any {
 //     hand-off for verify tasks (which gate a branch the upstream coder
 //     task already produced) and the escape hatch for any task that
 //     wants to pin the branch name from the caller.
-//  2. issue-fix with Payload.Issue > 0 derives foreman/issue-<N>.
+//  2. issue-fix with Payload.Issue > 0 derives <prefix>/issue-<N>,
+//     where <prefix> comes from Payload.BranchPrefix when set,
+//     otherwise repo.BranchPrefix (default "foreman").
 //  3. Everything else falls back to foreman/<task-name>.
 //
 // v0.1 keeps slugs minimal; v0.2 may take an explicit IssueTitle field
@@ -631,7 +633,11 @@ func branchNameForTask(task *foremanv1alpha1.AgenticTask) string {
 		return task.Spec.Payload.Branch
 	}
 	if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindIssueFix && task.Spec.Payload.Issue > 0 {
-		return fmt.Sprintf("%s/issue-%d", repo.BranchPrefix, task.Spec.Payload.Issue)
+		prefix := task.Spec.Payload.BranchPrefix
+		if prefix == "" {
+			prefix = repo.BranchPrefix
+		}
+		return fmt.Sprintf("%s/issue-%d", prefix, task.Spec.Payload.Issue)
 	}
 	return fmt.Sprintf("%s/%s", repo.BranchPrefix, task.Name)
 }
