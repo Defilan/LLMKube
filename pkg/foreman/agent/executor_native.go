@@ -300,7 +300,18 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 
 	// 9. Non-GO verdicts: no commit, no push, just record the model's
 	// stated outcome and return.
-	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+	//
+	// Reviewer-role Agents take this same path on GO. A reviewer's
+	// "GO" means APPROVE, not "commit this diff." Reviewers are
+	// read-only by design (tool whitelist excludes write_file and
+	// str_replace), so HasChanges would always be false and the
+	// model's structured findings in submit_result.extra would get
+	// dropped by the noChangesResult fallback. Route through
+	// modelDecidedResult so extra.modelExtra (the full review
+	// payload: reviewOutcome, findings, issueAsk, etc.) surfaces in
+	// status.result.
+	if verdict != foremanv1alpha1.AgenticTaskVerdictGo ||
+		agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer {
 		return e.modelDecidedResult(start, transcriptRef, loopRes, verdict), nil
 	}
 

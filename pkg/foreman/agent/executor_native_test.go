@@ -514,6 +514,150 @@ func TestNativeExecutor_ModelEmitsNoGo(t *testing.T) {
 	}
 }
 
+// --- Reviewer-role Agent: GO means APPROVE, not commit + push ------------
+
+// reviewerTaskAndAgent builds a reviewer-role Agent and a freeform
+// AgenticTask pointing at it. Distinct from taskAndAgent because the
+// role bit is exactly what this test exercises.
+func reviewerTaskAndAgent(name string) (*foremanv1alpha1.Agent, *foremanv1alpha1.AgenticTask) {
+	a := &foremanv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "reviewer-" + name, Namespace: "default"},
+		Spec: foremanv1alpha1.AgentSpec{
+			Role:                foremanv1alpha1.AgentRoleReviewer,
+			Model:               "test-model",
+			InferenceServiceRef: corev1.LocalObjectReference{Name: "test-svc"},
+			SystemPrompt:        "you are a test reviewer",
+			// Read-only tool whitelist: no write_file, no str_replace.
+			Tools:    []string{"read_file", "grep", "bash", "submit_result"},
+			MaxTurns: 5,
+		},
+	}
+	t := &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "default", UID: types.UID("test-uid-" + name),
+		},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindFreeform,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  9999,
+				Prompt: "review the branch",
+			},
+			AgentRef: &corev1.LocalObjectReference{Name: a.Name},
+		},
+	}
+	return a, t
+}
+
+// TestNativeExecutor_ReviewerGoIsApproveNotCommit checks that when a
+// reviewer-role Agent emits verdict=GO with no workspace changes (the
+// expected reviewer shape, since reviewers don't have write tools),
+// the executor takes the modelDecidedResult path and preserves the
+// model's structured extra (reviewOutcome, findings, issueAsk, etc.)
+// in status.result, instead of downgrading to NO-GO via noChangesResult.
+//
+// Regression test for defilantech/LLMKube#543.
+func TestNativeExecutor_ReviewerGoIsApproveNotCommit(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+	oaiSrv := scriptedOAI(t, []string{submitGoBody})
+
+	agent, task := reviewerTaskAndAgent("approves-clean")
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	// fakeRegistry returns a submit_result envelope that mimics the
+	// shape the M5-lite reviewer Agent produces in production: GO
+	// verdict, APPROVE outcome, three findings, an issueAsk quote,
+	// and the touched-files list. The reviewer never edits the
+	// workspace, so HasChanges would be false; this test asserts the
+	// no-commit reviewer path keeps that envelope intact.
+	reviewExtra := map[string]any{
+		"reviewOutcome": "APPROVE",
+		"issueAsk": "Update the existing release workflow so every tagged release " +
+			"builds the router-proxy image for amd64+arm64.",
+		"findings": []any{
+			map[string]any{
+				"severity": "info",
+				"area":     "scope-alignment",
+				"message": "Diff hits .goreleaser.yaml, values.yaml, and " +
+					"docs/site/concepts/model-router.md as the issue body names.",
+			},
+			map[string]any{
+				"severity": "info",
+				"area":     "style-consistency",
+				"message":  "New goreleaser entries mirror the existing controller + foreman-operator patterns.",
+			},
+		},
+		"filesTouched": []any{".goreleaser.yaml", "charts/llmkube/values.yaml", "docs/site/concepts/model-router.md"},
+		"riskLevel":    "low",
+		"testsAdded":   0,
+	}
+	reg := &fakeRegistry{
+		results: map[string]*foremanagent.ToolResult{
+			"submit_result": {
+				Terminal: true,
+				Verdict:  "GO",
+				Summary:  "APPROVE: diff matches the issue ask, minimal scope, idiomatic.",
+				Extra:    reviewExtra,
+			},
+		},
+	}
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Bot", Email: "b@x"},
+		CommitCommitter:          repo.Identity{Name: "Bot", Email: "b@x"},
+		RegistryFactory: func(_ string, _ *foremanv1alpha1.Agent) (foremanagent.ToolRegistry, error) {
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+	res, err := e.Execute(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// Verdict stays GO (not downgraded to NO-GO by noChangesResult).
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("verdict: want GO got %s; full result=%+v", res.Verdict, res)
+	}
+	// Outcome is MODEL-DECIDED (the no-commit reviewer path), not
+	// NO-CHANGES (the wrong path that drops modelExtra).
+	if got := res.Extra["outcome"]; got != "MODEL-DECIDED" {
+		t.Errorf("outcome: want MODEL-DECIDED got %v", got)
+	}
+	// modelExtra survives intact and carries the structured review.
+	mx, ok := res.Extra["modelExtra"].(map[string]any)
+	if !ok {
+		t.Fatalf("modelExtra: missing or wrong type; res.Extra=%+v", res.Extra)
+	}
+	if got := mx["reviewOutcome"]; got != "APPROVE" {
+		t.Errorf("modelExtra.reviewOutcome: want APPROVE got %v", got)
+	}
+	if findings, ok := mx["findings"].([]any); !ok || len(findings) != 2 {
+		t.Errorf("modelExtra.findings: want 2-element slice got %T %v", mx["findings"], mx["findings"])
+	}
+	if got := mx["issueAsk"]; got == nil {
+		t.Errorf("modelExtra.issueAsk: missing; the verbatim issue quote should survive")
+	}
+
+	// No branch should have landed on the remote: reviewers do not push.
+	out, _ := exec.Command("git", "-C", bare, "branch", "--list", "foreman/issue-9999").CombinedOutput()
+	if strings.Contains(string(out), "foreman/issue-9999") {
+		t.Errorf("reviewer path should not push; bare repo has branch: %s", out)
+	}
+
+	// Transcript still written.
+	cmKey := types.NamespacedName{Namespace: task.Namespace, Name: "foreman-transcript-" + task.Name}
+	var cm corev1.ConfigMap
+	if err := c.Get(context.Background(), cmKey, &cm); err != nil {
+		t.Errorf("transcript should exist on reviewer path: %v", err)
+	}
+}
+
 // --- Deterministic Agent path (M4): no LLM, single tool dispatch ----------
 
 func TestNativeExecutor_DeterministicGateAgent(t *testing.T) {
