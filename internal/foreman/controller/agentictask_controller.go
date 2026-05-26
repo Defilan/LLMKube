@@ -166,8 +166,22 @@ func (r *AgenticTaskReconciler) setInitialPending(ctx context.Context, task *for
 	return ctrl.Result{}, nil
 }
 
-// cascadeFailIfDepFailed returns a non-empty message if any dependency is
-// already Failed; the caller fails the task with that message.
+// cascadeFailIfDepFailed returns a non-empty message if any dependency
+// is terminal-without-success; the caller fails the task with that
+// message.
+//
+// "Terminal without success" means either:
+//   - Phase=Failed (executor errored out), OR
+//   - Phase=Succeeded but verdict in {INCOMPLETE, NO-GO, GATE-FAIL,
+//     GATE-ERROR}. The dep is done, but it did not produce a usable
+//     artifact. A downstream verify task should not run against a
+//     branch the coder never pushed; a downstream review task should
+//     not run against a coder verdict that already declined.
+//
+// Previously this gated on Phase=Failed only, which leaked INCOMPLETE
+// coder tasks through to their downstream verifiers and made the
+// downstream task fail GATE-FAIL on a clone-of-nonexistent-branch
+// (the wrong reason). Fixes defilantech/LLMKube#541.
 func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, error) {
 	for _, depName := range task.Spec.DependsOn {
 		var dep foremanv1alpha1.AgenticTask
@@ -180,12 +194,23 @@ func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task
 		if dep.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
 			return fmt.Sprintf("dependency %q failed; cascade-failing", depName), nil
 		}
+		// Phase=Succeeded but verdict not on-target = terminal without
+		// usable output. Cascade-fail so dependents don't run against
+		// a nonexistent artifact.
+		if dep.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded && !dep.SucceededOnTarget() {
+			return fmt.Sprintf("dependency %q ended with verdict=%s (not on-target); cascade-failing",
+				depName, dep.Status.Verdict), nil
+		}
 	}
 	return "", nil
 }
 
-// allDepsSucceeded returns true only when every dependency exists in the
-// same namespace AND is in phase=Succeeded.
+// allDepsSucceeded returns true only when every dependency exists in
+// the same namespace AND is on-target (Phase=Succeeded AND verdict in
+// {GO, GATE-PASS}).
+//
+// Previously gated on Phase=Succeeded alone, allowing INCOMPLETE /
+// GATE-FAIL deps to unblock dependents. Fixes defilantech/LLMKube#541.
 func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *foremanv1alpha1.AgenticTask) (bool, error) {
 	for _, depName := range task.Spec.DependsOn {
 		var dep foremanv1alpha1.AgenticTask
@@ -195,7 +220,7 @@ func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *fore
 			}
 			return false, err
 		}
-		if dep.Status.Phase != foremanv1alpha1.AgenticTaskPhaseSucceeded {
+		if !dep.SucceededOnTarget() {
 			return false, nil
 		}
 	}
