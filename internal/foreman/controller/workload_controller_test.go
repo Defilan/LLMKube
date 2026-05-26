@@ -155,6 +155,64 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		Expect(verify531.Spec.AgentRef.Name).To(Equal("gate"))
 	})
 
+	It("fans out one review task per ReviewerAgentRef, each depending on the verify task (v0.2)", func() {
+		wl := newWorkload("batch-with-reviewers", foremanv1alpha1.WorkloadSpec{
+			Intent:           "batch + reviewers",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{510, 531},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "reviewer-validator"},
+				{Name: "reviewer-falsification"},
+				{Name: "reviewer-thinking"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.WorkloadPhasePlanned))
+		// 2 issues * (code + verify + 3 reviewers) = 10 tasks total.
+		Expect(fresh.Status.Tasks).To(HaveLen(10))
+
+		// review-510-1 (the second reviewer of the first issue): kind +
+		// agentRef + dependsOn must all line up.
+		var review5101 foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: "default", Name: "batch-with-reviewers-review-510-1",
+		}, &review5101)).To(Succeed())
+		Expect(review5101.Spec.Kind).To(Equal(foremanv1alpha1.AgenticTaskKindReview))
+		Expect(review5101.Spec.AgentRef.Name).To(Equal("reviewer-falsification"))
+		Expect(review5101.Spec.DependsOn).To(ConsistOf("batch-with-reviewers-verify-510"))
+		Expect(review5101.Spec.Payload.Issue).To(Equal(int32(510)))
+		Expect(review5101.Spec.Payload.Branch).To(Equal("foreman/issue-510"))
+
+		// review-531-2: the third reviewer of the second issue. Confirms
+		// the cross-product expansion (per-issue x per-reviewer).
+		var review5312 foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: "default", Name: "batch-with-reviewers-review-531-2",
+		}, &review5312)).To(Succeed())
+		Expect(review5312.Spec.AgentRef.Name).To(Equal("reviewer-thinking"))
+		Expect(review5312.Spec.DependsOn).To(ConsistOf("batch-with-reviewers-verify-531"))
+
+		// review-510-0 must NOT depend on review-510-1 or any other
+		// reviewer: parallel-after-gate is the whole point.
+		var review5100 foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, types.NamespacedName{
+			Namespace: "default", Name: "batch-with-reviewers-review-510-0",
+		}, &review5100)).To(Succeed())
+		Expect(review5100.Spec.DependsOn).To(ConsistOf("batch-with-reviewers-verify-510"))
+	})
+
 	It("clips with MaxTasks and sets the Truncated condition", func() {
 		wl := newWorkload("max-tasks-clip", foremanv1alpha1.WorkloadSpec{
 			Intent:           "clipped",

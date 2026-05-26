@@ -45,7 +45,9 @@ const (
 //     for full control over a hand-authored pipeline.
 //  2. Issue-batch shortcut (Issues non-empty + CoderAgentRef +
 //     VerifierAgentRef set): emit one code+verify pair per issue. The
-//     most common shape for v0.1.
+//     most common shape for v0.1. When ReviewerAgentRefs is also set
+//     (v0.2), each issue additionally fans out one parallel review
+//     task per listed reviewer Agent, depending on the verify task.
 //  3. LLM-planner (Intent only, no Pipeline, no Issues): deferred to v0.2.
 //     v0.1 marks the Workload Failed with reason NoPlannerOrPipeline.
 type WorkloadSpec struct {
@@ -105,6 +107,28 @@ type WorkloadSpec struct {
 	// Pipeline mode.
 	// +optional
 	VerifierAgentRef *corev1.LocalObjectReference `json:"verifierAgentRef,omitempty"`
+
+	// ReviewerAgentRefs is the optional v0.2 third pipeline stage: each
+	// listed Agent runs a review task against the diff the coder
+	// produced, in parallel, all depending on the upstream verify task
+	// reaching GATE-PASS. The rendered task names are
+	// "<workload>-review-<N>-<i>" where N is the issue number and i is
+	// the index into this slice; the index keeps DNS-1123 lengths
+	// bounded across long agent names.
+	//
+	// Aggregation: any reviewer emitting verdict=NO-GO leaves that task
+	// Phase=Succeeded but not "succeeded on target," so the Workload
+	// rollup from #548 marks it under IncompleteTasks and the Workload
+	// reaches Phase=Failed with reason ChildrenIncomplete. Day 4
+	// extends this with a hybrid cloud reviewer Agent that the rollup
+	// can escalate to when the local fleet says NO-GO.
+	//
+	// Leave empty to keep the v0.1 two-step (code + verify) pipeline.
+	// Multi-strategy reviewing (validator / falsification / thinking-
+	// mode) is achieved by listing three Agent CRs with different
+	// system prompts and (optionally) the same underlying model.
+	// +optional
+	ReviewerAgentRefs []corev1.LocalObjectReference `json:"reviewerAgentRefs,omitempty"`
 }
 
 // PipelineStep is one step in an explicit Workload pipeline. Each step
