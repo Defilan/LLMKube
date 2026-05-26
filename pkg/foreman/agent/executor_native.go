@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -66,12 +67,28 @@ type NativeAgentLoopExecutor struct {
 	// push-to-fork.
 	GitRemoteURL string
 
-	// InferenceBaseURLOverride bypasses InferenceService resolution and
-	// dispatches OAI requests to this URL instead. Required when the
-	// foreman-agent runs outside the cluster (e.g. on the M5 Max host
-	// where in-cluster DNS does not resolve). Must include the /v1
-	// suffix; the OAI client appends /chat/completions.
+	// InferenceBaseURLOverride bypasses InferenceService resolution
+	// entirely and dispatches OAI requests to this URL. Use for tests
+	// and stub OAI servers; for off-cluster, same-host installs (e.g.
+	// foreman-agent on the M5 Max) prefer InferenceBaseURLHostOverride
+	// instead so the live port from the metal-agent's Endpoints object
+	// flows through on every llama-server respawn. Must include the
+	// /v1 suffix; the OAI client appends /chat/completions.
 	InferenceBaseURLOverride string
+
+	// InferenceBaseURLHostOverride, when non-empty, rewrites the host
+	// of the resolved InferenceService URL to this value (e.g.
+	// "127.0.0.1") and substitutes the live port from the v1 Endpoints
+	// object the metal-agent maintains for the InferenceService. The
+	// scheme and path are kept from InferenceService.status.endpoint.
+	//
+	// This is the K8s-native answer for off-cluster, same-host installs:
+	// the metal-agent rewrites Endpoints on every llama-server respawn,
+	// so each task dispatch re-reads the current port through the
+	// controller-runtime cache. Compare to InferenceBaseURLOverride,
+	// which locks the port at install time and breaks on respawn
+	// (#540).
+	InferenceBaseURLHostOverride string
 
 	// CommitAuthor and CommitCommitter are the git identities the
 	// resulting commit carries. v0.1 sets both to the same Identity.
@@ -463,9 +480,18 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 }
 
 // resolveInferenceBaseURL turns Agent.spec.inferenceServiceRef into a
-// base URL the OAI client can hit. Override wins for the v0.1 path
-// where foreman-agent runs outside the cluster; otherwise we read
-// InferenceService.status.endpoint and trim the chat-completions suffix.
+// base URL the OAI client can hit. Three modes, in precedence order:
+//
+//  1. InferenceBaseURLOverride: full URL replacement. Used by tests
+//     and stub OAI servers.
+//  2. InferenceBaseURLHostOverride: read InferenceService.status.endpoint
+//     for scheme + path, read the v1 Endpoints object the metal-agent
+//     maintains for the live port, substitute the override host. Used
+//     by off-cluster, same-host installs (foreman-agent on the M5 Max
+//     where cluster DNS does not resolve but the metal-agent rewrites
+//     Endpoints on every llama-server respawn).
+//  3. Default: trust status.endpoint as the cluster-DNS form, used by
+//     in-cluster foreman-agents.
 func (e *NativeAgentLoopExecutor) resolveInferenceBaseURL(
 	ctx context.Context,
 	namespace string,
@@ -489,7 +515,66 @@ func (e *NativeAgentLoopExecutor) resolveInferenceBaseURL(
 	// status.endpoint is the chat-completions URL; the OAI client
 	// expects the /v1 base.
 	endpoint = strings.TrimSuffix(endpoint, "/chat/completions")
-	return strings.TrimRight(endpoint, "/"), nil
+	endpoint = strings.TrimRight(endpoint, "/")
+
+	if e.InferenceBaseURLHostOverride != "" {
+		return e.rewriteHostFromEndpoints(ctx, namespace, isvc.Name, endpoint)
+	}
+	return endpoint, nil
+}
+
+// rewriteHostFromEndpoints replaces the host of baseURL with the
+// configured InferenceBaseURLHostOverride and the live port from the
+// InferenceService's v1 Endpoints object. The Endpoints name mirrors
+// the operator's sanitizeDNSName (dots become hyphens; see
+// internal/controller/inferenceservice_controller.go).
+//
+// EndpointSlice migration is tracked separately and producer + consumer
+// move together.
+//
+//nolint:staticcheck // SA1019: the metal-agent registers v1 Endpoints;
+func (e *NativeAgentLoopExecutor) rewriteHostFromEndpoints(
+	ctx context.Context, namespace, isvcName, baseURL string,
+) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse status.endpoint %q: %w", baseURL, err)
+	}
+	var eps corev1.Endpoints
+	epsName := strings.ReplaceAll(isvcName, ".", "-")
+	key := types.NamespacedName{Namespace: namespace, Name: epsName}
+	if err := e.Client.Get(ctx, key, &eps); err != nil {
+		return "", fmt.Errorf("get Endpoints %s for host-override resolution: %w", key, err)
+	}
+	port, err := firstReadyPort(eps)
+	if err != nil {
+		return "", fmt.Errorf("Endpoints %s: %w", key, err)
+	}
+	u.Host = fmt.Sprintf("%s:%d", e.InferenceBaseURLHostOverride, port)
+	return strings.TrimRight(u.String(), "/"), nil
+}
+
+// firstReadyPort returns the first port advertised on a subset that
+// has at least one ready address. metal-agent registers one address +
+// one port per InferenceService today; a future multi-replica metal
+// path would need a smarter selector, but for the v0.2 same-host case
+// "the only port" is the right port.
+//
+//nolint:staticcheck // SA1019: see rewriteHostFromEndpoints note.
+func firstReadyPort(eps corev1.Endpoints) (int32, error) {
+	for _, subset := range eps.Subsets {
+		if len(subset.Addresses) == 0 {
+			continue
+		}
+		for _, p := range subset.Ports {
+			if p.Port > 0 {
+				return p.Port, nil
+			}
+		}
+	}
+	// metal-agent has not registered llama-server yet, or just
+	// respawned and is between unregister + register.
+	return 0, errors.New("no ready address with a port on the Endpoints object")
 }
 
 // buildAuth resolves credentials via the configured AuthFactory or

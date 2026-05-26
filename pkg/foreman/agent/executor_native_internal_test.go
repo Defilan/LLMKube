@@ -23,12 +23,18 @@ package agent
 // failure rather than as a cascading executor flake.
 
 import (
+	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
 // TestBranchNameForTask covers the precedence rule between explicit
@@ -152,4 +158,216 @@ func TestBuildDeterministicArgs(t *testing.T) {
 			t.Errorf("cloneURL: want empty (so tool falls back to CloneURLBase+Repo) got %v", got["cloneURL"])
 		}
 	})
+}
+
+// resolveSchemeForTests builds a runtime scheme with the API types the
+// resolveInferenceBaseURL tests touch. corev1 covers Endpoints,
+// inferencev1alpha1 covers InferenceService, foreman covers the
+// Agent CR field types referenced incidentally.
+func resolveSchemeForTests(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatalf("corev1: %v", err)
+	}
+	if err := inferencev1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("inferencev1alpha1: %v", err)
+	}
+	if err := foremanv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("foreman: %v", err)
+	}
+	return s
+}
+
+// TestResolveInferenceBaseURL pins the precedence rules among the
+// three resolution modes (full override, host override + Endpoints,
+// status.endpoint default) and the error shapes the caller sees when
+// any prerequisite is missing. Regression for #540: the static
+// override locked the port at install time, so every metal-agent
+// respawn broke every subsequent task; the host-override path re-reads
+// the live port from Endpoints on each call.
+func TestResolveInferenceBaseURL(t *testing.T) {
+	// Helpers that build the canned cluster objects each case may want
+	// the fake client seeded with.
+	mkAgent := func(isvcName string) *foremanv1alpha1.Agent {
+		return &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "coder", Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				InferenceServiceRef: foremanv1alpha1Local(isvcName),
+			},
+		}
+	}
+	mkISvc := func(name, endpoint string) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Status:     inferencev1alpha1.InferenceServiceStatus{Endpoint: endpoint},
+		}
+	}
+	//nolint:staticcheck // SA1019: matches production code path.
+	mkEndpoints := func(name string, port int32, withAddress bool) *corev1.Endpoints {
+		eps := &corev1.Endpoints{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Subsets:    []corev1.EndpointSubset{{Ports: []corev1.EndpointPort{{Port: port}}}},
+		}
+		if withAddress {
+			eps.Subsets[0].Addresses = []corev1.EndpointAddress{{IP: "10.42.0.5"}}
+		}
+		return eps
+	}
+
+	cases := []struct {
+		name        string
+		executor    NativeAgentLoopExecutor
+		seedObjects []any
+		want        string
+		wantErrFrag string
+	}{
+		{
+			name: "full override wins over everything else",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLOverride:     "http://stub:7777/v1/",
+				InferenceBaseURLHostOverride: "127.0.0.1", // ignored when full override set
+			},
+			want: "http://stub:7777/v1",
+		},
+		{
+			name:     "default: status.endpoint cluster-DNS form, chat suffix stripped",
+			executor: NativeAgentLoopExecutor{},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+			},
+			want: "http://test-svc.default.svc.cluster.local:80/v1",
+		},
+		{
+			name: "host override rewrites host + uses live port from Endpoints",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: live port flows through after a respawn (different port)",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 49931, true), // metal-agent rolled it to a new port
+			},
+			want: "http://127.0.0.1:49931/v1",
+		},
+		{
+			name: "host override: dotted InferenceService name maps to hyphenated Endpoints",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				// Agent references the dotted name; the operator
+				// sanitizes dots to hyphens when naming the Endpoints
+				// object the metal-agent registers.
+				func() *foremanv1alpha1.Agent { return mkAgent("inf.svc.dotted") }(),
+				mkISvc("inf.svc.dotted", "http://inf-svc-dotted.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("inf-svc-dotted", 60177, true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: missing Endpoints surfaces a clear error (not connect-refused later)",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				// no Endpoints object
+			},
+			wantErrFrag: "get Endpoints",
+		},
+		{
+			name: "host override: Endpoints exists but has no ready address",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, false), // port present, no addresses
+			},
+			wantErrFrag: "no ready address with a port",
+		},
+		{
+			name:        "default: InferenceService not found",
+			executor:    NativeAgentLoopExecutor{},
+			seedObjects: nil,
+			wantErrFrag: "get InferenceService",
+		},
+		{
+			name:     "default: status.endpoint empty (operator has not populated it yet)",
+			executor: NativeAgentLoopExecutor{},
+			seedObjects: []any{
+				mkISvc("test-svc", ""),
+			},
+			wantErrFrag: "empty status.endpoint",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := fake.NewClientBuilder().WithScheme(resolveSchemeForTests(t))
+			// Build the agent for this case: the dotted-name case
+			// supplies its own; everything else uses the standard
+			// "test-svc" agent.
+			var agent *foremanv1alpha1.Agent
+			for _, obj := range tc.seedObjects {
+				switch v := obj.(type) {
+				case *foremanv1alpha1.Agent:
+					agent = v
+					b = b.WithObjects(v)
+				case *inferencev1alpha1.InferenceService:
+					b = b.WithObjects(v)
+				//nolint:staticcheck // SA1019: mirrors the production
+				// resolveInferenceBaseURL path; producer + consumer
+				// migrate from v1 Endpoints to discoveryv1 EndpointSlice
+				// together.
+				case *corev1.Endpoints:
+					b = b.WithObjects(v)
+				default:
+					t.Fatalf("unhandled seed object type %T", obj)
+				}
+			}
+			if agent == nil {
+				agent = mkAgent("test-svc")
+			}
+			e := tc.executor
+			e.Client = b.Build()
+
+			got, err := e.resolveInferenceBaseURL(context.Background(), "default", agent)
+			if tc.wantErrFrag != "" {
+				if err == nil {
+					t.Fatalf("want error containing %q, got nil (result=%q)", tc.wantErrFrag, got)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrFrag) {
+					t.Errorf("error fragment: want %q, got %v", tc.wantErrFrag, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveInferenceBaseURL: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("URL: want %q got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// foremanv1alpha1Local is a tiny test-side helper to avoid importing
+// corev1 directly in the test fixture builder. The Agent CR uses
+// corev1.LocalObjectReference for InferenceServiceRef, which the
+// production code already depends on; this function names the import
+// boundary so the test reads cleanly.
+func foremanv1alpha1Local(name string) corev1.LocalObjectReference {
+	return corev1.LocalObjectReference{Name: name}
 }
