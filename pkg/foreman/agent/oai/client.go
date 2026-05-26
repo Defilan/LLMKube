@@ -55,6 +55,10 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	maxRetries int
+	// authHeader, when non-empty, is sent verbatim on every request as
+	// the Authorization header (typically "Bearer <token>"). Empty
+	// dials without auth (the v0.1 local-llama-server path).
+	authHeader string
 	// backoffs are the inter-attempt delays. Each is wrapped with +/- 20%
 	// jitter so a fleet of agents does not retry in lockstep.
 	backoffs []time.Duration
@@ -76,6 +80,14 @@ func WithBackoffs(b []time.Duration) Option {
 	return func(cl *Client) {
 		cl.backoffs = append([]time.Duration(nil), b...)
 	}
+}
+
+// WithAuthHeader sets the Authorization header value sent on every
+// request. v0.2 uses this for the cloud-proxy provider (e.g.
+// "Bearer sk-..." for a LiteLLM gateway). Empty disables the header,
+// matching the v0.1 local-llama-server path which expects no auth.
+func WithAuthHeader(value string) Option {
+	return func(cl *Client) { cl.authHeader = value }
 }
 
 // New builds a client. baseURL must include the /v1 suffix
@@ -191,6 +203,9 @@ func (c *Client) doOnce(ctx context.Context, req ChatRequest) (*ChatResponse, er
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	if c.authHeader != "" {
+		httpReq.Header.Set("Authorization", c.authHeader)
+	}
 
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
