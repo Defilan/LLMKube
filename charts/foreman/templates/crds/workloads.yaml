@@ -320,6 +320,16 @@ spec:
                 description: FailedTasks counts child tasks in phase Failed.
                 format: int32
                 type: integer
+              incompleteTasks:
+                description: |-
+                  IncompleteTasks counts child tasks that reached Phase=Succeeded
+                  but did not produce a usable artifact (verdict in {INCOMPLETE,
+                  NO-GO, GATE-FAIL, GATE-ERROR}). These are surfaced separately
+                  from FailedTasks so callers can distinguish "the runtime errored"
+                  from "the agent legitimately gave up or the gate Job said the
+                  branch didn't pass the checks."
+                format: int32
+                type: integer
               phase:
                 description: Phase is the lifecycle state.
                 enum:
@@ -335,7 +345,11 @@ spec:
                   for this workload. Set after the planner runs.
                 type: string
               succeededTasks:
-                description: SucceededTasks counts child tasks in phase Succeeded.
+                description: |-
+                  SucceededTasks counts child tasks that reached a positive terminal
+                  outcome (Phase=Succeeded AND verdict in {GO, GATE-PASS}). A child
+                  in Phase=Succeeded with verdict INCOMPLETE / NO-GO / GATE-FAIL /
+                  GATE-ERROR is NOT counted here; it lands in IncompleteTasks.
                 format: int32
                 type: integer
               tasks:

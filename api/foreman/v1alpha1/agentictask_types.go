@@ -201,6 +201,34 @@ const (
 	AgenticTaskVerdictGateError AgenticTaskVerdict = "GATE-ERROR"
 )
 
+// SucceededOnTarget reports whether the task is in a terminal Succeeded
+// phase AND its verdict is a positive outcome that produced usable
+// downstream artifacts (GO for LLM-driven Agents, GATE-PASS for the
+// deterministic gate Agent).
+//
+// This is the correct gate for downstream behavior. A task can end with
+// Phase=Succeeded + Verdict=INCOMPLETE (e.g. MaxTurnsExhausted,
+// LoopContractViolation, AssistantHallucinatedFinish) when the executor
+// reached terminal state cleanly but the agent loop did not produce a
+// usable result. The dependents of such a task must NOT proceed against
+// nonexistent output (a verify task that tries to clone a branch the
+// coder never pushed crashes on GATE-FAIL for the wrong reason), and
+// the Workload status rollup must NOT count it as a win.
+//
+// Fixes defilantech/LLMKube#541: cascadeFailIfDepFailed and the Workload
+// rollup previously gated on Phase alone, leaking INCOMPLETE coder
+// tasks through.
+func (t *AgenticTask) SucceededOnTarget() bool {
+	if t == nil || t.Status.Phase != AgenticTaskPhaseSucceeded {
+		return false
+	}
+	switch t.Status.Verdict {
+	case AgenticTaskVerdictGo, AgenticTaskVerdictGatePass:
+		return true
+	}
+	return false
+}
+
 // AgenticTaskStatus defines the observed state of an AgenticTask.
 type AgenticTaskStatus struct {
 	// Phase is the current lifecycle phase.

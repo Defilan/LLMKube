@@ -166,13 +166,25 @@ type WorkloadStatus struct {
 	// +optional
 	Tasks []corev1.ObjectReference `json:"tasks,omitempty"`
 
-	// SucceededTasks counts child tasks in phase Succeeded.
+	// SucceededTasks counts child tasks that reached a positive terminal
+	// outcome (Phase=Succeeded AND verdict in {GO, GATE-PASS}). A child
+	// in Phase=Succeeded with verdict INCOMPLETE / NO-GO / GATE-FAIL /
+	// GATE-ERROR is NOT counted here; it lands in IncompleteTasks.
 	// +optional
 	SucceededTasks int32 `json:"succeededTasks,omitempty"`
 
 	// FailedTasks counts child tasks in phase Failed.
 	// +optional
 	FailedTasks int32 `json:"failedTasks,omitempty"`
+
+	// IncompleteTasks counts child tasks that reached Phase=Succeeded
+	// but did not produce a usable artifact (verdict in {INCOMPLETE,
+	// NO-GO, GATE-FAIL, GATE-ERROR}). These are surfaced separately
+	// from FailedTasks so callers can distinguish "the runtime errored"
+	// from "the agent legitimately gave up or the gate Job said the
+	// branch didn't pass the checks."
+	// +optional
+	IncompleteTasks int32 `json:"incompleteTasks,omitempty"`
 
 	// PlannerModel records which frontier model the planner actually used
 	// for this workload. Set after the planner runs.
