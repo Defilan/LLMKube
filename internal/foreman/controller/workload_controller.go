@@ -284,45 +284,71 @@ func (r *WorkloadReconciler) listChildren(ctx context.Context, w *foremanv1alpha
 }
 
 // rollup computes the Workload's terminal-or-in-flight state from its
-// children's phases and patches status. Triggered on every child phase
-// change via the Owns() watch.
+// children's phases AND verdicts and patches status. Triggered on every
+// child phase change via the Owns() watch.
+//
+// Counts children in four buckets:
+//   - succeeded: SucceededOnTarget() (Phase=Succeeded AND verdict in
+//     {GO, GATE-PASS}) — produced a usable artifact
+//   - incomplete: Phase=Succeeded but verdict in {INCOMPLETE, NO-GO,
+//     GATE-FAIL, GATE-ERROR} — terminal without usable output
+//   - failed: Phase=Failed
+//   - inFlight: everything else (Pending / Scheduled / Running)
+//
+// Previous rollup counted Phase=Succeeded as a win regardless of
+// verdict, which misreported the Memorial Day v5 batch as "12/12
+// Succeeded" when 2 of those 12 ended INCOMPLETE and 2 ended GATE-FAIL.
+// Fixes defilantech/LLMKube#541.
 func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Workload, children []foremanv1alpha1.AgenticTask) (ctrl.Result, error) {
 	var (
-		succeeded, failed, inFlight int32
+		succeeded, incomplete, failed, inFlight int32
 	)
 	for i := range children {
-		switch children[i].Status.Phase {
-		case foremanv1alpha1.AgenticTaskPhaseSucceeded:
+		switch {
+		case children[i].SucceededOnTarget():
 			succeeded++
-		case foremanv1alpha1.AgenticTaskPhaseFailed:
+		case children[i].Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded:
+			// Terminal Phase=Succeeded but verdict isn't on-target.
+			incomplete++
+		case children[i].Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed:
 			failed++
 		default:
 			inFlight++
 		}
 	}
 
+	total := succeeded + incomplete + failed + inFlight
 	patch := client.MergeFrom(w.DeepCopy())
 	now := metav1.Now()
 	w.Status.SucceededTasks = succeeded
 	w.Status.FailedTasks = failed
+	w.Status.IncompleteTasks = incomplete
 
 	switch {
-	case inFlight == 0 && failed == 0:
+	case inFlight == 0 && failed == 0 && incomplete == 0:
 		w.Status.Phase = foremanv1alpha1.WorkloadPhaseCompleted
 		setCondition(&w.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeCompleted,
 			Status:             metav1.ConditionTrue,
 			Reason:             "AllChildrenSucceeded",
-			Message:            fmt.Sprintf("%d/%d child tasks Succeeded", succeeded, succeeded),
+			Message:            fmt.Sprintf("%d/%d child tasks on-target Succeeded", succeeded, total),
 			LastTransitionTime: now,
 		})
-	case inFlight == 0 && failed > 0:
+	case inFlight == 0 && (failed > 0 || incomplete > 0):
+		// Any incomplete OR failed child rolls the Workload to Failed
+		// terminal state. The condition message breaks out both counts
+		// so the operator can distinguish "agent gave up" (incomplete)
+		// from "executor errored" (failed).
 		w.Status.Phase = foremanv1alpha1.WorkloadPhaseFailed
+		reason := "ChildrenFailed"
+		if failed == 0 {
+			reason = "ChildrenIncomplete"
+		}
 		setCondition(&w.Status.Conditions, metav1.Condition{
 			Type:               conditionTypeCompleted,
 			Status:             metav1.ConditionFalse,
-			Reason:             "ChildrenFailed",
-			Message:            fmt.Sprintf("%d child task(s) Failed", failed),
+			Reason:             reason,
+			Message:            fmt.Sprintf("%d on-target, %d incomplete, %d failed (of %d)", succeeded, incomplete, failed, total),
 			LastTransitionTime: now,
 		})
 	default:
@@ -331,7 +357,7 @@ func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Work
 			Type:               "Dispatched",
 			Status:             metav1.ConditionTrue,
 			Reason:             "ChildrenInFlight",
-			Message:            fmt.Sprintf("%d in-flight, %d Succeeded, %d Failed", inFlight, succeeded, failed),
+			Message:            fmt.Sprintf("%d in-flight, %d on-target, %d incomplete, %d failed", inFlight, succeeded, incomplete, failed),
 			LastTransitionTime: now,
 		})
 	}

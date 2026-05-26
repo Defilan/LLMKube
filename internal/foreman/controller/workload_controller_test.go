@@ -199,12 +199,24 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
 		Expect(err).NotTo(HaveOccurred())
 
-		// Force both children Succeeded via status patch.
-		for _, name := range []string{"rollup-test-code-42", "rollup-test-verify-42"} {
+		// Force both children Succeeded via status patch. As of #541
+		// the rollup distinguishes on-target Succeeded (verdict in
+		// {GO, GATE-PASS}) from terminal-without-output Succeeded;
+		// the coder gets verdict=GO and the verifier verdict=GATE-PASS
+		// so SucceededOnTarget() returns true for both.
+		on := []struct {
+			name    string
+			verdict foremanv1alpha1.AgenticTaskVerdict
+		}{
+			{"rollup-test-code-42", foremanv1alpha1.AgenticTaskVerdictGo},
+			{"rollup-test-verify-42", foremanv1alpha1.AgenticTaskVerdictGatePass},
+		}
+		for _, e := range on {
 			var t foremanv1alpha1.AgenticTask
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: name}, &t)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: e.name}, &t)).To(Succeed())
 			patch := client.MergeFrom(t.DeepCopy())
 			t.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+			t.Status.Verdict = e.verdict
 			Expect(k8sClient.Status().Patch(ctx, &t, patch)).To(Succeed())
 		}
 
@@ -239,19 +251,22 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
 		Expect(err).NotTo(HaveOccurred())
 
-		// One child Succeeded, the other Failed -> terminal Failed rollup.
+		// One child on-target Succeeded (GO), the other Failed.
+		// Terminal Failed rollup.
 		updates := []struct {
-			name  string
-			phase foremanv1alpha1.AgenticTaskPhase
+			name    string
+			phase   foremanv1alpha1.AgenticTaskPhase
+			verdict foremanv1alpha1.AgenticTaskVerdict
 		}{
-			{"rollup-fail-code-99", foremanv1alpha1.AgenticTaskPhaseSucceeded},
-			{"rollup-fail-verify-99", foremanv1alpha1.AgenticTaskPhaseFailed},
+			{"rollup-fail-code-99", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictGo},
+			{"rollup-fail-verify-99", foremanv1alpha1.AgenticTaskPhaseFailed, ""},
 		}
 		for _, u := range updates {
 			var t foremanv1alpha1.AgenticTask
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: u.name}, &t)).To(Succeed())
 			patch := client.MergeFrom(t.DeepCopy())
 			t.Status.Phase = u.phase
+			t.Status.Verdict = u.verdict
 			Expect(k8sClient.Status().Patch(ctx, &t, patch)).To(Succeed())
 		}
 
@@ -266,6 +281,68 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		completed := findCondition(fresh.Status.Conditions, conditionTypeCompleted)
 		Expect(completed).NotTo(BeNil())
 		Expect(completed.Reason).To(Equal("ChildrenFailed"))
+	})
+
+	// Regression for defilantech/LLMKube#541. Phase=Succeeded with a
+	// non-positive verdict (INCOMPLETE, NO-GO, GATE-FAIL, GATE-ERROR)
+	// must NOT count as a win in the rollup. The Memorial Day v5 batch
+	// reported "12/12 child tasks Succeeded" + Phase=Completed when
+	// 2 children were INCOMPLETE and 2 were GATE-FAIL; the new
+	// IncompleteTasks counter + Failed-on-incomplete phase logic
+	// makes that report honest.
+	It("rolls up Phase=Succeeded + verdict=INCOMPLETE into incompleteTasks and Failed phase (#541)", func() {
+		wl := newWorkload("rollup-incomplete", foremanv1alpha1.WorkloadSpec{
+			Intent:           "rollup-incomplete",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{1234},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Coder Succeeded but INCOMPLETE (MaxTurnsExhausted shape);
+		// verifier Succeeded with GATE-FAIL (it ran but the gate's
+		// `make` checks did not pass — also a terminal-without-output).
+		updates := []struct {
+			name    string
+			phase   foremanv1alpha1.AgenticTaskPhase
+			verdict foremanv1alpha1.AgenticTaskVerdict
+		}{
+			{"rollup-incomplete-code-1234", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictIncomplete},
+			{"rollup-incomplete-verify-1234", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictGateFail},
+		}
+		for _, u := range updates {
+			var t foremanv1alpha1.AgenticTask
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: u.name}, &t)).To(Succeed())
+			patch := client.MergeFrom(t.DeepCopy())
+			t.Status.Phase = u.phase
+			t.Status.Verdict = u.verdict
+			Expect(k8sClient.Status().Patch(ctx, &t, patch)).To(Succeed())
+		}
+
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		// Previously: Phase=Completed, SucceededTasks=2, FailedTasks=0.
+		// Now: Phase=Failed, SucceededTasks=0, FailedTasks=0,
+		//      IncompleteTasks=2, reason=ChildrenIncomplete.
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.WorkloadPhaseFailed),
+			"workload with all-incomplete children must NOT roll to Completed")
+		Expect(fresh.Status.SucceededTasks).To(Equal(int32(0)))
+		Expect(fresh.Status.FailedTasks).To(Equal(int32(0)))
+		Expect(fresh.Status.IncompleteTasks).To(Equal(int32(2)))
+		completed := findCondition(fresh.Status.Conditions, conditionTypeCompleted)
+		Expect(completed).NotTo(BeNil())
+		Expect(completed.Reason).To(Equal("ChildrenIncomplete"))
 	})
 })
 
