@@ -52,6 +52,16 @@ rules:
     resources: ["endpoints"]
     verbs: ["get", "list", "watch"]
 
+  # When an Agent's spec.provider is "cloud-proxy" (v0.2 Day 4), the
+  # native executor reads providerConfig.apiKeySecretRef and dispatches
+  # to the upstream HTTP endpoint with a Bearer token from the named
+  # Secret. Scope is intentionally just `get`: the executor never
+  # lists or watches Secrets, only reads the specific ones the
+  # referenced Agents point at.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+
   # Native executor writes the per-task transcript ConfigMap, owner-
   # ref'd to the AgenticTask.
   - apiGroups: [""]

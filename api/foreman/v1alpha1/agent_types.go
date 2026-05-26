@@ -45,6 +45,62 @@ const (
 	AgentRolePlanner AgentRole = "planner"
 )
 
+// AgentProvider names the model-serving backend the executor dispatches
+// to. v0.2 introduces this enum so reviewer Agents can route to an
+// OpenAI-compatible cloud proxy (typically a LiteLLM gateway hitting
+// Anthropic / OpenAI / Bedrock) without changing the agent loop. The
+// default "local" preserves the v0.1 behavior of resolving an
+// in-cluster InferenceService.
+//
+// Air-gapped orgs MUST keep cloud-proxy Agents out of dispatch; both
+// the operator-level kill switch (--allow-cloud-providers flag, chart
+// value foreman.allowCloudProviders) and the per-Workload opt-in
+// (Workload.spec.allowCloudReviewers) gate this.
+// +kubebuilder:validation:Enum=local;cloud-proxy
+type AgentProvider string
+
+const (
+	// AgentProviderLocal (default) dispatches via the Agent's
+	// InferenceServiceRef. The v0.1 path; nothing leaves the cluster.
+	AgentProviderLocal AgentProvider = "local"
+	// AgentProviderCloudProxy dispatches via providerConfig.baseURL to
+	// an OpenAI-compatible HTTP endpoint. The endpoint is typically a
+	// LiteLLM proxy (e.g. foundation-router:4000) that translates to
+	// Anthropic / OpenAI / Bedrock. Data leaves the cluster on every
+	// call; subject to the operator + workload sovereignty toggles.
+	AgentProviderCloudProxy AgentProvider = "cloud-proxy"
+)
+
+// ProviderConfig configures a non-local AgentProvider. Required when
+// AgentSpec.Provider is "cloud-proxy"; ignored when Provider is "local"
+// or unset.
+type ProviderConfig struct {
+	// BaseURL is the OpenAI-compatible HTTP endpoint the executor
+	// dispatches chat-completions requests to. The /chat/completions
+	// path is appended; supply the /v1 prefix (e.g.
+	// "http://foundation-router.lan:4000/v1"). Required for
+	// cloud-proxy.
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	BaseURL string `json:"baseURL,omitempty"`
+
+	// Model is the identifier the proxy expects in the request body
+	// (e.g. "claude-sonnet-4-6", "gpt-4o", "anthropic/claude-sonnet-4-6"
+	// when LiteLLM is in front). Required for cloud-proxy; overrides
+	// AgentSpec.Model on the wire while AgentSpec.Model remains the
+	// human-readable handle.
+	// +kubebuilder:validation:MinLength=1
+	// +optional
+	Model string `json:"model,omitempty"`
+
+	// APIKeySecretRef references a Secret carrying the bearer token
+	// the executor sends as the Authorization header. Optional: when
+	// nil, the proxy is dialed without auth (LAN-only LiteLLM behind
+	// a network policy is a common case).
+	// +optional
+	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
+}
+
 // AgentSpec is the reusable role definition referenced by AgenticTasks
 // via spec.agentRef. An Agent bundles the system prompt, tool whitelist,
 // model endpoint, and required host capability for one pipeline step.
@@ -55,6 +111,21 @@ type AgentSpec struct {
 	// the scheduler does not branch on it in v0.1.
 	// +kubebuilder:validation:Required
 	Role AgentRole `json:"role"`
+
+	// Provider selects the model-serving backend. Default "local" keeps
+	// the v0.1 behavior (resolve InferenceServiceRef). v0.2 adds
+	// "cloud-proxy" for OpenAI-compatible HTTP endpoints (typically a
+	// LiteLLM gateway); see ProviderConfig. Cloud-proxy Agents are
+	// subject to the foreman-operator's --allow-cloud-providers kill
+	// switch and to per-Workload spec.allowCloudReviewers gating.
+	// +kubebuilder:default=local
+	// +optional
+	Provider AgentProvider `json:"provider,omitempty"`
+
+	// ProviderConfig configures non-local providers. Required when
+	// Provider is "cloud-proxy"; ignored for "local".
+	// +optional
+	ProviderConfig *ProviderConfig `json:"providerConfig,omitempty"`
 
 	// Model is a free-form identifier for the model this Agent expects
 	// the referenced InferenceService to serve. Cosmetic in v0.1 (the

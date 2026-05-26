@@ -119,16 +119,42 @@ type WorkloadSpec struct {
 	// Aggregation: any reviewer emitting verdict=NO-GO leaves that task
 	// Phase=Succeeded but not "succeeded on target," so the Workload
 	// rollup from #548 marks it under IncompleteTasks and the Workload
-	// reaches Phase=Failed with reason ChildrenIncomplete. Day 4
-	// extends this with a hybrid cloud reviewer Agent that the rollup
-	// can escalate to when the local fleet says NO-GO.
+	// reaches Phase=Failed with reason ChildrenIncomplete.
+	//
+	// v0.2 (Day 4): entries whose Agent has spec.provider="cloud-proxy"
+	// are gated by AllowCloudReviewers (below) and by the operator-
+	// level --allow-cloud-providers kill switch. When either gate
+	// blocks, the WorkloadReconciler omits the cloud reviewer's task
+	// and surfaces a CloudReviewersSuppressed condition naming the
+	// skipped Agents; local reviewers in the same list still run.
 	//
 	// Leave empty to keep the v0.1 two-step (code + verify) pipeline.
 	// Multi-strategy reviewing (validator / falsification / thinking-
-	// mode) is achieved by listing three Agent CRs with different
-	// system prompts and (optionally) the same underlying model.
+	// mode + optionally a cloud frontier reviewer) is achieved by
+	// listing multiple Agent CRs with different system prompts and
+	// providers.
 	// +optional
 	ReviewerAgentRefs []corev1.LocalObjectReference `json:"reviewerAgentRefs,omitempty"`
+
+	// AllowCloudReviewers gates whether reviewer Agents whose
+	// spec.provider is "cloud-proxy" (or any non-"local" value) may be
+	// dispatched for this Workload. Three-valued via the *bool:
+	//
+	//   - nil (unset): treated as true; cloud reviewers run as long as
+	//     the operator-level kill switch also allows.
+	//   - *true: cloud reviewers run (subject to the operator gate).
+	//   - *false: cloud reviewers are suppressed for this Workload,
+	//     even if the operator allows them. The WorkloadReconciler
+	//     omits the cloud reviewer's task and records a
+	//     CloudReviewersSuppressed condition. Local reviewers and
+	//     coder/verifier tasks are unaffected.
+	//
+	// The independent operator-level kill switch
+	// (--allow-cloud-providers) is the cluster-wide hard stop for
+	// air-gapped or compliance-restricted environments. Both gates
+	// must allow for a cloud reviewer to dispatch.
+	// +optional
+	AllowCloudReviewers *bool `json:"allowCloudReviewers,omitempty"`
 }
 
 // PipelineStep is one step in an explicit Workload pipeline. Each step

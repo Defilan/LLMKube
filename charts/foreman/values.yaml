@@ -19,6 +19,21 @@ namespace: ""
 # Deployments when set.
 imagePullSecrets: []
 
+# Foreman-wide policy knobs that span operator + agent. Add new
+# settings here when they are not naturally scoped to one component.
+foreman:
+  # allowCloudProviders is the cluster-wide sovereignty kill switch
+  # for cloud-proxy reviewer Agents (v0.2 Day 4).
+  #
+  # When true (default), reviewer Agents whose spec.provider is
+  # "cloud-proxy" may dispatch, subject to per-Workload
+  # spec.allowCloudReviewers gating. When false, the
+  # WorkloadReconciler drops every step whose Agent.spec.provider is
+  # non-local and surfaces a CloudReviewersSuppressed condition on
+  # the Workload. Air-gapped and compliance-restricted clusters
+  # should set this false.
+  allowCloudProviders: true
+
 operator:
   enabled: true
   replicaCount: 1

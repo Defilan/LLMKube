@@ -158,15 +158,23 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		return nil, fmt.Errorf("resolve agent: %w", err)
 	}
 
-	// 2. Resolve the inference base URL -- but only when the Agent has
-	// an InferenceServiceRef. Deterministic Agents (M4 gate Agent: no
-	// LLM, just tool dispatch) leave InferenceServiceRef empty; their
-	// path runs every step from 3 onward except the loop.
-	deterministic := agent.Spec.InferenceServiceRef.Name == ""
-	var baseURL string
+	// 2. Resolve the model-serving endpoint. Three branches:
+	//
+	//   - Deterministic Agent (gate role, M4): no LLM at all. Empty
+	//     InferenceServiceRef AND provider unset / "local". The
+	//     executor runs the agent's first non-terminal tool directly
+	//     and skips the model loop entirely.
+	//   - Cloud-proxy Agent (v0.2 Day 4): provider="cloud-proxy",
+	//     dispatch via providerConfig.BaseURL + auth header from the
+	//     referenced Secret. No InferenceService lookup.
+	//   - Local Agent (default): resolveInferenceBaseURL reads
+	//     InferenceService.status.endpoint and optionally rewrites the
+	//     host (per #540).
+	deterministic := isDeterministicAgent(&agent)
+	var endpoint providerEndpoint
 	if !deterministic {
 		var err error
-		baseURL, err = e.resolveInferenceBaseURL(ctx, task.Namespace, &agent)
+		endpoint, err = e.resolveProviderEndpoint(ctx, task.Namespace, &agent)
 		if err != nil {
 			return e.failResult(start, "InferenceServiceUnavailable", err.Error()), nil
 		}
@@ -240,30 +248,38 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 	// 6+. LLM-driven path: extracted to keep Execute below the
 	// cyclomatic-complexity threshold. runLLMPath owns OAI + loop +
 	// transcript + commit/push.
-	return e.runLLMPath(ctx, task, &agent, baseURL, workspace, branch, registry, auth, start)
+	return e.runLLMPath(ctx, task, &agent, endpoint, workspace, branch, registry, auth, start)
 }
 
 // runLLMPath is the model-in-the-loop continuation of Execute. Called
-// only when the Agent has a non-empty InferenceServiceRef. The split
-// from Execute is purely about cyclomatic complexity, not separation
-// of concerns: nothing here should be reachable from the deterministic
-// branch.
+// only when the Agent runs a model loop (any non-deterministic Agent,
+// local or cloud-proxy). The split from Execute is purely about
+// cyclomatic complexity, not separation of concerns: nothing here
+// should be reachable from the deterministic branch.
 func (e *NativeAgentLoopExecutor) runLLMPath(
 	ctx context.Context,
 	task *foremanv1alpha1.AgenticTask,
 	agent *foremanv1alpha1.Agent,
-	baseURL, workspace, branch string,
+	endpoint providerEndpoint,
+	workspace, branch string,
 	registry ToolRegistry,
 	auth *repo.Auth,
 	start time.Time,
 ) (*Result, error) {
 	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
 
-	// 6. Build OAI client + loop.
+	// 6. Build OAI client + loop. The auth header is empty for local
+	// providers and "Bearer <token>" for cloud-proxy Agents whose
+	// providerConfig carries an APIKeySecretRef.
+	oaiOpts := []oai.Option{}
+	if endpoint.authHeader != "" {
+		oaiOpts = append(oaiOpts, oai.WithAuthHeader(endpoint.authHeader))
+	}
 	oaiClient := oai.New(
-		baseURL,
+		endpoint.baseURL,
 		durationFromSeconds(agent.Spec.RequestTimeoutSeconds, 600),
 		int(agent.Spec.MaxRetries),
+		oaiOpts...,
 	)
 	loopFactory := e.LoopFactory
 	if loopFactory == nil {
@@ -275,7 +291,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	userPrompt := buildUserPrompt(task)
 
 	cfg := LoopConfig{
-		Model:        agent.Spec.Model,
+		Model:        endpoint.modelName,
 		SystemPrompt: agent.Spec.SystemPrompt,
 		UserPrompt:   userPrompt,
 		Temperature:  parseTemperature(agent.Spec.Temperature),
@@ -477,6 +493,103 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 	}
 	out, _ := json.Marshal(args)
 	return out
+}
+
+// providerEndpoint is the resolved triple the LLM path needs to dial
+// any provider: where to POST, which model to name in the request body,
+// and the optional Authorization header value. The cloud-proxy branch
+// populates all three from Agent.spec.providerConfig + a referenced
+// Secret; the local branch leaves authHeader empty and pulls modelName
+// from Agent.spec.Model.
+type providerEndpoint struct {
+	baseURL    string
+	modelName  string
+	authHeader string
+}
+
+// isDeterministicAgent reports whether the Agent runs the model-free
+// branch. Deterministic = no LLM at all, only direct tool dispatch
+// (the M4 gate Agent shape). A cloud-proxy Agent is NEVER
+// deterministic; it always runs the LLM loop against its remote
+// endpoint.
+func isDeterministicAgent(agent *foremanv1alpha1.Agent) bool {
+	if agent.Spec.Provider != "" && agent.Spec.Provider != foremanv1alpha1.AgentProviderLocal {
+		return false
+	}
+	return agent.Spec.InferenceServiceRef.Name == ""
+}
+
+// resolveProviderEndpoint dispatches to the right resolver based on
+// Agent.spec.Provider. Empty / "local" -> existing InferenceService
+// resolution; "cloud-proxy" -> providerConfig.BaseURL + Secret lookup
+// for the auth header.
+func (e *NativeAgentLoopExecutor) resolveProviderEndpoint(
+	ctx context.Context, namespace string, agent *foremanv1alpha1.Agent,
+) (providerEndpoint, error) {
+	switch agent.Spec.Provider {
+	case "", foremanv1alpha1.AgentProviderLocal:
+		baseURL, err := e.resolveInferenceBaseURL(ctx, namespace, agent)
+		if err != nil {
+			return providerEndpoint{}, err
+		}
+		return providerEndpoint{baseURL: baseURL, modelName: agent.Spec.Model}, nil
+
+	case foremanv1alpha1.AgentProviderCloudProxy:
+		return e.resolveCloudProxyEndpoint(ctx, namespace, agent)
+
+	default:
+		return providerEndpoint{}, fmt.Errorf("unknown agent.spec.provider %q", agent.Spec.Provider)
+	}
+}
+
+// resolveCloudProxyEndpoint reads providerConfig + the optional
+// APIKeySecretRef to build the endpoint triple. baseURL and model are
+// required; the Secret is optional (LAN-only LiteLLM gateways behind a
+// NetworkPolicy can run without auth).
+func (e *NativeAgentLoopExecutor) resolveCloudProxyEndpoint(
+	ctx context.Context, namespace string, agent *foremanv1alpha1.Agent,
+) (providerEndpoint, error) {
+	cfg := agent.Spec.ProviderConfig
+	if cfg == nil {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig is required for provider=cloud-proxy")
+	}
+	if cfg.BaseURL == "" {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig.baseURL is required for provider=cloud-proxy")
+	}
+	if cfg.Model == "" {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig.model is required for provider=cloud-proxy")
+	}
+	ep := providerEndpoint{
+		baseURL:   strings.TrimRight(cfg.BaseURL, "/"),
+		modelName: cfg.Model,
+	}
+	if cfg.APIKeySecretRef != nil {
+		token, err := e.resolveAuthToken(ctx, namespace, cfg.APIKeySecretRef)
+		if err != nil {
+			return providerEndpoint{}, err
+		}
+		ep.authHeader = "Bearer " + token
+	}
+	return ep, nil
+}
+
+// resolveAuthToken reads the named Secret + key from the Agent's
+// namespace. Empty values are rejected so a misconfigured Secret
+// surfaces as a clean executor error rather than a 401 from the
+// upstream proxy after the loop has already burned a turn.
+func (e *NativeAgentLoopExecutor) resolveAuthToken(
+	ctx context.Context, namespace string, ref *corev1.SecretKeySelector,
+) (string, error) {
+	var secret corev1.Secret
+	key := types.NamespacedName{Name: ref.Name, Namespace: namespace}
+	if err := e.Client.Get(ctx, key, &secret); err != nil {
+		return "", fmt.Errorf("get Secret %s for provider auth: %w", key, err)
+	}
+	b, ok := secret.Data[ref.Key]
+	if !ok || len(b) == 0 {
+		return "", fmt.Errorf("Secret %s has no value for key %q", key, ref.Key)
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 // resolveInferenceBaseURL turns Agent.spec.inferenceServiceRef into a

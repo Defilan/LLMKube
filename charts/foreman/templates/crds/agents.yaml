@@ -125,6 +125,71 @@ spec:
                   to validate the InferenceService is actually serving the expected
                   model before the agent loop dispatches.
                 type: string
+              provider:
+                default: local
+                description: |-
+                  Provider selects the model-serving backend. Default "local" keeps
+                  the v0.1 behavior (resolve InferenceServiceRef). v0.2 adds
+                  "cloud-proxy" for OpenAI-compatible HTTP endpoints (typically a
+                  LiteLLM gateway); see ProviderConfig. Cloud-proxy Agents are
+                  subject to the foreman-operator's --allow-cloud-providers kill
+                  switch and to per-Workload spec.allowCloudReviewers gating.
+                enum:
+                - local
+                - cloud-proxy
+                type: string
+              providerConfig:
+                description: |-
+                  ProviderConfig configures non-local providers. Required when
+                  Provider is "cloud-proxy"; ignored for "local".
+                properties:
+                  apiKeySecretRef:
+                    description: |-
+                      APIKeySecretRef references a Secret carrying the bearer token
+                      the executor sends as the Authorization header. Optional: when
+                      nil, the proxy is dialed without auth (LAN-only LiteLLM behind
+                      a network policy is a common case).
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  baseURL:
+                    description: |-
+                      BaseURL is the OpenAI-compatible HTTP endpoint the executor
+                      dispatches chat-completions requests to. The /chat/completions
+                      path is appended; supply the /v1 prefix (e.g.
+                      "http://foundation-router.lan:4000/v1"). Required for
+                      cloud-proxy.
+                    minLength: 1
+                    type: string
+                  model:
+                    description: |-
+                      Model is the identifier the proxy expects in the request body
+                      (e.g. "claude-sonnet-4-6", "gpt-4o", "anthropic/claude-sonnet-4-6"
+                      when LiteLLM is in front). Required for cloud-proxy; overrides
+                      AgentSpec.Model on the wire while AgentSpec.Model remains the
+                      human-readable handle.
+                    minLength: 1
+                    type: string
+                type: object
               requestTimeoutSeconds:
                 default: 600
                 description: |-

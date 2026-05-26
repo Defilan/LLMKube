@@ -55,6 +55,7 @@ func main() {
 	var metricsAddr string
 	var probeAddr string
 	var enableLeaderElection bool
+	var allowCloudProviders bool
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081",
 		"The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8082",
@@ -62,6 +63,13 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&allowCloudProviders, "allow-cloud-providers", true,
+		"Cluster-wide sovereignty kill switch for cloud-proxy reviewer Agents. "+
+			"True (default) lets reviewer Agents whose spec.provider is non-local "+
+			"dispatch (subject to per-Workload spec.allowCloudReviewers). False "+
+			"causes the WorkloadReconciler to drop any step whose Agent has a "+
+			"non-local provider and surface a CloudReviewersSuppressed condition. "+
+			"Set false for air-gapped or compliance-restricted clusters.")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -81,8 +89,9 @@ func main() {
 	}
 
 	if err := (&foremancontroller.WorkloadReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		AllowCloudProviders: allowCloudProviders,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Workload")
 		os.Exit(1)

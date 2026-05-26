@@ -1,0 +1,132 @@
+# Foreman v0.2 cloud-proxy reviewer Agent.
+#
+# Dispatches reviews to an OpenAI-compatible HTTP endpoint instead of
+# an in-cluster InferenceService. The default config points at the
+# LAN LiteLLM gateway at foundation-router.lan:4000, which routes
+# claude-sonnet-4-6 to Anthropic; swap baseURL + model for any OAI-
+# compatible proxy (OpenRouter, Helicone, a private LiteLLM instance,
+# Azure OpenAI Service via LiteLLM, AWS Bedrock via LiteLLM, etc).
+#
+# Sovereignty
+# -----------
+# Cloud-proxy Agents are subject to TWO independent gates:
+#
+#   1. operator --allow-cloud-providers (chart value
+#      foreman.allowCloudProviders). Cluster-wide kill switch; set
+#      false on air-gapped or compliance-restricted clusters and no
+#      Workload can dispatch a cloud-provider Agent regardless of its
+#      own opt-in.
+#   2. Workload.spec.allowCloudReviewers. Per-Workload opt-in
+#      (default true via nil). Sensitive batches set explicit false
+#      to suppress cloud reviewers for that Workload only.
+#
+# When either gate blocks, the WorkloadReconciler omits this Agent's
+# task and writes a CloudReviewersSuppressed condition naming which
+# gate blocked.
+#
+# The API key Secret
+# ------------------
+# Create the referenced Secret in the same namespace as the Workload:
+#
+#   kubectl create secret generic litellm-master-key \
+#     --from-literal=token="<your LiteLLM master key>" \
+#     -n default
+#
+# The foreman-agent's ClusterRole has scoped `get` on Secrets so only
+# the specifically-referenced Secret is readable.
+apiVersion: foreman.llmkube.dev/v1alpha1
+kind: Agent
+metadata:
+  name: claude-sonnet-cloud-reviewer
+  namespace: default
+  labels:
+    app.kubernetes.io/part-of: foreman
+    foreman.llmkube.dev/role: reviewer
+    foreman.llmkube.dev/provider: cloud-proxy
+spec:
+  role: reviewer
+  # Provider selects the cloud-proxy executor branch. Without this
+  # field set, the executor would look up an InferenceService and
+  # fail because none is referenced.
+  provider: cloud-proxy
+  providerConfig:
+    # LiteLLM gateway on the LAN; replace with your proxy URL. Must
+    # include the /v1 suffix; the OAI client appends /chat/completions.
+    baseURL: http://foundation-router.lan:4000/v1
+    # LiteLLM resolves the model identifier to its configured provider
+    # (Anthropic / OpenAI / Bedrock). The exact value depends on how
+    # the proxy is configured; ask the proxy operator for the model
+    # name they registered.
+    model: claude-sonnet-4-6
+    # Optional. Comment out when the proxy is LAN-only behind a
+    # NetworkPolicy and doesn't require auth.
+    apiKeySecretRef:
+      name: litellm-master-key
+      key: token
+
+  # AgentSpec.Model is the human-readable handle for kubectl / metrics
+  # / observability. The wire model name comes from providerConfig.Model
+  # so we can name the same Anthropic model differently in dashboards
+  # vs the API request body if we want to.
+  model: claude-sonnet-4-6-cloud
+
+  temperature: "0.2"
+  maxTurns: 30
+  maxRetries: 2
+  # Cloud-proxy reviewers should be fast; if the proxy is slow we
+  # want to know quickly. The upstream model itself may take longer
+  # to think; this bounds the time we wait for the HEADER of the
+  # streaming response, not the total body duration. Total is
+  # bounded by the Agent's MaxTurns + the AgenticTask's TimeoutSeconds.
+  requestTimeoutSeconds: 300
+  bashTimeoutSeconds: 60
+
+  tools:
+    - read_file
+    - grep
+    - bash
+    - submit_result
+
+  # Cloud reviewers do not need a FleetNode capability match because
+  # they have no model on the host; any verifier-role FleetNode (or
+  # the dedicated reviewer-role node) can dispatch them. The empty
+  # requiredCapability section means "any Ready FleetNode whose roles
+  # include reviewer."
+  requiredCapability:
+    roles:
+      - reviewer
+
+  systemPrompt: |-
+    You review one LLMKube branch per run. You are the cloud reviewer,
+    called as the second opinion when the local reviewer ensemble
+    disagrees or as a baseline when the workload opts into multi-
+    strategy review. Be thorough, be precise, be conservative on
+    APPROVE.
+
+    Your task payload carries `repo`, `issue`, `branch`. Step 1
+    (mandatory) is to navigate to the branch:
+
+      bash("git fetch origin {branch}:refs/remotes/origin/{branch} \
+            && git checkout origin/{branch}")
+
+    Then read the issue body via `gh issue view`, the commit message
+    via `git log -1 HEAD`, the diff via `git diff main...HEAD`, and
+    the touched files via `read_file`.
+
+    Verdict mapping:
+      - GO     = APPROVE
+      - NO-GO  = REQUEST-CHANGES (at least one substantive concern)
+      - ERROR  = could-not-review
+
+    When in doubt between APPROVE and REQUEST-CHANGES, choose
+    REQUEST-CHANGES. Your role is to catch what the local fleet
+    missed; rubber-stamping defeats the purpose of escalation.
+
+    Required extra fields on submit_result:
+      - reviewOutcome :: APPROVE | REQUEST-CHANGES | REJECT
+      - findings      :: [{severity, area, message}]
+      - issueAsk      :: verbatim quote (<=200 chars) from issue body
+      - filesTouched  :: paths from git diff --stat
+
+    Do NOT call write_file, str_replace, git commit, git push, or any
+    branch-mutating command. You are reading only.

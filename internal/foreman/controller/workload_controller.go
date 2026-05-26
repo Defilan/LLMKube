@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -53,6 +54,16 @@ import (
 type WorkloadReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// AllowCloudProviders is the operator-level sovereignty kill
+	// switch. True (default) lets reviewer Agents with
+	// spec.provider="cloud-proxy" dispatch (subject to per-Workload
+	// AllowCloudReviewers gating). False makes the reconciler drop
+	// any step whose Agent has a non-local provider and surface a
+	// CloudReviewersSuppressed condition naming the dropped Agents.
+	// Wired from the --allow-cloud-providers flag on foreman-operator
+	// (charts/foreman value foreman.allowCloudProviders).
+	AllowCloudProviders bool
 }
 
 // labelWorkload is the label the reconciler stamps on rendered AgenticTasks
@@ -77,10 +88,18 @@ const conditionTypeTruncated = "Truncated"
 // a terminal way.
 const conditionTypeCompleted = "Completed"
 
+// conditionTypeCloudReviewersSuppressed is True when the sovereignty
+// gates (operator --allow-cloud-providers + Workload AllowCloudReviewers)
+// caused the reconciler to omit one or more reviewer Agents from the
+// rendered set. The message names the suppressed Agents and which gate
+// blocked each.
+const conditionTypeCloudReviewersSuppressed = "CloudReviewersSuppressed"
+
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=workloads,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=workloads/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=workloads/finalizers,verbs=update
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=agentictasks,verbs=create;get;list;watch
+// +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=agents,verbs=get;list;watch
 
 // Reconcile drives a Workload through Planning -> Planned -> Dispatched ->
 // Completed | Failed.
@@ -111,6 +130,17 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.failWorkload(ctx, &workload, "NoPlannerOrPipeline", modeErr.Error())
 	}
 
+	// Sovereignty filter (#540's sibling, Day 4): when either the
+	// operator kill switch or the per-Workload gate blocks cloud
+	// providers, drop the steps whose Agent.spec.Provider is non-
+	// local. Cloud-blocked steps are returned in `suppressed` so the
+	// CloudReviewersSuppressed condition can name them.
+	steps, suppressed, filterErr := r.filterCloudProviders(ctx, &workload, steps)
+	if filterErr != nil {
+		log.Info("cloud-provider filter failed", "reason", filterErr.Error())
+		return r.failWorkload(ctx, &workload, "AgentResolveFailed", filterErr.Error())
+	}
+
 	if err := r.markPlanning(ctx, &workload); err != nil {
 		return ctrl.Result{}, fmt.Errorf("mark planning: %w", err)
 	}
@@ -123,7 +153,64 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		log.Error(err, "rendering AgenticTasks failed mid-way", "createdSoFar", len(created))
 	}
 
-	return r.markPlanned(ctx, &workload, created, truncated, err)
+	return r.markPlanned(ctx, &workload, created, truncated, suppressed, err)
+}
+
+// filterCloudProviders drops PipelineSteps whose referenced Agent has a
+// non-local provider when either sovereignty gate is closed. Returns
+// the filtered steps, a list of skip messages (one per dropped step,
+// shaped "<agent> (<reason>)"), and a hard error only when an Agent
+// the steps reference can't be resolved.
+//
+// Fast path: when both gates are open, returns the input slice
+// unmodified and skips Agent API lookups entirely.
+func (r *WorkloadReconciler) filterCloudProviders(
+	ctx context.Context, w *foremanv1alpha1.Workload, steps []foremanv1alpha1.PipelineStep,
+) ([]foremanv1alpha1.PipelineStep, []string, error) {
+	operatorAllows := r.AllowCloudProviders
+	workloadAllows := w.Spec.AllowCloudReviewers == nil || *w.Spec.AllowCloudReviewers
+	if operatorAllows && workloadAllows {
+		return steps, nil, nil
+	}
+
+	kept := make([]foremanv1alpha1.PipelineStep, 0, len(steps))
+	var suppressed []string
+	for _, step := range steps {
+		// Only inspect reviewer steps. Coder + verifier are local by
+		// definition in v0.2; if a future deployment wants a cloud-
+		// proxy coder, this gate widens uniformly. The tighter scope
+		// also keeps the filter's API calls bounded (one Get per
+		// reviewer Agent, not per task) and avoids fetching the same
+		// coder/gate Agent N times per batch.
+		if step.Kind != foremanv1alpha1.AgenticTaskKindReview {
+			kept = append(kept, step)
+			continue
+		}
+		var agent foremanv1alpha1.Agent
+		key := types.NamespacedName{Name: step.AgentRef.Name, Namespace: w.Namespace}
+		if err := r.Get(ctx, key, &agent); err != nil {
+			return nil, nil, fmt.Errorf("get agent %s: %w", key, err)
+		}
+		if agent.Spec.Provider == "" || agent.Spec.Provider == foremanv1alpha1.AgentProviderLocal {
+			kept = append(kept, step)
+			continue
+		}
+		// Non-local provider; at least one gate is closed so we must
+		// decide which one to name in the suppression message.
+		switch {
+		case !operatorAllows:
+			suppressed = append(suppressed, fmt.Sprintf(
+				"%s (provider=%s; operator --allow-cloud-providers=false)",
+				agent.Name, agent.Spec.Provider,
+			))
+		case !workloadAllows:
+			suppressed = append(suppressed, fmt.Sprintf(
+				"%s (provider=%s; workload spec.allowCloudReviewers=false)",
+				agent.Name, agent.Spec.Provider,
+			))
+		}
+	}
+	return kept, suppressed, nil
 }
 
 // chooseSteps returns the rendered PipelineStep slice the reconciler will
@@ -408,11 +495,19 @@ func (r *WorkloadReconciler) markPlanning(ctx context.Context, w *foremanv1alpha
 }
 
 // markPlanned writes the post-render status: tasks list, Planned condition,
-// optional Truncated condition. If renderErr is non-nil we leave Phase at
-// Planning and surface the failure as a condition; the next reconcile
-// retries because chooseSteps is deterministic and Create with
-// IsAlreadyExists is idempotent.
-func (r *WorkloadReconciler) markPlanned(ctx context.Context, w *foremanv1alpha1.Workload, created []corev1.ObjectReference, truncated bool, renderErr error) (ctrl.Result, error) {
+// optional Truncated condition, optional CloudReviewersSuppressed
+// condition. If renderErr is non-nil we leave Phase at Planning and
+// surface the failure as a condition; the next reconcile retries because
+// chooseSteps is deterministic and Create with IsAlreadyExists is
+// idempotent.
+func (r *WorkloadReconciler) markPlanned(
+	ctx context.Context,
+	w *foremanv1alpha1.Workload,
+	created []corev1.ObjectReference,
+	truncated bool,
+	suppressed []string,
+	renderErr error,
+) (ctrl.Result, error) {
 	patch := client.MergeFrom(w.DeepCopy())
 	now := metav1.Now()
 
@@ -443,6 +538,16 @@ func (r *WorkloadReconciler) markPlanned(ctx context.Context, w *foremanv1alpha1
 			Status:             metav1.ConditionTrue,
 			Reason:             "MaxTasksCap",
 			Message:            fmt.Sprintf("MaxTasks=%d clipped the rendered set", w.Spec.MaxTasks),
+			LastTransitionTime: now,
+		})
+	}
+
+	if len(suppressed) > 0 {
+		setCondition(&w.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeCloudReviewersSuppressed,
+			Status:             metav1.ConditionTrue,
+			Reason:             "SovereigntyGate",
+			Message:            fmt.Sprintf("skipped %d cloud-provider Agent(s): %s", len(suppressed), strings.Join(suppressed, "; ")),
 			LastTransitionTime: now,
 		})
 	}

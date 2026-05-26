@@ -40,6 +40,9 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		reconciler = &WorkloadReconciler{
 			Client: k8sClient,
 			Scheme: k8sClient.Scheme(),
+			// Default to permissive in tests; the cloud-suppression
+			// scenarios flip this explicitly per-It.
+			AllowCloudProviders: true,
 		}
 	})
 
@@ -237,6 +240,125 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		truncated := findCondition(fresh.Status.Conditions, conditionTypeTruncated)
 		Expect(truncated).NotTo(BeNil())
 		Expect(truncated.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("suppresses cloud-provider reviewers when the operator kill switch is off (v0.2 #115)", func() {
+		// Seed two reviewer Agents: one local (existing pattern), one
+		// cloud-proxy. Operator-level allowCloudProviders=false should
+		// keep the cloud Agent out of the rendered set and write a
+		// CloudReviewersSuppressed condition.
+		reconciler.AllowCloudProviders = false
+		DeferCleanup(func() { reconciler.AllowCloudProviders = true })
+
+		Expect(k8sClient.Create(ctx, &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "local-validator", Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:                foremanv1alpha1.AgentRoleReviewer,
+				Provider:            foremanv1alpha1.AgentProviderLocal,
+				InferenceServiceRef: corev1.LocalObjectReference{Name: "test-svc"},
+				SystemPrompt:        "you are a reviewer",
+				Tools:               []string{"submit_result"},
+				MaxTurns:            5,
+			},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "cloud-sonnet", Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:     foremanv1alpha1.AgentRoleReviewer,
+				Provider: foremanv1alpha1.AgentProviderCloudProxy,
+				ProviderConfig: &foremanv1alpha1.ProviderConfig{
+					BaseURL: "http://foundation-router.lan:4000/v1",
+					Model:   "claude-sonnet-4-6",
+				},
+				SystemPrompt: "you are a cloud reviewer",
+				Tools:        []string{"submit_result"},
+				MaxTurns:     5,
+			},
+		})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, &foremanv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "local-validator", Namespace: "default"}})
+			_ = k8sClient.Delete(ctx, &foremanv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "cloud-sonnet", Namespace: "default"}})
+		})
+
+		wl := newWorkload("cloud-suppressed-operator", foremanv1alpha1.WorkloadSpec{
+			Intent:           "should suppress cloud reviewer",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{777},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "local-validator"},
+				{Name: "cloud-sonnet"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		// code-777 + verify-777 + review-777-0 (local) = 3 tasks; cloud
+		// reviewer was filtered out.
+		Expect(fresh.Status.Tasks).To(HaveLen(3))
+		cond := findCondition(fresh.Status.Conditions, conditionTypeCloudReviewersSuppressed)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Message).To(ContainSubstring("cloud-sonnet"))
+		Expect(cond.Message).To(ContainSubstring("operator --allow-cloud-providers=false"))
+	})
+
+	It("suppresses cloud-provider reviewers when spec.allowCloudReviewers is false (v0.2 #115)", func() {
+		// Operator allows cloud; workload explicitly opts out. The
+		// suppression message should name the workload-level gate as
+		// the blocker, not the operator.
+		Expect(k8sClient.Create(ctx, &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "cloud-sonnet-w", Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:     foremanv1alpha1.AgentRoleReviewer,
+				Provider: foremanv1alpha1.AgentProviderCloudProxy,
+				ProviderConfig: &foremanv1alpha1.ProviderConfig{
+					BaseURL: "http://foundation-router.lan:4000/v1",
+					Model:   "claude-sonnet-4-6",
+				},
+				SystemPrompt: "you are a cloud reviewer",
+				Tools:        []string{"submit_result"},
+				MaxTurns:     5,
+			},
+		})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, &foremanv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "cloud-sonnet-w", Namespace: "default"}})
+		})
+
+		falseVal := false
+		wl := newWorkload("cloud-suppressed-workload", foremanv1alpha1.WorkloadSpec{
+			Intent:              "workload opts out of cloud",
+			Repo:                "defilantech/LLMKube",
+			Issues:              []int32{888},
+			CoderAgentRef:       &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef:    &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs:   []corev1.LocalObjectReference{{Name: "cloud-sonnet-w"}},
+			AllowCloudReviewers: &falseVal,
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		Expect(fresh.Status.Tasks).To(HaveLen(2)) // code + verify only
+		cond := findCondition(fresh.Status.Conditions, conditionTypeCloudReviewersSuppressed)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Message).To(ContainSubstring("workload spec.allowCloudReviewers=false"))
 	})
 
 	It("rolls up child task phases into the Workload status", func() {

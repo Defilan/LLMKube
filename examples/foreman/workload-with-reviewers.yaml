@@ -69,5 +69,15 @@ spec:
   # reviewer-side fleet capacity supports.
   reviewerAgentRefs:
     - name: qwen36-35b-a3b-reviewer
-    # - name: qwen36-35b-a3b-reviewer-falsification  # v0.2.x
-    # - name: qwen36-35b-a3b-reviewer-thinking       # v0.2.x
+    # - name: qwen36-35b-a3b-reviewer-falsification  # v0.2.x local variant
+    # - name: qwen36-35b-a3b-reviewer-thinking       # v0.2.x local variant
+    # v0.2 Day 4: cloud reviewer for second opinion. Subject to
+    # foreman.allowCloudProviders (chart) + spec.allowCloudReviewers
+    # (below) sovereignty gates. Comment out for air-gap-only runs.
+    - name: claude-sonnet-cloud-reviewer
+
+  # v0.2 Day 4: per-Workload sovereignty toggle. nil (unset) is
+  # treated as true; set explicit false to suppress cloud-provider
+  # reviewers for this specific batch even when the operator allows
+  # them globally. The reconciler still emits local reviewers.
+  # allowCloudReviewers: false

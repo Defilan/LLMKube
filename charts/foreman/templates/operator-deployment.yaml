@@ -46,6 +46,11 @@ spec:
             - --metrics-bind-address=:{{ .Values.operator.metrics.port }}
             {{- end }}
             - --zap-log-level={{ .Values.operator.logLevel }}
+            # Cluster-wide sovereignty kill switch for cloud-proxy
+            # reviewer Agents. False blocks dispatch to any non-local
+            # provider regardless of per-Workload opt-in (#540 sibling,
+            # Day 4 v0.2). Air-gapped installs set this false.
+            - --allow-cloud-providers={{ .Values.foreman.allowCloudProviders }}
           ports:
             - name: health
               containerPort: {{ .Values.operator.health.port }}
