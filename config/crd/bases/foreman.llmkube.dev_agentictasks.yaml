@@ -93,6 +93,7 @@ spec:
                 enum:
                 - issue-fix
                 - verify
+                - review
                 - freeform
                 type: string
               modelRef:

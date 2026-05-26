@@ -156,6 +156,7 @@ spec:
                       enum:
                       - issue-fix
                       - verify
+                      - review
                       - freeform
                       type: string
                     name:
@@ -232,6 +233,44 @@ spec:
                   generated AgenticTask in issue-batch mode. Ignored in explicit
                   Pipeline mode (each step carries its own Payload.Repo).
                 type: string
+              reviewerAgentRefs:
+                description: |-
+                  ReviewerAgentRefs is the optional v0.2 third pipeline stage: each
+                  listed Agent runs a review task against the diff the coder
+                  produced, in parallel, all depending on the upstream verify task
+                  reaching GATE-PASS. The rendered task names are
+                  "<workload>-review-<N>-<i>" where N is the issue number and i is
+                  the index into this slice; the index keeps DNS-1123 lengths
+                  bounded across long agent names.
+
+                  Aggregation: any reviewer emitting verdict=NO-GO leaves that task
+                  Phase=Succeeded but not "succeeded on target," so the Workload
+                  rollup from #548 marks it under IncompleteTasks and the Workload
+                  reaches Phase=Failed with reason ChildrenIncomplete. Day 4
+                  extends this with a hybrid cloud reviewer Agent that the rollup
+                  can escalate to when the local fleet says NO-GO.
+
+                  Leave empty to keep the v0.1 two-step (code + verify) pipeline.
+                  Multi-strategy reviewing (validator / falsification / thinking-
+                  mode) is achieved by listing three Agent CRs with different
+                  system prompts and (optionally) the same underlying model.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
               verifierAgentRef:
                 description: |-
                   VerifierAgentRef is required when Issues is set: names the same-

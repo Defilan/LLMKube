@@ -24,7 +24,7 @@ import (
 
 // AgenticTaskKind is the unit of work the task performs. Each kind has a
 // payload shape, scheduler routing, and lifecycle.
-// +kubebuilder:validation:Enum=issue-fix;verify;freeform
+// +kubebuilder:validation:Enum=issue-fix;verify;review;freeform
 type AgenticTaskKind string
 
 const (
@@ -35,6 +35,14 @@ const (
 	// codegen sync) against a pushed branch. Typically scheduled by the
 	// controller as a child of a Succeeded issue-fix task.
 	AgenticTaskKindVerify AgenticTaskKind = "verify"
+	// AgenticTaskKindReview runs a reviewer Agent against the diff that a
+	// Succeeded issue-fix produced. v0.2 emits one review task per entry
+	// in WorkloadSpec.ReviewerAgentRefs, all parallel, all depending on
+	// the upstream verify task reaching GATE-PASS. The rollup from #548
+	// treats verdict=NO-GO as "Succeeded but incomplete," so any reviewer
+	// NO-GO marks the parent Workload review-failed; Day 4 escalates that
+	// case to a hybrid cloud reviewer Agent.
+	AgenticTaskKindReview AgenticTaskKind = "review"
 	// AgenticTaskKindFreeform passes an arbitrary prompt to a named agent.
 	AgenticTaskKindFreeform AgenticTaskKind = "freeform"
 )

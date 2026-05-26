@@ -153,17 +153,24 @@ func (r *WorkloadReconciler) chooseSteps(w *foremanv1alpha1.Workload) (steps []f
 }
 
 // synthesizeIssueBatch turns Workload.spec.Issues into a flat PipelineStep
-// slice of code + verify pairs. Each issue N produces:
+// slice. Each issue N produces:
 //
 //   - step "code-<N>" (kind issue-fix, agentRef = CoderAgentRef)
 //   - step "verify-<N>" (kind verify, agentRef = VerifierAgentRef,
 //     dependsOn [code-<N>])
+//   - for each i in 0..len(ReviewerAgentRefs)-1:
+//     step "review-<N>-<i>" (kind review, agentRef = ReviewerAgentRefs[i],
+//     dependsOn [verify-<N>]). Parallel across i; the cascade-on-verdict
+//     logic from #548 short-circuits these to Incomplete if verify-<N>
+//     lands GATE-FAIL or GATE-ERROR rather than running the reviewer
+//     loop against a branch the gate already rejected.
 //
-// Payload.Branch is "foreman/issue-<N>" in both halves so the gate clones
-// the branch the coder produced (the cloneURL passthrough from #528 makes
-// the gate hit the fork, not upstream).
+// Payload.Branch is "foreman/issue-<N>" in all stages so each task
+// clones the branch the coder produced (the cloneURL passthrough from
+// #528 makes the gate hit the fork, not upstream).
 func synthesizeIssueBatch(w *foremanv1alpha1.Workload) []foremanv1alpha1.PipelineStep {
-	steps := make([]foremanv1alpha1.PipelineStep, 0, len(w.Spec.Issues)*2)
+	tasksPerIssue := 2 + len(w.Spec.ReviewerAgentRefs)
+	steps := make([]foremanv1alpha1.PipelineStep, 0, len(w.Spec.Issues)*tasksPerIssue)
 	for _, n := range w.Spec.Issues {
 		codeName := fmt.Sprintf("code-%d", n)
 		verifyName := fmt.Sprintf("verify-%d", n)
@@ -191,6 +198,19 @@ func synthesizeIssueBatch(w *foremanv1alpha1.Workload) []foremanv1alpha1.Pipelin
 				},
 			},
 		)
+		for i, reviewerRef := range w.Spec.ReviewerAgentRefs {
+			steps = append(steps, foremanv1alpha1.PipelineStep{
+				Name:      fmt.Sprintf("review-%d-%d", n, i),
+				Kind:      foremanv1alpha1.AgenticTaskKindReview,
+				AgentRef:  reviewerRef,
+				DependsOn: []string{verifyName},
+				Payload: foremanv1alpha1.AgenticTaskPayload{
+					Repo:   w.Spec.Repo,
+					Issue:  n,
+					Branch: branch,
+				},
+			})
+		}
 	}
 	return steps
 }
