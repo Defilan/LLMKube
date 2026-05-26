@@ -90,7 +90,7 @@ pkill -f 'llmkube-foreman-agent --agent-mode=stub' || true
   --task-namespace=default \
   --workspace-dir=$HOME/foreman-workspaces \
   --git-remote-url=https://github.com/Defilan/LLMKube.git \
-  --inference-base-url-override=http://localhost:8080/v1 \
+  --inference-base-url-host-override=127.0.0.1 \
   --commit-author-name="Foreman Bot" \
   --commit-author-email="foreman@$(hostname -s).local" \
   --installed-models=qwen36-35b-carnice-mtp \
@@ -102,11 +102,16 @@ Why each native-mode flag:
 
 - `--git-remote-url`: v0.1 clones from and pushes to the same URL (the
   fork). v0.2 will split clone-from-upstream from push-to-fork.
-- `--inference-base-url-override`: required when foreman-agent runs
-  on the host (where `*.svc.cluster.local` does not resolve);
-  bypasses InferenceService endpoint resolution. The path here must
-  match the actual llama.cpp port (`localhost:8080/v1` on the M5
-  Max default).
+- `--inference-base-url-host-override`: required when foreman-agent
+  runs on the host (where `*.svc.cluster.local` does not resolve).
+  The executor still reads `InferenceService.status.endpoint` for the
+  scheme and path; it substitutes this host and re-reads the live
+  port from the v1 Endpoints object the metal-agent rewrites on every
+  llama-server respawn. Set to `127.0.0.1` for the launchd-on-M5-Max
+  case. (`--inference-base-url-override` is still available for tests
+  and stub OAI servers as a full-URL replacement, but it locks the
+  port at install time and breaks on every metal-agent respawn,
+  which is exactly the bug #540 fixes.)
 - `--commit-author-email`: required; the executor refuses to start
   without it because DCO sign-off needs a real email.
 - `--installed-models`, `--max-context-tokens`, `--tokens-per-second`:

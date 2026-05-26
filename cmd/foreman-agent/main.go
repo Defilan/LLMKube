@@ -98,9 +98,10 @@ func main() {
 		staticTotalRAMGB int
 
 		// M3 executor flags
-		agentMode            string
-		gitRemoteURL         string
-		inferenceURLOverride string
+		agentMode                string
+		gitRemoteURL             string
+		inferenceURLOverride     string
+		inferenceURLHostOverride string
 
 		// M4 gate-tool flags
 		foremanNamespace  string
@@ -149,9 +150,18 @@ func main() {
 	flag.StringVar(&gitRemoteURL, "git-remote-url", "",
 		"git URL to clone from and push branches to. v0.1 uses the fork for both. Required when --agent-mode=native.")
 	flag.StringVar(&inferenceURLOverride, "inference-base-url-override", "",
-		"Override the inference URL the OAI client dispatches to (e.g. http://localhost:8080/v1). "+
-			"Required when foreman-agent runs outside the cluster; the in-cluster "+
-			"path resolves from InferenceService.status.endpoint.")
+		"Replace the resolved InferenceService URL entirely (e.g. http://localhost:8080/v1). "+
+			"Use for tests and stub OAI servers; for off-cluster, same-host installs prefer "+
+			"--inference-base-url-host-override so the live port flows through on every "+
+			"llama-server respawn (#540).")
+	flag.StringVar(&inferenceURLHostOverride, "inference-base-url-host-override", "",
+		"Rewrite the host of the resolved InferenceService URL to this value (e.g. 127.0.0.1) "+
+			"and substitute the live port from the v1 Endpoints object the metal-agent "+
+			"maintains for the InferenceService. Use for off-cluster, same-host installs "+
+			"(foreman-agent on the same Mac as the metal-agent) where cluster DNS does not "+
+			"resolve but the local llama-server's port rolls on every respawn. The "+
+			"controller-runtime cache re-reads the current port on each task dispatch, so "+
+			"this stays current without restart.")
 	flag.StringVar(&commitAuthorName, "commit-author-name", "Foreman Bot",
 		"git author + committer name for branches produced by the native loop.")
 	flag.StringVar(&commitAuthorEmail, "commit-author-email", "",
@@ -266,10 +276,11 @@ func main() {
 		executor = &foremanagent.StubExecutor{SleepDuration: stubSleep}
 	case "native":
 		executor = &foremanagent.NativeAgentLoopExecutor{
-			Client:                   kc,
-			WorkspaceRoot:            workspaceDir,
-			GitRemoteURL:             gitRemoteURL,
-			InferenceBaseURLOverride: inferenceURLOverride,
+			Client:                       kc,
+			WorkspaceRoot:                workspaceDir,
+			GitRemoteURL:                 gitRemoteURL,
+			InferenceBaseURLOverride:     inferenceURLOverride,
+			InferenceBaseURLHostOverride: inferenceURLHostOverride,
 			CommitAuthor: repo.Identity{
 				Name: commitAuthorName, Email: commitAuthorEmail,
 			},
