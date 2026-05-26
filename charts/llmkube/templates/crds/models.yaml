@@ -86,6 +86,7 @@ spec:
                     - metal
                     - cuda
                     - rocm
+                    - intel
                     type: string
                   gpu:
                     description: GPU specifies GPU device requirements
