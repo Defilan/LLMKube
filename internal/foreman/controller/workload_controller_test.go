@@ -148,7 +148,9 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "batch-shortcut-code-531"}, &code531)).To(Succeed())
 		Expect(code531.Spec.Kind).To(Equal(foremanv1alpha1.AgenticTaskKindIssueFix))
 		Expect(code531.Spec.Payload.Issue).To(Equal(int32(531)))
-		Expect(code531.Spec.Payload.Branch).To(Equal("foreman/issue-531"))
+		// #573: branch now includes the workload name to disambiguate
+		// reruns on the same issue across Workloads.
+		Expect(code531.Spec.Payload.Branch).To(Equal("foreman/batch-shortcut/issue-531"))
 		Expect(code531.Spec.AgentRef.Name).To(Equal("coder"))
 
 		var verify531 foremanv1alpha1.AgenticTask
@@ -196,7 +198,7 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		Expect(review5101.Spec.AgentRef.Name).To(Equal("reviewer-falsification"))
 		Expect(review5101.Spec.DependsOn).To(ConsistOf("batch-with-reviewers-verify-510"))
 		Expect(review5101.Spec.Payload.Issue).To(Equal(int32(510)))
-		Expect(review5101.Spec.Payload.Branch).To(Equal("foreman/issue-510"))
+		Expect(review5101.Spec.Payload.Branch).To(Equal("foreman/batch-with-reviewers/issue-510"))
 
 		// review-531-2: the third reviewer of the second issue. Confirms
 		// the cross-product expansion (per-issue x per-reviewer).

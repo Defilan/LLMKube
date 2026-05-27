@@ -252,16 +252,23 @@ func (r *WorkloadReconciler) chooseSteps(w *foremanv1alpha1.Workload) (steps []f
 //     lands GATE-FAIL or GATE-ERROR rather than running the reviewer
 //     loop against a branch the gate already rejected.
 //
-// Payload.Branch is "foreman/issue-<N>" in all stages so each task
-// clones the branch the coder produced (the cloneURL passthrough from
-// #528 makes the gate hit the fork, not upstream).
+// Payload.Branch is "foreman/<workload-name>/issue-<N>" in all stages
+// so each task clones the branch the coder produced (the cloneURL
+// passthrough from #528 makes the gate hit the fork, not upstream).
+//
+// Including the workload name in the branch makes the branch unique
+// across reruns on the same issue set: a second Workload on the same
+// issues produces a distinct branch, the executor can push without
+// fast-forward conflicts, and the empirical artifact (the foreman-
+// authored branch) survives even when an earlier run already produced
+// a branch on the same issue. See #573 for the motivating trace.
 func synthesizeIssueBatch(w *foremanv1alpha1.Workload) []foremanv1alpha1.PipelineStep {
 	tasksPerIssue := 2 + len(w.Spec.ReviewerAgentRefs)
 	steps := make([]foremanv1alpha1.PipelineStep, 0, len(w.Spec.Issues)*tasksPerIssue)
 	for _, n := range w.Spec.Issues {
 		codeName := fmt.Sprintf("code-%d", n)
 		verifyName := fmt.Sprintf("verify-%d", n)
-		branch := fmt.Sprintf("foreman/issue-%d", n)
+		branch := fmt.Sprintf("foreman/%s/issue-%d", w.Name, n)
 		steps = append(steps,
 			foremanv1alpha1.PipelineStep{
 				Name:     codeName,
