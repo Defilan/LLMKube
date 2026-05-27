@@ -277,6 +277,32 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              failureReason:
+                description: |-
+                  FailureReason categorizes WHY a task did not reach a "succeeded
+                  on target" outcome. Distinct from Verdict (which carries the
+                  externally-meaningful WHAT). Empty on a successful task. See
+                  AgenticTaskFailureReason for the full enum + per-reason semantics.
+
+                  v0.3 #559: introduces the structured reason so downstream
+                  consumers (the Workload reconciler's rollup, future retry
+                  policy, batch-level metrics) can route on a typed value rather
+                  than mining the Result.Extra map.
+                enum:
+                - AgentNotFound
+                - InferenceServiceUnavailable
+                - AuthUnavailable
+                - GitRemoteNotConfigured
+                - CloneFailed
+                - ModelMisunderstood
+                - ToolFailed
+                - MaxTurnsExhausted
+                - ConstraintViolated
+                - Timeout
+                - InfrastructureError
+                - GateFailed
+                - GateError
+                type: string
               finishedAt:
                 description: FinishedAt is when the executor produced a verdict (success
                   or fail).

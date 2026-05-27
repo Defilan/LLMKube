@@ -152,7 +152,7 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		if apierrors.IsNotFound(err) {
 			// Scheduler should have caught this; if we got here the
 			// Agent was deleted between scheduling and execution.
-			return e.failResult(start, "AgentNotFound",
+			return e.failResult(start, foremanv1alpha1.FailureAgentNotFound,
 				fmt.Sprintf("Agent %q not found in namespace %q", agentKey.Name, agentKey.Namespace)), nil
 		}
 		return nil, fmt.Errorf("resolve agent: %w", err)
@@ -176,7 +176,7 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		var err error
 		endpoint, err = e.resolveProviderEndpoint(ctx, task.Namespace, &agent)
 		if err != nil {
-			return e.failResult(start, "InferenceServiceUnavailable", err.Error()), nil
+			return e.failResult(start, foremanv1alpha1.FailureInferenceServiceUnavailable, err.Error()), nil
 		}
 	}
 
@@ -208,13 +208,13 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 
 	auth, err := e.buildAuth()
 	if err != nil {
-		return e.failResult(start, "AuthUnavailable", err.Error()), nil
+		return e.failResult(start, foremanv1alpha1.FailureAuthUnavailable, err.Error()), nil
 	}
 	defer func() { _ = auth.Close() }()
 
 	cloneURL := e.GitRemoteURL
 	if cloneURL == "" {
-		return e.failResult(start, "GitRemoteURLNotConfigured",
+		return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured,
 			"foreman-agent was not started with --git-remote-url; cannot clone"), nil
 	}
 	if err := repo.Clone(ctx, repo.CloneOptions{
@@ -222,20 +222,26 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		Dest:      workspace,
 		Auth:      auth,
 	}); err != nil {
-		return e.failResult(start, "CloneFailed", err.Error()), nil
+		return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
 	}
 
 	// 4. Branch off main.
 	branch := branchNameForTask(task)
 	if err := repo.CreateAndCheckoutBranch(ctx, workspace, branch); err != nil {
-		return e.failResult(start, "BranchCheckoutFailed", err.Error()), nil
+		// Branch checkout is part of workspace prep; bucket with
+		// CloneFailed so downstream retry policy treats them the same.
+		return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
 	}
 
 	// 5. Build tool registry pinned to this workspace + filtered by the
 	// Agent's tool whitelist.
 	registry, err := e.RegistryFactory(workspace, &agent)
 	if err != nil {
-		return e.failResult(start, "ToolRegistryBuildFailed", err.Error()), nil
+		// Registry build failure is an operator config issue (bad
+		// whitelist name, duplicate tool); not a runtime model
+		// failure. Bucket as infrastructure so it surfaces distinctly
+		// from in-loop tool errors.
+		return e.failResult(start, foremanv1alpha1.FailureInfrastructureError, err.Error()), nil
 	}
 
 	// 5b. Deterministic Agent path: no LLM loop. Dispatch the agent's
@@ -313,13 +319,21 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		switch {
 		case errors.Is(loopErr, ErrMaxTurnsExhausted):
 			return e.incompleteResult(start, transcriptRef, loopRes,
-				"MaxTurnsExhausted", "model did not call submit_result within max_turns"), nil
+				foremanv1alpha1.FailureMaxTurnsExhausted,
+				"model did not call submit_result within max_turns"), nil
 		case errors.Is(loopErr, ErrAssistantNoToolCalls):
 			return e.incompleteResult(start, transcriptRef, loopRes,
-				"AssistantHallucinatedFinish", "model returned text without tool_calls; loop cannot make progress"), nil
+				foremanv1alpha1.FailureModelMisunderstood,
+				"model returned text without tool_calls; loop cannot make progress"), nil
+		case errors.Is(loopErr, context.Canceled), errors.Is(loopErr, context.DeadlineExceeded):
+			return e.incompleteResult(start, transcriptRef, loopRes,
+				foremanv1alpha1.FailureTimeout,
+				loopErr.Error()), nil
 		default:
 			// Anything else is a system / transport failure: bubble up
-			// as an error so the watcher records ExecutorError.
+			// as an error so the watcher records ExecutorError. The
+			// watcher's execErr path tags this as InfrastructureError
+			// via the FailureReason mapping in patchTerminal.
 			return nil, loopErr
 		}
 	}
@@ -328,7 +342,8 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// Defensive: loop returned nil error but no terminal. Shouldn't
 		// happen given the loop's invariants; report it explicitly.
 		return e.incompleteResult(start, transcriptRef, loopRes,
-			"LoopContractViolation", "loop returned nil error but no terminal result"), nil
+			foremanv1alpha1.FailureInfrastructureError,
+			"loop returned nil error but no terminal result"), nil
 	}
 
 	verdict := foremanv1alpha1.AgenticTaskVerdict(loopRes.Terminal.Verdict)
@@ -414,7 +429,7 @@ func (e *NativeAgentLoopExecutor) executeDeterministic(
 ) *Result {
 	toolName := pickDeterministicTool(agent.Spec.Tools)
 	if toolName == "" {
-		return e.failResult(start, "NoDeterministicTool",
+		return e.failResult(start, foremanv1alpha1.FailureInfrastructureError,
 			"deterministic Agent has no non-terminal tool in spec.tools; expected exactly one (e.g. run_gate_job)")
 	}
 
@@ -429,7 +444,7 @@ func (e *NativeAgentLoopExecutor) executeDeterministic(
 
 	result, dispatchErr := registry.Dispatch(ctx, toolName, args)
 	if dispatchErr != nil {
-		return e.failResult(start, "ToolDispatchFailed",
+		return e.failResult(start, foremanv1alpha1.FailureToolFailed,
 			fmt.Sprintf("%s: %s", toolName, dispatchErr.Error()))
 	}
 
@@ -448,6 +463,17 @@ func (e *NativeAgentLoopExecutor) executeDeterministic(
 	}
 
 	r := NewResult(e.Kind(), verdict, summary, time.Since(start))
+	// v0.3 #559: surface a structured FailureReason for the gate
+	// verdicts. GATE-PASS / GO leave FailureReason empty (success);
+	// GATE-FAIL maps to GateFailed (diff didn't meet quality bar;
+	// retry is a code-side fix, not a gate-side issue); GATE-ERROR
+	// maps to GateError (gate infrastructure problem, retryable).
+	switch verdict {
+	case foremanv1alpha1.AgenticTaskVerdictGateFail:
+		r.FailureReason = foremanv1alpha1.FailureGateFailed
+	case foremanv1alpha1.AgenticTaskVerdictGateError:
+		r.FailureReason = foremanv1alpha1.FailureGateError
+	}
 	r.Extra = map[string]any{
 		"outcome":        "",
 		"deterministic":  true,
@@ -704,26 +730,32 @@ func (e *NativeAgentLoopExecutor) buildAuth() (*repo.Auth, error) {
 // --- Result builders ------------------------------------------------------
 
 // failResult builds a verdict=INCOMPLETE Result that the watcher will
-// patch as phase=Succeeded; the failure shape lives in Result.Extra.
-// Used for environment errors (Agent not found, clone failed, etc.)
-// where the executor never reached the model. We do not return an
-// error from these paths because the failure is data-shaped: the task
-// got a real, structured outcome that a downstream consumer can read.
-func (e *NativeAgentLoopExecutor) failResult(start time.Time, reason, message string) *Result {
+// patch as phase=Succeeded; the failure shape lives in Result.Extra
+// and (v0.3 #559) in the structured Result.FailureReason. Used for
+// environment errors (Agent not found, clone failed, etc.) where the
+// executor never reached the model. We do not return an error from
+// these paths because the failure is data-shaped: the task got a
+// real, structured outcome that a downstream consumer can read.
+func (e *NativeAgentLoopExecutor) failResult(
+	start time.Time, reason foremanv1alpha1.AgenticTaskFailureReason, message string,
+) *Result {
 	r := NewResult(e.Kind(), foremanv1alpha1.AgenticTaskVerdictIncomplete, message, time.Since(start))
+	r.FailureReason = reason
 	r.Extra = map[string]any{
-		"reason":  reason,
+		"reason":  string(reason), // mirror for back-compat; v0.3 #559
 		"outcome": "EXECUTOR-PRECONDITION-FAILED",
 	}
 	return r
 }
 
 func (e *NativeAgentLoopExecutor) incompleteResult(
-	start time.Time, tref corev1.ObjectReference, lr *LoopResult, reason, msg string,
+	start time.Time, tref corev1.ObjectReference, lr *LoopResult,
+	reason foremanv1alpha1.AgenticTaskFailureReason, msg string,
 ) *Result {
 	r := NewResult(e.Kind(), foremanv1alpha1.AgenticTaskVerdictIncomplete, msg, time.Since(start))
+	r.FailureReason = reason
 	r.Extra = map[string]any{
-		"reason":        reason,
+		"reason":        string(reason),
 		"outcome":       "LOOP-INCOMPLETE",
 		"transcriptRef": objRefAsMap(tref),
 		"turnCount":     lr.Turns,

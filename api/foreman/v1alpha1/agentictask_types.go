@@ -47,6 +47,108 @@ const (
 	AgenticTaskKindFreeform AgenticTaskKind = "freeform"
 )
 
+// AgenticTaskFailureReason categorizes WHY a task did not reach a
+// "succeeded-on-target" outcome. Distinct from AgenticTaskVerdict
+// (which carries the externally-meaningful WHAT: GO / NO-GO /
+// GATE-PASS / GATE-FAIL / INCOMPLETE / GATE-ERROR). Together they let
+// downstream consumers route differently on different failure modes:
+// retry the recoverable ones in place, escalate the role-discipline
+// ones, alert on infrastructure ones.
+//
+// Reason coexists with Verdict: a task can be Phase=Succeeded +
+// Verdict=GATE-FAIL + FailureReason=GateFailed, or Phase=Failed +
+// FailureReason=InfrastructureError. Empty reason on a successful
+// task is normal.
+//
+// v0.3 #559 introduces the enum + emission; per-reason retry policy
+// on AgenticTaskSpec and retry-with-correction in the loop are
+// follow-up work that consumes this signal.
+// +kubebuilder:validation:Enum=AgentNotFound;InferenceServiceUnavailable;AuthUnavailable;GitRemoteNotConfigured;CloneFailed;ModelMisunderstood;ToolFailed;MaxTurnsExhausted;ConstraintViolated;Timeout;InfrastructureError;GateFailed;GateError
+type AgenticTaskFailureReason string
+
+const (
+	// Pre-loop executor failures (the task never reached the model loop):
+
+	// FailureAgentNotFound: the Agent referenced by spec.agentRef was
+	// not present in the task's namespace at executor time. Usually a
+	// race between scheduling and execution; not retryable in place.
+	FailureAgentNotFound AgenticTaskFailureReason = "AgentNotFound"
+
+	// FailureInferenceServiceUnavailable: the Agent's InferenceServiceRef
+	// could not be resolved to a usable endpoint. The metal-agent may
+	// not have spawned llama-server yet, or the host-override port
+	// lookup failed. Retryable; #540's live-Endpoints path catches
+	// most transient cases automatically.
+	FailureInferenceServiceUnavailable AgenticTaskFailureReason = "InferenceServiceUnavailable"
+
+	// FailureAuthUnavailable: GitHub auth could not be built (no
+	// GITHUB_TOKEN, no ~/.config/foreman/github-token). Operator
+	// config error; not retryable.
+	FailureAuthUnavailable AgenticTaskFailureReason = "AuthUnavailable"
+
+	// FailureGitRemoteNotConfigured: foreman-agent was started without
+	// --git-remote-url and a coder-shaped task arrived. Operator
+	// config error; not retryable.
+	FailureGitRemoteNotConfigured AgenticTaskFailureReason = "GitRemoteNotConfigured"
+
+	// FailureCloneFailed: git clone of the workspace failed. Often
+	// network or auth; sometimes a missing branch. Retryable for
+	// transient cases.
+	FailureCloneFailed AgenticTaskFailureReason = "CloneFailed"
+
+	// In-loop failures (the model loop ran but did not reach
+	// submit_result with a successful verdict):
+
+	// FailureModelMisunderstood: model emitted a syntactically valid
+	// turn that the loop could not act on. Examples: assistant message
+	// with no tool_calls; tool call referencing a tool name unknown to
+	// the system (typo / hallucinated tool). Often recoverable with a
+	// corrective system message + retry (deferred to v0.3 follow-up).
+	FailureModelMisunderstood AgenticTaskFailureReason = "ModelMisunderstood"
+
+	// FailureToolFailed: a tool dispatch returned a structured error
+	// (str_replace context not found, bash non-zero exit, etc.). The
+	// loop surfaces these as tool messages today; this reason fires
+	// when a tool error escalates to terminal (every available retry
+	// exhausted in a future loop revision).
+	FailureToolFailed AgenticTaskFailureReason = "ToolFailed"
+
+	// FailureMaxTurnsExhausted: the loop hit Agent.spec.MaxTurns
+	// without the model calling submit_result. The model effectively
+	// gave up. Not retryable without intervention (different
+	// MaxTurns or different prompt).
+	FailureMaxTurnsExhausted AgenticTaskFailureReason = "MaxTurnsExhausted"
+
+	// FailureConstraintViolated: the model called a tool excluded by
+	// the Agent's spec.tools whitelist (#561's
+	// tools.ErrToolNotInWhitelist). Indicates a role-discipline
+	// violation. Should escalate rather than retry blindly.
+	FailureConstraintViolated AgenticTaskFailureReason = "ConstraintViolated"
+
+	// FailureTimeout: wall-clock budget exceeded. The task's
+	// spec.timeoutSeconds elapsed, or the per-turn
+	// requestTimeoutSeconds fired and no retry recovered.
+	FailureTimeout AgenticTaskFailureReason = "Timeout"
+
+	// FailureInfrastructureError: a non-model failure: apiserver
+	// unreachable, llama-server crashed, the OAI client got a 5xx,
+	// transcript ConfigMap write failed. Typically retryable.
+	FailureInfrastructureError AgenticTaskFailureReason = "InfrastructureError"
+
+	// Gate-specific failures (deterministic verify path):
+
+	// FailureGateFailed: the gate Job ran cleanly but at least one
+	// check (fmt / vet / lint / test / codegen-sync) failed. The
+	// coder's diff didn't meet quality bar; cascade-on-verdict from
+	// #548 short-circuits the downstream reviewer task.
+	FailureGateFailed AgenticTaskFailureReason = "GateFailed"
+
+	// FailureGateError: the gate Job itself failed to execute
+	// (image pull error, PVC issue, timeout before any check ran).
+	// Infrastructure rather than diff-quality; retryable.
+	FailureGateError AgenticTaskFailureReason = "GateError"
+)
+
 // AgenticTaskAccelerator pins which accelerator family a task needs from the
 // node that runs it. "any" lets the scheduler pick from any Ready FleetNode.
 // +kubebuilder:validation:Enum=metal;cuda;any
@@ -262,6 +364,18 @@ type AgenticTaskStatus struct {
 	// Verdict is the final outcome category.
 	// +optional
 	Verdict AgenticTaskVerdict `json:"verdict,omitempty"`
+
+	// FailureReason categorizes WHY a task did not reach a "succeeded
+	// on target" outcome. Distinct from Verdict (which carries the
+	// externally-meaningful WHAT). Empty on a successful task. See
+	// AgenticTaskFailureReason for the full enum + per-reason semantics.
+	//
+	// v0.3 #559: introduces the structured reason so downstream
+	// consumers (the Workload reconciler's rollup, future retry
+	// policy, batch-level metrics) can route on a typed value rather
+	// than mining the Result.Extra map.
+	// +optional
+	FailureReason AgenticTaskFailureReason `json:"failureReason,omitempty"`
 
 	// Result is the structured JSON the agent emitted, validated against the
 	// foreman.v1 schema. Opaque to the API server.
