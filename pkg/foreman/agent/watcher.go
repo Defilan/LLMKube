@@ -83,6 +83,53 @@ type AgenticTaskWatcher struct {
 	inflight   *foremanv1alpha1.AgenticTask
 }
 
+// recoverOrphanedTasks lists AgenticTasks that are still Running and
+// assigned to this node (likely left over from a previous agent
+// process that died).  It resets them to Pending with a recovery
+// condition so the poll loop can re-claim them.
+func (w *AgenticTaskWatcher) recoverOrphanedTasks(ctx context.Context) error {
+	log := logf.FromContext(ctx).WithName("agentictask-watcher").WithValues("node", w.NodeName)
+
+	var tasks foremanv1alpha1.AgenticTaskList
+	if err := w.Client.List(ctx, &tasks, client.InNamespace(w.Namespace)); err != nil {
+		return fmt.Errorf("list tasks for recovery: %w", err)
+	}
+
+	recovered := 0
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Status.AssignedNode != w.NodeName || t.Status.Phase != foremanv1alpha1.AgenticTaskPhaseRunning {
+			continue
+		}
+
+		log.Info("recovering orphaned task", "task", client.ObjectKeyFromObject(t).String())
+
+		patch := client.MergeFrom(t.DeepCopy())
+		t.Status.Phase = foremanv1alpha1.AgenticTaskPhasePending
+		t.Status.AssignedNode = ""
+		t.Status.ClaimedAt = nil
+		t.Status.StartedAt = nil
+		t.Status.Conditions = append(t.Status.Conditions, metav1.Condition{
+			Type:               "Recovery",
+			Status:             metav1.ConditionTrue,
+			LastTransitionTime: metav1.Now(),
+			Reason:             "AgentRestartRecovery",
+			Message:            "Task was Running when agent restarted; reset to Pending for re-claim",
+		})
+
+		if err := w.Client.Status().Patch(ctx, t, patch); err != nil {
+			log.Error(err, "failed to recover task", "task", client.ObjectKeyFromObject(t).String())
+			continue
+		}
+		recovered++
+	}
+
+	if recovered > 0 {
+		log.Info("recovered orphaned tasks", "count", recovered)
+	}
+	return nil
+}
+
 // Run blocks, polling every Interval until ctx is cancelled. Returns
 // ErrWatcherStalled if List() fails MaxConsecutiveFailures times in a
 // row; the supervisor should recycle the process.
@@ -103,6 +150,11 @@ func (w *AgenticTaskWatcher) Run(ctx context.Context) error {
 	}
 
 	log.Info("starting", "interval", interval.String(), "namespace", ns, "executor", w.Executor.Kind())
+
+	// Recover any tasks that were Running when the previous agent died.
+	if err := w.recoverOrphanedTasks(ctx); err != nil {
+		log.Error(err, "failed to recover orphaned tasks")
+	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
