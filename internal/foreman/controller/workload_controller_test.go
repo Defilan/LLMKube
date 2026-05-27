@@ -526,6 +526,71 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		Expect(completed).NotTo(BeNil())
 		Expect(completed.Reason).To(Equal("ChildrenIncomplete"))
 	})
+
+	It("fails the Workload when gate passes but any reviewer emits NO-GO (#575)", func() {
+		// v0.4 regression test: this lock-in confirms the
+		// cascade-on-verdict behavior from #541 also catches the
+		// reviewer-NO-GO + gate-PASS case. The reviewer is the
+		// design-quality second pass after the gate's mechanical
+		// `make` checks; REQUEST-CHANGES from any reviewer MUST
+		// drive the Workload to Failed even when the gate said the
+		// commit was technically buildable.
+		wl := newWorkload("reviewer-blocks", foremanv1alpha1.WorkloadSpec{
+			Intent:           "reviewer NO-GO blocks workload completion",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{1234},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "reviewer"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Coder GO, verifier GATE-PASS, reviewer NO-GO (the
+		// "design quality" failure mode the v0.4 reviewer is
+		// designed to catch).
+		updates := []struct {
+			name    string
+			phase   foremanv1alpha1.AgenticTaskPhase
+			verdict foremanv1alpha1.AgenticTaskVerdict
+		}{
+			{"reviewer-blocks-code-1234", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictGo},
+			{"reviewer-blocks-verify-1234", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictGatePass},
+			{"reviewer-blocks-review-1234-0", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo},
+		}
+		for _, u := range updates {
+			var t foremanv1alpha1.AgenticTask
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: u.name}, &t)).To(Succeed())
+			patch := client.MergeFrom(t.DeepCopy())
+			t.Status.Phase = u.phase
+			t.Status.Verdict = u.verdict
+			Expect(k8sClient.Status().Patch(ctx, &t, patch)).To(Succeed())
+		}
+
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		// Two on-target (coder GO, verify GATE-PASS) + one
+		// reviewer NO-GO = workload Failed with one IncompleteTask.
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.WorkloadPhaseFailed),
+			"reviewer NO-GO must drive Workload to Failed even when gate passed")
+		Expect(fresh.Status.SucceededTasks).To(Equal(int32(2)))
+		Expect(fresh.Status.IncompleteTasks).To(Equal(int32(1)))
+		Expect(fresh.Status.FailedTasks).To(Equal(int32(0)))
+		reviewerBlocksCompleted := findCondition(fresh.Status.Conditions, conditionTypeCompleted)
+		Expect(reviewerBlocksCompleted).NotTo(BeNil())
+		Expect(reviewerBlocksCompleted.Reason).To(Equal("ChildrenIncomplete"))
+	})
 })
 
 // newWorkload builds a Workload with the test-conventional shape. Lets the
