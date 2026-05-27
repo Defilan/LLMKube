@@ -18,8 +18,11 @@ package agent
 
 import (
 	"context"
+	"net"
+	"strings"
 	"testing"
 
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -416,7 +419,8 @@ func TestReconcileOrphanEndpoints_EmptyCluster(t *testing.T) {
 
 func TestGetHostIP(t *testing.T) {
 	// getHostIP should return a non-empty string regardless of environment
-	ip := getHostIP()
+	logger, _ := zap.NewDevelopment()
+	ip := getHostIP(logger.Sugar())
 	if ip == "" {
 		t.Error("getHostIP returned empty string")
 	}
@@ -488,4 +492,165 @@ func TestRegisterEndpoint_ExplicitHostIP(t *testing.T) {
 	if endpoints.Subsets[0].Addresses[0].IP != "10.0.0.42" {
 		t.Errorf("Endpoint IP = %q, want %q", endpoints.Subsets[0].Addresses[0].IP, "10.0.0.42")
 	}
+}
+
+// mockIfaceList is a fake implementation of ifaceList for testing.
+type mockIfaceList struct {
+	entries []ifaceEntry
+}
+
+func (m *mockIfaceList) Interfaces() ([]ifaceEntry, error) {
+	return m.entries, nil
+}
+
+// resolveHostIPForTest is a test helper that calls resolveHostIP with a
+// mock ifaceList.
+func resolveHostIPForTest(ifaces ifaceList) (string, []string) {
+	return resolveHostIP(ifaces)
+}
+
+func TestResolveHostIP(t *testing.T) {
+	tests := []struct {
+		name           string
+		ifaces         []ifaceEntry
+		wantIP         string
+		wantRejected   int
+		wantCandidates int
+	}{
+		{
+			name: "Tailscale preferred over LAN",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "utun3", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "100.116.176.101/32")}},
+			},
+			wantIP:         "100.116.176.101",
+			wantRejected:   0,
+			wantCandidates: 2,
+		},
+		{
+			name: "Docker bridge excluded, LAN picked",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "utun3", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "100.116.176.101/32")}},
+				{Name: "utun5", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.65.254/24")}},
+			},
+			wantIP:         "100.116.176.101",
+			wantRejected:   1,
+			wantCandidates: 2,
+		},
+		{
+			name: "Only Docker bridge – no routable candidate",
+			ifaces: []ifaceEntry{
+				{Name: "utun5", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.65.254/24")}},
+			},
+			wantIP:         "",
+			wantRejected:   1,
+			wantCandidates: 0,
+		},
+		{
+			name: "Multiple LANs, no Tailscale",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "en1", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.2.10/24")}},
+			},
+			wantIP:         "192.168.1.47",
+			wantRejected:   0,
+			wantCandidates: 2,
+		},
+		{
+			name: "Docker default bridge excluded",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "docker0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "172.17.0.1/16")}},
+			},
+			wantIP:         "192.168.1.47",
+			wantRejected:   1,
+			wantCandidates: 1,
+		},
+		{
+			name: "Kubernetes service CIDR excluded",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "cni0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "10.96.0.1/12")}},
+			},
+			wantIP:         "192.168.1.47",
+			wantRejected:   1,
+			wantCandidates: 1,
+		},
+		{
+			name: "Down interface skipped",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "en1", Flags: 0, // down
+					Addrs: []net.Addr{mustParseAddr(t, "10.0.0.5/24")}},
+			},
+			wantIP:         "192.168.1.47",
+			wantRejected:   0,
+			wantCandidates: 1,
+		},
+		{
+			name: "Full multi-NIC macOS scenario",
+			ifaces: []ifaceEntry{
+				{Name: "en0", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.1.47/24")}},
+				{Name: "utun3", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "100.116.176.101/32")}},
+				{Name: "utun5", Flags: net.FlagUp | net.FlagRunning,
+					Addrs: []net.Addr{mustParseAddr(t, "192.168.65.254/24")}},
+			},
+			wantIP:         "100.116.176.101",
+			wantRejected:   1,
+			wantCandidates: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ifaces := &mockIfaceList{entries: tt.ifaces}
+
+			ip, rejected := resolveHostIPForTest(ifaces)
+
+			if ip != tt.wantIP {
+				t.Errorf("resolveHostIP() IP = %q, want %q", ip, tt.wantIP)
+			}
+			if len(rejected) != tt.wantRejected {
+				t.Errorf("resolveHostIP() rejected = %d, want %d (candidates: %v)",
+					len(rejected), tt.wantRejected, rejected)
+			}
+		})
+	}
+}
+
+// mustParseAddr parses an addr string like "192.168.1.47/24" and panics on error.
+// It returns a *net.IPNet whose IP field is the actual host IP (not the network
+// address), so that resolveHostIP sees the correct address.
+func mustParseAddr(t *testing.T, s string) net.Addr {
+	t.Helper()
+	_, ipNet, err := net.ParseCIDR(s)
+	if err != nil {
+		t.Fatalf("mustParseAddr(%q): %v", s, err)
+	}
+	// ipNet.IP is the network address (e.g. 192.168.1.0 for /24).
+	// We need the actual host IP. Parse it from the CIDR string.
+	parts := strings.SplitN(s, "/", 2)
+	hostIP := net.ParseIP(parts[0])
+	if hostIP == nil {
+		t.Fatalf("mustParseAddr(%q): invalid IP %q", s, parts[0])
+	}
+	// Build a new IPNet with the correct IP.
+	ipNet.IP = hostIP.To4()
+	return ipNet
 }

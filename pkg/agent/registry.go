@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 
 	"go.uber.org/zap"
@@ -291,29 +292,168 @@ func sanitizeServiceName(name string) string {
 
 // resolveHostIP returns the IP address that Kubernetes uses to reach this host.
 // If an explicit hostIP was provided via --host-ip, that value is returned.
-// Otherwise it falls back to DNS auto-detection (host.minikube.internal,
-// host.docker.internal) for co-located setups.
+// Otherwise it calls resolveHostIP() to auto-detect a routable address from
+// the host's network interfaces.
 func (r *ServiceRegistry) resolveHostIP() string {
 	if r.hostIP != "" {
 		return r.hostIP
 	}
-	return getHostIP()
+	return getHostIP(r.logger)
+}
+
+// ifaceEntry holds a single network interface and its addresses for testing.
+type ifaceEntry struct {
+	Name  string
+	Flags net.Flags
+	Addrs []net.Addr
+}
+
+// ifaceList is a testable interface for network interfaces.
+type ifaceList interface {
+	Interfaces() ([]ifaceEntry, error)
+}
+
+// realIfaceList is the production implementation.
+type realIfaceList struct{}
+
+func (realIfaceList) Interfaces() ([]ifaceEntry, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]ifaceEntry, 0, len(ifaces))
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		entries = append(entries, ifaceEntry{
+			Name:  iface.Name,
+			Flags: iface.Flags,
+			Addrs: addrs,
+		})
+	}
+	return entries, nil
+}
+
+// resolveHostIP enumerates the host's network interfaces and selects a
+// routable IP address for endpoint registration.  Preference order:
+//
+//  1. Tailscale interface (100.x.x.x) if present.
+//  2. Primary LAN IP (the interface carrying the default route).
+//  3. Loopback (127.0.0.1) only as a last resort.
+//
+// Bridge / NAT ranges are excluded: 192.168.65.x, 10.96.x.x, 172.17.x.x,
+// 172.18-31.x.x, 192.168.100.x, 192.168.200.x, 10.0.0.0/8 (except
+// Tailscale's 100.x.x.x), and any interface that is not UP / RUNNING.
+func resolveHostIP(ifaces ifaceList) (string, []string) {
+	if ifaces == nil {
+		ifaces = realIfaceList{}
+	}
+
+	// excludedSubnets lists CIDR prefixes that are considered virtual
+	// bridge / NAT ranges and should be skipped during auto-detection.
+	excludedSubnets := []*net.IPNet{
+		mustParseCIDR("192.168.65.0/24"), // Docker Desktop / colima / Lima
+		mustParseCIDR("10.96.0.0/12"),    // Kubernetes service CIDR
+		mustParseCIDR("172.17.0.0/16"),   // Docker default bridge
+		mustParseCIDR("172.18.0.0/15"),   // Docker ephemeral bridges
+		mustParseCIDR("172.20.0.0/14"),
+		mustParseCIDR("172.24.0.0/14"),
+		mustParseCIDR("172.28.0.0/14"),
+		mustParseCIDR("192.168.100.0/24"), // Docker Desktop WSL2
+		mustParseCIDR("192.168.200.0/24"), // Docker Desktop WSL2
+		mustParseCIDR("10.0.0.0/8"),       // generic private range (skip to avoid VMs)
+	}
+
+	// isExcluded checks whether an IP falls within any excluded subnet.
+	isExcluded := func(ip net.IP) bool {
+		for _, cidr := range excludedSubnets {
+			if cidr.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var candidates []net.Addr
+	var rejected []string
+
+	ifaceList, err := ifaces.Interfaces()
+	if err != nil {
+		return "", nil
+	}
+
+	for _, entry := range ifaceList {
+		// Skip down / loopback-only interfaces.
+		if entry.Flags&net.FlagUp == 0 ||
+			entry.Flags&net.FlagRunning == 0 ||
+			entry.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		for _, a := range entry.Addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil {
+				continue // IPv6 – skip for now
+			}
+
+			if isExcluded(ip) {
+				rejected = append(rejected, fmt.Sprintf("%s/%s (%s, excluded range)",
+					ip, ipNet.String(), entry.Name))
+				continue
+			}
+
+			candidates = append(candidates, &net.UDPAddr{
+				IP:   ip,
+				Zone: entry.Name,
+			})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", rejected
+	}
+
+	// Sort candidates by preference: Tailscale (100.x.x.x) first,
+	// then by IP for determinism.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		ni := candidates[i].(*net.UDPAddr)
+		nj := candidates[j].(*net.UDPAddr)
+		iTail := strings.HasPrefix(ni.IP.String(), "100.")
+		jTail := strings.HasPrefix(nj.IP.String(), "100.")
+		if iTail != jTail {
+			return iTail // Tailscale first
+		}
+		return ni.IP.String() < nj.IP.String()
+	})
+
+	picked := candidates[0].(*net.UDPAddr)
+	return picked.IP.String(), rejected
+}
+
+// mustParseCIDR parses a CIDR string and panics on error.
+func mustParseCIDR(s string) *net.IPNet {
+	_, cidr, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(fmt.Sprintf("resolveHostIP: invalid CIDR %q: %v", s, err))
+	}
+	return cidr
 }
 
 // getHostIP returns the auto-detected IP address that Kubernetes can use to
-// reach the host machine. For minikube, this is typically
-// host.minikube.internal which resolves to 192.168.65.254.
-func getHostIP() string {
-	// Try to resolve host.minikube.internal (for minikube)
-	if ips, err := net.LookupIP("host.minikube.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+// reach the host machine. It delegates to resolveHostIP() which enumerates
+// network interfaces and excludes bridge / NAT ranges.
+func getHostIP(logger *zap.SugaredLogger) string {
+	ip, rejected := resolveHostIP(nil)
+	if ip != "" {
+		logger.Infow("auto-detected host IP",
+			"hostIP", ip,
+			"rejectedCandidates", rejected)
+		return ip
 	}
-
-	// Fallback: Try to resolve host.docker.internal (for Docker Desktop)
-	if ips, err := net.LookupIP("host.docker.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
-	}
-
-	// Final fallback: Use a common default for minikube
-	return "192.168.65.254"
+	logger.Warnw("auto-detect found no routable interface; falling back to 127.0.0.1",
+		"rejectedCandidates", rejected)
+	return "127.0.0.1"
 }
