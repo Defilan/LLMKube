@@ -70,6 +70,13 @@ func WithBackoffs(b []time.Duration) Option {
 	}
 }
 
+// WithRequestTimeout sets the per-request HTTP timeout. This is the
+// timeout applied to each individual HTTP request (prompt-eval +
+// generation), as opposed to the loop-wide context deadline.
+func WithRequestTimeout(d time.Duration) Option {
+	return func(cl *Client) { cl.httpClient.Timeout = d }
+}
+
 // New builds a client. baseURL must include the /v1 suffix
 // ("http://localhost:8080/v1"). requestTimeout bounds a single HTTP
 // request. maxRetries bounds how many additional attempts we make on

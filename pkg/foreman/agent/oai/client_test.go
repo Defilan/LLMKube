@@ -258,3 +258,31 @@ func TestClient_Chat_ContextCancelDuringBackoff(t *testing.T) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestWithRequestTimeout(t *testing.T) {
+	// A server that delays past the per-request timeout.
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		time.Sleep(500 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+	}))
+	defer srv.Close()
+
+	// Create a client with a 50ms per-request timeout.
+	c := New(srv.URL+"/v1", time.Second, 0, WithRequestTimeout(50*time.Millisecond))
+
+	ctx := context.Background()
+	_, err := c.Chat(ctx, ChatRequest{Model: "test"})
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "Client.Timeout") {
+		t.Errorf("expected Client.Timeout error, got %v", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Errorf("expected 1 request, got %d", got)
+	}
+}

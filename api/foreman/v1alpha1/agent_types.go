@@ -116,11 +116,29 @@ type AgentSpec struct {
 
 	// RequestTimeoutSeconds bounds a single chat-completions HTTP
 	// request. Long-context decode on a local model can be slow; default
-	// is generous.
+	// is generous. Deprecated: use RequestTurnTimeoutSeconds for per-turn
+	// HTTP timeouts and set RequestTimeoutSeconds to the loop-wide budget
+	// instead.
 	// +kubebuilder:default=600
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	RequestTimeoutSeconds int32 `json:"requestTimeoutSeconds,omitempty"`
+
+	// RequestTurnTimeoutSeconds is the per-turn HTTP timeout for the OAI
+	// client. This bounds the duration of a single chat-completions
+	// request (prompt-eval + generation). When unset, falls back to
+	// RequestTimeoutSeconds for backwards compatibility. A value of 0
+	// disables the per-turn timeout (no deadline on individual HTTP
+	// requests).
+	//
+	// This field exists because prompt-eval latency on large warm
+	// contexts can exceed the default 600s request timeout, causing
+	// the loop to terminate mid-turn. A per-turn timeout in the
+	// 30-120s range with a separate loop-wide budget in the 1-2 hr
+	// range is the recommended shape.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	RequestTurnTimeoutSeconds int32 `json:"requestTurnTimeoutSeconds,omitempty"`
 
 	// BashTimeoutSeconds bounds a single bash tool invocation. The bash
 	// tool runs under "sh -c" with cwd pinned to the workspace and a

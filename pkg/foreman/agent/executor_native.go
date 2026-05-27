@@ -243,9 +243,17 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
 
 	// 6. Build OAI client + loop.
+	// Determine the per-turn HTTP timeout: use RequestTurnTimeoutSeconds
+	// if set (non-zero), otherwise fall back to RequestTimeoutSeconds for
+	// backwards compatibility.
+	perTurnTimeout := durationFromSeconds(agent.Spec.RequestTurnTimeoutSeconds, 0)
+	if perTurnTimeout == 0 {
+		perTurnTimeout = durationFromSeconds(agent.Spec.RequestTimeoutSeconds, 600)
+	}
+
 	oaiClient := oai.New(
 		baseURL,
-		durationFromSeconds(agent.Spec.RequestTimeoutSeconds, 600),
+		perTurnTimeout,
 		int(agent.Spec.MaxRetries),
 	)
 	loopFactory := e.LoopFactory
