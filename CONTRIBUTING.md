@@ -264,6 +264,9 @@ make test
 
 - [ ] Code passes all tests (`make test`)
 - [ ] Linter passes (`make lint`)
+- [ ] Cross-arch linter passes (`make lint-all`) — catches `//go:build`-tagged
+      files that the host's default `GOOS` would silently skip. About 2× slower
+      than `make lint`; intentional opt-in so the inner loop stays fast.
 - [ ] Manually tested in a Kubernetes cluster
 - [ ] GPU tests pass (if GPU-related: `./test/e2e/gpu_test.sh`)
 - [ ] Documentation updated (if adding features)

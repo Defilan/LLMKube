@@ -40,6 +40,10 @@ If you edited CRD types in `api/v1alpha1/`, also run:
 7. `git status` must be clean afterward. Uncommitted generated files mean a
    step was skipped, and the CI CRD sync check will fail.
 
+- Run `make lint-all` before pushing a PR to catch `//go:build`-tagged files
+  that the host's default `GOOS` would silently skip. About 2× slower than
+  `make lint`; intentional opt-in so the inner loop stays fast.
+
 ## Code style
 
 - Match the surrounding code: naming, error handling, comment density, layout.
