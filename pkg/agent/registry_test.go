@@ -18,8 +18,10 @@ package agent
 
 import (
 	"context"
+	"net"
 	"testing"
 
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -415,10 +417,12 @@ func TestReconcileOrphanEndpoints_EmptyCluster(t *testing.T) {
 }
 
 func TestGetHostIP(t *testing.T) {
-	// getHostIP should return a non-empty string regardless of environment
-	ip := getHostIP()
+	// resolveHostIP should return a non-empty string regardless of environment
+	logger, _ := zap.NewDevelopment()
+	sugar := logger.Sugar()
+	ip := resolveHostIP(sugar)
 	if ip == "" {
-		t.Error("getHostIP returned empty string")
+		t.Error("resolveHostIP returned empty string")
 	}
 }
 
@@ -487,5 +491,70 @@ func TestRegisterEndpoint_ExplicitHostIP(t *testing.T) {
 	}
 	if endpoints.Subsets[0].Addresses[0].IP != "10.0.0.42" {
 		t.Errorf("Endpoint IP = %q, want %q", endpoints.Subsets[0].Addresses[0].IP, "10.0.0.42")
+	}
+}
+
+func TestIsExcluded(t *testing.T) {
+	tests := []struct {
+		name     string
+		ip       net.IP
+		expected bool
+	}{
+		{"docker bridge 172.17", net.ParseIP("172.17.0.1"), true},
+		{"docker bridge 172.31", net.ParseIP("172.31.255.255"), true},
+		{"lima NAT 192.168.65", net.ParseIP("192.168.65.254"), true},
+		{"lima NAT 192.168.128", net.ParseIP("192.168.128.1"), true},
+		{"k8s service 10.96", net.ParseIP("10.96.0.1"), true},
+		{"loopback 127", net.ParseIP("127.0.0.1"), true},
+		{"tailscale 100.64", net.ParseIP("100.64.0.1"), false},
+		{"tailscale 100.100", net.ParseIP("100.100.50.25"), false},
+		{"lan 192.168.1", net.ParseIP("192.168.1.47"), false},
+		{"lan 10.0", net.ParseIP("10.0.0.1"), false},
+		{"lan 172.16", net.ParseIP("172.16.0.1"), false},
+		{"public 8.8.8.8", net.ParseIP("8.8.8.8"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isExcluded(tt.ip)
+			if result != tt.expected {
+				t.Errorf("isExcluded(%s) = %v, want %v", tt.ip, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseCIDR(t *testing.T) {
+	cidr := parseCIDR("192.168.65.0/24")
+	if cidr == nil {
+		t.Fatal("parseCIDR returned nil")
+	}
+	if !cidr.Contains(net.ParseIP("192.168.65.1")) {
+		t.Error("parseCIDR: 192.168.65.1 should be in 192.168.65.0/24")
+	}
+	if cidr.Contains(net.ParseIP("192.168.66.1")) {
+		t.Error("parseCIDR: 192.168.66.1 should NOT be in 192.168.65.0/24")
+	}
+}
+
+func TestResolveHostIP_ExcludesBridgeRanges(t *testing.T) {
+	// Create a logger that captures output.
+	logger, _ := zap.NewDevelopment()
+	sugar := logger.Sugar()
+
+	ip := resolveHostIP(sugar)
+
+	// The returned IP must not be in any excluded range.
+	if ip == "" {
+		t.Skip("no routable IP found on this host; skipping bridge exclusion check")
+	}
+
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		t.Fatalf("resolveHostIP returned invalid IP: %q", ip)
+	}
+
+	if isExcluded(parsed) {
+		t.Errorf("resolveHostIP(%s) returned an excluded IP; bridge/NAT ranges should be filtered out", ip)
 	}
 }

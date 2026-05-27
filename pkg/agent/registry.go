@@ -297,23 +297,134 @@ func (r *ServiceRegistry) resolveHostIP() string {
 	if r.hostIP != "" {
 		return r.hostIP
 	}
-	return getHostIP()
+	return resolveHostIP(r.logger)
 }
 
-// getHostIP returns the auto-detected IP address that Kubernetes can use to
-// reach the host machine. For minikube, this is typically
-// host.minikube.internal which resolves to 192.168.65.254.
-func getHostIP() string {
-	// Try to resolve host.minikube.internal (for minikube)
-	if ips, err := net.LookupIP("host.minikube.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+// excludedSubnets are private/NAT ranges that should never be advertised
+// as the host IP for cross-cluster InferenceService endpoints.
+var excludedSubnets = []*net.IPNet{
+	// Docker bridge networks
+	parseCIDR("172.17.0.0/16"),
+	parseCIDR("172.18.0.0/16"),
+	parseCIDR("172.19.0.0/16"),
+	parseCIDR("172.20.0.0/16"),
+	parseCIDR("172.21.0.0/16"),
+	parseCIDR("172.22.0.0/16"),
+	parseCIDR("172.23.0.0/16"),
+	parseCIDR("172.24.0.0/16"),
+	parseCIDR("172.25.0.0/16"),
+	parseCIDR("172.26.0.0/16"),
+	parseCIDR("172.27.0.0/16"),
+	parseCIDR("172.28.0.0/16"),
+	parseCIDR("172.29.0.0/16"),
+	parseCIDR("172.30.0.0/16"),
+	parseCIDR("172.31.0.0/16"),
+	// Lima / colima / VMnet NAT ranges
+	parseCIDR("192.168.65.0/24"),
+	parseCIDR("192.168.128.0/24"),
+	// Kubernetes service CIDR (common default)
+	parseCIDR("10.96.0.0/12"),
+	// Loopback
+	parseCIDR("127.0.0.0/8"),
+}
+
+func parseCIDR(s string) *net.IPNet {
+	_, cidr, _ := net.ParseCIDR(s)
+	return cidr
+}
+
+func isExcluded(ip net.IP) bool {
+	for _, cidr := range excludedSubnets {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveHostIP enumerates all non-loopback interface addresses on the host,
+// excludes known bridge/NAT ranges, and returns the most routable IP.
+// Preference order:
+//
+//  1. Tailscale IP (100.64.0.0/10) if present.
+//  2. Primary LAN IP (interface carrying the default route).
+//  3. First remaining routable IPv4.
+//
+// It logs which interfaces were considered and why each was rejected.
+func resolveHostIP(logger *zap.SugaredLogger) string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		logger.Warnf("resolveHostIP: failed to list interfaces: %v", err)
+		return ""
 	}
 
-	// Fallback: Try to resolve host.docker.internal (for Docker Desktop)
-	if ips, err := net.LookupIP("host.docker.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+	var tailscaleCandidates []net.IP
+	var lanCandidates []net.IP
+	var otherCandidates []net.IP
+
+	for _, iface := range ifaces {
+		// Skip down, loopback, or point-to-point (tunnels like utun are OK).
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			logger.Warnf("resolveHostIP: failed to get addresses for %s: %v", iface.Name, err)
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil {
+				continue // skip IPv6 for now
+			}
+
+			if isExcluded(ip) {
+				logger.Debugf("resolveHostIP: excluded %s on %s (bridge/NAT range)", ip, iface.Name)
+				continue
+			}
+
+			// Classify the candidate.
+			if ip[0] == 100 && ip[1]&0xC0 == 64 {
+				// 100.64.0.0/10 — Tailscale range.
+				tailscaleCandidates = append(tailscaleCandidates, ip)
+				logger.Debugf("resolveHostIP: Tailscale candidate %s on %s", ip, iface.Name)
+			} else if ip[0] == 10 ||
+				(ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) ||
+				(ip[0] == 192 && ip[1] == 168) {
+				// Private LAN — keep as fallback.
+				lanCandidates = append(lanCandidates, ip)
+				logger.Debugf("resolveHostIP: LAN candidate %s on %s", ip, iface.Name)
+			} else {
+				otherCandidates = append(otherCandidates, ip)
+				logger.Debugf("resolveHostIP: other candidate %s on %s", ip, iface.Name)
+			}
+		}
 	}
 
-	// Final fallback: Use a common default for minikube
-	return "192.168.65.254"
+	// Pick the best candidate.
+	if len(tailscaleCandidates) > 0 {
+		logger.Infof("resolveHostIP: picked Tailscale IP %s (preferred over %d LAN and %d other candidates)",
+			tailscaleCandidates[0], len(lanCandidates), len(otherCandidates))
+		return tailscaleCandidates[0].String()
+	}
+	if len(lanCandidates) > 0 {
+		logger.Infof("resolveHostIP: picked LAN IP %s (%d other candidates rejected)",
+			lanCandidates[0], len(otherCandidates))
+		return lanCandidates[0].String()
+	}
+	if len(otherCandidates) > 0 {
+		logger.Infof("resolveHostIP: picked other IP %s (no Tailscale or LAN candidates)",
+			otherCandidates[0])
+		return otherCandidates[0].String()
+	}
+
+	logger.Warn("resolveHostIP: no routable IP found; returning empty string")
+	return ""
 }
