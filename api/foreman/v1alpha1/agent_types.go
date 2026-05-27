@@ -212,6 +212,16 @@ type AgentSpec struct {
 	// +optional
 	ObservationWindowTurns int32 `json:"observationWindowTurns,omitempty"`
 
+	// StuckLoopDetection configures the per-Agent stuck-loop detector
+	// (#544). When nil the executor applies a conservative default
+	// (5 repeated calls / 15 edit-free turns / 90k soft cap / 140k
+	// hard cap). Set fields to zero to disable a specific signal; set
+	// the whole pointer to a struct with all-zero fields to disable
+	// the detector entirely for this Agent (useful for review-only
+	// roles where re-reading the same diff is normal).
+	// +optional
+	StuckLoopDetection *StuckLoopDetectionSpec `json:"stuckLoopDetection,omitempty"`
+
 	// RequestTimeoutSeconds bounds a single chat-completions HTTP
 	// request. Long-context decode on a local model can be slow; default
 	// is generous.
@@ -241,6 +251,50 @@ type AgentSpec struct {
 	// spec.requiredCapability. Single source of truth.
 	// +optional
 	RequiredCapability RequiredCapability `json:"requiredCapability,omitempty"`
+}
+
+// StuckLoopDetectionSpec tunes the per-Agent stuck-loop detector (#544).
+// The detector observes the agent loop turn by turn; when one of the
+// configured signals fires it appends a strong-directive nudge to the
+// user prompt for the next turn, then force-terminates with verdict
+// INCOMPLETE if the model does not change behavior. The full transcript
+// is preserved either way; the terminal envelope's extra map carries
+// outcome=STUCK-LOOP-DETECTED plus the signal name for downstream
+// consumers.
+//
+// Empirical motivation: the v0.3 batch on 2026-05-26 had Carnice
+// repeating the same `git log | grep "449"` 58 times before hitting
+// MaxTurns. With the detector at threshold=5 the loop force-terminates
+// at turn ~7 instead, recovering most of the wasted compute.
+type StuckLoopDetectionSpec struct {
+	// RepeatedToolThreshold is the number of identical (tool_name, args)
+	// calls required to fire the duplicate-call signal. Zero disables.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	RepeatedToolThreshold int32 `json:"repeatedToolThreshold,omitempty"`
+
+	// EditFreeTurnsLimit is the number of consecutive turns without a
+	// write_file, str_replace, or submit_result call required to fire
+	// the edit-free signal. Zero disables.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=200
+	// +optional
+	EditFreeTurnsLimit int32 `json:"editFreeTurnsLimit,omitempty"`
+
+	// ContextSoftCap is the approximate-token budget that nudges the
+	// model once. Zero disables (paired with ContextHardCap).
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ContextSoftCap int32 `json:"contextSoftCap,omitempty"`
+
+	// ContextHardCap is the approximate-token budget that force-
+	// terminates without a nudge stage. Must be > ContextSoftCap when
+	// both are set; the executor disables both if soft >= hard rather
+	// than producing inconsistent decisions.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	ContextHardCap int32 `json:"contextHardCap,omitempty"`
 }
 
 // AgentStatus is the reconciler's view of the Agent's readiness. M3 keeps

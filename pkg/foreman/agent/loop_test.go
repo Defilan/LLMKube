@@ -325,6 +325,90 @@ func TestLoop_TranscriptPreservedOnError(t *testing.T) {
 	}
 }
 
+// TestLoop_StuckLoopDetectorForceTerminates exercises the #544 wire-in:
+// the model rapid-fires the same read_file call over and over. The
+// progress monitor nudges on the threshold-th call, then force-
+// terminates on the next still-stuck turn. Total turns should be
+// threshold + 1 (nudge) + 1 (escalation) at most, well below MaxTurns.
+func TestLoop_StuckLoopDetectorForceTerminates(t *testing.T) {
+	// 10 identical read_file responses; threshold=3 means we'll nudge
+	// at turn 3 and force-terminate at turn 4. MaxTurns=10 gives the
+	// detector room to fire well before the cap so the test is
+	// unambiguous about which path terminated the loop.
+	script := make([]string, 10)
+	for i := range script {
+		script[i] = toolCallReadFile
+	}
+	srv, _ := scriptedOAIServer(t, script)
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"read_file": {Output: map[string]any{"content": "# README\n"}},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	res, err := loop.Run(context.Background(), LoopConfig{
+		Model:    "test",
+		MaxTurns: 10,
+		Progress: ProgressConfig{RepeatedToolThreshold: 3},
+	})
+	if !errors.Is(err, ErrStuckLoopDetected) {
+		t.Fatalf("expected ErrStuckLoopDetected; got %v", err)
+	}
+	if res.Terminal == nil {
+		t.Fatal("expected synthesized Terminal envelope")
+	}
+	if res.Terminal.Verdict != "INCOMPLETE" {
+		t.Errorf("synthesized verdict: want INCOMPLETE; got %q", res.Terminal.Verdict)
+	}
+	if got := res.Terminal.Extra["outcome"]; got != "STUCK-LOOP-DETECTED" {
+		t.Errorf("Extra.outcome: want STUCK-LOOP-DETECTED; got %v", got)
+	}
+	if got := res.Terminal.Extra["signal"]; got != "RepeatedToolCall" {
+		t.Errorf("Extra.signal: want RepeatedToolCall; got %v", got)
+	}
+	// Turns should be 4 (3 to nudge, +1 to escalate); definitely < 10.
+	if res.Turns > 5 {
+		t.Errorf("detector should fire within 5 turns; got %d", res.Turns)
+	}
+	// Transcript must include the nudge message (synthetic user role)
+	// between the nudge turn's tool result and the next assistant turn.
+	var sawNudge bool
+	for _, m := range res.Transcript {
+		if m.Role == oai.RoleUser && strings.Contains(m.Content, "PROGRESS MONITOR") {
+			sawNudge = true
+			break
+		}
+	}
+	if !sawNudge {
+		t.Errorf("nudge message should appear in transcript")
+	}
+}
+
+// TestLoop_ProgressMonitorDisabledByDefault confirms that a LoopConfig
+// with a zero-value Progress field disables detection entirely. Lets
+// callers opt out by omitting the field rather than having to spell
+// out negative thresholds.
+func TestLoop_ProgressMonitorDisabledByDefault(t *testing.T) {
+	// Same setup as TestLoop_StuckLoopDetectorForceTerminates but
+	// without Progress set. The loop should now hit MaxTurns rather
+	// than force-terminate.
+	script := make([]string, 5)
+	for i := range script {
+		script[i] = toolCallReadFile
+	}
+	srv, _ := scriptedOAIServer(t, script)
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"read_file": {Output: map[string]any{"content": "# README\n"}},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	_, err := loop.Run(context.Background(), LoopConfig{Model: "test", MaxTurns: 5})
+	if !errors.Is(err, ErrMaxTurnsExhausted) {
+		t.Fatalf("expected ErrMaxTurnsExhausted (detector disabled by default); got %v", err)
+	}
+}
+
 // contains is a tiny strings.Contains avoiding the extra import for one use.
 func contains(haystack, needle string) bool {
 	if len(needle) == 0 {

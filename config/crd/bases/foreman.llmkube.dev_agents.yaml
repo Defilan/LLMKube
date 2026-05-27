@@ -287,6 +287,50 @@ spec:
                 - reviewer
                 - planner
                 type: string
+              stuckLoopDetection:
+                description: |-
+                  StuckLoopDetection configures the per-Agent stuck-loop detector
+                  (#544). When nil the executor applies a conservative default
+                  (5 repeated calls / 15 edit-free turns / 90k soft cap / 140k
+                  hard cap). Set fields to zero to disable a specific signal; set
+                  the whole pointer to a struct with all-zero fields to disable
+                  the detector entirely for this Agent (useful for review-only
+                  roles where re-reading the same diff is normal).
+                properties:
+                  contextHardCap:
+                    description: |-
+                      ContextHardCap is the approximate-token budget that force-
+                      terminates without a nudge stage. Must be > ContextSoftCap when
+                      both are set; the executor disables both if soft >= hard rather
+                      than producing inconsistent decisions.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  contextSoftCap:
+                    description: |-
+                      ContextSoftCap is the approximate-token budget that nudges the
+                      model once. Zero disables (paired with ContextHardCap).
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  editFreeTurnsLimit:
+                    description: |-
+                      EditFreeTurnsLimit is the number of consecutive turns without a
+                      write_file, str_replace, or submit_result call required to fire
+                      the edit-free signal. Zero disables.
+                    format: int32
+                    maximum: 200
+                    minimum: 0
+                    type: integer
+                  repeatedToolThreshold:
+                    description: |-
+                      RepeatedToolThreshold is the number of identical (tool_name, args)
+                      calls required to fire the duplicate-call signal. Zero disables.
+                    format: int32
+                    maximum: 100
+                    minimum: 0
+                    type: integer
+                type: object
               systemPrompt:
                 description: |-
                   SystemPrompt is the literal system message the Agent sees on every
