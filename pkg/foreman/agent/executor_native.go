@@ -294,12 +294,20 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	}
 	loop := loopFactory(oaiClient, registry)
 
-	// 7. Build the user prompt from the task payload. For coder Agents
-	// we prepend a repo-map summary of the workspace so the model has a
-	// localized starting point (see #560). Build() is best-effort: any
-	// error is logged and the loop runs without the prefix. Restricted
-	// to AgentRoleCoder in v0.3; reviewer + planner roles can opt in
-	// once we've measured impact on them.
+	// 7. Build the user prompt from the task payload. The composition,
+	// outermost-first:
+	//
+	//   1. Workspace orientation block (always; #567)
+	//   2. Repo-map summary (coder Agents only; #560)
+	//   3. The role-specific task prompt from buildUserPrompt
+	//
+	// The orientation block gives the model a stable anchor for
+	// "where is my workspace" so it does not fall back to `find /`
+	// and pick up stale paths from previous batches. The cd-guard in
+	// BashTool enforces the boundary; this block tells the model the
+	// contract exists. The repo-map prefix (when present) sits between
+	// the two so the model reads orientation -> repo map -> task in a
+	// natural order.
 	userPrompt := buildUserPrompt(task)
 	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
 		issueText := repoMapQuery(task)
@@ -311,6 +319,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			userPrompt = summary + "\n" + userPrompt
 		}
 	}
+	userPrompt = workspaceOrientationBlock(workspace) + "\n" + userPrompt
 
 	cfg := LoopConfig{
 		Model:                  endpoint.modelName,
@@ -917,6 +926,27 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		b.WriteString(p.Prompt)
 	}
 	return b.String()
+}
+
+// workspaceOrientationBlock renders the anchor block prepended to
+// every coder/reviewer Agent's user prompt. The block tells the model
+// where its workspace lives and that the value is also available as
+// $WORKSPACE_ROOT in any bash call.
+//
+// Fact-only language by design. Prohibitions ("do not cd outside the
+// workspace") get ignored by a confused model and look like a
+// band-aid in a debut release; the cd-guard in BashTool does the
+// enforcement, this block just provides the contract. See #567.
+func workspaceOrientationBlock(workspace string) string {
+	if workspace == "" {
+		return ""
+	}
+	return "## Workspace\n" +
+		"Your repository is at `" + workspace + "`.\n" +
+		"The same path is exported to bash calls as `$WORKSPACE_ROOT`.\n" +
+		"All relative paths you pass to read_file, write_file, grep, and " +
+		"str_replace resolve against this root. Bash commands start with " +
+		"cwd set to this root.\n"
 }
 
 // repoMapQuery returns the text the repo-map scorer uses to rank files.

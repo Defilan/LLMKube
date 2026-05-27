@@ -61,6 +61,30 @@ const (
 	defaultBashWaitDelay = 5 * time.Second
 )
 
+// cdGuardPrefix is a POSIX shell function prepended to every sh -c
+// command string. It shadows the cd builtin so absolute-path arguments
+// are rejected, keeping the model anchored to the workspace tree even
+// when its first reflex is to cd somewhere it remembers from training
+// data (e.g. /home/user/repos/<project> on a Mac, /workspace inside a
+// containerized run).
+//
+// Relative cd still works for normal navigation within the workspace
+// (cd pkg/foreman, cd .., cd ./internal). The guard catches the
+// specific failure mode where the model loses orientation, runs
+// `find / -name AGENTS.md`, sees stale paths from previous batches in
+// /private/tmp/review-tool-*, and cd's into one of them. See #567 for
+// the failure trace.
+//
+// `command cd` invokes the cd builtin without recursing through our
+// function definition. `CDPATH=` neuters any inherited CDPATH that
+// could redirect a bare `cd foo` to an unexpected absolute prefix.
+// The function is defined as a single line so it composes cleanly with
+// any user command appended after a semicolon. Works under bash
+// (macOS), dash (Alpine, Debian), zsh, and busybox sh.
+const cdGuardPrefix = `cd() { case "$1" in /*) ` +
+	`echo "bash: cd: $1: outside workspace (foreman sandbox)" >&2; return 1;; ` +
+	`*) CDPATH= command cd "$@";; esac; }; `
+
 // BashTool runs a shell command in the workspace under "sh -c" with a
 // scrubbed environment, a bounded timeout, and capped output. cwd is
 // always the workspace; PATH, HOME, and GIT_* are preserved so common
@@ -117,8 +141,14 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (*agent.To
 
 	// G204 (subprocess launched with variable): the bash tool is the
 	// point of admitting variable input. Containment lives at the
-	// workspace boundary and the env allowlist below.
-	cmd := exec.CommandContext(runCtx, "sh", "-c", a.Command) //nolint:gosec // G204: bash by design
+	// workspace boundary, the env allowlist, and the cd-guard prefix
+	// below.
+	//
+	// cdGuardPrefix is prepended to every command so absolute-path cd
+	// returns 1 with a clear error message instead of moving the shell
+	// to an unrelated directory. See cdGuardPrefix for the rationale.
+	guardedCommand := cdGuardPrefix + a.Command
+	cmd := exec.CommandContext(runCtx, "sh", "-c", guardedCommand) //nolint:gosec // G204: bash by design
 	cmd.Dir = t.Workspace
 	cmd.Env = t.scrubbedEnv()
 
@@ -191,7 +221,9 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (*agent.To
 // shell. PATH + HOME let common tools resolve; LANG/LC_ALL/TZ keep
 // locale-sensitive output deterministic enough for diffing; GIT_* and
 // GITHUB_TOKEN are required for the Phase D repo helpers when they
-// shell out to git from inside a bash tool call.
+// shell out to git from inside a bash tool call. WORKSPACE_ROOT is
+// injected separately by scrubbedEnv (it is not read from the parent
+// process; it is computed from BashTool.Workspace).
 var defaultBashEnvAllowlist = []string{
 	"PATH",
 	"HOME",
@@ -208,8 +240,14 @@ var defaultBashEnvAllowlist = []string{
 }
 
 // scrubbedEnv returns the env vars in the allowlist that are actually
-// set on the process. Anything else (notably ANTHROPIC_API_KEY, AWS
+// set on the process, plus WORKSPACE_ROOT set to the BashTool's
+// workspace path. Anything else (notably ANTHROPIC_API_KEY, AWS
 // credentials, etc.) does not reach the sandboxed shell.
+//
+// WORKSPACE_ROOT gives the model a stable reference for "where am I"
+// that does not require it to run `pwd` or `find /` from scratch on
+// each turn. The system prompt's workspace orientation block tells the
+// model the variable exists; see executor_native.go runLLMPath.
 func (t *BashTool) scrubbedEnv() []string {
 	allow := t.EnvAllowlist
 	if len(allow) == 0 {
@@ -228,6 +266,13 @@ func (t *BashTool) scrubbedEnv() []string {
 		if _, ok := allowSet[kv[:eq]]; ok {
 			out = append(out, kv)
 		}
+	}
+	// WORKSPACE_ROOT is computed from BashTool.Workspace, not read
+	// from the parent. Empty workspace yields no entry (a test
+	// constructing a BashTool without a workspace is doing something
+	// odd and we won't paper over it with a misleading "").
+	if t.Workspace != "" {
+		out = append(out, "WORKSPACE_ROOT="+t.Workspace)
 	}
 	return out
 }
