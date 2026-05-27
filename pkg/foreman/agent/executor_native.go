@@ -41,6 +41,7 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/repo"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/repomap"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/reviewer"
 )
 
 // NativeAgentLoopExecutor is the M3 production executor. It resolves an
@@ -405,6 +406,17 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// status.result.
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo ||
 		agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer {
+		// For reviewer terminals, validate the structured findings
+		// payload and log a one-line summary so operators can see what
+		// the reviewer flagged without opening the transcript ConfigMap.
+		// Malformed findings are dropped with a warning; the verdict
+		// (GO=APPROVE / NO-GO=REQUEST-CHANGES) is the authoritative
+		// signal regardless of findings validity (see pkg/foreman/agent/
+		// reviewer/findings.go for the schema).
+		if agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer &&
+			loopRes.Terminal != nil {
+			logReviewerFindings(log, loopRes.Terminal.Extra)
+		}
 		return e.modelDecidedResult(start, transcriptRef, loopRes, verdict), nil
 	}
 
@@ -968,6 +980,34 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		b.WriteString(p.Prompt)
 	}
 	return b.String()
+}
+
+// logReviewerFindings parses the reviewer's submit_result.extra
+// findings payload and emits a single info log line summarizing the
+// findings count by severity. Malformed findings produce warning log
+// lines but do not change task state. The reviewer's verdict
+// (NO-GO = REQUEST-CHANGES) remains the cascade-affecting signal;
+// findings are decoration that helps operators debug.
+//
+// See pkg/foreman/agent/reviewer/findings.go for the schema and
+// config/foreman/system-prompts/reviewer.md for the contract the
+// reviewer agent is asked to honor.
+func logReviewerFindings(log logr.Logger, extra map[string]any) {
+	findings, warnings := reviewer.ParseFindings(extra)
+	for _, w := range warnings {
+		log.Info("reviewer findings: malformed entry dropped", "warning", w)
+	}
+	if len(findings) == 0 {
+		return
+	}
+	counts := reviewer.CountBySeverity(findings)
+	log.Info("reviewer findings",
+		"total", len(findings),
+		"blocker", counts[reviewer.SeverityBlocker],
+		"major", counts[reviewer.SeverityMajor],
+		"minor", counts[reviewer.SeverityMinor],
+		"hasBlockers", reviewer.HasBlockers(findings),
+	)
 }
 
 // fetchIssueBodyIfNeeded populates task.Spec.Payload.Prompt from the
