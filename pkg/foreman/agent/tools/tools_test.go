@@ -673,6 +673,117 @@ func TestBash_EnvScrubbed(t *testing.T) {
 	}
 }
 
+// --- bash sandbox: WORKSPACE_ROOT + cd guard (#567) ----------------------
+
+// TestBash_WorkspaceRootEnvIsSet verifies that the model can read its
+// workspace path from $WORKSPACE_ROOT inside a bash call. This is the
+// orientation contract the system prompt's workspace block tells the
+// model about; without it the model has to discover the path with
+// `pwd` on every turn (or worse, `find /`).
+func TestBash_WorkspaceRootEnvIsSet(t *testing.T) {
+	ws := makeWorkspace(t)
+	b := &BashTool{Workspace: ws}
+	res, err := b.Execute(context.Background(),
+		json.RawMessage(`{"command":"printf %s \"$WORKSPACE_ROOT\""}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	out := res.Output.(map[string]any)
+	stdout, _ := out["stdout"].(string)
+	if stdout != ws {
+		t.Errorf("WORKSPACE_ROOT in bash: want %q got %q", ws, stdout)
+	}
+}
+
+// TestBash_CdGuardBlocksAbsolutePath proves the cd-guard rejects an
+// absolute-path cd. The post-cd command (echo) must NOT run because
+// the `cd ... && ...` short-circuits on the cd's non-zero exit.
+func TestBash_CdGuardBlocksAbsolutePath(t *testing.T) {
+	b := &BashTool{Workspace: makeWorkspace(t)}
+	res, err := b.Execute(context.Background(),
+		json.RawMessage(`{"command":"cd /tmp && echo SHOULD-NOT-PRINT"}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	out := res.Output.(map[string]any)
+	if strings.Contains(out["stdout"].(string), "SHOULD-NOT-PRINT") {
+		t.Errorf("guard failed; absolute cd allowed downstream cmd to run. stdout=%q", out["stdout"])
+	}
+	if !strings.Contains(out["stderr"].(string), "outside workspace") {
+		t.Errorf("guard error message missing from stderr. stderr=%q", out["stderr"])
+	}
+	if out["exit_code"].(int) == 0 {
+		t.Errorf("exit_code should be non-zero on blocked cd; got 0")
+	}
+}
+
+// TestBash_CdGuardAllowsRelativePath confirms relative cd still works
+// for normal workspace navigation. The model needs this for routine
+// tasks like `cd internal/foo && grep ...`.
+func TestBash_CdGuardAllowsRelativePath(t *testing.T) {
+	ws := makeWorkspace(t)
+	// Make a subdir we can cd into.
+	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "sub", "marker"), []byte("ok\n"), 0o644); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	b := &BashTool{Workspace: ws}
+	res, err := b.Execute(context.Background(),
+		json.RawMessage(`{"command":"cd sub && cat marker"}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	out := res.Output.(map[string]any)
+	if !strings.Contains(out["stdout"].(string), "ok") {
+		t.Errorf("relative cd should work; stdout=%q stderr=%q", out["stdout"], out["stderr"])
+	}
+	if out["exit_code"].(int) != 0 {
+		t.Errorf("exit_code: want 0 got %v", out["exit_code"])
+	}
+}
+
+// TestBash_CdGuardAllowsParentRelative confirms `cd ..` works. The
+// guard only blocks paths starting with `/`; parent-relative navigation
+// stays unrestricted so the model can move freely within the workspace
+// tree. The OS still rejects parent traversal that exits the workspace
+// at exec time (workspace was created as a temp dir; `cd ../..` lands
+// outside it but is still a non-absolute cd and so allowed by guard).
+//
+// This is intentional: the cd-guard is for *orientation*, not security.
+// Path-bounded tools (read_file, str_replace, grep) already enforce
+// containment via resolveInside; bash is the escape hatch by design.
+func TestBash_CdGuardAllowsParentRelative(t *testing.T) {
+	b := &BashTool{Workspace: makeWorkspace(t)}
+	res, err := b.Execute(context.Background(),
+		json.RawMessage(`{"command":"cd .. && pwd"}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	out := res.Output.(map[string]any)
+	if out["exit_code"].(int) != 0 {
+		t.Errorf("cd .. should succeed; got exit=%v stderr=%q",
+			out["exit_code"], out["stderr"])
+	}
+}
+
+// TestBash_CdGuardBlocksTildeHome confirms cd ~ and cd ~user are
+// blocked. Tilde expansion produces an absolute path before the
+// function sees it, so the `/*` case catches it.
+func TestBash_CdGuardBlocksTildeHome(t *testing.T) {
+	b := &BashTool{Workspace: makeWorkspace(t)}
+	res, err := b.Execute(context.Background(),
+		json.RawMessage(`{"command":"cd ~ && echo NOPE"}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	out := res.Output.(map[string]any)
+	if strings.Contains(out["stdout"].(string), "NOPE") {
+		t.Errorf("guard failed on cd ~; stdout=%q", out["stdout"])
+	}
+}
+
 // --- submit_result --------------------------------------------------------
 
 func TestSubmitResult_HappyPath(t *testing.T) {

@@ -815,20 +815,34 @@ func TestNativeExecutor_CoderPromptHasRepoMapPrefix(t *testing.T) {
 	}
 	first := captured[0]
 	if !strings.Contains(first, "## Repository overview") {
-		t.Errorf("first OAI request body missing repo-map header. body excerpt:\n%s", truncForTest(first, 1000))
+		t.Errorf("first OAI request body missing repo-map header. body excerpt:\n%s", truncForTest(first))
 	}
 	if !strings.Contains(first, "tools/bash.go") {
 		t.Errorf("first OAI request body missing seeded path tools/bash.go (issue should rank it top). body excerpt:\n%s",
-			truncForTest(first, 1000))
+			truncForTest(first))
+	}
+	// Workspace orientation block from #567 must also be present.
+	// It is prepended outermost, so the model reads orientation ->
+	// repo map -> task in order.
+	if !strings.Contains(first, "## Workspace") {
+		t.Errorf("first OAI request body missing workspace orientation header (#567). body excerpt:\n%s",
+			truncForTest(first))
+	}
+	if !strings.Contains(first, "WORKSPACE_ROOT") {
+		t.Errorf("orientation block should mention $WORKSPACE_ROOT. body excerpt:\n%s",
+			truncForTest(first))
 	}
 }
 
-// truncForTest keeps test failure output bounded.
-func truncForTest(s string, n int) string {
-	if len(s) <= n {
+// truncForTest keeps test failure output bounded. 1000 chars is enough
+// to spot the missing-header cases the assertions look for while still
+// fitting in a terminal screen of test output.
+func truncForTest(s string) string {
+	const cap = 1000
+	if len(s) <= cap {
 		return s
 	}
-	return s[:n] + "...[truncated]"
+	return s[:cap] + "...[truncated]"
 }
 
 // --- Deterministic Agent path (M4): no LLM, single tool dispatch ----------
