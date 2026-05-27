@@ -18,8 +18,10 @@ package agent
 
 import (
 	"context"
+	"net"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -419,6 +421,54 @@ func TestGetHostIP(t *testing.T) {
 	ip := getHostIP()
 	if ip == "" {
 		t.Error("getHostIP returned empty string")
+	}
+}
+
+func TestEnumerateHostIPs(t *testing.T) {
+	tests := []struct {
+		name           string
+		inputIPs       []string
+		expectRejected bool
+	}{
+		{
+			name:           "tailscale not a bridge range",
+			inputIPs:       []string{"100.116.176.101"},
+			expectRejected: false,
+		},
+		{
+			name:           "LAN not a bridge range",
+			inputIPs:       []string{"192.168.1.47"},
+			expectRejected: false,
+		},
+		{
+			name:           "docker bridge is excluded",
+			inputIPs:       []string{"192.168.65.254"},
+			expectRejected: true,
+		},
+		{
+			name:           "docker compose bridge is excluded",
+			inputIPs:       []string{"172.17.0.2"},
+			expectRejected: true,
+		},
+		{
+			name:           "k8s service range is excluded",
+			inputIPs:       []string{"10.96.0.1"},
+			expectRejected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, ipStr := range tt.inputIPs {
+				ip := net.ParseIP(ipStr)
+				if ip == nil {
+					t.Fatalf("invalid IP: %s", ipStr)
+				}
+				isRejected := isBridgeNATRange(ip)
+				assert.Equal(t, tt.expectRejected, isRejected,
+					"expected isBridgeNATRange(%s) = %v", ipStr, tt.expectRejected)
+			}
+		})
 	}
 }
 

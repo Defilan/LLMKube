@@ -60,6 +60,14 @@ func (r *ServiceRegistry) RegisterEndpoint(
 	isvc *inferencev1alpha1.InferenceService,
 	port int,
 ) error {
+	hostIP := r.resolveHostIP()
+	candidates, rejected := enumerateHostIPs()
+	if len(rejected) > 0 {
+		r.logger.Infof("hostIP=%s: rejected bridge/NAT interfaces: %s", hostIP, strings.Join(rejected, ", "))
+	}
+	if len(candidates) > 1 {
+		r.logger.Infof("hostIP=%s: selected from %d candidates: %s", hostIP, len(candidates), strings.Join(candidates, ", "))
+	}
 	// Sanitize service name (replace dots with dashes for DNS-1035 compliance)
 	serviceName := sanitizeServiceName(isvc.Name)
 
@@ -301,19 +309,142 @@ func (r *ServiceRegistry) resolveHostIP() string {
 }
 
 // getHostIP returns the auto-detected IP address that Kubernetes can use to
-// reach the host machine. For minikube, this is typically
-// host.minikube.internal which resolves to 192.168.65.254.
+// reach the host machine. It enumerates network interfaces, excludes bridge/NAT
+// ranges, and prefers Tailscale > primary LAN > loopback.
 func getHostIP() string {
-	// Try to resolve host.minikube.internal (for minikube)
-	if ips, err := net.LookupIP("host.minikube.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+	candidates, _ := enumerateHostIPs()
+	if len(candidates) == 0 {
+		return "127.0.0.1"
+	}
+	return candidates[0]
+}
+
+// isBridgeNATRange returns true if the given IP belongs to a known
+// bridge / NAT / virtual-adapter subnet that should not be advertised.
+func isBridgeNATRange(ip net.IP) bool {
+	if ip.To4() == nil {
+		return false
+	}
+	// Docker bridge default
+	_, dockerNet, _ := net.ParseCIDR("172.17.0.0/16")
+	if dockerNet.Contains(ip) {
+		return true
+	}
+	// Docker Compose / custom bridges (172.18-31.x.x)
+	for i := 17; i <= 31; i++ {
+		subnet := fmt.Sprintf("172.%d.0.0/16", i)
+		_, cidr, _ := net.ParseCIDR(subnet)
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	// Docker Desktop / colima / Lima NAT bridge
+	_, natNet, _ := net.ParseCIDR("192.168.65.0/24")
+	if natNet.Contains(ip) {
+		return true
+	}
+	// Kubernetes service cluster IP range (common default)
+	_, k8sNet, _ := net.ParseCIDR("10.96.0.0/12")
+	return k8sNet.Contains(ip)
+}
+
+// enumerateHostIPs enumerates network interfaces and returns a prioritized
+// list of routable IPv4 addresses.  It excludes bridge/NAT ranges and
+// returns (candidates, rejected) so callers can log the decision.
+func enumerateHostIPs() ([]string, []string) {
+	var candidates []string
+	var rejected []string
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil
 	}
 
-	// Fallback: Try to resolve host.docker.internal (for Docker Desktop)
-	if ips, err := net.LookupIP("host.docker.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+	// Determine which interface carries the default route.
+	defaultIfName := ""
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+				if ip4 := ipNet.IP.To4(); ip4 != nil {
+					for _, iface := range ifaces {
+						ifaceAddrs, _ := iface.Addrs()
+						for _, ia := range ifaceAddrs {
+							if iaStr, ok := ia.(*net.IPNet); ok && iaStr.IP.Equal(ip4) {
+								defaultIfName = iface.Name
+								break
+							}
+						}
+						if defaultIfName != "" {
+							break
+						}
+					}
+					if defaultIfName != "" {
+						break
+					}
+				}
+			}
+		}
 	}
 
-	// Final fallback: Use a common default for minikube
-	return "192.168.65.254"
+	for _, iface := range ifaces {
+		// Skip down / loopback / virtual bridge interfaces.
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		ifaceAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range ifaceAddrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil {
+				continue
+			}
+
+			// Skip loopback addresses.
+			if ip.IsLoopback() {
+				continue
+			}
+
+			// Skip bridge / NAT ranges.
+			if isBridgeNATRange(ip) {
+				rejected = append(rejected, fmt.Sprintf("%s (%s, bridge/NAT range)", ip, iface.Name))
+				continue
+			}
+
+			entry := fmt.Sprintf("%s (%s)", ip, iface.Name)
+
+			// Tailscale (100.64.x.x) gets highest priority.
+			if ip[0] == 100 && ip[1] == 64 {
+				candidates = append([]string{entry}, candidates...)
+				continue
+			}
+
+			// Primary LAN interface (carries default route) gets second priority.
+			if defaultIfName != "" && iface.Name == defaultIfName {
+				candidates = append(candidates, entry)
+				continue
+			}
+
+			// Other routable interfaces go after.
+			candidates = append(candidates, entry)
+		}
+	}
+
+	// If nothing else matched, fall back to loopback.
+	if len(candidates) == 0 {
+		candidates = append(candidates, "127.0.0.1 (loopback)")
+	}
+
+	return candidates, rejected
 }
