@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 
 	"go.uber.org/zap"
@@ -291,29 +292,193 @@ func sanitizeServiceName(name string) string {
 
 // resolveHostIP returns the IP address that Kubernetes uses to reach this host.
 // If an explicit hostIP was provided via --host-ip, that value is returned.
-// Otherwise it falls back to DNS auto-detection (host.minikube.internal,
-// host.docker.internal) for co-located setups.
+// Otherwise it enumerates network interfaces and picks the best routable IP
+// using the following preference order:
+//
+//  1. Tailscale interface (100.x.x.x) if present.
+//  2. Primary LAN IP (the interface carrying the default route).
+//  3. First non-loopback, non-bridge IPv4 address found.
+//
+// Bridge / NAT ranges (192.168.65.x, 10.96.x.x, 172.17.x.x, 172.18-31.x.x)
+// are excluded from candidates.
 func (r *ServiceRegistry) resolveHostIP() string {
 	if r.hostIP != "" {
 		return r.hostIP
 	}
-	return getHostIP()
+
+	candidates, rejected := enumerateHostIPs()
+	if len(candidates) == 0 {
+		r.logger.Warnw("no routable host IP found; endpoints will use 127.0.0.1 (remote access will fail)",
+			"rejected", rejected)
+		return "127.0.0.1"
+	}
+
+	picked := candidates[0]
+	r.logger.Infow("auto-detected host IP",
+		"picked", picked,
+		"pickedInterface", candidates[0].iface,
+		"candidates", candidates,
+		"rejected", rejected)
+	return candidates[0].ip
 }
 
-// getHostIP returns the auto-detected IP address that Kubernetes can use to
-// reach the host machine. For minikube, this is typically
-// host.minikube.internal which resolves to 192.168.65.254.
-func getHostIP() string {
-	// Try to resolve host.minikube.internal (for minikube)
-	if ips, err := net.LookupIP("host.minikube.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+// hostIPIface carries an IP address alongside the name of the interface it
+// belongs to, for logging purposes.
+type hostIPIface struct {
+	ip    string
+	iface string
+}
+
+// isBridgeNAT returns true if the given IP belongs to a known bridge / NAT
+// range that should be excluded from host-IP candidates.
+func isBridgeNAT(ip net.IP) bool {
+	// 192.168.65.0/24 — Docker Desktop / minikube default
+	if ip[0] == 192 && ip[1] == 168 && ip[2] == 65 {
+		return true
+	}
+	// 10.96.0.0/16 — Kubernetes service CIDR (kubeadm default)
+	if ip[0] == 10 && ip[1] == 96 {
+		return true
+	}
+	// 172.17.0.0/16 — Docker default bridge
+	if ip[0] == 172 && ip[1] == 17 {
+		return true
+	}
+	// 172.18-31.0.0/16 — Docker dynamic bridges
+	if ip[0] == 172 && ip[1] >= 18 && ip[1] <= 31 {
+		return true
+	}
+	return false
+}
+
+// enumerateHostIPs scans all network interfaces and returns routable IPv4
+// addresses sorted by preference (Tailscale first, then primary LAN, then
+// others).  It also returns a list of rejected candidates with reasons.
+func enumerateHostIPs() ([]hostIPIface, []string) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, nil
 	}
 
-	// Fallback: Try to resolve host.docker.internal (for Docker Desktop)
-	if ips, err := net.LookupIP("host.docker.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+	var tailscale []hostIPIface
+	var primaryLAN []hostIPIface
+	var other []hostIPIface
+	rejected := make([]string, 0)
+
+	// Determine which interface carries the default route.
+	defaultIfaceName := defaultRouteInterface()
+
+	for _, iface := range ifaces {
+		// Skip down, loopback, or virtual bridge interfaces.
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagLoopback != 0 ||
+			iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil || ip.IsUnspecified() || ip.IsLoopback() {
+				continue
+			}
+
+			// Exclude bridge / NAT ranges.
+			if isBridgeNAT(ip) {
+				rejected = append(rejected, fmt.Sprintf("%s/%s (bridge/NAT range)", iface.Name, ip))
+				continue
+			}
+
+			hip := hostIPIface{ip: ip.String(), iface: iface.Name}
+
+			// Tailscale interfaces start with 100.x.x.x.
+			if ip[0] == 100 && ip[1] == 64 {
+				tailscale = append(tailscale, hip)
+				continue
+			}
+			// Generic Tailscale 100.x.x.x (RFC 6598 / CGNAT range used by TS)
+			if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+				tailscale = append(tailscale, hip)
+				continue
+			}
+
+			// Prefer the interface carrying the default route.
+			if iface.Name == defaultIfaceName {
+				primaryLAN = append(primaryLAN, hip)
+			} else {
+				other = append(other, hip)
+			}
+		}
 	}
 
-	// Final fallback: Use a common default for minikube
-	return "192.168.65.254"
+	// Build final ordered list: Tailscale > primary LAN > other.
+	candidates := make([]hostIPIface, 0, len(tailscale)+len(primaryLAN)+len(other))
+	candidates = append(candidates, tailscale...)
+	candidates = append(candidates, primaryLAN...)
+	candidates = append(candidates, other...)
+
+	return candidates, rejected
+}
+
+// defaultRouteInterface returns the name of the interface that carries the
+// default IPv4 route, or "" if it cannot be determined.
+//
+// On Linux it parses /proc/net/route; on macOS it falls back to scanning
+// all interfaces and picking the one whose IP is in the 192.168.x.x or
+// 10.x.x.x private range (a heuristic that works for most laptops).
+func defaultRouteInterface() string {
+	// Linux: parse /proc/net/route for the default route (destination 00000000).
+	if data, err := os.ReadFile("/proc/net/route"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 3 {
+				continue
+			}
+			// destination column (index 1) in hex; "00000000" = default.
+			if fields[1] == "00000000" {
+				return fields[0]
+			}
+		}
+	}
+
+	// Fallback: scan interfaces and pick the first non-loopback, non-bridge
+	// private IP (10.x.x.x or 192.168.x.x).  This is a heuristic but works
+	// on most macOS laptops where the default route goes through en0.
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil || ip.IsLoopback() || isBridgeNAT(ip) {
+				continue
+			}
+			// Prefer 10.x.x.x or 192.168.x.x.
+			if (ip[0] == 10) || (ip[0] == 192 && ip[1] == 168) {
+				return iface.Name
+			}
+		}
+	}
+	return ""
 }

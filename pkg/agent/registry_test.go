@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -414,12 +415,57 @@ func TestReconcileOrphanEndpoints_EmptyCluster(t *testing.T) {
 	}
 }
 
-func TestGetHostIP(t *testing.T) {
-	// getHostIP should return a non-empty string regardless of environment
-	ip := getHostIP()
-	if ip == "" {
-		t.Error("getHostIP returned empty string")
-	}
+func TestEnumerateHostIPs(t *testing.T) {
+	// isBridgeNAT tests.
+	t.Run("isBridgeNAT", func(t *testing.T) {
+		tests := []struct {
+			ip     string
+			expect bool
+		}{
+			{"192.168.65.254", true},
+			{"192.168.65.1", true},
+			{"10.96.0.1", true},
+			{"10.96.255.255", true},
+			{"172.17.0.2", true},
+			{"172.18.0.1", true},
+			{"172.31.255.255", true},
+			{"172.16.0.1", false},
+			{"172.32.0.1", false},
+			{"192.168.1.47", false},
+			{"100.64.0.1", false},
+			{"100.116.176.101", false},
+			{"127.0.0.1", false},
+			{"8.8.8.8", false},
+		}
+		for _, tc := range tests {
+			t.Run(tc.ip, func(t *testing.T) {
+				ip := net.ParseIP(tc.ip).To4()
+				if ip == nil {
+					t.Fatalf("bad IP: %s", tc.ip)
+				}
+				got := isBridgeNAT(ip)
+				if got != tc.expect {
+					t.Errorf("isBridgeNAT(%s) = %v, want %v", tc.ip, got, tc.expect)
+				}
+			})
+		}
+	})
+
+	t.Run("preference_order", func(t *testing.T) {
+		tailscaleIP := net.ParseIP("100.116.176.101").To4()
+		lanIP := net.ParseIP("192.168.1.47").To4()
+		dockerIP := net.ParseIP("192.168.65.254").To4()
+
+		if !isBridgeNAT(dockerIP) {
+			t.Error("Docker bridge 192.168.65.254 should be excluded")
+		}
+		if isBridgeNAT(tailscaleIP) {
+			t.Error("Tailscale IP should not be excluded")
+		}
+		if isBridgeNAT(lanIP) {
+			t.Error("LAN IP should not be excluded")
+		}
+	})
 }
 
 func TestResolveHostIP_Explicit(t *testing.T) {
