@@ -9,3 +9,9 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include the gate-job YAML template the foreman-agent embeds via
+# //go:embed in pkg/foreman/agent/tools/run_gate_job.go. The Docker
+# build fails at the go-build step without this; goreleaser builds
+# embed before docker-build so they're unaffected. Fixes #531.
+!pkg/foreman/agent/tools/gate_job_template.yaml
