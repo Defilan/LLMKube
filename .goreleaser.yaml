@@ -108,6 +108,21 @@ builds:
     env:
       - CGO_ENABLED=0
 
+  - id: router-proxy
+    main: ./cmd/router-proxy/
+    binary: router-proxy
+
+    # Linux containers only (the router-proxy runs in-cluster).
+    goos:
+      - linux
+
+    goarch:
+      - amd64
+      - arm64
+
+    env:
+      - CGO_ENABLED=0
+
 archives:
   - id: llmkube-cli
     builds:
@@ -172,6 +187,40 @@ dockers:
     image_templates:
       - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-arm64"
     dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+
+  - id: router-proxy-amd64
+    goos: linux
+    goarch: amd64
+    ids:
+      - router-proxy
+    image_templates:
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-amd64"
+    dockerfile: Dockerfile.router-proxy
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.created={{.Date}}"
+      - "--label=org.opencontainers.image.title={{.ProjectName}}"
+      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+      - "--label=org.opencontainers.image.version={{.Version}}"
+      - "--label=org.opencontainers.image.source={{.GitURL}}"
+
+  - id: router-proxy-arm64
+    goos: linux
+    goarch: arm64
+    ids:
+      - router-proxy
+    image_templates:
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-arm64"
+    dockerfile: Dockerfile.router-proxy
     use: buildx
     build_flag_templates:
       - "--platform=linux/arm64"
@@ -254,6 +303,11 @@ docker_manifests:
     image_templates:
       - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-amd64"
       - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-amd64"
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-arm64"
 
   - name_template: "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}"
     image_templates:
