@@ -905,21 +905,45 @@ func objRefAsMap(ref corev1.ObjectReference) map[string]any {
 //
 //  1. Explicit task.Spec.Payload.Branch wins. This is the documented
 //     hand-off for verify tasks (which gate a branch the upstream coder
-//     task already produced) and the escape hatch for any task that
-//     wants to pin the branch name from the caller.
-//  2. issue-fix with Payload.Issue > 0 derives foreman/issue-<N>.
-//  3. Everything else falls back to foreman/<task-name>.
-//
-// v0.1 keeps slugs minimal; v0.2 may take an explicit IssueTitle field
-// on AgenticTaskPayload and slug it for the branch.
+//     task already produced), the M6 reconciler's prepopulated
+//     foreman/<workload>/issue-N name, and the escape hatch for any
+//     caller that wants to pin the branch name.
+//  2. issue-fix with Payload.Issue > 0 plus a Workload owner-ref
+//     derives foreman/<workload>/issue-N. The workload prefix is what
+//     makes the branch unique across reruns on the same issue (#573).
+//  3. issue-fix with Payload.Issue > 0 and no workload owner falls
+//     back to foreman/issue-N. Kept for hand-applied AgenticTasks
+//     that target a one-off issue with no parent Workload.
+//  4. Everything else falls back to foreman/<task-name>.
 func branchNameForTask(task *foremanv1alpha1.AgenticTask) string {
 	if task.Spec.Payload.Branch != "" {
 		return task.Spec.Payload.Branch
 	}
 	if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindIssueFix && task.Spec.Payload.Issue > 0 {
+		if owner := workloadOwnerName(task); owner != "" {
+			return fmt.Sprintf("%s/%s/issue-%d", repo.BranchPrefix, owner, task.Spec.Payload.Issue)
+		}
 		return fmt.Sprintf("%s/issue-%d", repo.BranchPrefix, task.Spec.Payload.Issue)
 	}
 	return fmt.Sprintf("%s/%s", repo.BranchPrefix, task.Name)
+}
+
+// workloadOwnerName returns the .metadata.name of the Workload that
+// owns this AgenticTask (set by WorkloadReconciler via owner-ref), or
+// "" if no Workload owner exists. Used by branchNameForTask to
+// disambiguate per-rerun branches.
+//
+// The check is intentionally name-based, not UID-based: the reader
+// is human-friendly (foreman/v03-validation-batch-rerun-5/issue-510
+// is greppable; a UUID suffix is not), and the name is unique within
+// a namespace which is the only scope the executor cares about.
+func workloadOwnerName(task *foremanv1alpha1.AgenticTask) string {
+	for _, ref := range task.OwnerReferences {
+		if ref.Kind == "Workload" && ref.APIVersion == foremanv1alpha1.GroupVersion.String() {
+			return ref.Name
+		}
+	}
+	return ""
 }
 
 // buildUserPrompt assembles the prompt the loop sends as the first user

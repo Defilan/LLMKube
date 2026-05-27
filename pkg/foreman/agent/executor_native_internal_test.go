@@ -98,6 +98,61 @@ func TestBranchNameForTask(t *testing.T) {
 			},
 			want: "foreman/verify-only",
 		},
+		{
+			// #573: issue-fix with a Workload owner-ref produces a
+			// workload-prefixed branch so reruns on the same issue do
+			// not collide.
+			name: "issue-fix with workload owner produces workload-prefixed branch",
+			task: &foremanv1alpha1.AgenticTask{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "code-510",
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							APIVersion: foremanv1alpha1.GroupVersion.String(),
+							Kind:       "Workload",
+							Name:       "v03-validation-batch-rerun-6",
+						},
+					},
+				},
+				Spec: foremanv1alpha1.AgenticTaskSpec{
+					Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+					Payload: foremanv1alpha1.AgenticTaskPayload{Issue: 510},
+				},
+			},
+			want: "foreman/v03-validation-batch-rerun-6/issue-510",
+		},
+		{
+			// Backward-compat: hand-applied issue-fix task without a
+			// Workload owner still gets the legacy foreman/issue-N path.
+			name: "issue-fix without workload owner uses legacy form",
+			task: &foremanv1alpha1.AgenticTask{
+				ObjectMeta: metav1.ObjectMeta{Name: "code-503"},
+				Spec: foremanv1alpha1.AgenticTaskSpec{
+					Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+					Payload: foremanv1alpha1.AgenticTaskPayload{Issue: 503},
+				},
+			},
+			want: "foreman/issue-503",
+		},
+		{
+			// A non-Workload owner-ref must not be mistaken for a
+			// Workload (cluster-roles can chain-own resources via
+			// arbitrary kinds; we only want our own kind).
+			name: "non-workload owner-ref does not affect branch name",
+			task: &foremanv1alpha1.AgenticTask{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "code-507",
+					OwnerReferences: []metav1.OwnerReference{
+						{APIVersion: "v1", Kind: "ConfigMap", Name: "irrelevant"},
+					},
+				},
+				Spec: foremanv1alpha1.AgenticTaskSpec{
+					Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+					Payload: foremanv1alpha1.AgenticTaskPayload{Issue: 507},
+				},
+			},
+			want: "foreman/issue-507",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
