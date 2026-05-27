@@ -329,6 +329,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		MaxTurns:               int(agent.Spec.MaxTurns),
 		ContextWindowTokens:    int(agent.Spec.ContextWindowTokens),
 		ObservationWindowTurns: int(agent.Spec.ObservationWindowTurns),
+		Progress:               progressConfigFromAgent(agent),
 	}
 
 	// 8. Run the loop. Always persist the transcript afterwards,
@@ -926,6 +927,29 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		b.WriteString(p.Prompt)
 	}
 	return b.String()
+}
+
+// progressConfigFromAgent maps the Agent CR's stuckLoopDetection field
+// onto a ProgressConfig the loop can use. The contract:
+//
+//   - Nil pointer  -> DefaultProgressConfig (debut-quality defaults; #544)
+//   - Non-nil with zero fields -> all-zero ProgressConfig (detector disabled)
+//   - Non-nil with set fields -> per-field override
+//
+// The non-nil-but-zero case lets a review-only Agent CR opt out
+// explicitly with `stuckLoopDetection: {}`; the nil case (the default
+// shape when no key is set) gets the conservative production defaults.
+func progressConfigFromAgent(agent *foremanv1alpha1.Agent) ProgressConfig {
+	if agent == nil || agent.Spec.StuckLoopDetection == nil {
+		return DefaultProgressConfig
+	}
+	s := agent.Spec.StuckLoopDetection
+	return ProgressConfig{
+		RepeatedToolThreshold: int(s.RepeatedToolThreshold),
+		EditFreeTurnsLimit:    int(s.EditFreeTurnsLimit),
+		ContextSoftCap:        int(s.ContextSoftCap),
+		ContextHardCap:        int(s.ContextHardCap),
+	}
 }
 
 // workspaceOrientationBlock renders the anchor block prepended to

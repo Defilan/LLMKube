@@ -37,6 +37,18 @@ spec:
   temperature: "0.2"
   maxTurns: 80
   maxRetries: 3
+  # Stuck-loop detector (#544). Same numbers as DefaultProgressConfig
+  # in pkg/foreman/agent/progress.go; spelled out here so operators can
+  # see and tune them without reading Go source. Empirically motivated
+  # by the v0.3 batch on 2026-05-26 where Carnice repeated the same
+  # `git log | grep "449"` call 58 times before MaxTurns; with these
+  # thresholds the loop nudges at turn ~5 and force-terminates at
+  # turn ~7.
+  stuckLoopDetection:
+    repeatedToolThreshold: 5
+    editFreeTurnsLimit: 15
+    contextSoftCap: 90000
+    contextHardCap: 140000
   # 30 min per HTTP request to llama-server. With the tool-output caps
   # in pkg/foreman/agent/tools (read_file at 16 KiB default + ranged reads,
   # bash at 16 KiB per stream) this is well above the natural per-turn

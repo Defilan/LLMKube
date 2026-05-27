@@ -102,6 +102,13 @@ type LoopConfig struct {
 	// messages kept in full regardless of the budget. <= 0 falls back
 	// to DefaultObservationWindowTurns (3).
 	ObservationWindowTurns int
+
+	// Progress configures the stuck-loop detector (#544). The default
+	// value (all zeros) disables detection; callers wanting the
+	// debut-quality default should set this to DefaultProgressConfig.
+	// The executor maps Agent.spec.stuckLoopDetection here; an unset
+	// Agent CR field yields DefaultProgressConfig.
+	Progress ProgressConfig
 }
 
 // DefaultContextWindowTokens is the budget used when LoopConfig.ContextWindowTokens
@@ -143,6 +150,14 @@ type LoopResult struct {
 // INCOMPLETE (the model declined to finish) rather than ERROR (the
 // runtime failed): the loop ran cleanly, the model just gave up.
 var ErrMaxTurnsExhausted = errors.New("loop: max turns exhausted")
+
+// ErrStuckLoopDetected is the marker returned from Loop.Run when the
+// progress monitor force-terminated. LoopResult.Terminal is also set
+// to a synthetic submit_result envelope with verdict=INCOMPLETE and
+// extra.outcome=STUCK-LOOP-DETECTED so callers that key on Terminal
+// see the normal terminal shape; this error gives callers that key
+// on err the same signal.
+var ErrStuckLoopDetected = errors.New("loop: stuck-loop detector force-terminated")
 
 // ErrAssistantNoToolCalls is returned when the model replies with text
 // only and no tool_calls. The loop has no way to make forward progress
@@ -194,17 +209,64 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 		},
 	}
 	schemas := l.registry.Schemas()
+	monitor := NewLoopProgressMonitor(cfg.Progress)
 
 	for turn := 1; turn <= cfg.MaxTurns; turn++ {
 		res.Turns = turn
-		if err := l.runOneTurn(ctx, cfg, schemas, res); err != nil {
-			if errors.Is(err, errTerminalReached) {
+
+		// runOneTurn appends the assistant message + tool messages to
+		// res.Transcript. It returns errTerminalReached on submit_result.
+		// We capture the assistant message's tool_calls before consulting
+		// the monitor; cleanest place to read them is after the turn
+		// returns successfully (errTerminalReached counts as success
+		// here -- submit_result is the model's chosen terminal).
+		turnErr := l.runOneTurn(ctx, cfg, schemas, res)
+		if turnErr != nil {
+			if errors.Is(turnErr, errTerminalReached) {
 				return res, nil
 			}
-			return res, err
+			return res, turnErr
+		}
+
+		// Consult the progress monitor. The most recent assistant
+		// message in the transcript has this turn's tool_calls.
+		calls := mostRecentAssistantToolCalls(res.Transcript)
+		decision := monitor.Observe(turn, calls, res.Transcript)
+		switch decision.Action {
+		case ProgressContinue:
+			// nothing to do
+		case ProgressNudge:
+			// Append a synthetic user message with the nudge text. The
+			// next turn's request will include it; the model gets one
+			// chance to recover before escalation.
+			res.Transcript = append(res.Transcript, oai.Message{
+				Role:    oai.RoleUser,
+				Content: NudgeMessage(decision),
+			})
+		case ProgressForceTerminate:
+			// Synthesize a submit_result envelope and exit. The
+			// transcript is left intact so the executor can persist
+			// the trajectory for review; res.Terminal carries the
+			// synthesized envelope so downstream consumers see a
+			// normal terminal shape.
+			res.Terminal = ForceTerminateEnvelope(decision, turn)
+			return res, ErrStuckLoopDetected
 		}
 	}
 	return res, ErrMaxTurnsExhausted
+}
+
+// mostRecentAssistantToolCalls walks the transcript backwards and
+// returns the tool_calls from the latest assistant message. Empty if
+// no assistant message exists. Used by the progress monitor to inspect
+// what the model just asked the harness to do.
+func mostRecentAssistantToolCalls(transcript []oai.Message) []oai.ToolCall {
+	for i := len(transcript) - 1; i >= 0; i-- {
+		if transcript[i].Role == oai.RoleAssistant {
+			return transcript[i].ToolCalls
+		}
+	}
+	return nil
 }
 
 // errTerminalReached is an internal sentinel from runOneTurn signaling

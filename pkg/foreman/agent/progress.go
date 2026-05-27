@@ -1,0 +1,435 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package agent
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
+)
+
+// ProgressConfig configures the LoopProgressMonitor. Zero values mean
+// "disabled for that signal" so a config with all zeros is equivalent
+// to no monitoring at all. The executor populates this from
+// Agent.spec.stuckLoopDetection; the empty value (a nil pointer on
+// the CRD) yields the DefaultProgressConfig defaults below.
+type ProgressConfig struct {
+	// RepeatedToolThreshold is how many identical (tool_name, args)
+	// calls trigger the duplicate-call signal. Two calls is normal
+	// (model reads a file, then re-reads after an edit); the threshold
+	// catches the pattern where the model rapid-fires the same call
+	// without intermediate progress.
+	//
+	// Zero disables the signal.
+	RepeatedToolThreshold int
+
+	// EditFreeTurnsLimit is the number of consecutive turns without a
+	// write_file, str_replace, or submit_result tool call that triggers
+	// the edit-free signal. A coder Agent that reads for 15 turns
+	// without making a single edit is exploring without converging.
+	//
+	// Zero disables the signal.
+	EditFreeTurnsLimit int
+
+	// ContextSoftCap and ContextHardCap are token-budget guards.
+	// Crossing the soft cap nudges the model to wrap up; crossing the
+	// hard cap force-terminates regardless of model behavior.
+	//
+	// Token count is approximated as chars/4 against the wire-mapped
+	// transcript (the same heuristic loop.go uses for masking
+	// decisions); precise tokenization is not required for an early-
+	// warning threshold.
+	//
+	// Zero disables the signal (caps must be > 0 to be active). When
+	// both are set, ContextSoftCap < ContextHardCap must hold;
+	// otherwise the monitor treats the config as invalid and disables
+	// itself rather than returning a misconfigured-but-active state.
+	ContextSoftCap int
+	ContextHardCap int
+}
+
+// DefaultProgressConfig is the conservative default applied when the
+// Agent CR omits stuckLoopDetection. Thresholds are slightly looser
+// than the most-aggressive setting we could ship so we don't false-
+// trigger on edge cases (a coder genuinely re-reading the same file
+// across an edit-verify cycle, for example).
+//
+// Empirical motivation: the v0.3 batch on 2026-05-26 had Carnice
+// rapid-firing the same `git log | grep "449"` 58 times. Threshold=5
+// catches it at turn ~6. Edit-free=15 catches a coder that read all
+// the way through MaxTurns without ever editing. Caps are sized for
+// a 64k-window model with headroom.
+var DefaultProgressConfig = ProgressConfig{
+	RepeatedToolThreshold: 5,
+	EditFreeTurnsLimit:    15,
+	ContextSoftCap:        90000,
+	ContextHardCap:        140000,
+}
+
+// ProgressAction is the recommendation the monitor returns after each
+// turn. The loop reads the action and either:
+//
+//   - Continue: append nothing, run the next turn normally.
+//   - Nudge: append a synthetic user message warning the model and
+//     suggesting it call submit_result, then run the next turn.
+//   - ForceTerminate: synthesize a terminal submit_result with
+//     verdict=INCOMPLETE and outcome=STUCK-LOOP-DETECTED, return.
+//
+// The state machine: Continue -> Nudge (first time a signal fires) ->
+// ForceTerminate (next time the same signal still holds). Each signal
+// gets one nudge before escalation; once a signal has nudged, that
+// signal does not nudge again on the same trajectory.
+type ProgressAction int
+
+const (
+	// ProgressContinue means no concerning pattern observed.
+	ProgressContinue ProgressAction = iota
+	// ProgressNudge means a signal fired for the first time. The loop
+	// appends the nudge text and gives the model one more turn.
+	ProgressNudge
+	// ProgressForceTerminate means a previously-nudged signal still
+	// holds after the model's chance to recover. The loop synthesizes
+	// a submit_result envelope and exits.
+	ProgressForceTerminate
+)
+
+// ProgressDecision is what Observe returns. Action carries the
+// recommendation; Signal names which detector fired (for telemetry);
+// Detail is human-readable context the nudge message and force-
+// terminate envelope quote so the model and downstream consumers can
+// understand why the harness stepped in.
+type ProgressDecision struct {
+	Action ProgressAction
+	Signal string // "RepeatedToolCall" | "EditFreeStreak" | "ContextSoftCap" | "ContextHardCap"
+	Detail string // human-readable summary the nudge/force envelope reproduces
+}
+
+// LoopProgressMonitor tracks the running state of one Loop.Run call
+// and emits ProgressDecisions after each turn. Stateful; one Monitor
+// per Run.
+//
+// All fields are written by Observe and read by Verdict; not safe for
+// concurrent use. The loop is single-threaded, so this is fine.
+type LoopProgressMonitor struct {
+	cfg ProgressConfig
+
+	// History buffers (per signal). All start empty. recentCallHashes
+	// is bounded at RepeatedToolThreshold*2 to keep memory small while
+	// observing a wide-enough window to detect the pattern.
+	recentCallHashes []string
+	editFreeStreak   int // turns since last edit/submit
+	contextTokens    int // approximate wire token count after most recent turn
+
+	// Nudge state. Once a signal has fired, the next-turn trigger
+	// escalates to ForceTerminate. For RepeatedToolCall we track the
+	// specific hash that nudged so a model that changes course on the
+	// next turn isn't punished for the historical buffer; the
+	// nudged-hash recurring even ONCE post-nudge escalates immediately.
+	// For the other signals a bool is enough.
+	nudgedRepeatedToolHash string // "" means not yet nudged
+	nudgedEditFree         bool
+	nudgedContextSoft      bool
+
+	// turnSeen is the last turn Observe was called on; protects against
+	// out-of-order calls (defensive; the loop calls in order).
+	turnSeen int
+}
+
+// NewLoopProgressMonitor constructs a monitor with the given config.
+// A monitor with an entirely-zero config returns ProgressContinue
+// always (effectively disabled) so callers can pass zero values
+// safely when the feature is opt-out.
+func NewLoopProgressMonitor(cfg ProgressConfig) *LoopProgressMonitor {
+	// Validate: if both soft+hard caps are set but soft >= hard, the
+	// config is invalid; disable the context signal by clearing both
+	// rather than producing meaningless decisions.
+	if cfg.ContextSoftCap > 0 && cfg.ContextHardCap > 0 && cfg.ContextSoftCap >= cfg.ContextHardCap {
+		cfg.ContextSoftCap = 0
+		cfg.ContextHardCap = 0
+	}
+	return &LoopProgressMonitor{cfg: cfg}
+}
+
+// editProducingTools are the tool names that count as "made progress"
+// for the EditFreeStreak signal. submit_result is included so a
+// model that immediately submits without editing (legitimate for
+// review-only roles or "nothing to fix" cases) does not get
+// false-flagged.
+var editProducingTools = map[string]struct{}{
+	"write_file":    {},
+	"str_replace":   {},
+	"submit_result": {},
+}
+
+// Observe records the result of one turn and returns a decision for
+// the loop to act on. The transcript argument is the full transcript
+// after the turn's tool messages were appended (i.e. what the next
+// turn's request would carry on the wire before masking).
+//
+// Observe must be called exactly once per turn, in order, after the
+// turn's tool dispatch has appended to the transcript. Out-of-order
+// calls are detected via turnSeen and yield ProgressContinue
+// defensively.
+func (m *LoopProgressMonitor) Observe(turn int, calls []oai.ToolCall, transcript []oai.Message) ProgressDecision {
+	if turn <= m.turnSeen {
+		return ProgressDecision{Action: ProgressContinue}
+	}
+	m.turnSeen = turn
+
+	// 1. Update state from this turn.
+	m.recordCalls(calls)
+	m.updateEditFreeStreak(calls)
+	m.contextTokens = approxTokens(transcript)
+
+	// 2. Evaluate each signal in priority order: hard cap first
+	// (deadliest), then soft cap, then edit-free, then repeated tool.
+	// A nudged signal escalates to ForceTerminate if it still fires;
+	// an un-nudged signal nudges on first fire.
+
+	// 2a. ContextHardCap: no nudge stage; immediate force-terminate.
+	if m.cfg.ContextHardCap > 0 && m.contextTokens >= m.cfg.ContextHardCap {
+		return ProgressDecision{
+			Action: ProgressForceTerminate,
+			Signal: "ContextHardCap",
+			Detail: fmt.Sprintf(
+				"approximate wire-token count %d >= hard cap %d at turn %d",
+				m.contextTokens, m.cfg.ContextHardCap, turn),
+		}
+	}
+
+	// 2b. ContextSoftCap: nudge once, then force-terminate.
+	if m.cfg.ContextSoftCap > 0 && m.contextTokens >= m.cfg.ContextSoftCap {
+		if m.nudgedContextSoft {
+			return ProgressDecision{
+				Action: ProgressForceTerminate,
+				Signal: "ContextSoftCap",
+				Detail: fmt.Sprintf(
+					"approximate wire-token count %d >= soft cap %d for second "+
+						"consecutive turn (turn %d); model did not call submit_result "+
+						"after the prior nudge",
+					m.contextTokens, m.cfg.ContextSoftCap, turn),
+			}
+		}
+		m.nudgedContextSoft = true
+		return ProgressDecision{
+			Action: ProgressNudge,
+			Signal: "ContextSoftCap",
+			Detail: fmt.Sprintf(
+				"approximate wire-token count %d >= soft cap %d at turn %d",
+				m.contextTokens, m.cfg.ContextSoftCap, turn),
+		}
+	}
+
+	// 2c. EditFreeStreak.
+	if m.cfg.EditFreeTurnsLimit > 0 && m.editFreeStreak >= m.cfg.EditFreeTurnsLimit {
+		if m.nudgedEditFree {
+			return ProgressDecision{
+				Action: ProgressForceTerminate,
+				Signal: "EditFreeStreak",
+				Detail: fmt.Sprintf(
+					"no write_file/str_replace/submit_result tool call in %d "+
+						"consecutive turns (turn %d); model did not change behavior "+
+						"after the prior nudge",
+					m.editFreeStreak, turn),
+			}
+		}
+		m.nudgedEditFree = true
+		return ProgressDecision{
+			Action: ProgressNudge,
+			Signal: "EditFreeStreak",
+			Detail: fmt.Sprintf(
+				"no write_file/str_replace/submit_result tool call in %d consecutive turns (turn %d)",
+				m.editFreeStreak, turn),
+		}
+	}
+
+	// 2d. RepeatedToolCall.
+	//
+	// Post-nudge fast path: if we previously nudged on a specific hash
+	// and any call in this turn matches that hash, escalate.
+	// Otherwise fall through to the threshold check.
+	if m.cfg.RepeatedToolThreshold > 0 {
+		if m.nudgedRepeatedToolHash != "" {
+			for _, tc := range calls {
+				h := callHash(tc.Function.Name, tc.Function.Arguments)
+				if h == m.nudgedRepeatedToolHash {
+					return ProgressDecision{
+						Action: ProgressForceTerminate,
+						Signal: "RepeatedToolCall",
+						Detail: fmt.Sprintf(
+							"%s called again with identical arguments (hash %s) at turn %d after a prior nudge for the same pattern",
+							extractToolName(h), h, turn),
+					}
+				}
+			}
+		}
+		if dup, name, hash := m.findRepeatedCall(); dup {
+			m.nudgedRepeatedToolHash = hash
+			// Reset the call buffer so the historical duplicates don't
+			// keep re-firing on a model that changes course; future
+			// recurrence of this specific hash will catch on the
+			// fast path above.
+			m.recentCallHashes = m.recentCallHashes[:0]
+			return ProgressDecision{
+				Action: ProgressNudge,
+				Signal: "RepeatedToolCall",
+				Detail: fmt.Sprintf(
+					"%s called >= %d times with identical arguments (hash %s) at turn %d",
+					name, m.cfg.RepeatedToolThreshold, hash, turn),
+			}
+		}
+	}
+
+	return ProgressDecision{Action: ProgressContinue}
+}
+
+// recordCalls appends every tool call from this turn to the
+// recentCallHashes buffer. Buffer is bounded at RepeatedToolThreshold
+// * 2 entries to keep memory small while still observing a window
+// large enough to detect the pattern.
+func (m *LoopProgressMonitor) recordCalls(calls []oai.ToolCall) {
+	if m.cfg.RepeatedToolThreshold <= 0 {
+		return
+	}
+	for _, tc := range calls {
+		h := callHash(tc.Function.Name, tc.Function.Arguments)
+		m.recentCallHashes = append(m.recentCallHashes, h)
+	}
+	// Keep the buffer bounded.
+	maxLen := m.cfg.RepeatedToolThreshold * 2
+	if maxLen < m.cfg.RepeatedToolThreshold+2 {
+		maxLen = m.cfg.RepeatedToolThreshold + 2
+	}
+	if len(m.recentCallHashes) > maxLen {
+		m.recentCallHashes = m.recentCallHashes[len(m.recentCallHashes)-maxLen:]
+	}
+}
+
+// updateEditFreeStreak increments the streak counter when the turn
+// contains zero edit-producing calls; resets it when any edit tool
+// fires (including submit_result, since that means the model is
+// converging).
+func (m *LoopProgressMonitor) updateEditFreeStreak(calls []oai.ToolCall) {
+	for _, tc := range calls {
+		if _, ok := editProducingTools[tc.Function.Name]; ok {
+			m.editFreeStreak = 0
+			return
+		}
+	}
+	m.editFreeStreak++
+}
+
+// findRepeatedCall scans the recentCallHashes buffer for any hash
+// appearing >= RepeatedToolThreshold times. Returns true plus the
+// name/hash of the duplicate so the decision message can reference
+// it.
+//
+// Hashes are stored as the full hash; the name is extracted by
+// re-hashing each call name as we walk back through recent calls.
+// In practice the bounded buffer keeps this O(buffer-size); the
+// fast path on a non-repeated trajectory is a single map lookup.
+func (m *LoopProgressMonitor) findRepeatedCall() (dup bool, name, hash string) {
+	if len(m.recentCallHashes) < m.cfg.RepeatedToolThreshold {
+		return false, "", ""
+	}
+	counts := make(map[string]int, len(m.recentCallHashes))
+	for _, h := range m.recentCallHashes {
+		counts[h]++
+		if counts[h] >= m.cfg.RepeatedToolThreshold {
+			return true, extractToolName(h), h
+		}
+	}
+	return false, "", ""
+}
+
+// callHash returns a stable hash of (tool_name, args). The args are
+// canonicalized as "name|args" before hashing; small differences
+// (whitespace) in the model's JSON output should produce identical
+// hashes for semantically identical calls, but we accept that
+// trade-off: in practice the model emits identical strings turn after
+// turn when stuck (see the v0.3 batch evidence of 58x exact-string
+// repeats).
+//
+// The first 8 chars of the SHA-256 hex digest are the tool-name
+// reference embedded as a prefix marker; extractToolName reverses
+// this to give the decision message a human-readable name.
+func callHash(name, args string) string {
+	h := sha256.Sum256([]byte(name + "\x00" + args))
+	// Prefix with name (truncated to 16 chars) so extractToolName can
+	// recover a readable identifier without us maintaining a separate
+	// map. The hash portion ensures uniqueness; the prefix is just for
+	// debug ergonomics.
+	prefix := name
+	if len(prefix) > 16 {
+		prefix = prefix[:16]
+	}
+	return prefix + ":" + hex.EncodeToString(h[:8])
+}
+
+// extractToolName recovers the tool name from a callHash output.
+// Used for human-readable decision messages.
+func extractToolName(hash string) string {
+	idx := strings.IndexByte(hash, ':')
+	if idx <= 0 {
+		return hash
+	}
+	return hash[:idx]
+}
+
+// NudgeMessage returns the synthetic user message the loop appends
+// when Observe returns ProgressNudge. The message is a strong
+// directive instructing the model to either change approach or call
+// submit_result; soft suggestions have shown poor recovery rates on
+// confused trajectories in practice.
+func NudgeMessage(d ProgressDecision) string {
+	var b strings.Builder
+	b.WriteString("PROGRESS MONITOR ALERT: ")
+	b.WriteString(d.Detail)
+	b.WriteString("\n\nThis pattern is not making progress. Stop. Either:\n")
+	b.WriteString("  - call submit_result(verdict=\"NO-GO\") with a clear summary of what is blocking you, OR\n")
+	b.WriteString("  - change your approach entirely (different tool, different arguments, different file).\n\n")
+	b.WriteString("Continuing the same pattern will be force-terminated as a stuck loop.")
+	return b.String()
+}
+
+// ForceTerminateEnvelope builds the synthetic submit_result envelope
+// the loop emits when Observe returns ProgressForceTerminate. The
+// envelope mirrors what the model would emit if it had called
+// submit_result(verdict="INCOMPLETE", summary="stuck-loop", ...) so
+// downstream consumers (executor, gate, reviewer) see a normal
+// terminal shape with a populated extra map.
+func ForceTerminateEnvelope(d ProgressDecision, turn int) *ToolResult {
+	return &ToolResult{
+		Terminal:      true,
+		Verdict:       "INCOMPLETE",
+		Summary:       "stuck-loop detector intervened: " + d.Signal,
+		CommitMessage: "",
+		Output: map[string]any{
+			"verdict": "INCOMPLETE",
+			"summary": "stuck-loop detector intervened: " + d.Signal,
+		},
+		Extra: map[string]any{
+			"outcome":       "STUCK-LOOP-DETECTED",
+			"signal":        d.Signal,
+			"detail":        d.Detail,
+			"terminateTurn": turn,
+		},
+	}
+}
