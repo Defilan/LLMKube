@@ -38,6 +38,7 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/repo"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/repomap"
 )
 
 // NativeAgentLoopExecutor is the M3 production executor. It resolves an
@@ -287,8 +288,23 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	}
 	loop := loopFactory(oaiClient, registry)
 
-	// 7. Build the user prompt from the task payload.
+	// 7. Build the user prompt from the task payload. For coder Agents
+	// we prepend a repo-map summary of the workspace so the model has a
+	// localized starting point (see #560). Build() is best-effort: any
+	// error is logged and the loop runs without the prefix. Restricted
+	// to AgentRoleCoder in v0.3; reviewer + planner roles can opt in
+	// once we've measured impact on them.
 	userPrompt := buildUserPrompt(task)
+	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
+		issueText := repoMapQuery(task)
+		summary, mapErr := repomap.Build(ctx, workspace, issueText, repomap.Options{})
+		switch {
+		case mapErr != nil:
+			log.Info("repomap build failed; continuing without summary", "err", mapErr.Error())
+		case summary != "":
+			userPrompt = summary + "\n" + userPrompt
+		}
+	}
 
 	cfg := LoopConfig{
 		Model:                  endpoint.modelName,
@@ -869,6 +885,29 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		b.WriteString(p.Prompt)
 	}
 	return b.String()
+}
+
+// repoMapQuery returns the text the repo-map scorer uses to rank files.
+// For issue-fix tasks we concatenate the issue number + the (often
+// rich) body the planner wrote into payload.Prompt; that combination
+// gives the scorer both the path hints ("see tools/bash.go") that
+// often appear in issue bodies and the bag-of-words signal from the
+// rest of the prose. Freeform tasks pass the prompt through unchanged.
+func repoMapQuery(task *foremanv1alpha1.AgenticTask) string {
+	p := task.Spec.Payload
+	if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindIssueFix {
+		var b strings.Builder
+		if p.Issue > 0 {
+			fmt.Fprintf(&b, "issue #%d ", p.Issue)
+		}
+		if p.Repo != "" {
+			b.WriteString(p.Repo)
+			b.WriteString(" ")
+		}
+		b.WriteString(p.Prompt)
+		return strings.TrimSpace(b.String())
+	}
+	return p.Prompt
 }
 
 // parseTemperature turns the *string Agent.spec.temperature into a
