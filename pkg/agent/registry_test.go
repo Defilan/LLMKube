@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -488,4 +489,113 @@ func TestRegisterEndpoint_ExplicitHostIP(t *testing.T) {
 	if endpoints.Subsets[0].Addresses[0].IP != "10.0.0.42" {
 		t.Errorf("Endpoint IP = %q, want %q", endpoints.Subsets[0].Addresses[0].IP, "10.0.0.42")
 	}
+}
+
+func TestResolveHostIP_MultiInterface(t *testing.T) {
+	// Save and restore the real net.Interfaces function.
+	realInterfaces := netInterfaces
+	realAddrs := ifaceAddrs
+	realNetstat := parseNetstat
+	defer func() {
+		netInterfaces = realInterfaces
+		ifaceAddrs = realAddrs
+		parseNetstat = realNetstat
+	}()
+
+	t.Run("multi-interface with Tailscale and Docker bridge", func(t *testing.T) {
+		// Simulate a macOS machine with:
+		// - en0: 192.168.1.47 (primary LAN, default route)
+		// - utun3: 100.116.176.101 (Tailscale)
+		// - utun5: 192.168.65.254 (Docker bridge)
+		netInterfaces = func() ([]net.Interface, error) {
+			return []net.Interface{
+				{Index: 1, MTU: 1500, Name: "en0", Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast},
+				{Index: 2, MTU: 1280, Name: "utun3", Flags: net.FlagUp | net.FlagPointToPoint},
+				{Index: 3, MTU: 1500, Name: "utun5", Flags: net.FlagUp | net.FlagBroadcast | net.FlagMulticast},
+			}, nil
+		}
+
+		ifaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
+			switch iface.Name {
+			case "en0":
+				return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.1.47"), Mask: net.CIDRMask(24, 32)}}, nil
+			case "utun3":
+				return []net.Addr{&net.IPNet{IP: net.ParseIP("100.116.176.101"), Mask: net.CIDRMask(32, 32)}}, nil
+			case "utun5":
+				return []net.Addr{&net.IPNet{IP: net.ParseIP("192.168.65.254"), Mask: net.CIDRMask(18, 32)}}, nil
+			default:
+				return nil, nil
+			}
+		}
+
+		parseNetstat = func() ([]netRouteEntry, error) {
+			return []netRouteEntry{
+				{Destination: "0.0.0.0/0", Gateway: "192.168.1.1", Iface: "en0"},
+			}, nil
+		}
+
+		candidates, rejected := resolveHostIP()
+
+		// Should have 2 candidates (Tailscale + LAN), Docker bridge rejected.
+		if len(candidates) != 2 {
+			t.Fatalf("expected 2 candidates, got %d", len(candidates))
+		}
+		if len(rejected) != 1 {
+			t.Fatalf("expected 1 rejected, got %d", len(rejected))
+		}
+
+		// First candidate should be Tailscale (priority 0).
+		if candidates[0].Addr != "100.116.176.101" {
+			t.Errorf("expected first candidate to be Tailscale IP, got %s", candidates[0].Addr)
+		}
+		if candidates[0].Priority != 0 {
+			t.Errorf("expected Tailscale priority 0, got %d", candidates[0].Priority)
+		}
+
+		// Second candidate should be LAN (priority 1).
+		if candidates[1].Addr != "192.168.1.47" {
+			t.Errorf("expected second candidate to be LAN IP, got %s", candidates[1].Addr)
+		}
+		if candidates[1].Priority != 1 {
+			t.Errorf("expected LAN priority 1, got %d", candidates[1].Priority)
+		}
+
+		// Rejected should be the Docker bridge.
+		if rejected[0].Addr != "192.168.65.254" {
+			t.Errorf("expected rejected Docker bridge, got %s", rejected[0].Addr)
+		}
+		if rejected[0].Reason != "bridge/NAT range" {
+			t.Errorf("expected reason 'bridge/NAT range', got %s", rejected[0].Reason)
+		}
+	})
+
+	t.Run("bridge ranges are excluded", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			ip       string
+			expected bool
+		}{
+			{"docker 172.17", "172.17.0.1", true},
+			{"docker 172.18", "172.18.0.1", true},
+			{"lima 192.168.64.1", "192.168.64.1", true},
+			{"lima 192.168.65.254", "192.168.65.254", true},
+			{"lima 192.168.127.254", "192.168.127.254", true},
+			{"k8s 10.96", "10.96.0.1", true},
+			{"loopback", "127.0.0.1", true},
+			{"link-local", "169.254.1.1", true},
+			{"tailscale", "100.116.176.101", false},
+			{"lan", "192.168.1.47", false},
+			{"private 10.0", "10.0.0.1", false},
+			{"private 172.16", "172.16.0.1", false},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				result := isBridgeNATRange(net.ParseIP(tt.ip))
+				if result != tt.expected {
+					t.Errorf("isBridgeNATRange(%s) = %v, want %v", tt.ip, result, tt.expected)
+				}
+			})
+		}
+	})
 }

@@ -20,6 +20,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"os/exec"
+	"sort"
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -31,6 +35,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+)
+
+// Test hooks for resolveHostIP.
+var (
+	netInterfaces = net.Interfaces
+	ifaceAddrs    = func(iface *net.Interface) ([]net.Addr, error) {
+		return iface.Addrs()
+	}
+	parseNetstat = realParseNetstat
 )
 
 // ServiceRegistry manages Kubernetes Service and Endpoint resources
@@ -301,19 +314,272 @@ func (r *ServiceRegistry) resolveHostIP() string {
 }
 
 // getHostIP returns the auto-detected IP address that Kubernetes can use to
-// reach the host machine. For minikube, this is typically
-// host.minikube.internal which resolves to 192.168.65.254.
+// reach the host machine. It enumerates all network interfaces and selects
+// the best routable IP using the following preference order:
+//
+//  1. Tailscale IP (100.x.x.x) if Tailscale is up.
+//  2. Primary LAN IP (the interface carrying the default route).
+//  3. Any other routable IPv4 address.
+//
+// Bridge / NAT ranges (Docker, Lima, colima, vmnet, etc.) are excluded.
+// If no suitable interface is found, it falls back to 127.0.0.1 with a
+// warning.
 func getHostIP() string {
-	// Try to resolve host.minikube.internal (for minikube)
-	if ips, err := net.LookupIP("host.minikube.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+	ips, rejected := resolveHostIP()
+
+	if len(ips) == 0 {
+		// Nothing routable found; warn and fall back to loopback.
+		for _, r := range rejected {
+			fmt.Printf("[WARN] rejected %s: %s\n", r.Addr, r.Reason)
+		}
+		fmt.Println("[WARN] no routable interface found; falling back to 127.0.0.1")
+		return "127.0.0.1"
 	}
 
-	// Fallback: Try to resolve host.docker.internal (for Docker Desktop)
-	if ips, err := net.LookupIP("host.docker.internal"); err == nil && len(ips) > 0 {
-		return ips[0].String()
+	// Pick the best candidate (Tailscale > LAN > other).
+	picked := ips[0]
+	fmt.Printf("[INFO] hostIP=%s via %s\n", picked.Addr, picked.Interface.Name)
+	for _, r := range rejected {
+		fmt.Printf("[INFO] rejected %s (%s): %s\n", r.Addr, r.Interface.Name, r.Reason)
+	}
+	return picked.Addr
+}
+
+// hostIPElection represents a single candidate IP during auto-detection.
+type hostIPElection struct {
+	Addr      string
+	Interface *net.Interface
+	Priority  int // lower is better; 0 = Tailscale, 1 = LAN, 2 = other
+	Reason    string
+}
+
+// isBridgeNATRange returns true if the given IP belongs to a known
+// bridge / NAT range that should be excluded from host-IP selection.
+func isBridgeNATRange(ip net.IP) bool {
+	if ip.IsLoopback() {
+		return true
+	}
+	if ip.IsLinkLocalUnicast() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// Docker bridge: 172.17.0.0/12 (172.17-31.0.0/16)
+		if ip4[0] == 172 && ip4[1] >= 17 && ip4[1] <= 31 {
+			return true
+		}
+		// Lima / colima / vmnet: 192.168.64.0/18
+		if ip4[0] == 192 && ip4[1] == 168 && ip4[2]&0xC0 == 64 {
+			return true
+		}
+		// Kubernetes service CIDR (common default): 10.96.0.0/12
+		if ip4[0] == 10 && ip4[1] == 96 {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveHostIP enumerates all network interfaces and returns a sorted
+// list of routable IPv4 candidates, plus a list of rejected addresses
+// with reasons. The returned list is ordered by preference: Tailscale
+// first, then LAN (default-route interface), then other routable IPs.
+func resolveHostIP() ([]hostIPElection, []hostIPElection) {
+	var candidates []hostIPElection
+	var rejected []hostIPElection
+
+	ifaces, err := netInterfaces()
+	if err != nil {
+		fmt.Printf("[WARN] failed to list interfaces: %v\n", err)
+		return nil, nil
 	}
 
-	// Final fallback: Use a common default for minikube
-	return "192.168.65.254"
+	// Determine which interface carries the default route.
+	defaultRouteIface := ""
+	routes, err := netRouteTable()
+	if err == nil {
+		for _, r := range routes {
+			if r.Destination == "0.0.0.0/0" {
+				defaultRouteIface = r.Iface
+				break
+			}
+		}
+	}
+
+	for _, iface := range ifaces {
+		// Skip down / loopback / virtual interfaces.
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := ifaceAddrs(&iface)
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil {
+				continue // skip IPv6
+			}
+
+			// Exclude bridge / NAT ranges.
+			if isBridgeNATRange(ip) {
+				rejected = append(rejected, hostIPElection{
+					Addr:      ip.String(),
+					Interface: &iface,
+					Reason:    "bridge/NAT range",
+				})
+				continue
+			}
+
+			// Determine priority.
+			priority := 2 // "other"
+			if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+				priority = 0 // Tailscale
+			} else if iface.Name == defaultRouteIface {
+				priority = 1 // Primary LAN
+			}
+
+			candidates = append(candidates, hostIPElection{
+				Addr:      ip.String(),
+				Interface: &iface,
+				Priority:  priority,
+				Reason:    "",
+			})
+		}
+	}
+
+	// Sort candidates by priority, then by IP for determinism.
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Priority != candidates[j].Priority {
+			return candidates[i].Priority < candidates[j].Priority
+		}
+		return bytesCompare(candidates[i].Addr, candidates[j].Addr) < 0
+	})
+
+	return candidates, rejected
+}
+
+// netRouteEntry holds a single IPv4 route from the kernel routing table.
+type netRouteEntry struct {
+	Destination string
+	Gateway     string
+	Iface       string
+}
+
+// netRouteTable returns the IPv4 routing table on the local host.
+// This is a best-effort implementation that parses /proc/net/route
+// (Linux) or runs `netstat -rn` (macOS / BSD).
+func netRouteTable() ([]netRouteEntry, error) {
+	// Linux: parse /proc/net/route.
+	if data, err := readFile("/proc/net/route"); err == nil {
+		return parseProcNetRoute(data)
+	}
+
+	// macOS / BSD: use netstat.
+	return parseNetstat()
+}
+
+// readFile reads a file and returns its contents.
+func readFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// bytesCompare compares two IPv4 address strings lexicographically.
+func bytesCompare(a, b string) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return len(a) - len(b)
+}
+
+// parseProcNetRoute parses the Linux /proc/net/route file.
+func parseProcNetRoute(data string) ([]netRouteEntry, error) {
+	var routes []netRouteEntry
+	lines := strings.Split(data, "\n")
+	for i, line := range lines {
+		if i == 0 {
+			continue // skip header
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		destHex := fields[1]
+		gwHex := fields[2]
+		iface := fields[0]
+
+		dest, err := hexToIP(destHex)
+		if err != nil {
+			continue
+		}
+		gw, _ := hexToIP(gwHex)
+
+		routes = append(routes, netRouteEntry{
+			Destination: dest.String(),
+			Gateway:     gw.String(),
+			Iface:       iface,
+		})
+	}
+	return routes, nil
+}
+
+// hexToIP converts a hex string from /proc/net/route to an IP.
+func hexToIP(hex string) (net.IP, error) {
+	var b [4]byte
+	for i := 0; i < 4 && i*2+1 < len(hex); i++ {
+		val, err := strconv.ParseUint(hex[i*2:i*2+2], 16, 8)
+		if err != nil {
+			return nil, err
+		}
+		b[3-i] = byte(val)
+	}
+	return net.IPv4(b[0], b[1], b[2], b[3]), nil
+}
+
+// realParseNetstat parses the output of `netstat -rn` on macOS / BSD.
+func realParseNetstat() ([]netRouteEntry, error) {
+	cmd := exec.CommandContext(context.Background(), "netstat", "-rn")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	var routes []netRouteEntry
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		dest := fields[0]
+		iface := fields[len(fields)-1]
+
+		// Skip non-IPv4 destinations.
+		if !strings.Contains(dest, ".") {
+			continue
+		}
+
+		routes = append(routes, netRouteEntry{
+			Destination: dest,
+			Iface:       iface,
+		})
+	}
+	return routes, nil
 }
