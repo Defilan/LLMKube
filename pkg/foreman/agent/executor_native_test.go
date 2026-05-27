@@ -269,7 +269,13 @@ func TestNativeExecutor_AgentNotFound(t *testing.T) {
 		t.Fatalf("expected INCOMPLETE result, got %+v", res)
 	}
 	if got := res.Extra["reason"]; got != "AgentNotFound" {
-		t.Errorf("reason: want AgentNotFound got %v", got)
+		t.Errorf("Extra[reason]: want AgentNotFound got %v", got)
+	}
+	// v0.3 #559: same value should also surface on the structured
+	// Result.FailureReason field (which the watcher writes to
+	// Status.FailureReason for downstream consumers).
+	if got := res.FailureReason; got != foremanv1alpha1.FailureAgentNotFound {
+		t.Errorf("FailureReason: want %q got %q", foremanv1alpha1.FailureAgentNotFound, got)
 	}
 }
 

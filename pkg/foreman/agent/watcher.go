@@ -235,6 +235,11 @@ func (w *AgenticTaskWatcher) patchTerminal(
 	if execErr != nil {
 		fresh.Status.Phase = foremanv1alpha1.AgenticTaskPhaseFailed
 		fresh.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictIncomplete
+		// v0.3 #559: the bubble-up path lands here. Map to
+		// InfrastructureError (the watcher has no visibility into
+		// what KIND of err this is, only that the executor wanted
+		// the supervisor to see it).
+		fresh.Status.FailureReason = foremanv1alpha1.FailureInfrastructureError
 		setCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               "Completed",
 			Status:             metav1.ConditionFalse,
@@ -250,6 +255,7 @@ func (w *AgenticTaskWatcher) patchTerminal(
 		// surface it explicitly rather than silently succeeding.
 		fresh.Status.Phase = foremanv1alpha1.AgenticTaskPhaseFailed
 		fresh.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictIncomplete
+		fresh.Status.FailureReason = foremanv1alpha1.FailureInfrastructureError
 		setCondition(&fresh.Status.Conditions, metav1.Condition{
 			Type:               "Completed",
 			Status:             metav1.ConditionFalse,
@@ -262,6 +268,11 @@ func (w *AgenticTaskWatcher) patchTerminal(
 
 	fresh.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
 	fresh.Status.Verdict = res.Verdict
+	// v0.3 #559: lift the structured FailureReason from the Result
+	// envelope onto the status. Empty on a successful task (Verdict
+	// in {GO, GATE-PASS}); set on Phase=Succeeded + non-success
+	// Verdict (NO-GO, GATE-FAIL, INCOMPLETE).
+	fresh.Status.FailureReason = res.FailureReason
 	raw, err := json.Marshal(res)
 	if err != nil {
 		return fmt.Errorf("marshal result: %w", err)

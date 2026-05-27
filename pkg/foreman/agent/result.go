@@ -50,6 +50,17 @@ type Result struct {
 	// exactly when both are present.
 	Verdict foremanv1alpha1.AgenticTaskVerdict `json:"verdict"`
 
+	// FailureReason categorizes WHY a non-success Verdict landed. The
+	// watcher copies this into AgenticTaskStatus.FailureReason. Empty
+	// on a successful task (Verdict in {GO, GATE-PASS}). See
+	// AgenticTaskFailureReason for the enum.
+	//
+	// v0.3 #559: structured failure taxonomy. Result.Extra["reason"]
+	// is kept in sync for one release for back-compat with any
+	// observer that mines the JSON; new code should read this typed
+	// field instead.
+	FailureReason foremanv1alpha1.AgenticTaskFailureReason `json:"failureReason,omitempty"`
+
 	// Summary is a human-readable one-liner. The watcher copies this into
 	// the Completed condition's Message; keep it terse.
 	Summary string `json:"summary"`

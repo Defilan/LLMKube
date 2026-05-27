@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -371,6 +372,86 @@ func TestResolveInferenceBaseURL(t *testing.T) {
 // boundary so the test reads cleanly.
 func foremanv1alpha1Local(name string) corev1.LocalObjectReference {
 	return corev1.LocalObjectReference{Name: name}
+}
+
+// TestFailResult_EmitsStructuredFailureReason pins the v0.3 #559
+// invariant: the failResult helper writes the typed reason to BOTH
+// Result.FailureReason (the structured field; what the watcher writes
+// to Status.FailureReason for downstream consumers) AND
+// Result.Extra["reason"] (the back-compat mirror; v0.1 observers).
+//
+// The whitebox path keeps the surface small; the executor's many
+// failResult call sites pass typed constants, and this test pins
+// that the conversion to the wire shape is correct.
+func TestFailResult_EmitsStructuredFailureReason(t *testing.T) {
+	e := &NativeAgentLoopExecutor{}
+	cases := []struct {
+		name   string
+		reason foremanv1alpha1.AgenticTaskFailureReason
+	}{
+		{"AgentNotFound", foremanv1alpha1.FailureAgentNotFound},
+		{"InferenceServiceUnavailable", foremanv1alpha1.FailureInferenceServiceUnavailable},
+		{"AuthUnavailable", foremanv1alpha1.FailureAuthUnavailable},
+		{"GitRemoteNotConfigured", foremanv1alpha1.FailureGitRemoteNotConfigured},
+		{"CloneFailed", foremanv1alpha1.FailureCloneFailed},
+		{"InfrastructureError", foremanv1alpha1.FailureInfrastructureError},
+		{"ToolFailed", foremanv1alpha1.FailureToolFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := e.failResult(time.Time{}, tc.reason, "some message")
+			if r.FailureReason != tc.reason {
+				t.Errorf("Result.FailureReason: want %q got %q", tc.reason, r.FailureReason)
+			}
+			if got := r.Extra["reason"]; got != string(tc.reason) {
+				t.Errorf("Result.Extra[reason]: want %q got %v", string(tc.reason), got)
+			}
+			// Verdict on a failResult is always INCOMPLETE; the watcher
+			// patches Phase=Failed in this path.
+			if r.Verdict != foremanv1alpha1.AgenticTaskVerdictIncomplete {
+				t.Errorf("Verdict: want INCOMPLETE got %q", r.Verdict)
+			}
+		})
+	}
+}
+
+// TestIncompleteResult_EmitsStructuredFailureReason mirrors the
+// failResult test for the in-loop incomplete path. The incompleteResult
+// helper is called when the loop exited cleanly but without a terminal
+// (MaxTurns, AssistantNoToolCalls, ctx Timeout). Each path must emit
+// the right structured reason.
+func TestIncompleteResult_EmitsStructuredFailureReason(t *testing.T) {
+	e := &NativeAgentLoopExecutor{}
+	cases := []foremanv1alpha1.AgenticTaskFailureReason{
+		foremanv1alpha1.FailureMaxTurnsExhausted,
+		foremanv1alpha1.FailureModelMisunderstood,
+		foremanv1alpha1.FailureTimeout,
+		foremanv1alpha1.FailureInfrastructureError,
+	}
+	for _, reason := range cases {
+		t.Run(string(reason), func(t *testing.T) {
+			r := e.incompleteResult(
+				time.Time{},
+				corev1.ObjectReference{Name: "transcript"},
+				&LoopResult{Turns: 7},
+				reason,
+				"msg",
+			)
+			if r.FailureReason != reason {
+				t.Errorf("Result.FailureReason: want %q got %q", reason, r.FailureReason)
+			}
+			if got := r.Extra["reason"]; got != string(reason) {
+				t.Errorf("Result.Extra[reason]: want %q got %v", string(reason), got)
+			}
+			// turnCount + outcome carry across as before.
+			if got := r.Extra["turnCount"]; got != 7 {
+				t.Errorf("Extra[turnCount]: want 7 got %v", got)
+			}
+			if got := r.Extra["outcome"]; got != "LOOP-INCOMPLETE" {
+				t.Errorf("Extra[outcome]: want LOOP-INCOMPLETE got %v", got)
+			}
+		})
+	}
 }
 
 // TestResolveProviderEndpoint covers the v0.2 cloud-proxy resolution
