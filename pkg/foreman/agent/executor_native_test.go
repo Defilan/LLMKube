@@ -658,6 +658,173 @@ func TestNativeExecutor_ReviewerGoIsApproveNotCommit(t *testing.T) {
 	}
 }
 
+// --- repo-map prefix (#560): coder Agent sees a workspace summary --------
+
+// initBareWithGoSeed extends initBareWithSeed with a small Go source
+// file so the repo-map walk has something to index. Without a .go file
+// the package returns an empty summary and the executor wiring is a
+// no-op (correct, but doesn't exercise the prefix path we want to
+// regression-cover).
+func initBareWithGoSeed(t *testing.T, root string) string {
+	t.Helper()
+	bare := filepath.Join(root, "origin.git")
+	if out, err := exec.Command("git", "init", "--bare", "-b", "main", bare).CombinedOutput(); err != nil {
+		t.Fatalf("git init bare: %v: %s", err, out)
+	}
+	seed := filepath.Join(root, "seed")
+	if out, err := exec.Command("git", "clone", bare, seed).CombinedOutput(); err != nil {
+		t.Fatalf("git clone seed: %v: %s", err, out)
+	}
+	files := map[string]string{
+		"README.md": "# seed\n",
+		"tools/bash.go": "// Package tools holds the agent's tool implementations.\n" +
+			"package tools\n\n" +
+			"// BashTool runs shell commands inside the agent workspace.\n" +
+			"type BashTool struct{}\n\n" +
+			"// Run executes the supplied command and returns its output.\n" +
+			"func (b *BashTool) Run(cmd string) (string, error) { return \"\", nil }\n",
+	}
+	for rel, body := range files {
+		p := filepath.Join(seed, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	for _, args := range [][]string{
+		{"git", "-c", "user.email=seed@x", "-c", "user.name=seed", "add", "-A"},
+		{"git", "-c", "user.email=seed@x", "-c", "user.name=seed", "commit", "-m", "seed"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Dir = seed
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %v: %s", args, err, out)
+		}
+	}
+	cur, _ := exec.Command("git", "-C", seed, "branch", "--show-current").Output()
+	if strings.TrimSpace(string(cur)) != "main" {
+		cmd := exec.Command("git", "-C", seed, "branch", "-M", strings.TrimSpace(string(cur)), "main")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("rename main: %v: %s", err, out)
+		}
+	}
+	if out, err := exec.Command("git", "-C", seed, "push", "origin", "main").CombinedOutput(); err != nil {
+		t.Fatalf("seed push: %v: %s", err, out)
+	}
+	return bare
+}
+
+// recordingOAI wraps scriptedOAI to capture request bodies. The first
+// captured body is the only one we look at; that is the turn where the
+// loop sends system + user messages for the first time, which is where
+// the repomap prefix has to land.
+func recordingOAI(t *testing.T, bodies []string, sink *[]string) *httptest.Server {
+	t.Helper()
+	var i atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := readAll(r.Body)
+		*sink = append(*sink, string(body))
+		k := int(i.Add(1) - 1)
+		if k >= len(bodies) {
+			k = len(bodies) - 1
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(chatJSONBodyToSSE(t, bodies[k])))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// readAll is a tiny io.ReadAll equivalent so we don't have to import
+// "io" just for the test helper. Returns the bytes plus any read error;
+// callers ignore the error because httptest bodies always close cleanly.
+func readAll(r interface{ Read(p []byte) (int, error) }) ([]byte, error) {
+	var out []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			out = append(out, buf[:n]...)
+		}
+		if err != nil {
+			if err.Error() == "EOF" {
+				return out, nil
+			}
+			return out, err
+		}
+	}
+}
+
+// TestNativeExecutor_CoderPromptHasRepoMapPrefix exercises the #560
+// wiring: a coder Agent's first OAI request should carry the repo-map
+// markdown header in its user message. Non-coder Agents (verifier,
+// reviewer) get no prefix in v0.3 even when an LLM is in the loop.
+func TestNativeExecutor_CoderPromptHasRepoMapPrefix(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithGoSeed(t, root)
+
+	var captured []string
+	oaiSrv := recordingOAI(t, []string{submitGoBody}, &captured)
+
+	agent, task := taskAndAgent("repomap")
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	reg := &fakeRegistry{
+		results: map[string]*foremanagent.ToolResult{
+			"submit_result": {
+				Terminal: true, Verdict: "GO", Summary: "ok",
+				CommitMessage: "fix: trivial\n",
+			},
+		},
+		touch: func(name string, ws string) {
+			if name == "submit_result" {
+				_ = os.WriteFile(filepath.Join(ws, "fix.txt"), []byte("x\n"), 0o644)
+			}
+		},
+	}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Bot", Email: "b@x"},
+		CommitCommitter:          repo.Identity{Name: "Bot", Email: "b@x"},
+		RegistryFactory: func(ws string, _ *foremanv1alpha1.Agent) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+
+	if _, err := e.Execute(context.Background(), task); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if len(captured) == 0 {
+		t.Fatal("no OAI requests captured")
+	}
+	first := captured[0]
+	if !strings.Contains(first, "## Repository overview") {
+		t.Errorf("first OAI request body missing repo-map header. body excerpt:\n%s", truncForTest(first, 1000))
+	}
+	if !strings.Contains(first, "tools/bash.go") {
+		t.Errorf("first OAI request body missing seeded path tools/bash.go (issue should rank it top). body excerpt:\n%s",
+			truncForTest(first, 1000))
+	}
+}
+
+// truncForTest keeps test failure output bounded.
+func truncForTest(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...[truncated]"
+}
+
 // --- Deterministic Agent path (M4): no LLM, single tool dispatch ----------
 
 func TestNativeExecutor_DeterministicGateAgent(t *testing.T) {
