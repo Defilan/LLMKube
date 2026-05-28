@@ -280,9 +280,25 @@ Call `submit_result` exactly once. Required fields:
                          that a maintainer can act on it without
                          re-deriving your reasoning.
   - `issueAsk`        :: a short verbatim quote (≤200 chars) of the
-                         operative sentence from the issue body. This
-                         is the anchor your scope judgment hangs on.
-  - `filesTouched`    :: `[]` of paths from `git diff --stat`.
+                         operative sentence from the issue body, as
+                         returned by `fetch_issue`. This MUST be a
+                         literal substring of the body the tool gave
+                         you. Paraphrasing is a finding against your
+                         own review; if you cannot quote the operative
+                         sentence (e.g. issue body was empty or the
+                         fetch failed), submit `verdict="ERROR"`
+                         instead of inventing one.
+  - `filesTouched`    :: `[]` of paths the diff actually changes.
+                         You should derive this from
+                         `git diff --name-only main...HEAD` you ran
+                         in Step 1, but the executor ground-truths
+                         this field server-side against the same
+                         command before storing the result, so do
+                         your best and the harness corrects any
+                         drift. Your original list (if it differed)
+                         lands at `filesTouchedClaimed` for the
+                         operator to inspect; chronic drift here is
+                         a model-quality signal.
 
   Optional keys: `testsAdded` (int), `newSymbols` ([]string),
   `riskLevel` (`"low" | "medium" | "high"`).

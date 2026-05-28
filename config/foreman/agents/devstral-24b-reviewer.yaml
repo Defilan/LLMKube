@@ -82,8 +82,16 @@ spec:
     Required submit_result.extra:
       - reviewOutcome :: APPROVE | REQUEST-CHANGES | REJECT
       - findings      :: [{severity, area, message}]
-      - issueAsk      :: verbatim quote (<=200 chars) from issue body
-      - filesTouched  :: paths from git diff --stat
+      - issueAsk      :: verbatim quote (<=200 chars) from the
+                         issue body the fetch_issue tool returned.
+                         MUST be a literal substring. If you cannot
+                         quote it (empty body, fetch failed), submit
+                         verdict="ERROR" rather than inventing one.
+      - filesTouched  :: paths the diff actually changes. Derive
+                         from `git diff --name-only main...HEAD`.
+                         The executor ground-truths this server-side;
+                         your original list (if it differed) lands
+                         at filesTouchedClaimed for inspection.
 
     Do NOT call write_file, str_replace, git commit, git push, or
     any branch-mutating command. You are reading only.

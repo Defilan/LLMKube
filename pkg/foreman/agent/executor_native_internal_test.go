@@ -25,10 +25,15 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -837,4 +842,199 @@ func TestBuildUserPrompt_ReviewerCaseProducesNonEmptyContent(t *testing.T) {
 			t.Errorf("reviewer prompt missing %q in:\n%s", want, got)
 		}
 	}
+}
+
+// TestFileListsEqual_TypeShapes covers the two ways the model's
+// claim shows up in extra: as []string (the executor's own writes)
+// or as []any (the standard shape after a json.Unmarshal pass over
+// submit_result.extra). Equality is order-insensitive because git's
+// diff order is deterministic but not semantically meaningful.
+// Closes part of #582.
+func TestFileListsEqual_TypeShapes(t *testing.T) {
+	gt := []string{"a.go", "b.go", "c.go"}
+
+	cases := []struct {
+		name string
+		prev any
+		want bool
+	}{
+		{"any-slice-same-order", []any{"a.go", "b.go", "c.go"}, true},
+		{"any-slice-different-order", []any{"c.go", "a.go", "b.go"}, true},
+		{"any-slice-missing-one", []any{"a.go", "b.go"}, false},
+		{"any-slice-extra-one", []any{"a.go", "b.go", "c.go", "d.go"}, false},
+		{"string-slice-same", []string{"b.go", "a.go", "c.go"}, true},
+		{"string-slice-different", []string{"x.go", "y.go", "z.go"}, false},
+		{"nil-claim", nil, false},
+		{"wrong-type", "a.go,b.go,c.go", false},
+		{"any-with-non-string", []any{"a.go", 42, "c.go"}, false},
+		{"both-empty-vs-non-empty-gt", []any{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fileListsEqual(tc.prev, gt)
+			if got != tc.want {
+				t.Errorf("fileListsEqual: want %v got %v", tc.want, got)
+			}
+		})
+	}
+
+	if !fileListsEqual([]any{}, []string{}) {
+		t.Error("two empty lists should be equal")
+	}
+}
+
+// TestReconcileReviewerFilesTouched_OverwritesAndPreservesClaim is the
+// headline test for #582: a model that confabulates filesTouched gets
+// its claim preserved under filesTouchedClaimed while the actual
+// reported filesTouched gets rewritten to the diff's ground truth.
+func TestReconcileReviewerFilesTouched_OverwritesAndPreservesClaim(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	ws := setupTestRepoWithFeatureBranch(t)
+
+	confabulatedClaim := []any{
+		"internal/controller/fake.go",
+		"internal/controller/also-fake.go",
+		"internal/controller/never-existed.go",
+	}
+	extra := map[string]any{
+		"reviewOutcome": "REQUEST-CHANGES",
+		"issueAsk":      "Some asks here",
+		"filesTouched":  confabulatedClaim,
+		"findings":      []any{},
+	}
+
+	reconcileReviewerFilesTouched(context.Background(), logr.Discard(), ws, extra)
+
+	got, ok := extra["filesTouched"].([]string)
+	if !ok {
+		t.Fatalf("filesTouched should be []string after reconcile, got %T (%v)",
+			extra["filesTouched"], extra["filesTouched"])
+	}
+	wantSet := map[string]bool{"a.go": true, "c.go": true}
+	if len(got) != len(wantSet) {
+		t.Errorf("filesTouched: want 2 files got %d (%v)", len(got), got)
+	}
+	for _, p := range got {
+		if !wantSet[p] {
+			t.Errorf("filesTouched contains unexpected %q (b.go was unchanged)", p)
+		}
+	}
+
+	claim, ok := extra["filesTouchedClaimed"].([]any)
+	if !ok {
+		t.Fatalf("filesTouchedClaimed should be []any (preserved); got %T",
+			extra["filesTouchedClaimed"])
+	}
+	if !reflect.DeepEqual(claim, confabulatedClaim) {
+		t.Errorf("filesTouchedClaimed mutated: want %v got %v", confabulatedClaim, claim)
+	}
+
+	if extra["reviewOutcome"] != "REQUEST-CHANGES" {
+		t.Error("reviewOutcome should be untouched by reconciliation")
+	}
+	if extra["issueAsk"] != "Some asks here" {
+		t.Error("issueAsk should be untouched by reconciliation")
+	}
+}
+
+func TestReconcileReviewerFilesTouched_HonestClaimNoClaimedFieldAdded(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	ws := setupTestRepoWithFeatureBranch(t)
+
+	honestClaim := []any{"a.go", "c.go"}
+	extra := map[string]any{"filesTouched": honestClaim}
+	reconcileReviewerFilesTouched(context.Background(), logr.Discard(), ws, extra)
+
+	if _, present := extra["filesTouchedClaimed"]; present {
+		t.Errorf("filesTouchedClaimed should NOT be set when claim matched; got %v",
+			extra["filesTouchedClaimed"])
+	}
+	got, ok := extra["filesTouched"].([]string)
+	if !ok {
+		t.Fatalf("filesTouched should be canonicalized to []string; got %T",
+			extra["filesTouched"])
+	}
+	if len(got) != 2 {
+		t.Errorf("filesTouched: want 2 entries got %v", got)
+	}
+}
+
+func TestReconcileReviewerFilesTouched_NilExtraIsNoOp(t *testing.T) {
+	reconcileReviewerFilesTouched(context.Background(), logr.Discard(), "/tmp", nil)
+	reconcileReviewerFilesTouched(context.Background(), logr.Discard(), "", map[string]any{"x": 1})
+}
+
+func TestReconcileReviewerFilesTouched_GitFailurePreservesClaim(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	ws := t.TempDir()
+	if out, err := exec.Command("git", "-C", ws, "init", "-b", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	originalClaim := []any{"some-file.go"}
+	extra := map[string]any{"filesTouched": originalClaim}
+	reconcileReviewerFilesTouched(context.Background(), logr.Discard(), ws, extra)
+
+	got, ok := extra["filesTouched"].([]any)
+	if !ok {
+		t.Fatalf("filesTouched should keep model's original type on git failure; got %T",
+			extra["filesTouched"])
+	}
+	if !reflect.DeepEqual(got, originalClaim) {
+		t.Errorf("filesTouched mutated on git failure: want %v got %v", originalClaim, got)
+	}
+	if _, claimed := extra["filesTouchedClaimed"]; claimed {
+		t.Errorf("filesTouchedClaimed should not be set when reconciliation could not run")
+	}
+}
+
+func setupTestRepoWithFeatureBranch(t *testing.T) string {
+	t.Helper()
+	ws := t.TempDir()
+	ctx := context.Background()
+
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = ws
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		full := filepath.Join(ws, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdirall %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	run("init", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	write("a.go", "package a\n")
+	write("b.go", "package b\n")
+	run("add", ".")
+	run("commit", "-m", "initial")
+
+	run("checkout", "-b", "feature")
+	write("a.go", "package a\n// edit\n")
+	write("c.go", "package c\n")
+	run("add", ".")
+	run("commit", "-m", "feature work")
+
+	return ws
 }
