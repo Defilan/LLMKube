@@ -33,6 +33,18 @@ A change is not done until all of these pass:
 3. `make lint`
 4. `make test`
 
+## Before pushing a PR
+
+Run the cross-arch lint pass:
+
+```sh
+make lint-all
+```
+
+This catches `//go:build`-tagged files that the host's default `GOOS` would
+silently skip. About 2× slower than `make lint`; intentional opt-in so the
+inner loop stays fast.
+
 If you edited CRD types in `api/v1alpha1/`, also run:
 
 5. `make generate` — DeepCopy methods
