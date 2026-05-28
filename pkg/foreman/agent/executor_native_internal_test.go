@@ -42,6 +42,7 @@ import (
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 )
 
 // TestBranchNameForTask covers the precedence rule between explicit
@@ -1037,4 +1038,215 @@ func setupTestRepoWithFeatureBranch(t *testing.T) string {
 	run("commit", "-m", "feature work")
 
 	return ws
+}
+
+// ---- issueAsk reconciliation (#582 follow-on; second confabulation fix) ----
+
+func TestFirstBodyParagraph_SkipsHeadersTakesFirstProse(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		max  int
+		want string
+	}{
+		{"empty", "", 200, ""},
+		{"plain-prose", "Fix the thing.", 200, "Fix the thing."},
+		{
+			"strips-leading-h2",
+			"## Bug Description\n\nThe metal-agent picks the wrong IP.",
+			200,
+			"The metal-agent picks the wrong IP.",
+		},
+		{
+			"strips-leading-h1",
+			"# Feature\n\nAdd a make lint-all target nudge to AGENTS.md.",
+			200,
+			"Add a make lint-all target nudge to AGENTS.md.",
+		},
+		{
+			"joins-wrapped-lines-of-first-paragraph",
+			"## Bug Description\n\nLine one of the bug\nstill same paragraph\n\nLine of paragraph two",
+			200,
+			"Line one of the bug still same paragraph",
+		},
+		{
+			"truncates-at-maxchars",
+			"short header\n\n" + strings.Repeat("x", 300),
+			50,
+			"short header",
+		},
+		{
+			"only-headers-no-prose",
+			"## Bug Description\n## Steps\n## Expected",
+			200,
+			"",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := firstBodyParagraph(tc.in, tc.max)
+			if got != tc.want {
+				t.Errorf("got %q\nwant %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExtractFetchIssueBody_HappyAndMissing(t *testing.T) {
+	// Synthesize a fetch_issue tool-call + tool-result pair in a
+	// realistic transcript shape.
+	mkMsgs := func(toolID, content string) []oai.Message {
+		return []oai.Message{
+			{Role: oai.RoleUser, Content: "you are reviewing the branch ..."},
+			{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+				ID:   toolID,
+				Type: "function",
+				Function: oai.ToolCallFunction{
+					Name:      "fetch_issue",
+					Arguments: `{"repo":"defilantech/LLMKube","number":510}`,
+				},
+			}}},
+			{Role: oai.RoleTool, ToolCallID: toolID, Content: content},
+		}
+	}
+
+	body := extractFetchIssueBody(mkMsgs("tc-1",
+		`{"number":510,"title":"docs","body":"The real issue body here.","state":"open"}`))
+	if body != "The real issue body here." {
+		t.Errorf("happy path body: got %q", body)
+	}
+
+	if body := extractFetchIssueBody(nil); body != "" {
+		t.Errorf("nil msgs: want empty got %q", body)
+	}
+
+	if body := extractFetchIssueBody([]oai.Message{
+		{Role: oai.RoleUser, Content: "no tool calls here"},
+	}); body != "" {
+		t.Errorf("no fetch_issue call: want empty got %q", body)
+	}
+
+	if body := extractFetchIssueBody(mkMsgs("tc-2", `not-valid-json`)); body != "" {
+		t.Errorf("malformed JSON tool content: want empty got %q", body)
+	}
+
+	if body := extractFetchIssueBody(mkMsgs("tc-3",
+		`{"number":510,"title":"docs","state":"open"}`)); body != "" {
+		t.Errorf("missing body field: want empty got %q", body)
+	}
+
+	// Multiple fetch_issue calls: last successful body wins.
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{ID: "tc-a", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue", Arguments: `{"number":1}`}}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-a",
+			Content: `{"body":"first body"}`},
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{ID: "tc-b", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue", Arguments: `{"number":2}`}}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-b",
+			Content: `{"body":"second body"}`},
+	}
+	if got := extractFetchIssueBody(msgs); got != "second body" {
+		t.Errorf("last-wins: want %q got %q", "second body", got)
+	}
+}
+
+func TestReconcileReviewerIssueAsk_VerbatimQuotePreserved(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{
+				Name: "fetch_issue", Arguments: `{"repo":"o/r","number":510}`,
+			},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1",
+			Content: `{"body":"` + strings.ReplaceAll(body, "`", "\\u0060") + `"}`},
+	}
+	// Pre-serialize the body via json.Marshal so escaping is correct.
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs[1].Content = string(content)
+
+	extra := map[string]any{
+		"issueAsk": "Add a `make lint-all` nudge to AGENTS.md per #508 follow-up.",
+	}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"] != "Add a `make lint-all` nudge to AGENTS.md per #508 follow-up." {
+		t.Errorf("verbatim claim should be preserved unchanged; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); !v {
+		t.Errorf("verbatim claim should set issueAskVerified=true; got %v", extra["issueAskVerified"])
+	}
+	if _, claimed := extra["issueAskClaimed"]; claimed {
+		t.Errorf("issueAskClaimed should not be set for honest quote")
+	}
+}
+
+func TestReconcileReviewerIssueAsk_ConfabulationRewritten(t *testing.T) {
+	body := "## Bug Description\n\nmetal-agent picks the wrong IP on multi-NIC macOS hosts."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+
+	confab := "Add a reconciler that cleans up orphaned Service+Endpoints objects when agent restarts."
+	extra := map[string]any{"issueAsk": confab}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"] != "metal-agent picks the wrong IP on multi-NIC macOS hosts." {
+		t.Errorf("confabulated claim should be rewritten with body excerpt; got %v",
+			extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); v {
+		t.Errorf("rewritten issueAsk should mark issueAskVerified=false; got true")
+	}
+	if extra["issueAskClaimed"] != confab {
+		t.Errorf("issueAskClaimed should preserve original confabulation; got %v",
+			extra["issueAskClaimed"])
+	}
+}
+
+func TestReconcileReviewerIssueAsk_NoFetchInTranscript(t *testing.T) {
+	extra := map[string]any{"issueAsk": "some claim"}
+	reconcileReviewerIssueAsk(logr.Discard(), []oai.Message{
+		{Role: oai.RoleUser, Content: "no fetch_issue here"},
+	}, extra)
+	if extra["issueAsk"] != "some claim" {
+		t.Errorf("with no fetch_issue body in transcript, claim should be preserved unchanged; got %v", extra["issueAsk"])
+	}
+	if _, verified := extra["issueAskVerified"]; verified {
+		t.Errorf("issueAskVerified should NOT be set when reconciliation could not run")
+	}
+}
+
+func TestReconcileReviewerIssueAsk_EmptyClaimFilledFromBody(t *testing.T) {
+	body := "## Feature\n\nDocument the new --lint-all flag."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+	extra := map[string]any{} // model omitted issueAsk entirely
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+	if extra["issueAsk"] != "Document the new --lint-all flag." {
+		t.Errorf("empty claim should be filled from body excerpt; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); v {
+		t.Errorf("body-derived issueAsk should mark issueAskVerified=false")
+	}
+	if _, claimed := extra["issueAskClaimed"]; claimed {
+		t.Errorf("issueAskClaimed should not be set when model had no claim to archive")
+	}
+}
+
+func TestReconcileReviewerIssueAsk_NilExtraIsNoOp(t *testing.T) {
+	reconcileReviewerIssueAsk(logr.Discard(), nil, nil) // must not panic
 }
