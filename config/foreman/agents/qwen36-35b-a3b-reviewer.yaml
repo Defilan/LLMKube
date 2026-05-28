@@ -41,7 +41,16 @@ spec:
   # over-cold reviewers default to APPROVE more than they should.
   # Still conservative enough to keep verdicts stable across reruns.
   temperature: "0.35"
-  maxTurns: 40
+  # 80 turns instead of 40: the v0.4 prompt requires ~5-7 setup tool
+  # calls (Step 1), then 1 read_file per touched file (Section B-D),
+  # then grep for call sites (D), then `git show main:path` reads for
+  # regression checks (F), then read_file of every godoc context (G).
+  # On a 6-file diff that adds up to 35+ turns before the model is
+  # ready to call submit_result. 40 was empirically too tight on
+  # rerun-10 (qwen INCOMPLETE on #449 and #526). 80 gives ~3 minutes
+  # of headroom at qwen's ~2 turns/sec pace and lets full Section-A-
+  # through-H reviews of multi-file diffs converge. Closes #583.
+  maxTurns: 80
   maxRetries: 3
   # 15 min per HTTP request to llama-server. Reviewers read the diff,
   # the issue body, and a handful of files; they should never need
@@ -236,9 +245,20 @@ spec:
                              Each finding cites file/line or quoted
                              issue text.
       - `issueAsk`        :: short verbatim quote (<=200 chars) from
-                             the issue body, the anchor your scope
-                             judgment hangs on.
-      - `filesTouched`    :: `[]` of paths from `git diff --stat`.
+                             the issue body the `fetch_issue` tool
+                             returned. MUST be a literal substring
+                             of that body; paraphrasing counts as
+                             confabulation. If you cannot quote the
+                             operative sentence (empty body, fetch
+                             failed), submit `verdict="ERROR"`
+                             instead of inventing one.
+      - `filesTouched`    :: `[]` of paths the diff actually changes.
+                             Derive from `git diff --name-only
+                             main...HEAD` you ran in Step 1. The
+                             executor ground-truths this server-side;
+                             your original list (if it differed)
+                             lands at `filesTouchedClaimed` for
+                             operator inspection.
       Optional: `testsAdded` (int), `newSymbols` ([]string),
       `riskLevel` (`"low" | "medium" | "high"`).
 

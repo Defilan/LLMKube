@@ -415,6 +415,13 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// reviewer/findings.go for the schema).
 		if agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer &&
 			loopRes.Terminal != nil {
+			// Ground-truth filesTouched against the actual diff before
+			// findings are logged. Devstral, in particular, hallucinates
+			// this field on multi-file diffs (#582) even when its tool
+			// calls returned correct data; the server-side rewrite makes
+			// the model's claim a debugging artifact and the diff the
+			// authoritative answer.
+			reconcileReviewerFilesTouched(ctx, log, workspace, loopRes.Terminal.Extra)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 		}
 		return e.modelDecidedResult(start, transcriptRef, loopRes, verdict), nil
@@ -1024,6 +1031,104 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 // See pkg/foreman/agent/reviewer/findings.go for the schema and
 // config/foreman/system-prompts/reviewer.md for the contract the
 // reviewer agent is asked to honor.
+// reconcileReviewerFilesTouched overwrites
+// `submit_result.extra.filesTouched` with the ground-truth file list
+// from `git diff --name-only main...HEAD` in the reviewer's workspace.
+// Preserves the model's original claim under `filesTouchedClaimed` so
+// the discrepancy stays inspectable in the AgenticTask result.
+//
+// Why this exists (#582): devstral on multi-file diffs reliably emits
+// a confabulated filesTouched even when its earlier read_file / bash
+// tool calls accessed the correct files. The "trust the model's
+// terminal payload" assumption is wrong for reviewers above a small
+// complexity threshold. The fix is structural: the executor knows
+// what changed (the workspace has the diff), so it should be the
+// authority on filesTouched, not the model.
+//
+// Failure modes are non-fatal: a git error or an absent main ref
+// just logs a warning and leaves the model's claim untouched. The
+// reviewer's verdict + findings still surface; only the filesTouched
+// field is downgraded to "model-reported" instead of "ground-truth."
+//
+// Note about base ref selection: we use the local `main` branch.
+// `repo.Clone` defaults to cloning from origin with main checked out;
+// when the model runs Step 1 (`git fetch <branch> + git checkout`),
+// the local main branch stays at clone-time HEAD, which is the right
+// base for the three-dot diff (compare HEAD against the merge-base
+// with main).
+func reconcileReviewerFilesTouched(
+	ctx context.Context, log logr.Logger,
+	workspace string, extra map[string]any,
+) {
+	if extra == nil || workspace == "" {
+		return
+	}
+	groundTruth, err := repo.DiffNameOnly(ctx, workspace, "main")
+	if err != nil {
+		log.Info("reviewer filesTouched: ground-truth diff failed; preserving model claim",
+			"err", err.Error())
+		return
+	}
+	prev := extra["filesTouched"]
+	if !fileListsEqual(prev, groundTruth) {
+		// Preserve what the model said so the confabulation case is
+		// inspectable (kubectl get agentictask -o yaml). filesTouched
+		// becomes the source of truth; filesTouchedClaimed is the
+		// archaeology field.
+		extra["filesTouchedClaimed"] = prev
+		log.Info("reviewer filesTouched: overwriting model claim with diff ground truth",
+			"groundTruth", groundTruth,
+			"modelClaim", prev,
+		)
+	}
+	extra["filesTouched"] = groundTruth
+}
+
+// fileListsEqual returns true when prev (which is `any` because it
+// came through map[string]any from a json.Unmarshal of the model's
+// submit_result.extra) names the same set of files as groundTruth.
+// Used to skip the noisy "overwriting" log line when the model
+// already got it right; the executor still rewrites the field so the
+// stored payload is a canonical []string.
+func fileListsEqual(prev any, groundTruth []string) bool {
+	got, ok := prev.([]any)
+	if !ok {
+		if s, sok := prev.([]string); sok {
+			if len(s) != len(groundTruth) {
+				return false
+			}
+			seen := make(map[string]bool, len(s))
+			for _, v := range s {
+				seen[v] = true
+			}
+			for _, g := range groundTruth {
+				if !seen[g] {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}
+	if len(got) != len(groundTruth) {
+		return false
+	}
+	seen := make(map[string]bool, len(got))
+	for _, v := range got {
+		s, ok := v.(string)
+		if !ok {
+			return false
+		}
+		seen[s] = true
+	}
+	for _, g := range groundTruth {
+		if !seen[g] {
+			return false
+		}
+	}
+	return true
+}
+
 func logReviewerFindings(log logr.Logger, extra map[string]any) {
 	findings, warnings := reviewer.ParseFindings(extra)
 	for _, w := range warnings {
