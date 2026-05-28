@@ -64,7 +64,7 @@ order.
   still applies: an older AgenticTask CRD silently rejects
   `spec.requiredCapability.roles` under strict decode.
 
-## Step 1 :: install Foreman
+## Step 1: install Foreman
 
 From the published chart repo (recommended once you have llmkube
 installed via the prerequisite above):
@@ -152,7 +152,7 @@ The "Starting workers" line for each of the four reconcilers
 (Agent, AgenticTask, FleetNode, Workload) means the operator is
 healthy.
 
-## Step 2 :: confirm the agent registered itself
+## Step 2: confirm the agent registered itself
 
 ```sh
 kubectl get fleetnodes
@@ -184,7 +184,7 @@ If you see only `- worker`, the Helm install missed the `roles`
 override. Re-run the `helm upgrade` with the `--set 'agent.roles=…'`
 line above.
 
-## Step 3 :: optional smoke task (stub executor)
+## Step 3: optional smoke task (stub executor)
 
 Foreman ships with a stub executor that does nothing but sleep + write
 a synthetic Succeeded result. It's the cheapest way to convince
@@ -224,7 +224,7 @@ helm upgrade --reuse-values foreman \
   defilantech/foreman -n foreman-system --set agent.mode=native
 ```
 
-## Step 4 :: applying the gate Agent CR
+## Step 4: applying the gate Agent CR
 
 The actual gate Agent + the V3 two-step demo manifests land with
 Phase F. Once those merge, the workflow is:
@@ -239,25 +239,25 @@ full V3 demo.
 
 ## Troubleshooting
 
-**`fleetnodes` list is empty** :: the `foreman-agent` Pod has not
+**`fleetnodes` list is empty**: the `foreman-agent` Pod has not
 registered yet. Check its log: `kubectl -n
 foreman-system logs -l app.kubernetes.io/component=agent`. The most
 common cause is the ServiceAccount missing `create` on
 `fleetnodes`; re-run `helm upgrade` to refresh the RBAC.
 
-**ClusterRole permission denied** on FleetNode write :: the chart's
+**ClusterRole permission denied** on FleetNode write: the chart's
 agent ClusterRole grants `create`/`update`/`patch` on
 `foreman.llmkube.dev/fleetnodes`. If you customized the chart's
 RBAC, diff against `charts/foreman/templates/agent-rbac.yaml` and
 confirm the rule is intact.
 
-**`foreman-gate-cache` PVC stuck Pending** :: the cluster has no
+**`foreman-gate-cache` PVC stuck Pending**: the cluster has no
 default StorageClass, or the chosen StorageClass cannot satisfy
 ReadWriteOnce. Set `agent.gateCache.storageClass` explicitly or
 disable the PVC: `--set agent.gateCache.enabled=false` (gate runs
 will still work, just without the inter-run cache).
 
-**Agent Pod startup info-log "--git-remote-url is unset"** :: not
+**Agent Pod startup info-log "--git-remote-url is unset"**: not
 an error. Foreman v0.7.10+ logs this as INFO and proceeds; coder
 tasks that actually need the URL fail per-task with reason
 `GitRemoteURLNotConfigured`. Deterministic Agents (e.g. the M4
