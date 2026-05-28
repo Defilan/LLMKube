@@ -422,6 +422,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the model's claim a debugging artifact and the diff the
 			// authoritative answer.
 			reconcileReviewerFilesTouched(ctx, log, workspace, loopRes.Terminal.Extra)
+			// Ground-truth issueAsk against the fetch_issue tool result
+			// the model already had in its context. Devstral on the same
+			// post-#584 batch confabulated issueAsk on every multi-file
+			// diff -- the prompt-tightening to require verbatim quoting
+			// did not change the model behavior, and the confabulated
+			// ask then drove a *false NO-GO* on #526. Mirror of the
+			// #582/filesTouched fix: harness owns the authoritative
+			// field, model's claim is archived under issueAskClaimed.
+			reconcileReviewerIssueAsk(log, loopRes.Transcript, loopRes.Terminal.Extra)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 		}
 		return e.modelDecidedResult(start, transcriptRef, loopRes, verdict), nil
@@ -1127,6 +1136,151 @@ func fileListsEqual(prev any, groundTruth []string) bool {
 		}
 	}
 	return true
+}
+
+// reconcileReviewerIssueAsk grounds the reviewer's
+// `submit_result.extra.issueAsk` field against the real issue body
+// that came back from the reviewer's `fetch_issue` tool call. The
+// claim has to be a literal substring of that body; if it is not,
+// the harness archives the model's claim under `issueAskClaimed`
+// and rewrites `issueAsk` with the first useful prose paragraph of
+// the body (skipping markdown headers). Pairs with #582's filesTouched
+// fix: same shape, different field.
+//
+// Why this is structural rather than a prompt-tightening fix: the
+// post-#584 rereview showed devstral on the Mac Studio confabulating
+// `issueAsk` on every multi-file diff *even though* the prompt was
+// explicitly tightened to require verbatim quoting and to set
+// verdict=ERROR on failure to quote. The model's claim was a confident
+// hallucination ("Add a cluster-wide default LiteLLM URL ..." for
+// #449, "reconcile orphaned endpoints" for #526) that then drove a
+// false NO-GO on #526 because the diff did not address the
+// hallucinated ask. Prompt tightening did not move the model below
+// its confabulation ceiling; the harness has to own the field.
+//
+// Failure modes are non-fatal: a missing fetch_issue tool result,
+// malformed tool content JSON, or a missing body field all log a
+// warning and leave the model's claim untouched. The reviewer's
+// verdict + findings still surface; only the issueAsk field is
+// downgraded to "model-reported" instead of "ground-truth."
+func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[string]any) {
+	if extra == nil {
+		return
+	}
+	body := extractFetchIssueBody(msgs)
+	if body == "" {
+		log.Info("reviewer issueAsk: no fetch_issue body in transcript; preserving model claim")
+		return
+	}
+	claim, _ := extra["issueAsk"].(string)
+	claim = strings.TrimSpace(claim)
+	if claim == "" {
+		// Model omitted the field. Fill it from the body so downstream
+		// has *some* scope anchor; mark unverified for archaeology.
+		extra["issueAsk"] = firstBodyParagraph(body, 200)
+		extra["issueAskVerified"] = false
+		return
+	}
+	if strings.Contains(body, claim) {
+		// Honest claim: model quoted from the body verbatim. Leave alone
+		// and mark verified so downstream knows the field is trustworthy.
+		extra["issueAskVerified"] = true
+		return
+	}
+	// Confabulation: claim is not a substring of the body the model
+	// itself fetched. Archive it and rewrite issueAsk with a real
+	// excerpt from the body.
+	extra["issueAskClaimed"] = claim
+	replaced := firstBodyParagraph(body, 200)
+	extra["issueAsk"] = replaced
+	extra["issueAskVerified"] = false
+	log.Info("reviewer issueAsk: model claim not a substring of fetch_issue body; rewriting from body",
+		"modelClaim", claim,
+		"rewrittenTo", replaced,
+	)
+}
+
+// extractFetchIssueBody finds the most recent fetch_issue tool result
+// in the transcript and pulls the "body" field out of its JSON content.
+// Returns "" if no fetch_issue call landed in the transcript or if
+// the result content was malformed; either case is non-fatal in the
+// reconciler.
+//
+// Multiple fetch_issue calls are unusual but legal (the model might
+// retry on transient failure); we take the last successful one.
+func extractFetchIssueBody(msgs []oai.Message) string {
+	// First pass: collect ids of every fetch_issue tool_call the model
+	// emitted. Second pass: find their matching tool-role results.
+	fetchIDs := make(map[string]bool, 2)
+	for _, m := range msgs {
+		if m.Role != oai.RoleAssistant {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Function.Name == "fetch_issue" {
+				fetchIDs[tc.ID] = true
+			}
+		}
+	}
+	if len(fetchIDs) == 0 {
+		return ""
+	}
+	var lastBody string
+	for _, m := range msgs {
+		if m.Role != oai.RoleTool {
+			continue
+		}
+		if !fetchIDs[m.ToolCallID] {
+			continue
+		}
+		var parsed struct {
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(m.Content), &parsed); err != nil {
+			continue
+		}
+		if parsed.Body != "" {
+			lastBody = parsed.Body
+		}
+	}
+	return lastBody
+}
+
+// firstBodyParagraph returns up to maxChars of the first useful
+// paragraph in an issue body. Skips leading markdown headers
+// ("## ...", "# ...") and blank lines so the rewritten issueAsk
+// points at actual prose rather than a section title.
+func firstBodyParagraph(body string, maxChars int) string {
+	lines := strings.Split(body, "\n")
+	var paragraph strings.Builder
+	for _, l := range lines {
+		stripped := strings.TrimSpace(l)
+		if stripped == "" {
+			if paragraph.Len() > 0 {
+				break
+			}
+			continue
+		}
+		if strings.HasPrefix(stripped, "#") {
+			// Markdown heading: skip; the prose starts after it.
+			if paragraph.Len() > 0 {
+				break
+			}
+			continue
+		}
+		if paragraph.Len() > 0 {
+			paragraph.WriteByte(' ')
+		}
+		paragraph.WriteString(stripped)
+		if paragraph.Len() >= maxChars {
+			break
+		}
+	}
+	out := paragraph.String()
+	if len(out) > maxChars {
+		out = out[:maxChars]
+	}
+	return out
 }
 
 func logReviewerFindings(log logr.Logger, extra map[string]any) {

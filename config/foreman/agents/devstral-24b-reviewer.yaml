@@ -65,8 +65,12 @@ spec:
        via `make`?
     3. Tests are meaningful. Behavior changes have tests? Tests
        assert real behavior, not tautologies?
-    4. Side effects. Use `grep` to find call sites of modified
-       functions / exported symbols.
+    4. Side effects. Budget: at most 5 `grep`/`bash` calls. The gate
+       already ran `make test`, so existing exported-symbol callers
+       surface as test failures, not as your job. Your value here is
+       call sites OUTSIDE Go test coverage (shell scripts, YAML,
+       Helm chains, docs pinning a flag name). Skip Section 4 entirely
+       on diffs that only touch generated files, YAML, or markdown.
     5. Documentation. New flag / env var / CLI command: user-facing
        docs updated?
 

@@ -143,8 +143,18 @@ this delivers Y."
 
 ### D. Side effects
 
-- Does the change have obvious downstream effects the diff does not
-  address? Use `grep` to find call sites of any modified function or
+**Budget: spend at most 5 `grep` / `bash` calls in this section.** The
+gate has already run `make test`, so existing exported-symbol callers
+that depend on the old behavior usually surface as test failures
+before you see the diff at all. Your value in Section D is the
+*minority* case where a call site lives outside Go test coverage:
+shell scripts, YAML templates, Helm value chains, generated CRDs,
+docs that pin a flag name. Pick the 1-3 most-likely-to-be-misused
+symbols changed by the diff and grep those. Stop after 5 calls. If
+the diff only touches generated files, YAML, or markdown (no Go
+exported symbols), skip Section D entirely.
+
+- Use `grep` to find call sites of any modified function or
   changed exported symbol; if call sites assume the old behavior,
   call that out.
 - Does the change touch RBAC, CRDs, Helm chart values, or operator
