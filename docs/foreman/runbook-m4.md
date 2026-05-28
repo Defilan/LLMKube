@@ -46,7 +46,7 @@ If you have not yet installed Foreman on a verifier node, read
   m5max-…          Ready   metal   [worker]
   ```
 
-## Step 1 :: pick an issue + apply the demo manifest
+## Step 1: pick an issue + apply the demo manifest
 
 ```sh
 # Edit examples/foreman/m4-two-step-demo.yaml: bump the `issue:`
@@ -59,7 +59,7 @@ kubectl apply -f examples/foreman/m4-two-step-demo.yaml
 Both tasks land in `Pending`. The scheduler picks them up on the
 next reconcile.
 
-## Step 2 :: watch code-N run
+## Step 2: watch code-N run
 
 ```sh
 kubectl get agentictasks -w
@@ -86,7 +86,7 @@ kubectl -n foreman-system logs \
 (If running the coder locally rather than as the in-cluster Pod,
 tail `~/Library/Logs/foreman-agent.log` instead.)
 
-## Step 3 :: watch gate-N pick up + the Job land
+## Step 3: watch gate-N pick up + the Job land
 
 The moment `code-503` reaches `Succeeded`, the controller marks
 `gate-503` schedulable. The the verifier-node foreman-agent claims it and
@@ -107,7 +107,7 @@ foreman-gate-gate-503-…   0/1 Running       0s
 foreman-gate-gate-503-…   1/1 Completed   ~2-3 min (warm) or ~10 min (cold)
 ```
 
-## Step 4 :: inspect the verdict + log tail
+## Step 4: inspect the verdict + log tail
 
 ```sh
 kubectl get agentictask gate-503 -o yaml | yq '.status'
@@ -144,7 +144,7 @@ result:
 The `logTail` carries the last 32 KiB of the gate Pod's log so a
 human reviewer can scan the failure mode without `kubectl exec`-ing.
 
-## Step 5 :: optional, the GATE-FAIL case
+## Step 5: optional, the GATE-FAIL case
 
 Reproduce by re-running on a known-broken branch:
 
@@ -178,7 +178,7 @@ is the field downstream consumers should pivot on, not `phase`.
 
 ## Troubleshooting
 
-**gate-N stays Pending forever** :: the scheduler matches Roles
+**gate-N stays Pending forever**: the scheduler matches Roles
 strictly. Confirm the verifier FleetNode actually advertises
 `verifier`:
 ```sh
@@ -188,14 +188,14 @@ If the role list is missing, re-run the Helm install with the
 `agent.roles={worker,verifier}` override per
 [`install-verifier-node.md`](./install-verifier-node.md).
 
-**Job submits but never picks up** :: the gate-cache PVC is stuck
+**Job submits but never picks up**: the gate-cache PVC is stuck
 Pending. Run `kubectl -n foreman-system
 describe pvc foreman-gate-cache` for the events. Common causes:
 no default StorageClass, or no node can satisfy ReadWriteOnce.
 Workarounds: `--set agent.gateCache.storageClass=...` or disable
 the cache via `--set agent.gateCache.enabled=false`.
 
-**Verdict GATE-ERROR with "create job: forbidden"** :: the agent
+**Verdict GATE-ERROR with "create job: forbidden"**: the agent
 ServiceAccount is missing `create` on `batch/jobs` in
 `foreman-system`. Re-apply the chart's RBAC:
 ```sh
@@ -203,7 +203,7 @@ helm upgrade --reuse-values foreman \
   defilantech/foreman -n foreman-system
 ```
 
-**Verdict GATE-ERROR with "poll timeout"** :: the Job ran past the
+**Verdict GATE-ERROR with "poll timeout"**: the Job ran past the
 PollTimeout (default 2 * activeDeadlineSeconds = 60 min). Either
 the gate Job is genuinely slow (cold cache + 8Gi RAM ceiling can
 push past 30 min) or the apiserver is dropping watches. Pull the
