@@ -42,27 +42,42 @@ func (p *DarwinMemoryProvider) TotalMemory() (uint64, error) {
 }
 
 // AvailableMemory returns an estimate of available memory by parsing vm_stat output.
-// It sums free and inactive pages multiplied by the page size.
 // Apple Silicon uses 16KB pages.
 func (p *DarwinMemoryProvider) AvailableMemory() (uint64, error) {
 	out, err := exec.Command("vm_stat").Output()
 	if err != nil {
 		return 0, fmt.Errorf("vm_stat: %w", err)
 	}
+	return availableBytesFromVMStat(string(out)), nil
+}
 
-	pageSize, bodyLines := parseVMStatHeader(string(out))
+// availableBytesFromVMStat computes available memory from raw vm_stat
+// output. Pure (no exec) so it can be unit-tested with a fixture.
+func availableBytesFromVMStat(output string) uint64 {
+	pageSize, bodyLines := parseVMStatHeader(output)
 
-	var freePages, inactivePages uint64
+	// macOS treats free, inactive, speculative, and purgeable pages as
+	// reclaimable/available (matching Activity Monitor's "memory
+	// available" heuristic). Counting only free+inactive severely
+	// undercounts on a host with a Metal-wired model loaded, where a
+	// large fraction of RAM is wired and the rest of the available
+	// budget lives in speculative + purgeable. See defilantech/LLMKube#578.
+	var freePages, inactivePages, speculativePages, purgeablePages uint64
 	for _, line := range bodyLines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Pages free:") {
+		switch {
+		case strings.HasPrefix(line, "Pages free:"):
 			freePages = parseVMStatValue(line)
-		} else if strings.HasPrefix(line, "Pages inactive:") {
+		case strings.HasPrefix(line, "Pages inactive:"):
 			inactivePages = parseVMStatValue(line)
+		case strings.HasPrefix(line, "Pages speculative:"):
+			speculativePages = parseVMStatValue(line)
+		case strings.HasPrefix(line, "Pages purgeable:"):
+			purgeablePages = parseVMStatValue(line)
 		}
 	}
 
-	return (freePages + inactivePages) * pageSize, nil
+	return (freePages + inactivePages + speculativePages + purgeablePages) * pageSize
 }
 
 // WiredMemory returns the amount of wired (non-pageable) memory by parsing vm_stat.
