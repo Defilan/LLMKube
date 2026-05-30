@@ -48,6 +48,25 @@ func appendContextSizeArgs(args []string, contextSize *int32) []string {
 	return args
 }
 
+func appendRopeScalingArgs(args []string, rope *inferencev1alpha1.RopeScalingSpec, extraArgs []string) ([]string, error) {
+	if rope == nil || rope.Type == "" {
+		return args, nil
+	}
+	// extraArgs has precedence: if the user already pinned --rope-scaling,
+	// defer the whole block so we never double-set or fight their override.
+	if hasMatchingExtraArg(extraArgs, "rope-scaling") {
+		return args, errors.New("spec.ropeScaling is set but `--rope-scaling` is already defined in spec.ExtraArgs, skipping")
+	}
+	args = append(args, "--rope-scaling", string(rope.Type))
+	if rope.Factor != "" {
+		args = append(args, "--rope-scale", rope.Factor)
+	}
+	if rope.OriginalContext != nil && *rope.OriginalContext > 0 {
+		args = append(args, "--yarn-orig-ctx", fmt.Sprintf("%d", *rope.OriginalContext))
+	}
+	return args, nil
+}
+
 func appendParallelSlotsArgs(args []string, parallelSlots *int32, extraArgs []string) ([]string, error) {
 	// NOTE(#339): extra args has precedence.
 	if parallelSlots != nil && *parallelSlots >= 1 {

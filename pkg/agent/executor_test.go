@@ -160,6 +160,35 @@ func TestBuildLlamaServerArgs_Defaults(t *testing.T) {
 	}
 }
 
+func TestBuildLlamaServerArgs_RopeScaling(t *testing.T) {
+	args := buildLlamaServerArgs("/models/test.gguf", 8080, ExecutorConfig{
+		ContextSize:        262144,
+		RopeScalingType:    "yarn",
+		RopeScalingFactor:  "2.0",
+		RopeScalingOrigCtx: 131072,
+	})
+
+	want := map[string]string{
+		"--rope-scaling":  "yarn",
+		"--rope-scale":    "2.0",
+		"--yarn-orig-ctx": "131072",
+	}
+	for flag, expected := range want {
+		if got := flagValue(args, flag); got != expected {
+			t.Errorf("%s = %q, want %q (full args: %v)", flag, got, expected, args)
+		}
+	}
+}
+
+func TestBuildLlamaServerArgs_RopeScalingOmittedWhenUnset(t *testing.T) {
+	args := buildLlamaServerArgs("/models/test.gguf", 8080, ExecutorConfig{ContextSize: 4096})
+	for _, unwanted := range []string{"--rope-scaling", "--rope-scale", "--yarn-orig-ctx"} {
+		if hasFlag(args, unwanted) {
+			t.Errorf("unexpected rope flag %q when ropeScaling unset: %v", unwanted, args)
+		}
+	}
+}
+
 func TestBuildLlamaServerArgs_AppleSiliconOptimized(t *testing.T) {
 	args := buildLlamaServerArgs("/models/test.gguf", 9000, ExecutorConfig{
 		ContextSize:    65536,

@@ -40,6 +40,14 @@ type ExecutorConfig struct {
 	ContextSize int
 	Jinja       bool
 
+	// RopeScaling* map to llama.cpp's RoPE context-extension flags, resolved
+	// from InferenceService.spec.ropeScaling at the agent boundary. Empty
+	// RopeScalingType omits the flags entirely. Factor maps to --rope-scale;
+	// OrigCtx (when > 0) maps to --yarn-orig-ctx.
+	RopeScalingType    string
+	RopeScalingFactor  string
+	RopeScalingOrigCtx int
+
 	// FlashAttention enables llama.cpp's --flash-attn flag. On Apple Silicon
 	// this is a clear win for long-context agentic workloads (prevents the
 	// ~25% decode degradation observed at 4K+ context on Qwen-class models).
@@ -334,6 +342,18 @@ func buildLlamaServerArgs(modelPath string, port int, config ExecutorConfig) []s
 		"--n-gpu-layers", fmt.Sprintf("%d", gpuLayers),
 		"--ctx-size", fmt.Sprintf("%d", config.ContextSize),
 		"--metrics",
+	}
+
+	// RoPE context extension (InferenceService.spec.ropeScaling). ExtraArgs
+	// still come last, so a user override there wins over these.
+	if config.RopeScalingType != "" {
+		args = append(args, "--rope-scaling", config.RopeScalingType)
+		if config.RopeScalingFactor != "" {
+			args = append(args, "--rope-scale", config.RopeScalingFactor)
+		}
+		if config.RopeScalingOrigCtx > 0 {
+			args = append(args, "--yarn-orig-ctx", fmt.Sprintf("%d", config.RopeScalingOrigCtx))
+		}
 	}
 
 	if config.ParallelSlots > 1 {

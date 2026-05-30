@@ -1350,6 +1350,41 @@ spec:
                     description: Memory requests (e.g., "4Gi")
                     type: string
                 type: object
+              ropeScaling:
+                description: |-
+                  RopeScaling configures RoPE-based context extension so a model can be
+                  served past its native trained context (e.g. 128K served at 256K via
+                  YaRN). For the llamacpp runtime this maps to --rope-scaling /
+                  --rope-scale / --yarn-orig-ctx. Prefer this over raw spec.extraArgs:
+                  it is validated and discoverable via `kubectl explain`. If --rope-scaling
+                  is also present in spec.extraArgs, extraArgs wins and this is skipped.
+                properties:
+                  factor:
+                    description: |-
+                      Factor is the scale multiplier (--rope-scale), e.g. "2.0" to double the
+                      native context. A string to avoid CRD float pitfalls; the runtime parses
+                      it as a float. Optional.
+                    pattern: ^[0-9]+(\.[0-9]+)?$
+                    type: string
+                  originalContext:
+                    description: |-
+                      OriginalContext is the model's native training context length
+                      (--yarn-orig-ctx), e.g. 131072 for a 128K model. Recommended with yarn.
+                    format: int32
+                    minimum: 128
+                    type: integer
+                  type:
+                    description: |-
+                      Type is the scaling method (--rope-scaling). "yarn" is the usual choice
+                      for extending context (e.g. 128K to 256K).
+                    enum:
+                    - linear
+                    - yarn
+                    - longrope
+                    type: string
+                required:
+                - type
+                type: object
               runtime:
                 default: llamacpp
                 description: |-

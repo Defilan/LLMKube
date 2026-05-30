@@ -77,6 +77,43 @@ func TestLlamaCppBuildArgs(t *testing.T) {
 		},
 		{
 			model: model,
+			name:  "ropeScaling set emits rope flags",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:  "llama",
+				ModelRef: "test-model",
+				RopeScaling: &inferencev1alpha1.RopeScalingSpec{
+					Type:            "yarn",
+					Factor:          "2.0",
+					OriginalContext: ptrInt32(131072),
+				},
+			},
+			contains: []FlagCheck{{"--rope-scaling", "yarn"}, {"--rope-scale", "2.0"}, {"--yarn-orig-ctx", "131072"}},
+		},
+		{
+			model: model,
+			name:  "ropeScaling nil does not emit rope flags",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:  "llama",
+				ModelRef: "test-model",
+			},
+			notContains: []string{"--rope-scaling", "--rope-scale", "--yarn-orig-ctx"},
+		},
+		{
+			model: model,
+			name:  "ropeScaling skipped when extraArgs already sets --rope-scaling",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:     "llama",
+				ModelRef:    "test-model",
+				ExtraArgs:   []string{"--rope-scaling", "linear"},
+				RopeScaling: &inferencev1alpha1.RopeScalingSpec{Type: "yarn", Factor: "2.0"},
+			},
+			// extraArgs wins: the whole rope block is skipped, so --rope-scale
+			// is absent and the only --rope-scaling is the extraArgs value.
+			contains:    []FlagCheck{{"--rope-scaling", "linear"}},
+			notContains: []string{"--rope-scale", "--yarn-orig-ctx"},
+		},
+		{
+			model: model,
 			name:  "parallelSlots set emits flag (without extraArgs precedence)",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:       "llama",
