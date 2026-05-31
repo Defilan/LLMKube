@@ -22,6 +22,34 @@ import (
 )
 
 // InferenceServiceSpec defines the desired state of InferenceService
+// RopeScalingType selects the RoPE context-extension method. Mirrors
+// llama.cpp's --rope-scaling values.
+// +kubebuilder:validation:Enum=linear;yarn;longrope
+type RopeScalingType string
+
+// RopeScalingSpec configures RoPE-based context extension for serving a model
+// past its native trained context. For the llamacpp runtime it maps to
+// --rope-scaling (Type), --rope-scale (Factor), and --yarn-orig-ctx
+// (OriginalContext).
+type RopeScalingSpec struct {
+	// Type is the scaling method (--rope-scaling). "yarn" is the usual choice
+	// for extending context (e.g. 128K to 256K).
+	Type RopeScalingType `json:"type"`
+
+	// Factor is the scale multiplier (--rope-scale), e.g. "2.0" to double the
+	// native context. A string to avoid CRD float pitfalls; the runtime parses
+	// it as a float. Optional.
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?$`
+	// +optional
+	Factor string `json:"factor,omitempty"`
+
+	// OriginalContext is the model's native training context length
+	// (--yarn-orig-ctx), e.g. 131072 for a 128K model. Recommended with yarn.
+	// +kubebuilder:validation:Minimum=128
+	// +optional
+	OriginalContext *int32 `json:"originalContext,omitempty"`
+}
+
 type InferenceServiceSpec struct {
 	// ModelRef references the Model CR that contains the model to serve
 	// +kubebuilder:validation:Required
@@ -115,6 +143,15 @@ type InferenceServiceSpec struct {
 	// +kubebuilder:validation:Maximum=2097152
 	// +optional
 	ContextSize *int32 `json:"contextSize,omitempty"`
+
+	// RopeScaling configures RoPE-based context extension so a model can be
+	// served past its native trained context (e.g. 128K served at 256K via
+	// YaRN). For the llamacpp runtime this maps to --rope-scaling /
+	// --rope-scale / --yarn-orig-ctx. Prefer this over raw spec.extraArgs:
+	// it is validated and discoverable via `kubectl explain`. If --rope-scaling
+	// is also present in spec.extraArgs, extraArgs wins and this is skipped.
+	// +optional
+	RopeScaling *RopeScalingSpec `json:"ropeScaling,omitempty"`
 
 	// ParallelSlots sets the number of concurrent request slots for the llama.cpp
 	// server (--parallel flag). Each slot processes one request independently;

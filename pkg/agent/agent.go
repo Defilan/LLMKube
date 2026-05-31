@@ -505,6 +505,14 @@ func buildExecutorConfig(
 ) ExecutorConfig {
 	cacheTypeK, cacheTypeV := resolveCacheTypes(isvc)
 
+	var ropeType, ropeFactor string
+	var ropeOrigCtx int
+	if r := isvc.Spec.RopeScaling; r != nil {
+		ropeType = string(r.Type)
+		ropeFactor = r.Factor
+		ropeOrigCtx = derefInt32(r.OriginalContext)
+	}
+
 	return ExecutorConfig{
 		Name:                   isvc.Name,
 		Namespace:              isvc.Namespace,
@@ -512,6 +520,9 @@ func buildExecutorConfig(
 		ModelName:              model.Name,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
+		RopeScalingType:        ropeType,
+		RopeScalingFactor:      ropeFactor,
+		RopeScalingOrigCtx:     ropeOrigCtx,
 		Jinja:                  derefBool(isvc.Spec.Jinja),
 		FlashAttention:         base.FlashAttention,
 		Mlock:                  true,
