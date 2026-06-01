@@ -61,6 +61,10 @@ foreman-chart-crds: manifests ## Sync foreman.llmkube.dev CRDs to the foreman ch
 	  synced=$$((synced+1)); \
 	done; echo "Synced $$synced foreman CRD(s)"
 
+.PHONY: check-helm-rbac
+check-helm-rbac: manifests ## Verify the Helm charts' RBAC covers every kubebuilder-generated rule (#379).
+	@./scripts/check-helm-rbac.sh
+
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
