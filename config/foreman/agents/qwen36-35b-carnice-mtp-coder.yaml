@@ -49,12 +49,17 @@ spec:
     editFreeTurnsLimit: 15
     contextSoftCap: 90000
     contextHardCap: 140000
-  # 30 min per HTTP request to llama-server. With the tool-output caps
-  # in pkg/foreman/agent/tools (read_file at 16 KiB default + ranged reads,
-  # bash at 16 KiB per stream) this is well above the natural per-turn
-  # ceiling but gives headroom for issues that legitimately need long
-  # bash invocations (e.g. `make test` on a cold gate-cache).
-  requestTimeoutSeconds: 1800
+  # Timeouts (#532). requestTurnTimeoutSeconds bounds one HTTP request to
+  # llama-server (the wait for the first token of a turn); a turn that
+  # exceeds it is retried up to maxRetries. requestTimeoutSeconds is the
+  # loop-wide wall-clock budget for the whole task; when it fires the loop
+  # ends with an INCOMPLETE verdict and the partial transcript preserved.
+  # The per-turn value keeps the previous 30-min per-request headroom for
+  # long-context prompt-eval on Carnice; the 2h loop budget comfortably
+  # covers an 80-turn run. Tighten requestTurnTimeoutSeconds toward the
+  # 120s default to fail fast and retry sooner on a warm, degraded context.
+  requestTurnTimeoutSeconds: 1800
+  requestTimeoutSeconds: 7200
   bashTimeoutSeconds: 60
   tools:
     - read_file

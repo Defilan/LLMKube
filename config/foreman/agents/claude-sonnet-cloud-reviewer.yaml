@@ -73,12 +73,15 @@ spec:
   temperature: "0.2"
   maxTurns: 30
   maxRetries: 2
-  # Cloud-proxy reviewers should be fast; if the proxy is slow we
-  # want to know quickly. The upstream model itself may take longer
-  # to think; this bounds the time we wait for the HEADER of the
-  # streaming response, not the total body duration. Total is
-  # bounded by the Agent's MaxTurns + the AgenticTask's TimeoutSeconds.
-  requestTimeoutSeconds: 300
+  # Cloud-proxy reviewers should be fast; if the proxy is slow we want to
+  # know quickly. requestTurnTimeoutSeconds bounds the wait for the HEADER
+  # of one streaming response (not the total body); a turn over the limit
+  # is retried up to maxRetries. requestTimeoutSeconds is the loop-wide
+  # wall-clock budget (#532): the review ends INCOMPLETE with its transcript
+  # preserved if it fires. Total is also bounded by the Agent's MaxTurns and
+  # the AgenticTask's TimeoutSeconds.
+  requestTurnTimeoutSeconds: 300
+  requestTimeoutSeconds: 1800
   bashTimeoutSeconds: 60
 
   tools:

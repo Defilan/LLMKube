@@ -20,7 +20,13 @@ spec:
   temperature: "0.3"
   maxTurns: 40
   maxRetries: 3
-  requestTimeoutSeconds: 900
+  # Timeouts (#532): requestTurnTimeoutSeconds bounds one HTTP request (a
+  # turn over its limit is retried up to maxRetries); requestTimeoutSeconds
+  # is the loop-wide wall-clock budget (the review ends INCOMPLETE with its
+  # transcript preserved on exhaustion). Per-turn keeps the prior 15-min
+  # per-request bound; the 1h loop budget covers a 40-turn review.
+  requestTurnTimeoutSeconds: 900
+  requestTimeoutSeconds: 3600
   bashTimeoutSeconds: 60
   tools:
     - read_file
