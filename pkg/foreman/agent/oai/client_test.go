@@ -228,6 +228,70 @@ func TestClient_Chat_RetriesTruncatedThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestClient_Chat_RetriesHeaderTimeoutThenSucceeds(t *testing.T) {
+	// A per-request header timeout (the #532 shape: prompt-eval so slow
+	// the first token never arrives within requestTimeout) should be
+	// retried, not surfaced as a hard error. First attempt stalls past
+	// the 60ms header timeout; the retry responds immediately.
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			time.Sleep(250 * time.Millisecond) // > requestTimeout, no headers
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(chatResponseToSSE(t, okBodyOneToolCall)))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL+"/v1", 60*time.Millisecond, 3, WithBackoffs(noJitterBackoffs))
+	resp, err := c.Chat(context.Background(), ChatRequest{Model: "test"})
+	if err != nil {
+		t.Fatalf("Chat should recover from a transient header timeout via retry, got: %v", err)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Errorf("expected at least one retry after the header timeout; attempts=%d", got)
+	}
+	if resp.Choices[0].Message.ToolCalls[0].Function.Name != "read_file" {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+}
+
+func TestClient_Chat_NoRetryWhenContextDone(t *testing.T) {
+	// When the parent context is done (e.g. the loop-wide budget fired),
+	// a timeout must propagate immediately so the loop sees
+	// context.DeadlineExceeded and exits gracefully, rather than being
+	// swallowed by a retry storm against a model that won't answer.
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	// Generous per-request timeout; the short parent deadline is what fires.
+	c := New(srv.URL+"/v1", 5*time.Second, 3, WithBackoffs(noJitterBackoffs))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := c.Chat(ctx, ChatRequest{Model: "test"})
+	if err == nil {
+		t.Fatal("expected an error when the parent context expires")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error chain must include context.DeadlineExceeded, got: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("Chat should return promptly on ctx expiry, took %s (retry storm?)", elapsed)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("must not retry once the parent ctx is done; attempts=%d", got)
+	}
+}
+
 func TestClient_Chat_ExhaustsRetries(t *testing.T) {
 	var attempts atomic.Int64
 	srv := httptest.NewServer(scriptedHandler(t, &attempts,

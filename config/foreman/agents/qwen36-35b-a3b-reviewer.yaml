@@ -52,11 +52,15 @@ spec:
   # through-H reviews of multi-file diffs converge. Closes #583.
   maxTurns: 80
   maxRetries: 3
-  # 15 min per HTTP request to llama-server. Reviewers read the diff,
-  # the issue body, and a handful of files; they should never need
-  # a long-running `make test` cycle the way the coder does. If a
-  # review exceeds 15 min on a single request, something is wrong.
-  requestTimeoutSeconds: 900
+  # Timeouts (#532). requestTurnTimeoutSeconds bounds one HTTP request to
+  # llama-server; a turn over the limit is retried up to maxRetries.
+  # Reviewers read the diff, the issue body, and a handful of files; they
+  # should never need a long `make test` cycle the way the coder does, so
+  # 15 min per turn is already generous. requestTimeoutSeconds is the
+  # loop-wide budget (review ends INCOMPLETE, transcript preserved, on
+  # exhaustion); 90 min covers an 80-turn review.
+  requestTurnTimeoutSeconds: 900
+  requestTimeoutSeconds: 5400
   bashTimeoutSeconds: 60
   # Reviewer tool whitelist: read-only. No write_file, no str_replace.
   # If the reviewer needs to recommend a change, it says so in the

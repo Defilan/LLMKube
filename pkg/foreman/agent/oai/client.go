@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -141,12 +142,33 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		if err == nil {
 			return resp, nil
 		}
-		if !errors.Is(err, ErrTruncatedToolCallArguments) {
+		// Never retry once the parent context is done: a loop-wide budget
+		// (#532) or external cancellation must propagate so the caller can
+		// exit gracefully instead of spinning retries against a model that
+		// will not answer in time. Checked before classification because a
+		// context deadline also satisfies net.Error.Timeout().
+		if ctx.Err() != nil {
 			return nil, err
 		}
-		lastErr = err
+		// Retry a truncated tool-call stream (a streaming hiccup) and a
+		// transient per-request header timeout (slow prompt-eval on a warm
+		// long context, #532). Any other error is returned as-is.
+		if errors.Is(err, ErrTruncatedToolCallArguments) || isRetryableTimeout(err) {
+			lastErr = err
+			continue
+		}
+		return nil, err
 	}
 	return nil, fmt.Errorf("after %d retries: %w", c.maxRetries, lastErr)
+}
+
+// isRetryableTimeout reports whether err is a network timeout (e.g. the
+// transport's ResponseHeaderTimeout firing while awaiting the first
+// token). Callers must rule out a done parent context first, since
+// context.DeadlineExceeded also satisfies net.Error.Timeout().
+func isRetryableTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // sleepBackoff blocks for backoffs[i] +/- 20% jitter, honoring ctx

@@ -190,6 +190,58 @@ func newTestLoop(srv *httptest.Server, reg ToolRegistry) *Loop {
 	return NewLoop(client, reg, nil)
 }
 
+// blockingOAIServer never sends a response; it holds each request open
+// until the client's context is cancelled. Simulates a turn whose
+// prompt-eval is so slow that the loop's wall-clock budget fires before
+// any headers arrive (the #532 failure shape).
+func blockingOAIServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Hold the request open until the client gives up, but bound the
+		// block so srv.Close() in t.Cleanup never hangs if the client-side
+		// cancellation is slow to propagate to the server context.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestLoop_LoopBudgetExhausted_GracefulTerminal(t *testing.T) {
+	// A turn that never returns before the loop-wide budget fires must
+	// end the loop gracefully: an INCOMPLETE terminal with the transcript
+	// preserved, NOT a hard error that the executor maps to a retry-less
+	// ExecutorError that kills the whole AgenticTask. Regression for #532.
+	srv := blockingOAIServer(t)
+	// Generous per-request timeout so the loop budget, not the per-turn
+	// header timeout, is the thing that fires.
+	client := oai.New(srv.URL+"/v1", 10*time.Second, 0)
+	reg := &fakeRegistry{results: map[string]*ToolResult{}}
+	loop := NewLoop(client, reg, nil)
+
+	res, err := loop.Run(context.Background(), LoopConfig{
+		Model:        "test",
+		SystemPrompt: "sys",
+		UserPrompt:   "go",
+		MaxTurns:     50,
+		LoopBudget:   80 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("expected graceful nil error on budget exhaustion, got %v", err)
+	}
+	if res.Terminal == nil || res.Terminal.Verdict != "INCOMPLETE" {
+		t.Fatalf("expected INCOMPLETE terminal, got %+v", res.Terminal)
+	}
+	if got := res.Terminal.Extra["outcome"]; got != LoopBudgetOutcome {
+		t.Errorf("outcome: want %q got %v", LoopBudgetOutcome, got)
+	}
+	if len(res.Transcript) < 2 || res.Transcript[0].Role != oai.RoleSystem {
+		t.Errorf("transcript not preserved: %+v", res.Transcript)
+	}
+}
+
 func TestLoop_HappyPath_TerminalSubmitResult(t *testing.T) {
 	srv, calls := scriptedOAIServer(t, []string{toolCallReadFile, toolCallSubmitGo})
 	reg := &fakeRegistry{
