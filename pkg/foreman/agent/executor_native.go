@@ -294,7 +294,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	}
 	oaiClient := oai.New(
 		endpoint.baseURL,
-		durationFromSeconds(agent.Spec.RequestTimeoutSeconds, 600),
+		// Per-request header timeout (#532): how long one turn waits for
+		// the first token before retrying. The loop-wide budget is
+		// applied separately via LoopConfig.LoopBudget below.
+		durationFromSeconds(agent.Spec.RequestTurnTimeoutSeconds, 120),
 		int(agent.Spec.MaxRetries),
 		oaiOpts...,
 	)
@@ -348,6 +351,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		ContextWindowTokens:    int(agent.Spec.ContextWindowTokens),
 		ObservationWindowTurns: int(agent.Spec.ObservationWindowTurns),
 		Progress:               progressConfigFromAgent(agent),
+		// Loop-wide wall-clock budget (#532). Repurposed from the old
+		// per-request meaning of RequestTimeoutSeconds; the per-request
+		// header timeout now lives on the OAI client above.
+		LoopBudget: durationFromSeconds(agent.Spec.RequestTimeoutSeconds, 3600),
 	}
 
 	// 8. Run the loop. Always persist the transcript afterwards,

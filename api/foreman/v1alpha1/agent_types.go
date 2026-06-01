@@ -222,13 +222,28 @@ type AgentSpec struct {
 	// +optional
 	StuckLoopDetection *StuckLoopDetectionSpec `json:"stuckLoopDetection,omitempty"`
 
-	// RequestTimeoutSeconds bounds a single chat-completions HTTP
-	// request. Long-context decode on a local model can be slow; default
-	// is generous.
-	// +kubebuilder:default=600
+	// RequestTimeoutSeconds is the loop-wide wall-clock budget for the
+	// whole agent run (#532). When the budget is exhausted mid-turn the
+	// loop exits gracefully with an INCOMPLETE verdict and the partial
+	// transcript preserved, rather than failing the task with a
+	// retry-less ExecutorError. This is distinct from the per-request
+	// header timeout (RequestTurnTimeoutSeconds): a single slow turn no
+	// longer caps the whole loop, and vice versa.
+	// +kubebuilder:default=3600
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	RequestTimeoutSeconds int32 `json:"requestTimeoutSeconds,omitempty"`
+
+	// RequestTurnTimeoutSeconds bounds a single chat-completions HTTP
+	// request's "awaiting response headers" wait, i.e. how long the agent
+	// waits for the first token of one turn before treating the request
+	// as a transient timeout and retrying it (up to MaxRetries). Keep this
+	// tight relative to RequestTimeoutSeconds so a slow warm-context turn
+	// fails fast and retries instead of hanging out the whole loop budget.
+	// +kubebuilder:default=120
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	RequestTurnTimeoutSeconds int32 `json:"requestTurnTimeoutSeconds,omitempty"`
 
 	// BashTimeoutSeconds bounds a single bash tool invocation. The bash
 	// tool runs under "sh -c" with cwd pinned to the workspace and a

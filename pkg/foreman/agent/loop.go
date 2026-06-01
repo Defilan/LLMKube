@@ -109,6 +109,16 @@ type LoopConfig struct {
 	// The executor maps Agent.spec.stuckLoopDetection here; an unset
 	// Agent CR field yields DefaultProgressConfig.
 	Progress ProgressConfig
+
+	// LoopBudget is the loop-wide wall-clock ceiling (#532). When > 0 the
+	// loop wraps its context with this deadline; if a turn's request is
+	// still pending when the budget fires, the loop exits gracefully with
+	// an INCOMPLETE terminal (transcript preserved) rather than bubbling a
+	// retry-less error that kills the AgenticTask. <= 0 disables it (only
+	// MaxTurns and the per-request timeout bound the run). The executor
+	// maps Agent.spec.requestTimeoutSeconds here; the per-request header
+	// timeout is the separate Agent.spec.requestTurnTimeoutSeconds.
+	LoopBudget time.Duration
 }
 
 // DefaultContextWindowTokens is the budget used when LoopConfig.ContextWindowTokens
@@ -161,6 +171,35 @@ var ErrMaxTurnsExhausted = errors.New("loop: max turns exhausted")
 // surfaces in AgenticTask.status.result.
 const StuckLoopOutcome = "STUCK-LOOP-DETECTED"
 
+// LoopBudgetOutcome is the value the loop sets in
+// LoopResult.Terminal.Extra["outcome"] when LoopConfig.LoopBudget is
+// exhausted mid-turn (#532). Like the stuck-loop case, the loop returns
+// a nil error with a populated INCOMPLETE terminal so the executor's
+// normal terminal-handling path persists the partial transcript instead
+// of recording a retry-less ExecutorError.
+const LoopBudgetOutcome = "LOOP-BUDGET-EXHAUSTED"
+
+// LoopBudgetExhaustedEnvelope synthesizes the INCOMPLETE terminal the
+// loop returns when its wall-clock budget fires. turn is the turn that
+// was in flight when the deadline hit.
+func LoopBudgetExhaustedEnvelope(turn int) *ToolResult {
+	const summary = "loop wall-clock budget exhausted before the agent finished"
+	return &ToolResult{
+		Terminal:      true,
+		Verdict:       "INCOMPLETE",
+		Summary:       summary,
+		CommitMessage: "",
+		Output: map[string]any{
+			"verdict": "INCOMPLETE",
+			"summary": summary,
+		},
+		Extra: map[string]any{
+			"outcome":       LoopBudgetOutcome,
+			"terminateTurn": turn,
+		},
+	}
+}
+
 // ErrAssistantNoToolCalls is returned when the model replies with text
 // only and no tool_calls. The loop has no way to make forward progress
 // in that case because every agent ends through submit_result. We
@@ -204,6 +243,16 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	if cfg.ObservationWindowTurns <= 0 {
 		cfg.ObservationWindowTurns = DefaultObservationWindowTurns
 	}
+	// Loop-wide wall-clock budget (#532). Distinct from the per-request
+	// header timeout baked into the OAI client: this bounds the whole
+	// run, so one slow long-context turn can't hang past the budget, and
+	// the per-request timeout can stay tight without doubling as the
+	// loop cap.
+	if cfg.LoopBudget > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.LoopBudget)
+		defer cancel()
+	}
 	res := &LoopResult{
 		Transcript: []oai.Message{
 			{Role: oai.RoleSystem, Content: cfg.SystemPrompt},
@@ -225,6 +274,15 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 		turnErr := l.runOneTurn(ctx, cfg, schemas, res)
 		if turnErr != nil {
 			if errors.Is(turnErr, errTerminalReached) {
+				return res, nil
+			}
+			// Loop-wide budget exhausted: exit gracefully with an
+			// INCOMPLETE terminal so the executor persists the partial
+			// transcript instead of recording a retry-less ExecutorError
+			// (#532). Only the loop's own deadline maps here; an external
+			// cancellation (context.Canceled) still propagates as an error.
+			if cfg.LoopBudget > 0 && errors.Is(turnErr, context.DeadlineExceeded) {
+				res.Terminal = LoopBudgetExhaustedEnvelope(turn)
 				return res, nil
 			}
 			return res, turnErr
