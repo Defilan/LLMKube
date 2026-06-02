@@ -24,6 +24,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -247,6 +248,34 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	} else if err != nil {
 		log.Error(err, "Failed to get Deployment")
 		return nil, 0, nil, err
+	}
+
+	// Deployment.spec.selector is immutable. A Deployment created by an older
+	// operator version can carry a smaller selector than we now generate
+	// (pre-0.8 used {app: <name>}; we now also add inference.llmkube.dev/service).
+	// An in-place Update then fails permanently with "field is immutable" and
+	// the controller hot-loops (#606). Migrate by recreating the Deployment
+	// with the correct selector. This is a one-time, logged recreate; the
+	// brief pod churn is unavoidable for an immutable-selector change.
+	if !apiequality.Semantic.DeepEqual(existingDeployment.Spec.Selector, deployment.Spec.Selector) {
+		log.Info("Deployment selector changed; recreating (selector is immutable)",
+			"name", deployment.Name,
+			"oldSelector", existingDeployment.Spec.Selector,
+			"newSelector", deployment.Spec.Selector)
+		if err := r.Delete(ctx, existingDeployment); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to delete stale Deployment for selector migration")
+			return nil, 0, nil, err
+		}
+		if err := r.Create(ctx, deployment); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// The old Deployment is still terminating; recreate on the
+				// next reconcile once its deletion has propagated.
+				return nil, 0, &ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+			}
+			log.Error(err, "Failed to recreate Deployment after selector change")
+			return nil, 0, nil, err
+		}
+		return deployment, existingDeployment.Status.ReadyReplicas, nil, nil
 	}
 
 	// Snapshot externally-set template metadata before the wholesale
