@@ -798,16 +798,9 @@ var _ = Describe("computeCacheKey", func() {
 	})
 })
 
-var _ = Describe("checkAcceleratorAvailability", func() {
-	It("should return true when hardware is nil", func() {
-		reconciler := &ModelReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(reconciler.checkAcceleratorAvailability(nil)).To(BeTrue())
-	})
-	It("should return true when hardware is non-nil", func() {
-		reconciler := &ModelReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
-		Expect(reconciler.checkAcceleratorAvailability(&inferencev1alpha1.HardwareSpec{Accelerator: "cuda"})).To(BeTrue())
-	})
-})
+// checkAcceleratorAvailability is covered comprehensively by the table-driven
+// TestCheckAcceleratorAvailability in model_accelerator_test.go (nil/cpu/metal
+// available; cuda/rocm gated on node capacity).
 
 var _ = Describe("copyLocalModel", func() {
 	It("should copy file successfully", func() {

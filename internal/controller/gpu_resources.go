@@ -17,6 +17,7 @@ const (
 
 var (
 	nvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
+	amdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
 	intelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
 	intelGPUResourceNameXE   = corev1.ResourceName("gpu.intel.com/xe")
 )
