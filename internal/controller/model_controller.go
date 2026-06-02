@@ -53,6 +53,9 @@ const (
 	// acceleratorMetal is the Model.Spec.Hardware.Accelerator value for the
 	// host metal-agent path.
 	acceleratorMetal      = "metal"
+	acceleratorCUDA       = "cuda"
+	acceleratorROCm       = "rocm"
+	acceleratorCPU        = "cpu"
 	DefaultModelCachePath = "/models"
 
 	ConditionAvailable   = "Available"
@@ -72,6 +75,7 @@ type ModelReconciler struct {
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=models/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=models/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()
@@ -150,7 +154,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		model.Status.Path = finalPath
 		model.Status.Size = formatBytes(fileInfo.Size())
 		model.Status.CacheKey = cacheKey
-		model.Status.AcceleratorReady = r.checkAcceleratorAvailability(model.Spec.Hardware)
+		model.Status.AcceleratorReady = r.checkAcceleratorAvailability(ctx, model)
 		now := metav1.Now()
 		model.Status.LastUpdated = &now
 
@@ -261,7 +265,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	model.Status.Path = finalPath
 	model.Status.Size = formatBytes(size)
 	model.Status.CacheKey = cacheKey
-	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(model.Spec.Hardware)
+	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(ctx, model)
 	now := metav1.Now()
 	model.Status.LastUpdated = &now
 
@@ -329,7 +333,7 @@ func (r *ModelReconciler) reconcilePVCSource(ctx context.Context, model *inferen
 	model.Status.Phase = PhaseReady
 	model.Status.Path = mountPath
 	model.Status.CacheKey = cacheKey
-	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(model.Spec.Hardware)
+	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(ctx, model)
 	now := metav1.Now()
 	model.Status.LastUpdated = &now
 
@@ -438,7 +442,7 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 	model.Status.Path = ""
 	model.Status.CacheKey = cacheKey
 	model.Status.Size = "0"
-	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(model.Spec.Hardware)
+	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(ctx, model)
 	now := metav1.Now()
 	model.Status.LastUpdated = &now
 
@@ -631,13 +635,54 @@ func (r *ModelReconciler) updateStatus(ctx context.Context, model *inferencev1al
 	return r.Status().Update(ctx, model)
 }
 
+// checkAcceleratorAvailability reports whether the accelerator the Model
+// requests is actually present in the cluster, so status.acceleratorReady
+// reflects reality instead of always being true (#230). CPU and an unset
+// accelerator are always available. Metal runs on an off-cluster metal-agent
+// for which the operator has no reliable in-cluster liveness signal yet, so it
+// is treated as available (probing the agent is a follow-up). GPU accelerators
+// (cuda/rocm/intel) require at least one Node advertising the matching
+// extended resource in its capacity.
+//
 //nolint:unparam
-func (r *ModelReconciler) checkAcceleratorAvailability(hardware *inferencev1alpha1.HardwareSpec) bool {
-	if hardware == nil {
+func (r *ModelReconciler) checkAcceleratorAvailability(ctx context.Context, model *inferencev1alpha1.Model) bool {
+	if model == nil || model.Spec.Hardware == nil {
 		return true
 	}
-	// TODO: implement actual GPU/Metal availability checking
-	return true
+	accel := strings.ToLower(strings.TrimSpace(model.Spec.Hardware.Accelerator))
+	switch accel {
+	case "", acceleratorCPU:
+		return true
+	case acceleratorMetal:
+		return true
+	}
+
+	var resName corev1.ResourceName
+	switch accel {
+	case acceleratorROCm:
+		resName = amdGPUResourceName
+	case acceleratorCUDA:
+		resName = nvidiaGPUResourceName
+	default:
+		// intel (and any other GPU vendor resolveGPUResourceName knows).
+		resName = resolveGPUResourceName(model)
+	}
+
+	var nodes corev1.NodeList
+	if err := r.List(ctx, &nodes); err != nil {
+		// Cannot determine availability; fail open rather than spuriously
+		// reporting the accelerator unavailable on a transient or RBAC error.
+		log.FromContext(ctx).Error(err,
+			"checkAcceleratorAvailability: listing nodes failed; assuming available",
+			"accelerator", accel)
+		return true
+	}
+	for i := range nodes.Items {
+		if q, ok := nodes.Items[i].Status.Capacity[resName]; ok && !q.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 func formatBytes(bytes int64) string {
