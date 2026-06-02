@@ -104,4 +104,11 @@ Add `--runtime yourengine` handling in `pkg/cli/deploy.go`.
 | `personaplex` | PersonaPlex/Moshi | 8998 | TCP socket | No | — |
 | `vllm` | vLLM | 8000 | HTTP /health | Yes | vllm:num_requests_running |
 | `tgi` | TGI | 80 | HTTP /health | No (HF download) | tgi:queue_size |
+| `whisper` | speaches (faster-whisper) | 8000 | HTTP /health | No (HF download) | — |
 | `generic` | Any container | 8080 | TCP socket | No | — |
+
+The `whisper` runtime serves the OpenAI audio API (`/v1/audio/transcriptions`)
+rather than `/v1/chat/completions`; it declares this via the optional
+`EndpointPathProvider` interface, which `constructEndpoint` consults for the
+default status endpoint path. It is configured entirely through env vars
+(`EnvBuilder`), not CLI args.

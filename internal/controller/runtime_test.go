@@ -3,6 +3,8 @@ package controller
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
@@ -25,6 +27,32 @@ func containsArg(args []string, flag, value string) bool {
 	return false
 }
 
+// containsEnv reports whether env contains a var named name. When value is
+// non-empty, it also requires the literal .Value to equal value. For
+// secret-backed vars, pass value == "" and assert ValueFrom via envSecretRef.
+func containsEnv(env []corev1.EnvVar, name, value string) bool {
+	for _, e := range env {
+		if e.Name != name {
+			continue
+		}
+		if value == "" {
+			return true
+		}
+		return e.Value == value
+	}
+	return false
+}
+
+// envSecretRef returns the SecretKeySelector backing the named env var, or nil.
+func envSecretRef(env []corev1.EnvVar, name string) *corev1.SecretKeySelector {
+	for _, e := range env {
+		if e.Name == name && e.ValueFrom != nil {
+			return e.ValueFrom.SecretKeyRef
+		}
+	}
+	return nil
+}
+
 // ptrString, ptrBool, ptrInt32 are local helpers so tests read naturally.
 func ptrBool(b bool) *bool          { return &b }
 func ptrFloat64(f float64) *float64 { return &f }
@@ -45,6 +73,7 @@ func TestRuntimeNameLabel(t *testing.T) {
 		{name: "empty runtime defaults to llamacpp", runtime: "", expected: "llamacpp"},
 		{name: "vllm passes through", runtime: "vllm", expected: "vllm"},
 		{name: "tgi passes through", runtime: "tgi", expected: "tgi"},
+		{name: "whisper passes through", runtime: "whisper", expected: "whisper"},
 		{name: "personaplex passes through", runtime: "personaplex", expected: "personaplex"},
 		{name: "generic passes through", runtime: "generic", expected: "generic"},
 		// Future runtimes (vllm-swift on metal, etc.) pass through

@@ -224,8 +224,11 @@ spec:
                 description: Endpoint defines the service endpoint configuration
                 properties:
                   path:
-                    default: /v1/chat/completions
-                    description: Path is the HTTP path for the inference endpoint
+                    description: |-
+                      Path is the HTTP path for the inference endpoint. When unset, the
+                      effective default is the runtime's OpenAI-compatible path
+                      (/v1/chat/completions for text runtimes, /v1/audio/transcriptions for the
+                      whisper runtime), resolved when the status endpoint is constructed.
                     type: string
                   port:
                     default: 8080
@@ -1398,11 +1401,13 @@ spec:
                   "personaplex": NVIDIA PersonaPlex (Moshi) speech-to-speech server.
                   "vllm": vLLM OpenAI-compatible server with PagedAttention.
                   "tgi": HuggingFace Text Generation Inference server.
+                  "whisper": speaches (faster-whisper) OpenAI-compatible audio transcription server.
                 enum:
                 - llamacpp
                 - personaplex
                 - vllm
                 - tgi
+                - whisper
                 - generic
                 type: string
               runtimeClassName:
@@ -1908,6 +1913,100 @@ spec:
                     description: TensorParallelSize sets the number of GPUs for tensor
                       parallelism.
                     format: int32
+                    type: integer
+                type: object
+              whisperConfig:
+                description: |-
+                  WhisperConfig holds configuration for the whisper (speaches) runtime.
+                  Only used when Runtime is "whisper".
+                properties:
+                  apiKeySecretRef:
+                    description: |-
+                      APIKeySecretRef references a Secret containing an API key speaches will require
+                      on requests (sets the speaches API_KEY).
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  computeType:
+                    description: |-
+                      ComputeType sets the CTranslate2 compute type (speaches WHISPER__COMPUTE_TYPE).
+                      When unset, falls back to a recognized Model spec.quantization, else the speaches default.
+                    enum:
+                    - int8
+                    - int8_float16
+                    - int8_bfloat16
+                    - int8_float32
+                    - int16
+                    - float16
+                    - bfloat16
+                    - float32
+                    - default
+                    type: string
+                  enableUI:
+                    description: EnableUI exposes the speaches Gradio web UI. Defaults
+                      to false.
+                    type: boolean
+                  hfTokenSecretRef:
+                    description: |-
+                      HFTokenSecretRef references a Secret containing a HuggingFace token, used to
+                      download gated CTranslate2 models.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  inferenceDevice:
+                    description: |-
+                      InferenceDevice sets the device speaches loads models on (WHISPER__INFERENCE_DEVICE).
+                      When unset, derived from the referenced Model's hardware.accelerator (cuda/rocm/intel -> cuda,
+                      cpu/metal -> cpu), defaulting to auto.
+                    enum:
+                    - auto
+                    - cuda
+                    - cpu
+                    type: string
+                  modelTTLSeconds:
+                    description: |-
+                      ModelTTLSeconds is how long an idle model stays loaded before being unloaded
+                      (speaches WHISPER__TTL). -1 keeps models loaded indefinitely.
+                    format: int32
+                    minimum: -1
                     type: integer
                 type: object
             required:

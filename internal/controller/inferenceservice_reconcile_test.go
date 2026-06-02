@@ -504,6 +504,83 @@ var _ = Describe("Reconcile lifecycle", func() {
 			Expect(updated.Status.Endpoint).NotTo(BeEmpty())
 		})
 
+		It("should create a speaches Deployment for the whisper runtime", func() {
+			modelName := "whisper-model-ready"
+			isvcName := "whisper-isvc"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "Systran/faster-whisper-large-v3",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cuda"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Runtime:  "whisper",
+					Replicas: &replicas,
+					WhisperConfig: &inferencev1alpha1.WhisperConfig{
+						ComputeType: "float16",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the speaches container, port, env, and probes")
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			Expect(dep.Spec.Template.Spec.InitContainers).To(BeEmpty(), "whisper runtime needs no model-init container")
+			containers := dep.Spec.Template.Spec.Containers
+			Expect(containers).To(HaveLen(1))
+			c := containers[0]
+			Expect(c.Name).To(Equal("speaches"))
+			Expect(c.Ports[0].ContainerPort).To(Equal(int32(8000)))
+			Expect(c.ReadinessProbe.HTTPGet.Path).To(Equal("/health"))
+
+			envNames := map[string]string{}
+			for _, e := range c.Env {
+				envNames[e.Name] = e.Value
+			}
+			Expect(envNames).To(HaveKeyWithValue("WHISPER__INFERENCE_DEVICE", "cuda"))
+			Expect(envNames).To(HaveKeyWithValue("WHISPER__COMPUTE_TYPE", "float16"))
+			Expect(envNames).To(HaveKey("HF_HOME"))
+
+			By("verifying the status endpoint advertises the audio transcription path")
+			updated := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Endpoint).To(HaveSuffix("/v1/audio/transcriptions"))
+		})
+
 		It("should skip Deployment for Metal accelerator", func() {
 			modelName := "metal-model"
 			isvcName := "isvc-metal"

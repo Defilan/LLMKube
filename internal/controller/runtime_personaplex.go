@@ -86,7 +86,7 @@ func (b *PersonaPlexBackend) BuildProbes(port int32) (startup, liveness, readine
 
 // BuildEnv returns environment variables for the PersonaPlex container,
 // including HF_TOKEN from a Secret reference if configured.
-func (b *PersonaPlexBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar {
+func (b *PersonaPlexBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService, _ *inferencev1alpha1.Model) []corev1.EnvVar {
 	var env []corev1.EnvVar
 
 	cfg := isvc.Spec.PersonaPlexConfig

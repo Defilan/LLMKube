@@ -190,7 +190,7 @@ func (b *VLLMBackend) BuildProbes(port int32) (*corev1.Probe, *corev1.Probe, *co
 	return startup, liveness, readiness
 }
 
-func (b *VLLMBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar {
+func (b *VLLMBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService, _ *inferencev1alpha1.Model) []corev1.EnvVar {
 	cfg := isvc.Spec.VLLMConfig
 	if cfg != nil && cfg.HFTokenSecretRef != nil {
 		return []corev1.EnvVar{{

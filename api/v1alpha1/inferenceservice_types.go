@@ -61,7 +61,8 @@ type InferenceServiceSpec struct {
 	// "personaplex": NVIDIA PersonaPlex (Moshi) speech-to-speech server.
 	// "vllm": vLLM OpenAI-compatible server with PagedAttention.
 	// "tgi": HuggingFace Text Generation Inference server.
-	// +kubebuilder:validation:Enum=llamacpp;personaplex;vllm;tgi;generic
+	// "whisper": speaches (faster-whisper) OpenAI-compatible audio transcription server.
+	// +kubebuilder:validation:Enum=llamacpp;personaplex;vllm;tgi;whisper;generic
 	// +kubebuilder:default=llamacpp
 	// +optional
 	Runtime string `json:"runtime,omitempty"`
@@ -338,6 +339,11 @@ type InferenceServiceSpec struct {
 	// +optional
 	TGIConfig *TGIConfig `json:"tgiConfig,omitempty"`
 
+	// WhisperConfig holds configuration for the whisper (speaches) runtime.
+	// Only used when Runtime is "whisper".
+	// +optional
+	WhisperConfig *WhisperConfig `json:"whisperConfig,omitempty"`
+
 	// ImagePullSecrets for pulling container images from private registries.
 	// +optional
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
@@ -386,8 +392,10 @@ type EndpointSpec struct {
 	// +optional
 	Port int32 `json:"port,omitempty"`
 
-	// Path is the HTTP path for the inference endpoint
-	// +kubebuilder:default="/v1/chat/completions"
+	// Path is the HTTP path for the inference endpoint. When unset, the
+	// effective default is the runtime's OpenAI-compatible path
+	// (/v1/chat/completions for text runtimes, /v1/audio/transcriptions for the
+	// whisper runtime), resolved when the status endpoint is constructed.
 	// +optional
 	Path string `json:"path,omitempty"`
 
@@ -665,6 +673,45 @@ type TGIConfig struct {
 	// HFTokenSecretRef references a Secret containing the HuggingFace token.
 	// +optional
 	HFTokenSecretRef *corev1.SecretKeySelector `json:"hfTokenSecretRef,omitempty"`
+}
+
+// WhisperConfig holds deploy-time server settings for the whisper (speaches)
+// runtime. speaches selects the model, language, and task per request, so those
+// are NOT server config; the model id clients request comes from the referenced
+// Model's spec.source.
+type WhisperConfig struct {
+	// ComputeType sets the CTranslate2 compute type (speaches WHISPER__COMPUTE_TYPE).
+	// When unset, falls back to a recognized Model spec.quantization, else the speaches default.
+	// +kubebuilder:validation:Enum=int8;int8_float16;int8_bfloat16;int8_float32;int16;float16;bfloat16;float32;default
+	// +optional
+	ComputeType string `json:"computeType,omitempty"`
+
+	// InferenceDevice sets the device speaches loads models on (WHISPER__INFERENCE_DEVICE).
+	// When unset, derived from the referenced Model's hardware.accelerator (cuda/rocm/intel -> cuda,
+	// cpu/metal -> cpu), defaulting to auto.
+	// +kubebuilder:validation:Enum=auto;cuda;cpu
+	// +optional
+	InferenceDevice string `json:"inferenceDevice,omitempty"`
+
+	// ModelTTLSeconds is how long an idle model stays loaded before being unloaded
+	// (speaches WHISPER__TTL). -1 keeps models loaded indefinitely.
+	// +kubebuilder:validation:Minimum=-1
+	// +optional
+	ModelTTLSeconds *int32 `json:"modelTTLSeconds,omitempty"`
+
+	// EnableUI exposes the speaches Gradio web UI. Defaults to false.
+	// +optional
+	EnableUI *bool `json:"enableUI,omitempty"`
+
+	// HFTokenSecretRef references a Secret containing a HuggingFace token, used to
+	// download gated CTranslate2 models.
+	// +optional
+	HFTokenSecretRef *corev1.SecretKeySelector `json:"hfTokenSecretRef,omitempty"`
+
+	// APIKeySecretRef references a Secret containing an API key speaches will require
+	// on requests (sets the speaches API_KEY).
+	// +optional
+	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 }
 
 // InferenceServiceStatus defines the observed state of InferenceService.

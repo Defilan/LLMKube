@@ -224,7 +224,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 
 	// Add runtime-generated env vars, then user-specified env vars (user wins on conflict)
 	if eb, ok := backend.(EnvBuilder); ok {
-		container.Env = append(container.Env, eb.BuildEnv(isvc)...)
+		container.Env = append(container.Env, eb.BuildEnv(isvc, model)...)
 	}
 	if len(isvc.Spec.Env) > 0 {
 		container.Env = append(container.Env, isvc.Spec.Env...)

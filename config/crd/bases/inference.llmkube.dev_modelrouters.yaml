@@ -234,8 +234,11 @@ spec:
                   through. Mirrors the shape used by InferenceService.
                 properties:
                   path:
-                    default: /v1/chat/completions
-                    description: Path is the HTTP path for the inference endpoint
+                    description: |-
+                      Path is the HTTP path for the inference endpoint. When unset, the
+                      effective default is the runtime's OpenAI-compatible path
+                      (/v1/chat/completions for text runtimes, /v1/audio/transcriptions for the
+                      whisper runtime), resolved when the status endpoint is constructed.
                     type: string
                   port:
                     default: 8080

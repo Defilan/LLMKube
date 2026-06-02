@@ -80,6 +80,15 @@ func (r *InferenceServiceReconciler) constructEndpoint(isvc *inferencev1alpha1.I
 	port := int32(8080)
 	path := "/v1/chat/completions"
 
+	// A backend may declare a different default OpenAI-compatible path (e.g. the
+	// whisper runtime serves /v1/audio/transcriptions). A user-set
+	// spec.endpoint.path still wins, checked below.
+	if ep, ok := resolveBackend(isvc).(EndpointPathProvider); ok {
+		if p := ep.DefaultEndpointPath(); p != "" {
+			path = p
+		}
+	}
+
 	if isvc.Spec.Endpoint != nil {
 		if isvc.Spec.Endpoint.Port > 0 {
 			port = isvc.Spec.Endpoint.Port

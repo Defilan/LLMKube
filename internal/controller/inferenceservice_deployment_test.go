@@ -3720,7 +3720,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 					},
 				},
 			}
-			env := backend.BuildEnv(isvc)
+			env := backend.BuildEnv(isvc, nil)
 			Expect(env).To(HaveLen(2))
 			Expect(env[0].Name).To(Equal("HF_TOKEN"))
 			Expect(env[0].ValueFrom.SecretKeyRef.Name).To(Equal("hf-token"))

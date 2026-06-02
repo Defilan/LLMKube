@@ -38,8 +38,18 @@ type CommandBuilder interface {
 }
 
 // EnvBuilder is optionally implemented by backends that generate runtime-specific env vars.
+// It receives the Model so backends can derive env values (e.g. device, model id) from the
+// Model spec, consistent with BuildArgs.
 type EnvBuilder interface {
-	BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar
+	BuildEnv(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) []corev1.EnvVar
+}
+
+// EndpointPathProvider is optionally implemented by backends whose OpenAI-compatible API path
+// differs from the default /v1/chat/completions (e.g. the whisper runtime serves
+// /v1/audio/transcriptions). constructEndpoint consults it for the default status endpoint path
+// when the user has not set spec.endpoint.path explicitly.
+type EndpointPathProvider interface {
+	DefaultEndpointPath() string
 }
 
 // HPAMetricProvider is optionally implemented by backends that have a default autoscaling metric.
@@ -68,6 +78,8 @@ func resolveBackend(isvc *inferencev1alpha1.InferenceService) RuntimeBackend {
 		return &VLLMBackend{}
 	case "tgi":
 		return &TGIBackend{}
+	case "whisper":
+		return &WhisperBackend{}
 	case "generic":
 		return &GenericBackend{}
 	default:

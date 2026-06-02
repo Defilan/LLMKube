@@ -1,0 +1,22 @@
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: whisper-large-v3
+  namespace: default
+spec:
+  # speaches loads CTranslate2 / faster-whisper models from HuggingFace by repo
+  # id. This is the model clients pass in the OpenAI `model` field, and it drives
+  # the runtime device/compute defaults. The operator does not download it: the
+  # speaches server fetches it from HuggingFace on first request.
+  source: Systran/faster-whisper-large-v3
+  format: custom
+  hardware:
+    accelerator: cuda
+    gpu:
+      enabled: true
+      count: 1
+      vendor: nvidia
+      memory: "8Gi"
+  resources:
+    cpu: "2"
+    memory: "4Gi"

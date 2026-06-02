@@ -1,0 +1,31 @@
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: whisper
+  namespace: default
+spec:
+  modelRef: whisper-large-v3
+  runtime: whisper
+  replicas: 1
+  # Endpoint path is optional: the whisper runtime defaults it to
+  # /v1/audio/transcriptions automatically. Override only if you front it
+  # differently.
+  endpoint:
+    port: 8000
+    type: ClusterIP
+  whisperConfig:
+    # CTranslate2 compute type. float16 suits most NVIDIA GPUs; use int8 or
+    # int8_float16 to trade a little accuracy for memory/speed. Omit to inherit
+    # the model's quantization (when recognized) or the speaches default.
+    computeType: float16
+    # Optional: derived from the Model accelerator when omitted (cuda here).
+    # inferenceDevice: cuda
+    # Optional: keep idle models loaded (-1) instead of unloading after 300s.
+    # modelTTLSeconds: -1
+  resources:
+    gpu: 1
+    gpuMemory: "8Gi"
+    cpu: "2"
+    memory: "4Gi"
+  # CPU-only deployments: drop the gpu resources above and override the image:
+  # image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
