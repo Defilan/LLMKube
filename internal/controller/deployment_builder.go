@@ -163,12 +163,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		image = isvc.Spec.Image
 	}
 
-	port := backend.DefaultPort()
-	if isvc.Spec.ContainerPort != nil {
-		port = *isvc.Spec.ContainerPort
-	} else if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Port > 0 {
-		port = isvc.Spec.Endpoint.Port
-	}
+	port := resolveServicePort(isvc)
 
 	skipInit := isvc.Spec.SkipModelInit != nil && *isvc.Spec.SkipModelInit
 
@@ -220,6 +215,11 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	}
 	if args != nil {
 		container.Args = args
+	}
+
+	// Optional container lifecycle hook (e.g. whisper preloads its model via postStart).
+	if lp, ok := backend.(LifecycleProvider); ok {
+		container.Lifecycle = lp.BuildLifecycle(isvc, model, port)
 	}
 
 	// Add runtime-generated env vars, then user-specified env vars (user wins on conflict)

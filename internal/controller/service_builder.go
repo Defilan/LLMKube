@@ -38,10 +38,7 @@ func (r *InferenceServiceReconciler) constructService(isvc *inferencev1alpha1.In
 		"inference.llmkube.dev/service": isvc.Name,
 	}
 
-	port := int32(8080)
-	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Port > 0 {
-		port = isvc.Spec.Endpoint.Port
-	}
+	port := resolveServicePort(isvc)
 
 	serviceType := corev1.ServiceTypeClusterIP
 	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Type != "" {

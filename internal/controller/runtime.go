@@ -57,6 +57,13 @@ type HPAMetricProvider interface {
 	DefaultHPAMetric() string
 }
 
+// LifecycleProvider is optionally implemented by backends that need a container
+// lifecycle hook (e.g. the whisper runtime preloads its model via a postStart
+// hook because speaches does not download models on the first request).
+type LifecycleProvider interface {
+	BuildLifecycle(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, port int32) *corev1.Lifecycle
+}
+
 // ServiceLinksOptOut is optionally implemented by backends that should run with
 // the legacy Kubernetes service-link env-var injection disabled. Returning true
 // sets `enableServiceLinks: false` on the Pod spec, which suppresses the
@@ -97,6 +104,21 @@ func runtimeNameLabel(isvc *inferencev1alpha1.InferenceService) string {
 		return "llamacpp"
 	}
 	return isvc.Spec.Runtime
+}
+
+// resolveServicePort returns the port the inference container listens on,
+// which the Service and the advertised endpoint must match. Precedence:
+// spec.containerPort, then spec.endpoint.port, then the backend's DefaultPort.
+// This keeps the Service/endpoint aligned with the container for runtimes whose
+// default port is not 8080 (e.g. vllm/whisper on 8000, tgi on 80).
+func resolveServicePort(isvc *inferencev1alpha1.InferenceService) int32 {
+	port := resolveBackend(isvc).DefaultPort()
+	if isvc.Spec.ContainerPort != nil {
+		port = *isvc.Spec.ContainerPort
+	} else if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Port > 0 {
+		port = isvc.Spec.Endpoint.Port
+	}
+	return port
 }
 
 // resolveGPUCount determines the GPU count from Model spec or InferenceService spec.

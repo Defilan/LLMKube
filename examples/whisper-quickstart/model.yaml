@@ -4,10 +4,11 @@ metadata:
   name: whisper-large-v3
   namespace: default
 spec:
-  # speaches loads CTranslate2 / faster-whisper models from HuggingFace by repo
-  # id. This is the model clients pass in the OpenAI `model` field, and it drives
-  # the runtime device/compute defaults. The operator does not download it: the
-  # speaches server fetches it from HuggingFace on first request.
+  # speaches uses CTranslate2 / faster-whisper models, referenced by HuggingFace
+  # repo id. This is the model clients pass in the OpenAI `model` field, and it
+  # drives the runtime device/compute defaults. The operator preloads it into
+  # speaches via a postStart hook (speaches does not auto-download on first
+  # request), so the pod becomes Ready only once the model is installed.
   source: Systran/faster-whisper-large-v3
   format: custom
   hardware:

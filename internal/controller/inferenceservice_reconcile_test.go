@@ -566,6 +566,13 @@ var _ = Describe("Reconcile lifecycle", func() {
 			Expect(c.Name).To(Equal("speaches"))
 			Expect(c.Ports[0].ContainerPort).To(Equal(int32(8000)))
 			Expect(c.ReadinessProbe.HTTPGet.Path).To(Equal("/health"))
+			By("verifying the postStart model-preload hook is wired")
+			Expect(c.Lifecycle).NotTo(BeNil())
+			Expect(c.Lifecycle.PostStart.Exec.Command[2]).To(ContainSubstring("/v1/models/$LLMKUBE_WHISPER_MODEL"))
+			By("verifying the Service port matches the speaches container port (8000)")
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc)).To(Succeed())
+			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8000)))
 
 			envNames := map[string]string{}
 			for _, e := range c.Env {

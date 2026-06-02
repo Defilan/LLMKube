@@ -77,7 +77,7 @@ func (r *InferenceServiceReconciler) reconcileVLLMSpecCondition(isvc *inferencev
 }
 
 func (r *InferenceServiceReconciler) constructEndpoint(isvc *inferencev1alpha1.InferenceService, svc *corev1.Service) string {
-	port := int32(8080)
+	port := resolveServicePort(isvc)
 	path := "/v1/chat/completions"
 
 	// A backend may declare a different default OpenAI-compatible path (e.g. the
@@ -89,13 +89,8 @@ func (r *InferenceServiceReconciler) constructEndpoint(isvc *inferencev1alpha1.I
 		}
 	}
 
-	if isvc.Spec.Endpoint != nil {
-		if isvc.Spec.Endpoint.Port > 0 {
-			port = isvc.Spec.Endpoint.Port
-		}
-		if isvc.Spec.Endpoint.Path != "" {
-			path = isvc.Spec.Endpoint.Path
-		}
+	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Path != "" {
+		path = isvc.Spec.Endpoint.Path
 	}
 
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d%s", svc.Name, svc.Namespace, port, path)

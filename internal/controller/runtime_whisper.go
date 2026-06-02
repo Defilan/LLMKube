@@ -97,6 +97,13 @@ func (b *WhisperBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService, mode
 		{Name: "WHISPER__INFERENCE_DEVICE", Value: whisperDevice(cfg, model)},
 	}
 
+	// LLMKUBE_WHISPER_MODEL is consumed by the postStart preload hook (BuildLifecycle),
+	// not by speaches itself. speaches does not download models on first request, so the
+	// hook installs this model id once the server is up.
+	if model != nil && model.Spec.Source != "" {
+		env = append(env, corev1.EnvVar{Name: "LLMKUBE_WHISPER_MODEL", Value: model.Spec.Source})
+	}
+
 	if ct := whisperComputeType(cfg, model); ct != "" {
 		env = append(env, corev1.EnvVar{Name: "WHISPER__COMPUTE_TYPE", Value: ct})
 	}
@@ -117,6 +124,29 @@ func (b *WhisperBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService, mode
 	}
 
 	return env
+}
+
+// BuildLifecycle returns a postStart hook that installs the model into speaches
+// once the server is healthy. speaches (v0.8.x) does not download models on the
+// first transcription request: it returns 400 until the model is installed via
+// POST /v1/models/{id}. The hook blocks the container from reporting Running
+// (and therefore Ready) until the model is installed, so the Service only
+// receives traffic once transcription will succeed. Returns nil when there is no
+// model source to preload.
+func (b *WhisperBackend) BuildLifecycle(_ *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, port int32) *corev1.Lifecycle {
+	if model == nil || model.Spec.Source == "" {
+		return nil
+	}
+	// curl is present in the speaches image (its own healthcheck uses it). The
+	// model id is read from the LLMKUBE_WHISPER_MODEL env var (set by BuildEnv) to
+	// avoid interpolating CR data into the shell script.
+	script := fmt.Sprintf(`for i in $(seq 1 90); do curl -sf -m 5 http://localhost:%d/health >/dev/null 2>&1 && break; sleep 2; done
+curl -sf -m 1800 -X POST "http://localhost:%d/v1/models/$LLMKUBE_WHISPER_MODEL" >/dev/null 2>&1 || true`, port, port)
+	return &corev1.Lifecycle{
+		PostStart: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"sh", "-c", script}},
+		},
+	}
 }
 
 func whisperEnableUI(cfg *inferencev1alpha1.WhisperConfig) string {

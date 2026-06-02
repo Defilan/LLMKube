@@ -100,6 +100,7 @@ func TestWhisperBuildEnv(t *testing.T) {
 				"HF_HOME":                   "/home/ubuntu/.cache/huggingface",
 				"ENABLE_UI":                 "false",
 				"WHISPER__INFERENCE_DEVICE": "cpu",
+				"LLMKUBE_WHISPER_MODEL":     "Systran/faster-whisper-large-v3",
 			},
 			wantAbsent: []string{"WHISPER__COMPUTE_TYPE", "WHISPER__TTL", "HF_TOKEN", "API_KEY"},
 		},
@@ -197,6 +198,37 @@ func TestWhisperBuildEnv(t *testing.T) {
 	}
 }
 
+func TestWhisperBuildLifecycle(t *testing.T) {
+	b := &WhisperBackend{}
+
+	t.Run("postStart preloads the model", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{Runtime: "whisper"},
+		}
+		lc := b.BuildLifecycle(isvc, whisperModel("cuda", ""), 8000)
+		if lc == nil || lc.PostStart == nil || lc.PostStart.Exec == nil {
+			t.Fatal("expected a postStart exec hook")
+		}
+		cmd := lc.PostStart.Exec.Command
+		if len(cmd) != 3 || cmd[0] != "sh" || cmd[1] != "-c" {
+			t.Fatalf("expected sh -c <script>, got %v", cmd)
+		}
+		script := cmd[2]
+		for _, want := range []string{"/v1/models/$LLMKUBE_WHISPER_MODEL", "localhost:8000/health", "-X POST"} {
+			if !containsSubstr(script, want) {
+				t.Errorf("postStart script missing %q; got:\n%s", want, script)
+			}
+		}
+	})
+
+	t.Run("nil when no model source", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{}
+		if lc := b.BuildLifecycle(isvc, &inferencev1alpha1.Model{}, 8000); lc != nil {
+			t.Errorf("expected nil lifecycle when model source empty, got %+v", lc)
+		}
+	})
+}
+
 // TestConstructEndpointRuntimeAwareDefault verifies the runtime-aware default path:
 // whisper resolves to the audio endpoint, other runtimes keep the chat endpoint,
 // and an explicit spec.endpoint.path always wins.
@@ -212,10 +244,11 @@ func TestConstructEndpointRuntimeAwareDefault(t *testing.T) {
 		path     string
 		wantEnds string
 	}{
-		{name: "whisper default", runtime: "whisper", wantEnds: "/v1/audio/transcriptions"},
-		{name: "llamacpp default", runtime: "", wantEnds: "/v1/chat/completions"},
-		{name: "vllm default", runtime: "vllm", wantEnds: "/v1/chat/completions"},
-		{name: "explicit path wins on whisper", runtime: "whisper", path: "/custom", wantEnds: "/custom"},
+		// Port follows the backend DefaultPort: whisper/vllm on 8000, llamacpp on 8080.
+		{name: "whisper default", runtime: "whisper", wantEnds: ":8000/v1/audio/transcriptions"},
+		{name: "llamacpp default", runtime: "", wantEnds: ":8080/v1/chat/completions"},
+		{name: "vllm default", runtime: "vllm", wantEnds: ":8000/v1/chat/completions"},
+		{name: "explicit path wins on whisper", runtime: "whisper", path: "/custom", wantEnds: ":8000/custom"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -235,4 +268,38 @@ func TestConstructEndpointRuntimeAwareDefault(t *testing.T) {
 
 func endsWith(s, suffix string) bool {
 	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
+}
+
+// TestResolveServicePort verifies the Service/endpoint port follows the backend
+// default (so non-8080 runtimes route correctly) while explicit overrides win.
+func TestResolveServicePort(t *testing.T) {
+	cases := []struct {
+		name          string
+		runtime       string
+		containerPort *int32
+		endpointPort  int32
+		want          int32
+	}{
+		{name: "whisper defaults to 8000", runtime: "whisper", want: 8000},
+		{name: "llamacpp defaults to 8080", runtime: "", want: 8080},
+		{name: "tgi defaults to 80", runtime: "tgi", want: 80},
+		{name: "endpoint port overrides backend default", runtime: "whisper", endpointPort: 9000, want: 9000},
+		{name: "containerPort wins over endpoint port", runtime: "whisper", containerPort: ptrInt32(7000), endpointPort: 9000, want: 7000},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:       tc.runtime,
+					ContainerPort: tc.containerPort,
+				},
+			}
+			if tc.endpointPort > 0 {
+				isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: tc.endpointPort}
+			}
+			if got := resolveServicePort(isvc); got != tc.want {
+				t.Errorf("resolveServicePort() = %d, want %d", got, tc.want)
+			}
+		})
+	}
 }

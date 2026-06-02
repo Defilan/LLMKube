@@ -11,8 +11,10 @@ runtime, backed by [speaches](https://speaches.ai) (faster-whisper / CTranslate2
   port 8000.
 
 The operator manages the Deployment, Service, probes (`/health`), GPU
-scheduling, and scaling. speaches downloads the CTranslate2 model from
-HuggingFace on first request.
+scheduling, and scaling. It also preloads the model into speaches via a
+postStart hook (speaches does not auto-download on the first request), so the
+pod reports Ready only once the model is installed and transcription will
+succeed.
 
 ## Apply
 
@@ -38,10 +40,12 @@ The response is OpenAI-compatible JSON (`{"text": "..."}`). The model id in the
 
 ## Notes and limitations (v1)
 
-- **First request downloads the model.** speaches fetches the CTranslate2 model
-  from HuggingFace on demand. Until a persistent cache volume lands (see below),
-  the model re-downloads on each pod start, so this runtime currently requires
-  HuggingFace reachability and is not yet air-gapped.
+- **The operator preloads the model.** A postStart hook installs it via
+  `POST /v1/models/{id}` once speaches is healthy; the pod becomes Ready only
+  after that completes. There is no persistent cache yet, so the model
+  re-downloads on each pod start. This runtime therefore requires HuggingFace
+  reachability and is not yet air-gapped (persistent cache + air-gapped support
+  are a tracked follow-up).
 - **No Prometheus metrics.** speaches exposes none, so the cluster PodMonitor
   will see 404s scraping `/metrics` for these pods. This is benign.
 - **CPU-only:** drop the `gpu` resources from `inferenceservice.yaml` and set
