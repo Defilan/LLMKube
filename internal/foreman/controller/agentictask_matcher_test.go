@@ -46,7 +46,7 @@ func TestCapabilitySatisfies_RequiresModelInstalledBypassesRAMGate(t *testing.T)
 		InstalledModels: []string{"devstral-24b"},
 	})
 
-	if !capabilitySatisfies(req, "devstral-24b", node) {
+	if !capabilitySatisfies(req, "devstral-24b", node, false) {
 		t.Fatalf("expected match: model loaded on node, RAM gate should be bypassed")
 	}
 }
@@ -64,7 +64,7 @@ func TestCapabilitySatisfies_RequiresModelInstalledButModelAbsent(t *testing.T) 
 		InstalledModels: []string{"qwen3-coder-30b"},
 	})
 
-	if capabilitySatisfies(req, "devstral-24b", node) {
+	if capabilitySatisfies(req, "devstral-24b", node, false) {
 		t.Fatalf("expected no match: required model not in node's installedModels")
 	}
 }
@@ -83,7 +83,7 @@ func TestCapabilitySatisfies_RequiresModelInstalledWithEmptyModel(t *testing.T) 
 		InstalledModels: []string{"devstral-24b"},
 	})
 
-	if capabilitySatisfies(req, "", node) {
+	if capabilitySatisfies(req, "", node, false) {
 		t.Fatalf("expected no match: no resolvable model to confirm residency")
 	}
 }
@@ -99,7 +99,7 @@ func TestCapabilitySatisfies_DefaultStillEnforcesRAMGate(t *testing.T) {
 		AvailableRAMGB: 16, // below MinRAMGB
 	})
 
-	if capabilitySatisfies(req, "", node) {
+	if capabilitySatisfies(req, "", node, false) {
 		t.Fatalf("expected no match: 16 < 32 and RequiresModelInstalled not set")
 	}
 }
