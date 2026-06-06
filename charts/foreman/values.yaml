@@ -237,3 +237,15 @@ coder:
     # so a sample Agent's spec.execution.serviceAccountName=foreman-coder
     # works without extra wiring. Override to suit your naming.
     name: ""
+
+  # Git Secret the coder Job projects as GITHUB_TOKEN for the clone +
+  # push (#620). These pass through to the foreman-agent watcher as
+  # --coder-git-secret / --coder-git-secret-key.
+  #
+  # Defaults match the standalone foreman-git-credentials Secret (key
+  # "token") so existing installs are unchanged. To REUSE an existing
+  # git Secret instead of creating a new one, point these at it: e.g.
+  # gitCredentialsSecret: foreman-github with gitCredentialsSecretKey:
+  # GITHUB_TOKEN reuses the same Secret the foreman-agent itself uses.
+  gitCredentialsSecret: foreman-git-credentials
+  gitCredentialsSecretKey: token

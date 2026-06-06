@@ -119,6 +119,26 @@ target (for LLMKube, the `Defilan/LLMKube` fork the executor pushes
 branches to). Rotate it on your usual cadence; nothing in the chart pins
 its lifetime.
 
+### Reusing an existing git Secret
+
+You do not have to create `foreman-git-credentials` at all. If the
+cluster already has a git Secret (for example the `foreman-github`
+Secret with key `GITHUB_TOKEN` that the foreman-agent itself uses for
+git auth), point the coder Job at it instead by setting
+`coder.gitCredentialsSecret` and `coder.gitCredentialsSecretKey`:
+
+```sh
+helm upgrade --install foreman ./charts/foreman \
+  --set coder.gitCredentialsSecret=foreman-github \
+  --set coder.gitCredentialsSecretKey=GITHUB_TOKEN
+```
+
+These pass through to the foreman-agent watcher as
+`--coder-git-secret` / `--coder-git-secret-key`, which the watcher uses
+when it renders each coder Job's `GITHUB_TOKEN` projection. The defaults
+remain `foreman-git-credentials` and `token`, so existing installs are
+unchanged.
+
 ## Optional model-auth Secret
 
 When the remote model endpoint requires authentication, the Job template

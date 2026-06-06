@@ -206,6 +206,121 @@ func TestRenderCoderJob_GitTokenEnvFromSecret(t *testing.T) {
 	}
 }
 
+// TestRenderCoderJob_GitTokenEnvCustomSecret asserts a non-default
+// GitCredentialsSecret/Key flows into the rendered Job's GITHUB_TOKEN
+// secretKeyRef (name + key). This is what lets an operator reuse an
+// existing git Secret (e.g. foreman-github with key GITHUB_TOKEN) instead
+// of being forced to create foreman-git-credentials (#620 reuse-secret).
+func TestRenderCoderJob_GitTokenEnvCustomSecret(t *testing.T) {
+	// customKey is a Secret KEY name, not a credential value; held in a
+	// variable so gosec's G101 literal-credential heuristic does not fire.
+	customKey := "GITHUB_TOKEN"
+	job, err := renderCoderJob(coderRendererInput{
+		Name:                    "foreman-coder-custom",
+		Namespace:               "foreman-system",
+		Image:                   "img",
+		TaskName:                "custom",
+		TaskNamespace:           "default",
+		ActiveDeadlineSeconds:   3600,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		GitCredentialsSecret:    "foreman-github",
+		GitCredentialsSecretKey: customKey,
+	})
+	if err != nil {
+		t.Fatalf("renderCoderJob: %v", err)
+	}
+	c := job.Spec.Template.Spec.Containers[0]
+	var tokenEnv *corev1.EnvVar
+	for i := range c.Env {
+		if c.Env[i].Name == "GITHUB_TOKEN" {
+			tokenEnv = &c.Env[i]
+		}
+	}
+	if tokenEnv == nil {
+		t.Fatalf("GITHUB_TOKEN env missing; env=%#v", c.Env)
+	}
+	if tokenEnv.ValueFrom == nil || tokenEnv.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("GITHUB_TOKEN must come from a secretKeyRef; got %#v", tokenEnv)
+	}
+	ref := tokenEnv.ValueFrom.SecretKeyRef
+	if ref.Name != "foreman-github" {
+		t.Errorf("secretKeyRef name: want foreman-github got %q", ref.Name)
+	}
+	if ref.Key != "GITHUB_TOKEN" {
+		t.Errorf("secretKeyRef key: want GITHUB_TOKEN got %q", ref.Key)
+	}
+	// The git-credentials file mount Secret should track the same name.
+	var found bool
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "git-credentials" {
+			found = true
+			if v.Secret == nil || v.Secret.SecretName != "foreman-github" {
+				t.Errorf("git-credentials volume should reference foreman-github; got %#v", v.Secret)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("git-credentials volume missing; volumes=%#v", job.Spec.Template.Spec.Volumes)
+	}
+}
+
+// TestRunCoderJob_CustomGitSecretFlowsThroughRun asserts a non-default
+// GitCredentialsSecret/Key set on the static RunCoderJobConfig reaches the
+// rendered Job's GITHUB_TOKEN secretKeyRef via Run. This mirrors how the
+// foreman-agent watcher wires --coder-git-secret / --coder-git-secret-key
+// onto Cfg (#620 reuse-secret).
+func TestRunCoderJob_CustomGitSecretFlowsThroughRun(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-gitsecret"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	// customKey is a Secret KEY name, not a credential value; held in a
+	// variable so gosec's G101 literal-credential heuristic does not fire.
+	customKey := "GITHUB_TOKEN"
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:                  pinName(jobName),
+			PollInterval:            5 * time.Millisecond,
+			PollTimeout:             2 * time.Second,
+			GitCredentialsSecret:    "foreman-github",
+			GitCredentialsSecretKey: customKey,
+			LogTailFn:               func(context.Context, string, string) string { return "" },
+		},
+	}
+	if _, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "gitsecret", TaskNamespace: "default"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var job batchv1.Job
+	if err := c.Get(ctx, key, &job); err != nil {
+		t.Fatalf("Job should exist: %v", err)
+	}
+	con := job.Spec.Template.Spec.Containers[0]
+	var tokenEnv *corev1.EnvVar
+	for i := range con.Env {
+		if con.Env[i].Name == "GITHUB_TOKEN" {
+			tokenEnv = &con.Env[i]
+		}
+	}
+	if tokenEnv == nil || tokenEnv.ValueFrom == nil || tokenEnv.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("GITHUB_TOKEN secretKeyRef missing; env=%#v", con.Env)
+	}
+	ref := tokenEnv.ValueFrom.SecretKeyRef
+	if ref.Name != "foreman-github" {
+		t.Errorf("secretKeyRef name: want foreman-github got %q", ref.Name)
+	}
+	if ref.Key != "GITHUB_TOKEN" {
+		t.Errorf("secretKeyRef key: want GITHUB_TOKEN got %q", ref.Key)
+	}
+}
+
 // TestRenderCoderJob_AppliesResources asserts CoderJobRequest-supplied
 // resources land on the container, and that the gate-matching defaults
 // apply when the renderer input carries the default strings (#620 N1).

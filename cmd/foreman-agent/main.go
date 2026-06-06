@@ -121,6 +121,10 @@ func main() {
 		commitAuthorName  string
 		commitAuthorEmail string
 		keepWorkspace     bool
+
+		// #620 coder-Job git Secret selection
+		coderGitSecret    string
+		coderGitSecretKey string
 	)
 
 	flag.StringVar(&fleetNodeName, "fleet-node-name", "",
@@ -183,6 +187,13 @@ func main() {
 		"Preserve the per-task clone workspace after the run. Useful for debugging; default removes it.")
 	flag.StringVar(&foremanNamespace, "foreman-namespace", "foreman-system",
 		"Namespace the M4 run_gate_job tool submits gate Jobs into. Defaults to foreman-system.")
+	flag.StringVar(&coderGitSecret, "coder-git-secret", "foreman-git-credentials",
+		"Name of the Secret the coder Job projects as GITHUB_TOKEN for the clone + push (#620). "+
+			"Point this at an existing git Secret (e.g. foreman-github) to reuse it instead of "+
+			"creating foreman-git-credentials.")
+	flag.StringVar(&coderGitSecretKey, "coder-git-secret-key", "token",
+		"Key within --coder-git-secret that holds the token (e.g. GITHUB_TOKEN when reusing an "+
+			"existing git Secret).")
 
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
@@ -311,8 +322,10 @@ func main() {
 			CoderJobSubmitter: &foremantools.RunCoderJob{
 				Client: kc,
 				Cfg: foremantools.RunCoderJobConfig{
-					Namespace: foremanNamespace,
-					LogTailFn: makePodLogTailFn(kcs),
+					Namespace:               foremanNamespace,
+					GitCredentialsSecret:    coderGitSecret,
+					GitCredentialsSecretKey: coderGitSecretKey,
+					LogTailFn:               makePodLogTailFn(kcs),
 				},
 			},
 		}
