@@ -49,6 +49,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -78,6 +79,17 @@ func init() {
 }
 
 func main() {
+	// Subcommand dispatch. The default (no subcommand) runs the long-
+	// lived node daemon (FleetNode registrar + AgenticTask watcher). The
+	// "run-task" subcommand runs ONE AgenticTask to completion and exits;
+	// it is the body of the ephemeral coder Job (#620). We branch on
+	// os.Args[1] before flag.Parse because the flag package has no native
+	// subcommand support and the two modes carry different flag sets.
+	if len(os.Args) > 1 && os.Args[1] == "run-task" {
+		runTaskCommand(os.Args[2:])
+		return
+	}
+
 	// Note: --kubeconfig is auto-registered by sigs.k8s.io/controller-runtime/pkg/client/config
 	// at import time; loadKubeconfig honors it via GetConfigWithContext. We
 	// only add --kube-context on top.
@@ -330,6 +342,109 @@ func main() {
 		os.Exit(1)
 	}
 	setupLog.Info("foreman-agent stopped cleanly")
+}
+
+// runTaskCommand implements `foreman-agent run-task`: run exactly ONE
+// AgenticTask to completion and exit. It is the entrypoint the coder Job
+// (#620) runs. The Job's ServiceAccount provides in-cluster credentials;
+// off-cluster invocations fall back to the standard kubeconfig discovery
+// chain (loadKubeconfig). The process exits non-zero on a system /
+// execution error so the Job reflects failure; a NO-GO / INCOMPLETE
+// verdict is a successful run with a data-shaped outcome and exits 0.
+func runTaskCommand(args []string) {
+	fs := flag.NewFlagSet("run-task", flag.ExitOnError)
+	var (
+		taskName                 string
+		namespace                string
+		workspaceDir             string
+		kubeContext              string
+		gitRemoteURL             string
+		inferenceURLOverride     string
+		inferenceURLHostOverride string
+		commitAuthorName         string
+		commitAuthorEmail        string
+		foremanNamespace         string
+		keepWorkspace            bool
+	)
+	fs.StringVar(&taskName, "task", "",
+		"Name of the AgenticTask to run. Required.")
+	fs.StringVar(&namespace, "namespace", "default",
+		"Namespace of the AgenticTask to run.")
+	fs.StringVar(&workspaceDir, "workspace-dir", "",
+		"Working directory for the per-task clone. Defaults to $HOME/foreman-workspaces.")
+	fs.StringVar(&kubeContext, "kube-context", "",
+		"kubeconfig context override. Ignored in-cluster.")
+	fs.StringVar(&gitRemoteURL, "git-remote-url", "",
+		"git URL to clone from and push the result branch to. Required for coder tasks.")
+	fs.StringVar(&inferenceURLOverride, "inference-base-url-override", "",
+		"Replace the resolved InferenceService URL entirely (e.g. http://localhost:8080/v1).")
+	fs.StringVar(&inferenceURLHostOverride, "inference-base-url-host-override", "",
+		"Rewrite the host of the resolved InferenceService URL and substitute the live port "+
+			"from the v1 Endpoints object (off-cluster same-host installs).")
+	fs.StringVar(&commitAuthorName, "commit-author-name", "Foreman Bot",
+		"git author + committer name for the produced branch.")
+	fs.StringVar(&commitAuthorEmail, "commit-author-email", "",
+		"git author + committer email. Required for coder tasks that commit.")
+	fs.StringVar(&foremanNamespace, "foreman-namespace", "foreman-system",
+		"Namespace deterministic tools (e.g. run_gate_job) submit Jobs into.")
+	fs.BoolVar(&keepWorkspace, "keep-workspace", false,
+		"Preserve the per-task clone workspace after the run.")
+
+	opts := zap.Options{Development: true}
+	opts.BindFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		setupLog.Error(err, "parse run-task flags")
+		os.Exit(2)
+	}
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if taskName == "" {
+		setupLog.Error(nil, "--task is required")
+		os.Exit(2)
+	}
+
+	cfg, err := loadKubeconfig(kubeContext)
+	if err != nil {
+		setupLog.Error(err, "failed to load kubeconfig")
+		os.Exit(1)
+	}
+	kc, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "failed to construct kubernetes client")
+		os.Exit(1)
+	}
+	kcs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		setupLog.Error(err, "failed to construct kubernetes clientset")
+		os.Exit(1)
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	res, err := foremanagent.RunTask(ctx, foremanagent.RunTaskConfig{
+		Client:                       kc,
+		Task:                         types.NamespacedName{Namespace: namespace, Name: taskName},
+		WorkspaceDir:                 workspaceDir,
+		GitRemoteURL:                 gitRemoteURL,
+		InferenceBaseURLOverride:     inferenceURLOverride,
+		InferenceBaseURLHostOverride: inferenceURLHostOverride,
+		CommitAuthor:                 repo.Identity{Name: commitAuthorName, Email: commitAuthorEmail},
+		CommitCommitter:              repo.Identity{Name: commitAuthorName, Email: commitAuthorEmail},
+		KeepWorkspace:                keepWorkspace,
+		RegistryFactory:              makeRegistryFactory(kc, kcs, foremanNamespace),
+		IssueFetcher:                 githubissue.NewClient(),
+	})
+	if err != nil {
+		// System / execution failure: the result line + ERROR sentinel
+		// were already emitted by RunTask on its stdout. Exit non-zero so
+		// the Job reflects failure.
+		setupLog.Error(err, "run-task failed", "task", taskName, "namespace", namespace)
+		os.Exit(1)
+	}
+	setupLog.Info("run-task completed",
+		"task", taskName, "namespace", namespace,
+		"verdict", res.Verdict, "branch", res.Branch, "commitSHA", res.CommitSHA)
 }
 
 // loadKubeconfig defers to controller-runtime's standard discovery chain:
