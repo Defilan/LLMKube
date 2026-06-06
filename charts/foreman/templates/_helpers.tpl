@@ -97,6 +97,27 @@ ServiceAccount name for the foreman-agent.
 {{- end }}
 
 {{/*
+Coder Job pod labels = base selector + component=coder.
+*/}}
+{{- define "foreman.coder.labels" -}}
+{{ include "foreman.selectorLabels" . }}
+app.kubernetes.io/component: coder
+{{- end }}
+
+{{/*
+ServiceAccount name for the coder Job pods. Defaults to "foreman-coder"
+so the sample Agent's spec.execution.serviceAccountName lines up out of
+the box; override via coder.serviceAccount.name.
+*/}}
+{{- define "foreman.coder.serviceAccountName" -}}
+{{- if .Values.coder.serviceAccount.create }}
+{{- default "foreman-coder" .Values.coder.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.coder.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
 Foreman operator image (registry/repo:tag or registry/repo@digest).
 */}}
 {{- define "foreman.operator.image" -}}
