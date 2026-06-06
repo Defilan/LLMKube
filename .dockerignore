@@ -15,3 +15,10 @@
 # build fails at the go-build step without this; goreleaser builds
 # embed before docker-build so they're unaffected. Fixes #531.
 !pkg/foreman/agent/tools/gate_job_template.yaml
+
+# Re-include the coder-job YAML template the foreman-agent embeds via
+# //go:embed in pkg/foreman/agent/tools/run_coder_job.go (#620). Without
+# this the go-build step fails with "pattern coder_job_template.yaml: no
+# matching files found", breaking both Dockerfile.foreman-agent and the
+# Dockerfile.foreman-agent-builder coder-Job image.
+!pkg/foreman/agent/tools/coder_job_template.yaml

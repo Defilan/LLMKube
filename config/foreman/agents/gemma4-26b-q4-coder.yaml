@@ -83,9 +83,12 @@ spec:
     - grep
     - bash
     - submit_result
-  # Job mode runs against an in-cluster CUDA InferenceService, so the
-  # capability match is just the accelerator; the metal/minContextTokens
-  # pins the Carnice (in-process) Agent carries do not apply here.
+  # requiredCapability is INERT under Job mode: the scheduler skips the
+  # capability match for Job-mode Agents (the loop runs in an ephemeral
+  # Job, not on a capability-tagged FleetNode), so this accelerator pin is
+  # not enforced. It is kept only as documentation of the intended model
+  # host (an in-cluster CUDA InferenceService). The metal/minContextTokens
+  # pins the Carnice (in-process) Agent carries do not apply here either.
   requiredCapability:
     accelerator: cuda
   systemPrompt: |-

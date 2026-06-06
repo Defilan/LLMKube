@@ -25,9 +25,18 @@
 #   .ActiveDeadlineSeconds -- max wall-clock for the Job.
 #   .TTLSecondsAfterFinished -- how long resources linger for log fetch.
 #   .CPURequest / .CPULimit / .MemRequest / .MemLimit
-#   .GitCredentialsSecret -- name of a Secret mounted at /secrets/git for
-#                      the clone + push. RBAC + provisioning is Task 5;
-#                      the template only references the conventional name.
+#   .GitCredentialsSecret -- name of a Secret holding the GitHub token for
+#                      the clone + push. Projected as the GITHUB_TOKEN env
+#                      var (which the run-task body reads via
+#                      repo.TokenFromEnvOrFile) AND mounted as a file at
+#                      /secrets/git for callers that prefer a file. The env
+#                      var is the wiring the body actually reads; the mount
+#                      is left in place for forward compatibility. The
+#                      secretKeyRef is optional, so the pod still starts
+#                      when the Secret is absent (public repos take the
+#                      graceful no-token path; the fork push needs it).
+#   .GitCredentialsSecretKey -- key within that Secret holding the token.
+#                      Defaults to "token".
 #   .ModelAuthSecret -- optional. When set, mounts a Secret at
 #                      /secrets/model for the remote model endpoint auth
 #                      (e.g. a bearer token). Omitted when empty.
@@ -69,6 +78,21 @@ spec:
             - --workspace-dir
             - /workspace
           env:
+            # The run-task body resolves git auth via
+            # repo.TokenFromEnvOrFile, which reads $GITHUB_TOKEN. Project
+            # it from the git Secret so the in-pod clone + push can
+            # authenticate. optional: true keeps the pod startable when the
+            # Secret is absent (public-repo / no-push runs); the fork push
+            # then fails cleanly with ErrNoToken rather than the pod never
+            # starting. Model-endpoint auth (the in-cluster InferenceService
+            # is unauthenticated today) is a follow-up; external / cloud-
+            # proxy model auth wiring is not plumbed here yet.
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .GitCredentialsSecret }}
+                  key: {{ .GitCredentialsSecretKey }}
+                  optional: true
             - name: GOMODCACHE
               value: /workspace/.cache/gomod
             - name: GOCACHE

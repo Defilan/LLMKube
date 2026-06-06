@@ -431,18 +431,8 @@ func applyConfigDefaults(c RunGateJobToolConfig) RunGateJobToolConfig {
 	if c.TTLSecondsAfterFinished == 0 {
 		c.TTLSecondsAfterFinished = 86400
 	}
-	if c.CPURequest == "" {
-		c.CPURequest = "2"
-	}
-	if c.CPULimit == "" {
-		c.CPULimit = "4"
-	}
-	if c.MemRequest == "" {
-		c.MemRequest = "4Gi"
-	}
-	if c.MemLimit == "" {
-		c.MemLimit = "8Gi"
-	}
+	c.CPURequest, c.CPULimit, c.MemRequest, c.MemLimit = defaultJobResources(
+		c.CPURequest, c.CPULimit, c.MemRequest, c.MemLimit)
 	if c.PollInterval == 0 {
 		c.PollInterval = 5 * time.Second
 	}
@@ -462,6 +452,26 @@ func applyConfigDefaults(c RunGateJobToolConfig) RunGateJobToolConfig {
 		}
 	}
 	return c
+}
+
+// defaultJobResources fills in the gate-matching container resource
+// defaults (2/4 CPU, 4Gi/8Gi memory) for any field left empty. Shared by
+// the gate and coder submitters so their defaulting stays identical and
+// in one place.
+func defaultJobResources(cpuReq, cpuLim, memReq, memLim string) (string, string, string, string) {
+	if cpuReq == "" {
+		cpuReq = "2"
+	}
+	if cpuLim == "" {
+		cpuLim = "4"
+	}
+	if memReq == "" {
+		memReq = "4Gi"
+	}
+	if memLim == "" {
+		memLim = "8Gi"
+	}
+	return cpuReq, cpuLim, memReq, memLim
 }
 
 // sanitizeName turns an arbitrary taskName into a DNS-1123-friendly

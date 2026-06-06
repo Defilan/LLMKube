@@ -28,6 +28,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -93,15 +94,28 @@ type RunCoderJobConfig struct {
 	MemRequest string
 	MemLimit   string
 
-	// GitCredentialsSecret is the Secret name mounted at /secrets/git
-	// for the clone + push. RBAC + provisioning is a later task; this is
-	// the conventional name the template references. Defaults to
-	// "foreman-git-credentials".
+	// GitCredentialsSecret is the Secret name holding the GitHub token for
+	// the clone + push. The template projects it as the GITHUB_TOKEN env
+	// var (read by the run-task body via repo.TokenFromEnvOrFile) and also
+	// mounts it at /secrets/git. Defaults to "foreman-git-credentials".
 	GitCredentialsSecret string
+
+	// GitCredentialsSecretKey is the key within GitCredentialsSecret that
+	// holds the token. Defaults to "token".
+	GitCredentialsSecretKey string
 
 	// ModelAuthSecret, when non-empty, mounts a Secret at /secrets/model
 	// for remote model endpoint auth. Empty omits the mount entirely.
+	// NOTE: the in-cluster InferenceService is unauthenticated today, so
+	// nothing reads this yet; external / cloud-proxy model auth wiring is
+	// a follow-up.
 	ModelAuthSecret string
+
+	// Resources, when non-nil, overrides the coder container's resource
+	// requests + limits (from Agent.spec.execution.resources). Any field
+	// it leaves unset falls back to the gate-matching string defaults
+	// (CPURequest/CPULimit/MemRequest/MemLimit).
+	Resources *corev1.ResourceRequirements
 
 	// PollInterval is how often Run polls Job.Status while waiting for a
 	// terminal phase. Default 5s; tests inject milliseconds.
@@ -207,6 +221,9 @@ func (r *RunCoderJob) Submit(ctx context.Context, req agent.CoderJobRequest) (ag
 	if req.ActiveDeadlineSeconds != nil {
 		sub.Cfg.ActiveDeadlineSeconds = *req.ActiveDeadlineSeconds
 	}
+	if req.Resources != nil {
+		sub.Cfg.Resources = req.Resources
+	}
 
 	res, err := sub.Run(ctx, RunCoderJobArgs{
 		TaskName:      req.TaskName,
@@ -260,7 +277,9 @@ func (r *RunCoderJob) Run(ctx context.Context, args RunCoderJobArgs) (CoderJobRe
 		MemRequest:              cfg.MemRequest,
 		MemLimit:                cfg.MemLimit,
 		GitCredentialsSecret:    cfg.GitCredentialsSecret,
+		GitCredentialsSecretKey: cfg.GitCredentialsSecretKey,
 		ModelAuthSecret:         cfg.ModelAuthSecret,
+		Resources:               cfg.Resources,
 	})
 	if err != nil {
 		return r.errorResult(jobName, cfg.Namespace, "render: "+err.Error(), ""), nil
@@ -424,7 +443,14 @@ type coderRendererInput struct {
 	MemRequest              string
 	MemLimit                string
 	GitCredentialsSecret    string
+	GitCredentialsSecretKey string
 	ModelAuthSecret         string
+
+	// Resources, when non-nil, replaces the container resources the
+	// string fields above produce. Applied after the template unmarshals
+	// so a partially-specified ResourceRequirements still keeps the
+	// defaults for the fields it omits.
+	Resources *corev1.ResourceRequirements
 }
 
 func renderCoderJob(in coderRendererInput) (*batchv1.Job, error) {
@@ -433,6 +459,9 @@ func renderCoderJob(in coderRendererInput) (*batchv1.Job, error) {
 	}
 	if in.TaskName == "" {
 		in.TaskName = "unknown"
+	}
+	if in.GitCredentialsSecretKey == "" {
+		in.GitCredentialsSecretKey = "token"
 	}
 	tmpl, err := template.New("coder-job").Parse(coderJobTemplate)
 	if err != nil {
@@ -446,7 +475,36 @@ func renderCoderJob(in coderRendererInput) (*batchv1.Job, error) {
 	if err := yaml.Unmarshal(buf.Bytes(), &job); err != nil {
 		return nil, fmt.Errorf("unmarshal job: %w", err)
 	}
+	applyResourceOverrides(&job, in.Resources)
 	return &job, nil
+}
+
+// applyResourceOverrides folds a per-Agent ResourceRequirements override
+// onto the coder container the template produced. It merges field-by-field
+// so a partially-specified override (e.g. only a CPU limit) keeps the
+// gate-matching string defaults for every field it omits. A nil override
+// leaves the template's defaults untouched.
+func applyResourceOverrides(job *batchv1.Job, res *corev1.ResourceRequirements) {
+	if res == nil {
+		return
+	}
+	containers := job.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		return
+	}
+	c := &containers[0]
+	for name, q := range res.Requests {
+		if c.Resources.Requests == nil {
+			c.Resources.Requests = corev1.ResourceList{}
+		}
+		c.Resources.Requests[name] = q
+	}
+	for name, q := range res.Limits {
+		if c.Resources.Limits == nil {
+			c.Resources.Limits = corev1.ResourceList{}
+		}
+		c.Resources.Limits[name] = q
+	}
 }
 
 // applyCoderConfigDefaults fills in every empty field with the documented
@@ -465,20 +523,13 @@ func applyCoderConfigDefaults(c RunCoderJobConfig) RunCoderJobConfig {
 	if c.TTLSecondsAfterFinished == 0 {
 		c.TTLSecondsAfterFinished = 86400
 	}
-	if c.CPURequest == "" {
-		c.CPURequest = "2"
-	}
-	if c.CPULimit == "" {
-		c.CPULimit = "4"
-	}
-	if c.MemRequest == "" {
-		c.MemRequest = "4Gi"
-	}
-	if c.MemLimit == "" {
-		c.MemLimit = "8Gi"
-	}
+	c.CPURequest, c.CPULimit, c.MemRequest, c.MemLimit = defaultJobResources(
+		c.CPURequest, c.CPULimit, c.MemRequest, c.MemLimit)
 	if c.GitCredentialsSecret == "" {
 		c.GitCredentialsSecret = "foreman-git-credentials"
+	}
+	if c.GitCredentialsSecretKey == "" {
+		c.GitCredentialsSecretKey = "token"
 	}
 	if c.PollInterval == 0 {
 		c.PollInterval = 5 * time.Second

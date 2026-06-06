@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
@@ -59,6 +60,11 @@ type CoderJobRequest struct {
 	// ActiveDeadlineSeconds bounds the Job wall-clock. nil lets the
 	// submitter default it.
 	ActiveDeadlineSeconds *int64
+
+	// Resources overrides the Job container resource requests + limits
+	// from Agent.spec.execution.resources. nil lets the submitter apply
+	// its gate-matching defaults.
+	Resources *corev1.ResourceRequirements
 }
 
 // CoderJobResult is the parsed outcome the submitter returns. It mirrors
@@ -125,6 +131,7 @@ func (e *NativeAgentLoopExecutor) executeCoderJob(
 		req.Image = agent.Spec.Execution.Image
 		req.ServiceAccountName = agent.Spec.Execution.ServiceAccountName
 		req.ActiveDeadlineSeconds = agent.Spec.Execution.ActiveDeadlineSeconds
+		req.Resources = agent.Spec.Execution.Resources
 	}
 
 	cjr, err := e.CoderJobSubmitter.Submit(ctx, req)

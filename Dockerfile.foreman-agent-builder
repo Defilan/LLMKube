@@ -1,0 +1,58 @@
+# Foreman coder-Job builder image (#620).
+#
+# The coder Job (pkg/foreman/agent/tools/coder_job_template.yaml) runs
+# `foreman-agent run-task`, whose `bash` tool shells out to
+# `make fmt vet lint test` to verify the model's change. That needs the
+# full toolchain (go + make + git), which the published, intentionally
+# minimal Dockerfile.foreman-agent (alpine + git, no go/make) does not
+# carry. This image bundles the foreman-agent binary with that toolchain.
+#
+# Two stages:
+#   1. builder -- compile the static foreman-agent binary, identical to
+#      Dockerfile.foreman-agent's build stage.
+#   2. runtime -- FROM golang:1.26, the SAME base the gate Job uses
+#      (gate_job_template.yaml default image). It already ships go, make,
+#      and git, so the coder's bash gate checks run unmodified.
+#
+# The binary lands at /usr/local/bin/foreman-agent (on PATH) so the
+# template's `command: ["foreman-agent"]` resolves by bare name. We do
+# NOT set an ENTRYPOINT: an ENTRYPOINT would prepend itself to the
+# container's command and break that bare-name invocation.
+
+# Build stage: full Go toolchain on a small base.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+# Dependency layer cache.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY api/ api/
+COPY cmd/ cmd/
+COPY internal/ internal/
+COPY pkg/ pkg/
+
+# Static build so the binary runs regardless of the runtime base's libc.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o foreman-agent ./cmd/foreman-agent
+
+# Runtime stage: golang:1.26 -- the same image the gate Job runs on, so it
+# already has go, make, and git for the coder's `make fmt vet lint test`.
+FROM golang:1.26
+
+# make is the only gate-check dependency golang:1.26 does not already
+# ship (go and git are present in the official image).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends make \
+    && rm -rf /var/lib/apt/lists/*
+
+# /usr/local/bin is on PATH in the golang image, so the template's bare
+# `command: ["foreman-agent"]` resolves here.
+COPY --from=builder /workspace/foreman-agent /usr/local/bin/foreman-agent
+
+# No ENTRYPOINT on purpose: the Job template supplies
+# `command: ["foreman-agent"]` and relies on PATH resolution.

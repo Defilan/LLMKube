@@ -39,10 +39,13 @@ Stick with the InProcess (metal) path when the coder model is served on
 the same machine as the foreman-agent, as on the M5 Max.
 
 Job mode also relaxes the capability pins the in-process coder carries.
-The sample Agent's `requiredCapability` is just `accelerator: cuda`; the
-`accelerator: metal` and `minContextTokens` pins from the Carnice Agent
-do not apply, because the model runs in the cluster rather than on the
-node hosting the loop.
+The sample Agent's `requiredCapability` is just `accelerator: cuda`, but
+that pin is inert under Job mode: the scheduler skips the capability
+match for Job-mode Agents (the loop runs in an ephemeral Job, not on a
+capability-tagged FleetNode), so it is kept only as documentation of the
+intended model host. The `accelerator: metal` and `minContextTokens`
+pins from the Carnice Agent do not apply either, because the model runs
+in the cluster rather than on the node hosting the loop.
 
 ## The builder image
 
@@ -92,23 +95,29 @@ spec:
     serviceAccountName: foreman-coder
 ```
 
-## Creating the git-credentials Secret
+## Creating the foreman-git-credentials Secret
 
 The coder Job clones the repo and pushes the foreman-authored branch to
-the fork. The Job template mounts a Secret named `git-credentials` at
-`/secrets/git` (mount is `optional: true`, so the pod still starts if
-the Secret is absent, but the push will fail). Create it in the chart's
-namespace with a token that can push to the fork:
+the fork. The run-task body resolves git auth from the `GITHUB_TOKEN`
+env var (via `repo.TokenFromEnvOrFile`), so the Job template projects
+the Secret as that env var with `secretKeyRef`, and also mounts it as a
+file at `/secrets/git`. Both the env projection and the mount are
+optional, so the pod still starts if the Secret is absent (a public-repo
+run takes the graceful no-token path); the fork push, however, requires
+the token. Create the Secret in the chart's namespace with a token that
+can push to the fork:
 
 ```sh
-kubectl create secret generic git-credentials \
+kubectl create secret generic foreman-git-credentials \
   --namespace foreman-system \
   --from-literal=token=ghp_yourtokenhere
 ```
 
-Scope the token to push access on the fork you target (for LLMKube, the
-`Defilan/LLMKube` fork the executor pushes branches to). Rotate it on
-your usual cadence; nothing in the chart pins its lifetime.
+The Secret name defaults to `foreman-git-credentials` and the token key
+defaults to `token`. Scope the token to push access on the fork you
+target (for LLMKube, the `Defilan/LLMKube` fork the executor pushes
+branches to). Rotate it on your usual cadence; nothing in the chart pins
+its lifetime.
 
 ## Optional model-auth Secret
 
@@ -125,7 +134,10 @@ kubectl create secret generic model-auth \
 ```
 
 An in-cluster InferenceService that does not require auth needs no
-model-auth Secret; leave it unset.
+model-auth Secret; leave it unset. The in-cluster InferenceService is
+unauthenticated today, so the run-task body does not yet read this
+mount: wiring the mounted credential into the model endpoint auth header
+for external / cloud-proxy endpoints is a follow-up.
 
 ## The sample Agent
 
@@ -188,4 +200,4 @@ kubectl logs -l foreman.llmkube.dev/task-name=fix-issue-620 --tail=50
 When the Job finishes, the watcher patches the AgenticTask status with
 the verdict and summary parsed from the Job log, exactly as the
 in-process path does. On a `GO` verdict the branch is pushed to the fork
-using the `git-credentials` token.
+using the `foreman-git-credentials` token.

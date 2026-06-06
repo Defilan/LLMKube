@@ -26,11 +26,18 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	foremanagent "github.com/defilantech/llmkube/pkg/foreman/agent"
 )
+
+// mustQuantity parses a resource quantity for tests, panicking on a bad
+// literal (these are all compile-time-known constants).
+func mustQuantity(s string) resource.Quantity {
+	return resource.MustParse(s)
+}
 
 // --- Template rendering ---------------------------------------------------
 
@@ -146,6 +153,188 @@ func TestRenderCoderJob_OptionalModelAuthSecret(t *testing.T) {
 	if !found {
 		t.Errorf("model-auth volume should be present when set; volumes=%#v",
 			job.Spec.Template.Spec.Volumes)
+	}
+}
+
+// TestRenderCoderJob_GitTokenEnvFromSecret asserts the coder container
+// projects a GITHUB_TOKEN env var from the git Secret via secretKeyRef so
+// the run-task body (repo.TokenFromEnvOrFile) can read it. The mount at
+// /secrets/git alone is never read by the body; the env var is the wiring
+// that actually reaches the clone + push (#620 B2).
+func TestRenderCoderJob_GitTokenEnvFromSecret(t *testing.T) {
+	job, err := renderCoderJob(coderRendererInput{
+		Name:                    "foreman-coder-tok",
+		Namespace:               "foreman-system",
+		Image:                   "img",
+		TaskName:                "tok",
+		TaskNamespace:           "default",
+		ActiveDeadlineSeconds:   3600,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		GitCredentialsSecret:    "foreman-git-credentials",
+		GitCredentialsSecretKey: "token",
+	})
+	if err != nil {
+		t.Fatalf("renderCoderJob: %v", err)
+	}
+	c := job.Spec.Template.Spec.Containers[0]
+	var tokenEnv *corev1.EnvVar
+	for i := range c.Env {
+		if c.Env[i].Name == "GITHUB_TOKEN" {
+			tokenEnv = &c.Env[i]
+		}
+	}
+	if tokenEnv == nil {
+		t.Fatalf("GITHUB_TOKEN env missing; env=%#v", c.Env)
+	}
+	if tokenEnv.ValueFrom == nil || tokenEnv.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("GITHUB_TOKEN must come from a secretKeyRef; got %#v", tokenEnv)
+	}
+	ref := tokenEnv.ValueFrom.SecretKeyRef
+	if ref.Name != "foreman-git-credentials" {
+		t.Errorf("secretKeyRef name: want foreman-git-credentials got %q", ref.Name)
+	}
+	if ref.Key != "token" {
+		t.Errorf("secretKeyRef key: want token got %q", ref.Key)
+	}
+	// Optional so the pod still starts when the Secret is absent (public
+	// repos take the graceful no-token path).
+	if ref.Optional == nil || !*ref.Optional {
+		t.Errorf("secretKeyRef should be optional; got %#v", ref.Optional)
+	}
+}
+
+// TestRenderCoderJob_AppliesResources asserts CoderJobRequest-supplied
+// resources land on the container, and that the gate-matching defaults
+// apply when the renderer input carries the default strings (#620 N1).
+func TestRenderCoderJob_AppliesResources(t *testing.T) {
+	job, err := renderCoderJob(coderRendererInput{
+		Name:                  "foreman-coder-res",
+		Namespace:             "foreman-system",
+		Image:                 "img",
+		TaskName:              "res",
+		TaskNamespace:         "default",
+		ActiveDeadlineSeconds: 3600,
+		CPURequest:            "3",
+		CPULimit:              "6",
+		MemRequest:            "5Gi",
+		MemLimit:              "10Gi",
+		GitCredentialsSecret:  "foreman-git-credentials",
+	})
+	if err != nil {
+		t.Fatalf("renderCoderJob: %v", err)
+	}
+	c := job.Spec.Template.Spec.Containers[0]
+	if got := c.Resources.Requests.Cpu().String(); got != "3" {
+		t.Errorf("cpu request: want 3 got %q", got)
+	}
+	if got := c.Resources.Limits.Cpu().String(); got != "6" {
+		t.Errorf("cpu limit: want 6 got %q", got)
+	}
+	if got := c.Resources.Requests.Memory().String(); got != "5Gi" {
+		t.Errorf("mem request: want 5Gi got %q", got)
+	}
+	if got := c.Resources.Limits.Memory().String(); got != "10Gi" {
+		t.Errorf("mem limit: want 10Gi got %q", got)
+	}
+}
+
+// TestRunCoderJob_RequestResourcesOverrideDefaults asserts the executor's
+// CoderJobRequest.Resources flow through Run onto the rendered Job, and
+// that the defaults apply when the request omits them (#620 N1).
+func TestRunCoderJob_RequestResourcesOverrideDefaults(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// With explicit overrides on the static Cfg.
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-resoverride"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			CPURequest:   "8",
+			MemLimit:     "16Gi",
+			LogTailFn:    func(context.Context, string, string) string { return "" },
+		},
+	}
+	if _, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "resoverride", TaskNamespace: "default"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	var job batchv1.Job
+	if err := c.Get(ctx, key, &job); err != nil {
+		t.Fatalf("Job should exist: %v", err)
+	}
+	con := job.Spec.Template.Spec.Containers[0]
+	if got := con.Resources.Requests.Cpu().String(); got != "8" {
+		t.Errorf("cpu request override: want 8 got %q", got)
+	}
+	if got := con.Resources.Limits.Memory().String(); got != "16Gi" {
+		t.Errorf("mem limit override: want 16Gi got %q", got)
+	}
+	// Untouched fields fall back to the gate-matching defaults.
+	if got := con.Resources.Limits.Cpu().String(); got != "4" {
+		t.Errorf("cpu limit default: want 4 got %q", got)
+	}
+	if got := con.Resources.Requests.Memory().String(); got != "4Gi" {
+		t.Errorf("mem request default: want 4Gi got %q", got)
+	}
+}
+
+// TestSubmit_ForwardsResources asserts the agent.CoderJobRequest.Resources
+// reach the rendered Job through Submit (the executor seam, #620 N1).
+func TestSubmit_ForwardsResources(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-submitres"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn:    func(context.Context, string, string) string { return "" },
+		},
+	}
+	req := foremanagent.CoderJobRequest{
+		TaskName:      "submitres",
+		TaskNamespace: "default",
+		Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    mustQuantity("7"),
+				corev1.ResourceMemory: mustQuantity("12Gi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    mustQuantity("9"),
+				corev1.ResourceMemory: mustQuantity("18Gi"),
+			},
+		},
+	}
+	if _, err := tool.Submit(ctx, req); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	var job batchv1.Job
+	if err := c.Get(ctx, key, &job); err != nil {
+		t.Fatalf("Job should exist: %v", err)
+	}
+	con := job.Spec.Template.Spec.Containers[0]
+	if got := con.Resources.Requests.Cpu().String(); got != "7" {
+		t.Errorf("cpu request: want 7 got %q", got)
+	}
+	if got := con.Resources.Limits.Memory().String(); got != "18Gi" {
+		t.Errorf("mem limit: want 18Gi got %q", got)
 	}
 }
 
