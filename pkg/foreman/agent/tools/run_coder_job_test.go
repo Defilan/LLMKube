@@ -1,0 +1,378 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	foremanagent "github.com/defilantech/llmkube/pkg/foreman/agent"
+)
+
+// --- Template rendering ---------------------------------------------------
+
+func TestRenderCoderJob_RendersCommandImageAndWorkspace(t *testing.T) {
+	job, err := renderCoderJob(coderRendererInput{
+		Name:                  "foreman-coder-issue-510",
+		Namespace:             "foreman-system",
+		Image:                 "ghcr.io/defilantech/foreman-agent:dev",
+		TaskName:              "issue-510",
+		TaskNamespace:         "default",
+		ServiceAccountName:    "foreman-coder",
+		ActiveDeadlineSeconds: 3600,
+		CPURequest:            "2",
+		CPULimit:              "4",
+		MemRequest:            "4Gi",
+		MemLimit:              "8Gi",
+		GitCredentialsSecret:  "foreman-git-credentials",
+	})
+	if err != nil {
+		t.Fatalf("renderCoderJob: %v", err)
+	}
+	if job.Name != "foreman-coder-issue-510" {
+		t.Errorf("Name: %q", job.Name)
+	}
+	c := job.Spec.Template.Spec.Containers[0]
+	if c.Image != "ghcr.io/defilantech/foreman-agent:dev" {
+		t.Errorf("Image: %q", c.Image)
+	}
+	args := strings.Join(c.Args, " ")
+	if !strings.Contains(args, "run-task --task issue-510") {
+		t.Errorf("Args missing run-task command:\n%s", args)
+	}
+	if !strings.Contains(args, "--namespace default") {
+		t.Errorf("Args missing namespace:\n%s", args)
+	}
+	if !strings.Contains(args, "--workspace-dir /workspace") {
+		t.Errorf("Args missing workspace-dir:\n%s", args)
+	}
+	if job.Spec.Template.Spec.ServiceAccountName != "foreman-coder" {
+		t.Errorf("ServiceAccountName: %q", job.Spec.Template.Spec.ServiceAccountName)
+	}
+	// Workspace must be an emptyDir at /workspace (NOT a PVC like the gate).
+	var foundWorkspace bool
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "workspace" {
+			if v.EmptyDir == nil {
+				t.Errorf("workspace volume must be emptyDir; got %#v", v)
+			}
+			if v.PersistentVolumeClaim != nil {
+				t.Errorf("workspace volume must NOT be a PVC")
+			}
+			foundWorkspace = true
+		}
+	}
+	if !foundWorkspace {
+		t.Errorf("missing workspace volume; volumes=%#v", job.Spec.Template.Spec.Volumes)
+	}
+	var mounted bool
+	for _, m := range c.VolumeMounts {
+		if m.Name == "workspace" && m.MountPath == "/workspace" {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("workspace volume not mounted at /workspace; mounts=%#v", c.VolumeMounts)
+	}
+	if job.Labels["app.kubernetes.io/name"] != "foreman-coder" {
+		t.Errorf("missing canonical label: %#v", job.Labels)
+	}
+}
+
+// TestRenderCoderJob_OptionalModelAuthSecret asserts the model-auth Secret
+// mount is conditional: absent when unset, present when named.
+func TestRenderCoderJob_OptionalModelAuthSecret(t *testing.T) {
+	base := coderRendererInput{
+		Name:                  "foreman-coder-x",
+		Namespace:             "foreman-system",
+		Image:                 "img",
+		TaskName:              "x",
+		TaskNamespace:         "default",
+		ActiveDeadlineSeconds: 3600,
+		CPURequest:            "2",
+		CPULimit:              "4",
+		MemRequest:            "4Gi",
+		MemLimit:              "8Gi",
+		GitCredentialsSecret:  "foreman-git-credentials",
+	}
+
+	// Without a model-auth secret, no model-auth volume should render.
+	job, err := renderCoderJob(base)
+	if err != nil {
+		t.Fatalf("renderCoderJob (no model-auth): %v", err)
+	}
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "model-auth" {
+			t.Errorf("model-auth volume should be absent when unset")
+		}
+	}
+
+	// With one, the volume + mount should appear.
+	withAuth := base
+	withAuth.ModelAuthSecret = "foreman-model-auth"
+	job, err = renderCoderJob(withAuth)
+	if err != nil {
+		t.Fatalf("renderCoderJob (with model-auth): %v", err)
+	}
+	var found bool
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "model-auth" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("model-auth volume should be present when set; volumes=%#v",
+			job.Spec.Template.Spec.Volumes)
+	}
+}
+
+// --- Submit + poll happy paths -------------------------------------------
+
+func TestRunCoderJob_GOVerdictFromLog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-issue-510"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	rt := foremanagent.RunTaskResult{
+		Verdict:       "GO",
+		Summary:       "fixed it",
+		Branch:        "foreman/issue-510",
+		CommitSHA:     "abc123",
+		CommitMessage: "fix: thing",
+	}
+	rtJSON, err := json.Marshal(rt)
+	if err != nil {
+		t.Fatalf("marshal RunTaskResult: %v", err)
+	}
+	logTail := fmt.Sprintf("%s%s\n%s\n",
+		foremanagent.RunTaskResultPrefix, string(rtJSON), foremanagent.RunTaskSentinelGo)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			Image:        "ghcr.io/defilantech/foreman-agent:dev",
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn: func(context.Context, string, string) string {
+				return logTail
+			},
+		},
+	}
+
+	res, err := tool.Run(ctx, RunCoderJobArgs{
+		TaskName:      "issue-510",
+		TaskNamespace: "default",
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Verdict != "GO" {
+		t.Errorf("Verdict: want GO got %q", res.Verdict)
+	}
+	if res.Branch != "foreman/issue-510" {
+		t.Errorf("Branch: want foreman/issue-510 got %q", res.Branch)
+	}
+	if res.CommitSHA != "abc123" {
+		t.Errorf("CommitSHA: want abc123 got %q", res.CommitSHA)
+	}
+	if res.Summary != "fixed it" {
+		t.Errorf("Summary: %q", res.Summary)
+	}
+	if !strings.Contains(res.LogTail, foremanagent.RunTaskSentinelGo) {
+		t.Errorf("LogTail should carry the sentinel; got %q", res.LogTail)
+	}
+
+	// And the Job was actually created with the expected name + image.
+	var job batchv1.Job
+	if err := c.Get(ctx, key, &job); err != nil {
+		t.Fatalf("Job should exist on apiserver: %v", err)
+	}
+	if got := job.Spec.Template.Spec.Containers[0].Image; got != "ghcr.io/defilantech/foreman-agent:dev" {
+		t.Errorf("Image: %q", got)
+	}
+	args := strings.Join(job.Spec.Template.Spec.Containers[0].Args, " ")
+	if !strings.Contains(args, "run-task --task issue-510") {
+		t.Errorf("Job args missing run-task command:\n%s", args)
+	}
+	if job.Spec.Template.Spec.Volumes[0].EmptyDir == nil &&
+		!hasEmptyDirWorkspace(job) {
+		t.Errorf("Job should mount an emptyDir workspace")
+	}
+}
+
+func hasEmptyDirWorkspace(job batchv1.Job) bool {
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "workspace" && v.EmptyDir != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunCoderJob_NoGoVerdictFromLog(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-nogo"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	logTail := fmt.Sprintf(
+		"%s{\"verdict\":\"NO-GO\",\"summary\":\"declined\"}\n%s\n",
+		foremanagent.RunTaskResultPrefix, foremanagent.RunTaskSentinelNoGo,
+	)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn:    func(context.Context, string, string) string { return logTail },
+		},
+	}
+
+	res, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "nogo", TaskNamespace: "default"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Verdict != "NO-GO" {
+		t.Errorf("Verdict: want NO-GO got %q", res.Verdict)
+	}
+}
+
+// --- Error paths ----------------------------------------------------------
+
+func TestRunCoderJob_JobFailedProducesERROR(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-fail"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+
+	go flipStatusOnce(ctx, c, key, 0, 1)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn: func(context.Context, string, string) string {
+				return "OOMKilled\n" + foremanagent.RunTaskSentinelError + "\n"
+			},
+		},
+	}
+
+	res, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "fail", TaskNamespace: "default"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Verdict != "ERROR" {
+		t.Errorf("Verdict: want ERROR got %q", res.Verdict)
+	}
+	if res.FailureReason == "" {
+		t.Errorf("FailureReason should be set on Job failure")
+	}
+	if !strings.Contains(res.LogTail, "OOMKilled") {
+		t.Errorf("LogTail should carry pod log on failure; got %q", res.LogTail)
+	}
+}
+
+func TestRunCoderJob_PollTimeoutProducesERROR(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).Build()
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName("foreman-coder-stuck"),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  50 * time.Millisecond,
+			LogTailFn:    func(context.Context, string, string) string { return "(no logs)" },
+		},
+	}
+
+	res, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "stuck", TaskNamespace: "default"})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Verdict != "ERROR" {
+		t.Errorf("Verdict: want ERROR got %q", res.Verdict)
+	}
+	if res.FailureReason == "" {
+		t.Errorf("FailureReason should be set on poll timeout")
+	}
+}
+
+func TestRunCoderJob_RequiresClient(t *testing.T) {
+	tool := &RunCoderJob{}
+	_, err := tool.Run(context.Background(), RunCoderJobArgs{TaskName: "x", TaskNamespace: "default"})
+	if err == nil || !strings.Contains(err.Error(), "Client") {
+		t.Errorf("expected Client-required error; got %v", err)
+	}
+}
+
+func TestRunCoderJob_RequiresTaskName(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).Build()
+	tool := &RunCoderJob{Client: c}
+	_, err := tool.Run(context.Background(), RunCoderJobArgs{TaskNamespace: "default"})
+	if err == nil || !strings.Contains(err.Error(), "task") {
+		t.Errorf("expected task-required error; got %v", err)
+	}
+}
+
+func TestApplyCoderConfigDefaults_FillsEveryField(t *testing.T) {
+	c := applyCoderConfigDefaults(RunCoderJobConfig{})
+	if c.Namespace == "" || c.Image == "" {
+		t.Errorf("string defaults missing: %#v", c)
+	}
+	if c.ActiveDeadlineSeconds == 0 {
+		t.Errorf("deadline default missing: %#v", c)
+	}
+	if c.CPURequest == "" || c.CPULimit == "" || c.MemRequest == "" || c.MemLimit == "" {
+		t.Errorf("resource defaults missing: %#v", c)
+	}
+	if c.PollInterval == 0 || c.PollTimeout == 0 {
+		t.Errorf("poll defaults missing: %#v", c)
+	}
+	if c.NameFn == nil {
+		t.Errorf("NameFn default missing")
+	}
+}
+
+// ensure corev1 stays imported for the resource-shape assertions above.
+var _ = corev1.ResourceRequirements{}

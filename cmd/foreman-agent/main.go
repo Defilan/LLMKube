@@ -303,6 +303,18 @@ func main() {
 			KeepWorkspace:   keepWorkspace,
 			RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace),
 			IssueFetcher:    githubissue.NewClient(),
+			// CoderJobSubmitter routes Job-mode Agents to an ephemeral
+			// per-task Job (#620). Wired ONLY on the watcher executor: the
+			// run-task path (which the Job itself runs) builds its executor
+			// inside foremanagent.RunTask without a submitter, so it runs
+			// the loop in-process and cannot recurse into another Job.
+			CoderJobSubmitter: &foremantools.RunCoderJob{
+				Client: kc,
+				Cfg: foremantools.RunCoderJobConfig{
+					Namespace: foremanNamespace,
+					LogTailFn: makePodLogTailFn(kcs),
+				},
+			},
 		}
 	default:
 		setupLog.Error(nil, "unknown --agent-mode", "value", agentMode, "valid", "stub|native")
