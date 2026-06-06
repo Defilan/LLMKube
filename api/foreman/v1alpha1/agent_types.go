@@ -101,6 +101,46 @@ type ProviderConfig struct {
 	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 }
 
+// ExecutionMode selects where the agent loop + workspace + toolchain run.
+// +kubebuilder:validation:Enum=InProcess;Job
+type ExecutionMode string
+
+const (
+	// ExecutionModeInProcess (default) runs the loop in the foreman-agent
+	// process, co-located with a locally-installed model + toolchain (the
+	// Mac metal-agent path). Unchanged v0.1 behavior.
+	ExecutionModeInProcess ExecutionMode = "InProcess"
+	// ExecutionModeJob runs the loop + git workspace + toolchain in an
+	// ephemeral per-task Kubernetes Job. The model is the only remote
+	// (HTTP) dependency. Enables coders/reviewers backed by an in-cluster
+	// cuda InferenceService or an external URL. See #620.
+	ExecutionModeJob ExecutionMode = "Job"
+)
+
+// ExecutionSpec configures Job-mode execution. Ignored when Mode is
+// InProcess (the default).
+type ExecutionSpec struct {
+	// Mode selects the execution strategy. Default InProcess.
+	// +kubebuilder:default=InProcess
+	// +optional
+	Mode ExecutionMode `json:"mode,omitempty"`
+	// Image is the per-task Job image: the foreman-agent binary plus the
+	// project toolchain (go/make/git). Required when Mode is Job.
+	// +optional
+	Image string `json:"image,omitempty"`
+	// ServiceAccountName runs the Job pod under a least-privilege SA.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
+	// ActiveDeadlineSeconds bounds the Job's wall-clock runtime.
+	// +kubebuilder:default=3600
+	// +optional
+	ActiveDeadlineSeconds *int64 `json:"activeDeadlineSeconds,omitempty"`
+	// Resources overrides the Job container resources (defaults mirror the
+	// gate Job).
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+}
+
 // AgentSpec is the reusable role definition referenced by AgenticTasks
 // via spec.agentRef. An Agent bundles the system prompt, tool whitelist,
 // model endpoint, and required host capability for one pipeline step.
@@ -126,6 +166,10 @@ type AgentSpec struct {
 	// Provider is "cloud-proxy"; ignored for "local".
 	// +optional
 	ProviderConfig *ProviderConfig `json:"providerConfig,omitempty"`
+
+	// Execution selects where the agent loop runs. Omitted = InProcess.
+	// +optional
+	Execution *ExecutionSpec `json:"execution,omitempty"`
 
 	// Model is a free-form identifier for the model this Agent expects
 	// the referenced InferenceService to serve. Cosmetic in v0.1 (the
