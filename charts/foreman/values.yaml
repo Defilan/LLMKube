@@ -217,3 +217,35 @@ agent:
   podAnnotations: {}
   podLabels: {}
   env: []
+
+# coder gates the ServiceAccount + namespaced Role the Job-mode coder
+# pods run under (#620). A Job-mode Agent (spec.execution.mode=Job) runs
+# `foreman-agent run-task` in an ephemeral Job whose pod uses this SA.
+# The run-task body only READS the AgenticTask, the referenced Agent, and
+# its InferenceService, so the Role is read-only. Leave enabled when any
+# Agent in the cluster uses Job-mode execution; disable on clusters that
+# only run the in-process (metal) coder path.
+coder:
+  enabled: true
+
+  serviceAccount:
+    # When create is true, the chart provisions the SA and its Role +
+    # RoleBinding. Set false to bind an externally managed SA (still
+    # gets the Role + RoleBinding so long as coder.enabled is true).
+    create: true
+    # Name of the coder Job ServiceAccount. Defaults to "foreman-coder"
+    # so a sample Agent's spec.execution.serviceAccountName=foreman-coder
+    # works without extra wiring. Override to suit your naming.
+    name: ""
+
+  # Git Secret the coder Job projects as GITHUB_TOKEN for the clone +
+  # push (#620). These pass through to the foreman-agent watcher as
+  # --coder-git-secret / --coder-git-secret-key.
+  #
+  # Defaults match the standalone foreman-git-credentials Secret (key
+  # "token") so existing installs are unchanged. To REUSE an existing
+  # git Secret instead of creating a new one, point these at it: e.g.
+  # gitCredentialsSecret: foreman-github with gitCredentialsSecretKey:
+  # GITHUB_TOKEN reuses the same Secret the foreman-agent itself uses.
+  gitCredentialsSecret: foreman-git-credentials
+  gitCredentialsSecretKey: token

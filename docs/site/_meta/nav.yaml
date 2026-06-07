@@ -105,6 +105,9 @@ sections:
       - label: Verifier node install
         slug: foreman/install-verifier-node
         file: foreman/install-verifier-node.md
+      - label: Remote-model coder
+        slug: foreman/remote-model-coder
+        file: foreman/remote-model-coder.md
       - label: Model compatibility
         slug: foreman/model-compatibility
         file: foreman/model-compatibility.md

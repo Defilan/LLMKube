@@ -328,6 +328,55 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 	})
 })
 
+var _ = Describe("capabilitySatisfies jobMode", func() {
+	// In Job mode the model is remote (an in-cluster cuda InferenceService
+	// or an external URL) and the agent loop runs in an ephemeral Job, so
+	// the claiming FleetNode only needs the role + nodeSelector. The
+	// accelerator / installedModels / RAM / context gates that bind a
+	// node to a locally-resident model must be skipped. See #620.
+
+	newEmptyCapNode := func() *foremanv1alpha1.FleetNode {
+		// Ready-shaped node with an EMPTY capability: no accelerator,
+		// AvailableRAMGB 0, no installed models, no context. Only the
+		// worker role is set.
+		return &foremanv1alpha1.FleetNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "empty-cap-node"},
+			Spec: foremanv1alpha1.FleetNodeSpec{
+				NodeName: "empty-cap-node",
+				Roles:    []string{"worker"},
+			},
+		}
+	}
+
+	It("gates on accelerator/RAM in InProcess mode (jobMode=false)", func() {
+		req := foremanv1alpha1.RequiredCapability{
+			Accelerator: foremanv1alpha1.AgenticTaskAccelerator("cuda"),
+			MinRAMGB:    16,
+		}
+		node := newEmptyCapNode()
+		Expect(capabilitySatisfies(req, "", node, false)).To(BeFalse())
+	})
+
+	It("skips accelerator/RAM gates in Job mode (jobMode=true)", func() {
+		req := foremanv1alpha1.RequiredCapability{
+			Accelerator: foremanv1alpha1.AgenticTaskAccelerator("cuda"),
+			MinRAMGB:    16,
+		}
+		node := newEmptyCapNode()
+		Expect(capabilitySatisfies(req, "", node, true)).To(BeTrue())
+	})
+
+	It("still enforces roles in Job mode", func() {
+		req := foremanv1alpha1.RequiredCapability{
+			Accelerator: foremanv1alpha1.AgenticTaskAccelerator("cuda"),
+			MinRAMGB:    16,
+			Roles:       []string{"verifier"},
+		}
+		node := newEmptyCapNode() // worker-only, no verifier role
+		Expect(capabilitySatisfies(req, "", node, true)).To(BeFalse())
+	})
+})
+
 // --- test helpers ---
 
 func newTask(name string) *foremanv1alpha1.AgenticTask {

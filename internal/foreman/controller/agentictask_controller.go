@@ -116,7 +116,7 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// it wins: we look up the Agent and use its capability. The task's own
 	// spec.requiredCapability is ignored in that path; that is the locked
 	// M3 contract. An Agent that does not exist fails the task fast.
-	required, requiredModel, err := r.effectiveRequiredCapability(ctx, &task)
+	required, requiredModel, jobMode, err := r.effectiveRequiredCapability(ctx, &task)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.failTask(ctx, &task, "AgentNotFound",
@@ -126,7 +126,7 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	// Find a FleetNode that satisfies the effective RequiredCapability.
-	nodeName, err := r.firstFitNode(ctx, required, requiredModel)
+	nodeName, err := r.firstFitNode(ctx, required, requiredModel, jobMode)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -142,16 +142,23 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // match against. When spec.agentRef is set the Agent's capability wins;
 // otherwise the task's own. NotFound on AgentRef is propagated so the
 // caller can fail the task with a clear reason.
-func (r *AgenticTaskReconciler) effectiveRequiredCapability(ctx context.Context, task *foremanv1alpha1.AgenticTask) (foremanv1alpha1.RequiredCapability, string, error) {
+//
+// The trailing bool reports whether the referenced Agent runs in Job mode
+// (execution.mode: Job). In Job mode the model is remote and the agent
+// loop runs in an ephemeral Job, so the claiming node only needs the
+// role/nodeSelector: the scheduler relaxes the model-binding capability
+// gates. The no-AgentRef path is never Job mode (false). See #620.
+func (r *AgenticTaskReconciler) effectiveRequiredCapability(ctx context.Context, task *foremanv1alpha1.AgenticTask) (foremanv1alpha1.RequiredCapability, string, bool, error) {
 	if task.Spec.AgentRef == nil || task.Spec.AgentRef.Name == "" {
-		return task.Spec.RequiredCapability, "", nil
+		return task.Spec.RequiredCapability, "", false, nil
 	}
 	var agent foremanv1alpha1.Agent
 	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.AgentRef.Name}
 	if err := r.Get(ctx, key, &agent); err != nil {
-		return foremanv1alpha1.RequiredCapability{}, "", err
+		return foremanv1alpha1.RequiredCapability{}, "", false, err
 	}
-	return agent.Spec.RequiredCapability, agentModelIdentity(&agent), nil
+	jobMode := agent.Spec.Execution != nil && agent.Spec.Execution.Mode == foremanv1alpha1.ExecutionModeJob
+	return agent.Spec.RequiredCapability, agentModelIdentity(&agent), jobMode, nil
 }
 
 // agentModelIdentity returns the model name used to test installedModels
@@ -242,7 +249,7 @@ func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *fore
 // firstFitNode picks the alphabetically-first Ready FleetNode whose
 // advertised capability satisfies the effective RequiredCapability and
 // that is not already running another task.
-func (r *AgenticTaskReconciler) firstFitNode(ctx context.Context, required foremanv1alpha1.RequiredCapability, requiredModel string) (string, error) {
+func (r *AgenticTaskReconciler) firstFitNode(ctx context.Context, required foremanv1alpha1.RequiredCapability, requiredModel string, jobMode bool) (string, error) {
 	var nodes foremanv1alpha1.FleetNodeList
 	if err := r.List(ctx, &nodes); err != nil {
 		return "", err
@@ -258,7 +265,7 @@ func (r *AgenticTaskReconciler) firstFitNode(ctx context.Context, required forem
 		if n.Status.CurrentTask != "" {
 			continue // v0.1: one task per node
 		}
-		if !capabilitySatisfies(required, requiredModel, n) {
+		if !capabilitySatisfies(required, requiredModel, n, jobMode) {
 			continue
 		}
 		return n.Name, nil
@@ -269,29 +276,38 @@ func (r *AgenticTaskReconciler) firstFitNode(ctx context.Context, required forem
 // capabilitySatisfies returns true when the node's advertised capability
 // meets every requirement the task declares. Unset requirements are
 // unconstrained; an "any" accelerator matches everything.
-func capabilitySatisfies(req foremanv1alpha1.RequiredCapability, requiredModel string, n *foremanv1alpha1.FleetNode) bool {
+//
+// When jobMode is true the agent loop runs in an ephemeral Job and the
+// model is a remote (HTTP) dependency, so the claiming node does not host
+// the model: the accelerator, RequiresModelInstalled, minRAMGB, and
+// minContextTokens gates (all of which bind a node to a locally-resident
+// model) are skipped. nodeSelector and roles still apply, since they
+// constrain where the Job's claiming node may live. See #620.
+func capabilitySatisfies(req foremanv1alpha1.RequiredCapability, requiredModel string, n *foremanv1alpha1.FleetNode, jobMode bool) bool {
 	cap := n.Status.Capability
 
-	if req.Accelerator != "" && req.Accelerator != foremanv1alpha1.AgenticTaskAccelerator("any") {
-		if string(cap.Accelerator) != string(req.Accelerator) {
+	if !jobMode {
+		if req.Accelerator != "" && req.Accelerator != foremanv1alpha1.AgenticTaskAccelerator("any") {
+			if string(cap.Accelerator) != string(req.Accelerator) {
+				return false
+			}
+		}
+		if req.RequiresModelInstalled {
+			// Warm-driver path: the Agent's model must already be resident on
+			// the node, and the minRAMGB gate is bypassed (the loaded model
+			// has already paid the RAM cost; the loop adds ~0). An empty
+			// requiredModel is a misconfiguration we cannot confirm, so it
+			// fails the match rather than silently bypassing the gate.
+			// See defilantech/LLMKube#579.
+			if requiredModel == "" || !slices.Contains(cap.InstalledModels, requiredModel) {
+				return false
+			}
+		} else if req.MinRAMGB > 0 && req.MinRAMGB > cap.AvailableRAMGB {
 			return false
 		}
-	}
-	if req.RequiresModelInstalled {
-		// Warm-driver path: the Agent's model must already be resident on
-		// the node, and the minRAMGB gate is bypassed (the loaded model
-		// has already paid the RAM cost; the loop adds ~0). An empty
-		// requiredModel is a misconfiguration we cannot confirm, so it
-		// fails the match rather than silently bypassing the gate.
-		// See defilantech/LLMKube#579.
-		if requiredModel == "" || !slices.Contains(cap.InstalledModels, requiredModel) {
+		if req.MinContextTokens > 0 && req.MinContextTokens > cap.MaxContextTokens {
 			return false
 		}
-	} else if req.MinRAMGB > 0 && req.MinRAMGB > cap.AvailableRAMGB {
-		return false
-	}
-	if req.MinContextTokens > 0 && req.MinContextTokens > cap.MaxContextTokens {
-		return false
 	}
 	for k, v := range req.NodeSelector {
 		if n.Labels[k] != v {

@@ -1,0 +1,49 @@
+{{- if .Values.coder.enabled }}
+{{- if .Values.coder.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "foreman.coder.serviceAccountName" . }}
+  namespace: {{ include "foreman.namespace" . }}
+  labels:
+    {{- include "foreman.coder.labels" . | nindent 4 }}
+---
+{{- end }}
+# Least-privilege Role for the coder Job pods. A Job-mode coder runs
+# `foreman-agent run-task`, which READS the AgenticTask, the referenced
+# Agent, and the Agent's InferenceService from the API to resolve the
+# executor's base URL, then runs the native loop in-process. It never
+# writes task status (the foreman-agent watcher polls the Job's log tail
+# and patches status), so this Role is read-only and namespaced to where
+# the chart (and the tasks) live.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "foreman.fullname" . }}-coder
+  namespace: {{ include "foreman.namespace" . }}
+  labels:
+    {{- include "foreman.coder.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["foreman.llmkube.dev"]
+    resources: ["agentictasks", "agents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["inference.llmkube.dev"]
+    resources: ["inferenceservices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "foreman.fullname" . }}-coder
+  namespace: {{ include "foreman.namespace" . }}
+  labels:
+    {{- include "foreman.coder.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "foreman.fullname" . }}-coder
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "foreman.coder.serviceAccountName" . }}
+    namespace: {{ include "foreman.namespace" . }}
+{{- end }}

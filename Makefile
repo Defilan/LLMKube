@@ -228,8 +228,12 @@ build-router-proxy: fmt vet ## Build router-proxy binary into bin/.
 # Foreman operator + agent: built per-arch via goreleaser at release
 # time; these targets exist for local development against a kind
 # cluster and for the helm-chart CI's smoke install.
-FOREMAN_OPERATOR_IMG ?= ghcr.io/defilantech/llmkube-foreman-operator:dev
-FOREMAN_AGENT_IMG    ?= ghcr.io/defilantech/llmkube-foreman-agent:dev
+FOREMAN_OPERATOR_IMG     ?= ghcr.io/defilantech/llmkube-foreman-operator:dev
+FOREMAN_AGENT_IMG        ?= ghcr.io/defilantech/llmkube-foreman-agent:dev
+# Coder-Job builder image (#620): foreman-agent binary + go/make/git
+# toolchain on the gate's golang:1.26 base, so the in-Job coder can run
+# `make fmt vet lint test`. Referenced by Agent.spec.execution.image.
+FOREMAN_AGENT_BUILDER_IMG ?= ghcr.io/defilantech/llmkube-foreman-agent-builder:dev
 
 .PHONY: docker-build-foreman-operator
 docker-build-foreman-operator: ## Build docker image for the foreman-operator.
@@ -239,6 +243,10 @@ docker-build-foreman-operator: ## Build docker image for the foreman-operator.
 docker-build-foreman-agent: ## Build docker image for the foreman-agent.
 	$(CONTAINER_TOOL) build -f Dockerfile.foreman-agent -t ${FOREMAN_AGENT_IMG} .
 
+.PHONY: docker-build-foreman-agent-builder
+docker-build-foreman-agent-builder: ## Build the coder-Job builder image (foreman-agent + go/make/git).
+	$(CONTAINER_TOOL) build -f Dockerfile.foreman-agent-builder -t ${FOREMAN_AGENT_BUILDER_IMG} .
+
 .PHONY: docker-push-foreman-operator
 docker-push-foreman-operator: ## Push the foreman-operator image.
 	$(CONTAINER_TOOL) push ${FOREMAN_OPERATOR_IMG}
@@ -246,6 +254,10 @@ docker-push-foreman-operator: ## Push the foreman-operator image.
 .PHONY: docker-push-foreman-agent
 docker-push-foreman-agent: ## Push the foreman-agent image.
 	$(CONTAINER_TOOL) push ${FOREMAN_AGENT_IMG}
+
+.PHONY: docker-push-foreman-agent-builder
+docker-push-foreman-agent-builder: ## Push the coder-Job builder image.
+	$(CONTAINER_TOOL) push ${FOREMAN_AGENT_BUILDER_IMG}
 
 .PHONY: build-foreman-operator
 build-foreman-operator: fmt vet ## Build foreman-operator binary into bin/.

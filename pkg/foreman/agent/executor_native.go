@@ -127,6 +127,21 @@ type NativeAgentLoopExecutor struct {
 	// preserving backward compatibility. Tests inject a fake; production
 	// wires githubissue.NewClient() in cmd/foreman-agent.
 	IssueFetcher githubissue.Fetcher
+
+	// CoderJobSubmitter, when non-nil, routes Job-mode Agents
+	// (spec.execution.mode == Job) to an ephemeral per-task Kubernetes Job
+	// instead of running the loop in this process (#620). It is the seam
+	// to pkg/foreman/agent/tools.RunCoderJob; the agent package cannot
+	// import tools directly (tools imports agent), so cmd/foreman-agent
+	// wires a closure over RunCoderJob.Run here.
+	//
+	// RECURSION GUARD: the coder Job itself runs `foreman-agent run-task`,
+	// which calls Execute with the SAME Agent (still mode==Job). RunTask
+	// builds its executor WITHOUT a CoderJobSubmitter, so useCoderJobPath
+	// returns false inside the Job and the loop runs in-process there. The
+	// Job IS the execution; only the watcher's executor (the one this
+	// field is set on) ever submits a Job. See executor_coderjob.go.
+	CoderJobSubmitter CoderJobSubmitter
 }
 
 // Kind identifies this executor in Result.Kind and in logs.
@@ -167,6 +182,19 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 				fmt.Sprintf("Agent %q not found in namespace %q", agentKey.Name, agentKey.Namespace)), nil
 		}
 		return nil, fmt.Errorf("resolve agent: %w", err)
+	}
+
+	// 1b. Job-mode dispatch (#620). When the Agent selects spec.execution.
+	// mode == Job AND a CoderJobSubmitter is wired, the loop + workspace +
+	// toolchain run in an ephemeral per-task Kubernetes Job instead of in
+	// this process. None of the in-process steps below (endpoint resolve,
+	// clone, registry, loop) happen here -- the Job does all of that by
+	// running `foreman-agent run-task`, which re-enters Execute IN-PROCESS
+	// (RunTask wires no submitter, so useCoderJobPath is false there). The
+	// InProcess path (Execution nil or mode==InProcess, or no submitter
+	// wired) is left byte-for-byte unchanged below.
+	if e.useCoderJobPath(&agent) {
+		return e.executeCoderJob(ctx, task, &agent, start), nil
 	}
 
 	// 2. Resolve the model-serving endpoint. Three branches:
@@ -911,6 +939,7 @@ func (e *NativeAgentLoopExecutor) goResult(
 		"outcome":       "",
 		"branch":        branch,
 		"commitSHA":     sha,
+		"commitMessage": lr.Terminal.CommitMessage,
 		"transcriptRef": objRefAsMap(tref),
 		"turnCount":     lr.Turns,
 		"modelExtra":    lr.Terminal.Extra,

@@ -1132,3 +1132,139 @@ func TestNativeExecutor_DeterministicGateAgent(t *testing.T) {
 		t.Errorf("dispatched repo: want defilantech/LLMKube got %v", got["repo"])
 	}
 }
+
+// --- Job-mode dispatch (#620) --------------------------------------------
+
+// fakeCoderJobSubmitter records the request it was handed and returns a
+// canned result. Tests inject it to assert Execute routes Job-mode Agents
+// to the coder-Job path without standing up a real Job.
+type fakeCoderJobSubmitter struct {
+	called bool
+	gotReq foremanagent.CoderJobRequest
+	result foremanagent.CoderJobResult
+	err    error
+}
+
+func (f *fakeCoderJobSubmitter) Submit(
+	_ context.Context, req foremanagent.CoderJobRequest,
+) (foremanagent.CoderJobResult, error) {
+	f.called = true
+	f.gotReq = req
+	return f.result, f.err
+}
+
+// TestNativeExecutor_JobModeDispatchesToCoderJob asserts that an Agent
+// with spec.execution.mode==Job AND a wired CoderJobSubmitter takes the
+// coder-Job path: the submitter is called with the task identity + the
+// Agent's ExecutionSpec, and its GO result is folded into the *Result.
+// The in-process loop (RegistryFactory / clone / OAI) is never touched.
+func TestNativeExecutor_JobModeDispatchesToCoderJob(t *testing.T) {
+	agent, task := taskAndAgent("job-mode")
+	deadline := int64(1800)
+	agent.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+		Mode:                  foremanv1alpha1.ExecutionModeJob,
+		Image:                 "ghcr.io/defilantech/foreman-agent:dev",
+		ServiceAccountName:    "foreman-coder",
+		ActiveDeadlineSeconds: &deadline,
+	}
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	sub := &fakeCoderJobSubmitter{
+		result: foremanagent.CoderJobResult{
+			Verdict:   "GO",
+			Summary:   "fixed in a Job",
+			Branch:    "foreman/issue-9999",
+			CommitSHA: "deadbeef",
+			JobName:   "foreman-coder-job-mode-1",
+		},
+	}
+
+	// RegistryFactory is set but should never be invoked on the Job path;
+	// a t.Fatal here proves the in-process path was not taken.
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client: c,
+		RegistryFactory: func(string, *foremanv1alpha1.Agent) (foremanagent.ToolRegistry, error) {
+			t.Fatalf("RegistryFactory must NOT be called on the Job path")
+			return nil, nil
+		},
+		CoderJobSubmitter: sub,
+	}
+
+	res, err := e.Execute(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !sub.called {
+		t.Fatalf("submitter was not called; Job path not taken")
+	}
+	if sub.gotReq.TaskName != task.Name || sub.gotReq.TaskNamespace != task.Namespace {
+		t.Errorf("request task identity: got %+v", sub.gotReq)
+	}
+	if sub.gotReq.Image != "ghcr.io/defilantech/foreman-agent:dev" {
+		t.Errorf("request image: got %q", sub.gotReq.Image)
+	}
+	if sub.gotReq.ServiceAccountName != "foreman-coder" {
+		t.Errorf("request SA: got %q", sub.gotReq.ServiceAccountName)
+	}
+	if sub.gotReq.ActiveDeadlineSeconds == nil || *sub.gotReq.ActiveDeadlineSeconds != deadline {
+		t.Errorf("request deadline: got %v", sub.gotReq.ActiveDeadlineSeconds)
+	}
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Errorf("Verdict: want GO got %s", res.Verdict)
+	}
+	if got, _ := res.Extra["branch"].(string); got != "foreman/issue-9999" {
+		t.Errorf("Extra.branch: got %v", res.Extra["branch"])
+	}
+	if got, _ := res.Extra["commitSHA"].(string); got != "deadbeef" {
+		t.Errorf("Extra.commitSHA: got %v", res.Extra["commitSHA"])
+	}
+	if got, _ := res.Extra["executionMode"].(string); got != "Job" {
+		t.Errorf("Extra.executionMode: got %v", res.Extra["executionMode"])
+	}
+}
+
+// TestNativeExecutor_JobModeWithoutSubmitterRunsInProcess is the
+// recursion guard: an Agent in Job mode but with NO CoderJobSubmitter
+// wired (the state inside the run-task Job) must NOT take the Job path. It
+// proves useCoderJobPath returns false, so the in-process loop runs
+// instead. We detect "in-process path taken" by observing that the
+// executor proceeds to endpoint resolution and fails on the missing
+// InferenceService (no submitter short-circuit happened).
+func TestNativeExecutor_JobModeWithoutSubmitterRunsInProcess(t *testing.T) {
+	agent, task := taskAndAgent("job-no-sub")
+	agent.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+		Mode:  foremanv1alpha1.ExecutionModeJob,
+		Image: "img",
+	}
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	registryCalled := false
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:       c,
+		GitRemoteURL: "file:///nope",
+		RegistryFactory: func(string, *foremanv1alpha1.Agent) (foremanagent.ToolRegistry, error) {
+			registryCalled = true
+			return &fakeRegistry{}, nil
+		},
+		AuthFactory: fakeAuth(t),
+		// CoderJobSubmitter intentionally nil: this is the run-task-in-Job
+		// state. The Job path must not activate.
+	}
+
+	res, err := e.Execute(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// The in-process path resolves the (missing) InferenceService before
+	// it would reach the registry, so it fails with
+	// InferenceServiceUnavailable. The key assertion is simply that we did
+	// NOT short-circuit into a Job: a non-nil result on the in-process
+	// failure path, never a JOB-* outcome.
+	if res == nil {
+		t.Fatalf("expected an in-process failure result, got nil")
+	}
+	if got, _ := res.Extra["executionMode"].(string); got == "Job" {
+		t.Errorf("must NOT take Job path without a submitter; got executionMode=Job")
+	}
+	_ = registryCalled // registry may or may not be reached depending on resolve order
+}

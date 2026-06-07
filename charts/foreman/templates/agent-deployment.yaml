@@ -64,6 +64,12 @@ spec:
             {{- if .Values.agent.commitAuthorEmail }}
             - --commit-author-email={{ .Values.agent.commitAuthorEmail }}
             {{- end }}
+            {{- if .Values.coder.gitCredentialsSecret }}
+            - --coder-git-secret={{ .Values.coder.gitCredentialsSecret }}
+            {{- end }}
+            {{- if .Values.coder.gitCredentialsSecretKey }}
+            - --coder-git-secret-key={{ .Values.coder.gitCredentialsSecretKey }}
+            {{- end }}
           env:
             - name: FLEET_NODE_NAME
               valueFrom:
