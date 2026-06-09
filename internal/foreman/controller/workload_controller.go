@@ -143,7 +143,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return r.failWorkload(ctx, &workload, "NoPlannerOrPipeline", modeErr.Error())
 	}
 
-	// Sovereignty filter (#540's sibling, Day 4): when either the
+	// Sovereignty filter (#540's sibling, v0.2): when either the
 	// operator kill switch or the per-Workload gate blocks cloud
 	// providers, drop the steps whose Agent.spec.Provider is non-
 	// local. Cloud-blocked steps are returned in `suppressed` so the

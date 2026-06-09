@@ -124,7 +124,7 @@ type WorkloadSpec struct {
 	// rollup from #548 marks it under IncompleteTasks and the Workload
 	// reaches Phase=Failed with reason ChildrenIncomplete.
 	//
-	// v0.2 (Day 4): entries whose Agent has spec.provider="cloud-proxy"
+	// v0.2: entries whose Agent has spec.provider="cloud-proxy"
 	// are gated by AllowCloudReviewers (below) and by the operator-
 	// level --allow-cloud-providers kill switch. When either gate
 	// blocks, the WorkloadReconciler omits the cloud reviewer's task
