@@ -48,6 +48,9 @@ const (
 //     most common shape for v0.1. When ReviewerAgentRefs is also set
 //     (v0.2), each issue additionally fans out one parallel review
 //     task per listed reviewer Agent, depending on the verify task.
+//     When EscalationReviewerAgentRefs is also set, a second reviewer
+//     tier is emitted per issue only after a base reviewer returns
+//     NO-GO.
 //  3. LLM-planner (Intent only, no Pipeline, no Issues): deferred to v0.2.
 //     v0.1 marks the Workload Failed with reason NoPlannerOrPipeline.
 type WorkloadSpec struct {
@@ -135,6 +138,27 @@ type WorkloadSpec struct {
 	// providers.
 	// +optional
 	ReviewerAgentRefs []corev1.LocalObjectReference `json:"reviewerAgentRefs,omitempty"`
+
+	// EscalationReviewerAgentRefs is the optional second reviewer tier
+	// (v0.2, #546). For each issue N in issue-batch mode, the
+	// WorkloadReconciler emits one review task per listed Agent
+	// (rendered name "<workload>-escalate-<N>-<j>") ONLY after every
+	// base reviewer task for that issue (the ReviewerAgentRefs fan-out)
+	// is terminal AND at least one
+	// returned verdict=NO-GO. This bounds the cost of an expensive
+	// reviewer (typically a larger local model; a cloud-proxy Agent is
+	// allowed but stays behind the same sovereignty gates as base
+	// reviewers) to the small fraction of branches a cheap reviewer
+	// already flagged.
+	//
+	// Escalation verdicts are advisory in v0.2: they are recorded on
+	// the task and surfaced via the EscalationTriggered condition, but
+	// the base NO-GO still rolls the Workload to Failed so a human
+	// reviews both verdicts. Escalation tasks never trigger further
+	// escalation. Requires ReviewerAgentRefs to be non-empty; ignored
+	// in explicit Pipeline mode. Counts against MaxTasks.
+	// +optional
+	EscalationReviewerAgentRefs []corev1.LocalObjectReference `json:"escalationReviewerAgentRefs,omitempty"`
 
 	// AllowCloudReviewers gates whether reviewer Agents whose
 	// spec.provider is "cloud-proxy" (or any non-"local" value) may be
