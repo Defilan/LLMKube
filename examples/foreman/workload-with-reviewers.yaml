@@ -27,10 +27,9 @@
 #     Workload to Phase=Failed with reason=ChildrenIncomplete, and
 #     surfaces "the gate passed, but at least one reviewer caught
 #     something the gate cannot."
-#   - Day 4 will extend this with a hybrid cloud reviewer Agent the
-#     rollup can escalate to when the local fleet says NO-GO; the
-#     local ensemble is the air-gap-friendly path, the cloud
-#     reviewer is the optional second opinion.
+#
+# For a second, escalation-only reviewer tier (runs only after a base
+# reviewer NO-GO), see workload-with-escalation.yaml.
 #
 # Multi-strategy reviewing (the v0.2 thesis): list three reviewer
 # Agent CRs with DIFFERENT system prompts and (optionally) the same
@@ -71,12 +70,12 @@ spec:
     - name: qwen36-35b-a3b-reviewer
     # - name: qwen36-35b-a3b-reviewer-falsification  # v0.2.x local variant
     # - name: qwen36-35b-a3b-reviewer-thinking       # v0.2.x local variant
-    # v0.2 Day 4: cloud reviewer for second opinion. Subject to
+    # v0.2 cloud reviewer for second opinion. Subject to
     # foreman.allowCloudProviders (chart) + spec.allowCloudReviewers
     # (below) sovereignty gates. Comment out for air-gap-only runs.
     - name: claude-sonnet-cloud-reviewer
 
-  # v0.2 Day 4: per-Workload sovereignty toggle. nil (unset) is
+  # v0.2: per-Workload sovereignty toggle. nil (unset) is
   # treated as true; set explicit false to suppress cloud-provider
   # reviewers for this specific batch even when the operator allows
   # them globally. The reconciler still emits local reviewers.

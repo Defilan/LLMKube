@@ -40,8 +40,10 @@ const (
 	// in WorkloadSpec.ReviewerAgentRefs, all parallel, all depending on
 	// the upstream verify task reaching GATE-PASS. The rollup from #548
 	// treats verdict=NO-GO as "Succeeded but incomplete," so any reviewer
-	// NO-GO marks the parent Workload review-failed; Day 4 escalates that
-	// case to a hybrid cloud reviewer Agent.
+	// NO-GO marks the parent Workload review-failed. When
+	// WorkloadSpec.EscalationReviewerAgentRefs is set (#546), a second
+	// reviewer tier is emitted per issue only after the base reviewers are
+	// terminal with at least one NO-GO.
 	AgenticTaskKindReview AgenticTaskKind = "review"
 	// AgenticTaskKindFreeform passes an arbitrary prompt to a named agent.
 	AgenticTaskKindFreeform AgenticTaskKind = "freeform"

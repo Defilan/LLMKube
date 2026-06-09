@@ -26,7 +26,7 @@ networkPolicies:
   additionalEgressCIDRs: []
 foreman:
   # allowCloudProviders is the cluster-wide sovereignty kill switch
-  # for cloud-proxy reviewer Agents (v0.2 Day 4).
+  # for cloud-proxy reviewer Agents (v0.2).
   #
   # When true (default), reviewer Agents whose spec.provider is
   # "cloud-proxy" may dispatch, subject to per-Workload

@@ -613,6 +613,11 @@ func (in *WorkloadSpec) DeepCopyInto(out *WorkloadSpec) {
 		*out = make([]v1.LocalObjectReference, len(*in))
 		copy(*out, *in)
 	}
+	if in.EscalationReviewerAgentRefs != nil {
+		in, out := &in.EscalationReviewerAgentRefs, &out.EscalationReviewerAgentRefs
+		*out = make([]v1.LocalObjectReference, len(*in))
+		copy(*out, *in)
+	}
 	if in.AllowCloudReviewers != nil {
 		in, out := &in.AllowCloudReviewers, &out.AllowCloudReviewers
 		*out = new(bool)

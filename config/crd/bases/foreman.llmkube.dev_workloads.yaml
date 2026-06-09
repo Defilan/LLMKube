@@ -102,6 +102,47 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              escalationReviewerAgentRefs:
+                description: |-
+                  EscalationReviewerAgentRefs is the optional second reviewer tier
+                  (v0.2, #546). For each issue N in issue-batch mode, the
+                  WorkloadReconciler emits one review task per listed Agent
+                  (rendered name "<workload>-escalate-<N>-<j>") ONLY after every
+                  base reviewer task for that issue (the ReviewerAgentRefs fan-out)
+                  is terminal AND at least one
+                  returned verdict=NO-GO. This bounds the cost of an expensive
+                  reviewer (typically a larger local model; a cloud-proxy Agent is
+                  allowed but stays behind the same sovereignty gates as base
+                  reviewers) to the small fraction of branches a cheap reviewer
+                  already flagged.
+
+                  Escalation verdicts are advisory in v0.2: the
+                  EscalationTriggered condition records that the tier fired, the
+                  verdict itself is read from the escalation AgenticTask, and the
+                  base NO-GO still rolls the Workload to Failed so a human reviews
+                  both verdicts. Note that adding escalation refs to an
+                  already-Failed issue-batch Workload re-opens it: the next
+                  reconcile emits the escalation tier against the recorded NO-GO.
+                  Escalation tasks never trigger further escalation. Requires
+                  ReviewerAgentRefs to be non-empty; ignored in explicit Pipeline
+                  mode. Counts against MaxTasks.
+                items:
+                  description: |-
+                    LocalObjectReference contains enough information to let you locate the
+                    referenced object inside the same namespace.
+                  properties:
+                    name:
+                      default: ""
+                      description: |-
+                        Name of the referent.
+                        This field is effectively required, but due to backwards compatibility is
+                        allowed to be empty. Instances of this type with an empty value here are
+                        almost certainly wrong.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
               intent:
                 description: |-
                   Intent is the natural-language description of what to do.
@@ -268,7 +309,7 @@ spec:
                   rollup from #548 marks it under IncompleteTasks and the Workload
                   reaches Phase=Failed with reason ChildrenIncomplete.
 
-                  v0.2 (Day 4): entries whose Agent has spec.provider="cloud-proxy"
+                  v0.2: entries whose Agent has spec.provider="cloud-proxy"
                   are gated by AllowCloudReviewers (below) and by the operator-
                   level --allow-cloud-providers kill switch. When either gate
                   blocks, the WorkloadReconciler omits the cloud reviewer's task
