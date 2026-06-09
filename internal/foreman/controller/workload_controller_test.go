@@ -21,6 +21,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -687,6 +688,193 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 			"advisory: escalation GO does not clear the base NO-GO in v0.2")
 		Expect(fresh.Status.SucceededTasks).To(Equal(int32(3)))  // code, verify, escalate
 		Expect(fresh.Status.IncompleteTasks).To(Equal(int32(1))) // base reviewer NO-GO
+	})
+
+	It("suppresses a cloud-proxy escalation reviewer when the operator kill switch is off (#546)", func() {
+		reconciler.AllowCloudProviders = false
+		DeferCleanup(func() { reconciler.AllowCloudProviders = true })
+
+		Expect(k8sClient.Create(ctx, &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "esc-local-base", Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:                foremanv1alpha1.AgentRoleReviewer,
+				Provider:            foremanv1alpha1.AgentProviderLocal,
+				InferenceServiceRef: corev1.LocalObjectReference{Name: "test-svc"},
+				SystemPrompt:        "you are a reviewer",
+				Tools:               []string{"submit_result"},
+				MaxTurns:            5,
+			},
+		})).To(Succeed())
+		Expect(k8sClient.Create(ctx, &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: "esc-cloud-big", Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:     foremanv1alpha1.AgentRoleReviewer,
+				Provider: foremanv1alpha1.AgentProviderCloudProxy,
+				ProviderConfig: &foremanv1alpha1.ProviderConfig{
+					BaseURL: "http://foundation-router.lan:4000/v1",
+					Model:   "claude-sonnet-4-6",
+				},
+				SystemPrompt: "you are an escalation reviewer",
+				Tools:        []string{"submit_result"},
+				MaxTurns:     5,
+			},
+		})).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, &foremanv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "esc-local-base", Namespace: "default"}})
+			_ = k8sClient.Delete(ctx, &foremanv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Name: "esc-cloud-big", Namespace: "default"}})
+		})
+
+		wl := newWorkload("escalation-gated", foremanv1alpha1.WorkloadSpec{
+			Intent:           "cloud escalation suppressed by operator gate",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{642},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "esc-local-base"},
+			},
+			EscalationReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "esc-cloud-big"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		updates := []struct {
+			name    string
+			verdict foremanv1alpha1.AgenticTaskVerdict
+		}{
+			{"escalation-gated-code-642", foremanv1alpha1.AgenticTaskVerdictGo},
+			{"escalation-gated-verify-642", foremanv1alpha1.AgenticTaskVerdictGatePass},
+			{"escalation-gated-review-642-0", foremanv1alpha1.AgenticTaskVerdictNoGo},
+		}
+		for _, u := range updates {
+			var task foremanv1alpha1.AgenticTask
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: u.name}, &task)).To(Succeed())
+			patch := client.MergeFrom(task.DeepCopy())
+			task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+			task.Status.Verdict = u.verdict
+			Expect(k8sClient.Status().Patch(ctx, &task, patch)).To(Succeed())
+		}
+
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		// The cloud escalation reviewer must NOT have been created.
+		var escTask foremanv1alpha1.AgenticTask
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "escalation-gated-escalate-642-0"}, &escTask)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "cloud escalation task must be suppressed")
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		cond := findCondition(fresh.Status.Conditions, conditionTypeCloudReviewersSuppressed)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Message).To(ContainSubstring("esc-cloud-big"))
+		Expect(cond.Message).To(ContainSubstring("operator --allow-cloud-providers=false"))
+
+		escCond := findCondition(fresh.Status.Conditions, conditionTypeEscalationTriggered)
+		Expect(escCond).NotTo(BeNil())
+		Expect(escCond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(escCond.Message).To(ContainSubstring("0 task(s) created, 1 suppressed"))
+	})
+
+	It("suppresses escalation when MaxTasks leaves no room and reports it (#546)", func() {
+		wl := newWorkload("escalation-capped", foremanv1alpha1.WorkloadSpec{
+			Intent:           "maxTasks blocks escalation",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{643},
+			MaxTasks:         3, // code + verify + review fills the cap
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "base-reviewer"},
+			},
+			EscalationReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "big-reviewer"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		updates := []struct {
+			name    string
+			verdict foremanv1alpha1.AgenticTaskVerdict
+		}{
+			{"escalation-capped-code-643", foremanv1alpha1.AgenticTaskVerdictGo},
+			{"escalation-capped-verify-643", foremanv1alpha1.AgenticTaskVerdictGatePass},
+			{"escalation-capped-review-643-0", foremanv1alpha1.AgenticTaskVerdictNoGo},
+		}
+		for _, u := range updates {
+			var task foremanv1alpha1.AgenticTask
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: u.name}, &task)).To(Succeed())
+			patch := client.MergeFrom(task.DeepCopy())
+			task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+			task.Status.Verdict = u.verdict
+			Expect(k8sClient.Status().Patch(ctx, &task, patch)).To(Succeed())
+		}
+
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var escTask foremanv1alpha1.AgenticTask
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "escalation-capped-escalate-643-0"}, &escTask)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "MaxTasks must suppress escalation emission")
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		trunc := findCondition(fresh.Status.Conditions, conditionTypeTruncated)
+		Expect(trunc).NotTo(BeNil())
+		Expect(trunc.Status).To(Equal(metav1.ConditionTrue))
+		Expect(trunc.Reason).To(Equal("MaxTasksEscalationCap"))
+		// And the workload still terminates Failed on the base NO-GO.
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.WorkloadPhaseFailed))
+	})
+
+	It("flags escalation refs without base reviewers via EscalationTriggered=False (#546)", func() {
+		wl := newWorkload("escalation-nobase", foremanv1alpha1.WorkloadSpec{
+			Intent:           "escalation without base tier",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{644},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			EscalationReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "big-reviewer"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		// Plan, then trigger one rollup pass.
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var escTask foremanv1alpha1.AgenticTask
+		err = k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "escalation-nobase-escalate-644-0"}, &escTask)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "no escalation may be emitted without a base reviewer tier")
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		cond := findCondition(fresh.Status.Conditions, conditionTypeEscalationTriggered)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Reason).To(Equal("NoBaseReviewers"))
 	})
 })
 
