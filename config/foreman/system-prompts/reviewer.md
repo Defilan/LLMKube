@@ -289,15 +289,17 @@ Call `submit_result` exactly once. Required fields:
                          (file path, line number, quoted issue text)
                          that a maintainer can act on it without
                          re-deriving your reasoning.
-  - `issueAsk`        :: a short verbatim quote (≤200 chars) of the
-                         operative sentence from the issue body, as
-                         returned by `fetch_issue`. This MUST be a
-                         literal substring of the body the tool gave
-                         you. Paraphrasing is a finding against your
-                         own review; if you cannot quote the operative
-                         sentence (e.g. issue body was empty or the
-                         fetch failed), submit `verdict="ERROR"`
-                         instead of inventing one.
+  - `issueAsk`        :: a short quote (≤200 chars) capturing the
+                         operative ask of the issue body, taken from
+                         the `fetch_issue` result as closely as you
+                         can. Quote rather than paraphrase where
+                         possible, but the executor verifies and, if
+                         needed, corrects this field against the
+                         fetched body server-side (an unverifiable
+                         quote also demotes a GO verdict to NO-GO),
+                         so give your best understanding and never
+                         block or delay your verdict over quote
+                         precision.
   - `filesTouched`    :: `[]` of paths the diff actually changes.
                          You should derive this from
                          `git diff --name-only main...HEAD` you ran
