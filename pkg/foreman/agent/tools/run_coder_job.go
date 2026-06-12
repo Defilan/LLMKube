@@ -188,8 +188,10 @@ type CoderJobResult struct {
 	// CommitMessage is the model's commit message on a GO verdict.
 	CommitMessage string
 
-	// FailureReason is a short machine-ish reason set only on an ERROR
-	// verdict (job-failed, poll-timeout, create-failed, render-failed).
+	// FailureReason is a short machine-ish reason. On an ERROR verdict it is
+	// a job-infrastructure tag (job-failed, poll-timeout, create-failed,
+	// render-failed); on INCOMPLETE it carries the typed failure reason
+	// lifted from the in-pod FOREMAN-RESULT envelope when present.
 	FailureReason string
 
 	// LogTail is the captured pod log tail, for operator triage.

@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -361,7 +362,60 @@ func (w *AgenticTaskWatcher) patchTerminal(
 		Message:            res.Summary,
 		LastTransitionTime: now,
 	})
-	return w.Client.Status().Patch(ctx, &fresh, patch)
+	patchErr := w.Client.Status().Patch(ctx, &fresh, patch)
+	if patchErr == nil {
+		return nil
+	}
+	if !apierrors.IsInvalid(patchErr) {
+		return patchErr
+	}
+
+	// The apiserver rejected the patch, most likely because res.Verdict or
+	// res.FailureReason carries a string value not (yet) in the CRD enum.
+	// This can happen when a future contract version emits a verdict string
+	// that the currently-installed CRD does not know about. Without a
+	// fallback the task would stay in Running forever, wedging the node.
+	//
+	// Defensive recovery: re-fetch, overwrite with minimal known-valid
+	// status, and patch again. The raw Result JSON is preserved in
+	// status.result because that field is x-kubernetes-preserve-unknown-fields
+	// and is therefore not subject to enum validation.
+	log := logf.FromContext(ctx).WithName("agentictask-watcher").WithValues("task", t.Name)
+	log.Error(patchErr, "terminal patch rejected by apiserver; falling back to InfrastructureError",
+		"rejectedVerdict", res.Verdict,
+		"rejectedFailureReason", res.FailureReason,
+	)
+
+	var fallback foremanv1alpha1.AgenticTask
+	if getErr := w.Client.Get(ctx, key, &fallback); getErr != nil {
+		return fmt.Errorf("fallback refetch %s: %w", key, getErr)
+	}
+	fallbackPatch := client.MergeFrom(fallback.DeepCopy())
+	fallbackNow := metav1.Now()
+	fallback.Status.Phase = foremanv1alpha1.AgenticTaskPhaseFailed
+	fallback.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictIncomplete
+	fallback.Status.FailureReason = foremanv1alpha1.FailureInfrastructureError
+	fallback.Status.FinishedAt = &fallbackNow
+	// Preserve the raw result envelope: status.result is
+	// x-kubernetes-preserve-unknown-fields so it survives the patch even
+	// if Verdict inside the JSON is not in the current enum.
+	fallback.Status.Result = &runtime.RawExtension{Raw: raw}
+
+	// Truncate the validation error message so the condition stays within
+	// apiserver limits (conditions.message is limited to 32768 chars).
+	patchErrMsg := patchErr.Error()
+	const maxErrLen = 512
+	if len(patchErrMsg) > maxErrLen {
+		patchErrMsg = patchErrMsg[:maxErrLen] + "... (truncated)"
+	}
+	setCondition(&fallback.Status.Conditions, metav1.Condition{
+		Type:               "Completed",
+		Status:             metav1.ConditionFalse,
+		Reason:             "TerminalPatchRejected",
+		Message:            fmt.Sprintf("original verdict %q rejected by apiserver: %s", res.Verdict, patchErrMsg),
+		LastTransitionTime: fallbackNow,
+	})
+	return w.Client.Status().Patch(ctx, &fallback, fallbackPatch)
 }
 
 // setCondition upserts a condition by type. Unexported because both the
