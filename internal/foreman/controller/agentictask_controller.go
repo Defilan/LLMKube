@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strconv"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,6 +35,16 @@ import (
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
+
+// claimExpiriesAnnotation tracks how many times this task has been released
+// back to Pending due to a stale or absent FleetNode. The 3-strike ladder
+// (>= 2 prior expiries) terminal-fails the task to bound poison loops.
+const claimExpiriesAnnotation = "foreman.llmkube.dev/claim-expiries"
+
+// claimExpiryLimit is the maximum number of prior expiries before the task is
+// terminal-failed. At count >= claimExpiryLimit this would be the
+// (claimExpiryLimit+1)th expiry, which we refuse.
+const claimExpiryLimit = 2
 
 // AgenticTaskReconciler is the Foreman v0.1 scheduler. It watches
 // AgenticTask resources and routes each Pending task to the first Ready
@@ -90,8 +101,22 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setInitialPending(ctx, &task)
 	}
 
-	// The scheduler only acts on Pending. Every other phase is the
-	// FleetAgent's domain.
+	// Terminal phases are done; nothing left to do.
+	if task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
+		task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
+		return ctrl.Result{}, nil
+	}
+
+	// In-flight phases (Scheduled / Running / Verifying) with an AssignedNode
+	// need claim-expiry checking: if the node is gone or stale the task must
+	// be released back to Pending so the scheduler can re-dispatch it.
+	if task.Status.Phase != foremanv1alpha1.AgenticTaskPhasePending &&
+		task.Status.AssignedNode != "" {
+		return r.checkClaimExpiry(ctx, &task)
+	}
+
+	// For non-Pending phases with no assigned node (unexpected but safe to
+	// ignore), and for phases not handled above, do nothing.
 	if task.Status.Phase != foremanv1alpha1.AgenticTaskPhasePending {
 		return ctrl.Result{}, nil
 	}
@@ -380,6 +405,185 @@ func (r *AgenticTaskReconciler) failTask(ctx context.Context, task *foremanv1alp
 	return ctrl.Result{}, r.Status().Patch(ctx, task, patch)
 }
 
+// checkClaimExpiry inspects the FleetNode named by task.status.assignedNode.
+// If the node is absent or its heartbeat is stale the task is either
+// released back to Pending (3-strike ladder: < claimExpiryLimit prior
+// expiries) or terminal-failed (>= claimExpiryLimit prior expiries).
+// If the node is fresh the task is left untouched and a requeue is scheduled
+// at FleetNodeHeartbeatTimeout/2 so staleness is caught promptly without
+// relying solely on events.
+//
+// Counter ordering: the metadata annotation (counter) is updated BEFORE the
+// status patch so that a crash between the two errs toward counting more
+// expiries rather than fewer, bounding poison loops conservatively.
+func (r *AgenticTaskReconciler) checkClaimExpiry(ctx context.Context, task *foremanv1alpha1.AgenticTask) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	var node foremanv1alpha1.FleetNode
+	nodeNotFound := false
+	lastHeartbeatMsg := ""
+
+	if err := r.Get(ctx, types.NamespacedName{Name: task.Status.AssignedNode}, &node); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, fmt.Errorf("get FleetNode %s: %w", task.Status.AssignedNode, err)
+		}
+		nodeNotFound = true
+		lastHeartbeatMsg = "FleetNode not found"
+	}
+
+	// Node is present and heartbeat is fresh: nothing to do yet.
+	if !nodeNotFound && !node.HeartbeatStale(time.Now()) {
+		return ctrl.Result{RequeueAfter: foremanv1alpha1.FleetNodeHeartbeatTimeout / 2}, nil
+	}
+
+	if !nodeNotFound {
+		// Build the last-heartbeat context for the condition message.
+		if node.Status.LastHeartbeatTime != nil {
+			lastHeartbeatMsg = fmt.Sprintf("last heartbeat %s", node.Status.LastHeartbeatTime.Format(time.RFC3339))
+		} else {
+			lastHeartbeatMsg = "no heartbeat recorded"
+		}
+	}
+
+	// Read the prior expiry count from the annotation.
+	prior := 0
+	if raw, ok := task.Annotations[claimExpiriesAnnotation]; ok {
+		if n, err := strconv.Atoi(raw); err == nil {
+			prior = n
+		}
+	}
+
+	nodeName := task.Status.AssignedNode
+
+	if prior >= claimExpiryLimit {
+		// 3-strike limit reached: terminal-fail.
+		log.Info("claim expiry limit reached; terminal-failing task",
+			"task", task.Name, "node", nodeName, "priorExpiries", prior)
+		return r.terminalFailExpired(ctx, task, nodeName, prior)
+	}
+
+	// Release: increment counter first (crash-safe ordering), then release.
+	log.Info("claim expired; releasing task to Pending",
+		"task", task.Name, "node", nodeName, "priorExpiries", prior, "heartbeat", lastHeartbeatMsg)
+	if err := r.incrementExpiryCounter(ctx, task, prior); err != nil {
+		return ctrl.Result{}, err
+	}
+	return r.releaseExpiredClaim(ctx, task, nodeName, lastHeartbeatMsg)
+}
+
+// incrementExpiryCounter writes max(freshValue, snapshotValue)+1 into the
+// claim-expiries annotation, where freshValue is read from the live object.
+// Using the live value closes an informer-lag window: if a prior expiry
+// landed between the reconcile snapshot and this write, the snapshot's
+// counter would be stale and we would double-count the expiry on the next
+// reconcile (or under-count after a crash). Taking the max ensures we
+// never regress the counter regardless of which view is ahead.
+//
+// This is a metadata (non-status) Update, distinct from the status patch
+// that follows. It must happen first so a crash between the two errs toward
+// counting more expiries.
+func (r *AgenticTaskReconciler) incrementExpiryCounter(ctx context.Context, task *foremanv1alpha1.AgenticTask, snapshotPrior int) error {
+	// Re-fetch to get the current resourceVersion for the metadata patch.
+	var current foremanv1alpha1.AgenticTask
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, &current); err != nil {
+		return fmt.Errorf("re-fetch for expiry counter: %w", err)
+	}
+	// Read the freshly-fetched counter; fall back to 0 if absent/invalid.
+	freshPrior := 0
+	if raw, ok := current.Annotations[claimExpiriesAnnotation]; ok {
+		if n, err := strconv.Atoi(raw); err == nil {
+			freshPrior = n
+		}
+	}
+	// Advance from whichever view is higher to avoid regressing the counter.
+	base := freshPrior
+	if snapshotPrior > base {
+		base = snapshotPrior
+	}
+	patch := client.MergeFrom(current.DeepCopy())
+	if current.Annotations == nil {
+		current.Annotations = map[string]string{}
+	}
+	current.Annotations[claimExpiriesAnnotation] = strconv.Itoa(base + 1)
+	return r.Patch(ctx, &current, patch)
+}
+
+// releaseExpiredClaim resets the task to Pending, clears the claim fields,
+// and records a ClaimExpired condition.
+//
+// Guard: after the re-fetch the function bails out without patching if the
+// live object has already moved to a terminal phase (Succeeded/Failed) or if
+// its AssignedNode no longer matches the node we judged stale. Either
+// condition means a concurrent terminal patch landed in the window between
+// checkClaimExpiry's staleness decision and this write; yanking the task back
+// to Pending in that case would undo legitimate agent progress.
+func (r *AgenticTaskReconciler) releaseExpiredClaim(ctx context.Context, task *foremanv1alpha1.AgenticTask, nodeName, heartbeatMsg string) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	var current foremanv1alpha1.AgenticTask
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, &current); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetch for claim release: %w", err)
+	}
+	if current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
+		current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed ||
+		current.Status.AssignedNode != nodeName {
+		log.Info("claim expiry superseded by concurrent state change; skipping release",
+			"task", current.Name, "node", nodeName,
+			"livePhase", current.Status.Phase, "liveAssignedNode", current.Status.AssignedNode)
+		return ctrl.Result{}, nil
+	}
+	patch := client.MergeFrom(current.DeepCopy())
+	now := metav1.Now()
+	current.Status.Phase = foremanv1alpha1.AgenticTaskPhasePending
+	current.Status.AssignedNode = ""
+	current.Status.ClaimedAt = nil
+	current.Status.StartedAt = nil
+	setCondition(&current.Status.Conditions, metav1.Condition{
+		Type:               "ClaimExpired",
+		Status:             metav1.ConditionTrue,
+		Reason:             "ClaimExpired",
+		Message:            fmt.Sprintf("released from node %q: %s", nodeName, heartbeatMsg),
+		LastTransitionTime: now,
+	})
+	return ctrl.Result{}, r.Status().Patch(ctx, &current, patch)
+}
+
+// terminalFailExpired marks a task Failed after it has exhausted the
+// 3-strike expiry ladder.
+//
+// Guard: same as releaseExpiredClaim. If the live object is already terminal
+// or has been reassigned away from the stale node, a concurrent patch already
+// resolved the task; bail out without patching to avoid overwriting it.
+func (r *AgenticTaskReconciler) terminalFailExpired(ctx context.Context, task *foremanv1alpha1.AgenticTask, nodeName string, priorExpiries int) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	var current foremanv1alpha1.AgenticTask
+	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, &current); err != nil {
+		return ctrl.Result{}, fmt.Errorf("re-fetch for expiry terminal-fail: %w", err)
+	}
+	if current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
+		current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed ||
+		current.Status.AssignedNode != nodeName {
+		log.Info("claim expiry superseded by concurrent state change; skipping terminal-fail",
+			"task", current.Name, "node", nodeName,
+			"livePhase", current.Status.Phase, "liveAssignedNode", current.Status.AssignedNode)
+		return ctrl.Result{}, nil
+	}
+	patch := client.MergeFrom(current.DeepCopy())
+	now := metav1.Now()
+	current.Status.Phase = foremanv1alpha1.AgenticTaskPhaseFailed
+	current.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictIncomplete
+	current.Status.FailureReason = foremanv1alpha1.FailureInfrastructureError
+	current.Status.FinishedAt = &now
+	setCondition(&current.Status.Conditions, metav1.Condition{
+		Type:   "Failed",
+		Status: metav1.ConditionTrue,
+		Reason: "ClaimExpiryLimitReached",
+		Message: fmt.Sprintf("task on node %q expired %d time(s); terminal-failing to prevent poison loop",
+			nodeName, priorExpiries+1),
+		LastTransitionTime: now,
+	})
+	return ctrl.Result{}, r.Status().Patch(ctx, &current, patch)
+}
+
 // setCondition upserts a condition by type. Local to the controller
 // because the watcher in pkg/foreman/agent has its own copy; promote to
 // an internal helpers package if a third writer appears.
@@ -399,30 +603,49 @@ func setCondition(conds *[]metav1.Condition, c metav1.Condition) {
 func (r *AgenticTaskReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&foremanv1alpha1.AgenticTask{}).
-		Watches(&foremanv1alpha1.FleetNode{}, handler.EnqueueRequestsFromMapFunc(r.fleetNodeEnqueuesPending)).
+		Watches(&foremanv1alpha1.FleetNode{}, handler.EnqueueRequestsFromMapFunc(r.fleetNodeEnqueues)).
 		Named("agentictask").
 		Complete(r)
 }
 
-// fleetNodeEnqueuesPending re-enqueues every Pending AgenticTask when a
-// FleetNode event arrives. Cheap because the controller-runtime
-// workqueue dedupes; expensive in the limit only when there are many
-// Pending tasks, which is exactly when faster dispatch matters.
-func (r *AgenticTaskReconciler) fleetNodeEnqueuesPending(ctx context.Context, _ client.Object) []ctrl.Request {
+// fleetNodeEnqueues re-enqueues AgenticTasks when a FleetNode event arrives:
+//   - Every Pending task (scheduling: a newly-Ready node may satisfy a waiting
+//     task immediately rather than waiting for the requeue-after timer).
+//   - Every in-flight task (Scheduled/Running/Verifying) whose AssignedNode
+//     matches the changed node (claim expiry: a node going stale or deleted
+//     must trigger the expiry check on its assigned task promptly rather than
+//     waiting for the 45s backstop requeue).
+//
+// The workqueue dedupes so the worst-case cost is one reconcile per task per
+// FleetNode event, which is acceptable at v0.1 task volumes.
+func (r *AgenticTaskReconciler) fleetNodeEnqueues(ctx context.Context, obj client.Object) []ctrl.Request {
 	var list foremanv1alpha1.AgenticTaskList
 	if err := r.List(ctx, &list); err != nil {
 		logf.FromContext(ctx).Error(err, "fleetnode-trigger list failed")
 		return nil
 	}
+	changedNodeName := obj.GetName()
 	requests := make([]ctrl.Request, 0, len(list.Items))
+	seen := make(map[types.NamespacedName]struct{}, len(list.Items))
 	for i := range list.Items {
 		t := &list.Items[i]
-		if t.Status.Phase != foremanv1alpha1.AgenticTaskPhasePending {
-			continue
+		key := types.NamespacedName{Namespace: t.Namespace, Name: t.Name}
+		switch t.Status.Phase {
+		case foremanv1alpha1.AgenticTaskPhasePending:
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				requests = append(requests, ctrl.Request{NamespacedName: key})
+			}
+		case foremanv1alpha1.AgenticTaskPhaseScheduled,
+			foremanv1alpha1.AgenticTaskPhaseRunning,
+			foremanv1alpha1.AgenticTaskPhaseVerifying:
+			if t.Status.AssignedNode == changedNodeName {
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+					requests = append(requests, ctrl.Request{NamespacedName: key})
+				}
+			}
 		}
-		requests = append(requests, ctrl.Request{
-			NamespacedName: types.NamespacedName{Namespace: t.Namespace, Name: t.Name},
-		})
 	}
 	return requests
 }
