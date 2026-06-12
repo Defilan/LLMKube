@@ -602,6 +602,53 @@ func TestRegisterEndpointWithRetry_Exhausted(t *testing.T) {
 	}
 }
 
+// TestRegisterEndpoint_StampsHeartbeat verifies that RegisterEndpoint stamps the
+// llmkube.ai/agent-heartbeat annotation on the Endpoints object with a
+// deterministic RFC3339 timestamp on every call (issue #663). The clock is
+// pinned so the assertion is exact rather than "after test start".
+func TestRegisterEndpoint_StampsHeartbeat(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+
+	// Pin the clock so the annotation value is deterministic.
+	frozen := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	registry.now = func() time.Time { return frozen }
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hb-model",
+			Namespace: "default",
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "hb-model",
+		},
+	}
+
+	if err := registry.RegisterEndpoint(context.Background(), isvc, 50051); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+
+	//nolint:staticcheck // SA1019: Endpoints API is still functional and matches production code under test
+	eps := &corev1.Endpoints{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "hb-model", Namespace: "default"}, eps); err != nil {
+		t.Fatalf("get endpoints: %v", err)
+	}
+
+	raw := eps.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat]
+	if raw == "" {
+		t.Fatalf("heartbeat annotation %q absent on endpoints", inferencev1alpha1.AnnotationAgentHeartbeat)
+	}
+	const want = "2026-06-12T12:00:00Z"
+	if raw != want {
+		t.Fatalf("heartbeat annotation = %q, want %q", raw, want)
+	}
+}
+
 // TestRegisterEndpointWithRetry_ContextCancelled verifies that when the context
 // is already cancelled before the first attempt, the returned error wraps
 // context.Canceled rather than rendering as a garbled %!w(<nil>).

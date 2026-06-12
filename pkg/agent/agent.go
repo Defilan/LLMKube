@@ -31,6 +31,7 @@ import (
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -447,6 +448,11 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		a.logger.With("subsystem", "health-monitor"),
 	)
 	go monitor.Run(ctx)
+
+	// Start heartbeat loop: periodically re-registers every running process's
+	// endpoint to refresh the llmkube.ai/agent-heartbeat annotation and
+	// self-heal any missed registration (#663, #657).
+	go a.runHeartbeatLoop(ctx)
 
 	// Start Apple Silicon power sampler (if enabled). The sampler shells out
 	// to powermetrics under sudo and publishes the apple_power_*_watts gauges
@@ -1136,6 +1142,95 @@ func (a *MetalAgent) scheduleRestart(ctx context.Context, name, namespace string
 
 	if err := a.ensureProcess(ctx, isvc); err != nil {
 		a.logger.Warnw("failed to restart process", "name", name, "namespace", namespace, "error", err)
+	}
+}
+
+// heartbeatOnce re-registers the endpoint for every currently-running managed
+// process. It snapshots the running process set under RLock, releases the lock,
+// then performs one best-effort re-registration per process (no lock held during
+// network I/O). Failures are logged at Warn and skipped; the next tick is the
+// retry (no separate backoff wrapper here because the interval itself provides
+// the retry cadence, and using RegisterEndpointWithRetry would serialize all
+// heartbeats behind a single stalled one).
+//
+// Two additional safety checks run per entry before re-registering:
+//   - If the InferenceService is scaled to zero (spec.replicas == 0) or has a
+//     DeletionTimestamp, skip re-registration — re-asserting Service+Endpoints
+//     for a deleted or scaled-to-zero service would leave a routable ClusterIP
+//     pointing at a dead port with no self-heal path.
+//   - If the InferenceService is NotFound, treat it as a missed deletion event
+//     and tear the process down via deleteProcess (the same path the watch event
+//     handler uses), then continue to the next entry.
+func (a *MetalAgent) heartbeatOnce(ctx context.Context) {
+	a.mu.RLock()
+	// Snapshot name/namespace/port while holding the lock so we don't hold it
+	// across the API calls below.
+	type entry struct {
+		namespace, name string
+		port            int
+	}
+	entries := make([]entry, 0, len(a.processes))
+	for _, p := range a.processes {
+		if p == nil || p.Port <= 0 {
+			continue
+		}
+		entries = append(entries, entry{p.Namespace, p.Name, p.Port})
+	}
+	a.mu.RUnlock()
+
+	for _, e := range entries {
+		isvc := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
+			Namespace: e.namespace,
+			Name:      e.name,
+		}, isvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Missed deletion event: tear the process down via the same path
+				// the watch-event handler uses. deleteProcess acquires its own
+				// lock so it is safe to call here without holding a.mu.
+				key := types.NamespacedName{Namespace: e.namespace, Name: e.name}.String()
+				a.logger.Warnw("heartbeat: InferenceService gone; tearing down lingering process",
+					"namespace", e.namespace, "name", e.name)
+				if tearErr := a.deleteProcess(ctx, key); tearErr != nil {
+					a.logger.Warnw("heartbeat: teardown failed",
+						"namespace", e.namespace, "name", e.name, "error", tearErr)
+				}
+				continue
+			}
+			a.logger.Warnw("heartbeat: failed to fetch InferenceService",
+				"namespace", e.namespace, "name", e.name, "error", err)
+			continue
+		}
+
+		// Skip re-registration when the service is being deleted or has been
+		// scaled to zero. Re-asserting Service+Endpoints here would resurrect
+		// networking that deleteProcess (or handleScaleToZero) just cleaned up.
+		if isvc.DeletionTimestamp != nil || (isvc.Spec.Replicas != nil && *isvc.Spec.Replicas == 0) {
+			continue
+		}
+
+		if err := a.registry.RegisterEndpoint(ctx, isvc, e.port); err != nil {
+			a.logger.Warnw("heartbeat: failed to re-register endpoint",
+				"namespace", e.namespace, "name", e.name, "error", err)
+		}
+	}
+}
+
+// runHeartbeatLoop periodically re-registers every running process's
+// endpoint. This both refreshes the llmkube.ai/agent-heartbeat annotation
+// (the controller expires registrations whose heartbeat goes stale, #663)
+// and re-asserts the registration content, healing any update the agent
+// failed to deliver earlier (#657).
+func (a *MetalAgent) runHeartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(inferencev1alpha1.DefaultAgentHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.heartbeatOnce(ctx)
+		}
 	}
 }
 
