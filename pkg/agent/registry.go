@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -28,7 +29,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -39,6 +42,8 @@ type ServiceRegistry struct {
 	client client.Client
 	hostIP string // explicit host IP; if empty, auto-detect via DNS
 	logger *zap.SugaredLogger
+	// retryBackoff bounds RegisterEndpointWithRetry. Overridable in tests.
+	retryBackoff wait.Backoff
 }
 
 // NewServiceRegistry creates a new service registry.
@@ -50,6 +55,12 @@ func NewServiceRegistry(k8sClient client.Client, hostIP string, logger *zap.Suga
 		client: k8sClient,
 		hostIP: hostIP,
 		logger: logger,
+		retryBackoff: wait.Backoff{
+			Duration: 2 * time.Second,
+			Factor:   2,
+			Steps:    5,
+			Cap:      30 * time.Second,
+		},
 	}
 }
 
@@ -63,82 +74,61 @@ func (r *ServiceRegistry) RegisterEndpoint(
 	// Sanitize service name (replace dots with dashes for DNS-1035 compliance)
 	serviceName := sanitizeServiceName(isvc.Name)
 
-	// Create or update Service
 	service := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: isvc.Namespace,
-			Labels: map[string]string{
-				"app":                          isvc.Name,
-				"llmkube.ai/managed-by":        "metal-agent",
-				"llmkube.ai/inference-service": isvc.Name,
-			},
-			Annotations: map[string]string{
-				"llmkube.ai/metal-accelerated": "true",
-				"llmkube.ai/native-process":    "true",
-			},
-		},
-		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeClusterIP,
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "http",
-					Port:       8080,
-					TargetPort: intstr.FromInt(port),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
-			// Note: No selector - we'll manually manage Endpoints
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: isvc.Namespace},
 	}
-
-	if err := r.client.Create(ctx, service); err != nil {
-		// Try update if already exists
-		if err := r.client.Update(ctx, service); err != nil {
-			return fmt.Errorf("failed to create/update service: %w", err)
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.client, service, func() error {
+		service.Labels = map[string]string{
+			"app":                          isvc.Name,
+			"llmkube.ai/managed-by":        "metal-agent",
+			"llmkube.ai/inference-service": isvc.Name,
 		}
+		service.Annotations = map[string]string{
+			"llmkube.ai/metal-accelerated": "true",
+			"llmkube.ai/native-process":    "true",
+		}
+		service.Spec.Type = corev1.ServiceTypeClusterIP
+		service.Spec.Ports = []corev1.ServicePort{{
+			Name:       "http",
+			Port:       8080,
+			TargetPort: intstr.FromInt(port),
+			Protocol:   corev1.ProtocolTCP,
+		}}
+		// No selector: Endpoints are managed manually.
+		service.Spec.Selector = nil
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to create/update service: %w", err)
 	}
 
-	// Create or update Endpoints to point to the host
 	//nolint:staticcheck // SA1019: Endpoints API is still functional and appropriate for manual endpoint management
 	endpoints := &corev1.Endpoints{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: isvc.Namespace,
-			Labels: map[string]string{
-				"app":                          isvc.Name,
-				"llmkube.ai/managed-by":        "metal-agent",
-				"llmkube.ai/inference-service": isvc.Name,
-			},
-		},
-		//nolint:staticcheck // SA1019: EndpointSubset still functional
-		Subsets: []corev1.EndpointSubset{
-			{
-				Addresses: []corev1.EndpointAddress{
-					{
-						IP: r.resolveHostIP(),
-						TargetRef: &corev1.ObjectReference{
-							Kind: "Pod",
-							Name: fmt.Sprintf("%s-metal", isvc.Name),
-						},
-					},
-				},
-				Ports: []corev1.EndpointPort{
-					{
-						Name:     "http",
-						Port:     int32(port), //nolint:gosec // G115: TCP port numbers 0-65535 fit in int32
-						Protocol: corev1.ProtocolTCP,
-					},
-				},
-			},
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: isvc.Namespace},
 	}
-
-	if err := r.client.Create(ctx, endpoints); err != nil {
-		// Try update if already exists
-		if err := r.client.Update(ctx, endpoints); err != nil {
-			return fmt.Errorf("failed to create/update endpoints: %w", err)
+	if _, err := controllerutil.CreateOrUpdate(ctx, r.client, endpoints, func() error {
+		endpoints.Labels = map[string]string{
+			"app":                          isvc.Name,
+			"llmkube.ai/managed-by":        "metal-agent",
+			"llmkube.ai/inference-service": isvc.Name,
 		}
+		//nolint:staticcheck // SA1019: EndpointSubset still functional
+		endpoints.Subsets = []corev1.EndpointSubset{{
+			Addresses: []corev1.EndpointAddress{{
+				IP: r.resolveHostIP(),
+				TargetRef: &corev1.ObjectReference{
+					Kind: "Pod",
+					Name: fmt.Sprintf("%s-metal", isvc.Name),
+				},
+			}},
+			Ports: []corev1.EndpointPort{{
+				Name:     "http",
+				Port:     int32(port), //nolint:gosec // G115: TCP ports fit in int32
+				Protocol: corev1.ProtocolTCP,
+			}},
+		}}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to create/update endpoints: %w", err)
 	}
 
 	r.logger.Infow("registered endpoint",
@@ -148,6 +138,33 @@ func (r *ServiceRegistry) RegisterEndpoint(
 		"port", port,
 	)
 
+	return nil
+}
+
+// RegisterEndpointWithRetry retries RegisterEndpoint with exponential backoff
+// so a brief API-server outage during a process respawn cannot strand stale
+// Endpoints (issue #657). All errors are treated as retriable: the agent has
+// no path to durable success other than the API server coming back.
+func (r *ServiceRegistry) RegisterEndpointWithRetry(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	port int,
+) error {
+	var lastErr error
+	err := wait.ExponentialBackoffWithContext(ctx, r.retryBackoff, func(ctx context.Context) (bool, error) {
+		if lastErr = r.RegisterEndpoint(ctx, isvc, port); lastErr != nil {
+			r.logger.Warnw("endpoint registration failed; will retry",
+				"namespace", isvc.Namespace, "name", isvc.Name, "port", port, "error", lastErr)
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		if lastErr == nil {
+			lastErr = err // ctx cancelled before the first attempt
+		}
+		return fmt.Errorf("endpoint registration failed after retries: %w", lastErr)
+	}
 	return nil
 }
 
