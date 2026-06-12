@@ -307,15 +307,23 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(fresh.Status.AssignedNode).To(Equal(verifierNode.Name))
 	})
 
-	It("does not touch a task already past Pending (FleetAgent's domain)", func() {
+	It("does not reschedule a Running task whose assigned node is fresh", func() {
+		// The scheduler must leave Running tasks alone when the FleetNode is
+		// healthy; only claim expiry (stale/absent node) may alter them.
+		node := newFleetNode("hands-off-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+
 		task := newTask("hands-off")
 		Expect(k8sClient.Create(ctx, task)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
 		setPhase(task, foremanv1alpha1.AgenticTaskPhaseRunning)
 
-		// Also set assignedNode to confirm the scheduler doesn't clobber.
 		patch := client.MergeFrom(task.DeepCopy())
-		task.Status.AssignedNode = "some-node"
+		task.Status.AssignedNode = node.Name
 		Expect(k8sClient.Status().Patch(ctx, task, patch)).To(Succeed())
 
 		_, err := reconciler.Reconcile(ctx, reqFor(task))
@@ -324,7 +332,7 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		var fresh foremanv1alpha1.AgenticTask
 		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
 		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseRunning))
-		Expect(fresh.Status.AssignedNode).To(Equal("some-node"))
+		Expect(fresh.Status.AssignedNode).To(Equal(node.Name))
 	})
 })
 
