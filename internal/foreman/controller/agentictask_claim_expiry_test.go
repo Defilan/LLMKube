@@ -253,4 +253,123 @@ var _ = Describe("AgenticTaskReconciler claim expiry", func() {
 		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictGo))
 		Expect(fresh.Annotations[claimExpiriesAnnotation]).To(BeEmpty())
 	})
+
+	// Tests 7 + 8 exercise the concurrent-terminal guard by calling the
+	// helpers directly with a stale snapshot. This models the race that
+	// envtest cannot stage deterministically through Reconcile: the
+	// informer's view says Running, but the agent's terminal patch landed
+	// between checkClaimExpiry's staleness decision and the write, so the
+	// live object is already Succeeded when releaseExpiredClaim /
+	// terminalFailExpired performs its re-fetch.
+
+	It("releaseExpiredClaim is a no-op when the live object is already Succeeded (stale snapshot)", func() {
+		// Test 7: guard in releaseExpiredClaim.
+		// 1. Create the task and put it in Succeeded state in etcd.
+		// 2. Build a stale in-memory snapshot that claims it is still Running.
+		// 3. Call releaseExpiredClaim directly with that snapshot.
+		// 4. Confirm the live object is untouched.
+		node := newFleetNode("guard-release-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+
+		task := newTask("guard-release-task")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+
+		// Write Succeeded into etcd (what a concurrent agent terminal patch
+		// would have done).
+		succPatch := client.MergeFrom(task.DeepCopy())
+		finishedAt := metav1.Now()
+		task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+		task.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictGo
+		task.Status.AssignedNode = node.Name
+		task.Status.FinishedAt = &finishedAt
+		Expect(k8sClient.Status().Patch(ctx, task, succPatch)).To(Succeed())
+
+		// Build a stale snapshot: the informer still thinks the task is Running
+		// on the same node. We construct it from the original task pointer
+		// (before the Succeeded patch) so its resourceVersion is older.
+		staleSnapshot := task.DeepCopy()
+		now := metav1.Now()
+		staleSnapshot.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+		staleSnapshot.Status.AssignedNode = node.Name
+		staleSnapshot.Status.ClaimedAt = &now
+		staleSnapshot.Status.StartedAt = &now
+
+		res, err := reconciler.releaseExpiredClaim(ctx, staleSnapshot, node.Name, "FleetNode not found")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		// Live object must still be Succeeded, not regressed to Pending.
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseSucceeded))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictGo))
+		Expect(fresh.Annotations[claimExpiriesAnnotation]).To(BeEmpty())
+	})
+
+	It("terminalFailExpired is a no-op when the live object is already Succeeded (stale snapshot)", func() {
+		// Test 8: guard in terminalFailExpired.
+		// Same setup as Test 7 but exercises the 3-strike code path.
+		node := newFleetNode("guard-termfail-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+
+		task := newTask("guard-termfail-task")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+
+		// Write Succeeded into etcd.
+		succPatch := client.MergeFrom(task.DeepCopy())
+		finishedAt := metav1.Now()
+		task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+		task.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictGo
+		task.Status.AssignedNode = node.Name
+		task.Status.FinishedAt = &finishedAt
+		Expect(k8sClient.Status().Patch(ctx, task, succPatch)).To(Succeed())
+
+		// Stale snapshot: two prior expiries, still Running.
+		staleSnapshot := task.DeepCopy()
+		claimedAt := metav1.Now()
+		staleSnapshot.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+		staleSnapshot.Status.AssignedNode = node.Name
+		staleSnapshot.Status.ClaimedAt = &claimedAt
+		if staleSnapshot.Annotations == nil {
+			staleSnapshot.Annotations = map[string]string{}
+		}
+		staleSnapshot.Annotations[claimExpiriesAnnotation] = "2"
+
+		res, err := reconciler.terminalFailExpired(ctx, staleSnapshot, node.Name, 2)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeZero())
+
+		// Live object must still be Succeeded, not overwritten with Failed.
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseSucceeded))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictGo))
+	})
+
+	It("incrementExpiryCounter uses max(fresh, snapshot) to avoid counter regression", func() {
+		// Test 9: counter freshness. If the annotation in etcd already holds a
+		// higher value than the reconcile snapshot (informer lag), the write must
+		// advance from the higher value, not the snapshot.
+		task := newTask("counter-freshness-task")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+
+		// etcd already has counter=2 (a prior expiry beat us to the write).
+		setExpiryAnnotation(task, "2")
+
+		// Snapshot only knows about counter=1 (informer lag).
+		snapshotPrior := 1
+
+		err := reconciler.incrementExpiryCounter(ctx, task, snapshotPrior)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Result must be max(2, 1)+1 = 3, not 1+1 = 2.
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Annotations[claimExpiriesAnnotation]).To(Equal("3"))
+	})
 })

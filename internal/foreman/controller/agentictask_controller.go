@@ -471,30 +471,65 @@ func (r *AgenticTaskReconciler) checkClaimExpiry(ctx context.Context, task *fore
 	return r.releaseExpiredClaim(ctx, task, nodeName, lastHeartbeatMsg)
 }
 
-// incrementExpiryCounter writes prior+1 into the claim-expiries annotation.
+// incrementExpiryCounter writes max(freshValue, snapshotValue)+1 into the
+// claim-expiries annotation, where freshValue is read from the live object.
+// Using the live value closes an informer-lag window: if a prior expiry
+// landed between the reconcile snapshot and this write, the snapshot's
+// counter would be stale and we would double-count the expiry on the next
+// reconcile (or under-count after a crash). Taking the max ensures we
+// never regress the counter regardless of which view is ahead.
+//
 // This is a metadata (non-status) Update, distinct from the status patch
 // that follows. It must happen first so a crash between the two errs toward
 // counting more expiries.
-func (r *AgenticTaskReconciler) incrementExpiryCounter(ctx context.Context, task *foremanv1alpha1.AgenticTask, prior int) error {
+func (r *AgenticTaskReconciler) incrementExpiryCounter(ctx context.Context, task *foremanv1alpha1.AgenticTask, snapshotPrior int) error {
 	// Re-fetch to get the current resourceVersion for the metadata patch.
 	var current foremanv1alpha1.AgenticTask
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, &current); err != nil {
 		return fmt.Errorf("re-fetch for expiry counter: %w", err)
 	}
+	// Read the freshly-fetched counter; fall back to 0 if absent/invalid.
+	freshPrior := 0
+	if raw, ok := current.Annotations[claimExpiriesAnnotation]; ok {
+		if n, err := strconv.Atoi(raw); err == nil {
+			freshPrior = n
+		}
+	}
+	// Advance from whichever view is higher to avoid regressing the counter.
+	base := freshPrior
+	if snapshotPrior > base {
+		base = snapshotPrior
+	}
 	patch := client.MergeFrom(current.DeepCopy())
 	if current.Annotations == nil {
 		current.Annotations = map[string]string{}
 	}
-	current.Annotations[claimExpiriesAnnotation] = strconv.Itoa(prior + 1)
+	current.Annotations[claimExpiriesAnnotation] = strconv.Itoa(base + 1)
 	return r.Patch(ctx, &current, patch)
 }
 
 // releaseExpiredClaim resets the task to Pending, clears the claim fields,
 // and records a ClaimExpired condition.
+//
+// Guard: after the re-fetch the function bails out without patching if the
+// live object has already moved to a terminal phase (Succeeded/Failed) or if
+// its AssignedNode no longer matches the node we judged stale. Either
+// condition means a concurrent terminal patch landed in the window between
+// checkClaimExpiry's staleness decision and this write; yanking the task back
+// to Pending in that case would undo legitimate agent progress.
 func (r *AgenticTaskReconciler) releaseExpiredClaim(ctx context.Context, task *foremanv1alpha1.AgenticTask, nodeName, heartbeatMsg string) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	var current foremanv1alpha1.AgenticTask
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, &current); err != nil {
 		return ctrl.Result{}, fmt.Errorf("re-fetch for claim release: %w", err)
+	}
+	if current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
+		current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed ||
+		current.Status.AssignedNode != nodeName {
+		log.Info("claim expiry superseded by concurrent state change; skipping release",
+			"task", current.Name, "node", nodeName,
+			"livePhase", current.Status.Phase, "liveAssignedNode", current.Status.AssignedNode)
+		return ctrl.Result{}, nil
 	}
 	patch := client.MergeFrom(current.DeepCopy())
 	now := metav1.Now()
@@ -514,10 +549,23 @@ func (r *AgenticTaskReconciler) releaseExpiredClaim(ctx context.Context, task *f
 
 // terminalFailExpired marks a task Failed after it has exhausted the
 // 3-strike expiry ladder.
+//
+// Guard: same as releaseExpiredClaim. If the live object is already terminal
+// or has been reassigned away from the stale node, a concurrent patch already
+// resolved the task; bail out without patching to avoid overwriting it.
 func (r *AgenticTaskReconciler) terminalFailExpired(ctx context.Context, task *foremanv1alpha1.AgenticTask, nodeName string, priorExpiries int) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	var current foremanv1alpha1.AgenticTask
 	if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: task.Name}, &current); err != nil {
 		return ctrl.Result{}, fmt.Errorf("re-fetch for expiry terminal-fail: %w", err)
+	}
+	if current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
+		current.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed ||
+		current.Status.AssignedNode != nodeName {
+		log.Info("claim expiry superseded by concurrent state change; skipping terminal-fail",
+			"task", current.Name, "node", nodeName,
+			"livePhase", current.Status.Phase, "liveAssignedNode", current.Status.AssignedNode)
+		return ctrl.Result{}, nil
 	}
 	patch := client.MergeFrom(current.DeepCopy())
 	now := metav1.Now()
