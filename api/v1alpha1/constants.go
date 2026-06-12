@@ -1,0 +1,36 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v1alpha1
+
+import "time"
+
+const (
+	// AnnotationAgentHeartbeat is stamped (RFC3339) on agent-managed Endpoints
+	// every heartbeat interval. The InferenceService controller treats
+	// registrations whose heartbeat is older than DefaultAgentHeartbeatTimeout
+	// as not ready (issue #663). Endpoints without the annotation (older
+	// agents) are exempt from expiry for backward compatibility.
+	AnnotationAgentHeartbeat = "llmkube.ai/agent-heartbeat"
+
+	// DefaultAgentHeartbeatInterval is how often the metal-agent re-asserts
+	// its registrations (which also self-heals any missed update, #657).
+	DefaultAgentHeartbeatInterval = 30 * time.Second
+
+	// DefaultAgentHeartbeatTimeout is how stale a heartbeat may be before the
+	// controller stops counting the registration as ready (6 intervals).
+	DefaultAgentHeartbeatTimeout = 3 * time.Minute
+)

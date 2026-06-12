@@ -44,6 +44,9 @@ type ServiceRegistry struct {
 	logger *zap.SugaredLogger
 	// retryBackoff bounds RegisterEndpointWithRetry. Overridable in tests.
 	retryBackoff wait.Backoff
+	// now returns the current time. Defaults to time.Now; overridable in tests
+	// to assert deterministic heartbeat annotation values.
+	now func() time.Time
 }
 
 // NewServiceRegistry creates a new service registry.
@@ -61,6 +64,7 @@ func NewServiceRegistry(k8sClient client.Client, hostIP string, logger *zap.Suga
 			Steps:    5,
 			Cap:      30 * time.Second,
 		},
+		now: time.Now,
 	}
 }
 
@@ -111,6 +115,10 @@ func (r *ServiceRegistry) RegisterEndpoint(
 			"llmkube.ai/managed-by":        "metal-agent",
 			"llmkube.ai/inference-service": isvc.Name,
 		}
+		if endpoints.Annotations == nil {
+			endpoints.Annotations = map[string]string{}
+		}
+		endpoints.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat] = r.now().UTC().Format(time.RFC3339)
 		//nolint:staticcheck // SA1019: EndpointSubset still functional
 		endpoints.Subsets = []corev1.EndpointSubset{{
 			Addresses: []corev1.EndpointAddress{{

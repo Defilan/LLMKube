@@ -27,6 +27,7 @@ import (
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1069,5 +1070,196 @@ func TestEnsureProcess_InFlightGuard(t *testing.T) {
 	agent.mu.Unlock()
 	if leftover != 0 {
 		t.Errorf("starting map not cleared after spawn, has %d entries", leftover)
+	}
+}
+
+// TestHeartbeatOnce verifies that heartbeatOnce re-registers the endpoint for
+// each tracked process and that the resulting Endpoints object carries a fresh
+// llmkube.ai/agent-heartbeat annotation (issue #663).
+func TestHeartbeatOnce(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "hb-once-model", Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "hb-once-model"},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(isvc).
+		Build()
+
+	a := &MetalAgent{
+		config: MetalAgentConfig{
+			K8sClient: k8sClient,
+			Namespace: "default",
+		},
+		processes: map[string]*ManagedProcess{
+			"default/hb-once-model": {
+				Name:      "hb-once-model",
+				Namespace: "default",
+				Port:      50051,
+				Healthy:   true,
+			},
+		},
+		logger: newNopLogger(),
+	}
+	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger())
+
+	before := time.Now().Add(-time.Second)
+	a.heartbeatOnce(context.Background())
+
+	//nolint:staticcheck // SA1019: Endpoints API is still functional and matches production code under test
+	eps := &corev1.Endpoints{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "hb-once-model", Namespace: "default"}, eps); err != nil {
+		t.Fatalf("get endpoints after heartbeatOnce: %v", err)
+	}
+
+	raw := eps.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat]
+	if raw == "" {
+		t.Fatalf("heartbeat annotation absent after heartbeatOnce")
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("heartbeat annotation %q not RFC3339: %v", raw, err)
+	}
+	if ts.Before(before) {
+		t.Fatalf("heartbeat timestamp %v predates test start %v", ts, before)
+	}
+}
+
+// nopExecutor is a minimal ProcessExecutor stub for tests that exercise paths
+// that call deleteProcess but do not need a real inference runtime.
+type nopExecutor struct{}
+
+func (nopExecutor) StartProcess(_ context.Context, _ ExecutorConfig) (*ManagedProcess, error) {
+	return nil, nil
+}
+func (nopExecutor) StopProcess(_ int) error { return nil }
+
+// TestHeartbeatOnce_ScaledToZero verifies that heartbeatOnce does NOT
+// re-register the Service+Endpoints for a process whose InferenceService has
+// been scaled to zero (spec.replicas == 0). Re-asserting networking for a
+// scaled-to-zero service would recreate the ClusterIP routing that
+// handleScaleToZero / deleteProcess just removed, leaving a live routable
+// address to a dead port with no self-heal path.
+func TestHeartbeatOnce_ScaledToZero(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	zero := int32(0)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "scaled-zero", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "scaled-zero",
+			Replicas: &zero,
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(isvc).
+		Build()
+
+	a := &MetalAgent{
+		config: MetalAgentConfig{
+			K8sClient: k8sClient,
+			Namespace: "default",
+		},
+		processes: map[string]*ManagedProcess{
+			"default/scaled-zero": {
+				Name:      "scaled-zero",
+				Namespace: "default",
+				Port:      50052,
+				Healthy:   true,
+			},
+		},
+		executor: nopExecutor{},
+		logger:   newNopLogger(),
+	}
+	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger())
+
+	a.heartbeatOnce(context.Background())
+
+	// The heartbeat must NOT have created Service or Endpoints for the
+	// scaled-to-zero service.
+	//nolint:staticcheck // SA1019: Endpoints API is still functional and matches production code under test
+	eps := &corev1.Endpoints{}
+	err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "scaled-zero", Namespace: "default"}, eps)
+	if err == nil {
+		t.Fatal("heartbeatOnce must not create Endpoints for a scaled-to-zero InferenceService")
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("unexpected error checking for Endpoints: %v", err)
+	}
+}
+
+// TestHeartbeatOnce_NotFound verifies that when heartbeatOnce discovers that
+// an InferenceService no longer exists in the API server (NotFound), it treats
+// the condition as a missed deletion event and tears the process down via
+// deleteProcess — the same path the watch-event handler uses. After the call
+// the process must be absent from the map and its Endpoints must be gone.
+func TestHeartbeatOnce_NotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	// The fake client starts with NO InferenceService for "gone-model".
+	// Pre-populate the Endpoints so UnregisterEndpoint has something to delete.
+	existingEps := &corev1.Endpoints{ //nolint:staticcheck // SA1019: matches production path
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gone-model",
+			Namespace: "default",
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(existingEps).
+		Build()
+
+	a := &MetalAgent{
+		config: MetalAgentConfig{
+			K8sClient: k8sClient,
+			Namespace: "default",
+		},
+		processes: map[string]*ManagedProcess{
+			"default/gone-model": {
+				Name:      "gone-model",
+				Namespace: "default",
+				Port:      50053,
+				Healthy:   true,
+			},
+		},
+		executor: nopExecutor{},
+		logger:   newNopLogger(),
+	}
+	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger())
+
+	a.heartbeatOnce(context.Background())
+
+	// Process must be removed from the map.
+	a.mu.RLock()
+	_, still := a.processes["default/gone-model"]
+	a.mu.RUnlock()
+	if still {
+		t.Fatal("heartbeatOnce_NotFound: process must be removed from map after teardown")
+	}
+
+	// Endpoints must be deleted by UnregisterEndpoint inside deleteProcess.
+	//nolint:staticcheck // SA1019: Endpoints API is still functional and matches production code under test
+	eps := &corev1.Endpoints{}
+	err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "gone-model", Namespace: "default"}, eps)
+	if err == nil {
+		t.Fatal("heartbeatOnce_NotFound: Endpoints must be deleted after teardown")
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("heartbeatOnce_NotFound: unexpected error checking Endpoints: %v", err)
 	}
 }
