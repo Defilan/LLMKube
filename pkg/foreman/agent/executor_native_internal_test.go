@@ -1419,3 +1419,184 @@ func TestCoderJobResultToResult_NoEmbeddedReasonFallsBackToMaxTurns(t *testing.T
 		t.Errorf("failureReason: want MaxTurnsExhausted got %s", r.FailureReason)
 	}
 }
+
+// ---- workspace resilience (#654) ----
+
+// TestRemoveAllResilient_HappyPath verifies that removeAllResilient
+// removes a normal (all-writable) tree successfully.
+func TestRemoveAllResilient_HappyPath(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir sub: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sub, "file.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	target := filepath.Join(root, "sub")
+	if err := removeAllResilient(target); err != nil {
+		t.Fatalf("removeAllResilient on normal tree: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("target should not exist after removal; stat err: %v", err)
+	}
+}
+
+// TestRemoveAllResilient_ReadOnlyTree verifies that removeAllResilient
+// succeeds when the workspace contains a read-only file (0444) inside
+// a read-only directory (0555) — the shape left behind by envtest-
+// fetched etcd binaries (issue #654). A bare os.RemoveAll fails with
+// "permission denied" on this fixture; removeAllResilient must not.
+//
+// Fixture layout:
+//
+//	<target>/
+//	  child/         (0555: read-only dir — blocks unlink of its children)
+//	    data.bin     (0444: read-only file)
+//
+// On Linux and macOS the kernel checks the *parent directory* write
+// permission before allowing unlink; making the dir 0555 is what
+// causes permission denied, not merely the file mode.
+//
+// Two separate temp-rooted fixtures are used:
+//  1. A "canary" fixture proves that bare os.RemoveAll actually fails on
+//     this platform/user combination; the test is skipped (not failed) if
+//     the OS bypasses permission checks (e.g. running as root in CI).
+//  2. A fresh "target" fixture is passed to removeAllResilient so the
+//     helper does its own chmod-and-retry without relying on any pre-
+//     applied chmod from the canary phase.
+func TestRemoveAllResilient_ReadOnlyTree(t *testing.T) {
+	buildFixture := func(root string) (target, child string) {
+		target = filepath.Join(root, "workspace")
+		child = filepath.Join(target, "child")
+		if err := os.MkdirAll(child, 0o755); err != nil {
+			t.Fatalf("mkdir child: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(child, "data.bin"), []byte("binary"), 0o444); err != nil {
+			t.Fatalf("write data.bin: %v", err)
+		}
+		if err := os.Chmod(child, 0o555); err != nil { //nolint:gosec // intentional: building read-only fixture to test resilient removal
+			t.Fatalf("chmod child: %v", err)
+		}
+		return target, child
+	}
+
+	// Phase 1: confirm the fixture actually breaks bare os.RemoveAll.
+	// Use a dedicated temp root so a failed partial RemoveAll does not
+	// corrupt the fixture used in phase 2.
+	canaryRoot := t.TempDir()
+	canaryTarget, canaryChild := buildFixture(canaryRoot)
+	_ = canaryChild
+	if err := os.RemoveAll(canaryTarget); err == nil {
+		// Running as root (some CI environments) bypasses permission
+		// checks. Skip rather than false-pass.
+		t.Skip("os.RemoveAll succeeded on read-only fixture (running as root?); skipping")
+	}
+	// Repair the canary so t.TempDir's own cleanup can remove it.
+	_ = os.Chmod(canaryChild, 0o755) //nolint:gosec // intentional: restoring writable perms so test cleanup succeeds
+
+	// Phase 2: build a fresh fixture and test removeAllResilient.
+	targetRoot := t.TempDir()
+	target, _ := buildFixture(targetRoot)
+
+	if err := removeAllResilient(target); err != nil {
+		t.Fatalf("removeAllResilient failed on read-only tree: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("target should not exist after resilient removal; stat err: %v", err)
+	}
+}
+
+// TestRemoveAllResilient_NonExistent verifies that a non-existent path
+// is treated as a no-op (mirrors os.RemoveAll behaviour).
+func TestRemoveAllResilient_NonExistent(t *testing.T) {
+	if err := removeAllResilient(filepath.Join(t.TempDir(), "does-not-exist")); err != nil {
+		t.Fatalf("removeAllResilient on non-existent path should be a no-op: %v", err)
+	}
+}
+
+// TestRemoveAllResilient_SymlinkToExternal is a security regression test for
+// the case where the workspace contains a symlink pointing to a file OUTSIDE
+// the workspace. os.Chmod follows symlinks, so a naive chmod of every entry
+// would silently rewrite the target's permissions.
+//
+// Fixture layout:
+//
+//	<workspaceRoot>/
+//	  workspace/
+//	    readonly/        (0555: blocks RemoveAll without repair)
+//	      link -> <externalRoot>/victim.txt
+//
+//	<externalRoot>/
+//	  victim.txt         (0755: mode that must not change)
+//
+// Assertions:
+//  1. The workspace tree is fully removed.
+//  2. The external victim still exists with its original mode (0755).
+func TestRemoveAllResilient_SymlinkToExternal(t *testing.T) {
+	// Build external target in its own temp root.
+	externalRoot := t.TempDir()
+	victim := filepath.Join(externalRoot, "victim.txt")
+	if err := os.WriteFile(victim, []byte("external"), 0o755); err != nil { //nolint:gosec // intentional: specific mode for assertion
+		t.Fatalf("create victim: %v", err)
+	}
+
+	// Build the workspace.
+	workspaceRoot := t.TempDir()
+	workspace := filepath.Join(workspaceRoot, "workspace")
+	readonly := filepath.Join(workspace, "readonly")
+	if err := os.MkdirAll(readonly, 0o755); err != nil {
+		t.Fatalf("mkdir readonly: %v", err)
+	}
+	link := filepath.Join(readonly, "link")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	// Make the directory read-only so RemoveAll needs the chmod-and-retry path.
+	if err := os.Chmod(readonly, 0o555); err != nil { //nolint:gosec // intentional: building read-only fixture to test resilient removal
+		t.Fatalf("chmod readonly: %v", err)
+	}
+
+	// Phase 1: confirm the fixture actually breaks bare os.RemoveAll.
+	// If it doesn't (e.g. running as root), skip rather than give a false pass.
+	canaryRoot := t.TempDir()
+	canaryWorkspace := filepath.Join(canaryRoot, "workspace")
+	canaryReadonly := filepath.Join(canaryWorkspace, "readonly")
+	if err := os.MkdirAll(canaryReadonly, 0o755); err != nil {
+		t.Fatalf("mkdir canary readonly: %v", err)
+	}
+	if err := os.Symlink(victim, filepath.Join(canaryReadonly, "link")); err != nil {
+		t.Fatalf("canary symlink: %v", err)
+	}
+	if err := os.Chmod(canaryReadonly, 0o555); err != nil { //nolint:gosec // intentional: building read-only canary fixture
+		t.Fatalf("chmod canary readonly: %v", err)
+	}
+	if removeErr := os.RemoveAll(canaryWorkspace); removeErr == nil {
+		// Running as root bypasses permission checks; repair canary and skip.
+		_ = os.Chmod(canaryReadonly, 0o755) //nolint:gosec // intentional: restoring writable perms so test cleanup succeeds
+		t.Skip("os.RemoveAll succeeded on read-only fixture (running as root?); skipping")
+	}
+	_ = os.Chmod(canaryReadonly, 0o755) //nolint:gosec // intentional: restoring writable perms so test cleanup succeeds
+
+	// Phase 2: run removeAllResilient on the real workspace fixture.
+	if err := removeAllResilient(workspace); err != nil {
+		t.Fatalf("removeAllResilient failed: %v", err)
+	}
+
+	// Assertion (a): workspace fully removed.
+	if _, err := os.Stat(workspace); !os.IsNotExist(err) {
+		t.Errorf("workspace should not exist after removal; stat err: %v", err)
+	}
+
+	// Assertion (b): external victim still exists with its original mode.
+	info, err := os.Stat(victim)
+	if err != nil {
+		t.Fatalf("external victim should still exist: %v", err)
+	}
+	gotMode := info.Mode().Perm()
+	const wantMode = os.FileMode(0o755)
+	if gotMode != wantMode {
+		t.Errorf("external victim mode changed: got %04o, want %04o", gotMode, wantMode)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -234,12 +235,12 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 	}
 	// Reset workspace if it exists from a prior partial run; safer than
 	// re-using a half-cloned tree.
-	if err := os.RemoveAll(workspace); err != nil {
+	if err := removeAllResilient(workspace); err != nil {
 		return nil, fmt.Errorf("reset workspace: %w", err)
 	}
 	if !e.KeepWorkspace {
 		defer func() {
-			if rmErr := os.RemoveAll(workspace); rmErr != nil {
+			if rmErr := removeAllResilient(workspace); rmErr != nil {
 				log.Error(rmErr, "workspace cleanup failed")
 			}
 		}()
@@ -1638,4 +1639,40 @@ func normalizeModelVerdict(raw string) (foremanv1alpha1.AgenticTaskVerdict, fore
 		return foremanv1alpha1.AgenticTaskVerdictIncomplete, foremanv1alpha1.FailureModelReportedError
 	}
 	return foremanv1alpha1.AgenticTaskVerdict(raw), ""
+}
+
+// removeAllResilient removes path like os.RemoveAll, but tolerates
+// read-only files and directories left behind by prior runs (e.g.
+// envtest-fetched binaries, issue #654): on a permission error it walks
+// the tree restoring owner write+execute on directories and write on
+// files, then retries the removal once.
+//
+// WalkDir visits each directory node before descending into it, so
+// chmodding the dir in its own callback unblocks the subsequent descent
+// into its children. This means a single walk is sufficient to repair
+// arbitrarily deep read-only trees.
+func removeAllResilient(path string) error {
+	if err := os.RemoveAll(path); err == nil || os.IsNotExist(err) {
+		return nil
+	}
+	// Best-effort permission repair; WalkDir visits what it can reach.
+	// Because WalkDir calls the function for a directory before reading
+	// its entries, chmodding the dir here allows the walk to descend and
+	// process its children in the same pass.
+	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // unreadable entries are handled by the retry below
+		}
+		if d.IsDir() {
+			_ = os.Chmod(p, 0o755) //nolint:gosec // intentional: restore owner rwx so RemoveAll can descend and unlink
+		} else if d.Type().IsRegular() {
+			_ = os.Chmod(p, 0o644) //nolint:gosec // intentional: restore owner write so RemoveAll can unlink
+		}
+		// Symlinks and other special entries get no chmod: os.Chmod follows
+		// links, which would rewrite the permissions of a target OUTSIDE the
+		// workspace (e.g. a model-created symlink to a host file). RemoveAll
+		// unlinks the link itself once its parent dir is writable.
+		return nil
+	})
+	return os.RemoveAll(path)
 }
