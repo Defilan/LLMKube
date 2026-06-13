@@ -20,6 +20,9 @@ spec:
     - jsonPath: .status.phase
       name: Phase
       type: string
+    - jsonPath: .status.agentVersion
+      name: Version
+      type: string
     - jsonPath: .status.capability.accelerator
       name: Accelerator
       type: string
@@ -89,6 +92,25 @@ spec:
               status is the agent's heartbeat-driven view of its host. The
               scheduler reads it; the agent writes it.
             properties:
+              agentKind:
+                allOf:
+                - enum:
+                  - foreman-agent
+                  - metal-agent
+                - enum:
+                  - foreman-agent
+                  - metal-agent
+                description: |-
+                  AgentKind identifies which agent binary manages this FleetNode.
+                  metal-agent does not register a FleetNode in v0.1, but the enum
+                  documents intent for future use.
+                type: string
+              agentVersion:
+                description: |-
+                  AgentVersion is the observed running version of the agent, reported
+                  on heartbeat. Set by the foreman-agent using the binary's build-time
+                  version string; empty for agents that predate this field.
+                type: string
               capability:
                 description: Capability is what this node advertises to the scheduler.
                 properties:

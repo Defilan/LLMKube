@@ -101,6 +101,10 @@ type FleetNodeSpec struct {
 	Roles []string `json:"roles,omitempty"`
 }
 
+// FleetNodeAgentKind identifies which agent binary manages the FleetNode.
+// +kubebuilder:validation:Enum=foreman-agent;metal-agent
+type FleetNodeAgentKind string
+
 // FleetNodeStatus is the FleetAgent's live view of its host. Updated on
 // every heartbeat (every 30s); the FleetNodeReconciler marks the phase
 // NotReady when the heartbeat goes stale.
@@ -126,6 +130,19 @@ type FleetNodeStatus struct {
 	// +optional
 	CurrentTask string `json:"currentTask,omitempty"`
 
+	// AgentVersion is the observed running version of the agent, reported
+	// on heartbeat. Set by the foreman-agent using the binary's build-time
+	// version string; empty for agents that predate this field.
+	// +optional
+	AgentVersion string `json:"agentVersion,omitempty"`
+
+	// AgentKind identifies which agent binary manages this FleetNode.
+	// metal-agent does not register a FleetNode in v0.1, but the enum
+	// documents intent for future use.
+	// +kubebuilder:validation:Enum=foreman-agent;metal-agent
+	// +optional
+	AgentKind FleetNodeAgentKind `json:"agentKind,omitempty"`
+
 	// Conditions track standard health signals: Ready, Draining, etc.
 	// +listType=map
 	// +listMapKey=type
@@ -137,6 +154,7 @@ type FleetNodeStatus struct {
 // +kubebuilder:resource:scope=Cluster,shortName=fn
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Version",type=string,JSONPath=`.status.agentVersion`
 // +kubebuilder:printcolumn:name="Accelerator",type=string,JSONPath=`.status.capability.accelerator`
 // +kubebuilder:printcolumn:name="RAM",type=integer,JSONPath=`.status.capability.availableRAMGB`
 // +kubebuilder:printcolumn:name="Current Task",type=string,JSONPath=`.status.currentTask`
