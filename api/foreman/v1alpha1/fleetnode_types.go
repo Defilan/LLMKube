@@ -105,6 +105,25 @@ type FleetNodeSpec struct {
 // +kubebuilder:validation:Enum=foreman-agent;metal-agent
 type FleetNodeAgentKind string
 
+// FleetNodeUpdateRequest is written by the AgentReleaseReconciler to
+// signal the node's agent that a self-update is available. The agent
+// reads this on each heartbeat (PR4) and performs the update; the
+// reconciler clears the field once the node reports the target version.
+type FleetNodeUpdateRequest struct {
+	// TargetVersion is the version string the node should update to.
+	// +kubebuilder:validation:Required
+	TargetVersion string `json:"targetVersion"`
+
+	// URL is the download location for the agent binary artifact.
+	// +kubebuilder:validation:Required
+	URL string `json:"url"`
+
+	// SHA256 is the lowercase hex-encoded SHA-256 digest of the artifact.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
+	SHA256 string `json:"sha256"`
+}
+
 // FleetNodeStatus is the FleetAgent's live view of its host. Updated on
 // every heartbeat (every 30s); the FleetNodeReconciler marks the phase
 // NotReady when the heartbeat goes stale.
@@ -141,6 +160,25 @@ type FleetNodeStatus struct {
 	// documents intent for future use.
 	// +optional
 	AgentKind FleetNodeAgentKind `json:"agentKind,omitempty"`
+
+	// OS is the operating system reported by the agent on heartbeat
+	// (runtime.GOOS). Used by the AgentReleaseReconciler to select the
+	// correct platform artifact for this node.
+	// +optional
+	OS string `json:"os,omitempty"`
+
+	// Arch is the CPU architecture reported by the agent on heartbeat
+	// (runtime.GOARCH). Used alongside OS for platform artifact selection.
+	// +optional
+	Arch string `json:"arch,omitempty"`
+
+	// UpdateRequest is written by the AgentReleaseReconciler when a new
+	// agent version is ready for this node to install. The agent reads
+	// this field on each heartbeat (PR4) and performs the self-update.
+	// The reconciler clears the field once the node reports the target
+	// version and passes the health gate.
+	// +optional
+	UpdateRequest *FleetNodeUpdateRequest `json:"updateRequest,omitempty"`
 
 	// Conditions track standard health signals: Ready, Draining, etc.
 	// +listType=map
