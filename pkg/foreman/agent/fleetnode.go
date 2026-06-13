@@ -55,6 +55,16 @@ type Registrar struct {
 	Spec     foremanv1alpha1.FleetNodeSpec
 	Provider CapabilityProvider
 	Interval time.Duration // zero defaults to DefaultHeartbeatInterval
+
+	// Version is the agent binary's version string (e.g. "v0.8.4").
+	// Set from the build-time ldflags var and stamped on FleetNode.status
+	// every heartbeat so the cluster can observe which version is running.
+	// Empty string is accepted (older agents omit this field).
+	Version string
+
+	// Kind identifies the agent type. Conventionally "foreman-agent".
+	// Stamped on FleetNode.status.agentKind every heartbeat.
+	Kind string
 }
 
 // Upsert creates the FleetNode if missing, otherwise updates its Spec so
@@ -108,6 +118,12 @@ func (r *Registrar) PatchHeartbeat(ctx context.Context, phase foremanv1alpha1.Fl
 	node.Status.Phase = phase
 	node.Status.LastHeartbeatTime = &now
 	node.Status.Capability = r.Provider.Capability()
+	if r.Version != "" {
+		node.Status.AgentVersion = r.Version
+	}
+	if r.Kind != "" {
+		node.Status.AgentKind = foremanv1alpha1.FleetNodeAgentKind(r.Kind)
+	}
 	if err := r.Client.Status().Patch(ctx, &node, patch); err != nil {
 		return fmt.Errorf("patch FleetNode status: %w", err)
 	}
