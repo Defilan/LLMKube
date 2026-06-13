@@ -70,6 +70,7 @@ type MetalAgentConfig struct {
 	// 0 disables the proxy.
 	ClientPort int
 	HostIP     string // explicit IP to register in K8s endpoints; empty = auto-detect
+	Version    string // agent binary version string stamped on Endpoints annotations; empty omits the annotation
 	Logger     *zap.SugaredLogger
 
 	// EventRecorder publishes Kubernetes events on managed InferenceService
@@ -403,7 +404,12 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		a.executor = metalExec
 	}
 
-	a.registry = NewServiceRegistry(a.config.K8sClient, a.config.HostIP, a.logger.With("subsystem", "registry"))
+	a.registry = NewServiceRegistry(
+		a.config.K8sClient,
+		a.config.HostIP,
+		a.logger.With("subsystem", "registry"),
+		a.config.Version,
+	)
 
 	// Reconcile orphaned Service+Endpoints from prior agent sessions. The
 	// watcher's `seen` map starts fresh each Watch() call, so InferenceServices
