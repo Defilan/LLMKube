@@ -303,8 +303,18 @@ spec:
                   description: AgentReleaseNodeStatus is the per-node rollout state
                     within a release.
                   properties:
+                    dispatchedAt:
+                      description: |-
+                        DispatchedAt is the time the controller wrote the UpdateRequest onto the
+                        FleetNode. The timeout clock (HealthGate.TimeoutSeconds) is measured
+                        from this timestamp. Set at dispatch; not updated thereafter.
+                      format: date-time
+                      type: string
                     lastTransitionTime:
-                      description: LastTransitionTime is when Phase last changed.
+                      description: |-
+                        LastTransitionTime is the time the node first reported the target agent
+                        version (i.e. the soak clock start). The health-gate soak window
+                        (HealthGate.MinHealthySeconds) is measured from this timestamp.
                       format: date-time
                       type: string
                     message:
@@ -329,6 +339,14 @@ spec:
                       - Updating
                       - Updated
                       - Failed
+                      type: string
+                    reason:
+                      description: |-
+                        Reason is a machine-readable explanation for why Phase is Failed.
+                        Set only when Phase==Failed; empty otherwise.
+                      enum:
+                      - NodeUpdateTimeout
+                      - NoMatchingArtifact
                       type: string
                   required:
                   - name

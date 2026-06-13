@@ -107,6 +107,11 @@ spec:
                   on heartbeat. Set by the foreman-agent using the binary's build-time
                   version string; empty for agents that predate this field.
                 type: string
+              arch:
+                description: |-
+                  Arch is the CPU architecture reported by the agent on heartbeat
+                  (runtime.GOARCH). Used alongside OS for platform artifact selection.
+                type: string
               capability:
                 description: Capability is what this node advertises to the scheduler.
                 properties:
@@ -227,6 +232,12 @@ spec:
                   this stalls (default threshold: 90 seconds).
                 format: date-time
                 type: string
+              os:
+                description: |-
+                  OS is the operating system reported by the agent on heartbeat
+                  (runtime.GOOS). Used by the AgentReleaseReconciler to select the
+                  correct platform artifact for this node.
+                type: string
               phase:
                 description: |-
                   Phase is the heartbeat-driven health state. The scheduler treats
@@ -237,6 +248,32 @@ spec:
                 - NotReady
                 - Unknown
                 type: string
+              updateRequest:
+                description: |-
+                  UpdateRequest is written by the AgentReleaseReconciler when a new
+                  agent version is ready for this node to install. The agent reads
+                  this field on each heartbeat (PR4) and performs the self-update.
+                  The reconciler clears the field once the node reports the target
+                  version and passes the health gate.
+                properties:
+                  sha256:
+                    description: SHA256 is the lowercase hex-encoded SHA-256 digest
+                      of the artifact.
+                    pattern: ^[0-9a-f]{64}$
+                    type: string
+                  targetVersion:
+                    description: TargetVersion is the version string the node should
+                      update to.
+                    type: string
+                  url:
+                    description: URL is the download location for the agent binary
+                      artifact.
+                    type: string
+                required:
+                - sha256
+                - targetVersion
+                - url
+                type: object
             type: object
         required:
         - spec

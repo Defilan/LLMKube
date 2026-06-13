@@ -16,7 +16,7 @@ metadata:
   labels:
     {{- include "foreman.operator.labels" . | nindent 4 }}
 rules:
-  # Foreman CRs (the four kinds the four controllers reconcile).
+  # Foreman CRs (the five kinds the five controllers reconcile).
   - apiGroups: ["foreman.llmkube.dev"]
     resources:
       - workloads
@@ -37,6 +37,19 @@ rules:
       - agentictasks/finalizers
       - agents/finalizers
       - fleetnodes/finalizers
+    verbs: ["update"]
+  # AgentReleaseReconciler: full status management + approval gate.
+  - apiGroups: ["foreman.llmkube.dev"]
+    resources:
+      - agentreleases
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["foreman.llmkube.dev"]
+    resources:
+      - agentreleases/status
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["foreman.llmkube.dev"]
+    resources:
+      - agentreleases/finalizers
     verbs: ["update"]
 
   # AgentReconciler resolves Agent.spec.inferenceServiceRef against an

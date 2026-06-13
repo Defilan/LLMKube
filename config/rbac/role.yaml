@@ -89,6 +89,7 @@ rules:
   - foreman.llmkube.dev
   resources:
   - agentictasks/finalizers
+  - agentreleases/finalizers
   - agents/finalizers
   - fleetnodes/finalizers
   - workloads/finalizers
@@ -98,6 +99,7 @@ rules:
   - foreman.llmkube.dev
   resources:
   - agentictasks/status
+  - agentreleases/status
   - agents/status
   - fleetnodes/status
   - workloads/status
@@ -105,6 +107,16 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - foreman.llmkube.dev
+  resources:
+  - agentreleases
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - inference.llmkube.dev
   resources:
