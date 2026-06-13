@@ -100,6 +100,21 @@ type AgentReleaseHealthGate struct {
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 }
 
+// AgentReleaseNodeFailureReason is a machine-readable explanation for why a
+// node's Phase transitioned to Failed.
+// +kubebuilder:validation:Enum=NodeUpdateTimeout;NoMatchingArtifact
+type AgentReleaseNodeFailureReason string
+
+const (
+	// AgentReleaseNodeReasonTimeout means the node did not reach the target
+	// version within HealthGate.TimeoutSeconds after the update was dispatched.
+	AgentReleaseNodeReasonTimeout AgentReleaseNodeFailureReason = "NodeUpdateTimeout"
+
+	// AgentReleaseNodeReasonNoArtifact means no artifact matched the node's
+	// reported OS/Arch tuple, so no update could be dispatched.
+	AgentReleaseNodeReasonNoArtifact AgentReleaseNodeFailureReason = "NoMatchingArtifact"
+)
+
 // AgentReleaseNodeStatus is the per-node rollout state within a release.
 type AgentReleaseNodeStatus struct {
 	// Name is the FleetNode name (metadata.name of the FleetNode CR).
@@ -117,7 +132,20 @@ type AgentReleaseNodeStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// LastTransitionTime is when Phase last changed.
+	// Reason is a machine-readable explanation for why Phase is Failed.
+	// Set only when Phase==Failed; empty otherwise.
+	// +optional
+	Reason AgentReleaseNodeFailureReason `json:"reason,omitempty"`
+
+	// DispatchedAt is the time the controller wrote the UpdateRequest onto the
+	// FleetNode. The timeout clock (HealthGate.TimeoutSeconds) is measured
+	// from this timestamp. Set at dispatch; not updated thereafter.
+	// +optional
+	DispatchedAt *metav1.Time `json:"dispatchedAt,omitempty"`
+
+	// LastTransitionTime is the time the node first reported the target agent
+	// version (i.e. the soak clock start). The health-gate soak window
+	// (HealthGate.MinHealthySeconds) is measured from this timestamp.
 	// +optional
 	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 

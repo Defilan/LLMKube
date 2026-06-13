@@ -138,6 +138,7 @@ func (r *AgentReleaseReconciler) reconcileActive(ctx context.Context, release *f
 					if findArtifact(release.Spec.Artifacts, nodeOS, nodeArch) == nil {
 						msg := fmt.Sprintf("no artifact for %s/%s", nodeOS, nodeArch)
 						nodeStatuses[i].Phase = nodePhaseFailed
+						nodeStatuses[i].Reason = foremanv1alpha1.AgentReleaseNodeReasonNoArtifact
 						nodeStatuses[i].Message = msg
 						nodeStatuses[i].LastTransitionTime = &now2
 						failedNodes = append(failedNodes, nodes[j].Name)
@@ -283,7 +284,6 @@ func (r *AgentReleaseReconciler) computeNodeStatuses(
 		n := &nodes[i]
 		ns := existing[n.Name]
 		ns.Name = n.Name
-		ns.ObservedVersion = n.Status.AgentVersion
 
 		ready := !n.HeartbeatStale(now) && n.Status.Phase == foremanv1alpha1.FleetNodePhaseReady
 
@@ -291,15 +291,22 @@ func (r *AgentReleaseReconciler) computeNodeStatuses(
 			// Node is reporting the target version with a fresh heartbeat.
 			// Start or continue the soak window.
 			if ns.Phase != nodePhaseUpdated {
-				if ns.Phase != nodePhaseUpdating || ns.LastTransitionTime == nil {
-					// First time we see this node on the target version: record
-					// the soak-start time.
+				// Detect the version-arrival transition: the node has just
+				// switched to the target version for the first time this
+				// reconcile, OR has never had its soak clock stamped.
+				// We key off ObservedVersion so the check is idempotent:
+				// once ObservedVersion==spec.version the seed is done.
+				if ns.ObservedVersion != release.Spec.Version || ns.LastTransitionTime == nil {
+					// Version-arrival: (re)start the soak clock.
 					ns.Phase = nodePhaseUpdating
 					nowMeta := metav1.NewTime(now)
 					ns.LastTransitionTime = &nowMeta
 					ns.Message = "soak window started"
 				}
-				// Check if soak window has elapsed.
+				// Update ObservedVersion now that we've seeded (or confirmed) it.
+				ns.ObservedVersion = n.Status.AgentVersion
+
+				// Check if the soak window has elapsed.
 				soakStart := ns.LastTransitionTime.Time
 				if now.Sub(soakStart) >= minHealthySecs {
 					ns.Phase = nodePhaseUpdated
@@ -312,16 +319,25 @@ func (r *AgentReleaseReconciler) computeNodeStatuses(
 						return nil, 0, nil, nil, fmt.Errorf("clear updateRequest for node %s: %w", n.Name, err)
 					}
 				}
+			} else {
+				// Already Updated: keep ObservedVersion current.
+				ns.ObservedVersion = n.Status.AgentVersion
 			}
 		} else if ns.Phase != nodePhaseUpdated && ns.Phase != nodePhaseFailed {
 			// Node is not yet on the target version (or lost it).
-			// Check for timeout on in-flight nodes.
+			// Update the observed version for visibility.
+			ns.ObservedVersion = n.Status.AgentVersion
+
+			// Check for timeout on in-flight nodes. Timeout is measured from
+			// DispatchedAt (when the controller wrote the UpdateRequest), NOT
+			// from LastTransitionTime (the soak clock / version-arrival clock).
 			if n.Status.UpdateRequest != nil &&
 				n.Status.UpdateRequest.TargetVersion == release.Spec.Version &&
-				ns.LastTransitionTime != nil {
-				elapsed := now.Sub(ns.LastTransitionTime.Time)
+				ns.DispatchedAt != nil {
+				elapsed := now.Sub(ns.DispatchedAt.Time)
 				if elapsed > timeoutSecs {
 					ns.Phase = nodePhaseFailed
+					ns.Reason = foremanv1alpha1.AgentReleaseNodeReasonTimeout
 					ns.Message = fmt.Sprintf("update timed out after %s (threshold: %s)",
 						elapsed.Round(time.Second), timeoutSecs)
 					nowMeta := metav1.NewTime(now)
@@ -332,7 +348,7 @@ func (r *AgentReleaseReconciler) computeNodeStatuses(
 					if ns.Phase == "" {
 						ns.Phase = nodePhaseUpdating
 						nowMeta := metav1.NewTime(now)
-						ns.LastTransitionTime = &nowMeta
+						ns.DispatchedAt = &nowMeta
 					}
 					inFlight = append(inFlight, n.Name)
 				}
@@ -344,6 +360,9 @@ func (r *AgentReleaseReconciler) computeNodeStatuses(
 			} else if ns.Phase == "" {
 				ns.Phase = nodePhasePending
 			}
+		} else {
+			// Updated or Failed: keep ObservedVersion current.
+			ns.ObservedVersion = n.Status.AgentVersion
 		}
 
 		if ns.Phase == nodePhaseUpdated {
@@ -472,11 +491,15 @@ func (r *AgentReleaseReconciler) dispatchCandidates(
 			return fmt.Errorf("patch FleetNode %s updateRequest: %w", n.Name, patchErr)
 		}
 		// Update the in-memory nodeStatus entry for this node.
+		// DispatchedAt is the dispatch clock (for timeout measurement).
+		// LastTransitionTime is the soak clock (for minHealthySeconds) and is
+		// NOT set here; it is stamped later when the node first reports the
+		// target version.
 		nowMeta := metav1.NewTime(now)
 		for j := range nodeStatuses {
 			if nodeStatuses[j].Name == n.Name {
 				nodeStatuses[j].Phase = nodePhaseUpdating
-				nodeStatuses[j].LastTransitionTime = &nowMeta
+				nodeStatuses[j].DispatchedAt = &nowMeta
 				nodeStatuses[j].Message = fmt.Sprintf("dispatched update to %s/%s", n.Status.OS, n.Status.Arch)
 				break
 			}
@@ -545,15 +568,18 @@ func (r *AgentReleaseReconciler) haltFailed(ctx context.Context, release *forema
 	current.Status.Phase = foremanv1alpha1.AgentReleasePhaseFailed
 	now := metav1.Now()
 
-	// Determine the reason: timeout vs no-artifact.
-	reason := "NodeUpdateTimeout"
+	// Determine the reason: read the typed Reason field on the node status
+	// rather than parsing the human-readable message string.
+	reason := string(foremanv1alpha1.AgentReleaseNodeReasonTimeout)
 	msg := fmt.Sprintf("node %q timed out during update; rollout halted to bound blast radius", nodeName)
-	// Check if the failure was a no-artifact case.
 	for _, ns := range current.Status.NodeStatuses {
-		if ns.Name == nodeName && ns.Message != "" {
-			if len(ns.Message) > 12 && ns.Message[:12] == "no artifact " {
-				reason = "NoMatchingArtifact"
+		if ns.Name == nodeName {
+			switch ns.Reason {
+			case foremanv1alpha1.AgentReleaseNodeReasonNoArtifact:
+				reason = string(foremanv1alpha1.AgentReleaseNodeReasonNoArtifact)
 				msg = fmt.Sprintf("node %q has no matching artifact: %s", nodeName, ns.Message)
+			case foremanv1alpha1.AgentReleaseNodeReasonTimeout:
+				// default msg already set above
 			}
 			break
 		}

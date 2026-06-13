@@ -362,14 +362,16 @@ var _ = Describe("AgentReleaseReconciler", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, &fn)).To(Succeed())
 		Expect(fn.Status.UpdateRequest).NotTo(BeNil(), "updateRequest should be dispatched")
 
-		// Backdate dispatch timestamp to trigger timeout.
+		// Backdate DispatchedAt (the timeout clock) to trigger timeout.
+		// LastTransitionTime (the soak clock) is left nil because the node
+		// never reached the target version — it timed out first.
 		timeout := metav1.NewTime(time.Now().Add(-5 * time.Minute))
 		var freshRel foremanv1alpha1.AgentRelease
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
 		patchRel := freshRel.DeepCopy()
 		for i := range patchRel.Status.NodeStatuses {
 			if patchRel.Status.NodeStatuses[i].Name == node.Name {
-				patchRel.Status.NodeStatuses[i].LastTransitionTime = &timeout
+				patchRel.Status.NodeStatuses[i].DispatchedAt = &timeout
 			}
 		}
 		Expect(k8sClient.Status().Update(ctx, patchRel)).To(Succeed())
@@ -421,14 +423,14 @@ var _ = Describe("AgentReleaseReconciler", func() {
 		_, err = reconciler.Reconcile(ctx, reqForRelease(rel))
 		Expect(err).NotTo(HaveOccurred())
 
-		// Backdate node1's dispatch time.
+		// Backdate node1's DispatchedAt (the timeout clock) to trigger timeout.
 		timeout := metav1.NewTime(time.Now().Add(-5 * time.Minute))
 		var freshRel foremanv1alpha1.AgentRelease
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
 		patchRel := freshRel.DeepCopy()
 		for i := range patchRel.Status.NodeStatuses {
 			if patchRel.Status.NodeStatuses[i].Name == node1.Name {
-				patchRel.Status.NodeStatuses[i].LastTransitionTime = &timeout
+				patchRel.Status.NodeStatuses[i].DispatchedAt = &timeout
 			}
 		}
 		Expect(k8sClient.Status().Update(ctx, patchRel)).To(Succeed())
@@ -546,6 +548,164 @@ var _ = Describe("AgentReleaseReconciler", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeARM.Name}, &freshARM)).To(Succeed())
 		Expect(freshARM.Status.UpdateRequest).NotTo(BeNil())
 		Expect(freshARM.Status.UpdateRequest.URL).To(Equal("http://example.com/agent-arm64"))
+	})
+
+	// -----------------------------------------------------------------------
+	// Soak clock: must start at VERSION-ARRIVAL, not at dispatch
+	// -----------------------------------------------------------------------
+
+	// This test is the definitive regression guard for the soak-clock fix.
+	//
+	// Scenario:
+	//   1. Node starts on the OLD version. Reconcile dispatches the updateRequest
+	//      (sets DispatchedAt = T0, Phase=Updating).
+	//   2. Simulate a long download/install delay: backdate DispatchedAt to 5
+	//      minutes ago so that, if the soak clock were measured from dispatch, the
+	//      soak window (60s) would ALREADY have elapsed.
+	//   3. Now simulate the node reporting the target version (version-arrival).
+	//      Reconcile must (a) NOT mark the node Updated yet (soak just started)
+	//      and (b) stamp LastTransitionTime = now (the soak-start clock).
+	//   4. Reconcile again without advancing the soak clock: still Updating.
+	//   5. Backdate LastTransitionTime by 2 minutes → soak elapsed.
+	//   6. Final reconcile: node becomes Updated.
+	//
+	// If the soak clock were still measured from dispatch (the old bug), step 3
+	// would incorrectly mark the node Updated immediately after the first
+	// version-arrival reconcile.
+	It("soak clock starts at version-arrival, not at dispatch", func() {
+		node := makeFleetNode("soakarr-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		// Node starts on OLD version.
+		setAgentNodeReady(node, "amd64", "v0.8.0")
+
+		rel := makeAgentRelease("soakarr-release",
+			[]foremanv1alpha1.AgentReleaseArtifact{linuxAMD64Artifact("9")},
+			true)
+		rel.Spec.HealthGate = foremanv1alpha1.AgentReleaseHealthGate{
+			MinHealthySeconds: 60,
+			TimeoutSeconds:    600,
+		}
+		Expect(k8sClient.Create(ctx, rel)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, rel) })
+
+		// Reconcile 1: Pending init.
+		_, err := reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+
+		// Reconcile 2: node on old version → dispatch (sets DispatchedAt).
+		_, err = reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fn foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, &fn)).To(Succeed())
+		Expect(fn.Status.UpdateRequest).NotTo(BeNil(), "updateRequest should be dispatched")
+
+		// Backdate DispatchedAt to 5 minutes ago to simulate a slow
+		// download/install. If the soak clock were tied to DispatchedAt,
+		// the 60s soak would appear already elapsed at version-arrival.
+		longAgo := metav1.NewTime(time.Now().Add(-5 * time.Minute))
+		var freshRel foremanv1alpha1.AgentRelease
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
+		patchRel := freshRel.DeepCopy()
+		for i := range patchRel.Status.NodeStatuses {
+			if patchRel.Status.NodeStatuses[i].Name == node.Name {
+				patchRel.Status.NodeStatuses[i].DispatchedAt = &longAgo
+				// Ensure LastTransitionTime is nil so the soak clock has not
+				// been stamped yet (simulates pre-version-arrival state).
+				patchRel.Status.NodeStatuses[i].LastTransitionTime = nil
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, patchRel)).To(Succeed())
+
+		// Simulate the node arriving on the target version.
+		setAgentNodeReady(node, "amd64", "v0.9.0")
+
+		// Reconcile 3: version-arrival.
+		// The soak clock must be stamped NOW (not 5 minutes ago), so the node
+		// must remain Updating (soak has NOT yet elapsed).
+		_, err = reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
+		ns := findNodeStatus(freshRel.Status.NodeStatuses, node.Name)
+		Expect(ns).NotTo(BeNil())
+		Expect(ns.Phase).To(Equal(nodePhaseUpdating),
+			"soak clock just stamped at version-arrival: node must remain Updating, not Updated")
+		Expect(ns.LastTransitionTime).NotTo(BeNil(),
+			"LastTransitionTime (soak clock) must be set at version-arrival")
+		// The soak clock must be recent (within the last few seconds), NOT 5 min ago.
+		Expect(time.Since(ns.LastTransitionTime.Time)).To(BeNumerically("<", 30*time.Second),
+			"soak clock must be stamped at version-arrival, not backdated to dispatch time")
+
+		// Reconcile 4: soak not yet elapsed (no time manipulation); still Updating.
+		_, err = reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
+		ns = findNodeStatus(freshRel.Status.NodeStatuses, node.Name)
+		Expect(ns).NotTo(BeNil())
+		Expect(ns.Phase).To(Equal(nodePhaseUpdating), "soak not yet elapsed: should still be Updating")
+
+		// Backdate LastTransitionTime (soak clock) to 2 minutes ago so the
+		// 60s gate has elapsed.
+		soakStart := metav1.NewTime(time.Now().Add(-2 * time.Minute))
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
+		patchRel2 := freshRel.DeepCopy()
+		for i := range patchRel2.Status.NodeStatuses {
+			if patchRel2.Status.NodeStatuses[i].Name == node.Name {
+				patchRel2.Status.NodeStatuses[i].LastTransitionTime = &soakStart
+			}
+		}
+		Expect(k8sClient.Status().Update(ctx, patchRel2)).To(Succeed())
+
+		// Reconcile 5: soak elapsed → Updated.
+		_, err = reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
+		ns = findNodeStatus(freshRel.Status.NodeStatuses, node.Name)
+		Expect(ns).NotTo(BeNil())
+		Expect(ns.Phase).To(Equal(nodePhaseUpdated),
+			"soak elapsed from version-arrival: node must be Updated")
+		Expect(freshRel.Status.Phase).To(Equal(foremanv1alpha1.AgentReleasePhaseSucceeded))
+	})
+
+	// -----------------------------------------------------------------------
+	// Typed failure reason: NoMatchingArtifact
+	// -----------------------------------------------------------------------
+
+	It("sets Reason=NoMatchingArtifact on the node status and halt condition when no artifact matches", func() {
+		node := makeFleetNode("reason-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		// arm64 node, only amd64 artifact provided.
+		setAgentNodeReady(node, "arm64", "v0.8.0")
+
+		rel := makeAgentRelease("reason-release",
+			[]foremanv1alpha1.AgentReleaseArtifact{linuxAMD64Artifact("7")},
+			true)
+		Expect(k8sClient.Create(ctx, rel)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, rel) })
+
+		_, err := reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+		_, err = reconciler.Reconcile(ctx, reqForRelease(rel))
+		Expect(err).NotTo(HaveOccurred())
+
+		var freshRel foremanv1alpha1.AgentRelease
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: rel.Name}, &freshRel)).To(Succeed())
+
+		ns := findNodeStatus(freshRel.Status.NodeStatuses, node.Name)
+		Expect(ns).NotTo(BeNil())
+		Expect(ns.Phase).To(Equal(nodePhaseFailed))
+		Expect(ns.Reason).To(Equal(foremanv1alpha1.AgentReleaseNodeReasonNoArtifact),
+			"typed Reason must be NoMatchingArtifact, not derived from message string")
+
+		Expect(freshRel.Status.Phase).To(Equal(foremanv1alpha1.AgentReleasePhaseFailed))
+		cond := findCondition(freshRel.Status.Conditions, "Halted")
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("NoMatchingArtifact"))
 	})
 
 	// -----------------------------------------------------------------------
