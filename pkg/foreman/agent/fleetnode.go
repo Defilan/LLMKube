@@ -65,6 +65,15 @@ type Registrar struct {
 	// Kind identifies the agent type. Conventionally "foreman-agent".
 	// Stamped on FleetNode.status.agentKind every heartbeat.
 	Kind string
+
+	// OS is the operating system this agent is running on (runtime.GOOS).
+	// Stamped on FleetNode.status.os every heartbeat so the
+	// AgentReleaseReconciler can select the correct platform artifact.
+	OS string
+
+	// Arch is the CPU architecture this agent is running on (runtime.GOARCH).
+	// Stamped on FleetNode.status.arch every heartbeat.
+	Arch string
 }
 
 // Upsert creates the FleetNode if missing, otherwise updates its Spec so
@@ -108,11 +117,31 @@ func (r *Registrar) Upsert(ctx context.Context) error {
 // time, the current phase, and the latest capability snapshot. Uses a
 // merge patch so concurrent edits to other status fields by future
 // reconcilers (M2+) do not conflict.
+//
+// Multiple writers own different fields on FleetNode.status:
+//   - Agent: phase, lastHeartbeatTime, capability, agentVersion, agentKind, os, arch.
+//   - FleetNodeReconciler: staleness phase + Ready condition.
+//   - AgentReleaseReconciler: updateRequest.
+//
+// The field-scoped MergeFrom patch ensures each writer only touches its
+// own fields without clobbering concurrent writes from others.
 func (r *Registrar) PatchHeartbeat(ctx context.Context, phase foremanv1alpha1.FleetNodePhase) error {
+	log := logf.FromContext(ctx)
 	var node foremanv1alpha1.FleetNode
 	if err := r.Client.Get(ctx, types.NamespacedName{Name: r.NodeName}, &node); err != nil {
 		return fmt.Errorf("get FleetNode for heartbeat: %w", err)
 	}
+
+	// Log any pending update request so an operator watching logs can see
+	// the dispatch. The actual self-update action is implemented in PR4;
+	// for now we surface the request without acting on it.
+	if node.Status.UpdateRequest != nil {
+		log.Info("update requested",
+			"target", node.Status.UpdateRequest.TargetVersion,
+			"url", node.Status.UpdateRequest.URL,
+		)
+	}
+
 	patch := client.MergeFrom(node.DeepCopy())
 	now := metav1.Now()
 	node.Status.Phase = phase
@@ -123,6 +152,12 @@ func (r *Registrar) PatchHeartbeat(ctx context.Context, phase foremanv1alpha1.Fl
 	}
 	if r.Kind != "" {
 		node.Status.AgentKind = foremanv1alpha1.FleetNodeAgentKind(r.Kind)
+	}
+	if r.OS != "" {
+		node.Status.OS = r.OS
+	}
+	if r.Arch != "" {
+		node.Status.Arch = r.Arch
 	}
 	if err := r.Client.Status().Patch(ctx, &node, patch); err != nil {
 		return fmt.Errorf("patch FleetNode status: %w", err)

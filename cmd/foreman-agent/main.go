@@ -41,6 +41,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	goruntime "runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -301,6 +302,8 @@ func main() {
 		Interval: heartbeat,
 		Version:  Version,
 		Kind:     "foreman-agent",
+		OS:       goruntime.GOOS,
+		Arch:     goruntime.GOARCH,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
