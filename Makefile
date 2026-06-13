@@ -145,11 +145,18 @@ install-cli: build-cli ## Install llmkube CLI to /usr/local/bin (requires sudo).
 
 ##@ Metal Agent (macOS only)
 
+# METAL_AGENT_VERSION is stamped into the ldflags Version variable. Defaults to
+# the git-describe tag (matching build-foreman-agent-versioned); override on the
+# command line when releasing, e.g. `make build-metal-agent METAL_AGENT_VERSION=0.8.6`.
+METAL_AGENT_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
+
 .PHONY: build-metal-agent
 build-metal-agent: fmt vet ## Build Metal agent for macOS (requires macOS).
-	@echo "Building Metal agent for macOS..."
+	@echo "Building Metal agent for macOS ($(METAL_AGENT_VERSION))..."
 	GOOS=darwin GOARCH=$(shell uname -m | sed 's/x86_64/amd64/;s/arm64/arm64/') \
-		go build -o bin/llmkube-metal-agent ./cmd/metal-agent
+		go build \
+		-ldflags "-X main.Version=$(METAL_AGENT_VERSION) -X main.GitCommit=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown) -X main.BuildDate=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		-o bin/llmkube-metal-agent ./cmd/metal-agent
 
 # LLMKUBE_METAL_AGENT_LABEL is the launchd service label for metal-agent.
 LLMKUBE_METAL_AGENT_LABEL ?= com.llmkube.metal-agent

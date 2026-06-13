@@ -102,11 +102,13 @@ builds:
       - -X main.GitCommit={{.FullCommit}}
       - -X main.BuildDate={{.Date}}
 
-    # Linux containers only (the foreman-agent Linux Pod is
-    # Linux; the M5 Max + Mac Studio run from `go install` or a
-    # launchd-managed local binary, not the ghcr image).
+    # linux: the in-cluster foreman-agent Pod (consumed by the docker
+    # images below). darwin: the M5 Max + Mac Studio native agents, shipped
+    # as a release archive so Mac bootstraps and AgentRelease self-update
+    # artifacts can be download-based instead of build-from-source.
     goos:
       - linux
+      - darwin
 
     goarch:
       - amd64
@@ -164,6 +166,22 @@ archives:
       - README.md
       - examples/metal-quickstart/*
       - deployment/macos/*
+
+  - id: llmkube-foreman-agent
+    builds:
+      - llmkube-foreman-agent
+
+    # Archive name template. Produces darwin (Mac native agents) and linux
+    # (edge nodes) archives; the linux foreman-agent Pod still ships as a
+    # ghcr image via the dockers section below.
+    name_template: "{{ .ProjectName }}-foreman-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+    # Files to include
+    files:
+      - LICENSE
+      - README.md
+      - deployment/macos/*
+      - deployment/linux/*
 
 checksum:
   name_template: "checksums.txt"
