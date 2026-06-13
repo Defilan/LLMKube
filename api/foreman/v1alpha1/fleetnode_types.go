@@ -139,7 +139,6 @@ type FleetNodeStatus struct {
 	// AgentKind identifies which agent binary manages this FleetNode.
 	// metal-agent does not register a FleetNode in v0.1, but the enum
 	// documents intent for future use.
-	// +kubebuilder:validation:Enum=foreman-agent;metal-agent
 	// +optional
 	AgentKind FleetNodeAgentKind `json:"agentKind,omitempty"`
 

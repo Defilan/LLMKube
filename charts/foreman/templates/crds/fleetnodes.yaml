@@ -93,17 +93,13 @@ spec:
               scheduler reads it; the agent writes it.
             properties:
               agentKind:
-                allOf:
-                - enum:
-                  - foreman-agent
-                  - metal-agent
-                - enum:
-                  - foreman-agent
-                  - metal-agent
                 description: |-
                   AgentKind identifies which agent binary manages this FleetNode.
                   metal-agent does not register a FleetNode in v0.1, but the enum
                   documents intent for future use.
+                enum:
+                - foreman-agent
+                - metal-agent
                 type: string
               agentVersion:
                 description: |-
