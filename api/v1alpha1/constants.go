@@ -26,6 +26,13 @@ const (
 	// agents) are exempt from expiry for backward compatibility.
 	AnnotationAgentHeartbeat = "llmkube.ai/agent-heartbeat"
 
+	// AnnotationAgentVersion is stamped on agent-managed Endpoints with the
+	// running version of the metal-agent binary (e.g. "v0.8.4"). Set on every
+	// RegisterEndpoint call so the cluster can observe which version is
+	// managing a given InferenceService. Absent on Endpoints created by older
+	// agents that predate this annotation.
+	AnnotationAgentVersion = "llmkube.ai/agent-version"
+
 	// DefaultAgentHeartbeatInterval is how often the metal-agent re-asserts
 	// its registrations (which also self-heals any missed update, #657).
 	DefaultAgentHeartbeatInterval = 30 * time.Second

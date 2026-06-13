@@ -169,7 +169,7 @@ func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *te
 	a := newPressureTestAgent(t, low, high)
 	a.config.EvictionEnabled = true
 	a.executor = stubExecutor{}
-	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger())
+	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 
 	a.processes["default/svc-low"] = &ManagedProcess{
 		Name: "svc-low", Namespace: "default", Priority: "low",
@@ -206,7 +206,7 @@ func TestHandleMemoryPressure_DisabledHonorsCLIFlag(t *testing.T) {
 	a := newPressureTestAgent(t, isvc)
 	a.config.EvictionEnabled = false // explicit
 	a.executor = stubExecutor{}
-	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger())
+	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 
 	a.processes["default/svc-low"] = &ManagedProcess{
 		Name: "svc-low", Namespace: "default", Priority: "low",
@@ -430,7 +430,7 @@ func TestHandleMemoryPressure_IncrementsSkippedCounter(t *testing.T) {
 			a := newPressureTestAgent(t)
 			a.config.EvictionEnabled = tc.evictionEnable
 			a.executor = stubExecutor{}
-			a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger())
+			a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 			tc.processes(a)
 
 			before := readSkippedCounter(t, tc.wantReason)
@@ -550,7 +550,7 @@ func TestHandleMemoryPressure_EmitsEvictedEvent(t *testing.T) {
 	a := newPressureTestAgent(t, low, high)
 	a.config.EvictionEnabled = true
 	a.executor = stubExecutor{}
-	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger())
+	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 	rec := record.NewFakeRecorder(32)
 	a.config.EventRecorder = rec
 
@@ -595,7 +595,7 @@ func TestHandleMemoryPressure_EmitsEvictionSkippedWhenDisabled(t *testing.T) {
 	a := newPressureTestAgent(t, isvc)
 	a.config.EvictionEnabled = false
 	a.executor = stubExecutor{}
-	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger())
+	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 	rec := record.NewFakeRecorder(32)
 	a.config.EventRecorder = rec
 

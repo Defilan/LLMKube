@@ -474,6 +474,7 @@ func main() {
 		LlamaServerBin:            cfg.LlamaServerBin,
 		LlamaServerPort:           cfg.LlamaServerPort,
 		Runtime:                   cfg.Runtime,
+		Version:                   Version,
 		OMLXBin:                   cfg.OMLXBin,
 		OMLXPort:                  cfg.OMLXPort,
 		OllamaPort:                cfg.OllamaPort,

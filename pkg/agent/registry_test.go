@@ -65,7 +65,7 @@ func TestNewServiceRegistry(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	if registry == nil {
 		t.Fatal("NewServiceRegistry returned nil")
@@ -78,7 +78,7 @@ func TestRegisterEndpoint(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -166,7 +166,7 @@ func TestRegisterEndpoint_SanitizedName(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -219,7 +219,7 @@ func TestUnregisterEndpoint(t *testing.T) {
 		WithRuntimeObjects(svc, endpoints).
 		Build()
 
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	err := registry.UnregisterEndpoint(context.Background(), "default", "test-model")
 	if err != nil {
@@ -261,7 +261,7 @@ func TestUnregisterEndpoint_SanitizedName(t *testing.T) {
 		WithRuntimeObjects(svc, endpoints).
 		Build()
 
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	// Pass the dotted name — UnregisterEndpoint should sanitize it
 	err := registry.UnregisterEndpoint(context.Background(), "default", "model.v1.0")
@@ -295,7 +295,7 @@ func TestUnregisterEndpoint_Idempotent(t *testing.T) {
 		WithScheme(scheme).
 		WithRuntimeObjects(svc, endpoints).
 		Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	if err := registry.UnregisterEndpoint(context.Background(), "default", "idempotent-model"); err != nil {
 		t.Fatalf("first UnregisterEndpoint returned error: %v", err)
@@ -363,7 +363,7 @@ func TestReconcileOrphanEndpoints(t *testing.T) {
 		WithRuntimeObjects(liveISVC, liveSvc, orphanSvc, orphanEndpoints, foreignSvc).
 		Build()
 
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	cleaned, err := registry.ReconcileOrphanEndpoints(context.Background(), "default")
 	if err != nil {
@@ -409,7 +409,7 @@ func TestReconcileOrphanEndpoints_EmptyCluster(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	cleaned, err := registry.ReconcileOrphanEndpoints(context.Background(), "default")
 	if err != nil {
@@ -433,7 +433,7 @@ func TestResolveHostIP_Explicit(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "100.103.147.52", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "100.103.147.52", newNopLogger(), "")
 
 	ip := registry.resolveHostIP()
 	if ip != "100.103.147.52" {
@@ -446,7 +446,7 @@ func TestResolveHostIP_AutoDetect(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	ip := registry.resolveHostIP()
 	if ip == "" {
@@ -460,7 +460,7 @@ func TestRegisterEndpoint_ExplicitHostIP(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "10.0.0.42", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "10.0.0.42", newNopLogger(), "")
 
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{
@@ -505,7 +505,7 @@ func TestRegisterEndpoint_PortChange(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-model", Namespace: "default"},
@@ -555,7 +555,7 @@ func TestRegisterEndpointWithRetry_TransientFailure(t *testing.T) {
 				return c.Create(ctx, obj, opts...)
 			},
 		}).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 	registry.retryBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 2, Steps: 5}
 
 	isvc := &inferencev1alpha1.InferenceService{
@@ -585,7 +585,7 @@ func TestRegisterEndpointWithRetry_Exhausted(t *testing.T) {
 				return apierrors.NewServerTimeout(corev1.Resource("services"), "create", 1)
 			},
 		}).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 	registry.retryBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 2, Steps: 3}
 
 	isvc := &inferencev1alpha1.InferenceService{
@@ -612,7 +612,7 @@ func TestRegisterEndpoint_StampsHeartbeat(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	// Pin the clock so the annotation value is deterministic.
 	frozen := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
@@ -649,6 +649,81 @@ func TestRegisterEndpoint_StampsHeartbeat(t *testing.T) {
 	}
 }
 
+// TestRegisterEndpoint_StampsAgentVersion verifies that RegisterEndpoint stamps
+// the llmkube.ai/agent-version annotation on the Endpoints object when the
+// registry is created with a non-empty version string.
+func TestRegisterEndpoint_StampsAgentVersion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "v0.9.0")
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ver-model",
+			Namespace: "default",
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "ver-model",
+		},
+	}
+
+	if err := registry.RegisterEndpoint(context.Background(), isvc, 50051); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+
+	//nolint:staticcheck // SA1019: Endpoints API is still functional and matches production code under test
+	eps := &corev1.Endpoints{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "ver-model", Namespace: "default"}, eps); err != nil {
+		t.Fatalf("get endpoints: %v", err)
+	}
+
+	got := eps.Annotations[inferencev1alpha1.AnnotationAgentVersion]
+	if got != "v0.9.0" {
+		t.Fatalf("agent-version annotation = %q, want %q", got, "v0.9.0")
+	}
+}
+
+// TestRegisterEndpoint_OmitsAgentVersionWhenEmpty verifies that the
+// llmkube.ai/agent-version annotation is absent when the registry is
+// created without a version string (older-agent compatibility).
+func TestRegisterEndpoint_OmitsAgentVersionWhenEmpty(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "") // empty version
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "nover-model",
+			Namespace: "default",
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "nover-model",
+		},
+	}
+
+	if err := registry.RegisterEndpoint(context.Background(), isvc, 50051); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+
+	//nolint:staticcheck // SA1019: Endpoints API is still functional and matches production code under test
+	eps := &corev1.Endpoints{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "nover-model", Namespace: "default"}, eps); err != nil {
+		t.Fatalf("get endpoints: %v", err)
+	}
+
+	if v, ok := eps.Annotations[inferencev1alpha1.AnnotationAgentVersion]; ok {
+		t.Fatalf("agent-version annotation should be absent, got %q", v)
+	}
+}
+
 // TestRegisterEndpointWithRetry_ContextCancelled verifies that when the context
 // is already cancelled before the first attempt, the returned error wraps
 // context.Canceled rather than rendering as a garbled %!w(<nil>).
@@ -658,7 +733,7 @@ func TestRegisterEndpointWithRetry_ContextCancelled(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	registry := NewServiceRegistry(k8sClient, "", newNopLogger())
+	registry := NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 	registry.retryBackoff = wait.Backoff{Duration: time.Millisecond, Factor: 2, Steps: 5}
 
 	isvc := &inferencev1alpha1.InferenceService{

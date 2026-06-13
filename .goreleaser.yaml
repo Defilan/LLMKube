@@ -95,6 +95,13 @@ builds:
     main: ./cmd/foreman-agent
     binary: foreman-agent
 
+    # Set version information at build time.
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.GitCommit={{.FullCommit}}
+      - -X main.BuildDate={{.Date}}
+
     # Linux containers only (the foreman-agent Linux Pod is
     # Linux; the M5 Max + Mac Studio run from `go install` or a
     # launchd-managed local binary, not the ghcr image).

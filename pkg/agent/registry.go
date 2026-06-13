@@ -39,9 +39,10 @@ import (
 // ServiceRegistry manages Kubernetes Service and Endpoint resources
 // to expose native Metal processes to the cluster
 type ServiceRegistry struct {
-	client client.Client
-	hostIP string // explicit host IP; if empty, auto-detect via DNS
-	logger *zap.SugaredLogger
+	client  client.Client
+	hostIP  string // explicit host IP; if empty, auto-detect via DNS
+	version string // agent binary version stamped on endpoint annotations
+	logger  *zap.SugaredLogger
 	// retryBackoff bounds RegisterEndpointWithRetry. Overridable in tests.
 	retryBackoff wait.Backoff
 	// now returns the current time. Defaults to time.Now; overridable in tests
@@ -53,11 +54,19 @@ type ServiceRegistry struct {
 // If hostIP is non-empty it is used as the endpoint address registered in
 // Kubernetes; otherwise the IP is auto-detected via DNS lookups
 // (host.minikube.internal / host.docker.internal).
-func NewServiceRegistry(k8sClient client.Client, hostIP string, logger *zap.SugaredLogger) *ServiceRegistry {
+// version is the agent binary's version string (e.g. "v0.8.4") stamped on
+// every Endpoints object as AnnotationAgentVersion; pass empty to omit it.
+func NewServiceRegistry(
+	k8sClient client.Client,
+	hostIP string,
+	logger *zap.SugaredLogger,
+	version string,
+) *ServiceRegistry {
 	return &ServiceRegistry{
-		client: k8sClient,
-		hostIP: hostIP,
-		logger: logger,
+		client:  k8sClient,
+		hostIP:  hostIP,
+		version: version,
+		logger:  logger,
 		retryBackoff: wait.Backoff{
 			Duration: 2 * time.Second,
 			Factor:   2,
@@ -119,6 +128,9 @@ func (r *ServiceRegistry) RegisterEndpoint(
 			endpoints.Annotations = map[string]string{}
 		}
 		endpoints.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat] = r.now().UTC().Format(time.RFC3339)
+		if r.version != "" {
+			endpoints.Annotations[inferencev1alpha1.AnnotationAgentVersion] = r.version
+		}
 		//nolint:staticcheck // SA1019: EndpointSubset still functional
 		endpoints.Subsets = []corev1.EndpointSubset{{
 			Addresses: []corev1.EndpointAddress{{

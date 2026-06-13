@@ -160,7 +160,7 @@ func TestHandleEvent_CreateMissingModel(t *testing.T) {
 	})
 	agent.watcher = NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	event := InferenceServiceEvent{
 		Type: EventTypeCreated,
@@ -447,7 +447,7 @@ func TestDeleteProcess_StopFailureStillUnregistersEndpoint(t *testing.T) {
 
 	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient})
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 	agent.processes["default/test-model"] = &ManagedProcess{
 		Name:      "test-model",
 		Namespace: "default",
@@ -692,7 +692,7 @@ func runEnsureProcessExpectingMapEviction(
 
 	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	key := "default/" + name
 	agent.processes[key] = &ManagedProcess{
@@ -728,7 +728,7 @@ func TestEnsureProcess_ReplicasZeroNoOpWhenNoProcess(t *testing.T) {
 
 	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	zeroReplicas := int32(0)
 	isvc := &inferencev1alpha1.InferenceService{
@@ -780,7 +780,7 @@ func TestEnsureProcess_ReplicasZeroPatchesStatus(t *testing.T) {
 
 	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	if err := agent.ensureProcess(context.Background(), isvc); err != nil {
 		t.Fatalf("ensureProcess returned unexpected error: %v", err)
@@ -866,7 +866,7 @@ func TestEnsureProcess_ReplicasZeroStatusPatchIdempotent(t *testing.T) {
 
 	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	// Snapshot the *seeded* transition time as the fake client stored
 	// it. The fake client serializes metav1.Time at second precision,
@@ -914,7 +914,7 @@ func TestEnsureProcess_HealthyAndSpecMatchesIsNoOp(t *testing.T) {
 
 	agent := NewMetalAgent(MetalAgentConfig{K8sClient: k8sClient, Namespace: "default"})
 	agent.executor = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	ctx := int32(65536)
 	isvc := &inferencev1alpha1.InferenceService{
@@ -1029,7 +1029,7 @@ func TestEnsureProcess_InFlightGuard(t *testing.T) {
 	})
 	exec := &blockingExecutor{entered: make(chan struct{}), release: make(chan struct{})}
 	agent.executor = exec
-	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger())
+	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	// First caller proceeds and blocks inside StartProcess.
 	firstDone := make(chan error, 1)
@@ -1106,7 +1106,7 @@ func TestHeartbeatOnce(t *testing.T) {
 		},
 		logger: newNopLogger(),
 	}
-	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger())
+	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger(), "")
 
 	before := time.Now().Add(-time.Second)
 	a.heartbeatOnce(context.Background())
@@ -1181,7 +1181,7 @@ func TestHeartbeatOnce_ScaledToZero(t *testing.T) {
 		executor: nopExecutor{},
 		logger:   newNopLogger(),
 	}
-	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger())
+	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger(), "")
 
 	a.heartbeatOnce(context.Background())
 
@@ -1239,7 +1239,7 @@ func TestHeartbeatOnce_NotFound(t *testing.T) {
 		executor: nopExecutor{},
 		logger:   newNopLogger(),
 	}
-	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger())
+	a.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger(), "")
 
 	a.heartbeatOnce(context.Background())
 

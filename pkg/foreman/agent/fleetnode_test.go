@@ -256,6 +256,63 @@ func TestRegistrar_PatchHeartbeat_WritesPhaseAndCapability(t *testing.T) {
 	}
 }
 
+func TestRegistrar_PatchHeartbeat_StampsVersionAndKind(t *testing.T) {
+	existing := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "studio"},
+		Spec:       foremanv1alpha1.FleetNodeSpec{NodeName: "studio"},
+	}
+	kc := newFakeClient(t, existing)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "studio",
+		Provider: &fixedCapability{},
+		Version:  "v0.9.0",
+		Kind:     "foreman-agent",
+	}
+	if err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "studio"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.AgentVersion != "v0.9.0" {
+		t.Errorf("AgentVersion = %q, want %q", got.Status.AgentVersion, "v0.9.0")
+	}
+	if got.Status.AgentKind != foremanv1alpha1.FleetNodeAgentKind("foreman-agent") {
+		t.Errorf("AgentKind = %q, want %q", got.Status.AgentKind, "foreman-agent")
+	}
+}
+
+func TestRegistrar_PatchHeartbeat_EmptyVersionOmitted(t *testing.T) {
+	// When Version and Kind are not set, the status fields must remain empty
+	// (not overwrite a value set by a newer agent restart with blank).
+	existing := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "studio2"},
+		Spec:       foremanv1alpha1.FleetNodeSpec{NodeName: "studio2"},
+	}
+	kc := newFakeClient(t, existing)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "studio2",
+		Provider: &fixedCapability{},
+		// Version and Kind intentionally zero
+	}
+	if err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "studio2"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.AgentVersion != "" {
+		t.Errorf("AgentVersion = %q, want empty (version not set)", got.Status.AgentVersion)
+	}
+	if got.Status.AgentKind != "" {
+		t.Errorf("AgentKind = %q, want empty (kind not set)", got.Status.AgentKind)
+	}
+}
+
 func TestRegistrar_Run_DrainsAndExitsOnCancel(t *testing.T) {
 	existing := &foremanv1alpha1.FleetNode{
 		ObjectMeta: metav1.ObjectMeta{Name: "m5-max"},
