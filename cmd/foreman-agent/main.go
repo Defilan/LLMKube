@@ -68,6 +68,13 @@ import (
 )
 
 var (
+	// Version information injected at build time via -ldflags.
+	Version   = "dev"
+	GitCommit = "unknown"
+	BuildDate = "unknown"
+)
+
+var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
@@ -195,9 +202,18 @@ func main() {
 		"Key within --coder-git-secret that holds the token (e.g. GITHUB_TOKEN when reusing an "+
 			"existing git Secret).")
 
+	showVersion := flag.Bool("version", false, "Print version information and exit.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("foreman-agent version %s\n", Version)
+		fmt.Printf("  git commit: %s\n", GitCommit)
+		fmt.Printf("  build date: %s\n", BuildDate)
+		os.Exit(0)
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	if fleetNodeName == "" {
@@ -283,6 +299,8 @@ func main() {
 		Spec:     spec,
 		Provider: provider,
 		Interval: heartbeat,
+		Version:  Version,
+		Kind:     "foreman-agent",
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
