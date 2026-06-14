@@ -142,6 +142,7 @@ rules:
   resources:
   - backends
   - backendtrafficpolicies
+  - securitypolicies
   verbs:
   - create
   - delete

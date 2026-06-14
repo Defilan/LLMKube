@@ -59,6 +59,9 @@ const (
 	modelRouterGatewayReasonUnsupportedBudgetField = "UnsupportedBudgetField"
 	modelRouterGatewayReasonUnsupportedBudgetScope = "UnsupportedBudgetScope"
 	modelRouterGatewayReasonInvalidBudget          = "InvalidBudget"
+
+	// slice 2d-core auth fail-loud reason.
+	modelRouterGatewayReasonInvalidAuth = "InvalidAuth"
 )
 
 // ModelRouterGatewayReconciler compiles a ModelRouter in dataPlane: Gateway mode
@@ -80,6 +83,7 @@ type ModelRouterGatewayReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=gateway.envoyproxy.io,resources=backendtrafficpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.envoyproxy.io,resources=securitypolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile compiles the gateway resources for a ModelRouter in dataPlane:
 // Gateway mode, or no-ops cleanly when the router is in Proxy mode or when the
@@ -138,6 +142,14 @@ func (r *ModelRouterGatewayReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, reason, msg)
 	}
 
+	// Fail-loud on a half-configured auth block. A SecurityPolicy missing a
+	// required JWT field would either fail open or reject everything; we generate
+	// NOTHING and surface why, same ordering as the match check (before any
+	// CreateOrUpdate).
+	if msg := invalidAuthMessage(mr); msg != "" {
+		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonInvalidAuth, msg)
+	}
+
 	if err := r.reconcileGatewayResources(ctx, mr); err != nil {
 		_ = r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonReconcile, err.Error())
 		return ctrl.Result{}, err
@@ -175,6 +187,12 @@ func (r *ModelRouterGatewayReconciler) reconcileGatewayResources(
 		newRouterAIGatewayRoute(mr, mr.Spec.GatewayRef, rules, budgets),
 		newRouterBackendTrafficPolicy(mr, budgets),
 	)
+
+	// When auth.jwt is configured, also compile a SecurityPolicy targeting the
+	// generated HTTPRoute. A router with no auth produces no SecurityPolicy.
+	if jwt := routerJWT(mr); jwt != nil {
+		desired = append(desired, newRouterSecurityPolicy(mr, jwt))
+	}
 
 	for _, obj := range desired {
 		if err := r.applyResource(ctx, mr, obj); err != nil {
@@ -268,15 +286,21 @@ func (r *ModelRouterGatewayReconciler) setGatewayReady(
 	mr *inferencev1alpha1.ModelRouter,
 ) error {
 	patch := client.MergeFrom(mr.DeepCopy())
+	authEnabled := routerJWT(mr) != nil
 	mr.Status.Gateway = &inferencev1alpha1.GatewayStatus{
-		RouteReady: true,
-		Endpoint:   gatewayEndpointAddress(mr.Spec.GatewayRef),
+		RouteReady:  true,
+		Endpoint:    gatewayEndpointAddress(mr.Spec.GatewayRef),
+		AuthEnabled: authEnabled,
+	}
+	message := gatewayReadyMessage(mr)
+	if authEnabled {
+		message += "; JWT authentication enforced"
 	}
 	apimeta.SetStatusCondition(&mr.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterGatewayConditionReady,
 		Status:  metav1.ConditionTrue,
 		Reason:  modelRouterGatewayReasonExposed,
-		Message: gatewayReadyMessage(mr),
+		Message: message,
 	})
 	return r.Status().Patch(ctx, mr, patch)
 }
@@ -460,6 +484,46 @@ func unsupportedBudgetMessage(mr *inferencev1alpha1.ModelRouter) (reason, messag
 		}
 	}
 	return "", ""
+}
+
+// routerJWT returns the configured JWT auth block, or nil when the router
+// declares no policy.auth.jwt.
+func routerJWT(mr *inferencev1alpha1.ModelRouter) *inferencev1alpha1.JWTAuthSpec {
+	if mr.Spec.Policy == nil || mr.Spec.Policy.Auth == nil {
+		return nil
+	}
+	return mr.Spec.Policy.Auth.JWT
+}
+
+// invalidAuthMessage returns a non-empty message when policy.auth.jwt is set but
+// missing a required field (issuer, jwksURI, or teamClaim). Empty means auth is
+// absent or fully configured. CRD validation should also reject these, but the
+// reconciler defends fail-loud so a partial SecurityPolicy is never emitted. The
+// provider name is structurally required too; an empty one is reported here for
+// completeness.
+func invalidAuthMessage(mr *inferencev1alpha1.ModelRouter) string {
+	jwt := routerJWT(mr)
+	if jwt == nil {
+		return ""
+	}
+	var missing []string
+	if jwt.Provider == "" {
+		missing = append(missing, "provider")
+	}
+	if jwt.Issuer == "" {
+		missing = append(missing, "issuer")
+	}
+	if jwt.JWKSURI == "" {
+		missing = append(missing, "jwksURI")
+	}
+	if jwt.TeamClaim == "" {
+		missing = append(missing, "teamClaim")
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	sort.Strings(missing)
+	return fmt.Sprintf("policy.auth.jwt is set but missing required field(s): %s", strings.Join(missing, ", "))
 }
 
 // unsupportedMatchMessage returns a non-empty message naming the first rule
