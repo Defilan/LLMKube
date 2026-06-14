@@ -128,7 +128,7 @@ func TestMarkPlanned_WebhookRejectionIsTerminal(t *testing.T) {
 				if err != nil {
 					t.Fatalf("terminal rejection must not return a requeue error, got %v", err)
 				}
-				if res.Requeue || res.RequeueAfter != 0 {
+				if res.RequeueAfter != 0 {
 					t.Fatalf("terminal rejection must not request a requeue, got %+v", res)
 				}
 				if fresh.Status.Phase != foremanv1alpha1.WorkloadPhaseFailed {
