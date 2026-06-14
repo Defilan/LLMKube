@@ -179,20 +179,24 @@ func (r *ModelRouterGatewayReconciler) reconcileGatewayResources(
 
 	// Order matters for clean upserts: Backends and AIServiceBackends before the
 	// route that references them, then the BTP that targets the route.
-	desired := make([]*unstructured.Unstructured, 0, len(backends)*2+2)
+	desired := make([]*unstructured.Unstructured, 0, len(backends)*2+3)
 	for _, b := range backends {
 		desired = append(desired, newRouterBackend(mr, b), newRouterAIServiceBackend(mr, b))
 	}
+
+	// When auth.jwt is configured, apply the SecurityPolicy BEFORE the route, so
+	// the JWT filter is in place the moment the generated HTTPRoute appears,
+	// minimizing any window where the route could serve unauthenticated. A router
+	// with no auth produces no SecurityPolicy. (targetRef may reference the route
+	// before it exists; Envoy Gateway attaches it once the route appears.)
+	if jwt := routerJWT(mr); jwt != nil {
+		desired = append(desired, newRouterSecurityPolicy(mr, jwt))
+	}
+
 	desired = append(desired,
 		newRouterAIGatewayRoute(mr, mr.Spec.GatewayRef, rules, budgets),
 		newRouterBackendTrafficPolicy(mr, budgets),
 	)
-
-	// When auth.jwt is configured, also compile a SecurityPolicy targeting the
-	// generated HTTPRoute. A router with no auth produces no SecurityPolicy.
-	if jwt := routerJWT(mr); jwt != nil {
-		desired = append(desired, newRouterSecurityPolicy(mr, jwt))
-	}
 
 	for _, obj := range desired {
 		if err := r.applyResource(ctx, mr, obj); err != nil {
