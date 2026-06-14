@@ -93,6 +93,14 @@ jobs:
           IMG_AG_REPO="${FOREMAN_AGENT_IMG%:*}"
           IMG_AG_TAG="${FOREMAN_AGENT_IMG##*:}"
 
+          # Create the task namespace BEFORE install so the agent's
+          # namespace-scoped cache (pinned via agent.taskNamespace below)
+          # has it at startup. The agent watches ONLY this namespace for
+          # AgenticTasks, so it must match where we apply the task; with the
+          # chart default ("" -> omit the flag) the agent falls back to the
+          # binary default "default" and would never claim a task here.
+          kubectl create namespace "${TASK_NS}"
+
           helm install foreman ./charts/foreman \
             --namespace "${FOREMAN_NS}" \
             --create-namespace \
@@ -103,6 +111,7 @@ jobs:
             --set agent.image.tag="${IMG_AG_TAG}" \
             --set agent.image.pullPolicy=Never \
             --set agent.mode=stub \
+            --set agent.taskNamespace="${TASK_NS}" \
             --set agent.gateCache.enabled=false \
             --set coder.enabled=false \
             --wait \
@@ -146,7 +155,8 @@ jobs:
       # ignores both and just sleeps, then writes Succeeded.
       - name: Apply stub AgenticTask
         run: |
-          kubectl create namespace "${TASK_NS}"
+          # Namespace was created before install (see the install step) so the
+          # agent's namespace-scoped cache is watching it.
           cat <<'EOF' | kubectl apply -f -
           apiVersion: foreman.llmkube.dev/v1alpha1
           kind: AgenticTask
