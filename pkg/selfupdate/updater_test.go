@@ -738,6 +738,66 @@ func TestPruneOldVersions_ProtectsCurrentAndPrevious(t *testing.T) {
 	}
 }
 
+// TestPruneOldVersions_DeterministicOnMtimeTie verifies that when several
+// prunable version dirs share an identical mtime (coarse-granularity FS, or
+// versions staged within the same clock tick), the survivor set is
+// deterministic: the comparator breaks mtime ties by name. The protected
+// current/previous targets survive on a separate key regardless.
+func TestPruneOldVersions_DeterministicOnMtimeTie(t *testing.T) {
+	dir := t.TempDir()
+	installRoot := filepath.Join(dir, "foreman-agent")
+
+	now := time.Now()
+	// Initial current target; becomes previous after the flip, so it is
+	// protected and must survive.
+	curDir := seedVersion(t, installRoot, "v0.1.0", now.Add(-100*time.Hour))
+	// The tie pool: four dirs sharing one identical mtime.
+	tie := now.Add(-30 * time.Hour)
+	seedVersion(t, installRoot, "v0.5.0", tie)
+	seedVersion(t, installRoot, "v0.5.1", tie)
+	seedVersion(t, installRoot, "v0.5.2", tie)
+	seedVersion(t, installRoot, "v0.5.3", tie)
+
+	if err := os.Symlink(curDir, filepath.Join(installRoot, "current")); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(w, testBlob)
+	}))
+	defer srv.Close()
+
+	u := newUpdater(t, srv, installRoot, "foreman-agent", "v0.1.0")
+	u.RetainVersions = 2
+
+	if _, err := u.MaybeApply(selfupdate.Target{
+		Version: "v0.9.0",
+		URL:     srv.URL + "/download",
+		SHA256:  blobSHA256(testBlob),
+	}); err != nil {
+		t.Fatalf("MaybeApply: %v", err)
+	}
+
+	gotSet := map[string]bool{}
+	for _, n := range remainingVersions(t, installRoot) {
+		gotSet[n] = true
+	}
+
+	// Protected on a separate key: new current and the old current (now previous).
+	for _, must := range []string{"v0.9.0", "v0.1.0"} {
+		if !gotSet[must] {
+			t.Errorf("protected version %s was pruned; remaining=%v", must, gotSet)
+		}
+	}
+	// Tie pool, retain=2, name-descending tiebreak keeps the two highest names.
+	if !gotSet["v0.5.3"] || !gotSet["v0.5.2"] {
+		t.Errorf("expected v0.5.3 and v0.5.2 retained on name tiebreak; remaining=%v", gotSet)
+	}
+	if gotSet["v0.5.0"] || gotSet["v0.5.1"] {
+		t.Errorf("expected v0.5.0 and v0.5.1 pruned on name tiebreak; remaining=%v", gotSet)
+	}
+}
+
 // TestPruneOldVersions_NonFatalOnError verifies that a prune failure does not
 // fail MaybeApply: the update still reports Restarting=true and the current
 // symlink points at the new version. We provoke a non-fatal situation by

@@ -327,9 +327,15 @@ func (u *Updater) pruneOldVersions(retain int) error {
 		return nil
 	}
 
-	// Newest first by mtime; keep the first `retain`, delete the rest.
+	// Newest first by mtime; keep the first `retain`, delete the rest. Break
+	// mtime ties by name so the survivor set is deterministic when several
+	// version dirs share a coarse-granularity mtime (current and previous are
+	// protected on a separate key, so a tie can never drop a needed version).
 	sort.Slice(prunable, func(i, j int) bool {
-		return prunable[i].mtime > prunable[j].mtime
+		if prunable[i].mtime != prunable[j].mtime {
+			return prunable[i].mtime > prunable[j].mtime
+		}
+		return prunable[i].name > prunable[j].name
 	})
 
 	var firstErr error
