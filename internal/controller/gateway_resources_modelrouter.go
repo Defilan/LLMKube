@@ -415,14 +415,23 @@ func compileBudgetRateLimit(budgets []inferencev1alpha1.BudgetSpec) map[string]i
 	}
 }
 
-// compileBudgetRule compiles one budget into a rateLimit rule. The limit is the
-// budget's MaxTokens over the window unit derived from WindowSeconds (see
-// budgetWindowUnit). team scope adds a Distinct header clientSelector.
+// compileBudgetRule compiles one budget into a rateLimit rule. Envoy expresses a
+// limit as "N per ONE unit" (Second/Minute/Hour/Day), so MaxTokens (the cap over
+// WindowSeconds) is scaled to the chosen unit to keep the enforced average rate
+// faithful for arbitrary windows. team scope adds a Distinct header clientSelector.
 func compileBudgetRule(b inferencev1alpha1.BudgetSpec) map[string]interface{} {
+	unit := budgetWindowUnit(b.WindowSeconds)
+	// requests = MaxTokens * unitSeconds / WindowSeconds, floored, min 1. Using a
+	// raw MaxTokens with a sub-window unit would under-enforce (e.g. 5M tokens
+	// over 90s emitted as "5M per Second" is ~90x too loose).
+	requests := *b.MaxTokens * budgetUnitSeconds(unit) / int64(b.WindowSeconds)
+	if requests < 1 {
+		requests = 1
+	}
 	rule := map[string]interface{}{
 		"limit": map[string]interface{}{
-			"requests": *b.MaxTokens,
-			"unit":     budgetWindowUnit(b.WindowSeconds),
+			"requests": requests,
+			"unit":     unit,
 		},
 		// Token-denominated: request path is check-only; usage is charged from
 		// the response's total-token dynamic metadata at completion.
@@ -470,26 +479,38 @@ func teamHeaderKey(b inferencev1alpha1.BudgetSpec) string {
 	return defaultTeamHeaderKey
 }
 
-// budgetWindowUnit maps a rolling window in seconds onto the Envoy Gateway
-// rateLimit unit the limit is denominated in. Envoy supports only a single unit
-// (Second/Minute/Hour/Day), not "per N units", so we pick the largest unit that
-// the window is a clean multiple of and treat the budget as MaxTokens per that
-// unit. Clean windows (60 -> Minute, 3600 -> Hour, 86400 -> Day, otherwise
-// Second) map exactly. A window that is not a clean multiple of a larger unit
-// rounds DOWN to the largest unit it does divide into (e.g. 90s -> Second),
-// which is the conservative choice: a shorter effective window enforces the cap
-// at least as tightly as requested rather than loosening it. The CRD default is
-// 3600 (Hour).
+// budgetWindowUnit picks the Envoy Gateway rateLimit unit the limit is
+// denominated in: the LARGEST unit whose duration is <= WindowSeconds, so the
+// scaled request count (see compileBudgetRule) stays a sensible integer rather
+// than rounding toward zero. Envoy supports only a single unit
+// (Second/Minute/Hour/Day), not "per N units"; compileBudgetRule scales
+// MaxTokens to this unit so any window enforces the faithful average rate. Exact
+// windows (60 -> Minute, 3600 -> Hour, 86400 -> Day) scale to requests ==
+// MaxTokens. The CRD default is 3600 (Hour).
 func budgetWindowUnit(windowSeconds int32) string {
 	switch {
-	case windowSeconds >= 86400 && windowSeconds%86400 == 0:
+	case windowSeconds >= 86400:
 		return "Day"
-	case windowSeconds >= 3600 && windowSeconds%3600 == 0:
+	case windowSeconds >= 3600:
 		return "Hour"
-	case windowSeconds >= 60 && windowSeconds%60 == 0:
+	case windowSeconds >= 60:
 		return "Minute"
 	default:
 		return "Second"
+	}
+}
+
+// budgetUnitSeconds is the duration in seconds of a budgetWindowUnit value.
+func budgetUnitSeconds(unit string) int64 {
+	switch unit {
+	case "Day":
+		return 86400
+	case "Hour":
+		return 3600
+	case "Minute":
+		return 60
+	default:
+		return 1
 	}
 }
 

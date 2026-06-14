@@ -817,3 +817,36 @@ func TestUnsupportedMatchMessage_GlobModel(t *testing.T) {
 		})
 	}
 }
+
+// TestCompileBudgetRule_WindowScaling pins the window-to-unit scaling: Envoy
+// expresses a limit as "N per ONE unit", so MaxTokens (the cap over
+// WindowSeconds) must be scaled to the chosen unit. Exact-unit windows keep
+// requests == MaxTokens; non-exact windows scale so the enforced average rate
+// stays faithful (a raw MaxTokens with a sub-window unit silently under-enforces).
+func TestCompileBudgetRule_WindowScaling(t *testing.T) {
+	maxTok := int64(5_000_000)
+	tests := []struct {
+		window   int32
+		wantUnit string
+		wantReq  int64
+	}{
+		{3600, "Hour", 5_000_000},  // exact: 1 hour
+		{60, "Minute", 5_000_000},  // exact: 1 minute
+		{86400, "Day", 5_000_000},  // exact: 1 day
+		{120, "Minute", 2_500_000}, // 5M*60/120
+		{7200, "Hour", 2_500_000},  // 5M*3600/7200
+		{90, "Minute", 3_333_333},  // 5M*60/90 floored
+		{3601, "Hour", 4_998_611},  // 5M*3600/3601 floored (was ~3600x too loose)
+		{30, "Second", 166_666},    // 5M/30 floored
+	}
+	for _, tt := range tests {
+		b := inferencev1alpha1.BudgetSpec{Scope: "router", WindowSeconds: tt.window, MaxTokens: &maxTok}
+		limit := compileBudgetRule(b)["limit"].(map[string]interface{})
+		if limit["unit"] != tt.wantUnit {
+			t.Errorf("window %ds: unit = %v, want %s", tt.window, limit["unit"], tt.wantUnit)
+		}
+		if got, _ := limit["requests"].(int64); got != tt.wantReq {
+			t.Errorf("window %ds: requests = %d, want %d", tt.window, got, tt.wantReq)
+		}
+	}
+}
