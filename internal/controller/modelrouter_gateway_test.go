@@ -33,6 +33,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -353,6 +354,306 @@ func TestModelRouterGateway_CRDsAbsentIsCleanNoOp(t *testing.T) {
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonCRDsMissing {
 		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonCRDsMissing, cond)
+	}
+}
+
+// authedRouter builds a dataPlane: Gateway ModelRouter with one backend, one
+// simple model rule, and the given (possibly nil) JWT auth block.
+func authedRouter(name string, jwt *inferencev1alpha1.JWTAuthSpec) *inferencev1alpha1.ModelRouter {
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "qwen-cuda", InferenceServiceRef: corev1LocalRef("qwen-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"qwen-cuda"}},
+				},
+			},
+		},
+	}
+	if jwt != nil {
+		mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{
+			Auth: &inferencev1alpha1.RouterAuthSpec{JWT: jwt},
+		}
+	}
+	return mr
+}
+
+// newFakeRouterReconcilerWithGateway builds a ModelRouter gateway reconciler
+// backed by a fake client (no CRD field validation) whose RESTMapper reports the
+// gateway GVKs as present, so the CRD-presence gate passes and the reconcile body
+// runs. Used to exercise reconcile-orchestration paths (like the auth fail-loud
+// guard) with object shapes a real CRD would reject at apply time.
+func newFakeRouterReconcilerWithGateway(t *testing.T, objs ...client.Object) *ModelRouterGatewayReconciler {
+	t.Helper()
+	s := scheme.Scheme
+	if err := inferencev1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+
+	mapper := apimeta.NewDefaultRESTMapper(nil)
+	for _, gvk := range modelRouterGatewayGVKs() {
+		mapper.Add(gvk, apimeta.RESTScopeNamespace)
+	}
+
+	c := fake.NewClientBuilder().
+		WithScheme(s).
+		WithRESTMapper(mapper).
+		WithObjects(objs...).
+		WithStatusSubresource(&inferencev1alpha1.ModelRouter{}).
+		Build()
+	return &ModelRouterGatewayReconciler{Client: c, Scheme: s}
+}
+
+// assertNotExistsClient asserts a resource of the given GVK/name is absent in the
+// given client (the envtest variant, assertNotExists, uses the package client c).
+func assertNotExistsClient(t *testing.T, c client.Client, gvk schema.GroupVersionKind, name string) {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: testNS}, u)
+	if err == nil {
+		t.Errorf("expected %s/%s to not exist, but it does", gvk.Kind, name)
+	}
+}
+
+// claimToHeaderOf extracts the single claim->header mapping from a SecurityPolicy
+// jwt provider, returning (claim, header).
+func claimToHeaderOf(t *testing.T, sp *unstructured.Unstructured) (string, string) {
+	t.Helper()
+	providers, found, err := unstructured.NestedSlice(sp.Object, "spec", "jwt", "providers")
+	if err != nil || !found || len(providers) == 0 {
+		t.Fatalf("securitypolicy has no jwt.providers (found=%v err=%v)", found, err)
+	}
+	p := providers[0].(map[string]interface{})
+	cths := p["claimToHeaders"].([]interface{})
+	if len(cths) != 1 {
+		t.Fatalf("jwt provider has %d claimToHeaders, want 1", len(cths))
+	}
+	cth := cths[0].(map[string]interface{})
+	claim, _ := cth["claim"].(string)
+	header, _ := cth["header"].(string)
+	return claim, header
+}
+
+// TestModelRouterGateway_JWTAuthProducesSecurityPolicy covers case (a): a
+// ModelRouter with policy.auth.jwt set produces a SecurityPolicy owner-ref'd to
+// the router, targeting the generated HTTPRoute (shares the route name), with the
+// provider's issuer + remoteJWKS.uri and a claimToHeaders mapping the teamClaim
+// onto the default x-llmkube-team header.
+func TestModelRouterGateway_JWTAuthProducesSecurityPolicy(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := authedRouter("auth-router", &inferencev1alpha1.JWTAuthSpec{
+		Provider:  "keycloak",
+		Issuer:    "https://issuer.example/realms/lab",
+		JWKSURI:   "https://issuer.example/realms/lab/protocol/openid-connect/certs",
+		TeamClaim: "team",
+	})
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	sp := getUnstructured(t, c, securityPolicyGVK(), "auth-router")
+	assertOwnedByRouter(t, sp, mr)
+
+	// Targets the generated HTTPRoute by the router's name.
+	targetRefs, _, _ := unstructured.NestedSlice(sp.Object, "spec", "targetRefs")
+	if len(targetRefs) != 1 {
+		t.Fatalf("securitypolicy has %d targetRefs, want 1", len(targetRefs))
+	}
+	tr := targetRefs[0].(map[string]interface{})
+	if tr["kind"] != "HTTPRoute" || tr["name"] != "auth-router" {
+		t.Errorf("securitypolicy targetRef = %+v, want HTTPRoute/auth-router", tr)
+	}
+
+	// Provider carries issuer + remoteJWKS.uri.
+	providers, _, _ := unstructured.NestedSlice(sp.Object, "spec", "jwt", "providers")
+	if len(providers) != 1 {
+		t.Fatalf("jwt has %d providers, want 1", len(providers))
+	}
+	p := providers[0].(map[string]interface{})
+	if p["name"] != "keycloak" {
+		t.Errorf("provider name = %v, want keycloak", p["name"])
+	}
+	if p["issuer"] != "https://issuer.example/realms/lab" {
+		t.Errorf("provider issuer = %v", p["issuer"])
+	}
+	remoteURI, _ := p["remoteJWKS"].(map[string]interface{})["uri"].(string)
+	if remoteURI != "https://issuer.example/realms/lab/protocol/openid-connect/certs" {
+		t.Errorf("provider remoteJWKS.uri = %q", remoteURI)
+	}
+
+	// claimToHeaders maps team -> default x-llmkube-team.
+	claim, header := claimToHeaderOf(t, sp)
+	if claim != "team" {
+		t.Errorf("claimToHeaders claim = %q, want team", claim)
+	}
+	if header != "x-llmkube-team" {
+		t.Errorf("claimToHeaders header = %q, want x-llmkube-team (default)", header)
+	}
+
+	// The authorization stanza of the spike manifest is slice 2d.2; 2d-core must
+	// NOT compile it.
+	if _, found, _ := unstructured.NestedMap(sp.Object, "spec", "authorization"); found {
+		t.Error("securitypolicy should not carry spec.authorization in slice 2d-core")
+	}
+
+	// status surfaces auth enabled.
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "auth-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter status: %v", err)
+	}
+	if fresh.Status.Gateway == nil || !fresh.Status.Gateway.AuthEnabled {
+		t.Errorf("status.gateway.authEnabled not set, got %+v", fresh.Status.Gateway)
+	}
+	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("GatewayReady not True, got %+v", cond)
+	}
+}
+
+// TestModelRouterGateway_JWTAuthHonorsCustomHeaderKey covers case (b): an
+// explicit headerKey overrides the x-llmkube-team default in the claimToHeaders
+// mapping.
+func TestModelRouterGateway_JWTAuthHonorsCustomHeaderKey(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := authedRouter("custom-hdr-router", &inferencev1alpha1.JWTAuthSpec{
+		Provider:  "keycloak",
+		Issuer:    "https://issuer.example/realms/lab",
+		JWKSURI:   "https://issuer.example/realms/lab/certs",
+		TeamClaim: "tenant",
+		HeaderKey: "x-tenant-id",
+	})
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	sp := getUnstructured(t, c, securityPolicyGVK(), "custom-hdr-router")
+	claim, header := claimToHeaderOf(t, sp)
+	if claim != "tenant" {
+		t.Errorf("claimToHeaders claim = %q, want tenant", claim)
+	}
+	if header != "x-tenant-id" {
+		t.Errorf("claimToHeaders header = %q, want x-tenant-id", header)
+	}
+}
+
+// TestModelRouterGateway_InvalidAuthRejectedByCRD covers case (c) primary guard:
+// an auth.jwt block missing a required field (here, jwksURI) is rejected by the
+// CRD's Required+MinLength validation at apply time, so a half-configured
+// SecurityPolicy can never be persisted.
+func TestModelRouterGateway_InvalidAuthRejectedByCRD(t *testing.T) {
+	c, _, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := authedRouter("badauth-router", &inferencev1alpha1.JWTAuthSpec{
+		Provider:  "keycloak",
+		Issuer:    "https://issuer.example/realms/lab",
+		JWKSURI:   "", // missing required field
+		TeamClaim: "team",
+	})
+	err := c.Create(context.Background(), mr)
+	if err == nil {
+		t.Fatalf("expected CRD to reject auth.jwt with empty jwksURI, but create succeeded")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("expected an Invalid error from CRD validation, got %v", err)
+	}
+}
+
+// TestModelRouterGateway_InvalidAuthFailsLoud covers case (c) defense-in-depth:
+// the reconciler's fail-loud guard. If a half-configured auth.jwt somehow reaches
+// the reconciler (e.g. a future CRD relaxation, or an object written before a
+// validation tightening), it sets GatewayReady=False/InvalidAuth and generates
+// NOTHING rather than emitting a partial SecurityPolicy. The CRD-validated env
+// cannot persist such an object, so this drives the reconcile against a
+// validation-free fake client. The CRD-presence gate is satisfied by registering
+// the gateway GVKs in the fake client's RESTMapper.
+func TestModelRouterGateway_InvalidAuthFailsLoud(t *testing.T) {
+	mr := authedRouter("badauth-router", &inferencev1alpha1.JWTAuthSpec{
+		Provider:  "keycloak",
+		Issuer:    "https://issuer.example/realms/lab",
+		JWKSURI:   "", // missing required field
+		TeamClaim: "team",
+	})
+
+	r := newFakeRouterReconcilerWithGateway(t, mr)
+	reconcileRouter(t, r, mr)
+
+	// Generates NOTHING: no SecurityPolicy, and none of the route resources.
+	assertNotExistsClient(t, r.Client, securityPolicyGVK(), "badauth-router")
+	assertNotExistsClient(t, r.Client, backendGVK(), "qwen-cuda")
+	assertNotExistsClient(t, r.Client, aiServiceBackendGVK(), "qwen-cuda")
+	assertNotExistsClient(t, r.Client, aiGatewayRouteGVK(), "badauth-router")
+	assertNotExistsClient(t, r.Client, btpGVK(), "badauth-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "badauth-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuth {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuth, cond)
+	}
+	if fresh.Status.Gateway != nil && fresh.Status.Gateway.RouteReady {
+		t.Errorf("status.gateway.routeReady should be false on invalid auth")
+	}
+}
+
+// TestModelRouterGateway_NoAuthProducesNoSecurityPolicy covers case (d): a
+// ModelRouter with no policy.auth generates the slice-2a resources but NO
+// SecurityPolicy, and status.gateway.authEnabled is false. This is the #693
+// non-regression: the rest of the output is unchanged.
+func TestModelRouterGateway_NoAuthProducesNoSecurityPolicy(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := authedRouter("noauth-router", nil)
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	// The 2a resources still exist (non-regression).
+	getUnstructured(t, c, backendGVK(), "qwen-cuda")
+	getUnstructured(t, c, aiServiceBackendGVK(), "qwen-cuda")
+	getUnstructured(t, c, aiGatewayRouteGVK(), "noauth-router")
+	getUnstructured(t, c, btpGVK(), "noauth-router")
+
+	// But NO SecurityPolicy.
+	assertNotExists(t, c, securityPolicyGVK(), "noauth-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "noauth-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if fresh.Status.Gateway == nil || fresh.Status.Gateway.AuthEnabled {
+		t.Errorf("status.gateway.authEnabled should be false with no auth, got %+v", fresh.Status.Gateway)
 	}
 }
 
