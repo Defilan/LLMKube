@@ -409,3 +409,58 @@ func assertBackendRefPriority(t *testing.T, ref interface{}, wantName string, wa
 		t.Errorf("backendRef %s priority = %d, want %d", wantName, got, wantPriority)
 	}
 }
+
+// TestUnsupportedMatchMessage_GlobModel pins the fail-loud boundary for glob
+// model patterns: Proxy mode matches "qwen3-*" via path.Match, but the gateway
+// data plane can only do an Exact x-ai-eg-model header match, so a glob must be
+// rejected loudly rather than compiled to a literal that never fires. A literal
+// model and headers must still compile (empty message).
+func TestUnsupportedMatchMessage_GlobModel(t *testing.T) {
+	tests := []struct {
+		name       string
+		match      *inferencev1alpha1.RuleMatch
+		wantReject bool
+	}{
+		{
+			name:       "literal model compiles",
+			match:      &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+			wantReject: false,
+		},
+		{
+			name:       "header-only compiles",
+			match:      &inferencev1alpha1.RuleMatch{Headers: map[string]string{"x-team": "a"}},
+			wantReject: false,
+		},
+		{
+			name:       "star glob rejected",
+			match:      &inferencev1alpha1.RuleMatch{Models: []string{"qwen3-*"}},
+			wantReject: true,
+		},
+		{
+			name:       "question glob rejected",
+			match:      &inferencev1alpha1.RuleMatch{Models: []string{"gpt-?"}},
+			wantReject: true,
+		},
+		{
+			name:       "bracket glob rejected",
+			match:      &inferencev1alpha1.RuleMatch{Models: []string{"llama[0-9]"}},
+			wantReject: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mr := &inferencev1alpha1.ModelRouter{
+				Spec: inferencev1alpha1.ModelRouterSpec{
+					Rules: []inferencev1alpha1.RouterRule{{Name: "r0", Match: tt.match}},
+				},
+			}
+			msg := unsupportedMatchMessage(mr)
+			if tt.wantReject && msg == "" {
+				t.Errorf("expected rule rejected, got empty message")
+			}
+			if !tt.wantReject && msg != "" {
+				t.Errorf("expected rule compiled, got rejection: %s", msg)
+			}
+		})
+	}
+}

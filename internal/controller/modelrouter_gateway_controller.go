@@ -411,6 +411,22 @@ func unsupportedMatchFields(m *inferencev1alpha1.RuleMatch) []string {
 	if m.LatencySLOMs != nil {
 		fields = append(fields, "latencySLOMs")
 	}
+	if hasGlobModel(m.Models) {
+		fields = append(fields, "glob model pattern")
+	}
 	sort.Strings(fields)
 	return fields
+}
+
+// hasGlobModel reports whether any model pattern carries glob metacharacters.
+// Proxy mode matches these via path.Match; the gateway data plane can only do
+// an Exact x-ai-eg-model header match, so a glob would compile to a literal
+// that never fires. We fail loud rather than silently route nothing.
+func hasGlobModel(models []string) bool {
+	for _, mdl := range models {
+		if strings.ContainsAny(mdl, "*?[") {
+			return true
+		}
+	}
+	return false
 }
