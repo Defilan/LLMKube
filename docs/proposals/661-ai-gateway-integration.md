@@ -151,6 +151,22 @@ ModelRouter stays the user-facing policy surface (rules, budgets, classification
 - **Honest boundary (fail-loud).** The gateway data plane can match model name and headers, but NOT `dataClassification`, `taskComplexity`, `requiredCapabilities`, or `latencySLO` (those need request-body inspection / router-side scoring, which is slice 2e). A ModelRouter rule using any of those in `Gateway` mode sets the ModelRouter condition `False` (reason `UnsupportedMatchInGatewayMode`) and generates NOTHING, rather than silently compiling a partial route that drops a rule the user expects. A validating webhook to reject this at apply time is a follow-up.
 - **Status.** `status.gateway` on the ModelRouter (routes ready + resolved endpoint) plus a condition.
 
+#### Sub-slice 2b (detailed design): token budgets and 429 enforcement
+
+Compile `policy.budgets[]` into token-denominated rate limiting on the resources 2a already generates.
+
+- **One BTP, extended in place.** The `rateLimit` stanza is added to the SAME `BackendTrafficPolicy` 2a created for retry/failover, NOT a new policy. This is footgun 7.1 made structural: two `BackendTrafficPolicy` objects targeting one route silently conflict (the oldest wins), so retry and rate limit must share one BTP. The 2b builder extends the 2a BTP rather than emitting a second one.
+- **Token-denominated.** Add `llmRequestCosts` (TotalToken) to the `AIGatewayRoute` 2a generates so the limit is charged in tokens at response completion, with the request path check-only. This is the mechanism the spike validated.
+- **Scopes compiled in 2b: `router` and `team`.** `router` becomes a global rateLimit descriptor (applies to all traffic through the ModelRouter). `team` becomes a descriptor keyed on `BudgetSpec.HeaderKey` (default `x-llmkube-team`), so each distinct header value gets its own bucket. Each budget compiles `MaxTokens` over `WindowSeconds` into a rateLimit rule; exceeding it yields instant 429s with budget-countdown headers.
+
+**Deliberately deferred, with the reasoning (so a later slice picks up a decided question, not an open one):**
+
+- **`MaxUSD` (dollar budgets) -> fail-loud (`UnsupportedBudgetField`) until a dedicated follow-up.** The gateway rate-limits on tokens, so a dollar cap must convert to a token-equivalent. With heterogeneous backends at different `CostPerMillionTokens` under one rule, there is no single honest conversion (which backend's price sets the rate?). Rather than silently pick one and under- or over-charge, 2b ships `MaxTokens` enforcement and fails loud on `MaxUSD`. The conversion semantics (per-backend, blended, or worst-case-conservative) are a design question that gets its own slice once chosen.
+- **`rule` scope -> fail-loud (`UnsupportedBudgetScope`) until a follow-up.** `router` and `team` are the high-value cases (total cap, per-tenant cap). `rule`-scoped budgets need a per-rule rateLimit clientSelector keyed on the rule's model match, which is fiddlier; deferring it keeps 2b tight and is reversible.
+- **`team` scope is compiled now but documented as needing auth to be tamper-proof.** A `team` budget keys on whatever populates `HeaderKey`; without auth (slice 2d) a client can spoof that header for a fresh bucket. We compile it anyway (rather than block on 2d) because the rateLimit-by-header mechanism is identity-agnostic and the budget feature is useful immediately; 2d later derives the header from a verified JWT claim, which makes the same budget tamper-proof. The status/docs note this pairing so an operator is not misled into thinking header-keyed budgets are secure on their own.
+
+- **Status.** Surface compiled budgets and any fail-loud reason (`UnsupportedBudgetField` / `UnsupportedBudgetScope`) on the ModelRouter condition, consistent with 2a's honest-boundary handling.
+
 ### 5.3 Backend health bridging (sub-projects 3 + 4)
 metal-agent (#662) ejects/restores the address on its managed Endpoints object on health change and surfaces status. The operator (sub-project 4) compiles that health, plus pod health, into gateway `Backend` ejection/restoration, giving off-cluster Metal endpoints the event-driven detection that pods get from the EPP. This mutates the `Backend`s the MVP generates.
 
