@@ -223,6 +223,25 @@ spec:
                   type: object
                 minItems: 1
                 type: array
+              dataPlane:
+                default: Proxy
+                description: |-
+                  DataPlane selects how this ModelRouter serves traffic.
+
+                  "Proxy" (default) provisions the managed router-proxy Deployment +
+                  Service and routes in-process per the rules below (today's behavior,
+                  fully back-compat).
+
+                  "Gateway" compiles the backends and rules onto a pre-installed Envoy AI
+                  Gateway: a Backend + AIServiceBackend per InferenceServiceRef backend, a
+                  multi-rule AIGatewayRoute, and a retry/failover BackendTrafficPolicy. In
+                  Gateway mode the router-proxy is NOT provisioned. Requires the aigw CRDs
+                  to be installed; when they are absent the gateway resources are not
+                  generated and a condition explains why.
+                enum:
+                - Proxy
+                - Gateway
+                type: string
               defaultRoute:
                 description: |-
                   DefaultRoute names a backend used when no rule matches.
@@ -297,6 +316,26 @@ spec:
                     - NodePort
                     - LoadBalancer
                     type: string
+                type: object
+              gatewayRef:
+                description: |-
+                  GatewayRef identifies the pre-installed Gateway (gateway.networking.k8s.io)
+                  the generated AIGatewayRoute attaches to when DataPlane is "Gateway".
+                  Required in Gateway mode; ignored in Proxy mode. The Gateway and the Envoy
+                  AI Gateway stack are a documented prerequisite; LLMKube does not install
+                  or own them. Cross-namespace attachment requires the Gateway listener's
+                  allowedRoutes.namespaces to permit this ModelRouter's namespace.
+                properties:
+                  name:
+                    description: Name is the Gateway's name.
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the Gateway's namespace. Empty means the InferenceService's
+                      own namespace.
+                    type: string
+                required:
+                - name
                 type: object
               mcpServer:
                 description: |-
@@ -770,6 +809,7 @@ spec:
                   - "Available":     the router-proxy is serving traffic
                   - "Degraded":      at least one backend is unhealthy but the router
                                      can still serve other routes
+                  - "GatewayReady":  (dataPlane: Gateway) the gateway resources reconciled
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -833,6 +873,32 @@ spec:
                   Endpoint is the in-cluster URL clients should hit. Populated once
                   the router-proxy Service is ready.
                 type: string
+              gateway:
+                description: |-
+                  Gateway reports the observed state of dataPlane: Gateway exposure: whether
+                  the AIGatewayRoute (and its backing Backend / AIServiceBackend /
+                  BackendTrafficPolicy) reconciled, and the resolved gateway endpoint. nil
+                  in Proxy mode. Also surfaced via the GatewayReady condition.
+                properties:
+                  endpoint:
+                    description: |-
+                      Endpoint is the gateway address clients send OpenAI requests to. Set by
+                      the ModelRouter dataPlane: Gateway path (resolved from the referenced
+                      Gateway); empty for the InferenceService path.
+                    type: string
+                  modelName:
+                    description: |-
+                      ModelName is the resolved model-name match value clients send as the
+                      OpenAI "model" string to reach this InferenceService through the gateway.
+                      Set by the InferenceService path; empty for ModelRouter (which fronts
+                      many model names).
+                    type: string
+                  routeReady:
+                    description: |-
+                      RouteReady indicates the AIGatewayRoute (and its backing Backend +
+                      AIServiceBackend) were reconciled successfully against the gateway.
+                    type: boolean
+                type: object
               lastUpdated:
                 description: LastUpdated is the timestamp of the last status reconciliation.
                 format: date-time
