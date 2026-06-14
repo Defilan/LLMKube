@@ -113,6 +113,20 @@ webhook:
   # operator that should always be running. "Ignore" admits the CR
   # unvalidated; use only if a transient operator outage blocking applies
   # is worse than admitting an occasional invalid CR.
+  #
+  # Operational tradeoff with a SINGLE operator replica (the default):
+  # because the webhook server runs in the operator pod, a rolling
+  # restart or upgrade leaves a brief window where the old pod is gone
+  # and the new pod is not yet Ready. During that window, with
+  # failurePolicy "Fail", EVERY Agent and AgenticTask CREATE/UPDATE
+  # clusterwide is rejected (the API server cannot reach any webhook
+  # backend), which can stall the Foreman pipeline and any controller
+  # that patches these CRs. If that window is unacceptable, either set
+  # failurePolicy to "Ignore" (accept unvalidated CRs during the gap) or
+  # run 2+ operator replicas so a Ready webhook backend always exists
+  # across a rollout. Do NOT add a namespaceSelector to dodge this: it
+  # would narrow enforcement and let unvalidated CRs through in the
+  # excluded namespaces permanently, not just during a restart.
   failurePolicy: Fail
 
   # port the operator's webhook server listens on (matches the container
