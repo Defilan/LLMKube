@@ -792,8 +792,12 @@ type InferenceServiceStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// GatewayStatus reports the observed state of Envoy AI Gateway exposure for an
-// InferenceService.
+// GatewayStatus reports the observed state of Envoy AI Gateway exposure. It is
+// shared by InferenceService gateway exposure (slice 1) and ModelRouter
+// dataPlane: Gateway mode (slice 2a). The InferenceService path leaves Endpoint
+// empty (a single route, no router-level endpoint string); the ModelRouter path
+// populates Endpoint with the resolved gateway address and leaves ModelName
+// empty (a ModelRouter fronts many model names, one per rule).
 type GatewayStatus struct {
 	// RouteReady indicates the AIGatewayRoute (and its backing Backend +
 	// AIServiceBackend) were reconciled successfully against the gateway.
@@ -802,8 +806,16 @@ type GatewayStatus struct {
 
 	// ModelName is the resolved model-name match value clients send as the
 	// OpenAI "model" string to reach this InferenceService through the gateway.
+	// Set by the InferenceService path; empty for ModelRouter (which fronts
+	// many model names).
 	// +optional
 	ModelName string `json:"modelName,omitempty"`
+
+	// Endpoint is the gateway address clients send OpenAI requests to. Set by
+	// the ModelRouter dataPlane: Gateway path (resolved from the referenced
+	// Gateway); empty for the InferenceService path.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
 }
 
 // +kubebuilder:object:root=true

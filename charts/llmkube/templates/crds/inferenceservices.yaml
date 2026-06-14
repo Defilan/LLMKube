@@ -2050,10 +2050,18 @@ spec:
                   is disabled because the aigw CRDs are not installed; that case is also
                   surfaced via the GatewayReady condition).
                 properties:
+                  endpoint:
+                    description: |-
+                      Endpoint is the gateway address clients send OpenAI requests to. Set by
+                      the ModelRouter dataPlane: Gateway path (resolved from the referenced
+                      Gateway); empty for the InferenceService path.
+                    type: string
                   modelName:
                     description: |-
                       ModelName is the resolved model-name match value clients send as the
                       OpenAI "model" string to reach this InferenceService through the gateway.
+                      Set by the InferenceService path; empty for ModelRouter (which fronts
+                      many model names).
                     type: string
                   routeReady:
                     description: |-

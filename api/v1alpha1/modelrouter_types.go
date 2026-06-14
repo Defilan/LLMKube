@@ -21,6 +21,19 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ModelRouterDataPlane selects how a ModelRouter serves traffic.
+type ModelRouterDataPlane string
+
+const (
+	// ModelRouterDataPlaneProxy provisions the managed router-proxy Deployment
+	// and routes in-process. This is the default and preserves today's behavior.
+	ModelRouterDataPlaneProxy ModelRouterDataPlane = "Proxy"
+
+	// ModelRouterDataPlaneGateway compiles the router policy onto a pre-installed
+	// Envoy AI Gateway instead of provisioning the router-proxy.
+	ModelRouterDataPlaneGateway ModelRouterDataPlane = "Gateway"
+)
+
 // ModelRouterSpec defines the desired state of a ModelRouter.
 //
 // A ModelRouter exposes a single OpenAI-compatible HTTP endpoint that
@@ -31,6 +44,32 @@ import (
 // supports fail-closed semantics for sensitive-data routes so PII never
 // escapes the cluster boundary.
 type ModelRouterSpec struct {
+	// DataPlane selects how this ModelRouter serves traffic.
+	//
+	// "Proxy" (default) provisions the managed router-proxy Deployment +
+	// Service and routes in-process per the rules below (today's behavior,
+	// fully back-compat).
+	//
+	// "Gateway" compiles the backends and rules onto a pre-installed Envoy AI
+	// Gateway: a Backend + AIServiceBackend per InferenceServiceRef backend, a
+	// multi-rule AIGatewayRoute, and a retry/failover BackendTrafficPolicy. In
+	// Gateway mode the router-proxy is NOT provisioned. Requires the aigw CRDs
+	// to be installed; when they are absent the gateway resources are not
+	// generated and a condition explains why.
+	// +kubebuilder:validation:Enum=Proxy;Gateway
+	// +kubebuilder:default=Proxy
+	// +optional
+	DataPlane ModelRouterDataPlane `json:"dataPlane,omitempty"`
+
+	// GatewayRef identifies the pre-installed Gateway (gateway.networking.k8s.io)
+	// the generated AIGatewayRoute attaches to when DataPlane is "Gateway".
+	// Required in Gateway mode; ignored in Proxy mode. The Gateway and the Envoy
+	// AI Gateway stack are a documented prerequisite; LLMKube does not install
+	// or own them. Cross-namespace attachment requires the Gateway listener's
+	// allowedRoutes.namespaces to permit this ModelRouter's namespace.
+	// +optional
+	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
+
 	// Backends are the candidate destinations the router can dispatch to.
 	// Order is not significant; selection is rule-driven. At least one
 	// backend must be declared.
@@ -483,6 +522,13 @@ type ModelRouterStatus struct {
 	// +optional
 	LastUpdated *metav1.Time `json:"lastUpdated,omitempty"`
 
+	// Gateway reports the observed state of dataPlane: Gateway exposure: whether
+	// the AIGatewayRoute (and its backing Backend / AIServiceBackend /
+	// BackendTrafficPolicy) reconciled, and the resolved gateway endpoint. nil
+	// in Proxy mode. Also surfaced via the GatewayReady condition.
+	// +optional
+	Gateway *GatewayStatus `json:"gateway,omitempty"`
+
 	// conditions represent the current state of the ModelRouter resource.
 	//
 	// Standard condition types:
@@ -491,6 +537,7 @@ type ModelRouterStatus struct {
 	// - "Available":     the router-proxy is serving traffic
 	// - "Degraded":      at least one backend is unhealthy but the router
 	//                    can still serve other routes
+	// - "GatewayReady":  (dataPlane: Gateway) the gateway resources reconciled
 	//
 	// +listType=map
 	// +listMapKey=type

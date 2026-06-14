@@ -61,14 +61,13 @@ type InferenceServiceGatewayReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 
-	// crdsPresent caches a POSITIVE detection only: once the aigw CRDs are seen
-	// registered we stop re-checking. While absent we re-check on every reconcile
-	// so a gateway installed after the operator starts is picked up without a
-	// restart. crdMu guards both fields for concurrent reconciles; loggedAbsent
-	// keeps the disabled message to a single log line.
-	crdMu        sync.Mutex
-	crdsPresent  bool
-	loggedAbsent bool
+	// detector is the shared CRD-presence gate. Lazily initialized on first
+	// reconcile (so a zero-value reconciler, as built in cmd/main.go, works) and
+	// reused thereafter. It caches a positive detection and re-checks while
+	// absent so a gateway installed after startup is picked up without a
+	// restart.
+	detectorOnce sync.Once
+	detector     *gatewayCRDDetector
 }
 
 // +kubebuilder:rbac:groups=gateway.envoyproxy.io,resources=backends,verbs=get;list;watch;create;update;patch;delete
@@ -173,50 +172,19 @@ func (r *InferenceServiceGatewayReconciler) applyResource(
 	return err
 }
 
-// gatewayCRDsPresent reports whether all three aigw CRDs are registered.
-// A positive result is cached; while absent it re-checks on every call so a
-// gateway installed after startup is picked up without an operator restart.
-// A transient discovery error (not a missing kind) is returned so the caller
-// requeues instead of caching a false negative. The disabled message is logged
-// once.
+// gatewayCRDsPresent reports whether the three aigw CRDs slice 1 generates are
+// registered, delegating to the shared gatewayCRDDetector. A positive result is
+// cached; while absent it re-checks on every call so a gateway installed after
+// startup is picked up without an operator restart. A transient discovery error
+// (not a missing kind) is returned so the caller requeues instead of caching a
+// false negative. The disabled message is logged once.
 func (r *InferenceServiceGatewayReconciler) gatewayCRDsPresent(log logr.Logger) (bool, error) {
-	r.crdMu.Lock()
-	defer r.crdMu.Unlock()
-
-	if r.crdsPresent {
-		return true, nil
-	}
-
-	present, err := r.detectGatewayCRDs()
-	if err != nil {
-		return false, err
-	}
-	if present {
-		r.crdsPresent = true
-		return true, nil
-	}
-	if !r.loggedAbsent {
-		log.Info("gateway integration disabled (CRDs not installed)")
-		r.loggedAbsent = true
-	}
-	return false, nil
-}
-
-// detectGatewayCRDs queries the RESTMapper for each generated kind. A missing
-// kind (NoKindMatchError) means "not installed" and returns (false, nil). Any
-// other error is treated as transient (for example a lazy-discovery hiccup) and
-// returned so the caller requeues rather than caching a false negative.
-func (r *InferenceServiceGatewayReconciler) detectGatewayCRDs() (bool, error) {
-	mapper := r.Client.RESTMapper()
-	for _, gvk := range []schema.GroupVersionKind{backendGVK(), aiServiceBackendGVK(), aiGatewayRouteGVK()} {
-		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
-			if apimeta.IsNoMatchError(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("check gateway CRD %s: %w", gvk.Kind, err)
-		}
-	}
-	return true, nil
+	r.detectorOnce.Do(func() {
+		r.detector = newGatewayCRDDetector([]schema.GroupVersionKind{
+			backendGVK(), aiServiceBackendGVK(), aiGatewayRouteGVK(),
+		})
+	})
+	return r.detector.Present(r.Client, log)
 }
 
 // setGatewayReady writes the success status: GatewayReady=True plus
