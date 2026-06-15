@@ -61,15 +61,29 @@ const (
 	// for the total-token key within it.
 	aiGatewayMetadataNamespace = "io.envoy.ai_gateway"
 
-	// defaultTeamHeaderKey is the request header a team-scope budget keys its
-	// rateLimit bucket on when BudgetSpec.HeaderKey is unset. Matches the CRD
-	// default documented on BudgetSpec.HeaderKey.
+	// defaultTeamHeaderKey is the team header shared by two slices: a team-scope
+	// budget (2b) keys its rateLimit bucket on it, and JWT auth (2d) lands the
+	// verified team claim on it, so the gateway derives team identity from the
+	// token instead of a client header. Matches the CRD default on
+	// BudgetSpec.HeaderKey and JWTAuthSpec.HeaderKey.
 	defaultTeamHeaderKey = "x-llmkube-team"
 
 	// Budget scopes compiled in slice 2b. "rule" is fail-loud (deferred).
 	budgetScopeRouter = "router"
 	budgetScopeTeam   = "team"
 	budgetScopeRule   = "rule"
+
+	// securityPolicyKind is the gateway.envoyproxy.io SecurityPolicy kind. Slice
+	// 2d-core compiles policy.auth.jwt into one of these to validate inbound JWTs
+	// and map a verified claim onto a trusted header.
+	securityPolicyKind     = "SecurityPolicy"
+	securityPolicyResource = "securitypolicies"
+
+	// metadataNameField is the "name" key used throughout the unstructured
+	// object builders in this file (metadata.name and the many nested
+	// backendRef/targetRef name fields). Extracted to a const because slice 2d
+	// pushed the package-wide occurrence count past the goconst threshold.
+	metadataNameField = "name"
 )
 
 // aiGatewayTotalTokenKey is the dynamic-metadata key (within
@@ -88,6 +102,12 @@ func aiGatewayTotalTokenKey() string {
 // Backend (gateway.envoyproxy.io/v1alpha1).
 func btpGVK() schema.GroupVersionKind {
 	return schema.GroupVersionKind{Group: gatewayBackendGroup, Version: gatewayBackendVersion, Kind: btpKind}
+}
+
+// securityPolicyGVK is the GVK of the generated SecurityPolicy. Same
+// group/version as Backend (gateway.envoyproxy.io/v1alpha1).
+func securityPolicyGVK() schema.GroupVersionKind {
+	return schema.GroupVersionKind{Group: gatewayBackendGroup, Version: gatewayBackendVersion, Kind: securityPolicyKind}
 }
 
 // routerBackendResource is one resolved ModelRouter backend ready to compile:
@@ -174,12 +194,12 @@ func newRouterAIServiceBackend(mr *inferencev1alpha1.ModelRouter, b routerBacken
 	u.SetNamespace(mr.Namespace)
 	u.Object["spec"] = map[string]interface{}{
 		"schema": map[string]interface{}{
-			"name": aiGatewayBackendSchemaName,
+			metadataNameField: aiGatewayBackendSchemaName,
 		},
 		"backendRef": map[string]interface{}{
-			"name":  name,
-			"kind":  gatewayBackendKind,
-			"group": gatewayBackendGroup,
+			metadataNameField: name,
+			"kind":            gatewayBackendKind,
+			"group":           gatewayBackendGroup,
 		},
 	}
 	return u
@@ -197,9 +217,9 @@ func newRouterAIGatewayRoute(
 	budgets []inferencev1alpha1.BudgetSpec,
 ) *unstructured.Unstructured {
 	parentRef := map[string]interface{}{
-		"name":  gatewayRef.Name,
-		"kind":  aiGatewayRouteParentRefKind,
-		"group": gatewayBackendRefGroupAPI,
+		metadataNameField: gatewayRef.Name,
+		"kind":            aiGatewayRouteParentRefKind,
+		"group":           gatewayBackendRefGroupAPI,
 	}
 	if gatewayRef.Namespace != "" {
 		parentRef["namespace"] = gatewayRef.Namespace
@@ -286,9 +306,9 @@ func compileRuleMatches(rule routerRuleResource) []interface{} {
 // modelHeaderMatch is the Exact x-ai-eg-model header match for one model name.
 func modelHeaderMatch(model string) map[string]interface{} {
 	return map[string]interface{}{
-		"type":  "Exact",
-		"name":  aiGatewayModelHeader,
-		"value": model,
+		"type":            "Exact",
+		metadataNameField: aiGatewayModelHeader,
+		"value":           model,
 	}
 }
 
@@ -307,9 +327,9 @@ func sortedHeaderMatches(headers map[string]string) []interface{} {
 	out := make([]interface{}, 0, len(names))
 	for _, name := range names {
 		out = append(out, map[string]interface{}{
-			"type":  "Exact",
-			"name":  name,
-			"value": headers[name],
+			"type":            "Exact",
+			metadataNameField: name,
+			"value":           headers[name],
 		})
 	}
 	return out
@@ -321,7 +341,7 @@ func compileRuleBackendRefs(refs []routerBackendRef) []interface{} {
 	out := make([]interface{}, 0, len(refs))
 	for _, ref := range refs {
 		backendRef := map[string]interface{}{
-			"name": sanitizeDNSName(ref.Name),
+			metadataNameField: sanitizeDNSName(ref.Name),
 		}
 		if ref.Priority != nil {
 			backendRef["priority"] = *ref.Priority
@@ -345,9 +365,9 @@ func newRouterBackendTrafficPolicy(mr *inferencev1alpha1.ModelRouter, budgets []
 	spec := map[string]interface{}{
 		"targetRefs": []interface{}{
 			map[string]interface{}{
-				"group": gatewayBackendRefGroupAPI,
-				"kind":  httpRouteKind,
-				"name":  name,
+				"group":           gatewayBackendRefGroupAPI,
+				"kind":            httpRouteKind,
+				metadataNameField: name,
 			},
 		},
 		"retry": map[string]interface{}{
@@ -460,8 +480,8 @@ func compileBudgetRule(b inferencev1alpha1.BudgetSpec) map[string]interface{} {
 			map[string]interface{}{
 				"headers": []interface{}{
 					map[string]interface{}{
-						"name": teamHeaderKey(b),
-						"type": "Distinct",
+						metadataNameField: teamHeaderKey(b),
+						"type":            "Distinct",
 					},
 				},
 			},
@@ -475,6 +495,15 @@ func compileBudgetRule(b inferencev1alpha1.BudgetSpec) map[string]interface{} {
 func teamHeaderKey(b inferencev1alpha1.BudgetSpec) string {
 	if b.HeaderKey != "" {
 		return b.HeaderKey
+	}
+	return defaultTeamHeaderKey
+}
+
+// routerJWTHeaderKey is where the verified team claim lands: the explicit
+// HeaderKey, else the x-llmkube-team default (matching team-scoped budgets).
+func routerJWTHeaderKey(jwt *inferencev1alpha1.JWTAuthSpec) string {
+	if jwt.HeaderKey != "" {
+		return jwt.HeaderKey
 	}
 	return defaultTeamHeaderKey
 }
@@ -514,15 +543,58 @@ func budgetUnitSeconds(unit string) int64 {
 	}
 }
 
+// newRouterSecurityPolicy builds the gateway.envoyproxy.io SecurityPolicy that
+// validates inbound JWTs and maps the verified team claim onto a trusted header.
+// It targets the generated HTTPRoute (which shares the AIGatewayRoute's name),
+// like the BTP. The JWT filter runs before the AI extproc, so an invalid token
+// is a 401 before any model dispatch. Mirrors the jwt stanza of the spike's
+// 07-security-policy.yaml; the authorization stanza of that manifest is slice
+// 2d.2 and deliberately NOT compiled here.
+func newRouterSecurityPolicy(mr *inferencev1alpha1.ModelRouter, jwt *inferencev1alpha1.JWTAuthSpec) *unstructured.Unstructured {
+	name := modelRouterGatewayResourceName(mr)
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(securityPolicyGVK())
+	u.SetName(name)
+	u.SetNamespace(mr.Namespace)
+	u.Object["spec"] = map[string]interface{}{
+		"targetRefs": []interface{}{
+			map[string]interface{}{
+				"group":           gatewayBackendRefGroupAPI,
+				"kind":            httpRouteKind,
+				metadataNameField: name,
+			},
+		},
+		"jwt": map[string]interface{}{
+			"providers": []interface{}{
+				map[string]interface{}{
+					metadataNameField: jwt.Provider,
+					"issuer":          jwt.Issuer,
+					"remoteJWKS": map[string]interface{}{
+						"uri": jwt.JWKSURI,
+					},
+					"claimToHeaders": []interface{}{
+						map[string]interface{}{
+							"claim":  jwt.TeamClaim,
+							"header": routerJWTHeaderKey(jwt),
+						},
+					},
+				},
+			},
+		},
+	}
+	return u
+}
+
 // modelRouterGatewayGVKs are the GVKs the ModelRouter gateway path needs the
-// cluster to have registered before it generates anything: slice 1's three plus
-// the BackendTrafficPolicy.
+// cluster to have registered before it generates anything: slice 1's three, the
+// BackendTrafficPolicy (2a), and the SecurityPolicy (2d-core).
 func modelRouterGatewayGVKs() []schema.GroupVersionKind {
 	return []schema.GroupVersionKind{
 		backendGVK(),
 		aiServiceBackendGVK(),
 		aiGatewayRouteGVK(),
 		btpGVK(),
+		securityPolicyGVK(),
 	}
 }
 
