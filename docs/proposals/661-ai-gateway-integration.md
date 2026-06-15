@@ -179,6 +179,22 @@ Add a new auth surface to ModelRouter and compile it into a `SecurityPolicy` att
 
 **Deferred to 2d.2, with reasoning:** per-team model **allowlists** (the spike's `authorization` block: default-Deny + per-claim, per-model Allow rules). Authorization is a separate design (default-deny semantics, claim-to-model mapping, how an empty allowlist behaves, status surfacing) and is meatier than authN. 2d-core ships authentication + the budget unlock first so identity and tamper-proof budgets land immediately; 2d.2 adds access control on top of the same SecurityPolicy. Authentication without authorization is still useful here: it establishes verified identity and correct budget attribution; it just does not yet restrict which teams reach which models.
 
+#### Sub-slice 2d.2 (detailed design): per-team model allowlists
+
+Add a per-team model **allowlist** surface and compile it into the `authorization` block of the SAME `SecurityPolicy` 2d-core generates. authZ on top of authN: 2d-core verifies identity, 2d.2 restricts which verified team reaches which model.
+
+- **API surface (`spec.policy.auth.allowlists[]`).** A sibling of `auth.jwt`, so `auth.jwt` is authentication and `auth.allowlists` is authorization. Each entry is `{team, models[]}`: `team` is a verified `teamClaim` value, `models` is the set of model names that team may reach. `models` empty means that team may reach ALL models (identity-only allow). Matches the spike's `allow-team-a-all` (no model restriction) vs `allow-team-b-qwen-only` (model-restricted).
+
+- **Compilation.** When `allowlists` is non-empty, extend the SecurityPolicy with `authorization: {defaultAction: Deny, rules: [...]}`. One Allow rule per entry: `principal.jwt.provider = jwt.Provider`, `principal.jwt.claims = [{name: jwt.TeamClaim, values: [team]}]`, plus (only when `models` is non-empty) `principal.headers = [{name: x-ai-eg-model, values: models}]`. `x-ai-eg-model` is the resolved model header the AI Gateway extproc sets before RBAC runs (validated in the spike); it is the same value `spec.rules[].match.models` route on.
+
+- **Default-deny only when configured.** The `authorization` block is emitted ONLY when `allowlists` is non-empty. An authN-only router (2d-core, no allowlists) keeps allow-all-authenticated semantics, so adding the field cannot retroactively lock out an existing router. A non-empty allowlist flips to default-Deny: any team not named is rejected (403). This is the secure default once a user opts into authorization.
+
+- **Honest boundary (fail-loud), consistent with 2a/2b/2d-core.** `allowlists` set without `auth.jwt` is `AuthorizationRequiresJWT` (you cannot authorize on an unverified claim); an entry with an empty `team`, or a duplicate `team`, is `InvalidAuthorization`. Any of these sets `GatewayReady=False` and generates NOTHING rather than emit a SecurityPolicy whose default-Deny would silently lock everyone out or whose principals are malformed.
+
+- **Status.** On success, append an allowlist summary to the ready message (`; N team model allowlist(s) enforced`), consistent with the JWT and budget summaries.
+
+**Deferred from 2d.2 (with reasoning):** cross-validating allowlist model names against the union of `spec.rules[].match.models` (catch a typo that silently denies) is a useful guard but couples authZ to rule/`defaultRoute` resolution (header-only rules, catch-alls) and is reversible; it is a follow-up. A validating webhook to reject these fail-loud cases at apply time (rather than status-only) is the same cross-slice follow-up noted for 2a/2d-core.
+
 ### 5.3 Backend health bridging (sub-projects 3 + 4)
 metal-agent (#662) ejects/restores the address on its managed Endpoints object on health change and surfaces status. The operator (sub-project 4) compiles that health, plus pod health, into gateway `Backend` ejection/restoration, giving off-cluster Metal endpoints the event-driven detection that pods get from the EPP. This mutates the `Backend`s the MVP generates.
 
