@@ -1,0 +1,85 @@
+suite: modelrouter validating webhook
+templates:
+  - webhook.yaml
+
+tests:
+  # Default ON: the chart self-generates a stable serving cert, so the webhook
+  # is wired by default (matches foreman). Renders exactly three documents:
+  # the cert Secret, the webhook Service, and the ValidatingWebhookConfiguration.
+  - it: should render Secret + Service + ValidatingWebhookConfiguration by default
+    asserts:
+      - hasDocuments:
+          count: 3
+
+  - it: should render a kubernetes.io/tls cert Secret
+    documentIndex: 0
+    asserts:
+      - isKind:
+          of: Secret
+      - equal:
+          path: type
+          value: kubernetes.io/tls
+      - isNotNullOrEmpty:
+          path: data["tls.crt"]
+      - isNotNullOrEmpty:
+          path: data["tls.key"]
+      - isNotNullOrEmpty:
+          path: data["ca.crt"]
+
+  - it: should render a webhook Service exposing the named webhook port
+    documentIndex: 1
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.ports[0].port
+          value: 443
+      - equal:
+          path: spec.ports[0].targetPort
+          value: webhook
+
+  - it: should render a ValidatingWebhookConfiguration for modelrouters
+    documentIndex: 2
+    asserts:
+      - isKind:
+          of: ValidatingWebhookConfiguration
+      - equal:
+          path: webhooks[0].name
+          value: vmodelrouter.inference.llmkube.dev
+      - equal:
+          path: webhooks[0].clientConfig.service.path
+          value: /validate-inference-llmkube-dev-v1alpha1-modelrouter
+      - equal:
+          path: webhooks[0].rules[0].apiGroups[0]
+          value: inference.llmkube.dev
+      - equal:
+          path: webhooks[0].rules[0].resources[0]
+          value: modelrouters
+      - contains:
+          path: webhooks[0].rules[0].operations
+          content: CREATE
+      - contains:
+          path: webhooks[0].rules[0].operations
+          content: UPDATE
+      - equal:
+          path: webhooks[0].failurePolicy
+          value: Fail
+
+  # failurePolicy is wired from values.
+  - it: should honor a custom failurePolicy
+    set:
+      webhook.failurePolicy: Ignore
+    documentIndex: 2
+    asserts:
+      - equal:
+          path: webhooks[0].failurePolicy
+          value: Ignore
+
+  # Disabled renders NOTHING: existing installs that set webhook.enabled=false
+  # are completely unaffected.
+  - it: should render nothing when the webhook is disabled
+    set:
+      webhook.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

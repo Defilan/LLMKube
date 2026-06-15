@@ -131,3 +131,59 @@ Prometheus PrometheusRule namespace
 {{- define "llmkube.prometheus.prometheusRule.namespace" -}}
 {{- default "monitoring" .Values.prometheus.prometheusRule.namespace }}
 {{- end }}
+
+{{/*
+Webhook Service name. The validating webhook's clientConfig targets this
+Service; the controller-manager pod labels are the Service selector.
+*/}}
+{{- define "llmkube.webhook.serviceName" -}}
+{{- printf "%s-webhook" (include "llmkube.fullname" .) -}}
+{{- end }}
+
+{{/*
+Webhook serving-cert Secret name. Holds tls.crt + tls.key (+ ca.crt for
+reference). Mounted into the controller pod at the controller-runtime default
+cert dir and reused across upgrades via lookup.
+*/}}
+{{- define "llmkube.webhook.secretName" -}}
+{{- printf "%s-webhook-cert" (include "llmkube.fullname" .) -}}
+{{- end }}
+
+{{/*
+ValidatingWebhookConfiguration name.
+*/}}
+{{- define "llmkube.webhook.configName" -}}
+{{- printf "%s-validating-webhook" (include "llmkube.fullname" .) -}}
+{{- end }}
+
+{{/*
+llmkube.webhook.certs resolves the serving cert + CA bundle for the webhook,
+reusing the existing Secret's material when present so the cert and the injected
+caBundle stay STABLE across `helm upgrade`. Returns a dict with keys "ca",
+"cert", "key" (all base64-encoded PEM).
+
+Lookup-reuse: if the serving Secret already exists AND carries tls.crt /
+tls.key / ca.crt, reuse them verbatim. Otherwise generate a fresh self-signed
+CA + serving cert whose SANs cover the in-cluster Service DNS names. The
+caBundle in the ValidatingWebhookConfiguration is injected from the SAME dict,
+so they always match.
+
+Note: `lookup` returns an empty dict during `helm template` / dry-run, so those
+always render freshly-generated material (fine: template output is not
+applied). On a real install/upgrade against an API server the existing Secret
+is found and reused.
+*/}}
+{{- define "llmkube.webhook.certs" -}}
+{{- $svc := include "llmkube.webhook.serviceName" . -}}
+{{- $ns := include "llmkube.namespace" . -}}
+{{- $altNames := list (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) -}}
+{{- $secretName := include "llmkube.webhook.secretName" . -}}
+{{- $existing := lookup "v1" "Secret" $ns $secretName -}}
+{{- if and $existing $existing.data (index $existing.data "tls.crt") (index $existing.data "tls.key") (index $existing.data "ca.crt") -}}
+{{- dict "ca" (index $existing.data "ca.crt") "cert" (index $existing.data "tls.crt") "key" (index $existing.data "tls.key") | toYaml -}}
+{{- else -}}
+{{- $ca := genCA (printf "%s-webhook-ca" (include "llmkube.fullname" .)) (int .Values.webhook.certValidityDays) -}}
+{{- $cert := genSignedCert $svc nil $altNames (int .Values.webhook.certValidityDays) $ca -}}
+{{- dict "ca" ($ca.Cert | b64enc) "cert" ($cert.Cert | b64enc) "key" ($cert.Key | b64enc) | toYaml -}}
+{{- end -}}
+{{- end }}
