@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -799,8 +801,8 @@ func TestModelRouterGateway_ValidAllowlistsProduceAuthorization(t *testing.T) {
 	if len(rules) != 2 {
 		t.Fatalf("got %d authorization rules, want 2", len(rules))
 	}
-	allowlistRuleByName(t, rules, "allow-platform")
-	teamB := allowlistRuleByName(t, rules, "allow-team-b")
+	allowlistRuleByName(t, rules, "allow-platform-0")
+	teamB := allowlistRuleByName(t, rules, "allow-team-b-1")
 	if _, hasHeaders := teamB["principal"].(map[string]interface{})["headers"]; !hasHeaders {
 		t.Error("model-scoped allow-team-b rule should carry principal.headers")
 	}
@@ -887,10 +889,42 @@ func jwtPrincipalOf(t *testing.T, rule map[string]interface{}) map[string]interf
 // router to default-Deny.
 func TestNewRouterSecurityPolicy_NoAllowlistsNoAuthorization(t *testing.T) {
 	mr := authedRouter("plain-auth", jwtForAllowlist())
+	jwt := jwtForAllowlist()
 
-	withAllowlists := newRouterSecurityPolicy(mr, jwtForAllowlist(), nil)
-	if _, found, _ := unstructured.NestedMap(withAllowlists.Object, "spec", "authorization"); found {
-		t.Error("securitypolicy with no allowlists must NOT carry spec.authorization")
+	sp := newRouterSecurityPolicy(mr, jwt, nil)
+
+	// Back-compat contract: byte-identical to the 2d-core authN-only spec
+	// (targetRefs + jwt, no authorization). A deep-equal (not a mere
+	// key-absence check) catches any future drift in the authN-only shape.
+	name := modelRouterGatewayResourceName(mr)
+	wantSpec := map[string]interface{}{
+		"targetRefs": []interface{}{
+			map[string]interface{}{
+				"group":           gatewayBackendRefGroupAPI,
+				"kind":            httpRouteKind,
+				metadataNameField: name,
+			},
+		},
+		"jwt": map[string]interface{}{
+			"providers": []interface{}{
+				map[string]interface{}{
+					metadataNameField: jwt.Provider,
+					"issuer":          jwt.Issuer,
+					"remoteJWKS": map[string]interface{}{
+						"uri": jwt.JWKSURI,
+					},
+					"claimToHeaders": []interface{}{
+						map[string]interface{}{
+							"claim":  jwt.TeamClaim,
+							"header": routerJWTHeaderKey(jwt),
+						},
+					},
+				},
+			},
+		},
+	}
+	if !reflect.DeepEqual(sp.Object["spec"], wantSpec) {
+		t.Errorf("securitypolicy spec drifted from the 2d-core authN-only shape\n got: %#v\nwant: %#v", sp.Object["spec"], wantSpec)
 	}
 }
 
@@ -909,7 +943,7 @@ func TestNewRouterSecurityPolicy_EmptyModelsIdentityOnly(t *testing.T) {
 	if len(rules) != 1 {
 		t.Fatalf("got %d authorization rules, want 1", len(rules))
 	}
-	rule := allowlistRuleByName(t, rules, "allow-platform")
+	rule := allowlistRuleByName(t, rules, "allow-platform-0")
 	if rule["action"] != "Allow" {
 		t.Errorf("rule action = %v, want Allow", rule["action"])
 	}
@@ -949,7 +983,7 @@ func TestNewRouterSecurityPolicy_ModelsAddHeaderMatch(t *testing.T) {
 
 	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
 	rules := securityPolicyAuthzRules(t, sp)
-	rule := allowlistRuleByName(t, rules, "allow-team-b")
+	rule := allowlistRuleByName(t, rules, "allow-team-b-0")
 
 	principal := rule["principal"].(map[string]interface{})
 	headers, ok := principal["headers"].([]interface{})
@@ -981,9 +1015,129 @@ func TestNewRouterSecurityPolicy_MultipleTeams(t *testing.T) {
 	if len(rules) != 2 {
 		t.Fatalf("got %d authorization rules, want 2", len(rules))
 	}
-	allowlistRuleByName(t, rules, "allow-platform")
-	allowlistRuleByName(t, rules, "allow-team-b")
+	allowlistRuleByName(t, rules, "allow-platform-0")
+	allowlistRuleByName(t, rules, "allow-team-b-1")
 }
+
+// TestNewRouterSecurityPolicy_SanitizeCollisionDistinctRuleNames is the Finding 1
+// regression test: two DISTINCT teams that sanitize to the same fragment
+// ("team.b" and "team-b") must compile to two Allow rules with DISTINCT names
+// (the index suffix disambiguates), both valid and both prefixed "allow-". The
+// teams are genuinely different JWT-claim values, so neither is a duplicate.
+func TestNewRouterSecurityPolicy_SanitizeCollisionDistinctRuleNames(t *testing.T) {
+	mr := authedRouter("collide", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "team.b"},
+		{Team: "team-b"},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 2 {
+		t.Fatalf("got %d authorization rules, want 2", len(rules))
+	}
+
+	name0 := rules[0].(map[string]interface{})["name"].(string)
+	name1 := rules[1].(map[string]interface{})["name"].(string)
+	if name0 == name1 {
+		t.Errorf("distinct teams produced colliding rule names: %q == %q", name0, name1)
+	}
+	if !strings.HasPrefix(name0, "allow-") || !strings.HasPrefix(name1, "allow-") {
+		t.Errorf("rule names must start with allow-, got %q and %q", name0, name1)
+	}
+
+	// And each team's claim value is preserved verbatim (sanitization is for the
+	// rule NAME only, never the matched claim value).
+	claim0 := jwtPrincipalOf(t, rules[0].(map[string]interface{}))["claims"].([]interface{})[0].(map[string]interface{})
+	claim1 := jwtPrincipalOf(t, rules[1].(map[string]interface{}))["claims"].([]interface{})[0].(map[string]interface{})
+	if claim0["values"].([]interface{})[0] != "team.b" {
+		t.Errorf("rule 0 claim values = %v, want [team.b]", claim0["values"])
+	}
+	if claim1["values"].([]interface{})[0] != "team-b" {
+		t.Errorf("rule 1 claim values = %v, want [team-b]", claim1["values"])
+	}
+}
+
+// TestNewRouterSecurityPolicy_NonDNSTeamRuleNameIsDNSSafe asserts a team with
+// uppercase and a slash compiles to a DNS-safe rule name (lowercased, non-DNS
+// chars collapsed to '-', index suffix). The matched claim value is still the
+// verbatim team. This is the builder half of Finding 2.
+func TestNewRouterSecurityPolicy_NonDNSTeamRuleNameIsDNSSafe(t *testing.T) {
+	mr := authedRouter("nondns", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "Team/B"},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 1 {
+		t.Fatalf("got %d authorization rules, want 1", len(rules))
+	}
+	name := rules[0].(map[string]interface{})["name"].(string)
+	if !dnsSafeRuleName.MatchString(name) {
+		t.Errorf("rule name %q is not DNS-safe (want ^allow-[a-z0-9-]+-\\d+$)", name)
+	}
+
+	// The claim still matches the verbatim team value, NOT the sanitized name.
+	claim := jwtPrincipalOf(t, rules[0].(map[string]interface{}))["claims"].([]interface{})[0].(map[string]interface{})
+	if claim["values"].([]interface{})[0] != "Team/B" {
+		t.Errorf("claim values = %v, want [Team/B] (verbatim)", claim["values"])
+	}
+}
+
+// TestModelRouterGateway_WhitespaceOnlyTeamFailsLoud covers the Finding 2
+// validation half: a whitespace-only team (" ") passes CRD MinLength=1 but is
+// semantically empty, so it fails loud as InvalidAuthorization and generates
+// nothing. Driven against the validation-free fake client (the CRD would not
+// reject " ").
+func TestModelRouterGateway_WhitespaceOnlyTeamFailsLoud(t *testing.T) {
+	mr := allowlistRouter("wsteam-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: " "},
+	})
+
+	r := newFakeRouterReconcilerWithGateway(t, mr)
+	reconcileRouter(t, r, mr)
+
+	assertNotExistsClient(t, r.Client, securityPolicyGVK(), "wsteam-router")
+	assertNotExistsClient(t, r.Client, aiGatewayRouteGVK(), "wsteam-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "wsteam-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuthz {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuthz, cond)
+	}
+}
+
+// TestModelRouterGateway_WhitespacePaddedTeamFailsLoud covers the other Finding 2
+// validation half: a leading/trailing-whitespace team (" team-b ") can never
+// match the exact JWT claim "team-b", so it fails loud as InvalidAuthorization
+// rather than silently denying. Driven against the validation-free fake client.
+func TestModelRouterGateway_WhitespacePaddedTeamFailsLoud(t *testing.T) {
+	mr := allowlistRouter("padteam-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: " team-b "},
+	})
+
+	r := newFakeRouterReconcilerWithGateway(t, mr)
+	reconcileRouter(t, r, mr)
+
+	assertNotExistsClient(t, r.Client, securityPolicyGVK(), "padteam-router")
+	assertNotExistsClient(t, r.Client, aiGatewayRouteGVK(), "padteam-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "padteam-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuthz {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuthz, cond)
+	}
+}
+
+// dnsSafeRuleName matches a compiled Allow rule name: allow-<dns-fragment>-<index>.
+var dnsSafeRuleName = regexp.MustCompile(`^allow-[a-z0-9-]+-\d+$`)
 
 // --- helpers ---
 
