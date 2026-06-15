@@ -200,6 +200,10 @@ func TestModelRouterGateway_FailoverProducesResources(t *testing.T) {
 	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "passive"); !found {
 		t.Error("btp missing spec.healthCheck.passive")
 	}
+	// 4a adds an active HTTP health check alongside the passive block.
+	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "active"); !found {
+		t.Error("btp missing spec.healthCheck.active")
+	}
 	// 2b adds rateLimit to THIS BTP; 2a must NOT include it.
 	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "rateLimit"); found {
 		t.Error("btp should not carry rateLimit in slice 2a")
@@ -215,6 +219,92 @@ func TestModelRouterGateway_FailoverProducesResources(t *testing.T) {
 	}
 	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Errorf("GatewayReady condition not True, got %+v", cond)
+	}
+}
+
+// TestModelRouterGateway_ActiveHealthCheck covers slice 4a (#662): the generated
+// BackendTrafficPolicy carries an active HTTP health check (type HTTP, GET
+// /health, expectedStatuses 200, with the tuned interval/timeout/threshold
+// consts) so Envoy probes each backend cluster directly and ejects a dead host
+// (including an abruptly-killed Mac behind a ClusterIP) without waiting on the
+// per-attempt request timeout. The existing passive block and retry stanza must
+// remain (adding active must not drop them).
+func TestModelRouterGateway_ActiveHealthCheck(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "hc-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "qwen-cuda", InferenceServiceRef: corev1LocalRef("qwen-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"qwen-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	btp := getUnstructured(t, c, btpGVK(), "hc-router")
+
+	// Regression: retry and the passive outlier block must survive 4a.
+	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "retry"); !found {
+		t.Error("btp missing spec.retry (2a stanza must remain)")
+	}
+	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "passive"); !found {
+		t.Error("btp missing spec.healthCheck.passive (2a stanza must remain)")
+	}
+
+	active, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "active")
+	if !found {
+		t.Fatal("btp missing spec.healthCheck.active")
+	}
+	if got, _ := active["type"].(string); got != "HTTP" {
+		t.Errorf("active.type = %q, want HTTP", got)
+	}
+	if got, _ := active["interval"].(string); got != activeHealthCheckInterval {
+		t.Errorf("active.interval = %q, want %q", got, activeHealthCheckInterval)
+	}
+	if got, _ := active["timeout"].(string); got != activeHealthCheckTimeout {
+		t.Errorf("active.timeout = %q, want %q", got, activeHealthCheckTimeout)
+	}
+	if got, _ := active["unhealthyThreshold"].(int64); got != activeHealthCheckUnhealthyThreshold {
+		t.Errorf("active.unhealthyThreshold = %d, want %d", got, activeHealthCheckUnhealthyThreshold)
+	}
+	if got, _ := active["healthyThreshold"].(int64); got != activeHealthCheckHealthyThreshold {
+		t.Errorf("active.healthyThreshold = %d, want %d", got, activeHealthCheckHealthyThreshold)
+	}
+
+	httpCheck, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "active", "http")
+	if !found {
+		t.Fatal("btp missing spec.healthCheck.active.http")
+	}
+	if got, _ := httpCheck["path"].(string); got != activeHealthCheckPath {
+		t.Errorf("active.http.path = %q, want %q", got, activeHealthCheckPath)
+	}
+	if got, _ := httpCheck["method"].(string); got != "GET" {
+		t.Errorf("active.http.method = %q, want GET", got)
+	}
+	statuses, _ := httpCheck["expectedStatuses"].([]interface{})
+	if len(statuses) != 1 {
+		t.Fatalf("active.http.expectedStatuses = %v, want exactly [200]", statuses)
+	}
+	if got, _ := statuses[0].(int64); got != int64(200) {
+		t.Errorf("active.http.expectedStatuses[0] = %v, want 200", statuses[0])
 	}
 }
 
@@ -1248,6 +1338,9 @@ func TestModelRouterGateway_RouterBudgetProducesRateLimit(t *testing.T) {
 	}
 	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "passive"); !found {
 		t.Error("btp missing spec.healthCheck.passive (2a stanza must remain)")
+	}
+	if _, found, _ := unstructured.NestedMap(btp.Object, "spec", "healthCheck", "active"); !found {
+		t.Error("btp missing spec.healthCheck.active (4a stanza must remain)")
 	}
 	rlType, _, _ := unstructured.NestedString(btp.Object, "spec", "rateLimit", "type")
 	if rlType != "Global" {

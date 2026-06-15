@@ -211,8 +211,25 @@ Deliver the audit trail as a gateway-scoped access log, NOT a per-ModelRouter co
 
 **Deferred from 2c (with reasoning):** an operator-managed singleton EnvoyProxy keyed by `gatewayRef` that merges each ModelRouter's `auditLog` into one shared access-log config. It keeps the per-router field meaningful but makes the operator mutate gateway infra it does not own, with cross-router conflict/ordering risk; rejected for v1 in favor of the honest gateway-scoped artifact.
 
-### 5.3 Backend health bridging (sub-projects 3 + 4)
-metal-agent (#662) ejects/restores the address on its managed Endpoints object on health change and surfaces status. The operator (sub-project 4) compiles that health, plus pod health, into gateway `Backend` ejection/restoration, giving off-cluster Metal endpoints the event-driven detection that pods get from the EPP. This mutates the `Backend`s the MVP generates.
+### 5.3 Backend health bridging (sub-projects 3 + 4, issue #662)
+
+**The problem (measured in the spike).** A Metal backend is an fqdn `Backend` pointing at a selectorless Service's ClusterIP. When the Mac dies abruptly, Envoy still sees the ClusterIP as up: in-flight requests stall for the full per-attempt timeout (60s measured) and passive outlier detection never engages (a blackholed connection produces no consecutive 5xx). Pods behind an InferencePool fail new requests over in 2-4ms; off-cluster Metal has no equivalent because pools are structurally pods-only. Something must actively tell Envoy the tier is down.
+
+The chosen posture is **defense in depth**: an always-on active-probe safety net that catches abrupt death at probe speed, plus an event-driven layer that reacts instantly to health the agent/operator already knows. Three reviewable pieces:
+
+#### Slice 4a (detailed design): active health checks on the BTP
+
+Extend the `BackendTrafficPolicy` the operator already generates (2a, which carries retry + passive outlier `healthCheck`) with an `healthCheck.active` HTTP checker (EG v1.8 schema): `type: HTTP`, `http.path: /health` (the llama.cpp/llama-server health endpoint), `method: GET`, `expectedStatuses: [200]`, a short `interval` (default 2s, tunable), `timeout`, `unhealthyThreshold`, `healthyThreshold`. Envoy then probes every backend cluster directly (bypassing the route filters) and ejects a dead host, including an abruptly-killed Mac behind ClusterIP, without waiting on the request timeout. This is the smallest, most self-contained piece and the one that makes the lab failover demo work; it applies to all gateway-mode backends (pods benefit too). Active probing is independent of the long-generation request timeout (it hits `/health`, not the generation path), so it does not reintroduce the short-timeout conflict #662 calls out. The per-backend health path is `/health` for v1; making it configurable per runtime is a follow-up.
+
+#### Slice 3 (detailed design): metal-agent proactive withdraw/restore
+
+metal-agent already runs the three-probe runtime health check and manages its Endpoints registration (`RegisterEndpoint`/`UnregisterEndpoint`, with retry from #657). Wire the health signal outward: on the runtime going **unhealthy** (agent alive, runtime down), proactively `UnregisterEndpoint` (withdraw the address so kube-proxy stops DNATing) and surface the state; on recovery, re-register. This is event-driven and fast for the graceful case. Abrupt agent death (the Mac is yanked) is still covered by the operator's existing heartbeat-staleness expiry (#663) feeding Slice 4b, and at probe speed by Slice 4a.
+
+#### Slice 4b (detailed design): event-driven route-level ejection
+
+The operator watches Metal endpoint health (the #663 heartbeat classification `metalHBFresh/Stale` plus Slice 3's withdrawal, both visible as Endpoints changes) and recompiles the `AIGatewayRoute` to exclude backends whose referenced InferenceService is unhealthy, restoring them on recovery. This needs an InferenceService/Endpoints -> ModelRouter watch (enqueue the ModelRouters that reference a changed InferenceService) and a flap **debounce/soak** so a briefly-stale heartbeat does not thrash the route. This is the event-speed layer that reacts the instant the agent/operator knows, rather than at active-probe interval; it sits on top of 4a's safety net, not instead of it.
+
+**Ordering:** 4a first (self-contained, delivers the demo), then Slice 3 (agent-side, independent), then 4b (the most operator surface: new watch + ejection logic + debounce). **Deferred:** per-runtime configurable health path (4a hardcodes `/health`); making the active-check thresholds a ModelRouter API surface (hardcoded sensible defaults for v1, mirroring how the passive `healthCheck` block is hardcoded).
 
 ---
 
