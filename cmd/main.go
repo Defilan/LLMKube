@@ -21,6 +21,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"path/filepath"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -97,6 +98,7 @@ func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
+	var webhookPort int
 	var enableLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
@@ -150,6 +152,7 @@ func main() {
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
+	flag.IntVar(&webhookPort, "webhook-port", 9443, "The port the validating webhook server binds.")
 	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
 	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
 	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
@@ -189,6 +192,7 @@ func main() {
 	webhookTLSOpts := tlsOpts
 	webhookServerOptions := webhook.Options{
 		TLSOpts: webhookTLSOpts,
+		Port:    webhookPort,
 	}
 
 	if len(webhookCertPath) > 0 {
@@ -315,6 +319,23 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouterGateway")
 		os.Exit(1)
 	}
+
+	// Register the ModelRouter validating webhook ONLY when the serving cert is
+	// actually present in the configured cert dir. The webhook server crashes the
+	// manager if a webhook is registered but the cert is missing, so a dev run
+	// without certs (or a chart install with webhook.enabled=false, which omits
+	// the cert Secret + volume) degrades to "no webhook" instead of a crash loop.
+	// The gate keys off the SAME path the webhook server was configured with.
+	if webhookCertPath != "" && webhookCertsPresent(webhookCertPath, webhookCertName, webhookCertKey) {
+		if err := controller.SetupModelRouterWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ModelRouter")
+			os.Exit(1)
+		}
+		setupLog.Info("validating webhook enabled", "webhook", "ModelRouter", "certDir", webhookCertPath)
+	} else if webhookCertPath != "" {
+		setupLog.Info("webhook cert path set but no serving cert found; skipping ModelRouter webhook",
+			"certDir", webhookCertPath)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -331,4 +352,20 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// webhookCertsPresent reports whether both the serving cert and key exist in
+// certDir. The webhook server crashes the manager if a webhook is registered
+// but the cert is missing, so the operator only wires the webhook when the
+// serving Secret has actually been mounted (a chart install with
+// webhook.enabled=true). A dev run without certs degrades to "no webhook"
+// rather than a crash loop. The cert/key file names are the same the webhook
+// server is configured with (--webhook-cert-name / --webhook-cert-key).
+func webhookCertsPresent(certDir, certName, keyName string) bool {
+	for _, name := range []string{certName, keyName} {
+		if _, err := os.Stat(filepath.Join(certDir, name)); err != nil {
+			return false
+		}
+	}
+	return true
 }

@@ -350,6 +350,26 @@
           "items": { "type": "string" }
         }
       }
+    },
+    "webhook": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "failurePolicy": {
+          "type": "string",
+          "enum": ["Fail", "Ignore"]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "certValidityDays": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
     }
   }
 }

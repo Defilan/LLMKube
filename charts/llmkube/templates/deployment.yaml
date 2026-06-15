@@ -63,6 +63,15 @@ spec:
         {{- with .Values.controllerManager.routerProxy.defaultLiteLLMURL }}
         - --default-litellm-url={{ . }}
         {{- end }}
+        {{- if .Values.webhook.enabled }}
+        # Point the controller-runtime webhook server at the mounted serving
+        # cert. cmd/main.go registers the ModelRouter validating webhook only
+        # when this path holds tls.crt + tls.key, so webhook.enabled=false
+        # (which omits the flag, the cert Secret, and the volume below) leaves
+        # the operator running with no webhook.
+        - --webhook-cert-path=/tmp/k8s-webhook-server/serving-certs
+        - --webhook-port={{ .Values.webhook.port }}
+        {{- end }}
         ports:
         - name: health
           containerPort: 8081
@@ -70,6 +79,11 @@ spec:
         {{- if .Values.metrics.enabled }}
         - name: metrics
           containerPort: {{ .Values.metrics.service.port }}
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.webhook.enabled }}
+        - name: webhook
+          containerPort: {{ .Values.webhook.port }}
           protocol: TCP
         {{- end }}
         {{- with .Values.controllerManager.env }}
@@ -87,6 +101,14 @@ spec:
         volumeMounts:
         - name: tmp
           mountPath: /tmp
+        {{- if .Values.webhook.enabled }}
+        # controller-runtime's default serving-cert location. The self-signed
+        # cert Secret is mounted read-only here so the webhook server finds
+        # tls.crt + tls.key without extra flags.
+        - name: webhook-certs
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+        {{- end }}
         {{- if .Values.modelCache.enabled }}
         - name: model-cache
           mountPath: {{ .Values.modelCache.mountPath }}
@@ -94,6 +116,11 @@ spec:
       volumes:
       - name: tmp
         emptyDir: {}
+      {{- if .Values.webhook.enabled }}
+      - name: webhook-certs
+        secret:
+          secretName: {{ include "llmkube.webhook.secretName" . }}
+      {{- end }}
       {{- if .Values.modelCache.enabled }}
       - name: model-cache
         persistentVolumeClaim:
