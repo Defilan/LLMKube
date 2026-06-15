@@ -67,6 +67,16 @@ GETTING STARTED:
    - Inference alerts: {{ if .Values.prometheus.prometheusRule.rules.inference.enabled }}Enabled{{ else }}Disabled{{ end }}
 {{- end }}
 
+{{- if .Values.gateway.auditLog.enabled }}
+
+7. Gateway audit access log is enabled!
+   EnvoyProxy: {{ .Values.gateway.auditLog.envoyProxyName }} (namespace: {{ .Values.gateway.auditLog.envoyProxyNamespace | default .Release.Namespace }})
+   ACTION REQUIRED: reference this EnvoyProxy from your GatewayClass
+   (spec.parametersRef) or Gateway (spec.infrastructure.parametersRef);
+   the chart cannot own external gateway infra, so the access log only
+   takes effect once that parametersRef is wired.
+{{- end }}
+
 ---
 DOCUMENTATION:
 

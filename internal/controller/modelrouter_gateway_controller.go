@@ -70,6 +70,13 @@ const (
 	// GatewayReady False, consistent with the 2a/2b/2d-core honest boundary.
 	modelRouterGatewayReasonAuthzRequiresJWT = "AuthorizationRequiresJWT"
 	modelRouterGatewayReasonInvalidAuthz     = "InvalidAuthorization"
+
+	// slice 2c audit-log fail-loud reason. policy.auditLog is a Proxy-mode-only
+	// field (it names the router-proxy container and a file path); in Gateway mode
+	// it has no per-router meaning, so it is refused loudly rather than silently
+	// ignored. Consistent with the 2a/2b/2d honest boundary: GatewayReady goes
+	// False and the router generates NOTHING.
+	modelRouterGatewayReasonUnsupportedAuditLog = "UnsupportedAuditLogInGatewayMode"
 )
 
 // ModelRouterGatewayReconciler compiles a ModelRouter in dataPlane: Gateway mode
@@ -165,6 +172,16 @@ func (r *ModelRouterGatewayReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// would silently lock everyone out).
 	if reason, msg := invalidAuthorizationMessage(mr); reason != "" {
 		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, reason, msg)
+	}
+
+	// Fail-loud on a per-router auditLog directive: policy.auditLog is a Proxy-mode
+	// field with no per-route Gateway equivalent (Envoy Gateway access logging is
+	// configured on the gateway-scoped EnvoyProxy, not per route). Silently ignoring
+	// an audit directive a user believes is active is a compliance footgun, so we
+	// generate NOTHING and point the operator at the gateway-level access-log config.
+	// Same ordering as the auth checks (before any CreateOrUpdate).
+	if msg := unsupportedAuditLogMessage(mr); msg != "" {
+		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonUnsupportedAuditLog, msg)
 	}
 
 	if err := r.reconcileGatewayResources(ctx, mr); err != nil {
@@ -529,6 +546,26 @@ func routerAllowlists(mr *inferencev1alpha1.ModelRouter) []inferencev1alpha1.Tea
 		return nil
 	}
 	return mr.Spec.Policy.Auth.Allowlists
+}
+
+// unsupportedAuditLogMessage returns a non-empty message when policy.auditLog is
+// set on a router in dataPlane: Gateway mode, or "" when it is absent. Any
+// auditLog block present means the user asked for per-router audit, which is a
+// Proxy-mode-only feature (it names the router-proxy container and a file path).
+// Envoy Gateway access logging is configured on the gateway-scoped EnvoyProxy
+// (telemetry.accessLog), not per route, and the operator does not own that
+// external gateway infra, so a per-router auditLog has no Gateway equivalent. Like
+// invalidAuthMessage it runs BEFORE generation so a rejected auditLog yields no
+// partial resources; refusing loudly avoids silently dropping an audit directive
+// (a compliance footgun). The field stays fully valid in Proxy mode.
+func unsupportedAuditLogMessage(mr *inferencev1alpha1.ModelRouter) string {
+	if mr.Spec.Policy == nil || mr.Spec.Policy.AuditLog == nil {
+		return ""
+	}
+	return "policy.auditLog is a Proxy-mode field with no per-router equivalent in dataPlane: Gateway; " +
+		"Envoy Gateway access logging is configured on the gateway-scoped EnvoyProxy (telemetry.accessLog), " +
+		"not per route. Enable the chart's gateway.auditLog values to ship the audit EnvoyProxy and reference " +
+		"it from your GatewayClass/Gateway parametersRef, or remove policy.auditLog"
 }
 
 // invalidAuthMessage returns a non-empty message when policy.auth.jwt is set but
