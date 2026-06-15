@@ -1,0 +1,86 @@
+suite: gateway audit access log
+templates:
+  - gateway-audit-envoyproxy.yaml
+
+tests:
+  # Default OFF: existing installs must be unaffected.
+  - it: should render nothing when auditLog is disabled (default)
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: should render an EnvoyProxy when auditLog is enabled
+    set:
+      gateway.auditLog.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - isKind:
+          of: EnvoyProxy
+      - equal:
+          path: apiVersion
+          value: gateway.envoyproxy.io/v1alpha1
+
+  - it: should name the EnvoyProxy from values
+    set:
+      gateway.auditLog.enabled: true
+      gateway.auditLog.envoyProxyName: my-audit
+      gateway.auditLog.envoyProxyNamespace: ai-gateway
+    asserts:
+      - equal:
+          path: metadata.name
+          value: my-audit
+      - equal:
+          path: metadata.namespace
+          value: ai-gateway
+
+  # File/stdout sink always on; OTel sink gated off by default.
+  - it: should emit only the File sink when otel is disabled
+    set:
+      gateway.auditLog.enabled: true
+    asserts:
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].type
+          value: Route
+      - lengthEqual:
+          path: spec.telemetry.accessLog.settings[0].sinks
+          count: 1
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].sinks[0].type
+          value: File
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].sinks[0].file.path
+          value: /dev/stdout
+
+  # OTel sink appended only when enabled, wired from values.
+  - it: should append the OpenTelemetry sink when otel is enabled
+    set:
+      gateway.auditLog.enabled: true
+      gateway.auditLog.otel.enabled: true
+      gateway.auditLog.otel.backendRef.name: otel-collector
+      gateway.auditLog.otel.backendRef.namespace: envoy-gateway-system
+      gateway.auditLog.otel.backendRef.port: 4317
+    asserts:
+      - lengthEqual:
+          path: spec.telemetry.accessLog.settings[0].sinks
+          count: 2
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].sinks[1].type
+          value: OpenTelemetry
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].sinks[1].openTelemetry.backendRefs[0].name
+          value: otel-collector
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].sinks[1].openTelemetry.backendRefs[0].port
+          value: 4317
+
+  # Security posture: Authorization is never logged.
+  - it: should not log the Authorization header
+    set:
+      gateway.auditLog.enabled: true
+    asserts:
+      - notExists:
+          path: spec.telemetry.accessLog.settings[0].format.json.authorization
+      - equal:
+          path: spec.telemetry.accessLog.settings[0].format.json.team
+          value: "%REQ(X-TEAM)%"

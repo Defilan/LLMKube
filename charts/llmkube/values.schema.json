@@ -280,6 +280,45 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auditLog": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "envoyProxyName": { "type": "string", "minLength": 1 },
+            "envoyProxyNamespace": { "type": "string" },
+            "otel": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "backendRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "namespace": { "type": "string" },
+                    "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                  }
+                },
+                "resourceAttributes": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "serviceName": { "type": "string" },
+                    "clusterName": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "imagePullSecrets": {
       "type": "array",
       "items": {

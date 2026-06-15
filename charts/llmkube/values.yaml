@@ -169,6 +169,52 @@ metrics:
     nodePort: ""
     annotations: {}
 
+# Gateway-scoped audit access log (sub-slice 2c).
+#
+# Envoy Gateway configures access logging ONLY on the EnvoyProxy resource
+# (telemetry.accessLog), gateway-infrastructure-scoped, not per route. The
+# operator references an EXTERNAL Gateway via gatewayRef and does not own the
+# EnvoyProxy, so the audit trail ships here as an opt-in, gateway-scoped artifact
+# rather than a per-ModelRouter compiled resource. Default off, so existing
+# installs are unaffected.
+#
+# Security posture (from the homelab spike):
+#   - Header allowlist only: the Authorization header is NEVER logged.
+#   - Request path and query string are omitted.
+#   - Token fields (llm_input/output/total_token) are null on errors and
+#     non-final frames; they are present only at end-of-stream on success.
+#   - Request/response bodies are not loggable via access logs at all.
+#
+# The audit fields are produced by other slices already on the wire, so they
+# populate automatically once those slices are active:
+#   - team (x-team) from JWT auth (ModelRouter policy.auth.jwt),
+#   - model (x-ai-eg-model) from the ext_proc,
+#   - llm_*_token from the budget llmRequestCosts metadata.
+gateway:
+  auditLog:
+    # Enable the gateway audit EnvoyProxy. Off by default.
+    enabled: false
+    # Name/namespace of the rendered EnvoyProxy. You MUST reference this
+    # EnvoyProxy from your GatewayClass (spec.parametersRef) or Gateway
+    # (spec.infrastructure.parametersRef): the chart cannot own external gateway
+    # infra, so the access log only takes effect once you wire that parametersRef.
+    envoyProxyName: llmkube-audit
+    # Namespace for the EnvoyProxy (defaults to the release namespace).
+    envoyProxyNamespace: ""
+    # OpenTelemetry sink (the Loki/collector path). When disabled, only the
+    # File/stdout JSON sink is emitted.
+    otel:
+      enabled: false
+      # gRPC backend reference for the OTel collector.
+      backendRef:
+        name: otel-collector
+        namespace: ""
+        port: 4317
+      # Resource attributes attached to every emitted log record.
+      resourceAttributes:
+        serviceName: llmkube-ai-gateway
+        clusterName: llmkube
+
 # Prometheus Operator integration
 prometheus:
   # Enable Prometheus ServiceMonitor
