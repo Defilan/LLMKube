@@ -155,6 +155,12 @@ type routerBackendResource struct {
 	FQDN string
 	// Port is the Service port the Backend targets.
 	Port int64
+	// Healthy reports whether the referenced InferenceService currently has at
+	// least one ready replica (Status.ReadyReplicas > 0). An unhealthy backend is
+	// dropped from the AIGatewayRoute's rule backendRefs (slice 4b ejection) so
+	// Envoy fails over to a healthy backend, while its Backend/AIServiceBackend
+	// objects are still generated so it can be re-added on recovery.
+	Healthy bool
 }
 
 // routerRuleResource is one resolved ModelRouter rule ready to compile: the
