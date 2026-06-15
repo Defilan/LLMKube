@@ -76,8 +76,10 @@ func reconcileRouter(t *testing.T, r *ModelRouterGatewayReconciler, mr *inferenc
 	}
 }
 
-// makeBackendISvc creates a minimal InferenceService a ModelRouter backend can
-// reference, so resolveBackends finds a real Service FQDN/port.
+// makeBackendISvc creates a minimal, HEALTHY InferenceService a ModelRouter
+// backend can reference, so resolveBackends finds a real Service FQDN/port and
+// marks the backend Healthy (ReadyReplicas > 0). Use setISvcReadyReplicas to
+// flip it unhealthy in slice 4b ejection tests.
 func makeBackendISvc(t *testing.T, c client.Client, name string) {
 	t.Helper()
 	isvc := &inferencev1alpha1.InferenceService{
@@ -89,6 +91,22 @@ func makeBackendISvc(t *testing.T, c client.Client, name string) {
 	}
 	if err := c.Create(context.Background(), isvc); err != nil {
 		t.Fatalf("create backend isvc %s: %v", name, err)
+	}
+	setISvcReadyReplicas(t, c, name, 1)
+}
+
+// setISvcReadyReplicas writes Status.ReadyReplicas on a backend InferenceService
+// via the status subresource. readyReplicas == 0 marks the backend unhealthy,
+// driving slice 4b route-level ejection.
+func setISvcReadyReplicas(t *testing.T, c client.Client, name string, replicas int32) {
+	t.Helper()
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: testNS}, isvc); err != nil {
+		t.Fatalf("get backend isvc %s: %v", name, err)
+	}
+	isvc.Status.ReadyReplicas = replicas
+	if err := c.Status().Update(context.Background(), isvc); err != nil {
+		t.Fatalf("update backend isvc %s status: %v", name, err)
 	}
 }
 

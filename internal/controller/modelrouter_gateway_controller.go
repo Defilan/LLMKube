@@ -33,7 +33,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -184,12 +186,13 @@ func (r *ModelRouterGatewayReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonUnsupportedAuditLog, msg)
 	}
 
-	if err := r.reconcileGatewayResources(ctx, mr); err != nil {
+	ejected, err := r.reconcileGatewayResources(ctx, mr)
+	if err != nil {
 		_ = r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonReconcile, err.Error())
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, r.setGatewayReady(ctx, mr)
+	return ctrl.Result{}, r.setGatewayReady(ctx, mr, ejected)
 }
 
 // reconcileGatewayResources resolves the router's backends to cluster FQDNs,
@@ -198,21 +201,24 @@ func (r *ModelRouterGatewayReconciler) Reconcile(ctx context.Context, req ctrl.R
 func (r *ModelRouterGatewayReconciler) reconcileGatewayResources(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
-) error {
+) ([]string, error) {
 	backends, err := r.resolveBackends(ctx, mr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	rules, err := compileRouterRules(mr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	budgets := routerBudgets(mr)
 
 	// Order matters for clean upserts: Backends and AIServiceBackends before the
-	// route that references them, then the BTP that targets the route.
+	// route that references them, then the BTP that targets the route. Every
+	// backend (healthy or not) still gets a Backend + AIServiceBackend so an
+	// ejected backend exists to be probed and re-added on recovery; only the
+	// route's backendRefs are filtered below.
 	desired := make([]*unstructured.Unstructured, 0, len(backends)*2+3)
 	for _, b := range backends {
 		desired = append(desired, newRouterBackend(mr, b), newRouterAIServiceBackend(mr, b))
@@ -227,6 +233,12 @@ func (r *ModelRouterGatewayReconciler) reconcileGatewayResources(
 		desired = append(desired, newRouterSecurityPolicy(mr, jwt, routerAllowlists(mr)))
 	}
 
+	// Slice 4b: drop unhealthy backends from the route's rule backendRefs so Envoy
+	// fails over to a healthy backend, the instant the health signal changes. The
+	// Backend/AIServiceBackend objects above are generated for ALL backends; only
+	// the route is filtered, and a rule is never emptied (see ejectUnhealthyBackends).
+	rules, ejected := ejectUnhealthyBackends(rules, backends)
+
 	desired = append(desired,
 		newRouterAIGatewayRoute(mr, mr.Spec.GatewayRef, rules, budgets),
 		newRouterBackendTrafficPolicy(mr, budgets),
@@ -234,10 +246,10 @@ func (r *ModelRouterGatewayReconciler) reconcileGatewayResources(
 
 	for _, obj := range desired {
 		if err := r.applyResource(ctx, mr, obj); err != nil {
-			return fmt.Errorf("%s/%s: %w", obj.GetKind(), obj.GetName(), err)
+			return nil, fmt.Errorf("%s/%s: %w", obj.GetKind(), obj.GetName(), err)
 		}
 	}
-	return nil
+	return ejected, nil
 }
 
 // resolveBackends turns every InferenceServiceRef backend into a
@@ -276,6 +288,14 @@ func (r *ModelRouterGatewayReconciler) resolveBackends(
 			Name: b.Name,
 			FQDN: fmt.Sprintf("%s.%s.svc.cluster.local", sanitizeDNSName(isvc.Name), isvc.Namespace),
 			Port: port,
+			// A backend is healthy iff its InferenceService has at least one ready
+			// replica. This is the single aggregate both prior layers drive to 0:
+			// Slice 3's metal withdrawal flips the endpoint Ready:false, #663's
+			// heartbeat-staleness expiry zeroes it, and pod backends get it from pod
+			// readiness. An unhealthy backend is ejected from the route's
+			// backendRefs (slice 4b) while its Backend/AIServiceBackend stay in
+			// place for re-add on recovery.
+			Healthy: isvc.Status.ReadyReplicas > 0,
 		})
 	}
 	return resolved, nil
@@ -322,6 +342,7 @@ func (r *ModelRouterGatewayReconciler) gatewayCRDsPresent(log logr.Logger) (bool
 func (r *ModelRouterGatewayReconciler) setGatewayReady(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
+	ejected []string,
 ) error {
 	patch := client.MergeFrom(mr.DeepCopy())
 	authEnabled := routerJWT(mr) != nil
@@ -338,6 +359,11 @@ func (r *ModelRouterGatewayReconciler) setGatewayReady(
 		if n := len(routerAllowlists(mr)); n > 0 {
 			message += fmt.Sprintf("; %d team model allowlist(s) enforced", n)
 		}
+	}
+	// Slice 4b: surface route degradation so an operator sees the route is
+	// serving on its healthy backends while some are ejected.
+	if len(ejected) > 0 {
+		message += fmt.Sprintf("; ejected %d unhealthy backend(s): %s", len(ejected), strings.Join(ejected, ", "))
 	}
 	apimeta.SetStatusCondition(&mr.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterGatewayConditionReady,
@@ -407,8 +433,46 @@ func (r *ModelRouterGatewayReconciler) setGatewayNotReady(
 func (r *ModelRouterGatewayReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.ModelRouter{}).
+		Watches(
+			&inferencev1alpha1.InferenceService{},
+			handler.EnqueueRequestsFromMapFunc(r.modelRoutersForInferenceService),
+		).
 		Named(modelRouterGatewayControllerName).
 		Complete(r)
+}
+
+// modelRoutersForInferenceService maps a changed InferenceService to the
+// dataPlane: Gateway ModelRouters that reference it, so a backend's readiness
+// flip re-reconciles the route (slice 4b ejection/restore) within a reconcile
+// rather than at the active-probe interval. Reconcile is idempotent
+// (CreateOrUpdate no-ops on an unchanged route), so firing on unrelated
+// InferenceService updates is harmless. Proxy-mode routers are skipped: their
+// route is owned by ModelRouterReconciler, not this reconciler. Mirrors
+// ModelRouterReconciler.findModelRoutersForInferenceService.
+func (r *ModelRouterGatewayReconciler) modelRoutersForInferenceService(ctx context.Context, obj client.Object) []reconcile.Request {
+	isvc, ok := obj.(*inferencev1alpha1.InferenceService)
+	if !ok {
+		return nil
+	}
+
+	routerList := &inferencev1alpha1.ModelRouterList{}
+	if err := r.List(ctx, routerList, client.InNamespace(isvc.Namespace)); err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for i := range routerList.Items {
+		mr := &routerList.Items[i]
+		if mr.Spec.DataPlane != inferencev1alpha1.ModelRouterDataPlaneGateway {
+			continue
+		}
+		if routerReferencesInferenceService(mr, isvc.Name) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: mr.Namespace},
+			})
+		}
+	}
+	return requests
 }
 
 // compileRouterRules turns the ModelRouter's spec.rules (plus a trailing
