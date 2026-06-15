@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -656,6 +658,486 @@ func TestModelRouterGateway_NoAuthProducesNoSecurityPolicy(t *testing.T) {
 		t.Errorf("status.gateway.authEnabled should be false with no auth, got %+v", fresh.Status.Gateway)
 	}
 }
+
+// allowlistRouter builds a Gateway-mode ModelRouter with the given JWT auth and
+// allowlists. A nil jwt leaves policy.auth.jwt unset (the AuthorizationRequiresJWT
+// case); a nil allowlists leaves authorization off.
+func allowlistRouter(
+	name string,
+	jwt *inferencev1alpha1.JWTAuthSpec,
+	allowlists []inferencev1alpha1.TeamModelAllowlist,
+) *inferencev1alpha1.ModelRouter {
+	mr := authedRouter(name, jwt)
+	if len(allowlists) > 0 {
+		if mr.Spec.Policy == nil {
+			mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{}
+		}
+		if mr.Spec.Policy.Auth == nil {
+			mr.Spec.Policy.Auth = &inferencev1alpha1.RouterAuthSpec{}
+		}
+		mr.Spec.Policy.Auth.Allowlists = allowlists
+	}
+	return mr
+}
+
+// TestModelRouterGateway_AllowlistsWithoutJWTFailLoud covers the
+// AuthorizationRequiresJWT boundary: allowlists set with no policy.auth.jwt sets
+// GatewayReady=False/AuthorizationRequiresJWT and generates NOTHING (you cannot
+// authorize on an unverified claim). The CRD permits this shape (jwt is
+// optional), so it runs against a real envtest.
+func TestModelRouterGateway_AllowlistsWithoutJWTFailLoud(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := allowlistRouter("noauthz-router", nil, []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "platform"},
+	})
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	// Generates NOTHING.
+	assertNotExists(t, c, securityPolicyGVK(), "noauthz-router")
+	assertNotExists(t, c, aiGatewayRouteGVK(), "noauthz-router")
+	assertNotExists(t, c, btpGVK(), "noauthz-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "noauthz-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonAuthzRequiresJWT {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonAuthzRequiresJWT, cond)
+	}
+}
+
+// TestModelRouterGateway_EmptyTeamFailsLoud covers the InvalidAuthorization
+// boundary for an empty team. The CRD's MinLength rejects an empty team at apply
+// time, so (like the invalid-auth defense-in-depth test) this drives the
+// reconciler's fail-loud guard against a validation-free fake client.
+func TestModelRouterGateway_EmptyTeamFailsLoud(t *testing.T) {
+	mr := allowlistRouter("emptyteam-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: ""},
+	})
+
+	r := newFakeRouterReconcilerWithGateway(t, mr)
+	reconcileRouter(t, r, mr)
+
+	assertNotExistsClient(t, r.Client, securityPolicyGVK(), "emptyteam-router")
+	assertNotExistsClient(t, r.Client, aiGatewayRouteGVK(), "emptyteam-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "emptyteam-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuthz {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuthz, cond)
+	}
+}
+
+// TestModelRouterGateway_DuplicateTeamFailsLoud covers the InvalidAuthorization
+// boundary for a duplicate team. The CRD does not constrain this (no uniqueness
+// validation), so it runs against a real envtest.
+func TestModelRouterGateway_DuplicateTeamFailsLoud(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := allowlistRouter("duputeam-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "team-b", Models: []string{"qwen35-27b"}},
+		{Team: "team-b", Models: []string{"llama-8b"}},
+	})
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	assertNotExists(t, c, securityPolicyGVK(), "duputeam-router")
+	assertNotExists(t, c, aiGatewayRouteGVK(), "duputeam-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "duputeam-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuthz {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuthz, cond)
+	}
+}
+
+// TestModelRouterGateway_ValidAllowlistsProduceAuthorization covers the happy
+// path: valid allowlists paired with JWT produce a Ready router whose
+// SecurityPolicy carries the authorization block (default-Deny + an Allow rule
+// per team), and whose ready message names both the JWT and the allowlist count.
+func TestModelRouterGateway_ValidAllowlistsProduceAuthorization(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "qwen-cuda")
+
+	mr := allowlistRouter("authz-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "platform"},
+		{Team: "team-b", Models: []string{"qwen35-27b"}},
+	})
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	sp := getUnstructured(t, c, securityPolicyGVK(), "authz-router")
+	assertOwnedByRouter(t, sp, mr)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 2 {
+		t.Fatalf("got %d authorization rules, want 2", len(rules))
+	}
+	allowlistRuleByName(t, rules, "allow-platform-0")
+	teamB := allowlistRuleByName(t, rules, "allow-team-b-1")
+	if _, hasHeaders := teamB["principal"].(map[string]interface{})["headers"]; !hasHeaders {
+		t.Error("model-scoped allow-team-b rule should carry principal.headers")
+	}
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "authz-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("GatewayReady not True, got %+v", cond)
+	}
+	if !contains(cond.Message, "JWT authentication enforced") {
+		t.Errorf("ready message should mention JWT, got %q", cond.Message)
+	}
+	if !contains(cond.Message, "2 team model allowlist(s) enforced") {
+		t.Errorf("ready message should mention 2 allowlists, got %q", cond.Message)
+	}
+}
+
+// --- slice 2d.2 builder unit tests: per-team model allowlists ---
+
+// jwtForAllowlist is the JWT block the allowlist builder tests pair with: a
+// fully-configured keycloak provider whose teamClaim ("team") and provider name
+// ("keycloak") the authorization principals reference.
+func jwtForAllowlist() *inferencev1alpha1.JWTAuthSpec {
+	return &inferencev1alpha1.JWTAuthSpec{
+		Provider:  "keycloak",
+		Issuer:    "https://issuer.example/realms/lab",
+		JWKSURI:   "https://issuer.example/realms/lab/certs",
+		TeamClaim: "team",
+	}
+}
+
+// securityPolicyAuthzRules extracts spec.authorization.rules from a built
+// SecurityPolicy, asserting defaultAction is Deny.
+func securityPolicyAuthzRules(t *testing.T, sp *unstructured.Unstructured) []interface{} {
+	t.Helper()
+	authz, found, err := unstructured.NestedMap(sp.Object, "spec", "authorization")
+	if err != nil || !found {
+		t.Fatalf("securitypolicy has no spec.authorization (found=%v err=%v)", found, err)
+	}
+	if authz["defaultAction"] != "Deny" {
+		t.Errorf("authorization.defaultAction = %v, want Deny", authz["defaultAction"])
+	}
+	rules, ok := authz["rules"].([]interface{})
+	if !ok {
+		t.Fatalf("authorization.rules is not a slice: %T", authz["rules"])
+	}
+	return rules
+}
+
+// allowlistRuleByName finds the authorization rule with the given name.
+func allowlistRuleByName(t *testing.T, rules []interface{}, name string) map[string]interface{} {
+	t.Helper()
+	for _, r := range rules {
+		rule := r.(map[string]interface{})
+		if rule["name"] == name {
+			return rule
+		}
+	}
+	t.Fatalf("authorization rules have no entry named %q", name)
+	return nil
+}
+
+// jwtPrincipalOf returns the principal.jwt block of an authorization rule.
+func jwtPrincipalOf(t *testing.T, rule map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	principal, ok := rule["principal"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("rule %v has no principal map", rule["name"])
+	}
+	jwt, ok := principal["jwt"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("rule %v principal has no jwt map", rule["name"])
+	}
+	return jwt
+}
+
+// TestNewRouterSecurityPolicy_NoAllowlistsNoAuthorization covers builder case
+// (a): a SecurityPolicy built with an empty allowlist carries NO
+// spec.authorization key, byte-identical to the slice 2d-core output. This is
+// the back-compat contract: turning on JWT without allowlists must not flip the
+// router to default-Deny.
+func TestNewRouterSecurityPolicy_NoAllowlistsNoAuthorization(t *testing.T) {
+	mr := authedRouter("plain-auth", jwtForAllowlist())
+	jwt := jwtForAllowlist()
+
+	sp := newRouterSecurityPolicy(mr, jwt, nil)
+
+	// Back-compat contract: byte-identical to the 2d-core authN-only spec
+	// (targetRefs + jwt, no authorization). A deep-equal (not a mere
+	// key-absence check) catches any future drift in the authN-only shape.
+	name := modelRouterGatewayResourceName(mr)
+	wantSpec := map[string]interface{}{
+		"targetRefs": []interface{}{
+			map[string]interface{}{
+				"group":           gatewayBackendRefGroupAPI,
+				"kind":            httpRouteKind,
+				metadataNameField: name,
+			},
+		},
+		"jwt": map[string]interface{}{
+			"providers": []interface{}{
+				map[string]interface{}{
+					metadataNameField: jwt.Provider,
+					"issuer":          jwt.Issuer,
+					"remoteJWKS": map[string]interface{}{
+						"uri": jwt.JWKSURI,
+					},
+					"claimToHeaders": []interface{}{
+						map[string]interface{}{
+							"claim":  jwt.TeamClaim,
+							"header": routerJWTHeaderKey(jwt),
+						},
+					},
+				},
+			},
+		},
+	}
+	if !reflect.DeepEqual(sp.Object["spec"], wantSpec) {
+		t.Errorf("securitypolicy spec drifted from the 2d-core authN-only shape\n got: %#v\nwant: %#v", sp.Object["spec"], wantSpec)
+	}
+}
+
+// TestNewRouterSecurityPolicy_EmptyModelsIdentityOnly covers builder case (b): a
+// team entry with no models compiles to an Allow rule whose principal is a
+// jwt-claim match on the teamClaim, and carries NO header restriction (the team
+// may reach all models).
+func TestNewRouterSecurityPolicy_EmptyModelsIdentityOnly(t *testing.T) {
+	mr := authedRouter("identity-only", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "platform"},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 1 {
+		t.Fatalf("got %d authorization rules, want 1", len(rules))
+	}
+	rule := allowlistRuleByName(t, rules, "allow-platform-0")
+	if rule["action"] != "Allow" {
+		t.Errorf("rule action = %v, want Allow", rule["action"])
+	}
+
+	jwt := jwtPrincipalOf(t, rule)
+	if jwt["provider"] != "keycloak" {
+		t.Errorf("principal.jwt.provider = %v, want keycloak", jwt["provider"])
+	}
+	claims := jwt["claims"].([]interface{})
+	if len(claims) != 1 {
+		t.Fatalf("got %d claims, want 1", len(claims))
+	}
+	claim := claims[0].(map[string]interface{})
+	if claim["name"] != "team" {
+		t.Errorf("claim name = %v, want team (the teamClaim)", claim["name"])
+	}
+	vals := claim["values"].([]interface{})
+	if len(vals) != 1 || vals[0] != "platform" {
+		t.Errorf("claim values = %v, want [platform]", vals)
+	}
+
+	// Identity-only: NO header restriction on the principal.
+	if _, hasHeaders := rule["principal"].(map[string]interface{})["headers"]; hasHeaders {
+		t.Error("identity-only allowlist entry must NOT carry principal.headers")
+	}
+}
+
+// TestNewRouterSecurityPolicy_ModelsAddHeaderMatch covers builder case (c): a
+// team entry WITH models compiles to an Allow rule whose principal carries both
+// the jwt-claim match and an x-ai-eg-model header match listing exactly those
+// models.
+func TestNewRouterSecurityPolicy_ModelsAddHeaderMatch(t *testing.T) {
+	mr := authedRouter("model-scoped", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "team-b", Models: []string{"qwen35-27b", "llama-8b"}},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	rule := allowlistRuleByName(t, rules, "allow-team-b-0")
+
+	principal := rule["principal"].(map[string]interface{})
+	headers, ok := principal["headers"].([]interface{})
+	if !ok || len(headers) != 1 {
+		t.Fatalf("principal.headers = %v, want exactly one header match", principal["headers"])
+	}
+	h := headers[0].(map[string]interface{})
+	if h["name"] != aiGatewayModelHeader {
+		t.Errorf("header name = %v, want %s", h["name"], aiGatewayModelHeader)
+	}
+	vals := h["values"].([]interface{})
+	if len(vals) != 2 || vals[0] != "qwen35-27b" || vals[1] != "llama-8b" {
+		t.Errorf("header values = %v, want [qwen35-27b llama-8b]", vals)
+	}
+}
+
+// TestNewRouterSecurityPolicy_MultipleTeams covers builder case (d): multiple
+// allowlist entries compile to multiple Allow rules under a defaultAction Deny,
+// each rule named after its (sanitized) team.
+func TestNewRouterSecurityPolicy_MultipleTeams(t *testing.T) {
+	mr := authedRouter("multi-team", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "platform"},
+		{Team: "team-b", Models: []string{"qwen35-27b"}},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 2 {
+		t.Fatalf("got %d authorization rules, want 2", len(rules))
+	}
+	allowlistRuleByName(t, rules, "allow-platform-0")
+	allowlistRuleByName(t, rules, "allow-team-b-1")
+}
+
+// TestNewRouterSecurityPolicy_SanitizeCollisionDistinctRuleNames is the Finding 1
+// regression test: two DISTINCT teams that sanitize to the same fragment
+// ("team.b" and "team-b") must compile to two Allow rules with DISTINCT names
+// (the index suffix disambiguates), both valid and both prefixed "allow-". The
+// teams are genuinely different JWT-claim values, so neither is a duplicate.
+func TestNewRouterSecurityPolicy_SanitizeCollisionDistinctRuleNames(t *testing.T) {
+	mr := authedRouter("collide", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "team.b"},
+		{Team: "team-b"},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 2 {
+		t.Fatalf("got %d authorization rules, want 2", len(rules))
+	}
+
+	name0 := rules[0].(map[string]interface{})["name"].(string)
+	name1 := rules[1].(map[string]interface{})["name"].(string)
+	if name0 == name1 {
+		t.Errorf("distinct teams produced colliding rule names: %q == %q", name0, name1)
+	}
+	if !strings.HasPrefix(name0, "allow-") || !strings.HasPrefix(name1, "allow-") {
+		t.Errorf("rule names must start with allow-, got %q and %q", name0, name1)
+	}
+
+	// And each team's claim value is preserved verbatim (sanitization is for the
+	// rule NAME only, never the matched claim value).
+	claim0 := jwtPrincipalOf(t, rules[0].(map[string]interface{}))["claims"].([]interface{})[0].(map[string]interface{})
+	claim1 := jwtPrincipalOf(t, rules[1].(map[string]interface{}))["claims"].([]interface{})[0].(map[string]interface{})
+	if claim0["values"].([]interface{})[0] != "team.b" {
+		t.Errorf("rule 0 claim values = %v, want [team.b]", claim0["values"])
+	}
+	if claim1["values"].([]interface{})[0] != "team-b" {
+		t.Errorf("rule 1 claim values = %v, want [team-b]", claim1["values"])
+	}
+}
+
+// TestNewRouterSecurityPolicy_NonDNSTeamRuleNameIsDNSSafe asserts a team with
+// uppercase and a slash compiles to a DNS-safe rule name (lowercased, non-DNS
+// chars collapsed to '-', index suffix). The matched claim value is still the
+// verbatim team. This is the builder half of Finding 2.
+func TestNewRouterSecurityPolicy_NonDNSTeamRuleNameIsDNSSafe(t *testing.T) {
+	mr := authedRouter("nondns", jwtForAllowlist())
+	allowlists := []inferencev1alpha1.TeamModelAllowlist{
+		{Team: "Team/B"},
+	}
+
+	sp := newRouterSecurityPolicy(mr, jwtForAllowlist(), allowlists)
+	rules := securityPolicyAuthzRules(t, sp)
+	if len(rules) != 1 {
+		t.Fatalf("got %d authorization rules, want 1", len(rules))
+	}
+	name := rules[0].(map[string]interface{})["name"].(string)
+	if !dnsSafeRuleName.MatchString(name) {
+		t.Errorf("rule name %q is not DNS-safe (want ^allow-[a-z0-9-]+-\\d+$)", name)
+	}
+
+	// The claim still matches the verbatim team value, NOT the sanitized name.
+	claim := jwtPrincipalOf(t, rules[0].(map[string]interface{}))["claims"].([]interface{})[0].(map[string]interface{})
+	if claim["values"].([]interface{})[0] != "Team/B" {
+		t.Errorf("claim values = %v, want [Team/B] (verbatim)", claim["values"])
+	}
+}
+
+// TestModelRouterGateway_WhitespaceOnlyTeamFailsLoud covers the Finding 2
+// validation half: a whitespace-only team (" ") passes CRD MinLength=1 but is
+// semantically empty, so it fails loud as InvalidAuthorization and generates
+// nothing. Driven against the validation-free fake client (the CRD would not
+// reject " ").
+func TestModelRouterGateway_WhitespaceOnlyTeamFailsLoud(t *testing.T) {
+	mr := allowlistRouter("wsteam-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: " "},
+	})
+
+	r := newFakeRouterReconcilerWithGateway(t, mr)
+	reconcileRouter(t, r, mr)
+
+	assertNotExistsClient(t, r.Client, securityPolicyGVK(), "wsteam-router")
+	assertNotExistsClient(t, r.Client, aiGatewayRouteGVK(), "wsteam-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "wsteam-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuthz {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuthz, cond)
+	}
+}
+
+// TestModelRouterGateway_WhitespacePaddedTeamFailsLoud covers the other Finding 2
+// validation half: a leading/trailing-whitespace team (" team-b ") can never
+// match the exact JWT claim "team-b", so it fails loud as InvalidAuthorization
+// rather than silently denying. Driven against the validation-free fake client.
+func TestModelRouterGateway_WhitespacePaddedTeamFailsLoud(t *testing.T) {
+	mr := allowlistRouter("padteam-router", jwtForAllowlist(), []inferencev1alpha1.TeamModelAllowlist{
+		{Team: " team-b "},
+	})
+
+	r := newFakeRouterReconcilerWithGateway(t, mr)
+	reconcileRouter(t, r, mr)
+
+	assertNotExistsClient(t, r.Client, securityPolicyGVK(), "padteam-router")
+	assertNotExistsClient(t, r.Client, aiGatewayRouteGVK(), "padteam-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: "padteam-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonInvalidAuthz {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonInvalidAuthz, cond)
+	}
+}
+
+// dnsSafeRuleName matches a compiled Allow rule name: allow-<dns-fragment>-<index>.
+var dnsSafeRuleName = regexp.MustCompile(`^allow-[a-z0-9-]+-\d+$`)
 
 // --- helpers ---
 

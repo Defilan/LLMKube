@@ -18,13 +18,20 @@ package controller
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
+
+// nonDNSChar matches any run of characters that are not DNS label-safe
+// ([a-z0-9-]); allowlistRuleName collapses each run to a single '-' when
+// building a human-readable rule-name fragment from a team value.
+var nonDNSChar = regexp.MustCompile(`[^a-z0-9-]+`)
 
 // This file is the ModelRouter dataPlane: Gateway compiler (proposal 5.2 slice
 // 2a). It reuses the GVK/constant helpers and resource shapes defined for the
@@ -550,13 +557,13 @@ func budgetUnitSeconds(unit string) int64 {
 // is a 401 before any model dispatch. Mirrors the jwt stanza of the spike's
 // 07-security-policy.yaml; the authorization stanza of that manifest is slice
 // 2d.2 and deliberately NOT compiled here.
-func newRouterSecurityPolicy(mr *inferencev1alpha1.ModelRouter, jwt *inferencev1alpha1.JWTAuthSpec) *unstructured.Unstructured {
+func newRouterSecurityPolicy(
+	mr *inferencev1alpha1.ModelRouter,
+	jwt *inferencev1alpha1.JWTAuthSpec,
+	allowlists []inferencev1alpha1.TeamModelAllowlist,
+) *unstructured.Unstructured {
 	name := modelRouterGatewayResourceName(mr)
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(securityPolicyGVK())
-	u.SetName(name)
-	u.SetNamespace(mr.Namespace)
-	u.Object["spec"] = map[string]interface{}{
+	spec := map[string]interface{}{
 		"targetRefs": []interface{}{
 			map[string]interface{}{
 				"group":           gatewayBackendRefGroupAPI,
@@ -582,7 +589,118 @@ func newRouterSecurityPolicy(mr *inferencev1alpha1.ModelRouter, jwt *inferencev1
 			},
 		},
 	}
+
+	// slice 2d.2: per-team model allowlists compile to the authorization block of
+	// THIS SAME SecurityPolicy (authZ on top of authN). When there are no
+	// allowlists we omit the key entirely so an authN-only router's SecurityPolicy
+	// is byte-identical to slice 2d-core's output (adding the field must not
+	// retroactively flip an existing router to default-Deny).
+	if len(allowlists) > 0 {
+		spec["authorization"] = compileRouterAuthorization(jwt, allowlists)
+	}
+
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(securityPolicyGVK())
+	u.SetName(name)
+	u.SetNamespace(mr.Namespace)
+	u.Object["spec"] = spec
 	return u
+}
+
+// compileRouterAuthorization turns the router's per-team model allowlists into
+// the SecurityPolicy authorization block: defaultAction Deny plus one Allow rule
+// per entry. A non-empty allowlist is the user opting into default-deny access
+// control, so any verified team not named here is rejected (403). Each rule's
+// principal matches the verified teamClaim value via principal.jwt.claims (using
+// the SAME jwt.Provider the authentication block declares, as Envoy Gateway
+// requires for claim authorization), and, when the entry lists models, restricts
+// to those models via a principal.headers match on the resolved x-ai-eg-model
+// header. Mirrors the authorization stanza of the spike's 07-security-policy.yaml.
+func compileRouterAuthorization(
+	jwt *inferencev1alpha1.JWTAuthSpec,
+	allowlists []inferencev1alpha1.TeamModelAllowlist,
+) map[string]interface{} {
+	rules := make([]interface{}, 0, len(allowlists))
+	for i, entry := range allowlists {
+		rules = append(rules, compileAllowlistRule(jwt, entry, i))
+	}
+	return map[string]interface{}{
+		// Deny is the secure default once authorization is configured: a verified
+		// team with no matching Allow rule is rejected rather than served.
+		"defaultAction": "Deny",
+		"rules":         rules,
+	}
+}
+
+// compileAllowlistRule compiles one allowlist entry into an Allow authorization
+// rule. The principal always carries a jwt-claim match on the teamClaim; when the
+// entry lists models it additionally carries an x-ai-eg-model header match (ANDed
+// with the claim, since multiple principal types all must match). The entry's
+// index i is folded into the rule name: the index suffix makes the name unique
+// regardless of team content, so two distinct teams that sanitize to the same
+// fragment (e.g. "team.b" and "team-b") still get distinct rule names.
+func compileAllowlistRule(jwt *inferencev1alpha1.JWTAuthSpec, entry inferencev1alpha1.TeamModelAllowlist, i int) map[string]interface{} {
+	principal := map[string]interface{}{
+		"jwt": map[string]interface{}{
+			"provider": jwt.Provider,
+			"claims": []interface{}{
+				map[string]interface{}{
+					metadataNameField: jwt.TeamClaim,
+					"values":          stringSlice(entry.Team),
+				},
+			},
+		},
+	}
+
+	// Empty models == identity-only allow (team may reach all models): no header
+	// restriction. Non-empty models restrict to those resolved model names. The AI
+	// Gateway extproc sets the x-ai-eg-model header to the resolved model before
+	// RBAC runs (validated in the spike), so it is the value to authorize on, the
+	// same value spec.rules[].match.models route on.
+	if len(entry.Models) > 0 {
+		principal["headers"] = []interface{}{
+			map[string]interface{}{
+				metadataNameField: aiGatewayModelHeader,
+				"values":          toInterfaceSlice(entry.Models),
+			},
+		}
+	}
+
+	return map[string]interface{}{
+		metadataNameField: allowlistRuleName(entry.Team, i),
+		"action":          "Allow",
+		"principal":       principal,
+	}
+}
+
+// allowlistRuleName builds a unique, DNS-safe name for the Allow rule of one
+// allowlist entry. The index suffix guarantees uniqueness even when two
+// distinct team values sanitize to the same fragment (e.g. "team.b" and
+// "team-b"); the fragment is for human readability only.
+func allowlistRuleName(team string, i int) string {
+	frag := strings.ToLower(team)
+	frag = nonDNSChar.ReplaceAllString(frag, "-") // any char not [a-z0-9-] -> '-'
+	frag = strings.Trim(frag, "-")
+	if frag == "" {
+		frag = "team"
+	}
+	return fmt.Sprintf("allow-%s-%d", frag, i)
+}
+
+// stringSlice wraps a single string into the []interface{} the unstructured
+// claim "values" array expects.
+func stringSlice(s string) []interface{} {
+	return []interface{}{s}
+}
+
+// toInterfaceSlice copies a []string into a []interface{} (the type the
+// unstructured object requires for string arrays).
+func toInterfaceSlice(in []string) []interface{} {
+	out := make([]interface{}, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
 }
 
 // modelRouterGatewayGVKs are the GVKs the ModelRouter gateway path needs the

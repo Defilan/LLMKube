@@ -62,6 +62,14 @@ const (
 
 	// slice 2d-core auth fail-loud reason.
 	modelRouterGatewayReasonInvalidAuth = "InvalidAuth"
+
+	// slice 2d.2 authorization (per-team model allowlist) fail-loud reasons.
+	// AuthorizationRequiresJWT is the structural prerequisite (you cannot
+	// authorize on an unverified claim); InvalidAuthorization covers a malformed
+	// allowlist (empty or duplicate team). Both generate NOTHING and set
+	// GatewayReady False, consistent with the 2a/2b/2d-core honest boundary.
+	modelRouterGatewayReasonAuthzRequiresJWT = "AuthorizationRequiresJWT"
+	modelRouterGatewayReasonInvalidAuthz     = "InvalidAuthorization"
 )
 
 // ModelRouterGatewayReconciler compiles a ModelRouter in dataPlane: Gateway mode
@@ -150,6 +158,15 @@ func (r *ModelRouterGatewayReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonInvalidAuth, msg)
 	}
 
+	// Fail-loud on a malformed authorization (per-team model allowlist) config:
+	// allowlists without JWT, or an empty/duplicate team. Same ordering as the
+	// auth check (before any CreateOrUpdate); a non-empty allowlist makes the
+	// SecurityPolicy default-Deny, so a malformed one must never be emitted (it
+	// would silently lock everyone out).
+	if reason, msg := invalidAuthorizationMessage(mr); reason != "" {
+		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, reason, msg)
+	}
+
 	if err := r.reconcileGatewayResources(ctx, mr); err != nil {
 		_ = r.setGatewayNotReady(ctx, mr, modelRouterGatewayReasonReconcile, err.Error())
 		return ctrl.Result{}, err
@@ -190,7 +207,7 @@ func (r *ModelRouterGatewayReconciler) reconcileGatewayResources(
 	// with no auth produces no SecurityPolicy. (targetRef may reference the route
 	// before it exists; Envoy Gateway attaches it once the route appears.)
 	if jwt := routerJWT(mr); jwt != nil {
-		desired = append(desired, newRouterSecurityPolicy(mr, jwt))
+		desired = append(desired, newRouterSecurityPolicy(mr, jwt, routerAllowlists(mr)))
 	}
 
 	desired = append(desired,
@@ -299,6 +316,11 @@ func (r *ModelRouterGatewayReconciler) setGatewayReady(
 	message := gatewayReadyMessage(mr)
 	if authEnabled {
 		message += "; JWT authentication enforced"
+		// Allowlists imply JWT (invalidAuthorizationMessage rejects allowlists
+		// without it), so this only appends on an already-authenticated router.
+		if n := len(routerAllowlists(mr)); n > 0 {
+			message += fmt.Sprintf("; %d team model allowlist(s) enforced", n)
+		}
 	}
 	apimeta.SetStatusCondition(&mr.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterGatewayConditionReady,
@@ -499,6 +521,16 @@ func routerJWT(mr *inferencev1alpha1.ModelRouter) *inferencev1alpha1.JWTAuthSpec
 	return mr.Spec.Policy.Auth.JWT
 }
 
+// routerAllowlists returns the configured per-team model allowlists (nil-safe
+// through policy.auth). nil/empty means no authorization is enforced; a non-empty
+// slice flips the generated SecurityPolicy to default-Deny. Mirrors routerJWT.
+func routerAllowlists(mr *inferencev1alpha1.ModelRouter) []inferencev1alpha1.TeamModelAllowlist {
+	if mr.Spec.Policy == nil || mr.Spec.Policy.Auth == nil {
+		return nil
+	}
+	return mr.Spec.Policy.Auth.Allowlists
+}
+
 // invalidAuthMessage returns a non-empty message when policy.auth.jwt is set but
 // missing a required field (issuer, jwksURI, or teamClaim). Empty means auth is
 // absent or fully configured. CRD validation should also reject these, but the
@@ -528,6 +560,62 @@ func invalidAuthMessage(mr *inferencev1alpha1.ModelRouter) string {
 	}
 	sort.Strings(missing)
 	return fmt.Sprintf("policy.auth.jwt is set but missing required field(s): %s", strings.Join(missing, ", "))
+}
+
+// invalidAuthorizationMessage returns a fail-loud (reason, message) for a
+// malformed authorization (per-team model allowlist) configuration, or ("", "")
+// when allowlists are absent or well-formed. Like the budget and auth guards it
+// runs BEFORE generation so a rejected allowlist yields no SecurityPolicy (whose
+// default-Deny could otherwise silently lock everyone out). The rejected cases
+// (proposal 5.2 authorization honest boundary):
+//   - allowlists set without policy.auth.jwt: authorization matches on a verified
+//     JWT claim, so it cannot stand without authentication
+//     (AuthorizationRequiresJWT).
+//   - an entry with a semantically-empty Team (empty or whitespace-only): a
+//     default-Deny policy with a malformed principal would not allow the intended
+//     team (InvalidAuthorization). CRD MinLength=1 only catches the truly-empty
+//     case; " " slips through, so the reconciler trims before checking.
+//   - an entry whose Team has leading/trailing whitespace: it can never match the
+//     exact JWT claim, so it is a silent-deny footgun (InvalidAuthorization).
+//   - a duplicate Team across entries: ambiguous intent (InvalidAuthorization).
+//     Detected on the raw Team string; distinct teams that merely sanitize to the
+//     same rule-name fragment are NOT duplicates (allowlistRuleName disambiguates
+//     them with an index suffix).
+//
+// CRD validation also rejects an empty Team (Required+MinLength), but the
+// reconciler defends fail-loud so a partial authorization is never emitted.
+func invalidAuthorizationMessage(mr *inferencev1alpha1.ModelRouter) (reason, message string) {
+	allowlists := routerAllowlists(mr)
+	if len(allowlists) == 0 {
+		return "", ""
+	}
+
+	if routerJWT(mr) == nil {
+		return modelRouterGatewayReasonAuthzRequiresJWT,
+			"policy.auth.allowlists is set but policy.auth.jwt is not; authorization matches on a verified JWT " +
+				"claim and cannot be enforced without authentication. Configure policy.auth.jwt, or remove the allowlists"
+	}
+
+	seen := make(map[string]struct{}, len(allowlists))
+	for i, entry := range allowlists {
+		if strings.TrimSpace(entry.Team) == "" {
+			return modelRouterGatewayReasonInvalidAuthz,
+				fmt.Sprintf("policy.auth.allowlists[%d] has an empty team; every allowlist entry must name the "+
+					"verified team it grants access to", i)
+		}
+		if entry.Team != strings.TrimSpace(entry.Team) {
+			return modelRouterGatewayReasonInvalidAuthz,
+				fmt.Sprintf("policy.auth.allowlists team %q has leading or trailing whitespace and would never match "+
+					"the exact JWT claim; trim the team value", entry.Team)
+		}
+		if _, dup := seen[entry.Team]; dup {
+			return modelRouterGatewayReasonInvalidAuthz,
+				fmt.Sprintf("policy.auth.allowlists has duplicate team %q; declare each team at most once "+
+					"(list all its models in a single entry)", entry.Team)
+		}
+		seen[entry.Team] = struct{}{}
+	}
+	return "", ""
 }
 
 // unsupportedMatchMessage returns a non-empty message naming the first rule

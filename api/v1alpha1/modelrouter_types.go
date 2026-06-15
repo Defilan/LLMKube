@@ -361,6 +361,46 @@ type RouterAuthSpec struct {
 	// header.
 	// +optional
 	JWT *JWTAuthSpec `json:"jwt,omitempty"`
+
+	// Allowlists restricts which verified team may reach which model
+	// (authorization), as a sibling of JWT (authentication). Each entry grants a
+	// team the models it may reach. JWT proves identity; Allowlists decide what
+	// that identity is permitted to do.
+	//
+	// Empty or nil means NO authorization is enforced: any authenticated request
+	// reaches any model (the authentication-only behavior of slice 2d-core, so
+	// adding this field cannot retroactively lock out an existing router). A
+	// non-empty Allowlists flips the generated SecurityPolicy to default-Deny:
+	// only the named teams (and, per entry, only their listed models) are
+	// allowed, and every other verified team is rejected with HTTP 403.
+	//
+	// Authorization requires authentication: Allowlists set without JWT is
+	// rejected fail-loud (you cannot authorize on an unverified claim), as is an
+	// entry with an empty Team or a duplicate Team. In dataPlane: Gateway mode
+	// these compile to the authorization block of the SAME SecurityPolicy JWT
+	// generates: one Allow rule per entry whose principal matches the verified
+	// TeamClaim value (and, when the entry lists models, the resolved
+	// x-ai-eg-model header).
+	// +optional
+	Allowlists []TeamModelAllowlist `json:"allowlists,omitempty"`
+}
+
+// TeamModelAllowlist grants one verified team access to a set of models. It is
+// the unit of the router's authorization surface (RouterAuthSpec.Allowlists),
+// compiled into one Allow rule of the SecurityPolicy authorization block in
+// dataPlane: Gateway mode.
+type TeamModelAllowlist struct {
+	// Team is the verified teamClaim value this entry grants access to.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Team string `json:"team"`
+
+	// Models is the set of model names this team may reach. Empty means the
+	// team may reach all models (identity-only allow). Each value matches the
+	// resolved model name (the x-ai-eg-model header), the same value
+	// spec.rules[].match.models route on.
+	// +optional
+	Models []string `json:"models,omitempty"`
 }
 
 // JWTAuthSpec configures JWT validation and claim-to-header mapping. In
