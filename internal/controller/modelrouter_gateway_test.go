@@ -1633,3 +1633,155 @@ func TestCompileBudgetRule_WindowScaling(t *testing.T) {
 		}
 	}
 }
+
+// TestModelRouterGateway_AuditLogFailsLoud covers the 2c honest boundary: a
+// dataPlane: Gateway router with policy.auditLog set is refused loudly
+// (GatewayReady=False, reason UnsupportedAuditLogInGatewayMode) and generates
+// NOTHING. auditLog is a Proxy-mode field; in Gateway mode audit is configured on
+// the gateway-scoped EnvoyProxy (the chart's gateway.auditLog values), not per
+// router, so silently ignoring it would be a compliance footgun.
+func TestModelRouterGateway_AuditLogFailsLoud(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "audit-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "audit-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "audit-cuda", InferenceServiceRef: corev1LocalRef("audit-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"audit-cuda"}},
+				},
+			},
+			Policy: &inferencev1alpha1.RouterPolicy{
+				AuditLog: &inferencev1alpha1.AuditLogPolicy{Sink: "stdout"},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	// Generates NOTHING: no Backend, AIServiceBackend, route, SecurityPolicy, or BTP.
+	assertNotExists(t, c, backendGVK(), "audit-cuda")
+	assertNotExists(t, c, aiServiceBackendGVK(), "audit-cuda")
+	assertNotExists(t, c, aiGatewayRouteGVK(), "audit-router")
+	assertNotExists(t, c, securityPolicyGVK(), "audit-router")
+	assertNotExists(t, c, btpGVK(), "audit-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "audit-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterGatewayReasonUnsupportedAuditLog {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", modelRouterGatewayReasonUnsupportedAuditLog, cond)
+	}
+	if fresh.Status.Gateway != nil && fresh.Status.Gateway.RouteReady {
+		t.Errorf("status.gateway.routeReady should be false on unsupported auditLog")
+	}
+}
+
+// TestModelRouterGateway_NoAuditLogStillReady is the positive control for the 2c
+// fail-loud check: an otherwise-identical router WITHOUT policy.auditLog reaches
+// GatewayReady=True and generates its resources, proving the auditLog guard is not
+// over-broad.
+func TestModelRouterGateway_NoAuditLogStillReady(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "noaudit-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "noaudit-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "noaudit-cuda", InferenceServiceRef: corev1LocalRef("noaudit-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"noaudit-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	// Resources are generated and the router reaches Ready.
+	getUnstructured(t, c, aiGatewayRouteGVK(), "noaudit-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "noaudit-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected GatewayReady=True, got %+v", cond)
+	}
+}
+
+// TestUnsupportedAuditLogMessage is a pure-function unit test for the 2c
+// fail-loud guard: nil policy and a policy without auditLog return "" (no
+// rejection); a policy with any auditLog block returns a non-empty message.
+func TestUnsupportedAuditLogMessage(t *testing.T) {
+	tests := []struct {
+		name       string
+		policy     *inferencev1alpha1.RouterPolicy
+		wantReject bool
+	}{
+		{
+			name:       "nil policy compiles",
+			policy:     nil,
+			wantReject: false,
+		},
+		{
+			name:       "policy without auditLog compiles",
+			policy:     &inferencev1alpha1.RouterPolicy{},
+			wantReject: false,
+		},
+		{
+			name:       "policy with empty auditLog block rejected",
+			policy:     &inferencev1alpha1.RouterPolicy{AuditLog: &inferencev1alpha1.AuditLogPolicy{}},
+			wantReject: true,
+		},
+		{
+			name:       "policy with populated auditLog rejected",
+			policy:     &inferencev1alpha1.RouterPolicy{AuditLog: &inferencev1alpha1.AuditLogPolicy{Sink: "otlp"}},
+			wantReject: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mr := &inferencev1alpha1.ModelRouter{
+				Spec: inferencev1alpha1.ModelRouterSpec{Policy: tt.policy},
+			}
+			msg := unsupportedAuditLogMessage(mr)
+			if tt.wantReject && msg == "" {
+				t.Errorf("expected auditLog rejected, got empty message")
+			}
+			if !tt.wantReject && msg != "" {
+				t.Errorf("expected auditLog accepted, got rejection: %s", msg)
+			}
+		})
+	}
+}
