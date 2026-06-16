@@ -4523,3 +4523,139 @@ var _ = Describe("constructDeployment Regression Tests", func() {
 // warning to HuggingFace repo IDs (the only source type that's truly
 // runtime-resolved). Below: the warning's full truth table so the heuristic
 // can't drift again.
+
+var _ = Describe("AMD Vulkan Deployment Construction", func() {
+	var (
+		reconciler *InferenceServiceReconciler
+		replicas   int32
+	)
+
+	BeforeEach(func() {
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+		}
+		replicas = 1
+	})
+
+	vulkanModel := func() *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://example.com/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					GPU: &inferencev1alpha1.GPUSpec{
+						Enabled: true,
+						Count:   1,
+						Vendor:  "amd",
+						Runtime: "vulkan",
+					},
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{
+				Phase: "Ready",
+				Path:  "/tmp/llmkube/models/test-model.gguf",
+			},
+		}
+	}
+
+	It("uses the pinned Vulkan image and devic.es/dri-render for vendor=amd runtime=vulkan", func() {
+		model := vulkanModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-service", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+
+		Expect(container.Image).To(Equal(llamaCppVulkanImage))
+		gpuLimit := container.Resources.Limits[vulkanDRIResourceName]
+		Expect(gpuLimit).To(Equal(resource.MustParse("1")))
+		// The ROCm resource must not be requested on the Vulkan path.
+		_, hasROCm := container.Resources.Limits[amdGPUResourceName]
+		Expect(hasROCm).To(BeFalse())
+	})
+
+	It("honors supplementalGroups via spec.podSecurityContext for the render group", func() {
+		model := vulkanModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-service-sg", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+				PodSecurityContext: &corev1.PodSecurityContext{
+					SupplementalGroups: []int64{44},
+				},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		Expect(deployment.Spec.Template.Spec.SecurityContext).NotTo(BeNil())
+		Expect(deployment.Spec.Template.Spec.SecurityContext.SupplementalGroups).To(ContainElement(int64(44)))
+	})
+
+	It("lets spec.image override the pinned Vulkan image", func() {
+		model := vulkanModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-service-img", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Image:     "ghcr.io/example/custom-vulkan:dev",
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/example/custom-vulkan:dev"))
+	})
+
+	It("lets resourceName override devic.es/dri-render on the Vulkan path", func() {
+		model := vulkanModel()
+		model.Spec.Hardware.GPU.ResourceName = "amd.com/gpu"
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-service-res", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+		gpuLimit := container.Resources.Limits[amdGPUResourceName]
+		Expect(gpuLimit).To(Equal(resource.MustParse("1")))
+		// Image is still the pinned Vulkan image; resourceName only affects scheduling.
+		Expect(container.Image).To(Equal(llamaCppVulkanImage))
+	})
+
+	It("keeps amd.com/gpu and the stock image for runtime=rocm", func() {
+		model := vulkanModel()
+		model.Spec.Hardware.GPU.Runtime = "rocm"
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "rocm-service", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Image).To(Equal((&LlamaCppBackend{}).DefaultImage()))
+		gpuLimit := container.Resources.Limits[amdGPUResourceName]
+		Expect(gpuLimit).To(Equal(resource.MustParse("1")))
+	})
+})

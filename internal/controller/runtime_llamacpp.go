@@ -14,6 +14,12 @@ import (
 // BuildArgs.
 var llamaCppLog = logf.Log.WithName("runtime.llamacpp")
 
+// llamaCppVulkanImage is LLMKube's hardware-validated Vulkan llama.cpp server
+// image, built and promoted by defilantech/llmkube-runtimes. Pinned by digest
+// for reproducibility; this digest is the :stable / :b9663-llmkube1 image. Bump
+// it via PR when the promoter publishes a new :stable digest.
+const llamaCppVulkanImage = "ghcr.io/defilantech/llmkube-llama-vulkan@sha256:cbab8af682ecac9b5c865d85219d808dc356814326c70346e05b8b20b333e295"
+
 // LlamaCppBackend generates container configuration for the llama.cpp inference server.
 type LlamaCppBackend struct{}
 
