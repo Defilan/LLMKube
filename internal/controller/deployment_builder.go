@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -41,6 +42,30 @@ import (
 // which is true). This keeps the legacy service-link env-var injection on for
 // llama.cpp / generic / personaplex / tgi where it is harmless, and disables
 // it for vLLM where the v0.20+ env-var validator turns it into log noise.
+// resolveRuntimeImage returns the container image for the runtime, making the
+// otherwise vendor-blind backend.DefaultImage() vendor- and runtime-aware where
+// it matters. Today the only divergence is the llama.cpp backend with an
+// AMD/Vulkan Model: it uses LLMKube's pinned Vulkan image instead of the stock
+// upstream image. Every other backend/vendor/runtime combination falls through
+// to backend.DefaultImage(). An explicit InferenceService.spec.image still wins
+// over whatever this returns (handled by the caller).
+func resolveRuntimeImage(backend RuntimeBackend, model *inferencev1alpha1.Model) string {
+	if _, ok := backend.(*LlamaCppBackend); ok && isVulkanAMDModel(model) {
+		return llamaCppVulkanImage
+	}
+	return backend.DefaultImage()
+}
+
+// isVulkanAMDModel reports whether the Model requests the AMD vendor with the
+// Vulkan GPU runtime.
+func isVulkanAMDModel(model *inferencev1alpha1.Model) bool {
+	if model == nil || model.Spec.Hardware == nil || model.Spec.Hardware.GPU == nil {
+		return false
+	}
+	gpu := model.Spec.Hardware.GPU
+	return strings.EqualFold(strings.TrimSpace(gpu.Vendor), "amd") && isVulkanRuntime(gpu.Runtime)
+}
+
 func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 	if d, ok := backend.(ServiceLinksOptOut); ok && d.DisableServiceLinks() {
 		f := false
@@ -158,7 +183,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		"inference.llmkube.dev/runtime": runtimeNameLabel(isvc),
 	}
 
-	image := backend.DefaultImage()
+	image := resolveRuntimeImage(backend, model)
 	if isvc.Spec.Image != "" {
 		image = isvc.Spec.Image
 	}

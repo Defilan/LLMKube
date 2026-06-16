@@ -66,12 +66,46 @@ func TestGPUResourceNameForSpec(t *testing.T) {
 			expected: nvidiaGPUResourceName,
 		},
 		{
+			name:     "vendor amd with runtime rocm maps to amd.com/gpu",
+			gpu:      &inferencev1alpha1.GPUSpec{Vendor: "amd", Runtime: "rocm"},
+			expected: amdGPUResourceName,
+		},
+		{
+			name:     "vendor amd with empty runtime maps to amd.com/gpu",
+			gpu:      &inferencev1alpha1.GPUSpec{Vendor: "amd", Runtime: ""},
+			expected: amdGPUResourceName,
+		},
+		{
+			name:     "vendor amd with runtime vulkan maps to devic.es/dri-render",
+			gpu:      &inferencev1alpha1.GPUSpec{Vendor: "amd", Runtime: "vulkan"},
+			expected: vulkanDRIResourceName,
+		},
+		{
+			name:     "vulkan runtime is case-insensitive",
+			gpu:      &inferencev1alpha1.GPUSpec{Vendor: "amd", Runtime: "Vulkan"},
+			expected: vulkanDRIResourceName,
+		},
+		{
+			name:     "vulkan runtime only applies to amd vendor",
+			gpu:      &inferencev1alpha1.GPUSpec{Vendor: "nvidia", Runtime: "vulkan"},
+			expected: nvidiaGPUResourceName,
+		},
+		{
 			name: "explicit ResourceName overrides vendor mapping",
 			gpu: &inferencev1alpha1.GPUSpec{
 				Vendor:       "amd",
 				ResourceName: "squat.ai/dri-render",
 			},
 			expected: corev1.ResourceName("squat.ai/dri-render"),
+		},
+		{
+			name: "explicit ResourceName wins over the vulkan default",
+			gpu: &inferencev1alpha1.GPUSpec{
+				Vendor:       "amd",
+				Runtime:      "vulkan",
+				ResourceName: "amd.com/gpu",
+			},
+			expected: amdGPUResourceName,
 		},
 		{
 			name: "explicit ResourceName wins even when vendor is unset",
@@ -99,6 +133,87 @@ func TestGPUResourceNameForSpec(t *testing.T) {
 			got := gpuResourceNameForSpec(model)
 			if got != tc.expected {
 				t.Fatalf("gpuResourceNameForSpec() = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+func amdModel(runtime string) *inferencev1alpha1.Model {
+	return &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{
+			Hardware: &inferencev1alpha1.HardwareSpec{
+				GPU: &inferencev1alpha1.GPUSpec{
+					Vendor:  "amd",
+					Runtime: runtime,
+				},
+			},
+		},
+	}
+}
+
+func TestResolveRuntimeImage(t *testing.T) {
+	stockLlamaCpp := (&LlamaCppBackend{}).DefaultImage()
+
+	cases := []struct {
+		name     string
+		backend  RuntimeBackend
+		model    *inferencev1alpha1.Model
+		expected string
+	}{
+		{
+			name:     "llamacpp amd vulkan selects the pinned vulkan image",
+			backend:  &LlamaCppBackend{},
+			model:    amdModel("vulkan"),
+			expected: llamaCppVulkanImage,
+		},
+		{
+			name:     "llamacpp amd vulkan is case-insensitive",
+			backend:  &LlamaCppBackend{},
+			model:    amdModel("Vulkan"),
+			expected: llamaCppVulkanImage,
+		},
+		{
+			name:     "llamacpp amd rocm keeps the stock image",
+			backend:  &LlamaCppBackend{},
+			model:    amdModel("rocm"),
+			expected: stockLlamaCpp,
+		},
+		{
+			name:     "llamacpp amd empty runtime keeps the stock image",
+			backend:  &LlamaCppBackend{},
+			model:    amdModel(""),
+			expected: stockLlamaCpp,
+		},
+		{
+			name:    "llamacpp nvidia keeps the stock image even with vulkan runtime",
+			backend: &LlamaCppBackend{},
+			model: &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						GPU: &inferencev1alpha1.GPUSpec{Vendor: "nvidia", Runtime: "vulkan"},
+					},
+				},
+			},
+			expected: stockLlamaCpp,
+		},
+		{
+			name:     "non-llamacpp backend ignores vulkan and uses its default image",
+			backend:  &VLLMBackend{},
+			model:    amdModel("vulkan"),
+			expected: (&VLLMBackend{}).DefaultImage(),
+		},
+		{
+			name:     "nil model uses backend default",
+			backend:  &LlamaCppBackend{},
+			model:    &inferencev1alpha1.Model{},
+			expected: stockLlamaCpp,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveRuntimeImage(tc.backend, tc.model); got != tc.expected {
+				t.Fatalf("resolveRuntimeImage() = %q, want %q", got, tc.expected)
 			}
 		})
 	}
