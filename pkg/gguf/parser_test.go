@@ -18,11 +18,16 @@ package gguf
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -607,4 +612,210 @@ func TestGGMLTypeString(t *testing.T) {
 	if unknown.String() != "Unknown(999)" {
 		t.Errorf("Unknown.String() = %q", unknown.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Remote header-only read
+// ---------------------------------------------------------------------------
+
+// fixtureMetadata is the metadata used by the remote-read fixtures, shared so
+// the local-vs-remote comparison asserts on the same expected values.
+func fixtureMetadata() []metadataEntry {
+	return []metadataEntry{
+		{key: "general.architecture", value: testString{s: "llama"}},
+		{key: "general.name", value: testString{s: "Llama 3.1 8B Instruct"}},
+		{key: "general.file_type", value: testUint32{v: 17}},
+		{key: "llama.context_length", value: testUint32{v: 131072}},
+		{key: "llama.embedding_length", value: testUint32{v: 4096}},
+		{key: "llama.block_count", value: testUint32{v: 32}},
+		{key: "llama.attention.head_count", value: testUint32{v: 32}},
+	}
+}
+
+// buildGGUFWithTensorData builds a GGUF whose header+metadata+tensor-info is
+// small but whose total file size is large (tensor data padding). This lets a
+// header-only remote read prove it transfers far fewer bytes than the file.
+func buildGGUFWithTensorData(metadata []metadataEntry, tensorCount uint64, tensorDataBytes int) []byte {
+	header := buildGGUF(metadata, tensorCount)
+	out := make([]byte, len(header)+tensorDataBytes)
+	copy(out, header)
+	// Padding stays zero — it is never read by a header-only parse.
+	return out
+}
+
+func TestParseFromURL_HeaderOnly(t *testing.T) {
+	// Small header section, ~4 MB of trailing tensor data.
+	const tensorDataBytes = 4 << 20
+	data := buildGGUFWithTensorData(fixtureMetadata(), 5, tensorDataBytes)
+
+	// Local parse is the ground truth.
+	local, err := Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("local parse failed: %v", err)
+	}
+
+	srv, served, supportsRange := newRangeFileServer(t, data)
+	defer srv.Close()
+	_ = supportsRange
+
+	remote, err := ParseFromURL(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("ParseFromURL failed: %v", err)
+	}
+
+	assertSameMetadata(t, local, remote)
+
+	got := served()
+	if got >= int64(len(data)) {
+		t.Fatalf("served %d bytes, expected materially fewer than file size %d", got, len(data))
+	}
+	if got >= int64(len(data))/2 {
+		t.Fatalf("served %d bytes, expected < half of file size %d (not header-only)", got, len(data))
+	}
+}
+
+func TestParseFromURL_NoRangeSupport(t *testing.T) {
+	const tensorDataBytes = 4 << 20
+	data := buildGGUFWithTensorData(fixtureMetadata(), 5, tensorDataBytes)
+
+	local, err := Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("local parse failed: %v", err)
+	}
+
+	srv, _, _ := newNoRangeFileServer(t, data)
+	defer srv.Close()
+
+	// Count bytes the client actually pulls through the body, independent of
+	// how aggressively the server (or the loopback socket buffer) pushes. This
+	// is what the parser controls: it stops reading once the metadata and
+	// tensor-info section is consumed and never touches the tensor data.
+	var consumed atomic.Int64
+	client := &http.Client{Transport: &countingTransport{rt: http.DefaultTransport, n: &consumed}}
+
+	remote, err := parseFromURL(context.Background(), client, srv.URL)
+	if err != nil {
+		t.Fatalf("ParseFromURL (no range) failed: %v", err)
+	}
+
+	assertSameMetadata(t, local, remote)
+
+	got := consumed.Load()
+	if got >= int64(len(data)) {
+		t.Fatalf("client consumed %d bytes, expected to stop before reading the full file %d", got, len(data))
+	}
+	if got >= int64(len(data))/2 {
+		t.Fatalf("client consumed %d bytes, expected < half of file size %d (not header-only)", got, len(data))
+	}
+}
+
+// countingTransport wraps an http.RoundTripper and counts the bytes read from
+// every response body it returns.
+type countingTransport struct {
+	rt http.RoundTripper
+	n  *atomic.Int64
+}
+
+func (c *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := c.rt.RoundTrip(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	resp.Body = &countingReadCloser{rc: resp.Body, n: c.n}
+	return resp, nil
+}
+
+type countingReadCloser struct {
+	rc io.ReadCloser
+	n  *atomic.Int64
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error { return c.rc.Close() }
+
+func assertSameMetadata(t *testing.T, want, got *GGUFFile) {
+	t.Helper()
+	if got.Architecture() != want.Architecture() {
+		t.Errorf("architecture = %q, want %q", got.Architecture(), want.Architecture())
+	}
+	if got.Name() != want.Name() {
+		t.Errorf("name = %q, want %q", got.Name(), want.Name())
+	}
+	if got.Quantization() != want.Quantization() {
+		t.Errorf("quantization = %q, want %q", got.Quantization(), want.Quantization())
+	}
+	if got.ContextLength() != want.ContextLength() {
+		t.Errorf("context_length = %d, want %d", got.ContextLength(), want.ContextLength())
+	}
+	if got.EmbeddingLength() != want.EmbeddingLength() {
+		t.Errorf("embedding_length = %d, want %d", got.EmbeddingLength(), want.EmbeddingLength())
+	}
+	if got.BlockCount() != want.BlockCount() {
+		t.Errorf("block_count = %d, want %d", got.BlockCount(), want.BlockCount())
+	}
+	if got.HeadCount() != want.HeadCount() {
+		t.Errorf("head_count = %d, want %d", got.HeadCount(), want.HeadCount())
+	}
+	if len(got.TensorInfo) != len(want.TensorInfo) {
+		t.Errorf("tensor info len = %d, want %d", len(got.TensorInfo), len(want.TensorInfo))
+	}
+}
+
+// newRangeFileServer serves data with full HTTP Range support and counts body
+// bytes written. Returns the server, a func reporting bytes served, and whether
+// the server advertised range support.
+func newRangeFileServer(t *testing.T, data []byte) (*httptest.Server, func() int64, bool) {
+	t.Helper()
+	var served atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cw := &countingResponseWriter{ResponseWriter: w, n: &served}
+		http.ServeContent(cw, r, "model.gguf", time.Time{}, bytes.NewReader(data))
+	}))
+	return srv, served.Load, true
+}
+
+// newNoRangeFileServer serves data WITHOUT range support: it ignores the Range
+// header and streams the full body, counting bytes the client actually reads
+// (the handler stops writing once the client closes the connection).
+func newNoRangeFileServer(t *testing.T, data []byte) (*httptest.Server, func() int64, bool) {
+	t.Helper()
+	var served atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		// Deliberately no Accept-Ranges; write in chunks so a client that stops
+		// reading early causes us to stop writing (broken pipe).
+		const chunk = 64 * 1024
+		for off := 0; off < len(data); off += chunk {
+			end := off + chunk
+			if end > len(data) {
+				end = len(data)
+			}
+			n, err := w.Write(data[off:end])
+			served.Add(int64(n))
+			if err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	return srv, served.Load, false
+}
+
+type countingResponseWriter struct {
+	http.ResponseWriter
+	n *atomic.Int64
+}
+
+func (c *countingResponseWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n.Add(int64(n))
+	return n, err
 }
