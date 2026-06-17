@@ -37,7 +37,33 @@ import (
 // modelStorageConfig that the deployment builder composes into pod spec.
 // This file also owns provisioning of the shared cache PVC per namespace.
 
+// ModelCachePVCName is the name of the shared, cluster-single model cache PVC.
+// It is used only in shared mode (ModelCacheModeShared); the default
+// per-InferenceService mode names each cache PVC after its InferenceService
+// (see modelCachePVCName).
 const ModelCachePVCName = "llmkube-model-cache"
+
+// Model cache provisioning modes. perService (the default) gives each
+// InferenceService its own RWO, WaitForFirstConsumer cache PVC that binds on
+// the node the serving pod schedules to, so the GPU pod and its cache co-locate
+// even when the operator runs on a different node (#728). shared keeps the
+// single, cluster-wide llmkube-model-cache PVC (back-compat for RWX setups that
+// want cross-isvc dedup).
+const (
+	ModelCacheModePerService = "perService"
+	ModelCacheModeShared     = "shared"
+)
+
+// modelCachePVCName returns the name of the model cache PVC for the given mode.
+// In shared mode this is the single cluster-wide PVC; otherwise it is the
+// per-InferenceService PVC "<isvc>-model-cache". A nil isvc (unit tests that
+// exercise the builder directly) falls back to the shared name.
+func modelCachePVCName(isvc *inferencev1alpha1.InferenceService, mode string) string {
+	if mode == ModelCacheModeShared || isvc == nil {
+		return ModelCachePVCName
+	}
+	return fmt.Sprintf("%s-model-cache", isvc.Name)
+}
 
 // isLocalModelSource delegates to the shared isLocalSource helper in source.go.
 func isLocalModelSource(source string) bool {
@@ -105,12 +131,12 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
 	if isPVCSource(model.Spec.Source) {
 		return buildPVCStorageConfig(model)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, caCertConfigMap, initContainerImage)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
 }
@@ -141,7 +167,7 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
 	// Match the basename the Model controller renames the file to after
 	// parsing GGUF metadata. If the controller has already populated
@@ -164,7 +190,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 			Name: "model-cache",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: ModelCachePVCName,
+					ClaimName: modelCachePVCName(isvc, cacheMode),
 					ReadOnly:  false,
 				},
 			},
@@ -273,13 +299,29 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	}
 }
 
-// ensureModelCachePVC creates the shared llmkube-model-cache PVC in the given
-// namespace if it does not already exist. Used by cached-mode deployments.
-func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, namespace string) error {
+// ensureModelCachePVC creates the model cache PVC for an InferenceService if it
+// does not already exist.
+//
+// In the default perService mode the PVC is named "<isvc>-model-cache", is RWO,
+// uses the cluster default storage class (which is WaitForFirstConsumer in the
+// common topology-aware case) unless an explicit class is configured, and is
+// owner-ref'd to the InferenceService so it is garbage-collected with it. RWO +
+// WaitForFirstConsumer is the #728 fix: the PVC binds on the node the serving
+// pod schedules to (the GPU node), co-locating download and serve instead of
+// pinning the cache to the operator's node.
+//
+// In shared mode the single cluster-wide llmkube-model-cache PVC is created (no
+// owner reference, since it outlives any one InferenceService) for RWX setups
+// that want cross-isvc dedup. This restores the pre-#728 behavior.
+func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
 	log := logf.FromContext(ctx)
 
+	shared := r.ModelCacheMode == ModelCacheModeShared
+	namespace := isvc.Namespace
+	pvcName := modelCachePVCName(isvc, r.ModelCacheMode)
+
 	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: namespace}, pvc)
+	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
 	if err == nil {
 		return nil
 	}
@@ -287,10 +329,12 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, na
 		return fmt.Errorf("failed to check for existing PVC: %w", err)
 	}
 
-	log.Info("Creating model cache PVC in namespace", "namespace", namespace)
+	log.Info("Creating model cache PVC", "namespace", namespace, "name", pvcName, "mode", r.ModelCacheMode)
 
+	// Per-isvc caches are RWO so they can bind WaitForFirstConsumer on the
+	// serving node. Only the shared cache honors the RWX opt-in.
 	accessMode := corev1.ReadWriteOnce
-	if r.ModelCacheAccessMode == "ReadWriteMany" {
+	if shared && r.ModelCacheAccessMode == "ReadWriteMany" {
 		accessMode = corev1.ReadWriteMany
 	}
 
@@ -305,7 +349,7 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, na
 
 	newPVC := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      ModelCachePVCName,
+			Name:      pvcName,
 			Namespace: namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":       "llmkube",
@@ -323,8 +367,22 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, na
 		},
 	}
 
+	// Do NOT set volumeBindingMode here; that is a StorageClass property, not a
+	// PVC one. Leaving StorageClassName unset uses the cluster default class,
+	// whose binding mode (WaitForFirstConsumer for topology-aware provisioners
+	// like GKE PD, EBS, local-path) defers binding to first pod schedule. An
+	// explicitly-configured class is honored as-is.
 	if r.ModelCacheClass != "" {
 		newPVC.Spec.StorageClassName = &r.ModelCacheClass
+	}
+
+	// Owner-ref per-isvc caches to their InferenceService so they are
+	// garbage-collected with it (no leaked caches). The shared cache is not
+	// owner-ref'd: it intentionally outlives any single InferenceService.
+	if !shared {
+		if err := setControllerReferenceUnblocked(isvc, newPVC, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set owner reference on model cache PVC: %w", err)
+		}
 	}
 
 	if err := r.Create(ctx, newPVC); err != nil {
@@ -334,6 +392,6 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, na
 		return fmt.Errorf("failed to create PVC: %w", err)
 	}
 
-	log.Info("Created model cache PVC", "namespace", namespace, "name", ModelCachePVCName)
+	log.Info("Created model cache PVC", "namespace", namespace, "name", pvcName)
 	return nil
 }

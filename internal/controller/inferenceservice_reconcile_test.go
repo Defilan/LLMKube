@@ -1013,8 +1013,9 @@ var _ = Describe("Reconcile lifecycle", func() {
 				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
 					_ = k8sClient.Delete(ctx, svc)
 				}
+				// Default mode is perService: the cache PVC is named after the isvc.
 				pvc := &corev1.PersistentVolumeClaim{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: "default"}, pvc); err == nil {
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName + "-model-cache", Namespace: "default"}, pvc); err == nil {
 					_ = k8sClient.Delete(ctx, pvc)
 				}
 			}()
@@ -1030,8 +1031,13 @@ var _ = Describe("Reconcile lifecycle", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
+			// In the default perService mode the operator provisions a per-isvc
+			// cache PVC "<isvc>-model-cache" (owner-ref'd to the isvc), not the
+			// cluster-wide shared PVC.
 			pvc := &corev1.PersistentVolumeClaim{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: "default"}, pvc)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName + "-model-cache", Namespace: "default"}, pvc)).To(Succeed())
+			Expect(pvc.OwnerReferences).To(HaveLen(1))
+			Expect(pvc.OwnerReferences[0].Name).To(Equal(isvcName))
 		})
 	})
 })

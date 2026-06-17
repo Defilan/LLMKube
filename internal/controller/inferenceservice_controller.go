@@ -49,8 +49,14 @@ type InferenceServiceReconciler struct {
 	ModelCacheSize       string
 	ModelCacheClass      string
 	ModelCacheAccessMode string
-	CACertConfigMap      string
-	InitContainerImage   string
+	// ModelCacheMode selects how model cache PVCs are provisioned:
+	// ModelCacheModePerService (default) gives each InferenceService its own
+	// RWO, WaitForFirstConsumer PVC that binds on the serving node (#728);
+	// ModelCacheModeShared uses the single cluster-wide llmkube-model-cache PVC
+	// for RWX setups. An empty value is treated as perService.
+	ModelCacheMode     string
+	CACertConfigMap    string
+	InitContainerImage string
 	// DefaultFSGroup is applied to the rendered PodSecurityContext when the
 	// user has not supplied one. Values <= 0 disable the default (recommended
 	// on OpenShift, where the restricted-v2 SCC injects fsGroup from the
@@ -137,7 +143,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if model.Status.CacheKey != "" && r.ModelCachePath != "" {
-		if err := r.ensureModelCachePVC(ctx, inferenceService.Namespace); err != nil {
+		if err := r.ensureModelCachePVC(ctx, inferenceService); err != nil {
 			log.Error(err, "Failed to ensure model cache PVC exists", "namespace", inferenceService.Namespace)
 			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, desiredReplicas, "", "Failed to create model cache PVC", nil)
 		}

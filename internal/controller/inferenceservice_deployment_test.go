@@ -4659,3 +4659,61 @@ var _ = Describe("AMD Vulkan Deployment Construction", func() {
 		Expect(gpuLimit).To(Equal(resource.MustParse("1")))
 	})
 })
+
+var _ = Describe("constructDeployment model cache PVC wiring (#728, Task 3)", func() {
+	newModel := func() *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache-model", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{Phase: "Ready", CacheKey: "test-cache-key"},
+		}
+	}
+	newISVC := func() *inferencev1alpha1.InferenceService {
+		replicas := int32(1)
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "cache-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "cache-model",
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+	}
+
+	findCacheVolume := func(d *appsv1.Deployment) *corev1.Volume {
+		for i := range d.Spec.Template.Spec.Volumes {
+			if d.Spec.Template.Spec.Volumes[i].Name == "model-cache" {
+				return &d.Spec.Template.Spec.Volumes[i]
+			}
+		}
+		return nil
+	}
+
+	It("mounts the per-isvc cache PVC in perService mode (default)", func() {
+		reconciler := &InferenceServiceReconciler{
+			ModelCachePath:     "/tmp/llmkube/models",
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+			// ModelCacheMode left empty: must behave as perService.
+		}
+		deployment := reconciler.constructDeployment(newISVC(), newModel(), 1)
+		vol := findCacheVolume(deployment)
+		Expect(vol).NotTo(BeNil())
+		Expect(vol.PersistentVolumeClaim).NotTo(BeNil())
+		Expect(vol.PersistentVolumeClaim.ClaimName).To(Equal("cache-isvc-model-cache"))
+	})
+
+	It("mounts the shared cache PVC in shared mode", func() {
+		reconciler := &InferenceServiceReconciler{
+			ModelCachePath:     "/tmp/llmkube/models",
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+			ModelCacheMode:     ModelCacheModeShared,
+		}
+		deployment := reconciler.constructDeployment(newISVC(), newModel(), 1)
+		vol := findCacheVolume(deployment)
+		Expect(vol).NotTo(BeNil())
+		Expect(vol.PersistentVolumeClaim).NotTo(BeNil())
+		Expect(vol.PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+	})
+})

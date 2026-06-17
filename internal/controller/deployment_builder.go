@@ -201,7 +201,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	var modelPath string
 	if backend.NeedsModelInit() && !skipInit {
 		useCache := model.Status.CacheKey != "" && r.ModelCachePath != ""
-		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.CACertConfigMap, r.InitContainerImage)
+		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage)
 		modelPath = storageConfig.modelPath
 	}
 
