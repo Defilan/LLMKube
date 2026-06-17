@@ -83,7 +83,7 @@ func probeURL(ctx context.Context, client *http.Client, url string) (size int64,
 	if err != nil {
 		return 0, false, fmt.Errorf("HEAD %s: %w", url, err)
 	}
-	defer drainAndClose(resp.Body)
+	defer closeBody(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
 		// HEAD not supported / not allowed — let the caller stream.
@@ -124,10 +124,10 @@ func parseFromURLStreaming(ctx context.Context, client *http.Client, url string)
 	return Parse(resp.Body)
 }
 
-// drainAndClose closes a response body. It intentionally does NOT drain the
+// closeBody closes a response body. It intentionally does NOT drain the
 // remaining bytes: for the header-only read we want to abandon the unread
 // tensor data, not pull it over the wire to enable connection reuse.
-func drainAndClose(rc io.Closer) {
+func closeBody(rc io.Closer) {
 	_ = rc.Close()
 }
 
@@ -161,6 +161,9 @@ func (r *rangeReaderAt) ReadAt(p []byte, off int64) (int, error) {
 
 	n := 0
 	for n < len(p) {
+		if err := r.ctx.Err(); err != nil {
+			return n, err
+		}
 		cur := off + int64(n)
 		if cur >= r.size {
 			return n, io.EOF
@@ -198,7 +201,7 @@ func (r *rangeReaderAt) fetchChunk(off int64) error {
 	if err != nil {
 		return fmt.Errorf("range GET %s: %w", r.url, err)
 	}
-	defer drainAndClose(resp.Body)
+	defer closeBody(resp.Body)
 
 	if resp.StatusCode != http.StatusPartialContent {
 		return fmt.Errorf("range GET %s: server did not honor Range (status %s)", r.url, resp.Status)
@@ -207,6 +210,11 @@ func (r *rangeReaderAt) fetchChunk(off int64) error {
 	buf, err := io.ReadAll(io.LimitReader(resp.Body, end-off+1))
 	if err != nil {
 		return fmt.Errorf("reading range body: %w", err)
+	}
+	// A 206 with no bytes would otherwise cache an empty chunk and spin the
+	// ReadAt loop forever (it never advances). Treat it as an error.
+	if len(buf) == 0 {
+		return fmt.Errorf("range GET %s: server returned no bytes for %d-%d", r.url, off, end)
 	}
 
 	r.chunk = buf
