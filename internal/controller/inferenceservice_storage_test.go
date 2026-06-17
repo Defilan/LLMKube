@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,7 +40,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123def456",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
 
 		Expect(config.modelPath).To(Equal("/models/abc123def456/model.gguf"))
 		Expect(config.volumes).To(HaveLen(1))
@@ -71,7 +72,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
 
 		Expect(config.volumes).To(HaveLen(2))
 		Expect(config.volumes[1].Name).To(Equal("host-model"))
@@ -92,7 +93,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "my-ca-certs", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0")
 
 		var found bool
 		for _, v := range config.volumes {
@@ -215,7 +216,7 @@ var _ = Describe("buildModelStorageConfig PVC dispatch", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "pvc://my-claim/model.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		config := buildModelStorageConfig(model, nil, "default", true, "", "curl:8.18.0")
+		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0")
 
 		// Should use PVC config, not cached config
 		Expect(config.volumes[0].Name).To(Equal("model-source"))
@@ -224,14 +225,19 @@ var _ = Describe("buildModelStorageConfig PVC dispatch", func() {
 	})
 })
 
-var _ = Describe("ensureModelCachePVC", func() {
+var _ = Describe("ensureModelCachePVC (shared mode)", func() {
 	var reconciler *InferenceServiceReconciler
+	var isvc *inferencev1alpha1.InferenceService
 
 	BeforeEach(func() {
 		deletePVCForcibly(context.Background(), "default")
 		reconciler = &InferenceServiceReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:         k8sClient,
+			Scheme:         k8sClient.Scheme(),
+			ModelCacheMode: ModelCacheModeShared,
+		}
+		isvc = &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "shared-isvc", Namespace: "default"},
 		}
 	})
 
@@ -239,8 +245,8 @@ var _ = Describe("ensureModelCachePVC", func() {
 		deletePVCForcibly(context.Background(), "default")
 	})
 
-	It("should create PVC with default 100Gi and ReadWriteOnce", func() {
-		err := reconciler.ensureModelCachePVC(context.Background(), "default")
+	It("should create the cluster-wide shared PVC with default 100Gi and ReadWriteOnce", func() {
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).NotTo(HaveOccurred())
 
 		pvc := &corev1.PersistentVolumeClaim{}
@@ -250,11 +256,13 @@ var _ = Describe("ensureModelCachePVC", func() {
 		storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 		Expect(storageReq.String()).To(Equal("100Gi"))
 		Expect(pvc.Labels["app.kubernetes.io/name"]).To(Equal("llmkube"))
+		// The shared cache outlives any single InferenceService; no owner ref.
+		Expect(pvc.OwnerReferences).To(BeEmpty())
 	})
 
 	It("should create PVC with custom size", func() {
 		reconciler.ModelCacheSize = "50Gi"
-		err := reconciler.ensureModelCachePVC(context.Background(), "default")
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).NotTo(HaveOccurred())
 
 		pvc := &corev1.PersistentVolumeClaim{}
@@ -266,7 +274,7 @@ var _ = Describe("ensureModelCachePVC", func() {
 
 	It("should create PVC with ReadWriteMany when configured", func() {
 		reconciler.ModelCacheAccessMode = "ReadWriteMany"
-		err := reconciler.ensureModelCachePVC(context.Background(), "default")
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).NotTo(HaveOccurred())
 
 		pvc := &corev1.PersistentVolumeClaim{}
@@ -277,7 +285,7 @@ var _ = Describe("ensureModelCachePVC", func() {
 
 	It("should set StorageClassName when configured", func() {
 		reconciler.ModelCacheClass = "fast-ssd"
-		err := reconciler.ensureModelCachePVC(context.Background(), "default")
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).NotTo(HaveOccurred())
 
 		pvc := &corev1.PersistentVolumeClaim{}
@@ -287,17 +295,140 @@ var _ = Describe("ensureModelCachePVC", func() {
 	})
 
 	It("should not error if PVC already exists", func() {
-		err := reconciler.ensureModelCachePVC(context.Background(), "default")
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).NotTo(HaveOccurred())
-		err = reconciler.ensureModelCachePVC(context.Background(), "default")
+		err = reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).NotTo(HaveOccurred())
 	})
 
 	It("should return error for invalid cache size", func() {
 		reconciler.ModelCacheSize = "not-a-size"
-		err := reconciler.ensureModelCachePVC(context.Background(), "default")
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("invalid cache size"))
+	})
+})
+
+var _ = Describe("ensureModelCachePVC (perService mode, default, #728)", func() {
+	var reconciler *InferenceServiceReconciler
+	var isvc *inferencev1alpha1.InferenceService
+	var pvcName string
+
+	deletePerServicePVC := func(name string) {
+		ctx := context.Background()
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Name: name, Namespace: "default"}
+		if err := k8sClient.Get(ctx, key, pvc); err != nil {
+			return
+		}
+		if len(pvc.Finalizers) > 0 {
+			pvc.Finalizers = nil
+			_ = k8sClient.Update(ctx, pvc)
+		}
+		_ = k8sClient.Delete(ctx, pvc)
+		Eventually(func() bool {
+			return errors.IsNotFound(k8sClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}))
+		}, "5s", "100ms").Should(BeTrue())
+	}
+
+	BeforeEach(func() {
+		// A real InferenceService gives the PVC a valid owner UID/GVK.
+		isvc = &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "perservice-isvc-",
+				Namespace:    "default",
+			},
+			Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: "some-model"},
+		}
+		Expect(k8sClient.Create(context.Background(), isvc)).To(Succeed())
+		pvcName = isvc.Name + "-model-cache"
+		// Empty ModelCacheMode must behave as perService (default).
+		reconciler = &InferenceServiceReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+	})
+
+	AfterEach(func() {
+		deletePerServicePVC(pvcName)
+		_ = k8sClient.Delete(context.Background(), isvc)
+	})
+
+	It("should create a per-isvc RWO PVC named <isvc>-model-cache owner-ref'd to the InferenceService", func() {
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
+		Expect(err).NotTo(HaveOccurred())
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: pvcName, Namespace: "default"}, pvc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pvc.Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
+		// No explicit StorageClassName: the cluster default class (whose binding
+		// mode is WaitForFirstConsumer in the topology-aware case) is used so the
+		// PVC binds on the serving node, not immediately on the operator's node.
+		Expect(pvc.Spec.StorageClassName).To(BeNil())
+
+		Expect(pvc.OwnerReferences).To(HaveLen(1))
+		Expect(pvc.OwnerReferences[0].Kind).To(Equal("InferenceService"))
+		Expect(pvc.OwnerReferences[0].Name).To(Equal(isvc.Name))
+		Expect(pvc.OwnerReferences[0].UID).To(Equal(isvc.UID))
+		Expect(*pvc.OwnerReferences[0].Controller).To(BeTrue())
+	})
+
+	It("should force RWO even when ModelCacheAccessMode=ReadWriteMany (RWX only applies to shared)", func() {
+		reconciler.ModelCacheAccessMode = "ReadWriteMany"
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
+		Expect(err).NotTo(HaveOccurred())
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: pvcName, Namespace: "default"}, pvc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(pvc.Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
+		Expect(pvc.Spec.AccessModes).NotTo(ContainElement(corev1.ReadWriteMany))
+	})
+
+	It("should not create the cluster-wide shared PVC in perService mode", func() {
+		err := reconciler.ensureModelCachePVC(context.Background(), isvc)
+		Expect(err).NotTo(HaveOccurred())
+
+		shared := &corev1.PersistentVolumeClaim{}
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: ModelCachePVCName, Namespace: "default"}, shared)
+		Expect(errors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("should be idempotent", func() {
+		Expect(reconciler.ensureModelCachePVC(context.Background(), isvc)).To(Succeed())
+		Expect(reconciler.ensureModelCachePVC(context.Background(), isvc)).To(Succeed())
+	})
+})
+
+var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() {
+	model := &inferencev1alpha1.Model{
+		Spec:   inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+		Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
+	}
+
+	It("references the per-isvc PVC in perService mode (default)", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
+		}
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModePerService, "", "curl:8.18.0")
+		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-isvc-model-cache"))
+	})
+
+	It("references the shared PVC in shared mode", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
+		}
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0")
+		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+	})
+
+	It("empty mode defaults to per-isvc PVC", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
+		}
+		config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0")
+		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-isvc-model-cache"))
 	})
 })
 
@@ -408,7 +539,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 			},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
 		cmd := config.initContainers[0].Command[2]
 		Expect(cmd).To(ContainSubstring("--etag-compare"))
 		Expect(cmd).To(ContainSubstring("kept cached copy"))
@@ -419,7 +550,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 			Spec:   inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
 		cmd := config.initContainers[0].Command[2]
 		Expect(cmd).NotTo(ContainSubstring("--etag-compare"))
 		Expect(cmd).To(ContainSubstring("skipping download"))
