@@ -478,21 +478,28 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// #582/filesTouched fix: harness owns the authoritative
 			// field, model's claim is archived under issueAskClaimed.
 			reconcileReviewerIssueAsk(log, loopRes.Transcript, loopRes.Terminal.Extra)
-			// Enforce the verification result (#644): an unverifiable
-			// issueAsk demotes a GO to NO-GO so it routes to escalation
-			// instead of approving a branch on fabricated understanding.
-			verdict = enforceReviewerIssueAsk(log, loopRes.Terminal.Extra, verdict)
 			// Computable scope-overlap check (#647): when the issue names
 			// concrete files and the diff touches none of them, demote a
-			// GO deterministically. Runs after the issueAsk enforcement
-			// so an already-demoted verdict is annotated, not re-demoted.
+			// GO deterministically. Runs before issueAsk enforcement so
+			// the scope signal can rescue an honest paraphrase (#744).
+			var scopeDriftDetected bool
+			var scopeMatched []string
 			if scopeDiff, scopeErr := repo.DiffNameOnly(ctx, workspace, "main"); scopeErr == nil {
 				verdict = enforceReviewerScopeOverlap(log, loopRes.Terminal.Extra,
 					extractFetchIssueBody(loopRes.Transcript), scopeDiff, verdict)
+				scopeDriftDetected, _ = loopRes.Terminal.Extra["scopeDriftDetected"].(bool)
+				scopeMatched, _ = loopRes.Terminal.Extra["scopeMatched"].([]string)
 			} else {
 				log.Info("reviewer scope: ground-truth diff unavailable; skipping scope check",
 					"err", scopeErr.Error())
 			}
+			// Enforce the verification result (#644): an unverifiable
+			// issueAsk demotes a GO to NO-GO so it routes to escalation
+			// instead of approving a branch on fabricated understanding.
+			// When scope-overlap vouches for the diff, keep GO even if
+			// the model paraphrased the issue ask (#744).
+			verdict = enforceReviewerIssueAsk(log, loopRes.Terminal.Extra, verdict,
+				scopeDriftDetected, scopeMatched)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 		}
 		r := e.modelDecidedResult(start, transcriptRef, loopRes, verdict)
@@ -1295,10 +1302,15 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 // hallucinated ask. Both confidently wrong verdicts stood.
 //
 // Policy:
-//   - verified false + GO: demote to NO-GO. A reviewer that cannot prove
-//     it read the issue must not approve a branch. Because the workload
-//     controller emits escalation reviewers on base NO-GO, demotion
-//     routes the branch to a bigger model instead of green-lighting it.
+//   - verified false + GO + scope vouches (scopeDriftDetected==false,
+//     scopeMatched non-empty): keep GO. The deterministic scope-overlap
+//     rail confirms the diff is in-scope even though the model paraphrased
+//     the issue ask instead of quoting it verbatim (#744).
+//   - verified false + GO + no scope vouch (drift detected or no refs):
+//     demote to NO-GO. A reviewer that cannot prove it read the issue
+//     must not approve a branch. Because the workload controller emits
+//     escalation reviewers on base NO-GO, demotion routes the branch to
+//     a bigger model instead of green-lighting it.
 //   - verified false + any other verdict: keep the verdict but mark it,
 //     so the escalation reviewer and operators know the base review's
 //     reasoning is untrusted.
@@ -1313,6 +1325,8 @@ func enforceReviewerIssueAsk(
 	log logr.Logger,
 	extra map[string]any,
 	verdict foremanv1alpha1.AgenticTaskVerdict,
+	scopeDriftDetected bool,
+	scopeMatched []string,
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if extra == nil {
 		return verdict
@@ -1324,14 +1338,32 @@ func enforceReviewerIssueAsk(
 
 	extra["verdictDemoted"] = true
 	extra["verdictClaimed"] = string(verdict)
-	extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
-		"fetched issue body; review verdict is untrusted"
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+			"fetched issue body; review verdict is untrusted"
 		log.Info("reviewer integrity: unverified issueAsk on non-GO verdict; keeping verdict but marking untrusted",
 			"verdict", verdict)
 		return verdict
 	}
+
+	// Scope-overlap vouch: when the issue names concrete files and the
+	// diff touches at least one of them, the deterministic scope rail
+	// confirms the reviewer was in-scope even though it paraphrased the
+	// issue ask. Keep GO and annotate the outcome (#744).
+	scopeVouches := !scopeDriftDetected && len(scopeMatched) > 0
+	if scopeVouches {
+		extra["issueAskVerified"] = false
+		extra["scopeVouched"] = true
+		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+			"fetched issue body; scope-overlap confirms in-scope review"
+		log.Info("reviewer integrity: unverified issueAsk on GO verdict; scope-overlap vouches, keeping GO",
+			"scopeMatched", scopeMatched)
+		return verdict
+	}
+
+	extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		"fetched issue body; review verdict is untrusted"
 	log.Info("reviewer integrity: unverified issueAsk on GO verdict; demoting to NO-GO",
 		"verdictClaimed", verdict)
 	return foremanv1alpha1.AgenticTaskVerdictNoGo

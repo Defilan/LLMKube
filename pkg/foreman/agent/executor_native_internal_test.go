@@ -1266,7 +1266,7 @@ func TestReconcileReviewerIssueAsk_NilExtraIsNoOp(t *testing.T) {
 
 func TestEnforceReviewerIssueAsk_VerifiedGoStands(t *testing.T) {
 	extra := map[string]any{"issueAskVerified": true}
-	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo)
+	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, false, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("verified GO should stand; got %v", got)
 	}
@@ -1277,7 +1277,7 @@ func TestEnforceReviewerIssueAsk_VerifiedGoStands(t *testing.T) {
 
 func TestEnforceReviewerIssueAsk_UnverifiedGoDemotedToNoGo(t *testing.T) {
 	extra := map[string]any{"issueAskVerified": false}
-	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo)
+	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, true, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Errorf("unverified GO must demote to NO-GO; got %v", got)
 	}
@@ -1294,7 +1294,7 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoDemotedToNoGo(t *testing.T) {
 
 func TestEnforceReviewerIssueAsk_UnverifiedNoGoKeptButMarked(t *testing.T) {
 	extra := map[string]any{"issueAskVerified": false}
-	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo)
+	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, true, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Errorf("unverified NO-GO should stay NO-GO; got %v", got)
 	}
@@ -1311,7 +1311,7 @@ func TestEnforceReviewerIssueAsk_AbsentFieldIsObserveOnly(t *testing.T) {
 	// to verify against (a harness-side gap, not model dishonesty);
 	// enforcement must not fire.
 	extra := map[string]any{"issueAsk": "some claim"}
-	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo)
+	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, false, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("absent issueAskVerified must not demote; got %v", got)
 	}
@@ -1321,9 +1321,70 @@ func TestEnforceReviewerIssueAsk_AbsentFieldIsObserveOnly(t *testing.T) {
 }
 
 func TestEnforceReviewerIssueAsk_NilExtraIsNoOp(t *testing.T) {
-	got := enforceReviewerIssueAsk(logr.Discard(), nil, foremanv1alpha1.AgenticTaskVerdictGo)
+	got := enforceReviewerIssueAsk(logr.Discard(), nil, foremanv1alpha1.AgenticTaskVerdictGo, false, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("nil extra must pass the verdict through; got %v", got)
+	}
+}
+
+// TestEnforceReviewerIssueAsk_UnverifiedGoScopeVouchKeepsGo covers #744:
+// an honest reviewer that paraphrases the issue ask (issueAskVerified==false)
+// but whose diff touches a file named in the issue (scope vouch) must keep
+// GO instead of being demoted to NO-GO.
+func TestEnforceReviewerIssueAsk_UnverifiedGoScopeVouchKeepsGo(t *testing.T) {
+	extra := map[string]any{"issueAskVerified": false}
+	got := enforceReviewerIssueAsk(logr.Discard(), extra,
+		foremanv1alpha1.AgenticTaskVerdictGo, false, []string{"internal/controller/model_controller.go"})
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Errorf("unverified GO with scope vouch must keep GO; got %v", got)
+	}
+	if v, _ := extra["verdictDemoted"].(bool); !v {
+		t.Errorf("demotion flag must still be set for observability; got %v", extra["verdictDemoted"])
+	}
+	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+		t.Errorf("verdictClaimed should archive the original GO; got %v", extra["verdictClaimed"])
+	}
+	if v, _ := extra["scopeVouched"].(bool); !v {
+		t.Errorf("scopeVouched should be true when scope rail confirms in-scope")
+	}
+	if reason, _ := extra["demotionReason"].(string); reason == "" {
+		t.Errorf("demotionReason must explain the scope-vouch outcome")
+	}
+}
+
+// TestEnforceReviewerIssueAsk_UnverifiedGoNoScopeVouchDemotes covers the
+// case where the model paraphrases the issue ask AND scope-overlap detects
+// drift (or has no refs to vouch). This must still demote to NO-GO.
+func TestEnforceReviewerIssueAsk_UnverifiedGoNoScopeVouchDemotes(t *testing.T) {
+	extra := map[string]any{"issueAskVerified": false}
+	got := enforceReviewerIssueAsk(logr.Discard(), extra,
+		foremanv1alpha1.AgenticTaskVerdictGo, true, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Errorf("unverified GO with scope drift must demote to NO-GO; got %v", got)
+	}
+	if v, _ := extra["verdictDemoted"].(bool); !v {
+		t.Errorf("demotion must set verdictDemoted=true; got %v", extra["verdictDemoted"])
+	}
+	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+		t.Errorf("verdictClaimed should archive the original GO; got %v", extra["verdictClaimed"])
+	}
+	if reason, _ := extra["demotionReason"].(string); reason == "" {
+		t.Errorf("demotionReason must explain the demotion")
+	}
+}
+
+// TestEnforceReviewerIssueAsk_UnverifiedGoNoRefsNoVouchDemotes covers the
+// case where the issue has no concrete file refs (scope observe-only) and
+// the model paraphrased the ask. Without scope vouch, must demote.
+func TestEnforceReviewerIssueAsk_UnverifiedGoNoRefsNoVouchDemotes(t *testing.T) {
+	extra := map[string]any{"issueAskVerified": false}
+	got := enforceReviewerIssueAsk(logr.Discard(), extra,
+		foremanv1alpha1.AgenticTaskVerdictGo, false, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Errorf("unverified GO with no scope refs must demote to NO-GO; got %v", got)
+	}
+	if v, _ := extra["verdictDemoted"].(bool); !v {
+		t.Errorf("demotion must set verdictDemoted=true; got %v", extra["verdictDemoted"])
 	}
 }
 
