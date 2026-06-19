@@ -40,10 +40,8 @@ type commandRunner func(
 
 // execCommandRunner is the production commandRunner backed by os/exec. It
 // appends extraEnv to the inherited process environment and captures
-// combined stdout+stderr. Part 3 wires this into the agent loop as the
-// runner passed to RunCoderGate.
-//
-//nolint:unused // Wired into the loop in a follow-up; kept here as the canonical production runner.
+// combined stdout+stderr. Wired into the coder agent loop via
+// makeCoderGateVerifier as the runner passed to RunCoderGate.
 var execCommandRunner commandRunner = func(
 	ctx context.Context,
 	dir string,

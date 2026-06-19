@@ -387,6 +387,16 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		LoopBudget: durationFromSeconds(agent.Spec.RequestTimeoutSeconds, 3600),
 	}
 
+	// Coder gate feedback loop (#749): coders verify their work through a
+	// deterministic in-workspace gate (fmt / vet / build / lint), not by
+	// hand-running tests (which on a Mac workspace cannot run the envtest
+	// suite and spiral the loop). Wire the verifier so a GO that fails the
+	// fast checks is sent back for a fix instead of landing dirty.
+	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
+		cfg.MaxVerifyRetries = coderGateMaxRetries
+		cfg.VerifyTerminal = makeCoderGateVerifier(workspace, log)
+	}
+
 	// 8. Run the loop. Always persist the transcript afterwards,
 	// even on error, so the executor's terminal status carries a
 	// pointer to the partial transcript.
@@ -552,6 +562,41 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	}
 
 	return e.goResult(start, transcriptRef, loopRes, branch, sha), nil
+}
+
+// coderGateMaxRetries bounds the coder gate fix attempts (#749): a GO whose
+// fast checks fail gets this many feedback-and-retry cycles before the loop
+// downgrades it to INCOMPLETE.
+const coderGateMaxRetries = 3
+
+// makeCoderGateVerifier returns the TerminalVerifier that runs the fast
+// in-workspace gate on a coder's GO terminal. Non-GO terminals pass through
+// untouched. golangci-lint is bootstrapped into the workspace bin on first
+// use; a bootstrap or run error is reported as could-not-verify so the
+// terminal stands and the clean-room gate Job remains the authoritative
+// backstop.
+func makeCoderGateVerifier(workspace string, log logr.Logger) TerminalVerifier {
+	return func(ctx context.Context, terminal *ToolResult, _ []oai.Message) (bool, string, error) {
+		if terminal == nil {
+			return true, "", nil
+		}
+		if v, _ := normalizeModelVerdict(terminal.Verdict); v != foremanv1alpha1.AgenticTaskVerdictGo {
+			return true, "", nil
+		}
+		lintPath := filepath.Join(workspace, "bin", "golangci-lint")
+		if _, statErr := os.Stat(lintPath); statErr != nil {
+			if _, err := execCommandRunner(ctx, workspace, nil, "make", "golangci-lint"); err != nil {
+				log.Info("coder gate: could not bootstrap golangci-lint; terminal stands, gate Job is the backstop",
+					"err", err.Error())
+				return true, "", err
+			}
+		}
+		pass, feedback := RunCoderGate(ctx, workspace, lintPath, execCommandRunner)
+		if !pass {
+			log.Info("coder gate: fast checks failed; returning feedback to the loop for a fix")
+		}
+		return pass, feedback, nil
+	}
 }
 
 // executeDeterministic is the no-LLM execution path. Used by Agents
