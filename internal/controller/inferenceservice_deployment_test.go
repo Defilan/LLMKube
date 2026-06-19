@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -4729,5 +4730,277 @@ var _ = Describe("constructDeployment model cache PVC wiring (#728, Task 3)", fu
 		Expect(vol).NotTo(BeNil())
 		Expect(vol.PersistentVolumeClaim).NotTo(BeNil())
 		Expect(vol.PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+	})
+})
+
+var _ = Describe("DRA Passthrough (resource.k8s.io/v1)", func() {
+	var reconciler *InferenceServiceReconciler
+
+	BeforeEach(func() {
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+		}
+	})
+
+	makeDRAModel := func(claims []corev1.PodResourceClaim) *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://example.com/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cuda",
+					GPU: &inferencev1alpha1.GPUSpec{
+						Enabled:        true,
+						ResourceClaims: claims,
+					},
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready", Path: "/tmp/llmkube/models/dra-model.gguf"},
+		}
+	}
+
+	It("wires container-level resource claims from model GPU spec", func() {
+		claimName := ptr.To("gpu-claim")
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: claimName},
+		})
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Resources.Claims).To(HaveLen(1))
+		Expect(container.Resources.Claims[0].Name).To(Equal("gpu"))
+	})
+
+	It("wires pod-level ResourceClaims from model GPU spec", func() {
+		claimName := ptr.To("gpu-claim")
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: claimName},
+		})
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		Expect(deployment.Spec.Template.Spec.ResourceClaims).To(HaveLen(1))
+		Expect(deployment.Spec.Template.Spec.ResourceClaims[0].Name).To(Equal("gpu"))
+		Expect(*deployment.Spec.Template.Spec.ResourceClaims[0].ResourceClaimName).To(Equal("gpu-claim"))
+	})
+
+	It("applies nodeSelector and tolerations for DRA pods", func() {
+		claimName := ptr.To("gpu-claim")
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: claimName},
+		})
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:     "dra-model",
+				Replicas:     ptr.To(int32(1)),
+				Image:        "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+				NodeSelector: map[string]string{"nvidia.com/gpu": "present"},
+				Tolerations: []corev1.Toleration{
+					{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists},
+				},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		Expect(deployment.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("nvidia.com/gpu", "present"))
+		Expect(deployment.Spec.Template.Spec.Tolerations).To(HaveLen(1))
+		Expect(deployment.Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
+	})
+
+	It("emits GPU args when DRA claims are set (gpuPresent gate)", func() {
+		claimName := ptr.To("gpu-claim")
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: claimName},
+		})
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:       "dra-model",
+				Replicas:       ptr.To(int32(1)),
+				Image:          "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+				FlashAttention: ptr.To(true),
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Args).To(ContainElement("--n-gpu-layers"))
+		Expect(container.Args).To(ContainElement("--flash-attn"))
+	})
+
+	It("does not set device-plugin GPU limits when DRA is used", func() {
+		claimName := ptr.To("gpu-claim")
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: claimName},
+		})
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Resources.Limits).NotTo(HaveKey(corev1.ResourceName("nvidia.com/gpu")))
+	})
+
+	It("skips DRA wiring when model has no ResourceClaims", func() {
+		model := makeDRAModel(nil)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Resources.Claims).To(BeNil())
+	})
+
+	It("supports resourceClaimTemplateName in DRA claims", func() {
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimTemplateName: ptr.To("gpu-template")},
+		})
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		Expect(deployment.Spec.Template.Spec.ResourceClaims).To(HaveLen(1))
+		Expect(*deployment.Spec.Template.Spec.ResourceClaims[0].ResourceClaimTemplateName).To(Equal("gpu-template"))
+	})
+})
+
+var _ = Describe("constructDeployment coverage", func() {
+	var reconciler *InferenceServiceReconciler
+
+	BeforeEach(func() {
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+		}
+	})
+
+	It("applies a custom readiness probe from ProbeOverrides", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "probe-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+				Format: "gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cpu",
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready", Path: "/tmp/llmkube/models/test-model.gguf"},
+		}
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "probe-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "probe-model",
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				ProbeOverrides: &inferencev1alpha1.ProbeOverrides{
+					Readiness: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/ready",
+								Port: intstr.FromInt32(8080),
+							},
+						},
+						PeriodSeconds:    5,
+						FailureThreshold: 3,
+					},
+				},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		probe := deployment.Spec.Template.Spec.Containers[0].ReadinessProbe
+		Expect(probe).NotTo(BeNil())
+		Expect(probe.HTTPGet.Path).To(Equal("/ready"))
+		Expect(probe.PeriodSeconds).To(Equal(int32(5)))
+	})
+
+	It("appends user tolerations to the device-plugin GPU toleration", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "toleration-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+				Format: "gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cuda",
+					GPU: &inferencev1alpha1.GPUSpec{
+						Enabled: true,
+						Count:   1,
+						Vendor:  "nvidia",
+						Layers:  99,
+					},
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready", Path: "/tmp/llmkube/models/test-model.gguf"},
+		}
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "toleration-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "toleration-model",
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+				Tolerations: []corev1.Toleration{
+					{Key: "custom-taint", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+				},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, 1)
+		tolerations := deployment.Spec.Template.Spec.Tolerations
+		Expect(tolerations).To(HaveLen(2))
+
+		var hasAuto, hasUser bool
+		for _, t := range tolerations {
+			if t.Key == "nvidia.com/gpu" {
+				hasAuto = true
+			}
+			if t.Key == "custom-taint" {
+				hasUser = true
+			}
+		}
+		Expect(hasAuto).To(BeTrue())
+		Expect(hasUser).To(BeTrue())
 	})
 })
