@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -1894,5 +1895,130 @@ func TestUnsupportedAuditLogMessage(t *testing.T) {
 				t.Errorf("expected auditLog accepted, got rejection: %s", msg)
 			}
 		})
+	}
+}
+
+// TestModelRouterGateway_RuleTimeoutPropagates verifies that RouterRule.Timeout
+// propagates to the AIGatewayRoute rule's timeouts.request, fixing the #734 bug
+// where the gateway data plane silently applied Envoy's 60s default.
+func TestModelRouterGateway_RuleTimeoutPropagates(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "timeout-cuda")
+
+	timeout := metav1.Duration{Duration: 30 * 60 * time.Second} // 30m
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "timeout-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "timeout-cuda", InferenceServiceRef: corev1LocalRef("timeout-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:    "qwen",
+					Match:   &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route:   inferencev1alpha1.RuleRoute{Backends: []string{"timeout-cuda"}},
+					Timeout: &timeout,
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	route := getUnstructured(t, c, aiGatewayRouteGVK(), "timeout-router")
+
+	// Verify the route has exactly one rule with timeouts.request == "30m0s".
+	rules, found, err := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if err != nil {
+		t.Fatalf("spec.rules: %v", err)
+	}
+	if !found || len(rules) != 1 {
+		t.Fatalf("expected 1 rule, found %d", len(rules))
+	}
+
+	ruleMap, ok := rules[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("rule[0] is not a map")
+	}
+
+	// Check timeouts.request.
+	timeouts, found, err := unstructured.NestedMap(ruleMap, "timeouts")
+	if !found {
+		t.Fatal("expected spec.rules[0].timeouts to be set, not found")
+	}
+	if err != nil {
+		t.Fatalf("timeouts: %v", err)
+	}
+
+	req, found, err := unstructured.NestedString(timeouts, "request")
+	if !found {
+		t.Fatal("expected timeouts.request to be set")
+	}
+	if err != nil {
+		t.Fatalf("timeouts.request: %v", err)
+	}
+	if req != "30m0s" {
+		t.Errorf("expected timeouts.request=30m0s, got %q", req)
+	}
+}
+
+// TestModelRouterGateway_NoTimeoutNoTimeoutsBlock verifies that when no rule
+// declares a Timeout, the generated AIGatewayRoute rule carries no timeouts
+// block (preserving Envoy's default).
+func TestModelRouterGateway_NoTimeoutNoTimeoutsBlock(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "notimeout-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "notimeout-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "notimeout-cuda", InferenceServiceRef: corev1LocalRef("notimeout-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"notimeout-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	route := getUnstructured(t, c, aiGatewayRouteGVK(), "notimeout-router")
+
+	rules, found, err := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if err != nil {
+		t.Fatalf("spec.rules: %v", err)
+	}
+	if !found || len(rules) != 1 {
+		t.Fatalf("expected 1 rule, found %d", len(rules))
+	}
+
+	ruleMap, ok := rules[0].(map[string]interface{})
+	if !ok {
+		t.Fatalf("rule[0] is not a map")
+	}
+
+	if _, found, _ := unstructured.NestedMap(ruleMap, "timeouts"); found {
+		t.Error("expected no timeouts block when rule.Timeout is nil")
 	}
 }
