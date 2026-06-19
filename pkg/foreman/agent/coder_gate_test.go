@@ -206,3 +206,59 @@ func TestRunCoderGateTruncation(t *testing.T) {
 		t.Errorf("output not truncated: %d x's exceed cap %d", got, maxCheckOutputBytes)
 	}
 }
+
+// TestRunCoderGate_TestTierFailsOnFailingTest covers the fast unit-test
+// tier: when a changed non-envtest package has a failing test, the gate
+// fails and the failure output is surfaced in the feedback so the coder
+// can fix it. The test tier must target the changed package (./pkg/cli/...).
+func TestRunCoderGate_TestTierFailsOnFailingTest(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	testTargeted := false
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git":
+			// git status --porcelain: one changed source file + a new test.
+			return " M pkg/cli/cache.go\n?? pkg/cli/cache_inspect_perisvc_test.go\n", nil
+		case name == "go" && len(args) > 0 && args[0] == "test":
+			if strings.Contains(strings.Join(args, " "), "./pkg/cli/...") {
+				testTargeted = true
+			}
+			return "--- FAIL: TestBuildDuCommand\n    expected 2 parts, got 3\nFAIL", errors.New("exit status 1")
+		default:
+			// gofmt, go vet, go build, golangci-lint all clean.
+			return "", nil
+		}
+	}
+	pass, feedback := RunCoderGate(context.Background(), "/ws", golangciPath, run)
+	if pass {
+		t.Fatal("gate should fail when a changed package has a failing test")
+	}
+	if !testTargeted {
+		t.Error("test tier should target the changed package ./pkg/cli/...")
+	}
+	if !strings.Contains(feedback, "go test") || !strings.Contains(feedback, "TestBuildDuCommand") {
+		t.Errorf("feedback should surface the failing test, got: %s", feedback)
+	}
+}
+
+// TestChangedTestPackages_ExcludesEnvtestAndNonGo verifies the test tier
+// scoping: changed fast packages are included, while envtest/e2e packages
+// and non-Go files are excluded (they cannot run in the workspace).
+func TestChangedTestPackages_ExcludesEnvtestAndNonGo(t *testing.T) {
+	run := func(_ context.Context, _ string, _ []string, name string, _ ...string) (string, error) {
+		if name == "git" {
+			return strings.Join([]string{
+				" M pkg/cli/cache.go",
+				" M internal/controller/model_controller.go",
+				" M internal/foreman/controller/agent_controller.go",
+				" M test/e2e/license_e2e_test.go",
+				" M docs/readme.md",
+			}, "\n"), nil
+		}
+		return "", nil
+	}
+	pkgs := changedTestPackages(context.Background(), "/ws", run)
+	if len(pkgs) != 1 || pkgs[0] != "./pkg/cli/..." {
+		t.Errorf("want only [./pkg/cli/...] (envtest, e2e, non-go excluded), got %v", pkgs)
+	}
+}

@@ -19,8 +19,20 @@ package agent
 import (
 	"context"
 	"os/exec"
+	"path"
 	"strings"
 )
+
+// envtestPackagePrefixes are repo paths whose tests need envtest
+// (KUBEBUILDER_ASSETS) or a live cluster and therefore CANNOT run in the
+// coder's macOS workspace: they hang waiting for a control plane that is
+// not there (the failure that spiraled #734). They are excluded from the
+// fast in-workspace test tier and left to the clean-room gate Job.
+var envtestPackagePrefixes = []string{
+	"internal/controller/",
+	"internal/foreman/controller/",
+	"test/",
+}
 
 // maxCheckOutputBytes bounds the captured output included in the gate
 // feedback for each failing check, so a noisy compiler or linter cannot
@@ -71,11 +83,13 @@ type checkFailure struct {
 // golangci-lint binary (e.g. "./bin/golangci-lint"). run is the command
 // runner (production callers pass execCommandRunner).
 //
-// The gate runs four deterministic checks in order: gofmt, go vet,
-// go build, and golangci-lint. Heavy envtest or integration tests are
-// intentionally out of scope; they run in a separate clean-room
-// Kubernetes Job. All four checks run regardless of earlier failures so
-// the feedback reports everything wrong at once.
+// The gate runs five deterministic checks in order: gofmt, go vet,
+// go build, golangci-lint, and the fast unit tests for the changed
+// non-envtest packages. Heavy envtest or integration tests are
+// intentionally out of scope (they need a control plane the workspace
+// lacks); they run in a separate clean-room Kubernetes Job. Every check
+// runs regardless of earlier failures so the feedback reports everything
+// wrong at once.
 func RunCoderGate(ctx context.Context, workspace, golangciPath string, run commandRunner) (pass bool, feedback string) {
 	var failures []checkFailure
 
@@ -103,11 +117,73 @@ func RunCoderGate(ctx context.Context, workspace, golangciPath string, run comma
 		failures = append(failures, checkFailure{name: golangciPath + " run ./...", output: out})
 	}
 
+	// 5. Fast unit tests for the changed, non-envtest packages. This is what
+	// lets the coder stop hand-running `go test` (the loop that thrashed
+	// #731): it submits, the gate runs the tests, and a failure comes back
+	// as feedback. Envtest/e2e packages are excluded (see
+	// envtestPackagePrefixes); the clean-room gate Job covers those.
+	if pkgs := changedTestPackages(ctx, workspace, run); len(pkgs) > 0 {
+		testArgs := append([]string{"test", "-count=1", "-timeout=180s"}, pkgs...)
+		if out, err := run(ctx, workspace, nil, "go", testArgs...); err != nil {
+			failures = append(failures, checkFailure{
+				name:   "go test " + strings.Join(pkgs, " "),
+				output: out,
+			})
+		}
+	}
+
 	if len(failures) == 0 {
 		return true, ""
 	}
 
 	return false, buildFeedback(failures)
+}
+
+// changedTestPackages returns the `./<dir>/...` test patterns for packages
+// that have changed or new .go files in the workspace, excluding envtest
+// and e2e packages. It reads `git status --porcelain` so it sees the
+// coder's uncommitted edits (the gate runs before the executor commits).
+// Returns nil when nothing testable changed (e.g. a docs-only edit), in
+// which case the gate skips the test tier.
+func changedTestPackages(ctx context.Context, workspace string, run commandRunner) []string {
+	out, err := run(ctx, workspace, nil, "git", "status", "--porcelain")
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Porcelain lines are "XY <path>"; renames are "XY old -> new".
+		fields := strings.Fields(line)
+		p := fields[len(fields)-1]
+		if !strings.HasSuffix(p, ".go") {
+			continue
+		}
+		excluded := false
+		for _, prefix := range envtestPackagePrefixes {
+			if strings.HasPrefix(p, prefix) {
+				excluded = true
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
+		dir := path.Dir(p)
+		pattern := "./" + dir + "/..."
+		if dir == "." {
+			pattern = "./..."
+		}
+		if !seen[pattern] {
+			seen[pattern] = true
+			pkgs = append(pkgs, pattern)
+		}
+	}
+	return pkgs
 }
 
 // buildFeedback renders the directive and a per-check section for every
