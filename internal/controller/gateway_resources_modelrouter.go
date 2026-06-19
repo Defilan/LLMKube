@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
@@ -188,6 +189,10 @@ type routerRuleResource struct {
 	// BackendRefs are the ordered destinations. For primary-fallback each ref
 	// carries an ascending Priority; for weighted each carries a Weight.
 	BackendRefs []routerBackendRef
+	// Timeout is the per-rule request timeout (RouterRule.Timeout). When set it
+	// becomes the AIGatewayRoute rule's timeouts.request, overriding Envoy's
+	// 60s default.
+	Timeout *metav1.Duration
 }
 
 // routerBackendRef is one backendRef in a compiled rule.
@@ -316,12 +321,19 @@ func routerLLMRequestCosts() []interface{} {
 
 // compileRouteRule builds one AIGatewayRoute rule: the matches block (a match
 // per model name, ANDed with header matches; a header-only match when the rule
-// declares no models, e.g. a catch-all) and the backendRefs block.
+// declares no models, e.g. a catch-all), the backendRefs block, and an
+// optional timeouts.request derived from RouterRule.Timeout.
 func compileRouteRule(rule routerRuleResource) map[string]interface{} {
-	return map[string]interface{}{
+	ruleMap := map[string]interface{}{
 		"matches":     compileRuleMatches(rule),
 		"backendRefs": compileRuleBackendRefs(rule.BackendRefs),
 	}
+	if rule.Timeout != nil && rule.Timeout.Duration > 0 {
+		ruleMap["timeouts"] = map[string]interface{}{
+			"request": rule.Timeout.Duration.String(),
+		}
+	}
+	return ruleMap
 }
 
 // compileRuleMatches turns a rule's model names + data classifications + headers

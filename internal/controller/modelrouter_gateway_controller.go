@@ -533,7 +533,7 @@ func compileRouterRules(mr *inferencev1alpha1.ModelRouter) ([]routerRuleResource
 		if err != nil {
 			return nil, err
 		}
-		resolved := routerRuleResource{BackendRefs: refs}
+		resolved := routerRuleResource{BackendRefs: refs, Timeout: rule.Timeout}
 		if rule.Match != nil {
 			resolved.Models = rule.Match.Models
 			resolved.Headers = rule.Match.Headers
