@@ -42,13 +42,14 @@ const (
 
 // CacheEntry represents a cached model
 type CacheEntry struct {
-	CacheKey   string
-	Source     string
-	Size       int64
-	SizeHuman  string
-	ModTime    time.Time
-	ModelNames []string // Models using this cache entry
-	Status     string   // "active" or "orphaned"
+	CacheKey     string
+	Source       string
+	Size         int64
+	SizeHuman    string
+	ModTime      time.Time
+	ModelNames   []string // Models using this cache entry
+	OwnerService string   // InferenceService that owns the PVC (per-isvc cache)
+	Status       string   // "active" or "orphaned"
 }
 
 // NewCacheCommand creates the cache command
@@ -230,19 +231,7 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
 		} else if pvcEntries != nil {
 			pvcInspected = true
-			for _, pe := range pvcEntries {
-				if entry, exists := cacheEntries[pe.CacheKey]; exists {
-					entry.Size = pe.SizeBytes
-					entry.SizeHuman = formatBytes(pe.SizeBytes)
-				} else {
-					cacheEntries[pe.CacheKey] = &CacheEntry{
-						CacheKey:  pe.CacheKey,
-						Size:      pe.SizeBytes,
-						SizeHuman: formatBytes(pe.SizeBytes),
-						Status:    statusOrphaned,
-					}
-				}
-			}
+			mergePVCEntries(cacheEntries, pvcEntries)
 		}
 	}
 
@@ -268,7 +257,7 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if pvcInspected {
-		_, _ = fmt.Fprintln(w, "CACHE KEY\tSTATUS\tSIZE\tMODELS\tSOURCE")
+		_, _ = fmt.Fprintln(w, "CACHE KEY\tSTATUS\tSIZE\tMODELS\tOWNER\tSOURCE")
 	} else {
 		_, _ = fmt.Fprintln(w, "CACHE KEY\tSIZE\tMODELS\tSOURCE")
 	}
@@ -298,8 +287,13 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		}
 		totalBytes += entry.Size
 
+		owner := entry.OwnerService
+		if owner == "" {
+			owner = "-"
+		}
+
 		if pvcInspected {
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.CacheKey, entry.Status, size, models, source)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.CacheKey, entry.Status, size, models, owner, source)
 		} else {
 			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", entry.CacheKey, size, models, source)
 		}
@@ -498,4 +492,25 @@ func runCachePreload(modelID, namespace string) error {
 func computeCacheKey(source string) string {
 	hash := sha256.Sum256([]byte(source))
 	return hex.EncodeToString(hash[:])[:16]
+}
+
+// mergePVCEntries merges PVC inspection results into the cache entry map.
+func mergePVCEntries(entries map[string]*CacheEntry, pvcEntries []PVCCacheEntry) {
+	for _, pe := range pvcEntries {
+		if entry, exists := entries[pe.CacheKey]; exists {
+			entry.Size = pe.SizeBytes
+			entry.SizeHuman = formatBytes(pe.SizeBytes)
+			if entry.OwnerService == "" && pe.OwnerService != "" {
+				entry.OwnerService = pe.OwnerService
+			}
+		} else {
+			entries[pe.CacheKey] = &CacheEntry{
+				CacheKey:     pe.CacheKey,
+				Size:         pe.SizeBytes,
+				SizeHuman:    formatBytes(pe.SizeBytes),
+				OwnerService: pe.OwnerService,
+				Status:       statusOrphaned,
+			}
+		}
+	}
 }
