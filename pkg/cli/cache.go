@@ -222,9 +222,13 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		}
 	}
 
-	// Inspect actual PVC contents (only for single-namespace mode)
+	// Inspect actual PVC contents (only for single-namespace mode).
+	// First try the shared llmkube-model-cache PVC, then discover per-isvc
+	// cache PVCs (named <isvc>-model-cache) and aggregate entries with the
+	// owning InferenceService shown.
 	var pvcInspected bool
 	if !allNamespaces {
+		// Shared PVC.
 		pvcEntries, err := inspectPVCCache(ctx, cfg, k8sClient, namespace)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
@@ -240,6 +244,32 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 						Size:      pe.SizeBytes,
 						SizeHuman: formatBytes(pe.SizeBytes),
 						Status:    statusOrphaned,
+					}
+				}
+			}
+		}
+
+		// Per-InferenceService PVCs.
+		perSvcEntries, err := inspectPerServiceCache(ctx, cfg, k8sClient, namespace)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not inspect per-service PVCs: %v\n", err)
+		} else if len(perSvcEntries) > 0 {
+			pvcInspected = true
+			for _, pe := range perSvcEntries {
+				if entry, exists := cacheEntries[pe.CacheKey]; exists {
+					entry.Size = pe.SizeBytes
+					entry.SizeHuman = formatBytes(pe.SizeBytes)
+					// Tag the entry with the owning InferenceService.
+					if !containsString(entry.ModelNames, pe.OwnerInferenceService) {
+						entry.ModelNames = append(entry.ModelNames, pe.OwnerInferenceService)
+					}
+				} else {
+					cacheEntries[pe.CacheKey] = &CacheEntry{
+						CacheKey:   pe.CacheKey,
+						Size:       pe.SizeBytes,
+						SizeHuman:  formatBytes(pe.SizeBytes),
+						Status:     statusOrphaned,
+						ModelNames: []string{pe.OwnerInferenceService},
 					}
 				}
 			}
@@ -492,6 +522,16 @@ func runCachePreload(modelID, namespace string) error {
 			}
 		}
 	}
+}
+
+// containsString reports whether the slice contains the given string.
+func containsString(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // computeCacheKey generates a SHA256 hash of the source URL (same as controller)

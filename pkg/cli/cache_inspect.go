@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -38,13 +39,24 @@ import (
 const (
 	modelCachePVCName     = "llmkube-model-cache"
 	defaultModelMountPath = "/models"
+	cachePVCSuffix        = "-model-cache"
 )
 
+// PVCCacheEntry represents a cache directory found on a PVC.
 type PVCCacheEntry struct {
 	CacheKey  string
 	SizeBytes int64
 }
 
+// PVCCacheEntryWithOwner extends PVCCacheEntry with the owning InferenceService
+// name (empty for the shared cache PVC).
+type PVCCacheEntryWithOwner struct {
+	PVCCacheEntry
+	OwnerInferenceService string
+}
+
+// inspectPVCCache inspects the shared llmkube-model-cache PVC and returns
+// entries without an owner. Returns nil, nil when the PVC does not exist.
 func inspectPVCCache(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, namespace string,
 ) ([]PVCCacheEntry, error) {
@@ -93,6 +105,124 @@ func inspectPVCCache(
 
 	output, err := execInPod(ctx, cfg, clientset, namespace, pod.Name, containerName,
 		[]string{"sh", "-c", fmt.Sprintf("du -sb %s/*/ 2>/dev/null || true", mountPath)})
+	if err != nil {
+		return nil, fmt.Errorf("failed to exec in pod: %w", err)
+	}
+
+	return parseDuOutput(output), nil
+}
+
+// inspectPerServiceCache discovers all per-InferenceService cache PVCs
+// (named <isvc>-model-cache), inspects each one, and returns entries tagged
+// with the owning InferenceService name.
+func inspectPerServiceCache(
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, namespace string,
+) ([]PVCCacheEntryWithOwner, error) {
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := k8sClient.List(ctx, pvcList, client.InNamespace(namespace)); err != nil {
+		return nil, fmt.Errorf("failed to list PVCs: %w", err)
+	}
+
+	var clientset *kubernetes.Clientset
+	var err error
+	if cfg != nil {
+		clientset, err = kubernetes.NewForConfig(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create clientset: %w", err)
+		}
+	}
+
+	var allEntries []PVCCacheEntryWithOwner
+	for i := range pvcList.Items {
+		pvc := &pvcList.Items[i]
+		// Only inspect PVCs that look like per-isvc cache PVCs.
+		if !strings.HasSuffix(pvc.Name, cachePVCSuffix) || pvc.Name == modelCachePVCName {
+			continue
+		}
+		isvcName := strings.TrimSuffix(pvc.Name, cachePVCSuffix)
+
+		entries, err := inspectPVC(ctx, clientset, namespace, pvc.Name)
+		if err != nil {
+			// Log but continue with other PVCs.
+			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC %s: %v\n", pvc.Name, err)
+			continue
+		}
+		for _, e := range entries {
+			allEntries = append(allEntries, PVCCacheEntryWithOwner{
+				PVCCacheEntry:         e,
+				OwnerInferenceService: isvcName,
+			})
+		}
+	}
+
+	return allEntries, nil
+}
+
+// inspectPVC creates a transient inspector pod for the given PVC, waits for it
+// to run, executes du, and returns the parsed entries.
+func inspectPVC(
+	ctx context.Context, clientset *kubernetes.Clientset, namespace, pvcName string,
+) ([]PVCCacheEntry, error) {
+	if clientset == nil {
+		return nil, fmt.Errorf("kubernetes clientset is required to inspect PVC %s", pvcName)
+	}
+	podName := "llmkube-cache-inspector-" + strings.ReplaceAll(pvcName, "-", "")
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "llmkube-cli",
+				"app.kubernetes.io/component":  "cache-inspector",
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{
+				{
+					Name:    "inspector",
+					Image:   "busybox:1.37.0",
+					Command: []string{"sleep", "300"},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "model-cache",
+							MountPath: defaultModelMountPath,
+							ReadOnly:  true,
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "model-cache",
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvcName,
+							ReadOnly:  true,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create inspector pod: %w", err)
+	}
+	defer func() {
+		gracePeriod := int64(0)
+		_ = clientset.CoreV1().Pods(namespace).Delete(ctx, podName, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		})
+	}()
+
+	if err := waitForPodRunning(ctx, clientset, namespace, podName, 120*time.Second); err != nil {
+		return nil, fmt.Errorf("inspector pod failed to start: %w", err)
+	}
+
+	output, err := execInPod(ctx, nil, clientset, namespace, podName, "inspector",
+		[]string{"sh", "-c", fmt.Sprintf("du -sb %s/*/ 2>/dev/null || true", defaultModelMountPath)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to exec in pod: %w", err)
 	}
