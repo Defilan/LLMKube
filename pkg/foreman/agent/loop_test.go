@@ -277,6 +277,85 @@ func TestLoop_HappyPath_TerminalSubmitResult(t *testing.T) {
 	}
 }
 
+// TestLoop_VerifyTerminal_VetoThenAccept covers the coder gate feedback
+// loop (#749): the gate vetoes the first GO with feedback, the loop
+// injects that feedback as a user message and continues, and the gate
+// accepts the next GO so the terminal stands.
+func TestLoop_VerifyTerminal_VetoThenAccept(t *testing.T) {
+	srv, calls := scriptedOAIServer(t, []string{toolCallSubmitGo, toolCallSubmitGo})
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"submit_result": {Terminal: true, Verdict: "GO", Summary: "ok"},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	const feedback = "gate: gofmt reported internal/foo.go; fix it and resubmit"
+	verifyCalls := 0
+	res, err := loop.Run(context.Background(), LoopConfig{
+		Model: "test", UserPrompt: "go", MaxTurns: 5, MaxVerifyRetries: 2,
+		VerifyTerminal: func(_ context.Context, _ *ToolResult, _ []oai.Message) (bool, string, error) {
+			verifyCalls++
+			if verifyCalls == 1 {
+				return false, feedback, nil
+			}
+			return true, "", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Terminal == nil || res.Terminal.Verdict != "GO" {
+		t.Fatalf("want GO terminal after the gate accepts, got %+v", res.Terminal)
+	}
+	if verifyCalls != 2 {
+		t.Errorf("verify calls: want 2 got %d", verifyCalls)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("OAI calls: want 2 (veto consumed a turn) got %d", got)
+	}
+	found := false
+	for _, m := range res.Transcript {
+		if m.Role == oai.RoleUser && m.Content == feedback {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("gate feedback was not injected as a user message")
+	}
+}
+
+// TestLoop_VerifyTerminal_BudgetExhaustedDowngrades covers the case where
+// the gate never passes: after MaxVerifyRetries fix attempts the terminal
+// is downgraded to INCOMPLETE so a branch that still fails fmt/vet/build/
+// lint cannot land as a clean GO.
+func TestLoop_VerifyTerminal_BudgetExhaustedDowngrades(t *testing.T) {
+	srv, _ := scriptedOAIServer(t, []string{toolCallSubmitGo, toolCallSubmitGo, toolCallSubmitGo})
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"submit_result": {Terminal: true, Verdict: "GO", Summary: "ok"},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	res, err := loop.Run(context.Background(), LoopConfig{
+		Model: "test", UserPrompt: "go", MaxTurns: 5, MaxVerifyRetries: 2,
+		VerifyTerminal: func(_ context.Context, _ *ToolResult, _ []oai.Message) (bool, string, error) {
+			return false, "gate: still failing", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Terminal == nil || res.Terminal.Verdict != "INCOMPLETE" {
+		t.Fatalf("want INCOMPLETE downgrade, got %+v", res.Terminal)
+	}
+	if res.Terminal.Extra["outcome"] != CoderGateFailedOutcome {
+		t.Errorf("want outcome %s, got %v", CoderGateFailedOutcome, res.Terminal.Extra["outcome"])
+	}
+	if res.Terminal.Extra["gateAttempts"] != 2 {
+		t.Errorf("want gateAttempts 2, got %v", res.Terminal.Extra["gateAttempts"])
+	}
+}
+
 func TestLoop_MaxTurnsExhausted(t *testing.T) {
 	// Three calls all return read_file. With MaxTurns=3 the loop should
 	// hit the limit and return ErrMaxTurnsExhausted, transcript intact.

@@ -140,6 +140,21 @@ type LoopConfig struct {
 	// up with ErrAssistantReasoningOnly. Resets after any tool-calling
 	// turn. <= 0 falls back to DefaultMaxReasoningOnlyRetries.
 	MaxReasoningOnlyRetries int
+
+	// VerifyTerminal, when set, is the coder gate feedback loop (#749).
+	// On a terminal the loop would otherwise accept, the loop calls this
+	// hook; if it returns accept=false the loop appends `feedback` as a
+	// user message and continues so the agent can fix what the gate
+	// found, up to MaxVerifyRetries times. When the budget is exhausted
+	// the terminal is downgraded to a CoderGateFailedEnvelope (INCOMPLETE)
+	// so a branch that never passes fmt/vet/build/lint cannot land as GO.
+	// Nil disables the feature (default), preserving the prior behavior.
+	VerifyTerminal TerminalVerifier
+
+	// MaxVerifyRetries bounds the gate fix attempts when VerifyTerminal is
+	// set. <= 0 with a non-nil VerifyTerminal means "verify once, never
+	// retry": a failing gate immediately downgrades to INCOMPLETE.
+	MaxVerifyRetries int
 }
 
 // DefaultContextWindowTokens is the budget used when LoopConfig.ContextWindowTokens
@@ -215,6 +230,18 @@ const StuckLoopOutcome = "STUCK-LOOP-DETECTED"
 // of recording a retry-less ExecutorError.
 const LoopBudgetOutcome = "LOOP-BUDGET-EXHAUSTED"
 
+// CoderGateFailedOutcome is the value the loop sets in
+// LoopResult.Terminal.Extra["outcome"] when the coder verification gate
+// (#749) never passed within MaxVerifyRetries fix attempts. The terminal
+// is downgraded to INCOMPLETE so a branch whose fast checks (fmt / vet /
+// build / lint) still fail never lands as a clean GO.
+const CoderGateFailedOutcome = "CODER-GATE-FAILED"
+
+// outcomeKey is the Terminal.Extra map key the loop stamps with the
+// machine-readable outcome string (LoopBudgetOutcome, CoderGateFailedOutcome,
+// StuckLoopOutcome, ...).
+const outcomeKey = "outcome"
+
 // LoopBudgetExhaustedEnvelope synthesizes the INCOMPLETE terminal the
 // loop returns when its wall-clock budget fires. turn is the turn that
 // was in flight when the deadline hit.
@@ -230,11 +257,63 @@ func LoopBudgetExhaustedEnvelope(turn int) *ToolResult {
 			"summary": summary,
 		},
 		Extra: map[string]any{
-			"outcome":       LoopBudgetOutcome,
+			outcomeKey:      LoopBudgetOutcome,
 			"terminateTurn": turn,
 		},
 	}
 }
+
+// CoderGateFailedEnvelope synthesizes the INCOMPLETE terminal the loop
+// returns when the coder verification gate (#749) still fails after
+// MaxVerifyRetries fix attempts. attempts is how many gate cycles ran;
+// lastFeedback is the final gate output, truncated for the status field.
+func CoderGateFailedEnvelope(turn, attempts int, lastFeedback string) *ToolResult {
+	summary := fmt.Sprintf(
+		"verification gate did not pass after %d fix attempt(s); not landing a failing GO",
+		attempts)
+	return &ToolResult{
+		Terminal:      true,
+		Verdict:       "INCOMPLETE",
+		Summary:       summary,
+		CommitMessage: "",
+		Output: map[string]any{
+			"verdict": "INCOMPLETE",
+			"summary": summary,
+		},
+		Extra: map[string]any{
+			outcomeKey:      CoderGateFailedOutcome,
+			"terminateTurn": turn,
+			"gateAttempts":  attempts,
+			"gateOutput":    truncateGateOutput(lastFeedback),
+		},
+	}
+}
+
+// maxGateOutputBytes bounds the gate output stored in the terminal Extra
+// (status visibility), mirroring the gate-Job runbook's 32 KiB cap.
+const maxGateOutputBytes = 32 * 1024
+
+func truncateGateOutput(s string) string {
+	if len(s) <= maxGateOutputBytes {
+		return s
+	}
+	return "...(truncated)...\n" + s[len(s)-maxGateOutputBytes:]
+}
+
+// TerminalVerifier inspects a terminal the loop is about to accept and
+// reports whether it should stand. Returning accept=false makes the loop
+// append feedback as a user message and continue (up to
+// LoopConfig.MaxVerifyRetries), so the agent can fix what the gate found
+// and re-submit. A non-nil err is treated as "could not verify" and the
+// terminal is accepted as-is (the gate is best-effort; the clean-room
+// gate Job is the authoritative backstop). The verifier decides which
+// terminals it gates: it should accept non-GO verdicts and non-coder
+// roles immediately.
+type TerminalVerifier func(
+	ctx context.Context,
+	terminal *ToolResult,
+	transcript []oai.Message,
+) (accept bool, feedback string, err error)
 
 // ErrAssistantNoToolCalls is returned when the model replies with text
 // only and no tool_calls. The loop has no way to make forward progress
@@ -373,6 +452,8 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	// a tool call. It resets to zero after any successful tool-calling
 	// turn, so only sustained narration exhausts MaxNoToolCallRetries.
 	noToolCallStreak := 0
+	// verifyRetries counts coder-gate fix attempts spent so far (#749).
+	verifyRetries := 0
 	// reasoningOnlyStreak is the sibling counter for reasoning-only
 	// turns (#650); separate so a thinking model's pauses don't consume
 	// the prose-narration budget and vice versa.
@@ -411,6 +492,12 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 		editSucceeded, turnErr := l.runOneTurn(ctx, cfg, activeSchemas, res)
 		if turnErr != nil {
 			if errors.Is(turnErr, errTerminalReached) {
+				// Coder gate feedback loop (#749): give the gate a chance to
+				// veto a terminal the loop would otherwise accept. A veto
+				// with retries left injects feedback and continues the loop.
+				if l.applyTerminalGate(ctx, cfg, res, turn, &verifyRetries) {
+					continue
+				}
 				return res, nil
 			}
 			// Loop-wide budget exhausted: exit gracefully with an
@@ -599,6 +686,44 @@ func mostRecentAssistantToolCalls(transcript []oai.Message) []oai.ToolCall {
 // the loop should exit cleanly because the model called submit_result.
 // Not exported because the public surface is LoopResult.Terminal != nil.
 var errTerminalReached = errors.New("loop: terminal tool invoked")
+
+// applyTerminalGate runs the coder gate (#749) against a terminal the
+// loop would otherwise accept. It returns true when the loop should
+// CONTINUE (the gate vetoed the terminal with retries left, so feedback
+// was appended and res.Terminal cleared), and false when the terminal
+// stands (no gate configured, gate accepted, gate could not run, or the
+// retry budget was spent and the terminal was downgraded to a
+// CoderGateFailedEnvelope). verifyRetries is incremented on each veto.
+func (l *Loop) applyTerminalGate(
+	ctx context.Context,
+	cfg LoopConfig,
+	res *LoopResult,
+	turn int,
+	verifyRetries *int,
+) bool {
+	if cfg.VerifyTerminal == nil {
+		return false
+	}
+	accept, feedback, vErr := cfg.VerifyTerminal(ctx, res.Terminal, res.Transcript)
+	if vErr != nil || accept {
+		// Best-effort gate: a verifier error means "could not verify",
+		// so the terminal stands and the authoritative gate Job remains
+		// the backstop.
+		return false
+	}
+	if *verifyRetries < cfg.MaxVerifyRetries {
+		*verifyRetries++
+		res.Transcript = append(res.Transcript, oai.Message{
+			Role:    oai.RoleUser,
+			Content: feedback,
+		})
+		res.Terminal = nil
+		return true
+	}
+	// Budget spent and the gate still fails: do not land a failing GO.
+	res.Terminal = CoderGateFailedEnvelope(turn, *verifyRetries, feedback)
+	return false
+}
 
 // runOneTurn drives one chat-completions request + tool dispatch. It
 // appends to res.Transcript in place. Returns errTerminalReached when
