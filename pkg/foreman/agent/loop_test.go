@@ -356,6 +356,50 @@ func TestLoop_VerifyTerminal_BudgetExhaustedDowngrades(t *testing.T) {
 	}
 }
 
+// TestLoop_GateFixPhase_RestrictsToolsAfterGateFeedback covers the #749
+// follow-up (B+): once the coder gate vetoes a terminal, the loop enters
+// the edit-only phase. The turn after the veto must advertise the
+// restricted tool set (no grep, no bash) so the coder fixes exactly what
+// the gate reported and resubmits, instead of re-running go test / go
+// build / golangci-lint by hand (which spiraled #734 and thrashed #731).
+func TestLoop_GateFixPhase_RestrictsToolsAfterGateFeedback(t *testing.T) {
+	srv, advertised := recordingScriptedServer(t, []string{toolCallSubmitGo, toolCallSubmitGo})
+	reg := &fakeRegistry{
+		schemas: sixToolSchemas(),
+		results: map[string]*ToolResult{
+			"submit_result": {Terminal: true, Verdict: "GO", Summary: "ok"},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	verifyCalls := 0
+	_, err := loop.Run(context.Background(), LoopConfig{
+		Model: "test", UserPrompt: "go", MaxTurns: 10, MaxVerifyRetries: 2,
+		VerifyTerminal: func(_ context.Context, _ *ToolResult, _ []oai.Message) (bool, string, error) {
+			verifyCalls++
+			if verifyCalls == 1 {
+				return false, "gate: lint failed at internal/foo.go", nil
+			}
+			return true, "", nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	adv := *advertised
+	// Turn 1 (before the gate speaks): full set, exploration allowed.
+	if !hasTool(adv[0], "bash") || !hasTool(adv[0], "grep") {
+		t.Errorf("turn 1 should advertise the full set incl bash/grep, got %v", adv[0])
+	}
+	// Turn 2 (gate-fix phase): restricted, no bash/grep but keeps the edit
+	// and submit tools.
+	if hasTool(adv[1], "bash") || hasTool(adv[1], "grep") {
+		t.Errorf("turn 2 (gate-fix) must drop bash/grep, got %v", adv[1])
+	}
+	if !hasTool(adv[1], "read_file") || !hasTool(adv[1], "submit_result") {
+		t.Errorf("turn 2 (gate-fix) must keep read_file + submit_result, got %v", adv[1])
+	}
+}
+
 func TestLoop_MaxTurnsExhausted(t *testing.T) {
 	// Three calls all return read_file. With MaxTurns=3 the loop should
 	// hit the limit and return ErrMaxTurnsExhausted, transcript intact.

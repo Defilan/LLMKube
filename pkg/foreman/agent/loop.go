@@ -230,6 +230,11 @@ const StuckLoopOutcome = "STUCK-LOOP-DETECTED"
 // of recording a retry-less ExecutorError.
 const LoopBudgetOutcome = "LOOP-BUDGET-EXHAUSTED"
 
+// forceSubmitFinalTurns is how many turns before MaxTurns the loop
+// switches to advertising submit_result only (the final-turns convergence
+// guard). See activeSchemasForTurn.
+const forceSubmitFinalTurns = 3
+
 // CoderGateFailedOutcome is the value the loop sets in
 // LoopResult.Terminal.Extra["outcome"] when the coder verification gate
 // (#749) never passed within MaxVerifyRetries fix attempts. The terminal
@@ -445,7 +450,6 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	// legitimately read for many turns), so without this a non-converging
 	// reviewer just rambles to MaxTurns and yields an empty INCOMPLETE.
 	// Coders get it as a backstop behind the EditFreeStreak forcing function.
-	const forceSubmitFinalTurns = 3
 	forceSubmitAnnounced := false
 
 	// noToolCallStreak counts consecutive turns that returned text without
@@ -454,6 +458,14 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	noToolCallStreak := 0
 	// verifyRetries counts coder-gate fix attempts spent so far (#749).
 	verifyRetries := 0
+	// inGateFixPhase is set once the coder gate has returned feedback at
+	// least once (#749 follow-up): from then on the loop advertises the
+	// edit-only tool set (no grep, no bash) so the coder fixes exactly what
+	// the gate reported and re-submits, instead of re-running go test / go
+	// build / golangci-lint itself. The harness gate is the single source
+	// of verification truth; hand-running it is what spiraled #734 and
+	// thrashed #731 into a RepeatedToolCall stuck-loop.
+	inGateFixPhase := false
 	// reasoningOnlyStreak is the sibling counter for reasoning-only
 	// turns (#650); separate so a thinking model's pauses don't consume
 	// the prose-narration budget and vice versa.
@@ -462,28 +474,8 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	for turn := 1; turn <= cfg.MaxTurns; turn++ {
 		res.Turns = turn
 
-		// During the forcing phase, advertise the restricted set (no grep,
-		// no bash) so the model acts on what it has already read instead of
-		// launching a fresh exploration sweep.
-		activeSchemas := schemas
-		if forceEditOnly {
-			activeSchemas = restrictedSchemas
-		}
-
-		// Final-turns convergence guard (takes precedence over the forcing
-		// phase): in the last forceSubmitFinalTurns turns, advertise
-		// submit_result only and append a one-time hard nudge, so the model
-		// must conclude rather than exhaust MaxTurns with no verdict.
-		if cfg.MaxTurns > forceSubmitFinalTurns && turn > cfg.MaxTurns-forceSubmitFinalTurns {
-			activeSchemas = filterSubmitOnlySchemas(schemas)
-			if !forceSubmitAnnounced {
-				res.Transcript = append(res.Transcript, oai.Message{
-					Role:    oai.RoleUser,
-					Content: ForceSubmitMessage(cfg.MaxTurns - turn + 1),
-				})
-				forceSubmitAnnounced = true
-			}
-		}
+		activeSchemas := l.activeSchemasForTurn(turn, cfg, schemas, restrictedSchemas,
+			forceEditOnly || inGateFixPhase, &forceSubmitAnnounced, res)
 
 		// runOneTurn appends the assistant message + tool messages to
 		// res.Transcript. It returns errTerminalReached on submit_result.
@@ -496,6 +488,10 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 				// veto a terminal the loop would otherwise accept. A veto
 				// with retries left injects feedback and continues the loop.
 				if l.applyTerminalGate(ctx, cfg, res, turn, &verifyRetries) {
+					// The gate vetoed and injected feedback: from here on the
+					// coder fixes-and-resubmits under the edit-only tool set,
+					// with the gate as the sole verifier.
+					inGateFixPhase = true
 					continue
 				}
 				return res, nil
@@ -723,6 +719,37 @@ func (l *Loop) applyTerminalGate(
 	// Budget spent and the gate still fails: do not land a failing GO.
 	res.Terminal = CoderGateFailedEnvelope(turn, *verifyRetries, feedback)
 	return false
+}
+
+// activeSchemasForTurn picks the tool advertisement for this turn. The
+// final-turns convergence guard wins: in the last forceSubmitFinalTurns
+// turns it advertises submit_result only (plus a one-time hard nudge) so a
+// non-converging agent produces a verdict instead of exhausting MaxTurns.
+// Otherwise, during the EditFreeStreak forcing phase or the coder gate-fix
+// phase (restricted==true) it advertises the edit-only set (no grep/bash);
+// else the full set.
+func (l *Loop) activeSchemasForTurn(
+	turn int,
+	cfg LoopConfig,
+	schemas, restrictedSchemas []oai.Tool,
+	restricted bool,
+	forceSubmitAnnounced *bool,
+	res *LoopResult,
+) []oai.Tool {
+	if cfg.MaxTurns > forceSubmitFinalTurns && turn > cfg.MaxTurns-forceSubmitFinalTurns {
+		if !*forceSubmitAnnounced {
+			res.Transcript = append(res.Transcript, oai.Message{
+				Role:    oai.RoleUser,
+				Content: ForceSubmitMessage(cfg.MaxTurns - turn + 1),
+			})
+			*forceSubmitAnnounced = true
+		}
+		return filterSubmitOnlySchemas(schemas)
+	}
+	if restricted {
+		return restrictedSchemas
+	}
+	return schemas
 }
 
 // runOneTurn drives one chat-completions request + tool dispatch. It
