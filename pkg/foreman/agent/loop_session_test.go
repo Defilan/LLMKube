@@ -63,3 +63,36 @@ func TestCompactTranscript_ZeroBudgetReturnsIdentical(t *testing.T) {
 		t.Fatalf("wire length: want %d got %d", len(tx), len(wire))
 	}
 }
+
+func TestCompactTranscript_OverBudgetDropsOldestMiddle(t *testing.T) {
+	// 8 turn-groups, each tool ~4000 bytes (~1000 tokens). Head is tiny.
+	tx := transcriptFixture(8, 4000)
+	budget := 3500 // tokens: keeps head + a few newest groups
+	wire := compactTranscriptForWire(tx, budget)
+
+	// Something was dropped.
+	if len(wire) >= len(tx) {
+		t.Fatalf("expected compaction to drop messages: in=%d out=%d", len(tx), len(wire))
+	}
+	// Head preserved: system then the original task message.
+	if wire[0].Role != oai.RoleSystem {
+		t.Fatalf("head[0] not system: %s", wire[0].Role)
+	}
+	if wire[1].Role != oai.RoleUser || wire[1].Content != "fix issue 510" {
+		t.Fatalf("original task message not pinned: %+v", wire[1])
+	}
+	// Most recent turn-group preserved: last two messages of tx survive
+	// as the last two of wire.
+	if wire[len(wire)-1].Content != tx[len(tx)-1].Content {
+		t.Errorf("most recent tool result not kept")
+	}
+	if wire[len(wire)-2].Role != oai.RoleAssistant {
+		t.Errorf("most recent assistant turn not kept")
+	}
+	// Under budget after compaction.
+	if approxTokens(wire) > budget {
+		t.Errorf("still over budget after compaction: %d > %d", approxTokens(wire), budget)
+	}
+	// No orphaned tool_call_id.
+	assertNoOrphanedToolMessages(t, wire)
+}
