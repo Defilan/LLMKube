@@ -966,6 +966,19 @@ func maskedToolMessage(m oai.Message) oai.Message {
 	}
 }
 
+// compactTranscriptForWire implements the "session" context strategy: a
+// stable, append-only prefix that lets a caching runtime reuse the prompt
+// prefix across turns. Under budget the transcript is returned unchanged
+// (cache-stable). Over budget, the oldest whole turn-groups in the middle
+// are dropped, pinning the head (leading system messages + the first user
+// task message) and the most recent turn-group, so the agent never loses
+// its instructions, its task, or its latest work. Dropping is in
+// turn-group units so a tool_call_id is never orphaned. See issue #756.
+func compactTranscriptForWire(transcript []oai.Message, ctxBudget int) []oai.Message {
+	// Compaction is added in a later task; for now always passthrough.
+	return transcript
+}
+
 // approxTokens returns a chars/4 approximation of the wire payload's
 // token count. Real tokenization varies by model and language; the
 // "Complexity Trap" empirical result is that this level of precision
