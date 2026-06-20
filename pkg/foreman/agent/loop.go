@@ -104,6 +104,12 @@ type LoopConfig struct {
 	// to DefaultObservationWindowTurns (3).
 	ObservationWindowTurns int
 
+	// ContextStrategy selects the wire-payload builder. "" or "window"
+	// applies observation masking (ObservationWindowTurns); "session"
+	// keeps an append-only prefix and compacts at ContextWindowTokens.
+	// See selectWireTranscript and issue #756.
+	ContextStrategy string
+
 	// Progress configures the stuck-loop detector (#544). The default
 	// value (all zeros) disables detection; callers wanting the
 	// debut-quality default should set this to DefaultProgressConfig.
@@ -183,6 +189,15 @@ const DefaultMaxReasoningOnlyRetries = 4
 // is enough for the model to chain a read -> edit -> verify sequence
 // without losing the just-observed file contents.
 const DefaultObservationWindowTurns = 3
+
+const (
+	// ContextStrategyWindow applies observation masking bounded by
+	// ObservationWindowTurns (the default strategy).
+	ContextStrategyWindow = "window"
+	// ContextStrategySession keeps a stable, append-only prefix and
+	// compacts only at the ContextWindowTokens ceiling. See issue #756.
+	ContextStrategySession = "session"
+)
 
 // charsPerTokenApprox is the rough chars-per-token ratio used for
 // budget estimation. Real tokenizers vary by model and language; for
@@ -741,7 +756,7 @@ func (l *Loop) runOneTurn(
 	req := oai.ChatRequest{
 		Model: cfg.Model,
 		Messages: stripReasoningForWire(
-			maskTranscriptForWire(res.Transcript, cfg.ObservationWindowTurns, cfg.ContextWindowTokens)),
+			selectWireTranscript(cfg, res.Transcript)),
 		Tools:       schemas,
 		Temperature: cfg.Temperature,
 	}
@@ -1019,6 +1034,17 @@ func compactTranscriptForWire(transcript []oai.Message, ctxBudget int) []oai.Mes
 	}
 	// Degenerate: only head + last group remain (still possibly over budget).
 	return assembleSessionWire(transcript, headEnd, groups, len(groups)-1)
+}
+
+// selectWireTranscript routes the transcript through the configured
+// context strategy. "session" uses compactTranscriptForWire (stable
+// prefix, compact at budget); anything else (including "" and "window")
+// uses maskTranscriptForWire (observation masking).
+func selectWireTranscript(cfg LoopConfig, transcript []oai.Message) []oai.Message {
+	if cfg.ContextStrategy == ContextStrategySession {
+		return compactTranscriptForWire(transcript, cfg.ContextWindowTokens)
+	}
+	return maskTranscriptForWire(transcript, cfg.ObservationWindowTurns, cfg.ContextWindowTokens)
 }
 
 // assembleSessionWire builds the wire payload: the pinned head

@@ -110,3 +110,43 @@ func TestCompactTranscript_DegenerateKeepsHeadAndLastGroup(t *testing.T) {
 	}
 	assertNoOrphanedToolMessages(t, wire)
 }
+
+func TestSelectWireTranscript_SessionDoesNotMask(t *testing.T) {
+	tx := transcriptFixture(6, 4000)
+	cfg := LoopConfig{ContextStrategy: ContextStrategySession, ContextWindowTokens: 1000000}
+	wire := selectWireTranscript(cfg, tx)
+	for i := range tx {
+		if wire[i].Content != tx[i].Content {
+			t.Errorf("session strategy masked content at %d", i)
+		}
+	}
+}
+
+func TestSelectWireTranscript_WindowMasks(t *testing.T) {
+	tx := transcriptFixture(6, 4000)
+	cfg := LoopConfig{ContextStrategy: ContextStrategyWindow, ObservationWindowTurns: 1}
+	wire := selectWireTranscript(cfg, tx)
+	changed := false
+	for i := range tx {
+		if tx[i].Role == oai.RoleTool && wire[i].Content != tx[i].Content {
+			changed = true
+		}
+	}
+	if !changed {
+		t.Error("window strategy did not mask any tool messages")
+	}
+}
+
+func TestSelectWireTranscript_EmptyDefaultsToWindow(t *testing.T) {
+	tx := transcriptFixture(6, 4000)
+	got := selectWireTranscript(LoopConfig{ObservationWindowTurns: 1}, tx)
+	want := maskTranscriptForWire(tx, 1, 0)
+	if len(got) != len(want) {
+		t.Fatalf("empty strategy did not route to window: len got=%d want=%d", len(got), len(want))
+	}
+	for i := range got {
+		if got[i].Content != want[i].Content {
+			t.Errorf("message %d differs from window output", i)
+		}
+	}
+}
