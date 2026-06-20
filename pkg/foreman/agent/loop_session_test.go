@@ -98,7 +98,7 @@ func TestCompactTranscript_OverBudgetDropsOldestMiddle(t *testing.T) {
 }
 
 func TestCompactTranscript_DegenerateKeepsHeadAndLastGroup(t *testing.T) {
-	tx := transcriptFixture(4, 8000) // each tool ~2000 tokens
+	tx := transcriptFixture(4, 8000)          // each tool ~2000 tokens
 	wire := compactTranscriptForWire(tx, 100) // absurdly small budget
 
 	if wire[0].Role != oai.RoleSystem || wire[1].Role != oai.RoleUser {
