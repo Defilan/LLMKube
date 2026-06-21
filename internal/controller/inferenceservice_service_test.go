@@ -195,6 +195,87 @@ var _ = Describe("constructEndpoint", func() {
 	})
 })
 
+var _ = Describe("reconcileService update path", func() {
+	var reconciler *InferenceServiceReconciler
+
+	BeforeEach(func() {
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+	})
+
+	It("should update Service type from ClusterIP to NodePort when endpoint.type changes", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "update-type-svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "some-model"},
+		}
+		// First reconcile creates a ClusterIP Service
+		_, _, err := reconciler.reconcileService(context.Background(), isvc, true, 1, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		svc := &corev1.Service{}
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "update-type-svc", Namespace: "default"}, svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+
+		// Patch the InferenceService to NodePort
+		isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Type: "NodePort"}
+		_, _, err = reconciler.reconcileService(context.Background(), isvc, true, 1, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Service type should now be NodePort
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "update-type-svc", Namespace: "default"}, svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
+	})
+
+	It("should update Service type from ClusterIP to LoadBalancer when endpoint.type changes", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "update-lb-svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "some-model"},
+		}
+		_, _, err := reconciler.reconcileService(context.Background(), isvc, true, 1, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		svc := &corev1.Service{}
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "update-lb-svc", Namespace: "default"}, svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+
+		isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Type: "LoadBalancer"}
+		_, _, err = reconciler.reconcileService(context.Background(), isvc, true, 1, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "update-lb-svc", Namespace: "default"}, svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+	})
+
+	It("should update Service port when endpoint.port changes", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "update-port-svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "some-model"},
+		}
+		_, _, err := reconciler.reconcileService(context.Background(), isvc, true, 1, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		svc := &corev1.Service{}
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "update-port-svc", Namespace: "default"}, svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
+
+		isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: 9090}
+		_, _, err = reconciler.reconcileService(context.Background(), isvc, true, 1, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		err = k8sClient.Get(context.Background(), types.NamespacedName{Name: "update-port-svc", Namespace: "default"}, svc)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(svc.Spec.Ports[0].Port).To(Equal(int32(9090)))
+	})
+})
+
 var _ = Describe("reconcileService Metal path", func() {
 	var reconciler *InferenceServiceReconciler
 
