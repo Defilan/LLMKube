@@ -250,3 +250,34 @@ func TestCheckMemoryAdmission_PassesWithinBudget(t *testing.T) {
 		t.Fatalf("model within budget should pass admission, got: %v", err)
 	}
 }
+
+// Regression test for #777: when a previous memory check failed and set
+// SchedulingStatus/Message, a subsequent passing check must clear those
+// fields so the status reflects the current healthy state.
+func TestCheckMemoryAdmission_ClearsStaleSchedulingStatus(t *testing.T) {
+	isvc := newAdmissionTestISVC()
+	isvc.Status.SchedulingStatus = "InsufficientMemory"
+	isvc.Status.SchedulingMessage = "estimated 100 GiB required, budget 6 GiB"
+
+	agent := newAdmissionTestAgent(t, isvc, MetalAgentConfig{
+		MemoryProvider: &mockMemoryProvider{totalBytes: 128 * 1024 * 1024 * 1024},
+		MemoryFraction: 0.75,
+	})
+	model := newAdmissionTestModel("https://model-host.invalid/model.gguf", "20.0 GiB")
+
+	if err := agent.checkMemoryAdmission(context.Background(), isvc, model, 2048, "", ""); err != nil {
+		t.Fatalf("model within budget should pass admission, got: %v", err)
+	}
+
+	updated := &inferencev1alpha1.InferenceService{}
+	if getErr := agent.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: "test-isvc"}, updated); getErr != nil {
+		t.Fatalf("failed to re-fetch InferenceService: %v", getErr)
+	}
+	if updated.Status.SchedulingStatus != "" {
+		t.Errorf("SchedulingStatus = %q, want empty (stale status should be cleared)", updated.Status.SchedulingStatus)
+	}
+	if updated.Status.SchedulingMessage != "" {
+		t.Errorf("SchedulingMessage = %q, want empty (stale message should be cleared)", updated.Status.SchedulingMessage)
+	}
+}
