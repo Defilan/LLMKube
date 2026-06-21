@@ -1453,6 +1453,16 @@ func (a *MetalAgent) checkMemoryAdmission(
 		"headroom", formatMemory(budget.HeadroomBytes),
 		"source", resolved.Source,
 	)
+
+	// Clear any stale scheduling status from a previous failed check.
+	if isvc.Status.SchedulingStatus != "" || isvc.Status.SchedulingMessage != "" {
+		isvc.Status.SchedulingStatus = ""
+		isvc.Status.SchedulingMessage = ""
+		if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
+			a.logger.Warnw("failed to clear scheduling status", "error", updateErr)
+		}
+	}
+
 	return nil
 }
 
