@@ -68,6 +68,7 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 		source,
 		"--host", "0.0.0.0",
 		"--port", fmt.Sprintf("%d", port),
+		"--enable-metrics",
 	}
 
 	var err error
