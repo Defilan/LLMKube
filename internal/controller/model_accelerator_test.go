@@ -99,6 +99,12 @@ func modelWithDRA(claims []corev1.PodResourceClaim) *inferencev1alpha1.Model {
 	return m
 }
 
+func modelWithDRAInNamespace(ns string, claims []corev1.PodResourceClaim) *inferencev1alpha1.Model {
+	m := modelWithDRA(claims)
+	m.Namespace = ns
+	return m
+}
+
 func TestCheckAcceleratorAvailability(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
@@ -215,6 +221,16 @@ func TestCheckAcceleratorAvailability_DRA(t *testing.T) {
 			objects: []client.Object{
 				&resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "gpu-claim", Namespace: "default"}},
 				nodeWithCapacity("gpu1", "nvidia.com/gpu", "1"),
+			},
+			want: true,
+		},
+		{
+			name: "DRA ResourceClaim resolved in the model's own namespace, not default",
+			model: modelWithDRAInNamespace("prod", []corev1.PodResourceClaim{
+				{Name: "gpu", ResourceClaimName: ptrTo("gpu-claim")},
+			}),
+			objects: []client.Object{
+				&resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "gpu-claim", Namespace: "prod"}},
 			},
 			want: true,
 		},

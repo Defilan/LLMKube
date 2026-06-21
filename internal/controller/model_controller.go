@@ -772,7 +772,7 @@ func (r *ModelReconciler) checkAcceleratorAvailability(ctx context.Context, mode
 	// so AcceleratorReady reflects reality; fail-open (true) for transient or
 	// RBAC errors.
 	if model.Spec.Hardware.GPU != nil && len(model.Spec.Hardware.GPU.ResourceClaims) > 0 {
-		return r.hasDRAAvailability(ctx, model.Spec.Hardware.GPU.ResourceClaims)
+		return r.hasDRAAvailability(ctx, model.Namespace, model.Spec.Hardware.GPU.ResourceClaims)
 	}
 
 	// Honor the GPU resourceName override so the readiness check validates
@@ -821,11 +821,11 @@ func (r *ModelReconciler) nodeHasResource(ctx context.Context, res corev1.Resour
 // referenced by each claim in the model's GPU spec exists. Returns false if any
 // claim is NotFound; returns true if all claims are found or on transient/RBAC
 // errors (fail-open).
-func (r *ModelReconciler) hasDRAAvailability(ctx context.Context, claims []corev1.PodResourceClaim) bool {
+func (r *ModelReconciler) hasDRAAvailability(ctx context.Context, namespace string, claims []corev1.PodResourceClaim) bool {
 	for _, claim := range claims {
 		if claim.ResourceClaimName != nil {
 			var rc resourcev1.ResourceClaim
-			if err := r.Get(ctx, types.NamespacedName{Name: *claim.ResourceClaimName, Namespace: "default"}, &rc); err != nil {
+			if err := r.Get(ctx, types.NamespacedName{Name: *claim.ResourceClaimName, Namespace: namespace}, &rc); err != nil {
 				if errors.IsNotFound(err) {
 					log.FromContext(ctx).Info("DRA ResourceClaim not found; accelerator not ready",
 						"resourceClaim", *claim.ResourceClaimName)
@@ -839,7 +839,7 @@ func (r *ModelReconciler) hasDRAAvailability(ctx context.Context, claims []corev
 			}
 		} else if claim.ResourceClaimTemplateName != nil {
 			var rct resourcev1.ResourceClaimTemplate
-			if err := r.Get(ctx, types.NamespacedName{Name: *claim.ResourceClaimTemplateName, Namespace: "default"}, &rct); err != nil {
+			if err := r.Get(ctx, types.NamespacedName{Name: *claim.ResourceClaimTemplateName, Namespace: namespace}, &rct); err != nil {
 				if errors.IsNotFound(err) {
 					log.FromContext(ctx).Info("DRA ResourceClaimTemplate not found; accelerator not ready",
 						"resourceClaimTemplate", *claim.ResourceClaimTemplateName)
