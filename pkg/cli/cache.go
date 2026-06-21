@@ -50,6 +50,7 @@ type CacheEntry struct {
 	ModelNames       []string // Models using this cache entry
 	Status           string   // "active" or "orphaned"
 	InferenceService string   // owning InferenceService; empty for shared cache
+	Accelerator      string   // accelerator type (rocm, cuda, metal, cpu, etc.)
 }
 
 // NewCacheCommand creates the cache command
@@ -194,6 +195,40 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		return fmt.Errorf("failed to list models: %w", err)
 	}
 
+	cacheEntries := buildCacheEntries(modelList, allNamespaces)
+
+	// Inspect actual PVC contents (only for single-namespace mode)
+	var pvcInspected bool
+	if !allNamespaces {
+		pvcEntries, err := inspectPVCCache(ctx, cfg, k8sClient, namespace)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
+		} else if pvcEntries != nil {
+			pvcInspected = true
+			mergePVCEntries(cacheEntries, pvcEntries)
+		}
+	}
+
+	if orphanedOnly {
+		filterOrphaned(cacheEntries)
+	}
+
+	if len(cacheEntries) == 0 {
+		if orphanedOnly {
+			fmt.Println("No orphaned cache entries found.")
+		} else {
+			fmt.Println("No cache entries found.")
+		}
+		return nil
+	}
+
+	printCacheEntries(cacheEntries, pvcInspected, len(modelList.Items))
+
+	return nil
+}
+
+// buildCacheEntries builds a map of cache entries from the model list.
+func buildCacheEntries(modelList *inferencev1alpha1.ModelList, allNamespaces bool) map[string]*CacheEntry {
 	cacheEntries := make(map[string]*CacheEntry)
 	for _, model := range modelList.Items {
 		cacheKey := model.Status.CacheKey
@@ -221,59 +256,57 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		if model.Status.Size != "" {
 			entry.SizeHuman = model.Status.Size
 		}
-	}
 
-	// Inspect actual PVC contents (only for single-namespace mode)
-	var pvcInspected bool
-	if !allNamespaces {
-		pvcEntries, err := inspectPVCCache(ctx, cfg, k8sClient, namespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
-		} else if pvcEntries != nil {
-			pvcInspected = true
-			for _, pe := range pvcEntries {
-				if entry, exists := cacheEntries[pe.CacheKey]; exists {
-					entry.Size = pe.SizeBytes
-					entry.SizeHuman = formatBytes(pe.SizeBytes)
-					entry.InferenceService = pe.InferenceService
-				} else {
-					cacheEntries[pe.CacheKey] = &CacheEntry{
-						CacheKey:         pe.CacheKey,
-						Size:             pe.SizeBytes,
-						SizeHuman:        formatBytes(pe.SizeBytes),
-						Status:           statusOrphaned,
-						InferenceService: pe.InferenceService,
-					}
-				}
-			}
+		// Populate accelerator from the Model's hardware spec.
+		// When multiple models share a cache key, the first non-empty
+		// accelerator wins (models sharing a cache key typically use
+		// the same accelerator).
+		if entry.Accelerator == "" && model.Spec.Hardware != nil {
+			entry.Accelerator = model.Spec.Hardware.Accelerator
 		}
 	}
+	return cacheEntries
+}
 
-	if orphanedOnly {
-		for key, entry := range cacheEntries {
-			if entry.Status != statusOrphaned {
-				delete(cacheEntries, key)
-			}
-		}
-	}
-
-	if len(cacheEntries) == 0 {
-		if orphanedOnly {
-			fmt.Println("No orphaned cache entries found.")
+// mergePVCEntries merges PVC inspection results into the cache entries map,
+// adding size, InferenceService, and orphaned entries.
+func mergePVCEntries(cacheEntries map[string]*CacheEntry, pvcEntries []PVCCacheEntry) {
+	for _, pe := range pvcEntries {
+		if entry, exists := cacheEntries[pe.CacheKey]; exists {
+			entry.Size = pe.SizeBytes
+			entry.SizeHuman = formatBytes(pe.SizeBytes)
+			entry.InferenceService = pe.InferenceService
 		} else {
-			fmt.Println("No cache entries found.")
+			cacheEntries[pe.CacheKey] = &CacheEntry{
+				CacheKey:         pe.CacheKey,
+				Size:             pe.SizeBytes,
+				SizeHuman:        formatBytes(pe.SizeBytes),
+				Status:           statusOrphaned,
+				InferenceService: pe.InferenceService,
+			}
 		}
-		return nil
 	}
+}
 
+// filterOrphaned removes non-orphaned entries from the map.
+func filterOrphaned(cacheEntries map[string]*CacheEntry) {
+	for key, entry := range cacheEntries {
+		if entry.Status != statusOrphaned {
+			delete(cacheEntries, key)
+		}
+	}
+}
+
+// printCacheEntries formats and prints the cache entries table.
+func printCacheEntries(cacheEntries map[string]*CacheEntry, pvcInspected bool, modelCount int) {
 	fmt.Printf("\nModel Cache Entries\n")
 	fmt.Printf("═══════════════════════════════════════════════════════════════════════════════\n")
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	if pvcInspected {
-		_, _ = fmt.Fprintln(w, "CACHE KEY\tSTATUS\tSIZE\tISVC\tMODELS\tSOURCE")
+		_, _ = fmt.Fprintln(w, "CACHE KEY\tSTATUS\tSIZE\tISVC\tACCEL\tMODELS\tSOURCE")
 	} else {
-		_, _ = fmt.Fprintln(w, "CACHE KEY\tSIZE\tMODELS\tSOURCE")
+		_, _ = fmt.Fprintln(w, "CACHE KEY\tSIZE\tACCEL\tMODELS\tSOURCE")
 	}
 
 	var activeCount, orphanedCount int
@@ -299,6 +332,11 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 			isvc = "shared"
 		}
 
+		accel := entry.Accelerator
+		if accel == "" {
+			accel = "-"
+		}
+
 		if entry.Status == statusOrphaned {
 			orphanedCount++
 		} else {
@@ -307,9 +345,10 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		totalBytes += entry.Size
 
 		if pvcInspected {
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.CacheKey, entry.Status, size, isvc, models, source)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				entry.CacheKey, entry.Status, size, isvc, accel, models, source)
 		} else {
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", entry.CacheKey, size, models, source)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.CacheKey, size, accel, models, source)
 		}
 	}
 	_ = w.Flush()
@@ -318,10 +357,8 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		fmt.Printf("\nTotal: %d cache entries (%d active, %d orphaned), %s used\n",
 			len(cacheEntries), activeCount, orphanedCount, formatBytes(totalBytes))
 	} else {
-		fmt.Printf("\nTotal: %d cache entries, %d models\n", len(cacheEntries), len(modelList.Items))
+		fmt.Printf("\nTotal: %d cache entries, %d models\n", len(cacheEntries), modelCount)
 	}
-
-	return nil
 }
 
 func runCacheClear(modelName, namespace string, force bool) error {

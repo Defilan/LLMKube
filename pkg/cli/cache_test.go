@@ -158,3 +158,28 @@ func TestNewCachePreloadCommand(t *testing.T) {
 		t.Error("Missing --namespace flag")
 	}
 }
+
+func TestCacheEntryAcceleratorField(t *testing.T) {
+	// Verify the CacheEntry struct has the Accelerator field.
+	entry := &CacheEntry{
+		CacheKey:    "abc123",
+		Source:      "https://example.com/model.gguf",
+		Accelerator: "rocm",
+	}
+
+	if entry.Accelerator != "rocm" {
+		t.Errorf("Accelerator = %q, want %q", entry.Accelerator, "rocm")
+	}
+}
+
+func TestCacheEntryAcceleratorEmpty(t *testing.T) {
+	// Verify the Accelerator field defaults to empty string.
+	entry := &CacheEntry{
+		CacheKey: "abc123",
+		Source:   "https://example.com/model.gguf",
+	}
+
+	if entry.Accelerator != "" {
+		t.Errorf("Accelerator = %q, want empty", entry.Accelerator)
+	}
+}
