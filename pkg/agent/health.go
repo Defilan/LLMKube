@@ -156,6 +156,9 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 			m.agent.mu.Unlock()
 
 			processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(0)
+			// Immediately withdraw the endpoint so kube-proxy stops DNATing
+			// to the dead backend (#662).
+			m.agent.withdrawEndpoint(ctx, snap.Name, snap.Namespace)
 			m.agent.scheduleRestart(ctx, snap.Name, snap.Namespace)
 		} else if !snap.Healthy && healthy {
 			// unhealthy → healthy transition
@@ -169,6 +172,9 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 			m.agent.mu.Unlock()
 
 			processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(1)
+			// Immediately re-register the endpoint so kube-proxy resumes
+			// routing to the recovered backend (#662).
+			m.agent.registerEndpoint(ctx, snap.Name, snap.Namespace)
 		}
 	}
 }
