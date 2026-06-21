@@ -18,6 +18,9 @@ package cli
 
 import (
 	"testing"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestComputeCacheKey(t *testing.T) {
@@ -156,5 +159,169 @@ func TestNewCachePreloadCommand(t *testing.T) {
 
 	if f := cmd.Flags().Lookup("namespace"); f == nil {
 		t.Error("Missing --namespace flag")
+	}
+}
+
+func TestCacheEntryHasInferenceServiceNames(t *testing.T) {
+	entry := &CacheEntry{
+		CacheKey:              "abc123",
+		ModelNames:            []string{"model-a"},
+		InferenceServiceNames: []string{"isvc-a", "isvc-b"},
+		Status:                statusActive,
+	}
+
+	if len(entry.InferenceServiceNames) != 2 {
+		t.Errorf("InferenceServiceNames length = %d, want 2", len(entry.InferenceServiceNames))
+	}
+	if entry.InferenceServiceNames[0] != "isvc-a" {
+		t.Errorf("InferenceServiceNames[0] = %q, want %q", entry.InferenceServiceNames[0], "isvc-a")
+	}
+	if entry.InferenceServiceNames[1] != "isvc-b" {
+		t.Errorf("InferenceServiceNames[1] = %q, want %q", entry.InferenceServiceNames[1], "isvc-b")
+	}
+}
+
+func TestCacheEntryInferenceServiceNamesEmpty(t *testing.T) {
+	entry := &CacheEntry{
+		CacheKey:              "def456",
+		ModelNames:            []string{"model-b"},
+		InferenceServiceNames: []string{},
+		Status:                statusActive,
+	}
+
+	if len(entry.InferenceServiceNames) != 0 {
+		t.Errorf("InferenceServiceNames length = %d, want 0", len(entry.InferenceServiceNames))
+	}
+}
+
+func TestCacheEntryOrphanedWithInferenceService(t *testing.T) {
+	// An orphaned cache entry can still have InferenceService references
+	// when the Model was deleted but the InferenceService still references it.
+	entry := &CacheEntry{
+		CacheKey:              "ghi789",
+		ModelNames:            []string{},
+		InferenceServiceNames: []string{"isvc-c"},
+		Status:                statusOrphaned,
+	}
+
+	if entry.Status != statusOrphaned {
+		t.Errorf("Status = %q, want %q", entry.Status, statusOrphaned)
+	}
+	if len(entry.ModelNames) != 0 {
+		t.Errorf("ModelNames length = %d, want 0", len(entry.ModelNames))
+	}
+	if len(entry.InferenceServiceNames) != 1 {
+		t.Errorf("InferenceServiceNames length = %d, want 1", len(entry.InferenceServiceNames))
+	}
+}
+
+func TestCacheListInferenceServiceMapping(t *testing.T) {
+	// Verify that the modelCacheKey mapping logic correctly resolves
+	// InferenceService modelRef to cache keys.
+	models := []inferencev1alpha1.Model{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "model-a"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model-a.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "key-a"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "model-b"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model-b.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "key-b"},
+		},
+	}
+
+	isvcs := []inferencev1alpha1.InferenceService{
+		{Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: "model-a"}},
+		{Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: "model-b"}},
+		{Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: "model-a"}}, // second isvc using model-a
+		{Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: "model-c"}}, // references non-existent model
+	}
+
+	// Build model name → cache key map (same logic as runCacheList)
+	modelCacheKey := make(map[string]string, len(models))
+	for _, model := range models {
+		cacheKey := model.Status.CacheKey
+		if cacheKey == "" {
+			cacheKey = computeCacheKey(model.Spec.Source)
+		}
+		modelCacheKey[model.Name] = cacheKey
+	}
+
+	// Map InferenceServices to cache entries
+	cacheEntries := make(map[string]*CacheEntry)
+	for _, isvc := range isvcs {
+		cacheKey, ok := modelCacheKey[isvc.Spec.ModelRef]
+		if !ok {
+			continue // skip dangling references
+		}
+
+		entry, exists := cacheEntries[cacheKey]
+		if !exists {
+			entry = &CacheEntry{
+				CacheKey:              cacheKey,
+				ModelNames:            []string{},
+				InferenceServiceNames: []string{},
+				Status:                statusActive,
+			}
+			cacheEntries[cacheKey] = entry
+		}
+		entry.InferenceServiceNames = append(entry.InferenceServiceNames, isvc.Name)
+	}
+
+	// key-a should have 2 InferenceServices
+	entryA, ok := cacheEntries["key-a"]
+	if !ok {
+		t.Fatal("cache entry for key-a not found")
+	}
+	if len(entryA.InferenceServiceNames) != 2 {
+		t.Errorf("key-a InferenceServiceNames length = %d, want 2", len(entryA.InferenceServiceNames))
+	}
+
+	// key-b should have 1 InferenceService
+	entryB, ok := cacheEntries["key-b"]
+	if !ok {
+		t.Fatal("cache entry for key-b not found")
+	}
+	if len(entryB.InferenceServiceNames) != 1 {
+		t.Errorf("key-b InferenceServiceNames length = %d, want 1", len(entryB.InferenceServiceNames))
+	}
+
+	// model-c should not create a cache entry (model not found)
+	if _, ok := cacheEntries["key-c"]; ok {
+		t.Error("cache entry for key-c should not exist (model not found)")
+	}
+}
+
+func TestCacheListInferenceServiceMappingWithComputedCacheKey(t *testing.T) {
+	// When a Model has no Status.CacheKey, the cache key is computed from
+	// the source URL. The InferenceService mapping must use the same computed
+	// key to find the right cache entry.
+	model := inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-model"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: ""}, // no cache key set
+	}
+
+	isvc := inferencev1alpha1.InferenceService{
+		Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: model.Name},
+	}
+
+	// Build model name → cache key map
+	modelCacheKey := make(map[string]string)
+	cacheKey := model.Status.CacheKey
+	if cacheKey == "" {
+		cacheKey = computeCacheKey(model.Spec.Source)
+	}
+	modelCacheKey[model.Name] = cacheKey
+
+	// Map InferenceService to cache entry
+	cacheKeyFromIsvc, ok := modelCacheKey[isvc.Spec.ModelRef]
+	if !ok {
+		t.Fatal("could not resolve InferenceService modelRef to cache key")
+	}
+
+	if cacheKeyFromIsvc != cacheKey {
+		t.Errorf("cache key mismatch: %q != %q", cacheKeyFromIsvc, cacheKey)
 	}
 }
