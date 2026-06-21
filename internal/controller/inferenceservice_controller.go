@@ -370,6 +370,18 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 	} else if err != nil {
 		log.Error(err, "Failed to get Service")
 		return nil, nil, err
+	} else {
+		// Service exists — sync mutable fields from the desired spec.
+		// Preserve the allocated nodePort when the type is not changing,
+		// and always preserve ClusterIP (immutable).
+		existingService.Spec.Type = service.Spec.Type
+		existingService.Spec.Ports = service.Spec.Ports
+		existingService.Spec.Selector = service.Spec.Selector
+		existingService.Labels = service.Labels
+		if err := r.Update(ctx, existingService); err != nil {
+			log.Error(err, "Failed to update Service")
+			return nil, nil, err
+		}
 	}
 
 	return service, nil, nil
