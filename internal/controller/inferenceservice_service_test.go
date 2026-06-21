@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var _ = Describe("sanitizeDNSName", func() {
@@ -320,5 +321,179 @@ var _ = Describe("constructEndpoint with Metal minimal Service", func() {
 		}
 		endpoint := reconciler.constructEndpoint(isvc, minimalSvc)
 		Expect(endpoint).To(Equal("http://model-v2-1.ml.svc.cluster.local:8080/v1/chat/completions"))
+	})
+})
+
+var _ = Describe("reconcileService update path", func() {
+	var reconciler *InferenceServiceReconciler
+
+	BeforeEach(func() {
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+	})
+
+	It("should update Service type from ClusterIP to NodePort when endpoint.type changes", func() {
+		ctx := context.Background()
+
+		// Create a ready Model
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc-update-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://huggingface.co/test/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware:     &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				Resources:    &inferencev1alpha1.ResourceRequirements{CPU: "1", Memory: "1Gi"},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+
+		// Create InferenceService with ClusterIP (default)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc-update-test", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "svc-update-model",
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+		// Reconcile to create the Service
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "svc-update-test", Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify Service was created with ClusterIP
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-test", Namespace: "default"}, svc)).To(Succeed())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+
+		// Patch InferenceService to NodePort
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-test", Namespace: "default"}, isvc)).To(Succeed())
+		isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Type: "NodePort"}
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		// Reconcile again
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "svc-update-test", Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify Service type changed to NodePort
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-test", Namespace: "default"}, svc)).To(Succeed())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
+	})
+
+	It("should update Service type from ClusterIP to LoadBalancer when endpoint.type changes", func() {
+		ctx := context.Background()
+
+		// Create a ready Model
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc-update-lb-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://huggingface.co/test/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware:     &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				Resources:    &inferencev1alpha1.ResourceRequirements{CPU: "1", Memory: "1Gi"},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+
+		// Create InferenceService with ClusterIP (default)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc-update-lb-test", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "svc-update-lb-model",
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+		// Reconcile to create the Service
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "svc-update-lb-test", Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify Service was created with ClusterIP
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-lb-test", Namespace: "default"}, svc)).To(Succeed())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+
+		// Patch InferenceService to LoadBalancer
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-lb-test", Namespace: "default"}, isvc)).To(Succeed())
+		isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Type: "LoadBalancer"}
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		// Reconcile again
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "svc-update-lb-test", Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify Service type changed to LoadBalancer
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-lb-test", Namespace: "default"}, svc)).To(Succeed())
+		Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+	})
+
+	It("should update Service port when endpoint.port changes", func() {
+		ctx := context.Background()
+
+		// Create a ready Model
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc-update-port-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://huggingface.co/test/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware:     &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				Resources:    &inferencev1alpha1.ResourceRequirements{CPU: "1", Memory: "1Gi"},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+
+		// Create InferenceService with default port 8080
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc-update-port-test", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "svc-update-port-model",
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+		// Reconcile to create the Service
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "svc-update-port-test", Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify Service was created with port 8080
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-port-test", Namespace: "default"}, svc)).To(Succeed())
+		Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
+
+		// Patch InferenceService to use port 9090
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-port-test", Namespace: "default"}, isvc)).To(Succeed())
+		isvc.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: 9090}
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		// Reconcile again
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: "svc-update-port-test", Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify Service port changed to 9090
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "svc-update-port-test", Namespace: "default"}, svc)).To(Succeed())
+		Expect(svc.Spec.Ports[0].Port).To(Equal(int32(9090)))
 	})
 })
