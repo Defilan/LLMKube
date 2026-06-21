@@ -25,7 +25,14 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
 // mockHealthChecker is a test double for ProcessHealthChecker.
@@ -225,6 +232,132 @@ func TestHealthMonitor_RecordsRestartCount(t *testing.T) {
 	agent.mu.RUnlock()
 	if healthy {
 		t.Error("process should be unhealthy after failed check")
+	}
+}
+
+// TestHealthMonitor_WithdrawsOnUnhealthy verifies that the health monitor
+// immediately withdraws the endpoint (Ready=false) when it detects a
+// healthy→unhealthy transition, rather than waiting for the next heartbeat
+// tick (#662).
+func TestHealthMonitor_WithdrawsOnUnhealthy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "withdraw-model", Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "withdraw-model"},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(isvc).
+		Build()
+
+	agent := &MetalAgent{
+		config: MetalAgentConfig{
+			K8sClient: k8sClient,
+			Namespace: "default",
+		},
+		processes: map[string]*ManagedProcess{
+			"default/withdraw-model": {
+				Name:      "withdraw-model",
+				Namespace: "default",
+				Port:      8080,
+				Healthy:   true,
+			},
+		},
+		starting: make(map[string]bool),
+		logger:   newNopLogger(),
+	}
+	agent.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger(), "")
+
+	// First register the endpoint so it starts Ready=true.
+	if err := agent.registry.RegisterEndpoint(context.Background(), isvc, 8080); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+
+	checker := &mockHealthChecker{result: false}
+	monitor := NewHealthMonitor(agent, checker, time.Second, newNopLogger())
+
+	monitor.checkAll(context.Background())
+
+	// The endpoint should now be withdrawn (Ready=false).
+	slice := &discoveryv1.EndpointSlice{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "withdraw-model", Namespace: "default"}, slice); err != nil {
+		t.Fatalf("get endpointslice after health monitor: %v", err)
+	}
+	if len(slice.Endpoints) != 1 {
+		t.Fatalf("EndpointSlice has %d endpoints, want 1", len(slice.Endpoints))
+	}
+	if slice.Endpoints[0].Conditions.Ready == nil || *slice.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint Conditions.Ready = %v, want false after health monitor withdrawal",
+			slice.Endpoints[0].Conditions.Ready)
+	}
+}
+
+// TestHealthMonitor_RegistersOnRecovery verifies that the health monitor
+// immediately re-registers the endpoint (Ready=true) when it detects an
+// unhealthy→healthy transition, rather than waiting for the next heartbeat
+// tick (#662).
+func TestHealthMonitor_RegistersOnRecovery(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "recover-model", Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "recover-model"},
+	}
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithRuntimeObjects(isvc).
+		Build()
+
+	agent := &MetalAgent{
+		config: MetalAgentConfig{
+			K8sClient: k8sClient,
+			Namespace: "default",
+		},
+		processes: map[string]*ManagedProcess{
+			"default/recover-model": {
+				Name:      "recover-model",
+				Namespace: "default",
+				Port:      8080,
+				Healthy:   false,
+			},
+		},
+		starting: make(map[string]bool),
+		logger:   newNopLogger(),
+	}
+	agent.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger(), "")
+
+	// First withdraw the endpoint so it starts Ready=false.
+	if err := agent.registry.WithdrawEndpoint(context.Background(), isvc, 8080); err != nil {
+		t.Fatalf("WithdrawEndpoint: %v", err)
+	}
+
+	checker := &mockHealthChecker{result: true}
+	monitor := NewHealthMonitor(agent, checker, time.Second, newNopLogger())
+
+	monitor.checkAll(context.Background())
+
+	// The endpoint should now be registered (Ready=true).
+	slice := &discoveryv1.EndpointSlice{}
+	if err := k8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "recover-model", Namespace: "default"}, slice); err != nil {
+		t.Fatalf("get endpointslice after health monitor: %v", err)
+	}
+	if len(slice.Endpoints) != 1 {
+		t.Fatalf("EndpointSlice has %d endpoints, want 1", len(slice.Endpoints))
+	}
+	if slice.Endpoints[0].Conditions.Ready == nil || !*slice.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint Conditions.Ready = %v, want true after health monitor recovery",
+			slice.Endpoints[0].Conditions.Ready)
 	}
 }
 

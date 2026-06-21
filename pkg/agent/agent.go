@@ -1151,6 +1151,60 @@ func (a *MetalAgent) scheduleRestart(ctx context.Context, name, namespace string
 	}
 }
 
+// withdrawEndpoint fetches the InferenceService for the given name/namespace
+// and calls registry.WithdrawEndpoint to flip the endpoint's Ready condition
+// to false. This is the event-driven path (#662): the health monitor calls
+// this immediately when it detects a healthy→unhealthy transition, rather
+// than waiting for the next heartbeat tick.
+func (a *MetalAgent) withdrawEndpoint(ctx context.Context, name, namespace string) {
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
+		Namespace: namespace,
+		Name:      name,
+	}, isvc); err != nil {
+		a.logger.Warnw("failed to fetch InferenceService for withdrawal",
+			"name", name, "namespace", namespace, "error", err)
+		return
+	}
+
+	// Read the port from the managed process snapshot.
+	a.mu.RLock()
+	port := a.processes[types.NamespacedName{Namespace: namespace, Name: name}.String()].Port
+	a.mu.RUnlock()
+
+	if err := a.registry.WithdrawEndpoint(ctx, isvc, port); err != nil {
+		a.logger.Warnw("failed to withdraw endpoint",
+			"name", name, "namespace", namespace, "error", err)
+	}
+}
+
+// registerEndpoint fetches the InferenceService for the given name/namespace
+// and calls registry.RegisterEndpoint to flip the endpoint's Ready condition
+// back to true. This is the event-driven recovery path (#662): the health
+// monitor calls this immediately when it detects an unhealthy→healthy
+// transition, rather than waiting for the next heartbeat tick.
+func (a *MetalAgent) registerEndpoint(ctx context.Context, name, namespace string) {
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
+		Namespace: namespace,
+		Name:      name,
+	}, isvc); err != nil {
+		a.logger.Warnw("failed to fetch InferenceService for registration",
+			"name", name, "namespace", namespace, "error", err)
+		return
+	}
+
+	// Read the port from the managed process snapshot.
+	a.mu.RLock()
+	port := a.processes[types.NamespacedName{Namespace: namespace, Name: name}.String()].Port
+	a.mu.RUnlock()
+
+	if err := a.registry.RegisterEndpoint(ctx, isvc, port); err != nil {
+		a.logger.Warnw("failed to register endpoint",
+			"name", name, "namespace", namespace, "error", err)
+	}
+}
+
 // heartbeatOnce re-registers the endpoint for every currently-running managed
 // process. It snapshots the running process set under RLock, releases the lock,
 // then performs one best-effort re-registration per process (no lock held during
