@@ -3522,8 +3522,11 @@ var _ = Describe("RuntimeBackend interface", func() {
 			Expect(args).NotTo(ContainElement("--model"))
 			Expect(args).To(ContainElements("--host", "0.0.0.0"))
 			Expect(args).To(ContainElements("--port", "8000"))
-			// Five elements: <model> --host 0.0.0.0 --port 8000.
-			Expect(args).To(HaveLen(5))
+			// --enable-metrics is always set so vLLM pods expose /metrics for
+			// PodMonitor scraping (#409).
+			Expect(args).To(ContainElement("--enable-metrics"))
+			// Six elements: <model> --host 0.0.0.0 --port 8000 --enable-metrics.
+			Expect(args).To(HaveLen(6))
 		})
 
 		It("should append extraArgs after typed flags", func() {
