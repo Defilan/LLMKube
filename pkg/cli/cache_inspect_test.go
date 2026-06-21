@@ -18,6 +18,7 @@ package cli
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -733,8 +734,8 @@ func TestCreateInspectorPod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if podName != "llmkube-cache-inspector" {
-		t.Errorf("pod name = %q, want %q", podName, "llmkube-cache-inspector")
+	if want := inspectorPodName(modelCachePVCName); podName != want {
+		t.Errorf("pod name = %q, want %q", podName, want)
 	}
 
 	pod, err := clientset.CoreV1().Pods("test-ns").Get(ctx, podName, metav1.GetOptions{})
@@ -794,7 +795,7 @@ func TestCreateInspectorPod(t *testing.T) {
 func TestCreateInspectorPod_AlreadyExists(t *testing.T) {
 	existingPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "llmkube-cache-inspector",
+			Name:      inspectorPodName(modelCachePVCName),
 			Namespace: "default",
 		},
 	}
@@ -1268,15 +1269,17 @@ func TestDiscoverCachePVCs_SharedNotDuplicated(t *testing.T) {
 	}
 }
 
-// TestDiscoverCachePVCs_SkipsPendingPVC verifies a Pending (unbound) cache
-// PVC is excluded from discovery: it has no volume to inspect and would send
-// the inspector into a pod-create + wait that blocks until timeout (the #731
-// regression that hung `cache list` in the e2e). A Bound PVC alongside it is
-// still discovered.
-func TestDiscoverCachePVCs_SkipsPendingPVC(t *testing.T) {
+// TestDiscoverCachePVCs_IncludesPendingPVC verifies a Pending (unbound) cache
+// PVC IS discovered. Under a WaitForFirstConsumer storage class (kind
+// local-path, microk8s hostpath, most topology-aware CSI) the cache PVC stays
+// Pending until its first consumer is scheduled; the transient inspector pod is
+// that first consumer. Skipping Pending here would drop the STATUS column from
+// `cache list` entirely (#767 regression). A Bound PVC alongside it is also
+// discovered.
+func TestDiscoverCachePVCs_IncludesPendingPVC(t *testing.T) {
 	pendingPerIsvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "stuck-isvc-model-cache",
+			Name:      "pending-isvc-model-cache",
 			Namespace: "default",
 			Labels:    map[string]string{modelCacheLabel: modelCacheLabelValue},
 		},
@@ -1300,19 +1303,34 @@ func TestDiscoverCachePVCs_SkipsPendingPVC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	got := map[string]bool{}
 	for _, info := range infos {
-		if info.Name == "stuck-isvc-model-cache" {
-			t.Errorf("pending PVC %q must be skipped, but it was discovered", info.Name)
-		}
+		got[info.Name] = true
 	}
-	boundFound := false
-	for _, info := range infos {
-		if info.Name == "ready-isvc-model-cache" {
-			boundFound = true
-		}
+	if !got["pending-isvc-model-cache"] {
+		t.Error("pending PVC must be discovered (the inspector pod binds it as first consumer), but it was not")
 	}
-	if !boundFound {
+	if !got["ready-isvc-model-cache"] {
 		t.Error("bound PVC was not discovered")
+	}
+}
+
+// TestInspectorPodName_UniquePerPVC verifies each PVC yields a distinct,
+// non-colliding inspector pod name so that inspecting multiple PVCs in one
+// `cache list` run does not collide on a single shared pod name (#767).
+func TestInspectorPodName_UniquePerPVC(t *testing.T) {
+	a := inspectorPodName("llmkube-model-cache")
+	b := inspectorPodName("isvc-a-model-cache")
+	if a == b {
+		t.Fatalf("inspector pod names collided: both %q", a)
+	}
+	for _, name := range []string{a, b} {
+		if !strings.HasPrefix(name, "llmkube-cache-inspector-") {
+			t.Errorf("inspector pod name %q missing expected prefix", name)
+		}
+		if len(name) > 63 {
+			t.Errorf("inspector pod name %q exceeds DNS-1123 63-char limit", name)
+		}
 	}
 }
 
@@ -1581,8 +1599,8 @@ func TestCreateInspectorPodForPVC_SpecificPVCName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if podName != "llmkube-cache-inspector" {
-		t.Errorf("pod name = %q, want %q", podName, "llmkube-cache-inspector")
+	if want := inspectorPodName(pvcName); podName != want {
+		t.Errorf("pod name = %q, want %q", podName, want)
 	}
 
 	pod, err := clientset.CoreV1().Pods("test-ns").Get(ctx, podName, metav1.GetOptions{})

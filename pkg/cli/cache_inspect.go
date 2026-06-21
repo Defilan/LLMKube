@@ -72,14 +72,16 @@ func discoverCachePVCs(ctx context.Context, k8sClient client.Client, namespace s
 	seen := map[string]bool{}
 	for i := range pvcList.Items {
 		pvc := &pvcList.Items[i]
-		// A Pending (unbound) PVC has no volume to read and would send the
-		// inspector down a pod-create + wait path that blocks until timeout;
-		// skip it. Its owning Model still surfaces via the Model-list
-		// cross-reference in runCacheList. (Bound PVCs are inspected; any other
-		// non-readable state is handled by the per-PVC skip in inspectPVCCache.)
-		if pvc.Status.Phase == corev1.ClaimPending {
-			continue
-		}
+		// Pending PVCs are NOT skipped. The cluster default storage class is
+		// commonly WaitForFirstConsumer (kind local-path, microk8s hostpath,
+		// most topology-aware CSI), under which the cache PVC stays Pending
+		// until its first consumer is scheduled. The transient inspector pod
+		// inspectSinglePVC creates IS that first consumer: creating it binds
+		// the volume on the inspector's node, then it is read. Skipping Pending
+		// here would mean such a PVC is never inspected, so pvcInspected stays
+		// false and `cache list` drops the STATUS column entirely (#767). A
+		// genuinely unschedulable PVC is bounded by the inspector pod's start
+		// timeout and handled by the per-PVC skip in inspectPVCCache.
 		isvcName := ""
 		for _, ref := range pvc.OwnerReferences {
 			if ref.Kind == "InferenceService" && ref.Controller != nil && *ref.Controller {
@@ -105,9 +107,10 @@ func discoverCachePVCs(ctx context.Context, k8sClient client.Client, namespace s
 		err := k8sClient.Get(ctx, client.ObjectKey{Name: modelCachePVCName, Namespace: namespace}, shared)
 		switch {
 		case err == nil:
-			if shared.Status.Phase != corev1.ClaimPending {
-				infos = append(infos, PVCInfo{Name: modelCachePVCName, InferenceService: ""})
-			}
+			// Included regardless of phase; a Pending WaitForFirstConsumer
+			// shared cache binds when the inspector pod mounts it (see the
+			// loop comment above).
+			infos = append(infos, PVCInfo{Name: modelCachePVCName, InferenceService: ""})
 		case !apierrors.IsNotFound(err):
 			return nil, fmt.Errorf("failed to get shared cache PVC: %w", err)
 		}
@@ -132,7 +135,12 @@ func inspectPVCCache(
 		return nil, fmt.Errorf("failed to create clientset: %w", err)
 	}
 
-	var allEntries []PVCCacheEntry
+	// Non-nil even when no per-PVC entries are found: a successful inspection
+	// of an empty (e.g. not-yet-downloaded) cache must still tell runCacheList
+	// "PVC inspection ran" so it renders the STATUS column. Returning nil here
+	// would suppress STATUS and regress the listing to the pre-inspection
+	// format (#767).
+	allEntries := []PVCCacheEntry{}
 	for _, pvcInfo := range pvcInfos {
 		entries, err := inspectSinglePVC(ctx, cfg, k8sClient, clientset, namespace, pvcInfo)
 		if err != nil {
@@ -254,10 +262,20 @@ func findMountPathForPVC(pod *corev1.Pod, containerName, pvcName string) string 
 	return defaultModelMountPath
 }
 
+// inspectorPodName returns a per-PVC inspector pod name. Each cache list run
+// may inspect several PVCs in sequence; a single shared pod name would collide
+// (AlreadyExists) with the previous inspector while it is still terminating,
+// causing every PVC after the first to be skipped. Deriving the name from the
+// PVC keeps it unique per PVC and DNS-1123 safe (computeCacheKey is a 16-char
+// hex digest).
+func inspectorPodName(pvcName string) string {
+	return "llmkube-cache-inspector-" + computeCacheKey(pvcName)
+}
+
 func createInspectorPodForPVC(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
 ) (string, error) {
-	podName := "llmkube-cache-inspector"
+	podName := inspectorPodName(pvcName)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName,
