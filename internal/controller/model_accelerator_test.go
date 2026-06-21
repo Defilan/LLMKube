@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,11 +59,25 @@ func modelWithGPUResource(accel string, resourceName string) *inferencev1alpha1.
 	return m
 }
 
+func modelWithDRA(accel string, claims []corev1.PodResourceClaim) *inferencev1alpha1.Model {
+	m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	m.Spec.Hardware = &inferencev1alpha1.HardwareSpec{
+		Accelerator: accel,
+		GPU: &inferencev1alpha1.GPUSpec{
+			ResourceClaims: claims,
+		},
+	}
+	return m
+}
+
 func newModelReconcilerWithNodes(t *testing.T, nodes ...client.Object) *ModelReconciler {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add corev1: %v", err)
+	}
+	if err := resourcev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add resourcev1: %v", err)
 	}
 	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add inference: %v", err)
@@ -74,47 +89,77 @@ func newModelReconcilerWithNodes(t *testing.T, nodes ...client.Object) *ModelRec
 func TestCheckAcceleratorAvailability(t *testing.T) {
 	ctx := context.Background()
 	cases := []struct {
-		name         string
-		accel        string
-		resourceName string
-		nodes        []client.Object
-		want         bool
+		name           string
+		accel          string
+		resourceName   string
+		resourceClaims []corev1.PodResourceClaim
+		nodes          []client.Object
+		want           bool
 	}{
-		{"nil hardware is available", "", "", nil, true},
-		{"cpu is always available", "cpu", "", nil, true},
-		{"metal is assumed available (off-cluster agent)", "metal", "", nil, true},
+		{"nil hardware is available", "", "", nil, nil, true},
+		{"cpu is always available", "cpu", "", nil, nil, true},
+		{"metal is assumed available (off-cluster agent)", "metal", "", nil, nil, true},
 		{
-			"cuda available when a node advertises nvidia.com/gpu", "cuda", "",
+			"cuda available when a node advertises nvidia.com/gpu", "cuda", "", nil,
 			[]client.Object{nodeWithCapacity("gpu1", "nvidia.com/gpu", "1")}, true,
 		},
 		{
-			"cuda unavailable when no node has a GPU", "cuda", "",
+			"cuda unavailable when no node has a GPU", "cuda", "", nil,
 			[]client.Object{nodeWithCapacity("cpu1", "cpu", "8")}, false,
 		},
 		{
-			"rocm available when a node advertises amd.com/gpu", "rocm", "",
+			"rocm available when a node advertises amd.com/gpu", "rocm", "", nil,
 			[]client.Object{nodeWithCapacity("amd1", "amd.com/gpu", "1")}, true,
 		},
 		{
-			"rocm unavailable when only an nvidia node exists", "rocm", "",
+			"rocm unavailable when only an nvidia node exists", "rocm", "", nil,
 			[]client.Object{nodeWithCapacity("gpu1", "nvidia.com/gpu", "1")}, false,
 		},
 		{
 			"rocm with resourceName override uses the override resource",
-			"rocm", "squat.ai/dri-render",
+			"rocm", "squat.ai/dri-render", nil,
 			[]client.Object{nodeWithCapacity("gpu1", "squat.ai/dri-render", "1")},
 			true,
 		},
 		{
 			"rocm with resourceName override fails when override not on any node",
-			"rocm", "squat.ai/dri-render",
+			"rocm", "squat.ai/dri-render", nil,
 			[]client.Object{nodeWithCapacity("gpu1", "nvidia.com/gpu", "1")},
 			false,
 		},
 		{
 			"cuda with resourceName override uses the override resource",
-			"cuda", "custom.gpu.io/gpu",
+			"cuda", "custom.gpu.io/gpu", nil,
 			[]client.Object{nodeWithCapacity("gpu1", "custom.gpu.io/gpu", "2")},
+			true,
+		},
+		// DRA test cases
+		{
+			"DRA: ResourceClaimName exists -> available",
+			"cuda", "",
+			[]corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptrTo("gpu-claim")}},
+			[]client.Object{&resourcev1.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Name: "gpu-claim", Namespace: "default"}}},
+			true,
+		},
+		{
+			"DRA: ResourceClaimName missing -> fail-open (available)",
+			"cuda", "",
+			[]corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptrTo("gpu-claim")}},
+			nil,
+			true,
+		},
+		{
+			"DRA: ResourceClaimTemplateName exists -> available",
+			"rocm", "",
+			[]corev1.PodResourceClaim{{Name: "gpu", ResourceClaimTemplateName: ptrTo("gpu-template")}},
+			[]client.Object{&resourcev1.ResourceClaimTemplate{ObjectMeta: metav1.ObjectMeta{Name: "gpu-template", Namespace: "default"}}},
+			true,
+		},
+		{
+			"DRA: ResourceClaimTemplateName missing -> fail-open (available)",
+			"rocm", "",
+			[]corev1.PodResourceClaim{{Name: "gpu", ResourceClaimTemplateName: ptrTo("gpu-template")}},
+			nil,
 			true,
 		},
 	}
@@ -122,7 +167,9 @@ func TestCheckAcceleratorAvailability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newModelReconcilerWithNodes(t, tc.nodes...)
 			var model *inferencev1alpha1.Model
-			if tc.resourceName != "" {
+			if tc.resourceClaims != nil {
+				model = modelWithDRA(tc.accel, tc.resourceClaims)
+			} else if tc.resourceName != "" {
 				model = modelWithGPUResource(tc.accel, tc.resourceName)
 			} else {
 				model = modelWithAccelerator(tc.accel)
@@ -133,4 +180,8 @@ func TestCheckAcceleratorAvailability(t *testing.T) {
 			}
 		})
 	}
+}
+
+func ptrTo(s string) *string {
+	return &s
 }

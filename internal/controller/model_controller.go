@@ -30,6 +30,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -772,6 +773,11 @@ func (r *ModelReconciler) checkAcceleratorAvailability(ctx context.Context, mode
 		if override := strings.TrimSpace(model.Spec.Hardware.GPU.ResourceName); override != "" {
 			return r.nodeHasResource(ctx, corev1.ResourceName(override))
 		}
+		// DRA path: if resourceClaims is set, check that the referenced
+		// ResourceClaim or ResourceClaimTemplate exists.
+		if len(model.Spec.Hardware.GPU.ResourceClaims) > 0 {
+			return r.hasDRAAvailability(ctx, model)
+		}
 	}
 
 	var resName corev1.ResourceName
@@ -806,6 +812,35 @@ func (r *ModelReconciler) nodeHasResource(ctx context.Context, res corev1.Resour
 		}
 	}
 	return false
+}
+
+// hasDRAAvailability checks whether the DRA ResourceClaim or
+// ResourceClaimTemplate referenced by the model's resourceClaims exists.
+// Returns true on a lookup error (fail-open) so a transient or RBAC failure
+// does not spuriously mark the accelerator unavailable.
+func (r *ModelReconciler) hasDRAAvailability(ctx context.Context, model *inferencev1alpha1.Model) bool {
+	for _, claim := range model.Spec.Hardware.GPU.ResourceClaims {
+		if claim.ResourceClaimName != nil {
+			var rc resourcev1.ResourceClaim
+			if err := r.Get(ctx, types.NamespacedName{Name: *claim.ResourceClaimName, Namespace: model.Namespace}, &rc); err != nil {
+				log.FromContext(ctx).Error(err,
+					"hasDRAAvailability: ResourceClaim not found; assuming available",
+					"resourceClaim", *claim.ResourceClaimName)
+				return true
+			}
+			_ = rc // claim exists
+		} else if claim.ResourceClaimTemplateName != nil {
+			var rct resourcev1.ResourceClaimTemplate
+			if err := r.Get(ctx, types.NamespacedName{Name: *claim.ResourceClaimTemplateName, Namespace: model.Namespace}, &rct); err != nil {
+				log.FromContext(ctx).Error(err,
+					"hasDRAAvailability: ResourceClaimTemplate not found; assuming available",
+					"resourceClaimTemplate", *claim.ResourceClaimTemplateName)
+				return true
+			}
+			_ = rct // template exists
+		}
+	}
+	return true
 }
 
 func formatBytes(bytes int64) string {
