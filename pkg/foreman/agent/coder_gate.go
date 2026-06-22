@@ -140,6 +140,15 @@ func RunCoderGate(ctx context.Context, workspace, golangciPath string, run comma
 		failures = append(failures, checkFailure{name: "codegen drift", output: out})
 	}
 
+	// 7. Bite check: new/changed tests must fail when run against the
+	// pre-change production code. A test that passes against both the
+	// old and the new code is not testing the change and should fail
+	// the gate (#787). Skipped for test-only PRs (no production changes)
+	// and gracefully when git is unavailable.
+	if nonBiting, out := checkBite(ctx, workspace, run); nonBiting {
+		failures = append(failures, checkFailure{name: "bite check", output: out})
+	}
+
 	if len(failures) == 0 {
 		return true, ""
 	}
@@ -220,6 +229,122 @@ func checkCodegenDrift(ctx context.Context, workspace string, run commandRunner)
 		"Run 'make manifests chart-crds foreman-chart-crds' and commit the changes.\n\n" +
 		"Drifted files:\n"
 	return true, msg + out
+}
+
+// checkBite verifies that new/changed tests actually "bite" — i.e. they
+// fail when run against the pre-change production code. A test that
+// passes against both the old and the new code is not testing the change
+// and should fail the gate (#787).
+//
+// The algorithm:
+//  1. Identify changed test files and changed production (non-test) files.
+//  2. If there are no production changes (test-only PR), skip.
+//  3. Revert only the production files to their baseline state.
+//  4. Run the new/changed tests.
+//  5. If at least one test fails, the bite is confirmed (return false).
+//  6. If all tests pass, the tests are non-biting (return true).
+//  7. Restore the production files.
+//
+// Edge cases:
+//   - Pure-feature PRs where the test references a symbol that does not
+//     compile against the baseline: treat compile failure as "bite confirmed".
+//   - Test-only PRs: skip (no production changes to revert).
+//   - Git error: skip gracefully (return false).
+func checkBite(ctx context.Context, workspace string, run commandRunner) (nonBiting bool, output string) {
+	// Get the list of changed files.
+	out, err := run(ctx, workspace, nil, "git", "status", "--porcelain")
+	if err != nil {
+		return false, ""
+	}
+
+	var testFiles, prodFiles []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		path := fields[len(fields)-1]
+		if !strings.HasSuffix(path, ".go") {
+			continue
+		}
+		if strings.HasSuffix(path, "_test.go") {
+			testFiles = append(testFiles, path)
+		} else {
+			prodFiles = append(prodFiles, path)
+		}
+	}
+
+	// Test-only PR: no production changes to revert, skip.
+	if len(prodFiles) == 0 {
+		return false, ""
+	}
+
+	// Revert production files to baseline.
+	for _, f := range prodFiles {
+		_, _ = run(ctx, workspace, nil, "git", "checkout", "--", f)
+	}
+
+	// Determine the packages containing the changed test files.
+	pkgs := testPackagesForFiles(testFiles)
+
+	// Run the new/changed tests against the baseline.
+	if len(pkgs) == 0 {
+		// No test packages to run; restore and skip.
+		for _, f := range prodFiles {
+			_, _ = run(ctx, workspace, nil, "git", "checkout", "--", f)
+		}
+		return false, ""
+	}
+
+	args := append([]string{"test", "-count=1", "-timeout=180s"}, pkgs...)
+	_, testErr := run(ctx, workspace, nil, "go", args...)
+
+	// Restore production files regardless of outcome.
+	for _, f := range prodFiles {
+		_, _ = run(ctx, workspace, nil, "git", "checkout", "--", f)
+	}
+
+	// If the tests failed (or did not compile), the bite is confirmed.
+	if testErr != nil {
+		return false, ""
+	}
+
+	// All tests passed against the baseline — non-biting.
+	msg := "New/changed tests pass against the pre-change production code. " +
+		"These tests do not verify the change and should be rejected.\n\n" +
+		"Changed test files:\n"
+	for _, f := range testFiles {
+		msg += "  " + f + "\n"
+	}
+	return true, msg
+}
+
+// testPackagesForFiles returns the workspace-relative Go package directories
+// (as "./<dir>/" patterns) for the given test file paths, deduped and
+// excluding envtest-backed packages.
+func testPackagesForFiles(testFiles []string) []string {
+	seen := map[string]bool{}
+	var pkgs []string
+	for _, f := range testFiles {
+		dir := filepath.Dir(f)
+		if dir == "." {
+			continue
+		}
+		dirKey := dir + "/"
+		excluded := false
+		for _, pfx := range envtestPackagePrefixes {
+			if strings.HasPrefix(dirKey, pfx) {
+				excluded = true
+				break
+			}
+		}
+		if excluded || seen[dirKey] {
+			continue
+		}
+		seen[dirKey] = true
+		pkgs = append(pkgs, "./"+dirKey)
+	}
+	return pkgs
 }
 
 // buildFeedback renders the directive and a per-check section for every

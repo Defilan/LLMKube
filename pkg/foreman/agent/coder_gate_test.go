@@ -257,7 +257,7 @@ func TestRunCoderGate_FailsOnChangedPackageUnitTest(t *testing.T) {
 			return " M pkg/cli/cache_inspect_test.go\n", nil
 		case name == "go" && len(args) > 0 && args[0] == "test":
 			out := "panic: runtime error: invalid memory address\n" +
-				"FAIL\tgithub.com/defilantech/llmkube/pkg/cli"
+				"FAIL	github.com/defilantech/llmkube/pkg/cli"
 			return out, errors.New("exit status 1")
 		case name == "go":
 			return "", nil // vet, build pass
@@ -449,5 +449,174 @@ func TestRunCoderGate_CodegenDrift_FailsWhenMakeFails(t *testing.T) {
 	}
 	if !strings.Contains(feedback, "codegen drift") {
 		t.Errorf("feedback should cite codegen drift; got:\n%s", feedback)
+	}
+}
+
+// biteCheckRunnerConfig holds the per-test overrides for the bite check
+// fake runner. Zero values mean "pass" (empty output, nil error).
+type biteCheckRunnerConfig struct {
+	gitStatusOutput string        // output of git status --porcelain
+	goTestResponses []fakeCommand // responses for successive go test calls
+	trackCheckouts  bool          // whether to record git checkout calls
+}
+
+// newBiteCheckRunner builds a commandRunner for bite check tests using
+// the given config. It returns the runner and, if trackCheckouts is set,
+// a pointer to the slice of checkout paths.
+func newBiteCheckRunner(cfg biteCheckRunnerConfig) (commandRunner, *[]string) {
+	var checkoutCalls *[]string
+	if cfg.trackCheckouts {
+		checkoutCalls = &[]string{}
+	}
+	testIdx := 0
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "gofmt":
+			return "", nil
+		case name == "go" && len(args) > 0 && args[0] == "vet":
+			return "", nil
+		case name == "go" && len(args) > 0 && args[0] == "build":
+			return "", nil
+		case name == "go" && len(args) > 0 && args[0] == "test":
+			if testIdx < len(cfg.goTestResponses) {
+				resp := cfg.goTestResponses[testIdx]
+				testIdx++
+				return resp.output, resp.err
+			}
+			return "", nil // default: pass
+		case name == "./bin/golangci-lint":
+			return "", nil
+		case name == "git" && len(args) > 0 && args[0] == "status":
+			return cfg.gitStatusOutput, nil
+		case name == "git" && len(args) > 0 && args[0] == "checkout":
+			if checkoutCalls != nil && len(args) > 2 {
+				*checkoutCalls = append(*checkoutCalls, args[2])
+			}
+			return "", nil
+		case name == "test" && len(args) > 0 && args[0] == "-f":
+			return "", nil
+		case name == "make":
+			return "", nil
+		case name == "git" && len(args) > 0 && args[0] == "diff":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+	return run, checkoutCalls
+}
+
+// TestCheckBite_NonBitingTests_FailsGate verifies the gate fails when
+// new/changed tests pass against the pre-change production code (#787).
+func TestCheckBite_NonBitingTests_FailsGate(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	run, _ := newBiteCheckRunner(biteCheckRunnerConfig{
+		gitStatusOutput: " M pkg/cli/cache_inspect.go\n M pkg/cli/cache_inspect_test.go\n",
+		goTestResponses: []fakeCommand{{}, {}}, // both calls pass
+	})
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if pass {
+		t.Fatal("gate should fail when tests are non-biting")
+	}
+	if !strings.Contains(feedback, "bite check") {
+		t.Errorf("feedback should cite bite check; got:\n%s", feedback)
+	}
+	if !strings.Contains(feedback, "cache_inspect_test.go") {
+		t.Errorf("feedback should list the non-biting test file; got:\n%s", feedback)
+	}
+}
+
+// TestCheckBite_BitingTests_PassesGate verifies the gate passes when
+// new/changed tests fail against the pre-change production code (#787).
+// The first go test call (step 5) passes; the second (bite check) fails.
+func TestCheckBite_BitingTests_PassesGate(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	run, _ := newBiteCheckRunner(biteCheckRunnerConfig{
+		gitStatusOutput: " M pkg/cli/cache_inspect.go\n M pkg/cli/cache_inspect_test.go\n",
+		goTestResponses: []fakeCommand{
+			{}, // step 5: test tier passes
+			{output: "FAIL	pkg/cli", err: errors.New("exit status 1")}, // bite check: fails
+		},
+	})
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if !pass {
+		t.Fatalf("gate should pass when tests bite; feedback:\n%s", feedback)
+	}
+	if feedback != "" {
+		t.Errorf("expected empty feedback on pass, got %q", feedback)
+	}
+}
+
+// TestCheckBite_TestOnlyPR_SkipsBiteCheck verifies the bite check is
+// skipped for test-only PRs (no production changes to revert) (#787).
+func TestCheckBite_TestOnlyPR_SkipsBiteCheck(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	run, _ := newBiteCheckRunner(biteCheckRunnerConfig{
+		gitStatusOutput: " M pkg/cli/cache_inspect_test.go\n", // test-only change
+	})
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if !pass {
+		t.Fatalf("gate should pass for test-only PR; feedback:\n%s", feedback)
+	}
+	if feedback != "" {
+		t.Errorf("expected empty feedback on pass, got %q", feedback)
+	}
+}
+
+// TestCheckBite_CompilationFailureAgainstBaseline_BiteConfirmed verifies
+// that a compile failure of the new test against the baseline is treated
+// as "bite confirmed" (#787). The first go test call (step 5) passes;
+// the second (bite check) fails with a compile error.
+func TestCheckBite_CompilationFailureAgainstBaseline_BiteConfirmed(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	run, _ := newBiteCheckRunner(biteCheckRunnerConfig{
+		gitStatusOutput: " M pkg/cli/cache_inspect.go\n M pkg/cli/cache_inspect_test.go\n",
+		goTestResponses: []fakeCommand{
+			{}, // step 5: test tier passes
+			{output: "pkg/cli/cache_inspect_test.go:10: undefined: NewFeature", err: errors.New("exit status 1")},
+		},
+	})
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if !pass {
+		t.Fatalf("gate should pass when test fails to compile against baseline; feedback:\n%s", feedback)
+	}
+	if feedback != "" {
+		t.Errorf("expected empty feedback on pass, got %q", feedback)
+	}
+}
+
+// TestCheckBite_ProductionFilesRestored verifies production files are
+// restored after the bite check regardless of outcome (#787).
+func TestCheckBite_ProductionFilesRestored(t *testing.T) {
+	run, checkoutCalls := newBiteCheckRunner(biteCheckRunnerConfig{
+		gitStatusOutput: " M pkg/cli/cache_inspect.go\n M pkg/cli/cache_inspect_test.go\n",
+		goTestResponses: []fakeCommand{{}, {}}, // both pass — non-biting
+		trackCheckouts:  true,
+	})
+	RunCoderGate(context.Background(), "/work", "./bin/golangci-lint", run)
+
+	// Should have 2 checkout calls: one to revert, one to restore.
+	if len(*checkoutCalls) != 2 {
+		t.Fatalf("expected 2 git checkout calls (revert + restore), got %d: %v", len(*checkoutCalls), *checkoutCalls)
+	}
+	// Both should be the production file.
+	if (*checkoutCalls)[0] != "pkg/cli/cache_inspect.go" || (*checkoutCalls)[1] != "pkg/cli/cache_inspect.go" {
+		t.Errorf("checkout calls = %v, want both to be the production file", *checkoutCalls)
+	}
+}
+
+// TestCheckBite_NoProductionChanges_Skips verifies the bite check is
+// skipped when there are no production file changes (#787).
+func TestCheckBite_NoProductionChanges_Skips(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	run, _ := newBiteCheckRunner(biteCheckRunnerConfig{
+		gitStatusOutput: " M pkg/cli/cache_inspect_test.go\n", // only test file changed
+	})
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if !pass {
+		t.Fatalf("gate should pass when only test files changed; feedback:\n%s", feedback)
+	}
+	if feedback != "" {
+		t.Errorf("expected empty feedback on pass, got %q", feedback)
 	}
 }
