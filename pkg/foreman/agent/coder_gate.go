@@ -18,9 +18,12 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/defilantech/llmkube/pkg/foreman/agent/repomap"
 )
 
 // envtestPackagePrefixes are workspace-relative package path prefixes whose
@@ -80,15 +83,19 @@ type checkFailure struct {
 // it names the failing check(s) and includes their output so the model
 // can fix the issue and resubmit. golangciPath is the path to the
 // golangci-lint binary (e.g. "./bin/golangci-lint"). run is the command
-// runner (production callers pass execCommandRunner).
+// runner (production callers pass execCommandRunner). issueText is the
+// text the scope guard uses to rank files; empty string disables the
+// scope check (backward compatible).
 //
-// The gate runs six deterministic checks in order: gofmt, go vet,
+// The gate runs seven deterministic checks in order: gofmt, go vet,
 // go build, golangci-lint, a fast unit-test tier on changed packages,
-// and a codegen-drift check. Heavy envtest or integration tests are
-// intentionally out of scope; they run in a separate clean-room
-// Kubernetes Job. All checks run regardless of earlier failures so the
-// feedback reports everything wrong at once.
-func RunCoderGate(ctx context.Context, workspace, golangciPath string, run commandRunner) (pass bool, feedback string) {
+// a codegen-drift check, and a scope-overlap check. Heavy envtest or
+// integration tests are intentionally out of scope; they run in a
+// separate clean-room Kubernetes Job. All checks run regardless of
+// earlier failures so the feedback reports everything wrong at once.
+func RunCoderGate(
+	ctx context.Context, workspace, golangciPath string, run commandRunner, issueText string,
+) (pass bool, feedback string) {
 	var failures []checkFailure
 
 	// 1. gofmt -l . lists misformatted files on stdout and exits 0 even
@@ -138,6 +145,16 @@ func RunCoderGate(ctx context.Context, workspace, golangciPath string, run comma
 	// controller-gen is unavailable.
 	if drifted, out := checkCodegenDrift(ctx, workspace, run); drifted {
 		failures = append(failures, checkFailure{name: "codegen drift", output: out})
+	}
+
+	// 7. Scope-overlap check: flag a submit whose changed-file set has
+	// near-zero overlap with the files the issue text implies are
+	// relevant. This catches a coder that drifts to an unrelated
+	// subsystem (e.g. editing pkg/cli/cache.go for an issue about
+	// pkg/agent/). Skipped when issueText is empty (backward
+	// compatible). See issue #782.
+	if scopeFail, out := checkScopeOverlap(ctx, workspace, run, issueText); scopeFail {
+		failures = append(failures, checkFailure{name: "scope overlap", output: out})
 	}
 
 	if len(failures) == 0 {
@@ -245,3 +262,131 @@ func truncateOutput(output string) string {
 	}
 	return "...(truncated)...\n" + output[len(output)-maxCheckOutputBytes:]
 }
+
+// scopeOverlapChecker resolves the set of relevant files for a given
+// workspace and issue text. It returns a scored-order slice and a
+// membership map. Injectable so tests can supply canned relevant files
+// without walking the real filesystem.
+type scopeOverlapChecker func(workspace, issueText string) (paths []string, set map[string]bool)
+
+// defaultScopeChecker is the production scopeOverlapChecker backed by
+// the repomap scorer.
+var defaultScopeChecker scopeOverlapChecker = func(workspace, issueText string) (paths []string, set map[string]bool) {
+	files, err := repomap.Walk(workspace, nil)
+	if err != nil {
+		return nil, nil
+	}
+	scored := repomap.ScoreFiles(files, issueText)
+	out := make([]string, 0, len(scored))
+	s := make(map[string]bool, len(scored))
+	for _, sf := range scored {
+		out = append(out, sf.Path)
+		s[sf.Path] = true
+	}
+	return out, s
+}
+
+// checkScopeOverlap verifies that the coder's changed files have
+// meaningful overlap with the files the issue text implies are
+// relevant. It returns (scopeFail, output) where scopeFail is true
+// when the overlap is near-zero. output is the feedback text.
+//
+// The check works by:
+//  1. Collecting the set of changed files from git status.
+//  2. Collecting the set of relevant files from the repomap scorer
+//     (scored against issueText).
+//  3. Computing the overlap ratio: |changed ∩ relevant| / |changed|.
+//     If the ratio is below the threshold (currently 0, i.e., zero
+//     overlap), the check fails.
+//
+// The threshold is intentionally conservative (zero overlap) to avoid
+// false positives. A coder that touches one relevant file plus several
+// unrelated files will still pass; only a coder that touches zero
+// relevant files is flagged.
+//
+// Skipped when issueText is empty (backward compatible).
+func checkScopeOverlap(
+	ctx context.Context, workspace string, run commandRunner, issueText string,
+) (scopeFail bool, output string) {
+	if issueText == "" {
+		return false, ""
+	}
+
+	// 1. Collect changed files.
+	changed := changedFiles(ctx, workspace, run)
+	if len(changed) == 0 {
+		return false, ""
+	}
+
+	// 2. Collect relevant files from the repomap scorer.
+	relevantPaths, relevantSet := defaultScopeChecker(workspace, issueText)
+	if len(relevantPaths) == 0 {
+		return false, ""
+	}
+
+	// 3. Compute overlap.
+	overlap := 0
+	for _, c := range changed {
+		if relevantSet[c] {
+			overlap++
+		}
+	}
+
+	// Zero overlap means the coder touched no files the issue implies
+	// are relevant. This is the drift signal (#782).
+	if overlap > 0 {
+		return false, ""
+	}
+
+	// Build feedback that tells the coder which files they changed
+	// vs. which files are relevant.
+	var b strings.Builder
+	b.WriteString("Your changes have no overlap with the files relevant to this issue.\n")
+	b.WriteString("Changed files:\n")
+	for _, c := range changed {
+		b.WriteString("  - ")
+		b.WriteString(c)
+		b.WriteString("\n")
+	}
+	b.WriteString("\nRelevant files (top scored by issue text):\n")
+	limit := minRelevantFiles
+	if len(relevantPaths) < limit {
+		limit = len(relevantPaths)
+	}
+	for _, r := range relevantPaths[:limit] {
+		b.WriteString("  - ")
+		b.WriteString(r)
+		b.WriteString("\n")
+	}
+	if len(relevantPaths) > minRelevantFiles {
+		b.WriteString(fmt.Sprintf("  ... and %d more\n", len(relevantPaths)-minRelevantFiles))
+	}
+	return true, b.String()
+}
+
+// changedFiles returns the set of workspace-relative paths that have
+// uncommitted changes per `git status --porcelain`. It returns the
+// paths as a slice (order is not guaranteed). A git error yields an
+// empty slice.
+func changedFiles(ctx context.Context, workspace string, run commandRunner) []string {
+	out, err := run(ctx, workspace, nil, "git", "status", "--porcelain")
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 {
+			continue
+		}
+		// porcelain is "XY <path>" (renames end with "-> <new>"); the
+		// final field is the current path.
+		paths = append(paths, fields[len(fields)-1])
+	}
+	return paths
+}
+
+// minRelevantFiles caps how many relevant files are shown in the
+// scope-overlap feedback. The repomap can return dozens of files;
+// showing the top 10 is enough for the coder to see the drift.
+const minRelevantFiles = 10

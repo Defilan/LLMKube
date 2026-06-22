@@ -67,12 +67,15 @@ var defaultSkipDirs = map[string]bool{
 	"venv":         true,
 }
 
-// walk traverses workspace and returns every indexable Go file, with
+// Walk traverses workspace and returns every indexable Go file, with
 // its top-level declarations already extracted. Errors on a single
 // file (parse error, unreadable file) are logged via skipped-and-
 // counted but never abort the walk; partial coverage is more useful
 // than a hard failure mid-summary.
-func walk(workspace string, extraSkipPatterns []string) ([]indexableFile, error) {
+//
+// Walk is exported so the scope guard in the coder gate can use the
+// file list directly without parsing the formatted summary (#782).
+func Walk(workspace string, extraSkipPatterns []string) ([]indexableFile, error) {
 	var out []indexableFile
 
 	err := filepath.WalkDir(workspace, func(path string, d fs.DirEntry, walkErr error) error {
