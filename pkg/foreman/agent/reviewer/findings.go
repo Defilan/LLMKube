@@ -70,14 +70,16 @@ var validSeverities = map[Severity]struct{}{
 type Area string
 
 const (
-	AreaScope       Area = "scope"           // Section A: scope alignment
-	AreaStyle       Area = "style"           // Section B: minimal / idiomatic
-	AreaTests       Area = "tests"           // Section C: meaningful tests
-	AreaSideEffects Area = "side-effects"    // Section D: side effects
-	AreaDocs        Area = "docs"            // Section E: documentation / ergonomics
-	AreaRegression  Area = "regression"      // Section F: removed working logic
-	AreaDocConsist  Area = "doc-consistency" // Section G: doc vs code mismatch
-	AreaConstants   Area = "constants"       // Section H: magic-number justification
+	AreaScope            Area = "scope"              // Section A: scope alignment
+	AreaStyle            Area = "style"              // Section B: minimal / idiomatic
+	AreaTests            Area = "tests"              // Section C: meaningful tests
+	AreaSideEffects      Area = "side-effects"       // Section D: side effects
+	AreaDocs             Area = "docs"               // Section E: documentation / ergonomics
+	AreaRegression       Area = "regression"         // Section F: removed working logic
+	AreaDocConsist       Area = "doc-consistency"    // Section G: doc vs code mismatch
+	AreaConstants        Area = "constants"          // Section H: magic-number justification
+	AreaTestProdFidelity Area = "test-prod-fidelity" // Section I: real values, not placeholders
+	AreaWiredUp          Area = "wired-up"           // Section J: wired-up, not inert
 )
 
 // validAreas is the exhaustive set. Models occasionally invent areas
@@ -87,6 +89,7 @@ const (
 var validAreas = map[Area]struct{}{
 	AreaScope: {}, AreaStyle: {}, AreaTests: {}, AreaSideEffects: {},
 	AreaDocs: {}, AreaRegression: {}, AreaDocConsist: {}, AreaConstants: {},
+	AreaTestProdFidelity: {}, AreaWiredUp: {},
 }
 
 // Finding is one item in the reviewer's structured-findings list.
