@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -42,14 +43,14 @@ const (
 
 // CacheEntry represents a cached model
 type CacheEntry struct {
-	CacheKey         string
-	Source           string
-	Size             int64
-	SizeHuman        string
-	ModTime          time.Time
-	ModelNames       []string // Models using this cache entry
-	Status           string   // "active" or "orphaned"
-	InferenceService string   // owning InferenceService; empty for shared cache
+	CacheKey          string
+	Source            string
+	Size              int64
+	SizeHuman         string
+	ModTime           time.Time
+	ModelNames        []string // Models using this cache entry
+	Status            string   // "active" or "orphaned"
+	InferenceServices []string // InferenceServices using this cache entry
 }
 
 // NewCacheCommand creates the cache command
@@ -184,16 +185,55 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		return fmt.Errorf("failed to create client: %w", err)
 	}
 
-	modelList := &inferencev1alpha1.ModelList{}
 	listOpts := []client.ListOption{}
 	if !allNamespaces {
 		listOpts = append(listOpts, client.InNamespace(namespace))
 	}
 
+	modelList := &inferencev1alpha1.ModelList{}
 	if err := k8sClient.List(ctx, modelList, listOpts...); err != nil {
 		return fmt.Errorf("failed to list models: %w", err)
 	}
 
+	cacheEntries := buildCacheEntriesFromModels(modelList, allNamespaces)
+
+	// Discover InferenceService resources and correlate them with cache entries
+	// via their modelRef field. This provides per-InferenceService cache
+	// discovery: even without PVC inspection, the CLI can show which
+	// InferenceServices are using which cache entries.
+	if err := correlateInferenceServices(ctx, k8sClient, modelList, cacheEntries, listOpts, allNamespaces); err != nil {
+		return err
+	}
+
+	// Inspect actual PVC contents (only for single-namespace mode)
+	var pvcInspected bool
+	if !allNamespaces {
+		pvcInspected, err = inspectAndMergePVCCache(ctx, cfg, k8sClient, namespace, cacheEntries)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
+		}
+	}
+
+	if orphanedOnly {
+		filterOrphaned(cacheEntries)
+	}
+
+	if len(cacheEntries) == 0 {
+		if orphanedOnly {
+			fmt.Println("No orphaned cache entries found.")
+		} else {
+			fmt.Println("No cache entries found.")
+		}
+		return nil
+	}
+
+	printCacheEntries(cacheEntries, pvcInspected, len(modelList.Items))
+
+	return nil
+}
+
+// buildCacheEntriesFromModels creates cache entries from Model resources.
+func buildCacheEntriesFromModels(modelList *inferencev1alpha1.ModelList, allNamespaces bool) map[string]*CacheEntry {
 	cacheEntries := make(map[string]*CacheEntry)
 	for _, model := range modelList.Items {
 		cacheKey := model.Status.CacheKey
@@ -204,10 +244,11 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		entry, exists := cacheEntries[cacheKey]
 		if !exists {
 			entry = &CacheEntry{
-				CacheKey:   cacheKey,
-				Source:     model.Spec.Source,
-				ModelNames: []string{},
-				Status:     statusActive,
+				CacheKey:          cacheKey,
+				Source:            model.Spec.Source,
+				ModelNames:        []string{},
+				InferenceServices: []string{},
+				Status:            statusActive,
 			}
 			cacheEntries[cacheKey] = entry
 		}
@@ -222,50 +263,112 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 			entry.SizeHuman = model.Status.Size
 		}
 	}
+	return cacheEntries
+}
 
-	// Inspect actual PVC contents (only for single-namespace mode)
-	var pvcInspected bool
-	if !allNamespaces {
-		pvcEntries, err := inspectPVCCache(ctx, cfg, k8sClient, namespace)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
-		} else if pvcEntries != nil {
-			pvcInspected = true
-			for _, pe := range pvcEntries {
-				if entry, exists := cacheEntries[pe.CacheKey]; exists {
-					entry.Size = pe.SizeBytes
-					entry.SizeHuman = formatBytes(pe.SizeBytes)
-					entry.InferenceService = pe.InferenceService
-				} else {
-					cacheEntries[pe.CacheKey] = &CacheEntry{
-						CacheKey:         pe.CacheKey,
-						Size:             pe.SizeBytes,
-						SizeHuman:        formatBytes(pe.SizeBytes),
-						Status:           statusOrphaned,
-						InferenceService: pe.InferenceService,
-					}
-				}
-			}
-		}
+// correlateInferenceServices lists InferenceService resources and correlates
+// them with cache entries via their modelRef field.
+func correlateInferenceServices(
+	ctx context.Context, k8sClient client.Client,
+	modelList *inferencev1alpha1.ModelList,
+	cacheEntries map[string]*CacheEntry,
+	listOpts []client.ListOption, allNamespaces bool,
+) error {
+	isvcList := &inferencev1alpha1.InferenceServiceList{}
+	if err := k8sClient.List(ctx, isvcList, listOpts...); err != nil {
+		return fmt.Errorf("failed to list inferenceservices: %w", err)
 	}
 
-	if orphanedOnly {
-		for key, entry := range cacheEntries {
-			if entry.Status != statusOrphaned {
-				delete(cacheEntries, key)
-			}
+	modelCacheKey := buildModelCacheKeyMap(modelList)
+
+	for _, isvc := range isvcList.Items {
+		cacheKey, ok := modelCacheKey[isvc.Spec.ModelRef]
+		if !ok {
+			continue
 		}
+
+		entry, exists := cacheEntries[cacheKey]
+		if !exists {
+			entry = &CacheEntry{
+				CacheKey:          cacheKey,
+				ModelNames:        []string{},
+				InferenceServices: []string{},
+				Status:            statusActive,
+			}
+			cacheEntries[cacheKey] = entry
+		}
+
+		isvcName := isvc.Name
+		if allNamespaces {
+			isvcName = fmt.Sprintf("%s/%s", isvc.Namespace, isvc.Name)
+		}
+		entry.InferenceServices = append(entry.InferenceServices, isvcName)
+	}
+	return nil
+}
+
+// buildModelCacheKeyMap builds a map from model name to cache key.
+func buildModelCacheKeyMap(modelList *inferencev1alpha1.ModelList) map[string]string {
+	modelCacheKey := make(map[string]string)
+	for _, model := range modelList.Items {
+		cacheKey := model.Status.CacheKey
+		if cacheKey == "" {
+			cacheKey = computeCacheKey(model.Spec.Source)
+		}
+		modelCacheKey[model.Name] = cacheKey
+	}
+	return modelCacheKey
+}
+
+// inspectAndMergePVCCache inspects the PVC cache and merges results into
+// cacheEntries. Returns true if inspection succeeded.
+func inspectAndMergePVCCache(
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client,
+	namespace string, cacheEntries map[string]*CacheEntry,
+) (bool, error) {
+	pvcEntries, err := inspectPVCCache(ctx, cfg, k8sClient, namespace)
+	if err != nil {
+		return false, err
+	}
+	if pvcEntries == nil {
+		return false, nil
 	}
 
-	if len(cacheEntries) == 0 {
-		if orphanedOnly {
-			fmt.Println("No orphaned cache entries found.")
+	for _, pe := range pvcEntries {
+		if entry, exists := cacheEntries[pe.CacheKey]; exists {
+			entry.Size = pe.SizeBytes
+			entry.SizeHuman = formatBytes(pe.SizeBytes)
+			if pe.InferenceService != "" {
+				entry.InferenceServices = append(entry.InferenceServices, pe.InferenceService)
+			}
 		} else {
-			fmt.Println("No cache entries found.")
+			isvcList := []string{}
+			if pe.InferenceService != "" {
+				isvcList = append(isvcList, pe.InferenceService)
+			}
+			cacheEntries[pe.CacheKey] = &CacheEntry{
+				CacheKey:          pe.CacheKey,
+				Size:              pe.SizeBytes,
+				SizeHuman:         formatBytes(pe.SizeBytes),
+				Status:            statusOrphaned,
+				InferenceServices: isvcList,
+			}
 		}
-		return nil
 	}
+	return true, nil
+}
 
+// filterOrphaned removes non-orphaned entries from cacheEntries.
+func filterOrphaned(cacheEntries map[string]*CacheEntry) {
+	for key, entry := range cacheEntries {
+		if entry.Status != statusOrphaned {
+			delete(cacheEntries, key)
+		}
+	}
+}
+
+// printCacheEntries renders the cache entry table to stdout.
+func printCacheEntries(cacheEntries map[string]*CacheEntry, pvcInspected bool, modelCount int) {
 	fmt.Printf("\nModel Cache Entries\n")
 	fmt.Printf("═══════════════════════════════════════════════════════════════════════════════\n")
 
@@ -273,7 +376,7 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 	if pvcInspected {
 		_, _ = fmt.Fprintln(w, "CACHE KEY\tSTATUS\tSIZE\tISVC\tMODELS\tSOURCE")
 	} else {
-		_, _ = fmt.Fprintln(w, "CACHE KEY\tSIZE\tMODELS\tSOURCE")
+		_, _ = fmt.Fprintln(w, "CACHE KEY\tSIZE\tISVC\tMODELS\tSOURCE")
 	}
 
 	var activeCount, orphanedCount int
@@ -294,9 +397,9 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 			size = "-"
 		}
 
-		isvc := entry.InferenceService
+		isvc := strings.Join(entry.InferenceServices, ", ")
 		if isvc == "" {
-			isvc = "shared"
+			isvc = "-"
 		}
 
 		if entry.Status == statusOrphaned {
@@ -309,7 +412,7 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		if pvcInspected {
 			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", entry.CacheKey, entry.Status, size, isvc, models, source)
 		} else {
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", entry.CacheKey, size, models, source)
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.CacheKey, size, isvc, models, source)
 		}
 	}
 	_ = w.Flush()
@@ -318,10 +421,8 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 		fmt.Printf("\nTotal: %d cache entries (%d active, %d orphaned), %s used\n",
 			len(cacheEntries), activeCount, orphanedCount, formatBytes(totalBytes))
 	} else {
-		fmt.Printf("\nTotal: %d cache entries, %d models\n", len(cacheEntries), len(modelList.Items))
+		fmt.Printf("\nTotal: %d cache entries, %d models\n", len(cacheEntries), modelCount)
 	}
-
-	return nil
 }
 
 func runCacheClear(modelName, namespace string, force bool) error {

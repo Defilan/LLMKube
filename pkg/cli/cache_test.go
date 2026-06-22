@@ -18,6 +18,9 @@ package cli
 
 import (
 	"testing"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestComputeCacheKey(t *testing.T) {
@@ -156,5 +159,196 @@ func TestNewCachePreloadCommand(t *testing.T) {
 
 	if f := cmd.Flags().Lookup("namespace"); f == nil {
 		t.Error("Missing --namespace flag")
+	}
+}
+
+func TestCacheEntryInferenceServicesField(t *testing.T) {
+	// Verify CacheEntry has the InferenceServices field (slice of strings)
+	entry := &CacheEntry{
+		CacheKey:          "abc123",
+		InferenceServices: []string{"my-isvc", "other-isvc"},
+	}
+
+	if len(entry.InferenceServices) != 2 {
+		t.Errorf("InferenceServices length = %d, want 2", len(entry.InferenceServices))
+	}
+	if entry.InferenceServices[0] != "my-isvc" {
+		t.Errorf("InferenceServices[0] = %q, want %q", entry.InferenceServices[0], "my-isvc")
+	}
+	if entry.InferenceServices[1] != "other-isvc" {
+		t.Errorf("InferenceServices[1] = %q, want %q", entry.InferenceServices[1], "other-isvc")
+	}
+}
+
+func TestCacheEntryInferenceServicesEmpty(t *testing.T) {
+	entry := &CacheEntry{
+		CacheKey:          "abc123",
+		InferenceServices: []string{},
+	}
+
+	if len(entry.InferenceServices) != 0 {
+		t.Errorf("InferenceServices length = %d, want 0", len(entry.InferenceServices))
+	}
+}
+
+func TestCacheEntryInferenceServicesNil(t *testing.T) {
+	entry := &CacheEntry{
+		CacheKey: "abc123",
+	}
+
+	if entry.InferenceServices != nil {
+		t.Errorf("InferenceServices = %v, want nil", entry.InferenceServices)
+	}
+}
+
+func TestCacheEntryInferenceServicesMultipleISVCsSameModel(t *testing.T) {
+	// Two InferenceServices referencing the same model should both appear
+	// in the cache entry's InferenceServices list.
+	entry := &CacheEntry{
+		CacheKey:          "abc123",
+		InferenceServices: []string{},
+	}
+
+	// Simulate the correlation logic: for each InferenceService, look up
+	// its modelRef and add the ISVC name to the cache entry.
+	models := []inferencev1alpha1.Model{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "llama-3-8b", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/llama.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
+		},
+	}
+	isvcs := []inferencev1alpha1.InferenceService{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-1", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "llama-3-8b"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-2", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "llama-3-8b"},
+		},
+	}
+
+	// Build model -> cache key map
+	modelCacheKey := make(map[string]string)
+	for _, m := range models {
+		modelCacheKey[m.Name] = m.Status.CacheKey
+	}
+
+	// Correlate InferenceServices with cache entries
+	for _, isvc := range isvcs {
+		cacheKey, ok := modelCacheKey[isvc.Spec.ModelRef]
+		if !ok {
+			continue
+		}
+		if cacheKey == entry.CacheKey {
+			entry.InferenceServices = append(entry.InferenceServices, isvc.Name)
+		}
+	}
+
+	if len(entry.InferenceServices) != 2 {
+		t.Fatalf("InferenceServices length = %d, want 2", len(entry.InferenceServices))
+	}
+	if entry.InferenceServices[0] != "isvc-1" {
+		t.Errorf("InferenceServices[0] = %q, want %q", entry.InferenceServices[0], "isvc-1")
+	}
+	if entry.InferenceServices[1] != "isvc-2" {
+		t.Errorf("InferenceServices[1] = %q, want %q", entry.InferenceServices[1], "isvc-2")
+	}
+}
+
+func TestCacheEntryInferenceServicesNoMatchingModel(t *testing.T) {
+	// An InferenceService referencing a model that doesn't exist should not
+	// add anything to the cache entry.
+	entry := &CacheEntry{
+		CacheKey:          "abc123",
+		InferenceServices: []string{},
+	}
+
+	models := []inferencev1alpha1.Model{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "llama-3-8b", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/llama.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
+		},
+	}
+	isvcs := []inferencev1alpha1.InferenceService{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-1", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "nonexistent-model"},
+		},
+	}
+
+	modelCacheKey := make(map[string]string)
+	for _, m := range models {
+		modelCacheKey[m.Name] = m.Status.CacheKey
+	}
+
+	for _, isvc := range isvcs {
+		cacheKey, ok := modelCacheKey[isvc.Spec.ModelRef]
+		if !ok {
+			continue
+		}
+		if cacheKey == entry.CacheKey {
+			entry.InferenceServices = append(entry.InferenceServices, isvc.Name)
+		}
+	}
+
+	if len(entry.InferenceServices) != 0 {
+		t.Errorf("InferenceServices length = %d, want 0", len(entry.InferenceServices))
+	}
+}
+
+func TestCacheEntryInferenceServicesDifferentModels(t *testing.T) {
+	// Two InferenceServices referencing different models should not both
+	// appear in the same cache entry.
+	entry := &CacheEntry{
+		CacheKey:          "abc123",
+		InferenceServices: []string{},
+	}
+
+	models := []inferencev1alpha1.Model{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "llama-3-8b", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/llama.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "mistral-7b", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/mistral.gguf"},
+			Status:     inferencev1alpha1.ModelStatus{CacheKey: "def456"},
+		},
+	}
+	isvcs := []inferencev1alpha1.InferenceService{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-1", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "llama-3-8b"},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-2", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "mistral-7b"},
+		},
+	}
+
+	modelCacheKey := make(map[string]string)
+	for _, m := range models {
+		modelCacheKey[m.Name] = m.Status.CacheKey
+	}
+
+	for _, isvc := range isvcs {
+		cacheKey, ok := modelCacheKey[isvc.Spec.ModelRef]
+		if !ok {
+			continue
+		}
+		if cacheKey == entry.CacheKey {
+			entry.InferenceServices = append(entry.InferenceServices, isvc.Name)
+		}
+	}
+
+	if len(entry.InferenceServices) != 1 {
+		t.Fatalf("InferenceServices length = %d, want 1", len(entry.InferenceServices))
+	}
+	if entry.InferenceServices[0] != "isvc-1" {
+		t.Errorf("InferenceServices[0] = %q, want %q", entry.InferenceServices[0], "isvc-1")
 	}
 }
