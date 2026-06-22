@@ -178,3 +178,39 @@ func TestParseFindings_AllAreasAccepted(t *testing.T) {
 		})
 	}
 }
+
+// TestParseFindings_TestProdFidelityArea covers the new Section I
+// (real values, not placeholders) and Section J (wired-up, not
+// inert) areas added in #788. These areas must parse successfully
+// and carry the expected area constant.
+func TestParseFindings_TestProdFidelityArea(t *testing.T) {
+	extra := jsonExtra(t, `{
+		"findings": [
+			{
+				"severity": "blocker",
+				"area": "test-prod-fidelity",
+				"message": "test uses placeholder runtime mlx-server; production default is llamacpp",
+				"file": "pkg/agent/registry_test.go"
+			},
+			{
+				"severity": "major",
+				"area": "wired-up",
+				"message": "llmkube_inference_ttft_seconds registered but never emitted in production",
+				"file": "internal/metrics/metrics.go"
+			}
+		]
+	}`)
+	got, warnings := ParseFindings(extra)
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d findings; want 2", len(got))
+	}
+	if got[0].Area != AreaTestProdFidelity {
+		t.Errorf("first finding area: got %q; want %q", got[0].Area, AreaTestProdFidelity)
+	}
+	if got[1].Area != AreaWiredUp {
+		t.Errorf("second finding area: got %q; want %q", got[1].Area, AreaWiredUp)
+	}
+}
