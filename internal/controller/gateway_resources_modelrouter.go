@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -116,6 +117,13 @@ const (
 	activeHealthCheckPath               = "/health"
 	activeHealthCheckUnhealthyThreshold = int64(2)
 	activeHealthCheckHealthyThreshold   = int64(1)
+
+	// defaultRouterPerRetryTimeout is the fallback for the BTP retry
+	// perRetry.timeout when no rule or backend declares a Timeout. Envoy
+	// applies this per-attempt timeout on top of the route-level request
+	// timeout, so it must be at least as large as the longest configured
+	// timeout to avoid silently capping requests.
+	defaultRouterPerRetryTimeout = "60s"
 )
 
 // aiGatewayTotalTokenKey is the dynamic-metadata key (within
@@ -446,6 +454,29 @@ func compileRuleBackendRefs(refs []routerBackendRef) []interface{} {
 	return out
 }
 
+// maxConfiguredRouterTimeout returns the largest Timeout configured across all
+// rules and backends in the ModelRouter, or defaultRouterPerRetryTimeout when
+// none is set. Envoy applies the BTP retry perRetry.timeout on top of the
+// route-level request timeout, so it must be at least as large as the longest
+// configured timeout to avoid silently capping requests.
+func maxConfiguredRouterTimeout(mr *inferencev1alpha1.ModelRouter) string {
+	var max time.Duration
+	for _, rule := range mr.Spec.Rules {
+		if rule.Timeout != nil && rule.Timeout.Duration > max {
+			max = rule.Timeout.Duration
+		}
+	}
+	for _, be := range mr.Spec.Backends {
+		if be.Timeout != nil && be.Timeout.Duration > max {
+			max = be.Timeout.Duration
+		}
+	}
+	if max == 0 {
+		return defaultRouterPerRetryTimeout
+	}
+	return max.String()
+}
+
 // newRouterBackendTrafficPolicy builds the retry + passive-outlier + active
 // HTTP health-check BackendTrafficPolicy that makes priority failover actually
 // retry onto the secondary backend and ejects dead backends fast. It targets the
@@ -475,7 +506,7 @@ func newRouterBackendTrafficPolicy(mr *inferencev1alpha1.ModelRouter, budgets []
 					"baseInterval": "100ms",
 					"maxInterval":  "10s",
 				},
-				"timeout": "60s",
+				"timeout": maxConfiguredRouterTimeout(mr),
 			},
 			"retryOn": map[string]interface{}{
 				"httpStatusCodes": []interface{}{int64(500), int64(503)},

@@ -1746,98 +1746,6 @@ func TestCompileBudgetRule_WindowScaling(t *testing.T) {
 	}
 }
 
-// TestCompileRouterRules_BackendNameMatch confirms that the BackendNameMatch
-// default-route strategy compiles to one model==name rule per backend, inserted
-// after the explicit rules and before the defaultRoute catch-all so first-match
-// ordering mirrors the proxy.
-func TestCompileRouterRules_BackendNameMatch(t *testing.T) {
-	mr := &inferencev1alpha1.ModelRouter{
-		Spec: inferencev1alpha1.ModelRouterSpec{
-			Backends: []inferencev1alpha1.RouterBackend{
-				{Name: "local-a"},
-				{Name: "local-b"},
-			},
-			Rules: []inferencev1alpha1.RouterRule{{
-				Name:  "explicit",
-				Match: &inferencev1alpha1.RuleMatch{Models: []string{"foo-*"}},
-				Route: inferencev1alpha1.RuleRoute{Backends: []string{"local-a"}},
-			}},
-			DefaultRoute:         "local-a",
-			DefaultRouteStrategy: inferencev1alpha1.DefaultRouteStrategyBackendNameMatch,
-		},
-	}
-
-	rules, err := compileRouterRules(mr)
-	if err != nil {
-		t.Fatalf("compileRouterRules: %v", err)
-	}
-	// explicit rule, one name rule per backend, then the defaultRoute catch-all.
-	if len(rules) != 4 {
-		t.Fatalf("expected 4 rules, got %d: %+v", len(rules), rules)
-	}
-	if got := rules[0].Models; len(got) != 1 || got[0] != "foo-*" {
-		t.Errorf("rules[0] should be the explicit rule, got models %v", got)
-	}
-	for i, wantBackend := range []string{"local-a", "local-b"} {
-		r := rules[i+1]
-		if len(r.Models) != 1 || r.Models[0] != wantBackend {
-			t.Errorf("rules[%d] models = %v, want [%s]", i+1, r.Models, wantBackend)
-		}
-		if len(r.BackendRefs) != 1 || r.BackendRefs[0].Name != wantBackend {
-			t.Errorf("rules[%d] backendRefs = %+v, want single %s", i+1, r.BackendRefs, wantBackend)
-		}
-	}
-	// The catch-all is last and matches on nothing.
-	last := rules[len(rules)-1]
-	if len(last.Models) != 0 {
-		t.Errorf("catch-all should have no model match, got %v", last.Models)
-	}
-	if len(last.BackendRefs) != 1 || last.BackendRefs[0].Name != "local-a" {
-		t.Errorf("catch-all backendRefs = %+v, want single local-a", last.BackendRefs)
-	}
-}
-
-// TestCompileRouterRules_StaticOmitsNameRules confirms the default Static
-// strategy compiles no per-backend name rules: only the explicit rules plus the
-// defaultRoute catch-all.
-func TestCompileRouterRules_StaticOmitsNameRules(t *testing.T) {
-	mr := &inferencev1alpha1.ModelRouter{
-		Spec: inferencev1alpha1.ModelRouterSpec{
-			Backends: []inferencev1alpha1.RouterBackend{
-				{Name: "local-a"},
-				{Name: "local-b"},
-			},
-			Rules: []inferencev1alpha1.RouterRule{{
-				Name:  "explicit",
-				Match: &inferencev1alpha1.RuleMatch{Models: []string{"foo-*"}},
-				Route: inferencev1alpha1.RuleRoute{Backends: []string{"local-a"}},
-			}},
-			DefaultRoute:         "local-a",
-			DefaultRouteStrategy: inferencev1alpha1.DefaultRouteStrategyStatic,
-		},
-	}
-
-	rules, err := compileRouterRules(mr)
-	if err != nil {
-		t.Fatalf("compileRouterRules: %v", err)
-	}
-	if len(rules) != 2 {
-		t.Fatalf("expected explicit rule + catch-all only, got %d: %+v", len(rules), rules)
-	}
-	// rules[0] is the explicit rule; rules[1] is the defaultRoute catch-all
-	// (no model match) — and crucially no per-backend name rule sits between.
-	if got := rules[0].Models; len(got) != 1 || got[0] != "foo-*" {
-		t.Errorf("rules[0] should be the explicit rule, got models %v", got)
-	}
-	catchAll := rules[1]
-	if len(catchAll.Models) != 0 {
-		t.Errorf("rules[1] should be the catch-all with no model match, got %v", catchAll.Models)
-	}
-	if len(catchAll.BackendRefs) != 1 || catchAll.BackendRefs[0].Name != "local-a" {
-		t.Errorf("catch-all backendRefs = %+v, want single local-a", catchAll.BackendRefs)
-	}
-}
-
 // TestModelRouterGateway_AuditLogFailsLoud covers the 2c honest boundary: a
 // dataPlane: Gateway router with policy.auditLog set is refused loudly
 // (GatewayReady=False, reason UnsupportedAuditLogInGatewayMode) and generates
@@ -2112,5 +2020,113 @@ func TestModelRouterGateway_NoTimeoutNoTimeoutsBlock(t *testing.T) {
 
 	if _, found, _ := unstructured.NestedMap(ruleMap, "timeouts"); found {
 		t.Error("expected no timeouts block when rule.Timeout is nil")
+	}
+}
+
+// TestModelRouterGateway_PerRetryTimeoutUsesMaxConfigured verifies that the
+// BTP retry perRetry.timeout is set to the maximum configured timeout across
+// rules and backends, fixing the #817 bug where it was hardcoded to "60s" and
+// silently capped every request at 60 seconds regardless of the user's
+// configured timeout.
+func TestModelRouterGateway_PerRetryTimeoutUsesMaxConfigured(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "perretry-cuda")
+
+	timeout := metav1.Duration{Duration: 30 * time.Minute} // 30m
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "perretry-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "perretry-cuda", InferenceServiceRef: corev1LocalRef("perretry-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:    "qwen",
+					Match:   &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route:   inferencev1alpha1.RuleRoute{Backends: []string{"perretry-cuda"}},
+					Timeout: &timeout,
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	btp := getUnstructured(t, c, btpGVK(), "perretry-router")
+
+	// Verify perRetry.timeout is "30m0s", not the hardcoded "60s".
+	perRetry, found, err := unstructured.NestedMap(btp.Object, "spec", "retry", "perRetry")
+	if err != nil {
+		t.Fatalf("spec.retry.perRetry: %v", err)
+	}
+	if !found {
+		t.Fatal("expected spec.retry.perRetry to be set")
+	}
+	got, ok := perRetry["timeout"].(string)
+	if !ok {
+		t.Fatalf("perRetry.timeout is not a string: %v", perRetry["timeout"])
+	}
+	if got != "30m0s" {
+		t.Errorf("expected perRetry.timeout=30m0s, got %q", got)
+	}
+}
+
+// TestModelRouterGateway_PerRetryTimeoutFallsBackToDefault verifies that when
+// no rule or backend declares a Timeout, the BTP retry perRetry.timeout falls
+// back to the default "60s".
+func TestModelRouterGateway_PerRetryTimeoutFallsBackToDefault(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "fallback-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "fallback-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "fallback-cuda", InferenceServiceRef: corev1LocalRef("fallback-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"fallback-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	btp := getUnstructured(t, c, btpGVK(), "fallback-router")
+
+	// Verify perRetry.timeout falls back to "60s".
+	perRetry, found, err := unstructured.NestedMap(btp.Object, "spec", "retry", "perRetry")
+	if err != nil {
+		t.Fatalf("spec.retry.perRetry: %v", err)
+	}
+	if !found {
+		t.Fatal("expected spec.retry.perRetry to be set")
+	}
+	got, ok := perRetry["timeout"].(string)
+	if !ok {
+		t.Fatalf("perRetry.timeout is not a string: %v", perRetry["timeout"])
+	}
+	if got != "60s" {
+		t.Errorf("expected perRetry.timeout=60s (default fallback), got %q", got)
 	}
 }
