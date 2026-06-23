@@ -475,6 +475,79 @@ func TestClient_Chat_TerminatesOnFinishReasonWithoutDONE(t *testing.T) {
 	}
 }
 
+// TestClient_Chat_RetriesTransportErrorThenSucceeds verifies that a
+// mid-stream transport disconnect (io.ErrUnexpectedEOF) is retried
+// and ultimately returns the full response. This is the #815 fix: a
+// single transient blip on a long run should not discard all prior
+// turns.
+func TestClient_Chat_RetriesTransportErrorThenSucceeds(t *testing.T) {
+	var attempts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+
+		// First attempt: send a partial SSE stream then drop the
+		// connection mid-stream (simulating a gateway timeout or
+		// network blip).
+		if n == 1 {
+			partialChunk := "data: {\"id\":\"t1\",\"object\":\"chat.completion.chunk\"," +
+				"\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n"
+			_, _ = w.Write([]byte(partialChunk))
+			flusher.Flush()
+			// Close the connection without sending [DONE] or
+			// finish_reason. The client will see io.ErrUnexpectedEOF.
+			hijacker, ok := w.(http.Hijacker)
+			if ok {
+				conn, _, err := hijacker.Hijack()
+				if err == nil {
+					_ = conn.Close()
+				}
+			}
+			return
+		}
+		// Second attempt: complete response.
+		_, _ = w.Write([]byte(chatResponseToSSE(t, okBodyOneToolCall)))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL+"/v1", time.Second, 3, WithBackoffs(noJitterBackoffs))
+	resp, err := c.Chat(context.Background(), ChatRequest{Model: "test"})
+	if err != nil {
+		t.Fatalf("Chat should recover from a transient transport error via retry, got: %v", err)
+	}
+	if got := attempts.Load(); got < 2 {
+		t.Errorf("expected at least one retry after the transport error; attempts=%d", got)
+	}
+	if resp.Choices[0].Message.ToolCalls[0].Function.Name != "read_file" {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+}
+
+// TestClient_Chat_TransportErrorNotRetriedOnAPIError verifies that a
+// genuine API error (400 with a JSON error body) is NOT retried.
+// Only transport-level errors should be retried; API errors are
+// non-retryable.
+func TestClient_Chat_TransportErrorNotRetriedOnAPIError(t *testing.T) {
+	var attempts atomic.Int64
+	srv := httptest.NewServer(scriptedHandler(t, &attempts,
+		[]int{http.StatusBadRequest}, []string{`{"error":"invalid model"}`}))
+	defer srv.Close()
+
+	c := New(srv.URL+"/v1", time.Second, 3, WithBackoffs(noJitterBackoffs))
+	_, err := c.Chat(context.Background(), ChatRequest{Model: "test"})
+	if err == nil {
+		t.Fatal("expected error on 400")
+	}
+	if !strings.Contains(err.Error(), "status 400") {
+		t.Errorf("error did not mention status: %v", err)
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("API error must not retry; attempts=%d", got)
+	}
+}
+
 // TestClient_Chat_AggregatesMultiChunkArguments covers the streaming
 // aggregation path the real server uses: tool-call arguments arrive in
 // fragments, often character-by-character or token-by-token. The

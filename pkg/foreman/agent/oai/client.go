@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -150,10 +151,12 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		// Retry a truncated tool-call stream (a streaming hiccup) and a
+		// Retry a truncated tool-call stream (a streaming hiccup), a
 		// transient per-request header timeout (slow prompt-eval on a warm
-		// long context, #532). Any other error is returned as-is.
-		if errors.Is(err, ErrTruncatedToolCallArguments) || isRetryableTimeout(err) {
+		// long context, #532), and a transient transport disconnect
+		// (mid-stream EOF, connection reset, #815). Any other error is
+		// returned as-is.
+		if errors.Is(err, ErrTruncatedToolCallArguments) || isRetryableTimeout(err) || isRetryableTransportError(err) {
 			lastErr = err
 			continue
 		}
@@ -169,6 +172,37 @@ func (c *Client) Chat(ctx context.Context, req ChatRequest) (*ChatResponse, erro
 func isRetryableTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// isRetryableTransportError reports whether err is a transient transport
+// failure that can be retried by re-issuing the same request. This
+// covers mid-stream disconnects (io.ErrUnexpectedEOF, io.EOF), network
+// timeouts (net.Error.Timeout), and connection resets (syscall.ECONNRESET
+// or "connection reset by peer"). Genuine API errors (4xx/5xx JSON error
+// bodies) are NOT retryable and must pass through unchanged.
+func isRetryableTransportError(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// io.EOF mid-stream: the server closed the connection without
+	// sending [DONE] or a finish_reason. This is a transport-level
+	// disconnect, not a protocol-level end-of-stream.
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	// "connection reset by peer" can appear as a plain string in some
+	// Go versions / platforms where the syscall error is not wrapped.
+	if strings.Contains(err.Error(), "connection reset by peer") {
+		return true
+	}
+	return false
 }
 
 // sleepBackoff blocks for backoffs[i] +/- 20% jitter, honoring ctx
