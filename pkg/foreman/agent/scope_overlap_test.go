@@ -192,6 +192,40 @@ func TestEnforceReviewerScopeOverlap_DriftOnNoGoAnnotatesOnly(t *testing.T) {
 	}
 }
 
+// TestEnforceReviewerScopeOverlap_ZeroGoFilesSkipsScopeCheck verifies that
+// a diff with zero indexable Go files is not treated as scope drift (#800).
+// A legitimate docs- or YAML-only change should proceed.
+func TestEnforceReviewerScopeOverlap_ZeroGoFilesSkipsScopeCheck(t *testing.T) {
+	// Issue references Go files; diff contains only non-Go files.
+	diff := []string{"README.md", "config/crd/bases/inference.llmkube.dev_models.yaml"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("zero-Go-file diff must not demote GO; got %v", got)
+	}
+	if _, demoted := extra["verdictDemoted"]; demoted {
+		t.Error("should not claim demotion when zero Go files changed")
+	}
+}
+
+// TestEnforceReviewerScopeOverlap_RealDriftStillBites verifies that a diff
+// with Go files that do not match the issue refs is still flagged as drift
+// (#800).
+func TestEnforceReviewerScopeOverlap_RealDriftStillBites(t *testing.T) {
+	// Issue references Go files; diff contains Go files that don't match.
+	diff := []string{"internal/foreman/controller/agentictask_controller.go"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("real drift with Go files must still demote GO; got %v", got)
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); !v {
+		t.Error("scopeDriftDetected must be true for real drift")
+	}
+}
+
 func TestEnforceReviewerScopeOverlap_NilOrEmptyInputsPassThrough(t *testing.T) {
 	if got := enforceReviewerScopeOverlap(logr.Discard(), nil, issue379Body,
 		[]string{"x.go"}, foremanv1alpha1.AgenticTaskVerdictGo); got != foremanv1alpha1.AgenticTaskVerdictGo {
