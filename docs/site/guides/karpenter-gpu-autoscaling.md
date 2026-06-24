@@ -50,7 +50,7 @@ spec:
           operator: In
           values: ["on-demand"]
       nodeClassRef:
-        group: karpenter.aws.x-k8s.io
+        group: karpenter.k8s.aws
         kind: EC2NodeClass
         name: gpu-nodeclass
       taints:
@@ -58,7 +58,7 @@ spec:
           value: "true"
           effect: NoSchedule
 ---
-apiVersion: karpenter.aws.x-k8s.io/v1
+apiVersion: karpenter.k8s.aws/v1
 kind: EC2NodeClass
 metadata: { name: gpu-nodeclass }
 spec:
@@ -125,30 +125,11 @@ InferenceService reaches `Ready` phase.
 
 ## Step 3: Protect pods from disruption during startup
 
-LLMKube already manages the `karpenter.sh/do-not-disrupt`
-annotation automatically via the `DisruptionSpec` on the
-`InferenceService`. By default, `protectStartup: true` sets the
-annotation while the service is not yet Ready, then removes it
-afterward. This prevents Karpenter from consolidating the node
-while the model is still downloading and loading.
-
-If you need the annotation permanently (for example, a long-running
-service that should never be disrupted), use `protectAlways`:
-
-```yaml
-apiVersion: inference.llmkube.dev/v1alpha1
-kind: InferenceService
-metadata: { name: llama-3-8b }
-spec:
-  modelRef: llama-3-8b
-  disruption:
-    protectAlways: true
-```
-
-You can also set the annotation directly through the
-`podAnnotations` passthrough. This is useful when you want to
-control the annotation value yourself or when you need to set
-additional Karpenter annotations that the operator does not manage:
+While a model is still downloading and loading, Karpenter may try to
+consolidate the node out from under it. To prevent that, set the
+`karpenter.sh/do-not-disrupt` annotation on the inference pod through
+LLMKube's `podAnnotations` passthrough, which merges the annotation
+onto the pod's metadata:
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -160,9 +141,12 @@ spec:
     karpenter.sh/do-not-disrupt: "true"
 ```
 
-User-provided `podAnnotations` always win on collision with the
-operator-managed annotation. If you set the annotation via
-`podAnnotations`, the operator will not overwrite it.
+Karpenter will not disrupt or consolidate a node whose pods carry
+this annotation, so the model can finish loading and serve without
+the node being reclaimed. Remove the annotation once you want the
+node to be eligible for consolidation again (for example, after the
+service scales to zero), or leave it in place for a long-running
+service that should never be interrupted.
 
 ## Step 4: Scale to zero
 
@@ -248,9 +232,9 @@ kubectl describe pod -l inference.llmkube.dev/service=llama-3-8b
 Karpenter's default consolidation window is 5 minutes. If you
 scale an InferenceService up and immediately scale it back down,
 Karpenter may consolidate the node before the model finishes
-loading. This is rare in practice because the operator sets
-`karpenter.sh/do-not-disrupt: "true"` during startup by default.
-If you disabled `protectStartup`, you may see this.
+loading. Set the `karpenter.sh/do-not-disrupt` annotation via
+`podAnnotations` (see Step 3) so Karpenter leaves the node alone
+while the model loads.
 
 ### NodeSelector mismatch
 
