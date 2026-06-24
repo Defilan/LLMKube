@@ -20,6 +20,13 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/defilantech/llmkube/internal/metrics"
 )
 
 // Proxy is the router-proxy HTTP application. Construct via NewProxy and
@@ -29,6 +36,7 @@ type Proxy struct {
 	matcher *Matcher
 	disp    *Dispatcher
 	logger  *slog.Logger
+	tracer  trace.Tracer
 }
 
 // ProxyOption customizes a Proxy at construction time. The proxy
@@ -60,6 +68,7 @@ func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 		matcher: NewMatcher(cfg),
 		disp:    NewDispatcher(cfg),
 		logger:  logger,
+		tracer:  otel.Tracer("model_router"),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -138,8 +147,17 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, span := p.tracer.Start(r.Context(), "model_router.dispatch",
+		trace.WithAttributes(
+			attribute.String("model", features.Model),
+			attribute.String("classification", features.Classification),
+			attribute.String("task_complexity", features.TaskComplexity),
+		),
+	)
+	defer span.End()
+
 	start := time.Now()
-	chosen, resp, err := p.dispatchWithFallback(r.Context(), &decision, r.Header, body, "/v1/chat/completions")
+	chosen, resp, err := p.dispatchWithFallback(ctx, &decision, r.Header, body, "/v1/chat/completions")
 	elapsed := time.Since(start)
 	if err != nil {
 		// Runtime fail-closed: when every backend in a fail-closed
@@ -244,6 +262,10 @@ func (p *Proxy) dispatchWithFallback(
 	path string,
 ) (*Backend, *http.Response, error) {
 	var lastErr error
+	ruleName := ""
+	if dec.Rule != nil {
+		ruleName = dec.Rule.Name
+	}
 	for _, name := range dec.Backends {
 		b := p.matcher.BackendByName(name)
 		if b == nil {
@@ -256,10 +278,31 @@ func (p *Proxy) dispatchWithFallback(
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx,
 			resolveDispatchTimeout(dec, b, p.disp.ResponseHeaderTimeout()))
+
+		// Start a span for each backend dispatch attempt.
+		attemptCtx, span := p.tracer.Start(attemptCtx, "backend.request",
+			trace.WithAttributes(
+				attribute.String("backend", name),
+				attribute.String("backend_tier", b.Tier),
+			),
+		)
+
+		start := time.Now()
 		resp, err := p.disp.Dispatch(attemptCtx, b, http.MethodPost, path, headers, body)
+		elapsed := time.Since(start)
+
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+			span.End()
+			metrics.RouterDispatchTotal.WithLabelValues(name, "error").Inc()
+			metrics.RouterDispatchDuration.WithLabelValues(name).Observe(elapsed.Seconds())
+			metrics.RouterBackendHealth.WithLabelValues(name).Set(0)
 			cancel()
 			lastErr = err
+			if ruleName != "" {
+				metrics.RouterFallbackTotal.WithLabelValues(ruleName).Inc()
+			}
 			continue
 		}
 		if resp.StatusCode >= 500 {
@@ -268,6 +311,15 @@ func (p *Proxy) dispatchWithFallback(
 			_ = resp.Body.Close()
 			cancel()
 			lastErr = fmt.Errorf("%s returned %d", name, resp.StatusCode)
+			span.RecordError(lastErr)
+			span.SetStatus(codes.Error, lastErr.Error())
+			span.End()
+			metrics.RouterDispatchTotal.WithLabelValues(name, "5xx").Inc()
+			metrics.RouterDispatchDuration.WithLabelValues(name).Observe(elapsed.Seconds())
+			metrics.RouterBackendHealth.WithLabelValues(name).Set(0)
+			if ruleName != "" {
+				metrics.RouterFallbackTotal.WithLabelValues(ruleName).Inc()
+			}
 			continue
 		}
 		// Successful response: wrap the body so its Close also
@@ -276,6 +328,10 @@ func (p *Proxy) dispatchWithFallback(
 		// plumbing needed, and streaming dispatches keep the
 		// deadline alive until the client finishes reading.
 		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+		span.End()
+		metrics.RouterDispatchTotal.WithLabelValues(name, "ok").Inc()
+		metrics.RouterDispatchDuration.WithLabelValues(name).Observe(elapsed.Seconds())
+		metrics.RouterBackendHealth.WithLabelValues(name).Set(1)
 		return b, resp, nil
 	}
 	if lastErr == nil {

@@ -94,6 +94,41 @@ var (
 		},
 		[]string{"controller"},
 	)
+
+	// ModelRouter metrics
+
+	RouterDispatchTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_router_dispatch_total",
+			Help: "Total number of dispatch attempts by the ModelRouter.",
+		},
+		[]string{"backend", "status"},
+	)
+
+	RouterDispatchDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "llmkube_router_dispatch_duration_seconds",
+			Help:    "Duration of ModelRouter dispatch attempts.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"backend"},
+	)
+
+	RouterFallbackTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_router_fallback_total",
+			Help: "Total number of fallback attempts by the ModelRouter.",
+		},
+		[]string{"rule"},
+	)
+
+	RouterBackendHealth = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "llmkube_router_backend_health",
+			Help: "Health status of ModelRouter backends. 1=healthy, 0=unhealthy.",
+		},
+		[]string{"backend"},
+	)
 )
 
 func init() {
@@ -106,5 +141,9 @@ func init() {
 		GPUQueueWaitDuration,
 		ReconcileTotal,
 		ReconcileDuration,
+		RouterDispatchTotal,
+		RouterDispatchDuration,
+		RouterFallbackTotal,
+		RouterBackendHealth,
 	)
 }
