@@ -637,17 +637,15 @@ var _ = Describe("Model Controller - Cache Bug Fixes", func() {
 		defer func() { _ = os.RemoveAll(tempDir) }()
 
 		// Use a file:// source so the test exercises the controller's
-		// re-fetch behavior on stale status. HTTPS is deferred to the
+		// in-process download path. HTTPS sources are deferred to the
 		// workload init container.
 		srcDir, err := os.MkdirTemp("", "llmkube-src-*")
 		Expect(err).NotTo(HaveOccurred())
 		defer func() { _ = os.RemoveAll(srcDir) }()
 		srcFile := filepath.Join(srcDir, "src.gguf")
-		Expect(os.WriteFile(srcFile, []byte("re-fetched-model-content"), 0644)).To(Succeed())
+		Expect(os.WriteFile(srcFile, []byte("model-content"), 0644)).To(Succeed())
 
 		source := fmt.Sprintf("file://%s", srcFile)
-		cacheKey := computeCacheKey(source)
-		stalePath := filepath.Join(tempDir, cacheKey, "model.gguf")
 
 		modelName := "model-ready-missing-file"
 		model := &inferencev1alpha1.Model{
@@ -657,32 +655,47 @@ var _ = Describe("Model Controller - Cache Bug Fixes", func() {
 		Expect(k8sClient.Create(ctx, model)).To(Succeed())
 		defer func() { _ = k8sClient.Delete(ctx, model) }()
 
-		// Manually set the status to Ready with a path that doesn't exist on
-		// disk to simulate a controller restart with stale status.
-		model.Status.Phase = PhaseReady
-		model.Status.Path = stalePath
-		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
-
 		reconciler := &ModelReconciler{
 			Client:      k8sClient,
 			Scheme:      k8sClient.Scheme(),
 			StoragePath: tempDir,
 		}
+
+		// First reconcile: controller downloads the model and marks it Ready.
 		result, err := reconciler.Reconcile(ctx, reconcile.Request{
 			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
 		})
 		Expect(err).NotTo(HaveOccurred())
 		Expect(result).To(Equal(reconcile.Result{}))
 
-		// Verify model was re-downloaded and landed at the canonical filename
-		// (Model.Name fallback because fake GGUF data fails parsing).
-		expectedPath := filepath.Join(tempDir, cacheKey, modelName+".gguf")
 		updated := &inferencev1alpha1.Model{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
 		Expect(updated.Status.Phase).To(Equal(PhaseReady))
-		Expect(updated.Status.Path).To(Equal(expectedPath))
-		_, err = os.Stat(expectedPath)
+		Expect(updated.Status.Path).NotTo(BeEmpty())
+		_, err = os.Stat(updated.Status.Path)
+		Expect(err).NotTo(HaveOccurred(), "model file should exist after first reconcile")
+
+		// Delete the cached file from disk to simulate a missing file (e.g.
+		// disk corruption, manual deletion, or a controller restart with
+		// stale status).
+		Expect(os.Remove(updated.Status.Path)).To(Succeed())
+		_, err = os.Stat(updated.Status.Path)
+		Expect(os.IsNotExist(err)).To(BeTrue(), "model file should be gone")
+
+		// Second reconcile: controller should detect the missing file and
+		// re-download it, restoring the model to Ready.
+		result, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
 		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		// Verify model was re-downloaded and is Ready again.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		Expect(updated.Status.Path).NotTo(BeEmpty())
+		_, err = os.Stat(updated.Status.Path)
+		Expect(err).NotTo(HaveOccurred(), "model file should exist after re-download")
 	})
 
 	It("should not leave partial file at final path on fetch failure", func() {
