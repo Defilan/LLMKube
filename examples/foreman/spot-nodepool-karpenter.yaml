@@ -11,7 +11,7 @@
 # The companion gate-Job patch is at
 # examples/foreman/spot-gate-job-patch.yaml.
 
-apiVersion: karpenter.sh/v1beta1
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
   name: foreman-gate-spot
