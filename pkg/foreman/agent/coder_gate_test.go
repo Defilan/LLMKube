@@ -222,13 +222,14 @@ func TestRunCoderGateLintCacheScopedToWorkspace(t *testing.T) {
 func TestChangedTestPackages_ExcludesEnvtestAndDedups(t *testing.T) {
 	run := func(_ context.Context, _ string, _ []string, name string, _ ...string) (string, error) {
 		if name == "git" {
-			return " M pkg/cli/cache_inspect.go\n" +
-				" M pkg/cli/cache_inspect_test.go\n" +
-				"?? pkg/foreman/agent/loop_session_test.go\n" +
-				" M internal/controller/model_controller.go\n" +
-				" M internal/foreman/controller/agentictask_controller.go\n" +
-				" M test/e2e/e2e_test.go\n" +
-				" M README.md\n", nil
+			// git status -z uses NUL-terminated entries.
+			return " M pkg/cli/cache_inspect.go\x00" +
+				" M pkg/cli/cache_inspect_test.go\x00" +
+				"?? pkg/foreman/agent/loop_session_test.go\x00" +
+				" M internal/controller/model_controller.go\x00" +
+				" M internal/foreman/controller/agentictask_controller.go\x00" +
+				" M test/e2e/e2e_test.go\x00" +
+				" M README.md\x00", nil
 		}
 		return "", nil
 	}
@@ -254,7 +255,7 @@ func TestRunCoderGate_FailsOnChangedPackageUnitTest(t *testing.T) {
 		case name == "gofmt":
 			return "", nil
 		case name == "git":
-			return " M pkg/cli/cache_inspect_test.go\n", nil
+			return " M pkg/cli/cache_inspect_test.go\x00", nil
 		case name == "go" && len(args) > 0 && args[0] == "test":
 			out := "panic: runtime error: invalid memory address\n" +
 				"FAIL\tgithub.com/defilantech/llmkube/pkg/cli"

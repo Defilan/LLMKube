@@ -69,6 +69,16 @@ func extractIssuePathRefs(body string) []string {
 	return refs
 }
 
+// hasGoFile reports whether any path in paths ends with ".go".
+func hasGoFile(paths []string) bool {
+	for _, p := range paths {
+		if strings.HasSuffix(p, ".go") {
+			return true
+		}
+	}
+	return false
+}
+
 // isPathRef reports whether a single cleaned token is a concrete file
 // reference per the rules documented on extractIssuePathRefs.
 func isPathRef(tok string) bool {
@@ -139,6 +149,13 @@ func enforceReviewerScopeOverlap(
 	extra["scopeMatched"] = matched
 	extra["scopeDriftDetected"] = drift
 	if !drift {
+		return verdict
+	}
+
+	// A diff with zero indexable Go files is not scope drift — it is a
+	// legitimate docs- or YAML-only change (#800). Skip the scope check
+	// so the run proceeds.
+	if !hasGoFile(diffFiles) {
 		return verdict
 	}
 

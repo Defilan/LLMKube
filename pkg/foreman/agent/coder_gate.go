@@ -149,19 +149,20 @@ func RunCoderGate(ctx context.Context, workspace, golangciPath string, run comma
 
 // changedTestPackages returns the workspace-relative Go package directories
 // (as "./<dir>/" patterns) that have uncommitted changes per
-// `git status --porcelain` and are not envtest-backed. It dedups packages
-// and ignores non-Go files and root-level (package main) changes. A git
+// `git status -z` and are not envtest-backed. It dedups packages and
+// ignores non-Go files and root-level (package main) changes. A git
 // error yields no packages (the tier is skipped rather than failing the
-// gate spuriously).
+// gate spuriously). NUL-terminated output is used so filenames with
+// embedded newlines are handled correctly.
 func changedTestPackages(ctx context.Context, workspace string, run commandRunner) []string {
-	out, err := run(ctx, workspace, nil, "git", "status", "--porcelain")
+	out, err := run(ctx, workspace, nil, "git", "status", "-z")
 	if err != nil {
 		return nil
 	}
 	seen := map[string]bool{}
 	var pkgs []string
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
+	for _, entry := range strings.Split(out, "\x00") {
+		fields := strings.Fields(strings.TrimSpace(entry))
 		if len(fields) == 0 {
 			continue
 		}
