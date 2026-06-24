@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -489,4 +490,102 @@ func TestLlamaCppBuildArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLlamaCppRouterBackend(t *testing.T) {
+	backend := &LlamaCppRouterBackend{}
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-model", Namespace: "default"},
+	}
+	const modelPath = "/models/test"
+	const port = int32(8000)
+
+	t.Run("default values", func(t *testing.T) {
+		if got := backend.ContainerName(); got != "llama-server" {
+			t.Errorf("ContainerName() = %q, want %q", got, "llama-server")
+		}
+		if got := backend.DefaultImage(); got != "ghcr.io/ggml-org/llama.cpp:server" {
+			t.Errorf("DefaultImage() = %q, want %q", got, "ghcr.io/ggml-org/llama.cpp:server")
+		}
+		if got := backend.DefaultPort(); got != int32(8080) {
+			t.Errorf("DefaultPort() = %d, want %d", got, 8080)
+		}
+		if !backend.NeedsModelInit() {
+			t.Error("NeedsModelInit() = false, want true")
+		}
+		if got := backend.DefaultHPAMetric(); got != "llamacpp:requests_processing" {
+			t.Errorf("DefaultHPAMetric() = %q, want %q", got, "llamacpp:requests_processing")
+		}
+	})
+
+	t.Run("build args emits --router and omits --model", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-router", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:  "llamacpp-router",
+				ModelRef: "test-model",
+			},
+		}
+		args := backend.BuildArgs(isvc, model, modelPath, port)
+
+		// Router mode must emit --router
+		if !containsArg(args, "--router", "") {
+			t.Errorf("expected --router in args, got: %v", args)
+		}
+
+		// Router mode must NOT emit --model (it hosts multiple models)
+		if containsArg(args, "--model", "") {
+			t.Errorf("expected --model NOT in args for router mode, got: %v", args)
+		}
+
+		// Router mode still emits --host, --port, --metrics
+		if !containsArg(args, "--host", "0.0.0.0") {
+			t.Errorf("expected --host 0.0.0.0 in args, got: %v", args)
+		}
+		if !containsArg(args, "--port", fmt.Sprintf("%d", port)) {
+			t.Errorf("expected --port %d in args, got: %v", port, args)
+		}
+		if !containsArg(args, "--metrics", "") {
+			t.Errorf("expected --metrics in args, got: %v", args)
+		}
+	})
+
+	t.Run("build args with extraArgs", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-router-extra", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:   "llamacpp-router",
+				ModelRef:  "test-model",
+				ExtraArgs: []string{"--seed", "42"},
+			},
+		}
+		args := backend.BuildArgs(isvc, model, modelPath, port)
+
+		if !containsArg(args, "--router", "") {
+			t.Errorf("expected --router in args, got: %v", args)
+		}
+		if !containsArg(args, "--seed", "42") {
+			t.Errorf("expected --seed 42 in args, got: %v", args)
+		}
+	})
+
+	t.Run("single-model path unchanged", func(t *testing.T) {
+		// Verify the original LlamaCppBackend still emits --model
+		singleBackend := &LlamaCppBackend{}
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-single", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:  "llamacpp",
+				ModelRef: "test-model",
+			},
+		}
+		args := singleBackend.BuildArgs(isvc, model, modelPath, port)
+
+		if !containsArg(args, "--model", modelPath) {
+			t.Errorf("expected --model %s in single-model args, got: %v", modelPath, args)
+		}
+		if containsArg(args, "--router", "") {
+			t.Errorf("expected --router NOT in single-model args, got: %v", args)
+		}
+	})
 }

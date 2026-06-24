@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -47,6 +49,7 @@ func TestRuntimeNameLabel(t *testing.T) {
 		{name: "tgi passes through", runtime: "tgi", expected: "tgi"},
 		{name: "personaplex passes through", runtime: "personaplex", expected: "personaplex"},
 		{name: "generic passes through", runtime: "generic", expected: "generic"},
+		{name: "llamacpp-router passes through", runtime: "llamacpp-router", expected: "llamacpp-router"},
 		// Future runtimes (vllm-swift on metal, etc.) pass through
 		// untouched: the label is the user-declared identifier, not a
 		// validated enum, so new backends do not need to update this map.
@@ -68,6 +71,34 @@ func TestRuntimeNameLabel(t *testing.T) {
 			t.Errorf("runtimeNameLabel(nil) = %q, want %q", got, "llamacpp")
 		}
 	})
+}
+
+func TestResolveBackend(t *testing.T) {
+	cases := []struct {
+		name     string
+		runtime  string
+		expected string
+	}{
+		{name: "empty runtime returns LlamaCppBackend", runtime: "", expected: "LlamaCppBackend"},
+		{name: "llamacpp returns LlamaCppBackend", runtime: "llamacpp", expected: "LlamaCppBackend"},
+		{name: "llamacpp-router returns LlamaCppRouterBackend", runtime: "llamacpp-router", expected: "LlamaCppRouterBackend"},
+		{name: "vllm returns VLLMBackend", runtime: "vllm", expected: "VLLMBackend"},
+		{name: "tgi returns TGIBackend", runtime: "tgi", expected: "TGIBackend"},
+		{name: "personaplex returns PersonaPlexBackend", runtime: "personaplex", expected: "PersonaPlexBackend"},
+		{name: "generic returns GenericBackend", runtime: "generic", expected: "GenericBackend"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{Runtime: tc.runtime},
+			}
+			backend := resolveBackend(isvc)
+			got := fmt.Sprintf("%T", backend)
+			if !strings.HasSuffix(got, "*controller."+tc.expected) {
+				t.Errorf("resolveBackend(%q) = %s, want *controller.%s", tc.runtime, got, tc.expected)
+			}
+		})
+	}
 }
 
 func TestResolveGPUCount(t *testing.T) {

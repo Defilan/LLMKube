@@ -70,6 +70,8 @@ func resolveBackend(isvc *inferencev1alpha1.InferenceService) RuntimeBackend {
 		return &TGIBackend{}
 	case "generic":
 		return &GenericBackend{}
+	case "llamacpp-router":
+		return &LlamaCppRouterBackend{}
 	default:
 		return &LlamaCppBackend{}
 	}

@@ -23,6 +23,106 @@ const llamaCppVulkanImage = "ghcr.io/defilantech/llmkube-llama-vulkan@sha256:cba
 // LlamaCppBackend generates container configuration for the llama.cpp inference server.
 type LlamaCppBackend struct{}
 
+// LlamaCppRouterBackend generates container configuration for the llama.cpp
+// router mode, which hosts multiple models behind one Service and advertises
+// them on /v1/models. It reuses LlamaCppBackend's BuildArgs but prepends the
+// --router flag so llama.cpp runs in router mode instead of single-model mode.
+type LlamaCppRouterBackend struct{}
+
+func (b *LlamaCppRouterBackend) ContainerName() string    { return "llama-server" }
+func (b *LlamaCppRouterBackend) DefaultImage() string     { return "ghcr.io/ggml-org/llama.cpp:server" }
+func (b *LlamaCppRouterBackend) DefaultPort() int32       { return 8080 }
+func (b *LlamaCppRouterBackend) NeedsModelInit() bool     { return true }
+func (b *LlamaCppRouterBackend) DefaultHPAMetric() string { return "llamacpp:requests_processing" }
+
+func (b *LlamaCppRouterBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
+	args := []string{
+		"--router",
+		"--host", "0.0.0.0",
+		"--port", fmt.Sprintf("%d", port),
+	}
+
+	var err error
+
+	args = appendContextSizeArgs(args, isvc.Spec.ContextSize)
+	args, err = appendRopeScalingArgs(args, isvc.Spec.RopeScaling, isvc.Spec.ExtraArgs)
+	if err != nil {
+		llamaCppLog.Info(
+			err.Error(),
+			"inferenceService", isvc.Name,
+			"namespace", isvc.Namespace,
+		)
+	}
+	args, err = appendParallelSlotsArgs(args, isvc.Spec.ParallelSlots, isvc.Spec.ExtraArgs)
+	if err != nil {
+		llamaCppLog.Info(
+			err.Error(),
+			"inferenceService", isvc.Name,
+			"namespace", isvc.Namespace,
+		)
+	}
+	args = appendFlashAttentionArgs(args, isvc.Spec.FlashAttention, hasGPUPresent(isvc, model))
+	args = appendJinjaArgs(args, isvc.Spec.Jinja)
+	args = appendCacheTypeArgs(args, resolveCacheType(isvc.Spec.CacheTypeCustomK, isvc.Spec.CacheTypeK), resolveCacheType(isvc.Spec.CacheTypeCustomV, isvc.Spec.CacheTypeV))
+	args = appendMoeCPUOffloadArgs(args, isvc.Spec.MoeCPUOffload)
+	args = appendMoeCPULayersArgs(args, isvc.Spec.MoeCPULayers)
+	args = appendNoKvOffloadArgs(args, isvc.Spec.NoKvOffload)
+	args = appendTensorOverrideArgs(args, isvc.Spec.TensorOverrides)
+	args = appendBatchSizeArgs(args, isvc.Spec.BatchSize)
+	args = appendUBatchSizeArgs(args, isvc.Spec.UBatchSize)
+	args = appendNoWarmupArgs(args, isvc.Spec.NoWarmup)
+	args = appendReasoningBudgetArgs(args, isvc.Spec.ReasoningBudget, isvc.Spec.ReasoningBudgetMessage)
+	args = appendMetadataOverrideArgs(args, isvc.Spec.MetadataOverrides)
+	if len(isvc.Spec.ExtraArgs) > 0 {
+		args = append(args, isvc.Spec.ExtraArgs...)
+	}
+
+	// Enable Prometheus metrics endpoint on llama.cpp
+	args = append(args, "--metrics")
+
+	return args
+}
+
+func (b *LlamaCppRouterBackend) BuildProbes(port int32) (startup, liveness, readiness *corev1.Probe) {
+	startup = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/health",
+				Port: intstr.FromInt32(port),
+			},
+		},
+		PeriodSeconds:    10,
+		TimeoutSeconds:   5,
+		FailureThreshold: 180,
+	}
+
+	liveness = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/health",
+				Port: intstr.FromInt32(port),
+			},
+		},
+		PeriodSeconds:    15,
+		TimeoutSeconds:   5,
+		FailureThreshold: 3,
+	}
+
+	readiness = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/health",
+				Port: intstr.FromInt32(port),
+			},
+		},
+		PeriodSeconds:    10,
+		TimeoutSeconds:   5,
+		FailureThreshold: 3,
+	}
+
+	return startup, liveness, readiness
+}
+
 func (b *LlamaCppBackend) ContainerName() string {
 	return "llama-server"
 }

@@ -57,11 +57,13 @@ type InferenceServiceSpec struct {
 
 	// Runtime selects the inference server backend.
 	// "llamacpp" (default): llama.cpp server with auto-generated args and /health probes.
+	// "llamacpp-router": llama.cpp router mode hosting multiple models behind one Service,
+	// advertising them on /v1/models.
 	// "generic": user-provided container with custom command, args, env, and probes.
 	// "personaplex": NVIDIA PersonaPlex (Moshi) speech-to-speech server.
 	// "vllm": vLLM OpenAI-compatible server with PagedAttention.
 	// "tgi": HuggingFace Text Generation Inference server.
-	// +kubebuilder:validation:Enum=llamacpp;personaplex;vllm;tgi;generic
+	// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;generic
 	// +kubebuilder:default=llamacpp
 	// +optional
 	Runtime string `json:"runtime,omitempty"`
