@@ -290,6 +290,12 @@ type AgenticTaskSpec struct {
 	// Higher values dispatch first. v0.1 is FIFO and ignores priority.
 	// +optional
 	Priority int32 `json:"priority,omitempty"`
+
+	// GateProfile declares the gate commands, container image, and source
+	// file extensions for the task's language. Consumed in a later slice
+	// by the gate executor; unset means the "go" preset (current behavior).
+	// +optional
+	GateProfile *GateProfile `json:"gateProfile,omitempty"`
 }
 
 // AgenticTaskPhase is the lifecycle state of a task.
