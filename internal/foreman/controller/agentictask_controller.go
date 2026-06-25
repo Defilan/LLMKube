@@ -34,6 +34,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
 // claimExpiriesAnnotation tracks how many times this task has been released
@@ -61,6 +62,10 @@ const claimExpiryLimit = 2
 type AgenticTaskReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// AuditNamespace is where durable audit-record ConfigMaps are written.
+	// Empty means each record lands in its task's own namespace.
+	AuditNamespace string
 }
 
 // requeueNoFit is the backoff when no FleetNode satisfies the task's
@@ -101,9 +106,14 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.setInitialPending(ctx, &task)
 	}
 
-	// Terminal phases are done; nothing left to do.
+	// Terminal phases are done; record the durable audit entry once
+	// (best-effort: a failed audit write must not wedge reconciliation),
+	// then nothing left to do.
 	if task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
 		task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
+		if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
+			log.Error(err, "audit: failed to record terminal run (continuing)")
+		}
 		return ctrl.Result{}, nil
 	}
 

@@ -14,8 +14,12 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
 func TestWriteRecordCreatesDurableConfigMap(t *testing.T) {
@@ -63,5 +67,44 @@ func TestWriteRecordIdempotentUpsert(t *testing.T) {
 	_ = json.Unmarshal([]byte(cm.Data[auditDataKey]), &got)
 	if got.Verdict != "NO-GO" {
 		t.Errorf("upsert did not update, verdict=%q", got.Verdict)
+	}
+}
+
+func TestRecordTerminalWritesOnceAndSetsAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = foremanv1alpha1.AddToScheme(scheme)
+
+	task := coderTask() // from record_test.go (same package)
+	agent := coderAgent()
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(task, agent).
+		WithStatusSubresource(task).Build()
+	ctx := context.Background()
+
+	if err := RecordTerminal(ctx, c, task, "", logr.Discard()); err != nil {
+		t.Fatalf("RecordTerminal: %v", err)
+	}
+	// audit CM exists in the task namespace (empty audit ns -> task ns)
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "foreman-audit-coder-89"}, &cm); err != nil {
+		t.Fatalf("audit CM not written: %v", err)
+	}
+	// annotation guard set on the task
+	var got foremanv1alpha1.AgenticTask
+	_ = c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "coder-89"}, &got)
+	if got.Annotations[AuditedAnnotation] != "true" {
+		t.Errorf("audited annotation not set: %v", got.Annotations)
+	}
+
+	// second call is a no-op (already audited): delete the CM, call again,
+	// confirm it is NOT recreated.
+	_ = c.Delete(ctx, &cm)
+	if err := RecordTerminal(ctx, c, &got, "", logr.Discard()); err != nil {
+		t.Fatalf("second RecordTerminal: %v", err)
+	}
+	err := c.Get(ctx, types.NamespacedName{Namespace: "default", Name: "foreman-audit-coder-89"}, &corev1.ConfigMap{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("already-audited task must not re-write the record; got err=%v", err)
 	}
 }

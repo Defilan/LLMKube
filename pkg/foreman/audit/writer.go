@@ -17,6 +17,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
 const (
@@ -29,6 +31,10 @@ const (
 	auditDataKey = "audit.json"
 
 	auditNamePrefix = "foreman-audit-"
+
+	// AuditedAnnotation guards against re-writing a record on every reconcile
+	// of an already-terminal task (which would emit duplicate audit lines).
+	AuditedAnnotation = "foreman.llmkube.dev/audited"
 )
 
 // AuditConfigMapName returns the ConfigMap name for a task's audit record.
@@ -81,5 +87,48 @@ func WriteRecord(ctx context.Context, c client.Client, namespace string, rec Rec
 		"task", rec.Task.Name, "namespace", rec.Task.Namespace,
 		"verdict", rec.Verdict, "node", rec.AssignedNode,
 		"repo", rec.Repo, "issue", rec.Issue, "schemaVersion", rec.SchemaVersion)
+	return nil
+}
+
+// RecordTerminal writes the audit record for a terminal task exactly once.
+// It is a no-op if the task already carries AuditedAnnotation. auditNamespace
+// is the namespace for the record; empty means the task's own namespace. The
+// referenced Agent is fetched best-effort (a missing Agent yields a record
+// with no agent block, not an error). On success it stamps AuditedAnnotation
+// so subsequent reconciles skip the write.
+func RecordTerminal(ctx context.Context, c client.Client, task *foremanv1alpha1.AgenticTask, auditNamespace string, log logr.Logger) error {
+	if task.Annotations[AuditedAnnotation] == "true" {
+		return nil
+	}
+	ns := auditNamespace
+	if ns == "" {
+		ns = task.Namespace
+	}
+
+	var agent *foremanv1alpha1.Agent
+	if task.Spec.AgentRef != nil && task.Spec.AgentRef.Name != "" {
+		var a foremanv1alpha1.Agent
+		key := client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.AgentRef.Name}
+		if err := c.Get(ctx, key, &a); err == nil {
+			agent = &a
+		} else {
+			log.Info("audit: agent not resolvable; recording without agent block",
+				"agent", task.Spec.AgentRef.Name, "err", err.Error())
+		}
+	}
+
+	rec := BuildRecord(task, agent)
+	if err := WriteRecord(ctx, c, ns, rec, log); err != nil {
+		return err
+	}
+
+	patch := client.MergeFrom(task.DeepCopy())
+	if task.Annotations == nil {
+		task.Annotations = map[string]string{}
+	}
+	task.Annotations[AuditedAnnotation] = "true"
+	if err := c.Patch(ctx, task, patch); err != nil {
+		return fmt.Errorf("audit: set audited annotation: %w", err)
+	}
 	return nil
 }
