@@ -395,7 +395,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// fast checks is sent back for a fix instead of landing dirty.
 	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
 		cfg.MaxVerifyRetries = coderGateMaxRetries
-		cfg.VerifyTerminal = makeCoderGateVerifier(workspace, log)
+		cfg.VerifyTerminal = makeCoderGateVerifier(workspace, log, task.Spec.GateProfile)
 	}
 
 	// 8. Run the loop. Always persist the transcript afterwards,
@@ -576,13 +576,24 @@ const coderGateMaxRetries = 3
 // use; a bootstrap or run error is reported as could-not-verify so the
 // terminal stands and the clean-room gate Job remains the authoritative
 // backstop.
-func makeCoderGateVerifier(workspace string, log logr.Logger) TerminalVerifier {
+func makeCoderGateVerifier(workspace string, log logr.Logger, profile *foremanv1alpha1.GateProfile) TerminalVerifier {
 	return func(ctx context.Context, terminal *ToolResult, _ []oai.Message) (bool, string, error) {
 		if terminal == nil {
 			return true, "", nil
 		}
 		if v, _ := normalizeModelVerdict(terminal.Verdict); v != foremanv1alpha1.AgenticTaskVerdictGo {
 			return true, "", nil
+		}
+		// Non-Go GateProfiles run the language-agnostic generic gate from the
+		// resolved commands. The Go path below is left byte-identical: a nil,
+		// empty-language, or explicit-"go" profile takes it unchanged.
+		if usesGenericGate(profile) {
+			pass, feedback := RunGenericGate(ctx, workspace, profile.Resolve(), execCommandRunner)
+			if !pass {
+				log.Info("coder gate (generic): fast checks failed; returning feedback to the loop for a fix",
+					"language", string(profile.Language))
+			}
+			return pass, feedback, nil
 		}
 		lintPath := filepath.Join(workspace, "bin", "golangci-lint")
 		if _, statErr := os.Stat(lintPath); statErr != nil {
