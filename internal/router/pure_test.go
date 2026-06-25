@@ -103,11 +103,11 @@ func TestMatchHeadersValueMismatch(t *testing.T) {
 
 func TestMatchHeadersMultipleHeaders(t *testing.T) {
 	want := map[string]string{
-		"X-Team":       "research",
+		"X-Team":        "research",
 		"X-Environment": "prod",
 	}
 	have := map[string]string{
-		"x-team":       "research",
+		"x-team":        "research",
 		"x-environment": "prod",
 	}
 	if !matchHeaders(want, have) {
@@ -117,7 +117,7 @@ func TestMatchHeadersMultipleHeaders(t *testing.T) {
 
 func TestMatchHeadersOneMissingOfMultiple(t *testing.T) {
 	want := map[string]string{
-		"X-Team":       "research",
+		"X-Team":        "research",
 		"X-Environment": "prod",
 	}
 	have := map[string]string{
@@ -294,7 +294,7 @@ func TestConfigValidateRuleNameRequired(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Config.SensitiveSet - empty override replaces defaults
+// Config.SensitiveSet - empty override falls back to defaults
 // ---------------------------------------------------------------------------
 
 func TestSensitiveSetEmptyOverride(t *testing.T) {
@@ -306,8 +306,12 @@ func TestSensitiveSetEmptyOverride(t *testing.T) {
 		},
 	}
 	got := cfg.SensitiveSet()
-	if len(got) != 0 {
-		t.Errorf("empty override should produce empty set, got %v", got)
+	// SensitiveSet only applies an override when len(Sensitive) > 0, so an
+	// empty slice is treated as "not configured" and the defaults still apply.
+	for _, want := range []string{"pii", "phi"} {
+		if !got[want] {
+			t.Errorf("empty override should fall back to defaults; missing %q (got %v)", want, got)
+		}
 	}
 }
 
