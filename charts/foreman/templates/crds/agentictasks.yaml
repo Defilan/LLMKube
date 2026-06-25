@@ -88,6 +88,57 @@ spec:
                 items:
                   type: string
                 type: array
+              gateProfile:
+                description: |-
+                  GateProfile declares the gate commands, container image, and source
+                  file extensions for the task's language. Consumed in a later slice
+                  by the gate executor; unset means the "go" preset (current behavior).
+                properties:
+                  commands:
+                    description: |-
+                      Commands overrides the preset commands. Only non-empty fields
+                      replace the preset; empty fields keep the preset value.
+                    properties:
+                      build:
+                        description: Build is the command that compiles the project.
+                        type: string
+                      codegenCheck:
+                        description: |-
+                          CodegenCheck is the command that verifies generated files are
+                          in sync with their sources. Empty means no codegen check.
+                        type: string
+                      format:
+                        description: Format is the command that checks source formatting.
+                        type: string
+                      lint:
+                        description: Lint is the command that runs the linter.
+                        type: string
+                      test:
+                        description: Test is the command that runs the test suite.
+                        type: string
+                    type: object
+                  image:
+                    description: Image is the container image used to run the gate
+                      checks.
+                    type: string
+                  language:
+                    description: Language selects the built-in preset. Defaults to
+                      "go" when empty.
+                    enum:
+                    - go
+                    - python
+                    - rust
+                    - node
+                    - generic
+                    type: string
+                  sourceExtensions:
+                    description: |-
+                      SourceExtensions lists the file extensions the gate should
+                      consider as source files (e.g. ".go", ".py").
+                    items:
+                      type: string
+                    type: array
+                type: object
               kind:
                 description: Kind selects the work type and payload shape.
                 enum:
