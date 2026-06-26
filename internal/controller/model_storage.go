@@ -147,12 +147,12 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	if isPVCSource(model.Spec.Source) {
 		return buildPVCStorageConfig(model)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
 }
@@ -183,7 +183,7 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
 	// Match the basename the Model controller renames the file to after
 	// parsing GGUF metadata. If the controller has already populated
@@ -250,20 +250,92 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		cmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", cmd)
 	}
 
-	return modelStorageConfig{
-		modelPath: modelPath,
-		initContainers: []corev1.Container{
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
+	// Resolve the fsGroup the pod will actually run with. CSI drivers with
+	// fsGroupPolicy=None (CephFS, NFS) do not propagate the pod-level fsGroup
+	// into the volume, so the PVC root stays root:root 0755 and a non-root
+	// init container (curlimages/curl, uid 100) gets "permission denied" when
+	// it tries to create its cache subdir. The prep init container below runs
+	// as root and chowns/chmods the mount root so the downloader can write.
+	//
+	// The resolved fsGroup must mirror inferPodSecurityContext exactly: when
+	// the InferenceService sets its own podSecurityContext.FSGroup, that is
+	// what the pod actually runs with, so the chown target must match.
+	resolvedFSGroup := defaultFSGroup
+	if isvc != nil && isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
+		resolvedFSGroup = *isvc.Spec.PodSecurityContext.FSGroup
+	}
+
+	initContainers := []corev1.Container{}
+
+	// Prep init container: run as root to chown/chmod the mount root so the
+	// non-root downloader can write into it. Non-recursive (a shared cache
+	// holds other models' files).
+	if resolvedFSGroup > 0 {
+		// Default path: chown to the resolved fsGroup, give the group rw access
+		// to files and rwx to directories (g+rwX), so the downloader and the
+		// inference container can read/write regardless of their primary UID.
+		initContainers = append(initContainers, corev1.Container{
+			Name:    "model-cache-permissions",
+			Image:   initContainerImage,
+			Command: []string{"sh", "-c", fmt.Sprintf("chown 0:%d /models && chmod g+rwX /models", resolvedFSGroup)},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "model-cache", MountPath: "/models"},
 			},
-		},
-		volumes:      volumes,
-		volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:                int64Ptr(0),
+				AllowPrivilegeEscalation: boolPtr(false),
+				ReadOnlyRootFilesystem:   boolPtr(true),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+					Add:  []corev1.Capability{"CHOWN", "FOWNER"},
+				},
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
+			},
+		})
+	} else {
+		// fsGroup disabled (e.g. OpenShift restricted-v2 SCC manages it). The
+		// downloader runs with its own UID (curlimages/curl default 100); chown
+		// the mount root to that UID so the downloader can write.
+		initContainers = append(initContainers, corev1.Container{
+			Name:    "model-cache-permissions",
+			Image:   initContainerImage,
+			Command: []string{"sh", "-c", "chown 100:100 /models && chmod 770 /models"},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "model-cache", MountPath: "/models"},
+			},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsUser:                int64Ptr(0),
+				AllowPrivilegeEscalation: boolPtr(false),
+				ReadOnlyRootFilesystem:   boolPtr(true),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+					Add:  []corev1.Capability{"CHOWN", "FOWNER"},
+				},
+				SeccompProfile: &corev1.SeccompProfile{
+					Type: corev1.SeccompProfileTypeRuntimeDefault,
+				},
+			},
+		})
+	}
+
+	// model-downloader follows the prep container. Order matters: the prep
+	// container must run first so the downloader sees a writable mount.
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "model-downloader",
+		Image:           initContainerImage,
+		Command:         []string{"sh", "-c", cmd},
+		Env:             env,
+		VolumeMounts:    initVolumeMounts,
+		SecurityContext: initContainerSecurityContext(isvc),
+	})
+
+	return modelStorageConfig{
+		modelPath:      modelPath,
+		initContainers: initContainers,
+		volumes:        volumes,
+		volumeMounts:   []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 	}
 }
 

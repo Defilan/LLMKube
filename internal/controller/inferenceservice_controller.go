@@ -73,6 +73,11 @@ func sanitizeDNSName(name string) string {
 
 func boolPtr(b bool) *bool { return &b }
 
+// int64Ptr returns a pointer to the given int64. Used to construct
+// *int64 fields on SecurityContext / PodSecurityContext from a literal value
+// without an intermediate variable.
+func int64Ptr(v int64) *int64 { return &v }
+
 // initContainerSecurityContext returns the SecurityContext applied to the
 // model downloader init container. It inherits runAsUser/runAsGroup from the
 // pod-level Spec.PodSecurityContext when the user supplied one. The default

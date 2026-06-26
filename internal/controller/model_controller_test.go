@@ -1596,13 +1596,13 @@ var _ = Describe("Issue #363 regression — controller / workload cache disconne
 		// assert the init container's MODEL_PATH lines up with the Model's
 		// CacheKey. The init container's `if [ ! -f "$MODEL_PATH" ]` check
 		// only works when both sides agree on the path.
-		config := buildCachedStorageConfig(updated, nil, "", "", "curl:8.18.0")
+		config := buildCachedStorageConfig(updated, nil, "", "", "curl:8.18.0", 102)
 		expectedPrefix := "/models/" + updated.Status.CacheKey + "/"
 		Expect(config.modelPath).To(HavePrefix(expectedPrefix),
 			"init container MODEL_PATH must live under /models/<Status.CacheKey>/")
 
 		var modelPathEnv string
-		for _, e := range config.initContainers[0].Env {
+		for _, e := range config.initContainers[1].Env {
 			if e.Name == "MODEL_PATH" {
 				modelPathEnv = e.Value
 			}
