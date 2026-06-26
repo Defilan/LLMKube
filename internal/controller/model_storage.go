@@ -147,12 +147,12 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	if isPVCSource(model.Spec.Source) {
 		return buildPVCStorageConfig(model)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
 }
@@ -183,7 +183,35 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+// buildCachedStorageConfig wires the shared/per-isvc cache PVC path. The
+// PVC root is owned by root:root 0755 when the volume is backed by a CSI with
+// fsGroupPolicy=None (CephFS/NFS): kubelet never chowns the volume in that
+// configuration, so the non-root model-downloader init container (curlimages/
+// curl, uid 100) gets EACCES trying to mkdir its cache subdirectory.
+//
+// The fix is a root-run prep init container that runs BEFORE model-downloader
+// and chowns/chmods the mount root so the downloader's group matches the
+// resolved pod fsGroup. We chown the mount ROOT only (never -R): a shared
+// cache holds other models' files and we must not disturb them.
+//
+// Two branches:
+//   - defaultFSGroup > 0: the pod's real fsGroup is defaultFSGroup (kubelet
+//     adds it to every container's supplemental groups). chown 0:<fsGroup>
+//     /models && chmod g+rwX /models. The downloader writes because the
+//     mount group == the pod's real fsGroup and the dir is group-writable.
+//   - defaultFSGroup <= 0: the operator disabled the default (recommended on
+//     OpenShift). No supplemental group is injected, so we chown to the
+//     downloader's own uid (curlimages/curl runs as uid 100).
+//
+// The prep container reuses initContainerImage (the same alpine-based image
+// the downloader uses; air-gapped clusters mirror it). It runs as root by
+// necessity (chown of a root-owned mount needs uid 0) but is otherwise
+// least-privilege: drop ALL, add back only CHOWN+FOWNER (FOWNER is needed
+// because in the fsGroup-disabled branch the dir becomes owned by uid 100
+// after chown, and the still-uid-0 process then needs FOWNER to chmod it),
+// allowPrivilegeEscalation=false, readOnlyRootFilesystem=true, seccomp
+// RuntimeDefault.
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
 	// Match the basename the Model controller renames the file to after
 	// parsing GGUF metadata. If the controller has already populated
@@ -250,22 +278,89 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		cmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", cmd)
 	}
 
+	// Build the prep init container that fixes up the cache mount root so the
+	// non-root downloader can write into it. Ordered BEFORE model-downloader
+	// (prepended to the initContainers slice).
+	prep := buildCachePermPrep(initContainerImage, defaultFSGroup)
+
+	initContainers := make([]corev1.Container, 0, 2)
+	initContainers = append(initContainers, prep)
+	initContainers = append(initContainers, corev1.Container{
+		Name:            "model-downloader",
+		Image:           initContainerImage,
+		Command:         []string{"sh", "-c", cmd},
+		Env:             env,
+		VolumeMounts:    initVolumeMounts,
+		SecurityContext: initContainerSecurityContext(isvc),
+	})
+
 	return modelStorageConfig{
-		modelPath: modelPath,
-		initContainers: []corev1.Container{
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
-			},
-		},
-		volumes:      volumes,
-		volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
+		modelPath:      modelPath,
+		initContainers: initContainers,
+		volumes:        volumes,
+		volumeMounts:   []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 	}
 }
+
+// buildCachePermPrep returns the prep init container that chowns/chmods the
+// cache mount root so the non-root model-downloader can write into it. Two
+// branches based on the resolved pod fsGroup:
+//
+//   - defaultFSGroup > 0: chown 0:<fsGroup> /models && chmod g+rwX /models.
+//     The downloader writes because the mount group == the pod's real fsGroup
+//     (kubelet adds it to every container's supplemental groups) and the dir
+//     is group-writable.
+//   - defaultFSGroup <= 0: chown 100:100 /models && chmod 770 /models. The
+//     operator disabled the default (no supplemental group injected), so we
+//     chown to the downloader's own uid (curlimages/curl runs as uid 100).
+//
+// The prep runs as root by necessity (chown of a root-owned mount needs uid 0)
+// but is otherwise least-privilege: drop ALL, add back only CHOWN+FOWNER
+// (FOWNER is needed because in the fsGroup-disabled branch the dir becomes
+// owned by uid 100 after chown, and the still-uid-0 process then needs
+// FOWNER to chmod it), allowPrivilegeEscalation=false, readOnlyRootFilesystem
+// =true, seccomp RuntimeDefault.
+func buildCachePermPrep(initContainerImage string, defaultFSGroup int64) corev1.Container {
+	prep := corev1.Container{
+		Name:    "model-cache-perm",
+		Image:   initContainerImage,
+		Command: []string{"sh", "-c", "echo 'Preparing model cache directory for non-root downloader...' && chown 0:102 /models && chmod g+rwX /models"},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "model-cache", MountPath: "/models"},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                int64Ptr(0),
+			AllowPrivilegeEscalation: boolPtr(false),
+			ReadOnlyRootFilesystem:   boolPtr(true),
+			RunAsNonRoot:             boolPtr(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "FOWNER"},
+			},
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+	}
+
+	if defaultFSGroup > 0 {
+		// Default branch: chown to the resolved pod fsGroup. The downloader
+		// writes because the mount group == the pod's real fsGroup (kubelet
+		// adds it to every container's supplemental groups) and the dir is
+		// group-writable.
+		prep.Command = []string{"sh", "-c", fmt.Sprintf("echo 'Preparing model cache directory for non-root downloader...' && chown 0:%d /models && chmod g+rwX /models", defaultFSGroup)}
+	} else {
+		// fsGroup disabled (defaultFSGroup <= 0): no supplemental group is
+		// injected, so chown to the downloader's own uid (curlimages/curl
+		// runs as uid 100). chmod 770 so only owner+group can access.
+		prep.Command = []string{"sh", "-c", "echo 'Preparing model cache directory for non-root downloader...' && chown 100:100 /models && chmod 770 /models"}
+	}
+
+	return prep
+}
+
+// int64Ptr returns a pointer to the given int64.
+func int64Ptr(i int64) *int64 { return &i }
 
 func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
 	modelFileName := fmt.Sprintf("%s-%s.gguf", namespace, model.Name)

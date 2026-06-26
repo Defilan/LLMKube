@@ -247,7 +247,14 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	var modelPath string
 	if backend.NeedsModelInit() && !skipInit {
 		useCache := model.Status.CacheKey != "" && r.ModelCachePath != ""
-		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage)
+		// Resolve the pod fsGroup the same way inferPodSecurityContext does:
+		// isvc.Spec.PodSecurityContext.FSGroup if set, else r.DefaultFSGroup.
+		// This is what the prep init container chowns the cache mount root to.
+		resolvedFSGroup := r.DefaultFSGroup
+		if isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
+			resolvedFSGroup = *isvc.Spec.PodSecurityContext.FSGroup
+		}
+		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, resolvedFSGroup)
 		modelPath = storageConfig.modelPath
 	}
 

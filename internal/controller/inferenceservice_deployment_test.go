@@ -5146,4 +5146,69 @@ var _ = Describe("constructDeployment coverage", func() {
 		Expect(hasAuto).To(BeTrue())
 		Expect(hasUser).To(BeTrue())
 	})
+
+	It("threads the resolved pod fsGroup into the cache-backed storage config (#855)", func() {
+		// Model with a CacheKey so the cache-backed path is taken.
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "fsgroup-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Format:   "gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready", CacheKey: "abc123", Path: "/tmp/m.gguf"},
+		}
+		replicas := int32(1)
+
+		// Case 1: no explicit PodSecurityContext -> uses operator default (102)
+		isvcDefault := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "fsgroup-default", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "fsgroup-model",
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+		dep := reconciler.constructDeployment(isvcDefault, model, 1)
+		// The prep init container should chown to 0:102 (the operator default)
+		prep := dep.Spec.Template.Spec.InitContainers[0]
+		Expect(prep.Name).To(Equal("model-cache-perm"))
+		Expect(prep.Command[2]).To(ContainSubstring("chown 0:102 /models"))
+
+		// Case 2: explicit PodSecurityContext.FSGroup -> uses the explicit value
+		explicitFG := int64(2000)
+		isvcExplicit := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "fsgroup-explicit", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "fsgroup-model",
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				PodSecurityContext: &corev1.PodSecurityContext{
+					FSGroup: &explicitFG,
+				},
+			},
+		}
+		depExplicit := reconciler.constructDeployment(isvcExplicit, model, 1)
+		prepExplicit := depExplicit.Spec.Template.Spec.InitContainers[0]
+		Expect(prepExplicit.Name).To(Equal("model-cache-perm"))
+		Expect(prepExplicit.Command[2]).To(ContainSubstring("chown 0:2000 /models"))
+
+		// Case 3: fsGroup disabled (<=0) -> chown to uid 100
+		disabledFG := int64(0)
+		isvcDisabled := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "fsgroup-disabled", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "fsgroup-model",
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				PodSecurityContext: &corev1.PodSecurityContext{
+					FSGroup: &disabledFG,
+				},
+			},
+		}
+		depDisabled := reconciler.constructDeployment(isvcDisabled, model, 1)
+		prepDisabled := depDisabled.Spec.Template.Spec.InitContainers[0]
+		Expect(prepDisabled.Name).To(Equal("model-cache-perm"))
+		Expect(prepDisabled.Command[2]).To(ContainSubstring("chown 100:100 /models"))
+	})
 })
