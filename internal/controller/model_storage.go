@@ -183,6 +183,34 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
+// defaultFSGroupForCachePrep is the fallback fsGroup used by the cache-prep
+// init container when the InferenceService does not set a pod-level FSGroup.
+// It must match the operator's default (see inferPodSecurityContext / the
+// --default-fs-group flag) so the prep container and the downloader agree on
+// which GID owns the cache root.
+const defaultFSGroupForCachePrep = 1000
+
+// resolveCachePrepFSGroup returns the fsGroup the cache-prep init container
+// should chown the cache root to. It reads the value from the InferenceService's
+// podSecurityContext.FSGroup when set, otherwise falls back to the operator
+// default. A nil isvc is treated as using the default (unit tests that build
+// the config directly).
+func resolveCachePrepFSGroup(isvc *inferencev1alpha1.InferenceService) int64 {
+	if isvc != nil && isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
+		return *isvc.Spec.PodSecurityContext.FSGroup
+	}
+	return defaultFSGroupForCachePrep
+}
+
+// buildCachedStorageConfig mounts the shared (or per-isvc) model cache PVC and
+// emits the model-downloader init container that populates it. When the cache
+// PVC is backed by a CSI with fsGroupPolicy=None (CephFS, NFS), the pod-level
+// fsGroup is never applied by the provisioner, so a freshly-provisioned cache
+// root stays root:root 0755 and the non-root downloader (uid 100) cannot mkdir
+// its cache subdirectory. The fix is a tiny root-run prep init container that
+// runs BEFORE model-downloader and chowns/chmods the mount so the downloader
+// can write into it. The prep container is the only root container; the
+// downloader and the llama-server containers stay unprivileged.
 func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
 	// Match the basename the Model controller renames the file to after
@@ -250,22 +278,47 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		cmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", cmd)
 	}
 
-	return modelStorageConfig{
-		modelPath: modelPath,
-		initContainers: []corev1.Container{
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
+	// Build the root-run cache-prep init container. It is ordered BEFORE the
+	// model-downloader so the mount is group-writable before the downloader
+	// attempts mkdir. It runs as root (the CSI will not apply fsGroup on
+	// CephFS/NFS), drops ALL capabilities, and only needs chown/chmod, so the
+	// command is a single sh -c with a minimal busybox image.
+	fsGroup := resolveCachePrepFSGroup(isvc)
+	prepCmd := fmt.Sprintf("chown -R 0:%d /models && chmod -R g+rwX /models", fsGroup)
+	prepContainer := corev1.Container{
+		Name:    "model-cache-prep",
+		Image:   "busybox:1.36",
+		Command: []string{"sh", "-c", prepCmd},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "model-cache", MountPath: "/models"},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                int64Ptr(0),
+			AllowPrivilegeEscalation: boolPtr(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
 			},
 		},
+	}
+
+	return modelStorageConfig{
+		modelPath: modelPath,
+		initContainers: append([]corev1.Container{prepContainer}, corev1.Container{
+			Name:            "model-downloader",
+			Image:           initContainerImage,
+			Command:         []string{"sh", "-c", cmd},
+			Env:             env,
+			VolumeMounts:    initVolumeMounts,
+			SecurityContext: initContainerSecurityContext(isvc),
+		}),
 		volumes:      volumes,
 		volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 	}
 }
+
+// int64Ptr returns a pointer to the given int64. Used to build SecurityContext
+// RunAsUser values from integer constants in a readable way.
+func int64Ptr(v int64) *int64 { return &v }
 
 func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
 	modelFileName := fmt.Sprintf("%s-%s.gguf", namespace, model.Name)

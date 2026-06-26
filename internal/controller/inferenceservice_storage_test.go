@@ -620,3 +620,106 @@ var _ = Describe("shouldWarnMissingSkipModelInit", func() {
 		Expect(tt("Downloading", "Qwen/Qwen3.6-35B-A3B", nil)).To(BeFalse())
 	})
 })
+
+// buildCachedStorageConfig emits a root-run prep init container that chowns the
+// cache PVC root so the non-root downloader can write on CSIs that ignore
+// fsGroup (CephFS/NFS with fsGroupPolicy=None, issue #855). The prep container
+// must come before model-downloader, run as root, drop ALL capabilities, and
+// carry the chown/chmod command.
+var _ = Describe("buildCachedStorageConfig cache-prep init container (#855)", func() {
+	It("emits a model-cache-prep init container ordered before model-downloader, running as root with the chown/chmod command", func() {
+		model := &inferencev1alpha1.Model{
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+			},
+			Status: inferencev1alpha1.ModelStatus{
+				CacheKey: "abc123def456",
+			},
+		}
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
+
+		// Two init containers: the root prep, then the downloader.
+		Expect(config.initContainers).To(HaveLen(2))
+		Expect(config.initContainers[0].Name).To(Equal("model-cache-prep"))
+		Expect(config.initContainers[1].Name).To(Equal("model-downloader"))
+
+		prep := config.initContainers[0]
+		Expect(prep.Image).To(Equal("busybox:1.36"))
+		Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown -R 0:1000 /models && chmod -R g+rwX /models"}))
+
+		// The prep container must mount the same cache volume so it can chown
+		// the freshly-provisioned root.
+		Expect(prep.VolumeMounts).To(HaveLen(1))
+		Expect(prep.VolumeMounts[0].Name).To(Equal("model-cache"))
+		Expect(prep.VolumeMounts[0].MountPath).To(Equal("/models"))
+
+		// Least-privilege: run as root only for the prep step, drop ALL caps.
+		sc := prep.SecurityContext
+		Expect(sc).NotTo(BeNil())
+		Expect(sc.RunAsUser).NotTo(BeNil())
+		Expect(*sc.RunAsUser).To(Equal(int64(0)))
+		Expect(sc.AllowPrivilegeEscalation).NotTo(BeNil())
+		Expect(*sc.AllowPrivilegeEscalation).To(BeFalse())
+		Expect(sc.Capabilities).NotTo(BeNil())
+		Expect(sc.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")))
+
+		// The downloader stays unprivileged and keeps its original security
+		// context (no runAsUser override from the prep).
+		dl := config.initContainers[1]
+		Expect(dl.Name).To(Equal("model-downloader"))
+		Expect(dl.SecurityContext.RunAsUser).To(BeNil())
+	})
+
+	It("uses the InferenceService podSecurityContext fsGroup when set", func() {
+		model := &inferencev1alpha1.Model{
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+			},
+			Status: inferencev1alpha1.ModelStatus{
+				CacheKey: "abc123",
+			},
+		}
+		customFSGroup := int64(2000)
+		isvc := &inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				PodSecurityContext: &corev1.PodSecurityContext{
+					FSGroup: &customFSGroup,
+				},
+			},
+		}
+		config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0")
+
+		prep := config.initContainers[0]
+		Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown -R 0:2000 /models && chmod -R g+rwX /models"}))
+	})
+
+	It("falls back to the default fsGroup when no podSecurityContext is set", func() {
+		model := &inferencev1alpha1.Model{
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+			},
+			Status: inferencev1alpha1.ModelStatus{
+				CacheKey: "abc123",
+			},
+		}
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
+
+		prep := config.initContainers[0]
+		Expect(prep.Command).To(ContainSubstring("chown -R 0:1000 /models"))
+	})
+
+	It("does not emit the prep container for non-cache storage configs", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-model"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+		}
+		config := buildEmptyDirStorageConfig(model, nil, "default", "", "curl:8.18.0")
+		names := make([]string, len(config.initContainers))
+		for i, c := range config.initContainers {
+			names[i] = c.Name
+		}
+		Expect(names).NotTo(ContainElement("model-cache-prep"))
+		Expect(config.initContainers).To(HaveLen(1))
+		Expect(config.initContainers[0].Name).To(Equal("model-downloader"))
+	})
+})
