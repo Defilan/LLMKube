@@ -17,6 +17,7 @@ PrometheusRule and PodMonitor templates.
 | File | Description |
 |---|---|
 | `llmkube-inference.json` | Request latency, TTFT (vLLM only), GPU queue wait, container restart rate. Grouped by service, runtime, namespace. |
+| `model-router-dashboard.json` | ModelRouter data-plane metrics: requests/sec by router/rule/backend, P95 latency, fail-closed rate, budget utilization, backend health heatmap, fallback depth distribution. |
 
 ## Importing
 

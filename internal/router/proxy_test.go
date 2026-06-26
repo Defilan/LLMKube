@@ -585,6 +585,12 @@ func TestRouterMetricsRegistered(t *testing.T) {
 	t.Run("RouterBackendHealth", func(t *testing.T) {
 		prommetrics.RouterBackendHealth.WithLabelValues("test", "backend1").Set(1)
 	})
+	t.Run("RouterFirstTokenSeconds", func(t *testing.T) {
+		prommetrics.RouterFirstTokenSeconds.WithLabelValues("test", "backend1").Observe(0.1)
+	})
+	t.Run("RouterBudgetUtilization", func(t *testing.T) {
+		prommetrics.RouterBudgetUtilization.WithLabelValues("test", "rule").Set(0.75)
+	})
 }
 
 // TestProxyObservesRequestMetricsOnSuccess verifies that a successful

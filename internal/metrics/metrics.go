@@ -137,6 +137,23 @@ var (
 		},
 		[]string{"router", "backend"},
 	)
+
+	RouterFirstTokenSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "llmkube_router_first_token_seconds",
+			Help:    "Time to first token for streaming chat completions.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"router", "backend"},
+	)
+
+	RouterBudgetUtilization = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "llmkube_router_budget_utilization",
+			Help: "Fraction of the per-request timeout budget consumed (0.0 to 1.0).",
+		},
+		[]string{"router", "scope"},
+	)
 )
 
 func init() {
@@ -154,5 +171,7 @@ func init() {
 		RouterFailClosedTotal,
 		RouterActiveBackends,
 		RouterBackendHealth,
+		RouterFirstTokenSeconds,
+		RouterBudgetUtilization,
 	)
 }

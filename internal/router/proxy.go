@@ -199,10 +199,15 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		otelattribute.String("routing.backend.tier", chosen.Tier),
 	)
 
-	streamed := streamResponse(w, resp, isStream)
+	streamed, firstToken := streamResponse(w, resp, isStream)
 	outcome := streamedReason(streamed)
 	p.audit(features, decision, chosen, resp.StatusCode, outcome, elapsed)
 	p.observeRequest(&features, &decision, chosen, outcome, elapsed)
+	if streamed && chosen != nil {
+		prommetrics.RouterFirstTokenSeconds.WithLabelValues(
+			p.routerName, chosen.Name,
+		).Observe(firstToken.Sub(start).Seconds())
+	}
 }
 
 const maxRequestBodyBytes = 32 << 20 // 32 MiB, generous for long prompts
@@ -366,9 +371,10 @@ func resolveDispatchTimeout(dec *MatchResult, backend *Backend, proxyDefault tim
 
 // streamResponse copies the upstream response to the client. Returns
 // true if we treated the response as a stream (set SSE-friendly headers
-// and flushed after every chunk). The decision is driven by the
-// request's "stream": true flag and the upstream Content-Type.
-func streamResponse(w http.ResponseWriter, resp *http.Response, requestedStream bool) bool {
+// and flushed after every chunk), and the time of the first token for
+// streaming responses (zero for non-streaming). The decision is driven
+// by the request's "stream": true flag and the upstream Content-Type.
+func streamResponse(w http.ResponseWriter, resp *http.Response, requestedStream bool) (bool, time.Time) {
 	upstreamCT := resp.Header.Get("Content-Type")
 	isSSE := strings.HasPrefix(upstreamCT, "text/event-stream")
 	isStream := requestedStream || isSSE
@@ -389,15 +395,16 @@ func streamResponse(w http.ResponseWriter, resp *http.Response, requestedStream 
 
 	if !isStream {
 		_, _ = io.Copy(w, resp.Body)
-		return false
+		return false, time.Time{}
 	}
 
 	var flush func()
 	if f, ok := w.(http.Flusher); ok {
 		flush = f.Flush
 	}
+	firstToken := time.Now()
 	_, _ = PipeBody(w, resp.Body, flush)
-	return true
+	return true, firstToken
 }
 
 // audit emits one structured log line per request. Sink configuration
@@ -454,6 +461,26 @@ func (p *Proxy) observeRequest(f *RequestFeatures, dec *MatchResult, chosen *Bac
 		p.routerName, ruleName, backendName,
 	).Observe(elapsed.Seconds())
 	p.updateActiveBackendsMetrics()
+	p.observeBudgetUtilization(dec, chosen, elapsed)
+}
+
+// observeBudgetUtilization records the fraction of the per-request
+// timeout budget consumed. The scope label distinguishes "rule" (when
+// a rule matched) from "default" (when the default route was used).
+func (p *Proxy) observeBudgetUtilization(dec *MatchResult, chosen *Backend, elapsed time.Duration) {
+	budget := resolveDispatchTimeout(dec, chosen, p.disp.ResponseHeaderTimeout())
+	if budget <= 0 {
+		return
+	}
+	scope := "default"
+	if dec.Rule != nil {
+		scope = "rule"
+	}
+	utilization := elapsed.Seconds() / budget.Seconds()
+	if utilization > 1.0 {
+		utilization = 1.0
+	}
+	prommetrics.RouterBudgetUtilization.WithLabelValues(p.routerName, scope).Set(utilization)
 }
 
 // observeFailClosed records the llmkube_router_fail_closed_total counter
