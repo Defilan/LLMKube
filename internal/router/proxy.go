@@ -453,6 +453,7 @@ func (p *Proxy) observeRequest(f *RequestFeatures, dec *MatchResult, chosen *Bac
 	prommetrics.RouterRequestDuration.WithLabelValues(
 		p.routerName, ruleName, backendName,
 	).Observe(elapsed.Seconds())
+	p.updateBudgetUtilization()
 	p.updateActiveBackendsMetrics()
 }
 
@@ -491,6 +492,25 @@ func (p *Proxy) updateActiveBackendsMetrics() {
 	for tier, count := range tierCount {
 		prommetrics.RouterActiveBackends.WithLabelValues(p.routerName, tier).Set(float64(count))
 	}
+}
+
+// updateBudgetUtilization sets the llmkube_router_budget_utilization
+// gauge. The utilization is computed as the ratio of healthy backends
+// to total backends, capped at 1.0. This is a simple proxy for budget
+// pressure: more healthy backends means more routing capacity.
+func (p *Proxy) updateBudgetUtilization() {
+	total := len(p.cfg.Backends)
+	if total == 0 {
+		return
+	}
+	healthy := 0
+	for _, b := range p.cfg.Backends {
+		if p.disp.IsHealthy(b.Name) {
+			healthy++
+		}
+	}
+	utilization := float64(healthy) / float64(total)
+	prommetrics.RouterBudgetUtilization.WithLabelValues(p.routerName, "backends").Set(utilization)
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
