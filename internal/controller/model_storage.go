@@ -147,12 +147,12 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	if isPVCSource(model.Spec.Source) {
 		return buildPVCStorageConfig(model)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
 }
@@ -183,7 +183,28 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+// modelCachePermScript returns the shell command the prep init container runs
+// to make the cache mount writable for the non-root model-downloader. On a
+// CSI with fsGroupPolicy=None (CephFS, NFS) the kubelet skips applying the pod
+// fsGroup to the volume, so the mount root stays root:root 0755 and the
+// downloader (uid 100) gets "permission denied" on mkdir. The prep container
+// fixes this by chown/chmod'ing the mount root non-recursively so only the
+// directory entry changes — on a shared cache this avoids rewriting every
+// other model's cached files on every pod start.
+//
+// When the resolved fsGroup is <= 0 (operator disabled the default, e.g. on
+// OpenShift where the restricted-v2 SCC injects its own fsGroup), there is no
+// supplemental group to rely on, so chown the mount to the downloader's own
+// uid (100) so it owns the dir outright.
+func modelCachePermScript(resolvedFSGroup int64) string {
+	if resolvedFSGroup <= 0 {
+		// curlimages/curl runs as uid 100; own the mount root so mkdir succeeds.
+		return "chown 100:100 /models && chmod 770 /models"
+	}
+	return fmt.Sprintf("chown 0:%d /models && chmod g+rwX /models", resolvedFSGroup)
+}
+
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
 	// Match the basename the Model controller renames the file to after
 	// parsing GGUF metadata. If the controller has already populated
@@ -250,22 +271,61 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		cmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", cmd)
 	}
 
+	// Build the prep-init command that makes the cache mount writable for the
+	// non-root downloader. The resolved fsGroup is the value that will actually
+	// appear on the pod's FSGroup field (user-supplied or the operator default).
+	// On fsGroupPolicy=None the kubelet still adds this GID to every container's
+	// supplemental groups, so chown'ing the mount root to 0:<fsGroup> makes it
+	// group-writable for the downloader without rewriting the rest of the tree.
+	resolvedFSGroup := defaultFSGroup
+	if isvc != nil && isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
+		resolvedFSGroup = *isvc.Spec.PodSecurityContext.FSGroup
+	}
+	permCmd := modelCachePermScript(resolvedFSGroup)
+
+	// The prep container must run BEFORE model-downloader (it is inserted at
+	// index 0) and must reuse the same initContainerImage so air-gapped clusters
+	// that mirror that image keep working. It runs as root (no runAsUser) because
+	// it needs to chown the mount root; the downloader and llama-server stay
+	// unprivileged.
+	prepContainer := corev1.Container{
+		Name:            "model-cache-perm",
+		Image:           initContainerImage,
+		Command:         []string{"sh", "-c", permCmd},
+		VolumeMounts:    []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models"}},
+		SecurityContext: rootSecurityContext(),
+	}
+
+	initContainers := append([]corev1.Container{prepContainer}, corev1.Container{
+		Name:            "model-downloader",
+		Image:           initContainerImage,
+		Command:         []string{"sh", "-c", cmd},
+		Env:             env,
+		VolumeMounts:    initVolumeMounts,
+		SecurityContext: initContainerSecurityContext(isvc),
+	})
+
 	return modelStorageConfig{
-		modelPath: modelPath,
-		initContainers: []corev1.Container{
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
-			},
-		},
-		volumes:      volumes,
-		volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
+		modelPath:      modelPath,
+		initContainers: initContainers,
+		volumes:        volumes,
+		volumeMounts:   []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 	}
 }
+
+// rootSecurityContext returns a SecurityContext that runs the container as root.
+// Used by the model-cache-perm prep init container which needs root to chown
+// the cache mount root. The downloader and llama-server containers remain
+// unprivileged via initContainerSecurityContext / inferContainerSecurityContext.
+func rootSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		RunAsUser:                int64Ptr(0),
+		AllowPrivilegeEscalation: boolPtr(false),
+	}
+}
+
+// int64Ptr returns a pointer to the given int64.
+func int64Ptr(i int64) *int64 { return &i }
 
 func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
 	modelFileName := fmt.Sprintf("%s-%s.gguf", namespace, model.Name)
