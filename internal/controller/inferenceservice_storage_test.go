@@ -40,7 +40,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123def456",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 
 		Expect(config.modelPath).To(Equal("/models/abc123def456/model.gguf"))
 		Expect(config.volumes).To(HaveLen(1))
@@ -72,7 +72,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 
 		Expect(config.volumes).To(HaveLen(2))
 		Expect(config.volumes[1].Name).To(Equal("host-model"))
@@ -93,7 +93,7 @@ var _ = Describe("buildCachedStorageConfig", func() {
 				CacheKey: "abc123",
 			},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "my-ca-certs", "curl:8.18.0", 102)
 
 		var found bool
 		for _, v := range config.volumes {
@@ -104,6 +104,141 @@ var _ = Describe("buildCachedStorageConfig", func() {
 		}
 		Expect(found).To(BeTrue())
 		Expect(config.initContainers[0].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE=/custom-certs/"))
+	})
+
+	// Issue #855: cache-root prep init container for CSI drivers that don't
+	// apply fsGroup (CephFS/NFS with fsGroupPolicy=None).
+	Context("cache-root prep init container (issue #855)", func() {
+		It("prep is present and ordered BEFORE model-downloader in the single-file path", func() {
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+				},
+				Status: inferencev1alpha1.ModelStatus{
+					CacheKey: "abc123",
+				},
+			}
+			config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
+
+			Expect(config.initContainers).To(HaveLen(2))
+			Expect(config.initContainers[0].Name).To(Equal("model-cache-prep"))
+			Expect(config.initContainers[1].Name).To(Equal("model-downloader"))
+		})
+
+		It("DEFAULT case: prep command is chown 0:102 /models && chmod g+rwX /models", func() {
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+				},
+				Status: inferencev1alpha1.ModelStatus{
+					CacheKey: "abc123",
+				},
+			}
+			config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
+
+			prep := config.initContainers[0]
+			Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown 0:102 /models && chmod g+rwX /models"}))
+			// No recursive flag.
+			Expect(prep.Command[2]).NotTo(ContainSubstring("-R"))
+		})
+
+		It("EXPLICIT OVERRIDE case: isvc FSGroup=3000, defaultFSGroup=102 -> prep command contains chown 0:3000", func() {
+			fsGroup := int64(3000)
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					PodSecurityContext: &corev1.PodSecurityContext{
+						FSGroup: &fsGroup,
+					},
+				},
+			}
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+				},
+				Status: inferencev1alpha1.ModelStatus{
+					CacheKey: "abc123",
+				},
+			}
+			config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0", 102)
+
+			prep := config.initContainers[0]
+			Expect(prep.Command[2]).To(ContainSubstring("chown 0:3000"))
+			Expect(prep.Command[2]).NotTo(ContainSubstring("102"))
+		})
+
+		It("fsGroup<=0 case: prep command is chown 100:100 /models && chmod 770 /models", func() {
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+				},
+				Status: inferencev1alpha1.ModelStatus{
+					CacheKey: "abc123",
+				},
+			}
+			config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 0)
+
+			prep := config.initContainers[0]
+			Expect(prep.Command).To(Equal([]string{"sh", "-c", "chown 100:100 /models && chmod 770 /models"}))
+		})
+
+		It("prep reuses initContainerImage (no hardcoded image)", func() {
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+				},
+				Status: inferencev1alpha1.ModelStatus{
+					CacheKey: "abc123",
+				},
+			}
+			config := buildCachedStorageConfig(model, nil, "", "", "my-custom-init:1.0", 102)
+
+			prep := config.initContainers[0]
+			Expect(prep.Image).To(Equal("my-custom-init:1.0"))
+		})
+
+		It("prep SecurityContext: hardened (runAsUser=0, no privilege escalation, drop ALL add CHOWN/FOWNER, readOnlyRootFilesystem, seccomp RuntimeDefault)", func() {
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+				},
+				Status: inferencev1alpha1.ModelStatus{
+					CacheKey: "abc123",
+				},
+			}
+			config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
+
+			prep := config.initContainers[0]
+			sc := prep.SecurityContext
+			Expect(sc).NotTo(BeNil())
+			Expect(*sc.RunAsUser).To(Equal(int64(0)))
+			Expect(*sc.AllowPrivilegeEscalation).To(BeFalse())
+			Expect(*sc.ReadOnlyRootFilesystem).To(BeTrue())
+
+			// Capabilities: drop ALL, add CHOWN and FOWNER.
+			Expect(sc.Capabilities).NotTo(BeNil())
+			Expect(sc.Capabilities.Drop).To(ContainElement("ALL"))
+			Expect(sc.Capabilities.Add).To(ContainElement("CHOWN"))
+			Expect(sc.Capabilities.Add).To(ContainElement("FOWNER"))
+
+			// Seccomp profile: RuntimeDefault.
+			Expect(sc.SeccompProfile).NotTo(BeNil())
+			Expect(sc.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
+		})
+
+		It("prep NOT emitted for the emptyDir path", func() {
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "my-model"},
+				Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+			}
+			config := buildEmptyDirStorageConfig(model, nil, "default", "", "curl:8.18.0")
+
+			Expect(config.initContainers).To(HaveLen(1))
+			Expect(config.initContainers[0].Name).To(Equal("model-downloader"))
+			// No prep container.
+			for _, c := range config.initContainers {
+				Expect(c.Name).NotTo(Equal("model-cache-prep"))
+			}
+		})
 	})
 })
 
@@ -216,7 +351,7 @@ var _ = Describe("buildModelStorageConfig PVC dispatch", func() {
 			Spec:       inferencev1alpha1.ModelSpec{Source: "pvc://my-claim/model.gguf"},
 			Status:     inferencev1alpha1.ModelStatus{CacheKey: "abc123"},
 		}
-		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0")
+		config := buildModelStorageConfig(model, nil, "default", true, "", "", "curl:8.18.0", 102)
 
 		// Should use PVC config, not cached config
 		Expect(config.volumes[0].Name).To(Equal("model-source"))
@@ -417,7 +552,7 @@ var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() 
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
 		}
-		config := buildCachedStorageConfig(model, isvc, ModelCacheModePerService, "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModePerService, "", "curl:8.18.0", 102)
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("my-isvc-model-cache"))
 	})
 
@@ -425,7 +560,7 @@ var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() 
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
 		}
-		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, isvc, ModelCacheModeShared, "", "curl:8.18.0", 102)
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
 	})
 
@@ -433,7 +568,7 @@ var _ = Describe("buildCachedStorageConfig cache mode selection (#728)", func() 
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "my-isvc"},
 		}
-		config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, isvc, "", "", "curl:8.18.0", 102)
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
 	})
 })
@@ -563,7 +698,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 			},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		cmd := config.initContainers[0].Command[2]
 		Expect(cmd).To(ContainSubstring("--etag-compare"))
 		Expect(cmd).To(ContainSubstring("kept cached copy"))
@@ -574,7 +709,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 			Spec:   inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "abc123def456"},
 		}
-		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0")
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		cmd := config.initContainers[0].Command[2]
 		Expect(cmd).NotTo(ContainSubstring("--etag-compare"))
 		Expect(cmd).To(ContainSubstring("skipping download"))

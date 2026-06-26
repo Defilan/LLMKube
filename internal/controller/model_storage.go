@@ -147,12 +147,12 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	if isPVCSource(model.Spec.Source) {
 		return buildPVCStorageConfig(model)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
 }
@@ -183,7 +183,7 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
 	// Match the basename the Model controller renames the file to after
 	// parsing GGUF metadata. If the controller has already populated
@@ -250,21 +250,88 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		cmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", cmd)
 	}
 
+	// Resolve the fsGroup: use the InferenceService's explicit override when
+	// present, otherwise fall back to the operator-configured default. This
+	// ensures the prep init container chowns to the same GID that the pod
+	// actually runs with (see inferPodSecurityContext in deployment_builder.go).
+	resolvedFSGroup := defaultFSGroup
+	if isvc != nil && isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
+		resolvedFSGroup = *isvc.Spec.PodSecurityContext.FSGroup
+	}
+
+	// Prepend the cache-root prep init container so it runs before
+	// model-downloader. The downloader (curlimages/curl, uid 100) cannot
+	// mkdir into a root:root 0755 CSI mount when the CSI driver does not
+	// apply fsGroup to the volume (CephFS/NFS with fsGroupPolicy=None).
+	initContainers := []corev1.Container{
+		buildCachePrepInitContainer(resolvedFSGroup, initContainerImage),
+		{
+			Name:            "model-downloader",
+			Image:           initContainerImage,
+			Command:         []string{"sh", "-c", cmd},
+			Env:             env,
+			VolumeMounts:    initVolumeMounts,
+			SecurityContext: initContainerSecurityContext(isvc),
+		},
+	}
+
 	return modelStorageConfig{
-		modelPath: modelPath,
-		initContainers: []corev1.Container{
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
+		modelPath:      modelPath,
+		initContainers: initContainers,
+		volumes:        volumes,
+		volumeMounts:   []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
+	}
+}
+
+// buildCachePrepInitContainer returns the root-run init container that chowns
+// and chmods the cache mount root so the non-root model-downloader can write
+// into it. This is needed when the cache PVC is backed by a CSI driver that
+// does not apply fsGroup to the volume (e.g. CephFS/NFS with fsGroupPolicy=None).
+//
+// When resolvedFSGroup > 0 (the common case), the prep chowns to 0:<resolvedFSGroup>
+// and chmods g+rwX so the volume root is group-writable by the pod's fsGroup.
+// When resolvedFSGroup <= 0 (fsGroup disabled, e.g. OpenShift), the prep chowns
+// to 100:100 (the downloader's UID) and chmods 770 so the downloader can write.
+//
+// The prep reuses the configurable initContainerImage (no hardcoded busybox)
+// for air-gapped clusters. It runs as root (runAsUser=0) with a hardened
+// SecurityContext: Capabilities drop ALL add back ONLY CHOWN and FOWNER
+// (CHOWN to change owner; FOWNER because in the disabled branch the dir becomes
+// uid-100-owned after chown and the still-uid-0 process then needs FOWNER to
+// chmod it); allowPrivilegeEscalation false; readOnlyRootFilesystem true;
+// seccompProfile type RuntimeDefault.
+func buildCachePrepInitContainer(resolvedFSGroup int64, initContainerImage string) corev1.Container {
+	// Build the command based on whether fsGroup is enabled.
+	var cmd string
+	if resolvedFSGroup > 0 {
+		cmd = fmt.Sprintf("chown 0:%d /models && chmod g+rwX /models", resolvedFSGroup)
+	} else {
+		// fsGroup disabled: chown to the downloader's UID so it can write.
+		cmd = "chown 100:100 /models && chmod 770 /models"
+	}
+
+	return corev1.Container{
+		Name:    "model-cache-prep",
+		Image:   initContainerImage,
+		Command: []string{"sh", "-c", cmd},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                int64Ptr(0),
+			AllowPrivilegeEscalation: boolPtr(false),
+			ReadOnlyRootFilesystem:   boolPtr(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "FOWNER"},
+			},
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			},
 		},
-		volumes:      volumes,
-		volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 	}
+}
+
+// int64Ptr returns a pointer to the given int64 value.
+func int64Ptr(i int64) *int64 {
+	return &i
 }
 
 func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
