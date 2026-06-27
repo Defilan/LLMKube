@@ -599,3 +599,32 @@ func TestEstimateModelMemory_OverflowFallsBack(t *testing.T) {
 		t.Error("fallback estimate should exceed file size")
 	}
 }
+
+func TestCacheTypeBytesPerElement(t *testing.T) {
+	tests := []struct {
+		name      string
+		cacheType string
+		expected  float64
+	}{
+		{"empty defaults to f16", "", 2.0},
+		{"f16", "f16", 2.0},
+		{"f32", "f32", 4.0},
+		{"q8_0", "q8_0", 1.0625},
+		{"q5_0", "q5_0", 0.6875},
+		{"q5_1", "q5_1", 0.75},
+		{"q4_0", "q4_0", 0.5625},
+		{"iq4_nl", "iq4_nl", 0.5625},
+		{"q4_1", "q4_1", 0.625},
+		{"turbo3", "turbo3", 0.40625},
+		{"turbo4", "turbo4", 0.53125},
+		{"unknown falls back to f16", "unknown-type", 2.0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := cacheTypeBytesPerElement(tt.cacheType)
+			if got != tt.expected {
+				t.Errorf("cacheTypeBytesPerElement(%q) = %f, want %f", tt.cacheType, got, tt.expected)
+			}
+		})
+	}
+}
