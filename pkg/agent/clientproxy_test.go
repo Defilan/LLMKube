@@ -74,3 +74,33 @@ func TestClientProxy_503WhenNoBackend(t *testing.T) {
 		t.Errorf("503 body should carry a JSON error, got %q", rec.Body.String())
 	}
 }
+
+func TestStatusClass(t *testing.T) {
+	tests := []struct {
+		code     int
+		expected string
+	}{
+		{100, "other"},
+		{199, "other"},
+		{200, "2xx"},
+		{204, "2xx"},
+		{299, "2xx"},
+		{301, "3xx"},
+		{302, "3xx"},
+		{399, "3xx"},
+		{400, "4xx"},
+		{404, "4xx"},
+		{499, "4xx"},
+		{500, "5xx"},
+		{502, "5xx"},
+		{599, "5xx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.expected, func(t *testing.T) {
+			got := statusClass(tt.code)
+			if got != tt.expected {
+				t.Errorf("statusClass(%d) = %q, want %q", tt.code, got, tt.expected)
+			}
+		})
+	}
+}
