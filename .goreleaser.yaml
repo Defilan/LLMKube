@@ -135,7 +135,7 @@ builds:
 
 archives:
   - id: llmkube-cli
-    builds:
+    ids:
       - llmkube-cli
 
     # Archive name template
@@ -151,10 +151,11 @@ archives:
     # Format by OS
     format_overrides:
       - goos: windows
-        format: zip
+        formats:
+          - zip
 
   - id: llmkube-metal-agent
-    builds:
+    ids:
       - llmkube-metal-agent
 
     # Archive name template
@@ -168,12 +169,12 @@ archives:
       - deployment/macos/*
 
   - id: llmkube-foreman-agent
-    builds:
+    ids:
       - llmkube-foreman-agent
 
     # Archive name template. Produces darwin (Mac native agents) and linux
     # (edge nodes) archives; the linux foreman-agent Pod still ships as a
-    # ghcr image via the dockers section below.
+    # ghcr image via the dockers_v2 section below.
     name_template: "{{ .ProjectName }}-foreman-agent_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
     # Files to include
@@ -187,163 +188,86 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
-dockers:
-  - id: controller-amd64
-    goos: linux
-    goarch: amd64
+dockers_v2:
+  - image_templates:
+      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-amd64"
+      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-arm64"
     ids:
       - llmkube-controller
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-amd64"
     dockerfile: Dockerfile.goreleaser
     use: buildx
+    platforms:
+      - linux/amd64
+      - linux/arm64
     build_flag_templates:
-      - "--platform=linux/amd64"
+      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
       - "--label=org.opencontainers.image.source={{.GitURL}}"
+    manifest_templates:
+      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}"
 
-  - id: controller-arm64
-    goos: linux
-    goarch: arm64
-    ids:
-      - llmkube-controller
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-arm64"
-    dockerfile: Dockerfile.goreleaser
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-
-  - id: foreman-operator-amd64
-    goos: linux
-    goarch: amd64
+  - image_templates:
+      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-amd64"
+      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-arm64"
     ids:
       - llmkube-foreman-operator
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-amd64"
     dockerfile: Dockerfile.foreman-operator.goreleaser
     use: buildx
+    platforms:
+      - linux/amd64
+      - linux/arm64
     build_flag_templates:
-      - "--platform=linux/amd64"
+      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title=llmkube-foreman-operator"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
       - "--label=org.opencontainers.image.source={{.GitURL}}"
+    manifest_templates:
+      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}"
 
-  - id: foreman-operator-arm64
-    goos: linux
-    goarch: arm64
-    ids:
-      - llmkube-foreman-operator
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-arm64"
-    dockerfile: Dockerfile.foreman-operator.goreleaser
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title=llmkube-foreman-operator"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-
-  - id: foreman-agent-amd64
-    goos: linux
-    goarch: amd64
+  - image_templates:
+      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-amd64"
+      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-arm64"
     ids:
       - llmkube-foreman-agent
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-amd64"
     dockerfile: Dockerfile.foreman-agent.goreleaser
     use: buildx
+    platforms:
+      - linux/amd64
+      - linux/arm64
     build_flag_templates:
-      - "--platform=linux/amd64"
+      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title=llmkube-foreman-agent"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
       - "--label=org.opencontainers.image.source={{.GitURL}}"
+    manifest_templates:
+      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}"
 
-  - id: foreman-agent-arm64
-    goos: linux
-    goarch: arm64
-    ids:
-      - llmkube-foreman-agent
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-arm64"
-    dockerfile: Dockerfile.foreman-agent.goreleaser
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title=llmkube-foreman-agent"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-
-  - id: router-proxy-amd64
-    goos: linux
-    goarch: amd64
+  - image_templates:
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-amd64"
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-arm64"
     ids:
       - llmkube-router-proxy
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-amd64"
     dockerfile: Dockerfile.router-proxy.goreleaser
     use: buildx
+    platforms:
+      - linux/amd64
+      - linux/arm64
     build_flag_templates:
-      - "--platform=linux/amd64"
+      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title=llmkube-router-proxy"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
       - "--label=org.opencontainers.image.source={{.GitURL}}"
-
-  - id: router-proxy-arm64
-    goos: linux
-    goarch: arm64
-    ids:
-      - llmkube-router-proxy
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-arm64"
-    dockerfile: Dockerfile.router-proxy.goreleaser
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title=llmkube-router-proxy"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-
-docker_manifests:
-  - name_template: "ghcr.io/defilantech/llmkube-controller:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-arm64"
-
-  - name_template: "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-arm64"
+    manifest_templates:
+      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}"
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
@@ -446,7 +370,7 @@ release:
     **Full Changelog**: [CHANGELOG.md](https://github.com/defilantech/LLMKube/blob/main/CHANGELOG.md)
 
 # Homebrew tap
-brews:
+homebrew_casks:
   - name: llmkube
     # Only include the CLI archive (not Metal agent)
     ids:
