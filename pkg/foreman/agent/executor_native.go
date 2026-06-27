@@ -144,6 +144,33 @@ type NativeAgentLoopExecutor struct {
 	// Job IS the execution; only the watcher's executor (the one this
 	// field is set on) ever submits a Job. See executor_coderjob.go.
 	CoderJobSubmitter CoderJobSubmitter
+
+	// EnvtestJobRunner, when non-nil, is used by the coder gate to
+	// delegate verification of envtest-backed packages (those that need
+	// KUBEBUILDER_ASSETS) to a clean-room Kubernetes Job that runs
+	// `make test`. The agent package cannot import tools (tools imports
+	// agent), so cmd/foreman-agent wires a closure over
+	// tools.RunGateJobTool into this field. When nil, the gate falls
+	// back to the pre-#859 behavior: envtest packages are not verified
+	// in the coder loop (the clean-room gate Job remains the backstop).
+	EnvtestJobRunner EnvtestJobRunner
+}
+
+// EnvtestJobRunner is the seam between the executor (this package) and
+// the gate Job machinery (pkg/foreman/agent/tools). It submits a
+// Kubernetes Job that runs `make test` (envtest) for a given branch,
+// polls to terminal, and returns (pass, feedback). The dependency
+// direction is the reason it lives here: the tools package imports the
+// agent package (for ToolResult), so the agent package cannot import
+// tools without a cycle. cmd/foreman-agent wires a closure over
+// RunGateJobTool into the executor, which then passes it to the gate
+// via makeCoderGateVerifier.
+type EnvtestJobRunner interface {
+	// Run submits a gate Job for the given repository/branch/cloneURL
+	// and returns (pass, feedback). pass is true when the Job succeeds
+	// (GATE PASS), false otherwise. feedback is the Job's log tail or
+	// error message on failure.
+	Run(ctx context.Context, repository, branch, cloneURL string) (pass bool, feedback string)
 }
 
 // Kind identifies this executor in Result.Kind and in logs.
@@ -395,7 +422,11 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// fast checks is sent back for a fix instead of landing dirty.
 	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
 		cfg.MaxVerifyRetries = coderGateMaxRetries
-		cfg.VerifyTerminal = makeCoderGateVerifier(workspace, log, task.Spec.GateProfile)
+		cfg.VerifyTerminal = makeCoderGateVerifier(
+			workspace, log, task.Spec.GateProfile,
+			e.EnvtestJobRunner,
+			task.Spec.Payload.Repo, branch, e.GitRemoteURL,
+		)
 	}
 
 	// 8. Run the loop. Always persist the transcript afterwards,
@@ -576,8 +607,17 @@ const coderGateMaxRetries = 3
 // untouched. golangci-lint is bootstrapped into the workspace bin on first
 // use; a bootstrap or run error is reported as could-not-verify so the
 // terminal stands and the clean-room gate Job remains the authoritative
-// backstop.
-func makeCoderGateVerifier(workspace string, log logr.Logger, profile *foremanv1alpha1.GateProfile) TerminalVerifier {
+// backstop. envtestRunner, when non-nil, is passed to RunCoderGate so
+// envtest-backed packages are verified in a clean-room Kubernetes Job
+// (#859). repo, branch, and cloneURL are captured in the closure so the
+// envtest job runner can submit a gate Job for the correct branch.
+func makeCoderGateVerifier(
+	workspace string,
+	log logr.Logger,
+	profile *foremanv1alpha1.GateProfile,
+	envtestRunner EnvtestJobRunner,
+	repository, branch, cloneURL string,
+) TerminalVerifier {
 	return func(ctx context.Context, terminal *ToolResult, _ []oai.Message) (bool, string, error) {
 		if terminal == nil {
 			return true, "", nil
@@ -604,11 +644,29 @@ func makeCoderGateVerifier(workspace string, log logr.Logger, profile *foremanv1
 				return true, "", err
 			}
 		}
-		pass, feedback := RunCoderGate(ctx, workspace, lintPath, execCommandRunner, nil)
+		pass, feedback := RunCoderGate(ctx, workspace, lintPath, execCommandRunner,
+			makeEnvtestJobRunner(envtestRunner, repository, branch, cloneURL))
 		if !pass {
 			log.Info("coder gate: fast checks failed; returning feedback to the loop for a fix")
 		}
 		return pass, feedback, nil
+	}
+}
+
+// makeEnvtestJobRunner adapts the EnvtestJobRunner interface into the
+// envtestJobRunner function type that RunCoderGate expects. When
+// envtestRunner is nil, it returns nil (preserving the pre-#859 behavior).
+// repo, branch, and cloneURL are captured in the closure so the runner
+// can submit a gate Job for the correct branch.
+func makeEnvtestJobRunner(
+	envtestRunner EnvtestJobRunner,
+	repository, branch, cloneURL string,
+) envtestJobRunner {
+	if envtestRunner == nil {
+		return nil
+	}
+	return func(ctx context.Context) (bool, string) {
+		return envtestRunner.Run(ctx, repository, branch, cloneURL)
 	}
 }
 

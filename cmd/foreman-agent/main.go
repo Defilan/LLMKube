@@ -34,6 +34,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -419,6 +420,11 @@ func main() {
 					LogTailFn:         makePodLogTailFn(kcs),
 				},
 			},
+			// EnvtestJobRunner delegates envtest-backed package verification
+			// to a clean-room Kubernetes Job that runs `make test` (#859).
+			// The gate Job runs only the `test` target (envtest) since the
+			// fast in-workspace tier already ran fmt/vet/lint/build.
+			EnvtestJobRunner: makeEnvtestJobRunner(kc, foremanNamespace, makePodLogTailFn(kcs)),
 		}
 	default:
 		setupLog.Error(nil, "unknown --agent-mode", "value", agentMode, "valid", "stub|native")
@@ -718,6 +724,71 @@ func makePodLogTailFn(kcs kubernetes.Interface) func(ctx context.Context, namesp
 		}
 		return ""
 	}
+}
+
+// makeEnvtestJobRunner returns an EnvtestJobRunner that submits a
+// clean-room gate Job running `make test` (envtest) for the given
+// repo/branch/cloneURL. It reuses the RunGateJobTool machinery
+// (renderGateJob + pollForTerminal) and scopes the Job to the `test`
+// target only, since the fast in-workspace tier already ran
+// fmt/vet/lint/build (#859).
+func makeEnvtestJobRunner(
+	kc client.Client,
+	foremanNamespace string,
+	logTailFn func(ctx context.Context, namespace, jobName string) string,
+) foremanagent.EnvtestJobRunner {
+	tool := &foremantools.RunGateJobTool{
+		Client: kc,
+		Cfg: foremantools.RunGateJobToolConfig{
+			Namespace:    foremanNamespace,
+			LogTailFn:    logTailFn,
+			PollInterval: 5 * time.Second,
+			PollTimeout:  10 * time.Minute,
+		},
+	}
+	return &envtestJobRunnerImpl{
+		tool: tool,
+	}
+}
+
+// envtestJobRunnerImpl implements foremanagent.EnvtestJobRunner by
+// delegating to the RunGateJobTool with the `test` make target.
+type envtestJobRunnerImpl struct {
+	tool *foremantools.RunGateJobTool
+}
+
+func (e *envtestJobRunnerImpl) Run(
+	ctx context.Context, repository, branch, cloneURL string,
+) (pass bool, feedback string) {
+	args := map[string]any{
+		"repo":     repository,
+		"branch":   branch,
+		"cloneURL": cloneURL,
+		"checks":   []string{"test"},
+		"taskRef": map[string]string{
+			"namespace": "default",
+			"name":      "envtest-gate",
+		},
+	}
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return false, "envtest gate: marshal args: " + err.Error()
+	}
+	result, err := e.tool.Execute(ctx, argsJSON)
+	if err != nil {
+		return false, "envtest gate: " + err.Error()
+	}
+	if result == nil {
+		return false, "envtest gate: nil result"
+	}
+	if result.Verdict == foremantools.VerdictGatePass {
+		return true, ""
+	}
+	fb := result.Summary
+	if logTail, ok := result.Extra["logTail"].(string); ok && logTail != "" {
+		fb += "\n" + logTail
+	}
+	return false, fb
 }
 
 var dns1123Bad = regexp.MustCompile(`[^a-z0-9-]+`)

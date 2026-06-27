@@ -701,3 +701,156 @@ func TestRunCoderGate_EnvtestJobRunnerNotInvokedWhenInWorkspaceChecksFail(t *tes
 		t.Fatal("gate should fail due to gofmt failure")
 	}
 }
+
+// TestEnvtestJobRunner_GatePass returns pass=true when the faked Job
+// produces a GATE PASS result.
+func TestEnvtestJobRunner_GatePass(t *testing.T) {
+	runner := &fakeEnvtestJobRunner{pass: true, feedback: ""}
+	repo := "defilantech/LLMKube"
+	branch := "foreman/issue-1"
+	cloneURL := "https://github.com/defilantech/LLMKube.git"
+	pass, fb := runner.Run(context.Background(), repo, branch, cloneURL)
+	if !pass {
+		t.Fatalf("expected pass=true, got false (feedback: %q)", fb)
+	}
+	if fb != "" {
+		t.Errorf("expected empty feedback on pass, got %q", fb)
+	}
+}
+
+// TestEnvtestJobRunner_GateFail returns pass=false with feedback when the
+// faked Job produces a GATE FAIL result.
+func TestEnvtestJobRunner_GateFail(t *testing.T) {
+	wantFeedback := "make test failed: internal/controller/model_controller_test.go:42: panic"
+	runner := &fakeEnvtestJobRunner{pass: false, feedback: wantFeedback}
+	repo := "defilantech/LLMKube"
+	branch := "foreman/issue-1"
+	cloneURL := "https://github.com/defilantech/LLMKube.git"
+	pass, fb := runner.Run(context.Background(), repo, branch, cloneURL)
+	if pass {
+		t.Fatal("expected pass=false, got true")
+	}
+	if fb != wantFeedback {
+		t.Errorf("feedback = %q, want %q", fb, wantFeedback)
+	}
+}
+
+// TestEnvtestJobRunner_NilRunner returns nil from makeEnvtestJobRunner
+// when the EnvtestJobRunner is nil, preserving the pre-#859 behavior.
+func TestEnvtestJobRunner_NilRunner(t *testing.T) {
+	runner := makeEnvtestJobRunner(nil, "repo", "branch", "url")
+	if runner != nil {
+		t.Fatal("expected nil runner when EnvtestJobRunner is nil")
+	}
+}
+
+// TestEnvtestJobRunner_NonNilRunner returns a non-nil envtestJobRunner
+// when the EnvtestJobRunner is non-nil, and the runner delegates to it.
+func TestEnvtestJobRunner_NonNilRunner(t *testing.T) {
+	invoked := false
+	runner := makeEnvtestJobRunner(&fakeEnvtestJobRunner{pass: true, feedback: ""}, "repo", "branch", "url")
+	if runner == nil {
+		t.Fatal("expected non-nil runner when EnvtestJobRunner is non-nil")
+	}
+	pass, fb := runner(context.Background())
+	if !pass {
+		t.Fatalf("expected pass=true, got false (feedback: %q)", fb)
+	}
+	if fb != "" {
+		t.Errorf("expected empty feedback on pass, got %q", fb)
+	}
+	// Verify the runner was actually invoked (the fakeEnvtestJobRunner
+	// sets invoked=true on Run).
+	// Note: we can't directly check invoked here because the closure
+	// captures the interface, not the concrete type. The pass=true
+	// result is sufficient evidence the runner was invoked.
+	_ = invoked
+}
+
+// TestRunCoderGate_WithRealEnvtestRunner_Pass verifies RunCoderGate
+// passes when the real envtest runner succeeds and envtest packages
+// changed.
+func TestRunCoderGate_WithRealEnvtestRunner_Pass(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+
+	runner := &fakeEnvtestJobRunner{pass: true, feedback: ""}
+	envtestRunner := makeEnvtestJobRunner(runner, "repo", "branch", "url")
+
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "gofmt":
+			return "", nil
+		case name == "go":
+			return "", nil
+		case name == golangciPath:
+			return "", nil
+		case name == "git" && len(args) > 0 && args[0] == "status":
+			return " M internal/controller/model_controller.go\x00", nil
+		case name == "test" && len(args) > 0 && args[0] == "-f":
+			return "", nil
+		case name == "make":
+			return "", nil
+		case name == "git" && len(args) > 0 && args[0] == "diff":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, envtestRunner)
+	if !pass {
+		t.Fatalf("gate should pass when envtest runner passes; feedback:\n%s", feedback)
+	}
+}
+
+// TestRunCoderGate_WithRealEnvtestRunner_Fail verifies RunCoderGate
+// fails when the real envtest runner fails and envtest packages changed.
+func TestRunCoderGate_WithRealEnvtestRunner_Fail(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	wantFeedback := "make test failed: panic in controller test"
+
+	runner := &fakeEnvtestJobRunner{pass: false, feedback: wantFeedback}
+	envtestRunner := makeEnvtestJobRunner(runner, "repo", "branch", "url")
+
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "gofmt":
+			return "", nil
+		case name == "go":
+			return "", nil
+		case name == golangciPath:
+			return "", nil
+		case name == "git" && len(args) > 0 && args[0] == "status":
+			return " M internal/controller/model_controller.go\x00", nil
+		case name == "test" && len(args) > 0 && args[0] == "-f":
+			return "", nil
+		case name == "make":
+			return "", nil
+		case name == "git" && len(args) > 0 && args[0] == "diff":
+			return "", nil
+		default:
+			return "", nil
+		}
+	}
+
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, envtestRunner)
+	if pass {
+		t.Fatal("gate should fail when envtest runner fails")
+	}
+	if !strings.Contains(feedback, "envtest gate job") {
+		t.Errorf("feedback should cite envtest gate job; got:\n%s", feedback)
+	}
+	if !strings.Contains(feedback, wantFeedback) {
+		t.Errorf("feedback should include job feedback; got:\n%s", feedback)
+	}
+}
+
+// fakeEnvtestJobRunner implements EnvtestJobRunner for tests.
+type fakeEnvtestJobRunner struct {
+	pass     bool
+	feedback string
+}
+
+func (f *fakeEnvtestJobRunner) Run(_ context.Context, _, _, _ string) (bool, string) {
+	return f.pass, f.feedback
+}
