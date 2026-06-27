@@ -209,6 +209,49 @@ func invalidFileSetInitContainer(initImage string) corev1.Container {
 	}
 }
 
+// cachePrepInitContainer returns the root-run prep init container that runs
+// BEFORE model-downloader in the cache-backed path. CSI drivers with
+// fsGroupPolicy=None (CephFS, NFS) never apply the pod fsGroup to the volume,
+// so the PVC root stays root:root 0755 and the non-root downloader (uid 100)
+// gets "permission denied" on mkdir. The prep chowns/chmods the mount root so
+// the downloader can write, without recursing over /models.
+//
+// When resolvedFSGroup > 0 the prep chowns to 0:<fsGroup> and grants group
+// rw on existing and future files/dirs (g+rwX). When resolvedFSGroup <= 0
+// (fsGroup disabled, e.g. OpenShift) the prep chowns to 100:100 (the
+// downloader's UID/GID) and sets 770 so only the downloader can write.
+//
+// The prep reuses the configurable initContainerImage (no hardcoded busybox)
+// so air-gapped clusters that mirror initContainerImage are covered.
+func cachePrepInitContainer(initImage string, resolvedFSGroup int64) corev1.Container {
+	var cmd string
+	if resolvedFSGroup > 0 {
+		cmd = fmt.Sprintf("chown 0:%d /models && chmod g+rwX /models", resolvedFSGroup)
+	} else {
+		cmd = "chown 100:100 /models && chmod 770 /models"
+	}
+	return corev1.Container{
+		Name:    "model-cache-prep",
+		Image:   initImage,
+		Command: []string{"sh", "-c", cmd},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "model-cache", MountPath: "/models"},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                int64Ptr(0),
+			AllowPrivilegeEscalation: boolPtr(false),
+			ReadOnlyRootFilesystem:   boolPtr(true),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "FOWNER"},
+			},
+			SeccompProfile: &corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			},
+		},
+	}
+}
+
 // multiFileInitEnvVars returns env vars for a multi-file init container.
 // MODEL_SOURCE is normalized (hf:// -> https://huggingface.co/), and
 // MODEL_FILES is newline-delimited.
@@ -273,12 +316,12 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	if isPVCSource(model.Spec.Source) {
 		return buildPVCStorageConfig(model)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup)
 	}
 	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
 }
@@ -309,8 +352,19 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", model.Status.CacheKey)
+
+	// Resolve the fsGroup that the CSI will actually apply to the volume.
+	// When the InferenceService sets its own FSGroup, that wins over the
+	// operator default (see inferPodSecurityContext in deployment_builder.go);
+	// chown'ing to the wrong GID would leave the downloader unable to write.
+	// A value <= 0 means the operator disabled fsGroup (e.g. OpenShift), so
+	// the prep must chown to the downloader's own UID instead.
+	resolvedFSGroup := defaultFSGroup
+	if isvc != nil && isvc.Spec.PodSecurityContext != nil && isvc.Spec.PodSecurityContext.FSGroup != nil {
+		resolvedFSGroup = *isvc.Spec.PodSecurityContext.FSGroup
+	}
 
 	// Multi-file staging branch: when spec.files or spec.mmproj are set, use
 	// the staging plan to download all artifacts. Returns early.
@@ -357,18 +411,23 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 
 		addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
-		return modelStorageConfig{
-			modelPath: modelPath,
-			initContainers: []corev1.Container{{
+		initContainers := []corev1.Container{
+			cachePrepInitContainer(initContainerImage, resolvedFSGroup),
+			{
 				Name:            "model-downloader",
 				Image:           initContainerImage,
 				Command:         []string{"sh", "-c", cmd},
 				Env:             env,
 				VolumeMounts:    initVolumeMounts,
 				SecurityContext: initContainerSecurityContext(isvc),
-			}},
-			volumes:      volumes,
-			volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
+			},
+		}
+
+		return modelStorageConfig{
+			modelPath:      modelPath,
+			initContainers: initContainers,
+			volumes:        volumes,
+			volumeMounts:   []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 		}
 	}
 
@@ -422,20 +481,23 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath)
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
-	return modelStorageConfig{
-		modelPath: modelPath,
-		initContainers: []corev1.Container{
-			{
-				Name:            "model-downloader",
-				Image:           initContainerImage,
-				Command:         []string{"sh", "-c", cmd},
-				Env:             env,
-				VolumeMounts:    initVolumeMounts,
-				SecurityContext: initContainerSecurityContext(isvc),
-			},
+	initContainers := []corev1.Container{
+		cachePrepInitContainer(initContainerImage, resolvedFSGroup),
+		{
+			Name:            "model-downloader",
+			Image:           initContainerImage,
+			Command:         []string{"sh", "-c", cmd},
+			Env:             env,
+			VolumeMounts:    initVolumeMounts,
+			SecurityContext: initContainerSecurityContext(isvc),
 		},
-		volumes:      volumes,
-		volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
+	}
+
+	return modelStorageConfig{
+		modelPath:      modelPath,
+		initContainers: initContainers,
+		volumes:        volumes,
+		volumeMounts:   []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}},
 	}
 }
 
