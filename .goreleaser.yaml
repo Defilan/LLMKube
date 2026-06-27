@@ -188,86 +188,82 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+# dockers_v2 builds one multi-arch manifest per image natively (buildx),
+# replacing the old per-arch `dockers` entries + `docker_manifests`. The
+# binaries are staged per platform under $TARGETPLATFORM in the build
+# context, so the Dockerfiles COPY from "$TARGETPLATFORM/<binary>".
 dockers_v2:
-  - image_templates:
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}-arm64"
+  - id: controller
     ids:
       - llmkube-controller
+    images:
+      - "ghcr.io/defilantech/llmkube-controller"
+    tags:
+      - "{{ .Version }}"
     dockerfile: Dockerfile.goreleaser
-    use: buildx
     platforms:
       - linux/amd64
       - linux/arm64
-    build_flag_templates:
-      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title={{.ProjectName}}"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-    manifest_templates:
-      - "ghcr.io/defilantech/llmkube-controller:{{ .Version }}"
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
 
-  - image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}-arm64"
+  - id: foreman-operator
     ids:
       - llmkube-foreman-operator
+    images:
+      - "ghcr.io/defilantech/llmkube-foreman-operator"
+    tags:
+      - "{{ .Version }}"
     dockerfile: Dockerfile.foreman-operator.goreleaser
-    use: buildx
     platforms:
       - linux/amd64
       - linux/arm64
-    build_flag_templates:
-      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title=llmkube-foreman-operator"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-    manifest_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-operator:{{ .Version }}"
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.title: "llmkube-foreman-operator"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
 
-  - image_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}-arm64"
+  - id: foreman-agent
     ids:
       - llmkube-foreman-agent
+    images:
+      - "ghcr.io/defilantech/llmkube-foreman-agent"
+    tags:
+      - "{{ .Version }}"
     dockerfile: Dockerfile.foreman-agent.goreleaser
-    use: buildx
     platforms:
       - linux/amd64
       - linux/arm64
-    build_flag_templates:
-      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title=llmkube-foreman-agent"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-    manifest_templates:
-      - "ghcr.io/defilantech/llmkube-foreman-agent:{{ .Version }}"
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.title: "llmkube-foreman-agent"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
 
-  - image_templates:
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-amd64"
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}-arm64"
+  - id: router-proxy
     ids:
       - llmkube-router-proxy
+    images:
+      - "ghcr.io/defilantech/llmkube-router-proxy"
+    tags:
+      - "{{ .Version }}"
     dockerfile: Dockerfile.router-proxy.goreleaser
-    use: buildx
     platforms:
       - linux/amd64
       - linux/arm64
-    build_flag_templates:
-      - "--platform={{ .TargetOS }}/{{ .TargetArch }}"
-      - "--label=org.opencontainers.image.created={{.Date}}"
-      - "--label=org.opencontainers.image.title=llmkube-router-proxy"
-      - "--label=org.opencontainers.image.revision={{.FullCommit}}"
-      - "--label=org.opencontainers.image.version={{.Version}}"
-      - "--label=org.opencontainers.image.source={{.GitURL}}"
-    manifest_templates:
-      - "ghcr.io/defilantech/llmkube-router-proxy:{{ .Version }}"
+    labels:
+      org.opencontainers.image.created: "{{ .Date }}"
+      org.opencontainers.image.title: "llmkube-router-proxy"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
 
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
@@ -369,28 +365,31 @@ release:
 
     **Full Changelog**: [CHANGELOG.md](https://github.com/defilantech/LLMKube/blob/main/CHANGELOG.md)
 
-# Homebrew tap
+# Homebrew tap. brews/formulas were deprecated in GoReleaser v2.16 in favor
+# of homebrew_casks, which uses cask stanzas (binaries) rather than the
+# formula install/test DSL.
 homebrew_casks:
   - name: llmkube
     # Only include the CLI archive (not Metal agent)
     ids:
       - llmkube-cli
+    binaries:
+      - llmkube
     repository:
       owner: defilantech
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    directory: Formula
+    directory: Casks
     description: "GPU-accelerated Kubernetes operator for local LLM inference"
     homepage: "https://github.com/defilantech/LLMKube"
-    license: "Apache-2.0"
-
-    # Install instructions
-    install: |
-      bin.install "llmkube"
-
-    # Test the installation
-    test: |
-      system "#{bin}/llmkube", "version"
+    # The released CLI binary is not notarized; strip the quarantine xattr so
+    # Gatekeeper does not block it on first run.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/llmkube"]
+          end
 
 # Metadata
 metadata:
