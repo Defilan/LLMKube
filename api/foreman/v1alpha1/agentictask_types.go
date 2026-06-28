@@ -164,7 +164,8 @@ const (
 
 // AgenticTaskAccelerator pins which accelerator family a task needs from the
 // node that runs it. "any" lets the scheduler pick from any Ready FleetNode.
-// +kubebuilder:validation:Enum=metal;cuda;any
+// "vulkan" is the AMD/Vulkan tier (e.g. Strix Halo gfx1151).
+// +kubebuilder:validation:Enum=metal;cuda;vulkan;any
 type AgenticTaskAccelerator string
 
 // RequiredCapability tells the scheduler which FleetNodes can serve this task.

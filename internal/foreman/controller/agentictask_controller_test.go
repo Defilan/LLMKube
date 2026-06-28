@@ -307,6 +307,44 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(fresh.Status.AssignedNode).To(Equal(verifierNode.Name))
 	})
 
+	It("schedules a vulkan task onto a vulkan node and not a metal node", func() {
+		// The AMD/Vulkan tier advertises accelerator=vulkan; a task pinned to
+		// vulkan must land on that node and never on a metal node. Creating the
+		// node and task also exercises the CRD enum (envtest validates the
+		// vulkan value on create).
+		metalNode := newFleetNode("metal-box")
+		Expect(k8sClient.Create(ctx, metalNode)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, metalNode) })
+		setNodeReady(metalNode, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+			TotalRAMGB:  64, AvailableRAMGB: 48,
+		})
+
+		vulkanNode := newFleetNode("vulkan-box")
+		Expect(k8sClient.Create(ctx, vulkanNode)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, vulkanNode) })
+		setNodeReady(vulkanNode, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("vulkan"),
+			TotalRAMGB:  128, AvailableRAMGB: 100,
+		})
+
+		task := newTask("vulkan-target")
+		task.Spec.RequiredCapability = foremanv1alpha1.RequiredCapability{
+			Accelerator: foremanv1alpha1.AgenticTaskAccelerator("vulkan"),
+		}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(fresh.Status.AssignedNode).To(Equal(vulkanNode.Name))
+	})
+
 	It("does not reschedule a Running task whose assigned node is fresh", func() {
 		// The scheduler must leave Running tasks alone when the FleetNode is
 		// healthy; only claim expiry (stale/absent node) may alter them.

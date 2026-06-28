@@ -40,7 +40,8 @@ const (
 )
 
 // FleetNodeAccelerator names the accelerator family the node hosts.
-// +kubebuilder:validation:Enum=metal;cuda;none
+// "vulkan" is the AMD/Vulkan tier (e.g. Strix Halo gfx1151).
+// +kubebuilder:validation:Enum=metal;cuda;vulkan;none
 type FleetNodeAccelerator string
 
 // FleetNodeCapability is what the FleetAgent advertises about its host so the

@@ -373,6 +373,7 @@ spec:
                     enum:
                     - metal
                     - cuda
+                    - vulkan
                     - any
                     type: string
                   minContextTokens:
