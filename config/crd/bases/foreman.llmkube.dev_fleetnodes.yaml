@@ -121,6 +121,7 @@ spec:
                     enum:
                     - metal
                     - cuda
+                    - vulkan
                     - none
                     type: string
                   availableRAMGB:
