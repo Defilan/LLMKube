@@ -112,7 +112,7 @@ func TestRunCoderGate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			run, _ := newFakeRunner(tt.responses)
-			pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+			pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 
 			if pass != tt.wantPass {
 				t.Fatalf("pass = %v, want %v (feedback: %q)", pass, tt.wantPass, feedback)
@@ -144,7 +144,7 @@ func TestRunCoderGateLintEnv(t *testing.T) {
 		golangciPath: {},
 	})
 
-	RunCoderGate(context.Background(), "/work", golangciPath, run)
+	RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 
 	var lintCall *recordedCall
 	for i := range *calls {
@@ -192,7 +192,7 @@ func TestRunCoderGateLintCacheScopedToWorkspace(t *testing.T) {
 		golangciPath: {},
 	})
 
-	RunCoderGate(context.Background(), "/work", golangciPath, run)
+	RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 
 	var lintCall *recordedCall
 	for i := range *calls {
@@ -266,7 +266,7 @@ func TestRunCoderGate_FailsOnChangedPackageUnitTest(t *testing.T) {
 			return "", nil // golangci-lint
 		}
 	}
-	pass, feedback := RunCoderGate(context.Background(), "/work", "./bin/golangci-lint", run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", "./bin/golangci-lint", run, "")
 	if pass {
 		t.Fatal("gate should fail when a changed package's unit test fails")
 	}
@@ -285,7 +285,7 @@ func TestRunCoderGate_SkipsTestTierWhenNoChangedPackages(t *testing.T) {
 		}
 		return "", nil // git status empty, all checks clean
 	}
-	if pass, _ := RunCoderGate(context.Background(), "/work", "./bin/golangci-lint", run); !pass {
+	if pass, _ := RunCoderGate(context.Background(), "/work", "./bin/golangci-lint", run, ""); !pass {
 		t.Fatal("gate should pass when all checks are clean and nothing changed")
 	}
 	if sawGoTest {
@@ -303,7 +303,7 @@ func TestRunCoderGateTruncation(t *testing.T) {
 		golangciPath: {output: huge, err: errors.New("boom")},
 	})
 
-	_, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	_, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 
 	if !strings.Contains(feedback, "...(truncated)...") {
 		t.Error("expected truncation marker in feedback")
@@ -373,7 +373,7 @@ func TestRunCoderGate_Codegen_AutoResolvesGeneratedDrift(t *testing.T) {
 		" M charts/foreman/templates/crds/agentictasks.yaml\n" +
 		" M api/foreman/v1alpha1/zz_generated.deepcopy.go\n"
 	run := codegenFake("", after, nil, false)
-	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 	if !pass {
 		t.Fatalf("gate should auto-resolve generated-only drift; feedback:\n%s", feedback)
 	}
@@ -396,7 +396,7 @@ func TestRunCoderGate_Codegen_IgnoresCoderEdits(t *testing.T) {
 		" M charts/foreman/templates/crds/agentictasks.yaml\n" +
 		" M api/foreman/v1alpha1/zz_generated.deepcopy.go\n"
 	run := codegenFake(before, after, nil, false)
-	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 	if !pass {
 		t.Fatalf("gate should ignore the coder's own edits and resolve generated drift; feedback:\n%s", feedback)
 	}
@@ -414,7 +414,7 @@ func TestRunCoderGate_Codegen_FailsWhenRegenTouchesNonGenerated(t *testing.T) {
 	after := " M charts/foreman/templates/crds/agentictasks.yaml\n" +
 		" M internal/controller/inferenceservice_controller.go\n"
 	run := codegenFake("", after, nil, false)
-	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 	if pass {
 		t.Fatal("gate should fail when regeneration touches a non-generated file")
 	}
@@ -434,7 +434,7 @@ func TestRunCoderGate_Codegen_FailsWhenRegenTouchesNonGenerated(t *testing.T) {
 func TestRunCoderGate_Codegen_PassesWhenClean(t *testing.T) {
 	const golangciPath = "./bin/golangci-lint"
 	run := codegenFake("", "", nil, false)
-	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 	if !pass {
 		t.Fatalf("gate should pass when codegen is clean; feedback:\n%s", feedback)
 	}
@@ -448,7 +448,7 @@ func TestRunCoderGate_Codegen_PassesWhenClean(t *testing.T) {
 func TestRunCoderGate_Codegen_SkippedWhenNoControllerGen(t *testing.T) {
 	const golangciPath = "./bin/golangci-lint"
 	run := codegenFake("", "", nil, true)
-	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 	if !pass {
 		t.Fatalf("gate should pass when controller-gen is unavailable; feedback:\n%s", feedback)
 	}
@@ -462,7 +462,7 @@ func TestRunCoderGate_Codegen_SkippedWhenNoControllerGen(t *testing.T) {
 func TestRunCoderGate_Codegen_FailsWhenMakeFails(t *testing.T) {
 	const golangciPath = "./bin/golangci-lint"
 	run := codegenFake("", "", errors.New("exit status 2"), false)
-	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
 	if pass {
 		t.Fatal("gate should fail when the regeneration make target fails")
 	}
@@ -608,5 +608,125 @@ func TestIsEnvtestPackage(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("isEnvtestPackage(%q) = %v, want %v", tt.pkg, got, tt.want)
 		}
+	}
+}
+
+// withScopeRelevant overrides the scopeRelevantFiles seam with a canned set
+// for the duration of the test.
+func withScopeRelevant(t *testing.T, paths []string) {
+	t.Helper()
+	orig := scopeRelevantFiles
+	set := map[string]bool{}
+	for _, p := range paths {
+		set[p] = true
+	}
+	scopeRelevantFiles = func(_, _ string) ([]string, map[string]bool) { return paths, set }
+	t.Cleanup(func() { scopeRelevantFiles = orig })
+}
+
+// scopeRunner returns a commandRunner whose `git status --porcelain` reports
+// the given porcelain output; all other commands succeed silently.
+func scopeRunner(porcelain string) commandRunner {
+	return func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain" {
+			return porcelain, nil
+		}
+		return "", nil
+	}
+}
+
+func TestCheckScopeOverlap_DriftFlagged(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go", "pkg/agent/health.go"})
+	run := scopeRunner(" M pkg/cli/cache.go\n")
+	drift, fb := checkScopeOverlap(context.Background(), "/work", run, "metal-agent endpoint health")
+	if !drift {
+		t.Fatal("expected drift when the changed Go file is outside the relevant set")
+	}
+	if !strings.Contains(fb, "pkg/cli/cache.go") || !strings.Contains(fb, "pkg/agent/endpoint.go") {
+		t.Errorf("feedback should name changed + relevant files; got:\n%s", fb)
+	}
+}
+
+func TestCheckScopeOverlap_InScopePasses(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go"})
+	// Touches a relevant file plus an unrelated one: any overlap is in scope.
+	run := scopeRunner(" M pkg/agent/endpoint.go\n M pkg/cli/cache.go\n")
+	if drift, _ := checkScopeOverlap(context.Background(), "/work", run, "x"); drift {
+		t.Error("expected no drift when a changed file is in the relevant set")
+	}
+}
+
+func TestCheckScopeOverlap_SkipsNonGoOnlyChanges(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go"})
+	run := scopeRunner(" M charts/foreman/x.yaml\n M docs/readme.md\n")
+	if drift, _ := checkScopeOverlap(context.Background(), "/work", run, "x"); drift {
+		t.Error("a yaml/docs-only change must not be flagged by the Go-aware guard")
+	}
+}
+
+func TestCheckScopeOverlap_SkipsTestOnlyChanges(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go"})
+	run := scopeRunner(" M pkg/cli/cache_test.go\n")
+	if drift, _ := checkScopeOverlap(context.Background(), "/work", run, "x"); drift {
+		t.Error("a test-only change must not be judged")
+	}
+}
+
+func TestCheckScopeOverlap_SkipsWhenNoGoSignal(t *testing.T) {
+	withScopeRelevant(t, nil) // issue produces no positively-scored Go files
+	run := scopeRunner(" M pkg/cli/cache.go\n")
+	if drift, _ := checkScopeOverlap(context.Background(), "/work", run, "x"); drift {
+		t.Error("no Go signal -> observe-only, no flag")
+	}
+}
+
+func TestCheckScopeOverlap_SkipsWhenIssueTextEmpty(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go"})
+	run := scopeRunner(" M pkg/cli/cache.go\n")
+	if drift, _ := checkScopeOverlap(context.Background(), "/work", run, ""); drift {
+		t.Error("empty issueText must disable the scope check")
+	}
+}
+
+// gateRunnerAllPassExcept builds a runner where gofmt/vet/build/lint pass,
+// codegen is skipped (no controller-gen), no changed test packages, and
+// `git status --porcelain` reports porcelain (for the scope tier).
+func gateRunnerScope(golangciPath, porcelain string) commandRunner {
+	return func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "gofmt", name == "go", name == golangciPath:
+			return "", nil
+		case name == "test" && len(args) > 0 && args[0] == "-f":
+			return "", errors.New("no controller-gen") // skip codegen tier
+		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "-z":
+			return "", nil // no changed test packages
+		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain":
+			return porcelain, nil
+		default:
+			return "", nil
+		}
+	}
+}
+
+func TestRunCoderGate_ScopeDriftFailsTheGate(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go"})
+	const golangciPath = "./bin/golangci-lint"
+	run := gateRunnerScope(golangciPath, " M pkg/cli/cache.go\n")
+	pass, fb := RunCoderGate(context.Background(), "/work", golangciPath, run, "metal-agent endpoint")
+	if pass {
+		t.Fatal("gate should fail when the coder drifts to an unrelated subsystem")
+	}
+	if !strings.Contains(fb, "scope overlap") {
+		t.Errorf("feedback should cite scope overlap; got:\n%s", fb)
+	}
+}
+
+func TestRunCoderGate_ScopeDisabledWhenIssueTextEmpty(t *testing.T) {
+	withScopeRelevant(t, []string{"pkg/agent/endpoint.go"})
+	const golangciPath = "./bin/golangci-lint"
+	run := gateRunnerScope(golangciPath, " M pkg/cli/cache.go\n")
+	pass, fb := RunCoderGate(context.Background(), "/work", golangciPath, run, "")
+	if !pass {
+		t.Fatalf("empty issueText should disable the scope check; gate should pass. feedback:\n%s", fb)
 	}
 }

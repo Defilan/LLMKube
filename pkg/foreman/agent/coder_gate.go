@@ -18,10 +18,13 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/defilantech/llmkube/pkg/foreman/agent/repomap"
 )
 
 // envtestPackagePrefixes are workspace-relative package path prefixes whose
@@ -81,18 +84,21 @@ type checkFailure struct {
 // it names the failing check(s) and includes their output so the model
 // can fix the issue and resubmit. golangciPath is the path to the
 // golangci-lint binary (e.g. "./bin/golangci-lint"). run is the command
-// runner (production callers pass execCommandRunner).
+// runner (production callers pass execCommandRunner). issueText is the
+// query the scope-overlap check ranks files against; an empty string
+// disables that check (backward compatible).
 //
-// The gate runs six deterministic checks in order: gofmt, go vet,
+// The gate runs seven deterministic checks in order: gofmt, go vet,
 // go build, golangci-lint, a fast unit-test tier on changed packages,
-// and a codegen-drift check. Heavy envtest or integration tests are
-// intentionally out of scope; they run in a separate post-push gate Job.
-// All checks run regardless of earlier failures so the feedback reports
-// everything wrong at once.
+// a codegen-drift check, and a scope-overlap check. Heavy envtest or
+// integration tests are intentionally out of scope; they run in a separate
+// post-push gate Job. All checks run regardless of earlier failures so the
+// feedback reports everything wrong at once.
 func RunCoderGate(
 	ctx context.Context,
 	workspace, golangciPath string,
 	run commandRunner,
+	issueText string,
 ) (pass bool, feedback string) {
 	var failures []checkFailure
 
@@ -145,6 +151,17 @@ func RunCoderGate(
 	// controller-gen is unavailable. (Originally a hard drift check, #775.)
 	if failed, out := resolveCodegenDrift(ctx, workspace, run); failed {
 		failures = append(failures, checkFailure{name: "codegen drift", output: out})
+	}
+
+	// 7. Scope-overlap check: flag a coder whose changed Go files have zero
+	// overlap with the files the issue implies are relevant, which catches a
+	// drift to an unrelated subsystem that every other check happily
+	// green-lights (e.g. refactoring pkg/cli/cache.go for a pkg/agent issue).
+	// Conservative by design: it only judges non-test Go changes, only fires
+	// on near-zero overlap, and stays silent when the issue gives no Go signal
+	// (#782).
+	if drift, out := checkScopeOverlap(ctx, workspace, run, issueText); drift {
+		failures = append(failures, checkFailure{name: "scope overlap", output: out})
 	}
 
 	if len(failures) == 0 {
@@ -375,4 +392,100 @@ func truncateOutput(output string) string {
 		return output
 	}
 	return "...(truncated)...\n" + output[len(output)-maxCheckOutputBytes:]
+}
+
+// scopeRelevantTopK bounds how many of the highest-scored files count as
+// "relevant" for the scope-overlap check. Generous on purpose: a larger set
+// means the check only fires on a clear drift (a change touching none of the
+// most-relevant files), keeping false positives low as #782 asks.
+const scopeRelevantTopK = 50
+
+// maxRelevantShown caps how many relevant files the scope feedback lists.
+const maxRelevantShown = 10
+
+// scopeRelevantFiles returns the workspace's Go files most relevant to
+// issueText: up to scopeRelevantTopK files with a positive relevance score
+// (the repomap scorer ranks descending, so a non-positive score ends the
+// set), as both an ordered slice and a membership set. Injectable so tests
+// can supply a canned relevant set without walking the real filesystem.
+var scopeRelevantFiles = func(workspace, issueText string) (paths []string, set map[string]bool) {
+	files, err := repomap.Walk(workspace, nil)
+	if err != nil {
+		return nil, nil
+	}
+	scored := repomap.ScoreFiles(files, issueText)
+	set = make(map[string]bool)
+	for _, sf := range scored {
+		if sf.Score <= 0 || len(paths) >= scopeRelevantTopK {
+			break
+		}
+		paths = append(paths, sf.Path)
+		set[sf.Path] = true
+	}
+	return paths, set
+}
+
+// checkScopeOverlap reports whether the coder's diff drifted to an unrelated
+// subsystem: its changed non-test Go files have zero overlap with the files
+// the issue implies are relevant. It returns (drift, feedback).
+//
+// It is deliberately conservative to avoid false positives (#782):
+//   - issueText empty -> skip (no signal).
+//   - no non-test Go files changed -> skip (a yaml/docs-only change is not
+//     judged by the Go-aware repomap).
+//   - the issue produces no positively-scored Go files -> skip (no Go signal
+//     to compare against).
+//   - any changed Go file is in the top-K relevant set -> in scope, pass.
+//
+// Only when there is a real Go signal AND the changed Go files miss it
+// entirely is the submit flagged, with feedback naming what changed vs. what
+// the issue points at.
+func checkScopeOverlap(
+	ctx context.Context, workspace string, run commandRunner, issueText string,
+) (drift bool, feedback string) {
+	if strings.TrimSpace(issueText) == "" {
+		return false, ""
+	}
+
+	var changedGo []string
+	for path := range dirtyPathSet(ctx, workspace, run) {
+		if strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
+			changedGo = append(changedGo, path)
+		}
+	}
+	if len(changedGo) == 0 {
+		return false, ""
+	}
+
+	relevantPaths, relevantSet := scopeRelevantFiles(workspace, issueText)
+	if len(relevantSet) == 0 {
+		return false, ""
+	}
+	for _, p := range changedGo {
+		if relevantSet[p] {
+			return false, ""
+		}
+	}
+
+	sort.Strings(changedGo)
+	var b strings.Builder
+	b.WriteString("Your changed Go files do not overlap with any of the files this issue points at. ")
+	b.WriteString("This usually means the change drifted to the wrong subsystem. ")
+	b.WriteString("Re-read the issue and edit the relevant files, or explain why these are correct.\n\n")
+	b.WriteString("Changed (non-test) Go files:\n")
+	for _, c := range changedGo {
+		b.WriteString("  - " + c + "\n")
+	}
+	b.WriteString("\nFiles most relevant to the issue:\n")
+	shown := relevantPaths
+	if len(shown) > maxRelevantShown {
+		shown = shown[:maxRelevantShown]
+	}
+	for _, r := range shown {
+		b.WriteString("  - " + r + "\n")
+	}
+	if len(relevantPaths) > len(shown) {
+		b.WriteString(fmt.Sprintf("  ... and %d more\n", len(relevantPaths)-len(shown)))
+	}
+	return true, b.String()
 }
