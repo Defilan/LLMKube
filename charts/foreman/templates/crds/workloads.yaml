@@ -236,6 +236,14 @@ spec:
                             Agent is the named agent to invoke. Required for freeform; defaults
                             to "issue-fixer" for issue-fix and "verify" for verify.
                           type: string
+                        baseBranch:
+                          description: |-
+                            BaseBranch is the upstream base ref the coder branch is cut from
+                            (and the verify gate's bite check diffs against). On an issue-fix task
+                            the executor fetches this ref from the upstream repo (payload.repo) and
+                            branches off it, so a stale fork default branch does not produce a
+                            stale-base branch. Optional; defaults to "main".
+                          type: string
                         branch:
                           description: Branch is the existing branch to gate. Required
                             for verify.
