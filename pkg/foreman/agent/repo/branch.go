@@ -19,9 +19,24 @@ package repo
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 )
+
+// gitRefAllowed limits refs/positional git arguments to git-ref-safe
+// characters. Combined with the leading-dash and ".." checks in gitRefSafe,
+// it prevents argv flag smuggling (a value like "--upload-pack=..." being
+// read as a git option) and path-traversal in refs.
+var gitRefAllowed = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
+// gitRefSafe reports whether s is safe to pass to git as a ref/positional
+// argument: non-empty, not an option (no leading '-'), no ".." component, and
+// composed only of git-ref-safe characters.
+func gitRefSafe(s string) bool {
+	return s != "" && !strings.HasPrefix(s, "-") &&
+		!strings.Contains(s, "..") && gitRefAllowed.MatchString(s)
+}
 
 // BranchPrefix is the namespace under which foreman branches live.
 // Keeping it consistent makes it trivial to write a fork-side cleanup
@@ -78,6 +93,76 @@ func CreateAndCheckoutBranch(ctx context.Context, workspace, branch string) erro
 	}
 	if _, err := runGit(ctx, workspace, baseEnv(), "checkout", "-b", branch); err != nil {
 		return err
+	}
+	return nil
+}
+
+// UpstreamBranchOptions configures CreateBranchFromUpstream.
+type UpstreamBranchOptions struct {
+	// Workspace is the cloned fork working tree to create the branch in.
+	Workspace string
+	// Branch is the new task branch name.
+	Branch string
+	// UpstreamURL is the upstream project's git URL (e.g.
+	// https://github.com/<owner>/<name>.git). The base ref is fetched from here.
+	UpstreamURL string
+	// BaseBranch is the upstream ref to branch from. Empty defaults to "main".
+	BaseBranch string
+	// Auth, when non-nil, provides the GIT_ASKPASS scaffolding for the fetch.
+	// A public upstream can leave it nil.
+	Auth *Auth
+}
+
+// CreateBranchFromUpstream fetches BaseBranch from UpstreamURL and creates
+// Branch at that fetched tip, so the task branch is cut from the CURRENT
+// upstream base regardless of the cloned fork's sync state (#813). The fork
+// stays origin (the branch still pushes there for the PR); only the base moves
+// to upstream. The fetched tip is referenced via FETCH_HEAD, so no extra
+// remote is left in the workspace and the helper is safe to re-run.
+func CreateBranchFromUpstream(ctx context.Context, opts UpstreamBranchOptions) error {
+	if opts.Workspace == "" {
+		return fmt.Errorf("CreateBranchFromUpstream: Workspace is required")
+	}
+	if opts.Branch == "" {
+		return fmt.Errorf("CreateBranchFromUpstream: Branch is required")
+	}
+	if opts.UpstreamURL == "" {
+		return fmt.Errorf("CreateBranchFromUpstream: UpstreamURL is required")
+	}
+	base := opts.BaseBranch
+	if base == "" {
+		base = "main"
+	}
+
+	// Validate refs and the upstream URL before they reach git argv, so a
+	// value beginning with '-' (or carrying a ".." traversal) cannot be
+	// smuggled in as a git option. The URL is not a ref, so it only needs the
+	// leading-dash guard.
+	if !gitRefSafe(base) {
+		return fmt.Errorf("CreateBranchFromUpstream: invalid base branch %q", base)
+	}
+	if !gitRefSafe(opts.Branch) {
+		return fmt.Errorf("CreateBranchFromUpstream: invalid branch name %q", opts.Branch)
+	}
+	if strings.HasPrefix(opts.UpstreamURL, "-") {
+		return fmt.Errorf("CreateBranchFromUpstream: invalid upstream url %q", opts.UpstreamURL)
+	}
+
+	env := baseEnv()
+	if opts.Auth != nil {
+		env = append(env, opts.Auth.Env()...)
+	}
+
+	// Fetch the current upstream base into FETCH_HEAD. The fork clone is full
+	// (no --depth), so the new branch carries upstream history.
+	if _, err := runGit(ctx, opts.Workspace, env, "fetch", opts.UpstreamURL, base); err != nil {
+		return fmt.Errorf("CreateBranchFromUpstream: fetch %s %s: %w", opts.UpstreamURL, base, err)
+	}
+
+	// Create (or reset) the task branch at the fetched upstream tip and switch
+	// to it. -B is used so the helper is idempotent.
+	if _, err := runGit(ctx, opts.Workspace, baseEnv(), "checkout", "-B", opts.Branch, "FETCH_HEAD"); err != nil {
+		return fmt.Errorf("CreateBranchFromUpstream: checkout -B %s FETCH_HEAD: %w", opts.Branch, err)
 	}
 	return nil
 }

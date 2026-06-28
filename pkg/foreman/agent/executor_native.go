@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -72,6 +73,14 @@ type NativeAgentLoopExecutor struct {
 	// serves both directions; v0.2 may separate clone-from-upstream +
 	// push-to-fork.
 	GitRemoteURL string
+
+	// UpstreamURLForRepo derives the upstream project's git URL from a
+	// payload.repo "owner/name" slug; the coder branch is cut from that
+	// upstream's base ref so a stale fork default branch does not produce a
+	// stale-base branch (#813). Nil uses the default GitHub derivation
+	// (https://github.com/<repo>.git); tests inject a local path. Returning ""
+	// makes the executor fall back to branching from the cloned fork HEAD.
+	UpstreamURLForRepo func(repoSlug string) string
 
 	// InferenceBaseURLOverride bypasses InferenceService resolution
 	// entirely and dispatches OAI requests to this URL. Use for tests
@@ -273,9 +282,32 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
 	}
 
-	// 4. Branch off main.
+	// 4. Branch off the CURRENT upstream base (#813). The clone above is the
+	// fork (origin = push target); cutting the task branch from the fork's
+	// default branch produces a stale-base branch whenever the fork lags
+	// upstream. When the task carries an upstream repo slug (payload.repo),
+	// fetch its base ref and branch from that instead. Origin stays the fork,
+	// so the branch still pushes there for the PR. Freeform tasks without a
+	// repo slug fall back to branching from the cloned fork HEAD.
 	branch := branchNameForTask(task)
-	if err := repo.CreateAndCheckoutBranch(ctx, workspace, branch); err != nil {
+	baseBranch := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+	resolveUpstream := upstreamURLForRepo
+	if e.UpstreamURLForRepo != nil {
+		resolveUpstream = e.UpstreamURLForRepo
+	}
+	if upstreamURL := resolveUpstream(task.Spec.Payload.Repo); upstreamURL != "" {
+		if err := repo.CreateBranchFromUpstream(ctx, repo.UpstreamBranchOptions{
+			Workspace:   workspace,
+			Branch:      branch,
+			UpstreamURL: upstreamURL,
+			BaseBranch:  baseBranch,
+			Auth:        auth,
+		}); err != nil {
+			// Fail loud rather than silently branching from the stale fork
+			// base; bucket with CloneFailed for the retry policy.
+			return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
+		}
+	} else if err := repo.CreateAndCheckoutBranch(ctx, workspace, branch); err != nil {
 		// Branch checkout is part of workspace prep; bucket with
 		// CloneFailed so downstream retry policy treats them the same.
 		return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
@@ -784,9 +816,9 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 		"biteCheck": true,
 		// baseBranch is the ref the bite check diffs the coder branch against
 		// and reverts production to. The clone is shallow + single-branch, so
-		// the bite check fetches this ref explicitly. LLMKube branches off
-		// main; the tool also defaults to main when empty.
-		"baseBranch": "main",
+		// the bite check fetches this ref explicitly. Defaults to main, and
+		// stays consistent with the base the coder branched from (#813).
+		"baseBranch": baseBranchOrDefault(task.Spec.Payload.BaseBranch),
 		// image is the container image the gate Job runs.
 		"image": resolved.Image,
 	}
@@ -1187,7 +1219,36 @@ func objRefAsMap(ref corev1.ObjectReference) map[string]any {
 //  3. issue-fix with Payload.Issue > 0 and no workload owner falls
 //     back to foreman/issue-N. Kept for hand-applied AgenticTasks
 //     that target a one-off issue with no parent Workload.
-//  4. Everything else falls back to foreman/<task-name>.
+//
+// baseBranchOrDefault resolves the task's base ref, defaulting to "main" when
+// payload.baseBranch is unset.
+func baseBranchOrDefault(baseBranch string) string {
+	if b := strings.TrimSpace(baseBranch); b != "" {
+		return b
+	}
+	return "main"
+}
+
+// upstreamURLForRepo derives the upstream project's HTTPS git URL from a
+// payload.repo "owner/name" slug (the GitHub convention LLMKube uses). It
+// returns "" for an empty or malformed slug so callers fall back to the cloned
+// fork's HEAD (e.g. freeform tasks that carry no repo slug). The slug is
+// validated against a strict "owner/name" allowlist so it cannot inject path
+// traversal, spaces, or extra path segments into the derived URL.
+func upstreamURLForRepo(repoSlug string) string {
+	repoSlug = strings.TrimSpace(repoSlug)
+	if !repoSlugPattern.MatchString(repoSlug) {
+		return ""
+	}
+	return "https://github.com/" + repoSlug + ".git"
+}
+
+// repoSlugPattern matches a single "owner/name" GitHub slug. Each segment is
+// limited to git/GitHub-safe characters and exactly one slash is allowed, so
+// "..", multiple path segments, and whitespace are rejected.
+var repoSlugPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+
+// 4. Everything else falls back to foreman/<task-name>.
 func branchNameForTask(task *foremanv1alpha1.AgenticTask) string {
 	if task.Spec.Payload.Branch != "" {
 		return task.Spec.Payload.Branch

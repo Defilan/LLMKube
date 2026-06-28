@@ -230,6 +230,14 @@ type AgenticTaskPayload struct {
 	// +optional
 	Branch string `json:"branch,omitempty"`
 
+	// BaseBranch is the upstream base ref the coder branch is cut from
+	// (and the verify gate's bite check diffs against). On an issue-fix task
+	// the executor fetches this ref from the upstream repo (payload.repo) and
+	// branches off it, so a stale fork default branch does not produce a
+	// stale-base branch. Optional; defaults to "main".
+	// +optional
+	BaseBranch string `json:"baseBranch,omitempty"`
+
 	// BranchPrefix overrides the branch name prefix on issue-fix tasks
 	// (default derived from the issue's labels via conventional commit
 	// prefixes: fix/, feat/, chore/, etc.).
