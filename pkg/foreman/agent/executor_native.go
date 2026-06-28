@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1230,15 +1231,22 @@ func baseBranchOrDefault(baseBranch string) string {
 
 // upstreamURLForRepo derives the upstream project's HTTPS git URL from a
 // payload.repo "owner/name" slug (the GitHub convention LLMKube uses). It
-// returns "" for an empty slug so callers fall back to the cloned fork's HEAD
-// (e.g. freeform tasks that carry no repo slug).
+// returns "" for an empty or malformed slug so callers fall back to the cloned
+// fork's HEAD (e.g. freeform tasks that carry no repo slug). The slug is
+// validated against a strict "owner/name" allowlist so it cannot inject path
+// traversal, spaces, or extra path segments into the derived URL.
 func upstreamURLForRepo(repoSlug string) string {
 	repoSlug = strings.TrimSpace(repoSlug)
-	if repoSlug == "" {
+	if !repoSlugPattern.MatchString(repoSlug) {
 		return ""
 	}
 	return "https://github.com/" + repoSlug + ".git"
 }
+
+// repoSlugPattern matches a single "owner/name" GitHub slug. Each segment is
+// limited to git/GitHub-safe characters and exactly one slash is allowed, so
+// "..", multiple path segments, and whitespace are rejected.
+var repoSlugPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
 
 // 4. Everything else falls back to foreman/<task-name>.
 func branchNameForTask(task *foremanv1alpha1.AgenticTask) string {

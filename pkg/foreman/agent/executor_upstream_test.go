@@ -32,6 +32,11 @@ func TestUpstreamURLForRepo(t *testing.T) {
 		{"  defilantech/LLMKube  ", "https://github.com/defilantech/LLMKube.git"},
 		{"", ""},
 		{"   ", ""},
+		// malformed / unsafe slugs derive no URL (caller falls back to fork HEAD).
+		{"defilantech", ""},               // no slash
+		{"defilantech/LLMKube/extra", ""}, // extra path segment
+		{"../../etc/passwd", ""},          // path traversal
+		{"defilan tech/LLMKube", ""},      // whitespace
 	}
 	for _, tc := range cases {
 		if got := upstreamURLForRepo(tc.repo); got != tc.want {

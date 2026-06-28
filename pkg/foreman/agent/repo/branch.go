@@ -19,9 +19,24 @@ package repo
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 )
+
+// gitRefAllowed limits refs/positional git arguments to git-ref-safe
+// characters. Combined with the leading-dash and ".." checks in gitRefSafe,
+// it prevents argv flag smuggling (a value like "--upload-pack=..." being
+// read as a git option) and path-traversal in refs.
+var gitRefAllowed = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
+
+// gitRefSafe reports whether s is safe to pass to git as a ref/positional
+// argument: non-empty, not an option (no leading '-'), no ".." component, and
+// composed only of git-ref-safe characters.
+func gitRefSafe(s string) bool {
+	return s != "" && !strings.HasPrefix(s, "-") &&
+		!strings.Contains(s, "..") && gitRefAllowed.MatchString(s)
+}
 
 // BranchPrefix is the namespace under which foreman branches live.
 // Keeping it consistent makes it trivial to write a fork-side cleanup
@@ -117,6 +132,20 @@ func CreateBranchFromUpstream(ctx context.Context, opts UpstreamBranchOptions) e
 	base := opts.BaseBranch
 	if base == "" {
 		base = "main"
+	}
+
+	// Validate refs and the upstream URL before they reach git argv, so a
+	// value beginning with '-' (or carrying a ".." traversal) cannot be
+	// smuggled in as a git option. The URL is not a ref, so it only needs the
+	// leading-dash guard.
+	if !gitRefSafe(base) {
+		return fmt.Errorf("CreateBranchFromUpstream: invalid base branch %q", base)
+	}
+	if !gitRefSafe(opts.Branch) {
+		return fmt.Errorf("CreateBranchFromUpstream: invalid branch name %q", opts.Branch)
+	}
+	if strings.HasPrefix(opts.UpstreamURL, "-") {
+		return fmt.Errorf("CreateBranchFromUpstream: invalid upstream url %q", opts.UpstreamURL)
 	}
 
 	env := baseEnv()

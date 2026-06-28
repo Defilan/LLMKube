@@ -132,6 +132,11 @@ func TestCreateBranchFromUpstream_Validation(t *testing.T) {
 		{"missing workspace", UpstreamBranchOptions{Branch: "b", UpstreamURL: "u"}},
 		{"missing branch", UpstreamBranchOptions{Workspace: "w", UpstreamURL: "u"}},
 		{"missing upstream url", UpstreamBranchOptions{Workspace: "w", Branch: "b"}},
+		// argv flag smuggling / traversal guards.
+		{"dash base", UpstreamBranchOptions{Workspace: "w", Branch: "b", UpstreamURL: "u", BaseBranch: "-x"}},
+		{"traversal base", UpstreamBranchOptions{Workspace: "w", Branch: "b", UpstreamURL: "u", BaseBranch: "../evil"}},
+		{"dash branch", UpstreamBranchOptions{Workspace: "w", Branch: "--upload-pack=x", UpstreamURL: "u"}},
+		{"dash upstream url", UpstreamBranchOptions{Workspace: "w", Branch: "b", UpstreamURL: "-x"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
