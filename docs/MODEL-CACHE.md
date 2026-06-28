@@ -312,3 +312,21 @@ modelCache:
 ```
 
 This will revert to the legacy behavior where each pod downloads the model via init container.
+
+## Security Considerations
+
+### PSA `restricted` incompatibility
+
+The model cache init container cannot satisfy Pod Security Admission (PSA) `restricted` policy. PSA `restricted` forbids both running as root and adding any capability except `NET_BIND_SERVICE`. Chowning a root-owned mount (which the cache-prep init container does on CSIs with `fsGroupPolicy: None`) requires either root or `CAP_CHOWN`/`CAP_FOWNER`, so the cache-prep init container cannot satisfy `restricted` no matter how it is tuned.
+
+This is inherent to the problem: the cache-prep init container exists precisely because `fsGroup` is not applied on `fsGroupPolicy: None` CSIs. On such a CSI in a PSA-`restricted` namespace, the shared cache path is not available. Alternatives:
+
+- Use an `fsGroupPolicy: File` CSI (the default on most clusters) so Kubernetes handles the ownership automatically.
+- Use an `emptyDir` model store (disable the persistent cache).
+- Use a less-strict PSA policy (e.g., `baseline` or `privileged`).
+
+### Shared-cache group-write multi-tenancy
+
+In `shared` mode, the cache-prep init container sets `chmod g+rwX /models`, making the cache root writable by any pod in the same `fsGroup`. On a shared cache PVC, multiple InferenceServices share that `fsGroup` and can write to each other's cached model files.
+
+Within one operator's trust domain this is fine. For a multi-tenant cache where distrusting tenants share the same namespace, this is a real consideration. Use per-service caches (`modelCache.mode: perService`) for isolation between distrusting tenants.
