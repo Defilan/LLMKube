@@ -112,7 +112,7 @@ func Build(_ context.Context, workspace string, issueText string, opts Options) 
 		maxFiles = DefaultMaxFiles
 	}
 
-	files, err := walk(workspace, opts.SkipPatterns)
+	files, err := Walk(workspace, opts.SkipPatterns)
 	if err != nil {
 		return "", fmt.Errorf("repomap walk: %w", err)
 	}
@@ -120,7 +120,7 @@ func Build(_ context.Context, workspace string, issueText string, opts Options) 
 		return "", nil
 	}
 
-	scored := scoreFiles(files, issueText)
+	scored := ScoreFiles(files, issueText)
 	if len(scored) > maxFiles {
 		scored = scored[:maxFiles]
 	}

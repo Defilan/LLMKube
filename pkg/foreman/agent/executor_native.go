@@ -399,8 +399,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// failed fetch logs and the loop runs with the pre-#571 behavior.
 	fetchIssueBodyIfNeeded(ctx, e.IssueFetcher, task, auth, log)
 	userPrompt := buildUserPrompt(task)
+	// issueText ranks files for both the repo-map prefix (coder Agents) and the
+	// scope-overlap guard in the coder gate verifier (#782).
+	issueText := repoMapQuery(task)
 	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
-		issueText := repoMapQuery(task)
 		summary, mapErr := repomap.Build(ctx, workspace, issueText, repomap.Options{})
 		switch {
 		case mapErr != nil:
@@ -450,7 +452,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// fast checks is sent back for a fix instead of landing dirty.
 	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
 		cfg.MaxVerifyRetries = coderGateMaxRetries
-		cfg.VerifyTerminal = makeCoderGateVerifier(workspace, log, task.Spec.GateProfile)
+		cfg.VerifyTerminal = makeCoderGateVerifier(workspace, issueText, log, task.Spec.GateProfile)
 	}
 
 	// Layer the model profile onto the resolved config (addendum + stuck-loop
@@ -649,8 +651,10 @@ const coderGateMaxRetries = 3
 // untouched. golangci-lint is bootstrapped into the workspace bin on first
 // use; a bootstrap or run error is reported as could-not-verify so the
 // terminal stands and the clean-room gate Job remains the authoritative
-// backstop.
-func makeCoderGateVerifier(workspace string, log logr.Logger, profile *foremanv1alpha1.GateProfile) TerminalVerifier {
+// backstop. issueText is passed to the gate's scope-overlap check (#782).
+func makeCoderGateVerifier(
+	workspace, issueText string, log logr.Logger, profile *foremanv1alpha1.GateProfile,
+) TerminalVerifier {
 	return func(ctx context.Context, terminal *ToolResult, _ []oai.Message) (bool, string, error) {
 		if terminal == nil {
 			return true, "", nil
@@ -677,7 +681,7 @@ func makeCoderGateVerifier(workspace string, log logr.Logger, profile *foremanv1
 				return true, "", err
 			}
 		}
-		pass, feedback := RunCoderGate(ctx, workspace, lintPath, execCommandRunner)
+		pass, feedback := RunCoderGate(ctx, workspace, lintPath, execCommandRunner, issueText)
 		if !pass {
 			log.Info("coder gate: fast checks failed; returning feedback to the loop for a fix")
 		}

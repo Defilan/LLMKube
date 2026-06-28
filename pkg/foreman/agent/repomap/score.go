@@ -31,7 +31,7 @@ type scoredFile struct {
 	Score float64
 }
 
-// scoreFiles assigns each file a relevance score relative to issueText.
+// ScoreFiles assigns each file a relevance score relative to issueText.
 // Files are returned sorted by score (descending). The scoring is
 // pure-Go heuristic, no model call; the empirical finding (Aider's
 // repo-map, Agentless) is that a simple bag-of-words intersection +
@@ -43,7 +43,7 @@ type scoredFile struct {
 // "what is this repo" fallback case useful for the deterministic gate
 // step's read of the repo or for a freeform task without a specific
 // issue.
-func scoreFiles(files []indexableFile, issueText string) []scoredFile {
+func ScoreFiles(files []indexableFile, issueText string) []scoredFile {
 	out := make([]scoredFile, len(files))
 	queryTokens := tokenize(issueText)
 	queryPaths := extractPathMentions(issueText)
