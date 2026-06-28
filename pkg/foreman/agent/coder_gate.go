@@ -20,6 +20,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -135,12 +136,14 @@ func RunCoderGate(
 		}
 	}
 
-	// 6. Codegen-drift check: regenerate manifests/CRDs and fail if the
-	// tree is dirty. This catches changes to API types, kubebuilder
-	// markers, or field doc comments that alter generated CRDs or
-	// role.yaml before they reach CI (#775). Skipped gracefully if
-	// controller-gen is unavailable.
-	if drifted, out := checkCodegenDrift(ctx, workspace, run); drifted {
+	// 6. Codegen drift: regenerate manifests/CRDs/deepcopy and deterministically
+	// resolve any drift confined to generated artifacts, rather than failing the
+	// coder on a mechanical step it was already told to run (#851). Regenerated
+	// generated files are left in the workspace and committed by the executor's
+	// `git add -A` (repo.Commit). Only a make error, or regeneration touching a
+	// NON-generated file, is reported as a failure. Skipped gracefully if
+	// controller-gen is unavailable. (Originally a hard drift check, #775.)
+	if failed, out := resolveCodegenDrift(ctx, workspace, run); failed {
 		failures = append(failures, checkFailure{name: "codegen drift", output: out})
 	}
 
@@ -237,34 +240,117 @@ func isEnvtestPackage(pkg string) bool {
 	return false
 }
 
-// checkCodegenDrift regenerates manifests and CRDs, then checks whether
-// the workspace tree is dirty. It returns (drifted, output) where output
-// lists the drifted files. Skipped (returns false, "") if
+// resolveCodegenDrift runs the full code-generation set and deterministically
+// resolves codegen drift instead of asking the model to (#851). It regenerates
+// manifests, deepcopy, and the Helm chart CRDs; any resulting changes confined
+// to generated artifacts are left in the workspace for the executor's
+// `git add -A` commit to absorb, so an API change lands with its generated
+// files in sync without burning gate-fix attempts on a mechanical step.
+//
+// It returns (failed, output). failed is true only when `make` itself errors,
+// or when regeneration changed a NON-generated file (an anomaly worth
+// surfacing, e.g. a hand-edit to a generated file or a generator that rewrote
+// source). Drift confined to generated artifacts returns (false, "").
+//
+// To distinguish what regeneration changed from the coder's own uncommitted
+// edits, it snapshots the dirty set before and after `make`: only paths newly
+// dirtied by `make` are evaluated. Skipped (returns false, "") if
 // bin/controller-gen is not present in the workspace.
-func checkCodegenDrift(ctx context.Context, workspace string, run commandRunner) (drifted bool, output string) {
+func resolveCodegenDrift(ctx context.Context, workspace string, run commandRunner) (failed bool, output string) {
 	controllerGen := filepath.Join(workspace, "bin", "controller-gen")
 	if _, err := run(ctx, workspace, nil, "test", "-f", controllerGen); err != nil {
 		// controller-gen not available; skip gracefully.
 		return false, ""
 	}
 
-	// Regenerate manifests, CRDs, and sync to Helm charts.
-	if out, err := run(ctx, workspace, nil, "make", "manifests", "chart-crds", "foreman-chart-crds"); err != nil {
-		// If make itself fails, report it as a drift failure.
-		return true, "make manifests chart-crds foreman-chart-crds failed:\n" + out
+	before := dirtyPathSet(ctx, workspace, run)
+
+	// Regenerate manifests, deepcopy, and sync CRDs to both Helm charts. The
+	// foreman CRDs need the separate foreman-chart-crds target; `generate`
+	// (deepcopy) is included so an API change that only alters zz_generated
+	// does not slip through to CI.
+	out, err := run(ctx, workspace, nil,
+		"make", "manifests", "generate", "chart-crds", "foreman-chart-crds")
+	if err != nil {
+		return true, "make manifests generate chart-crds foreman-chart-crds failed:\n" + out
 	}
 
-	// Check whether the tree is dirty after regeneration.
-	if _, err := run(ctx, workspace, nil, "git", "diff", "--quiet"); err == nil {
-		return false, ""
+	after := dirtyPathSet(ctx, workspace, run)
+
+	// Files newly dirtied by regeneration (not part of the coder's own edits).
+	var unexpected []string
+	for path := range after {
+		if before[path] {
+			continue
+		}
+		if !isGeneratedArtifact(path) {
+			unexpected = append(unexpected, path)
+		}
 	}
 
-	// Tree is dirty; collect the list of drifted files.
-	out, _ := run(ctx, workspace, nil, "git", "diff", "--name-only")
-	msg := "Generated files drifted after regeneration. " +
-		"Run 'make manifests chart-crds foreman-chart-crds' and commit the changes.\n\n" +
-		"Drifted files:\n"
-	return true, msg + out
+	if len(unexpected) > 0 {
+		sort.Strings(unexpected)
+		msg := "Regeneration changed files that are not generated artifacts. This usually " +
+			"means a generated file was hand-edited, or a source change needs review. " +
+			"Inspect and resolve these, then resubmit:\n\n" +
+			strings.Join(unexpected, "\n") + "\n"
+		return true, msg
+	}
+
+	// Any drift was confined to generated artifacts: regenerated files stay in
+	// the workspace and are committed by the executor's `git add -A`. Nothing
+	// for the model to do.
+	return false, ""
+}
+
+// dirtyPathSet returns the set of workspace-relative paths reported dirty by
+// `git status --porcelain` (modified, untracked, or staged). Rename entries
+// ("orig -> new") resolve to the new path. A git error yields an empty set so
+// the caller degrades to "no drift detected" rather than failing spuriously.
+func dirtyPathSet(ctx context.Context, workspace string, run commandRunner) map[string]bool {
+	out, err := run(ctx, workspace, nil, "git", "status", "--porcelain")
+	if err != nil {
+		return map[string]bool{}
+	}
+	set := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		// porcelain v1 lines are "XY <path>": 2 status chars + a space, then
+		// the path. Shorter lines (e.g. a trailing empty line) are skipped.
+		if len(line) < 4 {
+			continue
+		}
+		path := line[3:]
+		if i := strings.Index(path, " -> "); i >= 0 {
+			path = path[i+len(" -> "):]
+		}
+		if path = strings.TrimSpace(path); path != "" {
+			set[path] = true
+		}
+	}
+	return set
+}
+
+// isGeneratedArtifact reports whether a workspace-relative path is a
+// code-generation output produced by `make manifests generate chart-crds
+// foreman-chart-crds` (controller-gen CRDs/RBAC, deepcopy, and the synced Helm
+// chart CRDs). The allowlist is deliberately tight so that regeneration
+// touching anything outside it is surfaced rather than silently absorbed.
+func isGeneratedArtifact(path string) bool {
+	switch {
+	case strings.HasPrefix(path, "config/crd/"):
+		return true
+	case path == "config/rbac/role.yaml":
+		return true
+	case strings.HasPrefix(path, "config/webhook/"):
+		return true
+	case strings.HasPrefix(path, "charts/llmkube/templates/crds/"):
+		return true
+	case strings.HasPrefix(path, "charts/foreman/templates/crds/"):
+		return true
+	case strings.Contains(path, "zz_generated."):
+		return true
+	}
+	return false
 }
 
 // buildFeedback renders the directive and a per-check section for every

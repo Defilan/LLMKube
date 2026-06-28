@@ -320,69 +320,120 @@ func TestRunCoderGateTruncation(t *testing.T) {
 	}
 }
 
-// TestRunCoderGate_CodegenDrift_FailsWhenDrifted verifies the gate fails
-// when regenerated manifests/CRDs differ from the committed tree (#775).
-func TestRunCoderGate_CodegenDrift_FailsWhenDrifted(t *testing.T) {
-	const golangciPath = "./bin/golangci-lint"
-	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+// codegenFake builds a commandRunner for the codegen-drift tier. All of the
+// other gate checks (gofmt/vet/build/lint, test tier) pass. controller-gen is
+// present unless noControllerGen is set. The two `git status --porcelain`
+// calls (the before/after snapshots around make) return porcelainBefore then
+// porcelainAfter; make returns makeErr.
+// gateLintPath is the golangci-lint path the codegen gate tests pass to
+// RunCoderGate and that codegenFake matches as a passing lint invocation.
+const gateLintPath = "./bin/golangci-lint"
+
+func codegenFake(
+	porcelainBefore, porcelainAfter string,
+	makeErr error,
+	noControllerGen bool,
+) commandRunner {
+	porcelainCalls := 0
+	return func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
 		switch {
-		case name == "gofmt":
+		case name == "gofmt", name == "go", name == gateLintPath:
 			return "", nil
-		case name == "go":
-			return "", nil
-		case name == golangciPath:
-			return "", nil
-		case name == "git" && len(args) > 0 && args[0] == "status":
-			return "", nil // no changed packages for test tier
 		case name == "test" && len(args) > 0 && args[0] == "-f":
+			if noControllerGen {
+				return "", errors.New("exit status 1")
+			}
 			return "", nil // controller-gen exists
 		case name == "make":
-			return "", nil // make manifests chart-crds foreman-chart-crds succeeds
-		case name == "git" && len(args) > 0 && args[0] == "diff":
-			if len(args) > 1 && args[1] == "--quiet" {
-				return "", errors.New("exit status 1") // tree is dirty
+			if makeErr != nil {
+				return "Error: controller-gen: exit status 1\n", makeErr
 			}
-			return "config/crd/bases/inference.llmkube.dev_models.yaml\nrole.yaml\n", nil
+			return "", nil
+		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "-z":
+			return "", nil // changedTestPackages: no changed packages
+		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain":
+			porcelainCalls++
+			if porcelainCalls == 1 {
+				return porcelainBefore, nil
+			}
+			return porcelainAfter, nil
 		default:
 			return "", nil
 		}
 	}
+}
+
+// TestRunCoderGate_Codegen_AutoResolvesGeneratedDrift verifies the gate passes
+// (deterministic resolution, #851) when regeneration only dirties generated
+// artifacts: the executor's `git add -A` commits them, so the coder is not
+// asked to re-run a mechanical step.
+func TestRunCoderGate_Codegen_AutoResolvesGeneratedDrift(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	after := " M config/crd/bases/foreman.llmkube.dev_agentictasks.yaml\n" +
+		" M charts/foreman/templates/crds/agentictasks.yaml\n" +
+		" M api/foreman/v1alpha1/zz_generated.deepcopy.go\n"
+	run := codegenFake("", after, nil, false)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if !pass {
+		t.Fatalf("gate should auto-resolve generated-only drift; feedback:\n%s", feedback)
+	}
+	if feedback != "" {
+		t.Errorf("expected empty feedback on auto-resolve, got %q", feedback)
+	}
+}
+
+// TestRunCoderGate_Codegen_IgnoresCoderEdits is the #851/#813 case: the coder
+// changed an API type (and other source) but did not run the full codegen
+// sync. The coder's own edits are present before make; regeneration adds the
+// missing foreman chart CRD + deepcopy. Only make-induced drift is evaluated,
+// it is all generated, so the gate passes instead of failing on the
+// mechanical step.
+func TestRunCoderGate_Codegen_IgnoresCoderEdits(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	before := " M api/foreman/v1alpha1/agentictask_types.go\n" +
+		" M pkg/foreman/agent/executor_native.go\n"
+	after := before +
+		" M charts/foreman/templates/crds/agentictasks.yaml\n" +
+		" M api/foreman/v1alpha1/zz_generated.deepcopy.go\n"
+	run := codegenFake(before, after, nil, false)
+	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
+	if !pass {
+		t.Fatalf("gate should ignore the coder's own edits and resolve generated drift; feedback:\n%s", feedback)
+	}
+	if feedback != "" {
+		t.Errorf("expected empty feedback, got %q", feedback)
+	}
+}
+
+// TestRunCoderGate_Codegen_FailsWhenRegenTouchesNonGenerated verifies the gate
+// still fails when regeneration changes a file that is NOT a generated
+// artifact (an anomaly: a hand-edited generated file or a generator rewriting
+// source), and surfaces that file.
+func TestRunCoderGate_Codegen_FailsWhenRegenTouchesNonGenerated(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	after := " M charts/foreman/templates/crds/agentictasks.yaml\n" +
+		" M internal/controller/inferenceservice_controller.go\n"
+	run := codegenFake("", after, nil, false)
 	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
 	if pass {
-		t.Fatal("gate should fail when codegen drift is detected")
+		t.Fatal("gate should fail when regeneration touches a non-generated file")
 	}
 	if !strings.Contains(feedback, "codegen drift") {
 		t.Errorf("feedback should cite codegen drift; got:\n%s", feedback)
 	}
-	if !strings.Contains(feedback, "config/crd/bases/inference.llmkube.dev_models.yaml") {
-		t.Errorf("feedback should list drifted CRD file; got:\n%s", feedback)
+	if !strings.Contains(feedback, "internal/controller/inferenceservice_controller.go") {
+		t.Errorf("feedback should list the non-generated file; got:\n%s", feedback)
+	}
+	if strings.Contains(feedback, "charts/foreman/templates/crds/agentictasks.yaml") {
+		t.Errorf("feedback should not list generated artifacts; got:\n%s", feedback)
 	}
 }
 
-// TestRunCoderGate_CodegenDrift_PassesWhenClean verifies the gate passes
-// when regenerated manifests/CRDs match the committed tree (#775).
-func TestRunCoderGate_CodegenDrift_PassesWhenClean(t *testing.T) {
+// TestRunCoderGate_Codegen_PassesWhenClean verifies the gate passes when
+// regeneration produces no new drift.
+func TestRunCoderGate_Codegen_PassesWhenClean(t *testing.T) {
 	const golangciPath = "./bin/golangci-lint"
-	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
-		switch {
-		case name == "gofmt":
-			return "", nil
-		case name == "go":
-			return "", nil
-		case name == golangciPath:
-			return "", nil
-		case name == "git" && len(args) > 0 && args[0] == "status":
-			return "", nil // no changed packages for test tier
-		case name == "test" && len(args) > 0 && args[0] == "-f":
-			return "", nil // controller-gen exists
-		case name == "make":
-			return "", nil // make manifests chart-crds foreman-chart-crds succeeds
-		case name == "git" && len(args) > 0 && args[0] == "diff":
-			return "", nil // tree is clean
-		default:
-			return "", nil
-		}
-	}
+	run := codegenFake("", "", nil, false)
 	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
 	if !pass {
 		t.Fatalf("gate should pass when codegen is clean; feedback:\n%s", feedback)
@@ -392,27 +443,11 @@ func TestRunCoderGate_CodegenDrift_PassesWhenClean(t *testing.T) {
 	}
 }
 
-// TestRunCoderGate_CodegenDrift_SkippedWhenNoControllerGen verifies the
-// codegen-drift check is skipped gracefully when controller-gen is not
-// available in the workspace (#775).
-func TestRunCoderGate_CodegenDrift_SkippedWhenNoControllerGen(t *testing.T) {
+// TestRunCoderGate_Codegen_SkippedWhenNoControllerGen verifies the codegen
+// tier is skipped gracefully when controller-gen is not available.
+func TestRunCoderGate_Codegen_SkippedWhenNoControllerGen(t *testing.T) {
 	const golangciPath = "./bin/golangci-lint"
-	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
-		switch {
-		case name == "gofmt":
-			return "", nil
-		case name == "go":
-			return "", nil
-		case name == golangciPath:
-			return "", nil
-		case name == "git" && len(args) > 0 && args[0] == "status":
-			return "", nil // no changed packages for test tier
-		case name == "test" && len(args) > 0 && args[0] == "-f":
-			return "", errors.New("exit status 1") // controller-gen not found
-		default:
-			return "", nil
-		}
-	}
+	run := codegenFake("", "", nil, true)
 	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
 	if !pass {
 		t.Fatalf("gate should pass when controller-gen is unavailable; feedback:\n%s", feedback)
@@ -422,34 +457,79 @@ func TestRunCoderGate_CodegenDrift_SkippedWhenNoControllerGen(t *testing.T) {
 	}
 }
 
-// TestRunCoderGate_CodegenDrift_FailsWhenMakeFails verifies the gate fails
-// when make manifests chart-crds foreman-chart-crds itself errors (#775).
-func TestRunCoderGate_CodegenDrift_FailsWhenMakeFails(t *testing.T) {
+// TestRunCoderGate_Codegen_FailsWhenMakeFails verifies the gate fails when the
+// regeneration make target itself errors.
+func TestRunCoderGate_Codegen_FailsWhenMakeFails(t *testing.T) {
 	const golangciPath = "./bin/golangci-lint"
-	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
-		switch {
-		case name == "gofmt":
-			return "", nil
-		case name == "go":
-			return "", nil
-		case name == golangciPath:
-			return "", nil
-		case name == "git" && len(args) > 0 && args[0] == "status":
-			return "", nil // no changed packages for test tier
-		case name == "test" && len(args) > 0 && args[0] == "-f":
-			return "", nil // controller-gen exists
-		case name == "make":
-			return "Error: controller-gen: exit status 1\n", errors.New("exit status 2")
-		default:
-			return "", nil
-		}
-	}
+	run := codegenFake("", "", errors.New("exit status 2"), false)
 	pass, feedback := RunCoderGate(context.Background(), "/work", golangciPath, run)
 	if pass {
-		t.Fatal("gate should fail when make manifests fails")
+		t.Fatal("gate should fail when the regeneration make target fails")
 	}
 	if !strings.Contains(feedback, "codegen drift") {
 		t.Errorf("feedback should cite codegen drift; got:\n%s", feedback)
+	}
+}
+
+func TestIsGeneratedArtifact(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"config/crd/bases/foreman.llmkube.dev_agentictasks.yaml", true},
+		{"config/rbac/role.yaml", true},
+		{"config/webhook/manifests.yaml", true},
+		{"charts/llmkube/templates/crds/inferenceservices.yaml", true},
+		{"charts/foreman/templates/crds/agentictasks.yaml", true},
+		{"api/foreman/v1alpha1/zz_generated.deepcopy.go", true},
+		{"api/v1alpha1/inferenceservice_types.go", false},
+		{"pkg/foreman/agent/executor_native.go", false},
+		{"config/rbac/kustomization.yaml", false},
+		{"charts/foreman/templates/operator-rbac.yaml", false},
+		{"internal/controller/model_controller.go", false},
+	}
+	for _, tc := range cases {
+		if got := isGeneratedArtifact(tc.path); got != tc.want {
+			t.Errorf("isGeneratedArtifact(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+func TestDirtyPathSet(t *testing.T) {
+	const porcelain = " M api/foreman/v1alpha1/agentictask_types.go\n" +
+		"?? charts/foreman/templates/crds/agentictasks.yaml\n" +
+		"R  old/path.go -> pkg/foreman/agent/renamed.go\n" +
+		"\n"
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain" {
+			return porcelain, nil
+		}
+		return "", nil
+	}
+	got := dirtyPathSet(context.Background(), "/work", run)
+	want := []string{
+		"api/foreman/v1alpha1/agentictask_types.go",
+		"charts/foreman/templates/crds/agentictasks.yaml",
+		"pkg/foreman/agent/renamed.go",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("dirtyPathSet returned %d paths, want %d: %v", len(got), len(want), got)
+	}
+	for _, p := range want {
+		if !got[p] {
+			t.Errorf("dirtyPathSet missing %q; got %v", p, got)
+		}
+	}
+}
+
+// TestDirtyPathSet_GitErrorYieldsEmpty verifies a git error degrades to an
+// empty set so the codegen tier does not fail spuriously.
+func TestDirtyPathSet_GitErrorYieldsEmpty(t *testing.T) {
+	run := func(_ context.Context, _ string, _ []string, _ string, _ ...string) (string, error) {
+		return "", errors.New("not a git repo")
+	}
+	if got := dirtyPathSet(context.Background(), "/work", run); len(got) != 0 {
+		t.Errorf("expected empty set on git error, got %v", got)
 	}
 }
 
