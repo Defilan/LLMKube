@@ -175,6 +175,27 @@ func RunCoderGate(
 		failures = append(failures, checkFailure{name: "scope overlap", output: out})
 	}
 
+	// 9. Test-presence: a change that adds new functions must come with a test
+	// in their package. Pure diff inspection, so it covers controller/envtest
+	// packages the unit-test tier above cannot run (catches the #856 class:
+	// new logic, zero tests). Disabled by FOREMAN_MUTATION_GATE=0.
+	if !mutationGateDisabled() {
+		if failed, out := checkTestPresence(ctx, workspace, run); failed {
+			failures = append(failures, checkFailure{name: "test presence", output: out})
+		}
+	}
+
+	// 10. Neuter-survival: the changed code must actually be tested. For each
+	// non-envtest changed package that has a changed test, blank the changed
+	// function bodies on a backed-up copy and re-run the package's tests; if
+	// they still pass, the tests do not bite. Restored always. Controller/
+	// envtest packages are handled in the post-push gate Job (v1.1).
+	if !mutationGateDisabled() {
+		if failed, out := checkMutationSurvival(ctx, workspace, run); failed {
+			failures = append(failures, checkFailure{name: "mutation survival", output: out})
+		}
+	}
+
 	if len(failures) == 0 {
 		return true, ""
 	}
