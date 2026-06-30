@@ -910,7 +910,8 @@ func TestRunCoderGate_FailsOnUngroundedReference(t *testing.T) {
 	crd := "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n" +
 		"spec:\n  group: inference.llmkube.dev\n  names:\n    kind: InferenceService\n" +
 		"  versions:\n    - name: v1alpha1\n      schema:\n        openAPIV3Schema:\n" +
-		"          properties:\n            spec:\n              properties:\n                modelRef:\n                  type: string\n"
+		"          properties:\n            spec:\n              properties:\n" +
+		"                modelRef:\n                  type: string\n"
 	if err := os.MkdirAll(filepath.Join(ws, "config/crd/bases"), 0o755); err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,9 @@ var hunkHeader = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 // base...HEAD -- pathspec...`, each attributed to its new-file line number.
 // Header lines (+++), removed lines, and context are ignored. A git error is
 // returned; an empty diff yields nil with no error.
-func AddedLines(ctx context.Context, workspace string, run CommandRunner, base string, pathspec []string) ([]AddedLine, error) {
+func AddedLines(
+	ctx context.Context, workspace string, run CommandRunner, base string, pathspec []string,
+) ([]AddedLine, error) {
 	args := append([]string{"diff", "--unified=0", base + "...HEAD", "--"}, pathspec...)
 	out, err := run(ctx, workspace, nil, "git", args...)
 	if err != nil {

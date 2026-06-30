@@ -61,9 +61,11 @@ func TestDetectUngroundedReferences_MetricAndCLI(t *testing.T) {
 
 func TestDetectUngroundedReferences_478Fixture(t *testing.T) {
 	gt := &GroundTruth{
-		Groups:     map[string]bool{"inference.llmkube.dev": true},
-		Kinds:      map[string]bool{"InferenceService": true},
-		SpecFields: map[string]map[string]bool{"InferenceService": {"modelRef": true, "mode": true, "resources": true, "autoscaling": true}},
+		Groups: map[string]bool{"inference.llmkube.dev": true},
+		Kinds:  map[string]bool{"InferenceService": true},
+		SpecFields: map[string]map[string]bool{
+			"InferenceService": {"modelRef": true, "mode": true, "resources": true, "autoscaling": true},
+		},
 	}
 	added := []AddedLine{
 		{File: "docs/site/guides/metrics-driven-autoscaling.md", Line: 10, Text: "apiVersion: llmkube.io/v1alpha1"},

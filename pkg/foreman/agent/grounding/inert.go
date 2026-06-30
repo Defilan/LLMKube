@@ -47,8 +47,11 @@ func DetectInertSymbols(ctx context.Context, workspace string, run CommandRunner
 		}
 		if countNonEmptyLines(out) <= 1 {
 			findings = append(findings, Finding{
-				Severity: "major", Area: "wired-up", File: al.File, Line: al.Line,
-				Message: "annotation key " + key + " is written but never read (inert); confirm a consumer exists or the change is a no-op",
+				Severity: "major", Area: "wired-up",
+				File: al.File, Line: al.Line,
+				Message: "annotation key " + key +
+					" is written but never read (inert);" +
+					" confirm a consumer exists or the change is a no-op",
 			})
 		}
 	}

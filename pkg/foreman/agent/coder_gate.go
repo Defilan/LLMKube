@@ -583,7 +583,9 @@ func checkReferenceGrounding(ctx context.Context, workspace string, run commandR
 	if err != nil {
 		return false, ""
 	}
-	added, err := grounding.AddedLines(ctx, workspace, grounding.CommandRunner(run), "main", []string{"*.md", "*.yaml", "*.yml"})
+	added, err := grounding.AddedLines(
+		ctx, workspace, grounding.CommandRunner(run), "main", []string{"*.md", "*.yaml", "*.yml"},
+	)
 	if err != nil {
 		return false, ""
 	}
@@ -592,7 +594,8 @@ func checkReferenceGrounding(ctx context.Context, workspace string, run commandR
 		return false, ""
 	}
 	var b strings.Builder
-	b.WriteString("These docs reference LLMKube symbols that do not exist. Fix the reference (or the code) so it resolves:\n")
+	b.WriteString("These docs reference LLMKube symbols that do not exist." +
+		" Fix the reference (or the code) so it resolves:\n")
 	for _, f := range findings {
 		fmt.Fprintf(&b, "  - %s\n", f.String())
 	}

@@ -10,7 +10,7 @@ var llmkubeGroup = regexp.MustCompile(`\b([a-z0-9.-]*llmkube\.(?:dev|io))(?:/v[0
 
 var (
 	metricTokenRe = regexp.MustCompile(`\bllmkube_[a-z0-9_]+\b`)
-	cliTokenRe    = regexp.MustCompile("llmkube\\s+([a-z][a-z0-9-]*)")
+	cliTokenRe    = regexp.MustCompile(`llmkube\s+([a-z][a-z0-9-]*)`)
 )
 
 // checkMetricAndCLITokens appends findings for llmkube_* metric tokens and
@@ -21,14 +21,22 @@ func checkMetricAndCLITokens(al AddedLine, gt *GroundTruth, out *[]Finding) {
 	if len(gt.Metrics) > 0 {
 		for _, m := range metricTokenRe.FindAllString(al.Text, -1) {
 			if !gt.Metrics[m] {
-				*out = append(*out, Finding{Severity: "blocker", Area: "doc-consistency", File: al.File, Line: al.Line, Message: "unknown metric " + m})
+				*out = append(*out, Finding{
+					Severity: "blocker", Area: "doc-consistency",
+					File: al.File, Line: al.Line,
+					Message: "unknown metric " + m,
+				})
 			}
 		}
 	}
 	if len(gt.CLICmds) > 0 {
 		for _, m := range cliTokenRe.FindAllStringSubmatch(al.Text, -1) {
 			if !gt.CLICmds[m[1]] {
-				*out = append(*out, Finding{Severity: "blocker", Area: "doc-consistency", File: al.File, Line: al.Line, Message: "unknown llmkube subcommand " + m[1]})
+				*out = append(*out, Finding{
+					Severity: "blocker", Area: "doc-consistency",
+					File: al.File, Line: al.Line,
+					Message: "unknown llmkube subcommand " + m[1],
+				})
 			}
 		}
 	}
