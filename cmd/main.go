@@ -112,6 +112,7 @@ func main() {
 	var caCertConfigMap string
 	var initContainerImage string
 	var defaultFSGroup int64
+	var gpuNodeTaints string
 	var routerProxyImage string
 	var defaultLiteLLMURL string
 	var tlsOpts []func(*tls.Config)
@@ -143,6 +144,11 @@ func main() {
 			"write to a freshly-provisioned PVC. Set to 0 to disable on OpenShift, "+
 			"where the restricted-v2 SCC injects fsGroup from the namespace's allocated "+
 			"range and rejects pods with explicit values outside that range.")
+	flag.StringVar(&gpuNodeTaints, "gpu-node-taints", "",
+		"Comma-separated list of GPU node taints (key=value:effect) to annotate "+
+			"model cache PVCs with, so the storage provisioner's per-node helper pod "+
+			"can tolerate the GPU taint and provision the volume on the tainted node. "+
+			"See #850.")
 	flag.StringVar(&routerProxyImage, "router-proxy-image", "",
 		"Default container image for ModelRouter-managed router-proxy pods. "+
 			"Empty falls back to the controller's compiled-in default. "+
@@ -291,6 +297,7 @@ func main() {
 		CACertConfigMap:      caCertConfigMap,
 		InitContainerImage:   initContainerImage,
 		DefaultFSGroup:       defaultFSGroup,
+		GPUNodeTaints:        gpuNodeTaints,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
 		os.Exit(1)

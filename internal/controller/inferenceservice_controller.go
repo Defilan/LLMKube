@@ -65,6 +65,12 @@ type InferenceServiceReconciler struct {
 	// on OpenShift, where the restricted-v2 SCC injects fsGroup from the
 	// namespace's allocated range). Set via --default-fsgroup; default 102.
 	DefaultFSGroup int64
+	// GPUNodeTaints is a comma-separated list of taints (key=value:effect)
+	// for GPU nodes. When set, it is written as an annotation on the model
+	// cache PVC so that the storage provisioner's per-node helper pod can
+	// tolerate the GPU taint and provision the volume on the tainted node.
+	// See #850.
+	GPUNodeTaints string
 }
 
 func sanitizeDNSName(name string) string {

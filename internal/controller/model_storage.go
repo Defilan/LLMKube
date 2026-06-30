@@ -657,6 +657,14 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 				"app.kubernetes.io/component":  "model-cache",
 				"app.kubernetes.io/managed-by": "llmkube-controller",
 			},
+			Annotations: map[string]string{
+				// When the PVC is provisioned on a tainted GPU node (e.g. via
+				// WaitForFirstConsumer), the provisioner's per-node helper pod
+				// must tolerate the GPU taint to create the volume. This
+				// annotation carries the node taints so the provisioner can
+				// apply them to the helper pod. See #850.
+				"llmkube.io/gpu-taints": r.GPUNodeTaints,
+			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{accessMode},
