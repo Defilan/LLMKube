@@ -919,11 +919,13 @@ func TestRunCoderGate_FailsOnUngroundedReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := func(ctx context.Context, dir string, env []string, name string, args ...string) (string, error) {
-		// Check #11: git diff --unified=0 main...HEAD -- *.md *.yaml *.yml
-		if name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--unified=0" {
+		// Check #11 diffs the staged working tree: git diff --cached --unified=0
+		// --src-prefix=a/ --dst-prefix=b/ HEAD -- *.md *.yaml *.yml
+		if name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--cached" {
 			return "+++ b/docs/x.md\n@@ -0,0 +1,1 @@\n+apiVersion: llmkube.io/v1alpha1\n", nil
 		}
-		// All other commands pass silently (gofmt empty, go/lint success, git status empty).
+		// All other commands pass silently (gofmt empty, go/lint success,
+		// git add/status no-ops).
 		return "", nil
 	}
 	pass, feedback := RunCoderGate(context.Background(), ws, "./bin/golangci-lint", run, "")

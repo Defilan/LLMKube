@@ -585,7 +585,7 @@ func checkReferenceGrounding(ctx context.Context, workspace string, run commandR
 		return false, ""
 	}
 	added, err := grounding.AddedLines(
-		ctx, workspace, grounding.CommandRunner(run), "main", []string{"*.md", "*.yaml", "*.yml"},
+		ctx, workspace, grounding.CommandRunner(run), "HEAD", []string{"*.md", "*.yaml", "*.yml"},
 	)
 	if err != nil {
 		return false, ""
