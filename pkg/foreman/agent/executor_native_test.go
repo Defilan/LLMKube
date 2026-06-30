@@ -669,7 +669,7 @@ func TestNativeExecutor_ReviewerGoIsApproveNotCommit(t *testing.T) {
 		t.Errorf("modelExtra.findings: want 2-element slice got %T %v", mx["findings"], mx["findings"])
 	}
 	if got := mx["issueAsk"]; got == nil {
-		t.Errorf("modelExtra.issueAsk: missing; the verbatim issue quote should survive")
+		t.Errorf("modelExtra.issueAsk: missing; the issueAsk should survive")
 	}
 
 	// No branch should have landed on the remote: reviewers do not push.

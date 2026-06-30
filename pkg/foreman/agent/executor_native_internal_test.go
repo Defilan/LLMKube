@@ -1222,6 +1222,36 @@ func TestExtractFetchIssueBody_HappyAndMissing(t *testing.T) {
 	}
 }
 
+func TestReconcileReviewerIssueAsk_SemanticParaphraseVerified(t *testing.T) {
+	// A faithful paraphrase of the issue scope should be verified.
+	// The claim shares key terms with the body but is not a verbatim
+	// substring — this is the core scenario from #809.
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+	// Paraphrase: same key terms (lint-all, AGENTS.md, #508), different wording.
+	extra := map[string]any{
+		"issueAsk": "Update AGENTS.md with a lint-all check for #508.",
+	}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"] != "Update AGENTS.md with a lint-all check for #508." {
+		t.Errorf("paraphrased claim should be preserved; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); !v {
+		t.Errorf("semantic paraphrase should set issueAskVerified=true; got %v", extra["issueAskVerified"])
+	}
+	if _, claimed := extra["issueAskClaimed"]; claimed {
+		t.Errorf("issueAskClaimed should not be set for a semantic match")
+	}
+}
+
 func TestReconcileReviewerIssueAsk_VerbatimQuotePreserved(t *testing.T) {
 	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
 	msgs := []oai.Message{
@@ -1244,10 +1274,10 @@ func TestReconcileReviewerIssueAsk_VerbatimQuotePreserved(t *testing.T) {
 	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
 
 	if extra["issueAsk"] != "Add a `make lint-all` nudge to AGENTS.md per #508 follow-up." {
-		t.Errorf("verbatim claim should be preserved unchanged; got %v", extra["issueAsk"])
+		t.Errorf("claim should be preserved unchanged; got %v", extra["issueAsk"])
 	}
 	if v, _ := extra["issueAskVerified"].(bool); !v {
-		t.Errorf("verbatim claim should set issueAskVerified=true; got %v", extra["issueAskVerified"])
+		t.Errorf("claim should set issueAskVerified=true; got %v", extra["issueAskVerified"])
 	}
 	if _, claimed := extra["issueAskClaimed"]; claimed {
 		t.Errorf("issueAskClaimed should not be set for honest quote")
@@ -1345,8 +1375,12 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoDemotedToNoGo(t *testing.T) {
 	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
 		t.Errorf("verdictClaimed should archive the original GO; got %v", extra["verdictClaimed"])
 	}
-	if reason, _ := extra["demotionReason"].(string); reason == "" {
+	reason, _ := extra["demotionReason"].(string)
+	if reason == "" {
 		t.Errorf("demotionReason must explain the demotion")
+	}
+	if !strings.Contains(reason, "semantically cover") {
+		t.Errorf("demotionReason should reference semantic coverage; got %q", reason)
 	}
 }
 
@@ -1405,8 +1439,12 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoScopeVouchKeepsGo(t *testing.T) {
 	if v, _ := extra["scopeVouched"].(bool); !v {
 		t.Errorf("scopeVouched should be true when scope rail confirms in-scope")
 	}
-	if reason, _ := extra["demotionReason"].(string); reason == "" {
+	reason, _ := extra["demotionReason"].(string)
+	if reason == "" {
 		t.Errorf("demotionReason must explain the scope-vouch outcome")
+	}
+	if !strings.Contains(reason, "semantically cover") {
+		t.Errorf("demotionReason should reference semantic coverage; got %q", reason)
 	}
 }
 
@@ -1730,5 +1768,52 @@ func TestRemoveAllResilient_SymlinkToExternal(t *testing.T) {
 	const wantMode = os.FileMode(0o755)
 	if gotMode != wantMode {
 		t.Errorf("external victim mode changed: got %04o, want %04o", gotMode, wantMode)
+	}
+}
+
+func TestSemanticIssueAskMatch_Verbatim(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	claim := "Add a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	if !semanticIssueAskMatch(claim, body) {
+		t.Errorf("verbatim claim should match")
+	}
+}
+
+func TestSemanticIssueAskMatch_Paraphrase(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	claim := "Update AGENTS.md with a lint-all check for #508."
+	if !semanticIssueAskMatch(claim, body) {
+		t.Errorf("semantic paraphrase should match")
+	}
+}
+
+func TestSemanticIssueAskMatch_Confabulation(t *testing.T) {
+	body := "## Bug Description\n\nmetal-agent picks the wrong IP on multi-NIC macOS hosts."
+	claim := "Add a reconciler that cleans up orphaned Service+Endpoints objects when agent restarts."
+	if semanticIssueAskMatch(claim, body) {
+		t.Errorf("confabulated claim should not match")
+	}
+}
+
+func TestSemanticIssueAskMatch_EmptyBody(t *testing.T) {
+	if semanticIssueAskMatch("some claim", "") {
+		t.Errorf("empty body should not match")
+	}
+}
+
+func TestExtractKeyTerms(t *testing.T) {
+	text := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	terms := extractKeyTerms(text)
+	// Should contain domain-specific terms.
+	for _, want := range []string{"lint-all", "agents.md", "508", "follow-up"} {
+		if !terms[want] {
+			t.Errorf("key term %q missing from extracted terms", want)
+		}
+	}
+	// Should not contain stop words.
+	for _, stop := range []string{"the", "a", "to", "per"} {
+		if terms[stop] {
+			t.Errorf("stop word %q should not be in extracted terms", stop)
+		}
 	}
 }

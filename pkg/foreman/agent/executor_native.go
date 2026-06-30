@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -1452,11 +1453,13 @@ func fileListsEqual(prev any, groundTruth []string) bool {
 // reconcileReviewerIssueAsk grounds the reviewer's
 // `submit_result.extra.issueAsk` field against the real issue body
 // that came back from the reviewer's `fetch_issue` tool call. The
-// claim has to be a literal substring of that body; if it is not,
-// the harness archives the model's claim under `issueAskClaimed`
-// and rewrites `issueAsk` with the first useful prose paragraph of
-// the body (skipping markdown headers). Pairs with #582's filesTouched
-// fix: same shape, different field.
+// claim must semantically cover the issue scope (not merely be a
+// verbatim substring). If the claim is a faithful paraphrase the
+// harness marks it verified; if it is a hallucination the harness
+// archives the claim under `issueAskClaimed` and rewrites `issueAsk`
+// with the first useful prose paragraph of the body (skipping markdown
+// headers). Pairs with #582's filesTouched fix: same shape, different
+// field.
 //
 // Why this is structural rather than a prompt-tightening fix: the
 // post-#584 rereview showed devstral on the Mac Studio confabulating
@@ -1492,20 +1495,21 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 		extra["issueAskVerified"] = false
 		return
 	}
-	if strings.Contains(body, claim) {
-		// Honest claim: model quoted from the body verbatim. Leave alone
-		// and mark verified so downstream knows the field is trustworthy.
+	if semanticIssueAskMatch(claim, body) {
+		// Honest claim: model paraphrased the issue scope correctly.
+		// Leave alone and mark verified so downstream knows the field
+		// is trustworthy.
 		extra["issueAskVerified"] = true
 		return
 	}
-	// Confabulation: claim is not a substring of the body the model
-	// itself fetched. Archive it and rewrite issueAsk with a real
-	// excerpt from the body.
+	// Confabulation: claim does not semantically cover the issue the
+	// model itself fetched. Archive it and rewrite issueAsk with a
+	// real excerpt from the body.
 	extra["issueAskClaimed"] = claim
 	replaced := firstBodyParagraph(body, 200)
 	extra["issueAsk"] = replaced
 	extra["issueAskVerified"] = false
-	log.Info("reviewer issueAsk: model claim not a substring of fetch_issue body; rewriting from body",
+	log.Info("reviewer issueAsk: model claim does not semantically cover the issue; rewriting from body",
 		"modelClaim", claim,
 		"rewrittenTo", replaced,
 	)
@@ -1514,7 +1518,7 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 // enforceReviewerIssueAsk converts a failed issueAsk verification from
 // an observation into a routing decision (#644). reconcileReviewerIssueAsk
 // records whether the model's stated understanding of the issue is a
-// verbatim quote of the body it fetched; until now a `false` there was
+// semantic match of the body it fetched; until now a `false` there was
 // archaeology while the verdict stood. The 2026-06-10 Mellum2 battery
 // showed why that is not enough: 5/5 runs failed verification, including
 // a GO on a known scope-drift branch and a NO-GO justified by a fully
@@ -1559,7 +1563,7 @@ func enforceReviewerIssueAsk(
 	extra["verdictClaimed"] = string(verdict)
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
-		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		extra["demotionReason"] = "issueAsk does not semantically cover the " +
 			"fetched issue body; review verdict is untrusted"
 		log.Info("reviewer integrity: unverified issueAsk on non-GO verdict; keeping verdict but marking untrusted",
 			"verdict", verdict)
@@ -1574,14 +1578,14 @@ func enforceReviewerIssueAsk(
 	if scopeVouches {
 		extra["issueAskVerified"] = false
 		extra["scopeVouched"] = true
-		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		extra["demotionReason"] = "issueAsk does not semantically cover the " +
 			"fetched issue body; scope-overlap confirms in-scope review"
 		log.Info("reviewer integrity: unverified issueAsk on GO verdict; scope-overlap vouches, keeping GO",
 			"scopeMatched", scopeMatched)
 		return verdict
 	}
 
-	extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+	extra["demotionReason"] = "issueAsk does not semantically cover the " +
 		"fetched issue body; review verdict is untrusted"
 	log.Info("reviewer integrity: unverified issueAsk on GO verdict; demoting to NO-GO",
 		"verdictClaimed", verdict)
@@ -1632,6 +1636,82 @@ func extractFetchIssueBody(msgs []oai.Message) string {
 		}
 	}
 	return lastBody
+}
+
+// semanticIssueAskMatch reports whether the reviewer's stated issueAsk
+// semantically covers the fetched issue body. It uses a key-requirement
+// extraction heuristic: it pulls salient nouns and verbs from the issue
+// body (title + body) and checks whether the claim references a
+// sufficient fraction of them. This distinguishes "paraphrased but
+// correct" from "wrong issue entirely" — a faithful paraphrase will
+// share key terms with the body, while a hallucination will not.
+//
+// The threshold is 0.3: the claim must cover at least 30% of the
+// issue's key terms. This is intentionally loose enough to accept
+// paraphrases but tight enough to reject claims about unrelated
+// issues. The function is deterministic and local (no external API
+// calls).
+func semanticIssueAskMatch(claim, body string) bool {
+	claimTerms := extractKeyTerms(claim)
+	bodyTerms := extractKeyTerms(body)
+	if len(bodyTerms) == 0 {
+		return false
+	}
+	// Count how many body terms appear in the claim.
+	covered := 0
+	for term := range bodyTerms {
+		if claimTerms[term] {
+			covered++
+		}
+	}
+	return float64(covered)/float64(len(bodyTerms)) >= 0.3
+}
+
+// extractKeyTerms pulls salient nouns and verbs from a text block.
+// It lowercases, strips punctuation, removes common English stop words,
+// and returns a set of terms that are at least 3 characters long.
+// Hyphenated words are joined (e.g. "lint-all" → "lint-all") so that
+// compound domain terms are preserved. The goal is to capture the
+// issue's domain-specific keywords (e.g. "container", "image",
+// "golangci-lint", "controller-gen") while ignoring boilerplate.
+func extractKeyTerms(text string) map[string]bool {
+	stopWords := map[string]bool{
+		"the": true, "a": true, "an": true, "and": true, "or": true,
+		"but": true, "in": true, "on": true, "at": true, "to": true,
+		"for": true, "of": true, "with": true, "by": true, "from": true,
+		"is": true, "are": true, "was": true, "were": true, "be": true,
+		"been": true, "being": true, "have": true, "has": true, "had": true,
+		"do": true, "does": true, "did": true, "will": true, "would": true,
+		"could": true, "should": true, "may": true, "might": true,
+		"not": true, "no": true, "it": true, "its": true, "this": true,
+		"that": true, "these": true, "those": true, "i": true, "you": true,
+		"he": true, "she": true, "we": true, "they": true, "me": true,
+		"him": true, "her": true, "us": true, "them": true, "my": true,
+		"your": true, "his": true, "our": true, "their": true,
+		"as": true, "if": true, "then": true, "so": true, "than": true,
+		"too": true, "very": true, "just": true, "also": true, "per": true,
+	}
+	// Split on whitespace first, then join hyphenated runs so that
+	// compound terms like "lint-all" or "controller-gen" are preserved.
+	words := strings.Fields(text)
+	terms := make(map[string]bool)
+	for _, w := range words {
+		w = strings.ToLower(w)
+		// Join hyphenated segments into a single token.
+		w = strings.ReplaceAll(w, "-", "-")
+		// Strip leading/trailing non-alphanumeric chars (backticks, etc.)
+		w = strings.TrimFunc(w, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-'
+		})
+		if len(w) < 3 {
+			continue
+		}
+		if stopWords[w] {
+			continue
+		}
+		terms[w] = true
+	}
+	return terms
 }
 
 // firstBodyParagraph returns up to maxChars of the first useful
