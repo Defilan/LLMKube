@@ -485,9 +485,15 @@ func (r *ModelReconciler) reconcileBySourceType(
 
 	// HuggingFace repo IDs: the runtime container fetches at startup; the
 	// controller marks the model Ready so referencing InferenceServices can
-	// proceed.
+	// proceed. When multi-file staging is requested (spec.files/mmproj), the
+	// cacheKey must be set so the deployment builder uses the shared cache PVC
+	// instead of an emptyDir.
 	case isHFRepoSource(model.Spec.Source):
-		result, err = r.reconcileRuntimeResolvedSource(ctx, model, "")
+		cacheKey := ""
+		if hasMultiFileStaging(model) {
+			cacheKey = computeCacheKey(model.Spec.Source)
+		}
+		result, err = r.reconcileRuntimeResolvedSource(ctx, model, cacheKey)
 		return true, result, err
 
 	// Remote HTTP(S): the InferenceService Pod's init container downloads
