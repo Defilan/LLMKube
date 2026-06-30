@@ -627,6 +627,7 @@ func buildExecutorConfig(
 		ReasoningBudgetMessage: isvc.Spec.ReasoningBudgetMessage,
 		Mode:                   isvc.Spec.Mode,
 		ExtraArgs:              isvc.Spec.ExtraArgs,
+		TurboQuantBits:         derefInt32(isvc.Spec.TurboQuantBits),
 	}
 }
 

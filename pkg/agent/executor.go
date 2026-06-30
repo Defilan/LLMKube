@@ -118,6 +118,16 @@ type ExecutorConfig struct {
 	// ExtraArgs are appended to the command line as-is, last, so they can
 	// override any earlier flag llama-server emitted (last-wins).
 	ExtraArgs []string
+
+	// TurboQuantBits sets the KV cache quantization bit width for the oMLX
+	// runtime (3, 6, or 8). Maps to oMLX --kv-cache-quant. When set, the
+	// oMLX daemon uses TurboQuant to compress the KV cache, reducing memory
+	// usage by up to 67% with minimal speed impact (~7% overhead). Only
+	// meaningful for the omlx runtime; ignored by llamacpp and other runtimes.
+	// Requires oMLX v0.3.4+ (which introduced 3-bit TurboQuant) or a later
+	// dev build (6-bit and 8-bit options).
+	// +optional
+	TurboQuantBits int
 }
 
 // ProcessExecutor is the interface that both llama-server and oMLX executors

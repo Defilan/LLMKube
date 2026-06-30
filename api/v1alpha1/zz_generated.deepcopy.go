@@ -587,6 +587,11 @@ func (in *InferenceServiceSpec) DeepCopyInto(out *InferenceServiceSpec) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.TurboQuantBits != nil {
+		in, out := &in.TurboQuantBits, &out.TurboQuantBits
+		*out = new(int32)
+		**out = **in
+	}
 	if in.Command != nil {
 		in, out := &in.Command, &out.Command
 		*out = make([]string, len(*in))
