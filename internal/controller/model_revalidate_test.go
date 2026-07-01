@@ -184,7 +184,7 @@ var _ = Describe("Model source revalidation", func() {
 			// Simulate an existing cached model upgraded from an older operator:
 			// Ready, no stored fingerprint.
 			model.Status.Phase = PhaseReady
-			model.Status.CacheKey = computeCacheKey(source)
+			model.Status.CacheKey = ComputeCacheKey(source)
 			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
 			reconciler := &ModelReconciler{
@@ -228,7 +228,7 @@ var _ = Describe("Model source revalidation", func() {
 
 			// Pre-existing baseline fingerprint that the failing probe cannot refute.
 			model.Status.Phase = PhaseReady
-			model.Status.CacheKey = computeCacheKey(source)
+			model.Status.CacheKey = ComputeCacheKey(source)
 			model.Status.SourceETag = `"known-good"`
 			model.Status.SourceContentLength = 1234
 			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
@@ -293,7 +293,7 @@ var _ = Describe("Model source revalidation", func() {
 			// Already revalidated moments ago, long interval => gate closed.
 			now := metav1.Now()
 			model.Status.Phase = PhaseReady
-			model.Status.CacheKey = computeCacheKey(source)
+			model.Status.CacheKey = ComputeCacheKey(source)
 			model.Status.LastRevalidated = &now
 			model.Status.SourceETag = `"x"`
 			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())

@@ -178,7 +178,7 @@ var _ = Describe("Model Controller Reconcile", func() {
 		Expect(err).NotTo(HaveOccurred())
 		defer func() { _ = os.RemoveAll(tempDir) }()
 
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
 		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"), []byte("fake-model-data"), 0644)).To(Succeed())
@@ -254,7 +254,7 @@ var _ = Describe("Model Controller Reconcile", func() {
 		Expect(updated.Status.Phase).To(Equal(PhaseReady))
 		// CacheKey populated so the InferenceService init container can build
 		// the canonical /models/<cacheKey>/<basename> path.
-		Expect(updated.Status.CacheKey).To(Equal(computeCacheKey(source)))
+		Expect(updated.Status.CacheKey).To(Equal(ComputeCacheKey(source)))
 		// Controller-side fields stay empty: the workload populates these when
 		// it actually downloads the model.
 		Expect(updated.Status.Path).To(BeEmpty())
@@ -574,7 +574,7 @@ var _ = Describe("Model Controller - Cache Bug Fixes", func() {
 		srcFile := filepath.Join(srcDir, "src.gguf")
 		Expect(os.WriteFile(srcFile, []byte("cached-model-data"), 0644)).To(Succeed())
 		source := fmt.Sprintf("file://%s", srcFile)
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		legacyPath := filepath.Join(modelDir, "model.gguf")
 		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
@@ -708,7 +708,7 @@ var _ = Describe("Model Controller - Cache Bug Fixes", func() {
 		// non-HTTP sources (HTTP sources are deferred to the workload init
 		// container, see issue #363).
 		source := "file:///nonexistent/path/to/source-model.gguf"
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		modelPath := filepath.Join(modelDir, "model.gguf")
 
@@ -803,17 +803,17 @@ var _ = Describe("getLocalPath", func() {
 
 var _ = Describe("computeCacheKey", func() {
 	It("should return 16 hex char string", func() {
-		key := computeCacheKey("https://example.com/model.gguf")
+		key := ComputeCacheKey("https://example.com/model.gguf")
 		Expect(key).To(HaveLen(16))
 	})
 	It("should be deterministic", func() {
-		key1 := computeCacheKey("https://example.com/model.gguf")
-		key2 := computeCacheKey("https://example.com/model.gguf")
+		key1 := ComputeCacheKey("https://example.com/model.gguf")
+		key2 := ComputeCacheKey("https://example.com/model.gguf")
 		Expect(key1).To(Equal(key2))
 	})
 	It("should differ for different sources", func() {
-		key1 := computeCacheKey("https://example.com/model-a.gguf")
-		key2 := computeCacheKey("https://example.com/model-b.gguf")
+		key1 := ComputeCacheKey("https://example.com/model-a.gguf")
+		key2 := ComputeCacheKey("https://example.com/model-b.gguf")
 		Expect(key1).NotTo(Equal(key2))
 	})
 })
@@ -1020,7 +1020,7 @@ var _ = Describe("Model Controller - GGUF Filename Migration", func() {
 		Expect(updated.Status.GGUF).NotTo(BeNil())
 		Expect(updated.Status.GGUF.ModelName).To(Equal("Gemma-4-E4B-It"))
 
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		expectedPath := filepath.Join(tempDir, cacheKey, "Gemma-4-E4B-It.gguf")
 		Expect(updated.Status.Path).To(Equal(expectedPath))
 		_, err = os.Stat(expectedPath)
@@ -1064,7 +1064,7 @@ var _ = Describe("Model Controller - GGUF Filename Migration", func() {
 
 		updated := &inferencev1alpha1.Model{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		expectedPath := filepath.Join(tempDir, cacheKey, "Llama-3.1-Instruct.gguf")
 		Expect(updated.Status.Path).To(Equal(expectedPath))
 		_, err = os.Stat(expectedPath)
@@ -1153,7 +1153,7 @@ var _ = Describe("Model Controller - GGUF Filename Migration", func() {
 
 		updated := &inferencev1alpha1.Model{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		expectedPath := filepath.Join(tempDir, cacheKey, modelName+".gguf")
 		Expect(updated.Status.Path).To(Equal(expectedPath))
 	})
@@ -1173,7 +1173,7 @@ var _ = Describe("Model Controller - GGUF Filename Migration", func() {
 		srcFile := filepath.Join(srcDir, "src.gguf")
 		Expect(os.WriteFile(srcFile, ggufBytes, 0644)).To(Succeed())
 		source := fmt.Sprintf("file://%s", srcFile)
-		cacheKey := computeCacheKey(source)
+		cacheKey := ComputeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		legacyPath := filepath.Join(modelDir, "model.gguf")
 		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
@@ -1693,7 +1693,7 @@ var _ = Describe("SHA256 Verification", func() {
 		Expect(hasIntegrity).To(BeTrue())
 
 		// Verify the file was cleaned up
-		cacheKey := computeCacheKey(model.Spec.Source)
+		cacheKey := ComputeCacheKey(model.Spec.Source)
 		modelPath := filepath.Join(tempDir, cacheKey, "model.gguf")
 		_, statErr := os.Stat(modelPath)
 		Expect(os.IsNotExist(statErr)).To(BeTrue(), "model file should be removed after integrity check failure")

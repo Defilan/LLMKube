@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -180,21 +182,21 @@ func hasMultiFileStaging(model *inferencev1alpha1.Model) bool {
 	return model != nil && (len(model.Spec.Files) > 0 || model.Spec.Mmproj != "")
 }
 
-// effectiveModelCacheKey returns the key used to namespace a model's files
-// inside the cache PVC, and serves as the single source of truth for whether
-// the in-cluster serving pod should use the cache (non-empty) or an emptyDir
-// (empty). Both the PVC-ensure gate (InferenceService reconcile) and the
-// storage builder MUST consult this so they never disagree about caching.
+// ModelCacheKey returns the cache key used to namespace a model's files inside
+// the cache directory. The precedence is:
 //
-// For sources the controller fingerprints (http/https) this is the
-// controller-set Status.CacheKey. The runtime-resolved path (hf:// repo IDs)
-// deliberately leaves Status.CacheKey empty and keeps the Available condition
-// reason "RuntimeResolved", but an hf:// model with multi-file staging still
-// needs the cache PVC: otherwise every file re-downloads into an emptyDir on
-// each pod restart (#909). Derive a stable key from the source in that case.
-// Metal models have no init container and no cache PVC (the host metal-agent
-// loads the files directly), so they never cache here.
-func effectiveModelCacheKey(model *inferencev1alpha1.Model) string {
+//  1. Status.CacheKey (set by a previous reconcile, e.g. a metal agent that
+//     resolved the key client-side).
+//  2. A SHA256 of the source URL, scoped to non-metal multi-file staging
+//     (so `cache list` and `delete --purge-cache` can find the same directory
+//     the controller would create).
+//
+// Returns "" for metal models and single-file sources that the controller
+// resolves at runtime (PVC, local path, etc.).
+//
+// This is the single source of truth for cache-key derivation across the
+// controller and the CLI (serve / cache list / delete --purge-cache).
+func ModelCacheKey(model *inferencev1alpha1.Model) string {
 	if model == nil {
 		return ""
 	}
@@ -202,9 +204,17 @@ func effectiveModelCacheKey(model *inferencev1alpha1.Model) string {
 		return model.Status.CacheKey
 	}
 	if hasMultiFileStaging(model) && !isMetalModel(model) {
-		return computeCacheKey(model.Spec.Source)
+		return ComputeCacheKey(model.Spec.Source)
 	}
 	return ""
+}
+
+// ComputeCacheKey generates a SHA256 hash of the source URL, truncated to 16
+// hex characters. Exported so the CLI can derive the same key the controller
+// would use for non-metal multi-file staging sources.
+func ComputeCacheKey(source string) string {
+	hash := sha256.Sum256([]byte(source))
+	return hex.EncodeToString(hash[:])[:16]
 }
 
 // modelStagingPlan resolves the model's declared files into a staging plan.
@@ -399,7 +409,7 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 }
 
 func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
-	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
+	cacheDir := fmt.Sprintf("/models/%s", ModelCacheKey(model))
 
 	// Resolve the fsGroup that the CSI will actually apply to the volume.
 	// When the InferenceService sets its own FSGroup, that wins over the

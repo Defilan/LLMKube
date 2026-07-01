@@ -357,20 +357,20 @@ var _ = Describe("hasMultiFileStaging", func() {
 	})
 })
 
-var _ = Describe("effectiveModelCacheKey", func() {
+var _ = Describe("ModelCacheKey", func() {
 	It("returns the controller-set Status.CacheKey when present", func() {
 		model := &inferencev1alpha1.Model{
 			Spec:   inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
 			Status: inferencev1alpha1.ModelStatus{CacheKey: "controllerkey"},
 		}
-		Expect(effectiveModelCacheKey(model)).To(Equal("controllerkey"))
+		Expect(ModelCacheKey(model)).To(Equal("controllerkey"))
 	})
 
 	It("returns empty for a runtime-resolved single-file model with no cache key", func() {
 		model := &inferencev1alpha1.Model{
 			Spec: inferencev1alpha1.ModelSpec{Source: "hf://unsloth/gemma-4-31B-it-GGUF"},
 		}
-		Expect(effectiveModelCacheKey(model)).To(BeEmpty())
+		Expect(ModelCacheKey(model)).To(BeEmpty())
 	})
 
 	It("derives a stable key from the source for an hf:// multi-file model (#909)", func() {
@@ -384,7 +384,7 @@ var _ = Describe("effectiveModelCacheKey", func() {
 				Mmproj: "mmproj-F16.gguf",
 			},
 		}
-		Expect(effectiveModelCacheKey(model)).To(Equal(computeCacheKey(source)))
+		Expect(ModelCacheKey(model)).To(Equal(ComputeCacheKey(source)))
 	})
 
 	It("does not cache a metal multi-file model (no init container / cache PVC)", func() {
@@ -395,7 +395,7 @@ var _ = Describe("effectiveModelCacheKey", func() {
 				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: acceleratorMetal},
 			},
 		}
-		Expect(effectiveModelCacheKey(model)).To(BeEmpty())
+		Expect(ModelCacheKey(model)).To(BeEmpty())
 	})
 })
 
@@ -413,7 +413,7 @@ var _ = Describe("buildCachedStorageConfig cache key fallback", func() {
 
 		// The staged primary must land under the key derived from the source,
 		// never a bare /models/ which would collide across every keyless model.
-		key := computeCacheKey(source)
+		key := ComputeCacheKey(source)
 		Expect(key).NotTo(BeEmpty())
 		Expect(config.modelPath).To(Equal("/models/" + key + "/model.gguf"))
 	})

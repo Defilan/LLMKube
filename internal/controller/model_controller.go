@@ -141,7 +141,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return result, err
 	}
 
-	cacheKey := computeCacheKey(model.Spec.Source)
+	cacheKey := ComputeCacheKey(model.Spec.Source)
 	modelDir := filepath.Join(r.StoragePath, cacheKey)
 	// downloadPath is the path used during/after download. After GGUF metadata
 	// parsing, the file is migrated to canonicalModelPath(modelDir, model).
@@ -442,7 +442,7 @@ func (r *ModelReconciler) reconcilePVCSource(ctx context.Context, model *inferen
 	}
 
 	// PVC is valid and bound — set model as Ready
-	cacheKey := computeCacheKey(model.Spec.Source)
+	cacheKey := ComputeCacheKey(model.Spec.Source)
 	mountPath := fmt.Sprintf("/model-source/%s", modelFilePath)
 
 	model.Status.Phase = PhaseReady
@@ -506,7 +506,7 @@ func (r *ModelReconciler) reconcileBySourceType(
 	// fetch is deferred to the workload.
 	case isRemoteHTTPSource(model.Spec.Source):
 		result, err = r.reconcileRuntimeResolvedSource(
-			ctx, model, computeCacheKey(model.Spec.Source))
+			ctx, model, ComputeCacheKey(model.Spec.Source))
 		return true, result, err
 
 	// Metal-accelerated models with a local-path source live on the Metal
@@ -923,11 +923,6 @@ func formatBytes(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-func computeCacheKey(source string) string {
-	hash := sha256.Sum256([]byte(source))
-	return hex.EncodeToString(hash[:])[:16]
 }
 
 func (r *ModelReconciler) parseGGUFMetadata(path string) (*inferencev1alpha1.GGUFMetadata, error) {

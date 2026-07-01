@@ -23,6 +23,7 @@ import (
 	"time"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/controller"
 )
 
 const testDefaultNamespace = "default"
@@ -884,12 +885,12 @@ func TestComputeCacheKeyUsedByDeploy(t *testing.T) {
 	}
 
 	for _, source := range sources {
-		key := computeCacheKey(source)
+		key := controller.ComputeCacheKey(source)
 		if len(key) != 16 {
-			t.Errorf("computeCacheKey(%q) length = %d, want 16", source, len(key))
+			t.Errorf("controller.ComputeCacheKey(%q) length = %d, want 16", source, len(key))
 		}
 		// Verify determinism
-		key2 := computeCacheKey(source)
+		key2 := controller.ComputeCacheKey(source)
 		if key != key2 {
 			t.Errorf("computeCacheKey not deterministic for %q", source)
 		}
