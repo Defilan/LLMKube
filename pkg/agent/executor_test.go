@@ -774,7 +774,12 @@ func TestBuildLlamaServerArgsRuntimeArgParity(t *testing.T) {
 		"--no-kv-offload",
 		"--override-tensor",
 		"--override-kv",
-		"--threads",
+		// NOTE: --threads is intentionally NOT a parity flag. The metal-agent
+		// auto-detects it from Apple-Silicon performance cores
+		// (detectPerfCoreCount, which returns 0 on non-darwin), while the
+		// in-cluster controller deliberately omits it and lets llama.cpp
+		// auto-detect from the pod's CPU limits. It is metal-only, OS-dependent,
+		// and not spec-driven, so asserting it here breaks on Linux CI.
 		"--batch-size",
 		"--ubatch-size",
 		"--no-warmup",
