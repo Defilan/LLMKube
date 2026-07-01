@@ -1322,6 +1322,147 @@ func TestReconcileReviewerIssueAsk_NilExtraIsNoOp(t *testing.T) {
 	reconcileReviewerIssueAsk(logr.Discard(), nil, nil) // must not panic
 }
 
+// TestReconcileReviewerIssueAsk_ParaphraseVerified covers #809: a
+// reviewer that paraphrases the issue (rather than quoting it
+// verbatim) must still pass verification. The rail's job is to catch
+// hallucinations, not to penalize faithful restatements.
+func TestReconcileReviewerIssueAsk_ParaphraseVerified(t *testing.T) {
+	body := "## Feature Description\n\nUpdate the agent-builder Dockerfile to pin golangci-lint v1.64 and controller-gen v0.17.0 in the toolchain image."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+
+	// Faithful paraphrase: mentions the same key nouns (toolchain,
+	// golangci-lint, controller-gen) but in different wording.
+	claim := "Update the toolchain image to use golangci-lint v1.64 and controller-gen v0.17.0"
+	extra := map[string]any{"issueAsk": claim}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"] != claim {
+		t.Errorf("paraphrased claim should be preserved unchanged; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); !v {
+		t.Errorf("paraphrased claim should set issueAskVerified=true; got %v", extra["issueAskVerified"])
+	}
+	if _, claimed := extra["issueAskClaimed"]; claimed {
+		t.Errorf("issueAskClaimed should not be set for a faithful paraphrase")
+	}
+}
+
+// TestReconcileReviewerIssueAsk_HallucinationDemoted confirms the
+// semantic rail still catches a claim that does not share the issue's
+// key nouns, even when the claim is a long, confident-sounding sentence.
+func TestReconcileReviewerIssueAsk_HallucinationDemoted(t *testing.T) {
+	body := "## Feature Description\n\nUpdate the agent-builder Dockerfile to pin golangci-lint v1.64 and controller-gen v0.17.0 in the toolchain image."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+
+	// Hallucination: long, confident, but shares no key nouns with
+	// the issue body.
+	claim := "Add a cluster-wide default LiteLLM URL to the InferenceService CRD so users do not have to set it per model."
+	extra := map[string]any{"issueAsk": claim}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"].(string) == claim {
+		t.Errorf("hallucinated claim should be rewritten; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); v {
+		t.Errorf("hallucinated claim should mark issueAskVerified=false")
+	}
+	if extra["issueAskClaimed"] != claim {
+		t.Errorf("issueAskClaimed should preserve the original hallucination; got %v", extra["issueAskClaimed"])
+	}
+}
+
+// TestIssueAskMatches_VerbatimFastPath covers the cheap path: a
+// verbatim substring of the body must pass immediately, regardless of
+// key-noun overlap.
+func TestIssueAskMatches_VerbatimFastPath(t *testing.T) {
+	body := "## Feature Description\n\nUpdate the agent-builder Dockerfile to pin golangci-lint v1.64 and controller-gen v0.17.0 in the toolchain image."
+	if !issueAskMatches("Update the agent-builder Dockerfile", body) {
+		t.Errorf("verbatim substring should match")
+	}
+	if !issueAskMatches("toolchain image", body) {
+		t.Errorf("verbatim substring should match")
+	}
+}
+
+// TestIssueAskMatches_ParaphrasePasses covers the semantic path: a
+// claim that shares enough key nouns with the body must pass.
+func TestIssueAskMatches_ParaphrasePasses(t *testing.T) {
+	body := "## Feature Description\n\nUpdate the agent-builder Dockerfile to pin golangci-lint v1.64 and controller-gen v0.17.0 in the toolchain image."
+	paraphrase := "Update the toolchain image to use golangci-lint v1.64 and controller-gen v0.17.0"
+	if !issueAskMatches(paraphrase, body) {
+		t.Errorf("paraphrase sharing key nouns should match; got false")
+	}
+}
+
+// TestIssueAskMatches_HallucinationFails covers the semantic path: a
+// claim that shares too few key nouns with the body must fail.
+func TestIssueAskMatches_HallucinationFails(t *testing.T) {
+	body := "## Feature Description\n\nUpdate the agent-builder Dockerfile to pin golangci-lint v1.64 and controller-gen v0.17.0 in the toolchain image."
+	hallucination := "Add a cluster-wide default LiteLLM URL to the InferenceService CRD so users do not have to set it per model."
+	if issueAskMatches(hallucination, body) {
+		t.Errorf("hallucination sharing no key nouns should not match; got true")
+	}
+}
+
+// TestIssueAskMatches_EmptyBodyFallsBackToLeniency covers the edge
+// case where extractIssueKeys returns nothing (e.g. a body that is
+// only stop words or very short). The rail must not false-positive
+// demote a short on-topic claim in this case.
+func TestIssueAskMatches_EmptyBodyFallsBackToLeniency(t *testing.T) {
+	// Body too short to extract meaningful keys.
+	if !issueAskMatches("fix the thing", "a b c") {
+		t.Errorf("short body should fall back to leniency window")
+	}
+	// Short claim against a long body with no extractable keys: must
+	// fail (leniency requires body < 500 chars).
+	if issueAskMatches("fix the thing", strings.Repeat("a b c ", 200)) {
+		t.Errorf("long body with no keys should not fall back to leniency")
+	}
+}
+
+// TestExtractIssueKeys_DropsStopWordsAndShortTokens confirms the
+// key-extractor filters out noise so the semantic check has signal.
+func TestExtractIssueKeys_DropsStopWordsAndShortTokens(t *testing.T) {
+	body := "## Feature Description\n\nUpdate the agent-builder Dockerfile to pin golangci-lint v1.64 and controller-gen v0.17.0 in the toolchain image."
+	keys := extractIssueKeys(body)
+	// "the", "to", "and", "in" should be dropped (case-insensitive).
+	for _, stop := range []string{"the", "to", "and", "in"} {
+		for _, k := range keys {
+			if strings.EqualFold(k, stop) {
+				t.Errorf("stop word %q should not appear in keys", stop)
+			}
+		}
+	}
+	// "update", "agent", "builder", "dockerfile", "golangci", "lint",
+	// "controller", "toolchain", "image" should be present (case-insensitive).
+	for _, want := range []string{"update", "agent", "builder", "dockerfile", "golangci", "toolchain", "image"} {
+		found := false
+		for _, k := range keys {
+			if strings.EqualFold(k, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("key %q missing from extracted keys: %v", want, keys)
+		}
+	}
+}
+
 func TestEnforceReviewerIssueAsk_VerifiedGoStands(t *testing.T) {
 	extra := map[string]any{"issueAskVerified": true}
 	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, false, nil)

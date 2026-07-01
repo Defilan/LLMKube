@@ -1469,11 +1469,10 @@ func fileListsEqual(prev any, groundTruth []string) bool {
 // reconcileReviewerIssueAsk grounds the reviewer's
 // `submit_result.extra.issueAsk` field against the real issue body
 // that came back from the reviewer's `fetch_issue` tool call. The
-// claim has to be a literal substring of that body; if it is not,
-// the harness archives the model's claim under `issueAskClaimed`
-// and rewrites `issueAsk` with the first useful prose paragraph of
-// the body (skipping markdown headers). Pairs with #582's filesTouched
-// fix: same shape, different field.
+// claim must semantically cover the issue's scope (not merely be a
+// verbatim substring): a faithful paraphrase is accepted, a
+// hallucination is archived and rewritten from the body. Pairs with
+// #582's filesTouched fix: same shape, different field.
 //
 // Why this is structural rather than a prompt-tightening fix: the
 // post-#584 rereview showed devstral on the Mac Studio confabulating
@@ -1509,20 +1508,21 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 		extra["issueAskVerified"] = false
 		return
 	}
-	if strings.Contains(body, claim) {
-		// Honest claim: model quoted from the body verbatim. Leave alone
-		// and mark verified so downstream knows the field is trustworthy.
+	if issueAskMatches(claim, body) {
+		// Honest claim: the reviewer's stated ask semantically covers
+		// the issue (verbatim quote or faithful paraphrase). Mark
+		// verified so downstream knows the field is trustworthy.
 		extra["issueAskVerified"] = true
 		return
 	}
-	// Confabulation: claim is not a substring of the body the model
-	// itself fetched. Archive it and rewrite issueAsk with a real
-	// excerpt from the body.
+	// Confabulation: claim does not semantically cover the issue the
+	// model itself fetched. Archive it and rewrite issueAsk with a
+	// real excerpt from the body.
 	extra["issueAskClaimed"] = claim
 	replaced := firstBodyParagraph(body, 200)
 	extra["issueAsk"] = replaced
 	extra["issueAskVerified"] = false
-	log.Info("reviewer issueAsk: model claim not a substring of fetch_issue body; rewriting from body",
+	log.Info("reviewer issueAsk: model claim does not semantically cover the fetched issue body; rewriting from body",
 		"modelClaim", claim,
 		"rewrittenTo", replaced,
 	)
@@ -1531,7 +1531,7 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 // enforceReviewerIssueAsk converts a failed issueAsk verification from
 // an observation into a routing decision (#644). reconcileReviewerIssueAsk
 // records whether the model's stated understanding of the issue is a
-// verbatim quote of the body it fetched; until now a `false` there was
+// semantic match of the body it fetched; until now a `false` there was
 // archaeology while the verdict stood. The 2026-06-10 Mellum2 battery
 // showed why that is not enough: 5/5 runs failed verification, including
 // a GO on a known scope-drift branch and a NO-GO justified by a fully
@@ -1576,7 +1576,7 @@ func enforceReviewerIssueAsk(
 	extra["verdictClaimed"] = string(verdict)
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
-		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		extra["demotionReason"] = "issueAsk could not be verified as a semantic match of the " +
 			"fetched issue body; review verdict is untrusted"
 		log.Info("reviewer integrity: unverified issueAsk on non-GO verdict; keeping verdict but marking untrusted",
 			"verdict", verdict)
@@ -1591,14 +1591,14 @@ func enforceReviewerIssueAsk(
 	if scopeVouches {
 		extra["issueAskVerified"] = false
 		extra["scopeVouched"] = true
-		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		extra["demotionReason"] = "issueAsk could not be verified as a semantic match of the " +
 			"fetched issue body; scope-overlap confirms in-scope review"
 		log.Info("reviewer integrity: unverified issueAsk on GO verdict; scope-overlap vouches, keeping GO",
 			"scopeMatched", scopeMatched)
 		return verdict
 	}
 
-	extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+	extra["demotionReason"] = "issueAsk could not be verified as a semantic match of the " +
 		"fetched issue body; review verdict is untrusted"
 	log.Info("reviewer integrity: unverified issueAsk on GO verdict; demoting to NO-GO",
 		"verdictClaimed", verdict)
@@ -1686,6 +1686,129 @@ func firstBodyParagraph(body string, maxChars int) string {
 		out = out[:maxChars]
 	}
 	return out
+}
+
+// issueAskMatches reports whether `claim` semantically covers the
+// issue described by `body`. The check is a two-stage gate:
+//
+//  1. Verbatim fast path: if the claim is a substring of the body, the
+//     reviewer quoted the issue verbatim and we accept immediately.
+//
+//  2. Key-requirement fallback: extract the issue's salient nouns from
+//     the body (nouns that appear in the title or the first two
+//     paragraphs, excluding stop words and words shorter than 4
+//     characters) and require the claim to share at least half of
+//     them. This is the "does the reviewer understand the scope?"
+//     check the verbatim rail cannot make: a faithful paraphrase of
+//     "add golangci-lint to the agent-builder image" will still share
+//     the key nouns with the body, while a hallucinated ask like
+//     "enhance `llmkube cache list`" will not.
+//
+// The threshold is intentionally conservative: a reviewer that
+// paraphrases the issue correctly should pass. The rail's job is to
+// catch hallucinations, not to penalize paraphrasing (#809).
+func issueAskMatches(claim, body string) bool {
+	if strings.Contains(body, claim) {
+		return true
+	}
+	keys := extractIssueKeys(body)
+	if len(keys) == 0 {
+		// No extractable keys; fall back to a leniency window so a
+		// reviewer that restates the issue in its own words is not
+		// punished. A short, on-topic claim against a short body is
+		// accepted.
+		return len(claim) >= 10 && len(body) < 500
+	}
+	claimLower := strings.ToLower(claim)
+	shared := 0
+	for _, k := range keys {
+		if strings.Contains(claimLower, k) {
+			shared++
+		}
+	}
+	return shared >= len(keys)/2
+}
+
+// extractIssueKeys pulls the salient nouns out of `body` for a
+// semantic coverage check. It lowercases, strips non-alpha characters,
+// drops English stop words and words shorter than 4 characters, and
+// returns the unique keys in document order. The goal is to capture
+// the issue's concrete requirements (e.g. "golangci-lint",
+// "controller-gen", "toolchain") without carrying noise into the
+// comparison.
+func extractIssueKeys(body string) []string {
+	// Limit to title + first two paragraphs so the key-extraction
+	// does not get diluted by boilerplate in the issue body.
+	trimmed := strings.TrimSpace(body)
+	segments := strings.SplitN(trimmed, "\n\n", 3)
+	limited := strings.Join(segments, " ")
+
+	words := tokenize(limited)
+	seen := map[string]bool{}
+	var keys []string
+	for _, w := range words {
+		if stopWords[w] || len(w) < 4 {
+			continue
+		}
+		if seen[w] {
+			continue
+		}
+		seen[w] = true
+		keys = append(keys, w)
+	}
+	return keys
+}
+
+// tokenize splits `s` on non-alpha characters and lowercases each
+// token. Used by extractIssueKeys.
+func tokenize(s string) []string {
+	var out []string
+	var cur strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			cur.WriteRune(r)
+		} else {
+			if cur.Len() > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+			}
+		}
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+// stopWords is a small set of high-frequency English words that add no
+// signal to issue-ask matching. Kept local so the check has no
+// external dependency.
+var stopWords = map[string]bool{
+	"a": true, "an": true, "the": true, "and": true, "or": true,
+	"but": true, "in": true, "on": true, "at": true, "to": true,
+	"for": true, "of": true, "with": true, "by": true, "from": true,
+	"is": true, "are": true, "was": true, "were": true, "be": true,
+	"been": true, "being": true, "have": true, "has": true, "had": true,
+	"do": true, "does": true, "did": true, "will": true, "would": true,
+	"could": true, "should": true, "may": true, "might": true,
+	"can": true, "this": true, "that": true, "these": true, "those": true,
+	"it": true, "its": true, "they": true, "them": true, "their": true,
+	"we": true, "our": true, "you": true, "your": true, "he": true,
+	"she": true, "his": true, "her": true, "i": true, "me": true,
+	"my": true, "not": true, "no": true, "nor": true, "as": true,
+	"if": true, "then": true, "than": true, "too": true, "very": true,
+	"so": true, "also": true, "just": true, "only": true, "each": true,
+	"every": true, "all": true, "any": true, "both": true, "few": true,
+	"more": true, "most": true, "other": true, "some": true, "such": true,
+	"into": true, "over": true, "after": true, "before": true,
+	"between": true, "under": true, "again": true, "further": true,
+	"once": true, "here": true, "there": true, "when": true, "where": true,
+	"what": true, "which": true, "who": true, "whom": true, "how": true,
+	"up": true, "out": true, "off": true, "about": true, "above": true,
+	"below": true, "along": true, "against": true, "during": true,
+	"without": true, "within": true, "while": true, "because": true,
+	"until": true, "since": true, "however": true, "although": true,
+	"though": true, "yet": true, "own": true, "same": true,
 }
 
 func logReviewerFindings(log logr.Logger, extra map[string]any) {
