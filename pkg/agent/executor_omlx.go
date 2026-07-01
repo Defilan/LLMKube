@@ -51,6 +51,10 @@ type OMLXExecutor struct {
 	logger         *zap.SugaredLogger
 	httpClient     *http.Client
 	startupTimeout time.Duration
+	// turboQuantBits is the KV cache quantization bit width for the oMLX
+	// daemon (--kv-cache-quant). Set once when the daemon starts; shared
+	// across all models served by this daemon. Zero means no TurboQuant.
+	turboQuantBits int
 }
 
 // NewOMLXExecutor creates an executor that manages models via the oMLX daemon.
@@ -107,6 +111,12 @@ func (e *OMLXExecutor) StartProcess(ctx context.Context, config ExecutorConfig) 
 	}
 
 	e.logger.Infow("starting oMLX model", "modelID", modelID, "modelPath", modelPath)
+
+	// Set TurboQuant KV cache quantization on the daemon. This is a daemon-level
+	// setting applied once when the daemon starts; shared across all models.
+	e.mu.Lock()
+	e.turboQuantBits = config.TurboQuantBits
+	e.mu.Unlock()
 
 	// Ensure the oMLX daemon is running
 	if err := e.ensureOMLXRunning(ctx); err != nil {
@@ -210,6 +220,14 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context) error {
 		"--port", fmt.Sprint(e.port),
 		"--host", "0.0.0.0",
 	)
+
+	// TurboQuant KV cache quantization (oMLX v0.3.4+). Maps to --kv-cache-quant
+	// flag. The bits value (3, 6, or 8) is set via StartProcess before this
+	// call. When turboQuantBits is set, the flag is emitted; when omitted,
+	// oMLX uses its default (unquantized).
+	if e.turboQuantBits > 0 {
+		cmd.Args = append(cmd.Args, "--kv-cache-quant", fmt.Sprint(e.turboQuantBits))
+	}
 	cmd.Env = os.Environ()
 
 	if err := cmd.Start(); err != nil {
