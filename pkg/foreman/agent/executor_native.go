@@ -573,7 +573,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the scope signal can rescue an honest paraphrase (#744).
 			var scopeDriftDetected bool
 			var scopeMatched []string
-			if scopeDiff, scopeErr := repo.DiffNameOnly(ctx, workspace, "main"); scopeErr == nil {
+			if scopeDiff, scopeErr := repo.DiffNameOnly(ctx, workspace, "HEAD"); scopeErr == nil {
 				verdict = enforceReviewerScopeOverlap(log, loopRes.Terminal.Extra,
 					extractFetchIssueBody(loopRes.Transcript), scopeDiff, verdict,
 					task.Spec.GateProfile.Resolve().SourceExtensions)

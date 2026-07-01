@@ -23,11 +23,11 @@ import (
 )
 
 // DiffNameOnly returns the file paths that differ between `base` and
-// HEAD in the workspace. Uses `git diff --name-only base...HEAD`, the
-// three-dot form, which compares HEAD against the merge-base with
-// `base`: it is the right shape for "files this branch touched on
-// top of base," excluding files that changed on `base` since the
-// branch diverged.
+// HEAD in the workspace. It stages the working tree (`git add -A`) and
+// then runs `git diff --name-only --cached <base>`, which compares the
+// index against `base`. This catches uncommitted working-tree changes
+// (including new untracked files) that `git diff --name-only base...HEAD`
+// would miss because HEAD has not moved yet at gate time.
 //
 // Used by the reviewer-result executor path to ground-truth
 // `submit_result.extra.filesTouched` (a model-reported field that
@@ -48,7 +48,14 @@ func DiffNameOnly(ctx context.Context, workspace, base string) ([]string, error)
 	if base == "" {
 		return nil, fmt.Errorf("DiffNameOnly: base ref is required")
 	}
-	out, err := runGit(ctx, workspace, baseEnv(), "diff", "--name-only", base+"...HEAD")
+	// Stage working-tree changes so the diff reflects uncommitted edits.
+	// The gate runs before any commit, so `...HEAD` would otherwise see
+	// nothing; `--cached` against the index catches the coder's in-flight
+	// edits (including new untracked files).
+	if _, err := runGit(ctx, workspace, baseEnv(), "add", "-A"); err != nil {
+		return nil, err
+	}
+	out, err := runGit(ctx, workspace, baseEnv(), "diff", "--name-only", "--cached", base)
 	if err != nil {
 		return nil, err
 	}
