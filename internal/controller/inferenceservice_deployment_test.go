@@ -3471,9 +3471,6 @@ var _ = Describe("Security Context Configuration", func() {
 // boolPtr64 is a test helper for creating *int64 inline
 func boolPtr64(v int64) *int64 { return &v }
 
-// int32Ptr is a test helper for creating *int32 inline
-func int32Ptr(v int32) *int32 { return &v }
-
 var _ = Describe("RuntimeBackend interface", func() {
 	Context("LlamaCppBackend", func() {
 		var backend *LlamaCppBackend

@@ -47,6 +47,25 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Pattern=`^(https?|file|pvc|hf)://.*|^/[^\s]+$|^[a-zA-Z0-9][\w\-\.\/]+$`
 	Source string `json:"source"`
 
+	// Prefetch, when true, tells the operator to run a one-shot download Job
+	// for this Model as soon as it is created or updated. The Job uses the
+	// same init-container logic as an InferenceService's model-downloader
+	// sidecar, so the artifact ends up in the same cache PVC that a serving
+	// pod would mount. The operator reflects Job progress in
+	// status.phase (Pending -> Downloading -> Cached/Failed) and in the
+	// standard conditions.
+	//
+	// Prefetch is a no-op for local sources (file://, pvc://, absolute
+	// paths): there is nothing to download, and the Model is marked Cached
+	// immediately on reconcile. It is also a no-op when an InferenceService
+	// already references the Model and its serving pod is running the
+	// download — the operator skips the Job in that case to avoid a
+	// duplicate pull.
+	//
+	// +kubebuilder:default=false
+	// +optional
+	Prefetch bool `json:"prefetch,omitempty"`
+
 	// SHA256 is the expected SHA256 hash of the model file for integrity verification.
 	// When set, the controller verifies the downloaded/copied file matches this hash.
 	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
