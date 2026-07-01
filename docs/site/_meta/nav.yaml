@@ -58,6 +58,9 @@ sections:
       - label: Air-gapped install
         slug: guides/air-gapped
         file: guides/air-gapped.md
+      - label: Metrics-driven autoscaling
+        slug: guides/metrics-driven-autoscaling
+        file: guides/metrics-driven-autoscaling.md
       - label: OpenShift / OKD / MicroShift install
         slug: guides/openshift-install
         file: guides/openshift-install.md
