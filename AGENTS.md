@@ -123,6 +123,39 @@ Use `feat!:` / `fix!:` for breaking changes.
 The two CRDs are **Model** (a model spec) and **InferenceService** (a
 deployment config).
 
+## Runtime-arg parity
+
+Any new `InferenceServiceSpec` field that changes the llama-server command
+line must be wired into **all three** of these places, with a test for each:
+
+1. `LlamaCppBackend.BuildArgs` —
+   `internal/controller/runtime_llamacpp.go` (and the helper in
+   `runtime_llamacpp_args.go`). This is the controller-side arg builder that
+   renders the args for the in-cluster container.
+2. The metal-agent path:
+   `MetalAgent.ensureProcess` → `buildExecutorConfig` (in
+   `pkg/agent/agent.go`) → `MetalExecutor.StartProcess` /
+   `buildLlamaServerArgs` (in `pkg/agent/executor.go`). The metal-agent is
+   the out-of-cluster sibling that runs llama-server natively on Apple
+   Silicon hosts; its flags must match the controller's.
+3. `computeSpecHash` (in `pkg/agent/agent.go`) — any field that changes the
+   command line must also be folded into the spec hash so a change triggers
+   a respawn instead of a no-op.
+
+When adding a new field, mirror the existing `resolveCacheTypes` comment in
+`pkg/agent/agent.go`: add a one-line note in the new arg-builder site
+explaining that it mirrors the other side, and add a single table-driven
+Go test that feeds one representative `InferenceService` spec (with the
+runtime-affecting fields set) through **both** `LlamaCppBackend.BuildArgs`
+and the metal-agent's `buildLlamaServerArgs`, asserting the same flags
+appear on both sides for each field. This is the parity guard — it
+catches drift the moment someone wires a field into one side and forgets
+the other.
+
+Do **not** refactor the two arg builders into one shared function; they
+serve different runtimes and have different defaults. The parity test is
+the contract, not shared code.
+
 ## Do not
 
 - Do not hand-edit generated files (`zz_generated.*`, CRD YAML under `config/`

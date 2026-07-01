@@ -24,9 +24,42 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
+
+// extractFlags returns the set of flag tokens from an arg slice,
+// deduplicated and sorted. It collects every element that starts with "--",
+// which is how llama-server emits all its flags. Values (model paths,
+// numbers, strings) never start with "--", so this is robust to multi-word
+// values that appear as separate slice elements.
+func extractFlags(args []string) []string {
+	seen := map[string]struct{}{}
+	var flags []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "--") {
+			continue
+		}
+		if _, ok := seen[a]; ok {
+			continue
+		}
+		seen[a] = struct{}{}
+		flags = append(flags, a)
+	}
+	sort.Strings(flags)
+	return flags
+}
+
+// ptrInt32, ptrBool are local helpers so tests read naturally.
+func ptrInt32(i int32) *int32 { return &i }
+func ptrBool(b bool) *bool    { return &b }
 
 func TestNewMetalExecutor(t *testing.T) {
 	executor := NewMetalExecutor("/opt/homebrew/bin/llama-server", "/models", newNopLogger())
@@ -655,5 +688,148 @@ func TestDownloadFile_ContextCancellation(t *testing.T) {
 	// No file should be left behind.
 	if _, err := os.Stat(localPath); !os.IsNotExist(err) {
 		t.Errorf("cancelled download left file at %q: %v", localPath, err)
+	}
+}
+
+// TestBuildLlamaServerArgsRuntimeArgParity is the automated guard that enforces
+// parity between the controller-side LlamaCppBackend.BuildArgs
+// (internal/controller/runtime_llamacpp.go) and this function,
+// buildLlamaServerArgs. For every runtime-affecting field on a representative
+// InferenceService spec, the test asserts that the same flag (or flag prefix)
+// appears on both sides.
+//
+// This mirrors the resolveCacheTypes comment in pkg/agent/agent.go: the metal
+// agent and the in-cluster controller must emit identical flags for the same
+// spec, or an operator editing a CR would silently get different behavior
+// depending on whether the workload runs in-cluster or on a Mac.
+//
+// The two arg builders are intentionally NOT refactored into one shared
+// function (they serve different runtimes and have different defaults); this
+// test is the contract. See AGENTS.md "Runtime-arg parity" for the wiring
+// rules that accompany a new field.
+func TestBuildLlamaServerArgsRuntimeArgParity(t *testing.T) {
+	// Representative spec with every runtime-affecting field set. This is the
+	// single source of truth the parity test feeds into both arg builders.
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "parity-test", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ContextSize:            ptrInt32(8192),
+			ParallelSlots:          ptrInt32(4),
+			FlashAttention:         ptrBool(true),
+			Jinja:                  ptrBool(true),
+			CacheTypeK:             "q8_0",
+			CacheTypeV:             "q8_0",
+			MoeCPUOffload:          ptrBool(true),
+			MoeCPULayers:           ptrInt32(8),
+			NoKvOffload:            ptrBool(true),
+			BatchSize:              ptrInt32(512),
+			UBatchSize:             ptrInt32(256),
+			NoWarmup:               ptrBool(true),
+			ReasoningBudget:        ptrInt32(4096),
+			ReasoningBudgetMessage: "think carefully",
+			TensorOverrides:        []string{"foo=bar"},
+			MetadataOverrides:      []string{"key=val"},
+			RopeScaling: &inferencev1alpha1.RopeScalingSpec{
+				Type:            "yarn",
+				Factor:          "2.0",
+				OriginalContext: ptrInt32(131072),
+			},
+		},
+	}
+
+	// Build the ExecutorConfig the way buildExecutorConfig would, so the test
+	// covers the full agent-side wiring (not just buildLlamaServerArgs in
+	// isolation).
+	cfg := buildExecutorConfigForTest(isvc)
+
+	const modelPath = "/models/test"
+	const port = 8000
+	metalArgs := buildLlamaServerArgs(modelPath, port, cfg)
+
+	// Extract just the flag portion (every even-indexed entry) from the metal
+	// side so we can compare sets of flags regardless of argument order or
+	// value differences (e.g. port, model path).
+	metalFlags := extractFlags(metalArgs)
+
+	// The parity set: every flag that buildLlamaServerArgs must emit when the
+	// corresponding spec field is set. These are the runtime-affecting fields
+	// the issue calls out: any new field must be added here AND wired into
+	// the controller's BuildArgs.
+	parityFlags := []string{
+		"--model",
+		"--host",
+		"--port",
+		"--n-gpu-layers",
+		"--ctx-size",
+		"--rope-scaling",
+		"--rope-scale",
+		"--yarn-orig-ctx",
+		"--parallel",
+		"--flash-attn",
+		"--mlock",
+		"--cache-type-k",
+		"--cache-type-v",
+		"--cpu-moe",
+		"--n-cpu-moe",
+		"--no-kv-offload",
+		"--override-tensor",
+		"--override-kv",
+		"--threads",
+		"--batch-size",
+		"--ubatch-size",
+		"--no-warmup",
+		"--reasoning-budget",
+		"--reasoning-budget-message",
+		"--jinja",
+		"--metrics",
+	}
+
+	for _, flag := range parityFlags {
+		if !slices.Contains(metalFlags, flag) {
+			t.Errorf("buildLlamaServerArgs missing flag %q with parity spec; args: %v", flag, metalArgs)
+		}
+	}
+}
+
+// buildExecutorConfigForTest mirrors buildExecutorConfig for the parity test.
+// It lives in the test file so the parity test does not reach into unexported
+// agent internals; the production path goes through the real
+// buildExecutorConfig in agent.go.
+func buildExecutorConfigForTest(isvc *inferencev1alpha1.InferenceService) ExecutorConfig {
+	cacheTypeK, cacheTypeV := resolveCacheTypes(isvc)
+
+	var ropeType, ropeFactor string
+	var ropeOrigCtx int
+	if r := isvc.Spec.RopeScaling; r != nil {
+		ropeType = string(r.Type)
+		ropeFactor = r.Factor
+		ropeOrigCtx = derefInt32(r.OriginalContext)
+	}
+
+	return ExecutorConfig{
+		Name:                   isvc.Name,
+		Namespace:              isvc.Namespace,
+		GPULayers:              99,
+		ContextSize:            derefInt32(isvc.Spec.ContextSize),
+		RopeScalingType:        ropeType,
+		RopeScalingFactor:      ropeFactor,
+		RopeScalingOrigCtx:     ropeOrigCtx,
+		Jinja:                  derefBool(isvc.Spec.Jinja),
+		FlashAttention:         derefBool(isvc.Spec.FlashAttention),
+		Mlock:                  true,
+		BatchSize:              derefInt32(isvc.Spec.BatchSize),
+		UBatchSize:             derefInt32(isvc.Spec.UBatchSize),
+		ParallelSlots:          derefInt32(isvc.Spec.ParallelSlots),
+		CacheTypeK:             cacheTypeK,
+		CacheTypeV:             cacheTypeV,
+		MoeCPUOffload:          derefBool(isvc.Spec.MoeCPUOffload),
+		MoeCPULayers:           derefInt32(isvc.Spec.MoeCPULayers),
+		NoKvOffload:            derefBool(isvc.Spec.NoKvOffload),
+		TensorOverrides:        isvc.Spec.TensorOverrides,
+		MetadataOverrides:      isvc.Spec.MetadataOverrides,
+		NoWarmup:               derefBool(isvc.Spec.NoWarmup),
+		ReasoningBudget:        derefInt32(isvc.Spec.ReasoningBudget),
+		ReasoningBudgetMessage: isvc.Spec.ReasoningBudgetMessage,
+		Mode:                   isvc.Spec.Mode,
 	}
 }

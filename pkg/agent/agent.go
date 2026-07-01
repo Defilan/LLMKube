@@ -1695,6 +1695,12 @@ func localModelSize(path string) (uint64, error) {
 // fields explicitly (rather than hashing the full Spec) keeps the hash stable
 // across CRD additions that don't affect process invocation — adding a new
 // status-only or controller-only field won't trigger a spurious respawn.
+//
+// Runtime-arg parity: this hash must cover every field that buildExecutorConfig
+// feeds into buildLlamaServerArgs. If a new field is added to one side and the
+// other side is updated to match (see the "Runtime-arg parity" subsection in
+// AGENTS.md), it must also be included here — otherwise a spec change would not
+// be detected and the process would keep running with stale flags.
 func computeSpecHash(isvc *inferencev1alpha1.InferenceService) string {
 	if isvc == nil {
 		return ""
