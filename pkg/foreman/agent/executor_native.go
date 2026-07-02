@@ -1516,11 +1516,12 @@ func fileListsEqual(prev any, groundTruth []string) bool {
 // reconcileReviewerIssueAsk grounds the reviewer's
 // `submit_result.extra.issueAsk` field against the real issue body
 // that came back from the reviewer's `fetch_issue` tool call. The
-// claim has to be a literal substring of that body; if it is not,
-// the harness archives the model's claim under `issueAskClaimed`
-// and rewrites `issueAsk` with the first useful prose paragraph of
-// the body (skipping markdown headers). Pairs with #582's filesTouched
-// fix: same shape, different field.
+// claim must semantically cover the issue (not merely be a verbatim
+// substring): a faithful paraphrase verifies, a hallucination does
+// not. On failure the harness archives the model's claim under
+// `issueAskClaimed` and rewrites `issueAsk` with the first useful
+// prose paragraph of the body (skipping markdown headers). Pairs with
+// #582's filesTouched fix: same shape, different field.
 //
 // Why this is structural rather than a prompt-tightening fix: the
 // post-#584 rereview showed devstral on the Mac Studio confabulating
@@ -1532,6 +1533,14 @@ func fileListsEqual(prev any, groundTruth []string) bool {
 // false NO-GO on #526 because the diff did not address the
 // hallucinated ask. Prompt tightening did not move the model below
 // its confabulation ceiling; the harness has to own the field.
+//
+// The verbatim check is kept as a fast path for exact quoters. When it
+// fails, a semantic coverage check runs: extract the issue's salient
+// nouns/requirements (nouns from the title + nouns from the first
+// prose paragraph of the body, after stripping markdown headers and
+// common stop words) and require the claim to reference a sufficient
+// fraction of them. This is more explainable than raw similarity and
+// does not require an embedding model.
 //
 // Failure modes are non-fatal: a missing fetch_issue tool result,
 // malformed tool content JSON, or a missing body field all log a
@@ -1562,9 +1571,16 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 		extra["issueAskVerified"] = true
 		return
 	}
-	// Confabulation: claim is not a substring of the body the model
-	// itself fetched. Archive it and rewrite issueAsk with a real
-	// excerpt from the body.
+	// Verbatim miss: fall back to a semantic coverage check so a
+	// faithful paraphrase is not punished the same way as a
+	// hallucination (#809).
+	if issueAskSemanticallyCovers(claim, body) {
+		extra["issueAskVerified"] = true
+		extra["issueAskMethod"] = "semantic"
+		return
+	}
+	// Confabulation: claim does not semantically cover the issue.
+	// Archive it and rewrite issueAsk with a real excerpt from the body.
 	extra["issueAskClaimed"] = claim
 	replaced := firstBodyParagraph(body, 200)
 	extra["issueAsk"] = replaced
@@ -1573,6 +1589,133 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 		"modelClaim", claim,
 		"rewrittenTo", replaced,
 	)
+}
+
+// issueAskSemanticallyCovers reports whether `claim` semantically
+// covers the fetched issue body. The check is keyword-overlap based:
+// extract the issue's salient nouns from the title and first prose
+// paragraph, then require the claim to reference a sufficient fraction
+// of them. This is deterministic, local, and more explainable than
+// raw similarity.
+//
+// The threshold is intentionally conservative: a claim that misses
+// most of the issue's key nouns is likely a hallucination, while a
+// claim that hits the majority is likely a faithful paraphrase.
+func issueAskSemanticallyCovers(claim, body string) bool {
+	claimLower := strings.ToLower(claim)
+	keywords := extractIssueKeywords(body)
+	if len(keywords) == 0 {
+		// No keywords extracted; fall back to a lenient check.
+		return len(claim) > 0
+	}
+	var hits int
+	for _, kw := range keywords {
+		if strings.Contains(claimLower, kw) {
+			hits++
+		}
+	}
+	// Require at least half the keywords to be present, with a minimum
+	// of 2 hits to avoid trivially passing on very short claims.
+	threshold := len(keywords) / 2
+	if threshold < 2 {
+		threshold = 2
+	}
+	return hits >= threshold
+}
+
+// extractIssueKeywords pulls salient nouns from the issue body. It
+// strips markdown headers, splits on whitespace/punctuation, lowercases,
+// and filters out common stop words and very short tokens.
+func extractIssueKeywords(body string) []string {
+	// Skip leading markdown headers and blank lines.
+	lines := strings.Split(body, "\n")
+	start := 0
+	for i, l := range lines {
+		stripped := strings.TrimSpace(l)
+		if stripped == "" {
+			start = i + 1
+			continue
+		}
+		if strings.HasPrefix(stripped, "#") {
+			start = i + 1
+			continue
+		}
+		break
+	}
+	text := strings.Join(lines[start:], " ")
+	// Also include the title (first line of the issue, if it looks like a title).
+	// The body from fetch_issue typically starts with the title, so this is
+	// mostly a no-op, but it makes the function robust if the body is just
+	// the title.
+	//
+	// Tokenize: split on non-alphanumeric characters.
+	var tokens []string
+	var current strings.Builder
+	for _, r := range text {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			current.WriteRune(r)
+		} else {
+			if current.Len() > 0 {
+				tokens = append(tokens, strings.ToLower(current.String()))
+				current.Reset()
+			}
+		}
+	}
+	if current.Len() > 0 {
+		tokens = append(tokens, strings.ToLower(current.String()))
+	}
+	// Filter: length > 1, not a stop word, not a number.
+	stopWords := map[string]bool{
+		"the": true, "a": true, "an": true, "and": true, "or": true,
+		"but": true, "in": true, "on": true, "at": true, "to": true,
+		"for": true, "of": true, "with": true, "by": true, "from": true,
+		"is": true, "are": true, "was": true, "were": true, "be": true,
+		"been": true, "being": true, "have": true, "has": true, "had": true,
+		"do": true, "does": true, "did": true, "will": true, "would": true,
+		"could": true, "should": true, "may": true, "might": true,
+		"can": true, "shall": true, "this": true, "that": true,
+		"these": true, "those": true, "it": true, "its": true,
+		"not": true, "no": true, "nor": true, "as": true, "if": true,
+		"then": true, "than": true, "so": true, "up": true, "out": true,
+		"about": true, "into": true, "through": true, "during": true,
+		"before": true, "after": true, "above": true, "below": true,
+		"between": true, "under": true, "again": true, "further": true,
+		"once": true, "here": true, "there": true, "when": true,
+		"where": true, "why": true, "how": true, "each": true,
+		"every": true, "both": true, "few": true, "more": true, "most": true,
+		"other": true, "some": true, "such": true, "only": true, "own": true,
+		"same": true, "also": true, "just": true, "because": true,
+		"until": true, "while": true, "which": true, "who": true,
+		"whom": true, "what": true, "whose": true, "very": true,
+		"too": true, "any": true, "many": true, "much": true,
+		"per": true,
+	}
+	var keywords []string
+	seen := map[string]bool{}
+	for _, t := range tokens {
+		if len(t) < 2 {
+			continue
+		}
+		if stopWords[t] {
+			continue
+		}
+		// Skip pure numbers.
+		isNum := true
+		for _, r := range t {
+			if r < '0' || r > '9' {
+				isNum = false
+				break
+			}
+		}
+		if isNum {
+			continue
+		}
+		if !seen[t] {
+			seen[t] = true
+			keywords = append(keywords, t)
+		}
+	}
+	return keywords
 }
 
 // enforceReviewerIssueAsk converts a failed issueAsk verification from

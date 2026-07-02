@@ -1322,6 +1322,128 @@ func TestReconcileReviewerIssueAsk_NilExtraIsNoOp(t *testing.T) {
 	reconcileReviewerIssueAsk(logr.Discard(), nil, nil) // must not panic
 }
 
+// TestReconcileReviewerIssueAsk_ParaphraseVerified covers #809: a
+// faithful paraphrase of the issue should verify via semantic coverage,
+// not verbatim substring match.
+func TestReconcileReviewerIssueAsk_ParaphraseVerified(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+
+	// Faithful paraphrase: mentions the key nouns (lint, AGENTS, #508)
+	// but is not a verbatim substring of the body.
+	paraphrase := "Add a lint-all check to AGENTS.md, following up on #508."
+	extra := map[string]any{"issueAsk": paraphrase}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"] != paraphrase {
+		t.Errorf("paraphrase should be preserved unchanged; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); !v {
+		t.Errorf("paraphrase should set issueAskVerified=true; got %v", extra["issueAskVerified"])
+	}
+	if extra["issueAskMethod"] != "semantic" {
+		t.Errorf("semantic verification should set issueAskMethod=semantic; got %v", extra["issueAskMethod"])
+	}
+	if _, claimed := extra["issueAskClaimed"]; claimed {
+		t.Errorf("issueAskClaimed should not be set for faithful paraphrase")
+	}
+}
+
+// TestReconcileReviewerIssueAsk_HallucinationNotVerified covers #809:
+// a hallucinated claim that does not semantically cover the issue
+// should still be rewritten.
+func TestReconcileReviewerIssueAsk_HallucinationNotVerified(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+
+	// Hallucination: completely unrelated to the issue.
+	hallucination := "Add a cluster-wide default LiteLLM URL to the controller config."
+	extra := map[string]any{"issueAsk": hallucination}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if extra["issueAsk"] == hallucination {
+		t.Errorf("hallucination should be rewritten; got %v", extra["issueAsk"])
+	}
+	if v, _ := extra["issueAskVerified"].(bool); v {
+		t.Errorf("hallucination should set issueAskVerified=false; got true")
+	}
+	if extra["issueAskClaimed"] != hallucination {
+		t.Errorf("issueAskClaimed should preserve original hallucination; got %v", extra["issueAskClaimed"])
+	}
+}
+
+// TestExtractIssueKeywords_CoversSalientNouns covers the keyword extraction
+// logic used by the semantic coverage check.
+func TestExtractIssueKeywords_CoversSalientNouns(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up.\n\nThis ensures all contributors run the full lint pass before pushing."
+	keywords := extractIssueKeywords(body)
+	// Should include: add, make, lint, nudge, agents, md, follow, ensures, contributors, run, full, pass, pushing
+	// Common stop words like "a", "to", "per" should be filtered out.
+	keywordSet := map[string]bool{}
+	for _, kw := range keywords {
+		keywordSet[kw] = true
+	}
+	// Key nouns should be present.
+	expected := []string{"make", "lint", "nudge", "agents", "md", "ensures", "contributors", "run", "full", "pass", "pushing"}
+	for _, exp := range expected {
+		if !keywordSet[exp] {
+			t.Errorf("keyword %q not found in extracted keywords: %v", exp, keywords)
+		}
+	}
+	// Stop words should be filtered out.
+	stopWords := []string{"a", "to", "per", "the", "and", "or", "before"}
+	for _, sw := range stopWords {
+		if keywordSet[sw] {
+			t.Errorf("stop word %q should not be in keywords: %v", sw, keywords)
+		}
+	}
+}
+
+// TestIssueAskSemanticallyCovers_DirectExercisesNewFunction covers the
+// new issueAskSemanticallyCovers function directly, ensuring it verifies
+// faithful paraphrases and rejects hallucinations.
+func TestIssueAskSemanticallyCovers_DirectExercisesNewFunction(t *testing.T) {
+	body := "## Feature Description\n\nAdd a `make lint-all` nudge to AGENTS.md per #508 follow-up."
+
+	// Faithful paraphrase: mentions key nouns (lint, agents, md, follow)
+	// but is not a verbatim substring.
+	paraphrase := "Add a lint-all check to AGENTS.md, following up on #508."
+	if !issueAskSemanticallyCovers(paraphrase, body) {
+		t.Errorf("faithful paraphrase should semantically cover the issue")
+	}
+
+	// Hallucination: completely unrelated.
+	hallucination := "Add a cluster-wide default LiteLLM URL to the controller config."
+	if issueAskSemanticallyCovers(hallucination, body) {
+		t.Errorf("hallucination should not semantically cover the issue")
+	}
+
+	// Empty claim: should not cover.
+	if issueAskSemanticallyCovers("", body) {
+		t.Errorf("empty claim should not semantically cover the issue")
+	}
+
+	// Body with no keywords (only headers): should pass leniently.
+	headerOnly := "## Feature Description\n## Steps\n## Expected"
+	if !issueAskSemanticallyCovers("anything", headerOnly) {
+		t.Errorf("claim should pass when body has no extractable keywords")
+	}
+}
+
 func TestEnforceReviewerIssueAsk_VerifiedGoStands(t *testing.T) {
 	extra := map[string]any{"issueAskVerified": true}
 	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, false, nil)
