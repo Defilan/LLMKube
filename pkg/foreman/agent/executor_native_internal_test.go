@@ -1322,6 +1322,119 @@ func TestReconcileReviewerIssueAsk_NilExtraIsNoOp(t *testing.T) {
 	reconcileReviewerIssueAsk(logr.Discard(), nil, nil) // must not panic
 }
 
+func TestReconcileReviewerIssueAsk_ParaphrasePassesSemanticCheck(t *testing.T) {
+	// Regression for #809: a faithful paraphrase of the issue scope
+	// must pass verification, not be demoted to NO-GO like a
+	// confabulation.
+	body := "## Feature\n\nUpdate the toolchain image to v2 in the agent-builder Dockerfile so the\nnew golangci-lint binary is available to the foreman-agent executor."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+	// Faithful paraphrase: references the same nouns but is not a verbatim substring.
+	claim := "Update the toolchain image to v2"
+	extra := map[string]any{"issueAsk": claim}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+	if !extra["issueAskVerified"].(bool) {
+		t.Errorf("paraphrased claim covering issue scope should pass semantic check; got verified=%v, coverage=%v",
+			extra["issueAskVerified"], extra["issueAskCoverage"])
+	}
+	if extra["issueAskClaimed"] != nil {
+		t.Errorf("paraphrased claim should not be archived under issueAskClaimed; got %v", extra["issueAskClaimed"])
+	}
+}
+
+func TestReconcileReviewerIssueAsk_UnrelatedClaimFailsSemanticCheck(t *testing.T) {
+	// The same issue body; a claim about an unrelated topic should fail.
+	body := "## Feature\n\nUpdate the toolchain image to v2 in the agent-builder Dockerfile so the\nnew golangci-lint binary is available to the foreman-agent executor."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+	// Unrelated claim (mirrors Run 1 in #797): "enhance `llmkube cache list`..."
+	claim := "enhance `llmkube cache list` with a new --format flag"
+	extra := map[string]any{"issueAsk": claim}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+	if extra["issueAskVerified"].(bool) {
+		t.Errorf("unrelated claim should fail semantic check; got verified=%v, coverage=%v",
+			extra["issueAskVerified"], extra["issueAskCoverage"])
+	}
+	if extra["issueAskClaimed"] != claim {
+		t.Errorf("failed claim should be archived under issueAskClaimed; got %v", extra["issueAskClaimed"])
+	}
+}
+
+func TestSemanticCoverage(t *testing.T) {
+	keywords := map[string]bool{
+		"toolchain": true, "image": true, "update": true,
+		"dockerfile": true, "golangci": true, "lint": true, "binary": true,
+	}
+	tests := []struct {
+		name     string
+		claim    string
+		expected float64
+	}{
+		{"full coverage", "Update the toolchain image in the Dockerfile", 0.5714285714285714},
+		{"no coverage", "Add a new CLI flag for cache listing", 0.0},
+		{"partial coverage", "Update the toolchain image", 0.42857142857142855},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := semanticCoverage(tc.claim, keywords)
+			if got != tc.expected {
+				t.Errorf("semanticCoverage(%q) = %v, want %v", tc.claim, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestExtractSalientKeywords(t *testing.T) {
+	text := "Update the toolchain image in the Dockerfile so the new golangci-lint binary is available."
+	got := extractSalientKeywords(text)
+	want := map[string]bool{
+		"update": true, "toolchain": true, "image": true,
+		"dockerfile": true, "golangci": true, "lint": true, "binary": true,
+		"available": true, "new": true,
+	}
+	if len(got) != len(want) {
+		t.Errorf("extractSalientKeywords() = %v, want %v", got, want)
+	}
+	for k := range want {
+		if !got[k] {
+			t.Errorf("missing keyword %q", k)
+		}
+	}
+}
+
+func TestExtractIssueTitle(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		expected string
+	}{
+		{"h1 heading", "## Bug Description\n\nmetal-agent picks the wrong IP.", "Bug Description"},
+		{"h2 heading", "# Feature\n\nUpdate the toolchain.", "Feature"},
+		{"no heading", "Just a paragraph with no header.", ""},
+		{"blank lines before heading", "\n\n## Title\n\nBody.", "Title"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractIssueTitle(tc.body)
+			if got != tc.expected {
+				t.Errorf("extractIssueTitle(%q) = %q, want %q", tc.body, got, tc.expected)
+			}
+		})
+	}
+}
+
 func TestEnforceReviewerIssueAsk_VerifiedGoStands(t *testing.T) {
 	extra := map[string]any{"issueAskVerified": true}
 	got := enforceReviewerIssueAsk(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, false, nil)
