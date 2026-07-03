@@ -357,6 +357,13 @@ func anchorContext(content, oldString string) (string, bool) {
 		}
 	}
 	if anchorIdx < 0 {
+		// No verbatim-unique anchor exists (large file with paraphrased lines).
+		// Fall back to the closest line by bounded Levenshtein distance against
+		// the most distinctive old_string line, so the model always gets some
+		// real file content to re-anchor on instead of a bare count error.
+		if fallback, ok := anchorContextFallback(contentLines, oldString); ok {
+			return fallback, true
+		}
 		return "", false
 	}
 	span := strings.Count(oldString, "\n") + 1
@@ -369,4 +376,78 @@ func anchorContext(content, oldString string) (string, bool) {
 		hi = len(contentLines)
 	}
 	return strings.Join(contentLines[lo:hi], "\n"), true
+}
+
+// anchorContextFallback is the best-effort locator used when anchorContext
+// finds no verbatim-unique anchor line. It picks the longest non-trivial
+// old_string line as the "most distinctive" probe, scores every content line
+// against it with boundedLevenshtein, and returns the surrounding real lines
+// of the single lowest-distance hit. Returns ok=false when no candidate is
+// within the distance budget or when the best hit is ambiguous.
+//
+// This is feedback only — never an auto-apply. The unique-window rule for
+// automatic edits stays as is.
+func anchorContextFallback(contentLines []string, oldString string) (string, bool) {
+	probe := pickDistinctiveProbe(oldString)
+	if probe == "" {
+		return "", false
+	}
+	const fallbackBudget = 50 // generous; we only need the closest match, not a tight bound
+	bestIdx, bestDist := -1, fallbackBudget+1
+	for i, cl := range contentLines {
+		d := boundedLevenshtein(cl, probe, fallbackBudget)
+		if d < bestDist {
+			bestDist = d
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 || bestDist > fallbackBudget {
+		return "", false
+	}
+	// Verify the best match is meaningfully better than the second-best.
+	// For feedback purposes we want a clear winner, not a tie among many
+	// equally-distant lines (which would confuse the model).
+	secondBest := fallbackBudget + 1
+	for i, cl := range contentLines {
+		if i == bestIdx {
+			continue
+		}
+		d := boundedLevenshtein(cl, probe, fallbackBudget)
+		if d < secondBest {
+			secondBest = d
+		}
+	}
+	if secondBest-bestDist <= 1 {
+		// Too ambiguous: the best match is within 1 edit of another line.
+		return "", false
+	}
+	span := strings.Count(oldString, "\n") + 1
+	lo := bestIdx - 2
+	if lo < 0 {
+		lo = 0
+	}
+	hi := bestIdx + span + 2
+	if hi > len(contentLines) {
+		hi = len(contentLines)
+	}
+	return fmt.Sprintf(
+		"approximate anchor (no verbatim-unique line; closest match at line %d, distance %d):\n%s",
+		bestIdx+1, bestDist, strings.Join(contentLines[lo:hi], "\n")), true
+}
+
+// pickDistinctiveProbe returns the longest non-trivial line of oldString,
+// suitable as a Levenshtein probe. Trivial lines (short, all-whitespace) are
+// skipped because they produce noisy distance scores across the file.
+func pickDistinctiveProbe(oldString string) string {
+	best := ""
+	for _, l := range strings.Split(oldString, "\n") {
+		trimmed := strings.TrimSpace(l)
+		if len(trimmed) < 8 {
+			continue
+		}
+		if len(trimmed) > len(best) {
+			best = trimmed
+		}
+	}
+	return best
 }

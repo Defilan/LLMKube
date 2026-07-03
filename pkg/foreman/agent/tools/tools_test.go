@@ -510,6 +510,121 @@ func TestStrReplace_ReturnsActualContentOnFabricatedOldString(t *testing.T) {
 	}
 }
 
+func TestStrReplace_NoAnchorFallbackUsesLevenshteinLocator(t *testing.T) {
+	ws := makeWorkspace(t)
+	// Build a ~50-line file where no line is verbatim-unique against the
+	// model's paraphrased old_string. Every line is a plausible "return"
+	// statement, so anchorContext's verbatim-unique scan finds nothing.
+	var b strings.Builder
+	for i := 1; i <= 50; i++ {
+		if i == 25 {
+			b.WriteString("\t// actual target: compute the running total\n")
+			b.WriteString("\ttotal += items[i]\n")
+		} else {
+			b.WriteString(fmt.Sprintf("\ttotal += items[%d]\n", i))
+		}
+	}
+	src := b.String()
+	if err := os.WriteFile(filepath.Join(ws, "f.go"), []byte(src), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	tool := &StrReplaceTool{Workspace: ws}
+	// Model drifts the target block: changes "items" to "vals" and
+	// paraphrases the comment slightly. The drifted line is close enough
+	// to a real line that boundedLevenshtein can find it, but the drift is
+	// beyond the fuzzy per-line budget (items→vals is 5 edits on an 8-char
+	// word, budget is int(0.25*8)=2), so fuzzy rejects it. No trimmed line
+	// is verbatim-unique, so anchorContext returns false and the fallback
+	// Levenshtein locator must kick in.
+	old := "\t// drifted comment: sum up the running total\n\ttotal += vals[i]"
+	args := map[string]string{"path": "f.go", "old_string": old, "new_string": "x"}
+	buf, _ := json.Marshal(args)
+	_, err := tool.Execute(context.Background(), buf)
+	if err == nil {
+		t.Fatal("expected error for paraphrased old_string")
+	}
+	msg := err.Error()
+	// The fallback must surface real file content (not just a count error).
+	if !strings.Contains(msg, "approximate anchor") {
+		t.Errorf("expected approximate-anchor fallback label, got: %v", err)
+	}
+	if !strings.Contains(msg, "actual target: compute the running total") {
+		t.Errorf("fallback should surface the real line near the closest match, got: %v", err)
+	}
+	if !strings.Contains(msg, "distance") {
+		t.Errorf("fallback should report the edit distance, got: %v", err)
+	}
+}
+
+// TestAnchorContextFallback_DirectUnit tests anchorContextFallback in
+// isolation: a clear winner exists, the probe is the longest non-trivial
+// line, and the surrounding context is returned with the approximate-anchor
+// label.
+func TestAnchorContextFallback_DirectUnit(t *testing.T) {
+	lines := []string{
+		"line 1",
+		"line 2",
+		"line 3",
+		"// close to the probe but with one typo",
+		"line 5",
+		"line 6",
+	}
+	oldString := "// close to the probe but with one typo\n\tsome code"
+	got, ok := anchorContextFallback(lines, oldString)
+	if !ok {
+		t.Fatalf("expected fallback to succeed")
+	}
+	if !strings.Contains(got, "approximate anchor") {
+		t.Errorf("expected approximate-anchor label, got: %s", got)
+	}
+	if !strings.Contains(got, "distance") {
+		t.Errorf("expected distance in output, got: %s", got)
+	}
+	if !strings.Contains(got, "close to the probe but with one typo") {
+		t.Errorf("expected the matching line to be surfaced, got: %s", got)
+	}
+}
+
+// TestAnchorContextFallback_AmbiguousReturnsFalse verifies that when many
+// lines tie for the best distance, the fallback refuses to guess and
+// returns ok=false.
+func TestAnchorContextFallback_AmbiguousReturnsFalse(t *testing.T) {
+	// Five identical lines: any of them could be the "best" match.
+	lines := []string{
+		"identical line A",
+		"identical line B",
+		"identical line C",
+		"identical line D",
+		"identical line E",
+	}
+	oldString := "identical line Z" // one char off from all of them
+	_, ok := anchorContextFallback(lines, oldString)
+	if ok {
+		t.Errorf("expected fallback to return false for ambiguous input")
+	}
+}
+
+// TestPickDistinctiveProbe_DirectUnit verifies pickDistinctiveProbe skips
+// trivial lines and returns the longest non-trivial one.
+func TestPickDistinctiveProbe_DirectUnit(t *testing.T) {
+	oldString := "}\nreturn\n    // this is the longest meaningful line\n\tx = 1"
+	got := pickDistinctiveProbe(oldString)
+	if got != "// this is the longest meaningful line" {
+		t.Errorf("pickDistinctiveProbe: got %q, want %q", got, "// this is the longest meaningful line")
+	}
+}
+
+// TestPickDistinctiveProbe_AllTrivialReturnsEmpty verifies that when every
+// line is trivial (short or all-whitespace), the probe is empty and the
+// caller should skip the fallback.
+func TestPickDistinctiveProbe_AllTrivialReturnsEmpty(t *testing.T) {
+	oldString := "}\nreturn\nx\n"
+	got := pickDistinctiveProbe(oldString)
+	if got != "" {
+		t.Errorf("pickDistinctiveProbe: got %q, want empty", got)
+	}
+}
+
 func TestStrReplace_CountMismatchIsError(t *testing.T) {
 	ws := makeWorkspace(t)
 	src := "x x x\n"
