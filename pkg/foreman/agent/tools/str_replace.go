@@ -139,6 +139,14 @@ func (t *StrReplaceTool) Execute(_ context.Context, args json.RawMessage) (*agen
 					"The file's actual current text near your edit is below - copy it "+
 					"VERBATIM into old_string and retry:\n%s%s", a.Path, actual, writeFileHint(content))
 			}
+			// No unique anchor existed; fall back to a best-effort locator so
+			// the model always gets some real file content to re-anchor on
+			// instead of the bare count error (#944).
+			if hint := bestEffortAnchor(content, a.OldString); hint != "" {
+				return nil, fmt.Errorf("str_replace: old_string not found in %q. "+
+					"No unique anchor line exists; the closest approximate match is below - "+
+					"copy the actual bytes and retry:\n%s%s", a.Path, hint, writeFileHint(content))
+			}
 		}
 		return nil, fmt.Errorf("str_replace: old_string found %d times in %q, want %d%s",
 			occurrences, a.Path, want, writeFileHint(content))
@@ -369,4 +377,58 @@ func anchorContext(content, oldString string) (string, bool) {
 		hi = len(contentLines)
 	}
 	return strings.Join(contentLines[lo:hi], "\n"), true
+}
+
+// bestEffortAnchor scores every file line against the most distinctive
+// old_string line with boundedLevenshtein and returns the surrounding real
+// lines of the single lowest-distance hit, labeled as approximate. This is a
+// fallback for when anchorContext finds no unique anchor (the dead end
+// described in #944): the model gets some real file content to re-anchor on
+// instead of the bare count error.
+func bestEffortAnchor(content, oldString string) string {
+	contentLines := strings.Split(content, "\n")
+	if len(contentLines) == 0 || (len(contentLines) == 1 && contentLines[0] == "") {
+		return ""
+	}
+	// Pick the most distinctive old_string line (longest trimmed line >= 8
+	// chars) to score against.
+	var bestOL string
+	for _, ol := range strings.Split(oldString, "\n") {
+		trimmed := strings.TrimSpace(ol)
+		if len(trimmed) < 8 {
+			continue
+		}
+		if len(trimmed) > len(bestOL) {
+			bestOL = trimmed
+		}
+	}
+	if bestOL == "" {
+		return ""
+	}
+	// Score every content line against the best old_string line.
+	bestDist, bestIdx := -1, -1
+	for i, cl := range contentLines {
+		d := boundedLevenshtein(strings.TrimSpace(cl), bestOL, len(bestOL))
+		if bestDist < 0 || d < bestDist {
+			bestDist = d
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 {
+		return ""
+	}
+	// Return a window around the closest match.
+	span := strings.Count(oldString, "\n") + 1
+	lo := bestIdx - 2
+	if lo < 0 {
+		lo = 0
+	}
+	hi := bestIdx + span + 2
+	if hi > len(contentLines) {
+		hi = len(contentLines)
+	}
+	// Label the snippet as approximate so the model knows it is not a
+	// verbatim match.
+	return fmt.Sprintf("approximate match at line %d (distance %d):\n%s",
+		bestIdx+1, bestDist, strings.Join(contentLines[lo:hi], "\n"))
 }

@@ -324,3 +324,64 @@ func TestStrReplace_NonexistentFileSteersToWriteFile(t *testing.T) {
 		t.Errorf("expected existence + write_file steering in the error, got: %v", err)
 	}
 }
+
+// Regression for #944: when the recovery ladder exhausts with zero matches
+// AND no unique anchor line exists (every distinctive old_string line appears
+// 0 or 2+ times), the model must still receive some real file content to
+// re-anchor on instead of the bare count error.
+func TestStrReplace_BestEffortAnchorWhenNoUniqueAnchor(t *testing.T) {
+	ws := makeWorkspace(t)
+	// Two identical blocks so no line is unique; the model's drifted
+	// old_string won't match exactly anywhere.
+	src := "func alpha() int {\n\treturn count\n}\n\nfunc beta() int {\n\treturn count\n}\n"
+	seedFile(t, ws, "f.go", src)
+	// Drifted old_string: "return cnt" (distance 1 from "return count")
+	// Neither "return count" line is unique (appears twice), so anchorContext
+	// returns ok=false. The best-effort fallback must surface the closest match.
+	err := execStrReplace(t, ws, "f.go", "\treturn cnt", "\treturn total")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "approximate match") {
+		t.Errorf("expected best-effort anchor hint, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "distance") {
+		t.Errorf("expected distance in the hint, got: %v", err)
+	}
+	// File must be unchanged.
+	if got := readBack(t, ws, "f.go"); got != src {
+		t.Errorf("file must be unchanged, got %q", got)
+	}
+}
+
+// bestEffortAnchor returns empty string when there is no old_string line
+// long enough to score against (all lines are trivial).
+func TestBestEffortAnchor_NoDistinctiveLine(t *testing.T) {
+	hint := bestEffortAnchor("x\ny\nz", "a\nb\nc")
+	if hint != "" {
+		t.Errorf("expected empty hint for trivial old_string, got %q", hint)
+	}
+}
+
+// bestEffortAnchor returns empty string for an empty file.
+func TestBestEffortAnchor_EmptyFile(t *testing.T) {
+	hint := bestEffortAnchor("", "some line")
+	if hint != "" {
+		t.Errorf("expected empty hint for empty file, got %q", hint)
+	}
+}
+
+// bestEffortAnchor returns the closest match with its distance.
+func TestBestEffortAnchor_ReturnsClosestMatch(t *testing.T) {
+	content := "func compute() int {\n\treturn userCount\n}\n"
+	hint := bestEffortAnchor(content, "\treturn usrCount")
+	if !strings.Contains(hint, "approximate match") {
+		t.Errorf("expected approximate match label, got %q", hint)
+	}
+	if !strings.Contains(hint, "distance") {
+		t.Errorf("expected distance in hint, got %q", hint)
+	}
+	if !strings.Contains(hint, "return userCount") {
+		t.Errorf("expected closest match text in hint, got %q", hint)
+	}
+}
