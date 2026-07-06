@@ -22,9 +22,24 @@ import (
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
+func TestPtrBool(t *testing.T) {
+	v := ptrBool(true)
+	if v == nil || *v != true {
+		t.Fatalf("ptrBool(true) = %v, want true", v)
+	}
+	v2 := ptrBool(false)
+	if v2 == nil || *v2 != false {
+		t.Fatalf("ptrBool(false) = %v, want false", v2)
+	}
+}
+
 func TestWriteRecordCreatesDurableConfigMap(t *testing.T) {
 	c := fake.NewClientBuilder().Build()
-	rec := Record{SchemaVersion: SchemaVersion, Task: TaskRef{Name: "coder-89", Namespace: "default"}, Verdict: "GO"}
+	rec := Record{
+		SchemaVersion: SchemaVersion,
+		Task:          TaskRef{Name: "coder-89", Namespace: "default", UID: "abc-123"},
+		Verdict:       "GO",
+	}
 
 	if err := WriteRecord(context.Background(), c, "default", rec, logr.Discard()); err != nil {
 		t.Fatalf("WriteRecord: %v", err)
@@ -35,8 +50,17 @@ func TestWriteRecordCreatesDurableConfigMap(t *testing.T) {
 	if err := c.Get(context.Background(), key, &cm); err != nil {
 		t.Fatalf("audit ConfigMap not created: %v", err)
 	}
-	if len(cm.OwnerReferences) != 0 {
-		t.Errorf("audit ConfigMap MUST NOT be owner-ref'd (must survive task GC), got %d refs", len(cm.OwnerReferences))
+	if len(cm.OwnerReferences) != 1 {
+		t.Fatalf("audit ConfigMap must have exactly 1 owner ref, got %d", len(cm.OwnerReferences))
+	}
+	if cm.OwnerReferences[0].Kind != "AgenticTask" || cm.OwnerReferences[0].Name != "coder-89" {
+		t.Errorf("owner ref wrong: %+v", cm.OwnerReferences[0])
+	}
+	if cm.OwnerReferences[0].UID != "abc-123" {
+		t.Errorf("owner ref UID wrong: %q", cm.OwnerReferences[0].UID)
+	}
+	if cm.OwnerReferences[0].BlockOwnerDeletion == nil || !*cm.OwnerReferences[0].BlockOwnerDeletion {
+		t.Errorf("BlockOwnerDeletion must be true")
 	}
 	if cm.Labels[AuditLabel] != "true" || cm.Labels[AuditTaskLabel] != "coder-89" {
 		t.Errorf("labels wrong: %v", cm.Labels)

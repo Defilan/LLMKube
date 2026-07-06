@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
@@ -40,11 +41,14 @@ const (
 // AuditConfigMapName returns the ConfigMap name for a task's audit record.
 func AuditConfigMapName(taskName string) string { return auditNamePrefix + taskName }
 
-// WriteRecord upserts a durable, NON-owner-ref'd ConfigMap holding rec, plus
-// emits the record as a single structured log line. The absence of an owner
-// reference is deliberate: the record must outlive the AgenticTask so it
-// remains a compliance trail after task garbage-collection. namespace is the
-// audit namespace (caller passes the task namespace when unset upstream).
+// ptrBool returns a pointer to a bool value.
+func ptrBool(v bool) *bool { return &v }
+
+// WriteRecord upserts a durable ConfigMap holding rec, plus emits the record
+// as a single structured log line. The ConfigMap is owner-ref'd to the
+// AgenticTask so it is garbage-collected when the task is deleted, preventing
+// unbounded accumulation. namespace is the audit namespace (caller passes the
+// task namespace when unset upstream).
 func WriteRecord(ctx context.Context, c client.Client, namespace string, rec Record, log logr.Logger) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
@@ -59,7 +63,15 @@ func WriteRecord(ctx context.Context, c client.Client, namespace string, rec Rec
 				AuditTaskLabel:              rec.Task.Name,
 				"app.kubernetes.io/part-of": "foreman",
 			},
-			// No OwnerReferences: survives task GC by design.
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         "foreman.llmkube.dev/v1alpha1",
+					Kind:               "AgenticTask",
+					Name:               rec.Task.Name,
+					UID:                types.UID(rec.Task.UID),
+					BlockOwnerDeletion: ptrBool(true),
+				},
+			},
 		},
 		Data: map[string]string{auditDataKey: string(data)},
 	}
