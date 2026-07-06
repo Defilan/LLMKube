@@ -923,12 +923,68 @@ func TestSubmitResult_SummaryRequired(t *testing.T) {
 	}
 }
 
-func TestSubmitResult_SummaryTooLong(t *testing.T) {
+func TestSubmitResult_SummaryTooLong_Truncates(t *testing.T) {
 	tool := SubmitResultTool{}
-	long := strings.Repeat("x", MaxSubmitSummaryLen+1)
+	long := strings.Repeat("x", MaxSubmitSummaryLen+50)
 	body, _ := json.Marshal(map[string]any{"verdict": "GO", "summary": long})
-	_, err := tool.Execute(context.Background(), body)
-	if err == nil || !strings.Contains(err.Error(), "chars or fewer") {
-		t.Errorf("expected summary-too-long error, got %v", err)
+	res, err := tool.Execute(context.Background(), body)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Verdict != "GO" {
+		t.Errorf("verdict: got %q, want GO", res.Verdict)
+	}
+	if len(res.Summary) > MaxSubmitSummaryLen {
+		t.Errorf("summary len %d exceeds cap %d", len(res.Summary), MaxSubmitSummaryLen)
+	}
+	if !strings.HasSuffix(res.Summary, "…") {
+		t.Errorf("summary should end with ellipsis; got %q…", res.Summary[len(res.Summary)-10:])
+	}
+}
+
+func TestSubmitResult_SummaryLongWithTrailingMultibyte(t *testing.T) {
+	// Summary that overflows mid-rune: the clamp must not split a
+	// multi-byte rune. The result must still end with the ellipsis.
+	tool := SubmitResultTool{}
+	// 279 ASCII chars + a 3-byte UTF-8 rune (U+1F600) = 282 bytes.
+	// Adding one more ASCII char pushes it over the cap.
+	summary := strings.Repeat("a", 279) + "😀" + "b"
+	body, _ := json.Marshal(map[string]any{"verdict": "GO", "summary": summary})
+	res, err := tool.Execute(context.Background(), body)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Verdict != "GO" {
+		t.Errorf("verdict: got %q, want GO", res.Verdict)
+	}
+	if len(res.Summary) > MaxSubmitSummaryLen {
+		t.Errorf("summary len %d exceeds cap %d", len(res.Summary), MaxSubmitSummaryLen)
+	}
+	if !strings.HasSuffix(res.Summary, "…") {
+		t.Errorf("summary should end with ellipsis")
+	}
+}
+
+func TestRuneSafeTruncate(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{"short", "hi", 10, "hi"},
+		{"exact", "abcdef", 6, "abcdef"},
+		{"truncate_ascii", "abcdefgh", 6, "abc…"},
+		{"truncate_multibyte", "日本語テスト", 5, "…"},
+		{"truncate_multibyte_larger", "日本語テスト", 7, "日…"},
+		{"emoji_boundary", "ab😀cd", 4, "a…"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runeSafeTruncate(tc.in, tc.n)
+			if got != tc.want {
+				t.Errorf("runeSafeTruncate(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+			}
+		})
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/defilantech/llmkube/pkg/foreman/agent"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
@@ -84,8 +85,7 @@ func (SubmitResultTool) Execute(_ context.Context, args json.RawMessage) (*agent
 		return nil, fmt.Errorf("submit_result: summary is required")
 	}
 	if len(a.Summary) > MaxSubmitSummaryLen {
-		return nil, fmt.Errorf("submit_result: summary must be %d chars or fewer (got %d)",
-			MaxSubmitSummaryLen, len(a.Summary))
+		a.Summary = runeSafeTruncate(a.Summary, MaxSubmitSummaryLen)
 	}
 	return &agent.ToolResult{
 		Terminal:      true,
@@ -98,4 +98,27 @@ func (SubmitResultTool) Execute(_ context.Context, args json.RawMessage) (*agent
 			"verdict":  a.Verdict,
 		},
 	}, nil
+}
+
+// runeSafeTruncate returns the first `n` bytes of s followed by an
+// ellipsis, without splitting a multi-byte rune. The returned string
+// is at most n bytes long (the ellipsis replaces trailing bytes if
+// truncation would exceed the cap).
+func runeSafeTruncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	ell := "…"
+	// Reserve room for the ellipsis.
+	avail := n - len(ell)
+	if avail <= 0 {
+		return ell
+	}
+	trunc := s[:avail]
+	// Back up if we landed inside a multi-byte rune so we don't
+	// produce invalid UTF-8.
+	for len(trunc) > 0 && !utf8.ValidString(trunc) {
+		trunc = trunc[:len(trunc)-1]
+	}
+	return trunc + ell
 }
