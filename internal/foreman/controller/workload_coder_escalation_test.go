@@ -51,6 +51,7 @@ func TestShouldEscalateCoder(t *testing.T) {
 		{"model gave up / stuck (like #921)", foremanv1alpha1.AgenticTaskVerdictIncomplete, "MODEL-DECIDED", "", false},
 		{"stuck-loop detected", foremanv1alpha1.AgenticTaskVerdictIncomplete, "STUCK-LOOP-DETECTED", "", false},
 		{"NO-GO but no-changes (trivial)", foremanv1alpha1.AgenticTaskVerdictNoGo, "NO-CHANGES", "", false},
+		{"NO-GO already resolved (like #152)", foremanv1alpha1.AgenticTaskVerdictNoGo, "ALREADY-RESOLVED", "", false},
 		{"GO", foremanv1alpha1.AgenticTaskVerdictGo, "", "", false},
 	}
 	for _, tc := range cases {

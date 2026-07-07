@@ -81,7 +81,8 @@ func coderSummary(task *foremanv1alpha1.AgenticTask) string {
 // solve this" bail) or a coder-gate failure (wrote code, could not pass
 // the gate) escalate; a model-decided INCOMPLETE (gave up / ran out of
 // turns), a harness STUCK-LOOP-DETECTED, a trivial NO-CHANGES NO-GO, an
-// ERROR, or a GO do not.
+// ERROR, a GO, or an ALREADY-RESOLVED NO-GO (the issue is already fixed
+// on the branch) do not.
 func shouldEscalateCoder(
 	verdict foremanv1alpha1.AgenticTaskVerdict, topOutcome, modelOutcome string,
 ) bool {

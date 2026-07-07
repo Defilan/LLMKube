@@ -1344,8 +1344,13 @@ func (e *NativeAgentLoopExecutor) modelDecidedResult(
 	verdict foremanv1alpha1.AgenticTaskVerdict,
 ) *Result {
 	r := NewResult(e.Kind(), verdict, lr.Terminal.Summary, time.Since(start))
+	outcome := "MODEL-DECIDED"
+	if verdict == foremanv1alpha1.AgenticTaskVerdictNoGo &&
+		strings.Contains(strings.ToLower(lr.Terminal.Summary), "already resolved") {
+		outcome = "ALREADY-RESOLVED"
+	}
 	r.Extra = map[string]any{
-		"outcome":       "MODEL-DECIDED",
+		"outcome":       outcome,
 		"transcriptRef": objRefAsMap(tref),
 		"turnCount":     lr.Turns,
 		"modelExtra":    lr.Terminal.Extra,
