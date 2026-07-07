@@ -84,8 +84,11 @@ func groundedBlockingFindings(
 
 // enforceReviewerGroundedFindings demotes a model NO-GO to GO when none of its
 // blocking findings cite a changed line. Returns the (possibly demoted)
-// verdict. It is a no-op on any non-NO-GO verdict, when disabled, or when
-// changedLines is nil (git unavailable -> degrade-open).
+// verdict. It is a no-op on any non-NO-GO verdict, when disabled, when
+// changedLines is nil (git unavailable -> degrade-open), or when the reviewer
+// outcome is REJECT (do-not-retry). A REJECT verdict cannot be overturned by
+// the absence of a line-grounded finding because the defect is what is absent,
+// not a specific changed line.
 //
 // changedLines(file) returns the set of new-file line numbers inside a changed
 // hunk for that file, or an empty/nil map for a file the diff did not change.
@@ -101,6 +104,13 @@ func enforceReviewerGroundedFindings(
 	if groundedFindingsDisabled() ||
 		verdict != foremanv1alpha1.AgenticTaskVerdictNoGo ||
 		extra == nil || changedLines == nil {
+		return verdict
+	}
+
+	// REJECT (do-not-retry) is exempt from grounded demotion: the defect is
+	// what is absent, not a specific changed line, so a wrong-issue rejection
+	// cannot cite a changed line and should not be demoted to GO.
+	if reviewOutcome, ok := extra["reviewOutcome"].(string); ok && reviewOutcome == "REJECT" {
 		return verdict
 	}
 
