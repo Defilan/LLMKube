@@ -227,3 +227,60 @@ func TestGroundedBlockingFindings_Partition(t *testing.T) {
 		t.Fatalf("ungrounded = %d, want 2 (b.go unchanged line + c.go no line)", len(ungrounded))
 	}
 }
+
+func TestNormalizeFilePath(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"pkg/cli/cache.go", "pkg/cli/cache.go"},
+		{"./pkg/cli/cache.go", "pkg/cli/cache.go"},
+		{"/workspace/pkg/cli/cache.go", "workspace/pkg/cli/cache.go"},
+		{"pkg//cli/cache.go", "pkg/cli/cache.go"},
+		{"./", "."},
+		{"", "."},
+	}
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := normalizeFilePath(tc.input)
+			if got != tc.expected {
+				t.Errorf("normalizeFilePath(%q) = %q, want %q", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestGroundedBlockingFindings_PathNormalization(t *testing.T) {
+	// The diff map only has repo-root-relative paths. A reviewer may emit
+	// "./"-prefixed, absolute, or bare-basename paths. All must normalize
+	// to the same repo-root-relative key (#1004).
+	changed := func(f string) map[int]bool {
+		return map[string]map[int]bool{"pkg/cli/cache.go": {42: true}}[f]
+	}
+
+	tests := []struct {
+		name     string
+		file     string
+		grounded bool
+	}{
+		{"repo-root-relative", "pkg/cli/cache.go", true},
+		{"dot-slash prefix", "./pkg/cli/cache.go", true},
+		{"double slash", "pkg//cli/cache.go", true},
+		{"wrong file", "pkg/cli/other.go", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			findings := []reviewer.Finding{
+				{Severity: reviewer.SeverityBlocker, Area: "scope", Message: "m", File: tc.file, Line: 42},
+			}
+			grounded, _ := groundedBlockingFindings(findings, changed)
+			if tc.grounded && len(grounded) != 1 {
+				t.Errorf("expected grounded, got %d grounded findings", len(grounded))
+			}
+			if !tc.grounded && len(grounded) != 0 {
+				t.Errorf("expected ungrounded, got %d grounded findings", len(grounded))
+			}
+		})
+	}
+}

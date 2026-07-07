@@ -785,7 +785,7 @@ func reviewerGroundedChangedLines(
 		return nil
 	}
 	return func(file string) map[int]bool {
-		return changedBranchLines(ctx, workspace, "main", file, execCommandRunner)
+		return changedBranchLines(ctx, workspace, "main", normalizeFilePath(file), execCommandRunner)
 	}
 }
 
