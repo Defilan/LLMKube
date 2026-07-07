@@ -162,6 +162,31 @@ var (
 		},
 		[]string{"router", "scope"},
 	)
+
+	// InferenceTTFTSeconds captures time-to-first-token (TTFT) for
+	// inference requests. Derived from runtime-specific metrics via
+	// PodMonitor relabeling and recording rules. Labels: service,
+	// namespace, runtime (one of "llamacpp", "vllm", "vllm-swift").
+	InferenceTTFTSeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "llmkube_inference_ttft_seconds",
+			Help:    "Time to first token for inference requests.",
+			Buckets: prometheus.ExponentialBuckets(0.01, 2, 12), // 10ms to ~20s
+		},
+		[]string{"service", "namespace", "runtime"},
+	)
+
+	// InferenceRequestErrorsTotal counts per-request errors by status
+	// class. Sourced from runtime-specific metrics (vllm:request_failure_total,
+	// llamacpp:request_failed). If the runtime doesn't expose error counts
+	// natively, the metric is set to 0.
+	InferenceRequestErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_inference_request_errors_total",
+			Help: "Total number of inference request errors by status class.",
+		},
+		[]string{"service", "namespace", "runtime", "status_class"},
+	)
 )
 
 func init() {
@@ -181,5 +206,7 @@ func init() {
 		RouterBackendHealth,
 		RouterFirstTokenSeconds,
 		RouterBudgetUtilization,
+		InferenceTTFTSeconds,
+		InferenceRequestErrorsTotal,
 	)
 }

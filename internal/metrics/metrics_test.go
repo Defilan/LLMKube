@@ -187,6 +187,7 @@ func TestHistogramBuckets(t *testing.T) {
 		{"InferenceServiceReadyDuration", InferenceServiceReadyDuration, []string{"bkt-test", "default"}, 10},
 		{"GPUQueueWaitDuration", GPUQueueWaitDuration, []string{"bkt-test", "default"}, 10},
 		{"ReconcileDuration", ReconcileDuration, []string{"bkt-test-ctrl"}, 11},
+		{"InferenceTTFTSeconds", InferenceTTFTSeconds, []string{"svc-test", "default", "vllm"}, 12},
 	}
 
 	for _, tt := range tests {
@@ -197,5 +198,37 @@ func TestHistogramBuckets(t *testing.T) {
 				t.Errorf("expected at least %d buckets, got %d", tt.minBkts, bucketCount)
 			}
 		})
+	}
+}
+
+func TestInferenceTTFTSeconds(t *testing.T) {
+	m := getHistogramMetric(t, InferenceTTFTSeconds, []string{"ttft-svc", "default", "vllm"}, 0.25)
+
+	if m.GetHistogram().GetSampleCount() == 0 {
+		t.Error("expected sample count > 0 after observation")
+	}
+	if m.GetHistogram().GetSampleSum() < 0.25 {
+		t.Errorf("expected sample sum >= 0.25, got %f", m.GetHistogram().GetSampleSum())
+	}
+}
+
+func TestInferenceRequestErrorsTotal(t *testing.T) {
+	InferenceRequestErrorsTotal.WithLabelValues("err-svc", "default", "vllm", "4xx").Inc()
+	InferenceRequestErrorsTotal.WithLabelValues("err-svc", "default", "vllm", "4xx").Inc()
+	InferenceRequestErrorsTotal.WithLabelValues("err-svc", "default", "vllm", "5xx").Inc()
+
+	var m dto.Metric
+	if err := InferenceRequestErrorsTotal.WithLabelValues("err-svc", "default", "vllm", "4xx").Write(&m); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	if m.GetCounter().GetValue() < 2 {
+		t.Errorf("expected 4xx counter >= 2, got %f", m.GetCounter().GetValue())
+	}
+
+	if err := InferenceRequestErrorsTotal.WithLabelValues("err-svc", "default", "vllm", "5xx").Write(&m); err != nil {
+		t.Fatalf("failed to write metric: %v", err)
+	}
+	if m.GetCounter().GetValue() < 1 {
+		t.Errorf("expected 5xx counter >= 1, got %f", m.GetCounter().GetValue())
 	}
 }
