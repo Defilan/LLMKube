@@ -1447,6 +1447,142 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoNoRefsNoVouchDemotes(t *testing.T) 
 	}
 }
 
+// ---- semantic similarity for issueAsk (#809) ----
+
+func TestTokenize_Basic(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"simple", "hello world", []string{"hello", "world"}},
+		{"punctuation", "hello, world!", []string{"hello", "world"}},
+		{"numbers", "fix bug 42", []string{"fix", "bug", "42"}},
+		{"empty", "", nil},
+		{"only-punct", "!!!", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tokenize(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d words, want %d: %v", len(got), len(tc.want), got)
+			}
+			for i, w := range got {
+				if w != tc.want[i] {
+					t.Errorf("word[%d]: got %q, want %q", i, w, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestTfidfVector_Basic(t *testing.T) {
+	v := tfidfVector("hello world hello")
+	if v["hello"] != 1.0 {
+		t.Errorf("hello TF should be 1.0 (max freq); got %f", v["hello"])
+	}
+	if v["world"] != 0.5 {
+		t.Errorf("world TF should be 0.5; got %f", v["world"])
+	}
+}
+
+func TestTfidfVector_Empty(t *testing.T) {
+	v := tfidfVector("")
+	if len(v) != 0 {
+		t.Errorf("empty text should produce empty vector; got %v", v)
+	}
+}
+
+func TestSemanticSimilarity_SameText(t *testing.T) {
+	s := semanticSimilarity("fix the bug", "fix the bug")
+	if s < 0.99 {
+		t.Errorf("identical strings should have near-1 similarity; got %f", s)
+	}
+}
+
+func TestSemanticSimilarity_ParaphraseAboveThreshold(t *testing.T) {
+	// A faithful paraphrase of the issue ask should score above threshold.
+	claim := "Upgrade the toolchain image to v2 in the Dockerfile"
+	body := "## Feature\n\nUpdate the toolchain image to v2 in the agent-builder Dockerfile."
+	s := semanticSimilarity(claim, body)
+	if s < issueAskSemanticThreshold {
+		t.Errorf("faithful paraphrase should be above threshold; got %f (threshold %f)", s, issueAskSemanticThreshold)
+	}
+}
+
+func TestSemanticSimilarity_UnrelatedBelowThreshold(t *testing.T) {
+	claim := "Add a cluster-wide default LiteLLM URL"
+	body := "## Bug\n\nmetal-agent picks the wrong IP on multi-NIC macOS hosts."
+	s := semanticSimilarity(claim, body)
+	if s >= issueAskSemanticThreshold {
+		t.Errorf("unrelated claim should be below threshold; got %f (threshold %f)", s, issueAskSemanticThreshold)
+	}
+}
+
+func TestSemanticSimilarity_EmptyStrings(t *testing.T) {
+	s := semanticSimilarity("", "some text")
+	if s != 0 {
+		t.Errorf("empty string should yield 0 similarity; got %f", s)
+	}
+}
+
+func TestReconcileReviewerIssueAsk_ParaphraseVerified(t *testing.T) {
+	// A paraphrase that is semantically similar should be verified
+	// even though it is not a verbatim substring. The claim must NOT
+	// be a substring of the body so the verbatim fast path is skipped.
+	body := "## Feature\n\nUpdate the toolchain image to v2 in the agent-builder Dockerfile."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+	// "Upgrade" instead of "Update" and "Dockerfile" instead of
+	// "agent-builder Dockerfile" — not a substring but semantically
+	// equivalent.
+	extra := map[string]any{
+		"issueAsk": "Upgrade the toolchain image to v2 in the Dockerfile",
+	}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if v, _ := extra["issueAskVerified"].(bool); !v {
+		t.Errorf("paraphrase should be verified via semantic similarity; got issueAskVerified=%v", extra["issueAskVerified"])
+	}
+	if score, ok := extra["issueAskSemanticScore"].(float64); !ok || score <= 0 {
+		t.Errorf("semantic score should be set; got %v", extra["issueAskSemanticScore"])
+	}
+	// issueAskClaimed should NOT be set (no confabulation detected).
+	if _, claimed := extra["issueAskClaimed"]; claimed {
+		t.Errorf("issueAskClaimed should not be set for a verified paraphrase")
+	}
+}
+
+func TestReconcileReviewerIssueAsk_ConfabulationStillRewritten(t *testing.T) {
+	// A claim that is both non-verbatim AND semantically unrelated
+	// should still be treated as confabulation.
+	body := "## Bug\n\nmetal-agent picks the wrong IP on multi-NIC macOS hosts."
+	content, _ := json.Marshal(map[string]string{"body": body})
+	msgs := []oai.Message{
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc-1", Type: "function",
+			Function: oai.ToolCallFunction{Name: "fetch_issue"},
+		}}},
+		{Role: oai.RoleTool, ToolCallID: "tc-1", Content: string(content)},
+	}
+	confab := "Add a cluster-wide default LiteLLM URL"
+	extra := map[string]any{"issueAsk": confab}
+	reconcileReviewerIssueAsk(logr.Discard(), msgs, extra)
+
+	if v, _ := extra["issueAskVerified"].(bool); v {
+		t.Errorf("confabulation should not be verified; got issueAskVerified=true")
+	}
+	if extra["issueAskClaimed"] != confab {
+		t.Errorf("issueAskClaimed should preserve the confabulated claim; got %v", extra["issueAskClaimed"])
+	}
+}
+
 // TestNormalizeModelVerdict_ErrorMapsToIncompleteWithModelReportedError pins
 // the #649 fix: the submit_result tool contract allows verdict="ERROR" (model
 // reports it cannot complete the task: a reviewer's could-not-review, a

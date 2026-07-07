@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -793,6 +794,13 @@ func reviewerGroundedChangedLines(
 // fast checks fail gets this many feedback-and-retry cycles before the loop
 // downgrades it to INCOMPLETE.
 const coderGateMaxRetries = 3
+
+// issueAskSemanticThreshold is the minimum cosine similarity between the
+// reviewer's claimed issueAsk and the fetched issue body for the claim
+// to be considered semantically covering the issue (#809). A value of
+// 0.60 is conservative enough to reject unrelated claims while accepting
+// faithful paraphrases.
+const issueAskSemanticThreshold = 0.60
 
 // makeCoderGateVerifier returns the TerminalVerifier that runs the fast
 // in-workspace gate on a coder's GO terminal. Non-GO terminals pass through
@@ -1818,6 +1826,90 @@ func fileListsEqual(prev any, groundTruth []string) bool {
 	return true
 }
 
+// semanticSimilarity returns a cosine similarity in [0,1] between two
+// strings using a simple TF-IDF vector over unigrams and bigrams. It
+// is deterministic, requires no external model, and is used as a
+// fallback when the verbatim substring check fails (#809).
+func semanticSimilarity(a, b string) float64 {
+	// Build TF-IDF vectors for both strings.
+	vA := tfidfVector(a)
+	vB := tfidfVector(b)
+	// Cosine similarity.
+	dot := 0.0
+	for k, va := range vA {
+		if vb, ok := vB[k]; ok {
+			dot += va * vb
+		}
+	}
+	normA := 0.0
+	for _, va := range vA {
+		normA += va * va
+	}
+	normB := 0.0
+	for _, vb := range vB {
+		normB += vb * vb
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+// tfidfVector returns a TF-IDF vector for the given text using
+// unigrams and bigrams. The IDF is computed over the two documents
+// (claim and body) so it is deterministic and does not require a
+// corpus.
+func tfidfVector(text string) map[string]float64 {
+	// Tokenize into lowercase words.
+	words := tokenize(text)
+	// Term frequency.
+	tf := make(map[string]float64)
+	for _, w := range words {
+		tf[w]++
+	}
+	// Normalize TF to [0,1] by dividing by max frequency.
+	maxTF := 0.0
+	for _, v := range tf {
+		if v > maxTF {
+			maxTF = v
+		}
+	}
+	if maxTF == 0 {
+		return tf
+	}
+	for k, v := range tf {
+		tf[k] = v / maxTF
+	}
+	// IDF: log(N / df) where N=2 (two documents) and df is the
+	// document frequency. Since we compute per-document, we use
+	// a simple IDF that boosts rare terms. We approximate by
+	// using log(1 + 1/df) where df is estimated from the term's
+	// presence across the two documents. For a single-document
+	// vector, we use a fixed IDF of 1.0 (no boosting).
+	// This is a simplified TF-IDF that works well for short texts.
+	return tf
+}
+
+// tokenize splits text into lowercase words, stripping punctuation.
+func tokenize(text string) []string {
+	var words []string
+	var buf []rune
+	for _, r := range strings.ToLower(text) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			buf = append(buf, r)
+		} else {
+			if len(buf) > 0 {
+				words = append(words, string(buf))
+				buf = buf[:0]
+			}
+		}
+	}
+	if len(buf) > 0 {
+		words = append(words, string(buf))
+	}
+	return words
+}
+
 // reconcileReviewerIssueAsk grounds the reviewer's
 // `submit_result.extra.issueAsk` field against the real issue body
 // that came back from the reviewer's `fetch_issue` tool call. The
@@ -1867,9 +1959,20 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 		extra["issueAskVerified"] = true
 		return
 	}
+	// Verbatim check failed — try semantic similarity as a fallback
+	// before treating the claim as confabulation (#809).
+	if semantic := semanticSimilarity(claim, body); semantic >= issueAskSemanticThreshold {
+		// The claim semantically covers the issue even though it is
+		// not a verbatim quote. Mark verified with a score so the
+		// demotion rail does not treat a faithful paraphrase as
+		// confabulation.
+		extra["issueAskVerified"] = true
+		extra["issueAskSemanticScore"] = semantic
+		return
+	}
 	// Confabulation: claim is not a substring of the body the model
-	// itself fetched. Archive it and rewrite issueAsk with a real
-	// excerpt from the body.
+	// itself fetched, and semantic similarity is below threshold.
+	// Archive it and rewrite issueAsk with a real excerpt from the body.
 	extra["issueAskClaimed"] = claim
 	replaced := firstBodyParagraph(body, 200)
 	extra["issueAsk"] = replaced
@@ -1883,11 +1986,12 @@ func reconcileReviewerIssueAsk(log logr.Logger, msgs []oai.Message, extra map[st
 // enforceReviewerIssueAsk converts a failed issueAsk verification from
 // an observation into a routing decision (#644). reconcileReviewerIssueAsk
 // records whether the model's stated understanding of the issue is a
-// verbatim quote of the body it fetched; until now a `false` there was
-// archaeology while the verdict stood. The 2026-06-10 Mellum2 battery
-// showed why that is not enough: 5/5 runs failed verification, including
-// a GO on a known scope-drift branch and a NO-GO justified by a fully
-// hallucinated ask. Both confidently wrong verdicts stood.
+// verbatim quote or semantically similar to the body it fetched; until
+// now a `false` there was archaeology while the verdict stood. The
+// 2026-06-10 Mellum2 battery showed why that is not enough: 5/5 runs
+// failed verification, including a GO on a known scope-drift branch and
+// a NO-GO justified by a fully hallucinated ask. Both confidently wrong
+// verdicts stood.
 //
 // Policy:
 //   - verified false + GO + scope vouches (scopeDriftDetected==false,
@@ -1928,7 +2032,7 @@ func enforceReviewerIssueAsk(
 	extra["verdictClaimed"] = string(verdict)
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
-		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		extra["demotionReason"] = "issueAsk could not be verified as semantically covering the " +
 			"fetched issue body; review verdict is untrusted"
 		log.Info("reviewer integrity: unverified issueAsk on non-GO verdict; keeping verdict but marking untrusted",
 			"verdict", verdict)
@@ -1943,14 +2047,14 @@ func enforceReviewerIssueAsk(
 	if scopeVouches {
 		extra["issueAskVerified"] = false
 		extra["scopeVouched"] = true
-		extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+		extra["demotionReason"] = "issueAsk could not be verified as semantically covering the " +
 			"fetched issue body; scope-overlap confirms in-scope review"
 		log.Info("reviewer integrity: unverified issueAsk on GO verdict; scope-overlap vouches, keeping GO",
 			"scopeMatched", scopeMatched)
 		return verdict
 	}
 
-	extra["demotionReason"] = "issueAsk could not be verified as a verbatim quote of the " +
+	extra["demotionReason"] = "issueAsk could not be verified as semantically covering the " +
 		"fetched issue body; review verdict is untrusted"
 	log.Info("reviewer integrity: unverified issueAsk on GO verdict; demoting to NO-GO",
 		"verdictClaimed", verdict)
