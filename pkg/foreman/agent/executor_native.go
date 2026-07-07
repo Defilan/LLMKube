@@ -785,8 +785,65 @@ func reviewerGroundedChangedLines(
 		return nil
 	}
 	return func(file string) map[int]bool {
-		return changedBranchLines(ctx, workspace, "main", file, execCommandRunner)
+		normalized := normalizeFindingFile(file, reviewDiff)
+		return changedBranchLines(ctx, workspace, "main", normalized, execCommandRunner)
 	}
+}
+
+// normalizeFindingFile normalizes a reviewer-supplied file path to a
+// repo-root-relative path that can be used with git diff. It strips a
+// leading "./" or leading "/" (absolute path). If the result is a bare
+// basename (no path separator), it attempts to resolve it against the
+// known diff file list; if the basename matches exactly one file in the
+// list, that file is returned. If the basename is ambiguous or not found,
+// the original (after prefix stripping) is returned unchanged.
+//
+// If the normalized path does not match any diff file exactly, a suffix
+// match is attempted: the first diff file whose path ends with the
+// normalized path is returned. This handles absolute paths like
+// "/workspace/pkg/cli/cache.go" where stripping "/" yields
+// "workspace/pkg/cli/cache.go" which does not match "pkg/cli/cache.go"
+// exactly but is a suffix of it.
+func normalizeFindingFile(file string, diffFiles []string) string {
+	if file == "" {
+		return file
+	}
+	// Strip leading "./"
+	file = strings.TrimPrefix(file, "./")
+	// Strip leading "/" (absolute path)
+	file = strings.TrimPrefix(file, "/")
+	// If the result has no path separator, it's a bare basename.
+	// Try to resolve it against the diff file list.
+	if !strings.Contains(file, "/") {
+		var matches []string
+		for _, df := range diffFiles {
+			if filepath.Base(df) == file {
+				matches = append(matches, df)
+			}
+		}
+		if len(matches) == 1 {
+			return matches[0]
+		}
+		// Ambiguous or no match: return the basename as-is.
+		return file
+	}
+	// Exact match first.
+	for _, df := range diffFiles {
+		if df == file {
+			return df
+		}
+	}
+	// Suffix match: find a diff file that is a suffix of the normalized
+	// path. This handles absolute paths where the workspace prefix was
+	// stripped but the rest of the path is correct, e.g.
+	// "/workspace/pkg/cli/cache.go" -> "workspace/pkg/cli/cache.go"
+	// matches diff file "pkg/cli/cache.go".
+	for _, df := range diffFiles {
+		if strings.HasSuffix(file, df) {
+			return df
+		}
+	}
+	return file
 }
 
 // coderGateMaxRetries bounds the coder gate fix attempts (#749): a GO whose
