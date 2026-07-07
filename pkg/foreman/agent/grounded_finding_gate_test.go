@@ -205,6 +205,34 @@ func TestReviewerGroundedChangedLines_EmptyBranchDiffDegradesClosed(t *testing.T
 	}
 }
 
+func TestGroundedFindings_REJECTExemptFromDemotion(t *testing.T) {
+	// A REJECT (do-not-retry) verdict must not be demoted to GO even when
+	// no blocking finding cites a changed line. The defect is what is
+	// absent, not a specific changed line, so it cannot be grounded.
+	extra := findingExtra("blocker", "pkg/cli/cache.go", 0) // no line pinned
+	extra["reviewOutcome"] = "REJECT"
+	fix := map[string]map[int]bool{"pkg/cli/cache.go": {42: true}}
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, changed(fix))
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("REJECT must not be demoted to GO, got %s", got)
+	}
+	if _, demoted := extra["groundedFindingDemotion"]; demoted {
+		t.Fatal("REJECT must not be marked demoted")
+	}
+}
+
+func TestGroundedFindings_REJECTExemptWithUngroundedFindings(t *testing.T) {
+	// REJECT with findings that cite files not in the diff must still
+	// stay NO-GO.
+	extra := findingExtra("blocker", "docs/MODEL-CACHE.md", 10) // fabricated file
+	extra["reviewOutcome"] = "REJECT"
+	fix := map[string]map[int]bool{"pkg/cli/cache.go": {42: true}} // docs file absent
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, changed(fix))
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("REJECT with ungrounded findings must not be demoted, got %s", got)
+	}
+}
+
 func TestGroundedBlockingFindings_Partition(t *testing.T) {
 	findings := []reviewer.Finding{
 		// grounded
