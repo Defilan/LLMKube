@@ -86,6 +86,11 @@ func coderSummary(task *foremanv1alpha1.AgenticTask) string {
 func shouldEscalateCoder(
 	verdict foremanv1alpha1.AgenticTaskVerdict, topOutcome, modelOutcome string,
 ) bool {
+	// ALREADY-RESOLVED is a terminal non-failure: the issue is already fixed
+	// on the branch, so there is nothing for a larger model to do.
+	if verdict == foremanv1alpha1.AgenticTaskVerdictAlreadyResolved {
+		return false
+	}
 	if verdict == foremanv1alpha1.AgenticTaskVerdictNoGo && topOutcome == "MODEL-DECIDED" {
 		return true
 	}

@@ -405,6 +405,12 @@ const (
 	// produce a change (e.g. the issue is already fixed, or the scope is
 	// out of reach for this agent kind). Distinct from Failed.
 	AgenticTaskVerdictNoGo AgenticTaskVerdict = "NO-GO"
+
+	// AgenticTaskVerdictAlreadyResolved is emitted when the coder determines
+	// the issue is already fixed on the branch (honest-bail "nothing to do").
+	// It is distinct from NO-GO / MODEL-DECIDED ("couldn't do it") so that
+	// escalation skips it and the controller can close the issue.
+	AgenticTaskVerdictAlreadyResolved AgenticTaskVerdict = "ALREADY-RESOLVED"
 	// AgenticTaskVerdictIncomplete signals the agent did not produce a
 	// terminal verdict before its run ended (timeout, mid-loop crash,
 	// upstream cascade-fail).
