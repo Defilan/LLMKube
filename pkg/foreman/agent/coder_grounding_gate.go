@@ -13,6 +13,38 @@ import (
 // tokens most prone to hallucination and the ones that failed on #409/#850.
 var metricIdentRe = regexp.MustCompile(`[a-z_][a-z0-9_]*:[a-z0-9_:]+`)
 
+// metricIdents returns the metric-name-shaped identifiers in s, EXCLUDING
+// host:port network addresses (whose path after the first colon is all digits,
+// e.g. "vllm:8000") -- those are not Prometheus metrics and must not be flagged.
+func metricIdents(s string) []string {
+	var out []string
+	for _, m := range metricIdentRe.FindAllString(s, -1) {
+		i := strings.IndexByte(m, ':')
+		if i < 0 {
+			continue
+		}
+		path := m[i+1:]
+		if path == "" || isAllDigits(path) {
+			continue // host:port, not a metric
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// isAllDigits returns true if s contains only ASCII digit characters.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // groundingViolation is one written external identifier that contradicts the
 // retrieved docs: its namespace was the subject of a context7 lookup this run,
 // yet the identifier itself does not appear anywhere in the retrieved evidence.
@@ -71,7 +103,7 @@ func groundingViolations(evidence []string, addedLines []string) []groundingViol
 	// All metric identifiers present in the evidence, grouped by namespace.
 	retrievedByNS := make(map[string][]string)
 	retrievedSet := make(map[string]bool)
-	for _, e := range metricIdentRe.FindAllString(corpus, -1) {
+	for _, e := range metricIdents(corpus) {
 		if retrievedSet[e] {
 			continue
 		}
@@ -84,7 +116,7 @@ func groundingViolations(evidence []string, addedLines []string) []groundingViol
 	var out []groundingViolation
 	seen := make(map[string]bool)
 	for _, line := range addedLines {
-		for _, w := range metricIdentRe.FindAllString(line, -1) {
+		for _, w := range metricIdents(line) {
 			if seen[w] {
 				continue
 			}

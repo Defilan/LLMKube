@@ -92,3 +92,16 @@ func TestGroundingViolations_EmptyEvidenceIsNoOp(t *testing.T) {
 		t.Fatalf("empty evidence must yield no violations, got %+v", got)
 	}
 }
+
+func TestGroundingViolations_IgnoresHostPortScrapeTargets(t *testing.T) {
+	// context7 WAS queried about vllm, but a host:port scrape target in the
+	// same namespace must NOT be flagged as a hallucinated metric.
+	evidence := []string{"vllm:request_success_total{finished_reason}"}
+	added := []string{
+		`      - targets: ['vllm:8000']`,
+		`      - targets: ['host.docker.internal:9091']`,
+	}
+	if got := groundingViolations(evidence, added); len(got) != 0 {
+		t.Fatalf("host:port targets must not be flagged, got %+v", got)
+	}
+}
