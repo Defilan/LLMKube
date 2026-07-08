@@ -18,8 +18,10 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -343,6 +345,29 @@ func TestNeuterAndTestPackage_RealGoTest(t *testing.T) {
 	weakDir := filepath.Join(ws, "weak")
 	if _, err := execCommandRunner(context.Background(), weakDir, nil, "go", "test", "./..."); err != nil {
 		t.Fatalf("weak test should PASS under neuter (survivor), got err: %v", err)
+	}
+}
+
+func TestAddedDiffLines_ReturnsAddedContentExcludingHeaders(t *testing.T) {
+	diff := "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,0 +2,2 @@\n" +
+		"+  expr: rate(vllm:request_failure_total[5m])\n" +
+		"+  labels: {}\n"
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		return diff, nil
+	}
+	got := addedDiffLines(context.Background(), "/ws", "main", run)
+	want := []string{"  expr: rate(vllm:request_failure_total[5m])", "  labels: {}"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("addedDiffLines = %#v, want %#v", got, want)
+	}
+}
+
+func TestAddedDiffLines_NilOnGitError(t *testing.T) {
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		return "", errors.New("boom")
+	}
+	if got := addedDiffLines(context.Background(), "/ws", "main", run); got != nil {
+		t.Fatalf("want nil on git error, got %#v", got)
 	}
 }
 
