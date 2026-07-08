@@ -185,3 +185,37 @@ func TestApplyCoderGroundingRailForTask_GatesOnIssueFixKind(t *testing.T) {
 		t.Fatalf("issue-fix kind should apply the rail; got %v", lr.Terminal.Extra["coderGroundingViolations"])
 	}
 }
+
+func TestGroundingViolations_Issue409Fixture(t *testing.T) {
+	// Real 2026-07-08 #409 run: context7 returned vLLM's /metrics output; the
+	// coder wrote the hallucinated failure metric instead of the retrieved
+	// success metric. The rail must flag exactly the hallucinated name.
+	evidence := []string{
+		`# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="meta-llama/Llama-3.1-8B-Instruct"} 8.0
+# HELP vllm:request_success_total Count of successfully processed requests.
+# TYPE vllm:request_success_total counter
+vllm:request_success_total{finished_reason="stop",model_name="meta-llama/Llama-3.1-8B-Instruct"} 1.0`,
+	}
+	added := []string{
+		`  - record: llmkube:inference:error_rate:5m`,
+		`    expr: rate(vllm:request_failure_total{status_class="5xx"}[5m])`,
+	}
+	got := groundingViolations(evidence, added)
+	if len(got) != 1 {
+		t.Fatalf("want exactly 1 violation, got %d: %+v", len(got), got)
+	}
+	if got[0].Written != "vllm:request_failure_total" {
+		t.Fatalf("violation.Written = %q, want vllm:request_failure_total", got[0].Written)
+	}
+	hasAlt := false
+	for _, a := range got[0].RetrievedAlternatives {
+		if a == "vllm:request_success_total" {
+			hasAlt = true
+		}
+	}
+	if !hasAlt {
+		t.Fatalf("RetrievedAlternatives = %v, want to include vllm:request_success_total", got[0].RetrievedAlternatives)
+	}
+}
