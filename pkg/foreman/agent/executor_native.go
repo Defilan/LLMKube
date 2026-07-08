@@ -585,6 +585,13 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			"loop returned nil error but no terminal result"), nil
 	}
 
+	// Coder grounding rail (v1, non-blocking): for issue-fix runs, flag any
+	// external metric identifier the coder wrote that contradicts the
+	// context7 docs it retrieved this run. Runs regardless of verdict (we
+	// flag hallucinations even on a GO coder) while workspace is still on
+	// disk. Records-and-logs only; never changes the verdict.
+	applyCoderGroundingRailForTask(ctx, log, task, workspace, loopRes)
+
 	verdict, normalizedReason := normalizeModelVerdict(loopRes.Terminal.Verdict)
 
 	// 9. Non-GO verdicts: no commit, no push, just record the model's

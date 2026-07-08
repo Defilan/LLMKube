@@ -1,9 +1,13 @@
 package agent
 
 import (
+	"context"
 	"regexp"
 	"strings"
 
+	"github.com/go-logr/logr"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 )
 
@@ -138,4 +142,56 @@ func groundingViolations(evidence []string, addedLines []string) []groundingViol
 		}
 	}
 	return out
+}
+
+// applyCoderGroundingRail records, on the coder's terminal result, any
+// external metric identifier the coder WROTE that contradicts the context7
+// docs it retrieved this run (namespace was queried, but the identifier is
+// absent from the docs). Non-blocking (v1): it surfaces violations under
+// Extra["coderGroundingViolations"] and logs them; the verdict is unchanged.
+// No-op unless there is context7 evidence AND added diff lines. Degrades
+// open: never returns an error, never mutates the verdict.
+func applyCoderGroundingRail(ctx context.Context, log logr.Logger, base, workspace string, loopRes *LoopResult) {
+	if loopRes == nil || loopRes.Terminal == nil {
+		return
+	}
+	evidence := context7Evidence(loopRes.Transcript)
+	if len(evidence) == 0 {
+		return
+	}
+	added := addedDiffLines(ctx, workspace, base, execCommandRunner)
+	if len(added) == 0 {
+		return
+	}
+	violations := groundingViolations(evidence, added)
+	if len(violations) == 0 {
+		return
+	}
+	recs := make([]map[string]any, 0, len(violations))
+	for _, v := range violations {
+		log.Info("coder grounding: wrote an identifier absent from the retrieved docs",
+			"written", v.Written, "namespace", v.Namespace, "retrievedAlternatives", v.RetrievedAlternatives)
+		recs = append(recs, map[string]any{
+			"written":               v.Written,
+			"namespace":             v.Namespace,
+			"retrievedAlternatives": v.RetrievedAlternatives,
+		})
+	}
+	if loopRes.Terminal.Extra == nil {
+		loopRes.Terminal.Extra = map[string]any{}
+	}
+	loopRes.Terminal.Extra["coderGroundingViolations"] = recs
+}
+
+// applyCoderGroundingRailForTask gates applyCoderGroundingRail to issue-fix
+// tasks and resolves the base branch. Extracted out of runLLMPath so the
+// call site there is a single statement rather than a branch, keeping
+// runLLMPath's cyclomatic complexity budget untouched.
+func applyCoderGroundingRailForTask(
+	ctx context.Context, log logr.Logger, task *foremanv1alpha1.AgenticTask, workspace string, loopRes *LoopResult,
+) {
+	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
+		return
+	}
+	applyCoderGroundingRail(ctx, log, baseBranchOrDefault(task.Spec.Payload.BaseBranch), workspace, loopRes)
 }

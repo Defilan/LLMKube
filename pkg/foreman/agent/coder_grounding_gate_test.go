@@ -1,9 +1,13 @@
 package agent
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
+	"github.com/go-logr/logr"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 )
 
@@ -103,5 +107,81 @@ func TestGroundingViolations_IgnoresHostPortScrapeTargets(t *testing.T) {
 	}
 	if got := groundingViolations(evidence, added); len(got) != 0 {
 		t.Fatalf("host:port targets must not be flagged, got %+v", got)
+	}
+}
+
+func TestApplyCoderGroundingRail_RecordsViolation(t *testing.T) {
+	orig := execCommandRunner
+	t.Cleanup(func() { execCommandRunner = orig })
+	execCommandRunner = func(_ context.Context, _ string, _ []string, _ string, _ ...string) (string, error) {
+		return "diff --git a/x b/x\n+++ b/x\n@@ @@\n+  expr: rate(vllm:request_failure_total[5m])\n", nil
+	}
+	queryCall := oai.ToolCall{
+		ID: "c1", Type: "function",
+		Function: oai.ToolCallFunction{Name: "mcp/context7/query-docs"},
+	}
+	lr := &LoopResult{
+		Transcript: []oai.Message{
+			{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{queryCall}},
+			{
+				Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp/context7/query-docs",
+				Content: "vllm:request_success_total{finished_reason}",
+			},
+		},
+		Terminal: &ToolResult{Extra: map[string]any{}},
+	}
+	applyCoderGroundingRail(context.Background(), logr.Discard(), "main", "/ws", lr)
+	recs, ok := lr.Terminal.Extra["coderGroundingViolations"].([]map[string]any)
+	if !ok || len(recs) != 1 || recs[0]["written"] != "vllm:request_failure_total" {
+		t.Fatalf("coderGroundingViolations = %v", lr.Terminal.Extra["coderGroundingViolations"])
+	}
+}
+
+func TestApplyCoderGroundingRail_NoEvidenceIsNoOp(t *testing.T) {
+	lr := &LoopResult{Transcript: nil, Terminal: &ToolResult{Extra: map[string]any{}}}
+	applyCoderGroundingRail(context.Background(), logr.Discard(), "main", "/ws", lr)
+	if _, present := lr.Terminal.Extra["coderGroundingViolations"]; present {
+		t.Fatal("no context7 evidence -> rail must be a no-op")
+	}
+}
+
+func TestApplyCoderGroundingRailForTask_GatesOnIssueFixKind(t *testing.T) {
+	orig := execCommandRunner
+	t.Cleanup(func() { execCommandRunner = orig })
+	execCommandRunner = func(_ context.Context, _ string, _ []string, _ string, _ ...string) (string, error) {
+		return "diff --git a/x b/x\n+++ b/x\n@@ @@\n+  expr: rate(vllm:request_failure_total[5m])\n", nil
+	}
+	newLoopRes := func() *LoopResult {
+		return &LoopResult{
+			Transcript: []oai.Message{
+				{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{
+					{ID: "c1", Type: "function", Function: oai.ToolCallFunction{Name: "mcp/context7/query-docs"}},
+				}},
+				{
+					Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp/context7/query-docs",
+					Content: "vllm:request_success_total{finished_reason}",
+				},
+			},
+			Terminal: &ToolResult{Extra: map[string]any{}},
+		}
+	}
+
+	reviewTask := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{Kind: foremanv1alpha1.AgenticTaskKindReview},
+	}
+	lr := newLoopRes()
+	applyCoderGroundingRailForTask(context.Background(), logr.Discard(), reviewTask, "/ws", lr)
+	if _, present := lr.Terminal.Extra["coderGroundingViolations"]; present {
+		t.Fatal("kind != issue-fix -> rail must be a no-op")
+	}
+
+	issueFixTask := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{Kind: foremanv1alpha1.AgenticTaskKindIssueFix},
+	}
+	lr = newLoopRes()
+	applyCoderGroundingRailForTask(context.Background(), logr.Discard(), issueFixTask, "/ws", lr)
+	recs, ok := lr.Terminal.Extra["coderGroundingViolations"].([]map[string]any)
+	if !ok || len(recs) != 1 || recs[0]["written"] != "vllm:request_failure_total" {
+		t.Fatalf("issue-fix kind should apply the rail; got %v", lr.Terminal.Extra["coderGroundingViolations"])
 	}
 }
