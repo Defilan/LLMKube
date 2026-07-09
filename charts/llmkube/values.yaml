@@ -205,6 +205,16 @@ gateway:
     # File/stdout JSON sink is emitted.
     otel:
       enabled: false
+
+# -- Enable Custom Resource State (CRS) metrics for Foreman CRDs via
+# kube-state-metrics. When enabled, a CustomResourceStateMetrics resource
+# is rendered that maps Workload, AgenticTask, and FleetNode status fields
+# to Prometheus gauges (e.g. foreman_agentictask_phase,
+# foreman_fleetnode_heartbeat_timestamp_seconds). Requires kube-state-metrics
+# to be deployed with --custom-resource-state-config-file pointed at the
+# rendered ConfigMap.
+foremanCRS:
+  enabled: false
       # gRPC backend reference for the OTel collector.
       backendRef:
         name: otel-collector

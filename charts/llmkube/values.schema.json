@@ -301,6 +301,13 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "foremanCRS": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
     "gateway": {
       "type": "object",
       "additionalProperties": false,

@@ -26,3 +26,104 @@ spec:
     matchNames:
     - {{ include "llmkube.namespace" . }}
 {{- end }}
+---
+{{- if .Values.foremanCRS.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "llmkube.fullname" . }}-foreman-crs
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+data:
+  foreman-crs.yaml: |
+    resources:
+      - groupVersionKind:
+          group: foreman.llmkube.dev
+          version: v1alpha1
+          kind: AgenticTask
+        metricNamePrefix: foreman_agentictask
+        metrics:
+          - name: info
+            help: "AgenticTask phase and verdict"
+            each:
+              type: Info
+              info:
+                labelsFromPath:
+                  phase: [status, phase]
+                  verdict: [status, verdict]
+                  workload: [metadata, labels, "foreman.llmkube.dev/workload"]
+          - name: phase
+            help: "AgenticTask phase as enum-style gauge"
+            each:
+              type: Gauge
+              gauge:
+                value: 1
+                labelsFromPath:
+                  phase: [status, phase]
+          - name: verdict
+            help: "AgenticTask verdict as enum-style gauge"
+            each:
+              type: Gauge
+              gauge:
+                value: 1
+                labelsFromPath:
+                  verdict: [status, verdict]
+      - groupVersionKind:
+          group: foreman.llmkube.dev
+          version: v1alpha1
+          kind: Workload
+        metricNamePrefix: foreman_workload
+        metrics:
+          - name: info
+            help: "Workload status"
+            each:
+              type: Info
+              info:
+                labelsFromPath:
+                  phase: [status, phase]
+          - name: tasks_total
+            help: "Total number of AgenticTasks for this Workload"
+            each:
+              type: Gauge
+              gauge:
+                valueFrom:
+                  jsonPath: "{.status.tasksTotal}"
+          - name: tasks_failed
+            help: "Number of failed AgenticTasks for this Workload"
+            each:
+              type: Gauge
+              gauge:
+                valueFrom:
+                  jsonPath: "{.status.tasksFailed}"
+      - groupVersionKind:
+          group: foreman.llmkube.dev
+          version: v1alpha1
+          kind: FleetNode
+        metricNamePrefix: foreman_fleetnode
+        metrics:
+          - name: info
+            help: "FleetNode node info"
+            each:
+              type: Info
+              info:
+                labelsFromPath:
+                  node: metadata.name
+                  accelerator: [status, accelerator]
+                  ram: [status, ram]
+          - name: heartbeat_timestamp_seconds
+            help: "FleetNode last heartbeat timestamp"
+            each:
+              type: Gauge
+              gauge:
+                valueFrom:
+                  jsonPath: "{.status.lastHeartbeatTimestamp}"
+          - name: phase
+            help: "FleetNode phase as enum-style gauge"
+            each:
+              type: Gauge
+              gauge:
+                value: 1
+                labelsFromPath:
+                  phase: [status, phase]
+{{- end }}
