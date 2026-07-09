@@ -1,0 +1,64 @@
+{{- if .Values.prometheus.foremanCrs.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: foreman-crs-metrics
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+data:
+  foreman.yaml: |
+    resources:
+    - group: foreman.llmkube.dev
+      version: v1alpha1
+      kind: AgentICTask
+      label_columns:
+      - agent
+      - gate
+      - kind
+      metric_columns:
+      - name: info
+        type: Gauge
+        path: ""
+        help: "Info metric for AgentICTask resources"
+      - name: phase
+        type: Gauge
+        path: status.phase
+        help: "Current phase of the AgentICTask (planning, planned, dispatched, completed, failed)"
+      - name: verdict
+        type: Gauge
+        path: status.verdict
+        help: "Final verdict of the AgentICTask (PASS, FAIL, ERROR)"
+    - group: foreman.llmkube.dev
+      version: v1alpha1
+      kind: Workload
+      label_columns:
+      - pipeline
+      metric_columns:
+      - name: tasks_total
+        type: Gauge
+        path: status.tasksTotal
+        help: "Total number of tasks dispatched by this Workload"
+      - name: tasks_failed
+        type: Gauge
+        path: status.tasksFailed
+        help: "Number of failed tasks in this Workload"
+    - group: foreman.llmkube.dev
+      version: v1alpha1
+      kind: FleetNode
+      label_columns:
+      - phase
+      metric_columns:
+      - name: info
+        type: Gauge
+        path: ""
+        help: "Info metric for FleetNode resources"
+      - name: heartbeat_timestamp_seconds
+        type: Gauge
+        path: status.lastHeartbeat
+        help: "Last heartbeat timestamp of the FleetNode (unix seconds)"
+      - name: phase
+        type: Gauge
+        path: status.phase
+        help: "Current phase of the FleetNode (ready, draining, notReady, unknown)"
+{{- end }}

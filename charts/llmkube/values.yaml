@@ -237,6 +237,13 @@ prometheus:
     # Scrape interval
     interval: 30s
 
+  # Enable CustomResourceState config for Foreman CRDs (agentictasks, workloads,
+  # fleetnodes). The rendered ConfigMap is mounted into kube-state-metrics via
+  # --custom-resource-state-config-file so the three Foreman CRDs are exposed as
+  # foreman_agentictask_*, foreman_workload_*, and foreman_fleetnode_* metrics.
+  foremanCrs:
+    enabled: false
+
   # Enable PrometheusRule for alerts
   prometheusRule:
     enabled: false
