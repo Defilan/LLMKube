@@ -1,0 +1,46 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: foreman-alerts
+  namespace: monitoring
+  labels:
+    app: foreman
+    prometheus: kube-prometheus-stack-prometheus
+    role: alert-rules
+spec:
+  groups:
+  - name: foreman.rules
+    interval: 30s
+    rules:
+    # AgenticTask finished with INCOMPLETE verdict
+    - alert: AgenticTaskFinishedWithoutWorking
+      expr: foreman_agentictask_info{phase="Succeeded", verdict="INCOMPLETE"} == 1
+      for: 0m
+      labels:
+        severity: warning
+        component: foreman
+      annotations:
+        summary: "AgenticTask finished without producing work"
+        description: "AgenticTask {{ $labels.name }} in {{ $labels.namespace }} completed with Succeeded/INCOMPLETE — the agent ran but did not produce a usable artifact."
+
+    # Workload stuck in Pending phase
+    - alert: WorkloadStuckPending
+      expr: foreman_agentictask_phase{phase="Pending"} > 0
+      for: 30m
+      labels:
+        severity: warning
+        component: foreman
+      annotations:
+        summary: "Workload has pending AgenticTasks"
+        description: "Workload {{ $labels.name }} in {{ $labels.namespace }} has {{ $value }} AgenticTask(s) stuck in Pending phase for more than 30 minutes."
+
+    # FleetNode heartbeat stale
+    - alert: FleetNodeHeartbeatStale
+      expr: (time() - foreman_fleetnode_heartbeat_timestamp_seconds) > 300
+      for: 0m
+      labels:
+        severity: critical
+        component: foreman
+      annotations:
+        summary: "FleetNode heartbeat is stale"
+        description: "FleetNode {{ $labels.name }} in {{ $labels.namespace }} has not sent a heartbeat for more than 5 minutes."
