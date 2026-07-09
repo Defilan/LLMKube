@@ -1,0 +1,129 @@
+# Default values for rocm-smi-exporter.
+# This chart deploys the rocm-smi-exporter DaemonSet into the
+# `monitoring` namespace to scrape AMD GPU metrics (temperature,
+# power, utilization) from Instinct GPUs.
+
+# -- Image repository for the rocm-smi-exporter container.
+image:
+  repository: prometheuscommunity/rocm-smi-exporter
+  tag: ""  # defaults to chart appVersion
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets for private registries.
+imagePullSecrets: []
+
+# -- Override the chart name.
+nameOverride: ""
+
+# -- Override the fully-qualified name.
+fullnameOverride: ""
+
+# -- Namespace where the DaemonSet and Service are deployed.
+# Must match the existing `monitoring` namespace.
+namespace: monitoring
+
+# -- ServiceAccount configuration.
+serviceAccount:
+  # -- Whether to create a ServiceAccount.
+  create: true
+  # -- Annotations to add to the ServiceAccount.
+  annotations: {}
+  # -- Name of the ServiceAccount. Defaults to `<release>-rocm-smi-exporter`.
+  name: ""
+
+# -- Node selector to target AMD GPU nodes.
+nodeSelector:
+  amd-gpu: "true"
+
+# -- Tolerations for AMD GPU nodes.
+tolerations: []
+# - key: "amd-gpu"
+#   operator: "Exists"
+#   effect: "NoSchedule"
+
+# -- Pod annotations.
+podAnnotations: {}
+
+# -- Pod labels.
+podLabels: {}
+
+# -- Pod security context.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+# -- Container security context.
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Resource requests and limits for the exporter container.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# -- Environment variables for the exporter container.
+env: []
+# - name: ROCM_SMI_EXPORTER_INTERVAL
+#   value: "10s"
+
+# -- Additional volumes to mount into the exporter pod.
+extraVolumes: []
+
+# -- Additional volume mounts for the exporter container.
+extraVolumeMounts: []
+
+# -- Additional containers to sidecar into the exporter pod.
+extraContainers: []
+
+# -- Additional init containers for the exporter pod.
+extraInitContainers: []
+
+# -- Affinity rules for pod scheduling.
+affinity: {}
+
+# -- Service configuration.
+service:
+  # -- Service type (ClusterIP, NodePort, LoadBalancer).
+  type: ClusterIP
+  # -- Service port.
+  port: 9515
+  # -- Target port (defaults to service port).
+  targetPort: 9515
+  # -- Annotations to add to the Service.
+  annotations: {}
+  # -- Labels to add to the Service.
+  labels: {}
+
+# -- DaemonSet update strategy.
+updateStrategy:
+  type: RollingUpdate
+
+# -- Pod disruption budget.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# -- Whether to create a Prometheus ServiceMonitor for this DaemonSet.
+serviceMonitor:
+  enabled: false
+  # -- Scrape interval.
+  interval: 30s
+  # -- Scrape timeout.
+  scrapeTimeout: 10s
+  # -- Additional labels for the ServiceMonitor.
+  additionalLabels: {}
+  # -- Metric relabel configs.
+  metricRelabelings: []
+  # -- Relabel configs.
+  relabelings: []
