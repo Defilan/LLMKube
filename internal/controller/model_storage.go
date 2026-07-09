@@ -55,6 +55,21 @@ const ModelCachePVCName = "llmkube-model-cache"
 // binds on the node the serving pod schedules to, so the GPU pod and its cache
 // co-locate even when the operator runs on a different node (#728), at the cost
 // of cross-isvc dedup.
+//
+// On a GPU node carrying a NoSchedule taint (the recommended pattern for
+// dedicating GPU nodes), dynamic provisioning of a new hostpath PVC for model
+// staging can fail: the storage provisioner's per-node helper pod does not
+// tolerate the GPU taint, so the PVC stays Pending and the InferenceService
+// (or a staging Job) can never bind it. This bites the AMD/Vulkan serving path
+// specifically, because those InferenceServices must read the GGUF from a
+// node-local PVC (the shared model cache lives on a different node, and pinning
+// the pod to the GPU node creates a volume node-affinity conflict).
+//
+// Working pattern on tainted nodes: pre-stage the GGUF via a download Job that
+// tolerates the GPU taint into a PVC, then use a pvc:// Model source. The
+// operator surfaces a clear warning when a PVC source is used on a tainted
+// node and the PVC has not yet bound, so the user knows the staging Job is the
+// blocker, not the operator.
 const (
 	ModelCacheModePerService = "perService"
 	ModelCacheModeShared     = "shared"

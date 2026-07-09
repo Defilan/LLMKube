@@ -23,6 +23,68 @@ modelCache:
 
 With the default RWO storage class the shared PVC is pinned to one node, so it only works single-node (a GPU on any other node would hit a `volume node affinity conflict`). If your multi-node cluster has no RWX storage class, use `perService` instead.
 
+## Tainted GPU nodes and hostpath PVC provisioning
+
+On a GPU node carrying a `NoSchedule` taint (the recommended pattern for
+dedicating GPU nodes), dynamic provisioning of a new hostpath PVC for model
+staging can fail: the storage provisioner's per-node helper pod does not
+tolerate the GPU taint, so the PVC stays `Pending` and the InferenceService
+(or a staging Job) can never bind it. This bites the AMD/Vulkan serving path
+specifically, because those InferenceServices must read the GGUF from a
+node-local PVC (the shared model cache lives on a different node, and pinning
+the pod to the GPU node creates a volume node-affinity conflict).
+
+**Working pattern on tainted nodes:** pre-stage the GGUF via a download Job
+that tolerates the GPU taint into a PVC, then use a `pvc://` Model source.
+The operator surfaces a clear warning when a PVC source is used on a tainted
+node and the PVC has not yet bound, so the user knows the staging Job is the
+blocker, not the operator.
+
+Example staging Job (tolerates `someresource=present:NoSchedule`):
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: stage-gguf
+spec:
+  template:
+    spec:
+      nodeSelector:
+        someresource: present
+      tolerations:
+        - key: "someresource"
+          operator: "Equal"
+          value: "present"
+          effect: "NoSchedule"
+      containers:
+        - name: downloader
+          image: curlimages/curl:8.12.1
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              curl -f -L -o /models/model.gguf "$MODEL_SOURCE"
+              echo "Model downloaded: $(ls -lh /models/model.gguf)"
+          env:
+            - name: MODEL_SOURCE
+              value: "https://huggingface.co/org/repo/resolve/main/model.gguf"
+          volumeMounts:
+            - name: model-pvc
+              mountPath: /models
+      volumes:
+        - name: model-pvc
+          persistentVolumeClaim:
+            claimName: model-pvc
+      restartPolicy: Never
+```
+
+**Storage guidance:** if you need dynamic provisioning to work on tainted
+nodes, use a provisioner whose helper pods inherit or allow tolerations
+(e.g. rancher local-path-provisioner with a `helperPod` template, or a
+tolerated provisioner config). The microk8s `cdkbot/hostpath-provisioner:1.5.0`
+provisioner has no knob to add tolerations to helper pods, and patching the
+provisioner Deployment's own tolerations does not propagate to them.
+
 ### `perService` (opt-in escape hatch)
 
 For multi-node clusters **without** an RWX storage class. Each InferenceService gets its own cache PVC (`<inferenceservice>-model-cache`):
