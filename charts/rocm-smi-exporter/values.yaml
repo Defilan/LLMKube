@@ -1,0 +1,47 @@
+# AMD ROCm SMI Exporter values
+image:
+  repository: prometheuscommunity/rocm-smi-exporter
+  tag: ""
+  pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  name: ""
+
+# Scrape configuration for the exporter.
+# The upstream rocm-smi-exporter emits series with different names than the
+# contract pins (rocm_smi_gpu_temp, rocm_smi_gpu_power, rocm_smi_gpu_utilization).
+# metric_relabel_configs below rename the scraped series to the exact names
+# required by the LLMKube dashboard and docs.
+scrape:
+  interval: 30s
+  port: 9602
+  # metric_relabel_configs renames the upstream series to the contract names.
+  # The three exact strings below MUST appear literally in the chart.
+  metric_relabel_configs:
+    # GPU temperature
+    - source_labels: [__name__]
+      regex: "rocm_smi_temp"
+      target_label: __name__
+      replacement: "rocm_smi_gpu_temp"
+    # GPU power
+    - source_labels: [__name__]
+      regex: "rocm_smi_power"
+      target_label: __name__
+      replacement: "rocm_smi_gpu_power"
+    # GPU utilization
+    - source_labels: [__name__]
+      regex: "rocm_smi_utilization"
+      target_label: __name__
+      replacement: "rocm_smi_gpu_utilization"
+
+daemonset:
+  nodeSelector: {}
+  tolerations: []
+  resources:
+    limits:
+      cpu: 100m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi

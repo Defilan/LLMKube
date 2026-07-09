@@ -1,0 +1,6 @@
+apiVersion: v2
+name: rocm-smi-exporter
+description: AMD ROCm SMI Prometheus exporter for GPU telemetry
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

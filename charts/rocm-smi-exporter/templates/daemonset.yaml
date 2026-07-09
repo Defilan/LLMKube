@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "rocm-smi-exporter.fullname" . }}
+  labels:
+    {{- include "rocm-smi-exporter.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "rocm-smi-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rocm-smi-exporter.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.scrape.port | quote }}
+        {{- with .Values.scrape.metric_relabel_configs }}
+        prometheus.io/param.metric_relabel_configs: |
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "rocm-smi-exporter.serviceAccountName" . }}
+      containers:
+        - name: rocm-smi-exporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.scrape.port }}
+              protocol: TCP
+          resources:
+            {{- toYaml .Values.daemonset.resources | nindent 12 }}
+          volumeMounts:
+            - name: dev
+              mountPath: /dev
+            - name: sys
+              mountPath: /sys
+      volumes:
+        - name: dev
+          hostPath:
+            path: /dev
+        - name: sys
+          hostPath:
+            path: /sys
+      {{- with .Values.daemonset.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.daemonset.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
