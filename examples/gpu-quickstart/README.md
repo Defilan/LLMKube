@@ -201,6 +201,16 @@ kubectl logs $POD_NAME | grep "llm_load_tensors"
 - **Multi-GPU**: Set `gpu.count: 2` for models that need >24GB VRAM
 - **Production**: Add resource limits, health checks, monitoring alerts
 
+## AMD (Vulkan) Tier
+
+A validated AMD example with Vulkan runtime lives at
+[examples/amd-vulkan-quickstart/](../amd-vulkan-quickstart/). It targets a
+Qwen3 30B-class MoE model on the 90GB unified pool and documents the same
+end-to-end flow (deploy, hit the OpenAI-compatible endpoint, confirm GPU
+offload, record decode/prefill tokens/sec) so the AMD tier has the same
+"here is a working manifest and here are the numbers" treatment as CUDA and
+Metal.
+
 ## Learn More
 
 - [LLMKube Documentation](../../README.md)

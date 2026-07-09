@@ -517,6 +517,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **foreman:** move docs/foreman to docs/site/foreman + register in site nav ([#594](https://github.com/defilantech/LLMKube/issues/594)) ([9fd85bb](https://github.com/defilantech/LLMKube/commit/9fd85bbe3f4bd2ec9135f71925ba677433b8adc2))
 
 
+### Features
+
+- **amd-vulkan:** add validated AMD (Vulkan) example InferenceService + benchmark
+  entry so the AMD tier has the same "here is a working manifest and here are
+  the numbers" treatment as CUDA and Metal. The example targets a Qwen3 30B-class
+  MoE model on the 90GB unified pool, documents the end-to-end run, and wires
+  the AMD node in as a real backend tier the gateway and router can target.
+  (#699)
+
 ### Miscellaneous
 
 * pin next release to 0.8.1 (Release-As) ([#605](https://github.com/defilantech/LLMKube/issues/605)) ([a876cc6](https://github.com/defilantech/LLMKube/commit/a876cc69ee7bda878b2f916a9e2fe1a28dfd6f50))

@@ -1,0 +1,20 @@
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-30b-amd
+  namespace: default
+spec:
+  source: https://huggingface.co/bartowski/Qwen3-30B-A3B-Instruct-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-Q8_0.gguf
+  format: gguf
+  quantization: Q8_0
+  hardware:
+    accelerator: vulkan
+    gpu:
+      enabled: true
+      count: 1
+      vendor: amd
+      layers: -1
+      memory: "90Gi"
+  resources:
+    cpu: "4"
+    memory: "16Gi"
