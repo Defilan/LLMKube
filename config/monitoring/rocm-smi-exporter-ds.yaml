@@ -1,0 +1,60 @@
+# rocm-smi-exporter DaemonSet
+#
+# Deploys the community rocm-smi-exporter on AMD GPU nodes (Strix Halo iGPU
+# and Instinct accelerators) so their telemetry lands in the llmkube
+# monitoring stack.
+#
+# The upstream device-metrics-exporter (NVIDIA DCGM) is Instinct-scoped and
+# does not cover AMD hardware; this DaemonSet is the AMD equivalent.
+#
+# Metrics prefix: rocm_smi_<metric>
+# Metrics port:   9515
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rocm-smi-exporter
+  namespace: llmkube-monitoring
+  labels:
+    app: rocm-smi-exporter
+spec:
+  selector:
+    matchLabels:
+      app: rocm-smi-exporter
+  template:
+    metadata:
+      labels:
+        app: rocm-smi-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9515"
+    spec:
+      serviceAccountName: rocm-smi-exporter
+      containers:
+      - name: rocm-smi-exporter
+        image: rocm-smi-exporter:latest
+        ports:
+        - containerPort: 9515
+          hostPort: 9515
+          name: metrics
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          runAsNonRoot: false
+          runAsUser: 0
+      nodeSelector:
+        gpu.vendor: amd
+      tolerations:
+      - key: gpu.vendor
+        operator: Equal
+        value: amd
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute
