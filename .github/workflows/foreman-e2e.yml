@@ -21,6 +21,7 @@ on:
       - 'Dockerfile.foreman-operator'
       - 'Dockerfile.foreman-agent'
       - '.github/workflows/foreman-e2e.yml'
+      - 'config/{samples,crd}/**'
   pull_request:
     paths:
       - 'charts/foreman/**'
@@ -32,6 +33,7 @@ on:
       - 'Dockerfile.foreman-operator'
       - 'Dockerfile.foreman-agent'
       - '.github/workflows/foreman-e2e.yml'
+      - 'config/{samples,crd}/**'
 
 jobs:
   foreman-e2e:
@@ -222,3 +224,19 @@ jobs:
           kubectl -n "${FOREMAN_NS}" logs deploy/foreman-operator --tail=300 || true
           echo "=== foreman-agent logs ==="
           kubectl -n "${FOREMAN_NS}" logs deploy/foreman-agent --tail=300 || true
+
+  validate-samples:
+    name: Validate sample manifests against CRD schemas
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run make validate-samples
+        run: make validate-samples
