@@ -524,6 +524,18 @@ We welcome contributions. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full gu
 - SafeTensors format support
 - Multi-node GPU sharding for 70B+ models
 
+### Sample validation
+
+CRD schemas and sample manifests live under `config/crd/bases/` and `config/samples/`. Run
+
+```bash
+make validate-samples
+```
+
+to schema-validate every sample in `config/samples/*.yaml` against the CRDs in `config/crd/bases/*.yaml` using `kubeconform`. This catches drift between a sample and its schema (missing required fields, wrong types, unknown properties) before it reaches a reviewer — a small regression that's easy to miss in a diff but painful to debug once merged.
+
+The CI workflow is wired to re-run `make validate-samples` on any change to `config/{samples,crd}/**`. If you add a new sample or tweak a CRD, the gate runs automatically on your PR.
+
 ### Contributors
 
 Thanks to the people who've shipped code, tests, and docs:
