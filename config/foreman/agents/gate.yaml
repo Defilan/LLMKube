@@ -50,3 +50,19 @@ spec:
   # run_gate_job's PollTimeout defaults to 2 * Job.activeDeadlineSeconds
   # (= 3600s = 60 min) which sits inside this envelope.
   requestTimeoutSeconds: 3900
+  # Steps run by the gate Agent on every verification task. The
+  # run_gate_job tool executes each entry in order; the executor
+  # passes the task payload (repo dir, slice plan, etc.) as context.
+  #
+  # `make validate-samples` runs kubeconform against every manifest
+  # under config/samples/ using the CRDs in config/crd/bases/. It is
+  # gated on changes to config/{samples,crd}/** in CI (see
+  # .github/workflows/foreman-e2e.yml) so it stays fast on pure-code
+  # PRs but still catches a sample that drifts from its schema.
+  steps:
+    - name: validate-samples
+      command: make validate-samples
+      description: >-
+        Validate every sample manifest in config/samples/ against the
+        CRDs in config/crd/bases/ using kubeconform. Skipped on pure
+        code PRs; triggered by changes to config/{samples,crd}/**.
