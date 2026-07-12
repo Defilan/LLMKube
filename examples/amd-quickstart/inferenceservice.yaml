@@ -1,0 +1,26 @@
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen3-30b-amd-service
+  namespace: default
+spec:
+  modelRef: qwen3-30b-amd
+  replicas: 1
+  # LLMKube's pinned Vulkan llama.cpp image (built by defilantech/llmkube-runtimes).
+  # The operator selects this automatically when hardware.gpu.vendor == amd and
+  # runtime == vulkan; the field is shown here for clarity and to allow override.
+  image: ghcr.io/defilantech/llmkube-llama-vulkan
+  endpoint:
+    port: 8080
+    path: /v1/chat/completions
+    type: ClusterIP
+  resources:
+    cpu: "2"
+    memory: "8Gi"
+  # Mount the AMD GPU device nodes via the device plugin.
+  # The operator maps vendor=amd + runtime=vulkan to devic.es/dri-render.
+  tolerations:
+    - key: "gpu"
+      operator: "Equal"
+      value: "amd"
+      effect: "NoSchedule"

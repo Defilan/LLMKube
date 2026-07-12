@@ -1,0 +1,23 @@
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-30b-amd
+  namespace: default
+spec:
+  # Qwen3 30B-class MoE model — showcases the 90GB unified memory pool on
+  # Strix Halo / Radeon 8060S (gfx1151).
+  source: https://huggingface.co/bartowski/Qwen3-30B-A3B-Instruct-Q8_0_GGUF/resolve/main/Qwen3-30B-A3B-Instruct-Q8_0.gguf
+  format: gguf
+  quantization: Q8_0
+  hardware:
+    accelerator: vulkan
+    gpu:
+      enabled: true
+      count: 1
+      vendor: amd
+      runtime: vulkan
+      layers: -1  # -1 means all layers (automatic)
+      memory: "90Gi"  # unified memory budget for the AMD tier
+  resources:
+    cpu: "4"
+    memory: "12Gi"
