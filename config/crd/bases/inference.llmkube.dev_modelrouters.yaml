@@ -607,6 +607,59 @@ spec:
                           type: string
                         type: array
                     type: object
+                  persistence:
+                    default: none
+                    description: |-
+                      Persistence configures where the router-proxy keeps budget and
+                      rolling-SLO state so it survives a pod restart. The proxy always
+                      runs with an in-memory store; Persistence selects an additional
+                      backing store that checkpoints state on a configurable cadence
+                      and restores it on startup.
+
+                      "none" (default) keeps state in memory only; counters reset on
+                      pod restart. This preserves today's behavior and is the only
+                      mode that requires no extra Kubernetes resources.
+
+                      "configmap" checkpoints state to a Kubernetes ConfigMap named
+                      <router>-state in the router's namespace. The proxy writes the
+                      checkpoint every CheckpointIntervalSeconds (default 30) and
+                      restores from it on startup. The ConfigMap is owner-referenced
+                      to the ModelRouter and garbage-collected with it. The ConfigMap
+                      route is the simplest air-gapped option: no sidecar, no network
+                      dependency, no new chart dependency. Coarse-grained writes every
+                      N seconds; sub-second consistency is not guaranteed.
+
+                      "redis" and "pvc" are reserved for future implementation; the
+                      proxy rejects the CRD with an explicit error if set today.
+                    enum:
+                    - none
+                    - configmap
+                    properties:
+                      checkpointIntervalSeconds:
+                        default: 30
+                        description: |-
+                          CheckpointIntervalSeconds is how often the proxy writes a state
+                          checkpoint to the backing store. Defaults to 30. Shorter intervals
+                          reduce state loss on crash at the cost of more frequent writes.
+                          Ignored when Mode is "none".
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      mode:
+                        default: none
+                        description: |-
+                          Mode selects the backing store. "none" keeps state in memory only.
+                          "configmap" checkpoints state to a ConfigMap in the router's
+                          namespace. "redis" and "pvc" are reserved for future implementation.
+                        enum:
+                        - none
+                        - configmap
+                        - redis
+                        - pvc
+                        type: string
+                    required:
+                    - mode
+                    type: object
                 type: object
               proxy:
                 description: |-

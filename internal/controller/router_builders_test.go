@@ -832,3 +832,61 @@ func TestReconcileRouterDeploymentPreservesExternalAnnotations(t *testing.T) {
 		}
 	}
 }
+
+// TestTranslatePolicyDefaults confirms translatePolicy returns a
+// defaulted policy when given a nil input. This is the common case:
+// most ModelRouters don't set policy at all.
+func TestTranslatePolicyDefaults(t *testing.T) {
+	got := translatePolicy(nil)
+	if got.Classification.Mode != "header-only" {
+		t.Errorf("Classification.Mode = %q, want header-only", got.Classification.Mode)
+	}
+	if got.AuditLog.Sink != "stdout" {
+		t.Errorf("AuditLog.Sink = %q, want stdout", got.AuditLog.Sink)
+	}
+	if got.Persistence.Mode != "none" {
+		t.Errorf("Persistence.Mode = %q, want none", got.Persistence.Mode)
+	}
+}
+
+// TestTranslatePolicyPreservesPersistence confirms translatePolicy
+// preserves the persistence mode and checkpoint interval from the
+// ModelRouter spec.
+func TestTranslatePolicyPreservesPersistence(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			Policy: &inferencev1alpha1.RouterPolicy{
+				Persistence: &inferencev1alpha1.PersistenceSpec{
+					Mode:                      "configmap",
+					CheckpointIntervalSeconds: 60,
+				},
+			},
+		},
+	}
+	got := translatePolicy(mr.Spec.Policy)
+	if got.Persistence.Mode != "configmap" {
+		t.Errorf("Persistence.Mode = %q, want configmap", got.Persistence.Mode)
+	}
+	if got.Persistence.CheckpointIntervalSeconds != 60 {
+		t.Errorf("Persistence.CheckpointIntervalSeconds = %d, want 60",
+			got.Persistence.CheckpointIntervalSeconds)
+	}
+}
+
+// TestTranslatePolicyDefaultsPersistenceMode confirms translatePolicy
+// defaults the persistence mode to "none" when the user omits it.
+func TestTranslatePolicyDefaultsPersistenceMode(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			Policy: &inferencev1alpha1.RouterPolicy{
+				Persistence: &inferencev1alpha1.PersistenceSpec{
+					Mode: "", // user omitted mode
+				},
+			},
+		},
+	}
+	got := translatePolicy(mr.Spec.Policy)
+	if got.Persistence.Mode != "none" {
+		t.Errorf("Persistence.Mode = %q, want none (empty should default)", got.Persistence.Mode)
+	}
+}

@@ -385,6 +385,53 @@ type RouterPolicy struct {
 	// model allowlists (authorization) are a separate surface.
 	// +optional
 	Auth *RouterAuthSpec `json:"auth,omitempty"`
+
+	// Persistence configures where the router-proxy keeps budget and
+	// rolling-SLO state so it survives a pod restart. The proxy always
+	// runs with an in-memory store; Persistence selects an additional
+	// backing store that checkpoints state on a configurable cadence
+	// and restores it on startup.
+	//
+	// "none" (default) keeps state in memory only; counters reset on
+	// pod restart. This preserves today's behavior and is the only
+	// mode that requires no extra Kubernetes resources.
+	//
+	// "configmap" checkpoints state to a Kubernetes ConfigMap named
+	// <router>-state in the router's namespace. The proxy writes the
+	// checkpoint every CheckpointIntervalSeconds (default 30) and
+	// restores from it on startup. The ConfigMap is owner-referenced
+	// to the ModelRouter and garbage-collected with it. The ConfigMap
+	// route is the simplest air-gapped option: no sidecar, no network
+	// dependency, no new chart dependency. Coarse-grained writes every
+	// N seconds; sub-second consistency is not guaranteed.
+	//
+	// "redis" and "pvc" are reserved for future implementation; the
+	// proxy rejects the CRD with an explicit error if set today.
+	// +kubebuilder:validation:Enum=none;configmap
+	// +kubebuilder:default=none
+	// +optional
+	Persistence *PersistenceSpec `json:"persistence,omitempty"`
+}
+
+// PersistenceSpec selects the router-proxy's state backing store.
+// The router-proxy always keeps an in-memory copy; Persistence adds a
+// durable checkpoint that survives pod restart.
+type PersistenceSpec struct {
+	// Mode selects the backing store. "none" keeps state in memory only.
+	// "configmap" checkpoints state to a ConfigMap in the router's
+	// namespace. "redis" and "pvc" are reserved for future implementation.
+	// +kubebuilder:validation:Enum=none;configmap;redis;pvc
+	// +kubebuilder:default=none
+	Mode string `json:"mode"`
+
+	// CheckpointIntervalSeconds is how often the proxy writes a state
+	// checkpoint to the backing store. Defaults to 30. Shorter intervals
+	// reduce state loss on crash at the cost of more frequent writes.
+	// Ignored when Mode is "none".
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=30
+	// +optional
+	CheckpointIntervalSeconds int32 `json:"checkpointIntervalSeconds,omitempty"`
 }
 
 // RouterAuthSpec configures request authentication for the router. Only JWT

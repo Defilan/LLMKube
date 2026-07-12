@@ -235,6 +235,45 @@ func TestClassificationHeaderOverride(t *testing.T) {
 	}
 }
 
+// TestConfigValidateAcceptsPersistenceNone confirms the canonical config
+// (with default persistence) passes validation. This is the default
+// path; persistence is opt-in.
+func TestConfigValidateAcceptsPersistenceNone(t *testing.T) {
+	cfg := validConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+}
+
+// TestConfigValidateRejectsInvalidPersistenceMode confirms the validator
+// rejects persistence modes that are not yet implemented.
+func TestConfigValidateRejectsInvalidPersistenceMode(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Persistence.Mode = "redis"
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "mode \"redis\" must be") {
+		t.Errorf("expected mode rejection error, got %v", err)
+	}
+}
+
+// TestConfigValidateRejectsZeroCheckpointInterval confirms the validator
+// rejects a checkpoint interval of zero (which would cause a busy loop).
+func TestConfigValidateRejectsZeroCheckpointInterval(t *testing.T) {
+	cfg := validConfig()
+	cfg.Policy.Persistence.Mode = "configmap"
+	cfg.Policy.Persistence.CheckpointIntervalSeconds = 0
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected validation error, got nil")
+	}
+	if !strings.Contains(err.Error(), "checkpointIntervalSeconds must be >= 1") {
+		t.Errorf("expected interval rejection error, got %v", err)
+	}
+}
+
 const canonicalJSON = `{
   "backends": [
     {"name": "local-qwen", "tier": "local", "address": "http://qwen.svc:8080"},
@@ -251,6 +290,7 @@ const canonicalJSON = `{
   "defaultRouteStrategy": "BackendNameMatch",
   "policy": {
     "classification": {"mode": "header-only"},
-    "auditLog": {"sink": "stdout"}
+    "auditLog": {"sink": "stdout"},
+    "persistence": {"mode": "none"}
   }
 }`

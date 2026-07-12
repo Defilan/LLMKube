@@ -309,6 +309,7 @@ func translatePolicy(p *inferencev1alpha1.RouterPolicy) router.Policy {
 	out := router.Policy{
 		Classification: router.ClassificationPolicy{Mode: "header-only"},
 		AuditLog:       router.AuditLogPolicy{Sink: "stdout"},
+		Persistence:    router.PersistencePolicy{Mode: "none"},
 	}
 	if p == nil {
 		return out
@@ -331,6 +332,15 @@ func translatePolicy(p *inferencev1alpha1.RouterPolicy) router.Policy {
 		}
 		if out.AuditLog.Sink == "" {
 			out.AuditLog.Sink = "stdout"
+		}
+	}
+	if p.Persistence != nil {
+		out.Persistence = router.PersistencePolicy{
+			Mode:                      p.Persistence.Mode,
+			CheckpointIntervalSeconds: p.Persistence.CheckpointIntervalSeconds,
+		}
+		if out.Persistence.Mode == "" {
+			out.Persistence.Mode = "none"
 		}
 	}
 	return out

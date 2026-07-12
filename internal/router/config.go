@@ -175,6 +175,44 @@ type RuleRoute struct {
 type Policy struct {
 	Classification ClassificationPolicy `json:"classification"`
 	AuditLog       AuditLogPolicy       `json:"auditLog"`
+	Persistence    PersistencePolicy    `json:"persistence"`
+}
+
+// PersistencePolicy configures the router-proxy's state backing store.
+// The proxy always keeps an in-memory copy; Persistence adds a durable
+// checkpoint that survives pod restart. Mode "none" (zero value) keeps
+// state in memory only. Mode "configmap" checkpoints to a ConfigMap in
+// the router's namespace on a configurable cadence.
+type PersistencePolicy struct {
+	// Mode selects the backing store. "none" keeps state in memory only.
+	// "configmap" checkpoints state to a ConfigMap.
+	// +kubebuilder:validation:Enum=none;configmap
+	Mode string `json:"mode"`
+
+	// CheckpointIntervalSeconds is how often the proxy writes a state
+	// checkpoint to the backing store. Defaults to 30 when Mode is
+	// "configmap". Ignored when Mode is "none".
+	// +optional
+	CheckpointIntervalSeconds int32 `json:"checkpointIntervalSeconds,omitempty"`
+}
+
+// Validate performs runtime sanity checks on the persistence policy.
+// The controller validates the CRD; this catches drift between
+// controller and proxy (e.g. a manually edited ConfigMap on a
+// debugging cluster).
+func (p PersistencePolicy) Validate() error {
+	switch p.Mode {
+	case "", "none", "configmap":
+		// Empty defaults to "none"; both are valid.
+	default:
+		return fmt.Errorf("mode %q must be \"none\" or \"configmap\"", p.Mode)
+	}
+	// checkpointIntervalSeconds is only enforced when mode is "configmap";
+	// when mode is "none" (the default), the field is ignored.
+	if p.Mode == "configmap" && p.CheckpointIntervalSeconds < 1 {
+		return fmt.Errorf("checkpointIntervalSeconds must be >= 1 when mode is configmap")
+	}
+	return nil
 }
 
 // ClassificationPolicy configures how the proxy determines the
@@ -260,6 +298,9 @@ func (c *Config) Validate() error {
 					i, r.Name, j, name)
 			}
 		}
+	}
+	if err := c.Policy.Persistence.Validate(); err != nil {
+		return fmt.Errorf("persistence: %w", err)
 	}
 	return nil
 }
