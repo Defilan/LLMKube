@@ -607,6 +607,44 @@ spec:
                           type: string
                         type: array
                     type: object
+                  persistence:
+                    default: none
+                    description: |-
+                      Persistence selects the backing store for router budget and rolling
+                      SLO state. In-memory (the default) resets on pod restart; ConfigMap
+                      checkpoints state across restarts at the cost of coarse-grained
+                      writes. The "redis" and "pvc" options are reserved for future phases.
+                    enum:
+                    - none
+                    - configmap
+                    - redis
+                    - pvc
+                    properties:
+                      checkpointIntervalSeconds:
+                        default: 30
+                        description: |-
+                          CheckpointIntervalSeconds is how often the proxy writes a state
+                          checkpoint to the backing store. Only honored when Type=configmap.
+                          Defaults to 30s when unset. Shorter intervals give fresher state
+                          across restarts but increase ConfigMap write load; longer intervals
+                          risk losing more state on crash.
+                        format: int32
+                        minimum: 5
+                        type: integer
+                      type:
+                        default: none
+                        description: |-
+                          Type selects the backing store. "none" (default) keeps state in
+                          memory only; "configmap" checkpoints state to a Kubernetes ConfigMap
+                          owned by the ModelRouter. "redis" and "pvc" are reserved for future
+                          phases and are rejected by the webhook when set.
+                        enum:
+                        - none
+                        - configmap
+                        - redis
+                        - pvc
+                        type: string
+                    type: object
                 type: object
               proxy:
                 description: |-

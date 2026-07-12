@@ -175,6 +175,27 @@ type RuleRoute struct {
 type Policy struct {
 	Classification ClassificationPolicy `json:"classification"`
 	AuditLog       AuditLogPolicy       `json:"auditLog"`
+	Persistence    PersistencePolicy    `json:"persistence,omitempty"`
+}
+
+// PersistencePolicy configures how the proxy persists budget and rolling
+// SLO state across restarts. The in-memory default is fine for dev and
+// single-replica setups; ConfigMap checkpointing is the first production
+// option (coarse-grained writes, no new dependencies).
+type PersistencePolicy struct {
+	// Type selects the backing store. "none" keeps state in memory only;
+	// "configmap" checkpoints state to a ConfigMap owned by the ModelRouter.
+	// +kubebuilder:validation:Enum=none;configmap
+	// +kubebuilder:default=none
+	Type string `json:"type,omitempty"`
+
+	// CheckpointIntervalSeconds is how often the proxy writes a state
+	// checkpoint to the backing store. Only honored when Type=configmap.
+	// Defaults to 30s when unset.
+	// +kubebuilder:validation:Minimum=5
+	// +kubebuilder:default=30
+	// +optional
+	CheckpointIntervalSeconds int32 `json:"checkpointIntervalSeconds,omitempty"`
 }
 
 // ClassificationPolicy configures how the proxy determines the

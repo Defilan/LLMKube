@@ -285,6 +285,16 @@ func routerProxyArgs(mr *inferencev1alpha1.ModelRouter) []string {
 		args = append(args, "--response-header-timeout",
 			mr.Spec.Proxy.ResponseHeaderTimeout.Duration.String())
 	}
+	if mr.Spec.Policy != nil && mr.Spec.Policy.Persistence != nil {
+		p := mr.Spec.Policy.Persistence
+		if p.Type != "" && p.Type != "none" {
+			args = append(args, "--persistence-type", p.Type)
+		}
+		if p.CheckpointIntervalSeconds != nil && *p.CheckpointIntervalSeconds > 0 {
+			args = append(args, "--persistence-interval",
+				fmt.Sprintf("%ds", *p.CheckpointIntervalSeconds))
+		}
+	}
 	return args
 }
 

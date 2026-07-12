@@ -332,7 +332,33 @@ func validateBudgets(
 			})
 		}
 	}
+	errs = append(errs, validatePersistence(spec)...)
 	return errs
+}
+
+// validatePersistence enforces invariants on spec.policy.persistence.
+// Reserved types (redis, pvc) are rejected at validation time so the
+// webhook doesn't have to carry the enum; "none" and "configmap" are
+// the only live values today.
+func validatePersistence(spec *inferencev1alpha1.ModelRouterSpec) []ModelRouterValidationError {
+	if spec.Policy == nil || spec.Policy.Persistence == nil {
+		return nil
+	}
+	p := spec.Policy.Persistence
+	switch p.Type {
+	case "", "none", "configmap":
+		return nil
+	case "redis", "pvc":
+		return []ModelRouterValidationError{{
+			Field:   "spec.policy.persistence.type",
+			Message: fmt.Sprintf("%q is reserved for a future phase; use \"none\" or \"configmap\"", p.Type),
+		}}
+	default:
+		return []ModelRouterValidationError{{
+			Field:   "spec.policy.persistence.type",
+			Message: fmt.Sprintf("must be one of: none, configmap, redis, pvc; got %q", p.Type),
+		}}
+	}
 }
 
 // sensitiveClassificationSet returns the set of classification values that

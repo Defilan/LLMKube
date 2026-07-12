@@ -659,6 +659,157 @@ func TestCompileRouterConfigCopiesDisplayName(t *testing.T) {
 	}
 }
 
+// TestCompileRouterConfigPersistenceDefaults verifies that when the user
+// does not set spec.policy.persistence, the compiled config carries the
+// in-memory default (type=none, interval=30s). This is the opt-in path:
+// existing ModelRouters keep their current behavior without any change.
+func TestCompileRouterConfigPersistenceDefaults(t *testing.T) {
+	mr := canonicalModelRouter()
+	// Strip the persistence block to simulate a user who never set it.
+	mr.Spec.Policy.Persistence = nil
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Policy.Persistence.Type != "none" {
+		t.Errorf("persistence type = %q, want 'none'", cfg.Policy.Persistence.Type)
+	}
+	if cfg.Policy.Persistence.CheckpointIntervalSeconds != 30 {
+		t.Errorf("persistence interval = %d, want 30", cfg.Policy.Persistence.CheckpointIntervalSeconds)
+	}
+}
+
+// TestCompileRouterConfigPersistenceConfigMap verifies that when the user
+// sets spec.policy.persistence.type=configmap, the compiled config carries
+// that value through. The proxy reads this to decide whether to start the
+// checkpoint goroutine.
+func TestCompileRouterConfigPersistenceConfigMap(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Policy.Persistence = &inferencev1alpha1.RouterPersistenceSpec{
+		Type:                      "configmap",
+		CheckpointIntervalSeconds: ptrInt32B(60),
+	}
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Policy.Persistence.Type != "configmap" {
+		t.Errorf("persistence type = %q, want 'configmap'", cfg.Policy.Persistence.Type)
+	}
+	if cfg.Policy.Persistence.CheckpointIntervalSeconds != 60 {
+		t.Errorf("persistence interval = %d, want 60", cfg.Policy.Persistence.CheckpointIntervalSeconds)
+	}
+}
+
+// TestCompileRouterConfigPersistenceReservedTypeRejected verifies that
+// reserved types (redis, pvc) are rejected at validation time with a
+// clear message pointing users at the supported options.
+func TestCompileRouterConfigPersistenceReservedTypeRejected(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Policy.Persistence = &inferencev1alpha1.RouterPersistenceSpec{
+		Type: "redis",
+	}
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret)
+	_, err := r.compileRouterConfig(context.Background(), mr)
+	if err == nil {
+		t.Fatal("expected validation error for reserved persistence type")
+	}
+	if !strings.Contains(err.Error(), "reserved") && !strings.Contains(err.Error(), "redis") {
+		t.Errorf("error %q should mention reserved/redis", err.Error())
+	}
+}
+
+// TestRouterDeploymentBuilderPersistenceArgs verifies that when the user
+// sets spec.policy.persistence, the controller renders the corresponding
+// --persistence-* flags on the proxy container. Without this the proxy
+// would never see the persistence configuration.
+func TestRouterDeploymentBuilderPersistenceArgs(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Policy.Persistence = &inferencev1alpha1.RouterPersistenceSpec{
+		Type:                      "configmap",
+		CheckpointIntervalSeconds: ptrInt32B(45),
+	}
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+	dep := r.newRouterDeployment(mr, "hash")
+
+	args := dep.Spec.Template.Spec.Containers[0].Args
+	var foundType, foundInterval bool
+	for i, a := range args {
+		if a == "--persistence-type" && i+1 < len(args) {
+			foundType = true
+			if args[i+1] != "configmap" {
+				t.Errorf("--persistence-type value = %q, want configmap", args[i+1])
+			}
+		}
+		if a == "--persistence-interval" && i+1 < len(args) {
+			foundInterval = true
+			if args[i+1] != "45s" {
+				t.Errorf("--persistence-interval value = %q, want 45s", args[i+1])
+			}
+		}
+	}
+	if !foundType {
+		t.Errorf("--persistence-type flag not rendered; args = %v", args)
+	}
+	if !foundInterval {
+		t.Errorf("--persistence-interval flag not rendered; args = %v", args)
+	}
+}
+
+// TestRouterDeploymentBuilderPersistenceDefaultOmitsFlags verifies that
+// when the user does NOT set spec.policy.persistence, the controller
+// does NOT render --persistence-* flags on the proxy container. This
+// keeps the proxy's compiled-in defaults (in-memory, no checkpointing)
+// active for existing deployments.
+func TestRouterDeploymentBuilderPersistenceDefaultOmitsFlags(t *testing.T) {
+	mr := canonicalModelRouter()
+	// Strip the persistence block to simulate a user who never set it.
+	mr.Spec.Policy.Persistence = nil
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+	dep := r.newRouterDeployment(mr, "hash")
+
+	args := dep.Spec.Template.Spec.Containers[0].Args
+	for _, a := range args {
+		if strings.HasPrefix(a, "--persistence-") {
+			t.Errorf("--persistence-* flag must be omitted when unset; args = %v", args)
+		}
+	}
+}
+
 // TestRouterServiceBuilder confirms ClusterIP default and the
 // canonical selector label.
 func TestRouterServiceBuilder(t *testing.T) {

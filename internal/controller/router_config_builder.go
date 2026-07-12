@@ -309,6 +309,7 @@ func translatePolicy(p *inferencev1alpha1.RouterPolicy) router.Policy {
 	out := router.Policy{
 		Classification: router.ClassificationPolicy{Mode: "header-only"},
 		AuditLog:       router.AuditLogPolicy{Sink: "stdout"},
+		Persistence:    router.PersistencePolicy{Type: "none", CheckpointIntervalSeconds: 30},
 	}
 	if p == nil {
 		return out
@@ -333,7 +334,23 @@ func translatePolicy(p *inferencev1alpha1.RouterPolicy) router.Policy {
 			out.AuditLog.Sink = "stdout"
 		}
 	}
+	if p.Persistence != nil {
+		out.Persistence = router.PersistencePolicy{
+			Type:                      p.Persistence.Type,
+			CheckpointIntervalSeconds: defaultCheckpointInterval(p.Persistence.CheckpointIntervalSeconds),
+		}
+	}
 	return out
+}
+
+// defaultCheckpointInterval returns the effective checkpoint interval,
+// applying the 5s minimum and 30s default. Pure helper so the
+// translatePolicy path stays readable.
+func defaultCheckpointInterval(v *int32) int32 {
+	if v == nil || *v < 5 {
+		return 30
+	}
+	return *v
 }
 
 func copyStringMap(in map[string]string) map[string]string {
@@ -389,14 +406,22 @@ func (r *ModelRouterReconciler) reconcileRouterConfigMap(
 // separate from reconcileRouterConfigMap so unit tests can call it
 // without a fake client.
 func newRouterConfigMap(mr *inferencev1alpha1.ModelRouter, compiled *compiledConfig) *corev1.ConfigMap {
+	annotations := map[string]string{
+		routerProxyConfigHashAnnotation: compiled.Hash,
+	}
+	// Surface the persistence type as an annotation so operators can
+	// predict whether the proxy will checkpoint state across restarts
+	// without reading the full spec. The proxy itself reads the value
+	// from config.json; this annotation is informational only.
+	if mr.Spec.Policy != nil && mr.Spec.Policy.Persistence != nil {
+		annotations[routerProxyPersistenceAnnotation] = mr.Spec.Policy.Persistence.Type
+	}
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      routerProxyResourceName(mr.Name),
-			Namespace: mr.Namespace,
-			Labels:    routerProxyLabels(mr),
-			Annotations: map[string]string{
-				routerProxyConfigHashAnnotation: compiled.Hash,
-			},
+			Name:        routerProxyResourceName(mr.Name),
+			Namespace:   mr.Namespace,
+			Labels:      routerProxyLabels(mr),
+			Annotations: annotations,
 		},
 		Data: map[string]string{
 			routerProxyConfigKey: string(compiled.JSON),

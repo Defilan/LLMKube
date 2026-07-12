@@ -382,3 +382,76 @@ func TestValidateBackendTimeoutBounds(t *testing.T) {
 		})
 	}
 }
+
+// TestValidatePersistenceReservedTypeRejected verifies that reserved
+// persistence types (redis, pvc) are rejected at validation time with
+// a clear message pointing users at the supported options.
+func TestValidatePersistenceReservedTypeRejected(t *testing.T) {
+	mr := validRouter()
+	mr.Spec.Policy.Persistence = &inferencev1alpha1.RouterPersistenceSpec{
+		Type: "redis",
+	}
+	errs := validatePersistence(&mr.Spec)
+	if len(errs) == 0 {
+		t.Fatal("expected validation error for reserved persistence type")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "spec.policy.persistence.type" &&
+			(strings.Contains(e.Message, "reserved") || strings.Contains(e.Message, "redis")) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected validation error for reserved persistence type, got: %v", errs)
+	}
+}
+
+// TestValidatePersistenceInvalidType verifies that an unknown
+// persistence type is rejected at validation time.
+func TestValidatePersistenceInvalidType(t *testing.T) {
+	mr := validRouter()
+	mr.Spec.Policy.Persistence = &inferencev1alpha1.RouterPersistenceSpec{
+		Type: "unknown",
+	}
+	errs := validatePersistence(&mr.Spec)
+	if len(errs) == 0 {
+		t.Fatal("expected validation error for invalid persistence type")
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "spec.policy.persistence.type" &&
+			strings.Contains(e.Message, "must be one of") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected validation error for invalid persistence type, got: %v", errs)
+	}
+}
+
+// TestDefaultCheckpointInterval verifies the default checkpoint interval
+// logic: nil or <5 returns 30, >=5 returns the value as-is.
+func TestDefaultCheckpointInterval(t *testing.T) {
+	cases := []struct {
+		name string
+		in   *int32
+		want int32
+	}{
+		{"nil returns default", nil, 30},
+		{"zero returns default", ptrInt32B(0), 30},
+		{"below minimum returns default", ptrInt32B(3), 30},
+		{"exactly minimum returns value", ptrInt32B(5), 5},
+		{"above minimum returns value", ptrInt32B(60), 60},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := defaultCheckpointInterval(tc.in)
+			if got != tc.want {
+				t.Errorf("defaultCheckpointInterval(%v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

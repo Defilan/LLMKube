@@ -39,6 +39,11 @@ const (
 	// template so a ConfigMap content change triggers a rollout.
 	routerProxyConfigHashAnnotation = "inference.llmkube.dev/router-config-hash"
 
+	// routerProxyPersistenceAnnotation is set on the router-proxy ConfigMap
+	// to surface the configured persistence type. Informational only; the
+	// proxy reads the actual value from config.json.
+	routerProxyPersistenceAnnotation = "inference.llmkube.dev/router-persistence"
+
 	// routerProxyPort is the HTTP port the proxy listens on.
 	routerProxyPort int32 = 8080
 )
