@@ -134,6 +134,39 @@ func TestValidateSlicePlan(t *testing.T) {
 	}
 }
 
+func TestIsIdentByte(t *testing.T) {
+	cases := []struct {
+		b   byte
+		yes bool
+	}{
+		{'_', true}, {'a', true}, {'Z', true}, {'0', true}, {'9', true},
+		{' ', false}, {'-', false}, {'.', false}, {'"', false},
+	}
+	for _, c := range cases {
+		if got := isIdentByte(c.b); got != c.yes {
+			t.Errorf("isIdentByte(%q) = %v, want %v", c.b, got, c.yes)
+		}
+	}
+}
+
+func TestValidateSlicePlan_PrefixPinIsRejected(t *testing.T) {
+	plan := samplePlan()
+	plan.SharedIdentifiers = []planSharedID{
+		{ID: "rocm_smi_", DefinedBy: "exporter", ReferencedBy: []string{"dashboard"}},
+	}
+	if err := validateSlicePlan(plan); err == nil {
+		t.Error("plan with trailing-underscore pin must be rejected")
+	}
+
+	// A complete identifier (ending on a letter) must still pass.
+	plan.SharedIdentifiers = []planSharedID{
+		{ID: "rocm_smi_gpu_temp", DefinedBy: "exporter", ReferencedBy: []string{"dashboard"}},
+	}
+	if err := validateSlicePlan(plan); err != nil {
+		t.Errorf("complete identifier rejected: %v", err)
+	}
+}
+
 func TestRunSlice_DryRunRendersYAML(t *testing.T) {
 	dir := t.TempDir()
 	planFile := dir + "/plan.yaml"

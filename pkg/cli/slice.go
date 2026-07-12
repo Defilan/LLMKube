@@ -181,6 +181,11 @@ func loadSlicePlan(path string) (slicePlan, error) {
 
 // validateSlicePlan enforces the invariants the render relies on: an issue, a
 // repo, at least one slice, and DISJOINT files (no file owned by two slices).
+// It also rejects pinned identifiers that end on an identifier-continuation
+// byte (letter, digit, underscore), because the reconcile check matches pins as
+// whole tokens and such a pin can never be satisfied (it is always a prefix of
+// the real identifier). Catching this at plan-validation time surfaces a clear
+// planner error instead of a misleading pinned-missing GATE-FAIL later.
 func validateSlicePlan(p slicePlan) error {
 	if p.Issue <= 0 {
 		return fmt.Errorf("plan has no issue number")
@@ -203,7 +208,31 @@ func validateSlicePlan(p slicePlan) error {
 			owner[f] = s.Name
 		}
 	}
+	for _, id := range p.SharedIdentifiers {
+		if id.ID == "" {
+			return fmt.Errorf("a shared identifier has no id")
+		}
+		if len(id.ID) > 0 && id.ID[len(id.ID)-1] == '_' {
+			return fmt.Errorf(
+				"shared identifier %q ends with a trailing underscore; "+
+					"the reconcile check matches whole tokens and a trailing "+
+					"underscore can never be a token boundary, so this pin can "+
+					"never be satisfied",
+				id.ID,
+			)
+		}
+	}
 	return nil
+}
+
+// isIdentByte reports whether b is an identifier character ([A-Za-z0-9_]).
+// Mirrors the same predicate in pkg/foreman/slicer/reconcile.go so the planner
+// and the CLI agree on what counts as a token boundary.
+func isIdentByte(b byte) bool {
+	return b == '_' ||
+		(b >= '0' && b <= '9') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z')
 }
 
 // buildSliceWorkload renders the Workload: one issue-fix step per slice, then an
