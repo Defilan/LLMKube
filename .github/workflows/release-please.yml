@@ -58,6 +58,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run GoReleaser
+        id: goreleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
@@ -66,6 +67,58 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.9.2
+        with:
+          cosign_version: v2.5.3
+
+      - name: Sign container images
+        # Keyless signing via OIDC id-token from GitHub Actions; the actor's
+        # GitHub identity becomes the signing identity so users can verify
+        # images with `cosign verify-attestation`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.release-please.outputs.version }}"
+          for image in \
+            ghcr.io/defilantech/llmkube-controller:"${VERSION}" \
+            ghcr.io/defilantech/llmkube-foreman-operator:"${VERSION}" \
+            ghcr.io/defilantech/llmkube-foreman-agent:"${VERSION}" \
+            ghcr.io/defilantech/llmkube-router-proxy:"${VERSION}"; do
+            echo "Signing ${image}"
+            cosign sign "${image}" --yes
+          done
+
+      - name: Extract image digest
+        # Parse the GoReleaser artifacts JSON to find the Docker manifest
+        # entry and extract the image name and digest for SLSA provenance.
+        id: image
+        env:
+          ARTIFACTS: "${{ steps.goreleaser.outputs.artifacts }}"
+        run: |
+          set -euo pipefail
+          image_and_digest=$(echo "$ARTIFACTS" | jq -r '.[] | select (.type=="Docker Manifest") | .path')
+          image=$(echo "${image_and_digest}" | cut -d'@' -f1 | cut -d':' -f1)
+          digest=$(echo "${image_and_digest}" | cut -d'@' -f2)
+          echo "name=${image}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SLSA provenance
+        # Generate SLSA Level 3 provenance for the container images so users
+        # can verify build provenance via `cosign verify-attestation`. The
+        # binary provenance job is omitted because the Go binaries ship as
+        # tarballs/zip archives whose checksums are already signed by cosign
+        # via the `signs` pipe in .goreleaser.yaml.
+        uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.9.0
+        with:
+          image: ${{ steps.image.outputs.name }}
+          digest: ${{ steps.image.outputs.digest }}
+          registry-username: ${{ github.actor }}
+        secrets:
+          registry-password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish Homebrew formula
         # GoReleaser no longer manages the tap (its cask replacement is

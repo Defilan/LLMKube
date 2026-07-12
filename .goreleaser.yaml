@@ -188,6 +188,23 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+# Sign the checksum file with cosign (keyless, via GitHub OIDC) so downstream
+# consumers can verify artifact provenance with `cosign verify-attestation`.
+# The container images are signed in the release workflow via the cosign
+# `sign` step; this covers the binary archives.
+signs:
+  - cmd: cosign
+    env:
+      - COSIGN_EXPERIMENTAL=1
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+    artifacts: checksum
+    output: true
+
 # dockers_v2 builds one multi-arch manifest per image natively (buildx),
 # replacing the old per-arch `dockers` entries + `docker_manifests`. The
 # binaries are staged per platform under $TARGETPLATFORM in the build
