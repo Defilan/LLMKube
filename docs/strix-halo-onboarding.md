@@ -280,6 +280,96 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   }' | jq '.timings.prompt_per_second, .timings.predicted_per_second'
 ```
 
+### Benchmark entry
+
+For the heterogeneous-fleet story, this node is a real backend tier the
+gateway (#661) and router can target. The `Model` + `InferenceService`
+manifests below are the canonical AMD/Vulkan example; they are the same
+shape as the CUDA and Metal examples in `config/samples/`, plus a larger
+MoE showcase for the unified-memory pool.
+
+```yaml
+# AMD Strix Halo: small model, Vulkan backend
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: llama-3b-amd-vulkan
+  namespace: default
+spec:
+  source: https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+  format: gguf
+  quantization: Q4_K_M
+  hardware:
+    gpu:
+      enabled: true
+      count: 1
+      vendor: amd
+      layers: -1
+  resources:
+    cpu: "4"
+    memory: "8Gi"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: llama-3b-amd-vulkan
+  namespace: default
+spec:
+  modelRef: llama-3b-amd-vulkan
+  replicas: 1
+  image: ghcr.io/defilantech/llmkube-llama-vulkan:stable
+  resources:
+    gpu: 1
+    cpu: "2"
+    memory: "4Gi"
+  endpoint:
+    port: 8080
+    type: ClusterIP
+```
+
+```yaml
+# AMD Strix Halo: MoE showcase (Qwen3 Coder 30B A3B)
+# Larger MoE model to showcase the unified-memory pool.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-coder-30b-amd-vulkan
+  namespace: default
+spec:
+  source: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/resolve/main/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+  format: gguf
+  quantization: Q4_K_M
+  hardware:
+    gpu:
+      enabled: true
+      count: 1
+      vendor: amd
+      layers: -1
+  resources:
+    cpu: "8"
+    memory: "16Gi"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen3-coder-30b-amd-vulkan
+  namespace: default
+spec:
+  modelRef: qwen3-coder-30b-amd-vulkan
+  replicas: 1
+  image: ghcr.io/defilantech/llmkube-llama-vulkan:stable
+  resources:
+    gpu: 1
+    cpu: "4"
+    memory: "8Gi"
+  endpoint:
+    port: 8080
+    type: ClusterIP
+```
+
+Wire the AMD tier into the gateway's routing rules (#661) so it can serve
+as a fallback or second tier in a heterogeneous failover demo.
+
 ## Troubleshooting
 
 ### renderD128 not present
