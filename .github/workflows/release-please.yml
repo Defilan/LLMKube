@@ -67,6 +67,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
+      - name: Install cosign
+        if: ${{ needs.release-please.outputs.release_created == 'true' }}
+        uses: sigstore/cosign-installer@v3.9.2
+        with:
+          cosign_release: v2.5.3
+
+      - name: Sign container images with cosign
+        if: ${{ needs.release-please.outputs.release_created == 'true' }}
+        env:
+          COSIGN_EXPERIMENTAL: 1
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Sign all images published by GoReleaser
+          for image in \
+            ghcr.io/defilantech/llmkube-controller \
+            ghcr.io/defilantech/llmkube-foreman-operator \
+            ghcr.io/defilantech/llmkube-foreman-agent \
+            ghcr.io/defilantech/llmkube-router-proxy; do
+            echo "Signing ${image}:${VERSION}"
+            cosign sign --yes "${image}:${VERSION}"
+          done
+
       - name: Publish Homebrew formula
         # GoReleaser no longer manages the tap (its cask replacement is
         # macOS-only). Publish a cross-platform binary formula from the
@@ -125,6 +148,37 @@ jobs:
           exit-code: '1'
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+
+  binary-provenance:
+    needs:
+      - release-please
+      - goreleaser
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v1.1.4
+    with:
+      base64-subjects: "${{ needs.goreleaser.outputs.hashes }}"
+      upload-assets: true
+
+  image-provenance:
+    needs:
+      - release-please
+      - goreleaser
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.1.4
+    with:
+      image: ghcr.io/defilantech/llmkube-controller
+      digest: "${{ needs.goreleaser.outputs.digest }}"
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
 
   release-helm:
     needs: release-please
