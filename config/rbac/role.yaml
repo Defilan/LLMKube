@@ -20,6 +20,7 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
   - nodes
   - pods
   - secrets
@@ -159,6 +160,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - inference.llmkube.dev
+  resources:
+  - gpuquotas
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - inference.llmkube.dev
