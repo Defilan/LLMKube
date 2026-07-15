@@ -401,3 +401,187 @@ var _ = Describe("isHFRepoSource rejects s3:// (source.go)", func() {
 		Expect(isHFRepoSource("S3://my-bucket/model.gguf")).To(BeFalse())
 	})
 })
+
+var _ = Describe("parseHFSource (source.go)", func() {
+	It("should parse hf:// source without revision", func() {
+		repoID, revision, err := parseHFSource("hf://org/repo")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should parse hf:// source with revision", func() {
+		repoID, revision, err := parseHFSource("hf://org/repo@main")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal("main"))
+	})
+	It("should parse hf:// source with tag revision", func() {
+		repoID, revision, err := parseHFSource("hf://org/repo@v1.0")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal("v1.0"))
+	})
+	It("should parse hf:// source with commit SHA revision", func() {
+		repoID, revision, err := parseHFSource("hf://org/repo@abc123def456789012345678901234567890abcd")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal("abc123def456789012345678901234567890abcd"))
+	})
+	It("should parse bare repo ID without revision", func() {
+		repoID, revision, err := parseHFSource("org/repo")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should parse bare repo ID with revision", func() {
+		repoID, revision, err := parseHFSource("org/repo@main")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal("main"))
+	})
+	It("should error on non-HF source", func() {
+		_, _, err := parseHFSource("http://example.com/model.gguf")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("not an HF source"))
+	})
+	It("should error on empty HF source", func() {
+		_, _, err := parseHFSource("hf://")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty HF source"))
+	})
+	It("should error on empty repo ID", func() {
+		_, _, err := parseHFSource("hf://@main")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty repo ID"))
+	})
+	It("should error on empty revision", func() {
+		_, _, err := parseHFSource("hf://org/repo@")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty revision"))
+	})
+	It("should handle revision with slashes (feature branch)", func() {
+		repoID, revision, err := parseHFSource("hf://org/repo@feature/foo/bar")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal("feature/foo/bar"))
+	})
+	It("should handle revision with PR ref", func() {
+		repoID, revision, err := parseHFSource("hf://org/repo@refs/pr/1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("org/repo"))
+		Expect(revision).To(Equal("refs/pr/1"))
+	})
+})
+
+var _ = Describe("hfResolveURL (source.go)", func() {
+	It("should produce correct URL with revision", func() {
+		Expect(hfResolveURL("org/repo", "main")).To(Equal("https://huggingface.co/org/repo/resolve/main/"))
+	})
+	It("should produce correct URL with commit SHA", func() {
+		Expect(hfResolveURL("org/repo", "abc123def456789012345678901234567890abcd")).To(Equal("https://huggingface.co/org/repo/resolve/abc123def456789012345678901234567890abcd/"))
+	})
+	It("should produce correct URL with tag", func() {
+		Expect(hfResolveURL("org/repo", "v1.0")).To(Equal("https://huggingface.co/org/repo/resolve/v1.0/"))
+	})
+	It("should produce correct URL with feature branch", func() {
+		Expect(hfResolveURL("org/repo", "feature/foo/bar")).To(Equal("https://huggingface.co/org/repo/resolve/feature/foo/bar/"))
+	})
+})
+
+var _ = Describe("validateHFRepoSource (source.go) with @rev", func() {
+	It("should return nil for valid bare repo ID without revision", func() {
+		Expect(validateHFRepoSource("org/repo")).To(Succeed())
+	})
+	It("should return nil for valid hf:// prefixed repo ID without revision", func() {
+		Expect(validateHFRepoSource("hf://org/repo")).To(Succeed())
+	})
+	It("should return nil for valid hf:// source with revision", func() {
+		Expect(validateHFRepoSource("hf://org/repo@main")).To(Succeed())
+	})
+	It("should return nil for valid hf:// source with tag revision", func() {
+		Expect(validateHFRepoSource("hf://org/repo@v1.0")).To(Succeed())
+	})
+	It("should return nil for valid hf:// source with commit SHA revision", func() {
+		Expect(validateHFRepoSource("hf://org/repo@abc123def456789012345678901234567890abcd")).To(Succeed())
+	})
+	It("should return nil for valid bare repo ID with revision", func() {
+		Expect(validateHFRepoSource("org/repo@main")).To(Succeed())
+	})
+	It("should return error for invalid revision (starts with special char)", func() {
+		err := validateHFRepoSource("hf://org/repo@-invalid")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid revision"))
+	})
+	It("should return error for invalid revision (contains space)", func() {
+		err := validateHFRepoSource("hf://org/repo@invalid rev")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid revision"))
+	})
+	It("should return error for empty revision", func() {
+		err := validateHFRepoSource("hf://org/repo@")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty revision"))
+	})
+	It("should return error for empty repo ID", func() {
+		err := validateHFRepoSource("hf://@main")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty repo ID"))
+	})
+})
+
+var _ = Describe("isHFRepoSource with @rev (source.go)", func() {
+	It("should return true for hf:// source with revision", func() {
+		Expect(isHFRepoSource("hf://org/repo@main")).To(BeTrue())
+	})
+	It("should return true for bare repo ID with revision", func() {
+		Expect(isHFRepoSource("org/repo@main")).To(BeTrue())
+	})
+	It("should return true for hf:// source with tag revision", func() {
+		Expect(isHFRepoSource("hf://org/repo@v1.0")).To(BeTrue())
+	})
+	It("should return true for hf:// source with feature branch revision", func() {
+		Expect(isHFRepoSource("hf://org/repo@feature/foo/bar")).To(BeTrue())
+	})
+	It("should return true for hf:// source with PR ref revision", func() {
+		Expect(isHFRepoSource("hf://org/repo@refs/pr/1")).To(BeTrue())
+	})
+})
+
+var _ = Describe("isValidGitRef (source.go)", func() {
+	It("should return true for main branch", func() {
+		Expect(isValidGitRef("main")).To(BeTrue())
+	})
+	It("should return true for tag", func() {
+		Expect(isValidGitRef("v1.0")).To(BeTrue())
+	})
+	It("should return true for commit SHA", func() {
+		Expect(isValidGitRef("abc123def456789012345678901234567890abcd")).To(BeTrue())
+	})
+	It("should return true for feature branch", func() {
+		Expect(isValidGitRef("feature/foo/bar")).To(BeTrue())
+	})
+	It("should return true for PR ref", func() {
+		Expect(isValidGitRef("refs/pr/1")).To(BeTrue())
+	})
+	It("should return true for branch with dots", func() {
+		Expect(isValidGitRef("release.1.0")).To(BeTrue())
+	})
+	It("should return true for branch with underscores", func() {
+		Expect(isValidGitRef("my_branch")).To(BeTrue())
+	})
+	It("should return false for empty string", func() {
+		Expect(isValidGitRef("")).To(BeFalse())
+	})
+	It("should return false for branch starting with dash", func() {
+		Expect(isValidGitRef("-invalid")).To(BeFalse())
+	})
+	It("should return false for branch starting with underscore", func() {
+		Expect(isValidGitRef("_invalid")).To(BeFalse())
+	})
+	It("should return false for branch with space", func() {
+		Expect(isValidGitRef("invalid rev")).To(BeFalse())
+	})
+	It("should return false for branch with special char", func() {
+		Expect(isValidGitRef("invalid!rev")).To(BeFalse())
+	})
+})
