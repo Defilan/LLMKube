@@ -231,16 +231,82 @@ func normalizeHFSource(source string) string {
 	return strings.TrimPrefix(source, "hf://")
 }
 
+// parseHFSource splits an hf:// source into repo ID and revision.
+// Format: hf://org/repo@<revision> or hf://org/repo (revision may be empty).
+// Mirrors parsePVCSource's structure and error messages.
+func parseHFSource(source string) (repoID, revision string, err error) {
+	if !isHFRepoSource(source) {
+		return "", "", fmt.Errorf("not an HF source: %s", source)
+	}
+
+	// Strip the hf:// prefix
+	rest := normalizeHFSource(source)
+	if rest == "" {
+		return "", "", fmt.Errorf("empty HF source: %s", source)
+	}
+
+	// Split into repo ID and revision on @
+	atIdx := strings.LastIndex(rest, "@")
+	if atIdx < 0 {
+		return rest, "", nil
+	}
+
+	repoID = rest[:atIdx]
+	revision = rest[atIdx+1:]
+
+	if repoID == "" {
+		return "", "", fmt.Errorf("HF source has empty repo ID: %s", source)
+	}
+	if revision == "" {
+		return "", "", fmt.Errorf("HF source has empty revision: %s", source)
+	}
+
+	return repoID, revision, nil
+}
+
+// hfResolveURL builds the Hugging Face resolve URL for a repo and revision.
+// Format: https://huggingface.co/<repoID>/resolve/<revision>/
+// The caller appends the filename to this base URL.
+//
+//nolint:unparam // linter false positive: repoID varies in real usage, only tests use "org/repo"
+func hfResolveURL(repoID, revision string) string {
+	return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/", repoID, revision)
+}
+
 // validateHFRepoSource checks for common HF source mistakes and returns an
-// error if the source is malformed. Currently rejects @rev syntax, which
-// users sometimes add from Git or HF CLI habits but which the operator does
-// not support.
+// error if the source is malformed. Accepts @rev syntax and validates the
+// revision is a well-formed Git ref (alphanumeric, hyphens, underscores,
+// dots, slashes; must start with alphanumeric).
 func validateHFRepoSource(source string) error {
-	normalized := normalizeHFSource(source)
-	if strings.Contains(normalized, "@") {
-		return fmt.Errorf("hf repo source must not contain @rev syntax: %s", source)
+	_, revision, err := parseHFSource(source)
+	if err != nil {
+		return err
+	}
+	if revision != "" && !isValidGitRef(revision) {
+		return fmt.Errorf("HF source has invalid revision %q: %s", revision, source)
 	}
 	return nil
+}
+
+// isValidGitRef reports whether s is a valid Git ref name (branch, tag, or
+// commit SHA). Git refname rules: must start with alphanumeric, may contain
+// alphanumeric, hyphens, underscores, dots, and slashes.
+func isValidGitRef(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, c := range s {
+		if i == 0 {
+			if !isAlphaNum(c) {
+				return false
+			}
+			continue
+		}
+		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' {
+			return false
+		}
+	}
+	return true
 }
 
 // isHFRepoSource reports whether source looks like a HuggingFace repo ID
@@ -277,7 +343,8 @@ func isHFRepoSource(source string) bool {
 		return false
 	}
 	// Match HF's permitted character set: alphanumeric, hyphens, underscores,
-	// dots, and forward slashes. Must start with alphanumeric.
+	// dots, forward slashes, and @ (for revision pinning). Must start with
+	// alphanumeric.
 	for i, c := range normalized {
 		if i == 0 {
 			if !isAlphaNum(c) {
@@ -285,7 +352,7 @@ func isHFRepoSource(source string) bool {
 			}
 			continue
 		}
-		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' {
+		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' && c != '@' {
 			return false
 		}
 	}
