@@ -1118,14 +1118,11 @@ type SGLangConfig struct {
 	// DataParallelSize sets the number of data-parallel replicas (SGLang-side controller).
 	// Maps to SGLang --dp flag. Not auto-derived; set explicitly.
 	//
-	// NOTE: at present this only sets the in-process SGLang `--dp` flag.
-	// Multi-replica rendezvous (SGLang's --dist-init-addr + a stable
-	// network identity per pod, e.g. headless service + StatefulSet) is
-	// not yet wired into the InferenceService controller and is tracked
-	// at https://github.com/defilantech/LLMKube/issues/1102. Setting
-	// this on an InferenceService with replicas > 1 will leave each
-	// replica starting as its own DP-1 group; operators wanting true
-	// DP coordination should hold off on this flag until #1102 lands.
+	// NOTE: the arg builder (sglangAppendMultiNodeDataParallel) emits the
+	// multi-node rendezvous flags (--dp-size, --dist-init-addr, --nnodes,
+	// --node-rank) when called, but wiring those flags into the
+	// InferenceService controller (pod identity, headless service, etc.)
+	// is tracked at https://github.com/defilantech/LLMKube/issues/1102.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	DataParallelSize *int32 `json:"dataParallelSize,omitempty"`

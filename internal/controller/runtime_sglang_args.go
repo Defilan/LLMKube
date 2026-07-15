@@ -52,6 +52,29 @@ func sglangAppendDataParallelSize(args []string, size *int32) []string {
 	return args
 }
 
+// sglangAppendMultiNodeDataParallel appends the SGLang flags needed for
+// multi-node data-parallel rendezvous. Each replica must know the total
+// data-parallel size, the rendezvous address, the total node count, and
+// its own node rank. The flags are:
+//
+//	--dp-size <int>     data-parallel size (total replicas across nodes)
+//	--dist-init-addr <addr>  rendezvous/init address (e.g. 172.16.4.52:20000)
+//	--nnodes <int>      total number of nodes
+//	--node-rank <int>   rank of the current node (0-based)
+//
+// See https://docs.sglang.ai/references/multi_node.html for the SGLang
+// multi-node documentation.
+func sglangAppendMultiNodeDataParallel(args []string, dpSize int32, distInitAddr string, nnodes, nodeRank int32) []string {
+	if dpSize < 1 || distInitAddr == "" || nnodes < 1 || nodeRank < 0 {
+		return args
+	}
+	args = append(args, "--dp-size", fmt.Sprintf("%d", dpSize))
+	args = append(args, "--dist-init-addr", distInitAddr)
+	args = append(args, "--nnodes", fmt.Sprintf("%d", nnodes))
+	args = append(args, "--node-rank", fmt.Sprintf("%d", nodeRank))
+	return args
+}
+
 func sglangAppendContextLength(args []string, ctx *int32) []string {
 	if ctx != nil {
 		return append(args, "--context-length", fmt.Sprintf("%d", *ctx))

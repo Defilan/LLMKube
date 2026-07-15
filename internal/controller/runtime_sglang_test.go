@@ -1108,3 +1108,103 @@ func TestSGLangBuildLoraModulePairs_Coverage(t *testing.T) {
 		}
 	})
 }
+
+// TestSGLangMultiNodeDataParallel verifies the exact argv emitted by
+// sglangAppendMultiNodeDataParallel for a multi-node DP group.
+func TestSGLangMultiNodeDataParallel(t *testing.T) {
+	cases := []struct {
+		name     string
+		dpSize   int32
+		distAddr string
+		nnodes   int32
+		nodeRank int32
+		want     []string
+	}{
+		{
+			name:     "basic multi-node DP group",
+			dpSize:   4,
+			distAddr: "172.16.4.52:20000",
+			nnodes:   2,
+			nodeRank: 0,
+			want:     []string{"--dp-size", "4", "--dist-init-addr", "172.16.4.52:20000", "--nnodes", "2", "--node-rank", "0"},
+		},
+		{
+			name:     "node rank 1",
+			dpSize:   4,
+			distAddr: "172.16.4.52:20000",
+			nnodes:   2,
+			nodeRank: 1,
+			want:     []string{"--dp-size", "4", "--dist-init-addr", "172.16.4.52:20000", "--nnodes", "2", "--node-rank", "1"},
+		},
+		{
+			name:     "single node (nnodes=1)",
+			dpSize:   2,
+			distAddr: "10.0.0.1:29500",
+			nnodes:   1,
+			nodeRank: 0,
+			want:     []string{"--dp-size", "2", "--dist-init-addr", "10.0.0.1:29500", "--nnodes", "1", "--node-rank", "0"},
+		},
+		{
+			name:     "four nodes",
+			dpSize:   8,
+			distAddr: "192.168.1.10:20000",
+			nnodes:   4,
+			nodeRank: 3,
+			want:     []string{"--dp-size", "8", "--dist-init-addr", "192.168.1.10:20000", "--nnodes", "4", "--node-rank", "3"},
+		},
+		// Invalid inputs: should return the args slice unchanged.
+		{
+			name:     "dpSize zero skips all flags",
+			dpSize:   0,
+			distAddr: "172.16.4.52:20000",
+			nnodes:   2,
+			nodeRank: 0,
+			want:     nil,
+		},
+		{
+			name:     "empty distAddr skips all flags",
+			dpSize:   4,
+			distAddr: "",
+			nnodes:   2,
+			nodeRank: 0,
+			want:     nil,
+		},
+		{
+			name:     "nnodes zero skips all flags",
+			dpSize:   4,
+			distAddr: "172.16.4.52:20000",
+			nnodes:   0,
+			nodeRank: 0,
+			want:     nil,
+		},
+		{
+			name:     "negative nodeRank skips all flags",
+			dpSize:   4,
+			distAddr: "172.16.4.52:20000",
+			nnodes:   2,
+			nodeRank: -1,
+			want:     nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sglangAppendMultiNodeDataParallel(nil, tc.dpSize, tc.distAddr, tc.nnodes, tc.nodeRank)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSGLangMultiNodeDataParallel_preservesArgs verifies that the function
+// appends to an existing args slice rather than replacing it.
+func TestSGLangMultiNodeDataParallel_preservesArgs(t *testing.T) {
+	existing := make([]string, 0, 12)
+	existing = append(existing, "--model-path", "/models/test", "--port", "30000")
+	want := append(existing, "--dp-size", "4", "--dist-init-addr", "172.16.4.52:20000", "--nnodes", "2", "--node-rank", "0")
+	got := sglangAppendMultiNodeDataParallel(existing, 4, "172.16.4.52:20000", 2, 0)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
