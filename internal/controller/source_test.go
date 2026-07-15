@@ -150,6 +150,12 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	It("should return true for hf:// with multi-part path", func() {
 		Expect(isHFRepoSource("hf://org/deep/nested/repo")).To(BeTrue())
 	})
+	It("should return true for hf:// with @rev suffix", func() {
+		Expect(isHFRepoSource("hf://org/repo@main")).To(BeTrue())
+	})
+	It("should return true for bare repo ID with @rev suffix", func() {
+		Expect(isHFRepoSource("org/repo@v1.0")).To(BeTrue())
+	})
 	It("should return false for https URL", func() {
 		Expect(isHFRepoSource("https://example.com/model.gguf")).To(BeFalse())
 	})
@@ -186,15 +192,24 @@ var _ = Describe("validateHFRepoSource (source.go)", func() {
 	It("should return nil for valid hf:// prefixed repo ID", func() {
 		Expect(validateHFRepoSource("hf://org/repo")).To(Succeed())
 	})
-	It("should return error for hf:// with @rev", func() {
-		err := validateHFRepoSource("hf://org/repo@main")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("@rev"))
+	It("should return nil for hf:// with @rev (branch)", func() {
+		Expect(validateHFRepoSource("hf://org/repo@main")).To(Succeed())
 	})
-	It("should return error for bare repo ID with @rev", func() {
-		err := validateHFRepoSource("org/repo@v1.0")
+	It("should return nil for bare repo ID with @rev (tag)", func() {
+		Expect(validateHFRepoSource("org/repo@v1.0")).To(Succeed())
+	})
+	It("should return nil for hf:// with @rev (commit SHA)", func() {
+		Expect(validateHFRepoSource("hf://org/repo@abc123def456")).To(Succeed())
+	})
+	It("should return error for empty repo ID", func() {
+		err := validateHFRepoSource("hf://@main")
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("@rev"))
+		Expect(err.Error()).To(ContainSubstring("empty"))
+	})
+	It("should return error for bare empty repo ID with @rev", func() {
+		err := validateHFRepoSource("@main")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty"))
 	})
 })
 
@@ -207,6 +222,39 @@ var _ = Describe("normalizeHFSource (source.go)", func() {
 	})
 	It("should leave non-hf source unchanged", func() {
 		Expect(normalizeHFSource("https://example.com/model.gguf")).To(Equal("https://example.com/model.gguf"))
+	})
+})
+
+var _ = Describe("parseHFSource (source.go)", func() {
+	It("should parse hf:// source without revision", func() {
+		repo, rev := parseHFSource("hf://org/repo")
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal(""))
+	})
+	It("should parse hf:// source with revision", func() {
+		repo, rev := parseHFSource("hf://org/repo@main")
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal("main"))
+	})
+	It("should parse bare repo ID without revision", func() {
+		repo, rev := parseHFSource("org/repo")
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal(""))
+	})
+	It("should parse bare repo ID with revision", func() {
+		repo, rev := parseHFSource("org/repo@v1.0")
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal("v1.0"))
+	})
+	It("should parse hf:// source with commit SHA revision", func() {
+		repo, rev := parseHFSource("hf://org/repo@abc123def456")
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal("abc123def456"))
+	})
+	It("should parse hf:// source with nested path and revision", func() {
+		repo, rev := parseHFSource("hf://org/deep/nested/repo@main")
+		Expect(repo).To(Equal("org/deep/nested/repo"))
+		Expect(rev).To(Equal("main"))
 	})
 })
 
@@ -262,6 +310,8 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 			"http://mirror.local/m.gguf",
 			"Qwen/Qwen3.6-35B-A3B",
 			"hf://org/repo",
+			"hf://org/repo@main",
+			"org/repo@v1.0",
 			"file:///mnt/models/m.gguf",
 			"/mnt/models/m.gguf",
 			"pvc://my-claim/path/m.gguf",

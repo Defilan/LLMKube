@@ -45,7 +45,7 @@ type ModelSpec struct {
 	// equivalent https://huggingface.co/.../<filename>.gguf URL which
 	// the runtime/init container resolves at deploy time.
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Pattern=`^(https?|file|pvc|hf|s3)://.*|^/[^\s]+$|^[a-zA-Z0-9][\w\-\.\/]+$`
+	// +kubebuilder:validation:Pattern=`^(https?|file|pvc|hf|s3)://.*|^/[^\\s]+$|^[a-zA-Z0-9][\\w\\-\\.\\/@]+$`
 	Source string `json:"source"`
 
 	// SHA256 is the expected SHA256 hash of the model file for integrity verification.

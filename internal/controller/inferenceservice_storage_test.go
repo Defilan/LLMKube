@@ -203,7 +203,9 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 
 		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 
-		Expect(config.modelPath).To(Equal("/models/abc123/gemma-4-31B-it-UD-Q4_K_XL.gguf"))
+		// For multi-file directory-format checkpoints, the model path is the
+		// directory containing the checkpoint files, not the first file.
+		Expect(config.modelPath).To(Equal("/models/abc123"))
 		cmd := config.initContainers[1].Command[2]
 		Expect(cmd).To(ContainSubstring("MODEL_FILES"))
 		Expect(cmd).To(ContainSubstring(`printf '%s\n'`))
@@ -236,6 +238,24 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 		env := config.initContainers[1].Env
 		modelFiles := getEnvVar(env, "MODEL_FILES")
 		Expect(modelFiles).To(ContainSubstring("MTP/weights.gguf"))
+	})
+
+	It("uses directory path for multi-file model with subdirectory primary", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "subdir", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "hf://org/subdir-repo",
+				Files: []string{
+					"checkpoint/model-00001-of-00002.safetensors",
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{CacheKey: "key4"},
+		}
+
+		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
+
+		// The model path should be the directory containing the primary file.
+		Expect(config.modelPath).To(Equal("/models/key4/checkpoint"))
 	})
 
 	It("normalizes hf:// source to huggingface.co URL in multi-file command", func() {
@@ -326,13 +346,30 @@ var _ = Describe("buildEmptyDirStorageConfig multi-file staging", func() {
 
 		config := buildEmptyDirStorageConfig(model, nil, "default", "", "curl:8.18.0")
 
-		Expect(config.modelPath).To(Equal("/models/default-empty-model/model.gguf"))
+		// For multi-file directory-format checkpoints, the model path is the
+		// directory containing the checkpoint files, not the first file.
+		Expect(config.modelPath).To(Equal("/models/default-empty-model"))
 		cmd := config.initContainers[0].Command[2]
 		Expect(cmd).To(ContainSubstring("MODEL_FILES"))
 
 		env := config.initContainers[0].Env
 		modelFiles := getEnvVar(env, "MODEL_FILES")
 		Expect(modelFiles).To(ContainSubstring("extra.gguf"))
+	})
+
+	It("uses directory path for multi-file model with subdirectory primary", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "subdir-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "hf://org/subdir-repo",
+				Files:  []string{"checkpoint/model-00001-of-00002.safetensors"},
+			},
+		}
+
+		config := buildEmptyDirStorageConfig(model, nil, "default", "", "curl:8.18.0")
+
+		// The model path should be the directory containing the primary file.
+		Expect(config.modelPath).To(Equal("/models/default-subdir-model/checkpoint"))
 	})
 
 	It("uses OnChange per-file etag revalidation in emptyDir storage", func() {
@@ -393,6 +430,22 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 		Expect(cmd).NotTo(ContainSubstring("[["))
 		Expect(cmd).To(ContainSubstring("case"))
 		Expect(cmd).To(ContainSubstring("esac"))
+	})
+
+	It("uses ${SOURCE%/}/$rel instead of hardcoded /resolve/main/", func() {
+		cmd := buildMultiFileInitCommand(true, RefreshPolicyIfNotPresent)
+		// The revision is now embedded in the SOURCE URL, so the URL template
+		// uses ${SOURCE%/}/$rel instead of ${SOURCE%/}/resolve/main/$rel.
+		Expect(cmd).NotTo(ContainSubstring("/resolve/main/"))
+		Expect(cmd).To(ContainSubstring(`"${SOURCE%/}/$rel"`))
+	})
+
+	It("embeds revision in normalize_hf_source for hf:// sources with @rev", func() {
+		cmd := buildMultiFileInitCommand(true, RefreshPolicyIfNotPresent)
+		// The normalize_hf_source function should extract the revision from
+		// the hf:// source and append /resolve/<rev> to the URL.
+		Expect(cmd).To(ContainSubstring("rev="))
+		Expect(cmd).To(ContainSubstring("resolve"))
 	})
 })
 
@@ -502,6 +555,14 @@ var _ = Describe("buildCachedStorageConfig cache key fallback", func() {
 var _ = Describe("resolveHFSourceURL", func() {
 	It("converts hf:// to https://huggingface.co/", func() {
 		Expect(resolveHFSourceURL("hf://unsloth/gemma-4-31B-it-GGUF")).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF"))
+	})
+
+	It("converts hf:// with @rev to https://huggingface.co/<repo>/resolve/<rev>", func() {
+		Expect(resolveHFSourceURL("hf://unsloth/gemma-4-31B-it-GGUF@main")).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main"))
+	})
+
+	It("converts hf:// with commit SHA revision", func() {
+		Expect(resolveHFSourceURL("hf://org/repo@abc123def456")).To(Equal("https://huggingface.co/org/repo/resolve/abc123def456"))
 	})
 
 	It("passes through https URLs unchanged", func() {

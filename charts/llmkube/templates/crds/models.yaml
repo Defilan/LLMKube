@@ -375,7 +375,7 @@ spec:
                   tightly (#405). Workaround: pre-stage on a pvc://, or use the
                   equivalent https://huggingface.co/.../<filename>.gguf URL which
                   the runtime/init container resolves at deploy time.
-                pattern: ^(https?|file|pvc|hf|s3)://.*|^/[^\s]+$|^[a-zA-Z0-9][\w\-\.\/]+$
+                pattern: ^(https?|file|pvc|hf|s3)://.*|^/[^\\s]+$|^[a-zA-Z0-9][\\w\\-\\.\\/@]+$
                 type: string
               sourceSecretRef:
                 description: |-

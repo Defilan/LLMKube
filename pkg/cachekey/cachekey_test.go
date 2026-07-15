@@ -133,3 +133,29 @@ func TestEffectiveKeySingleFile(t *testing.T) {
 		t.Errorf("EffectiveKey single-file = %q, want empty", got)
 	}
 }
+
+func TestEffectiveKeyMultiFileWithRevision(t *testing.T) {
+	// Different revisions must produce different cache keys.
+	modelRev1 := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{
+			Source: "hf://example/model@main",
+			Files:  []string{"model.gguf"},
+		},
+	}
+	modelRev2 := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{
+			Source: "hf://example/model@v1.0",
+			Files:  []string{"model.gguf"},
+		},
+	}
+	got1 := EffectiveKey(modelRev1)
+	got2 := EffectiveKey(modelRev2)
+	if got1 == got2 {
+		t.Errorf("EffectiveKey different revisions produced same key: %q", got1)
+	}
+	// The key should be based on the full source including @rev.
+	want := Compute("hf://example/model@main")
+	if got1 != want {
+		t.Errorf("EffectiveKey with revision = %q, want %q", got1, want)
+	}
+}

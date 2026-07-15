@@ -249,12 +249,18 @@ func modelEnvFrom(model *inferencev1alpha1.Model) []corev1.EnvFromSource {
 
 // resolveHFSourceURL converts hf://repo-id sources to their huggingface.co
 // HTTPS equivalent for init container env vars. Non-hf:// sources pass through unchanged.
+// When the source includes an @rev suffix (e.g. "hf://org/repo@main"), the URL
+// uses the /resolve/<rev>/ path segment so the init container fetches the exact
+// revision's bytes.
 func resolveHFSourceURL(source string) string {
-	if strings.HasPrefix(source, "hf://") {
-		repo := strings.TrimPrefix(source, "hf://")
-		return "https://huggingface.co/" + repo
+	if !strings.HasPrefix(source, "hf://") {
+		return source
 	}
-	return source
+	repo, rev := parseHFSource(source)
+	if rev != "" {
+		return "https://huggingface.co/" + repo + "/resolve/" + rev
+	}
+	return "https://huggingface.co/" + repo
 }
 
 // hasMultiFileStaging reports whether the model uses multi-file staging via
@@ -386,7 +392,10 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 		prefix = `mkdir -p /models && `
 	}
 
-	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) echo "https://huggingface.co/${1#hf://}" ;; *) echo "$1" ;; esac; }` + " && "
+	// normalize_hf_source strips the hf:// prefix and appends /resolve/<rev>
+	// when the source includes an @rev suffix (e.g. "hf://org/repo@main"
+	// -> "https://huggingface.co/org/repo/resolve/main").
+	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) repo="${1#hf://}"; rev="${repo#*/}"; repo="${repo%/*}"; if [ "$rev" != "${rev#*@}" ]; then repo="${repo%/*}"; rev="${rev#*@}"; echo "https://huggingface.co/${repo}/resolve/${rev}"; else echo "https://huggingface.co/${repo}"; fi ;; *) echo "$1" ;; esac; }` + " && "
 
 	if refreshPolicy == RefreshPolicyOnChange {
 		body := normalizeFn +
@@ -395,7 +404,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 			`[ -n "$rel" ] || continue; ` +
 			`dest="$CACHE_DIR/$rel"; ` +
 			`mkdir -p "$(dirname "$dest")"; ` +
-			`url="${SOURCE%/}/resolve/main/$rel"; ` +
+			`url="${SOURCE%/}/$rel"; ` +
 			`etag="$(dirname "$dest")/.$(basename "$dest").etag"; ` +
 			`if curl -fsSL --etag-compare "$etag" --etag-save "$etag" -o "$dest" "$url"; then ` +
 			`echo "Model artifact $rel revalidated"; ` +
@@ -411,7 +420,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 		`[ -n "$rel" ] || continue; ` +
 		`dest="$CACHE_DIR/$rel"; ` +
 		`mkdir -p "$(dirname "$dest")"; ` +
-		`url="${SOURCE%/}/resolve/main/$rel"; ` +
+		`url="${SOURCE%/}/$rel"; ` +
 		`if [ ! -f "$dest" ]; then ` +
 		`echo "Downloading model artifact $rel..."; ` +
 		`curl -f -L -o "$dest" "$url" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
@@ -532,7 +541,18 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		}
 	}
 	if plan != nil {
-		modelPath := stagedCachePath(cacheDir, plan.Primary)
+		// For multi-file directory-format checkpoints (safetensors), the
+		// runtime expects the model path to be the DIRECTORY containing the
+		// checkpoint files, not the first file. Derive the directory from the
+		// primary file path (e.g. "model-00001-of-00002.safetensors" -> "."
+		// -> cacheDir itself; "checkpoint/model-00001.safetensors" ->
+		// "checkpoint" -> cacheDir/checkpoint).
+		primaryDir := filepath.Dir(plan.Primary)
+		modelDir := cacheDir
+		if primaryDir != "." {
+			modelDir = filepath.Join(cacheDir, primaryDir)
+		}
+		modelPath := modelDir
 		cmd := buildMultiFileInitCommand(true, model.Spec.RefreshPolicy)
 		env := multiFileInitEnvVars(model.Spec.Source, cacheDir, plan.Files)
 
@@ -660,7 +680,16 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		}
 	}
 	if plan != nil {
-		modelPath := fmt.Sprintf("/models/%s-%s/%s", namespace, model.Name, plan.Primary)
+		// For multi-file directory-format checkpoints (safetensors), the
+		// runtime expects the model path to be the DIRECTORY containing the
+		// checkpoint files, not the first file. Derive the directory from the
+		// primary file path.
+		primaryDir := filepath.Dir(plan.Primary)
+		modelDir := fmt.Sprintf("/models/%s-%s", namespace, model.Name)
+		if primaryDir != "." {
+			modelDir = filepath.Join(modelDir, primaryDir)
+		}
+		modelPath := modelDir
 		cmd := buildMultiFileInitCommand(false, model.Spec.RefreshPolicy)
 		env := multiFileInitEnvVars(model.Spec.Source, fmt.Sprintf("/models/%s-%s", namespace, model.Name), plan.Files)
 

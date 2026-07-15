@@ -146,7 +146,7 @@ After code changes:
 - Downloading HuggingFace weights into the cache PVC (that's option 2 from the issue; not needed for the vLLM workflow and adds significant complexity)
 - Auth for HF_TOKEN in the Model controller (runtime handles this)
 - Format validation against HF model type (leave to the runtime)
-- Supporting HF revisions/branches (user can put `owner/repo@revision` syntax in source if HF supports it via vLLM; don't special-case here)
+- Supporting HF revisions/branches (now implemented: `owner/repo@revision` syntax is accepted and threaded into the download URL)
 
 ## Reference: existing code patterns to follow
 

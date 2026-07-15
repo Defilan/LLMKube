@@ -231,14 +231,30 @@ func normalizeHFSource(source string) string {
 	return strings.TrimPrefix(source, "hf://")
 }
 
+// parseHFSource splits an HF source into repo ID and optional revision.
+// "hf://org/repo@main" -> repo="org/repo", rev="main"
+// "org/repo" -> repo="org/repo", rev=""
+func parseHFSource(source string) (repo, rev string) {
+	normalized := normalizeHFSource(source)
+	if idx := strings.Index(normalized, "@"); idx >= 0 {
+		return normalized[:idx], normalized[idx+1:]
+	}
+	return normalized, ""
+}
+
 // validateHFRepoSource checks for common HF source mistakes and returns an
-// error if the source is malformed. Currently rejects @rev syntax, which
-// users sometimes add from Git or HF CLI habits but which the operator does
-// not support.
+// error if the source is malformed. Accepts optional @rev syntax (e.g.
+// "hf://org/repo@main" or "org/repo@v1.0") to pin the download to a
+// specific Git ref (branch, tag, or commit SHA).
 func validateHFRepoSource(source string) error {
 	normalized := normalizeHFSource(source)
-	if strings.Contains(normalized, "@") {
-		return fmt.Errorf("hf repo source must not contain @rev syntax: %s", source)
+	// Strip the optional @rev suffix before further validation.
+	repo := normalized
+	if idx := strings.Index(normalized, "@"); idx >= 0 {
+		repo = normalized[:idx]
+	}
+	if repo == "" {
+		return fmt.Errorf("hf repo source must not be empty: %s", source)
 	}
 	return nil
 }
@@ -277,7 +293,8 @@ func isHFRepoSource(source string) bool {
 		return false
 	}
 	// Match HF's permitted character set: alphanumeric, hyphens, underscores,
-	// dots, and forward slashes. Must start with alphanumeric.
+	// dots, forward slashes, and @ (for optional @rev suffix). Must start with
+	// alphanumeric.
 	for i, c := range normalized {
 		if i == 0 {
 			if !isAlphaNum(c) {
@@ -285,7 +302,7 @@ func isHFRepoSource(source string) bool {
 			}
 			continue
 		}
-		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' {
+		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' && c != '@' {
 			return false
 		}
 	}
