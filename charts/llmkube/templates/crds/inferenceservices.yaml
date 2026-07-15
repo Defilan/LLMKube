@@ -4727,9 +4727,9 @@ spec:
                   dataParallelSize:
                     description: |-
                       DataParallelSize sets the number of data-parallel replicas (SGLang-side controller).
-                      Maps to SGLang --dp flag. Not auto-derived; set explicitly.
+                      Maps to SGLang --dp-size flag. Not auto-derived; set explicitly.
 
-                      NOTE: at present this only sets the in-process SGLang `--dp` flag.
+                      NOTE: at present this only sets the in-process SGLang `--dp-size` flag.
                       Multi-replica rendezvous (SGLang's --dist-init-addr + a stable
                       network identity per pod, e.g. headless service + StatefulSet) is
                       not yet wired into the InferenceService controller and is tracked

@@ -47,8 +47,33 @@ func sglangAppendExpertParallelSize(args []string, size *int32) []string {
 
 func sglangAppendDataParallelSize(args []string, size *int32) []string {
 	if size != nil && *size >= 1 {
-		return append(args, "--dp", fmt.Sprintf("%d", *size))
+		return append(args, "--dp-size", fmt.Sprintf("%d", *size))
 	}
+	return args
+}
+
+// sglangAppendMultiNodeDataParallel appends the SGLang flags needed for one
+// replica to join a multi-node data-parallel group. The flags are:
+//
+//   - --dp-size <dpSize> — data-parallel size (alias --dp-size, replaces
+//     the legacy --dp flag).
+//   - --dist-init-addr <distInitAddr> — rendezvous/init address of the
+//     rank-0 node (e.g. "192.168.0.2:25000").
+//   - --nnodes <nnodes> — total number of nodes in the DP group.
+//   - --node-rank <nodeRank> — this node's rank within the group.
+//
+// All four flags are emitted together; omitting any one causes SGLang's
+// distributed init to fail. The caller is responsible for wiring the
+// Deployment/pod identity so each replica receives the correct nnodes and
+// nodeRank values.
+func sglangAppendMultiNodeDataParallel(args []string, dpSize int32, distInitAddr string, nnodes, nodeRank int32) []string {
+	if dpSize < 1 || distInitAddr == "" || nnodes < 1 || nodeRank < 0 {
+		return args
+	}
+	args = append(args, "--dp-size", fmt.Sprintf("%d", dpSize))
+	args = append(args, "--dist-init-addr", distInitAddr)
+	args = append(args, "--nnodes", fmt.Sprintf("%d", nnodes))
+	args = append(args, "--node-rank", fmt.Sprintf("%d", nodeRank))
 	return args
 }
 

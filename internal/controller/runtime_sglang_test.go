@@ -30,7 +30,7 @@ import (
 // appear in BuildArgs output when SGLangConfig is nil or empty. Shared across
 // TestSGLangBuildArgs_NilConfig and TestSGLangBuildArgs_EmptyConfig.
 var sglangFlagsNeverInBase = []string{
-	"--tp", "--ep", "--dp", "--context-length", "--mem-fraction-static",
+	"--tp", "--ep", "--dp-size", "--context-length", "--mem-fraction-static",
 	"--chunked-prefill-size", "--max-running-requests", "--quantization",
 	"--kv-cache-dtype", "--attention-backend", "--enable-prefix-caching",
 	"--tool-call-parser", "--reasoning-parser", "--chat-template",
@@ -257,12 +257,12 @@ func TestSGLangBuildArgs(t *testing.T) {
 		},
 		{
 			model: &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
-			name:  "dataParallelSize emits --dp",
+			name:  "dataParallelSize emits --dp-size",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:      "sglang",
 				SGLangConfig: &inferencev1alpha1.SGLangConfig{DataParallelSize: ptrInt32(4)},
 			},
-			contains: []FlagCheck{{"--dp", "4"}},
+			contains: []FlagCheck{{"--dp-size", "4"}},
 		},
 		{
 			model: &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
@@ -1107,4 +1107,78 @@ func TestSGLangBuildLoraModulePairs_Coverage(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestSGLangMultiNodeDataParallel asserts the exact argv emitted by
+// sglangAppendMultiNodeDataParallel for a valid multi-node DP group,
+// and that invalid inputs are silently skipped.
+func TestSGLangMultiNodeDataParallel(t *testing.T) {
+	base := []string{"--model-path", "/models/test", "--host", "::", "--port", "30000"}
+
+	cases := []struct {
+		name         string
+		dpSize       int32
+		distInitAddr string
+		nnodes       int32
+		nodeRank     int32
+		want         []string
+	}{
+		{
+			name:         "valid 2-node DP group",
+			dpSize:       2,
+			distInitAddr: "192.168.0.2:25000",
+			nnodes:       2,
+			nodeRank:     0,
+			want:         append(base, "--dp-size", "2", "--dist-init-addr", "192.168.0.2:25000", "--nnodes", "2", "--node-rank", "0"),
+		},
+		{
+			name:         "valid 4-node DP group, rank 3",
+			dpSize:       4,
+			distInitAddr: "10.0.0.1:25000",
+			nnodes:       4,
+			nodeRank:     3,
+			want:         append(base, "--dp-size", "4", "--dist-init-addr", "10.0.0.1:25000", "--nnodes", "4", "--node-rank", "3"),
+		},
+		{
+			name:         "dpSize zero skips all flags",
+			dpSize:       0,
+			distInitAddr: "192.168.0.2:25000",
+			nnodes:       2,
+			nodeRank:     0,
+			want:         base,
+		},
+		{
+			name:         "empty distInitAddr skips all flags",
+			dpSize:       2,
+			distInitAddr: "",
+			nnodes:       2,
+			nodeRank:     0,
+			want:         base,
+		},
+		{
+			name:         "nnodes zero skips all flags",
+			dpSize:       2,
+			distInitAddr: "192.168.0.2:25000",
+			nnodes:       0,
+			nodeRank:     0,
+			want:         base,
+		},
+		{
+			name:         "negative nodeRank skips all flags",
+			dpSize:       2,
+			distInitAddr: "192.168.0.2:25000",
+			nnodes:       2,
+			nodeRank:     -1,
+			want:         base,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sglangAppendMultiNodeDataParallel(base, tc.dpSize, tc.distInitAddr, tc.nnodes, tc.nodeRank)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
