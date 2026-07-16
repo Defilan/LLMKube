@@ -319,20 +319,21 @@ func isHFRepoSource(source string) bool {
 	if isRemoteHTTPSource(source) {
 		return false
 	}
-	normalized := normalizeHFSource(source)
-	if !strings.Contains(normalized, "/") {
+	// Strip hf:// prefix if present for validation
+	checkSource := strings.TrimPrefix(strings.ToLower(source), "hf://")
+	if !strings.Contains(checkSource, "/") {
 		return false
 	}
 	// Match HF's permitted character set: alphanumeric, hyphens, underscores,
-	// dots, and forward slashes. Must start with alphanumeric.
-	for i, c := range normalized {
+	// dots, forward slashes, and @ (for revision). Must start with alphanumeric.
+	for i, c := range checkSource {
 		if i == 0 {
 			if !isAlphaNum(c) {
 				return false
 			}
 			continue
 		}
-		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' {
+		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' && c != '@' {
 			return false
 		}
 	}

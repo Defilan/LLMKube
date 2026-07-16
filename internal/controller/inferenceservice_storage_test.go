@@ -251,7 +251,7 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		env := config.initContainers[1].Env
 		source := getEnvVar(env, "MODEL_SOURCE")
-		Expect(source).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF"))
+		Expect(source).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/"))
 	})
 
 	It("includes custom CA cert volume in multi-file cached storage", func() {
@@ -399,7 +399,7 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 var _ = Describe("multiFileInitEnvVars", func() {
 	It("sets MODEL_FILES as newline-delimited list", func() {
 		env := multiFileInitEnvVars("hf://org/repo", "/models/abc", []string{"a.gguf", "b.gguf"})
-		Expect(getEnvVar(env, "MODEL_SOURCE")).To(Equal("https://huggingface.co/org/repo"))
+		Expect(getEnvVar(env, "MODEL_SOURCE")).To(Equal("https://huggingface.co/org/repo/resolve/main/"))
 		Expect(getEnvVar(env, "CACHE_DIR")).To(Equal("/models/abc"))
 		Expect(getEnvVar(env, "MODEL_FILES")).To(Equal("a.gguf\nb.gguf"))
 	})
@@ -501,7 +501,7 @@ var _ = Describe("buildCachedStorageConfig cache key fallback", func() {
 
 var _ = Describe("resolveHFSourceURL", func() {
 	It("converts hf:// to https://huggingface.co/", func() {
-		Expect(resolveHFSourceURL("hf://unsloth/gemma-4-31B-it-GGUF")).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF"))
+		Expect(resolveHFSourceURL("hf://unsloth/gemma-4-31B-it-GGUF")).To(Equal("https://huggingface.co/unsloth/gemma-4-31B-it-GGUF/resolve/main/"))
 	})
 
 	It("passes through https URLs unchanged", func() {

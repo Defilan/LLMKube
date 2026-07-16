@@ -383,7 +383,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 		prefix = `mkdir -p /models && `
 	}
 
-	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) echo "https://huggingface.co/${1#hf://}" ;; *) echo "$1" ;; esac; }` + " && "
+	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) src="${1#hf://}"; rev="${src#*@}"; if [ "$rev" != "$src" ]; then echo "https://huggingface.co/${src%%@*}/resolve/$rev/"; else echo "https://huggingface.co/$src/resolve/main/"; fi ;; *) echo "$1" ;; esac; }` + " && "
 
 	if refreshPolicy == RefreshPolicyOnChange {
 		body := normalizeFn +
