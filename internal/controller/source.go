@@ -262,11 +262,32 @@ func parseHFSource(source string) (repoID, revision string, err error) {
 // users sometimes add from Git or HF CLI habits but which the operator does
 // not support.
 func validateHFRepoSource(source string) error {
-	repoID, _, err := parseHFSource(source)
-	if err != nil {
-		return err
+	// Accept both hf:// prefixed and bare repo IDs, with optional @revision.
+	if strings.HasPrefix(source, "hf://") {
+		repoID, _, err := parseHFSource(source)
+		if err != nil {
+			return err
+		}
+		if repoID == "" {
+			return fmt.Errorf("empty repo ID in HF source: %s", source)
+		}
+		return nil
 	}
-	if repoID == "" {
+	// Bare repo ID (no scheme)
+	if strings.Contains(source, "@") {
+		// Split revision if present
+		parts := strings.SplitN(source, "@", 2)
+		if parts[0] == "" {
+			return fmt.Errorf("empty repo ID in HF source: %s", source)
+		}
+		if strings.TrimSpace(parts[1]) == "" {
+			return fmt.Errorf("empty revision in HF source: %s", source)
+		}
+		if strings.ContainsAny(parts[1], " \t\n\r") {
+			return fmt.Errorf("revision contains whitespace in HF source: %s", source)
+		}
+	}
+	if source == "" {
 		return fmt.Errorf("empty repo ID in HF source: %s", source)
 	}
 	return nil
