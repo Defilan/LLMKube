@@ -134,7 +134,7 @@ var _ = Describe("getLocalPath (source.go)", func() {
 	})
 })
 
-var _ = Describe("isHFRepoSource (source.go)", func() {
+var _ = Describe("isHFRepoSource", func() {
 	It("should return true for TinyLlama repo ID", func() {
 		Expect(isHFRepoSource("TinyLlama/TinyLlama-1.1B-Chat-v1.0")).To(BeTrue())
 	})
@@ -150,16 +150,16 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	It("should return true for hf:// with multi-part path", func() {
 		Expect(isHFRepoSource("hf://org/deep/nested/repo")).To(BeTrue())
 	})
-	It("should return false for https URL", func() {
+	It("should return false for https://", func() {
 		Expect(isHFRepoSource("https://example.com/model.gguf")).To(BeFalse())
 	})
-	It("should return false for http URL", func() {
+	It("should return false for http://", func() {
 		Expect(isHFRepoSource("http://example.com/model.gguf")).To(BeFalse())
 	})
 	It("should return false for absolute path", func() {
 		Expect(isHFRepoSource("/models/local.gguf")).To(BeFalse())
 	})
-	It("should return false for file:// URL", func() {
+	It("should return false for file://", func() {
 		Expect(isHFRepoSource("file:///models/local.gguf")).To(BeFalse())
 	})
 	It("should return false for PVC source", func() {
@@ -179,7 +179,7 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	})
 })
 
-var _ = Describe("validateHFRepoSource (source.go)", func() {
+var _ = Describe("validateHFRepoSource", func() {
 	It("should return nil for valid bare repo ID", func() {
 		Expect(validateHFRepoSource("org/repo")).To(Succeed())
 	})
@@ -198,7 +198,7 @@ var _ = Describe("validateHFRepoSource (source.go)", func() {
 	})
 })
 
-var _ = Describe("normalizeHFSource (source.go)", func() {
+var _ = Describe("normalizeHFSource", func() {
 	It("should strip hf:// prefix", func() {
 		Expect(normalizeHFSource("hf://org/repo")).To(Equal("org/repo"))
 	})
@@ -210,12 +210,32 @@ var _ = Describe("normalizeHFSource (source.go)", func() {
 	})
 })
 
-var _ = Describe("isRemoteHTTPSource (source.go)", func() {
-	// Regression coverage for issue #363: the controller defers HTTP(S)
-	// sources to the workload init container so the per-namespace cache PVC
-	// is populated. If a future change widens or narrows what this matcher
-	// considers HTTP(S), the dispatch in Reconcile() flips silently, so this
-	// matcher needs explicit, exhaustive cases.
+var _ = Describe("parseHFSource", func() {
+	It("parses repo without revision", func() {
+		repo, rev, err := parseHFSource("hf://org/repo")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal(""))
+	})
+	It("parses repo with revision", func() {
+		repo, rev, err := parseHFSource("hf://org/repo@v1")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal("v1"))
+	})
+	It("fails on empty repo", func() {
+		_, _, err := parseHFSource("hf://@rev")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty repo ID"))
+	})
+	It("fails on whitespace revision", func() {
+		_, _, err := parseHFSource("hf://org/repo@rev with space")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("revision contains whitespace"))
+	})
+})
+
+var _ = Describe("isRemoteHTTPSource", func() {
 	It("should return true for https URL", func() {
 		Expect(isRemoteHTTPSource("https://huggingface.co/org/repo/resolve/main/model.gguf")).To(BeTrue())
 	})
@@ -240,13 +260,9 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 	It("should return false for empty string", func() {
 		Expect(isRemoteHTTPSource("")).To(BeFalse())
 	})
-	It("should return false for ftp:// URL (out of scope for the workload init container)", func() {
+	It("should return false for ftp:// URL", func() {
 		Expect(isRemoteHTTPSource("ftp://example.com/model.gguf")).To(BeFalse())
 	})
-	// URL schemes are case-insensitive (RFC 3986) and url.Parse lowercases
-	// them, so http.Client happily fetches "HTTP://..." URLs. The classifier
-	// must agree or a case-variant scheme dodges the guarded remote-source
-	// routing (GHSA-jw3m-8q7m-f35r).
 	It("should return true for case-variant HTTP:// scheme", func() {
 		Expect(isRemoteHTTPSource("HTTP://x")).To(BeTrue())
 	})
@@ -254,9 +270,6 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 		Expect(isRemoteHTTPSource("HtTpS://x")).To(BeTrue())
 	})
 	It("source-type matchers must be mutually exclusive", func() {
-		// Architectural invariant: every reachable source falls into exactly
-		// one category. If this regresses, Reconcile()'s dispatch order
-		// becomes load-bearing and silent bugs creep in.
 		cases := []string{
 			"https://huggingface.co/org/repo/resolve/main/m.gguf",
 			"http://mirror.local/m.gguf",
@@ -285,7 +298,7 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 	})
 })
 
-var _ = Describe("isUnrecoverableFetchError (source.go)", func() {
+var _ = Describe("isUnrecoverableFetchError", func() {
 	It("should return false for nil error", func() {
 		Expect(isUnrecoverableFetchError(nil)).To(BeFalse())
 	})
@@ -298,11 +311,7 @@ var _ = Describe("isUnrecoverableFetchError (source.go)", func() {
 		Expect(isUnrecoverableFetchError(fs.ErrPermission)).To(BeTrue())
 	})
 
-	It("should unwrap fmt.Errorf-wrapped fs.ErrNotExist (the #405 path)", func() {
-		// This is the exact wrap shape that copyLocalModel produces and
-		// that pinned a Mac kind cluster's CPU for 35 hours. If this
-		// assertion ever regresses, the hot-spin guard is silently
-		// disabled.
+	It("should unwrap fmt.Errorf-wrapped fs.ErrNotExist", func() {
 		_, openErr := os.Open(filepath.Join(GinkgoT().TempDir(), "definitely-does-not-exist.gguf"))
 		Expect(openErr).To(HaveOccurred())
 		wrapped := fmt.Errorf("failed to open local model file: %w", openErr)
@@ -318,15 +327,13 @@ var _ = Describe("isUnrecoverableFetchError (source.go)", func() {
 	})
 
 	It("should return true for double-wrapped fs.ErrNotExist", func() {
-		// errors.Is walks the wrap chain, so even a deeply-wrapped
-		// not-exist error must be detected.
 		inner := fmt.Errorf("inner: %w", fs.ErrNotExist)
 		outer := fmt.Errorf("outer: %w", inner)
 		Expect(isUnrecoverableFetchError(outer)).To(BeTrue())
 	})
 })
 
-var _ = Describe("isS3Source (source.go)", func() {
+var _ = Describe("isS3Source", func() {
 	It("should return true for s3:// prefix", func() {
 		Expect(isS3Source("s3://my-bucket/model.gguf")).To(BeTrue())
 	})
@@ -347,7 +354,7 @@ var _ = Describe("isS3Source (source.go)", func() {
 	})
 })
 
-var _ = Describe("parseS3Source (source.go)", func() {
+var _ = Describe("parseS3Source", func() {
 	It("should parse simple s3 source", func() {
 		bucket, key, err := parseS3Source("s3://my-bucket/model.gguf")
 		Expect(err).NotTo(HaveOccurred())
@@ -393,7 +400,7 @@ var _ = Describe("parseS3Source (source.go)", func() {
 	})
 })
 
-var _ = Describe("isHFRepoSource rejects s3:// (source.go)", func() {
+var _ = Describe("isHFRepoSource rejects s3://", func() {
 	It("should return false for s3:// source", func() {
 		Expect(isHFRepoSource("s3://my-bucket/model.gguf")).To(BeFalse())
 	})

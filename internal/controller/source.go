@@ -231,14 +231,43 @@ func normalizeHFSource(source string) string {
 	return strings.TrimPrefix(source, "hf://")
 }
 
+// parseHFSource splits an hf:// source into repo ID and optional revision.
+// The source may be of the form "hf://org/repo" or "hf://org/repo@rev".
+// It returns the repo ID ("org/repo") and the revision (empty if not provided).
+func parseHFSource(source string) (repoID, revision string, err error) {
+	if !strings.HasPrefix(source, "hf://") {
+		return "", "", fmt.Errorf("not an HF source: %s", source)
+	}
+	trim := strings.TrimPrefix(source, "hf://")
+	// Split on '@' for optional revision.
+	parts := strings.SplitN(trim, "@", 2)
+	repoID = parts[0]
+	if repoID == "" {
+		return "", "", fmt.Errorf("empty repo ID in HF source: %s", source)
+	}
+	if len(parts) == 2 {
+		revision = parts[1]
+		if strings.TrimSpace(revision) == "" {
+			return "", "", fmt.Errorf("empty revision in HF source: %s", source)
+		}
+		if strings.ContainsAny(revision, " \t\n\r") {
+			return "", "", fmt.Errorf("revision contains whitespace in HF source: %s", source)
+		}
+	}
+	return repoID, revision, nil
+}
+
 // validateHFRepoSource checks for common HF source mistakes and returns an
 // error if the source is malformed. Currently rejects @rev syntax, which
 // users sometimes add from Git or HF CLI habits but which the operator does
 // not support.
 func validateHFRepoSource(source string) error {
-	normalized := normalizeHFSource(source)
-	if strings.Contains(normalized, "@") {
-		return fmt.Errorf("hf repo source must not contain @rev syntax: %s", source)
+	repoID, _, err := parseHFSource(source)
+	if err != nil {
+		return err
+	}
+	if repoID == "" {
+		return fmt.Errorf("empty repo ID in HF source: %s", source)
 	}
 	return nil
 }
