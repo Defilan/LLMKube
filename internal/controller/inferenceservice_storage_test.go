@@ -394,6 +394,19 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 		Expect(cmd).To(ContainSubstring("case"))
 		Expect(cmd).To(ContainSubstring("esac"))
 	})
+
+	It("preserves slash between resolve base and filename in per-file URL (regression test for #1110)", func() {
+		// The bug: url="${SOURCE%/}$rel" strips trailing slash from SOURCE (which ends in /)
+		// and glues filename directly, producing ".../resolve/main" + "a.gguf" = ".../resolve/maina.gguf"
+		// The fix: url="${SOURCE%/}/$rel" adds the slash back, producing ".../resolve/main/a.gguf"
+		cmd := buildMultiFileInitCommand(true, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`url="${SOURCE%/}/$rel"`))
+	})
+
+	It("preserves slash between resolve base and filename in OnChange policy (regression test for #1110)", func() {
+		cmd := buildMultiFileInitCommand(true, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`url="${SOURCE%/}/$rel"`))
+	})
 })
 
 var _ = Describe("multiFileInitEnvVars", func() {
