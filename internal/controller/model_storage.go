@@ -251,8 +251,14 @@ func modelEnvFrom(model *inferencev1alpha1.Model) []corev1.EnvFromSource {
 // HTTPS equivalent for init container env vars. Non-hf:// sources pass through unchanged.
 func resolveHFSourceURL(source string) string {
 	if strings.HasPrefix(source, "hf://") {
-		repo := strings.TrimPrefix(source, "hf://")
-		return "https://huggingface.co/" + repo
+		repo, rev, err := parseHFSource(source)
+		if err != nil {
+			return source // fallback, though shouldn't happen
+		}
+		if rev == "" {
+			rev = "main"
+		}
+		return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/", repo, rev)
 	}
 	return source
 }
@@ -386,7 +392,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 		prefix = `mkdir -p /models && `
 	}
 
-	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) echo "https://huggingface.co/${1#hf://}" ;; *) echo "$1" ;; esac; }` + " && "
+	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) repo_rev="${1#hf://}"; repo="${repo_rev%%@*}"; rev="${repo_rev#*@}"; if [ "$rev" = "$repo_rev" ]; then rev="main"; fi; echo "https://huggingface.co/${repo}/resolve/${rev}/" ;; *) echo "$1" ;; esac; }` + " && "
 
 	if refreshPolicy == RefreshPolicyOnChange {
 		body := normalizeFn +

@@ -186,15 +186,11 @@ var _ = Describe("validateHFRepoSource", func() {
 	It("should return nil for valid hf:// prefixed repo ID", func() {
 		Expect(validateHFRepoSource("hf://org/repo")).To(Succeed())
 	})
-	It("should return error for hf:// with @rev", func() {
-		err := validateHFRepoSource("hf://org/repo@main")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("@rev"))
+	It("should accept hf:// with @rev", func() {
+		Expect(validateHFRepoSource("hf://org/repo@main")).To(Succeed())
 	})
-	It("should return error for bare repo ID with @rev", func() {
-		err := validateHFRepoSource("org/repo@v1.0")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("@rev"))
+	It("should accept bare repo ID with @rev", func() {
+		Expect(validateHFRepoSource("org/repo@v1.0")).To(Succeed())
 	})
 })
 
