@@ -299,6 +299,8 @@ func validateHFRepoSource(source string) error {
 //	Not a URL (no "://" scheme other than hf://)
 //	Not an absolute path (doesn't start with "/")
 //	Not a PVC source (handled separately)
+//	Not an S3 source (handled separately)
+//	Not an HTTP(S) source (handled separately)
 //	Contains at least one "/" separator (HF convention: owner/repo)
 //	Matches Hugging Face's permitted character set
 func isHFRepoSource(source string) bool {
@@ -317,20 +319,24 @@ func isHFRepoSource(source string) bool {
 	if isRemoteHTTPSource(source) {
 		return false
 	}
-	normalized := normalizeHFSource(source)
-	if !strings.Contains(normalized, "/") {
+	// Strip the hf:// prefix for classification if present.
+	rest := source
+	if hasSchemeFold(source, "hf://") {
+		rest = strings.TrimPrefix(source, "hf://")
+	}
+	if !strings.Contains(rest, "/") {
 		return false
 	}
 	// Match HF's permitted character set: alphanumeric, hyphens, underscores,
-	// dots, and forward slashes. Must start with alphanumeric.
-	for i, c := range normalized {
+	// dots, forward slashes, and @ (for revision). Must start with alphanumeric.
+	for i, c := range rest {
 		if i == 0 {
 			if !isAlphaNum(c) {
 				return false
 			}
 			continue
 		}
-		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' {
+		if !isAlphaNum(c) && c != '-' && c != '_' && c != '.' && c != '/' && c != '@' {
 			return false
 		}
 	}

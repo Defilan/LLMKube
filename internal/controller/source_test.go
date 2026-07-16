@@ -177,6 +177,15 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	It("should return true for multi-part nested path", func() {
 		Expect(isHFRepoSource("multi/part/path/thing")).To(BeTrue())
 	})
+	It("should return true for hf:// with @rev", func() {
+		Expect(isHFRepoSource("hf://unsloth/gemma-4-31B-it-GGUF@main")).To(BeTrue())
+	})
+	It("should return true for bare repo ID with @rev", func() {
+		Expect(isHFRepoSource("org/repo@abc123def456")).To(BeTrue())
+	})
+	It("should return false for hf:// with @rev and no slash", func() {
+		Expect(isHFRepoSource("hf://just-a-name@main")).To(BeFalse())
+	})
 })
 
 var _ = Describe("validateHFRepoSource (source.go)", func() {
@@ -262,18 +271,6 @@ var _ = Describe("normalizeHFSource (source.go)", func() {
 	})
 	It("should return resolve/<commit> for hf:// with commit hash", func() {
 		Expect(normalizeHFSource("hf://org/repo@abc123def456")).To(Equal("https://huggingface.co/org/repo/resolve/abc123def456"))
-	})
-	It("should leave bare repo ID unchanged", func() {
-		Expect(normalizeHFSource("org/repo")).To(Equal("org/repo"))
-	})
-	It("should leave non-hf source unchanged", func() {
-		Expect(normalizeHFSource("https://example.com/model.gguf")).To(Equal("https://example.com/model.gguf"))
-	})
-})
-
-var _ = Describe("normalizeHFSource (source.go)", func() {
-	It("should strip hf:// prefix", func() {
-		Expect(normalizeHFSource("hf://org/repo")).To(Equal("org/repo"))
 	})
 	It("should leave bare repo ID unchanged", func() {
 		Expect(normalizeHFSource("org/repo")).To(Equal("org/repo"))

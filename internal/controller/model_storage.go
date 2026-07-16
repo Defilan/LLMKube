@@ -249,10 +249,14 @@ func modelEnvFrom(model *inferencev1alpha1.Model) []corev1.EnvFromSource {
 
 // resolveHFSourceURL converts hf://repo-id sources to their huggingface.co
 // HTTPS equivalent for init container env vars. Non-hf:// sources pass through unchanged.
+// Handles @<revision> syntax: hf://org/repo@main → https://huggingface.co/org/repo/resolve/main
 func resolveHFSourceURL(source string) string {
 	if strings.HasPrefix(source, "hf://") {
 		repo := strings.TrimPrefix(source, "hf://")
-		return "https://huggingface.co/" + repo
+		if idx := strings.Index(repo, "@"); idx >= 0 {
+			return "https://huggingface.co/" + repo[:idx] + "/resolve/" + repo[idx+1:]
+		}
+		return "https://huggingface.co/" + repo + "/resolve/main"
 	}
 	return source
 }
@@ -386,7 +390,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 		prefix = `mkdir -p /models && `
 	}
 
-	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) echo "https://huggingface.co/${1#hf://}" ;; *) echo "$1" ;; esac; }` + " && "
+	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) rest="${1#hf://}"; case "$rest" in *@*) repo="${rest%@*}"; rev="${rest#*@}"; echo "https://huggingface.co/${repo}/resolve/${rev}" ;; *) echo "https://huggingface.co/${rest}/resolve/main" ;; esac ;; *) echo "$1" ;; esac; }` + " && "
 
 	if refreshPolicy == RefreshPolicyOnChange {
 		body := normalizeFn +
