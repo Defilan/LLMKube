@@ -186,15 +186,88 @@ var _ = Describe("validateHFRepoSource (source.go)", func() {
 	It("should return nil for valid hf:// prefixed repo ID", func() {
 		Expect(validateHFRepoSource("hf://org/repo")).To(Succeed())
 	})
-	It("should return error for hf:// with @rev", func() {
-		err := validateHFRepoSource("hf://org/repo@main")
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("@rev"))
+	It("should return nil for valid hf:// with @rev", func() {
+		Expect(validateHFRepoSource("hf://org/repo@main")).To(Succeed())
 	})
-	It("should return error for bare repo ID with @rev", func() {
-		err := validateHFRepoSource("org/repo@v1.0")
+	It("should return nil for valid bare repo ID with @rev", func() {
+		Expect(validateHFRepoSource("org/repo@v1.0")).To(Succeed())
+	})
+	It("should return nil for valid hf:// with commit hash revision", func() {
+		Expect(validateHFRepoSource("hf://org/repo@abc123def456")).To(Succeed())
+	})
+	It("should return error for hf:// with whitespace in revision", func() {
+		err := validateHFRepoSource("hf://org/repo@main branch")
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("@rev"))
+		Expect(err.Error()).To(ContainSubstring("whitespace"))
+	})
+	It("should return error for bare repo ID with whitespace in revision", func() {
+		err := validateHFRepoSource("org/repo@v1.0 beta")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("whitespace"))
+	})
+	It("should return error for empty repo ID", func() {
+		err := validateHFRepoSource("hf://@main")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty repo ID"))
+	})
+})
+
+var _ = Describe("parseHFSource (source.go)", func() {
+	It("should parse simple hf source", func() {
+		repo, rev, err := parseHFSource("hf://org/repo")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal(""))
+	})
+	It("should parse hf source with revision", func() {
+		repo, rev, err := parseHFSource("hf://org/repo@main")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal("main"))
+	})
+	It("should parse hf source with commit hash revision", func() {
+		repo, rev, err := parseHFSource("hf://org/repo@abc123def456")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repo).To(Equal("org/repo"))
+		Expect(rev).To(Equal("abc123def456"))
+	})
+	It("should error on non-HF source", func() {
+		_, _, err := parseHFSource("https://example.com/model.gguf")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("not an HF source"))
+	})
+	It("should error on empty HF source", func() {
+		_, _, err := parseHFSource("hf://")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty HF source"))
+	})
+	It("should error on empty repo ID", func() {
+		_, _, err := parseHFSource("hf://@main")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("empty repo ID"))
+	})
+	It("should error on whitespace in revision", func() {
+		_, _, err := parseHFSource("hf://org/repo@main branch")
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("whitespace"))
+	})
+})
+
+var _ = Describe("normalizeHFSource (source.go)", func() {
+	It("should strip hf:// prefix and return resolve/main for bare repo ID", func() {
+		Expect(normalizeHFSource("hf://org/repo")).To(Equal("https://huggingface.co/org/repo/resolve/main"))
+	})
+	It("should return resolve/<rev> for hf:// with revision", func() {
+		Expect(normalizeHFSource("hf://org/repo@main")).To(Equal("https://huggingface.co/org/repo/resolve/main"))
+	})
+	It("should return resolve/<commit> for hf:// with commit hash", func() {
+		Expect(normalizeHFSource("hf://org/repo@abc123def456")).To(Equal("https://huggingface.co/org/repo/resolve/abc123def456"))
+	})
+	It("should leave bare repo ID unchanged", func() {
+		Expect(normalizeHFSource("org/repo")).To(Equal("org/repo"))
+	})
+	It("should leave non-hf source unchanged", func() {
+		Expect(normalizeHFSource("https://example.com/model.gguf")).To(Equal("https://example.com/model.gguf"))
 	})
 })
 

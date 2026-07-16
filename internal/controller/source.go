@@ -225,20 +225,65 @@ func isRemoteHTTPSource(source string) bool {
 	return hasSchemeFold(source, "https://") || hasSchemeFold(source, "http://")
 }
 
-// normalizeHFSource strips the hf:// scheme prefix if present, returning the
-// bare repo ID (e.g., "hf://org/repo" -> "org/repo", "org/repo" -> "org/repo").
+// parseHFSource splits an hf:// source into repo ID and optional revision.
+// Format: hf://org/repo or hf://org/repo@<revision>.
+// Mirrors parsePVCSource error handling.
+func parseHFSource(source string) (repoID, revision string, err error) {
+	if !isHFRepoSource(source) {
+		return "", "", fmt.Errorf("not an HF source: %s", source)
+	}
+
+	// Strip the hf:// prefix
+	rest := strings.TrimPrefix(source, "hf://")
+	if rest == "" {
+		return "", "", fmt.Errorf("empty HF source: %s", source)
+	}
+
+	// Split into repo ID and optional revision
+	atIdx := strings.Index(rest, "@")
+	if atIdx >= 0 {
+		repoID = rest[:atIdx]
+		revision = rest[atIdx+1:]
+	} else {
+		repoID = rest
+	}
+
+	if repoID == "" {
+		return "", "", fmt.Errorf("HF source has empty repo ID: %s", source)
+	}
+	if revision != "" && strings.ContainsAny(revision, " \t\n\r") {
+		return "", "", fmt.Errorf("HF revision must not contain whitespace: %s", source)
+	}
+
+	return repoID, revision, nil
+}
+
+// normalizeHFSource converts an hf:// source to the Hugging Face resolve base URL.
+// For sources with a revision (e.g., "hf://org/repo@abc123"), returns
+// "https://huggingface.co/org/repo/resolve/abc123". For sources without a
+// revision, returns "https://huggingface.co/org/repo/resolve/main".
 func normalizeHFSource(source string) string {
-	return strings.TrimPrefix(source, "hf://")
+	repoID, revision, err := parseHFSource(source)
+	if err != nil {
+		// Not an HF source or parse error — return the source as-is.
+		return source
+	}
+	if revision != "" {
+		return "https://huggingface.co/" + repoID + "/resolve/" + revision
+	}
+	return "https://huggingface.co/" + repoID + "/resolve/main"
 }
 
 // validateHFRepoSource checks for common HF source mistakes and returns an
-// error if the source is malformed. Currently rejects @rev syntax, which
-// users sometimes add from Git or HF CLI habits but which the operator does
-// not support.
+// error if the source is malformed. Accepts @<revision> syntax and validates
+// the revision is well-formed (no whitespace).
 func validateHFRepoSource(source string) error {
-	normalized := normalizeHFSource(source)
-	if strings.Contains(normalized, "@") {
-		return fmt.Errorf("hf repo source must not contain @rev syntax: %s", source)
+	_, revision, err := parseHFSource(source)
+	if err != nil {
+		return err
+	}
+	if revision != "" && strings.ContainsAny(revision, " \t\n\r") {
+		return fmt.Errorf("HF revision must not contain whitespace: %s", source)
 	}
 	return nil
 }

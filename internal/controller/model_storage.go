@@ -395,7 +395,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 			`[ -n "$rel" ] || continue; ` +
 			`dest="$CACHE_DIR/$rel"; ` +
 			`mkdir -p "$(dirname "$dest")"; ` +
-			`url="${SOURCE%/}/resolve/main/$rel"; ` +
+			`url="${SOURCE%/}/$rel"; ` +
 			`etag="$(dirname "$dest")/.$(basename "$dest").etag"; ` +
 			`if curl -fsSL --etag-compare "$etag" --etag-save "$etag" -o "$dest" "$url"; then ` +
 			`echo "Model artifact $rel revalidated"; ` +
@@ -411,7 +411,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 		`[ -n "$rel" ] || continue; ` +
 		`dest="$CACHE_DIR/$rel"; ` +
 		`mkdir -p "$(dirname "$dest")"; ` +
-		`url="${SOURCE%/}/resolve/main/$rel"; ` +
+		`url="${SOURCE%/}/$rel"; ` +
 		`if [ ! -f "$dest" ]; then ` +
 		`echo "Downloading model artifact $rel..."; ` +
 		`curl -f -L -o "$dest" "$url" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
