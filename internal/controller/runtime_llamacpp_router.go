@@ -18,9 +18,7 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +40,12 @@ const RuntimeLlamaCppRouter = "llamacpp-router"
 // LlamaCppRouterBackend generates container configuration for the llama.cpp inference
 // server in router mode, which allows one Pod to host multiple models with dynamic
 // loading/unloading.
+//
+// Bring-your-own-models-volume: this runtime does NOT provision or mount the model
+// directory. Because NeedsModelInit returns false, the operator adds no model volume
+// or mount for it, so the model files must already be present at /models. Supply them
+// via spec.ExtraVolumes + spec.ExtraVolumeMounts (for example a PVC of GGUF files
+// mounted at /models).
 type LlamaCppRouterBackend struct{}
 
 func (b *LlamaCppRouterBackend) ContainerName() string {
@@ -70,13 +74,20 @@ func (b *LlamaCppRouterBackend) DefaultHPAMetric() string {
 // Router mode uses --models-dir instead of --model to enable dynamic multi-model
 // loading. Arguments are emitted in a deterministic order:
 //
-//  1. --models-dir (always, pointing to the shared model cache)
+//  1. --models-dir (always, pointing at /models)
 //  2. --host, --port (always)
-//  3. GPU configuration flags (when GPU resources are present)
+//  3. --metrics (always; Prometheus endpoint)
 //  4. ExtraArgs (user escape hatch, always last so user flags win)
+//
+// Router mode intentionally emits NO GPU flags (--n-gpu-layers, --tensor-split):
+// different models may need different GPU configs, so those are left to per-model INI
+// presets or user ExtraArgs. When GPU resources are present a warning is logged.
 func (b *LlamaCppRouterBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
-	// Router mode uses --models-dir to point to the directory containing models.
-	// The operator mounts the shared model cache at /models, so we use that path.
+	// Router mode uses --models-dir to point at the /models directory. NOTE: unlike the
+	// single-model runtime, router mode does NOT auto-mount /models -- NeedsModelInit is
+	// false, so the operator builds no model volume/mount (see deployment_builder.go,
+	// which only builds storage config when NeedsModelInit is true). The user must supply
+	// the models at /models via spec.ExtraVolumes + spec.ExtraVolumeMounts.
 	args := []string{
 		"--models-dir", "/models",
 		// Bind the dual-stack wildcard so pods are reachable on IPv6-only
@@ -155,43 +166,9 @@ func (b *LlamaCppRouterBackend) BuildProbes(port int32) (*corev1.Probe, *corev1.
 	return startup, liveness, readiness
 }
 
-// IdleProbe returns a probe closure that checks llama.cpp /slots endpoint for
-// idle status. All slots must report is_processing == false for the probe to
-// return true. This is the same logic used by the single-model llamacpp backend.
+// IdleProbe returns a probe closure that checks the llama.cpp /slots endpoint for
+// idle status (all slots is_processing == false). Shared with the single-model
+// llamacpp backend via llamaCppSlotsIdleProbe so the logic lives in one place.
 func (b *LlamaCppRouterBackend) IdleProbe(_ *inferencev1alpha1.InferenceService, client *http.Client) func(ctx context.Context, baseURL string) (bool, error) {
-	return func(ctx context.Context, baseURL string) (bool, error) {
-		url := fmt.Sprintf("%s/slots", baseURL)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return false, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return false, fmt.Errorf("failed to query /slots: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if resp.StatusCode != http.StatusOK {
-			return false, fmt.Errorf("/slots returned status %d", resp.StatusCode)
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return false, fmt.Errorf("failed to read /slots response: %w", err)
-		}
-
-		var slots []llamaCPUSlot
-		if err := json.Unmarshal(body, &slots); err != nil {
-			return false, fmt.Errorf("failed to parse /slots response: %w", err)
-		}
-
-		for _, slot := range slots {
-			if slot.IsProcessing {
-				return false, nil
-			}
-		}
-
-		return true, nil
-	}
+	return llamaCppSlotsIdleProbe(client)
 }
