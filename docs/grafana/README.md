@@ -17,6 +17,7 @@ PrometheusRule and PodMonitor templates.
 | File | Description |
 |---|---|
 | `llmkube-inference.json` | Request latency, TTFT (vLLM only), GPU queue wait, container restart rate. Grouped by service, runtime, namespace. |
+| `llmkube-slo.json` | SLO error-budget burn rates and availability. Uses Pyrra recording rules; select the Window suffix variable to match your `spec.slo.window` (4w = 28d, 7d = 7d, 2w = 14d, 12w = 90d). |
 
 ## Importing
 
