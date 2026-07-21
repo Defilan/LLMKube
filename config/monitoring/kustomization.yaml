@@ -7,3 +7,4 @@ resources:
 - namespace.yaml
 - node-exporter.yaml
 - dcgm-exporter.yaml
+- rocm-smi-exporter.yaml

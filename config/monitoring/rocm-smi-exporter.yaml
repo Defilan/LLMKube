@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rocm-smi-exporter
+  namespace: monitoring
+  labels:
+    app: rocm-smi-exporter
+spec:
+  selector:
+    matchLabels:
+      app: rocm-smi-exporter
+  template:
+    metadata:
+      labels:
+        app: rocm-smi-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9393"
+    spec:
+      containers:
+      - name: rocm-smi-exporter
+        image: rudimk/rocm-smi-exporter:latest
+        ports:
+        - containerPort: 9393
+          hostPort: 9393
+          name: metrics
+          protocol: TCP
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+        securityContext:
+          readOnlyRootFilesystem: true
+          runAsNonRoot: false
+          runAsUser: 0
+        volumeMounts:
+        - name: dev-dri
+          mountPath: /dev/dri
+          readOnly: true
+        - name: dev-kfd
+          mountPath: /dev/kfd
+          readOnly: true
+      nodeSelector:
+        accelerator: amd
+      tolerations:
+      - key: accelerator
+        operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute
+      volumes:
+      - name: dev-dri
+        hostPath:
+          path: /dev/dri
+      - name: dev-kfd
+        hostPath:
+          path: /dev/kfd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rocm-smi-exporter
+  namespace: monitoring
+  labels:
+    app: rocm-smi-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9393"
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+  - name: metrics
+    port: 9393
+    targetPort: 9393
+    protocol: TCP
+  selector:
+    app: rocm-smi-exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: rocm-smi-exporter
+  namespace: monitoring
+  labels:
+    app: rocm-smi-exporter
+    release: prometheus
+spec:
+  endpoints:
+  - port: metrics
+    interval: 30s
+  selector:
+    matchLabels:
+      app: rocm-smi-exporter
+  namespaceSelector:
+    matchNames:
+    - monitoring
