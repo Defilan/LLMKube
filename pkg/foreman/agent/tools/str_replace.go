@@ -184,11 +184,12 @@ func (t *StrReplaceTool) Execute(_ context.Context, args json.RawMessage) (*agen
 	}
 	occurrences := strings.Count(content, a.OldString)
 	if occurrences != want {
-		// Recovery is only attempted for the default single-replace case where
-		// the model's old_string did not match at all. This is the dominant
-		// failure mode for models that retype old_string from memory instead of
-		// copying it verbatim (whitespace drift, or a fabricated near-miss).
-		if want == 1 && occurrences == 0 {
+		// Recovery is attempted for the default single-replace case where
+		// the model's old_string did not match at all (occurrences == 0) or
+		// matched too many times (occurrences > 1). Both are drift failure
+		// modes for local models that retype old_string from memory instead
+		// of copying it verbatim (#941).
+		if want == 1 && occurrences != 1 {
 			if recovered, note, ok := t.applyWhitespaceMatch(content, a.OldString, a.NewString); ok {
 				if err := os.WriteFile(full, []byte(recovered), 0o644); err != nil { //nolint:gosec // G306: workspace file
 					return nil, fmt.Errorf("str_replace: write %q: %w", a.Path, err)
