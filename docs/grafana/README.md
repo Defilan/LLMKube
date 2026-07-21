@@ -21,6 +21,7 @@ PrometheusRule and PodMonitor templates.
 | File | Description |
 |---|---|
 | `llmkube-inference.json` | Request latency, TTFT (vLLM only), GPU queue wait, container restart rate. Grouped by service, runtime, namespace. |
+| `llmkube-quota.json` | Per-quota GPU utilization (usedGPUCount/gpuCount) and admission denial rate for GPUQuota resources. Grouped by quota name and namespace. |
 | `llmkube-slo.json` | Error budget remaining and multi-window burn rate for InferenceServices with `spec.slo` set, plus an SLO overview table. Reads the recording rules Pyrra's kubernetes operator writes per SLO. Templated on a `$slo` variable (`label_values(slo)`) and a manual `$objective` percentage variable, since Pyrra does not expose the target itself as a Prometheus series. Assumes the default 28d SLO window; see the dashboard description for details. |
 
 ## Importing
