@@ -1,0 +1,25 @@
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen3-30b-amd-service
+  namespace: default
+spec:
+  modelRef: qwen3-30b-amd
+  replicas: 1
+  image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+  endpoint:
+    port: 8080
+    path: /v1/chat/completions
+    type: ClusterIP
+  resources:
+    gpu: 1
+    gpuMemory: "24Gi"
+    cpu: "4"
+    memory: "32Gi"
+  nodeSelector:
+    gpu-vendor: amd
+  tolerations:
+    - key: gpu-vendor
+      operator: Equal
+      value: amd
+      effect: NoSchedule
