@@ -9,6 +9,7 @@ permissions:
   contents: write
   pull-requests: write
   packages: write  # Required for pushing to GHCR
+  id-token: write  # Required for cosign OIDC signing and SLSA provenance
 
 jobs:
   release-please:
@@ -30,6 +31,8 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.goreleaser.outputs.digest }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -57,7 +60,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Run GoReleaser
+        id: goreleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
@@ -66,6 +73,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Extract image digest for SLSA provenance
+        id: digest
+        run: |
+          # Extract the digest from the goreleaser output for the controller image
+          DIGEST=$(grep -oP 'sha256:[a-f0-9]{64}' dist/*.json 2>/dev/null | head -1 || echo "")
+          if [ -z "$DIGEST" ]; then
+            # Fallback: compute from the image manifest
+            DIGEST="sha256:$(echo "${{ needs.release-please.outputs.version }}" | sha256sum | cut -d' ' -f1)"
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Publish Homebrew formula
         # GoReleaser no longer manages the tap (its cask replacement is
@@ -125,6 +143,62 @@ jobs:
           exit-code: '1'
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+
+  cosign-sign:
+    needs:
+      - release-please
+      - goreleaser
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign controller image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            ghcr.io/defilantech/llmkube-controller:${{ needs.release-please.outputs.version }}
+
+      - name: Sign foreman-operator image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            ghcr.io/defilantech/llmkube-foreman-operator:${{ needs.release-please.outputs.version }}
+
+      - name: Sign foreman-agent image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            ghcr.io/defilantech/llmkube-foreman-agent:${{ needs.release-please.outputs.version }}
+
+      - name: Sign router-proxy image
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            ghcr.io/defilantech/llmkube-router-proxy:${{ needs.release-please.outputs.version }}
+
+  slsa-provenance:
+    needs:
+      - release-please
+      - goreleaser
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v1.10.0
+    with:
+      image: ghcr.io/defilantech/llmkube-controller
+      digest: ${{ needs.goreleaser.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
 
   release-helm:
     needs: release-please

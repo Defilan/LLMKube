@@ -188,6 +188,18 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    certificate: "${artifact}.pem"
+    args:
+      - "sign-blob"
+      - "--output-certificate=${certificate}"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
 # dockers_v2 builds one multi-arch manifest per image natively (buildx),
 # replacing the old per-arch `dockers` entries + `docker_manifests`. The
 # binaries are staged per platform under $TARGETPLATFORM in the build
