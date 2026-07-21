@@ -324,7 +324,14 @@ release:
 
     ### Homebrew (Recommended for macOS)
     ```bash
+    # CLI
     brew install defilantech/tap/llmkube
+
+    # Foreman agent (edge nodes)
+    brew install defilantech/tap/llmkube-foreman-agent
+
+    # Metal agent (Apple Silicon inference)
+    brew install defilantech/tap/llmkube-metal-agent
     ```
 
     ### Install Script (Linux/macOS)
@@ -368,8 +375,9 @@ release:
 # Homebrew tap: NOT configured here. GoReleaser removed `brews` (formulae) in
 # v2.16 and its only replacement, `homebrew_casks`, produces macOS-only casks,
 # which drops Linux Homebrew for a cross-platform CLI (see #1039 / #1040). The
-# release workflow instead runs hack/publish-homebrew-formula.sh to publish a
-# cross-platform binary formula from dist/checksums.txt.
+# release workflow instead runs hack/publish-homebrew-formula.sh to publish
+# binary formulae (llmkube, llmkube-foreman-agent, llmkube-metal-agent) from
+# dist/checksums.txt.
 
 # Metadata
 metadata:
