@@ -109,6 +109,17 @@ type ModelSpec struct {
 	// pass to runtimes that support projector arguments.
 	// +optional
 	Mmproj string `json:"mmproj,omitempty"`
+
+	// Prefetch instructs the operator to download the model into the model
+	// cache PVC immediately, without requiring an InferenceService to be
+	// created. When true and the source is a remote URL (http/https), the
+	// reconciler creates a download Job that writes into the shared model
+	// cache PVC and reflects progress through status phases
+	// (Downloading -> Ready/Cached). Local sources (file://, pvc://) and
+	// runtime-resolved sources (hf://) are no-ops: the file is already
+	// available or will be fetched by the runtime at serve time.
+	// +optional
+	Prefetch bool `json:"prefetch,omitempty"`
 }
 
 // HardwareSpec defines hardware acceleration settings

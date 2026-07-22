@@ -321,6 +321,17 @@ spec:
                   Mmproj is an optional multimodal projector file to stage from Source and
                   pass to runtimes that support projector arguments.
                 type: string
+              prefetch:
+                description: |-
+                  Prefetch instructs the operator to download the model into the model
+                  cache PVC immediately, without requiring an InferenceService to be
+                  created. When true and the source is a remote URL (http/https), the
+                  reconciler creates a download Job that writes into the shared model
+                  cache PVC and reflects progress through status phases
+                  (Downloading -> Ready/Cached). Local sources (file://, pvc://) and
+                  runtime-resolved sources (hf://) are no-ops: the file is already
+                  available or will be fetched by the runtime at serve time.
+                type: boolean
               quantization:
                 description: Quantization describes the quantization level (e.g.,
                   Q4_0, Q5_K_M, F16)

@@ -30,9 +30,11 @@ import (
 	"sync"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -114,6 +116,14 @@ type ModelReconciler struct {
 	// default) blocks all such ranges; public hosts are always allowed. See
 	// newGuardedHTTPClient and GHSA-jw3m-8q7m-f35r.
 	AllowedRemoteHosts []string
+	// InitContainerImage is the image used for the model-downloader init
+	// container and for prefetch download Jobs. Mirrors the InferenceService
+	// reconciler's InitContainerImage so both paths use the same image.
+	InitContainerImage string
+	// CACertConfigMap is the name of a ConfigMap containing custom CA
+	// certificates for the model-downloader. Mirrors the InferenceService
+	// reconciler's CACertConfigMap.
+	CACertConfigMap string
 
 	// metadataHTTPClient is the SSRF-guarded client used for all controller-
 	// side requests to Model.spec.source (metadata reads and revalidation
@@ -138,6 +148,7 @@ func (r *ModelReconciler) metadataClient() *http.Client {
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=models/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()
@@ -569,6 +580,10 @@ func (r *ModelReconciler) reconcileBySourceType(
 	// the operator-namespace PVC, which inference Pods cannot mount, so the
 	// fetch is deferred to the workload.
 	case isRemoteHTTPSource(model.Spec.Source):
+		if model.Spec.Prefetch {
+			result, err = r.reconcilePrefetch(ctx, model)
+			return true, result, err
+		}
 		result, err = r.reconcileRuntimeResolvedSource(
 			ctx, model, computeCacheKey(model.Spec.Source))
 		return true, result, err
@@ -690,6 +705,223 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 	llmkubemetrics.ReconcileTotal.WithLabelValues("model", "success").Inc()
 	logger.Info("Runtime-resolved model ready", "source", model.Spec.Source)
 	return ctrl.Result{}, nil
+}
+
+// reconcilePrefetch handles the prefetch path for remote HTTP(S) sources.
+// When spec.prefetch is true, the Model reconciler creates a download Job
+// that writes into the shared model cache PVC, so the model is available
+// before any InferenceService is created. The Job reuses the same init
+// container image and download command as the InferenceService init container.
+func (r *ModelReconciler) reconcilePrefetch(ctx context.Context, model *inferencev1alpha1.Model) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	cacheKey := computeCacheKey(model.Spec.Source)
+
+	// If the model is already Ready, the prefetch Job has already succeeded.
+	// Run a drift check for remote sources so the SourceDrifted condition
+	// stays current.
+	if model.Status.Phase == PhaseReady {
+		if _, requeueAfter, err := r.handleRevalidation(ctx, model); err != nil {
+			return ctrl.Result{}, err
+		} else {
+			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "success").Inc()
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+		}
+	}
+
+	// Ensure the model cache PVC exists before creating the Job.
+	if err := r.ensureModelCachePVCForPrefetch(ctx, model); err != nil {
+		logger.Error(err, "Failed to ensure model cache PVC for prefetch")
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Build and ensure the download Job.
+	job := r.buildPrefetchJob(model, cacheKey)
+
+	// Check if the Job already exists (idempotent: do not recreate).
+	existing := &batchv1.Job{}
+	err := r.Get(ctx, types.NamespacedName{Name: job.Name, Namespace: model.Namespace}, existing)
+	if err == nil {
+		// Job exists — check its status.
+		if jobCompleted(existing) {
+			// Job succeeded: mark the model Ready.
+			logger.Info("Prefetch Job completed successfully")
+			model.Status.Phase = PhaseReady
+			model.Status.CacheKey = cacheKey
+			model.Status.Size = "0"
+			model.Status.AcceleratorReady = r.checkAcceleratorAvailability(ctx, model)
+			now := metav1.Now()
+			model.Status.LastUpdated = &now
+			if err := r.updateStatus(ctx, model, "Available", metav1.ConditionTrue, "PrefetchComplete", "Model prefetched into cache PVC"); err != nil {
+				return ctrl.Result{}, err
+			}
+			llmkubemetrics.ModelStatus.WithLabelValues(model.Name, model.Namespace, "Ready").Set(1)
+			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "success").Inc()
+			return ctrl.Result{}, nil
+		}
+		if jobFailed(existing) {
+			// Job failed: mark the model Failed.
+			logger.Info("Prefetch Job failed")
+			model.Status.Phase = PhaseFailed
+			if err := r.updateStatus(ctx, model, ConditionDegraded, metav1.ConditionTrue, "PrefetchJobFailed", "Prefetch download Job failed"); err != nil {
+				return ctrl.Result{}, err
+			}
+			llmkubemetrics.ModelStatus.WithLabelValues(model.Name, model.Namespace, PhaseFailed).Set(1)
+			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "error").Inc()
+			return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+		}
+		// Job is still running.
+		if model.Status.Phase != "Downloading" {
+			model.Status.Phase = "Downloading"
+			model.Status.CacheKey = cacheKey
+			if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue, "PrefetchDownloading", "Prefetch download Job is running"); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		logger.Info("Prefetch Job is running", "job", job.Name)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
+	// Job does not exist — create it.
+	logger.Info("Creating prefetch download Job", "source", model.Spec.Source, "cacheKey", cacheKey)
+	if err := r.Create(ctx, job); err != nil {
+		logger.Error(err, "Failed to create prefetch Job")
+		return ctrl.Result{}, err
+	}
+
+	model.Status.Phase = "Downloading"
+	model.Status.CacheKey = cacheKey
+	if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue, "PrefetchDownloading", "Prefetch download Job created"); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// ensureModelCachePVCForPrefetch creates the shared model cache PVC if it
+// does not already exist. This is the same PVC the InferenceService init
+// container writes into, so the prefetch Job and the serving pod share the
+// same cache.
+func (r *ModelReconciler) ensureModelCachePVCForPrefetch(ctx context.Context, model *inferencev1alpha1.Model) error {
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: model.Namespace}, pvc)
+	if err == nil {
+		return nil // PVC already exists
+	}
+	if !errors.IsNotFound(err) {
+		return err
+	}
+
+	// PVC does not exist — create it.
+	pvc = &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ModelCachePVCName,
+			Namespace: model.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "llmkube",
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("10Gi"),
+				},
+			},
+		},
+	}
+	return r.Create(ctx, pvc)
+}
+
+// buildPrefetchJob constructs a batch/v1 Job that downloads the model into
+// the shared model cache PVC. It reuses the same image and download command
+// as the InferenceService init container.
+func (r *ModelReconciler) buildPrefetchJob(model *inferencev1alpha1.Model, cacheKey string) *batchv1.Job {
+	cacheDir := fmt.Sprintf("/models/%s", cacheKey)
+	basename := canonicalModelBasename(model)
+	modelPath := fmt.Sprintf("%s/%s", cacheDir, basename)
+
+	cmd := buildModelInitCommand(false, isS3Source(model.Spec.Source), true, model.Spec.RefreshPolicy)
+	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath)
+
+	var envFrom []corev1.EnvFromSource
+	if model.Spec.SourceSecretRef != nil {
+		envFrom = []corev1.EnvFromSource{
+			{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: *model.Spec.SourceSecretRef}},
+		}
+	}
+
+	var caCertCmd string
+	if r.CACertConfigMap != "" {
+		caCertCmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", cmd)
+	}
+
+	jobName := fmt.Sprintf("%s-prefetch", model.Name)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobName,
+			Namespace: model.Namespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "llmkube",
+				"llmkube.dev/model":            model.Name,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         "inference.llmkube.dev/v1alpha1",
+					Kind:               "Model",
+					Name:               model.Name,
+					UID:                model.UID,
+					BlockOwnerDeletion: boolPtr(true),
+					Controller:         boolPtr(true),
+				},
+			},
+		},
+		Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{
+						{
+							Name:    "model-downloader",
+							Image:   r.InitContainerImage,
+							Command: []string{"sh", "-c", caCertCmd},
+							Env:     env,
+							EnvFrom: envFrom,
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "model-cache", MountPath: "/models"},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "model-cache",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: ModelCachePVCName,
+									ReadOnly:  false,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// jobCompleted reports whether the Job has at least one successful completion.
+func jobCompleted(job *batchv1.Job) bool {
+	return job.Status.Succeeded > 0
+}
+
+// jobFailed reports whether the Job has failed.
+func jobFailed(job *batchv1.Job) bool {
+	return job.Status.Failed > 0
 }
 
 // verifySHA256 computes the SHA256 hash of the file and verifies it against the
@@ -1107,6 +1339,7 @@ func computeFileSHA256(path string) (string, error) {
 func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.Model{}).
+		Owns(&batchv1.Job{}).
 		Named("model").
 		Complete(r)
 }

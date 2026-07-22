@@ -31,10 +31,12 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2111,5 +2113,612 @@ var _ = Describe("Model Controller remote GGUF metadata (#728, Task 2)", func() 
 		Expect(updated.Status.GGUF).To(BeNil(), "guard must prevent the remote metadata read")
 		Expect(updated.Status.Size).To(Equal("0"))
 		Expect(hits).To(Equal(0), "the SSRF guard must block the connection at dial time")
+	})
+})
+
+var _ = Describe("Model Prefetch", func() {
+	ctx := context.Background()
+
+	It("should create a prefetch Job when prefetch is true and source is remote HTTP", func() {
+		modelName := "prefetch-model"
+		source := "https://example.com/prefetch-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).ToNot(BeZero(), "should requeue while Job is running")
+
+		// Verify the Job was created.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)).To(Succeed())
+		Expect(job.Spec.Template.Spec.Containers[0].Image).To(Equal("docker.io/curlimages/curl:8.18.0"))
+		Expect(job.Spec.Template.Spec.Containers[0].Name).To(Equal("model-downloader"))
+
+		// Verify owner reference.
+		Expect(job.OwnerReferences).To(HaveLen(1))
+		Expect(job.OwnerReferences[0].Name).To(Equal(modelName))
+		Expect(job.OwnerReferences[0].Kind).To(Equal("Model"))
+
+		// Verify the model status is Downloading.
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal("Downloading"))
+		Expect(updated.Status.CacheKey).To(Equal(computeCacheKey(source)))
+	})
+
+	It("should not create a prefetch Job when prefetch is false", func() {
+		modelName := "no-prefetch-model"
+		source := "https://example.com/no-prefetch-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: false,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		// No Job should exist.
+		job := &batchv1.Job{}
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)
+		Expect(errors.IsNotFound(err)).To(BeTrue(), "no prefetch Job should be created when prefetch is false")
+
+		// Model should be Ready (runtime-resolved).
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+	})
+
+	It("should not create a prefetch Job for local sources even when prefetch is true", func() {
+		modelName := "local-prefetch-model"
+		tempDir, err := os.MkdirTemp("", "llmkube-src-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+		srcFile := filepath.Join(tempDir, "local-model.gguf")
+		Expect(os.WriteFile(srcFile, []byte("fake-model-data"), 0644)).To(Succeed())
+		source := fmt.Sprintf("file://%s", srcFile)
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		storageDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(storageDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          storageDir,
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// No Job should exist for local sources.
+		job := &batchv1.Job{}
+		err = k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)
+		Expect(errors.IsNotFound(err)).To(BeTrue(), "no prefetch Job for local sources")
+	})
+
+	It("should not duplicate a prefetch Job on requeue", func() {
+		modelName := "dedup-prefetch-model"
+		source := "https://example.com/dedup-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// First reconcile: creates the Job.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Second reconcile: should not create a duplicate Job.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify only one Job exists.
+		var jobList batchv1.JobList
+		Expect(k8sClient.List(ctx, &jobList, client.InNamespace("default"))).To(Succeed())
+		prefetchJobs := 0
+		for _, j := range jobList.Items {
+			if strings.HasSuffix(j.Name, "-prefetch") {
+				prefetchJobs++
+			}
+		}
+		Expect(prefetchJobs).To(Equal(1), "should not duplicate the prefetch Job")
+	})
+
+	It("should mark model Ready when prefetch Job completes", func() {
+		modelName := "completed-prefetch-model"
+		source := "https://example.com/completed-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// First reconcile: creates the Job.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Simulate Job completion by patching the Job status.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)).To(Succeed())
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+		// Second reconcile: should detect completion and mark model Ready.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+	})
+
+	It("should mark model Failed when prefetch Job fails", func() {
+		modelName := "failed-prefetch-model"
+		source := "https://example.com/failed-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// First reconcile: creates the Job.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Simulate Job failure by patching the Job status.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)).To(Succeed())
+		job.Status.Failed = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+		// Second reconcile: should detect failure and mark model Failed.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseFailed))
+	})
+})
+
+var _ = Describe("buildPrefetchJob", func() {
+	It("should build a Job with correct owner reference and container spec", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-model",
+				Namespace: "default",
+				UID:       "test-uid",
+			},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/test-model.gguf",
+				Prefetch: true,
+			},
+		}
+
+		reconciler := &ModelReconciler{
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+
+		cacheKey := computeCacheKey(model.Spec.Source)
+		job := reconciler.buildPrefetchJob(model, cacheKey)
+
+		Expect(job.Name).To(Equal("test-model-prefetch"))
+		Expect(job.Namespace).To(Equal("default"))
+		Expect(job.OwnerReferences).To(HaveLen(1))
+		Expect(job.OwnerReferences[0].Name).To(Equal("test-model"))
+		Expect(job.OwnerReferences[0].Kind).To(Equal("Model"))
+		Expect(job.OwnerReferences[0].UID).To(Equal(types.UID("test-uid")))
+
+		container := job.Spec.Template.Spec.Containers[0]
+		Expect(container.Name).To(Equal("model-downloader"))
+		Expect(container.Image).To(Equal("docker.io/curlimages/curl:8.18.0"))
+
+		// Verify the model cache PVC volume is mounted.
+		Expect(job.Spec.Template.Spec.Volumes).To(HaveLen(1))
+		Expect(job.Spec.Template.Spec.Volumes[0].Name).To(Equal("model-cache"))
+		Expect(job.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+	})
+
+	It("should include SourceSecretRef envFrom when configured", func() {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "secret-model",
+				Namespace: "default",
+				UID:       "test-uid",
+			},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/secret-model.gguf",
+				Prefetch: true,
+				SourceSecretRef: &corev1.LocalObjectReference{
+					Name: "my-secret",
+				},
+			},
+		}
+
+		reconciler := &ModelReconciler{
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+
+		cacheKey := computeCacheKey(model.Spec.Source)
+		job := reconciler.buildPrefetchJob(model, cacheKey)
+
+		container := job.Spec.Template.Spec.Containers[0]
+		Expect(container.EnvFrom).To(HaveLen(1))
+		Expect(container.EnvFrom[0].SecretRef.LocalObjectReference.Name).To(Equal("my-secret"))
+	})
+})
+
+var _ = Describe("jobCompleted", func() {
+	It("should return true when Job has succeeded", func() {
+		job := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Succeeded: 1,
+			},
+		}
+		Expect(jobCompleted(job)).To(BeTrue())
+	})
+
+	It("should return false when Job has not succeeded", func() {
+		job := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Succeeded: 0,
+			},
+		}
+		Expect(jobCompleted(job)).To(BeFalse())
+	})
+})
+
+var _ = Describe("jobFailed", func() {
+	It("should return true when Job has failed", func() {
+		job := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Failed: 1,
+			},
+		}
+		Expect(jobFailed(job)).To(BeTrue())
+	})
+
+	It("should return false when Job has not failed", func() {
+		job := &batchv1.Job{
+			Status: batchv1.JobStatus{
+				Failed: 0,
+			},
+		}
+		Expect(jobFailed(job)).To(BeFalse())
+	})
+})
+
+var _ = Describe("ensureModelCachePVCForPrefetch", func() {
+	It("should create the model cache PVC when it does not exist", func() {
+		modelName := "pvc-prefetch-model"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/pvc-prefetch-model.gguf",
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          "/models",
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// ensureModelCachePVCForPrefetch should create the PVC.
+		err := reconciler.ensureModelCachePVCForPrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify the PVC was created.
+		pvc := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: "default"}, pvc)).To(Succeed())
+		Expect(pvc.Spec.AccessModes).To(ContainElement(corev1.ReadWriteMany))
+	})
+
+	It("should be a no-op when the model cache PVC already exists", func() {
+		modelName := "pvc-exists-prefetch-model"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/pvc-exists-prefetch-model.gguf",
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		// Pre-create the PVC.
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: ModelCachePVCName, Namespace: "default"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("10Gi"),
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          "/models",
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// ensureModelCachePVCForPrefetch should be a no-op.
+		err := reconciler.ensureModelCachePVCForPrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+	})
+})
+
+var _ = Describe("reconcilePrefetch", func() {
+	It("should create a Job and set Downloading phase on first reconcile", func() {
+		modelName := "reconcile-prefetch-model"
+		source := "https://example.com/reconcile-prefetch-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          "/models",
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		result, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).ToNot(BeZero())
+
+		// Verify the Job was created.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)).To(Succeed())
+
+		// Verify the model status is Downloading.
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal("Downloading"))
+	})
+
+	It("should mark model Ready when Job has succeeded", func() {
+		modelName := "reconcile-prefetch-ready-model"
+		source := "https://example.com/reconcile-prefetch-ready-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          "/models",
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// First reconcile: creates the Job.
+		_, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Simulate Job completion.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)).To(Succeed())
+		job.Status.Succeeded = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+		// Second reconcile: should mark model Ready.
+		result, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+	})
+
+	It("should mark model Failed when Job has failed", func() {
+		modelName := "reconcile-prefetch-failed-model"
+		source := "https://example.com/reconcile-prefetch-failed-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          "/models",
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// First reconcile: creates the Job.
+		_, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Simulate Job failure.
+		job := &batchv1.Job{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName + "-prefetch", Namespace: "default"}, job)).To(Succeed())
+		job.Status.Failed = 1
+		Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+
+		// Second reconcile: should mark model Failed.
+		result, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).ToNot(BeZero())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseFailed))
+	})
+
+	It("should requeue when Job is still running", func() {
+		modelName := "reconcile-prefetch-running-model"
+		source := "https://example.com/reconcile-prefetch-running-model.gguf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   source,
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          "/models",
+			AllowedHostPathRoots: testLocalRoots,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+		}
+
+		// First reconcile: creates the Job.
+		_, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Second reconcile: Job is still running (no Succeeded/Failed).
+		result, err := reconciler.reconcilePrefetch(ctx, model)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).ToNot(BeZero(), "should requeue while Job is running")
 	})
 })
