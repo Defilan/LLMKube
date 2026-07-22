@@ -2301,12 +2301,17 @@ func workloadOwnerName(task *foremanv1alpha1.AgenticTask) string {
 // message. v0.1 is straightforward: for issue-fix, drop the issue
 // number + repo + prompt body into a small template; for freeform,
 // pass the prompt through unchanged.
+var nowFunc = time.Now
+
 func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 	p := task.Spec.Payload
 	var b strings.Builder
 	switch task.Spec.Kind {
 	case foremanv1alpha1.AgenticTaskKindIssueFix:
 		fmt.Fprintf(&b, "You are working on issue #%d of repository %s.\n\n", p.Issue, p.Repo)
+		b.WriteString("Today's date is ")
+		b.WriteString(nowFunc().UTC().Format("2006-01-02"))
+		b.WriteString(". Treat this date as authoritative over your internal sense of time.\n\n")
 		if p.PromptPrefix != "" {
 			fmt.Fprintf(&b, "%s\n\n", p.PromptPrefix)
 		}
