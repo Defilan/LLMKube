@@ -16,7 +16,7 @@ type TGIBackend struct{}
 
 func (b *TGIBackend) ContainerName() string { return "tgi" }
 func (b *TGIBackend) DefaultImage() string {
-	return "ghcr.io/huggingface/text-generation-inference:latest"
+	return "ghcr.io/huggingface/text-generation-inference:3.3.5"
 }
 func (b *TGIBackend) DefaultPort() int32       { return 80 }
 func (b *TGIBackend) NeedsModelInit() bool     { return false }

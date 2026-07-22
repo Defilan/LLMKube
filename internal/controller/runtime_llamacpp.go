@@ -40,7 +40,7 @@ func (b *LlamaCppBackend) ContainerName() string {
 }
 
 func (b *LlamaCppBackend) DefaultImage() string {
-	return "ghcr.io/ggml-org/llama.cpp:server"
+	return "ghcr.io/ggml-org/llama.cpp:server-cuda"
 }
 
 func (b *LlamaCppBackend) DefaultPort() int32 {

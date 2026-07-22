@@ -686,8 +686,8 @@ func TestLlamaCppRouterBackend_Defaults(t *testing.T) {
 		t.Errorf("ContainerName = %q, want \"llama-server\"", backend.ContainerName())
 	}
 
-	if backend.DefaultImage() != "ghcr.io/ggml-org/llama.cpp:server" {
-		t.Errorf("DefaultImage = %q, want \"ghcr.io/ggml-org/llama.cpp:server\"", backend.DefaultImage())
+	if backend.DefaultImage() != "ghcr.io/ggml-org/llama.cpp:server-cuda" {
+		t.Errorf("DefaultImage = %q, want \"ghcr.io/ggml-org/llama.cpp:server-cuda\"", backend.DefaultImage())
 	}
 
 	if backend.DefaultPort() != 8080 {

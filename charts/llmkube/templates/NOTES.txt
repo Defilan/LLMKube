@@ -85,6 +85,23 @@ Pyrra ServiceLevelObjective. Pyrra must be installed separately:
 {{- end }}
 
 ---
+PLATFORM FLOORS (NVIDIA Blackwell / sm_100):
+
+If you are deploying on NVIDIA Blackwell-class GPUs (B200, GB200), verify
+your platform meets these minimum versions before first deploy:
+
+  NVIDIA driver:    {{ .Values.platformFloors.nvidiaDriver }}
+  CUDA toolkit:     {{ .Values.platformFloors.cudaToolkit }}
+  gpu-operator:     {{ .Values.platformFloors.gpuOperator }}
+  device-plugin:    {{ .Values.platformFloors.devicePlugin }}
+  NCCL:             {{ .Values.platformFloors.nccl }}
+  DCGM exporter:    {{ .Values.platformFloors.dcgmExporter }}
+  Fabric Manager:   {{ .Values.platformFloors.fabricManager }}
+
+These are informational only — the operator does not enforce them at runtime.
+See docs/operations/b200-validation-matrix.md for the full validation matrix.
+
+---
 DOCUMENTATION:
 
 - GitHub: https://github.com/defilantech/LLMKube

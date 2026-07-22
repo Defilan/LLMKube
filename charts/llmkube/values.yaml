@@ -409,3 +409,32 @@ multitenancy:
 networkPolicies:
   enabled: false
   additionalEgressCIDRs: []
+
+# Runtime image defaults. These values document the per-runtime default images
+# used by the operator when an InferenceService does not specify spec.image.
+# They are informational; to override a runtime's image, set spec.image on the
+# InferenceService. The operator does not currently read these chart values as
+# CLI flags — that is tracked as a follow-up.
+#
+# All tags are pinned to versions verified to ship sm_100 (Blackwell) codegen
+# or are the latest stable release at the time of pinning. Bump via PR when a
+# newer release is required.
+runtimeImages:
+  vllm: "vllm/vllm-openai:v0.20.0"
+  sglang: "lmsysorg/sglang:v0.5.15-cu129"
+  tgi: "ghcr.io/huggingface/text-generation-inference:3.3.5"
+  llamacpp: "ghcr.io/ggml-org/llama.cpp:server-cuda"
+
+# Platform floors for NVIDIA Blackwell (sm_100) deployments.
+# These values are rendered into NOTES.txt at install time so operators see
+# the minimum driver / CUDA / NCCL / device-plugin versions required for
+# Blackwell-class GPUs. They are informational only — the operator does not
+# enforce them at runtime.
+platformFloors:
+  nvidiaDriver: "R570 (570.124.06 minimum; 570.133.20 required for HGX B200)"
+  cudaToolkit: "12.8 (first public sm_100 codegen; 12.9+ recommended)"
+  gpuOperator: ">= v24.6 (v24.9 / v25.x recommended)"
+  devicePlugin: ">= v0.17.2 (Blackwell-aware product labels; v0.18.0+ preferred)"
+  nccl: ">= 2.25.1 (Blackwell support; 2.27+ recommended for NVLSTree)"
+  dcgmExporter: ">= 3.3.x (basic Blackwell counters; 4.5+ recommended)"
+  fabricManager: "Must match NVIDIA driver version exactly"

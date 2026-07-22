@@ -85,8 +85,8 @@ These are project changes the LLMKube codebase, Helm chart, or docs need to abso
 Audit the default images each runtime backend sets:
 
 - `internal/controller/runtime_vllm.go`: `vllm/vllm-openai:v0.20.0` is on the current line (latest released v0.20.1 as of May 2026). Blackwell support landed incrementally starting around **v0.15.x** per [vllm-project/vllm RFC #18153](https://github.com/vllm-project/vllm/issues/18153) (filed May 2025), maturing through v0.16-v0.18. **Practical floor: v0.18+.** Confirm exact tag at validation time and record it in the matrix row.
-- `internal/controller/runtime_llamacpp.go`: `ghcr.io/ggml-org/llama.cpp:server` must be a build that includes `CMAKE_CUDA_ARCHITECTURES="90;100"`. Pin to a tag verified to ship `sm_100` codegen.
-- `internal/controller/runtime_tgi.go`: `ghcr.io/huggingface/text-generation-inference:latest` should pin to a 3.x tag with rebuilt flash-attn for Blackwell.
+- `internal/controller/runtime_llamacpp.go`: `ghcr.io/ggml-org/llama.cpp:server-cuda` (CUDA 12 build). The upstream `server` tag is CPU-only; the `server-cuda` tag includes CUDA support. No official tag yet ships `sm_100` codegen — a custom build with `CMAKE_CUDA_ARCHITECTURES="90;100"` is required for Blackwell. Pin to a tag verified to ship `sm_100` codegen when available.
+- `internal/controller/runtime_tgi.go`: `ghcr.io/huggingface/text-generation-inference:3.3.5` (pinned from `latest`). TGI 3.3.x uses CUDA 12.8+ which is the minimum for `sm_100` codegen. No explicit Blackwell-specific tag exists; confirm at validation time.
 
 ### 4. FP8 / FP4 quantization in the CRD
 
