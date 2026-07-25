@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,7 +58,7 @@ var _ = Describe("updateStatusWithSchedulingInfo scaled-away conditions", func()
 
 	DescribeTable("Available condition on scaled-away phases",
 		func(phase string, wantReason string) {
-			isvcName := "stale-available-" + phase
+			isvcName := "stale-available-" + strings.ToLower(phase)
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:       isvcName,
