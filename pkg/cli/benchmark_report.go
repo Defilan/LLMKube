@@ -193,6 +193,42 @@ func (rw *ReportWriter) writeSweepResults(sweepReport *SweepReport) error {
 	return rw.writeSection(sweepReport.SweepType+" Sweep Results", buf.String())
 }
 
+func (rw *ReportWriter) writeDepthSweepResults(sweepReport *SweepReport) error {
+	var buf strings.Builder
+
+	buf.WriteString(fmt.Sprintf("**Sweep Type:** %s  \n", sweepReport.SweepType))
+	buf.WriteString(fmt.Sprintf("**Values Tested:** %s  \n", strings.Join(sweepReport.Values, ", ")))
+	buf.WriteString(fmt.Sprintf("**Duration:** %s  \n\n", sweepReport.Duration.Round(time.Second)))
+
+	buf.WriteString("| Depth | Achieved | Prefill (tok/s) | Decode (tok/s) | Status |\n")
+	buf.WriteString("|-------|----------|-----------------|----------------|--------|\n")
+
+	for _, result := range sweepReport.Results {
+		status := statusIconSuccess
+		achieved := "-"
+		prefStr := "-"
+		decStr := "-"
+
+		if result.Error != "" {
+			status = statusIconFailed
+		} else if result.Depth != nil {
+			d := result.Depth
+			achieved = strconv.Itoa(d.AchievedDepth)
+			prefStr = fmt.Sprintf("%.1f (%.1f - %.1f, σ=%.1f)",
+				d.PromptToksPerSec.Median, d.PromptToksPerSec.Min,
+				d.PromptToksPerSec.Max, d.PromptToksPerSec.StdDev)
+			decStr = fmt.Sprintf("%.1f (%.1f - %.1f, σ=%.1f)",
+				d.GenToksPerSec.Median, d.GenToksPerSec.Min,
+				d.GenToksPerSec.Max, d.GenToksPerSec.StdDev)
+		}
+
+		buf.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s |\n",
+			result.Value, achieved, prefStr, decStr, status))
+	}
+
+	return rw.writeSection(sweepReport.SweepType+" Sweep Results", buf.String())
+}
+
 func (rw *ReportWriter) writeGPUMetrics(metrics []GPUMetric) error {
 	if len(metrics) == 0 {
 		return nil
@@ -335,11 +371,16 @@ func newGPUMonitor() *gpuMonitor {
 	}
 }
 
-func (gm *gpuMonitor) start(interval time.Duration) {
+// gpuMonitorInterval is the sampling interval for GPU metrics. All callers
+// use the same value, so it is hardcoded here rather than passed as a
+// parameter.
+const gpuMonitorInterval = 10 * time.Second
+
+func (gm *gpuMonitor) start() {
 	gm.wg.Add(1)
 	go func() {
 		defer gm.wg.Done()
-		ticker := time.NewTicker(interval)
+		ticker := time.NewTicker(gpuMonitorInterval)
 		defer ticker.Stop()
 
 		if metric := gm.sample(); metric != nil {

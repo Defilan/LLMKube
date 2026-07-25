@@ -60,6 +60,7 @@ type benchmarkOptions struct {
 	concurrencySweep string
 	contextSweep     string
 	tokensSweep      string
+	promptDepthSweep string
 
 	// GPU monitoring
 	monitorGPU bool
@@ -208,7 +209,33 @@ type SweepResult struct {
 	Value     string             `json:"value"`
 	Summary   *BenchmarkSummary  `json:"summary,omitempty"`
 	Stress    *StressTestSummary `json:"stress,omitempty"`
+	Depth     *DepthSweepResult  `json:"depth,omitempty"`
 	Error     string             `json:"error,omitempty"`
+}
+
+// TokenSpread holds the spread of a metric across repetitions: median plus
+// min/max/stdev. A single central value cannot be defended for a published
+// curve, so every depth row reports the full spread.
+type TokenSpread struct {
+	Median float64 `json:"median"`
+	Min    float64 `json:"min"`
+	Max    float64 `json:"max"`
+	StdDev float64 `json:"std_dev"`
+}
+
+// DepthSweepResult holds the per-depth results for a prompt-depth sweep.
+// The achieved token count (from the server's prompt_n) is reported rather
+// than the requested target, because synthetic text does not tokenize at a
+// predictable ratio and tokenizers differ between models.
+type DepthSweepResult struct {
+	RequestedDepth   int         `json:"requested_depth"`
+	AchievedDepth    int         `json:"achieved_depth"`
+	PromptToksPerSec TokenSpread `json:"prompt_toks_per_sec"`
+	GenToksPerSec    TokenSpread `json:"gen_toks_per_sec"`
+	Iterations       int         `json:"iterations"`
+	Successful       int         `json:"successful"`
+	Failed           int         `json:"failed"`
+	Error            string      `json:"error,omitempty"`
 }
 
 // SweepReport holds results from a complete sweep test
@@ -420,6 +447,9 @@ Examples:
 			if opts.contextSweep != "" {
 				return runContextSweep(opts)
 			}
+			if opts.promptDepthSweep != "" {
+				return runPromptDepthSweep(opts)
+			}
 
 			return runBenchmark(opts)
 		},
@@ -471,6 +501,8 @@ Examples:
 		"Test multiple context sizes (comma-separated, e.g., 4096,8192,16384)")
 	cmd.Flags().StringVar(&opts.tokensSweep, "tokens-sweep", "",
 		"Test multiple max-token values (comma-separated, e.g., 64,256,512,1024)")
+	cmd.Flags().StringVar(&opts.promptDepthSweep, "prompt-depth-sweep", "",
+		"Test multiple prompt depths against a single deployment (comma-separated, e.g., 512,2048,8192)")
 
 	// GPU monitoring flag
 	cmd.Flags().BoolVar(&opts.monitorGPU, "monitor-gpu", false,
@@ -540,7 +572,7 @@ func runBenchmark(opts *benchmarkOptions) error {
 	var gpuMon *gpuMonitor
 	if opts.monitorGPU {
 		gpuMon = newGPUMonitor()
-		gpuMon.start(10 * time.Second)
+		gpuMon.start()
 		defer func() {
 			metrics := gpuMon.stop()
 			if reportWriter != nil && len(metrics) > 0 {
