@@ -35,7 +35,9 @@ import (
 //   - FIFO queue-position calculation across WaitingForGPU services
 //   - Priority → PriorityClass and preemption-value mapping
 
-const PhaseWaitingForGPU = "WaitingForGPU"
+// PhaseWaitingForGPU is hoisted to api/v1alpha1; aliased here for
+// unqualified use within the controller package.
+const PhaseWaitingForGPU = inferencev1alpha1.PhaseWaitingForGPU
 
 // Priority class mapping from priority level to Kubernetes PriorityClass name
 var priorityClassMap = map[string]string{

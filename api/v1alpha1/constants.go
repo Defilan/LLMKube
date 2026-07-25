@@ -47,6 +47,40 @@ const (
 	DefaultAgentHeartbeatTimeout = 3 * time.Minute
 )
 
+// InferenceService and Model lifecycle phase strings written to
+// status.phase by both the operator (internal/controller) and the
+// metal-agent (pkg/agent). Hoisted here so a rename on either side is a
+// compile error rather than a silent status-thrash bug: the two writers
+// previously disagreed on the phase string for a suspended service (#1254)
+// because pkg/agent could not import internal/controller and carried its
+// own copy. The string values are CRD- and client-visible and must not
+// change without a corresponding API bump.
+const (
+	// PhaseReady means the workload is serving (InferenceService) or the
+	// model is cached and available (Model).
+	PhaseReady = "Ready"
+	// PhaseFailed means the workload or model could not be brought up.
+	PhaseFailed = "Failed"
+	// PhaseCached means the model file is present in the cache but not
+	// yet referenced by a ready InferenceService.
+	PhaseCached = "Cached"
+	// PhaseDownloading means the model is being fetched or copied into
+	// the cache.
+	PhaseDownloading = "Downloading"
+	// PhaseCreating means the InferenceService is being provisioned
+	// (deployment/service creation, or waiting for the metal-agent).
+	PhaseCreating = "Creating"
+	// PhaseStopped means the InferenceService has been scaled to zero
+	// (spec.replicas=0) and the workload torn down.
+	PhaseStopped = "Stopped"
+	// PhaseSuspended means the InferenceService has spec.suspend=true and
+	// the workload torn down while preserving spec.replicas for resume.
+	PhaseSuspended = "Suspended"
+	// PhaseWaitingForGPU means the InferenceService is queued waiting for
+	// GPU resources to become available.
+	PhaseWaitingForGPU = "WaitingForGPU"
+)
+
 const (
 	// ConditionRolloutDeferred indicates whether a rollout is being deferred
 	// because the InferenceService has waitForIdle enabled and pods are not yet
