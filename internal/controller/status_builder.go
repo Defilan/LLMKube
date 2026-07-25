@@ -230,6 +230,19 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 	}
 	isvc.Status.QueuePosition = queuePos
 
+	// Reason/message constants for the scaled-away phases. These mirror the
+	// metal-agent's markStopped convention (pkg/agent/agent.go) so the two
+	// status writers agree: a Stopped or Suspended service reports
+	// Available=False with a reason that distinguishes the cause. Without
+	// these cases the switch falls through and a previously-Ready service
+	// keeps its stale Available=True condition (#1257).
+	const (
+		reasonManuallyScaledToZero  = "ManuallyScaledToZero"
+		reasonSuspended             = "Suspended"
+		messageManuallyScaledToZero = "spec.replicas=0; workload scaled to zero"
+		messageSuspended            = "spec.suspend=true; workload scaled to zero; spec.replicas preserved"
+	)
+
 	var condition metav1.Condition
 	switch phase {
 	case PhaseReady:
@@ -289,6 +302,34 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 		}
 		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
 		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Available")
+
+	case PhaseStopped:
+		condition = metav1.Condition{
+			Type:               ConditionAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             reasonManuallyScaledToZero,
+			Message:            messageManuallyScaledToZero,
+		}
+		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Progressing")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Degraded")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
+
+	case PhaseSuspended:
+		condition = metav1.Condition{
+			Type:               ConditionAvailable,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             reasonSuspended,
+			Message:            messageSuspended,
+		}
+		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Progressing")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Degraded")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
 
 	case "Pending":
 		condition = metav1.Condition{
