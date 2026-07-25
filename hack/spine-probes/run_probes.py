@@ -100,12 +100,12 @@ def classify(text):
     return "UNCLEAR"
 
 
-def ask(url, model, system, user, timeout, temperature):
+def ask(url, model, system, user, timeout, temperature, max_tokens=900):
     body = json.dumps({
         "model": model,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
-        "max_tokens": 900, "temperature": temperature,
+        "max_tokens": max_tokens, "temperature": temperature,
     }).encode()
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"})
@@ -126,6 +126,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--arms", default="", help="comma list, e.g. 124,1234")
     ap.add_argument("--seeds", type=int, default=1)
+    ap.add_argument("--max-tokens", type=int, default=900,
+                    help="raise for thinking models, which can spend the whole "
+                         "budget reasoning and return empty content")
     args = ap.parse_args()
 
     global TOKEN
@@ -136,8 +139,9 @@ def main():
     # Arms: no clause, full clause, and each rule dropped in turn. Dropping one
     # at a time attributes the refusal to a rule; the full/none pair bounds it.
     if args.arms:
-        # "124" means rules 1,2,4. Lets us test candidate minimal clauses.
-        arms = {a: [int(c) for c in a] for a in args.arms.split(",")}
+        # "124" means rules 1,2,4; "none" means no clause at all.
+        arms = {a: ([] if a in ("none", "0") else [int(c) for c in a])
+                for a in args.arms.split(",")}
     else:
         arms = {
             "none": [], "all": [1, 2, 3, 4],
@@ -154,7 +158,8 @@ def main():
                 t0 = time.time()
                 try:
                     content, reasoning = ask(args.url, args.model, system,
-                                             p["prompt"], args.timeout, args.temperature)
+                                             p["prompt"], args.timeout, args.temperature,
+                                             args.max_tokens)
                     verdict = classify(content)
                 except Exception as exc:                # noqa: BLE001
                     content, reasoning, verdict = f"ERROR: {exc}", "", "ERROR"

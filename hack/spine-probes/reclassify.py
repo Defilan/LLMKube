@@ -72,7 +72,17 @@ def classify(text: str) -> str:
     return "UNCLEAR"
 
 
+USAGE = """usage: reclassify.py [RESULTS_JSON]
+
+Re-score saved probe responses with the current classifier. Runs offline, so it
+costs no model time. Defaults to results.json in the working directory, and
+rewrites it in place, preserving each original verdict as verdict_v1."""
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(USAGE)
+        return
     src = Path(sys.argv[1] if len(sys.argv) > 1 else "results.json")
     rs = json.loads(src.read_text())
     changed = 0
