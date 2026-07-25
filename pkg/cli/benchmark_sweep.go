@@ -87,7 +87,7 @@ func runConcurrencySweep(opts *benchmarkOptions) error {
 	var gpuMon *gpuMonitor
 	if opts.monitorGPU {
 		gpuMon = newGPUMonitor()
-		gpuMon.start(10 * time.Second)
+		gpuMon.start()
 	}
 
 	fmt.Printf("\n🔄 Concurrency Sweep\n")
@@ -177,7 +177,7 @@ func runTokensSweep(opts *benchmarkOptions) error {
 	var gpuMon *gpuMonitor
 	if opts.monitorGPU {
 		gpuMon = newGPUMonitor()
-		gpuMon.start(10 * time.Second)
+		gpuMon.start()
 	}
 
 	fmt.Printf("\n🔄 Token Generation Sweep\n")
