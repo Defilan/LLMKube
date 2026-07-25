@@ -48,15 +48,17 @@ import (
 )
 
 const (
-	PhaseReady  = "Ready"
-	PhaseFailed = "Failed"
-	PhaseCached = "Cached"
-	// PhaseDownloading is also written as a raw string by the legacy
-	// download path's progressPhase; the const is the canonical spelling.
-	PhaseDownloading = "Downloading"
-	PhaseCreating    = "Creating"
-	PhaseStopped     = "Stopped"
-	PhaseSuspended   = "Suspended"
+	// Phase constants are hoisted to api/v1alpha1 so the metal-agent
+	// (pkg/agent) and the operator share one importable home; aliases keep
+	// the unqualified references in this package working. See
+	// api/v1alpha1/constants.go for the canonical definitions.
+	PhaseReady       = inferencev1alpha1.PhaseReady
+	PhaseFailed      = inferencev1alpha1.PhaseFailed
+	PhaseCached      = inferencev1alpha1.PhaseCached
+	PhaseDownloading = inferencev1alpha1.PhaseDownloading
+	PhaseCreating    = inferencev1alpha1.PhaseCreating
+	PhaseStopped     = inferencev1alpha1.PhaseStopped
+	PhaseSuspended   = inferencev1alpha1.PhaseSuspended
 	// acceleratorMetal is the Model.Spec.Hardware.Accelerator value for the
 	// host metal-agent path.
 	acceleratorMetal      = "metal"
