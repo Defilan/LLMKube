@@ -1224,11 +1224,16 @@ func TestStripReasoningForWire_PreserveTrailing(t *testing.T) {
 	if wire[3].ReasoningContent != "the truncated in-progress thought" {
 		t.Errorf("trailing assistant reasoning must be preserved, got %q", wire[3].ReasoningContent)
 	}
-	// A stripped reasoning-only assistant becomes non-empty (placeholder) so
-	// the wire stays valid (#935); the preserved one keeps its reasoning and
-	// needs no placeholder.
-	if strings.TrimSpace(wire[3].Content) != "" {
-		t.Errorf("preserved trailing message should not get a placeholder, got content=%q", wire[3].Content)
+	// The preserved message needs the placeholder too (#1276). This assertion
+	// previously required the opposite, on the premise that keeping
+	// reasoning_content was enough to make the message valid. It is not:
+	// Content and ReasoningContent are both omitempty, so a preserved
+	// reasoning-only turn serializes as {"role":"assistant",
+	// "reasoning_content":"..."} with no content key and no tool_calls, and
+	// llama-server rejects it with 400. That premise is what shipped the bug.
+	if strings.TrimSpace(wire[3].Content) == "" && len(wire[3].ToolCalls) == 0 {
+		t.Error("preserved trailing message must still carry content or tool_calls; " +
+			"reasoning_content alone does not satisfy the server and returns 400")
 	}
 	// Original transcript untouched.
 	if transcript[1].ReasoningContent != "old thought" {
@@ -1420,6 +1425,58 @@ func TestLoop_StrippedReasoningDoesNotProduceEmptyAssistant(t *testing.T) {
 		t.Errorf("wire assistant message must carry content or tool_calls after stripping; got empty message")
 	}
 	if transcript[0].ReasoningContent == "" || transcript[0].Content != "" {
+		t.Errorf("original transcript must be untouched: %+v", transcript[0])
+	}
+}
+
+// TestLoop_PreservedTruncatedReasoningDoesNotProduceEmptyAssistant covers the
+// case the sibling test above misses: preserveTrailingReasoning=true (#1276).
+//
+// A turn cut off by the per-turn token cap is reasoning-only by construction:
+// it was interrupted mid-<think>, before it could emit content or a tool call.
+// That is exactly the message preserveTrailingReasoning keeps, so the preserve
+// path selects for the empty-assistant case rather than rarely meeting it.
+// Keeping its reasoning must not also let it reach the wire with neither
+// content nor tool_calls, which llama-server rejects with 400 "Assistant
+// message must contain either 'content' or 'tool_calls'!", killing the run.
+func TestLoop_PreservedTruncatedReasoningDoesNotProduceEmptyAssistant(t *testing.T) {
+	transcript := []oai.Message{
+		{Role: oai.RoleAssistant, ReasoningContent: "partial think, cut off by the token cap"},
+		{Role: oai.RoleUser, Content: TruncationContinueMessage()},
+	}
+	wire := stripReasoningForWire(transcript, true)
+
+	// The point of the preserve path: the partial reasoning survives so the
+	// model resumes instead of re-thinking from scratch.
+	if wire[0].ReasoningContent == "" {
+		t.Error("preserved turn must keep its reasoning_content for the continuation")
+	}
+	// ...but it still may not be an otherwise-empty assistant message.
+	if strings.TrimSpace(wire[0].Content) == "" && len(wire[0].ToolCalls) == 0 {
+		t.Error("wire assistant message must carry content or tool_calls; " +
+			"an empty one is rejected with 400 and poisons every later turn")
+	}
+
+	// Assert on the serialized payload, not just the struct: Content and
+	// ReasoningContent are both omitempty, so the struct-level distinction
+	// that made this look safe disappears on the wire. Before the fix this
+	// marshalled to {"role":"assistant","reasoning_content":"..."} with no
+	// content key at all, which is precisely what the server rejects.
+	raw, err := json.Marshal(wire[0])
+	if err != nil {
+		t.Fatalf("marshal wire message: %v", err)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(raw, &sent); err != nil {
+		t.Fatalf("unmarshal wire message: %v", err)
+	}
+	if _, hasContent := sent["content"]; !hasContent {
+		if _, hasCalls := sent["tool_calls"]; !hasCalls {
+			t.Errorf("serialized assistant message has neither content nor tool_calls: %s", raw)
+		}
+	}
+
+	if transcript[0].Content != "" {
 		t.Errorf("original transcript must be untouched: %+v", transcript[0])
 	}
 }
