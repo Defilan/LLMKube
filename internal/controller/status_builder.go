@@ -300,6 +300,43 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 			Message:            errorMsg,
 		}
 		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+
+	case PhaseStopped:
+		// The workload has been scaled to zero (spec.replicas=0). The
+		// Available condition must flip False so a previously-Ready service
+		// does not keep reporting stale availability. The reason mirrors the
+		// metal-agent's reasonManuallyScaledToZero so the two status writers
+		// agree rather than inventing a second convention.
+		condition = metav1.Condition{
+			Type:               "Available",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             ReasonManuallyScaledToZero,
+			Message:            "spec.replicas=0; workload scaled to zero",
+		}
+		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Progressing")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Degraded")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
+
+	case PhaseSuspended:
+		// The workload has been suspended (spec.suspend=true). As with
+		// Stopped, Available must report False; the reason distinguishes
+		// Suspended from Stopped so the two phases cannot silently collapse
+		// into one. Mirrors the metal-agent's reasonSuspended.
+		condition = metav1.Condition{
+			Type:               "Available",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             ReasonSuspended,
+			Message:            "spec.suspend=true; workload scaled to zero, spec.replicas preserved",
+		}
+		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Progressing")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Degraded")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
 	}
 
 	// Set unconditionally (not gated on phase) so the Suspended condition

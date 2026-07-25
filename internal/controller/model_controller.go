@@ -87,6 +87,14 @@ const (
 
 	ReasonWorkloadResolved = "WorkloadResolved"
 
+	// ReasonManuallyScaledToZero is the Available=False reason for a service
+	// scaled to zero via spec.replicas=0. Mirrors the metal-agent's
+	// reasonManuallyScaledToZero so the two status writers agree.
+	ReasonManuallyScaledToZero = "ManuallyScaledToZero"
+	// ReasonSuspended is the Available=False reason for a service suspended
+	// via spec.suspend=true. Mirrors the metal-agent's reasonSuspended.
+	ReasonSuspended = "Suspended"
+
 	// RefreshPolicyIfNotPresent downloads only when the cached file is missing
 	// (the default; preserves historical behavior).
 	RefreshPolicyIfNotPresent = "IfNotPresent"
