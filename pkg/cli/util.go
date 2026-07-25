@@ -21,6 +21,11 @@ import (
 	"time"
 )
 
+// boolPtr returns a pointer to the given bool value.
+func boolPtr(b bool) *bool {
+	return &b
+}
+
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
