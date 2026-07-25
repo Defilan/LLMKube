@@ -157,6 +157,12 @@ type ChatCompletionRequest struct {
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 	Temperature float64       `json:"temperature,omitempty"`
 	Stream      bool          `json:"stream,omitempty"`
+	// CachePrompt disables llama.cpp's prompt cache so every benchmark
+	// iteration performs a genuine prefill instead of reusing a cached
+	// prefix. It is a pointer so that it is omitted from the request body
+	// unless explicitly set, preserving the default behavior for callers
+	// that do not opt in.
+	CachePrompt *bool `json:"cache_prompt,omitempty"`
 }
 
 type ChatMessage struct {

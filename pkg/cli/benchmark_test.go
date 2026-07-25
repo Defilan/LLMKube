@@ -19,6 +19,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -539,6 +540,75 @@ func TestChatCompletionRequestSerialization(t *testing.T) {
 	messages, ok := decoded["messages"].([]interface{})
 	if !ok || len(messages) != 1 {
 		t.Errorf("Expected 1 message, got %v", decoded["messages"])
+	}
+}
+
+func TestBenchmarkRequestDisablesPromptCache(t *testing.T) {
+	// Regression test for #1268: benchmark requests must disable llama.cpp's
+	// prompt cache so every iteration performs a genuine prefill instead of
+	// reusing a cached prefix, which would inflate the reported
+	// prompt-processing throughput.
+	opts := &benchmarkOptions{
+		prompt:    "Test prompt",
+		maxTokens: 50,
+		timeout:   10 * time.Second,
+	}
+
+	var receivedBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		response := ChatCompletionResponse{
+			ID:      "test-id",
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   "test-model",
+			Choices: []struct {
+				Index   int `json:"index"`
+				Message struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"message"`
+				FinishReason string `json:"finish_reason"`
+			}{
+				{
+					Index: 0,
+					Message: struct {
+						Role    string `json:"role"`
+						Content string `json:"content"`
+					}{
+						Role:    "assistant",
+						Content: "Test response",
+					},
+					FinishReason: "stop",
+				},
+			},
+			Usage: struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+			}{
+				PromptTokens:     10,
+				CompletionTokens: 20,
+				TotalTokens:      30,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	if _, err := sendBenchmarkRequest(t.Context(), server.URL, opts, 1); err != nil {
+		t.Fatalf("sendBenchmarkRequest failed: %v", err)
+	}
+
+	if len(receivedBody) == 0 {
+		t.Fatal("expected a non-empty request body")
+	}
+
+	// The marshalled request body must contain "cache_prompt":false so that
+	// llama.cpp does not reuse a cached prompt prefix across iterations.
+	if !strings.Contains(string(receivedBody), `"cache_prompt":false`) {
+		t.Errorf("expected request body to contain \"cache_prompt\":false, got: %s", string(receivedBody))
 	}
 }
 

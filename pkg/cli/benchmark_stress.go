@@ -264,6 +264,11 @@ func sendBenchmarkRequestWithPrompt(
 		Iteration: iteration,
 	}
 
+	// Disable llama.cpp's prompt cache so every iteration performs a real
+	// prefill. Without this, repeated identical prompts reuse the cached
+	// prefix and inflate the reported prompt-processing throughput.
+	cachePrompt := false
+
 	reqBody := ChatCompletionRequest{
 		Messages: []ChatMessage{
 			{Role: "user", Content: prompt},
@@ -271,6 +276,7 @@ func sendBenchmarkRequestWithPrompt(
 		MaxTokens:   opts.maxTokens,
 		Temperature: 0.7,
 		Stream:      false,
+		CachePrompt: &cachePrompt,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
