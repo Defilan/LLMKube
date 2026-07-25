@@ -3,7 +3,10 @@ package controller
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/apiutil"
 )
 
 func TestResolveGPUResourceName(t *testing.T) {
@@ -172,4 +175,28 @@ func TestDetectInsufficientGPUResource(t *testing.T) {
 			t.Fatalf("detectInsufficientGPUResource() = %q, want %q", got, vulkanDRIResourceName)
 		}
 	})
+}
+
+// TestGPUResourceLiteralsMatchAPIUtil is the drift guard for #1255: the
+// controller package's internal GPU resource-name literals must stay equal to
+// the exported apiutil constants they now alias. If someone edits one copy
+// without the other, this test fails the build.
+func TestGPUResourceLiteralsMatchAPIUtil(t *testing.T) {
+	cases := []struct {
+		name     string
+		internal corev1.ResourceName
+		external corev1.ResourceName
+	}{
+		{"nvidia", nvidiaGPUResourceName, apiutil.NvidiaGPUResourceName},
+		{"amd", amdGPUResourceName, apiutil.AmdGPUResourceName},
+		{"intel i915", intelGPUResourceNameI915, apiutil.IntelGPUResourceNameI915},
+		{"vulkan dri-render", vulkanDRIResourceName, apiutil.VulkanDRIResourceName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.internal != tc.external {
+				t.Fatalf("controller %s literal %q != apiutil %q", tc.name, tc.internal, tc.external)
+			}
+		})
+	}
 }
