@@ -914,21 +914,23 @@ func stripReasoningForWire(msgs []oai.Message, preserveTrailingReasoning bool) [
 	wire := make([]oai.Message, len(msgs))
 	copy(wire, msgs)
 	for i := range wire {
-		if wire[i].ReasoningContent == "" {
-			continue
+		// Strip reasoning everywhere except the one preserved turn, whose
+		// partial <think> must survive into the continuation request.
+		if wire[i].ReasoningContent != "" && i != keepIdx {
+			wire[i].ReasoningContent = ""
 		}
-		if i == keepIdx {
-			// Preserve this one message's reasoning so the truncated turn's
-			// partial <think> survives into the continuation request.
-			continue
-		}
-		wire[i].ReasoningContent = ""
-		// A reasoning-only turn would become a fully empty assistant
-		// message, which llama-server rejects with 400 ("Assistant
-		// message must contain either 'content' or 'tool_calls'!"),
-		// poisoning every later turn of the conversation. Leave a
-		// placeholder so the template stays valid and the adjacent
-		// continuation nudge still reads coherently.
+		// Invariant, evaluated for every assistant message rather than only
+		// the ones just stripped: llama-server rejects a request carrying an
+		// assistant message with neither content nor tool_calls, with 400
+		// ("Assistant message must contain either 'content' or
+		// 'tool_calls'!"), poisoning every later turn of the conversation.
+		//
+		// reasoning_content does not satisfy that check, so the preserved
+		// turn needs the placeholder too. It is not an edge case there: a
+		// turn cut off by the per-turn token cap was interrupted mid-<think>,
+		// before it could emit content or a tool call, so it is reasoning-only
+		// by construction. Skipping the check for that one message is what
+		// killed runs at the first truncation-continuation turn (#1276).
 		if wire[i].Role == oai.RoleAssistant &&
 			strings.TrimSpace(wire[i].Content) == "" && len(wire[i].ToolCalls) == 0 {
 			wire[i].Content = "[paused to reason internally; no action taken this turn]"
