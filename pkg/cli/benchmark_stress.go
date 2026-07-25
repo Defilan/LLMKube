@@ -271,6 +271,10 @@ func sendBenchmarkRequestWithPrompt(
 		MaxTokens:   opts.maxTokens,
 		Temperature: 0.7,
 		Stream:      false,
+		// Disable llama.cpp's prompt cache so every iteration performs a
+		// genuine prefill. Without this, repeated identical prompts reuse the
+		// cached prefix and inflate the reported prompt-processing throughput.
+		CachePrompt: boolPtr(false),
 	}
 
 	jsonBody, err := json.Marshal(reqBody)

@@ -542,6 +542,56 @@ func TestChatCompletionRequestSerialization(t *testing.T) {
 	}
 }
 
+func TestChatCompletionRequestCachePromptDisabled(t *testing.T) {
+	// Benchmark requests must disable llama.cpp's prompt cache so every
+	// iteration performs a genuine prefill instead of reusing the cached
+	// prefix (see issue #1268).
+	req := ChatCompletionRequest{
+		Model: "llama-3.1-8b",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "Hello, world!"},
+		},
+		MaxTokens:   50,
+		Temperature: 0.7,
+		Stream:      false,
+		CachePrompt: boolPtr(false),
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Failed to marshal request: %v", err)
+	}
+
+	// The marshalled body must contain "cache_prompt":false so llama.cpp
+	// disables its prompt cache for this request.
+	if !strings.Contains(string(data), `"cache_prompt":false`) {
+		t.Errorf("Expected marshalled request to contain \"cache_prompt\":false, got: %s", string(data))
+	}
+}
+
+func TestChatCompletionRequestCachePromptOmitted(t *testing.T) {
+	// When CachePrompt is not set, the field must be omitted from the JSON
+	// so existing behavior is preserved for non-benchmark callers.
+	req := ChatCompletionRequest{
+		Model: "llama-3.1-8b",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "Hello, world!"},
+		},
+		MaxTokens:   50,
+		Temperature: 0.7,
+		Stream:      false,
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Failed to marshal request: %v", err)
+	}
+
+	if strings.Contains(string(data), "cache_prompt") {
+		t.Errorf("Expected cache_prompt to be omitted when unset, got: %s", string(data))
+	}
+}
+
 func TestDefaultBenchmarkPrompt(t *testing.T) {
 	if defaultBenchmarkPrompt == "" {
 		t.Error("Default benchmark prompt should not be empty")
