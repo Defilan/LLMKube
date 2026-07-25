@@ -17,10 +17,12 @@ limitations under the License.
 package cli
 
 import (
+	"io"
 	"os"
 	"os/user"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -239,18 +241,41 @@ func TestCachePrepRequiresOwnerAndMode(t *testing.T) {
 		}
 	})
 
-	cmd := NewCachePrepCommand()
-
-	// Missing --owner
-	cmd.SetArgs([]string{"--mode", "0755", tmpDir})
-	if err := cmd.Execute(); err == nil {
-		t.Error("expected error when --owner is missing")
+	// Each case needs its own command. Cobra marks a flag Changed once it has
+	// been parsed, and that state survives on a reused command, so a second
+	// Execute still counted the first case's --mode as provided and skipped
+	// the required-flag check entirely. The command then ran the real chown,
+	// which errors only because chown is denied to a non-root user. That is
+	// why this passed locally and failed in CI: the gate runs as root, the
+	// chown succeeded, no error came back, and the test failed even though
+	// the production code was correct.
+	//
+	// Asserting on the specific error rather than merely that one occurred is
+	// what stops a case from passing for the wrong reason again.
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{"missing owner", []string{"--mode", "0755", tmpDir}, `required flag(s) "owner" not set`},
+		{"missing mode", []string{"--owner", "0:0", tmpDir}, `required flag(s) "mode" not set`},
 	}
 
-	// Missing --mode
-	cmd.SetArgs([]string{"--owner", "0:0", tmpDir})
-	if err := cmd.Execute(); err == nil {
-		t.Error("expected error when --mode is missing")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := NewCachePrepCommand()
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			cmd.SetArgs(tc.args)
+
+			err := cmd.Execute()
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("expected error containing %q, got %q", tc.wantErr, err.Error())
+			}
+		})
 	}
 }
 
