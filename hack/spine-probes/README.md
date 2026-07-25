@@ -25,12 +25,22 @@ python3 run_probes.py \
 python3 reclassify.py results.json     # scoring authority, see below
 ```
 
-Ablate a system-prompt clause rule by rule with `--arms` (digits are rule
-numbers) and repeat with `--seeds`:
+**Raise `--max-tokens` for a thinking model.** A model that reasons can spend
+the whole default budget of 900 on reasoning and return empty content, which
+scores `UNCLEAR` and reads like a broken probe rather than a budget that is too
+small. That is how Qwen3.6-35B was first mis-measured here.
+
+Ablate a system-prompt clause rule by rule with `--arms` and repeat with
+`--seeds`. Each digit in an arm is a rule number, so `124` means rules 1, 2 and
+4 with rule 3 dropped. The literal `none` runs with no clause at all, which is
+the baseline the other arms are measured against:
 
 ```bash
-python3 run_probes.py ... --arms 1234,124 --seeds 3
+python3 run_probes.py ... --arms none,1234,124 --seeds 3
 ```
+
+Dropping one rule at a time shows a rule is *individually* droppable. It never
+shows that two are *jointly* droppable.
 
 ## The probes
 
