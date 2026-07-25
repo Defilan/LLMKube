@@ -1027,18 +1027,16 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 
 // Condition / reason constants for the stop-path status patch. Kept here
 // next to the only caller; if we grow more agent-driven conditions they can
-// move into a shared constants file. The phase strings must match the
-// operator's PhaseStopped / PhaseSuspended values (internal/controller):
-// determinePhase returns Suspended unconditionally for spec.suspend, so if
-// the agent wrote Stopped for a suspended service the two status writers
-// would overwrite each other forever (the operator's watch has no
-// status-only filter).
+// move into a shared constants file. The phase strings are hoisted to
+// api/v1alpha1 (PhaseStopped / PhaseSuspended) so the agent and the operator
+// share one importable home: determinePhase returns Suspended
+// unconditionally for spec.suspend, so if the agent wrote Stopped for a
+// suspended service the two status writers would overwrite each other
+// forever (the operator's watch has no status-only filter).
 const (
 	conditionAvailable          = "Available"
 	reasonManuallyScaledToZero  = "ManuallyScaledToZero"
 	reasonSuspended             = "Suspended"
-	phaseStopped                = "Stopped"
-	phaseSuspended              = "Suspended"
 	messageManuallyScaledToZero = "spec.replicas=0; metal-agent has torn down the workload"
 	messageSuspended            = "spec.suspend=true; metal-agent has torn down the workload; spec.replicas preserved"
 )
@@ -1108,11 +1106,11 @@ func (a *MetalAgent) markStopped(ctx context.Context, isvc *inferencev1alpha1.In
 	// the source of truth (a suspend flipped between the watch event and
 	// now should win). Suspend beats replicas==0 when both hold, exactly
 	// like the operator's determinePhase ordering.
-	targetPhase := phaseStopped
+	targetPhase := inferencev1alpha1.PhaseStopped
 	reason := reasonManuallyScaledToZero
 	message := messageManuallyScaledToZero
 	if fresh.Spec.Suspend {
-		targetPhase = phaseSuspended
+		targetPhase = inferencev1alpha1.PhaseSuspended
 		reason = reasonSuspended
 		message = messageSuspended
 	}

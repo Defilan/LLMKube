@@ -119,3 +119,33 @@ func TestDefaultRouteStrategyConstants(t *testing.T) {
 		t.Errorf("DefaultRouteStrategyBackendNameMatch = %q; want %q", got, "BackendNameMatch")
 	}
 }
+
+// TestPhaseConstants verifies the lifecycle phase string values that are
+// shared between the operator (internal/controller) and the metal-agent
+// (pkg/agent). These strings are written to status.phase and are CRD- and
+// client-visible, so they must not change without an API bump. The test
+// pins the exact wire values so a rename on either side is caught here
+// rather than silently reintroducing the status-thrash bug from #1254.
+func TestPhaseConstants(t *testing.T) {
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"PhaseReady", PhaseReady, "Ready"},
+		{"PhaseFailed", PhaseFailed, "Failed"},
+		{"PhaseCached", PhaseCached, "Cached"},
+		{"PhaseDownloading", PhaseDownloading, "Downloading"},
+		{"PhaseCreating", PhaseCreating, "Creating"},
+		{"PhaseStopped", PhaseStopped, "Stopped"},
+		{"PhaseSuspended", PhaseSuspended, "Suspended"},
+		{"PhaseWaitingForGPU", PhaseWaitingForGPU, "WaitingForGPU"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("%s = %q; want %q", tc.name, tc.got, tc.want)
+			}
+		})
+	}
+}
