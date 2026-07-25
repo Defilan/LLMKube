@@ -17,11 +17,28 @@ const (
 	runtimeROCm   = "rocm"
 )
 
+// GPU resource-name literals. Exported so the operator's internal
+// controller package (and any other consumer) can reference the single
+// source of truth rather than redeclaring these strings, which would
+// silently drift between the apiutil path (pod resource requests) and
+// the internal path (toleration keys, federation accounting, readiness
+// checks). See issue #1255.
+const (
+	NVIDIAGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
+	AMDGPUResourceName       = corev1.ResourceName("amd.com/gpu")
+	IntelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
+	VulkanDRIResourceName    = corev1.ResourceName("devic.es/dri-render")
+)
+
+// Legacy unexported aliases retained for the internal controller package,
+// which still references them by their original names. They are assigned
+// from the exported constants above so there is exactly one definition of
+// each literal.
 var (
-	nvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
-	amdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
-	intelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
-	vulkanDRIResourceName    = corev1.ResourceName("devic.es/dri-render")
+	nvidiaGPUResourceName    = NVIDIAGPUResourceName
+	amdGPUResourceName       = AMDGPUResourceName
+	intelGPUResourceNameI915 = IntelGPUResourceNameI915
+	vulkanDRIResourceName    = VulkanDRIResourceName
 )
 
 func isRuntime(runtime, want string) bool {

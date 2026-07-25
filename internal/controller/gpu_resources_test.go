@@ -3,8 +3,38 @@ package controller
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/apiutil"
 )
+
+// TestGPUResourceNameLiteralsMatchAPIUtil is the drift guard from issue
+// #1255: the internal controller package's GPU resource-name literals must
+// always equal the exported constants in pkg/apiutil, which is the single
+// source of truth used by the pod resource-request path. If someone edits
+// one copy without the other, this test fails the build before a pod's
+// resource request can disagree with its toleration key.
+func TestGPUResourceNameLiteralsMatchAPIUtil(t *testing.T) {
+	cases := []struct {
+		name     string
+		internal corev1.ResourceName
+		external corev1.ResourceName
+	}{
+		{"nvidia", nvidiaGPUResourceName, apiutil.NVIDIAGPUResourceName},
+		{"amd", amdGPUResourceName, apiutil.AMDGPUResourceName},
+		{"intel i915", intelGPUResourceNameI915, apiutil.IntelGPUResourceNameI915},
+		{"vulkan dri-render", vulkanDRIResourceName, apiutil.VulkanDRIResourceName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.internal != tc.external {
+				t.Fatalf("internal %q = %q, apiutil = %q (drift detected, see #1255)",
+					tc.name, tc.internal, tc.external)
+			}
+		})
+	}
+}
 
 func TestResolveGPUResourceName(t *testing.T) {
 	t.Run("defaults to nvidia when model hardware is missing", func(t *testing.T) {
