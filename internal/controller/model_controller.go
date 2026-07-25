@@ -87,6 +87,16 @@ const (
 
 	ReasonWorkloadResolved = "WorkloadResolved"
 
+	// ReasonManuallyScaledToZero is the Available condition reason written when
+	// the workload is scaled away via spec.replicas=0 (PhaseStopped). Mirrors
+	// the metal-agent's reasonManuallyScaledToZero so the two status writers
+	// agree on the cause.
+	ReasonManuallyScaledToZero = "ManuallyScaledToZero"
+	// ReasonSuspended is the Available condition reason written when the
+	// workload is scaled away via spec.suspend (PhaseSuspended). Mirrors the
+	// metal-agent's reasonSuspended.
+	ReasonSuspended = "Suspended"
+
 	// RefreshPolicyIfNotPresent downloads only when the cached file is missing
 	// (the default; preserves historical behavior).
 	RefreshPolicyIfNotPresent = "IfNotPresent"

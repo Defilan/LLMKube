@@ -118,6 +118,16 @@ var _ = Describe("InferenceService suspend", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.ObservedGeneration).To(Equal(updated.Generation))
+
+		// Regression for #1257: a previously-Ready service that is suspended
+		// must not keep a stale Available: True from the Ready era. The
+		// Available condition must report False with a reason that
+		// distinguishes Suspended from Stopped, matching the metal-agent's
+		// markStopped so the two status writers agree.
+		avail := meta.FindStatusCondition(updated.Status.Conditions, ConditionAvailable)
+		Expect(avail).NotTo(BeNil())
+		Expect(avail.Status).To(Equal(metav1.ConditionFalse))
+		Expect(avail.Reason).To(Equal(ReasonSuspended))
 	})
 
 	It("restores the Deployment to spec.replicas on unsuspend", func() {
@@ -273,5 +283,75 @@ var _ = Describe("InferenceService suspend", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(k8sClient.Get(ctx, hpaKey, &autoscalingv2.HorizontalPodAutoscaler{})).To(Succeed())
+	})
+
+	It("reports Available: False/ReasonManuallyScaledToZero when scaled to zero", func() {
+		modelName := "stopped-model"
+		isvcName := "stopped-isvc"
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		replicas := int32(2)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: modelName,
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				Suspend:  false,
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, isvc)
+			dep := &appsv1.Deployment{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+				_ = k8sClient.Delete(ctx, dep)
+			}
+			svc := &corev1.Service{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+				_ = k8sClient.Delete(ctx, svc)
+			}
+		}()
+
+		// First reconcile with replicas=2: service reaches Ready, seeding
+		// Available: True so the regression (stale True) is observable.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		// Scale to zero and reconcile again.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, isvc)).To(Succeed())
+		zero := int32(0)
+		isvc.Spec.Replicas = &zero
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseStopped))
+
+		// Regression for #1257: Available must flip False with a reason that
+		// distinguishes Stopped from Suspended, matching the metal-agent's
+		// markStopped.
+		avail := meta.FindStatusCondition(updated.Status.Conditions, ConditionAvailable)
+		Expect(avail).NotTo(BeNil())
+		Expect(avail.Status).To(Equal(metav1.ConditionFalse))
+		Expect(avail.Reason).To(Equal(ReasonManuallyScaledToZero))
 	})
 })
