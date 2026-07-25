@@ -17,11 +17,25 @@ const (
 	runtimeROCm   = "rocm"
 )
 
+// GPU resource-name literals. These are the single source of truth for the
+// extended-resource names the operator requests and tolerates; the internal
+// controller package aliases them (see internal/controller/gpu_resources.go)
+// so a future edit to one copy cannot silently diverge from the other.
+const (
+	NvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
+	AmdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
+	IntelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
+	VulkanDRIResourceName    = corev1.ResourceName("devic.es/dri-render")
+)
+
+// Legacy aliases retained for backwards compatibility with external callers
+// that imported the unexported names before they were exported. New code must
+// use the exported constants above.
 var (
-	nvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
-	amdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
-	intelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
-	vulkanDRIResourceName    = corev1.ResourceName("devic.es/dri-render")
+	nvidiaGPUResourceName    = NvidiaGPUResourceName
+	amdGPUResourceName       = AmdGPUResourceName
+	intelGPUResourceNameI915 = IntelGPUResourceNameI915
+	vulkanDRIResourceName    = VulkanDRIResourceName
 )
 
 func isRuntime(runtime, want string) bool {

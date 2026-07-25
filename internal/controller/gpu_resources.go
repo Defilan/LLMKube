@@ -35,10 +35,15 @@ const gpuRuntimeROCm = "rocm"
 // acceleratorROCm is declared in model_controller.go (Model.Spec.Hardware.
 // Accelerator enum value "rocm"); reused here rather than redeclared.
 
+// GPU resource-name literals. These alias the exported constants in
+// pkg/apiutil so the operator's internal scheduling/toleration code and the
+// external apiutil mapping can never drift apart (#1255). The four literals
+// (nvidia.com/gpu, amd.com/gpu, gpu.intel.com/i915, devic.es/dri-render) now
+// exist in exactly one place: pkg/apiutil.
 var (
-	nvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
-	amdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
-	intelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
+	nvidiaGPUResourceName    = apiutil.NvidiaGPUResourceName
+	amdGPUResourceName       = apiutil.AmdGPUResourceName
+	intelGPUResourceNameI915 = apiutil.IntelGPUResourceNameI915
 	intelGPUResourceNameXE   = corev1.ResourceName("gpu.intel.com/xe")
 	// vulkanDRIResourceName is the generic-device-plugin resource that
 	// advertises /dev/dri render nodes. Requesting it makes the plugin inject
@@ -46,7 +51,7 @@ var (
 	// required. Used as the default GPU resource for the AMD/Vulkan path
 	// (both the scheduling path via gpuResourceNameForSpec and the
 	// readiness path via resolveGPUResourceName).
-	vulkanDRIResourceName = corev1.ResourceName("devic.es/dri-render")
+	vulkanDRIResourceName = apiutil.VulkanDRIResourceName
 )
 
 // gpuResourceNameForSpec resolves the extended resource the pod requests for
