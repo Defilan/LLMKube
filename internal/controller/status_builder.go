@@ -300,6 +300,42 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 			Message:            errorMsg,
 		}
 		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+
+	case PhaseStopped:
+		// The workload has been scaled away (spec.replicas=0). Mirror the
+		// metal-agent's markStopped convention so the two status writers
+		// agree: Available goes False with a Stopped-specific reason rather
+		// than lingering True from the prior Ready era.
+		condition = metav1.Condition{
+			Type:               "Available",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             "ManuallyScaledToZero",
+			Message:            "spec.replicas=0; workload scaled to zero",
+		}
+		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Progressing")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Degraded")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
+
+	case PhaseSuspended:
+		// The workload has been suspended (spec.suspend=true). Mirror the
+		// metal-agent's markStopped convention so the two status writers
+		// agree: Available goes False with a Suspended-specific reason
+		// rather than lingering True from the prior Ready era.
+		condition = metav1.Condition{
+			Type:               "Available",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             "Suspended",
+			Message:            "spec.suspend=true; workload scaled to zero; spec.replicas preserved",
+		}
+		meta.SetStatusCondition(&isvc.Status.Conditions, condition)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Progressing")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "Degraded")
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
 	}
 
 	// Set unconditionally (not gated on phase) so the Suspended condition
