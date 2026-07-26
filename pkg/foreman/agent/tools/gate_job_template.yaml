@@ -96,18 +96,17 @@ spec:
                 git diff --stat
                 rc=1
               fi
-              {{- if .BiteCheck }}
-              # Bite check: verify new/changed tests actually fail against pre-change
-              # production code. The gate Job clones the coder branch as a shallow,
-              # single-branch checkout (everything is committed, working tree is
-              # clean), so change detection works on the committed diff against the
-              # base branch, NOT on `git status`. Infra anomalies (base ref will not
-              # resolve, no merge-base found, a bogus base blowing up the diff size)
-              # are a loud skip (GATE-WARN), never a gate failure: only a genuine
-              # non-biting test result blocks the gate (#1259).
+              # --- shared change detection ------------------------------------------
+              # Resolve this branch's fork point ONCE and reuse it below. Both the
+              # non-Go lint and the revert-and-retest phase need to know what this
+              # branch changed, and the clone is `--depth 1`, so HEAD~1 does not
+              # exist. Anything that
+              # computes its own base from HEAD~N gets a fatal error, an empty file list
+              # once stderr is swallowed, and then silently checks nothing while still
+              # reporting a pass. That is how the first attempt at #1072 shipped a no-op.
               BASE="${BASE_BRANCH:-main}"
-              echo "=== bite check (base=$BASE) ==="
-              bite_skip() { echo "GATE-WARN: bite check skipped ($1)"; }
+              base_warn() { echo "GATE-WARN: change detection skipped ($1)"; }
+              BASE="${BASE_BRANCH:-main}"
               MB=""
               if [ -n "${UPSTREAM_URL:-}" ]; then
                 # Fetch the base from the CANONICAL repo, not the fork: the fork
@@ -118,7 +117,7 @@ spec:
                 # The `--` end-of-options guard keeps a crafted URL starting
                 # with `-` from being read as a git option (argv smuggling).
                 if ! git fetch --depth 100 -- "$UPSTREAM_URL" "+refs/heads/$BASE:refs/remotes/ubase/$BASE" >/dev/null 2>&1; then
-                  bite_skip "could not fetch $BASE from upstream"
+                  base_warn "could not fetch $BASE from upstream"
                 else
                   # The clone is shallow; deepen until the histories connect. Two
                   # rounds is plenty for any sane coder branch; beyond that the base
@@ -129,28 +128,85 @@ spec:
                     git fetch --deepen=1000 -- "$UPSTREAM_URL" "+refs/heads/$BASE:refs/remotes/ubase/$BASE" >/dev/null 2>&1 || true
                     MB=$(git merge-base HEAD "refs/remotes/ubase/$BASE" 2>/dev/null || true)
                   fi
-                  [ -z "$MB" ] && bite_skip "no merge-base between HEAD and upstream $BASE after deepening"
+                  [ -z "$MB" ] && base_warn "no merge-base between HEAD and upstream $BASE after deepening"
                 fi
               else
                 # No upstream URL (freeform task without a repo slug): pre-#1259
                 # behavior, fetch the base ref from origin and use its tip.
                 if ! git fetch --depth 1 origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" >/dev/null 2>&1; then
-                  bite_skip "could not fetch base ref origin/$BASE"
+                  base_warn "could not fetch base ref origin/$BASE"
                 elif ! git rev-parse --verify --quiet "origin/$BASE" >/dev/null; then
-                  bite_skip "base ref origin/$BASE did not resolve after fetch"
+                  base_warn "base ref origin/$BASE did not resolve after fetch"
                 else
                   MB="origin/$BASE"
                 fi
               fi
+              changed=""
               if [ -n "$MB" ]; then
                 changed=$(git diff --name-only "$MB" HEAD)
                 nchanged=$(printf '%s\n' "$changed" | sed '/^$/d' | wc -l | tr -d ' ')
                 if [ "$nchanged" -gt 200 ]; then
                   # A coder diff is tens of files at most. Hundreds means the base
-                  # resolution is wrong (the #1259 incident swept 103 commits of
-                  # drift); skipping is honest, failing would blame the coder.
-                  bite_skip "diff vs merge-base names $nchanged files; base resolution suspect"
-                else
+                  # resolution is wrong (the #1259 incident swept 103 commits of drift).
+                  # Drop the base rather than act on it: both consumers below then
+                  # degrade to a loud skip instead of blaming the coder.
+                  base_warn "diff vs merge-base names $nchanged files; base resolution suspect"
+                  MB=""; changed=""
+                fi
+              fi
+
+              # --- non-Go lint -------------------------------------------------------
+              # A diff that is entirely non-Go (CI YAML, shell, Ruby) otherwise reaches
+              # GATE PASS with nothing meaningful checked (#1072). Each checker is scoped
+              # to the files THIS branch changed: linting the whole repo would fail an
+              # unrelated contributor on a pre-existing violation they never touched.
+              # A missing linter is reported and skipped, never a failure, since the gate
+              # runs in a Go image. Only a real finding sets rc=1.
+              echo "=== non-go lint ==="
+              if [ -z "$MB" ]; then
+                echo "non-go lint: skipped, no usable base to diff against"
+              else
+                ng_wf=$(printf '%s\n' "$changed" | grep -E '^\.github/workflows/.+\.ya?ml$' || true)
+                ng_sh=$(printf '%s\n' "$changed" | grep -E '\.sh$' || true)
+                ng_rb=$(printf '%s\n' "$changed" | grep -E '\.rb$' || true)
+                if [ -z "$ng_wf$ng_sh$ng_rb" ]; then
+                  echo "non-go lint: no checkable non-Go files changed"
+                fi
+                if [ -n "$ng_wf" ]; then
+                  if command -v actionlint >/dev/null 2>&1; then
+                    echo "--- actionlint ---"
+                    printf '%s\n' "$ng_wf" | xargs -r actionlint || rc=1
+                  else
+                    echo "non-go lint: actionlint not installed, changed workflows unchecked"
+                  fi
+                fi
+                if [ -n "$ng_sh" ]; then
+                  if command -v shellcheck >/dev/null 2>&1; then
+                    echo "--- shellcheck ---"
+                    printf '%s\n' "$ng_sh" | xargs -r shellcheck || rc=1
+                  else
+                    echo "non-go lint: shellcheck not installed, changed shell scripts unchecked"
+                  fi
+                fi
+                if [ -n "$ng_rb" ]; then
+                  if command -v rubocop >/dev/null 2>&1; then
+                    echo "--- rubocop ---"
+                    printf '%s\n' "$ng_rb" | xargs -r rubocop --format progress || rc=1
+                  else
+                    echo "non-go lint: rubocop not installed, changed Ruby files unchecked"
+                  fi
+                fi
+              fi
+              {{- if .BiteCheck }}
+              # Bite check: verify new/changed tests actually fail against pre-change
+              # production code, using the base resolved above. Infra anomalies are a
+              # loud skip (GATE-WARN), never a gate failure: only a genuine non-biting
+              # test result blocks the gate (#1259).
+              bite_skip() { echo "GATE-WARN: bite check skipped ($1)"; }
+              echo "=== bite check (base=$BASE) ==="
+              if [ -z "$MB" ]; then
+                bite_skip "no usable base from change detection"
+              else
                   test_files=$(printf '%s\n' "$changed" | grep '_test\.go$' || true)
                   prod_files=$(printf '%s\n' "$changed" | grep '\.go$' | grep -v '_test\.go$' || true)
                   if [ -z "$test_files" ]; then
@@ -182,7 +238,6 @@ spec:
                       git checkout HEAD -- $prod_files >/dev/null 2>&1 || true
                     fi
                   fi
-                fi
               fi
               {{- end }}
               {{- end }}
