@@ -28,6 +28,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 )
 
@@ -179,6 +181,20 @@ type LoopConfig struct {
 	// (finish_reason=="length") becomes a bounded, recoverable event rather
 	// than a multi-hour hang. See ErrAssistantTruncated and #650.
 	MaxTokensPerTurn int
+
+	// ChatTemplateKwargs is the free-form map of template-specific keyword
+	// arguments forwarded verbatim on every chat-completions request as
+	// chat_template_kwargs. Each value is a raw JSON blob so booleans stay
+	// booleans (a JSON false must not become the string "false"). The
+	// primary use case is disabling thinking on reasoning models: llama.cpp
+	// supplies enable_thinking=true itself when the client omits the kwarg,
+	// so every request today is thinking-on. Setting
+	// {"enable_thinking": false} here turns it off.
+	//
+	// The executor maps Agent.spec.chatTemplateKwargs here. Nil or empty
+	// omits the field on the wire so the request is byte-identical to today
+	// for any agent that does not set it.
+	ChatTemplateKwargs map[string]apiextensionsv1.JSON
 
 	// MaxTruncationRetries bounds the streak of turns truncated by the token
 	// cap (finish_reason=="length") before the loop gives up with
@@ -1037,6 +1053,11 @@ func (l *Loop) runOneTurn(
 		// unbudgeted turn cannot run effectively unbounded on a
 		// large-context serve.
 		MaxTokens: cfg.MaxTokensPerTurn,
+		// chat_template_kwargs: forwarded verbatim so a configured kwarg
+		// map (e.g. {"enable_thinking": false}) reaches the server's chat
+		// template. Nil/empty omits the field on the wire so the request
+		// is byte-identical to today for agents that do not set it.
+		ChatTemplateKwargs: cfg.ChatTemplateKwargs,
 	}
 	resp, err := l.client.Chat(ctx, req)
 	if err != nil {

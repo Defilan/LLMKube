@@ -24,7 +24,11 @@ limitations under the License.
 // v0.1.
 package oai
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+)
 
 // Role names the chat-completions message role. We use the OpenAI v1
 // values verbatim; llama.cpp's OAI surface accepts the same set.
@@ -167,6 +171,20 @@ type ChatRequest struct {
 	// Stream is set by the client just before the wire send; callers
 	// do not need to populate it.
 	Stream bool `json:"stream"`
+
+	// ChatTemplateKwargs is the OAI chat_template_kwargs field: a
+	// free-form map of template-specific keyword arguments forwarded
+	// verbatim to the server's chat template. Each value is a raw JSON
+	// blob so booleans stay booleans (a JSON false must not become the
+	// string "false"). The primary use case is disabling thinking on
+	// reasoning models: llama.cpp supplies enable_thinking=true itself
+	// when the client omits the kwarg, so every request today is
+	// thinking-on. Setting {"enable_thinking": false} here turns it off.
+	//
+	// Omitted entirely when nil or empty so the request is byte-identical
+	// to today for any agent that does not set it.
+	// +optional
+	ChatTemplateKwargs map[string]apiextensionsv1.JSON `json:"chat_template_kwargs,omitempty"`
 }
 
 // ChatResponse is the relevant subset of the response body. The Client

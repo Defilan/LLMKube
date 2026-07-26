@@ -633,6 +633,11 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// into a bounded, recoverable truncation (see ErrAssistantTruncated).
 		// Agent.spec.maxOutputTokens overrides; 0 uses the package default.
 		MaxTokensPerTurn: maxTokensPerTurnForAgent(agent),
+		// chat_template_kwargs: forwarded verbatim so a configured kwarg
+		// map (e.g. {"enable_thinking": false}) reaches the server's chat
+		// template. Nil/empty omits the field on the wire so the request
+		// is byte-identical to today for agents that do not set it.
+		ChatTemplateKwargs: agent.Spec.ChatTemplateKwargs,
 	}
 
 	// Coder gate feedback loop (#749): coders verify their work through a

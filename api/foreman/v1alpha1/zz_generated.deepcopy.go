@@ -22,6 +22,7 @@ package v1alpha1
 
 import (
 	"k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -280,6 +281,13 @@ func (in *AgentSpec) DeepCopyInto(out *AgentSpec) {
 		in, out := &in.MaxEnvtestIterations, &out.MaxEnvtestIterations
 		*out = new(int32)
 		**out = **in
+	}
+	if in.ChatTemplateKwargs != nil {
+		in, out := &in.ChatTemplateKwargs, &out.ChatTemplateKwargs
+		*out = make(map[string]apiextensionsv1.JSON, len(*in))
+		for key, val := range *in {
+			(*out)[key] = *val.DeepCopy()
+		}
 	}
 	if in.StuckLoopDetection != nil {
 		in, out := &in.StuckLoopDetection, &out.StuckLoopDetection
