@@ -26,6 +26,7 @@ package oai
 
 import (
 	"encoding/json"
+	"fmt"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
@@ -248,4 +249,18 @@ type ToolCallDelta struct {
 type ToolCallFunctionDelta struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments,omitempty"`
+}
+
+// StatusError is a non-2xx response from the chat endpoint. It carries the
+// status code and the response body verbatim so a caller can react to a
+// specific provider rejection instead of string-matching a wrapped error.
+// The Error() text is unchanged from the previous fmt.Errorf form so log
+// output and existing assertions keep working.
+type StatusError struct {
+	Code int
+	Body string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("oai: status %d: %s", e.Code, e.Body)
 }

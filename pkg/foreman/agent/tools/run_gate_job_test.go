@@ -389,6 +389,12 @@ func renderGateArgsForTest(t *testing.T, in map[string]any) string {
 	if v, ok := in["checks"].([]string); ok {
 		rin.Checks = v
 	}
+	if v, ok := in["generic"].(bool); ok {
+		rin.Generic = v
+	}
+	if v, ok := in["commands"].([]string); ok {
+		rin.Commands = v
+	}
 	job, err := renderGateJob(rin)
 	if err != nil {
 		t.Fatalf("renderGateJob: %v", err)
@@ -1102,5 +1108,42 @@ func TestGateJobNamePreservesUniquenessSuffixWhenTruncated(t *testing.T) {
 	}
 	if n1 == n2 {
 		t.Fatalf("two submissions of the same long task name collide: %q", n1)
+	}
+}
+
+// TestRenderGateJob_MultiLineCommandStillUnmarshals covers #1293. A gate
+// command is a plain string field and multi-line shell is the natural way to
+// write a real check, but the template interpolates it inside a YAML block
+// scalar. Before the fix a newline ended the block and the whole Job failed to
+// unmarshal with "could not find expected ':'", so the gate never ran and the
+// operator saw a YAML error citing a template they never wrote.
+func TestRenderGateJob_MultiLineCommandStillUnmarshals(t *testing.T) {
+	multi := "if grep -q needle file.txt; then\n  echo 'found'\n  exit 1\nfi\necho ok"
+	args := renderGateArgsForTest(t, map[string]any{
+		"generic":  true,
+		"commands": []string{multi},
+	})
+	for _, want := range []string{"if grep -q needle file.txt; then", "echo 'found'", "exit 1", "echo ok"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("rendered args lost %q:\n%s", want, args)
+		}
+	}
+	if !strings.Contains(args, "...") {
+		t.Errorf("multi-line banner should be truncated with an ellipsis:\n%s", args)
+	}
+}
+
+// TestRenderGateJob_SingleLineCommandUnchanged guards the common case: a
+// one-line command renders exactly as before, with no ellipsis added.
+func TestRenderGateJob_SingleLineCommandUnchanged(t *testing.T) {
+	args := renderGateArgsForTest(t, map[string]any{
+		"generic":  true,
+		"commands": []string{"go build ./..."},
+	})
+	if !strings.Contains(args, `echo "=== go build ./... ==="`) {
+		t.Errorf("single-line command should render unchanged:\n%s", args)
+	}
+	if strings.Contains(args, "go build ./... ...") {
+		t.Error("single-line command must not gain an ellipsis")
 	}
 }

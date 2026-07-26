@@ -85,7 +85,7 @@ spec:
               rc=0
               {{- if .Generic }}
               {{- range .Commands }}
-              echo "=== {{ . }} ==="; ( {{ . }} ) || rc=1
+              echo "=== {{ firstLine . }} ==="; ( {{ indentShell . }} ) || rc=1
               {{- end }}
               {{- else }}
               {{- range .Checks }}

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1478,5 +1479,75 @@ func TestLoop_PreservedTruncatedReasoningDoesNotProduceEmptyAssistant(t *testing
 
 	if transcript[0].Content != "" {
 		t.Errorf("original transcript must be untouched: %+v", transcript[0])
+	}
+}
+
+// TestLoop_RetriesWithoutTemperatureOn400 covers a provider that rejects the
+// temperature field outright. Current Anthropic models answer 400 with
+// "`temperature` is deprecated for this model", which is a hard failure on
+// turn 1 for any Agent that sets one, and our own examples set one.
+//
+// The loop should drop the field and retry once, and the SECOND request must
+// not carry temperature.
+func TestLoop_RetriesWithoutTemperatureOn400(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"temperature is deprecated for this model."}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + emptyAssistantReply + "\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	temp := 0.2
+	loop := newTestLoop(srv, &fakeRegistry{results: map[string]*ToolResult{}})
+	res := &LoopResult{Transcript: []oai.Message{
+		{Role: oai.RoleSystem, Content: "sys"},
+		{Role: oai.RoleUser, Content: "go"},
+	}}
+	_, _ = loop.runOneTurn(context.Background(),
+		LoopConfig{Model: "test", Temperature: &temp}, sixToolSchemas(), res, false, nil)
+
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 requests (reject then retry), got %d", len(bodies))
+	}
+	if !strings.Contains(bodies[0], `"temperature"`) {
+		t.Errorf("first request should carry temperature: %s", bodies[0])
+	}
+	if strings.Contains(bodies[1], `"temperature"`) {
+		t.Errorf("retry must NOT carry temperature, got: %s", bodies[1])
+	}
+}
+
+// TestLoop_DoesNotRetryOnUnrelated400 is the other half: a 400 that has
+// nothing to do with temperature must fail immediately. Retrying every 400
+// would double the cost of every genuinely bad request.
+func TestLoop_DoesNotRetryOnUnrelated400(t *testing.T) {
+	var n int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"context length exceeded"}}`))
+	}))
+	defer srv.Close()
+
+	temp := 0.2
+	loop := newTestLoop(srv, &fakeRegistry{results: map[string]*ToolResult{}})
+	res := &LoopResult{Transcript: []oai.Message{
+		{Role: oai.RoleSystem, Content: "sys"},
+		{Role: oai.RoleUser, Content: "go"},
+	}}
+	_, err := loop.runOneTurn(context.Background(),
+		LoopConfig{Model: "test", Temperature: &temp}, sixToolSchemas(), res, false, nil)
+	if err == nil {
+		t.Fatal("expected the 400 to propagate")
+	}
+	if n != 1 {
+		t.Errorf("an unrelated 400 must not be retried, saw %d requests", n)
 	}
 }

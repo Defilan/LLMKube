@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -973,6 +974,19 @@ func stripReasoningForWire(msgs []oai.Message, preserveTrailingReasoning bool) [
 	return wire
 }
 
+// rejectsTemperature reports whether err is a provider rejecting the
+// temperature field itself, as opposed to any other 400. Matching on the
+// field name in the body is deliberately narrow: a 400 that does not mention
+// temperature is a real error and must not be retried, since a blind retry
+// would double the cost of every genuinely bad request.
+func rejectsTemperature(err error) bool {
+	var se *oai.StatusError
+	if !errors.As(err, &se) || se.Code != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(strings.ToLower(se.Body), "temperature")
+}
+
 // mostRecentAssistantToolCalls walks the transcript backwards and
 // returns the tool_calls from the latest assistant message. Empty if
 // no assistant message exists. Used by the progress monitor to inspect
@@ -1079,6 +1093,17 @@ func (l *Loop) runOneTurn(
 		ChatTemplateKwargs: cfg.ChatTemplateKwargs,
 	}
 	resp, err := l.client.Chat(ctx, req)
+	if err != nil && req.Temperature != nil && rejectsTemperature(err) {
+		// Some providers reject the field outright rather than ignoring it:
+		// current Anthropic models answer 400 with "`temperature` is
+		// deprecated for this model". That is a hard failure on turn 1 for
+		// any Agent that sets a temperature, which is most of them, since
+		// our own examples do. Drop the field and retry once rather than
+		// making every operator discover this and edit their Agent.
+		span.AddEvent("temperature rejected by provider, retrying without it")
+		req.Temperature = nil
+		resp, err = l.client.Chat(ctx, req)
+	}
 	if err != nil {
 		span.RecordError(err)
 		return false, fmt.Errorf("turn %d: chat: %w", res.Turns, err)

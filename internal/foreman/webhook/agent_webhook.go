@@ -166,11 +166,17 @@ func validateAgentPromptShape(agent *foremanv1alpha1.Agent, specPath *field.Path
 		return errs
 	}
 
-	// LLM-driven Agent.
+	// LLM-driven Agent. Name whichever field actually made it LLM-driven: a
+	// cloud-proxy Agent has no inferenceServiceRef, so citing that field sends
+	// the operator looking at something they never set.
 	if strings.TrimSpace(agent.Spec.SystemPrompt) == "" {
+		because := "inferenceServiceRef is set"
+		if agent.Spec.Provider == foremanv1alpha1.AgentProviderCloudProxy {
+			because = "provider is cloud-proxy"
+		}
 		errs = append(errs, field.Required(
 			specPath.Child("systemPrompt"),
-			"LLM-driven Agent (inferenceServiceRef set) requires a non-empty systemPrompt"))
+			"LLM-driven Agent ("+because+") requires a non-empty systemPrompt"))
 	}
 	return errs
 }

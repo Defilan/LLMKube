@@ -288,7 +288,7 @@ func (c *Client) doOnce(ctx context.Context, req ChatRequest) (*ChatResponse, er
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("oai: status %d: %s", resp.StatusCode, string(b))
+		return nil, &StatusError{Code: resp.StatusCode, Body: string(b)}
 	}
 
 	parsed, err := readSSEStream(resp.Body)
