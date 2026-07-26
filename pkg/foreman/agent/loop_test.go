@@ -1308,7 +1308,7 @@ func TestRunOneTurn_EmptyAssistantReply_SubstitutesPlaceholder(t *testing.T) {
 			{Role: oai.RoleUser, Content: "go"},
 		},
 	}
-	_, err := loop.runOneTurn(context.Background(), LoopConfig{Model: "test"}, sixToolSchemas(), res, false)
+	_, err := loop.runOneTurn(context.Background(), LoopConfig{Model: "test"}, sixToolSchemas(), res, false, nil)
 	// The placeholder makes the message non-empty, so runOneTurn treats
 	// it as a no-tool-call turn and returns ErrAssistantNoToolCalls.
 	if !errors.Is(err, ErrAssistantNoToolCalls) {
@@ -1372,7 +1372,7 @@ func TestRunOneTurn_ToolCallTurnNotClobbered(t *testing.T) {
 			{Role: oai.RoleUser, Content: "go"},
 		},
 	}
-	_, err := loop.runOneTurn(context.Background(), LoopConfig{Model: "test"}, sixToolSchemas(), res, false)
+	_, err := loop.runOneTurn(context.Background(), LoopConfig{Model: "test"}, sixToolSchemas(), res, false, nil)
 	// A tool-call turn is a normal, successful turn: no error expected.
 	if err != nil {
 		t.Fatalf("runOneTurn: expected nil error for a tool-call turn with empty content, got %v", err)

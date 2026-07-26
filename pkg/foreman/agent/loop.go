@@ -252,6 +252,18 @@ const (
 	ContextStrategySession = "session"
 )
 
+// sessionCompactionTargetPercent is how far below ContextWindowTokens a
+// session compaction compacts to. Compaction TRIGGERS at the budget and
+// compacts to this fraction of it, so the turns that follow fit without
+// dropping anything and the wire prefix stays byte-identical. Without the
+// gap, each turn drops one more group, the prefix changes every turn, and
+// the server's prefix-matched KV cache is invalidated every turn (#1286).
+//
+// 60 leaves roughly 36k tokens of headroom on the default 90k budget, which
+// is many turns of tool output, while still retaining the majority of the
+// window as history.
+const sessionCompactionTargetPercent = 60
+
 // charsPerTokenApprox is the rough chars-per-token ratio used for
 // budget estimation. Real tokenizers vary by model and language; for
 // the masking decision, 4 is close enough (arXiv 2508.21433 showed
@@ -735,6 +747,12 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	// bookkeeping. Each streak resets after any successful tool-calling turn,
 	// so only a sustained no-progress run exhausts its budget.
 	var streaks noProgressStreaks
+	// sessionDrop is how many oldest turn-groups the session strategy is
+	// currently dropping. It persists across turns deliberately: holding the
+	// drop point fixed keeps the wire prefix byte-identical, which is what
+	// lets the server reuse its prefix-matched KV cache instead of
+	// re-prefilling the entire context every turn (#1286).
+	sessionDrop := 0
 	// verifyRetries counts coder-gate fix attempts spent so far (#749).
 	verifyRetries := 0
 
@@ -772,7 +790,7 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 		// payload, so it is cleared immediately regardless of the outcome.
 		preserveReasoning := streaks.preserveReasoningNext
 		streaks.preserveReasoningNext = false
-		editSucceeded, turnErr := l.runOneTurn(ctx, cfg, activeSchemas, res, preserveReasoning)
+		editSucceeded, turnErr := l.runOneTurn(ctx, cfg, activeSchemas, res, preserveReasoning, &sessionDrop)
 		if turnErr != nil {
 			if errors.Is(turnErr, errTerminalReached) {
 				// Coder gate feedback loop (#749): give the gate a chance to
@@ -1035,7 +1053,7 @@ func (l *Loop) applyTerminalGate(
 // reasoning-only turn) is untouched.
 func (l *Loop) runOneTurn(
 	ctx context.Context, cfg LoopConfig, schemas []oai.Tool, res *LoopResult,
-	preserveTrailingReasoning bool,
+	preserveTrailingReasoning bool, sessionDrop *int,
 ) (editSucceeded bool, err error) {
 	ctx, span := l.tracer.Start(ctx, "foreman.agent.turn",
 		trace.WithAttributes(attribute.Int("turn", res.Turns)))
@@ -1045,7 +1063,8 @@ func (l *Loop) runOneTurn(
 	req := oai.ChatRequest{
 		Model: cfg.Model,
 		Messages: stripReasoningForWire(
-			selectWireTranscript(cfg, res.Transcript), preserveTrailingReasoning),
+			selectWireTranscriptSticky(cfg, res.Transcript, sessionDrop),
+			preserveTrailingReasoning),
 		Tools:       schemas,
 		Temperature: cfg.Temperature,
 		// Per-turn generation cap (0 omits max_tokens, deferring to the
@@ -1331,9 +1350,9 @@ type turnGroup struct{ start, end int }
 // task message) and the most recent turn-group, so the agent never loses
 // its instructions, its task, or its latest work. Dropping is in
 // turn-group units so a tool_call_id is never orphaned. See issue #756.
-func compactTranscriptForWire(transcript []oai.Message, ctxBudget int) []oai.Message {
-	if ctxBudget <= 0 || approxTokens(transcript) <= ctxBudget {
-		return transcript
+func compactTranscriptForWire(transcript []oai.Message, ctxBudget, minDrop int) ([]oai.Message, int) {
+	if ctxBudget <= 0 {
+		return transcript, 0
 	}
 
 	// headEnd is the exclusive index of the pinned head: all leading
@@ -1359,30 +1378,67 @@ func compactTranscriptForWire(transcript []oai.Message, ctxBudget int) []oai.Mes
 	}
 
 	if len(groups) <= 1 {
-		return transcript // 0 or 1 groups: nothing to drop (head + at most one group is the floor)
+		return transcript, 0 // head + at most one group is the floor
+	}
+	if minDrop < 0 {
+		minDrop = 0
+	}
+	if minDrop > len(groups)-1 {
+		minDrop = len(groups) - 1
 	}
 
-	// Drop oldest groups (after head, before the last group) until under
-	// budget or only the last group remains.
-	for dropCount := 1; dropCount < len(groups); dropCount++ {
-		kept := assembleSessionWire(transcript, headEnd, groups, dropCount)
-		if approxTokens(kept) <= ctxBudget {
-			return kept
+	// Sticky: reuse the previous turn's drop point while the payload still
+	// fits. This is the property that matters, and it is not the same as
+	// "compact to a smaller target": the transcript grows every turn, so
+	// recomputing the drop point from scratch slides the window forward by one
+	// group per turn no matter what target is chosen, and the wire prefix
+	// changes every turn. Holding the drop point fixed means the turn only
+	// appends, the prefix is byte-identical, and the server's prefix-matched
+	// KV cache is reused (#1286).
+	if kept := assembleSessionWire(transcript, headEnd, groups, minDrop); approxTokens(kept) <= ctxBudget {
+		return kept, minDrop
+	}
+
+	// Over budget: compact PAST the budget to a low-water mark, so the next
+	// several turns fit at this same drop point rather than forcing another
+	// compaction (and another full re-prefill) on the very next turn.
+	target := ctxBudget * sessionCompactionTargetPercent / 100
+	if target <= 0 {
+		target = ctxBudget
+	}
+	for d := minDrop + 1; d < len(groups); d++ {
+		kept := assembleSessionWire(transcript, headEnd, groups, d)
+		if approxTokens(kept) <= target {
+			return kept, d
 		}
 	}
 	// Degenerate: only head + last group remain (still possibly over budget).
-	return assembleSessionWire(transcript, headEnd, groups, len(groups)-1)
+	return assembleSessionWire(transcript, headEnd, groups, len(groups)-1), len(groups) - 1
+}
+
+// selectWireTranscriptSticky calls selectWireTranscript and persists the
+// updated drop point through the caller's pointer, so the next turn reuses it.
+func selectWireTranscriptSticky(cfg LoopConfig, transcript []oai.Message, drop *int) []oai.Message {
+	cur := 0
+	if drop != nil {
+		cur = *drop
+	}
+	wire, next := selectWireTranscript(cfg, transcript, cur)
+	if drop != nil {
+		*drop = next
+	}
+	return wire
 }
 
 // selectWireTranscript routes the transcript through the configured
 // context strategy. "session" uses compactTranscriptForWire (stable
 // prefix, compact at budget); anything else (including "" and "window")
 // uses maskTranscriptForWire (observation masking).
-func selectWireTranscript(cfg LoopConfig, transcript []oai.Message) []oai.Message {
+func selectWireTranscript(cfg LoopConfig, transcript []oai.Message, minDrop int) ([]oai.Message, int) {
 	if cfg.ContextStrategy == ContextStrategySession {
-		return compactTranscriptForWire(transcript, cfg.ContextWindowTokens)
+		return compactTranscriptForWire(transcript, cfg.ContextWindowTokens, minDrop)
 	}
-	return maskTranscriptForWire(transcript, cfg.ObservationWindowTurns, cfg.ContextWindowTokens)
+	return maskTranscriptForWire(transcript, cfg.ObservationWindowTurns, cfg.ContextWindowTokens), minDrop
 }
 
 // assembleSessionWire builds the wire payload: the pinned head
