@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -256,6 +257,20 @@ type AgentSpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	MaxOutputTokens int32 `json:"maxOutputTokens,omitempty"`
+
+	// ChatTemplateKwargs is a free-form map of template-specific keyword
+	// arguments forwarded verbatim on every chat-completions request as
+	// chat_template_kwargs. Each value is a raw JSON blob so booleans stay
+	// booleans (a JSON false must not become the string "false"). The
+	// primary use case is disabling thinking on reasoning models: llama.cpp
+	// supplies enable_thinking=true itself when the client omits the kwarg,
+	// so every request today is thinking-on. Setting
+	// {"enable_thinking": false} here turns it off.
+	//
+	// Omitted entirely when nil or empty so the request is byte-identical
+	// to today for any agent that does not set it.
+	// +optional
+	ChatTemplateKwargs map[string]apiextensionsv1.JSON `json:"chatTemplateKwargs,omitempty"`
 
 	// ContextWindowTokens is the soft token budget for the wire payload
 	// the loop sends on every turn. When the running message list

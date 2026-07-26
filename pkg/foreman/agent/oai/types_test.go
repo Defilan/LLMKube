@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 )
 
 // TestMessageMarshalJSON_NonAssistantAlwaysIncludesContent pins the
@@ -202,5 +204,88 @@ func TestMessageMarshalJSON_RoleAlwaysEmitted(t *testing.T) {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("role %q missing from payload %s", role, raw)
 		}
+	}
+}
+
+// TestChatRequestMarshalJSON_ChatTemplateKwargs pins the wire contract
+// for chat_template_kwargs (#1283): a configured kwarg map must appear
+// verbatim in the outbound JSON, and an empty/unset map must omit the
+// field entirely so the request is byte-identical to today. Values must
+// survive round-trip without coercion: a JSON false must not become the
+// string "false".
+func TestChatRequestMarshalJSON_ChatTemplateKwargs(t *testing.T) {
+	// A boolean false encoded as a raw JSON blob. The whole point of
+	// #1283 is that enable_thinking=false (a real boolean) disables
+	// thinking; a stringified "false" would not.
+	falseJSON := apiextensionsv1.JSON{Raw: []byte("false")}
+
+	cases := []struct {
+		name            string
+		kwargs          map[string]apiextensionsv1.JSON
+		wantHasKey      bool
+		wantBoolValue   bool // only checked when wantHasKey && key present
+		wantBoolPresent bool // whether the value should be a real bool, not a string
+	}{
+		{
+			name:            "set with enable_thinking=false emits real boolean",
+			kwargs:          map[string]apiextensionsv1.JSON{"enable_thinking": falseJSON},
+			wantHasKey:      true,
+			wantBoolValue:   false,
+			wantBoolPresent: true,
+		},
+		{
+			name:            "nil map omits the field entirely",
+			kwargs:          nil,
+			wantHasKey:      false,
+			wantBoolPresent: false,
+		},
+		{
+			name:            "empty map omits the field entirely",
+			kwargs:          map[string]apiextensionsv1.JSON{},
+			wantHasKey:      false,
+			wantBoolPresent: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := ChatRequest{
+				Model:              "test",
+				Messages:           []Message{{Role: RoleUser, Content: "go"}},
+				ChatTemplateKwargs: tc.kwargs,
+			}
+			raw, err := json.Marshal(req)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			hasKey := strings.Contains(string(raw), `"chat_template_kwargs":`)
+			if hasKey != tc.wantHasKey {
+				t.Fatalf("chat_template_kwargs present=%v want=%v in %s", hasKey, tc.wantHasKey, raw)
+			}
+			if !tc.wantHasKey {
+				return
+			}
+			// Round-trip parse to confirm the value is a real boolean,
+			// not the string "false".
+			var decoded map[string]any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatalf("round-trip decode: %v", err)
+			}
+			kwargs, ok := decoded["chat_template_kwargs"].(map[string]any)
+			if !ok {
+				t.Fatalf("chat_template_kwargs is not a JSON object: %v", decoded["chat_template_kwargs"])
+			}
+			val, ok := kwargs["enable_thinking"]
+			if !ok {
+				t.Fatalf("enable_thinking missing from chat_template_kwargs: %v", kwargs)
+			}
+			// A real boolean false, not the string "false".
+			boolVal, isBool := val.(bool)
+			if !isBool {
+				t.Errorf("enable_thinking is %T (%v), want bool — coercion bug", val, val)
+			}
+			if tc.wantBoolPresent && boolVal != tc.wantBoolValue {
+				t.Errorf("enable_thinking: want %v got %v", tc.wantBoolValue, boolVal)
+			}
+		})
 	}
 }

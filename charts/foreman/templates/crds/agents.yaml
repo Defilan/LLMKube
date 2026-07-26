@@ -74,6 +74,22 @@ spec:
                 format: int32
                 minimum: 1
                 type: integer
+              chatTemplateKwargs:
+                additionalProperties:
+                  x-kubernetes-preserve-unknown-fields: true
+                description: |-
+                  ChatTemplateKwargs is a free-form map of template-specific keyword
+                  arguments forwarded verbatim on every chat-completions request as
+                  chat_template_kwargs. Each value is a raw JSON blob so booleans stay
+                  booleans (a JSON false must not become the string "false"). The
+                  primary use case is disabling thinking on reasoning models: llama.cpp
+                  supplies enable_thinking=true itself when the client omits the kwarg,
+                  so every request today is thinking-on. Setting
+                  {"enable_thinking": false} here turns it off.
+
+                  Omitted entirely when nil or empty so the request is byte-identical
+                  to today for any agent that does not set it.
+                type: object
               contextStrategy:
                 default: window
                 description: |-
