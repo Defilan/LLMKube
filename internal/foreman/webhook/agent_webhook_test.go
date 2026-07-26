@@ -18,6 +18,8 @@ package webhook
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -283,5 +285,60 @@ func TestCanonicalToolNamesCoversWhitelist(t *testing.T) {
 		if !have[w] {
 			t.Errorf("canonical tool set missing expected tool %q (have %v)", w, names)
 		}
+	}
+}
+
+// TestValidateAgentPromptShape_MessageNamesTheRightField pins the wording of
+// the missing-systemPrompt error. A cloud-proxy Agent has no
+// inferenceServiceRef, so an error citing that field sends the operator
+// looking at something they never set. Hit on a clean cluster while writing
+// the getting-started walkthrough.
+func TestValidateAgentPromptShape_MessageNamesTheRightField(t *testing.T) {
+	cases := []struct {
+		name     string
+		agent    *foremanv1alpha1.Agent
+		wantCite string
+		notCite  string
+	}{
+		{
+			name: "cloud-proxy cites the provider",
+			agent: func() *foremanv1alpha1.Agent {
+				a := validLLMAgent()
+				a.Spec.Provider = foremanv1alpha1.AgentProviderCloudProxy
+				a.Spec.InferenceServiceRef = corev1.LocalObjectReference{}
+				a.Spec.ProviderConfig = &foremanv1alpha1.ProviderConfig{
+					BaseURL: "https://example.invalid/v1", Model: "m",
+				}
+				a.Spec.SystemPrompt = ""
+				return a
+			}(),
+			wantCite: "provider is cloud-proxy",
+			notCite:  "inferenceServiceRef is set",
+		},
+		{
+			name: "local cites the inferenceServiceRef",
+			agent: func() *foremanv1alpha1.Agent {
+				a := validLLMAgent()
+				a.Spec.SystemPrompt = ""
+				return a
+			}(),
+			wantCite: "inferenceServiceRef is set",
+			notCite:  "cloud-proxy",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateAgentPromptShape(tc.agent, field.NewPath("spec"))
+			if len(errs) == 0 {
+				t.Fatal("expected a validation error for the empty systemPrompt")
+			}
+			joined := errs.ToAggregate().Error()
+			if !strings.Contains(joined, tc.wantCite) {
+				t.Errorf("message should cite %q, got: %s", tc.wantCite, joined)
+			}
+			if strings.Contains(joined, tc.notCite) {
+				t.Errorf("message should not cite %q, got: %s", tc.notCite, joined)
+			}
+		})
 	}
 }

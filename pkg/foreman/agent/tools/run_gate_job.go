@@ -459,7 +459,15 @@ func renderGateJob(in rendererInput) (*batchv1.Job, error) {
 	if in.BaseBranch == "" {
 		in.BaseBranch = "main"
 	}
-	tmpl, err := template.New("gate-job").Parse(gateJobTemplate)
+	tmpl, err := template.New("gate-job").Funcs(template.FuncMap{
+		// A gate command may legitimately be multi-line shell. The template
+		// interpolates it inside a YAML block scalar, so a raw newline ends
+		// the block and the Job fails to unmarshal (#1293). indentShell
+		// re-indents continuation lines to the block's own indentation;
+		// firstLine keeps the echo label on one line.
+		"indentShell": indentShell,
+		"firstLine":   firstLine,
+	}).Parse(gateJobTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("parse template: %w", err)
 	}
@@ -572,4 +580,29 @@ func sanitizeName(in string) string {
 		return "task"
 	}
 	return out
+}
+
+// gateBlockIndent is the indentation of the command lines inside the Job
+// template's args block scalar. Continuation lines of a multi-line command
+// must match it or the YAML block ends early.
+const gateBlockIndent = "              "
+
+// indentShell re-indents every line after the first to gateBlockIndent, so a
+// multi-line gate command stays inside the YAML block scalar it is rendered
+// into.
+func indentShell(cmd string) string {
+	lines := strings.Split(cmd, "\n")
+	for i := 1; i < len(lines); i++ {
+		lines[i] = gateBlockIndent + lines[i]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// firstLine returns the first line of cmd, with an ellipsis when there are
+// more. Used for the "=== <cmd> ===" banner, which must stay on one line.
+func firstLine(cmd string) string {
+	if i := strings.IndexByte(cmd, '\n'); i >= 0 {
+		return strings.TrimSpace(cmd[:i]) + " ..."
+	}
+	return cmd
 }
