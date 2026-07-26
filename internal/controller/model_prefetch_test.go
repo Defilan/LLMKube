@@ -221,4 +221,99 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(updated.Status.Phase).To(Equal(PhaseDownloading))
 		})
 	})
+
+	var _ = Describe("Model Prefetch cache mode (#1139)", func() {
+		ctx := context.Background()
+		const ns = "prefetch-cache-mode-test"
+
+		prefetchReconciler := func(mode string) *ModelReconciler {
+			return &ModelReconciler{
+				Client:               k8sClient,
+				Scheme:               k8sClient.Scheme(),
+				InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+				DefaultFSGroup:       102,
+				ModelCacheSize:       "10Gi",
+				ModelCacheAccessMode: "ReadWriteOnce",
+				ModelCacheMode:       mode,
+			}
+		}
+
+		newPrefetchModel := func(name string) *inferencev1alpha1.Model {
+			return &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/models/llama.gguf",
+					Prefetch: true,
+				},
+			}
+		}
+
+		BeforeEach(func() {
+			nsObj := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}
+			err := k8sClient.Create(ctx, nsObj)
+			if err != nil {
+				Expect(client.IgnoreAlreadyExists(err)).To(Succeed())
+			}
+		})
+
+		// Regression for #1139: the prefetch path must not hardcode
+		// ModelCacheModeShared. When the operator is configured with
+		// --model-cache-mode=perService, the prefetch Job must resolve the
+		// PVC name through the same modelCachePVCName path the serving
+		// Deployment uses, so the two writers agree on the claimName and the
+		// Deployment does not oscillate. Because the prefetch has no
+		// InferenceService (nil isvc), modelCachePVCName correctly falls back
+		// to the shared name — but the mode must still be threaded through
+		// rather than silently overridden to shared.
+		It("threads the operator cache mode instead of hardcoding shared", func() {
+			model := newPrefetchModel("cache-mode-pref")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			r := prefetchReconciler(ModelCacheModePerService)
+			handled, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeTrue())
+
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cache-mode-pref-prefetch", Namespace: ns}, job)).To(Succeed())
+
+			// The prefetch has no isvc, so the PVC name resolves to the shared
+			// default regardless of mode — but the mode must be passed through
+			// (not hardcoded to shared) so that a future change to
+			// modelCachePVCName's nil-isvc handling does not silently diverge.
+			vol := findVolumeByName(job.Spec.Template.Spec.Volumes, "model-cache")
+			Expect(vol).NotTo(BeNil())
+			Expect(vol.PersistentVolumeClaim).NotTo(BeNil())
+			Expect(vol.PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+		})
+
+		It("uses shared mode by default (empty mode)", func() {
+			model := newPrefetchModel("cache-mode-shared")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			r := prefetchReconciler("")
+			handled, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeTrue())
+
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "cache-mode-shared-prefetch", Namespace: ns}, job)).To(Succeed())
+
+			vol := findVolumeByName(job.Spec.Template.Spec.Volumes, "model-cache")
+			Expect(vol).NotTo(BeNil())
+			Expect(vol.PersistentVolumeClaim).NotTo(BeNil())
+			Expect(vol.PersistentVolumeClaim.ClaimName).To(Equal(ModelCachePVCName))
+		})
+	})
 })
+
+func findVolumeByName(volumes []corev1.Volume, name string) *corev1.Volume {
+	for i := range volumes {
+		if volumes[i].Name == name {
+			return &volumes[i]
+		}
+	}
+	return nil
+}

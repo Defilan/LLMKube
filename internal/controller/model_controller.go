@@ -131,6 +131,7 @@ type ModelReconciler struct {
 	ModelCacheSize       string
 	ModelCacheClass      string
 	ModelCacheAccessMode string
+	ModelCacheMode       string
 
 	// metadataHTTPClient is the SSRF-guarded client used for all controller-
 	// side requests to Model.spec.source (metadata reads and revalidation

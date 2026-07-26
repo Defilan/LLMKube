@@ -423,6 +423,7 @@ func main() {
 		ModelCacheSize:       modelCacheSize,
 		ModelCacheClass:      modelCacheClass,
 		ModelCacheAccessMode: modelCacheAccessMode,
+		ModelCacheMode:       modelCacheMode,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Model")
 		os.Exit(1)

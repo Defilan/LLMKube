@@ -194,7 +194,14 @@ func (r *ModelReconciler) buildPrefetchJob(model *inferencev1alpha1.Model) (*bat
 	if effectiveModelCacheKey(model) == "" {
 		return nil, fmt.Errorf("prefetch: model has no cache key; refusing to build a Job that would download into an emptyDir")
 	}
-	storage := buildModelStorageConfig(model, nil, model.Namespace, true, ModelCacheModeShared,
+	// Respect the operator's configured cache mode rather than hardcoding
+	// shared: when --model-cache-mode=perService, the prefetch Job must
+	// resolve the same PVC name the serving Deployment does, otherwise the
+	// two writers disagree on spec.template.spec.volumes and the Deployment
+	// generation oscillates (#1139). The prefetch still targets the shared
+	// cache when the operator is in shared mode (the default), since perService
+	// PVCs are created per-InferenceService at serve time.
+	storage := buildModelStorageConfig(model, nil, model.Namespace, true, r.ModelCacheMode,
 		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
 	if len(storage.initContainers) == 0 {
 		return nil, fmt.Errorf("prefetch: source %q produced no downloader containers", model.Spec.Source)
