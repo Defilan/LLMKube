@@ -96,6 +96,45 @@ spec:
                 git diff --stat
                 rc=1
               fi
+              # Non-Go artifact checks: a diff that is entirely non-Go (CI
+              # YAML, shell, Ruby/Homebrew, docs) must not reach GATE-PASS
+              # without anything meaningful having been checked (#1072).
+              # The block detects changed non-Go files via git and runs the
+              # appropriate linter for each kind. Each checker degrades
+              # gracefully when absent: a missing linter is reported
+              # honestly, never silently skipped and never treated as a
+              # failure. A diff with no checkable non-Go content runs
+              # nothing here and does not fail.
+              echo "=== non-go lint ==="
+              # actionlint validates GitHub Actions workflows. Only run when
+              # the diff touches workflow YAML; a missing actionlint is
+              # reported, not a failure.
+              if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qE '\.github/workflows/.*\.ya?ml$'; then
+                if command -v actionlint >/dev/null 2>&1; then
+                  echo "--- actionlint ---"; actionlint .github/workflows/ || rc=1
+                else
+                  echo "non-go lint: actionlint not installed, skipping"
+                fi
+              fi
+              # shellcheck for shell scripts. Only run when the diff touches
+              # .sh files; a missing shellcheck is reported, not a failure.
+              if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qE '\.sh$'; then
+                if command -v shellcheck >/dev/null 2>&1; then
+                  echo "--- shellcheck ---"; shellcheck $(git ls-files '*.sh') || rc=1
+                else
+                  echo "non-go lint: shellcheck not installed, skipping"
+                fi
+              fi
+              # rubocop for Ruby / Homebrew formulae. Only run when the diff
+              # touches .rb files; a missing rubocop is reported, not a
+              # failure.
+              if git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -qE '\.rb$'; then
+                if command -v rubocop >/dev/null 2>&1; then
+                  echo "--- rubocop ---"; rubocop --format progress $(git ls-files '*.rb') || rc=1
+                else
+                  echo "non-go lint: rubocop not installed, skipping"
+                fi
+              fi
               {{- if .BiteCheck }}
               # Bite check: verify new/changed tests actually fail against pre-change
               # production code. The gate Job clones the coder branch as a shallow,

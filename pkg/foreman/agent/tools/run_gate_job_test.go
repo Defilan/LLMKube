@@ -562,6 +562,127 @@ func TestRenderGateJob_RendersChecksAndPVCMount(t *testing.T) {
 	}
 }
 
+// TestRenderGateJob_NonGoLintBlockPresent asserts the Go gate path renders
+// the non-Go artifact lint block (#1072). The block must always be present
+// in the Go path so a diff that is entirely non-Go does not reach GATE-PASS
+// without anything meaningful having been checked.
+func TestRenderGateJob_NonGoLintBlockPresent(t *testing.T) {
+	job, err := renderGateJob(rendererInput{
+		Name:                    "foreman-gate-nongo",
+		Namespace:               "foreman-system",
+		Image:                   "golang:1.26",
+		Repo:                    "defilantech/LLMKube",
+		Branch:                  "foreman/issue-1072",
+		Checks:                  []string{"fmt", "vet", "test"},
+		PVCName:                 "foreman-gate-cache",
+		ActiveDeadlineSeconds:   1800,
+		TTLSecondsAfterFinished: 86400,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		CloneURLBase:            "https://github.com",
+		TaskNamespace:           "default",
+		TaskName:                "gate-1072",
+	})
+	if err != nil {
+		t.Fatalf("renderGateJob: %v", err)
+	}
+	args := strings.Join(job.Spec.Template.Spec.Containers[0].Args, "\n")
+	// The non-go lint block must be present in the Go path.
+	if !strings.Contains(args, "=== non-go lint ===") {
+		t.Errorf("Go path must render the non-go lint block:\n%s", args)
+	}
+	// Each checker must be present with a graceful missing-linter guard.
+	for _, want := range []string{
+		"actionlint", "shellcheck", "rubocop",
+		"command -v", "not installed, skipping",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("non-go lint block missing %q:\n%s", want, args)
+		}
+	}
+}
+
+// TestRenderGateJob_NonGoLintGoOnlyDiffUnchanged asserts that the Go-only
+// path is unchanged: the non-go lint block is present but gated on
+// `git diff` detecting non-Go files, so a Go-only diff runs nothing extra
+// and does not fail.
+func TestRenderGateJob_NonGoLintGoOnlyDiffUnchanged(t *testing.T) {
+	job, err := renderGateJob(rendererInput{
+		Name:                    "foreman-gate-go-only",
+		Namespace:               "foreman-system",
+		Image:                   "golang:1.26",
+		Repo:                    "defilantech/LLMKube",
+		Branch:                  "foreman/issue-go",
+		Checks:                  []string{"fmt", "vet", "test"},
+		PVCName:                 "foreman-gate-cache",
+		ActiveDeadlineSeconds:   1800,
+		TTLSecondsAfterFinished: 86400,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		CloneURLBase:            "https://github.com",
+		TaskNamespace:           "default",
+		TaskName:                "gate-go",
+	})
+	if err != nil {
+		t.Fatalf("renderGateJob: %v", err)
+	}
+	args := strings.Join(job.Spec.Template.Spec.Containers[0].Args, "\n")
+	// The Go checks must still be present (unchanged behaviour).
+	if !strings.Contains(args, "make fmt") || !strings.Contains(args, "make vet") {
+		t.Errorf("Go checks missing from Go-only path:\n%s", args)
+	}
+	// The non-go lint block is present but each checker is gated on
+	// `git diff --name-only` detecting the relevant file type, so a
+	// Go-only diff runs nothing extra.
+	if !strings.Contains(args, "git diff --name-only HEAD~1 HEAD") {
+		t.Errorf("non-go lint block must gate on git diff:\n%s", args)
+	}
+}
+
+// TestRenderGateJob_NonGoLintMissingCheckerPath asserts the missing-checker
+// path: each linter is guarded by `command -v` so an absent linter is
+// reported honestly ("not installed, skipping") rather than silently
+// skipped or treated as a failure.
+func TestRenderGateJob_NonGoLintMissingCheckerPath(t *testing.T) {
+	job, err := renderGateJob(rendererInput{
+		Name:                    "foreman-gate-missing",
+		Namespace:               "foreman-system",
+		Image:                   "golang:1.26",
+		Repo:                    "defilantech/LLMKube",
+		Branch:                  "foreman/issue-missing",
+		Checks:                  []string{"fmt"},
+		PVCName:                 "foreman-gate-cache",
+		ActiveDeadlineSeconds:   1800,
+		TTLSecondsAfterFinished: 86400,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		CloneURLBase:            "https://github.com",
+		TaskNamespace:           "default",
+		TaskName:                "gate-missing",
+	})
+	if err != nil {
+		t.Fatalf("renderGateJob: %v", err)
+	}
+	args := strings.Join(job.Spec.Template.Spec.Containers[0].Args, "\n")
+	// Each checker must have a `command -v` guard and a skip message.
+	for _, checker := range []string{"actionlint", "shellcheck", "rubocop"} {
+		guard := "command -v " + checker
+		if !strings.Contains(args, guard) {
+			t.Errorf("missing %q guard for %s:\n%s", guard, checker, args)
+		}
+		skipMsg := checker + " not installed, skipping"
+		if !strings.Contains(args, skipMsg) {
+			t.Errorf("missing skip message for %s:\n%s", checker, args)
+		}
+	}
+}
+
 func TestRenderGateJob_GenericRunsCommandsNotMakeOrBiteCheck(t *testing.T) {
 	job, err := renderGateJob(rendererInput{
 		Name:                    "foreman-gate-py",
