@@ -220,7 +220,7 @@ An issue whose base coder returns NO-GO or trips the coder gate is
 re-dispatched once to `qwopus-27b-dense-coder`, with the base
 model's failure summary threaded into the prompt.
 
-### `ALREADY-RESOLVED` — honest "already done" bail (#970)
+### `ALREADY-RESOLVED`: honest "already done" bail (#970)
 
 When a coder concludes the work is already present on the branch or
 upstream base (e.g. a `Fixes #N` commit since `BaseBranch`, or an
