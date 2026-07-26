@@ -146,8 +146,9 @@ spec:
 kubectl get workload,agentictask -n default -w
 ```
 
-The Workload synthesizes a `code-510` AgenticTask (coder) and a
-`verify-510` AgenticTask (gate, depends on code). When both succeed,
+The Workload synthesizes a `fix-one-bug-code-510` AgenticTask (coder)
+and a `fix-one-bug-verify-510` AgenticTask (gate, depends on code),
+each step name prefixed with the Workload name. When both succeed,
 a DCO-signed branch lands on the fork
 (`Defilan/LLMKube:foreman/fix-one-bug/issue-510`). Verdict
 `GATE-PASS` means it cleared the gate; open the branch as an
