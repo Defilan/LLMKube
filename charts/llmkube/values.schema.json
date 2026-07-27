@@ -247,6 +247,51 @@
         }
       }
     },
+    "grafana": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dashboards": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "only": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "additionalLabels": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "namespace": { "type": "string" },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "operator": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "mode": { "type": "string", "enum": ["auto", "all"] },
+                "instanceSelector": {
+                  "type": "object",
+                  "additionalProperties": true
+                },
+                "allowCrossNamespaceImport": { "type": "boolean" },
+                "folder": { "type": "string" },
+                "resyncPeriod": { "type": "string", "pattern": "^$|^[0-9]+(ms|s|m|h)$" },
+                "datasources": {
+                  "type": "array",
+                  "items": { "type": "object" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "pyrra": {
       "type": "object",
       "additionalProperties": false,

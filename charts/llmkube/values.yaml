@@ -259,6 +259,51 @@ prometheus:
       inference:
         enabled: true
 
+# Grafana dashboards shipped in charts/llmkube/dashboards/. One ConfigMap holds
+# every dashboard, one key per file; the sidecar label and the grafana-operator
+# CRs are independent opt-ins on top of it.
+grafana:
+  dashboards:
+    enabled: false
+    # Dashboards to ship, by filename without .json. Empty ships all of them.
+    # A dashboard for something the cluster does not run renders blank, which
+    # is indistinguishable from an idle cluster, so narrow this to what you
+    # deploy: sglang-dashboard and vllm-dashboard need an InferenceService on
+    # that runtime, amd-gpu-observability needs AMD GPUs, llmkube-slo needs
+    # pyrra.enabled.
+    only: []
+    # Additional labels for the ConfigMap. grafana_dashboard is the key the
+    # kube-prometheus-stack Grafana sidecar watches for.
+    additionalLabels:
+      grafana_dashboard: "true"
+    # Namespace for the ConfigMap and the CRs (defaults to release namespace).
+    # The sidecar only reads namespaces it is configured to search.
+    namespace: ""
+    # Annotations for the ConfigMap (e.g. grafana_folder for the sidecar)
+    annotations: {}
+    # Emit grafana-operator GrafanaDashboard CRs referencing the ConfigMap
+    operator:
+      enabled: false
+      # auto: publish the runtime dashboards (SGLang, vLLM) only while an
+      # InferenceService on that runtime exists, so none of them renders blank.
+      # The chart hands those manifests to the operator instead of applying
+      # them; the rest are applied here as always. all: apply every dashboard.
+      mode: auto
+      # Required by the CRD and immutable once set; {} matches every Grafana.
+      instanceSelector: {}
+      allowCrossNamespaceImport: true
+      # Grafana folder for the dashboards. The sidecar path uses the
+      # grafana_folder annotation above instead; this is the CR's own field.
+      folder: ""
+      # How often grafana-operator re-reads the ConfigMap. Empty leaves the
+      # CRD default (5m).
+      resyncPeriod: ""
+      # Literal ${inputName} -> datasourceName replace over the dashboard JSON.
+      #   datasources:
+      #     - inputName: DS_PROMETHEUS
+      #       datasourceName: VictoriaMetrics
+      datasources: []
+
 # Pyrra SLO integration. When enabled, the operator renders a Pyrra
 # ServiceLevelObjective for every InferenceService that declares spec.slo,
 # and Pyrra generates the Prometheus recording/alert rules and error-budget

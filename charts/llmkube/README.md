@@ -164,6 +164,135 @@ against those older values need updating.
 The PodMonitor additionally promotes `service`, `namespace`, `model` and
 `runtime` onto every inference series.
 
+### Grafana Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `grafana.dashboards.enabled` | Ship the dashboards in `dashboards/` as a ConfigMap | `false` |
+| `grafana.dashboards.only` | Dashboards to ship, by filename without `.json`. Empty ships all of them | `[]` |
+| `grafana.dashboards.additionalLabels` | Additional labels for the dashboards ConfigMap | `{grafana_dashboard: "true"}` |
+| `grafana.dashboards.namespace` | ConfigMap/CR namespace (defaults to release namespace) | `""` |
+| `grafana.dashboards.annotations` | Annotations for the dashboards ConfigMap | `{}` |
+| `grafana.dashboards.operator.enabled` | Also emit grafana-operator `GrafanaDashboard` CRs | `false` |
+| `grafana.dashboards.operator.mode` | `auto` publishes runtime dashboards only while that runtime serves; `all` publishes every dashboard | `auto` |
+| `grafana.dashboards.operator.instanceSelector` | `GrafanaDashboard` instance selector (required by the CRD) | `{}` |
+| `grafana.dashboards.operator.allowCrossNamespaceImport` | Match Grafanas outside the CR's namespace | `true` |
+| `grafana.dashboards.operator.folder` | Grafana folder for the dashboards (sidecar path uses the `grafana_folder` annotation) | `""` |
+| `grafana.dashboards.operator.resyncPeriod` | How often grafana-operator re-reads the ConfigMap (empty leaves the CRD default) | `""` |
+| `grafana.dashboards.operator.datasources` | Datasource variable remaps (`inputName`/`datasourceName`) | `[]` |
+
+#### Grafana dashboards
+
+`grafana.dashboards.enabled=true` renders one ConfigMap,
+`<release>-llmkube-dashboards`, with a key per file in
+`charts/llmkube/dashboards/`. Both delivery mechanisms read that single copy of
+the JSON:
+
+- **kube-prometheus-stack sidecar** — the ConfigMap carries
+  `grafana_dashboard: "true"`, which the sidecar picks up in any namespace it
+  is configured to search. This is the default and needs nothing else.
+- **grafana-operator** — `grafana.dashboards.operator.enabled=true` adds a
+  `GrafanaDashboard` (`grafana.integreatly.org/v1beta1`) per dashboard whose
+  `configMapRef` points at the same ConfigMap key. Set
+  `operator.instanceSelector` to match your `Grafana` resource; the CRD
+  requires the field and rejects changes to it after creation. Set
+  `additionalLabels: {}` to drop the sidecar label if you run no sidecar.
+
+#### Dashboards that only have data sometimes
+
+`sglang-dashboard` and `vllm-dashboard` read one runtime's metrics, so they
+render blank until something serves that runtime — and blank looks the same as
+an idle cluster.
+
+With `operator.enabled` and the default `operator.mode: auto`, the chart hands
+those two manifests to the operator instead of applying them, and the operator
+publishes each one while an `InferenceService` on its runtime exists and
+retires it when the last one goes away. Nothing to configure: deploy a vLLM
+service and the vLLM dashboard appears. Set `operator.mode: all` to apply every
+dashboard at install time instead.
+
+The chart cannot make this call itself — which runtimes exist is an
+`InferenceService` fact that does not exist at `helm install` time, and Helm
+leaves nothing running to notice later. The sidecar path is unaffected: the
+ConfigMap always carries every dashboard the sidecar is asked to load.
+
+Because the operator applies these, Helm does not own them, and disabling the
+feature leaves nothing running to retire them. After
+`grafana.dashboards.enabled=false`, `operator.enabled=false`, or
+`helm uninstall`, clean them up by hand:
+
+```bash
+kubectl delete grafanadashboard -A -l dashboards.llmkube.dev/managed-by=llmkube
+```
+
+That label is on operator-published dashboards only, so a hand-authored
+`GrafanaDashboard` is never caught by it — and for the same reason the operator
+will not adopt, overwrite, or retire one that happens to share a name.
+
+Switching `operator.mode` needs no manual step in either direction. Deferred
+manifests carry `meta.helm.sh/release-name` and `-namespace`, so `auto` -> `all`
+lets Helm adopt what the operator has already published rather than refusing it
+as a foreign object; `all` -> `auto` drops the runtime CRs from Helm's manifest
+and the operator republishes whichever runtimes are actually serving.
+
+One residue worth knowing: a dashboard adopted that way keeps its
+`dashboards.llmkube.dev/managed-by` label, because Helm does not strip fields it
+did not set. It is inert — `mode: all` renders no candidate ConfigMap, so the
+reconciler returns before looking at anything — but it does mean the `kubectl
+delete` above would also catch a live, Helm-owned dashboard. Run that command
+only for the disabled or uninstalled case it is written for; a `mode: all`
+release is cleaned up by `helm uninstall` itself.
+
+`amd-gpu-observability` (needs AMD GPUs) and `llmkube-slo` (needs
+`pyrra.enabled`) have no such signal and are always published. To drop them, or
+to narrow the set on the sidecar path, list what you want:
+
+```yaml
+grafana:
+  dashboards:
+    enabled: true
+    only:
+      - llmkube-inference
+      - llmkube-quota
+      - vllm-dashboard
+```
+
+Every entry is checked on its own, so any name matching no file fails the
+render rather than silently shipping less than you asked for.
+
+`allowCrossNamespaceImport` defaults to `true` so the dashboards reach a
+Grafana installed in another namespace, which is the usual layout. Turning it
+back off on an existing CR is rejected by the CRD's own validation rule
+(`disabling spec.allowCrossNamespaceImport requires a recreate to ensure
+desired state`), so an upgrade that flips it to `false` fails until the CRs are
+deleted.
+
+`operator.datasources` is a literal `${inputName}` -> `datasourceName` replace
+over the dashboard JSON before it reaches Grafana. Most of the shipped
+dashboards read their datasource from a `DS_PROMETHEUS` template variable;
+`amd-gpu-observability.json` uses one named `datasource`. None of them declares
+a dashboard `__inputs` block, so both names are plain template variables and
+covering every dashboard takes two entries:
+
+```yaml
+grafana:
+  dashboards:
+    enabled: true
+    operator:
+      enabled: true
+      instanceSelector:
+        matchLabels:
+          dashboards: grafana
+      datasources:
+        - inputName: DS_PROMETHEUS
+          datasourceName: VictoriaMetrics
+        - inputName: datasource
+          datasourceName: VictoriaMetrics
+```
+
+The two dashboards under `config/grafana/` are not part of the chart and stay
+hand-imported.
+
 ### CRD Parameters
 
 | Parameter | Description | Default |
