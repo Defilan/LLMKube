@@ -55,6 +55,124 @@ func TestNewGitHubCodeHost(t *testing.T) {
 	}
 }
 
+func TestSplitRepoSlug(t *testing.T) {
+	tests := []struct {
+		name      string
+		repoSlug  string
+		wantOwner string
+		wantName  string
+		wantOK    bool
+	}{
+		{
+			name:      "simple owner/name",
+			repoSlug:  "defilantech/llmkube",
+			wantOwner: "defilantech",
+			wantName:  "llmkube",
+			wantOK:    true,
+		},
+		{
+			name:      "multi-segment splits on last slash",
+			repoSlug:  "group/subgroup/project",
+			wantOwner: "group/subgroup",
+			wantName:  "project",
+			wantOK:    true,
+		},
+		{
+			name:      "deeply nested",
+			repoSlug:  "a/b/c/d/e",
+			wantOwner: "a/b/c/d",
+			wantName:  "e",
+			wantOK:    true,
+		},
+		{
+			name:      "trailing whitespace is trimmed",
+			repoSlug:  "defilantech/llmkube ",
+			wantOwner: "defilantech",
+			wantName:  "llmkube",
+			wantOK:    true,
+		},
+		{
+			name:      "leading whitespace is trimmed",
+			repoSlug:  "  defilantech/llmkube",
+			wantOwner: "defilantech",
+			wantName:  "llmkube",
+			wantOK:    true,
+		},
+		{
+			name:      "empty slug",
+			repoSlug:  "",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "no slash",
+			repoSlug:  "defilantech",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "parent traversal at end",
+			repoSlug:  "group/..",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "parent traversal in middle",
+			repoSlug:  "group/../project",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "absolute path",
+			repoSlug:  "/defilantech/llmkube",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "empty segment",
+			repoSlug:  "defilantech//llmkube",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "trailing slash",
+			repoSlug:  "defilantech/llmkube/",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+		{
+			name:      "whitespace in segment",
+			repoSlug:  "defilantech/ll mkube",
+			wantOwner: "",
+			wantName:  "",
+			wantOK:    false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			owner, name, ok := splitRepoSlug(tc.repoSlug)
+			if ok != tc.wantOK {
+				t.Errorf("splitRepoSlug(%q) ok = %v, want %v", tc.repoSlug, ok, tc.wantOK)
+				return
+			}
+			if owner != tc.wantOwner {
+				t.Errorf("splitRepoSlug(%q) owner = %q, want %q", tc.repoSlug, owner, tc.wantOwner)
+			}
+			if name != tc.wantName {
+				t.Errorf("splitRepoSlug(%q) name = %q, want %q", tc.repoSlug, name, tc.wantName)
+			}
+		})
+	}
+}
+
 func TestResolveCloneURL(t *testing.T) {
 	g := &GitHubCodeHost{}
 
@@ -84,8 +202,43 @@ func TestResolveCloneURL(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "malformed slug - extra slash",
-			slug: "defilantech/llmkube/extra",
+			name: "multi-segment slug splits on last slash",
+			slug: "group/subgroup/project",
+			want: "https://github.com/group/subgroup/project.git",
+		},
+		{
+			name: "deeply nested slug",
+			slug: "a/b/c/d/e",
+			want: "https://github.com/a/b/c/d/e.git",
+		},
+		{
+			name: "slug with parent traversal is rejected",
+			slug: "group/..",
+			want: "",
+		},
+		{
+			name: "slug with traversal in middle is rejected",
+			slug: "group/../project",
+			want: "",
+		},
+		{
+			name: "absolute path is rejected",
+			slug: "/defilantech/llmkube",
+			want: "",
+		},
+		{
+			name: "empty segment is rejected",
+			slug: "defilantech//llmkube",
+			want: "",
+		},
+		{
+			name: "trailing slash is rejected",
+			slug: "defilantech/llmkube/",
+			want: "",
+		},
+		{
+			name: "whitespace segment is rejected",
+			slug: "defilantech/ll mkube",
 			want: "",
 		},
 		{
@@ -160,6 +313,23 @@ func TestEnsureChangeRequest(t *testing.T) {
 			wantURL:     "",
 			wantCreated: false,
 		},
+		{
+			name:       "multi-segment slug splits on last slash",
+			repoSlug:   "group/subgroup/project",
+			headBranch: "foreman/wl-x/issue-7",
+			baseBranch: "main",
+			title:      "Fix the thing",
+			body:       "Fixes #7",
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error) {
+				if owner != "group/subgroup" || repo != "project" {
+					t.Errorf("EnsurePR owner=%q repo=%q, want owner=%q repo=%q",
+						owner, repo, "group/subgroup", "project")
+				}
+				return &githubpr.Result{URL: "https://github.com/group/subgroup/project/pull/1", Created: true}, nil
+			},
+			wantURL:     "https://github.com/group/subgroup/project/pull/1",
+			wantCreated: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -219,6 +389,19 @@ func TestHeadCommitSubject(t *testing.T) {
 			headBranch:  "foreman/wl-x/issue-7",
 			commitFunc:  nil,
 			wantSubject: "",
+		},
+		{
+			name:       "multi-segment slug splits on last slash",
+			repoSlug:   "group/subgroup/project",
+			headBranch: "foreman/wl-x/issue-7",
+			commitFunc: func(ctx context.Context, owner, repo, ref, token string) string {
+				if owner != "group/subgroup" || repo != "project" {
+					t.Errorf("HeadCommitSubject owner=%q repo=%q, want owner=%q repo=%q",
+						owner, repo, "group/subgroup", "project")
+				}
+				return "feat: add the thing"
+			},
+			wantSubject: "feat: add the thing",
 		},
 	}
 
