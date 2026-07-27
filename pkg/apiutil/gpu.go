@@ -17,11 +17,14 @@ const (
 	runtimeROCm   = "rocm"
 )
 
+// The GPU extended-resource names below are the single source of truth for
+// the operator's GPU scheduling. internal/controller aliases them (see
+// gpu_resources.go) so a future edit cannot drift the two packages apart.
 var (
-	nvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
-	amdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
-	intelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
-	vulkanDRIResourceName    = corev1.ResourceName("devic.es/dri-render")
+	NvidiaGPUResourceName    = corev1.ResourceName("nvidia.com/gpu")
+	AmdGPUResourceName       = corev1.ResourceName("amd.com/gpu")
+	IntelGPUResourceNameI915 = corev1.ResourceName("gpu.intel.com/i915")
+	VulkanDRIResourceName    = corev1.ResourceName("devic.es/dri-render")
 )
 
 func isRuntime(runtime, want string) bool {
@@ -46,14 +49,14 @@ func GPUResourceName(model *inferencev1alpha1.Model) corev1.ResourceName {
 		case "amd":
 			if isRuntime(model.Spec.Hardware.GPU.Runtime, runtimeVulkan) ||
 				isRuntime(model.Spec.Hardware.GPU.Runtime, runtimeROCm) {
-				return vulkanDRIResourceName
+				return VulkanDRIResourceName
 			}
-			return amdGPUResourceName
+			return AmdGPUResourceName
 		case "intel":
-			return intelGPUResourceNameI915
+			return IntelGPUResourceNameI915
 		}
 	}
-	return nvidiaGPUResourceName
+	return NvidiaGPUResourceName
 }
 
 // GPUCount determines the desired GPU count per replica: the Model's

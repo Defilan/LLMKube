@@ -39,6 +39,36 @@ func TestGPUResourceName(t *testing.T) {
 	}
 }
 
+// TestGPUResourceNameLiterals is a drift guard for this package only:
+// it pins the four exported GPU resource-name values against their
+// string literals so a typo or copy/paste here is caught. It does not
+// and cannot cover internal/controller, because that package imports
+// pkg/apiutil (an import cycle would block the reverse). The real
+// cross-package protection is the compile-time aliasing in
+// internal/controller/gpu_resources.go, which assigns these exported
+// values to its own package-level variables; any divergent literal
+// there would have to be a hand-written value that no longer matches
+// the alias, and is guarded by the build, not by this test.
+func TestGPUResourceNameLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		got  corev1.ResourceName
+		want string
+	}{
+		{"nvidia", NvidiaGPUResourceName, "nvidia.com/gpu"},
+		{"amd", AmdGPUResourceName, "amd.com/gpu"},
+		{"intel i915", IntelGPUResourceNameI915, "gpu.intel.com/i915"},
+		{"vulkan dri-render", VulkanDRIResourceName, "devic.es/dri-render"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if string(tc.got) != tc.want {
+				t.Fatalf("%s GPU resource name = %q, want %q", tc.name, tc.got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGPUCount(t *testing.T) {
 	isvcWith := func(gpu int32) *inferencev1alpha1.InferenceService {
 		return &inferencev1alpha1.InferenceService{
