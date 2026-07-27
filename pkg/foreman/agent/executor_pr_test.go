@@ -257,7 +257,7 @@ func TestGitRemoteOwnerRepo(t *testing.T) {
 		{"/tmp/seed/bare.git", "", ""},
 		{"file:///srv/git/bare.git", "", ""},
 		{"https://github.com/onlyowner", "", ""},
-		{"https://github.com/a/b/c", "", ""},
+		{"https://github.com/a/b/c", "a/b", "c"},
 	}
 	for _, tc := range cases {
 		owner, name := gitRemoteOwnerRepo(tc.url)

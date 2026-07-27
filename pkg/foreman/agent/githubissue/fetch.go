@@ -214,13 +214,24 @@ func truncateBody(body string, cap int) string {
 	return body[:keep] + marker
 }
 
-// ParseRepo splits an "owner/repo" string into its parts. Returns an
-// error if the input is malformed; the executor logs the error and
-// skips the fetch (best-effort).
+// ParseRepo splits a repo slug into its owner (namespace) and repo
+// (name) parts, splitting on the last slash so multi-segment slugs like
+// "group/subgroup/project" are accepted: owner="group/subgroup",
+// repo="project". For GitHub this means the namespace is passed as-is
+// to the API path; GitHub will reject slugs that are not valid owner/repo
+// pairs at request time. Returns an error if the input is malformed
+// (no slash, empty segments, or a ".." traversal segment); the executor
+// logs the error and skips the fetch (best-effort).
 func ParseRepo(s string) (owner, repo string, err error) {
-	parts := strings.Split(s, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	idx := strings.LastIndex(s, "/")
+	if idx <= 0 || idx == len(s)-1 {
 		return "", "", errors.New("githubissue: repo must be owner/repo")
 	}
-	return parts[0], parts[1], nil
+	owner, repo = s[:idx], s[idx+1:]
+	for _, seg := range strings.Split(s, "/") {
+		if seg == "" || seg == ".." {
+			return "", "", errors.New("githubissue: repo must not contain empty or '..' segments")
+		}
+	}
+	return owner, repo, nil
 }

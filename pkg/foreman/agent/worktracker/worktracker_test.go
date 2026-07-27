@@ -112,6 +112,28 @@ func TestGitHubWorkItems_Get(t *testing.T) {
 			},
 		},
 		{
+			name:     "multi-segment repo slug",
+			repoSlug: "group/subgroup/project",
+			id:       "42",
+			fetcher: &fakeFetcher{
+				Issue: &githubissue.Issue{
+					Number: 42,
+					Title:  "Fix memory leak in agent",
+					Body:   "The agent leaks goroutines on shutdown.",
+					State:  "open",
+					Labels: []string{"bug", "agent"},
+				},
+			},
+			wantItem: &WorkItem{
+				ID:     "42",
+				Title:  "Fix memory leak in agent",
+				Body:   "The agent leaks goroutines on shutdown.",
+				State:  "open",
+				URL:    "",
+				Labels: []string{"bug", "agent"},
+			},
+		},
+		{
 			name:       "invalid repo slug",
 			repoSlug:   "bad-slug",
 			id:         "1",
