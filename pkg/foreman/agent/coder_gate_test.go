@@ -42,11 +42,25 @@ type recordedCall struct {
 }
 
 // newFakeRunner returns a commandRunner that replies from responses keyed
-// by command name, and a pointer to the slice of recorded calls.
+// by command name, and a pointer to the slice of recorded calls. It also
+// handles the git commands the diff-awareness guard issues (git add -A and
+// git diff --name-only --cached HEAD): by default it reports a single
+// changed .go file so the Go toolchain checks run, matching the pre-#1292
+// behavior these tests were written against. Tests that need a different
+// changed-file set use a custom runner instead.
 func newFakeRunner(responses map[string]fakeCommand) (commandRunner, *[]recordedCall) {
 	calls := &[]recordedCall{}
 	run := func(_ context.Context, _ string, extraEnv []string, name string, args ...string) (string, error) {
 		*calls = append(*calls, recordedCall{name: name, args: args, extraEnv: extraEnv})
+		// Diff-awareness guard (#1292): git add -A succeeds; git diff
+		// --name-only --cached HEAD reports a changed .go file so the Go
+		// checks run (the pre-#1292 default these tests assume).
+		if name == "git" && len(args) >= 2 && args[0] == "add" && args[1] == "-A" {
+			return "", nil
+		}
+		if name == "git" && len(args) >= 3 && args[0] == "diff" && args[1] == "--name-only" && args[2] == "--cached" {
+			return "pkg/cli/cache.go\n", nil
+		}
 		resp := responses[name]
 		return resp.output, resp.err
 	}
@@ -257,8 +271,10 @@ func TestRunCoderGate_FailsOnChangedPackageUnitTest(t *testing.T) {
 		switch {
 		case name == "gofmt":
 			return "", nil
-		case name == "git":
+		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "-z":
 			return " M pkg/cli/cache_inspect_test.go\x00", nil
+		case name == "git" && len(args) >= 3 && args[0] == "diff" && args[1] == "--name-only" && args[2] == "--cached":
+			return "pkg/cli/cache_inspect_test.go\n", nil
 		case name == "go" && len(args) > 0 && args[0] == "test":
 			out := "panic: runtime error: invalid memory address\n" +
 				"FAIL\tgithub.com/defilantech/llmkube/pkg/cli"
@@ -294,6 +310,146 @@ func TestRunCoderGate_SkipsTestTierWhenNoChangedPackages(t *testing.T) {
 	if sawGoTest {
 		t.Error("test tier should not run go test when no packages changed")
 	}
+}
+
+// TestRunCoderGate_SkipsGoChecksWhenNoGoFilesChanged verifies the gate skips
+// the Go toolchain checks (gofmt, go vet, go build, golangci-lint, go test)
+// when the coder's working-tree diff touches no .go files at all, and reports
+// the skip as an advisory rather than as a pass (#1292). A docs-only or
+// YAML-only change cannot be judged by Go tooling, so running it would only
+// surface environment failures the model cannot fix.
+func TestRunCoderGate_SkipsGoChecksWhenNoGoFilesChanged(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	sawGo := false
+	sawLint := false
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "go" {
+			sawGo = true
+		}
+		if name == golangciPath {
+			sawLint = true
+		}
+		// git add -A and git diff --name-only --cached HEAD: no .go files.
+		if name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only" {
+			return "README.md\n", nil
+		}
+		return "", nil
+	}
+	pass, feedback, advisories := RunCoderGate(context.Background(), "/work", golangciPath, run, "", "main", nil)
+	if !pass {
+		t.Fatalf("gate should pass when Go checks are skipped and nothing else fails; feedback:\n%s", feedback)
+	}
+	if sawGo {
+		t.Error("go toolchain checks should not run when the diff has no .go files")
+	}
+	if sawLint {
+		t.Error("golangci-lint should not run when the diff has no .go files")
+	}
+	if !containsAdvisory(advisories, goChecksSkipped) {
+		t.Errorf("expected a %q advisory reporting the skip; got %+v", goChecksSkipped, advisories)
+	}
+}
+
+// TestRunCoderGate_RunsGoChecksWhenGoFilesChanged verifies the gate still runs
+// the Go toolchain checks when the diff contains at least one .go file, so the
+// diff-awareness guard does not loosen the gate for Go changes (#1292).
+func TestRunCoderGate_RunsGoChecksWhenGoFilesChanged(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	sawGo := false
+	sawLint := false
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "go" {
+			sawGo = true
+		}
+		if name == golangciPath {
+			sawLint = true
+		}
+		// git add -A and git diff --name-only --cached HEAD: a .go file changed.
+		if name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only" {
+			return "pkg/cli/cache.go\n", nil
+		}
+		return "", nil
+	}
+	pass, feedback, advisories := RunCoderGate(context.Background(), "/work", golangciPath, run, "", "main", nil)
+	if !pass {
+		t.Fatalf("gate should pass when all Go checks are clean; feedback:\n%s", feedback)
+	}
+	if !sawGo {
+		t.Error("go toolchain checks should run when the diff has .go files")
+	}
+	if !sawLint {
+		t.Error("golangci-lint should run when the diff has .go files")
+	}
+	if containsAdvisory(advisories, goChecksSkipped) {
+		t.Errorf("Go checks should not be reported as skipped when .go files changed; got %+v", advisories)
+	}
+}
+
+// containsAdvisory reports whether advisories contains one with the given check name.
+func containsAdvisory(advisories []advisory, name string) bool {
+	for _, a := range advisories {
+		if a.Check == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TestChangedWorkingTreeAnyGoFiles verifies the diff-awareness predicate
+// returns the .go files (including _test.go) that differ from HEAD in the
+// working tree, and returns nil on a git error so the gate skips Go checks
+// rather than failing spuriously (#1292).
+func TestChangedWorkingTreeAnyGoFiles(t *testing.T) {
+	t.Run("returns go files including test files", func(t *testing.T) {
+		run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+			if name == "git" && len(args) >= 2 && args[0] == "add" && args[1] == "-A" {
+				return "", nil
+			}
+			if name == "git" && len(args) >= 3 && args[0] == "diff" && args[1] == "--name-only" && args[2] == "--cached" {
+				return "pkg/cli/cache.go\npkg/cli/cache_test.go\nREADME.md\n", nil
+			}
+			return "", nil
+		}
+		got := changedWorkingTreeAnyGoFiles(context.Background(), "/work", run)
+		want := []string{"pkg/cli/cache.go", "pkg/cli/cache_test.go"}
+		if len(got) != len(want) {
+			t.Fatalf("changedWorkingTreeAnyGoFiles = %v, want %v", got, want)
+		}
+		for i, p := range got {
+			if p != want[i] {
+				t.Errorf("changedWorkingTreeAnyGoFiles[%d] = %q, want %q", i, p, want[i])
+			}
+		}
+	})
+
+	t.Run("returns nil on git error", func(t *testing.T) {
+		run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+			if name == "git" && len(args) >= 2 && args[0] == "add" && args[1] == "-A" {
+				return "", errors.New("git add failed")
+			}
+			return "", nil
+		}
+		got := changedWorkingTreeAnyGoFiles(context.Background(), "/work", run)
+		if got != nil {
+			t.Errorf("changedWorkingTreeAnyGoFiles = %v, want nil on git error", got)
+		}
+	})
+
+	t.Run("returns nil when no go files changed", func(t *testing.T) {
+		run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+			if name == "git" && len(args) >= 2 && args[0] == "add" && args[1] == "-A" {
+				return "", nil
+			}
+			if name == "git" && len(args) >= 3 && args[0] == "diff" && args[1] == "--name-only" && args[2] == "--cached" {
+				return "README.md\nconfig/foreman.yaml\n", nil
+			}
+			return "", nil
+		}
+		got := changedWorkingTreeAnyGoFiles(context.Background(), "/work", run)
+		if len(got) != 0 {
+			t.Errorf("changedWorkingTreeAnyGoFiles = %v, want empty", got)
+		}
+	})
 }
 
 // TestRunCoderGateTruncation verifies per-check output is capped and marked.

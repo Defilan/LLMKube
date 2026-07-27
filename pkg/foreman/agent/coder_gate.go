@@ -81,6 +81,14 @@ type checkFailure struct {
 	output string
 }
 
+// goChecksSkipped is the advisory name emitted when the Go toolchain checks
+// (gofmt, go vet, go build, golangci-lint, go test tier) are skipped because
+// the coder's diff touches no Go files at all. The check is skipped, not
+// passed: a docs-only or YAML-only change cannot be judged by Go tooling, so
+// running it would only surface environment failures (e.g. toolchain version
+// mismatch) that the model cannot fix (#1292).
+const goChecksSkipped = "go-checks-skipped"
+
 // RunCoderGate runs the fast in-workspace verification tier against a
 // coder's workspace and reports whether every check passed. On failure,
 // feedback is a directive the agent loop injects as a user message:
@@ -108,6 +116,14 @@ type checkFailure struct {
 // post-push gate Job. All checks run regardless of earlier failures so the
 // feedback reports everything wrong at once.
 //
+// The Go toolchain checks (gofmt, go vet, go build, golangci-lint, and the
+// go test tier) are diff-aware: when the coder's working-tree diff touches
+// no .go files at all, those checks are skipped rather than run, so a
+// docs-only or YAML-only change is not blocked by Go tooling it cannot
+// satisfy (#1292). A diff containing any .go file runs the Go checks
+// exactly as before. A skipped check is reported as skipped (via an
+// advisory), never as passed.
+//
 // advisories is a slice of non-blocking findings from the tiered registry.
 // It is empty until later tasks add checks to gateCheckRegistry.
 func RunCoderGate(
@@ -119,21 +135,42 @@ func RunCoderGate(
 ) (pass bool, feedback string, advisories []advisory) {
 	var failures []checkFailure
 
+	// Diff-awareness guard (#1292): if the coder's working-tree diff
+	// touches no .go files at all, the Go toolchain checks cannot say
+	// anything about the change and would only surface environment
+	// failures (e.g. toolchain version mismatch) the model cannot fix.
+	// Skip them and report the skip as an advisory — never as a pass.
+	// A diff containing any .go file runs the Go checks exactly as before.
+	goFiles := changedWorkingTreeAnyGoFiles(ctx, workspace, run)
+	goChecksActive := len(goFiles) > 0
+	if !goChecksActive {
+		advisories = append(advisories, advisory{
+			Check:  goChecksSkipped,
+			Detail: "Go toolchain checks skipped: the diff touches no .go files",
+		})
+	}
+
 	// 1. gofmt -l . lists misformatted files on stdout and exits 0 even
 	// when files are listed, so the failure signal is non-empty output,
 	// not the exec error.
-	if out, _ := run(ctx, workspace, nil, "gofmt", "-l", "."); strings.TrimSpace(out) != "" {
-		failures = append(failures, checkFailure{name: "gofmt -l .", output: out})
+	if goChecksActive {
+		if out, _ := run(ctx, workspace, nil, "gofmt", "-l", "."); strings.TrimSpace(out) != "" {
+			failures = append(failures, checkFailure{name: "gofmt -l .", output: out})
+		}
 	}
 
 	// 2. go vet ./... fails with a non-nil error.
-	if out, err := run(ctx, workspace, nil, "go", "vet", "./..."); err != nil {
-		failures = append(failures, checkFailure{name: "go vet ./...", output: out})
+	if goChecksActive {
+		if out, err := run(ctx, workspace, nil, "go", "vet", "./..."); err != nil {
+			failures = append(failures, checkFailure{name: "go vet ./...", output: out})
+		}
 	}
 
 	// 3. go build ./... fails with a non-nil error.
-	if out, err := run(ctx, workspace, nil, "go", "build", "./..."); err != nil {
-		failures = append(failures, checkFailure{name: "go build ./...", output: out})
+	if goChecksActive {
+		if out, err := run(ctx, workspace, nil, "go", "build", "./..."); err != nil {
+			failures = append(failures, checkFailure{name: "go build ./...", output: out})
+		}
 	}
 
 	// 4. golangci-lint run ./... fails with a non-nil error. GOOS=linux is
@@ -142,9 +179,11 @@ func RunCoderGate(
 	// per-workspace sibling directory so stale analysis results from
 	// another coder workspace cannot pollute this run's lint (#759); the
 	// sibling location keeps the cache out of the workspace git tree.
-	lintEnv := []string{"GOOS=linux", "GOLANGCI_LINT_CACHE=" + workspace + ".golangci-cache"}
-	if out, err := run(ctx, workspace, lintEnv, golangciPath, "run", "./..."); err != nil {
-		failures = append(failures, checkFailure{name: golangciPath + " run ./...", output: out})
+	if goChecksActive {
+		lintEnv := []string{"GOOS=linux", "GOLANGCI_LINT_CACHE=" + workspace + ".golangci-cache"}
+		if out, err := run(ctx, workspace, lintEnv, golangciPath, "run", "./..."); err != nil {
+			failures = append(failures, checkFailure{name: golangciPath + " run ./...", output: out})
+		}
 	}
 
 	// 5. Fast unit-test tier: go test on the non-envtest packages the coder
@@ -152,10 +191,15 @@ func RunCoderGate(
 	// unit test, so a broken test would otherwise reach a GO and only fail
 	// in CI (#762). Envtest/integration packages are excluded (they need
 	// KUBEBUILDER_ASSETS / a cluster the workspace lacks; CI runs them).
-	if pkgs := changedTestPackages(ctx, workspace, run); len(pkgs) > 0 {
-		args := append([]string{"test", "-count=1", "-timeout=180s"}, pkgs...)
-		if out, err := run(ctx, workspace, nil, "go", args...); err != nil {
-			failures = append(failures, checkFailure{name: "go test " + strings.Join(pkgs, " "), output: out})
+	// Skipped when the diff has no Go files: there are no changed packages
+	// to test, and running go test on a docs-only change would only surface
+	// environment failures the model cannot fix (#1292).
+	if goChecksActive {
+		if pkgs := changedTestPackages(ctx, workspace, run); len(pkgs) > 0 {
+			args := append([]string{"test", "-count=1", "-timeout=180s"}, pkgs...)
+			if out, err := run(ctx, workspace, nil, "go", args...); err != nil {
+				failures = append(failures, checkFailure{name: "go test " + strings.Join(pkgs, " "), output: out})
+			}
 		}
 	}
 
@@ -225,7 +269,7 @@ func RunCoderGate(
 
 	blocking, adv := runGateChecks(ctx, workspace, run, gateCheckRegistry(issueText, evidenceBaseSHA, evidence))
 	failures = append(failures, blocking...)
-	advisories = adv
+	advisories = append(advisories, adv...)
 
 	if len(failures) == 0 {
 		return true, "", advisories
@@ -783,6 +827,44 @@ func checkReferenceGrounding(ctx context.Context, workspace string, run commandR
 		fmt.Fprintf(&b, "  - %s\n", f.String())
 	}
 	return true, b.String()
+}
+
+// changedWorkingTreeAnyGoFiles returns the workspace-relative Go file paths
+// (including _test.go files) that differ from HEAD in the coder's working
+// tree (staged + unstaged). It is the diff-awareness predicate for the Go
+// toolchain checks (#1292): a diff touching zero .go files skips gofmt, go
+// vet, go build, golangci-lint, and the go test tier, because those checks
+// cannot judge a docs-only or YAML-only change and would only surface
+// environment failures the model cannot fix. A diff containing any .go file
+// runs the Go checks exactly as before.
+//
+// It stages everything with `git add -A` and then runs
+// `git diff --name-only --cached HEAD` so the result reflects the coder's
+// uncommitted edits rather than committed history (the gate runs before any
+// commit, so `...HEAD` would see nothing). A git error yields nil (the caller
+// treats that as "no changed files" and skips the Go checks rather than
+// failing the gate spuriously).
+func changedWorkingTreeAnyGoFiles(ctx context.Context, workspace string, run commandRunner) []string {
+	// Stage everything so untracked new files appear in the diff.
+	if _, err := run(ctx, workspace, nil, "git", "add", "-A"); err != nil {
+		return nil
+	}
+	out, err := run(ctx, workspace, nil, "git", "diff", "--name-only",
+		"--cached", "HEAD")
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasSuffix(line, ".go") {
+			paths = append(paths, line)
+		}
+	}
+	return paths
 }
 
 // changedWorkingTreeGoFiles returns the workspace-relative Go file paths that
