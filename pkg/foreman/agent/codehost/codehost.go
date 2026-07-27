@@ -28,17 +28,57 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubpr"
 )
 
-// repoSlugPattern matches a single "owner/name" GitHub slug. Each segment
-// is limited to git/GitHub-safe characters and exactly one slash is allowed,
-// so "..", multiple path segments, and whitespace are rejected.
-var repoSlugPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
+// RepoSlugPattern matches a repo slug with one or more path segments
+// separated by slashes, e.g. "owner/name" (GitHub) or
+// "group/subgroup/project" (GitLab / nested Forgejo). Each segment is
+// limited to git/GitHub-safe characters. The pattern requires at least
+// two segments (one slash) and rejects empty segments, whitespace, and
+// absolute paths. Path-traversal segments ("..") are rejected by
+// IsValidRepoSlug, which wraps this pattern.
+var RepoSlugPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$`)
+
+// IsValidRepoSlug reports whether slug is a valid repo slug: it matches
+// RepoSlugPattern and contains no ".." path-traversal segment. The
+// character class in RepoSlugPattern includes ".", so ".." would
+// otherwise match; this check closes that gap so multi-segment slugs
+// cannot smuggle traversal segments.
+func IsValidRepoSlug(slug string) bool {
+	if !RepoSlugPattern.MatchString(slug) {
+		return false
+	}
+	for _, seg := range strings.Split(slug, "/") {
+		if seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// SplitRepoSlug splits a repo slug on the last slash so the final
+// segment is the repository name and everything before it is the
+// namespace. This supports multi-segment slugs like
+// "group/subgroup/project" (GitLab / nested Forgejo) while keeping
+// "owner/name" working exactly as before. Returns ok=false when the
+// slug is empty, has no slash, has an empty namespace or name, or
+// contains a ".." traversal segment.
+func SplitRepoSlug(slug string) (namespace, name string, ok bool) {
+	if !IsValidRepoSlug(slug) {
+		return "", "", false
+	}
+	idx := strings.LastIndex(slug, "/")
+	if idx <= 0 || idx == len(slug)-1 {
+		return "", "", false
+	}
+	return slug[:idx], slug[idx+1:], true
+}
 
 // CodeHost is the provider-neutral seam for code-host operations.
 // Implementations wrap a specific platform (GitHub, Forgejo, etc.) and
 // expose operations the executor needs without leaking platform details.
 type CodeHost interface {
 	// ResolveCloneURL derives the HTTPS git clone URL from a repo slug
-	// like "owner/name". Returns "" for an empty or malformed slug so
+	// like "owner/name" (GitHub) or "group/subgroup/project" (GitLab /
+	// nested Forgejo). Returns "" for an empty or malformed slug so
 	// callers fall back to the cloned fork's HEAD.
 	ResolveCloneURL(repoSlug string) string
 
@@ -71,12 +111,13 @@ func NewGitHubCodeHost(ensurer githubpr.Ensurer) *GitHubCodeHost {
 }
 
 // ResolveCloneURL derives the upstream project's HTTPS git URL from a
-// payload.repo "owner/name" slug (the GitHub convention LLMKube uses).
-// It returns "" for an empty or malformed slug so callers fall back to
-// the cloned fork's HEAD (e.g. freeform tasks that carry no repo slug).
+// payload.repo slug (e.g. "owner/name" for GitHub, "group/subgroup/project"
+// for GitLab / nested Forgejo). It returns "" for an empty or malformed
+// slug so callers fall back to the cloned fork's HEAD (e.g. freeform tasks
+// that carry no repo slug).
 func (g *GitHubCodeHost) ResolveCloneURL(repoSlug string) string {
 	repoSlug = strings.TrimSpace(repoSlug)
-	if !repoSlugPattern.MatchString(repoSlug) {
+	if !IsValidRepoSlug(repoSlug) {
 		return ""
 	}
 	return "https://github.com/" + repoSlug + ".git"
@@ -87,8 +128,8 @@ func (g *GitHubCodeHost) ResolveCloneURL(repoSlug string) string {
 func (g *GitHubCodeHost) EnsureChangeRequest(
 	ctx context.Context, repoSlug, headBranch, baseBranch, title, body string,
 ) (string, bool, error) {
-	owner, name, ok := strings.Cut(repoSlug, "/")
-	if !ok || owner == "" || name == "" {
+	owner, name, ok := SplitRepoSlug(repoSlug)
+	if !ok {
 		return "", false, nil
 	}
 	res, err := g.Ensurer.EnsurePR(ctx, owner, name, headBranch, baseBranch, title, body, g.Token)
@@ -102,8 +143,8 @@ func (g *GitHubCodeHost) EnsureChangeRequest(
 // message — the natural PR title (the coder writes a conventional
 // subject). Empty on any failure so callers can fall back.
 func (g *GitHubCodeHost) HeadCommitSubject(ctx context.Context, repoSlug, headBranch string) (string, error) {
-	owner, name, ok := strings.Cut(repoSlug, "/")
-	if !ok || owner == "" || name == "" {
+	owner, name, ok := SplitRepoSlug(repoSlug)
+	if !ok {
 		return "", nil
 	}
 	return g.Ensurer.HeadCommitSubject(ctx, owner, name, headBranch, g.Token), nil
