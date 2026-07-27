@@ -387,7 +387,9 @@ type InferenceServiceSpec struct {
 	// ExtraArgs provides additional command-line arguments passed directly to the
 	// runtime process. Use for flags not yet supported as typed CRD fields.
 	// Arguments are appended after all other configured flags.
-	// Supported by the "llamacpp" and "vllm" runtimes. Ignored by others.
+	// Supported by the "llamacpp", "llamacpp-router", "sglang", "tgi" and
+	// "vllm" runtimes. Ignored by "generic" (which takes spec.args instead)
+	// and "personaplex".
 	// Example: ["--seed", "42", "--log-disable"]
 	// +optional
 	ExtraArgs []string `json:"extraArgs,omitempty"`
