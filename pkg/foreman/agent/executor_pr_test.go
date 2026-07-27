@@ -239,7 +239,8 @@ func TestMaybeOpenPullRequest_SameRepoRemoteKeepsBareHead(t *testing.T) {
 
 // TestGitRemoteOwnerRepo pins the tolerant URL forms the fork-owner
 // derivation must understand, and the non-GitHub-shaped remotes it must
-// decline to parse.
+// decline to parse. Multi-segment paths like group/subgroup/project
+// are accepted (last segment is the repo name).
 func TestGitRemoteOwnerRepo(t *testing.T) {
 	cases := []struct {
 		url         string
@@ -257,7 +258,8 @@ func TestGitRemoteOwnerRepo(t *testing.T) {
 		{"/tmp/seed/bare.git", "", ""},
 		{"file:///srv/git/bare.git", "", ""},
 		{"https://github.com/onlyowner", "", ""},
-		{"https://github.com/a/b/c", "", ""},
+		{"https://github.com/a/b/c", "a/b", "c"},
+		{"https://github.com/group/subgroup/project.git", "group/subgroup", "project"},
 	}
 	for _, tc := range cases {
 		owner, name := gitRemoteOwnerRepo(tc.url)

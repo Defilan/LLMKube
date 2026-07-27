@@ -74,6 +74,16 @@ func TestResolveCloneURL(t *testing.T) {
 			want: "https://github.com/my-org/my-repo-name.git",
 		},
 		{
+			name: "valid multi-segment slug (GitLab subgroup)",
+			slug: "group/subgroup/project",
+			want: "https://github.com/group/subgroup/project.git",
+		},
+		{
+			name: "valid deep multi-segment slug",
+			slug: "a/b/c/d",
+			want: "https://github.com/a/b/c/d.git",
+		},
+		{
 			name: "empty slug",
 			slug: "",
 			want: "",
@@ -81,11 +91,6 @@ func TestResolveCloneURL(t *testing.T) {
 		{
 			name: "malformed slug - no slash",
 			slug: "defilantech",
-			want: "",
-		},
-		{
-			name: "malformed slug - extra slash",
-			slug: "defilantech/llmkube/extra",
 			want: "",
 		},
 		{
@@ -97,6 +102,16 @@ func TestResolveCloneURL(t *testing.T) {
 			name: "slug with leading whitespace",
 			slug: "  defilantech/llmkube",
 			want: "https://github.com/defilantech/llmkube.git",
+		},
+		{
+			name: "path traversal rejected (.. segment)",
+			slug: "group/../project",
+			want: "",
+		},
+		{
+			name: "path traversal rejected (.. in middle)",
+			slug: "a/b/../c",
+			want: "",
 		},
 	}
 
@@ -237,6 +252,128 @@ func TestHeadCommitSubject(t *testing.T) {
 			}
 			if subject != tc.wantSubject {
 				t.Errorf("HeadCommitSubject() = %q, want %q", subject, tc.wantSubject)
+			}
+		})
+	}
+}
+
+func TestRepoSlugValid(t *testing.T) {
+	tests := []struct {
+		name string
+		slug string
+		want bool
+	}{
+		{
+			name: "valid two-segment slug",
+			slug: "defilantech/llmkube",
+			want: true,
+		},
+		{
+			name: "valid multi-segment slug",
+			slug: "group/subgroup/project",
+			want: true,
+		},
+		{
+			name: "valid deep multi-segment slug",
+			slug: "a/b/c/d",
+			want: true,
+		},
+		{
+			name: "valid slug with dots and hyphens",
+			slug: "my-org/my-repo-name",
+			want: true,
+		},
+		{
+			name: "empty slug rejected",
+			slug: "",
+			want: false,
+		},
+		{
+			name: "no slash rejected",
+			slug: "defilantech",
+			want: false,
+		},
+		{
+			name: "path traversal rejected (.. segment)",
+			slug: "group/../project",
+			want: false,
+		},
+		{
+			name: "path traversal rejected (.. in middle)",
+			slug: "a/b/../c",
+			want: false,
+		},
+		{
+			name: "whitespace rejected",
+			slug: "owner/ repo",
+			want: false,
+		},
+		{
+			name: "absolute path rejected",
+			slug: "/owner/repo",
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := RepoSlugValid(tc.slug)
+			if got != tc.want {
+				t.Errorf("RepoSlugValid(%q) = %v, want %v", tc.slug, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSplitRepoSlug(t *testing.T) {
+	tests := []struct {
+		name  string
+		slug  string
+		wantO string
+		wantN string
+	}{
+		{
+			name:  "two-segment slug",
+			slug:  "defilantech/llmkube",
+			wantO: "defilantech",
+			wantN: "llmkube",
+		},
+		{
+			name:  "three-segment slug (GitLab subgroup)",
+			slug:  "group/subgroup/project",
+			wantO: "group/subgroup",
+			wantN: "project",
+		},
+		{
+			name:  "four-segment slug",
+			slug:  "a/b/c/d",
+			wantO: "a/b/c",
+			wantN: "d",
+		},
+		{
+			name:  "no slash returns empty",
+			slug:  "noslash",
+			wantO: "",
+			wantN: "",
+		},
+		{
+			name:  "leading slash returns empty owner",
+			slug:  "/project",
+			wantO: "",
+			wantN: "project",
+		},
+		{
+			name:  "trailing slash returns empty name",
+			slug:  "owner/",
+			wantO: "owner",
+			wantN: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			o, n := SplitRepoSlug(tc.slug)
+			if o != tc.wantO || n != tc.wantN {
+				t.Errorf("SplitRepoSlug(%q) = (%q, %q), want (%q, %q)",
+					tc.slug, o, n, tc.wantO, tc.wantN)
 			}
 		})
 	}

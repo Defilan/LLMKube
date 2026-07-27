@@ -214,13 +214,19 @@ func truncateBody(body string, cap int) string {
 	return body[:keep] + marker
 }
 
-// ParseRepo splits an "owner/repo" string into its parts. Returns an
-// error if the input is malformed; the executor logs the error and
-// skips the fetch (best-effort).
+// ParseRepo splits a repo slug into its namespace and repository name.
+// For "owner/repo" this yields owner and repo; for "group/subgroup/project"
+// it yields "group/subgroup" and "project". Returns an error if the input
+// is malformed; the executor logs the error and skips the fetch (best-effort).
 func ParseRepo(s string) (owner, repo string, err error) {
-	parts := strings.Split(s, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	idx := strings.LastIndex(s, "/")
+	if idx < 0 {
 		return "", "", errors.New("githubissue: repo must be owner/repo")
 	}
-	return parts[0], parts[1], nil
+	owner = s[:idx]
+	repo = s[idx+1:]
+	if owner == "" || repo == "" {
+		return "", "", errors.New("githubissue: repo must be owner/repo")
+	}
+	return owner, repo, nil
 }

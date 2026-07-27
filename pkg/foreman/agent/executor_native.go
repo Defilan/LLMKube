@@ -25,7 +25,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1739,15 +1738,15 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 // owner differs from payload.repo's owner, the PR is cross-fork: the
 // head must be qualified "forkOwner:branch" and the head commit read
 // from the fork, where the ref actually exists. A remote with the same
-// owner — or one that is not an owner/repo-shaped URL at all (local
-// paths in tests) — keeps the same-repo shape.
+// owner — or one that is not a repo-shaped URL at all (local paths in
+// tests) — keeps the same-repo shape.
 func (e *NativeAgentLoopExecutor) openPullRequest(
 	ctx context.Context, task *foremanv1alpha1.AgenticTask, auth *repo.Auth, reviewSummary string,
 ) (string, error) {
 	p := task.Spec.Payload
-	owner, name, ok := strings.Cut(p.Repo, "/")
-	if !ok || owner == "" || name == "" {
-		return "", fmt.Errorf("openPullRequest: payload.repo %q is not owner/name", p.Repo)
+	owner, name := codehost.SplitRepoSlug(p.Repo)
+	if owner == "" || name == "" {
+		return "", fmt.Errorf("openPullRequest: payload.repo %q is not a valid repo slug", p.Repo)
 	}
 	ch := e.codeHost(authToken(auth))
 	// The coder pushed the branch to e.GitRemoteURL, which may be a fork of
@@ -2218,11 +2217,12 @@ func baseBranchOrDefault(baseBranch string) string {
 }
 
 // upstreamURLForRepo derives the upstream project's HTTPS git URL from a
-// payload.repo "owner/name" slug (the GitHub convention LLMKube uses). It
-// returns "" for an empty or malformed slug so callers fall back to the cloned
-// fork's HEAD (e.g. freeform tasks that carry no repo slug). The slug is
-// validated against a strict "owner/name" allowlist so it cannot inject path
-// traversal, spaces, or extra path segments into the derived URL.
+// payload.repo slug with an arbitrary-depth namespace path (the GitHub
+// convention LLMKube uses). It returns "" for an empty or malformed slug
+// so callers fall back to the cloned fork's HEAD (e.g. freeform tasks that
+// carry no repo slug). The slug is validated against a strict allowlist
+// so it cannot inject path traversal, spaces, or invalid segments into
+// the derived URL.
 func upstreamURLForRepo(repoSlug string) string {
 	return cloneURLResolver.ResolveCloneURL(repoSlug)
 }
@@ -2234,18 +2234,14 @@ func upstreamURLForRepo(repoSlug string) string {
 // never touches it.
 var cloneURLResolver codehost.CodeHost = codehost.NewGitHubCodeHost(nil)
 
-// repoSlugPattern matches a single "owner/name" GitHub slug. Each segment is
-// limited to git/GitHub-safe characters and exactly one slash is allowed, so
-// "..", multiple path segments, and whitespace are rejected.
-var repoSlugPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
-
 // gitRemoteOwnerRepo extracts the owner and repository name from a git
 // remote URL, so openPullRequest can tell whether --git-remote-url is a
 // fork of payload.repo. Understood forms: http(s)://host/owner/repo,
 // ssh://git@host/owner/repo, and scp-like git@host:owner/repo — each
 // with or without the .git suffix. Anything else (local paths, file://
 // remotes used in tests, bare hosts) yields "", "" so callers fall back
-// to same-repo behavior.
+// to same-repo behavior. For multi-segment paths like
+// http(s)://host/group/subgroup/repo the last segment is the repo name.
 func gitRemoteOwnerRepo(remoteURL string) (owner, name string) {
 	remoteURL = strings.TrimSpace(remoteURL)
 	var path string
@@ -2267,10 +2263,10 @@ func gitRemoteOwnerRepo(remoteURL string) (owner, name string) {
 		return "", ""
 	}
 	path = strings.TrimSuffix(path, ".git")
-	if !repoSlugPattern.MatchString(path) {
+	if !codehost.RepoSlugValid(path) {
 		return "", ""
 	}
-	o, n, _ := strings.Cut(path, "/")
+	o, n := codehost.SplitRepoSlug(path)
 	return o, n
 }
 
