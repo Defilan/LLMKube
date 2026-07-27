@@ -30,13 +30,16 @@ func TestUpstreamURLForRepo(t *testing.T) {
 	}{
 		{"defilantech/LLMKube", "https://github.com/defilantech/LLMKube.git"},
 		{"  defilantech/LLMKube  ", "https://github.com/defilantech/LLMKube.git"},
+		// A slug with an arbitrary-depth namespace path (e.g. a GitLab
+		// subgroup or nested Forgejo org) resolves to a clone URL by
+		// splitting on the last slash (#1299).
+		{"defilantech/LLMKube/extra", "https://github.com/defilantech/LLMKube/extra.git"},
 		{"", ""},
 		{"   ", ""},
 		// malformed / unsafe slugs derive no URL (caller falls back to fork HEAD).
-		{"defilantech", ""},               // no slash
-		{"defilantech/LLMKube/extra", ""}, // extra path segment
-		{"../../etc/passwd", ""},          // path traversal
-		{"defilan tech/LLMKube", ""},      // whitespace
+		{"defilantech", ""},          // no slash: fewer than two segments
+		{"../../etc/passwd", ""},     // path traversal
+		{"defilan tech/LLMKube", ""}, // whitespace
 	}
 	for _, tc := range cases {
 		if got := upstreamURLForRepo(tc.repo); got != tc.want {
