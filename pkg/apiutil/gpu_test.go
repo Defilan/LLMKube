@@ -39,6 +39,30 @@ func TestGPUResourceName(t *testing.T) {
 	}
 }
 
+// TestGPUResourceNameLiterals is a drift guard: the four GPU resource-name
+// literals are the single source of truth in this package, and
+// internal/controller aliases them. If someone reintroduces a divergent
+// literal here (or in internal/controller), this test fails.
+func TestGPUResourceNameLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		got  corev1.ResourceName
+		want string
+	}{
+		{"nvidia", NvidiaGPUResourceName, "nvidia.com/gpu"},
+		{"amd", AmdGPUResourceName, "amd.com/gpu"},
+		{"intel i915", IntelGPUResourceNameI915, "gpu.intel.com/i915"},
+		{"vulkan dri-render", VulkanDRIResourceName, "devic.es/dri-render"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if string(tc.got) != tc.want {
+				t.Fatalf("%s GPU resource name = %q, want %q", tc.name, tc.got, tc.want)
+			}
+		})
+	}
+}
+
 func TestGPUCount(t *testing.T) {
 	isvcWith := func(gpu int32) *inferencev1alpha1.InferenceService {
 		return &inferencev1alpha1.InferenceService{
