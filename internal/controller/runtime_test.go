@@ -933,3 +933,57 @@ func TestBindAddressAcrossRuntimes(t *testing.T) {
 		})
 	}
 }
+
+// TestExtraArgsAppendedExactlyOnce is the regression test for #1305: the TGI
+// backend appended spec.extraArgs four times.
+//
+// The containsArg helper in this file cannot catch that. It returns on the
+// first match, so it is blind to repeats, and nothing else here asserts arg
+// counts. Counting occurrences is the point of this test; do not rewrite it in
+// terms of containsArg.
+//
+// Covers every runtime that consumes extraArgs, so a copy-paste into any of
+// them fails here rather than shipping.
+func TestExtraArgsAppendedExactlyOnce(t *testing.T) {
+	extra := []string{"--seed", "42", "--log-disable"}
+
+	backends := []struct {
+		runtime string
+		backend RuntimeBackend
+	}{
+		{"llamacpp", &LlamaCppBackend{}},
+		{"llamacpp-router", &LlamaCppRouterBackend{}},
+		{"vllm", &VLLMBackend{}},
+		{"tgi", &TGIBackend{}},
+		{"sglang", &SGLangBackend{}},
+	}
+
+	for _, tc := range backends {
+		t.Run(tc.runtime, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:  "m",
+					Runtime:   tc.runtime,
+					ExtraArgs: extra,
+				},
+			}
+			model := &inferencev1alpha1.Model{
+				Spec: inferencev1alpha1.ModelSpec{Source: "hf://org/model"},
+			}
+			args := tc.backend.BuildArgs(isvc, model, "/models/model.gguf", 8080)
+
+			for _, want := range extra {
+				n := 0
+				for _, a := range args {
+					if a == want {
+						n++
+					}
+				}
+				if n != 1 {
+					t.Errorf("runtime %s: arg %q appears %d times, want exactly 1\nargs: %v",
+						tc.runtime, want, n, args)
+				}
+			}
+		})
+	}
+}
