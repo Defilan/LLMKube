@@ -338,6 +338,35 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 		meta.RemoveStatusCondition(&isvc.Status.Conditions, "GPUAvailable")
 	}
 
+	// Backstop the Available condition (#1303).
+	//
+	// Only some cases above touch Available; a case that omits it leaves
+	// whatever the previous reconcile wrote. determinePhase returns
+	// "Creating" whenever readyReplicas==0 && desiredReplicas>0, which is not
+	// only cold start: it is also the unplanned-outage path (drained node,
+	// CrashLoopBackOff, ImagePullBackOff, or a metal host going offline via a
+	// stale heartbeat). A service that was Ready and then lost every replica
+	// therefore kept reporting Available=True/"ready and serving requests"
+	// for as long as it stayed down, which is what users and our own e2e
+	// helpers gate on.
+	//
+	// Enforcing the invariant once here, rather than adding another case,
+	// means a phase added later cannot silently reintroduce this. Phases that
+	// set Available themselves (Ready, Stopped, Suspended) and Failed (which
+	// removes it) are unaffected: this only fires when the condition is still
+	// True with nothing serving.
+	if readyReplicas == 0 && meta.IsStatusConditionTrue(isvc.Status.Conditions, "Available") {
+		meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
+			Type:               "Available",
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: isvc.Generation,
+			LastTransitionTime: now,
+			Reason:             "NoReadyReplicas",
+			Message: fmt.Sprintf("0/%d replicas ready; service is not serving (phase %s)",
+				desiredReplicas, phase),
+		})
+	}
+
 	// Set unconditionally (not gated on phase) so the Suspended condition
 	// flips to False on unsuspend rather than lingering True from a prior
 	// suspended pass.

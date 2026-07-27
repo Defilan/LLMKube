@@ -198,3 +198,116 @@ func TestUpdateStatusStoppedAndSuspendedReasonsDiffer(t *testing.T) {
 		t.Errorf("Stopped and Suspended reasons collapsed to %q; they must differ", stoppedCond.Reason)
 	}
 }
+
+// TestUpdateStatusAvailableFalseWhenNoReadyReplicas is the regression test for
+// #1303: Available must not stay True on a service that has stopped serving.
+//
+// determinePhase returns "Creating" whenever readyReplicas==0 &&
+// desiredReplicas>0, which covers the unplanned-outage path (drained node,
+// CrashLoopBackOff, metal host offline), so this is not a cold-start-only
+// concern. Before the fix, the Creating/Progressing/Pending/WaitingForGPU
+// cases left Available untouched and a previously-Ready service reported
+// Available=True/"ready and serving requests" for as long as it stayed down.
+//
+// Table covers every phase that can be reached with zero ready replicas so a
+// phase added later cannot regress the invariant unnoticed.
+func TestUpdateStatusAvailableFalseWhenNoReadyReplicas(t *testing.T) {
+	cases := []struct {
+		name       string
+		phase      string
+		wantReason string
+	}{
+		{"creating is the outage path", "Creating", "NoReadyReplicas"},
+		{"progressing with nothing ready", "Progressing", "NoReadyReplicas"},
+		{"pending", "Pending", "NoReadyReplicas"},
+		{"waiting for gpu", PhaseWaitingForGPU, "NoReadyReplicas"},
+		// Phases that set Available themselves keep their specific reason.
+		{"stopped keeps its own reason", PhaseStopped, "ManuallyScaledToZero"},
+		{"suspended keeps its own reason", PhaseSuspended, "Suspended"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "outage-isvc", Namespace: "default", Generation: 1,
+				},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "some-model",
+					Replicas: ptrInt32(1),
+				},
+			}
+			r := newStatusBuilderReconciler(t, isvc)
+			// Seed the stale True that the bug preserved.
+			seedReadyAvailable(t, ctx, r.Client, isvc)
+
+			if _, err := r.updateStatusWithSchedulingInfo(
+				ctx, isvc, tc.phase, true, 0, 1, "", "", nil); err != nil {
+				t.Fatalf("updateStatusWithSchedulingInfo: %v", err)
+			}
+
+			got := &inferencev1alpha1.InferenceService{}
+			if err := r.Client.Get(ctx, types.NamespacedName{
+				Name: isvc.Name, Namespace: isvc.Namespace,
+			}, got); err != nil {
+				t.Fatalf("get: %v", err)
+			}
+
+			cond := meta.FindStatusCondition(got.Status.Conditions, "Available")
+			if cond == nil {
+				t.Fatalf("Available condition missing for phase %q", tc.phase)
+			}
+			if cond.Status != metav1.ConditionFalse {
+				t.Errorf("phase %q: Available = %q, want False (0 ready replicas)",
+					tc.phase, cond.Status)
+			}
+			if cond.Reason != tc.wantReason {
+				t.Errorf("phase %q: Available reason = %q, want %q",
+					tc.phase, cond.Reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestUpdateStatusAvailableStaysTrueWithReadyReplicas guards the other
+// direction: the #1303 backstop must not fire when replicas are serving. A
+// partially-rolled deployment with some Ready replicas is still available,
+// matching Deployment semantics.
+func TestUpdateStatusAvailableStaysTrueWithReadyReplicas(t *testing.T) {
+	ctx := context.Background()
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "partial-isvc", Namespace: "default", Generation: 1,
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "some-model",
+			Replicas: ptrInt32(3),
+		},
+	}
+	r := newStatusBuilderReconciler(t, isvc)
+	seedReadyAvailable(t, ctx, r.Client, isvc)
+
+	// 1 of 3 ready: still serving, so Available must remain True.
+	if _, err := r.updateStatusWithSchedulingInfo(
+		ctx, isvc, "Progressing", true, 1, 3, "", "", nil); err != nil {
+		t.Fatalf("updateStatusWithSchedulingInfo: %v", err)
+	}
+
+	got := &inferencev1alpha1.InferenceService{}
+	if err := r.Client.Get(ctx, types.NamespacedName{
+		Name: isvc.Name, Namespace: isvc.Namespace,
+	}, got); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	cond := meta.FindStatusCondition(got.Status.Conditions, "Available")
+	if cond == nil {
+		t.Fatal("Available condition missing")
+	}
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("Available = %q, want True (1/3 replicas serving)", cond.Status)
+	}
+	if cond.Reason != "InferenceReady" {
+		t.Errorf("Available reason = %q, want InferenceReady", cond.Reason)
+	}
+}
