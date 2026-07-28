@@ -233,13 +233,16 @@ func testdataOwner(path string) (string, bool) {
 func fixtureFileChanges(entries []nameStatusEntry, prodPkgs map[string]bool) []string {
 	var out []string
 	for _, e := range entries {
-		owner, ok := testdataOwner(e.Path)
-		if !ok {
-			if e.OldPath == "" {
-				continue
-			}
-			owner, ok = testdataOwner(e.OldPath)
+		// Resolve the fixture's owning package from its PRE-change location:
+		// OldPath for a rename/copy (the package the fixture came from, which
+		// could have lost coverage), Path for a plain delete (no OldPath).
+		// Destination-first would miss a fixture moved OUT of a changed package
+		// into an untouched one, the exact dilution this catches (#1332).
+		lookup := e.Path
+		if e.OldPath != "" {
+			lookup = e.OldPath
 		}
+		owner, ok := testdataOwner(lookup)
 		if !ok || !prodPkgs[owner] {
 			continue
 		}

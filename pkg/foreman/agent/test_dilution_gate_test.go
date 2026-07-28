@@ -184,3 +184,28 @@ func TestFixtureFileChanges_DeleteAndRenameUnderChangedPkg(t *testing.T) {
 		t.Errorf("findings = %v", got)
 	}
 }
+
+func TestFixtureFileChanges_CrossPackageRenameOutOfChangedPkgFires(t *testing.T) {
+	// Moved OUT of a changed package into an untouched one: the changed
+	// package lost the fixture, so this must fire (was a false negative).
+	entries := []nameStatusEntry{
+		{Code: "R100", OldPath: "pkg/model/testdata/a.json", Path: "pkg/other/testdata/a.json"},
+	}
+	prod := map[string]bool{"pkg/model": true}
+	got := fixtureFileChanges(entries, prod)
+	if len(got) != 1 || !strings.Contains(got[0], "pkg/model/testdata/a.json -> pkg/other/testdata/a.json") {
+		t.Fatalf("expected a relocation finding attributed to the changed source package; got %v", got)
+	}
+}
+
+func TestFixtureFileChanges_CrossPackageRenameIntoChangedPkgSilent(t *testing.T) {
+	// Moved INTO a changed package from an untouched one: nothing was lost
+	// from the changed package, so this must stay silent (was a false positive).
+	entries := []nameStatusEntry{
+		{Code: "R100", OldPath: "pkg/other/testdata/a.json", Path: "pkg/model/testdata/a.json"},
+	}
+	prod := map[string]bool{"pkg/model": true}
+	if got := fixtureFileChanges(entries, prod); len(got) != 0 {
+		t.Fatalf("a fixture moved INTO the changed package must not fire; got %v", got)
+	}
+}
