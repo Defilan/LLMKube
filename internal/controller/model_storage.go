@@ -204,7 +204,14 @@ func buildModelInitCommand(isLocal, isS3, useCache bool, refreshPolicy string) s
 // good cache before any decision is made.
 //
 // Strategy (works for both origin and CDN-served files):
-//  1. HEAD the artifact and read Content-Length.
+//  1. HEAD the artifact and read Content-Length. This MUST use curl's
+//     -w '%header{content-length}' (curl 7.84+, satisfied by curlimages/curl):
+//     a HEAD has no response body, so -w '%{size_download}' would always report
+//     0 and the skip branch below could never fire. -L makes %header report the
+//     final CDN response's Content-Length across HuggingFace's 302 redirect.
+//     If the header is absent or the HEAD is rejected, remote_size is empty/0
+//     and the script downloads (size-equality is a truncation guard, not an
+//     integrity check).
 //  2. If the local file exists and its size matches Content-Length, the cache
 //     is current: log "revalidated" and skip the transfer.
 //  3. Otherwise download to "$dest.tmp" and `mv` it onto "$dest" on success,
@@ -218,7 +225,7 @@ func buildModelInitCommand(isLocal, isS3, useCache bool, refreshPolicy string) s
 // genuinely-missing file (nothing cached and the fetch failed) fails the init
 // container.
 const remoteRevalidateScript = `echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
-	`remote_size=$(curl -fsSL -I "$MODEL_SOURCE" -o /dev/null -w '%{size_download}' 2>/dev/null || echo 0); ` +
+	`remote_size=$(curl -fsSL -I "$MODEL_SOURCE" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0); ` +
 	`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 	`echo 'Model revalidated (unchanged, skipped download)'; ` +
 	`else ` +
@@ -406,7 +413,7 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 			`dest="$CACHE_DIR/$rel"; ` +
 			`mkdir -p "$(dirname "$dest")"; ` +
 			`url="${SOURCE%/}/$rel"; ` +
-			`remote_size=$(curl -fsSL -I "$url" -o /dev/null -w '%{size_download}' 2>/dev/null || echo 0); ` +
+			`remote_size=$(curl -fsSL -I "$url" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0); ` +
 			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
