@@ -119,9 +119,17 @@ func RunCoderGate(
 ) (pass bool, feedback string, advisories []advisory) {
 	var failures []checkFailure
 
-	// 1. gofmt -l . lists misformatted files on stdout and exits 0 even
-	// when files are listed, so the failure signal is non-empty output,
-	// not the exec error.
+	// 1. gofmt: auto-apply formatting rather than failing the coder on a
+	// mechanical step (#1327). Coders (especially smaller models) burn turns,
+	// sometimes their whole budget, hand-fixing gofmt via str_replace instead
+	// of doing the actual work. `gofmt -w .` rewrites misformatted files in
+	// place; the executor's `git add -A` (repo.Commit) commits them, mirroring
+	// the codegen-drift resolution below (#851). The tree is gofmt-clean in CI,
+	// so -w only touches the coder's own changes. Re-run `gofmt -l .`
+	// afterward: a file gofmt cannot rewrite (e.g. a syntax error) is still
+	// listed, so a genuine formatting problem surfaces rather than being
+	// silently swallowed.
+	run(ctx, workspace, nil, "gofmt", "-w", ".")
 	if out, _ := run(ctx, workspace, nil, "gofmt", "-l", "."); strings.TrimSpace(out) != "" {
 		failures = append(failures, checkFailure{name: "gofmt -l .", output: out})
 	}

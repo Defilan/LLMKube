@@ -137,6 +137,53 @@ func TestRunCoderGate(t *testing.T) {
 	}
 }
 
+// TestRunCoderGateAutoAppliesGofmt asserts the gate runs `gofmt -w .` to
+// auto-apply formatting and passes when gofmt can fix the tree, so a coder is
+// never sent back to hand-fix a mechanical formatting nit (#1327). The
+// rewritten files are left in the workspace for the executor's git add -A.
+func TestRunCoderGateAutoAppliesGofmt(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	var sawGofmtWrite bool
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "gofmt" && len(args) > 0 {
+			switch args[0] {
+			case "-w":
+				sawGofmtWrite = true // gofmt -w rewrites misformatted files in place
+				return "", nil
+			case "-l":
+				return "", nil // after -w the tree is clean
+			}
+		}
+		return "", nil // go vet/build/test and lint all pass
+	}
+	pass, feedback, _ := RunCoderGate(context.Background(), "/work", golangciPath, run, "", "main", nil)
+	if !sawGofmtWrite {
+		t.Error("gate did not run `gofmt -w .` to auto-apply formatting")
+	}
+	if !pass {
+		t.Errorf("gate should pass when gofmt can auto-fix the tree; feedback:\n%s", feedback)
+	}
+}
+
+// TestRunCoderGateGofmtUnfixableStillFails asserts that a file gofmt -w cannot
+// rewrite (for example a syntax error) still surfaces as a gofmt failure: the
+// auto-apply must not swallow a genuine problem.
+func TestRunCoderGateGofmtUnfixableStillFails(t *testing.T) {
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "gofmt" && len(args) > 0 && args[0] == "-l" {
+			return "internal/broken/parse_error.go\n", nil // still listed after -w
+		}
+		return "", nil
+	}
+	pass, feedback, _ := RunCoderGate(context.Background(), "/work", "./bin/golangci-lint", run, "", "main", nil)
+	if pass {
+		t.Error("gate should fail when gofmt cannot format a file")
+	}
+	if !strings.Contains(feedback, "gofmt -l .") {
+		t.Errorf("feedback should report the gofmt failure; got:\n%s", feedback)
+	}
+}
+
 // TestRunCoderGateLintEnv asserts the lint check receives GOOS=linux as an
 // extra env var while the other checks receive none.
 func TestRunCoderGateLintEnv(t *testing.T) {
