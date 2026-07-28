@@ -228,6 +228,11 @@ func TestMcpTool_Execute_SoftErrorOnCallToolFailure(t *testing.T) {
 	if records[0].Error != "boom" {
 		t.Fatalf("record.Error = %q, want %q", records[0].Error, "boom")
 	}
+	// A transport failure must set IsError so success accounting does not
+	// count it as a success (#1330).
+	if !records[0].IsError {
+		t.Fatalf("record.IsError = false, want true for a transport failure")
+	}
 	if records[0].Server != "fake" || records[0].Tool != "echo" {
 		t.Fatalf("record.Server/Tool = %q/%q, want fake/echo", records[0].Server, records[0].Tool)
 	}
@@ -291,6 +296,11 @@ func TestMcpTool_Execute_CallTimeout(t *testing.T) {
 	}
 	if records[0].Error == "" {
 		t.Fatalf("record.Error = %q, want non-empty (timeout should be recorded)", records[0].Error)
+	}
+	// The exact scenario in #1330: a timed-out call must record IsError so
+	// success metrics do not count it as a success.
+	if !records[0].IsError {
+		t.Fatalf("record.IsError = false, want true for a timed-out call")
 	}
 }
 

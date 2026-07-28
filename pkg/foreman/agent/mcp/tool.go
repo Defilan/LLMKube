@@ -52,11 +52,13 @@ type mcpCallRecord struct {
 	Truncated   bool
 	LatencyMs   int64
 	Error       string // "" on success; the callTool error string otherwise
-	// IsError reflects the remote server's tool-level isError flag: the
-	// call itself succeeded (no Go error, Error is "") but the tool
-	// reported its own failure (e.g. a bad lookup, an invalid argument
-	// the server validated itself). Distinct from Error, which is a
-	// transport/protocol failure.
+	// IsError is true whenever the call did not succeed, so success
+	// accounting can key on this single field (#1330). It covers two
+	// cases, told apart by Error:
+	//   - transport/protocol failure (timeout, dial error): Error is
+	//     non-empty.
+	//   - tool-level failure reported by the remote server (bad lookup,
+	//     invalid argument the server validated itself): Error is "".
 	IsError bool
 }
 
@@ -153,9 +155,15 @@ func (t *mcpTool) Execute(ctx context.Context, args json.RawMessage) (*agent.Too
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil {
+		// A transport/protocol failure (timeout, dial error) is a failed
+		// call: set IsError so success accounting keyed on it does not
+		// miscount the call as a success (#1330). Error stays populated so
+		// downstream can still tell a transport failure from a tool-level
+		// one (which sets IsError with an empty Error).
 		t.recordCall(args, mcpCallRecord{
 			LatencyMs: latency,
 			Error:     err.Error(),
+			IsError:   true,
 		})
 		return &agent.ToolResult{Output: "MCP error: " + err.Error()}, nil
 	}
