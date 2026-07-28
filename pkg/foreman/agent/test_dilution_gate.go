@@ -16,7 +16,12 @@ limitations under the License.
 
 package agent
 
-import "strings"
+import (
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+)
 
 // fileHunks holds the content (leading +/- stripped) of one file's added and
 // removed lines from a `git diff --unified=0` output.
@@ -111,4 +116,54 @@ func firstN(s []string, n int) []string {
 		return s[:n]
 	}
 	return s
+}
+
+var (
+	// urlHostRe captures the host of an http(s) URL string literal.
+	urlHostRe = regexp.MustCompile(`https?://([^/\s"'` + "`" + `]+)`)
+	// testdataPathRe captures a testdata/ file path literal.
+	testdataPathRe = regexp.MustCompile(`[\w./-]*testdata/[\w./-]+`)
+)
+
+// fixtureTokens extracts fixture-input identifiers from a set of diff lines:
+// URL hosts (prefixed "host:") and testdata/ paths (prefixed "path:"). The
+// prefix keeps the two kinds from colliding in the set-difference below.
+func fixtureTokens(lines []string) map[string]bool {
+	set := map[string]bool{}
+	for _, l := range lines {
+		for _, m := range urlHostRe.FindAllStringSubmatch(l, -1) {
+			set["host:"+m[1]] = true
+		}
+		for _, m := range testdataPathRe.FindAllString(l, -1) {
+			set["path:"+m] = true
+		}
+	}
+	return set
+}
+
+// fixtureLiteralChurn flags a fixture input that was changed in place: a host
+// or testdata path present only on the removed side while a different one
+// appears only on the added side. This is relocation (the #1322 signature),
+// distinct from a pure fixture addition (added only) or deletion (removed
+// only), both of which return nil. Deterministic: tokens are sorted.
+func fixtureLiteralChurn(fh *fileHunks) []string {
+	rem := fixtureTokens(fh.Removed)
+	add := fixtureTokens(fh.Added)
+	var gone, appeared []string
+	for tkn := range rem {
+		if !add[tkn] {
+			gone = append(gone, tkn)
+		}
+	}
+	for tkn := range add {
+		if !rem[tkn] {
+			appeared = append(appeared, tkn)
+		}
+	}
+	if len(gone) == 0 || len(appeared) == 0 {
+		return nil
+	}
+	sort.Strings(gone)
+	sort.Strings(appeared)
+	return []string{fmt.Sprintf("fixture input changed (removed %v, added %v)", gone, appeared)}
 }

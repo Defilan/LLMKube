@@ -2,6 +2,7 @@ package agent
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -87,5 +88,38 @@ func TestFirstN(t *testing.T) {
 	}
 	if got := firstN([]string{"a"}, 3); len(got) != 1 {
 		t.Fatalf("firstN under-length failed: %v", got)
+	}
+}
+
+func TestFixtureLiteralChurn_HostRelocation(t *testing.T) {
+	// The #1322 shape: a fixture URL host moved off huggingface.co.
+	fh := &fileHunks{
+		Removed: []string{`	src := "https://huggingface.co/org/model/resolve/main/f.gguf"`},
+		Added:   []string{`	src := "https://example.com/org/model/resolve/main/f.gguf"`},
+	}
+	got := fixtureLiteralChurn(fh)
+	if len(got) != 1 || !strings.Contains(got[0], "huggingface.co") || !strings.Contains(got[0], "example.com") {
+		t.Fatalf("expected a host-churn finding naming both hosts; got %q", got)
+	}
+}
+
+func TestFixtureLiteralChurn_PureAdditionSilent(t *testing.T) {
+	// Adding a new fixture (no matching removal) is not relocation.
+	fh := &fileHunks{
+		Added: []string{`	src := "https://huggingface.co/org/model/f.gguf"`},
+	}
+	if got := fixtureLiteralChurn(fh); got != nil {
+		t.Fatalf("pure addition must not flag churn; got %q", got)
+	}
+}
+
+func TestFixtureLiteralChurn_TestdataPathRelocation(t *testing.T) {
+	fh := &fileHunks{
+		Removed: []string{`	data := load("pkg/model/testdata/real_repo.json")`},
+		Added:   []string{`	data := load("pkg/model/testdata/renamed_repo.json")`},
+	}
+	got := fixtureLiteralChurn(fh)
+	if len(got) != 1 || !strings.Contains(got[0], "testdata/") {
+		t.Fatalf("expected a testdata path-churn finding; got %q", got)
 	}
 }
