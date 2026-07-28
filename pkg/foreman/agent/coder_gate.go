@@ -119,65 +119,80 @@ func RunCoderGate(
 ) (pass bool, feedback string, advisories []advisory) {
 	var failures []checkFailure
 
-	// 1. gofmt: auto-apply formatting rather than failing the coder on a
-	// mechanical step (#1327). Coders (especially smaller models) burn turns,
-	// sometimes their whole budget, hand-fixing gofmt via str_replace instead
-	// of doing the actual work. `gofmt -w .` rewrites misformatted files in
-	// place; the executor's `git add -A` (repo.Commit) commits them, mirroring
-	// the codegen-drift resolution below (#851). The tree is gofmt-clean in CI,
-	// so -w only touches the coder's own changes. Re-run `gofmt -l .`
-	// afterward: a file gofmt cannot rewrite (e.g. a syntax error) is still
-	// listed, so a genuine formatting problem surfaces rather than being
-	// silently swallowed. The -w exit status is intentionally ignored: any
-	// file it could not rewrite is reported by the -l re-check immediately
-	// below.
-	_, _ = run(ctx, workspace, nil, "gofmt", "-w", ".")
-	if out, _ := run(ctx, workspace, nil, "gofmt", "-l", "."); strings.TrimSpace(out) != "" {
-		failures = append(failures, checkFailure{name: "gofmt -l .", output: out})
-	}
-
-	// 2. go vet ./... fails with a non-nil error.
-	if out, err := run(ctx, workspace, nil, "go", "vet", "./..."); err != nil {
-		failures = append(failures, checkFailure{name: "go vet ./...", output: out})
-	}
-
-	// 3. go build ./... fails with a non-nil error.
-	if out, err := run(ctx, workspace, nil, "go", "build", "./..."); err != nil {
-		failures = append(failures, checkFailure{name: "go build ./...", output: out})
-	}
-
-	// 4. golangci-lint run ./... fails with a non-nil error. GOOS=linux is
-	// required: on macOS, plain lint silently skips //go:build !darwin
-	// files and would not match CI. GOLANGCI_LINT_CACHE is scoped to a
-	// per-workspace sibling directory so stale analysis results from
-	// another coder workspace cannot pollute this run's lint (#759); the
-	// sibling location keeps the cache out of the workspace git tree.
-	lintEnv := []string{"GOOS=linux", "GOLANGCI_LINT_CACHE=" + workspace + ".golangci-cache"}
-	if out, err := run(ctx, workspace, lintEnv, golangciPath, "run", "./..."); err != nil {
-		failures = append(failures, checkFailure{name: golangciPath + " run ./...", output: out})
-	}
-
-	// 5. Fast unit-test tier: go test on the non-envtest packages the coder
-	// changed. The static checks above cannot catch a failing or panicking
-	// unit test, so a broken test would otherwise reach a GO and only fail
-	// in CI (#762). Envtest/integration packages are excluded (they need
-	// KUBEBUILDER_ASSETS / a cluster the workspace lacks; CI runs them).
-	if pkgs := changedTestPackages(ctx, workspace, run); len(pkgs) > 0 {
-		args := append([]string{"test", "-count=1", "-timeout=180s"}, pkgs...)
-		if out, err := run(ctx, workspace, nil, "go", args...); err != nil {
-			failures = append(failures, checkFailure{name: "go test " + strings.Join(pkgs, " "), output: out})
+	// Checks 1-6 exercise the Go toolchain (gofmt, go vet, go build,
+	// golangci-lint, the unit-test tier, and codegen regeneration). A diff
+	// that changes no Go source (a docs- or config-only edit) cannot fail
+	// any of them, so running them wastes turns and, worse, surfaces a
+	// toolchain/env error the model cannot act on: an agent-image go.mod
+	// version wall reported as "go build ./... failed" is fed back as "fix
+	// the issues below and resubmit", burning the fix-attempt budget on an
+	// unfixable premise (#1292). Skip the whole Go tier when nothing Go
+	// changed, mirroring the diff-awareness the verify gate learned in
+	// #1072. The diff-aware checks below (goreleaser, scope-overlap,
+	// test-presence, mutation, reference-grounding) are already path-scoped
+	// and still run -- reference-grounding in particular is what validates a
+	// docs-only change.
+	if goToolchainRelevantChange(ctx, workspace, run) {
+		// 1. gofmt: auto-apply formatting rather than failing the coder on a
+		// mechanical step (#1327). Coders (especially smaller models) burn turns,
+		// sometimes their whole budget, hand-fixing gofmt via str_replace instead
+		// of doing the actual work. `gofmt -w .` rewrites misformatted files in
+		// place; the executor's `git add -A` (repo.Commit) commits them, mirroring
+		// the codegen-drift resolution below (#851). The tree is gofmt-clean in CI,
+		// so -w only touches the coder's own changes. Re-run `gofmt -l .`
+		// afterward: a file gofmt cannot rewrite (e.g. a syntax error) is still
+		// listed, so a genuine formatting problem surfaces rather than being
+		// silently swallowed. The -w exit status is intentionally ignored: any
+		// file it could not rewrite is reported by the -l re-check immediately
+		// below.
+		_, _ = run(ctx, workspace, nil, "gofmt", "-w", ".")
+		if out, _ := run(ctx, workspace, nil, "gofmt", "-l", "."); strings.TrimSpace(out) != "" {
+			failures = append(failures, checkFailure{name: "gofmt -l .", output: out})
 		}
-	}
 
-	// 6. Codegen drift: regenerate manifests/CRDs/deepcopy and deterministically
-	// resolve any drift confined to generated artifacts, rather than failing the
-	// coder on a mechanical step it was already told to run (#851). Regenerated
-	// generated files are left in the workspace and committed by the executor's
-	// `git add -A` (repo.Commit). Only a make error, or regeneration touching a
-	// NON-generated file, is reported as a failure. Skipped gracefully if
-	// controller-gen is unavailable. (Originally a hard drift check, #775.)
-	if failed, out := resolveCodegenDrift(ctx, workspace, run); failed {
-		failures = append(failures, checkFailure{name: "codegen drift", output: out})
+		// 2. go vet ./... fails with a non-nil error.
+		if out, err := run(ctx, workspace, nil, "go", "vet", "./..."); err != nil {
+			failures = append(failures, checkFailure{name: "go vet ./...", output: out})
+		}
+
+		// 3. go build ./... fails with a non-nil error.
+		if out, err := run(ctx, workspace, nil, "go", "build", "./..."); err != nil {
+			failures = append(failures, checkFailure{name: "go build ./...", output: out})
+		}
+
+		// 4. golangci-lint run ./... fails with a non-nil error. GOOS=linux is
+		// required: on macOS, plain lint silently skips //go:build !darwin
+		// files and would not match CI. GOLANGCI_LINT_CACHE is scoped to a
+		// per-workspace sibling directory so stale analysis results from
+		// another coder workspace cannot pollute this run's lint (#759); the
+		// sibling location keeps the cache out of the workspace git tree.
+		lintEnv := []string{"GOOS=linux", "GOLANGCI_LINT_CACHE=" + workspace + ".golangci-cache"}
+		if out, err := run(ctx, workspace, lintEnv, golangciPath, "run", "./..."); err != nil {
+			failures = append(failures, checkFailure{name: golangciPath + " run ./...", output: out})
+		}
+
+		// 5. Fast unit-test tier: go test on the non-envtest packages the coder
+		// changed. The static checks above cannot catch a failing or panicking
+		// unit test, so a broken test would otherwise reach a GO and only fail
+		// in CI (#762). Envtest/integration packages are excluded (they need
+		// KUBEBUILDER_ASSETS / a cluster the workspace lacks; CI runs them).
+		if pkgs := changedTestPackages(ctx, workspace, run); len(pkgs) > 0 {
+			args := append([]string{"test", "-count=1", "-timeout=180s"}, pkgs...)
+			if out, err := run(ctx, workspace, nil, "go", args...); err != nil {
+				failures = append(failures, checkFailure{name: "go test " + strings.Join(pkgs, " "), output: out})
+			}
+		}
+
+		// 6. Codegen drift: regenerate manifests/CRDs/deepcopy and deterministically
+		// resolve any drift confined to generated artifacts, rather than failing the
+		// coder on a mechanical step it was already told to run (#851). Regenerated
+		// generated files are left in the workspace and committed by the executor's
+		// `git add -A` (repo.Commit). Only a make error, or regeneration touching a
+		// NON-generated file, is reported as a failure. Skipped gracefully if
+		// controller-gen is unavailable. (Originally a hard drift check, #775.)
+		if failed, out := resolveCodegenDrift(ctx, workspace, run); failed {
+			failures = append(failures, checkFailure{name: "codegen drift", output: out})
+		}
 	}
 
 	// 7. Goreleaser config check: when .goreleaser.yaml or any
@@ -793,6 +808,40 @@ func checkReferenceGrounding(ctx context.Context, workspace string, run commandR
 		fmt.Fprintf(&b, "  - %s\n", f.String())
 	}
 	return true, b.String()
+}
+
+// goToolchainRelevantChange reports whether the coder's working-tree diff
+// touches any file the Go toolchain tier (gofmt, go vet, go build,
+// golangci-lint, the unit-test tier, codegen) could act on: a .go file
+// (test or not) or a module file (go.mod/go.sum). It stages everything with
+// `git add -A` and diffs against HEAD with `git diff --name-only --cached`,
+// the same working-tree basis the rest of the gate uses (the gate runs
+// before any commit, so `...HEAD` alone would see nothing). Test files are
+// deliberately included: a _test.go-only change must still vet/build/test.
+//
+// It is fail-safe: a git error returns true, so a bad diff signal runs the
+// checks rather than skipping them. When it returns false -- a docs- or
+// config-only diff -- the Go tier is skipped so the coder is not blocked on,
+// or fed, a Go check it cannot make pass (#1292).
+func goToolchainRelevantChange(ctx context.Context, workspace string, run commandRunner) bool {
+	if _, err := run(ctx, workspace, nil, "git", "add", "-A"); err != nil {
+		return true
+	}
+	out, err := run(ctx, workspace, nil, "git", "diff", "--name-only", "--cached", "HEAD")
+	if err != nil {
+		return true
+	}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		base := filepath.Base(line)
+		if strings.HasSuffix(line, ".go") || base == "go.mod" || base == "go.sum" {
+			return true
+		}
+	}
+	return false
 }
 
 // changedWorkingTreeGoFiles returns the workspace-relative Go file paths that
