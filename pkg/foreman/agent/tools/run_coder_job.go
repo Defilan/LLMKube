@@ -120,16 +120,28 @@ type RunCoderJobConfig struct {
 	// the watcher's --git-remote-url.
 	GitRemoteURL string
 
-	// CommitAuthorName is the git author + committer name run-task stamps
-	// onto the produced branch. Passed through as --commit-author-name;
-	// omitted when empty so run-task falls back to its own default.
+	// CommitAuthorName is the git author name run-task stamps onto the
+	// produced branch. Passed through as --commit-author-name; omitted
+	// when empty so run-task falls back to its own default.
 	CommitAuthorName string
 
-	// CommitAuthorEmail is the git author + committer email run-task
-	// stamps onto the produced branch. Passed through as
-	// --commit-author-email; omitted when empty (coder tasks that commit
-	// then fail cleanly). Mirrors the watcher's --commit-author-email.
+	// CommitAuthorEmail is the git author email run-task stamps onto the
+	// produced branch. Passed through as --commit-author-email; omitted
+	// when empty (coder tasks that commit then fail cleanly). Mirrors the
+	// watcher's --commit-author-email.
 	CommitAuthorEmail string
+
+	// CommitCommitterName is the git committer name for the DCO sign-off
+	// trailer. Passed through as --commit-committer-name; omitted when
+	// empty so run-task falls back to --commit-author-name. Lets a human
+	// committer produce a human Signed-off-by trailer while authorship
+	// still credits the bot (#1281).
+	CommitCommitterName string
+
+	// CommitCommitterEmail is the git committer email for the DCO
+	// sign-off trailer. Passed through as --commit-committer-email;
+	// omitted when empty so run-task falls back to --commit-author-email.
+	CommitCommitterEmail string
 
 	// Resources, when non-nil, overrides the coder container's resource
 	// requests + limits (from Agent.spec.execution.resources). Any field
@@ -314,6 +326,8 @@ func (r *RunCoderJob) Run(ctx context.Context, args RunCoderJobArgs) (CoderJobRe
 		GitRemoteURL:            cfg.GitRemoteURL,
 		CommitAuthorName:        cfg.CommitAuthorName,
 		CommitAuthorEmail:       cfg.CommitAuthorEmail,
+		CommitCommitterName:     cfg.CommitCommitterName,
+		CommitCommitterEmail:    cfg.CommitCommitterEmail,
 		Resources:               cfg.Resources,
 	})
 	if err != nil {
@@ -495,6 +509,8 @@ type coderRendererInput struct {
 	GitRemoteURL            string
 	CommitAuthorName        string
 	CommitAuthorEmail       string
+	CommitCommitterName     string
+	CommitCommitterEmail    string
 
 	// Resources, when non-nil, replaces the container resources the
 	// string fields above produce. Applied after the template unmarshals
