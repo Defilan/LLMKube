@@ -191,11 +191,25 @@ func buildModelInitCommand(isLocal, isS3, useCache bool, refreshPolicy string) s
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
-// sources fetched by the init container. It uses curl's native conditional
-// GET (--etag-compare / --etag-save) against a marker file kept next to the
-// model on the PVC: on a 304 curl leaves the cached file untouched, on a 200
-// (ETag changed) it overwrites in place. The cache layout is unchanged; the
-// marker is a dotfile sibling of the model file.
+// sources fetched by the init container. It revalidates the cached artifact
+// before transferring, so a warm cache skips the download entirely.
+//
+// Why not curl --etag-compare/--etag-save: HuggingFace serves LFS-backed
+// weights via a 302 redirect to a signed CDN URL on a different host, and the
+// If-None-Match conditional header is not forwarded across that redirect hop,
+// so the CDN always streams the full body. A 304 is therefore unreachable for
+// any LFS artifact, and --etag-compare can only ever short-circuit the small
+// origin-served config files. On top of that, `curl -o "$dest"` truncates the
+// cached file at request start, so a failed or full-200 transfer destroys the
+// good cache before any decision is made.
+//
+// Strategy (works for both origin and CDN-served files):
+//  1. HEAD the artifact and read Content-Length.
+//  2. If the local file exists and its size matches Content-Length, the cache
+//     is current: log "revalidated" and skip the transfer.
+//  3. Otherwise download to "$dest.tmp" and `mv` it onto "$dest" on success,
+//     so a redundant or failed transfer can never truncate a good cache. The
+//     rename also makes the artifact publish atomically.
 //
 // Robustness: the init container gates pod startup, so a transient network
 // failure (air-gapped, upstream 5xx, DNS) must not take down an
@@ -203,17 +217,15 @@ func buildModelInitCommand(isLocal, isS3, useCache bool, refreshPolicy string) s
 // already exists, the script logs and exits 0, keeping the cached file. Only a
 // genuinely-missing file (nothing cached and the fetch failed) fails the init
 // container.
-//
-// curlimages/curl 8.x supports --etag-compare/--etag-save (added in curl
-// 7.68.0), so no HEAD-compare fallback is needed for the default image.
-const remoteRevalidateScript = `ETAG_MARKER="$(dirname "$MODEL_PATH")/.$(basename "$MODEL_PATH").etag"; ` +
-	`echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
-	`if curl -fsSL --etag-compare "$ETAG_MARKER" --etag-save "$ETAG_MARKER" -o "$MODEL_PATH" "$MODEL_SOURCE"; then ` +
-	`echo 'Model revalidated (downloaded or unchanged)'; ` +
-	`elif [ -f "$MODEL_PATH" ]; then ` +
-	`echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
+const remoteRevalidateScript = `echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
+	`remote_size=$(curl -fsSL -I "$MODEL_SOURCE" -o /dev/null -w '%{size_download}' 2>/dev/null || echo 0); ` +
+	`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
+	`echo 'Model revalidated (unchanged, skipped download)'; ` +
 	`else ` +
-	`echo 'ERROR: model missing and revalidation failed'; exit 1; ` +
+	`if curl -fsSL -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"; then ` +
+	`echo 'Model revalidated (downloaded)'; ` +
+	`elif [ -f "$MODEL_PATH" ]; then echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
+	`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
 	`fi`
 
 func modelInitEnvVars(source, cacheDir, modelPath string) []corev1.EnvVar {
@@ -394,11 +406,15 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 			`dest="$CACHE_DIR/$rel"; ` +
 			`mkdir -p "$(dirname "$dest")"; ` +
 			`url="${SOURCE%/}/$rel"; ` +
-			`etag="$(dirname "$dest")/.$(basename "$dest").etag"; ` +
-			`if curl -fsSL --etag-compare "$etag" --etag-save "$etag" -o "$dest" "$url"; then ` +
-			`echo "Model artifact $rel revalidated"; ` +
+			`remote_size=$(curl -fsSL -I "$url" -o /dev/null -w '%{size_download}' 2>/dev/null || echo 0); ` +
+			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
+			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
+			`else ` +
+			`if curl -fsSL -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
+			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
+			`fi; ` +
 			`done`
 		return prefix + body
 	}
