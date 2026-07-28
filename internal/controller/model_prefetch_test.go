@@ -78,10 +78,10 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(prefetchEligible(m)).To(BeFalse())
 		})
 
-		It("is true for hf:// sources (normalized to https)", func() {
+		It("is false for hf:// sources (HF-repo sources are runtime-resolved, not prefetched)", func() {
 			m := newPrefetchModel("x")
-			m.Spec.Source = "hf://org/repo/model.gguf"
-			Expect(prefetchEligible(m)).To(BeTrue())
+			m.Spec.Source = "hf://org/repo"
+			Expect(prefetchEligible(m)).To(BeFalse())
 		})
 
 		It("is true for https sources", func() {

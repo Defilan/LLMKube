@@ -94,7 +94,7 @@ var _ = Describe("InferenceService Controller", func() {
 						Namespace: "default",
 					},
 					Spec: inferencev1alpha1.ModelSpec{
-						Source:       "https://huggingface.co/test/model.gguf",
+						Source:       "https://example.com/model.gguf",
 						Format:       "gguf",
 						Quantization: "Q4_K_M",
 						Hardware:     &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
@@ -181,7 +181,7 @@ var _ = Describe("Multi-GPU End-to-End Reconciliation", func() {
 						Namespace: "default",
 					},
 					Spec: inferencev1alpha1.ModelSpec{
-						Source:       "https://huggingface.co/test/multi-gpu-model.gguf",
+						Source:       "https://example.com/multi-gpu-model.gguf",
 						Format:       "gguf",
 						Quantization: "Q4_K_M",
 						Hardware: &inferencev1alpha1.HardwareSpec{

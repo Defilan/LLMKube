@@ -222,6 +222,13 @@ func hasNoUsableRoot(allowedRoots []string) bool {
 // that a case-sensitive classifier had failed to route to the guarded
 // remote-source path (GHSA-jw3m-8q7m-f35r).
 func isRemoteHTTPSource(source string) bool {
+	// HuggingFace URLs are HF-repo sources (runtime-resolved), not single-file
+	// HTTP downloads. Excluding them here keeps the source classifiers mutually
+	// exclusive: a huggingface.co URL matches isHFRepoSource, not
+	// isRemoteHTTPSource, so Reconcile's dispatch order stays non-load-bearing.
+	if isHuggingFaceURL(source) {
+		return false
+	}
 	return hasSchemeFold(source, "https://") || hasSchemeFold(source, "http://")
 }
 

@@ -441,8 +441,11 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 	// is populated. If a future change widens or narrows what this matcher
 	// considers HTTP(S), the dispatch in Reconcile() flips silently, so this
 	// matcher needs explicit, exhaustive cases.
-	It("should return true for https URL", func() {
-		Expect(isRemoteHTTPSource("https://huggingface.co/org/repo/resolve/main/model.gguf")).To(BeTrue())
+	It("should return false for huggingface.co URL (HF-repo source, not remote HTTP)", func() {
+		Expect(isRemoteHTTPSource("https://huggingface.co/org/repo/resolve/main/model.gguf")).To(BeFalse())
+	})
+	It("should return true for non-huggingface https URL", func() {
+		Expect(isRemoteHTTPSource("https://example.com/model.gguf")).To(BeTrue())
 	})
 	It("should return true for http URL", func() {
 		Expect(isRemoteHTTPSource("http://example.com/model.gguf")).To(BeTrue())
