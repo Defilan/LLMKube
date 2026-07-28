@@ -233,6 +233,18 @@ func dilutionRunner(nameStatus, testDiff string, addErr, nsErr, diffErr error) c
 	}
 }
 
+// erosionNS + erosionDiff describe a genuine dilution: a changed-prod package
+// (pkg/model) whose test net-removes an assertion. A fail-open test feeds these
+// plus one non-nil git error, so that WITHOUT the checked error branch execution
+// would reach this finding and return (true, ...); only the fail-open return
+// keeps it silent. That makes each fail-open test isolate its branch.
+const erosionNS = "M\tpkg/model/classifier.go\nM\tpkg/model/classifier_test.go\n"
+const erosionDiff = `--- a/pkg/model/classifier_test.go
++++ b/pkg/model/classifier_test.go
+@@ -10 +9 @@
+-	Expect(classify(u)).To(Equal(RepoSource))
+`
+
 func TestCheckTestDilution_FiresOnNetRemovedAssertions(t *testing.T) {
 	ns := "M\tpkg/model/classifier.go\nM\tpkg/model/classifier_test.go\n"
 	diff := `--- a/pkg/model/classifier_test.go
@@ -296,27 +308,26 @@ func TestCheckTestDilution_SilentWhenNoProdChange(t *testing.T) {
 }
 
 func TestCheckTestDilution_FailOpenOnGitError(t *testing.T) {
+	// name-status call errors: must fail open even though a real dilution is present.
 	if failed, out := checkTestDilution(context.Background(), "/w",
-		dilutionRunner("", "", nil, errors.New("boom"), nil)); failed || out != "" {
-		t.Fatalf("git error must fail open (silent); got failed=%v out=%q", failed, out)
+		dilutionRunner(erosionNS, erosionDiff, nil, errors.New("boom"), nil)); failed || out != "" {
+		t.Fatalf("name-status error must fail open (silent) despite a real dilution; got failed=%v out=%q", failed, out)
 	}
 }
 
 func TestCheckTestDilution_FailOpenOnAddError(t *testing.T) {
-	// git add -A failing must fail open (silent): exercises the stage-error branch.
+	// git add -A errors: must fail open even though a real dilution is present.
 	if failed, out := checkTestDilution(context.Background(), "/w",
-		dilutionRunner("", "", errors.New("boom"), nil, nil)); failed || out != "" {
-		t.Fatalf("git add error must fail open (silent); got failed=%v out=%q", failed, out)
+		dilutionRunner(erosionNS, erosionDiff, errors.New("boom"), nil, nil)); failed || out != "" {
+		t.Fatalf("git add error must fail open (silent) despite a real dilution; got failed=%v out=%q", failed, out)
 	}
 }
 
 func TestCheckTestDilution_FailOpenOnDiffError(t *testing.T) {
-	// The unified-diff call failing must fail open. A production change is present
-	// so execution reaches the diff call (past the no-prod-change early return).
-	ns := "M\tpkg/model/classifier.go\n"
+	// unified-diff call errors: must fail open even though a real dilution is present.
 	if failed, out := checkTestDilution(context.Background(), "/w",
-		dilutionRunner(ns, "", nil, nil, errors.New("boom"))); failed || out != "" {
-		t.Fatalf("unified-diff error must fail open (silent); got failed=%v out=%q", failed, out)
+		dilutionRunner(erosionNS, erosionDiff, nil, nil, errors.New("boom"))); failed || out != "" {
+		t.Fatalf("unified-diff error must fail open (silent) despite a real dilution; got failed=%v out=%q", failed, out)
 	}
 }
 
