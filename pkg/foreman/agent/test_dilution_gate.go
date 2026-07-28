@@ -265,9 +265,6 @@ func fixtureFileChanges(entries []nameStatusEntry, prodPkgs map[string]bool) []s
 //
 // Fail-open: any git error, or no production change in the submission, returns
 // (false, "") so a bad diff signal or a docs-only change stays silent.
-// nolint:unparam // workspace is parameterized to match the commandRunner-based
-// gate-check shape (see gateCheckRegistry in coder_gate.go); only the test file
-// calls this today and all its cases use "/w".
 func checkTestDilution(ctx context.Context, workspace string, run commandRunner) (bool, string) {
 	// Stage the working tree so a pre-commit diff includes new/untracked files.
 	// Idempotent with the executor's later `git add -A`; the -A exit status is

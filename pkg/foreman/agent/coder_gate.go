@@ -308,6 +308,17 @@ func gateCheckRegistry(issueText, evidenceBaseSHA string, evidence []grounding.E
 				return checkIssueExample(issueText)(ctx, ws, run)
 			},
 		},
+		{
+			// test-dilution (#1332): advisory. Surfaces to the reviewer when a
+			// submission that changes production code also weakens the tests
+			// covering it (net-removed assertions, relocated/deleted fixtures).
+			// No lang: fixture and assertion erosion are not Go-specific in
+			// principle, and the check is fail-open on any language it cannot
+			// parse. Never blocks; the coder never sees it.
+			name: "test-dilution",
+			tier: tierAdvisory,
+			fn:   checkTestDilution,
+		},
 	}
 }
 

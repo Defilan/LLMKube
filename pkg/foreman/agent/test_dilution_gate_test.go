@@ -344,3 +344,39 @@ func TestCheckTestDilution_SilentWhenErosionInUnchangedPackage(t *testing.T) {
 		t.Fatal("erosion in a package with no production change must not fire (package linkage)")
 	}
 }
+
+func TestTestDilution_RegisteredAsAdvisory(t *testing.T) {
+	var found bool
+	var tier gateTier
+	for _, c := range gateCheckRegistry("", "", nil) {
+		if c.name == "test-dilution" {
+			found = true
+			tier = c.tier
+		}
+	}
+	if !found {
+		t.Fatal(`gateCheckRegistry is missing the "test-dilution" check`)
+	}
+	if tier != tierAdvisory {
+		t.Errorf("test-dilution tier = %v, want tierAdvisory", tier)
+	}
+}
+
+func TestTestDilution_SurfacesAsAdvisoryNotBlocking(t *testing.T) {
+	ns := "M\tpkg/model/classifier.go\nM\tpkg/model/classifier_test.go\n"
+	diff := `--- a/pkg/model/classifier_test.go
++++ b/pkg/model/classifier_test.go
+@@ -20 +20 @@
+-	src := "https://huggingface.co/org/model/f.gguf"
++	src := "https://example.com/org/model/f.gguf"
+`
+	run := dilutionRunner(ns, diff, nil, nil, nil)
+	blocking, advisories := runGateChecks(context.Background(), "/w", run,
+		[]gateCheck{{name: "test-dilution", tier: tierAdvisory, fn: checkTestDilution}})
+	if len(blocking) != 0 {
+		t.Errorf("test-dilution must never block; got %d blocking", len(blocking))
+	}
+	if len(advisories) != 1 || advisories[0].Check != "test-dilution" {
+		t.Fatalf("expected one test-dilution advisory; got %+v", advisories)
+	}
+}
