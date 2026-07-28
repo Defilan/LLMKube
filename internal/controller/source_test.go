@@ -150,6 +150,24 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	It("should return true for hf:// with multi-part path", func() {
 		Expect(isHFRepoSource("hf://org/deep/nested/repo")).To(BeTrue())
 	})
+	It("should return true for https huggingface.co URL", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
+	})
+	It("should return true for https huggingface.co URL with trailing slash", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/")).To(BeTrue())
+	})
+	It("should return true for https huggingface.co tree URL", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")).To(BeTrue())
+	})
+	It("should return true for https huggingface.co blob URL", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/config.json")).To(BeTrue())
+	})
+	It("should return true for https huggingface.co resolve URL", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")).To(BeTrue())
+	})
+	It("should return true for http huggingface.co URL", func() {
+		Expect(isHFRepoSource("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
+	})
 	It("should return false for https URL", func() {
 		Expect(isHFRepoSource("https://example.com/model.gguf")).To(BeFalse())
 	})
@@ -176,6 +194,79 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	})
 	It("should return true for multi-part nested path", func() {
 		Expect(isHFRepoSource("multi/part/path/thing")).To(BeTrue())
+	})
+})
+
+var _ = Describe("isHuggingFaceURL (source.go)", func() {
+	It("should return true for https huggingface.co URL", func() {
+		Expect(isHuggingFaceURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
+	})
+	It("should return true for http huggingface.co URL", func() {
+		Expect(isHuggingFaceURL("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
+	})
+	It("should return true for https with www prefix", func() {
+		Expect(isHuggingFaceURL("https://www.huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
+	})
+	It("should return true for case-variant HTTPS scheme", func() {
+		Expect(isHuggingFaceURL("HTTPS://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
+	})
+	It("should return false for non-huggingface https URL", func() {
+		Expect(isHuggingFaceURL("https://example.com/model.gguf")).To(BeFalse())
+	})
+	It("should return false for bare repo ID", func() {
+		Expect(isHuggingFaceURL("Qwen/Qwen3.6-35B-A3B")).To(BeFalse())
+	})
+	It("should return false for empty string", func() {
+		Expect(isHuggingFaceURL("")).To(BeFalse())
+	})
+})
+
+var _ = Describe("extractHFRepoFromURL (source.go)", func() {
+	It("should extract repo ID from landing page URL", func() {
+		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B")
+		Expect(ok).To(BeTrue())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should extract repo ID from URL with trailing slash", func() {
+		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/")
+		Expect(ok).To(BeTrue())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should extract repo ID and revision from tree URL", func() {
+		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")
+		Expect(ok).To(BeTrue())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal("main"))
+	})
+	It("should extract repo ID and revision from blob URL", func() {
+		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")
+		Expect(ok).To(BeTrue())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal("v1.0"))
+	})
+	It("should extract repo ID and revision from resolve URL", func() {
+		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")
+		Expect(ok).To(BeTrue())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal("main"))
+	})
+	It("should return ok=false for non-huggingface URL", func() {
+		_, _, ok := extractHFRepoFromURL("https://example.com/model.gguf")
+		Expect(ok).To(BeFalse())
+	})
+	It("should return ok=false for URL with only namespace", func() {
+		_, _, ok := extractHFRepoFromURL("https://huggingface.co/Qwen")
+		Expect(ok).To(BeFalse())
+	})
+	It("should return ok=false for datasets URL", func() {
+		_, _, ok := extractHFRepoFromURL("https://huggingface.co/datasets/org/repo")
+		Expect(ok).To(BeFalse())
+	})
+	It("should return ok=false for spaces URL", func() {
+		_, _, ok := extractHFRepoFromURL("https://huggingface.co/spaces/org/repo")
+		Expect(ok).To(BeFalse())
 	})
 })
 
@@ -209,6 +300,46 @@ var _ = Describe("parseHFSource (source.go)", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(repoID).To(Equal("org/repo"))
 		Expect(revision).To(Equal("abc123def456"))
+	})
+	It("should parse https huggingface.co URL without revision", func() {
+		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should parse https huggingface.co URL with trailing slash", func() {
+		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should parse https huggingface.co tree URL with revision", func() {
+		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal("main"))
+	})
+	It("should parse https huggingface.co blob URL with revision", func() {
+		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal("v1.0"))
+	})
+	It("should parse https huggingface.co resolve URL with revision", func() {
+		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal("main"))
+	})
+	It("should parse http huggingface.co URL", func() {
+		repoID, revision, err := parseHFSource("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
+		Expect(revision).To(Equal(""))
+	})
+	It("should error on huggingface.co URL with only namespace", func() {
+		_, _, err := parseHFSource("https://huggingface.co/Qwen")
+		Expect(err).To(HaveOccurred())
 	})
 	It("should error on empty hf source", func() {
 		_, _, err := parseHFSource("hf://")
@@ -245,6 +376,12 @@ var _ = Describe("validateHFRepoSource (source.go)", func() {
 	It("should accept bare repo ID with @rev", func() {
 		Expect(validateHFRepoSource("org/repo@v1.0")).To(Succeed())
 	})
+	It("should accept https huggingface.co URL", func() {
+		Expect(validateHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(Succeed())
+	})
+	It("should accept https huggingface.co tree URL", func() {
+		Expect(validateHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")).To(Succeed())
+	})
 	It("should error on empty hf source", func() {
 		err := validateHFRepoSource("hf://")
 		Expect(err).To(HaveOccurred())
@@ -277,6 +414,24 @@ var _ = Describe("normalizeHFSource (source.go)", func() {
 	})
 	It("should leave non-hf source unchanged", func() {
 		Expect(normalizeHFSource("https://example.com/model.gguf")).To(Equal("https://example.com/model.gguf"))
+	})
+	It("should convert https huggingface.co URL to resolve URL with main", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
+	})
+	It("should convert https huggingface.co URL with trailing slash to resolve URL", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
+	})
+	It("should convert https huggingface.co tree URL to resolve URL with revision", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
+	})
+	It("should convert https huggingface.co blob URL to resolve URL with revision", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/v1.0/"))
+	})
+	It("should convert https huggingface.co resolve URL to resolve URL with revision", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
+	})
+	It("should convert http huggingface.co URL to resolve URL", func() {
+		Expect(normalizeHFSource("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
 	})
 })
 
@@ -332,6 +487,8 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 			"http://mirror.local/m.gguf",
 			"Qwen/Qwen3.6-35B-A3B",
 			"hf://org/repo",
+			"https://huggingface.co/Qwen/Qwen3.6-35B-A3B",
+			"https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main",
 			"file:///mnt/models/m.gguf",
 			"/mnt/models/m.gguf",
 			"pvc://my-claim/path/m.gguf",

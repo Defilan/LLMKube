@@ -225,10 +225,82 @@ func isRemoteHTTPSource(source string) bool {
 	return hasSchemeFold(source, "https://") || hasSchemeFold(source, "http://")
 }
 
+// isHuggingFaceURL reports whether source is a huggingface.co URL
+// (https://huggingface.co/... or http://huggingface.co/...).
+func isHuggingFaceURL(source string) bool {
+	if !hasSchemeFold(source, "https://") && !hasSchemeFold(source, "http://") {
+		return false
+	}
+	rest := source
+	if hasSchemeFold(rest, "https://") {
+		rest = rest[len("https://"):]
+	} else {
+		rest = rest[len("http://"):]
+	}
+	rest = strings.TrimPrefix(rest, "www.")
+	return strings.HasPrefix(rest, "huggingface.co/")
+}
+
+// extractHFRepoFromURL extracts the repo ID and optional revision from a
+// huggingface.co URL. Handles landing pages, tree views, blob views, and
+// resolve URLs. Returns ok=false if the URL does not contain a valid repo ID.
+func extractHFRepoFromURL(source string) (repoID, revision string, ok bool) {
+	rest := source
+	if hasSchemeFold(rest, "https://") {
+		rest = rest[len("https://"):]
+	} else if hasSchemeFold(rest, "http://") {
+		rest = rest[len("http://"):]
+	} else {
+		return "", "", false
+	}
+	rest = strings.TrimPrefix(rest, "www.")
+	if !strings.HasPrefix(rest, "huggingface.co/") {
+		return "", "", false
+	}
+	rest = rest[len("huggingface.co/"):]
+	segments := strings.Split(rest, "/")
+	var clean []string
+	for _, s := range segments {
+		if s != "" {
+			clean = append(clean, s)
+		}
+	}
+	if len(clean) < 2 {
+		return "", "", false
+	}
+	if clean[0] == "datasets" || clean[0] == "spaces" {
+		return "", "", false
+	}
+	repoID = clean[0] + "/" + clean[1]
+	if len(clean) >= 3 {
+		switch clean[2] {
+		case "tree", "blob", "resolve":
+			if len(clean) >= 4 {
+				revision = clean[3]
+			}
+		}
+	}
+	return repoID, revision, true
+}
+
 // parseHFSource splits an HF source into repo ID and optional revision.
-// Accepts both "hf://org/repo@rev" and "org/repo@rev" forms.
+// Accepts "hf://org/repo@rev", "org/repo@rev", and
+// "https://huggingface.co/org/repo[/tree/rev|...]" forms.
 // Returns (repoID, revision, error) where revision is "" if not specified.
 func parseHFSource(source string) (repoID, revision string, err error) {
+	if isHuggingFaceURL(source) {
+		repoID, revision, ok := extractHFRepoFromURL(source)
+		if !ok {
+			return "", "", fmt.Errorf("invalid huggingface.co URL: %s", source)
+		}
+		if repoID == "" {
+			return "", "", fmt.Errorf("empty repo ID in hf source: %s", source)
+		}
+		if revision != "" && strings.ContainsAny(revision, " \t\n\r") {
+			return "", "", fmt.Errorf("hf revision must not contain whitespace: %s", source)
+		}
+		return repoID, revision, nil
+	}
 	normalized := strings.TrimPrefix(source, "hf://")
 	if normalized == "" {
 		return "", "", fmt.Errorf("empty hf repo source: %s", source)
@@ -263,8 +335,19 @@ func parseHFSource(source string) (repoID, revision string, err error) {
 // normalizeHFSource converts an HF source to its full HTTPS resolve URL.
 // For hf://org/repo@rev, returns "https://huggingface.co/org/repo/resolve/rev/".
 // For hf://org/repo (no rev), returns "https://huggingface.co/org/repo/resolve/main/".
-// Non-hf sources pass through unchanged.
+// For https://huggingface.co/org/repo[/tree/rev|...], returns the equivalent
+// resolve URL. Non-hf sources pass through unchanged.
 func normalizeHFSource(source string) string {
+	if isHuggingFaceURL(source) {
+		repoID, revision, err := parseHFSource(source)
+		if err != nil {
+			return source
+		}
+		if revision == "" {
+			revision = "main"
+		}
+		return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/", repoID, revision)
+	}
 	if !strings.HasPrefix(strings.ToLower(source), "hf://") {
 		return source
 	}
@@ -281,9 +364,9 @@ func normalizeHFSource(source string) string {
 
 // validateHFRepoSource checks for common HF source mistakes and returns an
 // error if the source is malformed. Now accepts @rev syntax and validates
-// the revision is well-formed.
+// the revision is well-formed. Also validates huggingface.co URLs.
 func validateHFRepoSource(source string) error {
-	if !strings.HasPrefix(strings.ToLower(source), "hf://") {
+	if !strings.HasPrefix(strings.ToLower(source), "hf://") && !isHuggingFaceURL(source) {
 		return nil
 	}
 	_, _, err := parseHFSource(source)
@@ -315,6 +398,10 @@ func isHFRepoSource(source string) bool {
 	}
 	if isLocalSource(source) {
 		return false
+	}
+	if isHuggingFaceURL(source) {
+		_, _, ok := extractHFRepoFromURL(source)
+		return ok
 	}
 	if isRemoteHTTPSource(source) {
 		return false
