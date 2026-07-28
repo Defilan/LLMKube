@@ -18,6 +18,7 @@ package agent
 
 import (
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -166,4 +167,88 @@ func fixtureLiteralChurn(fh *fileHunks) []string {
 	sort.Strings(gone)
 	sort.Strings(appeared)
 	return []string{fmt.Sprintf("fixture input changed (removed %v, added %v)", gone, appeared)}
+}
+
+// nameStatusEntry is one file-level change from `git diff --name-status`.
+type nameStatusEntry struct {
+	Code    string // "M", "A", "D", "R100", "C75", ...
+	Path    string // destination path (rename) or the changed path
+	OldPath string // source path, only set for renames/copies
+}
+
+// parseNameStatus parses tab-separated `git diff --name-status` output. Rename
+// and copy rows carry two paths (old, new); all others carry one.
+func parseNameStatus(out string) []nameStatusEntry {
+	var entries []nameStatusEntry
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) < 2 {
+			continue
+		}
+		code := f[0]
+		if (strings.HasPrefix(code, "R") || strings.HasPrefix(code, "C")) && len(f) >= 3 {
+			entries = append(entries, nameStatusEntry{Code: code, OldPath: f[1], Path: f[2]})
+			continue
+		}
+		entries = append(entries, nameStatusEntry{Code: code, Path: f[len(f)-1]})
+	}
+	return entries
+}
+
+// changedProdPackages returns the set of package directories whose non-test Go
+// source changed. A package that changed only its tests is not included: the
+// linkage requires a production change to gate the test-dilution signal.
+func changedProdPackages(entries []nameStatusEntry) map[string]bool {
+	pkgs := map[string]bool{}
+	for _, e := range entries {
+		p := e.Path
+		if !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
+			continue
+		}
+		pkgs[filepath.Dir(p)] = true
+	}
+	return pkgs
+}
+
+// testdataOwner returns the package directory that owns a testdata path (the
+// segment before "/testdata/"), or ("", false) when the path is not under a
+// testdata directory. A top-level "testdata/..." is owned by ".".
+func testdataOwner(path string) (string, bool) {
+	if i := strings.Index(path, "/testdata/"); i >= 0 {
+		return path[:i], true
+	}
+	if strings.HasPrefix(path, "testdata/") {
+		return ".", true
+	}
+	return "", false
+}
+
+// fixtureFileChanges reports testdata fixtures that were deleted or renamed
+// under a package whose production code changed. Deleting or moving a fixture
+// is how coverage of a path can be dropped without touching an assertion.
+func fixtureFileChanges(entries []nameStatusEntry, prodPkgs map[string]bool) []string {
+	var out []string
+	for _, e := range entries {
+		owner, ok := testdataOwner(e.Path)
+		if !ok {
+			if e.OldPath == "" {
+				continue
+			}
+			owner, ok = testdataOwner(e.OldPath)
+		}
+		if !ok || !prodPkgs[owner] {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(e.Code, "D"):
+			out = append(out, "deleted fixture "+e.Path)
+		case strings.HasPrefix(e.Code, "R"):
+			out = append(out, "relocated fixture "+e.OldPath+" -> "+e.Path)
+		}
+	}
+	return out
 }

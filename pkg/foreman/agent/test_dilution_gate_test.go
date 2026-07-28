@@ -123,3 +123,64 @@ func TestFixtureLiteralChurn_TestdataPathRelocation(t *testing.T) {
 		t.Fatalf("expected a testdata path-churn finding; got %q", got)
 	}
 }
+
+func TestParseNameStatus_ModifyAndRename(t *testing.T) {
+	out := "M\tpkg/model/classifier.go\n" +
+		"D\tpkg/model/testdata/real.json\n" +
+		"R100\tpkg/model/testdata/a.json\tpkg/model/testdata/b.json\n"
+	got := parseNameStatus(out)
+	if len(got) != 3 {
+		t.Fatalf("got %d entries, want 3: %+v", len(got), got)
+	}
+	wantOldPath := "pkg/model/testdata/a.json"
+	wantNewPath := "pkg/model/testdata/b.json"
+	if got[2].Code[0] != 'R' || got[2].OldPath != wantOldPath || got[2].Path != wantNewPath {
+		t.Errorf("rename parsed wrong: %+v", got[2])
+	}
+}
+
+func TestChangedProdPackages_IgnoresTestAndNonGo(t *testing.T) {
+	entries := []nameStatusEntry{
+		{Code: "M", Path: "pkg/model/classifier.go"},
+		{Code: "M", Path: "pkg/model/classifier_test.go"},
+		{Code: "M", Path: "pkg/other/x_test.go"}, // test-only pkg: not prod-changed
+		{Code: "M", Path: "docs/readme.md"},
+	}
+	got := changedProdPackages(entries)
+	if !got["pkg/model"] {
+		t.Errorf("pkg/model should be a changed-prod package")
+	}
+	if got["pkg/other"] {
+		t.Errorf("pkg/other changed only a test file; must not count as prod-changed")
+	}
+	if len(got) != 1 {
+		t.Errorf("got %v, want only pkg/model", got)
+	}
+}
+
+func TestTestdataOwner(t *testing.T) {
+	if o, ok := testdataOwner("pkg/model/testdata/x.json"); !ok || o != "pkg/model" {
+		t.Errorf("owner = %q, %v; want pkg/model, true", o, ok)
+	}
+	if _, ok := testdataOwner("pkg/model/classifier.go"); ok {
+		t.Errorf("non-testdata path must not resolve an owner")
+	}
+}
+
+func TestFixtureFileChanges_DeleteAndRenameUnderChangedPkg(t *testing.T) {
+	entries := []nameStatusEntry{
+		{Code: "D", Path: "pkg/model/testdata/real.json"},
+		{Code: "R100", OldPath: "pkg/model/testdata/a.json", Path: "pkg/model/testdata/b.json"},
+		{Code: "D", Path: "pkg/other/testdata/z.json"}, // owner not prod-changed: ignored
+	}
+	prod := map[string]bool{"pkg/model": true}
+	got := fixtureFileChanges(entries, prod)
+	if len(got) != 2 {
+		t.Fatalf("got %d findings, want 2: %v", len(got), got)
+	}
+	joined := strings.Join(got, " | ")
+	if !strings.Contains(joined, "deleted fixture pkg/model/testdata/real.json") ||
+		!strings.Contains(joined, "relocated fixture pkg/model/testdata/a.json -> pkg/model/testdata/b.json") {
+		t.Errorf("findings = %v", got)
+	}
+}
