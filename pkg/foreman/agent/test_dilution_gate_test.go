@@ -52,3 +52,40 @@ func keys(m map[string]*fileHunks) []string {
 	}
 	return k
 }
+
+func TestAssertionErosion_NetRemovalCountedWithSnippets(t *testing.T) {
+	fh := &fileHunks{
+		Removed: []string{
+			"\tExpect(got).To(Equal(want))",
+			"\trequire.NoError(t, err)",
+			"\t// just a comment, not an assertion",
+		},
+		Added: []string{
+			"\tassert.Equal(t, want, got)",
+		},
+	}
+	removed, added, snippets := assertionErosion(fh)
+	if removed != 2 || added != 1 {
+		t.Fatalf("removed=%d added=%d, want 2 and 1", removed, added)
+	}
+	if len(snippets) != 2 || snippets[0] != "Expect(got).To(Equal(want))" {
+		t.Errorf("snippets = %q", snippets)
+	}
+}
+
+func TestAssertionErosion_NonAssertionsIgnored(t *testing.T) {
+	fh := &fileHunks{Removed: []string{"\tx := 1", "\treturn nil"}}
+	removed, _, _ := assertionErosion(fh)
+	if removed != 0 {
+		t.Fatalf("removed=%d, want 0 (no assertion-shaped lines)", removed)
+	}
+}
+
+func TestFirstN(t *testing.T) {
+	if got := firstN([]string{"a", "b", "c"}, 2); len(got) != 2 {
+		t.Fatalf("firstN cap failed: %v", got)
+	}
+	if got := firstN([]string{"a"}, 3); len(got) != 1 {
+		t.Fatalf("firstN under-length failed: %v", got)
+	}
+}

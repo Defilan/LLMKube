@@ -63,3 +63,52 @@ func parseUnifiedDiff(out string) map[string]*fileHunks {
 	}
 	return byFile
 }
+
+// assertionTokens are substrings that mark a line as an assertion. Kept
+// deliberately small and shape-based: Gomega (Expect/Ω), testify
+// (assert./require.), the ContainSubstring matcher, the stdlib t.Error/t.Fatal
+// failures, and the got/want comparison idiom.
+var assertionTokens = []string{
+	"Expect(", "Ω(", "assert.", "require.", "ContainSubstring(",
+	"t.Error", "t.Fatal", "!= want", "want !=", "got !=", "!= got",
+}
+
+// isAssertionLine reports whether a diff content line looks like a test
+// assertion. It is intentionally lenient: false positives only add reviewer
+// context, never fail a gate.
+func isAssertionLine(s string) bool {
+	t := strings.TrimSpace(s)
+	for _, tok := range assertionTokens {
+		if strings.Contains(t, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// assertionErosion counts assertion-shaped removed and added lines in one
+// file's hunks and returns the trimmed text of the removed assertions (for the
+// reviewer message). Net erosion is removed > added; the caller applies that.
+func assertionErosion(fh *fileHunks) (removed, added int, snippets []string) {
+	for _, l := range fh.Removed {
+		if isAssertionLine(l) {
+			removed++
+			snippets = append(snippets, strings.TrimSpace(l))
+		}
+	}
+	for _, l := range fh.Added {
+		if isAssertionLine(l) {
+			added++
+		}
+	}
+	return removed, added, snippets
+}
+
+// firstN returns the first n elements of s, or all of s when shorter. Used to
+// cap how many removed-assertion snippets appear in the advisory.
+func firstN(s []string, n int) []string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
