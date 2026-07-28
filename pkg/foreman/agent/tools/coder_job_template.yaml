@@ -46,9 +46,14 @@
 #                      tasks that need it then fail with
 #                      GitRemoteNotConfigured rather than parsing an empty
 #                      URL); gate-only installs have no remote.
-#   .CommitAuthorName / .CommitAuthorEmail -- optional. git author +
-#                      committer identity, passed as --commit-author-name /
+#   .CommitAuthorName / .CommitAuthorEmail -- optional. git author
+#                      identity, passed as --commit-author-name /
 #                      --commit-author-email. Each omitted when empty.
+#   .CommitCommitterName / .CommitCommitterEmail -- optional. git
+#                      committer identity for the DCO sign-off trailer,
+#                      passed as --commit-committer-name /
+#                      --commit-committer-email. Each omitted when empty
+#                      so run-task falls back to the author values (#1281).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -94,6 +99,12 @@ spec:
             {{- end }}
             {{- if .CommitAuthorEmail }}
             - --commit-author-email={{ .CommitAuthorEmail }}
+            {{- end }}
+            {{- if .CommitCommitterName }}
+            - --commit-committer-name={{ .CommitCommitterName }}
+            {{- end }}
+            {{- if .CommitCommitterEmail }}
+            - --commit-committer-email={{ .CommitCommitterEmail }}
             {{- end }}
           env:
             # The run-task body resolves git auth via

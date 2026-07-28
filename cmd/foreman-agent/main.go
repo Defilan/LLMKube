@@ -153,10 +153,12 @@ func main() {
 		inferenceURLHostOverride string
 
 		// M4 gate-tool flags
-		foremanNamespace  string
-		commitAuthorName  string
-		commitAuthorEmail string
-		keepWorkspace     bool
+		foremanNamespace     string
+		commitAuthorName     string
+		commitAuthorEmail    string
+		commitCommitterName  string
+		commitCommitterEmail string
+		keepWorkspace        bool
 
 		// #620 coder-Job git Secret selection
 		coderGitSecret    string
@@ -224,9 +226,15 @@ func main() {
 			"controller-runtime cache re-reads the current port on each task dispatch, so "+
 			"this stays current without restart.")
 	flag.StringVar(&commitAuthorName, "commit-author-name", "Foreman Bot",
-		"git author + committer name for branches produced by the native loop.")
+		"git author name for branches produced by the native loop.")
 	flag.StringVar(&commitAuthorEmail, "commit-author-email", "",
-		"git author + committer email. Required when --agent-mode=native.")
+		"git author email. Required when --agent-mode=native.")
+	flag.StringVar(&commitCommitterName, "commit-committer-name", "",
+		"git committer name for the DCO sign-off trailer. Defaults to "+
+			"--commit-author-name so existing deployments are unchanged.")
+	flag.StringVar(&commitCommitterEmail, "commit-committer-email", "",
+		"git committer email for the DCO sign-off trailer. Defaults to "+
+			"--commit-author-email so existing deployments are unchanged.")
 	flag.BoolVar(&keepWorkspace, "keep-workspace", false,
 		"Preserve the per-task clone workspace after the run. Useful for debugging; default removes it.")
 	flag.StringVar(&foremanNamespace, "foreman-namespace", "foreman-system",
@@ -424,7 +432,8 @@ func main() {
 				Name: commitAuthorName, Email: commitAuthorEmail,
 			},
 			CommitCommitter: repo.Identity{
-				Name: commitAuthorName, Email: commitAuthorEmail,
+				Name:  committerName(commitCommitterName, commitAuthorName),
+				Email: committerEmail(commitCommitterEmail, commitAuthorEmail),
 			},
 			KeepWorkspace:   keepWorkspace,
 			RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace),
@@ -446,10 +455,12 @@ func main() {
 					// into the coder Job's run-task invocation so the in-pod
 					// clone + push can authenticate and commit; without these
 					// run-task fails with GitRemoteNotConfigured (#620).
-					GitRemoteURL:      gitRemoteURL,
-					CommitAuthorName:  commitAuthorName,
-					CommitAuthorEmail: commitAuthorEmail,
-					LogTailFn:         makePodLogTailFn(kcs),
+					GitRemoteURL:         gitRemoteURL,
+					CommitAuthorName:     commitAuthorName,
+					CommitAuthorEmail:    commitAuthorEmail,
+					CommitCommitterName:  committerName(commitCommitterName, commitAuthorName),
+					CommitCommitterEmail: committerEmail(commitCommitterEmail, commitAuthorEmail),
+					LogTailFn:            makePodLogTailFn(kcs),
 				},
 			},
 			// EnvtestJobRunner verifies envtest-backed packages post-push in a
@@ -523,6 +534,8 @@ func runTaskCommand(args []string) {
 		inferenceURLHostOverride string
 		commitAuthorName         string
 		commitAuthorEmail        string
+		commitCommitterName      string
+		commitCommitterEmail     string
 		foremanNamespace         string
 		keepWorkspace            bool
 	)
@@ -542,9 +555,15 @@ func runTaskCommand(args []string) {
 		"Rewrite the host of the resolved InferenceService URL and substitute the live port "+
 			"from the v1 Endpoints object (off-cluster same-host installs).")
 	fs.StringVar(&commitAuthorName, "commit-author-name", "Foreman Bot",
-		"git author + committer name for the produced branch.")
+		"git author name for the produced branch.")
 	fs.StringVar(&commitAuthorEmail, "commit-author-email", "",
-		"git author + committer email. Required for coder tasks that commit.")
+		"git author email. Required for coder tasks that commit.")
+	fs.StringVar(&commitCommitterName, "commit-committer-name", "",
+		"git committer name for the DCO sign-off trailer. Defaults to "+
+			"--commit-author-name so existing deployments are unchanged.")
+	fs.StringVar(&commitCommitterEmail, "commit-committer-email", "",
+		"git committer email for the DCO sign-off trailer. Defaults to "+
+			"--commit-author-email so existing deployments are unchanged.")
 	fs.StringVar(&foremanNamespace, "foreman-namespace", "foreman-system",
 		"Namespace deterministic tools (e.g. run_gate_job) submit Jobs into.")
 	fs.BoolVar(&keepWorkspace, "keep-workspace", false,
@@ -590,12 +609,15 @@ func runTaskCommand(args []string) {
 		InferenceBaseURLOverride:     inferenceURLOverride,
 		InferenceBaseURLHostOverride: inferenceURLHostOverride,
 		CommitAuthor:                 repo.Identity{Name: commitAuthorName, Email: commitAuthorEmail},
-		CommitCommitter:              repo.Identity{Name: commitAuthorName, Email: commitAuthorEmail},
-		KeepWorkspace:                keepWorkspace,
-		RegistryFactory:              makeRegistryFactory(kc, kcs, foremanNamespace),
-		CodeHost:                     githubCodeHost(),
-		WorkItems:                    githubWorkItems(),
-		ChangePolicy:                 changepolicy.NewDefaultPolicy(),
+		CommitCommitter: repo.Identity{
+			Name:  committerName(commitCommitterName, commitAuthorName),
+			Email: committerEmail(commitCommitterEmail, commitAuthorEmail),
+		},
+		KeepWorkspace:   keepWorkspace,
+		RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace),
+		CodeHost:        githubCodeHost(),
+		WorkItems:       githubWorkItems(),
+		ChangePolicy:    changepolicy.NewDefaultPolicy(),
 	})
 	if err != nil {
 		// System / execution failure: the result line + ERROR sentinel
@@ -607,6 +629,27 @@ func runTaskCommand(args []string) {
 	setupLog.Info("run-task completed",
 		"task", taskName, "namespace", namespace,
 		"verdict", res.Verdict, "branch", res.Branch, "commitSHA", res.CommitSHA)
+}
+
+// committerName resolves the git committer name, falling back to the
+// author name when --commit-committer-name is unset. This preserves the
+// previous behavior (author == committer) for deployments that have not
+// opted into a separate committer identity, while letting a human
+// committer produce a human DCO sign-off trailer via `git commit -s`.
+func committerName(committerName, authorName string) string {
+	if committerName != "" {
+		return committerName
+	}
+	return authorName
+}
+
+// committerEmail resolves the git committer email, falling back to the
+// author email when --commit-committer-email is unset. See committerName.
+func committerEmail(committerEmail, authorEmail string) string {
+	if committerEmail != "" {
+		return committerEmail
+	}
+	return authorEmail
 }
 
 // loadKubeconfig defers to controller-runtime's standard discovery chain:

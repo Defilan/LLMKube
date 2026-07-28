@@ -91,3 +91,76 @@ func TestSoftResetToBase_NoSelfCommitIsNothingToCommit(t *testing.T) {
 		t.Errorf("want ErrNothingToCommit, got %v", err)
 	}
 }
+
+// TestCommit_CommitterAuthorSplit verifies that when Author and Committer
+// differ, the commit's author block reflects the Author identity while the
+// DCO sign-off trailer (`Signed-off-by`) is derived from the Committer
+// identity. This is the fix for #1281: a bot author + human committer
+// produces a human sign-off that satisfies CONTRIBUTING.md's DCO policy.
+func TestCommit_CommitterAuthorSplit(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareOrigin(t, root)
+	seedOrigin(t, bare)
+
+	ctx := context.Background()
+	dest := filepath.Join(root, "work")
+	if err := Clone(ctx, CloneOptions{RemoteURL: bare, Dest: dest}); err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	if err := CreateAndCheckoutBranch(ctx, dest, "foreman/issue-1281"); err != nil {
+		t.Fatalf("CreateAndCheckoutBranch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "change.txt"),
+		[]byte("bot-authored change\n"), 0o644); err != nil {
+		t.Fatalf("write change: %v", err)
+	}
+
+	bot := Identity{Name: "Foreman Bot", Email: "bot@foreman.test"}
+	human := Identity{Name: "Jory Dogfood", Email: "jory@example.com"}
+
+	sha, err := Commit(ctx, CommitOptions{
+		Workspace: dest,
+		Message:   "fix: demonstrate committer/author split\n\nFixes #1281",
+		Author:    bot,
+		Committer: human,
+	})
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if len(sha) < 7 {
+		t.Errorf("sha looks wrong: %q", sha)
+	}
+
+	// Author block must reflect the bot identity.
+	authorName := gitOut(t, dest, "log", "-1", "--format=%an", sha)
+	authorEmail := gitOut(t, dest, "log", "-1", "--format=%ae", sha)
+	if authorName != bot.Name {
+		t.Errorf("author name: got %q want %q", authorName, bot.Name)
+	}
+	if authorEmail != bot.Email {
+		t.Errorf("author email: got %q want %q", authorEmail, bot.Email)
+	}
+
+	// Committer block must reflect the human identity.
+	committerName := gitOut(t, dest, "log", "-1", "--format=%cn", sha)
+	committerEmail := gitOut(t, dest, "log", "-1", "--format=%ce", sha)
+	if committerName != human.Name {
+		t.Errorf("committer name: got %q want %q", committerName, human.Name)
+	}
+	if committerEmail != human.Email {
+		t.Errorf("committer email: got %q want %q", committerEmail, human.Email)
+	}
+
+	// The DCO sign-off trailer must be derived from the committer, not
+	// the author — this is the whole point of #1281.
+	body := gitOut(t, dest, "log", "-1", "--format=%B", sha)
+	wantSignoff := "Signed-off-by: " + human.Name + " <" + human.Email + ">"
+	if !strings.Contains(body, wantSignoff) {
+		t.Errorf("missing human DCO trailer; commit body was:\n%s", body)
+	}
+	botSignoff := "Signed-off-by: " + bot.Name + " <" + bot.Email + ">"
+	if strings.Contains(body, botSignoff) {
+		t.Errorf("bot DCO trailer must not appear; commit body was:\n%s", body)
+	}
+}

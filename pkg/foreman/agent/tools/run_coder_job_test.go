@@ -323,8 +323,10 @@ func TestRunCoderJob_CustomGitSecretFlowsThroughRun(t *testing.T) {
 
 // TestRenderCoderJob_GitRemoteAndCommitAuthorArgs asserts the rendered
 // run-task args carry --git-remote-url / --commit-author-email /
-// --commit-author-name when set, so the coder Job can clone + push (#620).
-// Without these the run-task body fails with GitRemoteNotConfigured.
+// --commit-author-name / --commit-committer-email / --commit-committer-name
+// when set, so the coder Job can clone + push (#620) and produce a human
+// DCO sign-off (#1281). Without these the run-task body fails with
+// GitRemoteNotConfigured.
 func TestRenderCoderJob_GitRemoteAndCommitAuthorArgs(t *testing.T) {
 	job, err := renderCoderJob(coderRendererInput{
 		Name:                  "foreman-coder-gitremote",
@@ -341,6 +343,8 @@ func TestRenderCoderJob_GitRemoteAndCommitAuthorArgs(t *testing.T) {
 		GitRemoteURL:          "https://github.com/Defilan/LLMKube.git",
 		CommitAuthorName:      "Foreman Bot",
 		CommitAuthorEmail:     "foreman@defilan.tech",
+		CommitCommitterName:   "Jory Dogfood",
+		CommitCommitterEmail:  "jory@example.com",
 	})
 	if err != nil {
 		t.Fatalf("renderCoderJob: %v", err)
@@ -354,6 +358,12 @@ func TestRenderCoderJob_GitRemoteAndCommitAuthorArgs(t *testing.T) {
 	}
 	if !strings.Contains(args, "--commit-author-name=Foreman Bot") {
 		t.Errorf("Args missing --commit-author-name:\n%s", args)
+	}
+	if !strings.Contains(args, "--commit-committer-email=jory@example.com") {
+		t.Errorf("Args missing --commit-committer-email:\n%s", args)
+	}
+	if !strings.Contains(args, "--commit-committer-name=Jory Dogfood") {
+		t.Errorf("Args missing --commit-committer-name:\n%s", args)
 	}
 }
 
@@ -388,6 +398,12 @@ func TestRenderCoderJob_GitRemoteArgsOmittedWhenEmpty(t *testing.T) {
 	if strings.Contains(args, "--commit-author-name") {
 		t.Errorf("Args should omit --commit-author-name when empty:\n%s", args)
 	}
+	if strings.Contains(args, "--commit-committer-email") {
+		t.Errorf("Args should omit --commit-committer-email when empty:\n%s", args)
+	}
+	if strings.Contains(args, "--commit-committer-name") {
+		t.Errorf("Args should omit --commit-committer-name when empty:\n%s", args)
+	}
 }
 
 // TestRunCoderJob_GitRemoteFlowsThroughRun asserts the static Cfg's
@@ -406,13 +422,15 @@ func TestRunCoderJob_GitRemoteFlowsThroughRun(t *testing.T) {
 	tool := &RunCoderJob{
 		Client: c,
 		Cfg: RunCoderJobConfig{
-			NameFn:            pinName(jobName),
-			PollInterval:      5 * time.Millisecond,
-			PollTimeout:       2 * time.Second,
-			GitRemoteURL:      "https://github.com/Defilan/LLMKube.git",
-			CommitAuthorName:  "Foreman Bot",
-			CommitAuthorEmail: "foreman@defilan.tech",
-			LogTailFn:         func(context.Context, string, string) string { return "" },
+			NameFn:               pinName(jobName),
+			PollInterval:         5 * time.Millisecond,
+			PollTimeout:          2 * time.Second,
+			GitRemoteURL:         "https://github.com/Defilan/LLMKube.git",
+			CommitAuthorName:     "Foreman Bot",
+			CommitAuthorEmail:    "foreman@defilan.tech",
+			CommitCommitterName:  "Jory Dogfood",
+			CommitCommitterEmail: "jory@example.com",
+			LogTailFn:            func(context.Context, string, string) string { return "" },
 		},
 	}
 	if _, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "gitflow", TaskNamespace: "default"}); err != nil {
@@ -431,6 +449,12 @@ func TestRunCoderJob_GitRemoteFlowsThroughRun(t *testing.T) {
 	}
 	if !strings.Contains(args, "--commit-author-name=Foreman Bot") {
 		t.Errorf("Args missing --commit-author-name:\n%s", args)
+	}
+	if !strings.Contains(args, "--commit-committer-email=jory@example.com") {
+		t.Errorf("Args missing --commit-committer-email:\n%s", args)
+	}
+	if !strings.Contains(args, "--commit-committer-name=Jory Dogfood") {
+		t.Errorf("Args missing --commit-committer-name:\n%s", args)
 	}
 }
 

@@ -252,3 +252,61 @@ func TestParseKeyValueCSV(t *testing.T) {
 		})
 	}
 }
+
+// TestCommitterName_FallbackToAuthor verifies the committer identity
+// helpers default to the author values when the committer flags are unset,
+// preserving the previous behavior (author == committer) for deployments
+// that have not opted into a separate committer identity (#1281).
+func TestCommitterName_FallbackToAuthor(t *testing.T) {
+	cases := []struct {
+		name           string
+		committerName  string
+		authorName     string
+		wantName       string
+		committerEmail string
+		authorEmail    string
+		wantEmail      string
+	}{
+		{
+			name:           "unset_committer_falls_back_to_author",
+			committerName:  "",
+			authorName:     "Foreman Bot",
+			wantName:       "Foreman Bot",
+			committerEmail: "",
+			authorEmail:    "bot@foreman.test",
+			wantEmail:      "bot@foreman.test",
+		},
+		{
+			name:           "set_committer_overrides_author",
+			committerName:  "Jory Dogfood",
+			authorName:     "Foreman Bot",
+			wantName:       "Jory Dogfood",
+			committerEmail: "jory@example.com",
+			authorEmail:    "bot@foreman.test",
+			wantEmail:      "jory@example.com",
+		},
+		{
+			name:           "both_empty_returns_empty",
+			committerName:  "",
+			authorName:     "",
+			wantName:       "",
+			committerEmail: "",
+			authorEmail:    "",
+			wantEmail:      "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotName := committerName(tc.committerName, tc.authorName)
+			if gotName != tc.wantName {
+				t.Errorf("committerName(%q, %q) = %q, want %q",
+					tc.committerName, tc.authorName, gotName, tc.wantName)
+			}
+			gotEmail := committerEmail(tc.committerEmail, tc.authorEmail)
+			if gotEmail != tc.wantEmail {
+				t.Errorf("committerEmail(%q, %q) = %q, want %q",
+					tc.committerEmail, tc.authorEmail, gotEmail, tc.wantEmail)
+			}
+		})
+	}
+}
