@@ -34,6 +34,7 @@ import (
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
+	"github.com/defilantech/llmkube/pkg/apiutil"
 )
 
 const (
@@ -123,17 +124,22 @@ func (r *GPUQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, err
 		}
 		for _, isvc := range isvcList.Items {
-			// GPU count per pod: nil resources means 0.
-			gpuPerPod := int32(0)
-			if isvc.Spec.Resources != nil && isvc.Spec.Resources.GPU > 0 {
-				gpuPerPod = isvc.Spec.Resources.GPU
+			// Fetch the referenced Model best-effort so the per-pod GPU
+			// count matches the pod spec (which prefers hardware.gpu.count).
+			// A nil Model falls through to resources.gpu in apiutil.GPUCount.
+			var model *inferencev1alpha1.Model
+			if isvc.Spec.ModelRef != "" {
+				m := &inferencev1alpha1.Model{}
+				if err := r.Get(ctx, types.NamespacedName{Name: isvc.Spec.ModelRef, Namespace: isvc.Namespace}, m); err == nil {
+					model = m
+				}
 			}
 			// Replicas: nil means 1.
 			replicas := int32(1)
 			if isvc.Spec.Replicas != nil {
 				replicas = *isvc.Spec.Replicas
 			}
-			usedGPUCount += gpuPerPod * replicas
+			usedGPUCount += apiutil.GPUCount(&isvc, model) * replicas
 
 			if vram, known := serviceVRAMBytesFor(ctx, r.Client, &isvc, r.VRAMPerDeviceGiB); known {
 				usedVRAMBytes += vram

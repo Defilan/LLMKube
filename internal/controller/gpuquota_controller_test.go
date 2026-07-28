@@ -768,6 +768,79 @@ func TestReconcileNilReplicas(t *testing.T) {
 	}
 }
 
+// #1310: a Model declaring hardware.gpu.count must be charged against
+// status.UsedGPUCount, not silently bypassed. The reconciler must fetch
+// the referenced Model and route through apiutil.GPUCount, matching the
+// pod spec.
+func TestReconcileModelDeclaredGPUCount(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = inferencev1alpha1.AddToScheme(scheme)
+
+	gq := &inferencev1alpha1.GPUQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-gq",
+			Namespace: "default",
+		},
+		Spec: inferencev1alpha1.GPUQuotaSpec{
+			NamespaceRef: "my-ns",
+			GPUCount:     10,
+		},
+	}
+
+	// Model declares 4 GPUs; ISVC leaves resources.gpu unset.
+	// With replicas: 2 the pod requests 8 GPUs (4 x 2).
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-model",
+			Namespace: "my-ns",
+		},
+		Spec: inferencev1alpha1.ModelSpec{
+			Hardware: &inferencev1alpha1.HardwareSpec{
+				GPU: &inferencev1alpha1.GPUSpec{
+					Count: 4,
+				},
+			},
+		},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-isvc",
+			Namespace: "my-ns",
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "my-model",
+			Replicas: ptrInt32GPUQuota(2),
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&inferencev1alpha1.GPUQuota{}).WithObjects(gq, model, isvc).Build()
+	r := &GPUQuotaReconciler{Client: c, Scheme: scheme}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "my-gq",
+			Namespace: "default",
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile() returned error: %v", err)
+	}
+	if result != (ctrl.Result{}) {
+		t.Errorf("Reconcile() returned %+v, want empty Result", result)
+	}
+
+	var updatedGQ inferencev1alpha1.GPUQuota
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "my-gq", Namespace: "default"}, &updatedGQ); err != nil {
+		t.Fatalf("failed to get GPUQuota after reconcile: %v", err)
+	}
+	if updatedGQ.Status.UsedGPUCount != 8 {
+		t.Errorf("Reconcile() status.UsedGPUCount = %d, want 8 (model gpu 4 * 2 replicas)", updatedGQ.Status.UsedGPUCount)
+	}
+}
+
 func TestReconcileNoScope(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
