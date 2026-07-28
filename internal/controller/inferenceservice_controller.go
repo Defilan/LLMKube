@@ -228,20 +228,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	isMetal := isMetalModel(model)
 
-	if r.Recorder != nil && needsOffloadMemoryWarning(inferenceService) {
-		r.Recorder.Eventf(inferenceService, nil, corev1.EventTypeWarning, "MissingMemoryRequest", "Reconcile",
-			"CPU/KV offloading is enabled but resources.memory/hostMemory is not set; hybrid pods consume significant host RAM")
-	}
-
-	if r.Recorder != nil && shouldWarnMissingSkipModelInit(model, inferenceService) {
-		r.Recorder.Eventf(inferenceService, nil, corev1.EventTypeWarning, "MissingSkipModelInit", "Reconcile",
-			"Model source is a HuggingFace repo ID (resolved by the runtime at startup); set spec.skipModelInit=true so the init container does not run")
-	}
-
-	if r.Recorder != nil && needsCPUOffloadNoopWarning(inferenceService) {
-		r.Recorder.Eventf(inferenceService, nil, corev1.EventTypeWarning, "CPUOffloadUnverified", "Reconcile",
-			cpuOffloadIneffectiveMessage)
-	}
+	r.emitSpecAdvisoryEvents(inferenceService, model)
 
 	deployment, readyReplicas, metalSnap, result, err := r.reconcileDeployment(ctx, inferenceService, model, desiredReplicas, modelReady, isMetal)
 	if err != nil || result != nil {
@@ -774,6 +761,29 @@ func shouldWarnMissingSkipModelInit(model *inferencev1alpha1.Model, isvc *infere
 		return false
 	}
 	return !needsSkipModelInit(isvc)
+}
+
+// emitSpecAdvisoryEvents emits the non-blocking spec-hygiene warnings in one
+// place: config that reconciliation tolerates but that predictably surprises
+// the operator later (host-RAM surprises, redundant init downloads, a
+// cpu-offload flag with an open upstream reliability report). Extracted from
+// Reconcile so each new advisory does not grow its cyclomatic complexity.
+func (r *InferenceServiceReconciler) emitSpecAdvisoryEvents(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
+	if r.Recorder == nil {
+		return
+	}
+	if needsOffloadMemoryWarning(isvc) {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "MissingMemoryRequest", "Reconcile",
+			"CPU/KV offloading is enabled but resources.memory/hostMemory is not set; hybrid pods consume significant host RAM")
+	}
+	if shouldWarnMissingSkipModelInit(model, isvc) {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "MissingSkipModelInit", "Reconcile",
+			"Model source is a HuggingFace repo ID (resolved by the runtime at startup); set spec.skipModelInit=true so the init container does not run")
+	}
+	if needsCPUOffloadNoopWarning(isvc) {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "CPUOffloadUnverified", "Reconcile",
+			cpuOffloadIneffectiveMessage)
+	}
 }
 
 func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
