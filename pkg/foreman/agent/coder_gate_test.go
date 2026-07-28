@@ -47,6 +47,16 @@ func newFakeRunner(responses map[string]fakeCommand) (commandRunner, *[]recorded
 	calls := &[]recordedCall{}
 	run := func(_ context.Context, _ string, extraEnv []string, name string, args ...string) (string, error) {
 		*calls = append(*calls, recordedCall{name: name, args: args, extraEnv: extraEnv})
+		if name == "git" {
+			// Report a changed Go file on the working-tree diff seam so the
+			// Go-toolchain tier (guarded by goToolchainRelevantChange, #1292)
+			// runs for these Go-check tests. git status -z stays empty, so
+			// the unit-test tier still sees no changed *packages*.
+			if len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only" {
+				return "pkg/foreman/agent/sample.go\n", nil
+			}
+			return "", nil
+		}
 		resp := responses[name]
 		return resp.output, resp.err
 	}
@@ -154,6 +164,9 @@ func TestRunCoderGateAutoAppliesGofmt(t *testing.T) {
 				return "", nil // after -w the tree is clean
 			}
 		}
+		if name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only" {
+			return "pkg/foreman/agent/sample.go\n", nil // Go change: run the Go tier (#1292)
+		}
 		return "", nil // go vet/build/test and lint all pass
 	}
 	pass, feedback, _ := RunCoderGate(context.Background(), "/work", golangciPath, run, "", "main", nil)
@@ -172,6 +185,9 @@ func TestRunCoderGateGofmtUnfixableStillFails(t *testing.T) {
 	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
 		if name == "gofmt" && len(args) > 0 && args[0] == "-l" {
 			return "internal/broken/parse_error.go\n", nil // still listed after -w
+		}
+		if name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only" {
+			return "pkg/foreman/agent/sample.go\n", nil // Go change: run the Go tier (#1292)
 		}
 		return "", nil
 	}
@@ -304,7 +320,12 @@ func TestRunCoderGate_FailsOnChangedPackageUnitTest(t *testing.T) {
 		switch {
 		case name == "gofmt":
 			return "", nil
+		case name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only":
+			// working-tree diff seam (goToolchainRelevantChange, #1292):
+			// clean newline-separated paths, so the Go tier runs.
+			return "pkg/cli/cache_inspect_test.go\n", nil
 		case name == "git":
+			// git status -z: NUL-terminated porcelain for changedTestPackages.
 			return " M pkg/cli/cache_inspect_test.go\x00", nil
 		case name == "go" && len(args) > 0 && args[0] == "test":
 			out := "panic: runtime error: invalid memory address\n" +
@@ -340,6 +361,52 @@ func TestRunCoderGate_SkipsTestTierWhenNoChangedPackages(t *testing.T) {
 	}
 	if sawGoTest {
 		t.Error("test tier should not run go test when no packages changed")
+	}
+}
+
+// TestRunCoderGate_SkipsGoTierOnDocsOnlyDiff pins #1292: a diff that changes no
+// Go source must not run the Go-toolchain tier (gofmt, go vet, go build,
+// golangci-lint, the unit-test tier, codegen). A docs-only edit cannot fail any
+// of them, and running them can surface an agent-image toolchain error (a go.mod
+// version wall) the model is then asked to "fix and resubmit", burning fix
+// attempts on an unfixable premise. The diff-aware checks (reference grounding
+// etc.) still run.
+func TestRunCoderGate_SkipsGoTierOnDocsOnlyDiff(t *testing.T) {
+	const golangciPath = "./bin/golangci-lint"
+	saw := map[string]bool{}
+	run := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only":
+			return "docs/foreman-gate.md\n", nil // docs-only change
+		case name == "git":
+			return "", nil // add -A no-op; status -z empty; unified diff empty
+		case name == "gofmt":
+			saw["gofmt"] = true
+			// A go.mod version wall would make go vet/build/lint fail; model
+			// them as failing to prove the skip, not the pass, carries the gate.
+			return "", nil
+		case name == "go":
+			saw["go "+strings.Join(args, " ")] = true
+			return "go: go.mod requires go >= 1.26.5 (running go 1.26.4)", errors.New("exit status 1")
+		case name == golangciPath:
+			saw["lint"] = true
+			return "level=error msg=\"go.mod requires go >= 1.26.5\"", errors.New("exit status 3")
+		case name == "make":
+			saw["make"] = true
+			return "", errors.New("exit status 1")
+		default:
+			return "", nil
+		}
+	}
+
+	pass, fb, _ := RunCoderGate(context.Background(), "/work", golangciPath, run, "", "main", nil)
+	if !pass {
+		t.Fatalf("docs-only diff should pass the gate (Go tier skipped), got fail:\n%s", fb)
+	}
+	for _, forbidden := range []string{"gofmt", "go vet ./...", "go build ./...", "lint", "make"} {
+		if saw[forbidden] {
+			t.Errorf("%q ran on a docs-only diff; the Go tier must be skipped (#1292)", forbidden)
+		}
 	}
 }
 
@@ -399,6 +466,10 @@ func codegenFake(
 				return "Error: controller-gen: exit status 1\n", makeErr
 			}
 			return "", nil
+		case name == "git" && len(args) >= 2 && args[0] == "diff" && args[1] == "--name-only":
+			// working-tree diff seam (goToolchainRelevantChange, #1292): a
+			// changed Go file so the codegen tier (inside the Go guard) runs.
+			return "api/v1alpha1/types.go\n", nil
 		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "-z":
 			return "", nil // changedTestPackages: no changed packages
 		case name == "git" && len(args) >= 2 && args[0] == "status" && args[1] == "--porcelain":
