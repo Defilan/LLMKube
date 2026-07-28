@@ -47,7 +47,7 @@ var _ = Describe("InferenceService Deployment selector migration (#606)", func()
 			Expect(k8sClient.Create(ctx, &inferencev1alpha1.Model{
 				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
 				Spec: inferencev1alpha1.ModelSpec{
-					Source:       "https://huggingface.co/test/model.gguf",
+					Source:       "https://example.com/model.gguf",
 					Format:       "gguf",
 					Quantization: "Q4_K_M",
 					Hardware:     &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},

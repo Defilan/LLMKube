@@ -74,7 +74,14 @@ func prefetchEligible(model *inferencev1alpha1.Model) bool {
 	if model == nil || !model.Spec.Prefetch {
 		return false
 	}
-	return isRemoteHTTPSource(normalizeHFSource(model.Spec.Source))
+	// A source is prefetchable when it normalizes to a fetchable http(s) URL:
+	// hf:// and huggingface.co repo URLs become resolve URLs, direct file URLs
+	// stay as-is, while bare org/name (runtime-resolved), local paths, pvc://
+	// and s3:// do not. Checking the normalized scheme directly preserves the
+	// original semantics without depending on isRemoteHTTPSource's repo-vs-file
+	// classification.
+	normalized := normalizeHFSource(model.Spec.Source)
+	return hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://")
 }
 
 // reconcilePrefetch drives the prefetch state machine. handled=true means

@@ -64,7 +64,7 @@ var _ = Describe("Model Controller", func() {
 						Namespace: "default",
 					},
 					Spec: inferencev1alpha1.ModelSpec{
-						Source:       "https://huggingface.co/test/model.gguf",
+						Source:       "https://example.com/model.gguf",
 						Format:       "gguf",
 						Quantization: "Q4_K_M",
 						Hardware:     &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
@@ -1827,7 +1827,7 @@ var _ = Describe("Issue #363 regression — controller / workload cache disconne
 		defer func() { _ = os.RemoveAll(tempDir) }()
 
 		modelName := "issue-363-no-fs-write"
-		source := "https://huggingface.co/example-org/example-repo/resolve/main/m.gguf"
+		source := "https://example.com/model.gguf"
 		model := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
 			Spec:       inferencev1alpha1.ModelSpec{Source: source},
@@ -1860,7 +1860,7 @@ var _ = Describe("Issue #363 regression — controller / workload cache disconne
 		defer func() { _ = os.RemoveAll(tempDir) }()
 
 		modelName := "issue-363-cachekey-roundtrip"
-		source := "https://huggingface.co/example-org/example-repo/resolve/main/m.gguf"
+		source := "https://example.com/model.gguf"
 		model := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
 			Spec:       inferencev1alpha1.ModelSpec{Source: source},

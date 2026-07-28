@@ -1497,7 +1497,13 @@ var _ = Describe("shouldWarnMissingSkipModelInit", func() {
 		Expect(tt(PhaseReady, "Qwen/Qwen3.6-35B-A3B", pTrue())).To(BeFalse())
 	})
 	It("does not warn: HTTPS source — init container is required to populate the per-namespace cache PVC (issue #363)", func() {
-		Expect(tt(PhaseReady, "https://huggingface.co/example/repo/resolve/main/m.gguf", nil)).To(BeFalse())
+		Expect(tt(PhaseReady, "https://example.com/m.gguf", nil)).To(BeFalse())
+	})
+	It("warns: HTTPS huggingface.co URL + Ready Model + skipModelInit unset (issue #1322)", func() {
+		Expect(tt(PhaseReady, "https://huggingface.co/Qwen/Qwen3.6-35B-A3B", nil)).To(BeTrue())
+	})
+	It("warns: HTTPS huggingface.co tree URL + Ready Model + skipModelInit unset (issue #1322)", func() {
+		Expect(tt(PhaseReady, "https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main", nil)).To(BeTrue())
 	})
 	It("does not warn: HTTP source — same as HTTPS", func() {
 		Expect(tt(PhaseReady, "http://example.com/m.gguf", nil)).To(BeFalse())

@@ -80,7 +80,9 @@ func (b *VLLMBackend) DisableServiceLinks() bool { return true }
 func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
 	source := modelPath
 	if source == "" {
-		source = normalizeHFSource(model.Spec.Source)
+		// Serve path: hand vLLM the bare "org/name[@rev]" repo id, not a resolve
+		// URL (which it rejects). See hfServeArg.
+		source = hfServeArg(model.Spec.Source)
 	}
 	// vLLM v0.20 deprecated --model in favor of a positional argument; --model
 	// will be removed in a future minor. The positional form is supported by

@@ -222,13 +222,134 @@ func hasNoUsableRoot(allowedRoots []string) bool {
 // that a case-sensitive classifier had failed to route to the guarded
 // remote-source path (GHSA-jw3m-8q7m-f35r).
 func isRemoteHTTPSource(source string) bool {
+	// A huggingface.co URL that is NOT a single-file download (a landing page,
+	// /tree/<rev>, a revision-pinned repo root, or a datasets/spaces page) is a
+	// runtime-resolved or non-model source, not a remote HTTP file. Only a
+	// huggingface.co URL that names a specific FILE
+	// (/resolve|blob/<rev>/<file>) is a single-file HTTP download and stays
+	// classified here.
+	if isHuggingFaceURL(source) && !isHuggingFaceFileURL(source) {
+		return false
+	}
 	return hasSchemeFold(source, "https://") || hasSchemeFold(source, "http://")
 }
 
+// isHuggingFaceURL reports whether source is a huggingface.co URL
+// (https://huggingface.co/... or http://huggingface.co/...).
+func isHuggingFaceURL(source string) bool {
+	if !hasSchemeFold(source, "https://") && !hasSchemeFold(source, "http://") {
+		return false
+	}
+	rest := source
+	if hasSchemeFold(rest, "https://") {
+		rest = rest[len("https://"):]
+	} else {
+		rest = rest[len("http://"):]
+	}
+	rest = strings.TrimPrefix(rest, "www.")
+	// Host is case-insensitive per RFC 3986; the repo path is not (Qwen/... must
+	// keep its case), so only lower-case for the host comparison.
+	return strings.HasPrefix(strings.ToLower(rest), "huggingface.co/")
+}
+
+// hfURLPathSegments returns the non-empty path segments after the
+// "huggingface.co/" host for a huggingface.co URL, with any query string or
+// fragment stripped. ok is false when source is not a huggingface.co URL.
+// The host comparison is case-insensitive (RFC 3986) but the returned segments
+// preserve their original case, since HF repo names are case-sensitive.
+func hfURLPathSegments(source string) (segments []string, ok bool) {
+	rest := source
+	if hasSchemeFold(rest, "https://") {
+		rest = rest[len("https://"):]
+	} else if hasSchemeFold(rest, "http://") {
+		rest = rest[len("http://"):]
+	} else {
+		return nil, false
+	}
+	rest = strings.TrimPrefix(rest, "www.")
+	// "huggingface.co/" is 15 bytes in any case, so slicing by the literal
+	// length is safe after a case-insensitive prefix check.
+	if !strings.HasPrefix(strings.ToLower(rest), "huggingface.co/") {
+		return nil, false
+	}
+	rest = rest[len("huggingface.co/"):]
+	// Browser pastes routinely carry "?library=vllm" or "#..." which would
+	// otherwise be glued onto the repo name.
+	if i := strings.IndexAny(rest, "?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	for _, s := range strings.Split(rest, "/") {
+		if s != "" {
+			segments = append(segments, s)
+		}
+	}
+	return segments, true
+}
+
+// isHuggingFaceFileURL reports whether source is a huggingface.co URL that names
+// a specific file, e.g. .../resolve/<rev>/<file> or .../blob/<rev>/<file>. Such
+// URLs are single-file downloads, not repo references.
+func isHuggingFaceFileURL(source string) bool {
+	clean, ok := hfURLPathSegments(source)
+	if !ok || len(clean) < 5 {
+		return false
+	}
+	return clean[2] == "resolve" || clean[2] == "blob"
+}
+
+// extractHFRepoFromURL extracts the repo ID and optional revision from a
+// huggingface.co REPO URL (landing page, /tree/<rev>, or a revision-pinned
+// resolve/blob root). It returns ok=false for datasets/spaces pages and for
+// URLs that name a specific file (/resolve|blob/<rev>/<file>), which are
+// single-file downloads rather than repo references.
+func extractHFRepoFromURL(source string) (repoID, revision string, ok bool) {
+	clean, isURL := hfURLPathSegments(source)
+	if !isURL || len(clean) < 2 {
+		return "", "", false
+	}
+	if clean[0] == "datasets" || clean[0] == "spaces" {
+		return "", "", false
+	}
+	repoID = clean[0] + "/" + clean[1]
+	if len(clean) >= 3 {
+		switch clean[2] {
+		case "tree":
+			if len(clean) >= 4 {
+				revision = clean[3]
+			}
+		case "resolve", "blob":
+			// A resolve/blob URL naming a specific file is a single-file
+			// download, not a repo; leave it to isRemoteHTTPSource. A
+			// resolve/blob root with only a revision is a revision-pinned repo.
+			if len(clean) >= 5 {
+				return "", "", false
+			}
+			if len(clean) >= 4 {
+				revision = clean[3]
+			}
+		}
+	}
+	return repoID, revision, true
+}
+
 // parseHFSource splits an HF source into repo ID and optional revision.
-// Accepts both "hf://org/repo@rev" and "org/repo@rev" forms.
+// Accepts "hf://org/repo@rev", "org/repo@rev", and
+// "https://huggingface.co/org/repo[/tree/rev|...]" forms.
 // Returns (repoID, revision, error) where revision is "" if not specified.
 func parseHFSource(source string) (repoID, revision string, err error) {
+	if isHuggingFaceURL(source) {
+		repoID, revision, ok := extractHFRepoFromURL(source)
+		if !ok {
+			return "", "", fmt.Errorf("invalid huggingface.co URL: %s", source)
+		}
+		if repoID == "" {
+			return "", "", fmt.Errorf("empty repo ID in hf source: %s", source)
+		}
+		if revision != "" && strings.ContainsAny(revision, " \t\n\r") {
+			return "", "", fmt.Errorf("hf revision must not contain whitespace: %s", source)
+		}
+		return repoID, revision, nil
+	}
 	normalized := strings.TrimPrefix(source, "hf://")
 	if normalized == "" {
 		return "", "", fmt.Errorf("empty hf repo source: %s", source)
@@ -263,8 +384,19 @@ func parseHFSource(source string) (repoID, revision string, err error) {
 // normalizeHFSource converts an HF source to its full HTTPS resolve URL.
 // For hf://org/repo@rev, returns "https://huggingface.co/org/repo/resolve/rev/".
 // For hf://org/repo (no rev), returns "https://huggingface.co/org/repo/resolve/main/".
-// Non-hf sources pass through unchanged.
+// For https://huggingface.co/org/repo[/tree/rev|...], returns the equivalent
+// resolve URL. Non-hf sources pass through unchanged.
 func normalizeHFSource(source string) string {
+	if isHuggingFaceURL(source) {
+		repoID, revision, err := parseHFSource(source)
+		if err != nil {
+			return source
+		}
+		if revision == "" {
+			revision = "main"
+		}
+		return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/", repoID, revision)
+	}
 	if !strings.HasPrefix(strings.ToLower(source), "hf://") {
 		return source
 	}
@@ -279,11 +411,38 @@ func normalizeHFSource(source string) string {
 	return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/", repoID, revision)
 }
 
+// hfServeArg returns the model argument a runtime (vLLM/TGI/SGLang) should
+// receive for an HF-repo source: the bare "org/name" repo id, with "@rev"
+// appended when a revision is pinned. This is identical to what the bare
+// "org/name" source form already yields, so hf:// sources and huggingface.co
+// repo URLs serve the same way the bare form does.
+//
+// Why not normalizeHFSource here: that returns a
+// "https://huggingface.co/org/repo/resolve/<rev>/" download URL, which is
+// correct for the init-container download path but is rejected by
+// vLLM/TGI/SGLang ("Repo id must be in the form 'namespace/repo_name'"). The
+// serve path needs the repo id, the download path needs the URL, so they use
+// different helpers. Non-HF-repo sources (local paths, s3://, direct file URLs)
+// pass through unchanged.
+func hfServeArg(source string) string {
+	if !isHFRepoSource(source) {
+		return source
+	}
+	repoID, revision, err := parseHFSource(source)
+	if err != nil || repoID == "" {
+		return source
+	}
+	if revision != "" {
+		return repoID + "@" + revision
+	}
+	return repoID
+}
+
 // validateHFRepoSource checks for common HF source mistakes and returns an
 // error if the source is malformed. Now accepts @rev syntax and validates
-// the revision is well-formed.
+// the revision is well-formed. Also validates huggingface.co URLs.
 func validateHFRepoSource(source string) error {
-	if !strings.HasPrefix(strings.ToLower(source), "hf://") {
+	if !strings.HasPrefix(strings.ToLower(source), "hf://") && !isHuggingFaceURL(source) {
 		return nil
 	}
 	_, _, err := parseHFSource(source)
@@ -315,6 +474,10 @@ func isHFRepoSource(source string) bool {
 	}
 	if isLocalSource(source) {
 		return false
+	}
+	if isHuggingFaceURL(source) {
+		_, _, ok := extractHFRepoFromURL(source)
+		return ok
 	}
 	if isRemoteHTTPSource(source) {
 		return false
