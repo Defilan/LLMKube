@@ -215,7 +215,6 @@ func TestFixtureFileChanges_CrossPackageRenameIntoChangedPkgSilent(t *testing.T)
 // dilutionRunner fakes the three git calls checkTestDilution makes:
 // `git add -A` (no-op), `git diff --name-status --cached HEAD`, and the
 // `git diff --cached --unified=0 ... -- *_test.go` line diff.
-// nolint:unparam // addErr is parameterized for clarity at call sites even though existing tests all pass nil
 func dilutionRunner(nameStatus, testDiff string, addErr, nsErr, diffErr error) commandRunner {
 	return func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
 		if name != "git" {
@@ -300,5 +299,37 @@ func TestCheckTestDilution_FailOpenOnGitError(t *testing.T) {
 	if failed, out := checkTestDilution(context.Background(), "/w",
 		dilutionRunner("", "", nil, errors.New("boom"), nil)); failed || out != "" {
 		t.Fatalf("git error must fail open (silent); got failed=%v out=%q", failed, out)
+	}
+}
+
+func TestCheckTestDilution_FailOpenOnAddError(t *testing.T) {
+	// git add -A failing must fail open (silent): exercises the stage-error branch.
+	if failed, out := checkTestDilution(context.Background(), "/w",
+		dilutionRunner("", "", errors.New("boom"), nil, nil)); failed || out != "" {
+		t.Fatalf("git add error must fail open (silent); got failed=%v out=%q", failed, out)
+	}
+}
+
+func TestCheckTestDilution_FailOpenOnDiffError(t *testing.T) {
+	// The unified-diff call failing must fail open. A production change is present
+	// so execution reaches the diff call (past the no-prod-change early return).
+	ns := "M\tpkg/model/classifier.go\n"
+	if failed, out := checkTestDilution(context.Background(), "/w",
+		dilutionRunner(ns, "", nil, nil, errors.New("boom"))); failed || out != "" {
+		t.Fatalf("unified-diff error must fail open (silent); got failed=%v out=%q", failed, out)
+	}
+}
+
+func TestCheckTestDilution_SilentWhenErosionInUnchangedPackage(t *testing.T) {
+	// Production changed in pkg/model, but the weakened test is in pkg/other,
+	// which has no production change: per-file package linkage must keep it silent.
+	ns := "M\tpkg/model/classifier.go\nM\tpkg/other/thing_test.go\n"
+	diff := `--- a/pkg/other/thing_test.go
++++ b/pkg/other/thing_test.go
+@@ -10 +9 @@
+-	Expect(classify(u)).To(Equal(RepoSource))
+`
+	if failed, _ := checkTestDilution(context.Background(), "/w", dilutionRunner(ns, diff, nil, nil, nil)); failed {
+		t.Fatal("erosion in a package with no production change must not fire (package linkage)")
 	}
 }
