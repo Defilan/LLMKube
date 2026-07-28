@@ -677,6 +677,43 @@ func TestValidateVLLMConfig(t *testing.T) {
 			},
 			wantReason: "SpeculativeMissingModel",
 		},
+		{
+			name: "cpuOffloadGB set surfaces CPUOffloadUnverified",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "vllm",
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						CPUOffloadGB: ptrInt32(4),
+					},
+				},
+			},
+			wantReason: "CPUOffloadUnverified",
+		},
+		{
+			name: "cpuOffloadGB zero is not warned",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "vllm",
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						CPUOffloadGB: ptrInt32(0),
+					},
+				},
+			},
+			wantReason: "",
+		},
+		{
+			name: "speculative-missing outranks cpu-offload (pins precedence)",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "vllm",
+					VLLMConfig: &inferencev1alpha1.VLLMConfig{
+						CPUOffloadGB: ptrInt32(4),
+						Speculative:  &inferencev1alpha1.SpeculativeConfig{Enabled: ptrBool(true)},
+					},
+				},
+			},
+			wantReason: "SpeculativeMissingModel",
+		},
 	}
 
 	for _, tc := range cases {
@@ -687,6 +724,38 @@ func TestValidateVLLMConfig(t *testing.T) {
 			}
 			if reason != "" && message == "" {
 				t.Errorf("expected non-empty message when reason is set, got empty")
+			}
+		})
+	}
+}
+
+// TestNeedsCPUOffloadNoopWarning covers the event predicate for #1320. The
+// runtime gate matters: the event call site is not runtime-scoped, so a
+// llamacpp service with a leftover vllmConfig must not warn.
+func TestNeedsCPUOffloadNoopWarning(t *testing.T) {
+	mk := func(runtime string, gb *int32) *inferencev1alpha1.InferenceService {
+		isvc := &inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{Runtime: runtime},
+		}
+		if gb != nil {
+			isvc.Spec.VLLMConfig = &inferencev1alpha1.VLLMConfig{CPUOffloadGB: gb}
+		}
+		return isvc
+	}
+	cases := []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+		want bool
+	}{
+		{"vllm with offload set", mk("vllm", ptrInt32(4)), true},
+		{"llamacpp with vllmConfig leftover", mk("llamacpp", ptrInt32(4)), false},
+		{"vllm with zero", mk("vllm", ptrInt32(0)), false},
+		{"vllm with nil config", mk("vllm", nil), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsCPUOffloadNoopWarning(tc.isvc); got != tc.want {
+				t.Fatalf("needsCPUOffloadNoopWarning() = %v, want %v", got, tc.want)
 			}
 		})
 	}

@@ -352,3 +352,150 @@ func TestConstructDeploymentGPUSharing(t *testing.T) {
 		}
 	})
 }
+
+// TestGPUSharingParallelismConflict backfills coverage for the mode-based
+// parallelism rule, which had none (#1320 review).
+func TestGPUSharingParallelismConflict(t *testing.T) {
+	tp2 := int32(2)
+	cases := []struct {
+		name    string
+		isvc    *inferencev1alpha1.InferenceService
+		wantErr bool
+	}{
+		{
+			name:    "exclusive mode allows explicit TP",
+			isvc:    withVLLMTP(sharingISvc(2, nil), &tp2),
+			wantErr: false,
+		},
+		{
+			name: "shared mode rejects explicit TP > 1",
+			isvc: withVLLMTP(sharingISvc(1, &inferencev1alpha1.GPUSharingSpec{
+				Mode: inferencev1alpha1.GPUSharingModeShared,
+			}), &tp2),
+			wantErr: true,
+		},
+		{
+			name: "partitioned mode rejects explicit TP > 1",
+			isvc: withVLLMTP(sharingISvc(1, &inferencev1alpha1.GPUSharingSpec{
+				Mode:    inferencev1alpha1.GPUSharingModePartitioned,
+				Profile: "1g.24gb",
+			}), &tp2),
+			wantErr: true,
+		},
+		{
+			name: "shared mode with no explicit parallelism is fine",
+			isvc: sharingISvc(1, &inferencev1alpha1.GPUSharingSpec{
+				Mode: inferencev1alpha1.GPUSharingModeShared,
+			}),
+			wantErr: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := gpuSharingParallelismConflict(tc.isvc)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("gpuSharingParallelismConflict() err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// withVLLMTP sets an explicit vllmConfig.tensorParallelSize on a fixture.
+func withVLLMTP(isvc *inferencev1alpha1.InferenceService, tp *int32) *inferencev1alpha1.InferenceService {
+	isvc.Spec.VLLMConfig = &inferencev1alpha1.VLLMConfig{TensorParallelSize: tp}
+	return isvc
+}
+
+// TestParallelismExceedsGPUCount is the regression test for #1320: explicit
+// parallelism larger than the pod's GPU count was admitted cleanly and died
+// in a crashloop (the shipped cpu-offload sample carried tensorParallelSize 8
+// on a 2 GPU spec).
+func TestParallelismExceedsGPUCount(t *testing.T) {
+	n := func(v int32) *int32 { return &v }
+	sglang := func(tp, dp, ep *int32) *inferencev1alpha1.SGLangConfig {
+		return &inferencev1alpha1.SGLangConfig{
+			TensorParallelSize: tp, DataParallelSize: dp, ExpertParallelSize: ep,
+		}
+	}
+	cases := []struct {
+		name    string
+		isvc    *inferencev1alpha1.InferenceService
+		model   *inferencev1alpha1.Model
+		wantErr string // substring; empty = no error
+	}{
+		{
+			name:  "TP nil is fine, auto-derive owns it",
+			isvc:  sharingISvc(2, nil),
+			model: sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 2}),
+		},
+		{
+			name:  "TP equal to count is fine",
+			isvc:  withVLLMTP(sharingISvc(2, nil), n(2)),
+			model: sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 2}),
+		},
+		{
+			name:    "TP 8 on 2 GPUs is the shipped-sample bug",
+			isvc:    withVLLMTP(sharingISvc(2, nil), n(8)),
+			model:   sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 2}),
+			wantErr: "tensorParallelSize 8 exceeds the 2 GPU",
+		},
+		{
+			name:  "TP below count is legitimate headroom",
+			isvc:  withVLLMTP(sharingISvc(2, nil), n(1)),
+			model: sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 2}),
+		},
+		{
+			name: "count 0 skips the check entirely",
+			isvc: withVLLMTP(sharingISvc(0, nil), n(8)),
+		},
+		{
+			name:    "model count wins over resources.gpu",
+			isvc:    withVLLMTP(sharingISvc(2, nil), n(4)),
+			model:   sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 4}),
+			wantErr: "",
+		},
+		{
+			name: "sglang tp x dp within count is fine",
+			isvc: func() *inferencev1alpha1.InferenceService {
+				i := sharingISvc(4, nil)
+				i.Spec.SGLangConfig = sglang(n(2), n(2), nil)
+				return i
+			}(),
+			model: sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 4}),
+		},
+		{
+			name: "sglang tp x dp over count fails",
+			isvc: func() *inferencev1alpha1.InferenceService {
+				i := sharingISvc(2, nil)
+				i.Spec.SGLangConfig = sglang(n(2), n(2), nil)
+				return i
+			}(),
+			model:   sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 2}),
+			wantErr: "needs 4 GPUs but this pod requests 2",
+		},
+		{
+			name: "sglang ep over count fails",
+			isvc: func() *inferencev1alpha1.InferenceService {
+				i := sharingISvc(2, nil)
+				i.Spec.SGLangConfig = sglang(n(2), nil, n(4))
+				return i
+			}(),
+			model:   sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Count: 2}),
+			wantErr: "expertParallelSize 4 exceeds",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parallelismExceedsGPUCount(tc.isvc, tc.model)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("parallelismExceedsGPUCount() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("parallelismExceedsGPUCount() = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -173,7 +173,9 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 // when the config is fine. The caller is expected to translate these into a
 // metav1.Condition on the InferenceService status.
 //
-// Today it only checks speculative decoding; add cases here as the CRD grows.
+// Only one (reason, message) is returned, so check ordering is precedence:
+// SpeculativeMissingModel (a flag that gets skipped entirely) outranks
+// CPUOffloadUnverified (a flag with an open upstream reliability report).
 func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, message string) {
 	if isvc == nil || isvc.Spec.VLLMConfig == nil {
 		return "", ""
@@ -185,8 +187,24 @@ func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, messa
 				"spec.vllmConfig.speculative.enabled is true but spec.vllmConfig.speculative.model is empty; speculative decoding flags will be skipped"
 		}
 	}
+	// TODO(#1320): remove once vllm-project/vllm#48468 ships in DefaultImage.
+	if cfg.CPUOffloadGB != nil && *cfg.CPUOffloadGB > 0 {
+		return "CPUOffloadUnverified", cpuOffloadIneffectiveMessage
+	}
 	return "", ""
 }
+
+// cpuOffloadIneffectiveMessage is shared by the VLLMSpecValid condition and
+// the reconcile-time Warning Event so the two surfaces cannot drift. Worded
+// as a dated factual claim so it stays true if upstream later fixes it.
+const cpuOffloadIneffectiveMessage = "spec.vllmConfig.cpuOffloadGB is set. " +
+	"vLLM's --cpu-offload-gb is reported silently ineffective in some " +
+	"configurations on current releases (vllm-project/vllm#48468, open): the " +
+	"flag is accepted but no weights offload, so VRAM-tight models OOM instead " +
+	"of spilling to host RAM. It is verified working in others (see the " +
+	"cpu-offload sample). Confirm it took effect in the server logs, via " +
+	"'Offloader set to' / 'offloaded parameters' lines or a Model-loading size " +
+	"below the full footprint, before relying on it"
 
 func (b *VLLMBackend) BuildProbes(port int32) (*corev1.Probe, *corev1.Probe, *corev1.Probe) {
 	startup := &corev1.Probe{

@@ -177,3 +177,16 @@ func appendTensorParallelSize(args []string, tensorParallelSize *int32) []string
 	}
 	return args
 }
+
+// needsCPUOffloadNoopWarning returns true when the vLLM runtime is selected
+// and spec.vllmConfig.cpuOffloadGB is set to a positive value. The flag is a
+// known silent no-op on current vLLM (vllm-project/vllm#48468), so the
+// controller emits a warning event: the field targets VRAM-constrained boxes,
+// where the no-op surfaces as an unexplained OOM rather than an error. The
+// runtime gate matters because the caller is not runtime-scoped.
+func needsCPUOffloadNoopWarning(isvc *inferencev1alpha1.InferenceService) bool {
+	return isvc.Spec.Runtime == RuntimeVLLM &&
+		isvc.Spec.VLLMConfig != nil &&
+		isvc.Spec.VLLMConfig.CPUOffloadGB != nil &&
+		*isvc.Spec.VLLMConfig.CPUOffloadGB > 0
+}

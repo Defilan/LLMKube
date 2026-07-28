@@ -183,7 +183,10 @@ func (v *InferenceServiceQuotaValidator) validateGPUSharing(ctx context.Context,
 	if _, err := resolveGPUSharing(isvc, model, v.GPUSharingSharedPool); err != nil {
 		return err
 	}
-	return gpuSharingParallelismConflict(isvc)
+	if err := gpuSharingParallelismConflict(isvc); err != nil {
+		return err
+	}
+	return parallelismExceedsGPUCount(isvc, model)
 }
 
 // listApplicableQuotas returns all GPUQuotas whose scope covers the given

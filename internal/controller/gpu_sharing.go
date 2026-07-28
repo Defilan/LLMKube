@@ -275,6 +275,73 @@ func gpuSharingParallelismConflict(isvc *inferencev1alpha1.InferenceService) err
 	return nil
 }
 
+// parallelismExceedsGPUCount rejects explicit per-pod parallelism that needs
+// more GPUs than the pod requests. LLMKube has no multi-node inference (no
+// Ray, no LeaderWorkerSet), so a world size larger than the pod's GPU count
+// can never start: vLLM and SGLang crash-loop probing for devices that do not
+// exist (#1320).
+//
+// Only EXPLICIT sizes are checked. When unset, the arg builders auto-derive
+// the size from the GPU count and are already correct. The check is skipped
+// when the resolved count is 0, which covers admission-time Model-not-found
+// (the reconcile backstop re-checks with the real Model) and DRA
+// resourceClaims, whose device count is unknowable here; silent beats wrong.
+//
+// vLLM's world size is TP alone today: VLLMConfig has no data/pipeline
+// parallel size fields, and EnableExpertParallel redistributes experts across
+// existing TP ranks. If DP/PP fields are ever added, this becomes the
+// product. SGLang differs: its in-process --dp launches dp engine replicas of
+// tp GPUs each inside one pod, so the per-pod need is tp*dp, and --ep cannot
+// exceed the world size either.
+func parallelismExceedsGPUCount(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) error {
+	var count int32
+	if model != nil {
+		count = resolveGPUCount(isvc, model)
+	} else if isvc.Spec.Resources != nil {
+		count = isvc.Spec.Resources.GPU
+	}
+	if count == 0 {
+		return nil
+	}
+
+	if cfg := isvc.Spec.VLLMConfig; cfg != nil && cfg.TensorParallelSize != nil &&
+		*cfg.TensorParallelSize > count {
+		return fmt.Errorf(
+			"vllmConfig.tensorParallelSize %d exceeds the %d GPU(s) this pod requests "+
+				"(model hardware.gpu.count / resources.gpu); multi-node inference is not "+
+				"supported, so the pod can never start. Lower tensorParallelSize, remove "+
+				"it to auto-match the GPU count, or request more GPUs",
+			*cfg.TensorParallelSize, count)
+	}
+
+	if cfg := isvc.Spec.SGLangConfig; cfg != nil {
+		tp, dp := int32(1), int32(1)
+		if cfg.TensorParallelSize != nil {
+			tp = *cfg.TensorParallelSize
+		}
+		if cfg.DataParallelSize != nil {
+			dp = *cfg.DataParallelSize
+		}
+		// Only enforce when at least one factor was explicit; both defaulted
+		// means the auto-derive path owns the answer.
+		if (cfg.TensorParallelSize != nil || cfg.DataParallelSize != nil) && tp*dp > count {
+			return fmt.Errorf(
+				"sglangConfig tensorParallelSize x dataParallelSize (%d x %d) needs %d "+
+					"GPUs but this pod requests %d; multi-node inference is not supported, "+
+					"so the pod can never start. Lower the sizes, remove them to auto-match "+
+					"the GPU count, or request more GPUs",
+				tp, dp, tp*dp, count)
+		}
+		if cfg.ExpertParallelSize != nil && *cfg.ExpertParallelSize > count {
+			return fmt.Errorf(
+				"sglangConfig.expertParallelSize %d exceeds the %d GPU(s) this pod "+
+					"requests; expert parallelism cannot exceed the pod's world size",
+				*cfg.ExpertParallelSize, count)
+		}
+	}
+	return nil
+}
+
 // serviceVRAMBytesFor derives the total VRAM footprint of an
 // InferenceService (per-pod footprint x replicas), fetching its Model for the
 // shared-mode hardware.gpu.memory fallback. A missing Model is not an error:

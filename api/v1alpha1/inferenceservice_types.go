@@ -1030,10 +1030,20 @@ type VLLMConfig struct {
 	// +optional
 	HFTokenSecretRef *corev1.SecretKeySelector `json:"hfTokenSecretRef,omitempty"`
 
-	// CPUOffloadGB increases the GPU memory size. When set, passes
-	// --cpu-offload-gb to vLLM. Per-rank, so 4 on TP=2 means 4 GB of
-	// CPU RAM per GPU. Use when FP8 model weights don't fit VRAM.
-	// Throughput hit is 2-5x on the offloaded path.
+	// CPUOffloadGB passes --cpu-offload-gb to vLLM. Per-rank, so 4 on TP=2
+	// means 4 GB of CPU RAM per GPU. Throughput hit is 2-5x on the offloaded
+	// path when it works.
+	//
+	// RELIABILITY NOTE: --cpu-offload-gb is reported silently ineffective in
+	// some configurations on current vLLM (vllm-project/vllm#48468, open):
+	// accepted but no weights offloaded, so VRAM-tight models OOM instead of
+	// spilling to host RAM. It is verified working in others, including the
+	// cpu-offload sample's configuration on both its pinned image and the
+	// operator default. Setting it surfaces a CPUOffloadUnverified advisory
+	// on the VLLMSpecValid condition and as an Event; confirm offload took
+	// effect in the server logs (Offloader/offloaded-parameters lines, or a
+	// Model-loading size below the full footprint) before relying on it. For
+	// MoE VRAM relief on llama.cpp use spec.moeCPUOffload.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	CPUOffloadGB *int32 `json:"cpuOffloadGB,omitempty"`
