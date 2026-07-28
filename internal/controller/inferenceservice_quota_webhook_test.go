@@ -1125,3 +1125,130 @@ func TestQuotaWebhookRejectsUnsatisfiableParallelism(t *testing.T) {
 		}
 	})
 }
+
+// #1311: HPA-driven scale-up is not gated by GPUQuota because the HPA
+// targets the Deployment, not the InferenceService, so HPA scaling never
+// re-enters the admission webhook. The quota must therefore charge
+// autoscaling.maxReplicas (the worst-case headroom) at admission time, not
+// spec.replicas.
+func TestQuotaWebhookChargesMaxReplicas(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core1: %v", err)
+	}
+
+	ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+	t.Run("maxReplicas over quota is denied at admission", func(t *testing.T) {
+		// gpu: 1, maxReplicas: 100 => 100 GPUs requested. Quota cap is 4.
+		// Before #1311 the webhook charged spec.replicas (1) and admitted.
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     4,
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "autoscaled-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Replicas: ptrInt32Val(1),
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{
+					GPU: 1,
+				},
+				Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+					MaxReplicas: 100,
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err == nil {
+			t.Fatal("expected denial (1*100=100 > 4), got nil")
+		}
+		if !strContains(err.Error(), "would exceed gpuCount") {
+			t.Fatalf("expected reason to mention gpuCount, got: %v", err)
+		}
+	})
+
+	t.Run("maxReplicas within quota is admitted", func(t *testing.T) {
+		// gpu: 1, maxReplicas: 4 => 4 GPUs requested. Quota cap is 8.
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     8,
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "autoscaled-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Replicas: ptrInt32Val(1),
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{
+					GPU: 1,
+				},
+				Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+					MaxReplicas: 4,
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		if _, err := v.ValidateCreate(ctx, &isvc); err != nil {
+			t.Fatalf("expected admission (1*4=4 <= 8), got error: %v", err)
+		}
+	})
+
+	t.Run("decide charges maxReplicas not spec.replicas", func(t *testing.T) {
+		// gpu: 2, maxReplicas: 3 => 6 GPUs. Quota cap is 5 => denied.
+		// spec.replicas is 1, which would have been admitted before #1311.
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     5,
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "autoscaled-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Replicas: ptrInt32Val(1),
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{
+					GPU: 2,
+				},
+				Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+					MaxReplicas: 3,
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		allow, reason := v.decide(ctx, quota, &isvc, nil)
+		if allow {
+			t.Fatal("expected deny (2*3=6 > 5), got allow")
+		}
+		if !strContains(reason, "would exceed gpuCount") {
+			t.Fatalf("expected reason to mention gpuCount, got: %s", reason)
+		}
+	})
+}
