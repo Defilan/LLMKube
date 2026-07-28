@@ -159,11 +159,11 @@ var _ = Describe("isHFRepoSource (source.go)", func() {
 	It("should return true for https huggingface.co tree URL", func() {
 		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")).To(BeTrue())
 	})
-	It("should return true for https huggingface.co blob URL", func() {
-		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/config.json")).To(BeTrue())
+	It("should return false for a blob file URL (single-file download, not a repo)", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/config.json")).To(BeFalse())
 	})
-	It("should return true for https huggingface.co resolve URL", func() {
-		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")).To(BeTrue())
+	It("should return false for a resolve file URL (single-file download, not a repo)", func() {
+		Expect(isHFRepoSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")).To(BeFalse())
 	})
 	It("should return true for http huggingface.co URL", func() {
 		Expect(isHFRepoSource("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(BeTrue())
@@ -240,17 +240,19 @@ var _ = Describe("extractHFRepoFromURL (source.go)", func() {
 		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
 		Expect(revision).To(Equal("main"))
 	})
-	It("should extract repo ID and revision from blob URL", func() {
-		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")
+	It("should return ok=false for a blob file URL (single-file download, not a repo)", func() {
+		_, _, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")
+		Expect(ok).To(BeFalse())
+	})
+	It("should return ok=false for a resolve file URL (single-file download, not a repo)", func() {
+		_, _, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")
+		Expect(ok).To(BeFalse())
+	})
+	It("should extract repo ID and revision from a resolve root (no file)", func() {
+		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/v1.0")
 		Expect(ok).To(BeTrue())
 		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
 		Expect(revision).To(Equal("v1.0"))
-	})
-	It("should extract repo ID and revision from resolve URL", func() {
-		repoID, revision, ok := extractHFRepoFromURL("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")
-		Expect(ok).To(BeTrue())
-		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
-		Expect(revision).To(Equal("main"))
 	})
 	It("should return ok=false for non-huggingface URL", func() {
 		_, _, ok := extractHFRepoFromURL("https://example.com/model.gguf")
@@ -319,17 +321,13 @@ var _ = Describe("parseHFSource (source.go)", func() {
 		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
 		Expect(revision).To(Equal("main"))
 	})
-	It("should parse https huggingface.co blob URL with revision", func() {
-		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
-		Expect(revision).To(Equal("v1.0"))
+	It("should error on a blob file URL (not a repo reference)", func() {
+		_, _, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")
+		Expect(err).To(HaveOccurred())
 	})
-	It("should parse https huggingface.co resolve URL with revision", func() {
-		repoID, revision, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")
-		Expect(err).NotTo(HaveOccurred())
-		Expect(repoID).To(Equal("Qwen/Qwen3.6-35B-A3B"))
-		Expect(revision).To(Equal("main"))
+	It("should error on a resolve file URL (not a repo reference)", func() {
+		_, _, err := parseHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")
+		Expect(err).To(HaveOccurred())
 	})
 	It("should parse http huggingface.co URL", func() {
 		repoID, revision, err := parseHFSource("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")
@@ -424,11 +422,11 @@ var _ = Describe("normalizeHFSource (source.go)", func() {
 	It("should convert https huggingface.co tree URL to resolve URL with revision", func() {
 		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/main")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
 	})
-	It("should convert https huggingface.co blob URL to resolve URL with revision", func() {
-		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/v1.0/"))
+	It("should leave a blob file URL unchanged (single-file download)", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/v1.0/config.json"))
 	})
-	It("should convert https huggingface.co resolve URL to resolve URL with revision", func() {
-		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
+	It("should leave a resolve file URL unchanged (single-file download)", func() {
+		Expect(normalizeHFSource("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/model.gguf"))
 	})
 	It("should convert http huggingface.co URL to resolve URL", func() {
 		Expect(normalizeHFSource("http://huggingface.co/Qwen/Qwen3.6-35B-A3B")).To(Equal("https://huggingface.co/Qwen/Qwen3.6-35B-A3B/resolve/main/"))
@@ -441,8 +439,11 @@ var _ = Describe("isRemoteHTTPSource (source.go)", func() {
 	// is populated. If a future change widens or narrows what this matcher
 	// considers HTTP(S), the dispatch in Reconcile() flips silently, so this
 	// matcher needs explicit, exhaustive cases.
-	It("should return false for huggingface.co URL (HF-repo source, not remote HTTP)", func() {
-		Expect(isRemoteHTTPSource("https://huggingface.co/org/repo/resolve/main/model.gguf")).To(BeFalse())
+	It("should return false for a huggingface.co repo URL (runtime-resolved, not remote HTTP)", func() {
+		Expect(isRemoteHTTPSource("https://huggingface.co/org/repo")).To(BeFalse())
+	})
+	It("should return true for a huggingface.co file URL (single-file download)", func() {
+		Expect(isRemoteHTTPSource("https://huggingface.co/org/repo/resolve/main/model.gguf")).To(BeTrue())
 	})
 	It("should return true for non-huggingface https URL", func() {
 		Expect(isRemoteHTTPSource("https://example.com/model.gguf")).To(BeTrue())

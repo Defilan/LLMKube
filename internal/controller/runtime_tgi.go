@@ -33,7 +33,9 @@ func (b *TGIBackend) DefaultHPAMetric() string { return "tgi:queue_size" }
 func (b *TGIBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
 	source := modelPath
 	if source == "" {
-		source = normalizeHFSource(model.Spec.Source)
+		// Serve path: hand TGI the bare "org/name[@rev]" repo id, not a resolve
+		// URL (which it rejects). See hfServeArg.
+		source = hfServeArg(model.Spec.Source)
 	}
 
 	args := []string{

@@ -82,7 +82,9 @@ func (b *SGLangBackend) DefaultHPAMetric() string { return "sglang:num_running_r
 func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
 	source := modelPath
 	if source == "" {
-		source = normalizeHFSource(model.Spec.Source)
+		// Serve path: hand SGLang the bare "org/name[@rev]" repo id, not a
+		// resolve URL (which it rejects). See hfServeArg.
+		source = hfServeArg(model.Spec.Source)
 	}
 	args := []string{
 		"--model-path", source,
