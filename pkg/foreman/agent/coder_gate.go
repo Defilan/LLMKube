@@ -128,8 +128,10 @@ func RunCoderGate(
 	// so -w only touches the coder's own changes. Re-run `gofmt -l .`
 	// afterward: a file gofmt cannot rewrite (e.g. a syntax error) is still
 	// listed, so a genuine formatting problem surfaces rather than being
-	// silently swallowed.
-	run(ctx, workspace, nil, "gofmt", "-w", ".")
+	// silently swallowed. The -w exit status is intentionally ignored: any
+	// file it could not rewrite is reported by the -l re-check immediately
+	// below.
+	_, _ = run(ctx, workspace, nil, "gofmt", "-w", ".")
 	if out, _ := run(ctx, workspace, nil, "gofmt", "-l", "."); strings.TrimSpace(out) != "" {
 		failures = append(failures, checkFailure{name: "gofmt -l .", output: out})
 	}
