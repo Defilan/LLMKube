@@ -94,3 +94,45 @@ var _ = Describe("modelEnvFrom", func() {
 		Expect(envFrom[0].SecretRef.Name).To(Equal("s3-credentials"))
 	})
 })
+
+var _ = Describe("revalidateDecision", func() {
+	// This is the behavioral test that the prior attempt (#1326) lacked.
+	// The storage tests only string-matched the generated command, so they
+	// were green on a script whose skip branch could never run. This test
+	// exercises the size-probe + skip/download decision directly and would
+	// FAIL if the probe returned 0 (the bug from #1309).
+	It("skips download when remote size matches local size", func() {
+		Expect(revalidateDecision("1024", 1024)).To(Equal(revalidateSkip))
+	})
+
+	It("downloads when remote size differs from local size", func() {
+		Expect(revalidateDecision("2048", 1024)).To(Equal(revalidateDownload))
+	})
+
+	It("downloads when remote size is empty (no Content-Length)", func() {
+		Expect(revalidateDecision("", 1024)).To(Equal(revalidateDownload))
+	})
+
+	It("downloads when remote size is 0 (the #1309 bug: size_download on HEAD)", func() {
+		// This is the exact defect: curl -I -w '%{size_download}' always
+		// returns 0 for a HEAD request. If the decision logic used that
+		// value, the skip branch would never fire and every restart would
+		// re-download. This assertion guards against that regression.
+		Expect(revalidateDecision("0", 1024)).To(Equal(revalidateDownload))
+	})
+
+	It("downloads when local file is missing (size 0) but remote has content", func() {
+		Expect(revalidateDecision("1024", 0)).To(Equal(revalidateDownload))
+	})
+
+	It("downloads when both remote and local are 0 (empty file, cannot confirm)", func() {
+		// A 0 remote size is treated as "no Content-Length" (the #1309 bug),
+		// so even an empty local file triggers a re-download rather than a
+		// false skip.
+		Expect(revalidateDecision("0", 0)).To(Equal(revalidateDownload))
+	})
+
+	It("downloads when remote size is non-numeric", func() {
+		Expect(revalidateDecision("abc", 1024)).To(Equal(revalidateDownload))
+	})
+})

@@ -191,11 +191,20 @@ func buildModelInitCommand(isLocal, isS3, useCache bool, refreshPolicy string) s
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
-// sources fetched by the init container. It uses curl's native conditional
-// GET (--etag-compare / --etag-save) against a marker file kept next to the
-// model on the PVC: on a 304 curl leaves the cached file untouched, on a 200
-// (ETag changed) it overwrites in place. The cache layout is unchanged; the
-// marker is a dotfile sibling of the model file.
+// sources fetched by the init container. It HEADs the artifact and compares
+// the remote Content-Length against the local file size before transferring:
+// when they match the cached copy is kept and the download is skipped.
+//
+// Why Content-Length and not curl's --etag-compare: HuggingFace redirects
+// resolve/<rev>/<file> to a signed CDN URL on a different host, and the
+// If-None-Match header is not reapplied across that hop, so the CDN always
+// streams the whole object (a 200, never a 304). A size probe is the only
+// check that works for LFS-backed weights and needs no schema change.
+//
+// Size-equality is a truncation guard, not an integrity check: a byte-for-byte
+// rewrite of the same length would pass. Digest validation would be stronger,
+// but sha256 pinning is not available on the Model CRD, so revision pinning
+// plus a size check is the practical ceiling today.
 //
 // Robustness: the init container gates pod startup, so a transient network
 // failure (air-gapped, upstream 5xx, DNS) must not take down an
@@ -204,17 +213,62 @@ func buildModelInitCommand(isLocal, isS3, useCache bool, refreshPolicy string) s
 // genuinely-missing file (nothing cached and the fetch failed) fails the init
 // container.
 //
-// curlimages/curl 8.x supports --etag-compare/--etag-save (added in curl
-// 7.68.0), so no HEAD-compare fallback is needed for the default image.
-const remoteRevalidateScript = `ETAG_MARKER="$(dirname "$MODEL_PATH")/.$(basename "$MODEL_PATH").etag"; ` +
-	`echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
-	`if curl -fsSL --etag-compare "$ETAG_MARKER" --etag-save "$ETAG_MARKER" -o "$MODEL_PATH" "$MODEL_SOURCE"; then ` +
-	`echo 'Model revalidated (downloaded or unchanged)'; ` +
-	`elif [ -f "$MODEL_PATH" ]; then ` +
-	`echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
+// curlimages/curl 8.x supports the %{header{content-length}} write-out
+// variable (added in curl 7.84.0), so no header-dump parsing fallback is
+// needed for the default image.
+const remoteRevalidateScript = `echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
+	`remote_size=$(curl -sIL \"$MODEL_SOURCE\" -w '%header{content-length}' -o /dev/null); ` +
+	`local_size=$(stat -c '%s' \"$MODEL_PATH\" 2>/dev/null || echo 0); ` +
+	`if [ -n \"$remote_size\" ] && [ \"$remote_size\" != \"0\" ] && [ \"$remote_size\" = \"$local_size\" ]; then ` +
+	`echo 'Model revalidated (unchanged, skipped download)'; ` +
+	`elif [ -f \"$MODEL_PATH\" ]; then ` +
+	`echo 'cannot revalidate (no Content-Length or size mismatch), re-downloading'; ` +
+	`curl -fsSL -o \"$MODEL_PATH.tmp\" \"$MODEL_SOURCE\" && mv \"$MODEL_PATH.tmp\" \"$MODEL_PATH\"; ` +
 	`else ` +
-	`echo 'ERROR: model missing and revalidation failed'; exit 1; ` +
-	`fi`
+	`echo 'cannot revalidate (no Content-Length), re-downloading'; ` +
+	`curl -fsSL -o \"$MODEL_PATH.tmp\" \"$MODEL_SOURCE\" && mv \"$MODEL_PATH.tmp\" \"$MODEL_PATH\"; ` +
+	`fi; ` +
+	`if [ ! -f \"$MODEL_PATH\" ]; then echo 'ERROR: model missing and revalidation failed'; exit 1; fi`
+
+// revalidateDecision is the testable core of remoteRevalidateScript: given the
+// remote Content-Length (as reported by curl's %{header{content-length}}
+// write-out) and the local file size, it decides whether to skip the download
+// or re-fetch. It is extracted so the skip/download decision can be unit-tested
+// without shelling out to curl.
+//
+// remoteSize is the raw string from the write-out variable. An empty string or
+// "0" means the HEAD returned no Content-Length (e.g. a 405, or a server that
+// omits the header); in that case the caller must re-download.
+//
+// Returns:
+//   - revalidateSkip: remote and local sizes match; the cached copy is valid.
+//   - revalidateDownload: sizes differ, or the remote size is unknown; the
+//     caller must download to a temp file and rename into place.
+func revalidateDecision(remoteSize string, localSize int64) revalidateAction {
+	if remoteSize == "" || remoteSize == "0" {
+		return revalidateDownload
+	}
+	var remote int64
+	if _, err := fmt.Sscanf(remoteSize, "%d", &remote); err != nil || remote < 0 {
+		return revalidateDownload
+	}
+	if remote == localSize {
+		return revalidateSkip
+	}
+	return revalidateDownload
+}
+
+// revalidateAction is the outcome of revalidateDecision.
+type revalidateAction int
+
+const (
+	// revalidateSkip means the cached file matches the remote size; do not
+	// download.
+	revalidateSkip revalidateAction = iota
+	// revalidateDownload means the remote size is unknown or differs from the
+	// local file; download to a temp file and rename into place.
+	revalidateDownload
+)
 
 func modelInitEnvVars(source, cacheDir, modelPath string) []corev1.EnvVar {
 	envs := []corev1.EnvVar{
@@ -394,11 +448,18 @@ func buildMultiFileInitCommand(useCache bool, refreshPolicy string) string {
 			`dest="$CACHE_DIR/$rel"; ` +
 			`mkdir -p "$(dirname "$dest")"; ` +
 			`url="${SOURCE%/}/$rel"; ` +
-			`etag="$(dirname "$dest")/.$(basename "$dest").etag"; ` +
-			`if curl -fsSL --etag-compare "$etag" --etag-save "$etag" -o "$dest" "$url"; then ` +
-			`echo "Model artifact $rel revalidated"; ` +
-			`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
-			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
+			`remote_size=$(curl -sIL "$url" -w '%header{content-length}' -o /dev/null); ` +
+			`local_size=$(stat -c '%s' "$dest" 2>/dev/null || echo 0); ` +
+			`if [ -n "$remote_size" ] && [ "$remote_size" != "0" ] && [ "$remote_size" = "$local_size" ]; then ` +
+			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
+			`elif [ -f "$dest" ]; then ` +
+			`echo "cannot revalidate (no Content-Length or size mismatch) for $rel, re-downloading"; ` +
+			`curl -fsSL -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; ` +
+			`else ` +
+			`echo "cannot revalidate (no Content-Length) for $rel, re-downloading"; ` +
+			`curl -fsSL -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; ` +
+			`fi; ` +
+			`if [ ! -f "$dest" ]; then echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
 			`done`
 		return prefix + body
 	}

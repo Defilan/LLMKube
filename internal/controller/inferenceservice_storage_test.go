@@ -307,9 +307,9 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 
 		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		cmd := config.initContainers[1].Command[2]
-		Expect(cmd).To(ContainSubstring("--etag-compare"))
-		Expect(cmd).To(ContainSubstring("--etag-save"))
-		Expect(cmd).To(ContainSubstring("kept cached copy"))
+		Expect(cmd).To(ContainSubstring("content-length"))
+		Expect(cmd).To(ContainSubstring("skipped download"))
+		Expect(cmd).To(ContainSubstring(".tmp"))
 	})
 
 	It("preserves legacy single-file behavior when no files/mmproj", func() {
@@ -379,9 +379,9 @@ var _ = Describe("buildEmptyDirStorageConfig multi-file staging", func() {
 
 		config := buildEmptyDirStorageConfig(model, nil, "default", "", "curl:8.18.0")
 		cmd := config.initContainers[0].Command[2]
-		Expect(cmd).To(ContainSubstring("--etag-compare"))
-		Expect(cmd).To(ContainSubstring("--etag-save"))
-		Expect(cmd).To(ContainSubstring("kept cached copy"))
+		Expect(cmd).To(ContainSubstring("content-length"))
+		Expect(cmd).To(ContainSubstring("skipped download"))
+		Expect(cmd).To(ContainSubstring(".tmp"))
 	})
 })
 
@@ -401,12 +401,12 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 		Expect(cmd).To(ContainSubstring("failed to download"))
 	})
 
-	It("generates etag revalidation for OnChange policy", func() {
+	It("generates size-based revalidation for OnChange policy", func() {
 		cmd := buildMultiFileInitCommand(true, RefreshPolicyOnChange)
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
-		Expect(cmd).To(ContainSubstring("--etag-compare"))
-		Expect(cmd).To(ContainSubstring("--etag-save"))
-		Expect(cmd).To(ContainSubstring("kept cached copy"))
+		Expect(cmd).To(ContainSubstring("content-length"))
+		Expect(cmd).To(ContainSubstring("skipped download"))
+		Expect(cmd).To(ContainSubstring(".tmp"))
 	})
 
 	It("uses emptyDir prefix without cache dir for non-cached storage", func() {
@@ -1272,15 +1272,13 @@ var _ = Describe("buildModelInitCommand", func() {
 	})
 
 	Context("RefreshPolicy=OnChange (http/https revalidation, issue #619)", func() {
-		It("cached: emits curl conditional GET against an etag marker beside the model", func() {
+		It("cached: emits size-based revalidation via Content-Length probe", func() {
 			cmd := buildModelInitCommand(false, false, true, RefreshPolicyOnChange)
 			// Still provisions the cache dir like IfNotPresent.
 			Expect(cmd).To(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
-			// Conditional GET via curl's native ETag flags.
-			Expect(cmd).To(ContainSubstring("--etag-compare"))
-			Expect(cmd).To(ContainSubstring("--etag-save"))
-			// Marker is a dotfile sibling derived from the model path.
-			Expect(cmd).To(ContainSubstring(`.etag`))
+			// Size probe reads Content-Length from the HEAD response.
+			Expect(cmd).To(ContainSubstring("content-length"))
+			Expect(cmd).To(ContainSubstring("skipped download"))
 			Expect(cmd).To(ContainSubstring(`"$MODEL_PATH"`))
 			Expect(cmd).To(ContainSubstring(`"$MODEL_SOURCE"`))
 			// It is NOT the existence-only path.
@@ -1289,8 +1287,8 @@ var _ = Describe("buildModelInitCommand", func() {
 
 		It("uncached: emits the same conditional GET without the cache dir mkdir", func() {
 			cmd := buildModelInitCommand(false, false, false, RefreshPolicyOnChange)
-			Expect(cmd).To(ContainSubstring("--etag-compare"))
-			Expect(cmd).To(ContainSubstring("--etag-save"))
+			Expect(cmd).To(ContainSubstring("content-length"))
+			Expect(cmd).To(ContainSubstring("skipped download"))
 			Expect(cmd).To(ContainSubstring(`"$MODEL_SOURCE"`))
 			Expect(cmd).NotTo(ContainSubstring("mkdir -p"))
 			Expect(cmd).NotTo(ContainSubstring("skipping download"))
@@ -1299,10 +1297,11 @@ var _ = Describe("buildModelInitCommand", func() {
 		It("keeps the cached file and exits 0 when revalidation is unreachable", func() {
 			cmd := buildModelInitCommand(false, false, true, RefreshPolicyOnChange)
 			// Robustness guard: a network blip must not take down a running
-			// InferenceService on pod restart.
+			// InferenceService on pod restart. The script re-downloads to a
+			// temp file and renames into place, preserving the cached copy.
 			Expect(cmd).To(ContainSubstring(`[ -f "$MODEL_PATH" ]`))
-			Expect(cmd).To(ContainSubstring("exit 0"))
-			Expect(cmd).To(ContainSubstring("kept cached copy"))
+			Expect(cmd).To(ContainSubstring("re-downloading"))
+			Expect(cmd).To(ContainSubstring(".tmp"))
 			// A genuinely-missing file still fails the init container.
 			Expect(cmd).To(ContainSubstring("exit 1"))
 		})
@@ -1313,7 +1312,7 @@ var _ = Describe("buildModelInitCommand", func() {
 			ifNotPresent := buildModelInitCommand(true, false, true, RefreshPolicyIfNotPresent)
 			onChange := buildModelInitCommand(true, false, true, RefreshPolicyOnChange)
 			Expect(onChange).To(Equal(ifNotPresent))
-			Expect(onChange).NotTo(ContainSubstring("--etag-compare"))
+			Expect(onChange).NotTo(ContainSubstring("content-length"))
 		})
 
 		It("does not contain user-controlled values in the OnChange command string", func() {
@@ -1335,8 +1334,9 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 		}
 		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		cmd := config.initContainers[1].Command[2]
-		Expect(cmd).To(ContainSubstring("--etag-compare"))
-		Expect(cmd).To(ContainSubstring("kept cached copy"))
+		Expect(cmd).To(ContainSubstring("content-length"))
+		Expect(cmd).To(ContainSubstring("skipped download"))
+		Expect(cmd).To(ContainSubstring(".tmp"))
 	})
 
 	It("keeps existence-only behavior when RefreshPolicy is unset (IfNotPresent default)", func() {
@@ -1346,7 +1346,7 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 		}
 		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		cmd := config.initContainers[1].Command[2]
-		Expect(cmd).NotTo(ContainSubstring("--etag-compare"))
+		Expect(cmd).NotTo(ContainSubstring("content-length"))
 		Expect(cmd).To(ContainSubstring("skipping download"))
 	})
 })
