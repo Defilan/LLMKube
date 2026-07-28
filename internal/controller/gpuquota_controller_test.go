@@ -841,6 +841,70 @@ func TestReconcileModelDeclaredGPUCount(t *testing.T) {
 	}
 }
 
+// #1311: status.usedGPUCount must count autoscaling.maxReplicas (the
+// ceiling the HPA can reach) rather than spec.replicas, so the reported
+// usage reflects the worst case the quota must cover. A service with
+// replicas: 1 and maxReplicas: 100 charges 100 GPUs, not 1.
+func TestReconcileAutoscalingMaxReplicas(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = inferencev1alpha1.AddToScheme(scheme)
+
+	gq := &inferencev1alpha1.GPUQuota{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-gq",
+			Namespace: "default",
+		},
+		Spec: inferencev1alpha1.GPUQuotaSpec{
+			NamespaceRef: "my-ns",
+			GPUCount:     10,
+		},
+	}
+
+	// gpu: 1, replicas: 1, maxReplicas: 100 => charges 100 GPUs.
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-isvc",
+			Namespace: "my-ns",
+		},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Replicas: ptrInt32GPUQuota(1),
+			Resources: &inferencev1alpha1.InferenceResourceRequirements{
+				GPU: 1,
+			},
+			Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+				MaxReplicas: 100,
+			},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&inferencev1alpha1.GPUQuota{}).WithObjects(gq, isvc).Build()
+	r := &GPUQuotaReconciler{Client: c, Scheme: scheme}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "my-gq",
+			Namespace: "default",
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Reconcile() returned error: %v", err)
+	}
+	if result != (ctrl.Result{}) {
+		t.Errorf("Reconcile() returned %+v, want empty Result", result)
+	}
+
+	var updatedGQ inferencev1alpha1.GPUQuota
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "my-gq", Namespace: "default"}, &updatedGQ); err != nil {
+		t.Fatalf("failed to get GPUQuota after reconcile: %v", err)
+	}
+	if updatedGQ.Status.UsedGPUCount != 100 {
+		t.Errorf("Reconcile() status.UsedGPUCount = %d, want 100 (gpu 1 * maxReplicas 100)", updatedGQ.Status.UsedGPUCount)
+	}
+}
+
 func TestReconcileNoScope(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)

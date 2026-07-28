@@ -260,6 +260,88 @@ func TestInferenceServiceQuotaValidator(t *testing.T) {
 		}
 	})
 
+	// #1311: HPA-driven scale-up is not gated by GPUQuota because the HPA
+	// targets the Deployment, not the InferenceService, so admission only
+	// fires on create/update. Charging spec.replicas under-reports the
+	// worst case: a service admitted at 1 GPU can reach maxReplicas
+	// GPU-consuming pods with no further admission review. Charge
+	// autoscaling.maxReplicas so the cap reflects the ceiling the tenant
+	// is asking for, and reject admission when it would exceed the quota.
+	t.Run("autoscaling maxReplicas is charged against gpuCount", func(t *testing.T) {
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     4,
+			},
+		}
+		// gpu: 1, replicas: 1, maxReplicas: 100 => charges 100 GPUs.
+		// Quota cap is 4, so this must be denied even though spec.replicas
+		// (1) alone would be within quota.
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Replicas: ptrInt32Val(1),
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{
+					GPU: 1,
+				},
+				Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+					MaxReplicas: 100,
+				},
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err == nil {
+			t.Fatal("expected denial (gpu 1 * maxReplicas 100 = 100 > 4), got nil")
+		}
+		if !strContains(err.Error(), "would exceed gpuCount") {
+			t.Fatalf("expected reason to mention gpuCount, got: %v", err)
+		}
+	})
+
+	t.Run("autoscaling within quota is admitted", func(t *testing.T) {
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     8,
+			},
+		}
+		// gpu: 1, maxReplicas: 4 => charges 4 GPUs, within the 8-GPU cap.
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Replicas: ptrInt32Val(1),
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{
+					GPU: 1,
+				},
+				Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+					MaxReplicas: 4,
+				},
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err != nil {
+			t.Fatalf("expected admission (gpu 1 * maxReplicas 4 = 4 <= 8), got error: %v", err)
+		}
+	})
+
 	t.Run("priority-floor deny", func(t *testing.T) {
 		quota := inferencev1alpha1.GPUQuota{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},

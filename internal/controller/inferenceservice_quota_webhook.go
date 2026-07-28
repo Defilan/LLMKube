@@ -338,10 +338,21 @@ func (v *InferenceServiceQuotaValidator) currentUsage(ctx context.Context, q inf
 // hardware.gpu.count is charged the same way the pod spec requests it.
 // The Model argument is nil-safe; when nil the count falls back to
 // isvc.Spec.Resources.GPU. Replicas default to 1 when nil.
+//
+// When autoscaling is configured, the HPA owns the live replica count and
+// scales the Deployment past spec.replicas up to autoscaling.maxReplicas.
+// Admission only fires on InferenceService create/update, so charging
+// spec.replicas would under-report the worst case the quota must cover: a
+// service admitted at 1 GPU can reach maxReplicas GPU-consuming pods with no
+// further admission review. Charge maxReplicas instead so the cap reflects
+// the ceiling the tenant is asking for (#1311).
 func gpuCount(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) int32 {
 	replicas := int32(1)
 	if isvc.Spec.Replicas != nil {
 		replicas = *isvc.Spec.Replicas
+	}
+	if isvc.Spec.Autoscaling != nil {
+		replicas = isvc.Spec.Autoscaling.MaxReplicas
 	}
 	return apiutil.GPUCount(isvc, model) * replicas
 }

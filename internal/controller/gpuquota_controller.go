@@ -134,10 +134,18 @@ func (r *GPUQuotaReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 					model = m
 				}
 			}
-			// Replicas: nil means 1.
+			// Replicas: nil means 1. When autoscaling is configured the HPA
+			// owns the live count up to maxReplicas, so charge the ceiling
+			// the tenant is asking for rather than the authored spec.replicas
+			// (which stays put while the HPA scales). This keeps
+			// status.usedGPUCount truthful and consistent with the admission
+			// gate (#1311).
 			replicas := int32(1)
 			if isvc.Spec.Replicas != nil {
 				replicas = *isvc.Spec.Replicas
+			}
+			if isvc.Spec.Autoscaling != nil {
+				replicas = isvc.Spec.Autoscaling.MaxReplicas
 			}
 			usedGPUCount += apiutil.GPUCount(&isvc, model) * replicas
 
