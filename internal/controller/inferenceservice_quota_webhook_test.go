@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -875,6 +876,62 @@ func TestValidate(t *testing.T) {
 		}
 		if !strContains(err.Error(), "would exceed gpuCount") {
 			t.Fatalf("expected error to mention gpuCount, got: %v", err)
+		}
+	})
+}
+
+// TestQuotaWebhookRejectsUnsatisfiableParallelism covers the #1320 wiring:
+// explicit TP larger than the pod's GPUs is denied at admission when the
+// webhook is enabled, and skipped (not falsely denied) when the count is
+// unknowable.
+func TestQuotaWebhookRejectsUnsatisfiableParallelism(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1: %v", err)
+	}
+	tp8 := int32(8)
+
+	t.Run("explicit TP over GPU count is denied naming the field", func(t *testing.T) {
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "tp-over", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{TensorParallelSize: &tp8},
+				Resources:  &inferencev1alpha1.InferenceResourceRequirements{GPU: 2},
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&ns).Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err == nil {
+			t.Fatal("expected denial, got admission")
+		}
+		if !strings.Contains(err.Error(), "tensorParallelSize") {
+			t.Fatalf("denial must name the offending field, got: %v", err)
+		}
+	})
+
+	t.Run("unknown GPU count is admitted, not falsely denied", func(t *testing.T) {
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "tp-unknown", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "not-created-yet",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{TensorParallelSize: &tp8},
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&ns).Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		if _, err := v.ValidateCreate(ctx, &isvc); err != nil {
+			t.Fatalf("count-unknown must be admitted (backstop re-checks), got: %v", err)
 		}
 	})
 }

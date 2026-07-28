@@ -238,6 +238,11 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			"Model source is a HuggingFace repo ID (resolved by the runtime at startup); set spec.skipModelInit=true so the init container does not run")
 	}
 
+	if r.Recorder != nil && needsCPUOffloadNoopWarning(inferenceService) {
+		r.Recorder.Eventf(inferenceService, nil, corev1.EventTypeWarning, "CPUOffloadIneffective", "Reconcile",
+			cpuOffloadIneffectiveMessage)
+	}
+
 	deployment, readyReplicas, metalSnap, result, err := r.reconcileDeployment(ctx, inferenceService, model, desiredReplicas, modelReady, isMetal)
 	if err != nil || result != nil {
 		if result != nil {
@@ -362,6 +367,16 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	if _, err := resolveGPUSharing(isvc, model, r.GPUSharingSharedPool); err != nil {
 		log.Info("Rejecting InferenceService with invalid gpuSharing spec", "reason", err.Error())
 		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "", fmt.Sprintf("Invalid gpuSharing: %v", err), nil)
+		return nil, 0, nil, &result, updateErr
+	}
+
+	// Explicit parallelism that cannot fit the pod's GPUs is equally fatal:
+	// the engine crash-loops probing for devices that do not exist (#1320).
+	// The quota webhook rejects this at admission when multitenancy is
+	// enabled; this backstop covers default installs.
+	if err := parallelismExceedsGPUCount(isvc, model); err != nil {
+		log.Info("Rejecting InferenceService with unsatisfiable parallelism", "reason", err.Error())
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "", fmt.Sprintf("Invalid parallelism: %v", err), nil)
 		return nil, 0, nil, &result, updateErr
 	}
 

@@ -5513,10 +5513,18 @@ spec:
                     type: string
                   cpuOffloadGB:
                     description: |-
-                      CPUOffloadGB increases the GPU memory size. When set, passes
-                      --cpu-offload-gb to vLLM. Per-rank, so 4 on TP=2 means 4 GB of
-                      CPU RAM per GPU. Use when FP8 model weights don't fit VRAM.
-                      Throughput hit is 2-5x on the offloaded path.
+                      CPUOffloadGB passes --cpu-offload-gb to vLLM. Per-rank, so 4 on TP=2
+                      means 4 GB of CPU RAM per GPU. Throughput hit is 2-5x on the offloaded
+                      path when it works.
+
+                      KNOWN ISSUE: on vLLM V1-engine releases through at least v0.26,
+                      including the default image, this flag is a silent no-op upstream
+                      (vllm-project/vllm#48468): it is accepted but no weights are offloaded,
+                      so VRAM-tight models OOM instead of spilling to host RAM. Setting it
+                      surfaces a CPUOffloadIneffective warning on the VLLMSpecValid condition
+                      and as an Event. Verify offload in the server logs before relying on
+                      it; for MoE VRAM relief use the llama.cpp runtime's spec.moeCPUOffload
+                      instead.
                     format: int32
                     minimum: 0
                     type: integer
