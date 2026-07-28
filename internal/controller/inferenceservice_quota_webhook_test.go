@@ -170,6 +170,96 @@ func TestInferenceServiceQuotaValidator(t *testing.T) {
 		}
 	})
 
+	// #1310: a Model declaring hardware.gpu.count must be charged against
+	// the gpuCount quota, not silently bypassed. The pod spec requests the
+	// GPUs via apiutil.GPUCount (which prefers the Model), so the quota
+	// must resolve through the same path.
+	t.Run("model-declared gpu count is charged against gpuCount", func(t *testing.T) {
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     4,
+			},
+		}
+		// Model declares 4 GPUs; ISVC leaves resources.gpu unset.
+		// With replicas: 2 the pod requests 8 GPUs (4 x 2), exceeding the
+		// 4-GPU cap. Before #1310 the quota charged 0 and admitted anyway.
+		model := inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					GPU: &inferencev1alpha1.GPUSpec{
+						Count: 4,
+					},
+				},
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "my-model",
+				Replicas: ptrInt32Val(2),
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &model, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err == nil {
+			t.Fatal("expected denial (model gpu 4 * replicas 2 = 8 > 4), got nil")
+		}
+		if !strContains(err.Error(), "would exceed gpuCount") {
+			t.Fatalf("expected reason to mention gpuCount, got: %v", err)
+		}
+	})
+
+	t.Run("model-declared gpu count within quota is admitted", func(t *testing.T) {
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     8,
+			},
+		}
+		// Model declares 4 GPUs; ISVC leaves resources.gpu unset.
+		// With replicas: 1 the pod requests 4 GPUs, within the 8-GPU cap.
+		model := inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					GPU: &inferencev1alpha1.GPUSpec{
+						Count: 4,
+					},
+				},
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "my-model",
+				Replicas: ptrInt32Val(1),
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &model, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err != nil {
+			t.Fatalf("expected admission (model gpu 4 <= 8), got error: %v", err)
+		}
+	})
+
 	t.Run("priority-floor deny", func(t *testing.T) {
 		quota := inferencev1alpha1.GPUQuota{
 			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
@@ -473,6 +563,60 @@ func TestInferenceServiceScheme(t *testing.T) {
 	}
 }
 
+// TestFetchModel verifies that fetchModel returns the referenced Model when
+// it exists, nil when ModelRef is empty, and nil when the Model cannot be
+// read (best-effort at admission time).
+func TestFetchModel(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = inferencev1alpha1.AddToScheme(scheme)
+
+	ctx := context.Background()
+
+	model := inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-model", Namespace: "default"},
+	}
+
+	t.Run("returns the Model when it exists", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(&model).Build()
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "my-model"},
+		}
+		got := v.fetchModel(ctx, &isvc)
+		if got == nil {
+			t.Fatal("expected non-nil Model, got nil")
+		}
+		if got.Name != "my-model" {
+			t.Errorf("expected Model name my-model, got %s", got.Name)
+		}
+	})
+
+	t.Run("returns nil when ModelRef is empty", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+		}
+		if got := v.fetchModel(ctx, &isvc); got != nil {
+			t.Fatalf("expected nil for empty ModelRef, got %v", got)
+		}
+	})
+
+	t.Run("returns nil when the Model does not exist", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "not-found"},
+		}
+		if got := v.fetchModel(ctx, &isvc); got != nil {
+			t.Fatalf("expected nil for missing Model, got %v", got)
+		}
+	})
+}
+
 // TestValidateDelete verifies that ValidateDelete is a no-op allow.
 func TestValidateDelete(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -629,7 +773,7 @@ func TestDecide(t *testing.T) {
 			Build()
 
 		v := &InferenceServiceQuotaValidator{Client: fakeClient}
-		allow, reason := v.decide(ctx, quota, &isvc)
+		allow, reason := v.decide(ctx, quota, &isvc, nil)
 		if !allow {
 			t.Fatalf("expected allow, got deny: %s", reason)
 		}
@@ -661,7 +805,7 @@ func TestDecide(t *testing.T) {
 			Build()
 
 		v := &InferenceServiceQuotaValidator{Client: fakeClient}
-		allow, reason := v.decide(ctx, quota, &isvc)
+		allow, reason := v.decide(ctx, quota, &isvc, nil)
 		if allow {
 			t.Fatal("expected deny (2*3=6 > 5), got allow")
 		}
@@ -694,7 +838,7 @@ func TestDecide(t *testing.T) {
 			Build()
 
 		v := &InferenceServiceQuotaValidator{Client: fakeClient}
-		allow, reason := v.decide(ctx, quota, &isvc)
+		allow, reason := v.decide(ctx, quota, &isvc, nil)
 		if allow {
 			t.Fatal("expected deny, got allow")
 		}
@@ -729,12 +873,58 @@ func TestDecide(t *testing.T) {
 			Build()
 
 		v := &InferenceServiceQuotaValidator{Client: fakeClient}
-		allow, reason := v.decide(ctx, quota, &isvc)
+		allow, reason := v.decide(ctx, quota, &isvc, nil)
 		if allow {
 			t.Fatal("expected deny, got allow")
 		}
 		if !strContains(reason, "priority") {
 			t.Fatalf("expected reason to mention priority, got: %s", reason)
+		}
+	})
+
+	// #1310: a Model declaring hardware.gpu.count must be charged against
+	// the gpuCount quota, not silently bypassed.
+	t.Run("model-declared gpu count is charged against gpuCount", func(t *testing.T) {
+		quota := inferencev1alpha1.GPUQuota{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-quota"},
+			Spec: inferencev1alpha1.GPUQuotaSpec{
+				NamespaceRef: "default",
+				GPUCount:     4,
+			},
+		}
+		// Model declares 4 GPUs; ISVC leaves resources.gpu unset.
+		// With replicas: 2 the pod requests 8 GPUs (4 x 2), exceeding the
+		// 4-GPU cap. Before #1310 the quota charged 0 and admitted anyway.
+		model := inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					GPU: &inferencev1alpha1.GPUSpec{
+						Count: 4,
+					},
+				},
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "my-model",
+				Replicas: ptrInt32Val(2),
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&quota, &model, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		allow, reason := v.decide(ctx, quota, &isvc, &model)
+		if allow {
+			t.Fatal("expected deny (model gpu 4 * replicas 2 = 8 > 4), got allow")
+		}
+		if !strContains(reason, "would exceed gpuCount") {
+			t.Fatalf("expected reason to mention gpuCount, got: %s", reason)
 		}
 	})
 }

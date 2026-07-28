@@ -32,6 +32,7 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/webhook/quota"
+	"github.com/defilantech/llmkube/pkg/apiutil"
 )
 
 // +kubebuilder:webhook:path=/validate-inference-llmkube-dev-v1alpha1-inferenceservice-quota,mutating=false,failurePolicy=fail,sideEffects=None,groups=inference.llmkube.dev,resources=inferenceservices,verbs=create;update,versions=v1alpha1,name=vinferenceservicequota.inference.llmkube.dev,admissionReviewVersions=v1
@@ -153,8 +154,14 @@ func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inf
 		return fmt.Errorf("listing applicable GPUQuotas: %w", err)
 	}
 
+	// Fetch the referenced Model best-effort so GPU-count accounting matches
+	// the pod spec (which prefers hardware.gpu.count). At admission time the
+	// Model may not exist yet; a nil Model falls through to resources.gpu in
+	// apiutil.GPUCount, exactly as the reconciler would on first sight.
+	model := v.fetchModel(ctx, isvc)
+
 	for _, q := range quotas {
-		allow, reason := v.decide(ctx, q, isvc)
+		allow, reason := v.decide(ctx, q, isvc, model)
 		if !allow {
 			// Record the denial as a metric (#416): a sideEffects=None
 			// validating webhook cannot mutate the GPUQuota status counter,
@@ -167,19 +174,29 @@ func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inf
 	return nil
 }
 
+// fetchModel returns the Model referenced by isvc.Spec.ModelRef, or nil when
+// the reference is empty or the Model cannot be read. Admission-time Model
+// absence is expected (the reconciler backstops with the real Model); a nil
+// Model resolves with the NVIDIA-default vendor exactly as the reconciler
+// would on first sight.
+func (v *InferenceServiceQuotaValidator) fetchModel(ctx context.Context, isvc *inferencev1alpha1.InferenceService) *inferencev1alpha1.Model {
+	if isvc.Spec.ModelRef == "" {
+		return nil
+	}
+	m := &inferencev1alpha1.Model{}
+	if err := v.Client.Get(ctx, types.NamespacedName{Name: isvc.Spec.ModelRef, Namespace: isvc.Namespace}, m); err != nil {
+		return nil
+	}
+	return m
+}
+
 // validateGPUSharing runs the resolver's sharing rules plus the explicit
 // parallelism cross-checks against the incoming InferenceService. The Model
 // is fetched best-effort: at admission time it may not exist yet, and a nil
 // Model resolves with the NVIDIA-default vendor exactly as the reconciler
 // would on first sight.
 func (v *InferenceServiceQuotaValidator) validateGPUSharing(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
-	var model *inferencev1alpha1.Model
-	if isvc.Spec.ModelRef != "" {
-		m := &inferencev1alpha1.Model{}
-		if err := v.Client.Get(ctx, types.NamespacedName{Name: isvc.Spec.ModelRef, Namespace: isvc.Namespace}, m); err == nil {
-			model = m
-		}
-	}
+	model := v.fetchModel(ctx, isvc)
 	if _, err := resolveGPUSharing(isvc, model, v.GPUSharingSharedPool); err != nil {
 		return err
 	}
@@ -233,7 +250,7 @@ func (v *InferenceServiceQuotaValidator) listApplicableQuotas(ctx context.Contex
 // the pure quota.Decide function. It computes current usage by listing
 // InferenceServices in the quota's scope and summing their GPU and VRAM
 // allocations.
-func (v *InferenceServiceQuotaValidator) decide(ctx context.Context, q inferencev1alpha1.GPUQuota, isvc *inferencev1alpha1.InferenceService) (bool, string) {
+func (v *InferenceServiceQuotaValidator) decide(ctx context.Context, q inferencev1alpha1.GPUQuota, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) (bool, string) {
 	currentUsage, err := v.currentUsage(ctx, q, isvc)
 	if err != nil {
 		// If we cannot read current usage, deny to be safe.
@@ -254,7 +271,7 @@ func (v *InferenceServiceQuotaValidator) decide(ctx context.Context, q inference
 	}
 
 	incoming := quota.Incoming{
-		GPUCount:  gpuCount(isvc),
+		GPUCount:  gpuCount(isvc, model),
 		VRAMBytes: vramBytes,
 		Priority:  isvc.Spec.Priority,
 	}
@@ -299,7 +316,11 @@ func (v *InferenceServiceQuotaValidator) currentUsage(ctx context.Context, q inf
 		if i.Namespace == isvc.Namespace && i.Name == isvc.Name {
 			continue
 		}
-		usage.GPUCount += gpuCount(&i)
+		// Fetch the referenced Model best-effort so the per-pod GPU count
+		// matches the pod spec (which prefers hardware.gpu.count). A nil
+		// Model falls through to resources.gpu in apiutil.GPUCount.
+		model := v.fetchModel(ctx, &i)
+		usage.GPUCount += gpuCount(&i, model)
 		// Stored objects whose VRAM footprint cannot be derived contribute
 		// zero: they were admitted before the cap (or before their footprint
 		// was declarable) and cannot be retroactively rejected. The cap
@@ -312,16 +333,15 @@ func (v *InferenceServiceQuotaValidator) currentUsage(ctx context.Context, q inf
 	return usage, nil
 }
 
-// gpuCount returns the GPU count for an InferenceService, defaulting to 0
-// when resources or resources.gpu is nil. It multiplies by replicas
-// (defaulting to 1 if nil) to account for total GPU usage across all pods.
-func gpuCount(isvc *inferencev1alpha1.InferenceService) int32 {
-	if isvc.Spec.Resources == nil {
-		return 0
-	}
+// gpuCount returns the total GPU count for an InferenceService across all
+// replicas, routing through apiutil.GPUCount so a Model-declared
+// hardware.gpu.count is charged the same way the pod spec requests it.
+// The Model argument is nil-safe; when nil the count falls back to
+// isvc.Spec.Resources.GPU. Replicas default to 1 when nil.
+func gpuCount(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) int32 {
 	replicas := int32(1)
 	if isvc.Spec.Replicas != nil {
 		replicas = *isvc.Spec.Replicas
 	}
-	return isvc.Spec.Resources.GPU * replicas
+	return apiutil.GPUCount(isvc, model) * replicas
 }
