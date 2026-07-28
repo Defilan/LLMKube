@@ -17,6 +17,7 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -254,4 +255,65 @@ func fixtureFileChanges(entries []nameStatusEntry, prodPkgs map[string]bool) []s
 		}
 	}
 	return out
+}
+
+// checkTestDilution is a tierAdvisory gate check (#1332). It surfaces to the
+// reviewer when a submission that changes production code also weakens the
+// tests covering that code: net-removed assertions, a relocated fixture input,
+// or a deleted/renamed testdata fixture, all scoped to a package whose
+// production code changed. It never fails the gate and never feeds the coder.
+//
+// Fail-open: any git error, or no production change in the submission, returns
+// (false, "") so a bad diff signal or a docs-only change stays silent.
+// nolint:unparam // workspace is parameterized to match the commandRunner-based
+// gate-check shape (see gateCheckRegistry in coder_gate.go); only the test file
+// calls this today and all its cases use "/w".
+func checkTestDilution(ctx context.Context, workspace string, run commandRunner) (bool, string) {
+	// Stage the working tree so a pre-commit diff includes new/untracked files.
+	// Idempotent with the executor's later `git add -A`; the -A exit status is
+	// not actionable here, so a stage error simply fails the check open below.
+	if _, err := run(ctx, workspace, nil, "git", "add", "-A"); err != nil {
+		return false, ""
+	}
+	nsOut, err := run(ctx, workspace, nil, "git", "diff", "--name-status", "--cached", "HEAD")
+	if err != nil {
+		return false, ""
+	}
+	entries := parseNameStatus(nsOut)
+	prodPkgs := changedProdPackages(entries)
+	if len(prodPkgs) == 0 {
+		return false, "" // no production change: not a green-gate-earning dilution
+	}
+
+	diffOut, err := run(ctx, workspace, nil, "git", "diff", "--cached", "--unified=0",
+		"--src-prefix=a/", "--dst-prefix=b/", "HEAD", "--", "*_test.go")
+	if err != nil {
+		return false, ""
+	}
+	byFile := parseUnifiedDiff(diffOut)
+
+	var findings []string
+	for file, fh := range byFile {
+		if !prodPkgs[filepath.Dir(file)] {
+			continue // package linkage: only judge tests of changed-prod packages
+		}
+		if removed, added, snippets := assertionErosion(fh); removed > added {
+			findings = append(findings, fmt.Sprintf(
+				"%s net-removed %d assertion(s): %s",
+				file, removed-added, strings.Join(firstN(snippets, 3), "; ")))
+		}
+		for _, c := range fixtureLiteralChurn(fh) {
+			findings = append(findings, file+" "+c)
+		}
+	}
+	findings = append(findings, fixtureFileChanges(entries, prodPkgs)...)
+
+	if len(findings) == 0 {
+		return false, ""
+	}
+	sort.Strings(findings) // deterministic order across map iteration
+	detail := "production code changed and its tests weakened their own coverage " +
+		"(confirm the changed behavior is still covered, not dodged): " +
+		strings.Join(findings, "; ")
+	return true, truncateOutput(detail)
 }

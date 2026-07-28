@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -207,5 +209,96 @@ func TestFixtureFileChanges_CrossPackageRenameIntoChangedPkgSilent(t *testing.T)
 	prod := map[string]bool{"pkg/model": true}
 	if got := fixtureFileChanges(entries, prod); len(got) != 0 {
 		t.Fatalf("a fixture moved INTO the changed package must not fire; got %v", got)
+	}
+}
+
+// dilutionRunner fakes the three git calls checkTestDilution makes:
+// `git add -A` (no-op), `git diff --name-status --cached HEAD`, and the
+// `git diff --cached --unified=0 ... -- *_test.go` line diff.
+// nolint:unparam // addErr is parameterized for clarity at call sites even though existing tests all pass nil
+func dilutionRunner(nameStatus, testDiff string, addErr, nsErr, diffErr error) commandRunner {
+	return func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name != "git" {
+			return "", nil
+		}
+		switch {
+		case len(args) >= 2 && args[0] == "add" && args[1] == "-A":
+			return "", addErr
+		case len(args) >= 2 && args[0] == "diff" && args[1] == "--name-status":
+			return nameStatus, nsErr
+		case len(args) >= 2 && args[0] == "diff" && args[1] == "--cached":
+			return testDiff, diffErr
+		default:
+			return "", nil
+		}
+	}
+}
+
+func TestCheckTestDilution_FiresOnNetRemovedAssertions(t *testing.T) {
+	ns := "M\tpkg/model/classifier.go\nM\tpkg/model/classifier_test.go\n"
+	diff := `--- a/pkg/model/classifier_test.go
++++ b/pkg/model/classifier_test.go
+@@ -10 +10 @@
+-	Expect(classify(u)).To(Equal(RepoSource))
+-	require.NoError(t, err)
++	// removed the assertions above
+`
+	failed, out := checkTestDilution(context.Background(), "/w", dilutionRunner(ns, diff, nil, nil, nil))
+	if !failed {
+		t.Fatal("expected an advisory when a changed-prod package net-removes assertions")
+	}
+	if !strings.Contains(out, "classifier_test.go") || !strings.Contains(out, "assertion") {
+		t.Errorf("detail = %q", out)
+	}
+}
+
+func TestCheckTestDilution_FiresOnFixtureRelocation_1322Shape(t *testing.T) {
+	// #1322 bite-check: prod classifier changed, and a fixture URL host moved
+	// off huggingface.co in the same package's test.
+	ns := "M\tpkg/model/classifier.go\nM\tpkg/model/classifier_test.go\n"
+	diff := `--- a/pkg/model/classifier_test.go
++++ b/pkg/model/classifier_test.go
+@@ -20 +20 @@
+-	src := "https://huggingface.co/org/model/resolve/main/f.gguf"
++	src := "https://example.com/org/model/resolve/main/f.gguf"
+`
+	failed, out := checkTestDilution(context.Background(), "/w", dilutionRunner(ns, diff, nil, nil, nil))
+	if !failed {
+		t.Fatal("expected an advisory for the #1322 fixture-relocation shape")
+	}
+	if !strings.Contains(out, "huggingface.co") {
+		t.Errorf("detail should name the moved host; got %q", out)
+	}
+}
+
+func TestCheckTestDilution_SilentWhenTestsOnlyGrow(t *testing.T) {
+	ns := "M\tpkg/model/classifier.go\nM\tpkg/model/classifier_test.go\n"
+	diff := `--- a/pkg/model/classifier_test.go
++++ b/pkg/model/classifier_test.go
+@@ -10 +11 @@
++	Expect(classify(u)).To(Equal(RepoSource))
+`
+	if failed, _ := checkTestDilution(context.Background(), "/w", dilutionRunner(ns, diff, nil, nil, nil)); failed {
+		t.Fatal("adding assertions must not fire the dilution advisory")
+	}
+}
+
+func TestCheckTestDilution_SilentWhenNoProdChange(t *testing.T) {
+	// Test-only submission: assertions removed but no production code changed.
+	ns := "M\tpkg/model/classifier_test.go\n"
+	diff := `--- a/pkg/model/classifier_test.go
++++ b/pkg/model/classifier_test.go
+@@ -10 +9 @@
+-	Expect(classify(u)).To(Equal(RepoSource))
+`
+	if failed, _ := checkTestDilution(context.Background(), "/w", dilutionRunner(ns, diff, nil, nil, nil)); failed {
+		t.Fatal("package-linkage: no production change means no advisory")
+	}
+}
+
+func TestCheckTestDilution_FailOpenOnGitError(t *testing.T) {
+	if failed, out := checkTestDilution(context.Background(), "/w",
+		dilutionRunner("", "", nil, errors.New("boom"), nil)); failed || out != "" {
+		t.Fatalf("git error must fail open (silent); got failed=%v out=%q", failed, out)
 	}
 }
