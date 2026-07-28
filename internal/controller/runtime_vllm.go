@@ -175,7 +175,7 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 //
 // Only one (reason, message) is returned, so check ordering is precedence:
 // SpeculativeMissingModel (a flag that gets skipped entirely) outranks
-// CPUOffloadIneffective (a flag that is passed but inert upstream).
+// CPUOffloadUnverified (a flag with an open upstream reliability report).
 func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, message string) {
 	if isvc == nil || isvc.Spec.VLLMConfig == nil {
 		return "", ""
@@ -189,7 +189,7 @@ func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, messa
 	}
 	// TODO(#1320): remove once vllm-project/vllm#48468 ships in DefaultImage.
 	if cfg.CPUOffloadGB != nil && *cfg.CPUOffloadGB > 0 {
-		return "CPUOffloadIneffective", cpuOffloadIneffectiveMessage
+		return "CPUOffloadUnverified", cpuOffloadIneffectiveMessage
 	}
 	return "", ""
 }
@@ -197,13 +197,14 @@ func ValidateVLLMConfig(isvc *inferencev1alpha1.InferenceService) (reason, messa
 // cpuOffloadIneffectiveMessage is shared by the VLLMSpecValid condition and
 // the reconcile-time Warning Event so the two surfaces cannot drift. Worded
 // as a dated factual claim so it stays true if upstream later fixes it.
-const cpuOffloadIneffectiveMessage = "spec.vllmConfig.cpuOffloadGB is set, but vLLM's " +
-	"--cpu-offload-gb is a known silent no-op on V1-engine releases through at " +
-	"least v0.26 (vllm-project/vllm#48468, unfixed as of the pinned default " +
-	"image): the flag is accepted but weights are not offloaded, so VRAM-tight " +
-	"models OOM instead of spilling to host RAM. Verify offload in the server " +
-	"logs before relying on it; for MoE VRAM relief use the llama.cpp runtime's " +
-	"spec.moeCPUOffload instead"
+const cpuOffloadIneffectiveMessage = "spec.vllmConfig.cpuOffloadGB is set. " +
+	"vLLM's --cpu-offload-gb is reported silently ineffective in some " +
+	"configurations on current releases (vllm-project/vllm#48468, open): the " +
+	"flag is accepted but no weights offload, so VRAM-tight models OOM instead " +
+	"of spilling to host RAM. It is verified working in others (see the " +
+	"cpu-offload sample). Confirm it took effect in the server logs, via " +
+	"'Offloader set to' / 'offloaded parameters' lines or a Model-loading size " +
+	"below the full footprint, before relying on it"
 
 func (b *VLLMBackend) BuildProbes(port int32) (*corev1.Probe, *corev1.Probe, *corev1.Probe) {
 	startup := &corev1.Probe{

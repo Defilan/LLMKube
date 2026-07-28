@@ -678,7 +678,7 @@ func TestValidateVLLMConfig(t *testing.T) {
 			wantReason: "SpeculativeMissingModel",
 		},
 		{
-			name: "cpuOffloadGB set surfaces CPUOffloadIneffective",
+			name: "cpuOffloadGB set surfaces CPUOffloadUnverified",
 			isvc: &inferencev1alpha1.InferenceService{
 				Spec: inferencev1alpha1.InferenceServiceSpec{
 					Runtime: "vllm",
@@ -687,7 +687,7 @@ func TestValidateVLLMConfig(t *testing.T) {
 					},
 				},
 			},
-			wantReason: "CPUOffloadIneffective",
+			wantReason: "CPUOffloadUnverified",
 		},
 		{
 			name: "cpuOffloadGB zero is not warned",

@@ -239,7 +239,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if r.Recorder != nil && needsCPUOffloadNoopWarning(inferenceService) {
-		r.Recorder.Eventf(inferenceService, nil, corev1.EventTypeWarning, "CPUOffloadIneffective", "Reconcile",
+		r.Recorder.Eventf(inferenceService, nil, corev1.EventTypeWarning, "CPUOffloadUnverified", "Reconcile",
 			cpuOffloadIneffectiveMessage)
 	}
 

@@ -5,7 +5,7 @@ metadata:
   name: qwen3-6-35b-a3b-fp8
   namespace: default
 spec:
-  source: "https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8"
+  source: "Qwen/Qwen3.6-35B-A3B-FP8"
   format: safetensors
   quantization: fp8
   hardware:
@@ -22,6 +22,10 @@ metadata:
   namespace: default
 spec:
   modelRef: qwen3-6-35b-a3b-fp8
+  # The source is an HF repo id resolved by vLLM at startup (with
+  # hfTokenSecretRef below); without this the init container tries to
+  # fetch the repo URL as a single file and produces an invalid artifact.
+  skipModelInit: true
   runtime: vllm
   image: vllm/vllm-openai:v0.20.0
   replicas: 1
@@ -29,8 +33,19 @@ spec:
     hfTokenSecretRef:
       name: hf-token
       key: HF_TOKEN
-    # Qwen3.6-35B-A3B-FP8 on 2x 5060 Ti needs ~18 GB/shard 
-    # `--cpu-offload-gb 4` per rank makes it fit at a throughput .
+    # Qwen3.6-35B-A3B-FP8 needs ~16.5 GB/rank at TP=2; a 5060 Ti has 16 GB.
+    # `--cpu-offload-gb 4` per rank makes it fit, at a 2-5x throughput cost
+    # on the offloaded path.
+    #
+    # Verified working for THIS configuration on 2x RTX 5060 Ti, on both the
+    # v0.20.0 image pinned above (model loading 13.01 GiB vs ~16.5 full,
+    # 4.2 GB offloaded per rank) and the operator-default v0.25.1 (13.17
+    # GiB, same offloader lines). --cpu-offload-gb is reported silently
+    # ineffective in OTHER configurations on current vLLM
+    # (vllm-project/vllm#48468, open), so the operator surfaces a
+    # CPUOffloadUnverified advisory whenever the field is set: after any
+    # image or model change, confirm the "Offloader set to" /
+    # "offloaded parameters" lines still appear in the server logs.
     cpuOffloadGB: 4
     # On tight setups raising it to 0.95-0.97 buys the headroom
     # needed for profile-run + cudagraph capture.
@@ -38,7 +53,6 @@ spec:
     maxNumBatchedTokens: 4096
     maxModelLen: 32768
     quantization: fp8
-    tensorParallelSize: 8
   endpoint:
     port: 8000
     type: ClusterIP
