@@ -74,6 +74,16 @@ func TestResolveCloneURL(t *testing.T) {
 			want: "https://github.com/my-org/my-repo-name.git",
 		},
 		{
+			name: "multi-segment slug (GitLab subgroup)",
+			slug: "group/subgroup/project",
+			want: "https://github.com/group/subgroup/project.git",
+		},
+		{
+			name: "deeply nested slug",
+			slug: "a/b/c/d",
+			want: "https://github.com/a/b/c/d.git",
+		},
+		{
 			name: "empty slug",
 			slug: "",
 			want: "",
@@ -84,8 +94,33 @@ func TestResolveCloneURL(t *testing.T) {
 			want: "",
 		},
 		{
-			name: "malformed slug - extra slash",
-			slug: "defilantech/llmkube/extra",
+			name: "malformed slug - path traversal",
+			slug: "defilantech/llmkube/..",
+			want: "",
+		},
+		{
+			name: "malformed slug - leading dot segment",
+			slug: "../llmkube",
+			want: "",
+		},
+		{
+			name: "malformed slug - empty segment",
+			slug: "defilantech//llmkube",
+			want: "",
+		},
+		{
+			name: "malformed slug - trailing slash",
+			slug: "defilantech/llmkube/",
+			want: "",
+		},
+		{
+			name: "malformed slug - leading slash",
+			slug: "/defilantech/llmkube",
+			want: "",
+		},
+		{
+			name: "malformed slug - whitespace in segment",
+			slug: "defilantech/llm kube",
 			want: "",
 		},
 		{
@@ -160,6 +195,23 @@ func TestEnsureChangeRequest(t *testing.T) {
 			wantURL:     "",
 			wantCreated: false,
 		},
+		{
+			name:       "multi-segment slug splits on last slash",
+			repoSlug:   "group/subgroup/project",
+			headBranch: "foreman/wl-x/issue-7",
+			baseBranch: "main",
+			title:      "Fix the thing",
+			body:       "Fixes #7",
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error) {
+				if owner != "group/subgroup" || repo != "project" {
+					t.Errorf("EnsurePR called with owner=%q repo=%q, want owner=%q repo=%q",
+						owner, repo, "group/subgroup", "project")
+				}
+				return &githubpr.Result{URL: "https://github.com/group/subgroup/project/pull/1", Created: true}, nil
+			},
+			wantURL:     "https://github.com/group/subgroup/project/pull/1",
+			wantCreated: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -220,6 +272,19 @@ func TestHeadCommitSubject(t *testing.T) {
 			commitFunc:  nil,
 			wantSubject: "",
 		},
+		{
+			name:       "multi-segment slug splits on last slash",
+			repoSlug:   "group/subgroup/project",
+			headBranch: "foreman/wl-x/issue-7",
+			commitFunc: func(ctx context.Context, owner, repo, ref, token string) string {
+				if owner != "group/subgroup" || repo != "project" {
+					t.Errorf("HeadCommitSubject called with owner=%q repo=%q, want owner=%q repo=%q",
+						owner, repo, "group/subgroup", "project")
+				}
+				return "feat: add the thing"
+			},
+			wantSubject: "feat: add the thing",
+		},
 	}
 
 	for _, tc := range tests {
@@ -237,6 +302,63 @@ func TestHeadCommitSubject(t *testing.T) {
 			}
 			if subject != tc.wantSubject {
 				t.Errorf("HeadCommitSubject() = %q, want %q", subject, tc.wantSubject)
+			}
+		})
+	}
+}
+
+func TestSplitRepoSlug(t *testing.T) {
+	tests := []struct {
+		name     string
+		slug     string
+		wantNS   string
+		wantName string
+		wantOK   bool
+	}{
+		{name: "owner/name", slug: "defilantech/llmkube", wantNS: "defilantech", wantName: "llmkube", wantOK: true},
+		{name: "group/subgroup/project", slug: "group/subgroup/project",
+			wantNS: "group/subgroup", wantName: "project", wantOK: true},
+		{name: "deeply nested", slug: "a/b/c/d", wantNS: "a/b/c", wantName: "d", wantOK: true},
+		{name: "no slash", slug: "defilantech", wantNS: "", wantName: "", wantOK: false},
+		{name: "empty string", slug: "", wantNS: "", wantName: "", wantOK: false},
+		{name: "trailing slash", slug: "defilantech/llmkube/", wantNS: "", wantName: "", wantOK: false},
+		{name: "leading slash", slug: "/defilantech/llmkube", wantNS: "", wantName: "", wantOK: false},
+		{name: "empty segment", slug: "defilantech//llmkube", wantNS: "", wantName: "", wantOK: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ns, name, ok := SplitRepoSlug(tc.slug)
+			if ns != tc.wantNS || name != tc.wantName || ok != tc.wantOK {
+				t.Errorf("SplitRepoSlug(%q) = (%q, %q, %v), want (%q, %q, %v)",
+					tc.slug, ns, name, ok, tc.wantNS, tc.wantName, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestIsValidRepoSlug(t *testing.T) {
+	tests := []struct {
+		name string
+		slug string
+		want bool
+	}{
+		{"owner/name", "defilantech/llmkube", true},
+		{"group/subgroup/project", "group/subgroup/project", true},
+		{"deeply nested", "a/b/c/d", true},
+		{"no slash", "defilantech", false},
+		{"empty string", "", false},
+		{"trailing slash", "defilantech/llmkube/", false},
+		{"leading slash", "/defilantech/llmkube", false},
+		{"empty segment", "defilantech//llmkube", false},
+		{"path traversal", "defilantech/llmkube/..", false},
+		{"leading dot segment", "../llmkube", false},
+		{"whitespace in segment", "defilantech/llm kube", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsValidRepoSlug(tc.slug); got != tc.want {
+				t.Errorf("IsValidRepoSlug(%q) = %v, want %v", tc.slug, got, tc.want)
 			}
 		})
 	}

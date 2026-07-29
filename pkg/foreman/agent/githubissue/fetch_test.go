@@ -34,11 +34,13 @@ func TestParseRepo(t *testing.T) {
 	}{
 		{"defilantech/LLMKube", "defilantech", "LLMKube", false},
 		{"owner/repo", "owner", "repo", false},
+		{"group/subgroup/project", "group/subgroup", "project", false},
+		{"a/b/c/d", "a/b/c", "d", false},
 		{"", "", "", true},
 		{"single", "", "", true},
-		{"a/b/c", "", "", true},
 		{"/empty-owner", "", "", true},
 		{"empty-repo/", "", "", true},
+		{"empty-segment//repo", "", "", true},
 	}
 	for _, tc := range cases {
 		o, r, err := ParseRepo(tc.in)

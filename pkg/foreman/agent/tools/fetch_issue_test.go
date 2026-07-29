@@ -246,16 +246,31 @@ func TestFetchIssueTool_Schema(t *testing.T) {
 // kind of bug that only surfaces against a real GitHub API; this test
 // pins the contract early.
 func TestFetchIssueTool_FetcherReceivesParsedRepo(t *testing.T) {
-	ff := &fakeFetcher{
-		issue: &githubissue.Issue{Number: 42, Title: "t", Body: "b", State: "open"},
+	tests := []struct {
+		name      string
+		repo      string
+		wantOwner string
+		wantRepo  string
+	}{
+		{"owner/name", "defilantech/LLMKube", "defilantech", "LLMKube"},
+		{"group/subgroup/project", "group/subgroup/project", "group/subgroup", "project"},
+		{"deeply nested", "a/b/c/d", "a/b/c", "d"},
 	}
-	tool := &FetchIssueTool{Fetcher: ff, Token: staticToken("tok")}
-	_, err := tool.Execute(context.Background(), json.RawMessage(`{"repo":"defilantech/LLMKube","number":42}`))
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
-	if ff.gotOwner != "defilantech" || ff.gotRepo != "LLMKube" || ff.gotNumber != 42 || ff.gotToken != "tok" {
-		t.Errorf("fetcher args: owner=%q repo=%q number=%d token=%q",
-			ff.gotOwner, ff.gotRepo, ff.gotNumber, ff.gotToken)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ff := &fakeFetcher{
+				issue: &githubissue.Issue{Number: 42, Title: "t", Body: "b", State: "open"},
+			}
+			tool := &FetchIssueTool{Fetcher: ff, Token: staticToken("tok")}
+			args := json.RawMessage(`{"repo":"` + tc.repo + `","number":42}`)
+			_, err := tool.Execute(context.Background(), args)
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if ff.gotOwner != tc.wantOwner || ff.gotRepo != tc.wantRepo || ff.gotNumber != 42 || ff.gotToken != "tok" {
+				t.Errorf("fetcher args: owner=%q repo=%q number=%d token=%q",
+					ff.gotOwner, ff.gotRepo, ff.gotNumber, ff.gotToken)
+			}
+		})
 	}
 }
