@@ -852,11 +852,12 @@ type GPUSharingSpec struct {
 	// +optional
 	Profile string `json:"profile,omitempty"`
 
-	// MemoryLimitGiB caps this service's device-memory footprint in
-	// shared mode. It drives quota accounting (a shared workload counts
-	// this many GiB against a GPUQuota vramBytes cap) and, where the
-	// runtime supports it, a memory-cap enforcement flag. Only valid for
-	// mode shared.
+	// MemoryLimitGiB declares this service's device-memory footprint in
+	// shared mode, in GiB. It is used for quota accounting only: a shared
+	// workload counts this many GiB against a GPUQuota vramBytes cap. It
+	// is NOT enforced at runtime; nothing caps the process's actual VRAM
+	// use. For hard isolation between tenants use mode partitioned (MIG).
+	// Only valid for mode shared.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MemoryLimitGiB *int32 `json:"memoryLimitGiB,omitempty"`
