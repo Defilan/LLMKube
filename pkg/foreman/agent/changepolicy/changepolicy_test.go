@@ -21,7 +21,7 @@ import (
 )
 
 func TestClassify(t *testing.T) {
-	policy := defaultPolicy{}
+	policy := NewDefaultPolicy()
 
 	tests := []struct {
 		name    string
@@ -147,7 +147,7 @@ func TestClassify(t *testing.T) {
 }
 
 func TestNeedsVerification(t *testing.T) {
-	policy := defaultPolicy{}
+	policy := NewDefaultPolicy()
 	tests := []struct {
 		name    string
 		changed map[string]int
@@ -198,7 +198,7 @@ func TestNeedsVerification(t *testing.T) {
 }
 
 func TestRequiresHumanReview(t *testing.T) {
-	policy := defaultPolicy{}
+	policy := NewDefaultPolicy()
 
 	tests := []struct {
 		name         string
@@ -310,7 +310,7 @@ func TestRequiresHumanReview(t *testing.T) {
 
 func TestClassifyCiPolicy(t *testing.T) {
 	// Regression test: .github/workflows must classify as ci-policy.
-	policy := defaultPolicy{}
+	policy := NewDefaultPolicy()
 	got := policy.Classify(map[string]int{".github/workflows/ci.yml": 10})
 	if got != workClassCIPolicy {
 		t.Errorf("Classify(ci.yml) = %q, want %q", got, workClassCIPolicy)
@@ -319,7 +319,7 @@ func TestClassifyCiPolicy(t *testing.T) {
 
 func TestClassifyCiPolicyActions(t *testing.T) {
 	// Regression test: .github/actions must classify as ci-policy.
-	policy := defaultPolicy{}
+	policy := NewDefaultPolicy()
 	got := policy.Classify(map[string]int{".github/actions/lint/action.yml": 5})
 	if got != workClassCIPolicy {
 		t.Errorf("Classify(actions/lint/action.yml) = %q, want %q", got, workClassCIPolicy)
@@ -329,7 +329,7 @@ func TestClassifyCiPolicyActions(t *testing.T) {
 func TestRequiresHumanReviewCiPolicyGate(t *testing.T) {
 	// Regression test: RequiresHumanReview returns true when
 	// a ci-policy change is not in the selfGO list.
-	policy := defaultPolicy{}
+	policy := NewDefaultPolicy()
 	got := policy.RequiresHumanReview(
 		[]string{".github/workflows/ci.yml"},
 		[]string{"code-fix", "docs", "config"},
@@ -388,6 +388,7 @@ func TestMatchGlob(t *testing.T) {
 }
 
 func TestClassifyFile(t *testing.T) {
+	policy := defaultPolicy{rules: DefaultClassRules}
 	tests := []struct {
 		name string
 		path string
@@ -481,7 +482,7 @@ func TestClassifyFile(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyFile(tt.path)
+			got := policy.classifyFile(tt.path)
 			if got != tt.want {
 				t.Errorf("classifyFile(%q) = %q, want %q", tt.path, got, tt.want)
 			}
@@ -490,6 +491,7 @@ func TestClassifyFile(t *testing.T) {
 }
 
 func TestClassifyFootprint(t *testing.T) {
+	policy := defaultPolicy{rules: DefaultClassRules}
 	tests := []struct {
 		name    string
 		changed map[string]int
@@ -523,7 +525,7 @@ func TestClassifyFootprint(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyFootprint(tt.changed)
+			got := policy.classifyFootprint(tt.changed)
 			if got != tt.want {
 				t.Errorf("classifyFootprint() = %q, want %q", got, tt.want)
 			}
@@ -565,4 +567,105 @@ func TestWorkClassInList(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNewDefaultPolicyMatchesDefaultRules verifies that NewDefaultPolicy
+// classifies exactly as the GitHub defaults, so existing behavior is
+// unchanged when no custom rules are supplied.
+func TestNewDefaultPolicyMatchesDefaultRules(t *testing.T) {
+	policy := NewDefaultPolicy()
+	tests := []struct {
+		name    string
+		changed map[string]int
+		want    WorkClass
+	}{
+		{"ci-policy: .github/workflows", map[string]int{".github/workflows/ci.yml": 10}, workClassCIPolicy},
+		{"ci-policy: .github/actions", map[string]int{".github/actions/lint/action.yml": 5}, workClassCIPolicy},
+		{"release-policy: .goreleaser", map[string]int{".goreleaser.yaml": 8}, workClassReleasePolicy},
+		{"release-policy: release-please", map[string]int{"release-please-config.json": 3}, workClassReleasePolicy},
+		{"packaging: Dockerfile", map[string]int{"Dockerfile": 20}, workClassPackaging},
+		{"packaging: charts", map[string]int{"charts/llmkube/values.yaml": 15}, workClassPackaging},
+		{"docs: README.md", map[string]int{"README.md": 7}, workClassDocs},
+		{"config: *.yaml", map[string]int{"config/rbac/role.yaml": 14}, workClassConfig},
+		{"code-fix: Go source", map[string]int{"pkg/agent/loop.go": 25}, workClassCodeFix},
+		{"empty changed", map[string]int{}, workClassCodeFix},
+		{"mixed: no dominant class", map[string]int{"pkg/agent/loop.go": 10, "README.md": 10}, workClassMixed},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := policy.Classify(tt.changed)
+			if got != tt.want {
+				t.Errorf("Classify() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewPolicyCustomRules verifies that a caller-supplied rule set
+// classifies a non-GitHub path (e.g. a Woodpecker config) as ci-policy,
+// while the default policy would classify it as code-fix.
+func TestNewPolicyCustomRules(t *testing.T) {
+	// A Woodpecker CI config path that the default GitHub rules would
+	// classify as code-fix (no extension match).
+	woodpeckerPath := ".woodpecker/ci.yaml"
+
+	t.Run("default policy classifies woodpecker path as config not ci-policy", func(t *testing.T) {
+		policy := NewDefaultPolicy()
+		got := policy.Classify(map[string]int{woodpeckerPath: 10})
+		if got == workClassCIPolicy {
+			t.Errorf("default Classify(%q) = %q, want something other than ci-policy", woodpeckerPath, got)
+		}
+	})
+
+	t.Run("custom rules classify woodpecker path as ci-policy", func(t *testing.T) {
+		// Custom rules: a Woodpecker config glob maps to ci-policy,
+		// followed by the default rules so other paths still classify.
+		rules := append([]ClassRule{
+			{[]string{".woodpecker/**"}, workClassCIPolicy},
+		}, DefaultClassRules...)
+		policy := NewPolicy(rules)
+		got := policy.Classify(map[string]int{woodpeckerPath: 10})
+		if got != workClassCIPolicy {
+			t.Errorf("custom Classify(%q) = %q, want %q", woodpeckerPath, got, workClassCIPolicy)
+		}
+	})
+
+	t.Run("custom rules still classify github paths as ci-policy", func(t *testing.T) {
+		rules := append([]ClassRule{
+			{[]string{".woodpecker/**"}, workClassCIPolicy},
+		}, DefaultClassRules...)
+		policy := NewPolicy(rules)
+		got := policy.Classify(map[string]int{".github/workflows/ci.yml": 10})
+		if got != workClassCIPolicy {
+			t.Errorf("custom Classify(.github/workflows/ci.yml) = %q, want %q", got, workClassCIPolicy)
+		}
+	})
+
+	t.Run("custom rules: ci-policy change requires review when not in selfGO", func(t *testing.T) {
+		rules := append([]ClassRule{
+			{[]string{".woodpecker/**"}, workClassCIPolicy},
+		}, DefaultClassRules...)
+		policy := NewPolicy(rules)
+		got := policy.RequiresHumanReview(
+			[]string{woodpeckerPath},
+			[]string{"code-fix", "docs", "config"},
+		)
+		if !got {
+			t.Error("RequiresHumanReview(woodpecker) = false, want true")
+		}
+	})
+
+	t.Run("custom rules: ci-policy change stands when in selfGO", func(t *testing.T) {
+		rules := append([]ClassRule{
+			{[]string{".woodpecker/**"}, workClassCIPolicy},
+		}, DefaultClassRules...)
+		policy := NewPolicy(rules)
+		got := policy.RequiresHumanReview(
+			[]string{woodpeckerPath},
+			[]string{"ci-policy", "code-fix", "docs", "config"},
+		)
+		if got {
+			t.Error("RequiresHumanReview(woodpecker) = true, want false")
+		}
+	})
 }
