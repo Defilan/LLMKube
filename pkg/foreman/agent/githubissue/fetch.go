@@ -40,8 +40,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
+
+	"github.com/defilantech/llmkube/pkg/foreman/agent/codehost"
 )
 
 // DefaultBodyCap bounds the issue body size we paste into the user
@@ -223,15 +224,20 @@ func truncateBody(body string, cap int) string {
 // (no slash, empty segments, or a ".." traversal segment); the executor
 // logs the error and skips the fetch (best-effort).
 func ParseRepo(s string) (owner, repo string, err error) {
-	idx := strings.LastIndex(s, "/")
-	if idx <= 0 || idx == len(s)-1 {
-		return "", "", errors.New("githubissue: repo must be owner/repo")
+	// Delegate to the shared codehost validator so a repo slug is validated
+	// and split by the SAME rule the clone and change-request paths use,
+	// rather than a divergent local reimplementation. The old local version
+	// checked only segment count and "..", so it accepted whitespace and
+	// other non-git-safe characters that codehost.IsValidRepoSlug rejects
+	// (e.g. "owner/name with space") -- inconsistent validation across the
+	// code-host seam (#1343). SplitRepoSlug enforces the character class,
+	// rejects empty/absolute/whitespace slugs and ".." traversal segments,
+	// and splits on the last slash so multi-segment slugs like
+	// "group/subgroup/project" yield owner="group/subgroup", repo="project".
+	namespace, name, ok := codehost.SplitRepoSlug(s)
+	if !ok {
+		return "", "", errors.New("githubissue: invalid repo slug (want owner/name or " +
+			"group/.../name with git-safe segments; no whitespace, empty, absolute, or '..' segments)")
 	}
-	owner, repo = s[:idx], s[idx+1:]
-	for _, seg := range strings.Split(s, "/") {
-		if seg == "" || seg == ".." {
-			return "", "", errors.New("githubissue: repo must not contain empty or '..' segments")
-		}
-	}
-	return owner, repo, nil
+	return namespace, name, nil
 }
