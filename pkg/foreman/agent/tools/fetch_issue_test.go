@@ -157,7 +157,7 @@ func TestFetchIssueTool_ArgValidation(t *testing.T) {
 		{"missing-repo", `{"number":1}`, "repo is required"},
 		{"zero-number", `{"repo":"o/r","number":0}`, "number must be a positive integer"},
 		{"negative-number", `{"repo":"o/r","number":-3}`, "number must be a positive integer"},
-		{"malformed-repo", `{"repo":"no-slash","number":1}`, "owner/repo"},
+		{"malformed-repo", `{"repo":"no-slash","number":1}`, "invalid repo slug"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
