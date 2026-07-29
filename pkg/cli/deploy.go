@@ -172,7 +172,9 @@ Examples:
 	cmd.Flags().Int32Var(&opts.gpuCount, "gpu-count", 1, "Number of GPUs per pod")
 	cmd.Flags().Int32Var(&opts.gpuLayers, "gpu-layers", -1,
 		"Number of model layers to offload to GPU (-1 = all layers, 0 = auto)")
-	cmd.Flags().StringVar(&opts.gpuMemory, "gpu-memory", "", "GPU memory request (e.g., '8Gi', '16Gi')")
+	cmd.Flags().StringVar(&opts.gpuMemory, "gpu-memory", "",
+		"GPU memory footprint recorded on the InferenceService, e.g. '8Gi'. "+
+			"Not enforced (sets no pod resource request)")
 	cmd.Flags().StringVar(&opts.gpuVendor, "gpu-vendor", defaultGPUVendor, "GPU vendor (nvidia, amd, intel)")
 
 	cmd.Flags().Int32Var(&opts.contextSize, "context", 0,

@@ -801,8 +801,14 @@ type InferenceResourceRequirements struct {
 	// +optional
 	HostMemory string `json:"hostMemory,omitempty"`
 
-	// GPUMemory specifies GPU memory limit per pod (e.g., "16Gi")
-	// Used for scheduling and validation
+	// GPUMemory is recorded on the object and has no effect. It sets no pod
+	// resource request, does not influence scheduling, and is not validated;
+	// nothing in the operator reads it.
+	//
+	// Superseded by gpuSharing.memoryLimitGiB for shared-GPU quota
+	// accounting, or the Model's hardware.gpu.memory to declare a model's
+	// footprint. This field is retained for compatibility with existing
+	// objects and will be removed in a future API version.
 	// +optional
 	GPUMemory string `json:"gpuMemory,omitempty"`
 
@@ -853,11 +859,16 @@ type GPUSharingSpec struct {
 	Profile string `json:"profile,omitempty"`
 
 	// MemoryLimitGiB declares this service's device-memory footprint in
-	// shared mode, in GiB. It is used for quota accounting only: a shared
-	// workload counts this many GiB against a GPUQuota vramBytes cap. It
-	// is NOT enforced at runtime; nothing caps the process's actual VRAM
-	// use. For hard isolation between tenants use mode partitioned (MIG).
-	// Only valid for mode shared.
+	// shared mode, in GiB. It drives quota accounting: a shared workload
+	// counts this many GiB against a GPUQuota vramBytes cap.
+	//
+	// It is NOT enforced at runtime. Nothing caps the process's actual VRAM
+	// use, so a workload that exceeds this figure will do so, and on a
+	// time-sliced device it can exhaust the VRAM its co-tenants need.
+	// Shared mode is co-scheduling for workloads that already trust each
+	// other, not an isolation boundary; for a hard boundary between tenants
+	// use mode partitioned (NVIDIA MIG), where the partition is enforced in
+	// hardware. Only valid for mode shared.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MemoryLimitGiB *int32 `json:"memoryLimitGiB,omitempty"`

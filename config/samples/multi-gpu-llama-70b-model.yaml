@@ -45,7 +45,7 @@ spec:
 
   resources:
     gpu: 4              # Request 4 GPUs per pod
-    gpuMemory: "96Gi"   # 24Gi per GPU minimum (96Gi total)
+    gpuMemory: "96Gi"   # ~24Gi per GPU across 4 GPUs, informational only (not enforced)
     cpu: "8"
     memory: "32Gi"
 

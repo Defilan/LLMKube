@@ -108,10 +108,18 @@ spec:
       memoryLimitGiB: 24
 ```
 
-This service co-locates on a shared GPU pool and declares a memory limit
-via `memoryLimitGiB`. The operator steers the pod onto the shared pool
-using the configured node selector. The `memoryLimitGiB` drives VRAM-based
-quota accounting.
+This service co-locates on a shared GPU pool and declares its memory
+footprint via `memoryLimitGiB`. The operator steers the pod onto the shared
+pool using the configured node selector. The `memoryLimitGiB` drives
+VRAM-based quota accounting.
+
+`memoryLimitGiB` is a declaration, not a cap. Nothing enforces it at
+runtime: a workload that grows its KV cache past the figure it declared will
+do so, and on a time-sliced device it can exhaust the VRAM its co-tenants
+need. Time-slicing multiplexes execution, not memory. Treat `shared` as
+co-scheduling for workloads that already trust each other, and reach for
+`partitioned` when you need a boundary that holds between tenants, since a
+MIG partition is enforced by the hardware.
 
 ## Fleet configuration
 

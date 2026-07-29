@@ -53,7 +53,7 @@ spec:
 
   resources:
     gpu: 2              # Request 2 GPUs per pod
-    gpuMemory: "16Gi"   # 8Gi per GPU minimum (16Gi total)
+    gpuMemory: "16Gi"   # ~8Gi per GPU across 2 GPUs, informational only (not enforced)
     cpu: "4"
     memory: "8Gi"
 

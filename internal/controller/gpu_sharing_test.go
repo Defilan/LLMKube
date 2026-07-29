@@ -351,6 +351,68 @@ func TestConstructDeploymentGPUSharing(t *testing.T) {
 			t.Fatalf("shared pod still requests the ordinary device resource, got %v", container.Resources.Limits)
 		}
 	})
+
+	// memoryLimitGiB is a quota-accounting declaration, not a runtime cap: its
+	// only reader is podVRAMBytes. The API doc used to claim it drove "a
+	// memory-cap enforcement flag", which sent an evaluator looking for an
+	// isolation guarantee that does not exist (#1312). This asserts the
+	// documented behaviour rather than trusting the comment, so the claim
+	// cannot come back without a test failing.
+	t.Run("memoryLimitGiB reaches nothing in the pod spec", func(t *testing.T) {
+		const declared = 24
+		r := &InferenceServiceReconciler{
+			DefaultFSGroup:       102,
+			GPUSharingSharedPool: map[string]string{"llmkube.dev/gpu-pool": "shared"},
+		}
+		limit := int32(declared)
+		isvc := sharingISvc(1, &inferencev1alpha1.GPUSharingSpec{
+			Mode:           inferencev1alpha1.GPUSharingModeShared,
+			MemoryLimitGiB: &limit,
+		})
+		model := sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Vendor: "nvidia"})
+
+		deployment := r.constructDeployment(isvc, model, 1)
+		pod := deployment.Spec.Template
+		container := pod.Spec.Containers[0]
+
+		// The declared figure must not appear as any resource quantity.
+		for name, q := range container.Resources.Limits {
+			if q.Value() == declared || q.Value() == declared*1024*1024*1024 {
+				t.Errorf("memoryLimitGiB leaked into resources.limits[%s] = %s", name, q.String())
+			}
+		}
+		for name, q := range container.Resources.Requests {
+			if q.Value() == declared || q.Value() == declared*1024*1024*1024 {
+				t.Errorf("memoryLimitGiB leaked into resources.requests[%s] = %s", name, q.String())
+			}
+		}
+
+		// Nor as a runtime flag, an env var, or an annotation. Substring match
+		// on "24" would be too eager, so look for the shapes a real cap would
+		// take.
+		needles := []string{"24Gi", "24GiB", "memoryLimitGiB", "--gpu-memory", "25769803776"}
+		for _, arg := range container.Args {
+			for _, n := range needles {
+				if strings.Contains(arg, n) {
+					t.Errorf("memoryLimitGiB leaked into container args: %q contains %q", arg, n)
+				}
+			}
+		}
+		for _, env := range container.Env {
+			for _, n := range needles {
+				if strings.Contains(env.Value, n) {
+					t.Errorf("memoryLimitGiB leaked into env %s = %q", env.Name, env.Value)
+				}
+			}
+		}
+		for k, v := range pod.Annotations {
+			for _, n := range needles {
+				if strings.Contains(v, n) {
+					t.Errorf("memoryLimitGiB leaked into annotation %s = %q", k, v)
+				}
+			}
+		}
+	})
 }
 
 // TestGPUSharingParallelismConflict backfills coverage for the mode-based

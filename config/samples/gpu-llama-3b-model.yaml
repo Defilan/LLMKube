@@ -65,4 +65,4 @@ spec:
     gpu: 1  # Each pod gets 1 L4 GPU (23GB VRAM)
     cpu: "2"  # 2 vCPUs for inference serving (g2-standard-4 has 4 total, ~3.9 allocatable)
     memory: "4Gi"  # 4GB RAM (g2-standard-4 has 16GB total, ~13.5GB allocatable)
-    gpuMemory: "8Gi"  # Reserve 8GB of GPU memory
+    gpuMemory: "8Gi"  # Model footprint, informational only (not enforced)
