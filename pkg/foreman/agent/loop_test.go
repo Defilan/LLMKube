@@ -1152,6 +1152,127 @@ func TestLoop_TruncatedTurn_ContinuationRetainsReasoningAndRecovers(t *testing.T
 	}
 }
 
+// TestLoop_TruncatedTurn_TrimsReasoningAfterContinuation pins the #1328
+// fix: after a truncation-continuation turn, the truncated assistant
+// message's partial reasoning is trimmed from the persisted transcript so
+// it does not re-enter the context window on every subsequent turn. The
+// continuation turn itself still receives the reasoning on the wire (that
+// is tested above), but the transcript must not retain it once the model
+// has resumed and acted.
+func TestLoop_TruncatedTurn_TrimsReasoningAfterContinuation(t *testing.T) {
+	srv, captured := capturingScriptedServer(t, []string{
+		assistantTruncated, toolCallSubmitGo,
+	})
+	reg := &fakeRegistry{results: map[string]*ToolResult{
+		"submit_result": {Terminal: true, Verdict: "GO"},
+	}}
+	loop := newTestLoop(srv, reg)
+
+	res, err := loop.Run(context.Background(), LoopConfig{
+		Model: "test", SystemPrompt: "sys", UserPrompt: "go",
+		MaxTurns: 5, MaxTokensPerTurn: 4096,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Terminal == nil || res.Terminal.Verdict != "GO" {
+		t.Fatalf("expected GO terminal after recovery, got %+v", res.Terminal)
+	}
+
+	// The truncated assistant message (the one that originally carried
+	// reasoning_content) must have its reasoning stripped from the persisted
+	// transcript after the continuation turn completed. We identify it by
+	// its position: it is the assistant message that precedes the
+	// continuation directive user message.
+	var sawTruncatedMsg bool
+	var sawReasoningTrimmed bool
+	for i := range res.Transcript {
+		if res.Transcript[i].Role == oai.RoleAssistant &&
+			strings.Contains(res.Transcript[i].ReasoningContent, "design the edit") {
+			// This should NOT happen — the reasoning should have been trimmed.
+			t.Errorf("truncated reasoning must be trimmed from transcript after continuation; "+
+				"found reasoning %q at idx %d", res.Transcript[i].ReasoningContent, i)
+		}
+		// The truncated assistant message is the one before the continuation
+		// directive. It should still exist (with its content/tool_calls) but
+		// with empty reasoning_content.
+		if res.Transcript[i].Role == oai.RoleUser &&
+			res.Transcript[i].Content == TruncationContinueMessage() {
+			// The assistant message immediately before this should be the
+			// truncated one.
+			if i > 0 && res.Transcript[i-1].Role == oai.RoleAssistant {
+				sawTruncatedMsg = true
+				if res.Transcript[i-1].ReasoningContent == "" {
+					sawReasoningTrimmed = true
+				}
+			}
+		}
+	}
+	if !sawTruncatedMsg {
+		t.Fatal("expected a truncated assistant message before the continuation directive")
+	}
+	if !sawReasoningTrimmed {
+		t.Error("truncated assistant message must have its reasoning trimmed after continuation")
+	}
+
+	// The continuation request (2nd) must still have retained the reasoning
+	// on the wire — the trim only affects the persisted transcript, not the
+	// continuation turn's request.
+	reqs := *captured
+	if len(reqs) != 2 {
+		t.Fatalf("want 2 captured requests, got %d", len(reqs))
+	}
+	var sawRetainedReasoning bool
+	for _, m := range reqs[1].Messages {
+		if m.Role == oai.RoleAssistant && strings.Contains(m.ReasoningContent, "design the edit") {
+			sawRetainedReasoning = true
+		}
+	}
+	if !sawRetainedReasoning {
+		t.Errorf("continuation request must retain the truncated reasoning on the wire")
+	}
+}
+
+// TestTrimTruncatedReasoning_TrimsReasoningCarryingAssistant pins the
+// helper in isolation: it strips reasoning_content from the assistant
+// message that carries it (the truncated turn), leaving earlier assistant
+// messages untouched. The truncated message is not necessarily the most-
+// recent one — the continuation turn appends a new assistant message with
+// tool_calls, so the truncated message is the one before it.
+func TestTrimTruncatedReasoning_TrimsReasoningCarryingAssistant(t *testing.T) {
+	tx := []oai.Message{
+		{Role: oai.RoleSystem, Content: "sys"},
+		{Role: oai.RoleAssistant, ReasoningContent: "old thought", Content: "prior"},
+		{Role: oai.RoleTool, Name: "read_file", Content: "{}"},
+		{Role: oai.RoleAssistant, ReasoningContent: "the truncated in-progress thought"},
+		{Role: oai.RoleUser, Content: TruncationContinueMessage()},
+		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{{
+			ID: "tc", Function: oai.ToolCallFunction{Name: "submit_result"},
+		}}},
+	}
+	trimTruncatedReasoning(tx)
+	if tx[1].ReasoningContent != "old thought" {
+		t.Errorf("earlier assistant reasoning must be untouched, got %q", tx[1].ReasoningContent)
+	}
+	if tx[3].ReasoningContent != "" {
+		t.Errorf("truncated assistant reasoning must be trimmed, got %q", tx[3].ReasoningContent)
+	}
+	if tx[5].ReasoningContent != "" {
+		t.Errorf("continuation assistant reasoning must be untouched, got %q", tx[5].ReasoningContent)
+	}
+}
+
+// TestLoop_TruncatedTurn_ContinuationMessageStrengthened pins the #1328
+// rail strengthening: the truncation continuation directive now includes
+// a "keep your reasoning short" instruction so the model does not re-enter
+// a long deliberation on the continuation turn.
+func TestLoop_TruncatedTurn_ContinuationMessageStrengthened(t *testing.T) {
+	msg := TruncationContinueMessage()
+	if !strings.Contains(msg, "Keep your reasoning short") {
+		t.Errorf("TruncationContinueMessage must include a short-reasoning rail; got %q", msg)
+	}
+}
+
 // TestLoop_TruncatedTurn_StreakResetsOnToolCall confirms a successful
 // tool-calling turn between truncations resets the streak, so intermittent
 // truncations never accumulate to a spurious ErrAssistantTruncated. The
