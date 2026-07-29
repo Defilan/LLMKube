@@ -60,6 +60,22 @@ func TestApplyVerdictPolicy(t *testing.T) {
 			t.Fatalf("verdict = %v, want GO", res.Verdict)
 		}
 	})
+	t.Run("mixed footprint of all self-GO classes stands (crd-regen, #1342)", func(t *testing.T) {
+		res := applyVerdictPolicy(goResult(),
+			map[string]int{
+				"api/v1alpha1/inferenceservice_types.go":                        6,
+				"charts/llmkube/templates/crds/inferenceservices.yaml":          6,
+				"config/crd/bases/inference.llmkube.dev_inferenceservices.yaml": 6,
+			}, defaultSelfGO, changepolicy.NewDefaultPolicy())
+		if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+			t.Fatalf("verdict = %v, want GO: a doc change that regenerates CRDs spans "+
+				"code-fix+packaging+config, all self-GO", res.Verdict)
+		}
+		if res.Extra["actualWorkClass"] != "mixed" {
+			t.Errorf("actualWorkClass = %v, want mixed (recorded even when it stands)",
+				res.Extra["actualWorkClass"])
+		}
+	})
 	t.Run("operator opt-in allows ci-policy", func(t *testing.T) {
 		res := applyVerdictPolicy(goResult(),
 			map[string]int{".github/workflows/release.yml": 40},

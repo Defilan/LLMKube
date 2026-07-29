@@ -111,9 +111,15 @@ type ChangePolicy interface {
 	// Classify returns the dominant work class for a set of changed paths
 	// with their added+deleted line counts.
 	Classify(changed map[string]int) WorkClass
-	// RequiresHumanReview returns true when any changed path classifies
-	// to a class NOT in the provided selfGO list.
+	// RequiresHumanReview returns true when a change over the given paths
+	// needs human review (falls outside the selfGO allowlist).
 	RequiresHumanReview(changedPaths []string, selfGO []string) bool
+	// NeedsVerification reports whether a change with the given footprint
+	// (path -> changed-line count) needs human verification: its class is
+	// outside selfGO, EXCEPT a "mixed" footprint whose every constituent
+	// class is itself in selfGO (a change merely spanning several self-GO
+	// classes, e.g. code plus its regenerated manifests, #1342).
+	NeedsVerification(changed map[string]int, selfGO []string) bool
 }
 
 // NewDefaultPolicy returns the default ChangePolicy, which mirrors the
@@ -133,16 +139,64 @@ func (defaultPolicy) Classify(changed map[string]int) WorkClass {
 }
 
 // RequiresHumanReview implements ChangePolicy.RequiresHumanReview.
-func (defaultPolicy) RequiresHumanReview(changedPaths []string, selfGO []string) bool {
-	// Build the footprint map from the path list (each path counts as 1
-	// line for the purpose of this gate; the caller may pass a richer
-	// map via Classify when line counts are available).
+func (d defaultPolicy) RequiresHumanReview(changedPaths []string, selfGO []string) bool {
+	// Each path counts as 1 line (callers with real line counts use
+	// NeedsVerification directly). Delegate so the mixed-all-selfGO
+	// relaxation (#1342) is applied consistently.
 	changed := map[string]int{}
 	for _, p := range changedPaths {
 		changed[p] = 1
 	}
+	return d.NeedsVerification(changed, selfGO)
+}
+
+// NeedsVerification implements ChangePolicy.NeedsVerification. A change needs
+// verification when its dominant class is outside selfGO, EXCEPT a "mixed"
+// footprint whose every constituent class is itself in selfGO: that is a
+// change merely spanning several self-GO classes (e.g. a doc-comment edit in a
+// *.go file that regenerates its CRDs spans code-fix + packaging + config, all
+// self-GO), not a genuinely unverifiable change, so it does not require
+// verification (#1342). A zero-line/empty footprint yields no constituent
+// classes and is never relaxed, so a rename-only change still needs review.
+func (defaultPolicy) NeedsVerification(changed map[string]int, selfGO []string) bool {
 	class := classifyFootprint(changed)
-	return !workClassInList(class, selfGO)
+	if workClassInList(class, selfGO) {
+		return false
+	}
+	if class == workClassMixed {
+		if cs := footprintClasses(changed); len(cs) > 0 {
+			for _, c := range cs {
+				if !workClassInList(c, selfGO) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// footprintClasses returns the distinct work classes present in a footprint,
+// counting only files with a positive changed-line count. It returns nil for
+// an empty or zero-line footprint (rename-only / permission-only), so such a
+// change is never treated as a set of self-GO classes.
+func footprintClasses(changed map[string]int) []WorkClass {
+	total := 0
+	set := map[WorkClass]bool{}
+	for f, n := range changed {
+		total += n
+		if n > 0 {
+			set[classifyFile(f)] = true
+		}
+	}
+	if total == 0 {
+		return nil
+	}
+	out := make([]WorkClass, 0, len(set))
+	for c := range set {
+		out = append(out, c)
+	}
+	return out
 }
 
 // workClassInList reports whether class's string form appears in list.
