@@ -5,6 +5,27 @@ tenants (namespaces, teams, or label-scoped groups). It works as a validating
 admission webhook on `InferenceService` creation and update, rejecting any
 request that would exceed the declared quota.
 
+## Prerequisites
+
+GPUQuota enforcement is **off by default**. The `vinferenceservicequota`
+validating webhook is rendered only when `multitenancy.enabled=true`
+(`charts/llmkube/values.yaml`); on a default install (`enabled=false`) the
+webhook is absent and **nothing is rejected**, even if you create GPUQuota
+resources.
+
+The GPUQuota reconciler, by contrast, is always registered. It still writes
+`status.usedGPUCount`, `status.usedVRAMBytes`, and the
+`llmkube_gpuquota_used_gpu_count`, `llmkube_gpuquota_used_vram_bytes`,
+`llmkube_gpuquota_gpu_count_limit`, and `llmkube_gpuquota_vram_bytes_limit`
+Prometheus gauges regardless of the flag. So on a default install you will see
+usage populate and dashboards move, but no admission is being gated. Set
+`multitenancy.enabled=true` before relying on enforcement.
+
+Quota is **opt-in per namespace**, not default-deny: a namespace covered by no
+GPUQuota has no cap at all. The webhook only denies against quotas whose
+`namespaceRef` or `selector` matches the incoming InferenceService's namespace;
+a namespace with no matching quota is admitted unconditionally.
+
 ## When to use
 
 Use GPUQuota when you need to guarantee that one tenant cannot starve another
@@ -23,10 +44,32 @@ of GPU resources. Common scenarios:
 A GPUQuota must declare exactly one of `selector` or `namespaceRef`; they are
 mutually exclusive, enforced by a CEL validation rule on the CRD.
 
+An InferenceService carrying the `kueue.x-k8s.io/queue-name` label skips
+GPUQuota accounting entirely: the webhook defers to Kueue's ClusterQueue for
+that object. The intent is to avoid double-gating a service that Kueue
+admits and then unsuspends. Note that the shipped `tenant` ClusterRole grants
+`create` on InferenceService, so a tenant can set this label themselves to
+opt out of GPUQuota gating.
+
+Autoscaled services are not re-gated on HPA-driven scale-up: the HPA targets
+the Deployment directly, so a scale event never re-enters the admission
+webhook. The reconciler charges `maxReplicas` against the quota at admission
+time to bound the worst-case headroom, but a service admitted at a lower
+replica count can still scale up within that ceiling without a further quota
+check. See #1311 for the separate tracking issue.
+
 ### Namespace-scoped quota
 
 Pins the quota to a single namespace. Every InferenceService created in that
 namespace is checked against this quota.
+
+> **Quota placement:** the webhook lists quotas cluster-wide, so a quota can
+> live in any namespace and still govern a tenant namespace. Prefer placing
+> the GPUQuota in an admin-owned namespace rather than co-locating it in the
+> tenant namespace. The shipped `tenant-admin` ClusterRole grants `delete` on
+> `gpuquotas`; if it is RoleBound in the tenant namespace, a tenant admin can
+> delete the quota governing them. An admin-owned namespace keeps the quota
+> out of tenant-reachable RBAC.
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
