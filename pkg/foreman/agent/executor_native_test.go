@@ -303,6 +303,76 @@ func TestNativeExecutor_NoAgentRefIsHardError(t *testing.T) {
 	}
 }
 
+// --- Freeform without repo: no auth, no clone (#1288) --------------------
+
+// TestNativeExecutor_FreeformNoRepoSkipsAuthAndClone proves that a freeform
+// AgenticTask with no payload.repo and no --git-remote-url does not attempt
+// GitHub auth resolution or repo clone. The AuthFactory is wired to fail if
+// called, and the workspace is checked to confirm no .git directory was
+// created. The model still runs and returns its verdict.
+func TestNativeExecutor_FreeformNoRepoSkipsAuthAndClone(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	oaiSrv := scriptedOAI(t, []string{submitGoBody})
+
+	agent, task := taskAndAgent("freeform-no-repo")
+	task.Spec.Kind = foremanv1alpha1.AgenticTaskKindFreeform
+	task.Spec.Payload.Repo = ""
+	task.Spec.Payload.Prompt = "Reply by calling submit_result immediately."
+
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(agent, task).
+		Build()
+
+	reg := &fakeRegistry{
+		results: map[string]*foremanagent.ToolResult{
+			"submit_result": {
+				Terminal: true, Verdict: "GO", Summary: "received",
+			},
+		},
+	}
+
+	workspaceRoot := filepath.Join(root, "ws")
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            workspaceRoot,
+		KeepWorkspace:            true,
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Bot", Email: "b@x"},
+		CommitCommitter:          repo.Identity{Name: "Bot", Email: "b@x"},
+		RegistryFactory: func(
+			_ context.Context, ws string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		// AuthFactory that fails if called: proves auth resolution is
+		// skipped for a freeform task with no repo (#1288).
+		AuthFactory: func() (*repo.Auth, error) {
+			return nil, errors.New("auth should not be called for freeform without repo")
+		},
+		// No GitRemoteURL: proves clone is skipped.
+	}
+
+	res, err := e.Execute(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("verdict: want GO got %s; result=%+v", res.Verdict, res)
+	}
+	// No commit SHA: there was no repo to commit to.
+	if got := res.Extra["commitSHA"]; got != "" && got != nil {
+		t.Errorf("commitSHA: want empty (no repo) got %v", got)
+	}
+	// The workspace should not be a git repo (no clone happened).
+	ws := filepath.Join(workspaceRoot, task.Namespace, task.Name)
+	if _, err := os.Stat(filepath.Join(ws, ".git")); !os.IsNotExist(err) {
+		t.Errorf("workspace should not be a git repo (no clone): %v", err)
+	}
+}
+
 // --- Happy path: clone, loop, submit_result GO, commit, push -------------
 
 const submitGoBody = `{
