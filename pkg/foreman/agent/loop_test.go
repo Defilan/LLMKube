@@ -1262,6 +1262,32 @@ func TestTrimTruncatedReasoning_TrimsReasoningCarryingAssistant(t *testing.T) {
 	}
 }
 
+// TestTrimTruncatedReasoning_ContinuationCarryingReasoning pins the case the
+// #1328 fix exists for: a verbose model keeps its reasoning "short" but
+// non-empty on the continuation turn, so the continuation assistant message
+// has BOTH reasoning_content and tool_calls. trimTruncatedReasoning must trim
+// the reasoning-only truncated message (no tool_calls) and leave the
+// continuation's live reasoning intact. A prior "most-recent assistant with
+// any reasoning" scan clears the continuation and leaves the wasted truncated
+// reasoning, defeating the fix.
+func TestTrimTruncatedReasoning_ContinuationCarryingReasoning(t *testing.T) {
+	tx := []oai.Message{
+		{Role: oai.RoleAssistant, ReasoningContent: "wasted truncated thought"},
+		{Role: oai.RoleUser, Content: TruncationContinueMessage()},
+		{Role: oai.RoleAssistant, ReasoningContent: "short continuation thought",
+			ToolCalls: []oai.ToolCall{{
+				ID: "tc", Function: oai.ToolCallFunction{Name: "submit_result"},
+			}}},
+	}
+	trimTruncatedReasoning(tx)
+	if tx[0].ReasoningContent != "" {
+		t.Errorf("wasted truncated reasoning must be trimmed, got %q", tx[0].ReasoningContent)
+	}
+	if tx[2].ReasoningContent != "short continuation thought" {
+		t.Errorf("continuation reasoning must survive (it has tool_calls), got %q", tx[2].ReasoningContent)
+	}
+}
+
 // TestLoop_TruncatedTurn_ContinuationMessageStrengthened pins the #1328
 // rail strengthening: the truncation continuation directive now includes
 // a "keep your reasoning short" instruction so the model does not re-enter

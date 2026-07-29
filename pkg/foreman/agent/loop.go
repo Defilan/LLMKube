@@ -995,14 +995,22 @@ func stripReasoningForWire(msgs []oai.Message, preserveTrailingReasoning bool) [
 // subsequent turn re-prefills the truncated reasoning, driving the context
 // ballooning and per-turn cost blowup described in #1328.
 //
-// The truncated assistant message is the one carrying reasoning_content
-// (a finish_reason=="length" turn is reasoning-only by construction). It
-// is NOT necessarily the most-recent assistant message: the continuation
-// turn appends a new assistant message with tool_calls, so the truncated
-// message is the one before it. The transcript is mutated in place.
+// The truncated assistant message is reasoning-only: a finish_reason=="length"
+// turn carries reasoning_content and NO tool_calls by construction (truncation
+// is only classified when len(ToolCalls)==0, see runOneTurn). It is NOT the
+// most-recent assistant message: the continuation turn appends a new assistant
+// message WITH tool_calls, and that continuation may itself carry a short
+// reasoning_content (the nudge asks to keep reasoning short, not to omit it).
+// So we must target the most-recent reasoning-only (no tool_calls) assistant
+// message, not simply the most-recent assistant message with any reasoning:
+// the latter would clear the continuation's live reasoning and leave the wasted
+// truncated reasoning in place, defeating the fix. The transcript is mutated in
+// place.
 func trimTruncatedReasoning(transcript []oai.Message) {
 	for i := len(transcript) - 1; i >= 0; i-- {
-		if transcript[i].Role == oai.RoleAssistant && transcript[i].ReasoningContent != "" {
+		if transcript[i].Role == oai.RoleAssistant &&
+			transcript[i].ReasoningContent != "" &&
+			len(transcript[i].ToolCalls) == 0 {
 			transcript[i].ReasoningContent = ""
 			return
 		}
