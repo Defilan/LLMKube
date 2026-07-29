@@ -155,7 +155,13 @@ func applyVerdictPolicy(
 		res.Extra["declaredWorkClass"] = declared
 	}
 
-	if !workClassInList(class, selfGO) {
+	// Downgrade to NEEDS-VERIFICATION when the change falls outside the
+	// self-GO allowlist. This delegates to the policy's NeedsVerification so
+	// a "mixed" footprint whose every constituent class is itself in selfGO
+	// (e.g. a doc-comment edit that regenerates its CRDs: code-fix +
+	// packaging + config) is NOT downgraded just because the mix has no
+	// dominant class (#1342). class above is retained for the audit record.
+	if policy.NeedsVerification(changed, selfGO) {
 		res.Verdict = foremanv1alpha1.AgenticTaskVerdictNoGo
 		res.Extra["outcome"] = needsVerificationOutcome
 		res.Extra["unverified"] = []map[string]string{unverifiedPolicyEntry(class)}

@@ -146,6 +146,57 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestNeedsVerification(t *testing.T) {
+	policy := defaultPolicy{}
+	tests := []struct {
+		name    string
+		changed map[string]int
+		selfGO  []string
+		want    bool
+	}{
+		{
+			// #1342 / #1312: doc-comment edit + regenerated CRDs spans
+			// code-fix + packaging + config (all selfGO) -> no verification.
+			name: "crd-regen doc change all selfGO",
+			changed: map[string]int{
+				"api/v1alpha1/inferenceservice_types.go":                        6,
+				"charts/llmkube/templates/crds/inferenceservices.yaml":          6,
+				"config/crd/bases/inference.llmkube.dev_inferenceservices.yaml": 6,
+			},
+			selfGO: []string{"code-fix", "docs", "packaging", "config"},
+			want:   false,
+		},
+		{
+			name:    "mixed with a non-selfGO constituent needs verification",
+			changed: map[string]int{"pkg/agent/loop.go": 10, ".github/workflows/ci.yml": 10},
+			selfGO:  []string{"code-fix", "docs", "packaging", "config"},
+			want:    true,
+		},
+		{
+			name:    "dominant selfGO class needs no verification",
+			changed: map[string]int{"pkg/agent/loop.go": 40},
+			selfGO:  []string{"code-fix", "docs", "packaging", "config"},
+			want:    false,
+		},
+		{
+			// Zero-line safety: a rename-only change (0 changed lines) has no
+			// constituent classes, so the mixed relaxation does not apply and
+			// it still needs verification.
+			name:    "zero-line rename still needs verification",
+			changed: map[string]int{"pkg/agent/loop.go": 0},
+			selfGO:  []string{"code-fix", "docs", "packaging", "config"},
+			want:    true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := policy.NeedsVerification(tc.changed, tc.selfGO); got != tc.want {
+				t.Errorf("NeedsVerification() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRequiresHumanReview(t *testing.T) {
 	policy := defaultPolicy{}
 
@@ -204,10 +255,34 @@ func TestRequiresHumanReview(t *testing.T) {
 			want:         true,
 		},
 		{
-			name:         "mixed change with selfGO missing mixed",
+			// #1342: a mixed footprint whose every constituent class is
+			// itself in selfGO (code-fix + docs) must NOT require review,
+			// even though "mixed" is absent from selfGO.
+			name:         "mixed change whose constituents are all selfGO",
 			changedPaths: []string{"pkg/agent/loop.go", "README.md"},
 			selfGO:       []string{"code-fix", "docs", "config"},
+			want:         false,
+		},
+		{
+			// #1342 boundary: a mixed footprint with a constituent OUTSIDE
+			// selfGO (ci-policy) still requires review.
+			name:         "mixed change with a non-selfGO constituent",
+			changedPaths: []string{"pkg/agent/loop.go", ".github/workflows/ci.yml"},
+			selfGO:       []string{"code-fix", "docs", "config"},
 			want:         true,
+		},
+		{
+			// #1342 / #1312: a doc-comment edit that regenerates its CRDs
+			// spans code-fix + packaging + config (all selfGO) -> mixed,
+			// no dominant class -> must NOT require review.
+			name: "crd-regen doc change: code-fix + packaging + config",
+			changedPaths: []string{
+				"api/v1alpha1/inferenceservice_types.go",
+				"charts/llmkube/templates/crds/inferenceservices.yaml",
+				"config/crd/bases/inference.llmkube.dev_inferenceservices.yaml",
+			},
+			selfGO: []string{"code-fix", "docs", "packaging", "config"},
+			want:   false,
 		},
 		{
 			name:         "mixed change with selfGO including mixed",
