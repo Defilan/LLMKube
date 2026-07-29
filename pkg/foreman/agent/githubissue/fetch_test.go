@@ -41,6 +41,13 @@ func TestParseRepo(t *testing.T) {
 		{"/empty-owner", "", "", true},
 		{"empty-repo/", "", "", true},
 		{"empty-segment//repo", "", "", true},
+		// #1343: the shared validator's character class rejects whitespace and
+		// other non-git-safe characters that the old local ParseRepo accepted.
+		{"owner/name with space", "", "", true},
+		{"owner/na\tme", "", "", true},
+		// #1343: ".." traversal segments stay rejected (guarded by name).
+		{"owner/..", "", "", true},
+		{"../etc/passwd", "", "", true},
 	}
 	for _, tc := range cases {
 		o, r, err := ParseRepo(tc.in)
