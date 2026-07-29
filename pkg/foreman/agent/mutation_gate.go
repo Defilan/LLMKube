@@ -279,12 +279,18 @@ func dedupSorted(in []string) []string {
 }
 
 // checkTestPresence fails when a changed package has NET-NEW functions in
-// hand-written, non-test Go that are not referenced by name in any changed
-// _test.go in that package. Body-modified functions are exempt: Layer 2
-// (mutation survival) covers them where the package has a changed test, and
-// CI's full suite covers them everywhere. Pure inspection -- no test
-// execution -- so it covers envtest/controller packages the fast unit-test
-// tier cannot run. Returns (failed, feedback).
+// hand-written, non-test Go that are not covered by a changed _test.go in
+// that package. An EXPORTED net-new function must be referenced by name in a
+// changed test (the public surface a test would name directly). An UNEXPORTED
+// net-new helper is accepted when the package has any changed test, since it
+// is an implementation detail exercised transitively through a tested public
+// entry point; it is only flagged when the package has NO changed test at all
+// (genuinely untested). This avoids the false rejection where a helper is
+// covered behaviorally but not named (#1329). Body-modified functions are
+// exempt: Layer 2 (mutation survival) covers them where the package has a
+// changed test, and CI's full suite covers them everywhere. Pure inspection --
+// no test execution -- so it covers envtest/controller packages the fast
+// unit-test tier cannot run. Returns (failed, feedback).
 func checkTestPresence(ctx context.Context, workspace string, run commandRunner) (bool, string) {
 	changed := changedNonTestGoFiles(ctx, workspace, run)
 	if len(changed) == 0 {
@@ -331,6 +337,16 @@ func checkTestPresence(ctx context.Context, workspace string, run commandRunner)
 
 		var unreferenced []string
 		for name := range funcSet {
+			// Unexported helpers are implementation details, exercised
+			// transitively through a tested public entry point: accept them
+			// when the package has any changed test, rather than demanding the
+			// helper's own name appear literally in a test (#1329). Exported
+			// functions -- the public surface a test would name directly --
+			// still require a by-name reference. An unexported helper in a
+			// package with NO changed test stays flagged (genuinely untested).
+			if !token.IsExported(name) && len(testFiles) > 0 {
+				continue
+			}
 			referenced := false
 			for _, tf := range testFiles {
 				if testFileReferencesFunc(workspace, tf, name) {
@@ -347,8 +363,10 @@ func checkTestPresence(ctx context.Context, workspace string, run commandRunner)
 		}
 		failed = true
 		sort.Strings(unreferenced)
-		fmt.Fprintf(&b, "Package %s/ changed functions (%s) have no test referencing them by name. "+
-			"Add a test that exercises the new behavior and fails without it.\n",
+		fmt.Fprintf(&b, "Package %s/ changed functions (%s) are not covered by a test. "+
+			"Name each changed EXPORTED function in a test that fails without it; for an "+
+			"unexported helper, add or change a test in this package that exercises it "+
+			"(directly or through a public entry point).\n",
 			dir, strings.Join(unreferenced, ", "))
 	}
 	if !failed {
