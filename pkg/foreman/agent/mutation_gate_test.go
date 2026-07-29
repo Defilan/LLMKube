@@ -202,6 +202,75 @@ func TestCheckTestPresence_ReferencingTestPasses(t *testing.T) { //nolint:dupl
 	}
 }
 
+// TestCheckTestPresence_ExportedFlaggedUnexportedAcceptedWithChangedTest pins
+// the #1329 split: with a changed test present, an EXPORTED net-new function
+// still requires a by-name reference (flagged if missing), while an UNEXPORTED
+// helper is accepted as covered transitively. Package pkg/model adds Classify
+// (exported) and extractRepo (unexported); the changed test names neither.
+func TestCheckTestPresence_ExportedFlaggedUnexportedAcceptedWithChangedTest(t *testing.T) {
+	ws := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(ws, "pkg/model"), 0o755)
+	_ = os.WriteFile(filepath.Join(ws, "pkg/model/classifier.go"),
+		[]byte("package model\nfunc Classify() {}\nfunc extractRepo() {}\n"), 0o644)
+	// Changed test names neither Classify nor extractRepo.
+	_ = os.WriteFile(filepath.Join(ws, "pkg/model/classifier_test.go"),
+		[]byte("package model\nimport \"testing\"\nfunc TestSomething(t *testing.T) { _ = 1 }\n"), 0o644)
+
+	statusOut := " M pkg/model/classifier.go\x00 M pkg/model/classifier_test.go\x00"
+	diffOut := "@@ -0,0 +1,3 @@\n+package model\n+func Classify() {}\n+func extractRepo() {}\n"
+	runner := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && args[0] == "status":
+			return statusOut, nil
+		case name == "git" && args[0] == "diff" && len(args) > 2 && args[1] == "-U0" && args[2] == "HEAD":
+			return diffOut, nil
+		case name == "git" && args[0] == "diff" && len(args) > 1 && args[1] == "HEAD":
+			return diffOut, nil
+		}
+		return "", nil
+	}
+
+	failed, out := checkTestPresence(context.Background(), ws, runner)
+	if !failed {
+		t.Fatal("expected failure: exported Classify has no test naming it")
+	}
+	if !strings.Contains(out, "Classify") {
+		t.Errorf("feedback should flag the exported Classify; got:\n%s", out)
+	}
+	if strings.Contains(out, "extractRepo") {
+		t.Errorf("unexported extractRepo must be accepted (changed test present), not flagged; got:\n%s", out)
+	}
+}
+
+// TestCheckTestPresence_UnexportedHelperFlaggedWithoutChangedTest pins the
+// honest boundary of #1329: an unexported helper is still flagged when the
+// package has NO changed test at all (nothing exercises it).
+func TestCheckTestPresence_UnexportedHelperFlaggedWithoutChangedTest(t *testing.T) {
+	ws := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(ws, "pkg/model"), 0o755)
+	_ = os.WriteFile(filepath.Join(ws, "pkg/model/classifier.go"),
+		[]byte("package model\nfunc extractRepo() {}\n"), 0o644)
+
+	statusOut := " M pkg/model/classifier.go\x00" // no changed _test.go
+	diffOut := "@@ -0,0 +1,2 @@\n+package model\n+func extractRepo() {}\n"
+	runner := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && args[0] == "status":
+			return statusOut, nil
+		case name == "git" && args[0] == "diff" && len(args) > 2 && args[1] == "-U0" && args[2] == "HEAD":
+			return diffOut, nil
+		case name == "git" && args[0] == "diff" && len(args) > 1 && args[1] == "HEAD":
+			return diffOut, nil
+		}
+		return "", nil
+	}
+
+	failed, out := checkTestPresence(context.Background(), ws, runner)
+	if !failed || !strings.Contains(out, "extractRepo") {
+		t.Fatalf("unexported helper with no changed test must be flagged; got failed=%v out=%q", failed, out)
+	}
+}
+
 // TestCheckTestPresence_ModifiedFuncDoesNotNeedTest verifies that a
 // body-modified function (no net-new +func line) does NOT demand a named
 // test. Behavior-preserving edits to existing functions are covered by
