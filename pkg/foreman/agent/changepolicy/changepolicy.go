@@ -40,15 +40,20 @@ const (
 // diff to take that class; below it the footprint is mixed.
 const footprintDominance = 0.70
 
-type classRule struct {
-	globs []string
-	class WorkClass
+// ClassRule maps a set of path globs to a work class. Rules are evaluated
+// in order; the first matching glob wins. Globs match with path.Match
+// against the full slash path and against the base name, plus a prefix
+// form for directory trees (dir/**).
+type ClassRule struct {
+	Globs []string
+	Class WorkClass
 }
 
-// classRules is evaluated in order; first matching glob wins. Globs match
-// with path.Match against the full slash path and against the base name,
-// plus a prefix form for directory trees (dir/**).
-var classRules = []classRule{
+// DefaultClassRules is the default set of path-to-class rules, mirroring
+// the GitHub-specific classification in workclass.go and the human-review
+// gate in verdict_policy.go. NewDefaultPolicy uses these rules so existing
+// behavior is unchanged.
+var DefaultClassRules = []ClassRule{
 	{[]string{".github/workflows/**", ".github/actions/**"}, workClassCIPolicy},
 	{[]string{".goreleaser*", "release-please*"}, workClassReleasePolicy},
 	{[]string{"Formula/**", "Dockerfile*", "charts/**", "*.spec",
@@ -72,39 +77,6 @@ func matchGlob(glob, path string) bool {
 	return false
 }
 
-func classifyFile(path string) WorkClass {
-	for _, r := range classRules {
-		for _, g := range r.globs {
-			if matchGlob(g, path) {
-				return r.class
-			}
-		}
-	}
-	return workClassCodeFix
-}
-
-func classifyFootprint(changed map[string]int) WorkClass {
-	if len(changed) == 0 {
-		return workClassCodeFix
-	}
-	total, byClass := 0, map[WorkClass]int{}
-	for f, n := range changed {
-		total += n
-		byClass[classifyFile(f)] += n
-	}
-	// Zero-line diffs (rename-only, permission-only) must not nondeterministically
-	// classify as a self-GO-able class; mixed is the safe fallback.
-	if total == 0 {
-		return workClassMixed
-	}
-	for class, n := range byClass {
-		if float64(n) >= footprintDominance*float64(total) {
-			return class
-		}
-	}
-	return workClassMixed
-}
-
 // ChangePolicy classifies changed paths into work classes and gates
 // human review when a change falls outside the self-GO allowlist.
 type ChangePolicy interface {
@@ -126,28 +98,38 @@ type ChangePolicy interface {
 // GitHub-specific classification in workclass.go and the human-review
 // gate in verdict_policy.go.
 func NewDefaultPolicy() ChangePolicy {
-	return defaultPolicy{}
+	return NewPolicy(DefaultClassRules)
+}
+
+// NewPolicy returns a ChangePolicy configured with the given path-to-class
+// rules. Pass DefaultClassRules (or use NewDefaultPolicy) for the GitHub
+// defaults; pass a custom set to classify non-GitHub paths (e.g. a
+// Woodpecker config at .woodpecker/**) as ci-policy without recompiling.
+func NewPolicy(rules []ClassRule) ChangePolicy {
+	return defaultPolicy{rules: rules}
 }
 
 // defaultPolicy is the default implementation that mirrors the
 // workclass.go/verdict_policy.go logic.
-type defaultPolicy struct{}
+type defaultPolicy struct {
+	rules []ClassRule
+}
 
 // Classify implements ChangePolicy.Classify.
-func (defaultPolicy) Classify(changed map[string]int) WorkClass {
-	return classifyFootprint(changed)
+func (p defaultPolicy) Classify(changed map[string]int) WorkClass {
+	return p.classifyFootprint(changed)
 }
 
 // RequiresHumanReview implements ChangePolicy.RequiresHumanReview.
-func (d defaultPolicy) RequiresHumanReview(changedPaths []string, selfGO []string) bool {
+func (p defaultPolicy) RequiresHumanReview(changedPaths []string, selfGO []string) bool {
 	// Each path counts as 1 line (callers with real line counts use
 	// NeedsVerification directly). Delegate so the mixed-all-selfGO
 	// relaxation (#1342) is applied consistently.
 	changed := map[string]int{}
-	for _, p := range changedPaths {
-		changed[p] = 1
+	for _, path := range changedPaths {
+		changed[path] = 1
 	}
-	return d.NeedsVerification(changed, selfGO)
+	return p.NeedsVerification(changed, selfGO)
 }
 
 // NeedsVerification implements ChangePolicy.NeedsVerification. A change needs
@@ -158,13 +140,13 @@ func (d defaultPolicy) RequiresHumanReview(changedPaths []string, selfGO []strin
 // self-GO), not a genuinely unverifiable change, so it does not require
 // verification (#1342). A zero-line/empty footprint yields no constituent
 // classes and is never relaxed, so a rename-only change still needs review.
-func (defaultPolicy) NeedsVerification(changed map[string]int, selfGO []string) bool {
-	class := classifyFootprint(changed)
+func (p defaultPolicy) NeedsVerification(changed map[string]int, selfGO []string) bool {
+	class := p.classifyFootprint(changed)
 	if workClassInList(class, selfGO) {
 		return false
 	}
 	if class == workClassMixed {
-		if cs := footprintClasses(changed); len(cs) > 0 {
+		if cs := p.footprintClasses(changed); len(cs) > 0 {
 			for _, c := range cs {
 				if !workClassInList(c, selfGO) {
 					return true
@@ -176,17 +158,54 @@ func (defaultPolicy) NeedsVerification(changed map[string]int, selfGO []string) 
 	return true
 }
 
+// classifyFile returns the work class for a single path, using the
+// policy's rules. First matching glob wins; unmatched paths are code-fix.
+func (p defaultPolicy) classifyFile(path string) WorkClass {
+	for _, r := range p.rules {
+		for _, g := range r.Globs {
+			if matchGlob(g, path) {
+				return r.Class
+			}
+		}
+	}
+	return workClassCodeFix
+}
+
+// classifyFootprint returns the dominant work class for a set of changed
+// paths with their added+deleted line counts.
+func (p defaultPolicy) classifyFootprint(changed map[string]int) WorkClass {
+	if len(changed) == 0 {
+		return workClassCodeFix
+	}
+	total, byClass := 0, map[WorkClass]int{}
+	for f, n := range changed {
+		total += n
+		byClass[p.classifyFile(f)] += n
+	}
+	// Zero-line diffs (rename-only, permission-only) must not nondeterministically
+	// classify as a self-GO-able class; mixed is the safe fallback.
+	if total == 0 {
+		return workClassMixed
+	}
+	for class, n := range byClass {
+		if float64(n) >= footprintDominance*float64(total) {
+			return class
+		}
+	}
+	return workClassMixed
+}
+
 // footprintClasses returns the distinct work classes present in a footprint,
 // counting only files with a positive changed-line count. It returns nil for
 // an empty or zero-line footprint (rename-only / permission-only), so such a
 // change is never treated as a set of self-GO classes.
-func footprintClasses(changed map[string]int) []WorkClass {
+func (p defaultPolicy) footprintClasses(changed map[string]int) []WorkClass {
 	total := 0
 	set := map[WorkClass]bool{}
 	for f, n := range changed {
 		total += n
 		if n > 0 {
-			set[classifyFile(f)] = true
+			set[p.classifyFile(f)] = true
 		}
 	}
 	if total == 0 {
