@@ -547,8 +547,8 @@ func ReasoningOnlyNudgeMessage() string {
 func TruncationContinueMessage() string {
 	return "Your previous turn hit the token limit before you finished. Do " +
 		"not restart your reasoning. Stop deliberating now and emit the tool " +
-		"call for your next concrete action. If your work is complete, call " +
-		"submit_result with your verdict."
+		"call for your next concrete action. Keep your reasoning short. If " +
+		"your work is complete, call submit_result with your verdict."
 }
 
 // NoToolCallNudgeMessage is the corrective the loop appends as a user
@@ -792,6 +792,18 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 		preserveReasoning := streaks.preserveReasoningNext
 		streaks.preserveReasoningNext = false
 		editSucceeded, turnErr := l.runOneTurn(ctx, cfg, activeSchemas, res, preserveReasoning, &sessionDrop)
+
+		// After a truncation-continuation turn, the just-truncated assistant
+		// message's partial reasoning has served its purpose: the model
+		// resumed from it on this turn. Trim it from the persisted transcript
+		// so the wasted generation does not re-enter the context window on
+		// every subsequent turn, which is what drives the context ballooning
+		// and per-turn cost blowup described in #1328. The wire payload for
+		// THIS turn already carried the reasoning (via preserveTrailingReasoning
+		// in runOneTurn), so stripping it here only affects future turns.
+		if preserveReasoning {
+			trimTruncatedReasoning(res.Transcript)
+		}
 		if turnErr != nil {
 			if errors.Is(turnErr, errTerminalReached) {
 				// Coder gate feedback loop (#749): give the gate a chance to
@@ -972,6 +984,37 @@ func stripReasoningForWire(msgs []oai.Message, preserveTrailingReasoning bool) [
 		}
 	}
 	return wire
+}
+
+// trimTruncatedReasoning strips reasoning_content from the assistant
+// message that was just continued after a truncation. It is called after a
+// truncation-continuation turn (where preserveTrailingReasoning was true):
+// the model has now resumed from the partial reasoning and emitted its
+// tool call, so the wasted generation has served its purpose and must not
+// re-enter the context window on future turns. Without this, every
+// subsequent turn re-prefills the truncated reasoning, driving the context
+// ballooning and per-turn cost blowup described in #1328.
+//
+// The truncated assistant message is reasoning-only: a finish_reason=="length"
+// turn carries reasoning_content and NO tool_calls by construction (truncation
+// is only classified when len(ToolCalls)==0, see runOneTurn). It is NOT the
+// most-recent assistant message: the continuation turn appends a new assistant
+// message WITH tool_calls, and that continuation may itself carry a short
+// reasoning_content (the nudge asks to keep reasoning short, not to omit it).
+// So we must target the most-recent reasoning-only (no tool_calls) assistant
+// message, not simply the most-recent assistant message with any reasoning:
+// the latter would clear the continuation's live reasoning and leave the wasted
+// truncated reasoning in place, defeating the fix. The transcript is mutated in
+// place.
+func trimTruncatedReasoning(transcript []oai.Message) {
+	for i := len(transcript) - 1; i >= 0; i-- {
+		if transcript[i].Role == oai.RoleAssistant &&
+			transcript[i].ReasoningContent != "" &&
+			len(transcript[i].ToolCalls) == 0 {
+			transcript[i].ReasoningContent = ""
+			return
+		}
+	}
 }
 
 // rejectsTemperature reports whether err is a provider rejecting the
