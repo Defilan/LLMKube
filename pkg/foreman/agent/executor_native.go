@@ -359,11 +359,25 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		}()
 	}
 
-	auth, err := e.buildAuth()
-	if err != nil {
-		return e.failResult(start, foremanv1alpha1.FailureAuthUnavailable, err.Error()), nil
+	// needsRepo decides whether this task requires a cloned working tree.
+	// issue-fix and verify always need one; freeform and other kinds need
+	// one only when payload.repo (or a static --git-remote-url) is set.
+	// A freeform task with only a prompt runs the loop against an empty
+	// workspace with no auth and no clone (#1288).
+	needsRepo := task.Spec.Payload.Repo != "" ||
+		task.Spec.Kind == foremanv1alpha1.AgenticTaskKindIssueFix ||
+		task.Spec.Kind == foremanv1alpha1.AgenticTaskKindVerify ||
+		e.GitRemoteURL != ""
+
+	var auth *repo.Auth
+	if needsRepo {
+		a, err := e.buildAuth()
+		if err != nil {
+			return e.failResult(start, foremanv1alpha1.FailureAuthUnavailable, err.Error()), nil
+		}
+		auth = a
+		defer func() { _ = auth.Close() }()
 	}
-	defer func() { _ = auth.Close() }()
 
 	// resolveUpstream derives a repo's git URL from its payload.repo
 	// "owner/name" slug. It picks the clone target when no static fork
@@ -375,34 +389,38 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		resolveUpstream = e.UpstreamURLForRepo
 	}
 
-	// Clone target: the statically configured fork remote when set,
-	// otherwise the task's own repo (#915). Deriving the clone+push target
-	// from payload.repo lets a single agent serve many repos instead of
-	// being pinned to one --git-remote-url; the branch still pushes to this
-	// clone's origin, which in that case is the task's repo itself.
-	cloneURL := e.GitRemoteURL
-	if cloneURL == "" {
-		cloneURL = resolveUpstream(task.Spec.Payload.Repo)
-	}
-	if cloneURL == "" {
-		return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured,
-			"no --git-remote-url configured and task payload.repo is empty or invalid; cannot clone"), nil
-	}
-	if err := repo.Clone(ctx, repo.CloneOptions{
-		RemoteURL: cloneURL,
-		Dest:      workspace,
-		Auth:      auth,
-	}); err != nil {
-		return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
-	}
-
-	// 4. Cut the task branch (see setupTaskBranch: revise-from-branch
-	// restore (#951), then upstream base fetch (#813), then clone-HEAD
-	// fallback). Failures bucket with CloneFailed for the retry policy.
 	branch := branchNameForTask(task)
-	baseBranch := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
-	if err := setupTaskBranch(ctx, task, workspace, branch, baseBranch, resolveUpstream, auth, log); err != nil {
-		return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
+	if needsRepo {
+		// Clone target: the statically configured fork remote when set,
+		// otherwise the task's own repo (#915). Deriving the clone+push
+		// target from payload.repo lets a single agent serve many repos
+		// instead of being pinned to one --git-remote-url; the branch
+		// still pushes to this clone's origin, which in that case is the
+		// task's repo itself.
+		cloneURL := e.GitRemoteURL
+		if cloneURL == "" {
+			cloneURL = resolveUpstream(task.Spec.Payload.Repo)
+		}
+		if cloneURL == "" {
+			return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured,
+				"no --git-remote-url configured and task payload.repo is empty or invalid; cannot clone"), nil
+		}
+		if err := repo.Clone(ctx, repo.CloneOptions{
+			RemoteURL: cloneURL,
+			Dest:      workspace,
+			Auth:      auth,
+		}); err != nil {
+			return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
+		}
+
+		// 4. Cut the task branch (see setupTaskBranch: revise-from-branch
+		// restore (#951), then upstream base fetch (#813), then
+		// clone-HEAD fallback). Failures bucket with CloneFailed for the
+		// retry policy.
+		baseBranch := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+		if err := setupTaskBranch(ctx, task, workspace, branch, baseBranch, resolveUpstream, auth, log); err != nil {
+			return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
+		}
 	}
 
 	// 5. Build tool registry pinned to this workspace + filtered by the
@@ -426,7 +444,7 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 	// 6+. LLM-driven path: extracted to keep Execute below the
 	// cyclomatic-complexity threshold. runLLMPath owns OAI + loop +
 	// transcript + commit/push.
-	return e.runLLMPath(ctx, task, &agent, endpoint, workspace, branch, registry, auth, start)
+	return e.runLLMPath(ctx, task, &agent, endpoint, workspace, branch, registry, auth, needsRepo, start)
 }
 
 // setupTaskBranch cuts the task's working branch in the freshly cloned
@@ -534,6 +552,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	workspace, branch string,
 	registry ToolRegistry,
 	auth *repo.Auth,
+	needsRepo bool,
 	start time.Time,
 ) (*Result, error) {
 	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
@@ -600,17 +619,9 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// Resolve an optional ModelProfile and layer it onto the loop config
 	// below. Cluster-scoped; a dangling ref degrades gracefully (run without
 	// the profile) rather than failing the task.
-	var modelProfile *foremanv1alpha1.ModelProfile
-	if ref := agent.Spec.ModelProfileRef; ref != "" {
-		var mp foremanv1alpha1.ModelProfile
-		switch err := e.Client.Get(ctx, types.NamespacedName{Name: ref}, &mp); {
-		case err == nil:
-			modelProfile = &mp
-		case apierrors.IsNotFound(err):
-			log.Info("modelProfileRef not found; running without profile", "profile", ref)
-		default:
-			return nil, fmt.Errorf("resolve model profile %q: %w", ref, err)
-		}
+	modelProfile, mpErr := e.resolveModelProfile(ctx, agent, log)
+	if mpErr != nil {
+		return nil, mpErr
 	}
 
 	cfg := LoopConfig{
@@ -806,6 +817,12 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// re-gate, bounded by the resolved iteration count (#768). Attempt 0 is
 	// the pre-#768 behavior byte-for-byte; exhausting the bound falls back to
 	// the pre-#768 ENVTEST-GATE-FAILED downgrade.
+	//
+	// A freeform task without a repo has no working tree to commit or push:
+	// return the GO result directly (#1288).
+	if r := e.freeformGoResult(start, transcriptRef, loopRes, branch, needsRepo); r != nil {
+		return r, nil
+	}
 	baseBranch := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
 	maxEnvtestIters := effectiveMaxEnvtestIterations(agent)
 	var sha string
@@ -2131,6 +2148,43 @@ func (e *NativeAgentLoopExecutor) pushFailedResult(
 		"turnCount":      lr.Turns,
 	}
 	return r
+}
+
+// freeformGoResult returns a non-nil GO Result when the task does not need a
+// repo (e.g. a freeform task with only a prompt). In that case there is no
+// working tree to commit or push, so the GO verdict is returned directly
+// without entering the commit/push/gate loop (#1288). Returns nil when
+// needsRepo is true, so the caller falls through to the normal commit path.
+func (e *NativeAgentLoopExecutor) freeformGoResult(
+	start time.Time, tref corev1.ObjectReference, lr *LoopResult, branch string, needsRepo bool,
+) *Result {
+	if needsRepo {
+		return nil
+	}
+	return e.goResult(start, tref, lr, branch, "")
+}
+
+// resolveModelProfile fetches the ModelProfile referenced by the Agent's
+// spec.modelProfileRef. A dangling ref degrades gracefully (returns nil,
+// run without the profile) rather than failing the task. Extracted from
+// runLLMPath to keep that function under the gocyclo ceiling.
+func (e *NativeAgentLoopExecutor) resolveModelProfile(
+	ctx context.Context, agent *foremanv1alpha1.Agent, log logr.Logger,
+) (*foremanv1alpha1.ModelProfile, error) {
+	ref := agent.Spec.ModelProfileRef
+	if ref == "" {
+		return nil, nil
+	}
+	var mp foremanv1alpha1.ModelProfile
+	switch err := e.Client.Get(ctx, types.NamespacedName{Name: ref}, &mp); {
+	case err == nil:
+		return &mp, nil
+	case apierrors.IsNotFound(err):
+		log.Info("modelProfileRef not found; running without profile", "profile", ref)
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("resolve model profile %q: %w", ref, err)
+	}
 }
 
 func (e *NativeAgentLoopExecutor) goResult(
