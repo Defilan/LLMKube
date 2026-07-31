@@ -16,7 +16,7 @@ LLMKube is currently validated on H100, L4, and L40S. This document captures the
 | Rows passing | 0 / 10 |
 | Rows blocked on hardware | 10 / 10 |
 | Concrete deltas already landed | None yet (see "Concrete deltas" below for the queue) |
-| Source-fact-checked | 2026-05-07 against NVIDIA driver/CUDA/MIG docs, gpu-operator + k8s-device-plugin + dcgm-exporter + NCCL release notes, vllm-project/vllm RFC #18153, llama.cpp build docs, DGX OS 7 release notes. Re-verify version floors quarterly; this is a fast-moving stack. |
+| Source-fact-checked | **2026-07-31** (#1374) against the NVIDIA supported-drivers matrix, CUDA release notes, gpu-operator + k8s-device-plugin + DCGM + NCCL release notes, the DCGM field reference, and DGX OS 7 release notes. Previous pass 2026-05-07. Re-verify version floors quarterly: the 2026-05 pass went stale in under three months, and one floor (driver R570) reached end-of-life in the interval. |
 
 When a row's status changes, update both this document and the tracking issue's checklist.
 
@@ -66,18 +66,23 @@ These are project changes the LLMKube codebase, Helm chart, or docs need to abso
 
 ### 1. Driver, CUDA, and GPU operator floors documented
 
-`charts/llmkube/README.md` should grow a "Tested platforms" section capturing:
+**LANDED (#1197; values corrected #1374, re-verified 2026-07-31).** These ship as
+`platformFloors` in `charts/llmkube/values.yaml` and render into `NOTES.txt` at install time:
 
-- NVIDIA driver: **R570 minimum** (570.124.06 GA; 570.133.20 required for HGX B200 per the gpu-operator platform-support docs); R570.86+ recommended for DGX OS 7. R550 and earlier do not list B200 in supported hardware. (R555 was the open-kernel-module preview branch and is unrelated to Blackwell GA timing.)
-- CUDA toolkit: **12.8 minimum** (first public `sm_100` codegen, January 2025); 12.9+ recommended; forward target CUDA 13.x.
-- `gpu-operator >= v24.6` (v24.9 / v25.x recommended); **`k8s-device-plugin >= v0.17.2`** (Blackwell-aware product labels); v0.18.0+ preferred for full architecture detection. (v0.15 / v0.16 do not advertise Blackwell architecture labels.)
-- **Fabric Manager package version MUST match the NVIDIA driver exactly.** A mismatch silently degrades NVLink5 to PCIe with no clear error surface. Highest-priority silent-failure mode; deserves its own runbook entry under `docs/operations/runbooks/`.
+- NVIDIA driver: **>= 580.173.02 (R580 LTS)**. **R570 reached end-of-life in February 2026** and must not be used; R580 LTS (EOL June 2028) is what DGX OS 7.5 ships, and any driver >= 580 covers the whole CUDA 13.x family via minor-version compatibility.
+- CUDA toolkit: **12.8 minimum** (first public `sm_100` codegen); **13.3 Update 1 is the current GA line** (13.4 is developer-preview only). Note CUDA 13 dropped pre-Turing architectures.
+- `gpu-operator`: **>= v26.3.3, and do NOT use v26.3.0/.1/.2** — those three unconditionally set `MOFED_ENABLED`/`GDS_ENABLED`, injecting ibverbs device nodes into every GPU container and breaking RDMA/NCCL, i.e. exactly the multi-GPU path a Blackwell fleet depends on. Also: **CDI has been the default since v25.10.0**, so stop emitting `runtimeClassName: nvidia`.
+- `k8s-device-plugin`: **>= v0.19.3** (Blackwell-aware product labels).
+- **Fabric Manager package version MUST match the NVIDIA driver exactly.** A mismatch silently degrades NVLink to PCIe with no clear error surface. Highest-priority silent-failure mode; runbook: [`runbooks/nvlink-degrade-to-pcie.md`](./runbooks/nvlink-degrade-to-pcie.md).
 
 ### 2. DCGM exporter floor
 
-- Floor: `dcgm-exporter` 3.3.x line for basic Blackwell coverage; the 3.3.x line picked up Blackwell counters incrementally.
-- Recommended: **`dcgm-exporter 4.5+`** (current line as of Feb 2026).
-- Verify exact DCGM field IDs (NVLink5 throughput, HBM3e bandwidth, PCIe link health, etc.) against the DCGM field reference at validation time rather than relying on this doc to enumerate them; the named-counter list shifts release-to-release.
+**Values corrected #1374 (verified 2026-07-31).**
+
+- Floor: **`dcgm-exporter >= 4.6.0-4.8.3`**. The tag format is `<DCGM version>-<exporter version>`, so this is DCGM 4.6.0 with exporter 4.8.3. **The 3.3.x line is NOT viable on B200**: Blackwell NVSwitch telemetry requires the NVSDM backend, which is a 4.x dependency.
+- **NVLink5 per-link counters are real and new in DCGM 4.6.0**: field IDs **1525-1533**, selected with the entity selector `gpu_link:<gpuId>:<linkIndex>`, plus aggregates 1200-1220 and the FEC histogram 1404-1419.
+- **Three commonly-assumed Blackwell counters do not exist.** Do not build panels or matrix rows on them: there is **no FP4/NVFP4 utilization field** anywhere in DCGM (FP4 work is invisible inside the undifferentiated `PROF_PIPE_TENSOR_ACTIVE`), **no per-die power** (B200's two dies present as a single NVML device, so all power/temp is module-scope), and **no absolute HBM3e bandwidth field** (only the ratio `DCGM_FI_PROF_DRAM_UTIL_RATIO`, ID 1005 — multiply by known peak yourself). PCIe coverage is generic only (`PCIE_LINK_GEN` 237, `PCIE_CORRECTABLE_ERROR_TOTAL` 1501); there are no Gen6-specific counters.
+- **dcgm-exporter ships zero Blackwell counters in its default CSV**, and `dcp-metrics-included.csv` is byte-identical to the default in its active set — a custom CSV is required. Note 4.6.0 also renamed `..._BANDWIDTH_*` to `..._THROUGHPUT_*`, and the default CSV still ships the deprecated NVLink4-era alias.
 - Update the Grafana dashboard from #409 to surface the verified counters once a known-good `dcgm-exporter` version is bundled in the chart.
 
 ### 3. Runtime image bumps + sm_100 codegen

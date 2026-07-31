@@ -499,7 +499,10 @@
         "nvidiaDriver": { "type": "string" },
         "cudaToolkit": { "type": "string" },
         "nccl": { "type": "string" },
-        "gpuOperator": { "type": "string" }
+        "gpuOperator": { "type": "string" },
+        "k8sDevicePlugin": { "type": "string" },
+        "dcgmExporter": { "type": "string" },
+        "fabricManager": { "type": "string" }
       }
     }
   }
