@@ -185,12 +185,12 @@ This is the lowest-friction signal. It scales on raw concurrency, not
 quality. Good for batch-oriented workloads where you just need more
 capacity.
 
-### Option B: KV cache pressure (memory-driven)
+### Option B: Deferred requests (saturation-driven)
 
-`llamacpp_kv_cache_usage_ratio` is a gauge reporting how full the
-llama.cpp KV cache is (0.0–1.0). When the cache is near capacity the
-server starts evicting entries and latency rises, so scaling out
-before that point keeps throughput stable:
+`llamacpp:requests_deferred` is a counter of requests llama.cpp
+defers when every decode slot is busy. It rises exactly when the
+pod cannot accept more work, so scaling out on it keeps headroom
+ahead of latency spikes:
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -208,15 +208,25 @@ spec:
     - type: Pods
       pods:
         metric:
-          name: llamacpp:kv_cache_usage_ratio
+          name: llamacpp:requests_deferred
         target:
           type: AverageValue
-          averageValue: "0.8"   # scale up when avg KV cache usage > 80%
+          averageValue: "1"   # scale up when avg deferred requests > 1
 ```
 
-Use this when your prompts vary in length and you want to avoid
-cache thrash. Like Option A, this metric is served to the HPA through
-the custom-metrics API by prometheus-adapter (see the adapter rule above).
+> **Note:** `llamacpp:kv_cache_usage_ratio` is documented elsewhere as
+> a llama.cpp series, but it is not exported by current llama.cpp
+> builds, so the HPA below would never scale. Use `llamacpp:`
+> `requests_deferred` (the count of requests deferred when all decode
+> slots are full) as the saturation signal instead.
+
+Use this when your workload is saturated by decode capacity rather
+than raw concurrency, or when you want a saturation signal in
+addition to the request-in-flight gauge of Option A. As with Option A,
+this metric is served to the HPA through the custom-metrics API by
+`prometheus-adapter` (see the adapter rule above).
+
+### Option C: GPU utilization (hardware-driven)
 
 ### Option C: GPU utilization (hardware-driven)
 
@@ -345,10 +355,10 @@ changes. The HPA reconciles every 15 seconds by default.
       - type: Pods
         pods:
           metric:
-            name: llamacpp:kv_cache_usage_ratio
+            name: llamacpp:requests_deferred
           target:
             type: AverageValue
-            averageValue: "0.8"
+            averageValue: "1"
     behavior:
       scaleUp:
         selectPolicy: Max
