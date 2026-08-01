@@ -5165,13 +5165,13 @@ spec:
                 description: |-
                   SpeculativeDecoding configures speculative decoding for the llama.cpp
                   runtime using MTP (Multi-Token Prediction) or draft-model decoding.
-                  Maps to llama.cpp --spec-type and --draft-n-max flags. Only the
+                  Maps to llama.cpp --spec-type and --spec-draft-n-max flags. Only the
                   "llamacpp" runtime supports this field; other runtimes must not set it.
                 properties:
                   nDraftMax:
                     description: |-
                       NDraftMax is the maximum number of draft tokens to propose per step
-                      (--draft-n-max). Only emitted when set; llama.cpp uses its own default
+                      (--spec-draft-n-max). Only emitted when set; llama.cpp uses its own default
                       otherwise.
                     format: int32
                     minimum: 1
