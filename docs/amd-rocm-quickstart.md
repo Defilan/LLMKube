@@ -279,6 +279,15 @@ already reaches the memory and (per [Benchmarks](#benchmarks)) is the faster
 backend on this hardware. The retune mainly matters if you specifically need
 the HIP stack for that workload (e.g. matching CDNA/MI deployments).
 
+> **How much of this we have actually run.** Of the kernel arguments below,
+> only `amdgpu.lockup_timeout=20000` is validated on our own gfx1151 node,
+> where it resolved a reproducible deep-context `VK_ERROR_DEVICE_LOST`. The
+> GTT and TTM sizing is derived from the documented parameter semantics
+> (`modinfo amdgpu`, `modinfo ttm`) rather than from a large-model ROCm run we
+> have completed end to end. Treat Steps 2 to 4 as a procedure to validate on
+> your hardware, not as a settled recipe, and see Step 3 for how to confirm it
+> took effect before trusting it.
+
 #### Step 1: Lower the BIOS UMA / VRAM carveout
 
 Enter your BIOS and set the UMA / "Frame Buffer Size" to the minimum (Auto or
@@ -294,34 +303,43 @@ and reboot:
 
 ```
 amd_iommu=off
-amdgpu.gttsize=117760
+amdgpu.gttsize=98304
 amdgpu.no_system_mem_limit=1
-ttm.pages_limit=24576000
+ttm.pages_limit=25165824
 ttm.page_pool_size=25165824
 amdgpu.vm_fragment_size=8
 amdgpu.lockup_timeout=20000
 ```
 
+The values above all target the same **96 GiB**, on a 128 GB box, leaving 32 GiB
+for the OS. Size them together: three knobs describing the same pool that
+disagree with each other is the easiest way to get this wrong.
+
 What each does:
 
-- **`amdgpu.gttsize=117760`** — sets the GTT aperture (in megabyte units). This
-  is the maximum system RAM that can be mapped into GPU address spaces. Size
-  it to the memory you want the GPU to reach, leaving headroom for the OS.
-- **`amdgpu.no_system_mem_limit=1`** — removes an internal amdgpu safeguard
-  on system memory usage. Without this, amdgpu may cap GTT-backed allocations
-  below `gttsize`. Use with understanding: overcommit can cause heavy swapping
-  or OOM.
-- **`ttm.pages_limit=24576000`** — caps how many 4KB pages TTM can use for
-  GTT-backed buffer objects. Formula: `pages = (target_GB × 1024 × 1024) /
-  4.096`. Size this to match your `gttsize` target, leaving headroom for the
-  OS.
-- **`ttm.page_pool_size=25165824`** — TTM page pool size (in 4KB pages).
-  Should be at least as large as `ttm.pages_limit`.
-- **`amdgpu.vm_fragment_size=8`** — GPU VM page table fragment size. 8 is
-  the recommended value for gfx1151 to reduce page table overhead.
-- **`amdgpu.lockup_timeout=20000`** — raises the GPU lockup/reset timeout to
-  20s (from ~10s default). Under sustained heavy inference on gfx1151 the
-  default can trip a spurious "device lost" reset.
+- **`amdgpu.gttsize=98304`** sets the GTT aperture, **in megabytes**, so 98304
+  is 96 GiB. This is the maximum system RAM that can be mapped into GPU address
+  spaces.
+- **`amdgpu.no_system_mem_limit=1`** removes an internal amdgpu safeguard on
+  system memory usage. Without it, amdgpu may cap GTT-backed allocations below
+  `gttsize`. Use with understanding: overcommit can cause heavy swapping or OOM.
+- **`ttm.pages_limit=25165824`** caps how many 4 KiB pages TTM may allocate for
+  GTT-backed buffer objects. Convert with `pages = target_GiB × 262144`
+  (1 GiB / 4 KiB = 262144), so 96 GiB is `96 × 262144 = 25165824`. Keep this
+  equal to your `gttsize` target rather than merely close to it.
+- **`ttm.page_pool_size=25165824`** is the TTM page pool size, also in 4 KiB
+  pages. It should be at least `ttm.pages_limit`.
+- **`amdgpu.vm_fragment_size=8`** sets the VM page-table fragment size **in
+  bits**, so 8 means 1 MB fragments against a default of 4 (64 KB); the maximum
+  is 9. Larger fragments reduce page-table overhead for the very large
+  allocations this retune is for. Treat 8 as a starting point to measure, not a
+  vendor-blessed value for gfx1151.
+- **`amdgpu.lockup_timeout=20000`** raises the GPU job watchdog to 20s. The
+  module default is **2000 ms** (`modinfo amdgpu` reports
+  `lockup_timeout: ... (default: 2000 ...)`). On gfx1151 a single large
+  flash-attention op at deep context can exceed 2s and trip a spurious
+  `VK_ERROR_DEVICE_LOST` reset, so this one matters even without the rest of
+  the retune.
 
 Confirm they are live after reboot:
 
@@ -342,7 +360,7 @@ default carveout.
 Run a model that exceeds the default carveout (e.g. GLM-4.7-REAP-218B
 low-quant, or any model whose weights plus KV cache exceed the carveout) under
 `runtime: rocm` and confirm it loads and serves. Compare throughput to the
-same model under Vulkan — Vulkan is the faster backend on gfx1151, so this
+same model under Vulkan. Vulkan is the faster backend on gfx1151, so this
 is mainly about whether HIP is worth it for your workload.
 
 #### Footgun: do not use `GGML_CUDA_ENABLE_UNIFIED_MEMORY`
