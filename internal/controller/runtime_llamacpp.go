@@ -156,8 +156,10 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 		args = append(args, isvc.Spec.ExtraArgs...)
 	}
 
-	// Enable Prometheus metrics endpoint on llama.cpp
-	args = append(args, "--metrics")
+	// Enable Prometheus metrics endpoint on llama.cpp; skip if already in extraArgs.
+	if !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "metrics") {
+		args = append(args, "--metrics")
+	}
 
 	return args
 }
