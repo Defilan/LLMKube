@@ -260,9 +260,10 @@ prometheus:
     namespace: monitoring
     # Alert rules configuration
     rules:
-      # GPU alerts
+      # GPU alerts — DCGM-only; default-off so AMD clusters don't get silent
+      # no-op alerting. Set enabled: true when DCGM exporter is present.
       gpu:
-        enabled: true
+        enabled: false
         highUtilizationThreshold: 90
         highTemperatureThreshold: 85
         memoryPressureThreshold: 90
