@@ -63,7 +63,7 @@ type RopeScalingSpec struct {
 type SpeculativeDecodingType string
 
 // SpeculativeDecodingSpec configures speculative decoding for the llama.cpp
-// runtime. It maps to --spec-type (Type) and --draft-n-max (NDraftMax).
+// runtime. It maps to --spec-type (Type) and --spec-draft-n-max (NDraftMax).
 // Only the "llamacpp" runtime supports this field; other runtimes must not
 // set it.
 type SpeculativeDecodingSpec struct {
@@ -73,7 +73,7 @@ type SpeculativeDecodingSpec struct {
 	Type SpeculativeDecodingType `json:"type"`
 
 	// NDraftMax is the maximum number of draft tokens to propose per step
-	// (--draft-n-max). Only emitted when set; llama.cpp uses its own default
+	// (--spec-draft-n-max). Only emitted when set; llama.cpp uses its own default
 	// otherwise.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
@@ -334,7 +334,7 @@ type InferenceServiceSpec struct {
 
 	// SpeculativeDecoding configures speculative decoding for the llama.cpp
 	// runtime using MTP (Multi-Token Prediction) or draft-model decoding.
-	// Maps to llama.cpp --spec-type and --draft-n-max flags. Only the
+	// Maps to llama.cpp --spec-type and --spec-draft-n-max flags. Only the
 	// "llamacpp" runtime supports this field; other runtimes must not set it.
 	// +optional
 	SpeculativeDecoding *SpeculativeDecodingSpec `json:"speculativeDecoding,omitempty"`
