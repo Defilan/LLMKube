@@ -157,7 +157,9 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 	}
 
 	// Enable Prometheus metrics endpoint on llama.cpp
-	args = append(args, "--metrics")
+	if !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "--metrics") {
+		args = append(args, "--metrics")
+	}
 
 	return args
 }
