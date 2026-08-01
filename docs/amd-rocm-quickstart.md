@@ -267,18 +267,85 @@ ROCm** without extra work. This is why very large models (for example a
 low-quant 218B) run on Strix Halo under Vulkan today. The 27B Q6_K example
 above (~22GB weights plus KV) fits comfortably under either backend.
 
-If you specifically need ROCm to address more than its carveout, it takes a
-reboot and is a per-node opt-in, not a default:
+### Host retune: let ROCm address beyond the carveout
 
-- **Lower the BIOS UMA / VRAM carveout** (e.g. to the minimum) so the OS
-  reclaims most of the 128GB, then raise `amdgpu.gttsize` and
-  `ttm.pages_limit` so the iGPU can map the unified pool. `ttm.pages_limit`
-  is in 4KB pages, so 12582912 pages is ~48GB; size it to the memory you want
-  the GPU to reach, leaving headroom for the OS.
-- Weigh whether it is worth it: for a model that big, Vulkan already reaches
-  the memory today, and (per [Benchmarks](#benchmarks)) Vulkan is the faster
-  backend on this hardware anyway. The ROCm-carveout retune mainly matters if
-  you specifically need the HIP stack for that workload.
+The ROCm carveout limit (see [Large-Model Note](#large-model-note-memory-ceiling) above) is a default, not a hard limit. ROCm/HIP can address system
+RAM via GTT mappings on Strix Halo, but the kernel's default GTT and TTM
+limits are conservative. With a reboot and per-node kernel cmdline changes, you
+can raise those limits so ROCm reaches most of the unified pool.
+
+**This is a per-node opt-in, not a default.** For a model that big, Vulkan
+already reaches the memory and (per [Benchmarks](#benchmarks)) is the faster
+backend on this hardware. The retune mainly matters if you specifically need
+the HIP stack for that workload (e.g. matching CDNA/MI deployments).
+
+#### Step 1: Lower the BIOS UMA / VRAM carveout
+
+Enter your BIOS and set the UMA / "Frame Buffer Size" to the minimum (Auto or
+a small value). This reserves only a small framebuffer for display, leaving most
+of the unified RAM as OS-visible system RAM that the GPU can map via GTT. A
+large UMA (e.g. several GB) removes that amount from CPU-visible RAM, which
+hurts both ROCm GTT and CPU-side use.
+
+#### Step 2: Raise kernel GTT and TTM limits
+
+Add or update these kernel arguments (in GRUB, Talos `extraKernelArgs`, etc.)
+and reboot:
+
+```
+amd_iommu=off
+amdgpu.gttsize=117760
+amdgpu.no_system_mem_limit=1
+ttm.pages_limit=24576000
+ttm.page_pool_size=25165824
+amdgpu.vm_fragment_size=8
+amdgpu.lockup_timeout=20000
+```
+
+What each does:
+
+- **`amdgpu.gttsize=117760`** — sets the GTT aperture (in megabyte units). This
+  is the maximum system RAM that can be mapped into GPU address spaces. Size
+  it to the memory you want the GPU to reach, leaving headroom for the OS.
+- **`amdgpu.no_system_mem_limit=1`** — removes an internal amdgpu safeguard
+  on system memory usage. Without this, amdgpu may cap GTT-backed allocations
+  below `gttsize`. Use with understanding: overcommit can cause heavy swapping
+  or OOM.
+- **`ttm.pages_limit=24576000`** — caps how many 4KB pages TTM can use for
+  GTT-backed buffer objects. Formula: `pages = (target_GB × 1024 × 1024) /
+  4.096`. Size this to match your `gttsize` target, leaving headroom for the
+  OS.
+- **`ttm.page_pool_size=25165824`** — TTM page pool size (in 4KB pages).
+  Should be at least as large as `ttm.pages_limit`.
+- **`amdgpu.vm_fragment_size=8`** — GPU VM page table fragment size. 8 is
+  the recommended value for gfx1151 to reduce page table overhead.
+- **`amdgpu.lockup_timeout=20000`** — raises the GPU lockup/reset timeout to
+  20s (from ~10s default). Under sustained heavy inference on gfx1151 the
+  default can trip a spurious "device lost" reset.
+
+Confirm they are live after reboot:
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep -E 'gttsize|ttm|amd_iommu|lockup_timeout|no_system_mem_limit|vm_fragment'
+```
+
+#### Step 3: Verify with `rocminfo`
+
+Before the retune (default config, BIOS VRAM carveout), `rocminfo` shows a memory
+pool matching the BIOS VRAM carveout. After the retune (GTT raised), the
+memory pool increases significantly. The exact number depends on your BIOS UMA
+setting and kernel args, but you should see a substantial increase over the
+default carveout.
+
+#### Step 4: Validate with a large model
+
+Run a model that exceeds the default carveout (e.g. GLM-4.7-REAP-218B
+low-quant, or any model whose weights plus KV cache exceed the carveout) under
+`runtime: rocm` and confirm it loads and serves. Compare throughput to the
+same model under Vulkan — Vulkan is the faster backend on gfx1151, so this
+is mainly about whether HIP is worth it for your workload.
+
+#### Footgun: do not use `GGML_CUDA_ENABLE_UNIFIED_MEMORY`
 
 Do **not** enable `GGML_CUDA_ENABLE_UNIFIED_MEMORY` to work around the
 carveout. It is presence-checked (any value, including `0`, turns it on), it
