@@ -527,6 +527,7 @@ func (r *ModelRouterGatewayReconciler) modelRoutersForInferenceService(ctx conte
 // matches were already vetted by unsupportedMatchMessage. Strategy decides
 // whether backendRefs carry priority (primary-fallback) or weight (weighted).
 func compileRouterRules(mr *inferencev1alpha1.ModelRouter) ([]routerRuleResource, error) {
+	overrides := externalModelOverrides(mr)
 	weights := backendWeights(mr)
 	// header-only is the only mode that reaches compilation with a
 	// dataClassification match; detector/hybrid are rejected earlier by
@@ -537,7 +538,7 @@ func compileRouterRules(mr *inferencev1alpha1.ModelRouter) ([]routerRuleResource
 
 	rules := make([]routerRuleResource, 0, len(mr.Spec.Rules)+len(mr.Spec.Backends)+1)
 	for _, rule := range mr.Spec.Rules {
-		refs, err := compileBackendRefs(rule.Name, rule.Route, weights)
+		refs, err := compileBackendRefs(rule.Name, rule.Route, weights, overrides)
 		if err != nil {
 			return nil, err
 		}
@@ -566,7 +567,7 @@ func compileRouterRules(mr *inferencev1alpha1.ModelRouter) ([]routerRuleResource
 			}
 			rules = append(rules, routerRuleResource{
 				Models:      []string{modelID},
-				BackendRefs: []routerBackendRef{{Name: b.Name}},
+				BackendRefs: []routerBackendRef{{Name: b.Name, ModelNameOverride: overrides[b.Name]}},
 			})
 		}
 	}
@@ -575,7 +576,7 @@ func compileRouterRules(mr *inferencev1alpha1.ModelRouter) ([]routerRuleResource
 	// routing to the named backend.
 	if mr.Spec.DefaultRoute != "" {
 		rules = append(rules, routerRuleResource{
-			BackendRefs: []routerBackendRef{{Name: mr.Spec.DefaultRoute}},
+			BackendRefs: []routerBackendRef{{Name: mr.Spec.DefaultRoute, ModelNameOverride: overrides[mr.Spec.DefaultRoute]}},
 		})
 	}
 
@@ -587,18 +588,18 @@ func compileRouterRules(mr *inferencev1alpha1.ModelRouter) ([]routerRuleResource
 // weighted assigns each backend's declared Weight (default 1). The shadow
 // strategy has no gateway equivalent and is rejected (caught earlier by
 // unsupportedMatchMessage, defended again here).
-func compileBackendRefs(ruleName string, route inferencev1alpha1.RuleRoute, weights map[string]int64) ([]routerBackendRef, error) {
+func compileBackendRefs(ruleName string, route inferencev1alpha1.RuleRoute, weights map[string]int64, overrides map[string]string) ([]routerBackendRef, error) {
 	refs := make([]routerBackendRef, 0, len(route.Backends))
 	switch route.Strategy {
 	case "", "primary-fallback":
 		for i, name := range route.Backends {
 			priority := int64(i)
-			refs = append(refs, routerBackendRef{Name: name, Priority: &priority})
+			refs = append(refs, routerBackendRef{Name: name, Priority: &priority, ModelNameOverride: overrides[name]})
 		}
 	case weightedStrategy:
 		for _, name := range route.Backends {
 			weight := weights[name]
-			refs = append(refs, routerBackendRef{Name: name, Weight: &weight})
+			refs = append(refs, routerBackendRef{Name: name, Weight: &weight, ModelNameOverride: overrides[name]})
 		}
 	default:
 		return nil, fmt.Errorf("rule %q uses strategy %q which has no gateway equivalent", ruleName, route.Strategy)
@@ -1019,4 +1020,22 @@ func resolveExternalBackend(b inferencev1alpha1.RouterBackend) (routerBackendRes
 		Healthy: true,
 		IsIP:    net.ParseIP(host) != nil,
 	}, nil
+}
+
+// externalModelOverrides maps backend name to the upstream model identifier for
+// every external backend that set external.model.
+//
+// The ModelRouter rule key is what a client sends and what the gateway forwards
+// by default, but it is a routing label, not an upstream model name. An
+// external server that validates the field rejects it; mlx_lm.server treats an
+// unknown name as a HuggingFace repo and 404s. In-cluster backends are absent
+// from this map because llama.cpp ignores the field entirely (#1397).
+func externalModelOverrides(mr *inferencev1alpha1.ModelRouter) map[string]string {
+	out := make(map[string]string, len(mr.Spec.Backends))
+	for _, b := range mr.Spec.Backends {
+		if b.External != nil && b.External.Model != "" {
+			out[b.Name] = b.External.Model
+		}
+	}
+	return out
 }

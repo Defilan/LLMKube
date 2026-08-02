@@ -3,6 +3,8 @@ package controller
 import (
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -84,5 +86,45 @@ func TestNewRouterBackendIPUsesIPEndpoint(t *testing.T) {
 	ep2 := eps2[0].(map[string]interface{})
 	if _, ok := ep2["fqdn"]; !ok {
 		t.Errorf("hostname backend must use fqdn, got %v", ep2)
+	}
+}
+
+// TestExternalModelOverrideReachesBackendRef covers #1397: an external
+// backend's external.model must reach the upstream as modelNameOverride,
+// otherwise the upstream receives the ModelRouter rule key and rejects it.
+func TestExternalModelOverrideReachesBackendRef(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{}
+	mr.Spec.Backends = []inferencev1alpha1.RouterBackend{
+		{Name: "ext", External: &inferencev1alpha1.ExternalProvider{
+			URL: "http://192.168.1.47:8083/v1", Model: "/models/qwopus-fusion-mxfp4"}},
+		{Name: "ext-no-model", External: &inferencev1alpha1.ExternalProvider{
+			URL: "http://192.168.1.47:8083/v1"}},
+		{Name: "in-cluster", InferenceServiceRef: &corev1.LocalObjectReference{Name: "svc"}},
+	}
+
+	got := externalModelOverrides(mr)
+	if got["ext"] != "/models/qwopus-fusion-mxfp4" {
+		t.Errorf("external backend with a model: got %q, want the upstream identifier", got["ext"])
+	}
+	// Absent, not empty-string: an external backend that set no model must keep
+	// today's pass-through, since some providers accept the router key directly.
+	if _, ok := got["ext-no-model"]; ok {
+		t.Errorf("external backend without a model must not get an override, got %q", got["ext-no-model"])
+	}
+	if _, ok := got["in-cluster"]; ok {
+		t.Errorf("in-cluster backend must never get an override, got %q", got["in-cluster"])
+	}
+
+	refs := compileRuleBackendRefs([]routerBackendRef{
+		{Name: "ext", ModelNameOverride: "/models/qwopus-fusion-mxfp4"},
+		{Name: "in-cluster"},
+	})
+	first := refs[0].(map[string]interface{})
+	if first["modelNameOverride"] != "/models/qwopus-fusion-mxfp4" {
+		t.Errorf("backendRef missing modelNameOverride: %v", first)
+	}
+	second := refs[1].(map[string]interface{})
+	if _, ok := second["modelNameOverride"]; ok {
+		t.Errorf("in-cluster backendRef must omit modelNameOverride entirely, got %v", second)
 	}
 }
