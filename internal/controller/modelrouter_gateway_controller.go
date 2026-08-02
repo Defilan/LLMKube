@@ -19,7 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -303,7 +306,12 @@ func (r *ModelRouterGatewayReconciler) resolveBackends(
 	resolved := make([]routerBackendResource, 0, len(mr.Spec.Backends))
 	for _, b := range mr.Spec.Backends {
 		if b.External != nil {
-			return nil, fmt.Errorf("backend %q is External; external backends are not supported in dataPlane: Gateway yet", b.Name)
+			res, err := resolveExternalBackend(b)
+			if err != nil {
+				return nil, err
+			}
+			resolved = append(resolved, res)
+			continue
 		}
 		if b.InferenceServiceRef == nil {
 			return nil, fmt.Errorf("backend %q has no inferenceServiceRef", b.Name)
@@ -953,4 +961,62 @@ func hasGlobModel(models []string) bool {
 		}
 	}
 	return false
+}
+
+// resolveExternalBackend turns a ModelRouter external backend into the
+// host/port pair the Gateway builders compile into an Envoy Backend (#1395).
+//
+// An external backend is any OpenAI-compatible endpoint outside the cluster: an
+// mlx_lm.server or llama.cpp on an Apple Silicon box, a LiteLLM proxy, a
+// workstation on the LAN. There is no InferenceService to read readiness from,
+// so these are always compiled as Healthy; liveness is Envoy's job via the
+// route's own health checking rather than something the reconciler can observe.
+//
+// The scheme supplies the port when the URL omits it, and a literal IP is
+// reported through IsIP because Envoy Gateway rejects an address given as an
+// fqdn hostname.
+func resolveExternalBackend(b inferencev1alpha1.RouterBackend) (routerBackendResource, error) {
+	raw := strings.TrimSpace(b.External.URL)
+	if raw == "" {
+		return routerBackendResource{}, fmt.Errorf("backend %q is External but has no url", b.Name)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return routerBackendResource{}, fmt.Errorf("backend %q: parsing external url %q: %w", b.Name, raw, err)
+	}
+	if u.Host == "" {
+		return routerBackendResource{}, fmt.Errorf(
+			"backend %q: external url %q has no host; it must be absolute, e.g. http://host:8080/v1", b.Name, raw)
+	}
+
+	host := u.Hostname()
+	port := int64(0)
+	if p := u.Port(); p != "" {
+		parsed, perr := strconv.ParseInt(p, 10, 32)
+		if perr != nil {
+			return routerBackendResource{}, fmt.Errorf("backend %q: external url %q has an invalid port: %w", b.Name, raw, perr)
+		}
+		port = parsed
+	} else {
+		switch strings.ToLower(u.Scheme) {
+		case "https":
+			port = 443
+		case "http":
+			port = 80
+		default:
+			return routerBackendResource{}, fmt.Errorf(
+				"backend %q: external url %q has no port and scheme %q implies none", b.Name, raw, u.Scheme)
+		}
+	}
+	if port < 1 || port > 65535 {
+		return routerBackendResource{}, fmt.Errorf("backend %q: external url %q port %d out of range", b.Name, raw, port)
+	}
+
+	return routerBackendResource{
+		Name:    b.Name,
+		FQDN:    host,
+		Port:    port,
+		Healthy: true,
+		IsIP:    net.ParseIP(host) != nil,
+	}, nil
 }
