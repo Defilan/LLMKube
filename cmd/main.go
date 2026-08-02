@@ -523,8 +523,9 @@ func main() {
 	// self-gates on the aigw CRDs being present, so a cluster without the gateway
 	// stack still starts the operator cleanly and this controller no-ops.
 	if err := (&controller.ModelRouterGatewayReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("modelrouter-gateway"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouterGateway")
 		os.Exit(1)
