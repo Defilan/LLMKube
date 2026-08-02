@@ -1,7 +1,13 @@
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -126,5 +132,64 @@ func TestExternalModelOverrideReachesBackendRef(t *testing.T) {
 	second := refs[1].(map[string]interface{})
 	if _, ok := second["modelNameOverride"]; ok {
 		t.Errorf("in-cluster backendRef must omit modelNameOverride entirely, got %v", second)
+	}
+}
+
+// TestGatewayNotReadyEmitsWarningEvent covers #1395 ask 2: a failed reconcile
+// must be visible somewhere an operator actually looks. The gateway keeps
+// serving its last-good compilation, so a status condition alone lets traffic
+// flow against a spec the operator believes they replaced.
+func TestGatewayNotReadyEmitsWarningEvent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	mr := &inferencev1alpha1.ModelRouter{}
+	mr.SetName("fleet-router")
+	mr.SetNamespace("default")
+
+	rec := record.NewFakeRecorder(4)
+	r := &ModelRouterGatewayReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(scheme).WithObjects(mr).WithStatusSubresource(mr).Build(),
+		Scheme:   scheme,
+		Recorder: rec,
+	}
+
+	if err := r.setGatewayNotReady(context.Background(), mr, "ReconcileFailed", "backend \"ext\" is broken"); err != nil {
+		t.Fatalf("setGatewayNotReady: %v", err)
+	}
+
+	select {
+	case ev := <-rec.Events:
+		if !strings.Contains(ev, "Warning") {
+			t.Errorf("event must be a Warning, got %q", ev)
+		}
+		// The point of the event is not that something failed, but that stale
+		// routes are still live. Without that sentence an operator reads the
+		// warning and assumes traffic stopped.
+		if !strings.Contains(ev, "last successfully compiled routes") {
+			t.Errorf("event must say the stale routes are still serving, got %q", ev)
+		}
+	default:
+		t.Fatal("no event emitted; a failed reconcile would be invisible at the request path")
+	}
+}
+
+// TestGatewayNotReadyWithoutRecorderDoesNotPanic pins the nil-Recorder path,
+// which every existing unit test constructs.
+func TestGatewayNotReadyWithoutRecorderDoesNotPanic(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("scheme: %v", err)
+	}
+	mr := &inferencev1alpha1.ModelRouter{}
+	mr.SetName("r")
+	mr.SetNamespace("default")
+	r := &ModelRouterGatewayReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(mr).WithStatusSubresource(mr).Build(),
+		Scheme: scheme,
+	}
+	if err := r.setGatewayNotReady(context.Background(), mr, "ReconcileFailed", "msg"); err != nil {
+		t.Fatalf("nil Recorder must not error: %v", err)
 	}
 }

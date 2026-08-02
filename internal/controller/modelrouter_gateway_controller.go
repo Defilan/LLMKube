@@ -27,12 +27,14 @@ import (
 	"sync"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -111,6 +113,12 @@ var defaultSensitiveClassifications = []string{"pii", "phi"}
 type ModelRouterGatewayReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// Recorder surfaces reconcile failures as Kubernetes Events. A failed
+	// reconcile does not retract the previously compiled gateway resources, so
+	// the data plane keeps serving its last-good config: requests still succeed
+	// while silently using stale routing. A status condition alone is not
+	// enough, because nobody watches conditions during a routing change (#1395).
+	Recorder record.EventRecorder
 
 	// detector is the shared CRD-presence gate, lazily initialized on first
 	// reconcile and reused thereafter. It requires slice 1's three kinds plus
@@ -467,6 +475,14 @@ func (r *ModelRouterGatewayReconciler) setGatewayNotReady(
 		Reason:  reason,
 		Message: message,
 	})
+	// Say plainly that the previously compiled routes are still live. The
+	// dangerous case is not the failure itself but that traffic keeps flowing
+	// against a config the operator believes they just replaced.
+	if r.Recorder != nil {
+		r.Recorder.Eventf(mr, corev1.EventTypeWarning, reason,
+			"%s; the gateway continues serving the last successfully compiled routes, "+
+				"so this router's traffic does NOT reflect the current spec", message)
+	}
 	return r.Status().Patch(ctx, mr, patch)
 }
 
