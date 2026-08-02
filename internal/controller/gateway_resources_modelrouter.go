@@ -221,6 +221,16 @@ type routerBackendRef struct {
 	// Weight is the traffic share for the weighted strategy. nil when the
 	// strategy is primary-fallback.
 	Weight *int64
+	// ModelNameOverride is the model identifier the upstream should receive,
+	// taken from an external backend's external.model. Empty for in-cluster
+	// backends and for external backends that did not set it, in which case the
+	// client's own model value passes through unchanged.
+	//
+	// Without this the upstream receives the ModelRouter rule key (e.g.
+	// "coder-fusion"), which any server that validates model names rejects.
+	// llama.cpp ignores the field, which is why in-cluster backends never
+	// needed it (#1397).
+	ModelNameOverride string
 }
 
 // modelRouterGatewayResourceName is the shared, DNS-sanitized name for the
@@ -465,6 +475,9 @@ func compileRuleBackendRefs(refs []routerBackendRef) []interface{} {
 		}
 		if ref.Weight != nil {
 			backendRef["weight"] = *ref.Weight
+		}
+		if ref.ModelNameOverride != "" {
+			backendRef["modelNameOverride"] = ref.ModelNameOverride
 		}
 		out = append(out, backendRef)
 	}
