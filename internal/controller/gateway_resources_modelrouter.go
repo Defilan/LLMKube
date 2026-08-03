@@ -177,6 +177,9 @@ type routerBackendResource struct {
 	// Only ever true for external backends; in-cluster backends always resolve
 	// to a Service FQDN.
 	IsIP bool
+	// ModelOverride is an external backend's external.model. Empty for
+	// in-cluster backends and for external backends that did not set one.
+	ModelOverride string
 }
 
 // routerRuleResource is one resolved ModelRouter rule ready to compile: the
@@ -290,6 +293,18 @@ func newRouterAIServiceBackend(mr *inferencev1alpha1.ModelRouter, b routerBacken
 			"kind":            gatewayBackendKind,
 			"group":           gatewayBackendGroup,
 		},
+	}
+	// modelNameOverride on the route rewrites the routing/metrics model name but
+	// does NOT rewrite the request body, so an upstream that reads body.model
+	// still receives the ModelRouter rule key and rejects it (#1399). bodyMutation
+	// is the mechanism that actually edits the JSON before it leaves the gateway.
+	if b.ModelOverride != "" {
+		spec := u.Object["spec"].(map[string]interface{})
+		spec["bodyMutation"] = map[string]interface{}{
+			"set": []interface{}{
+				map[string]interface{}{"path": "model", "value": b.ModelOverride},
+			},
+		}
 	}
 	return u
 }

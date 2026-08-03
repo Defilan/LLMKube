@@ -193,3 +193,38 @@ func TestGatewayNotReadyWithoutRecorderDoesNotPanic(t *testing.T) {
 		t.Fatalf("nil Recorder must not error: %v", err)
 	}
 }
+
+// TestAIServiceBackendBodyMutationRewritesModel covers #1399: modelNameOverride
+// on the route rewrites routing/metrics only, so an upstream that reads
+// body.model still receives the ModelRouter rule key. bodyMutation is what
+// actually edits the outgoing JSON.
+func TestAIServiceBackendBodyMutationRewritesModel(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{}
+	mr.SetName("r")
+	mr.SetNamespace("default")
+
+	u := newRouterAIServiceBackend(mr, routerBackendResource{
+		Name: "ext", FQDN: "192.168.1.47", Port: 8083, Healthy: true, IsIP: true,
+		ModelOverride: "/models/qwopus-fusion-mxfp4",
+	})
+	set, found, err := unstructured.NestedSlice(u.Object, "spec", "bodyMutation", "set")
+	if err != nil || !found {
+		t.Fatalf("external backend with a model must set bodyMutation: found=%v err=%v", found, err)
+	}
+	entry := set[0].(map[string]interface{})
+	if entry["path"] != "model" {
+		t.Errorf("bodyMutation must target the model field, got %v", entry)
+	}
+	if entry["value"] != "/models/qwopus-fusion-mxfp4" {
+		t.Errorf("bodyMutation must carry the upstream model id, got %v", entry)
+	}
+
+	// In-cluster backends must be byte-identical to before: llama.cpp ignores
+	// body.model, and adding a mutation would rewrite it to an empty string.
+	plain := newRouterAIServiceBackend(mr, routerBackendResource{
+		Name: "in", FQDN: "svc.default.svc.cluster.local", Port: 8080, Healthy: true,
+	})
+	if _, found, _ := unstructured.NestedSlice(plain.Object, "spec", "bodyMutation", "set"); found {
+		t.Errorf("in-cluster backend must not carry a bodyMutation")
+	}
+}

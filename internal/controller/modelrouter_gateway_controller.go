@@ -1030,11 +1030,12 @@ func resolveExternalBackend(b inferencev1alpha1.RouterBackend) (routerBackendRes
 	}
 
 	return routerBackendResource{
-		Name:    b.Name,
-		FQDN:    host,
-		Port:    port,
-		Healthy: true,
-		IsIP:    net.ParseIP(host) != nil,
+		Name:          b.Name,
+		FQDN:          host,
+		Port:          port,
+		Healthy:       true,
+		IsIP:          net.ParseIP(host) != nil,
+		ModelOverride: b.External.Model,
 	}, nil
 }
 
