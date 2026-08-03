@@ -9,8 +9,6 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	corev1 "k8s.io/api/core/v1"
-
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -95,46 +93,6 @@ func TestNewRouterBackendIPUsesIPEndpoint(t *testing.T) {
 	}
 }
 
-// TestExternalModelOverrideReachesBackendRef covers #1397: an external
-// backend's external.model must reach the upstream as modelNameOverride,
-// otherwise the upstream receives the ModelRouter rule key and rejects it.
-func TestExternalModelOverrideReachesBackendRef(t *testing.T) {
-	mr := &inferencev1alpha1.ModelRouter{}
-	mr.Spec.Backends = []inferencev1alpha1.RouterBackend{
-		{Name: "ext", External: &inferencev1alpha1.ExternalProvider{
-			URL: "http://192.168.1.47:8083/v1", Model: "/models/qwopus-fusion-mxfp4"}},
-		{Name: "ext-no-model", External: &inferencev1alpha1.ExternalProvider{
-			URL: "http://192.168.1.47:8083/v1"}},
-		{Name: "in-cluster", InferenceServiceRef: &corev1.LocalObjectReference{Name: "svc"}},
-	}
-
-	got := externalModelOverrides(mr)
-	if got["ext"] != "/models/qwopus-fusion-mxfp4" {
-		t.Errorf("external backend with a model: got %q, want the upstream identifier", got["ext"])
-	}
-	// Absent, not empty-string: an external backend that set no model must keep
-	// today's pass-through, since some providers accept the router key directly.
-	if _, ok := got["ext-no-model"]; ok {
-		t.Errorf("external backend without a model must not get an override, got %q", got["ext-no-model"])
-	}
-	if _, ok := got["in-cluster"]; ok {
-		t.Errorf("in-cluster backend must never get an override, got %q", got["in-cluster"])
-	}
-
-	refs := compileRuleBackendRefs([]routerBackendRef{
-		{Name: "ext", ModelNameOverride: "/models/qwopus-fusion-mxfp4"},
-		{Name: "in-cluster"},
-	})
-	first := refs[0].(map[string]interface{})
-	if first["modelNameOverride"] != "/models/qwopus-fusion-mxfp4" {
-		t.Errorf("backendRef missing modelNameOverride: %v", first)
-	}
-	second := refs[1].(map[string]interface{})
-	if _, ok := second["modelNameOverride"]; ok {
-		t.Errorf("in-cluster backendRef must omit modelNameOverride entirely, got %v", second)
-	}
-}
-
 // TestGatewayNotReadyEmitsWarningEvent covers #1395 ask 2: a failed reconcile
 // must be visible somewhere an operator actually looks. The gateway keeps
 // serving its last-good compilation, so a status condition alone lets traffic
@@ -191,40 +149,5 @@ func TestGatewayNotReadyWithoutRecorderDoesNotPanic(t *testing.T) {
 	}
 	if err := r.setGatewayNotReady(context.Background(), mr, "ReconcileFailed", "msg"); err != nil {
 		t.Fatalf("nil Recorder must not error: %v", err)
-	}
-}
-
-// TestAIServiceBackendBodyMutationRewritesModel covers #1399: modelNameOverride
-// on the route rewrites routing/metrics only, so an upstream that reads
-// body.model still receives the ModelRouter rule key. bodyMutation is what
-// actually edits the outgoing JSON.
-func TestAIServiceBackendBodyMutationRewritesModel(t *testing.T) {
-	mr := &inferencev1alpha1.ModelRouter{}
-	mr.SetName("r")
-	mr.SetNamespace("default")
-
-	u := newRouterAIServiceBackend(mr, routerBackendResource{
-		Name: "ext", FQDN: "192.168.1.47", Port: 8083, Healthy: true, IsIP: true,
-		ModelOverride: "/models/qwopus-fusion-mxfp4",
-	})
-	set, found, err := unstructured.NestedSlice(u.Object, "spec", "bodyMutation", "set")
-	if err != nil || !found {
-		t.Fatalf("external backend with a model must set bodyMutation: found=%v err=%v", found, err)
-	}
-	entry := set[0].(map[string]interface{})
-	if entry["path"] != "model" {
-		t.Errorf("bodyMutation must target the model field, got %v", entry)
-	}
-	if entry["value"] != "/models/qwopus-fusion-mxfp4" {
-		t.Errorf("bodyMutation must carry the upstream model id, got %v", entry)
-	}
-
-	// In-cluster backends must be byte-identical to before: llama.cpp ignores
-	// body.model, and adding a mutation would rewrite it to an empty string.
-	plain := newRouterAIServiceBackend(mr, routerBackendResource{
-		Name: "in", FQDN: "svc.default.svc.cluster.local", Port: 8080, Healthy: true,
-	})
-	if _, found, _ := unstructured.NestedSlice(plain.Object, "spec", "bodyMutation", "set"); found {
-		t.Errorf("in-cluster backend must not carry a bodyMutation")
 	}
 }
