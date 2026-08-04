@@ -87,7 +87,6 @@ func TestSynthesizeIssueBatch_CarriesIntent(t *testing.T) {
 	}
 	if code == nil {
 		t.Fatal("no issue-fix step synthesized")
-		return
 	}
 	if !strings.Contains(code.Payload.PromptPrefix, "SCOPED SLICE: only pin the three images.") {
 		t.Fatalf("coder step PromptPrefix missing the intent: %q", code.Payload.PromptPrefix)

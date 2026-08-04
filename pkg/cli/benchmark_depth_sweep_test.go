@@ -495,7 +495,6 @@ func TestPromptDepthSweepFlagRegistered(t *testing.T) {
 	flag := cmd.Flags().Lookup("prompt-depth-sweep")
 	if flag == nil {
 		t.Fatal("Expected --prompt-depth-sweep flag to be registered")
-		return
 	}
 	if flag.DefValue != "" {
 		t.Errorf("Expected default value '', got '%s'", flag.DefValue)
