@@ -265,6 +265,11 @@ prometheus:
         enabled: true
         highUtilizationThreshold: 90
         highTemperatureThreshold: 85
+        # Off by default: on an inference host VRAM utilization reports the
+        # fraction the runtime was configured to reserve, not pressure. Enable
+        # where VRAM is allocated on demand.
+        memoryPressure:
+          enabled: false
         memoryPressureThreshold: 90
         powerLimitThreshold: 250
       # Inference service alerts
