@@ -525,7 +525,7 @@ func main() {
 	if err := (&controller.ModelRouterGatewayReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("modelrouter-gateway"),
+		Recorder: mgr.GetEventRecorder("modelrouter-gateway"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouterGateway")
 		os.Exit(1)

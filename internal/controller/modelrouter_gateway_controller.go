@@ -34,7 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -118,7 +118,7 @@ type ModelRouterGatewayReconciler struct {
 	// the data plane keeps serving its last-good config: requests still succeed
 	// while silently using stale routing. A status condition alone is not
 	// enough, because nobody watches conditions during a routing change (#1395).
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 
 	// detector is the shared CRD-presence gate, lazily initialized on first
 	// reconcile and reused thereafter. It requires slice 1's three kinds plus
@@ -479,7 +479,7 @@ func (r *ModelRouterGatewayReconciler) setGatewayNotReady(
 	// dangerous case is not the failure itself but that traffic keeps flowing
 	// against a config the operator believes they just replaced.
 	if r.Recorder != nil {
-		r.Recorder.Eventf(mr, corev1.EventTypeWarning, reason,
+		r.Recorder.Eventf(mr, nil, corev1.EventTypeWarning, reason, "Reconcile",
 			"%s; the gateway continues serving the last successfully compiled routes, "+
 				"so this router's traffic does NOT reflect the current spec", message)
 	}
