@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -106,7 +106,7 @@ func TestGatewayNotReadyEmitsWarningEvent(t *testing.T) {
 	mr.SetName("fleet-router")
 	mr.SetNamespace("default")
 
-	rec := record.NewFakeRecorder(4)
+	rec := events.NewFakeRecorder(4)
 	r := &ModelRouterGatewayReconciler{
 		Client:   fake.NewClientBuilder().WithScheme(scheme).WithObjects(mr).WithStatusSubresource(mr).Build(),
 		Scheme:   scheme,
