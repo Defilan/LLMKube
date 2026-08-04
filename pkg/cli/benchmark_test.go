@@ -1713,6 +1713,7 @@ func TestNewGPUMonitor(t *testing.T) {
 	gm := newGPUMonitor()
 	if gm == nil {
 		t.Fatal("newGPUMonitor returned nil")
+		return
 	}
 	if gm.metrics == nil {
 		t.Error("metrics should be initialized")
