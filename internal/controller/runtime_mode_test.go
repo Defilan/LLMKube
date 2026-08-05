@@ -73,4 +73,23 @@ func TestAppendModeArgs(t *testing.T) {
 			t.Fatalf("chat mode should append nothing, got %v", args)
 		}
 	})
+	t.Run("embedding sets --cache-ram 0", func(t *testing.T) {
+		args := appendModeArgs(nil, servingModeEmbedding, nil)
+		if !containsArg(args, "--cache-ram", "0") {
+			t.Fatalf("embedding mode should set --cache-ram 0, got %v", args)
+		}
+	})
+	t.Run("rerank sets --cache-ram 0", func(t *testing.T) {
+		args := appendModeArgs(nil, servingModeRerank, nil)
+		if !containsArg(args, "--cache-ram", "0") {
+			t.Fatalf("rerank mode should set --cache-ram 0, got %v", args)
+		}
+	})
+	t.Run("does not override user --cache-ram in extraArgs", func(t *testing.T) {
+		extra := []string{"--cache-ram", "512"}
+		args := appendModeArgs(nil, servingModeEmbedding, extra)
+		if containsArg(args, "--cache-ram", "0") {
+			t.Fatalf("should not override user --cache-ram, got %v", args)
+		}
+	})
 }
