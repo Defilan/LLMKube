@@ -125,6 +125,9 @@ var (
 	urlHostRe = regexp.MustCompile(`https?://([^/\s"'` + "`" + `]+)`)
 	// testdataPathRe captures a testdata/ file path literal.
 	testdataPathRe = regexp.MustCompile(`[\w./-]*testdata/[\w./-]+`)
+	// assertionValueRe captures the matcher name and expected value in
+	// Gomega-style assertions like Equal(N) or ContainSubstring(N).
+	assertionValueRe = regexp.MustCompile(`(Equal|ContainSubstring)\(([^)]+)\)`)
 )
 
 // fixtureTokens extracts fixture-input identifiers from a set of diff lines:
@@ -168,6 +171,47 @@ func fixtureLiteralChurn(fh *fileHunks) []string {
 	sort.Strings(gone)
 	sort.Strings(appeared)
 	return []string{fmt.Sprintf("fixture input changed (removed %v, added %v)", gone, appeared)}
+}
+
+// assertionValueChurn flags an assertion whose expected value was rewritten
+// in place: a matcher+value pair (e.g. Equal(N)) present only on the removed
+// side while a different one appears only on the added side. This is the
+// #1347 shape: the coder changed the expected value to match buggy behavior.
+// Pure additions or deletions of assertions are not churn (those are caught
+// by assertionErosion). Deterministic: tokens are sorted.
+func assertionValueChurn(fh *fileHunks) []string {
+	rem := assertionValueTokens(fh.Removed)
+	add := assertionValueTokens(fh.Added)
+	var gone, appeared []string
+	for tkn := range rem {
+		if !add[tkn] {
+			gone = append(gone, tkn)
+		}
+	}
+	for tkn := range add {
+		if !rem[tkn] {
+			appeared = append(appeared, tkn)
+		}
+	}
+	if len(gone) == 0 || len(appeared) == 0 {
+		return nil
+	}
+	sort.Strings(gone)
+	sort.Strings(appeared)
+	return []string{fmt.Sprintf("assertion value changed (removed %v, added %v)", gone, appeared)}
+}
+
+// assertionValueTokens extracts matcher+value pairs from assertion lines:
+// e.g. "Equal(42)" or "ContainSubstring(boom)". The key is the full
+// matcher+value string so that Equal(42) vs Equal(0) is a churn signal.
+func assertionValueTokens(lines []string) map[string]bool {
+	set := map[string]bool{}
+	for _, l := range lines {
+		for _, m := range assertionValueRe.FindAllStringSubmatch(l, -1) {
+			set[m[0]] = true
+		}
+	}
+	return set
 }
 
 // nameStatusEntry is one file-level change from `git diff --name-status`.
@@ -300,6 +344,9 @@ func checkTestDilution(ctx context.Context, workspace string, run commandRunner)
 				file, removed-added, strings.Join(firstN(snippets, 3), "; ")))
 		}
 		for _, c := range fixtureLiteralChurn(fh) {
+			findings = append(findings, file+" "+c)
+		}
+		for _, c := range assertionValueChurn(fh) {
 			findings = append(findings, file+" "+c)
 		}
 	}
