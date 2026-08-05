@@ -503,6 +503,57 @@ func TestDashboardsQueryEmittedMetrics(t *testing.T) {
 	}
 }
 
+// TestDocContractMetrics fails when a prose document's metrics-contract region
+// names a metric that nothing produces. The region is delimited by
+// <!-- metrics-contract:begin --> and <!-- metrics-contract:end --> markers so
+// that "Known gaps" sections that deliberately name missing metrics are not
+// flagged.
+func TestDocContractMetrics(t *testing.T) {
+	known := declaredNames(t)
+	maps.Copy(known, chartRecordingRules(t))
+	maps.Copy(known, runtimeNames(t))
+
+	// Find all markdown files under the repo root.
+	mdGlobs := []string{"../../docs/**/*.md", "../../config/**/*.md"}
+	var mdFiles []string
+	for _, glob := range mdGlobs {
+		matched, err := filepath.Glob(glob)
+		if err != nil {
+			t.Fatalf("glob %s: %v", glob, err)
+		}
+		mdFiles = append(mdFiles, matched...)
+	}
+
+	for _, path := range mdFiles {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+
+		// Only process files with the contract markers.
+		begin := "<!-- metrics-contract:begin -->"
+		end := "<!-- metrics-contract:end -->"
+		idxBegin := strings.Index(string(raw), begin)
+		idxEnd := strings.Index(string(raw), end)
+		if idxBegin < 0 || idxEnd < 0 || idxEnd <= idxBegin {
+			continue
+		}
+
+		region := string(raw)[idxBegin+len(begin) : idxEnd]
+
+		// Extract backticked metric names (llamacpp:*, sglang:*, vllm:*, etc.).
+		backtick := regexp.MustCompile("`([a-zA-Z_:][a-zA-Z0-9_:]*)`")
+		for _, m := range backtick.FindAllStringSubmatch(region, -1) {
+			name := m[1]
+			if emitted(name, known) {
+				continue
+			}
+			t.Errorf("%s names %q inside metrics-contract region, which no registered collector, chart recording rule or allowlisted exporter emits",
+				path, name)
+		}
+	}
+}
+
 // TestInferenceDashboardCoversEveryRuntime fails when a panel on the shared
 // Inference Monitor reads one runtime's metrics without the others'. Such a
 // panel is blank in any namespace running only the runtime it omits (#1227).
