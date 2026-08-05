@@ -62,7 +62,7 @@ func TestAppendModeArgs(t *testing.T) {
 		}
 	})
 	t.Run("does not duplicate flags already in extraArgs", func(t *testing.T) {
-		extra := []string{"--embedding", "--pooling", "cls"}
+		extra := []string{"--embedding", "--pooling", "cls", "--cache-ram", "0"}
 		args := appendModeArgs(nil, servingModeEmbedding, extra)
 		if len(args) != 0 {
 			t.Fatalf("expected no appended flags when extraArgs already set them, got %v", args)
