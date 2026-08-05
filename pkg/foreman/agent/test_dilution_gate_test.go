@@ -453,3 +453,44 @@ func TestTestDilution_SurfacesAsAdvisoryNotBlocking(t *testing.T) {
 		t.Fatalf("expected one test-dilution advisory; got %+v", advisories)
 	}
 }
+
+// TestAssertionValueChurn_NestedParens covers the review note on #1416: a
+// `[^)]+` regex stops at the first ')', so Equal(f(x), 42) truncated to
+// "Equal(f(x)" and a rewrite of the trailing value produced an IDENTICAL
+// token on both sides. That is a silent miss, the wrong failure direction
+// for a dilution signal. Balanced-paren matching fixes it.
+func TestAssertionValueChurn_NestedParens(t *testing.T) {
+	got := assertionValueChurn(&fileHunks{
+		Removed: []string{`Expect(y).To(Equal(f(x), 42))`},
+		Added:   []string{`Expect(y).To(Equal(f(x), 0))`},
+	})
+	if len(got) == 0 {
+		t.Fatalf("expected churn for a value rewrite behind a nested paren, got none")
+	}
+}
+
+// TestAssertionValueChurn_SpacingIsNotChurn covers the review note that the
+// detector's description claimed normalisation it did not perform: a
+// gofmt-driven respacing inside the parens read as churn.
+func TestAssertionValueChurn_SpacingIsNotChurn(t *testing.T) {
+	got := assertionValueChurn(&fileHunks{
+		Removed: []string{`Expect(x).To(Equal(42))`},
+		Added:   []string{`Expect(x).To(Equal( 42 ))`},
+	})
+	if len(got) != 0 {
+		t.Fatalf("respacing alone must not be churn, got %v", got)
+	}
+}
+
+// TestAssertionValueChurn_LiteralSpacingIsChurn pins the boundary of the
+// normalisation: whitespace OUTSIDE a string literal is noise, whitespace
+// INSIDE one is a genuinely different expectation.
+func TestAssertionValueChurn_LiteralSpacingIsChurn(t *testing.T) {
+	got := assertionValueChurn(&fileHunks{
+		Removed: []string{`Expect(x).To(Equal("a b"))`},
+		Added:   []string{`Expect(x).To(Equal("a  b"))`},
+	})
+	if len(got) == 0 {
+		t.Fatalf("a changed string literal must still be churn, got none")
+	}
+}

@@ -127,7 +127,6 @@ var (
 	testdataPathRe = regexp.MustCompile(`[\w./-]*testdata/[\w./-]+`)
 	// assertionValueRe captures the matcher name and expected value in
 	// Gomega-style assertions like Equal(N) or ContainSubstring(N).
-	assertionValueRe = regexp.MustCompile(`(Equal|ContainSubstring)\(([^)]+)\)`)
 )
 
 // fixtureTokens extracts fixture-input identifiers from a set of diff lines:
@@ -207,11 +206,105 @@ func assertionValueChurn(fh *fileHunks) []string {
 func assertionValueTokens(lines []string) map[string]bool {
 	set := map[string]bool{}
 	for _, l := range lines {
-		for _, m := range assertionValueRe.FindAllStringSubmatch(l, -1) {
-			set[m[0]] = true
+		for _, tok := range extractAssertionTokens(l) {
+			set[tok] = true
 		}
 	}
 	return set
+}
+
+// assertionMatchers are the matcher names whose expected value is compared.
+var assertionMatchers = []string{"Equal", "ContainSubstring"}
+
+// extractAssertionTokens pulls "Equal(...)" / "ContainSubstring(...)" spans out
+// of a line using BALANCED paren matching, not a `[^)]+` run. A regex stops at
+// the first ')', so Equal(f(x), 42) truncates to "Equal(f(x)" and a rewrite of
+// the trailing 42 yields an identical token on both sides -- a silent miss, the
+// wrong failure direction for a dilution signal.
+func extractAssertionTokens(line string) []string {
+	var out []string
+	for _, name := range assertionMatchers {
+		for off := 0; off < len(line); {
+			i := strings.Index(line[off:], name+"(")
+			if i < 0 {
+				break
+			}
+			start := off + i
+			// Reject a match inside a longer identifier (e.g. NotEqual().
+			if start > 0 && isIdentByte(line[start-1]) {
+				off = start + 1
+				continue
+			}
+			end := matchParen(line, start+len(name))
+			if end < 0 {
+				off = start + 1
+				continue
+			}
+			out = append(out, normalizeAssertionToken(line[start:end+1]))
+			off = end + 1
+		}
+	}
+	return out
+}
+
+// matchParen returns the index of the ')' closing the '(' at open, or -1.
+// Parens inside string literals do not count toward the depth.
+func matchParen(s string, open int) int {
+	depth := 0
+	for i := open; i < len(s); i++ {
+		switch s[i] {
+		case '"', '`', '\'':
+			if j := skipString(s, i); j > i {
+				i = j
+			}
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// skipString returns the index of the closing quote for the literal opening at
+// i, or i if unterminated.
+func skipString(s string, i int) int {
+	q := s[i]
+	for j := i + 1; j < len(s); j++ {
+		if s[j] == '\\' && q != '`' {
+			j++
+			continue
+		}
+		if s[j] == q {
+			return j
+		}
+	}
+	return i
+}
+
+// normalizeAssertionToken drops whitespace that sits OUTSIDE string literals,
+// so a gofmt-driven respacing such as Equal( 42 ) does not read as churn
+// against Equal(42). Whitespace inside a literal is preserved, because
+// Equal("a b") and Equal("a  b") are genuinely different expectations.
+func normalizeAssertionToken(tok string) string {
+	var b strings.Builder
+	for i := 0; i < len(tok); i++ {
+		c := tok[i]
+		if c == '"' || c == '`' || c == '\'' {
+			end := skipString(tok, i)
+			b.WriteString(tok[i : end+1])
+			i = end
+			continue
+		}
+		if c == ' ' || c == '\t' {
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 // nameStatusEntry is one file-level change from `git diff --name-status`.
