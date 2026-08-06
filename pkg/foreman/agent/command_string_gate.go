@@ -55,7 +55,13 @@ func checkCommandStringTestDilution(ctx context.Context, workspace string, run c
 	}
 
 	// Get the full diff for all changed files (not just tests).
-	diffOut, err := run(ctx, workspace, nil, "git", "diff", "--cached", "--unified=0",
+	//
+	// --unified=3 rather than 0: a Go command-construction call is routinely
+	// spread over several lines, so with zero context the only thing in the
+	// diff is the changed argument, which carries no evidence that it belongs
+	// to a command at all. The context lines supply that evidence. Added and
+	// removed lines still arrive unpaired, and nothing here assumes otherwise.
+	diffOut, err := run(ctx, workspace, nil, "git", "diff", "--cached", "--unified=3",
 		"--src-prefix=a/", "--dst-prefix=b/", "HEAD")
 	if err != nil {
 		return false, ""
@@ -108,21 +114,102 @@ func commandStringChangedPackages(byFile map[string]*fileHunks, prodPkgs map[str
 }
 
 // hasCommandStringChange reports whether the diff hunks contain a
-// modification to a shell/exec command string. It checks added and removed
-// lines for exec.Command(, the pair "sh", "-c", or shell metacharacters
-// in a string literal used as a command.
+// modification to a shell/exec command string, using two detectors.
+//
+//	Direct: a changed line itself carries exec.Command(, the pair "sh", "-c",
+//	or shell metacharacters inside a string literal in command context.
+//
+//	Enclosing: a changed line is a bare string-literal argument, the shape an
+//	argument takes inside a multiline call, AND the surrounding context shows
+//	command construction.
+//
+// The second detector exists because the motivating case (#1309) is invisible
+// to the first. Changing `"-w", "%{size_download}"` to `"%{size_total}"` inside
+// a multiline exec.Command produces a diff line with no exec.Command(, no
+// "sh"/"-c" pair, and no character from shellMeta (note that % and { are not
+// shell metacharacters). The gate built to catch #1309 would have missed #1309.
 func hasCommandStringChange(fh *fileHunks) bool {
-	for _, l := range fh.Added {
+	changed := make([]string, 0, len(fh.Added)+len(fh.Removed))
+	changed = append(changed, fh.Added...)
+	changed = append(changed, fh.Removed...)
+
+	for _, l := range changed {
 		if isCommandStringLine(l) {
 			return true
 		}
 	}
-	for _, l := range fh.Removed {
-		if isCommandStringLine(l) {
+
+	if !contextHasCommandConstruction(fh.Context) {
+		return false
+	}
+	for _, l := range changed {
+		if isStringLiteralArgument(l) {
 			return true
 		}
 	}
 	return false
+}
+
+// contextHasCommandConstruction reports whether any unchanged context line
+// opens a command-construction call. Deliberately narrower than
+// isCommandStringLine: context is proximity evidence, not a change, so only
+// unambiguous constructors count. hasCommandContext's loose tokens ("cmd.",
+// "command") would match far too much surrounding code.
+func contextHasCommandConstruction(contextLines []string) bool {
+	for _, l := range contextLines {
+		if strings.Contains(l, "exec.Command(") || strings.Contains(l, "exec.CommandContext(") {
+			return true
+		}
+		if strings.Contains(l, `"sh"`) && strings.Contains(l, `"-c"`) {
+			return true
+		}
+	}
+	return false
+}
+
+// isStringLiteralArgument reports whether a line is purely argument-list
+// material: one or more double-quoted string literals separated by commas,
+// with nothing else but whitespace and an optional closing paren or ellipsis.
+// That is what a changed argument inside a multiline call looks like, e.g.
+//
+//	"-w", "%{size_total}",
+//
+// Requiring the whole line to be argument-shaped keeps this from matching
+// ordinary code that merely contains a string, such as `x := f("a") + b`.
+func isStringLiteralArgument(s string) bool {
+	t := strings.TrimSpace(s)
+	if !strings.HasPrefix(t, `"`) {
+		return false
+	}
+	inQuote := false
+	escaped := false
+	sawLiteral := false
+	for i := 0; i < len(t); i++ {
+		c := t[i]
+		if inQuote {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inQuote = false
+				sawLiteral = true
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inQuote = true
+		case ',', ' ', '\t', ')':
+			// Separator or a closing paren: still argument-shaped.
+		case '.':
+			// Tolerate a trailing variadic ellipsis.
+		default:
+			return false
+		}
+	}
+	return sawLiteral && !inQuote
 }
 
 // isCommandStringLine reports whether a diff content line looks like it
@@ -192,11 +279,17 @@ func hasCommandContext(s string) bool {
 	return false
 }
 
-// hasOnlyStringShapeAssertions checks whether a changed _test.go file in
-// the given package has added assertions that are exclusively string-shape
-// assertions. Returns true if the test file exists and all its added
-// assertions are string-shape only.
+// hasOnlyStringShapeAssertions reports whether EVERY changed _test.go file in
+// the package that added assertions added only string-shape ones. False when
+// the package added no assertions at all (nothing to judge).
+//
+// The "every file" quantifier is the point. Returning true on the first
+// shape-only file would fire on a package that added a real behavioral
+// assertion in a sibling file: a package with shape_test.go (ContainSubstring)
+// and behavior_test.go (Equal(0) on an exit code) is exactly the case this
+// advisory must stay silent for, because the behavior IS covered.
 func hasOnlyStringShapeAssertions(byFile map[string]*fileHunks, pkg string) bool {
+	sawAssertions := false
 	for file, fh := range byFile {
 		if filepath.Dir(file) != pkg {
 			continue
@@ -204,16 +297,15 @@ func hasOnlyStringShapeAssertions(byFile map[string]*fileHunks, pkg string) bool
 		if !strings.HasSuffix(file, "_test.go") {
 			continue
 		}
-		// Check if this test file has any added assertions.
 		if !hasAddedAssertions(fh) {
 			continue
 		}
-		// All added assertions must be string-shape only.
-		if allAddedAssertionsAreStringShape(fh) {
-			return true
+		sawAssertions = true
+		if !allAddedAssertionsAreStringShape(fh) {
+			return false
 		}
 	}
-	return false
+	return sawAssertions
 }
 
 // hasAddedAssertions reports whether the file hunks have any added
@@ -258,24 +350,23 @@ func isStringShapeAssertion(s string) bool {
 	if strings.Contains(t, "strings.Contains(") {
 		return true
 	}
-	// Equal( on a string literal: the assertion compares against a
-	// string literal, which is a shape check, not a behavioral check.
-	// We detect this by looking for Equal( followed by a string literal
-	// in the same line.
-	if strings.Contains(t, "Equal(") && hasStringLiteral(t) {
-		return true
-	}
-	return false
+	// Equal( whose DIRECT argument is a string literal: comparing against a
+	// literal string is a shape check, not a behavioral one.
+	return isEqualOnStringLiteral(t)
 }
 
-// hasStringLiteral reports whether a line contains a double-quoted string
-// literal (a simple heuristic: at least one pair of double quotes).
-func hasStringLiteral(s string) bool {
-	count := 0
-	for _, c := range s {
-		if c == '"' {
-			count++
-		}
+// isEqualOnStringLiteral reports whether the line contains an Equal( whose
+// first argument opens a string literal, e.g. Equal("draft-simple").
+//
+// Checking the direct argument rather than counting quotes anywhere on the
+// line matters: `Expect(exitCode).To(Equal(0)) // the "fast path" returns zero`
+// is a behavioral assertion, but a quote count of two or more reads it as
+// string-shape and misclassifies it.
+func isEqualOnStringLiteral(s string) bool {
+	idx := strings.Index(s, "Equal(")
+	if idx < 0 {
+		return false
 	}
-	return count >= 2
+	rest := strings.TrimLeft(s[idx+len("Equal("):], " \t")
+	return strings.HasPrefix(rest, `"`) || strings.HasPrefix(rest, "`")
 }
