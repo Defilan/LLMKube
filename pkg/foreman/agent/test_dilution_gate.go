@@ -25,11 +25,18 @@ import (
 	"strings"
 )
 
-// fileHunks holds the content (leading +/- stripped) of one file's added and
-// removed lines from a `git diff --unified=0` output.
+// fileHunks holds the content (leading +/-/space stripped) of one file's added,
+// removed, and context lines from a `git diff` output.
+//
+// Context is populated only when the caller requested a non-zero --unified;
+// under --unified=0 git emits no context lines and the slice stays nil. It
+// exists because a Go command-construction call is routinely spread over
+// several lines, so the changed line alone cannot show that it belongs to one
+// (see hasCommandStringChange).
 type fileHunks struct {
 	Added   []string
 	Removed []string
+	Context []string
 }
 
 // parseUnifiedDiff parses `git diff --unified=0 --src-prefix=a/ --dst-prefix=b/`
@@ -66,6 +73,10 @@ func parseUnifiedDiff(out string) map[string]*fileHunks {
 			if key != "" {
 				ensure(key).Removed = append(ensure(key).Removed, line[1:])
 			}
+		case strings.HasPrefix(line, " ") && cur != "":
+			// Context line. Only present when the caller passed a non-zero
+			// --unified; harmless (and empty) for --unified=0 callers.
+			ensure(cur).Context = append(ensure(cur).Context, line[1:])
 		}
 	}
 	return byFile
