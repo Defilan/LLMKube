@@ -1164,3 +1164,58 @@ func TestRenderGateJob_SingleLineCommandUnchanged(t *testing.T) {
 		t.Error("single-line command must not gain an ellipsis")
 	}
 }
+
+// TestGateJobInstallsHelmOnlyForChartChecks pins the #1441 fix. The gate image
+// is a plain golang image with no helm, so rendering the chart check without
+// installing helm turns every gate run into "helm: command not found". The
+// install must appear when a chart check is requested and must NOT appear
+// otherwise, so Go-only branches do not pay for a download they cannot use.
+func TestGateJobInstallsHelmOnlyForChartChecks(t *testing.T) {
+	render := func(checks []string) string {
+		job, err := renderGateJob(rendererInput{
+			Name: "g", Namespace: "foreman-system", Image: "golang:1.26",
+			Repo: "o/r", Branch: "b", BaseBranch: "main", Checks: checks,
+			PVCName: "foreman-gate-cache", CloneURLBase: "https://github.com",
+			ActiveDeadlineSeconds: 1800, TTLSecondsAfterFinished: 86400,
+			CPURequest: "1", CPULimit: "2", MemRequest: "1Gi", MemLimit: "2Gi",
+			HelmVersion: helmVersionFor(checks), HelmUnittestVersion: HelmUnittestVersion,
+		})
+		if err != nil {
+			t.Fatalf("renderGateJob: %v", err)
+		}
+		return strings.Join(job.Spec.Template.Spec.Containers[0].Args, "\n")
+	}
+
+	withChart := render([]string{"test", ChartCheck})
+	if !strings.Contains(withChart, "install helm "+HelmVersion) {
+		t.Error("chart check requested but the helm install is missing; the gate image has no helm")
+	}
+	// The plugin is fetched as a pinned tarball rather than via
+	// `helm plugin install`, mirroring CI; assert on the pinned URL.
+	if !strings.Contains(withChart, "unittest-"+HelmUnittestVersion+".tgz") {
+		t.Errorf("helm-unittest tarball not pinned to %s", HelmUnittestVersion)
+	}
+	// platformHooks must be stripped or the 3.x plugin loader rejects the
+	// plugin and the next `helm plugin list` hard-fails.
+	if !strings.Contains(withChart, "platformHooks") {
+		t.Error("plugin.yaml platformHooks strip is missing; helm 3.x will reject the plugin")
+	}
+
+	goOnly := render([]string{"fmt", "vet", "test"})
+	if strings.Contains(goOnly, "install helm") {
+		t.Error("helm installed for a Go-only run; the install must be conditional")
+	}
+}
+
+// TestNeedsHelm covers the predicate directly.
+func TestNeedsHelm(t *testing.T) {
+	if !needsHelm([]string{"fmt", ChartCheck}) {
+		t.Error("needsHelm should be true when the chart check is present")
+	}
+	if needsHelm([]string{"fmt", "vet", "lint", "test"}) {
+		t.Error("needsHelm should be false without a chart check")
+	}
+	if !needsHelm(DefaultGateChecks) {
+		t.Error("DefaultGateChecks must include the chart check (#1441)")
+	}
+}

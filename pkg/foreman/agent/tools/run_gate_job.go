@@ -65,7 +65,39 @@ const MaxLogTailBytes = 32 * 1024
 // pipeline ran across hundreds of coder-to-verifier runs.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "test",
-	"manifests", "chart-crds", "foreman-chart-crds", "test-chart",
+	"manifests", "chart-crds", "foreman-chart-crds", ChartCheck,
+}
+
+// ChartCheck is the make target that lints and unit-tests the Helm charts.
+// Named because the Job has to know whether to install helm before running
+// the checks: the gate image is a plain golang image with no helm in it.
+const ChartCheck = "test-chart"
+
+// Pinned so a helm or plugin release cannot silently change gate behavior.
+// HelmUnittestVersion matches .github/workflows/helm-chart.yml so the gate
+// and CI validate charts with the same tool.
+const (
+	HelmVersion         = "v3.13.0"
+	HelmUnittestVersion = "1.1.1"
+)
+
+// helmVersionFor returns the pinned helm version when the checks need it, and
+// "" otherwise so the template skips the install entirely on Go-only runs.
+func helmVersionFor(checks []string) string {
+	if needsHelm(checks) {
+		return HelmVersion
+	}
+	return ""
+}
+
+// needsHelm reports whether any requested check requires helm on PATH.
+func needsHelm(checks []string) bool {
+	for _, c := range checks {
+		if c == ChartCheck {
+			return true
+		}
+	}
+	return false
 }
 
 // RunGateJobToolConfig is the static configuration the foreman-agent
@@ -271,6 +303,8 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 		Branch:                  a.Branch,
 		BaseBranch:              a.BaseBranch,
 		Checks:                  a.Checks,
+		HelmVersion:             helmVersionFor(a.Checks),
+		HelmUnittestVersion:     HelmUnittestVersion,
 		BiteCheck:               a.BiteCheck,
 		Generic:                 a.Generic,
 		Commands:                a.Commands,
@@ -425,13 +459,17 @@ func upstreamURLSafe(s string) bool {
 // @ <branch> ===") so an operator scanning Pod logs sees what was
 // being verified, regardless of where the branch physically lives.
 type rendererInput struct {
-	Name                    string
-	Namespace               string
-	Image                   string
-	Repo                    string
-	Branch                  string
-	BaseBranch              string
-	Checks                  []string
+	Name       string
+	Namespace  string
+	Image      string
+	Repo       string
+	Branch     string
+	BaseBranch string
+	Checks     []string
+	// HelmVersion is non-empty only when a chart check was requested; the
+	// template installs helm and the unittest plugin when it is set.
+	HelmVersion             string
+	HelmUnittestVersion     string
 	BiteCheck               bool
 	Generic                 bool
 	Commands                []string
