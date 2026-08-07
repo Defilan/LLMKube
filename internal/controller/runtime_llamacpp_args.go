@@ -216,7 +216,7 @@ func appendSpeculativeDecodingArgs(args []string, spec *inferencev1alpha1.Specul
 	case "mtp":
 		specType = "draft-mtp"
 	case "draft":
-		specType = "draft"
+		specType = "draft-simple"
 	default:
 		return args
 	}
