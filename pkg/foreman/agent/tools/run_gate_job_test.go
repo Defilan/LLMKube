@@ -327,6 +327,23 @@ func TestApplyConfigDefaults_FillsEveryField(t *testing.T) {
 	}
 }
 
+// TestDefaultGateChecks_ContainsTestChart asserts that the chart validation
+// target is present in DefaultGateChecks so a future refactor cannot silently
+// drop it. Regression for #1441: a chart-only change that broke every helm
+// test still returned GATE-PASS because no chart check existed.
+func TestDefaultGateChecks_ContainsTestChart(t *testing.T) {
+	found := false
+	for _, c := range DefaultGateChecks {
+		if c == "test-chart" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("DefaultGateChecks missing test-chart: %v", DefaultGateChecks)
+	}
+}
+
 func TestSanitizeName(t *testing.T) {
 	cases := map[string]string{
 		"issue-503-foo": "issue-503-foo",

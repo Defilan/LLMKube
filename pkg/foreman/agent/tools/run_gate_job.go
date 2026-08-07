@@ -65,7 +65,7 @@ const MaxLogTailBytes = 32 * 1024
 // pipeline ran across hundreds of coder-to-verifier runs.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "test",
-	"manifests", "chart-crds", "foreman-chart-crds",
+	"manifests", "chart-crds", "foreman-chart-crds", "test-chart",
 }
 
 // RunGateJobToolConfig is the static configuration the foreman-agent
