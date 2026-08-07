@@ -109,6 +109,7 @@
             "additionalProperties": true
           }
         },
+        "caCertConfigMap": { "type": "string" },
         "routerProxy": {
           "type": "object",
           "additionalProperties": false,

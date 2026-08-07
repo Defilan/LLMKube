@@ -1,0 +1,18 @@
+suite: ca-cert-configmap operator flag
+templates:
+  - deployment.yaml
+
+tests:
+  - it: does not render --ca-cert-configmap when the value is empty (default)
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --ca-cert-configmap=
+
+  - it: renders --ca-cert-configmap when a ConfigMap name is set
+    set:
+      controllerManager.caCertConfigMap: my-ca-bundle
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --ca-cert-configmap=my-ca-bundle

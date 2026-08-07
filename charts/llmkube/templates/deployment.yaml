@@ -95,6 +95,9 @@ spec:
         {{- with .Values.controllerManager.routerProxy.defaultLiteLLMURL }}
         - --default-litellm-url={{ . }}
         {{- end }}
+        {{- with .Values.controllerManager.caCertConfigMap }}
+        - --ca-cert-configmap={{ . }}
+        {{- end }}
         {{- /* Nil-safe at every level: with helm upgrade --reuse-values the
              chart defaults are NOT merged, so a release whose stored values
              predate the gpuSharing block would nil-pointer on a chained

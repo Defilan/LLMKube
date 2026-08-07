@@ -93,6 +93,11 @@ controllerManager:
   # Additional environment variables
   env: []
 
+  # Name of a ConfigMap (in the operator's namespace) holding a CA bundle for
+  # model downloads from endpoints signed by a private CA. Mounted into the
+  # model-downloader init container at /custom-certs.
+  caCertConfigMap: ""
+
   # Default container image for ModelRouter-managed router-proxy pods.
   # Per-ModelRouter spec.proxy.image overrides this for individual routers.
   # The router-proxy is a lightweight HTTP server that fronts
