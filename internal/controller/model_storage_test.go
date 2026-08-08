@@ -77,6 +77,31 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 	})
 })
 
+// Issue #1435: interrupted transfers leave orphaned .tmp files that nothing
+// cleans up. The init command must remove stale .tmp files before starting a
+// new download so they do not accumulate on the shared cache PVC.
+var _ = Describe("buildModelInitCommand (orphan .tmp cleanup, #1435)", func() {
+	It("should remove stale .tmp before downloading in cached remote path", func() {
+		cmd := buildModelInitCommand(false, false, true, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+	})
+
+	It("should remove stale .tmp before downloading in cached S3 path", func() {
+		cmd := buildModelInitCommand(false, true, true, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+	})
+
+	It("should remove stale .tmp before downloading in cached local path", func() {
+		cmd := buildModelInitCommand(true, false, true, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+	})
+
+	It("should remove stale .tmp before downloading in cached OnChange path", func() {
+		cmd := buildModelInitCommand(false, false, true, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+	})
+})
+
 var _ = Describe("modelInitEnvVars (s3)", func() {
 	It("should include S3_BUCKET and S3_KEY for s3 source", func() {
 		envs := modelInitEnvVars("s3://my-bucket/models/model.gguf", "/models/cache", "/models/cache/model.gguf")
