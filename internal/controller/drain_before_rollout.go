@@ -487,7 +487,10 @@ func normalizeContainers(containers []corev1.Container) {
 	for i := range containers {
 		c := &containers[i]
 		c.TerminationMessagePath = ""
-		c.TerminationMessagePolicy = ""
+		// TerminationMessagePolicy is NOT stripped: the operator sets it on
+		// every container it generates (runtime container since #1425, init
+		// containers since #1437), so it is an owned field rather than
+		// API-server defaulting, and drift in it should be comparable.
 		c.ImagePullPolicy = ""
 		c.WorkingDir = ""
 		if c.SecurityContext != nil {
