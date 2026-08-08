@@ -85,7 +85,67 @@ type SpeculativeDecodingSpec struct {
 // mounts and populates the claim through the same prep + download init
 // containers as the built-in cache, but never creates, mutates, or deletes it;
 // the user owns the PVC end-to-end.
+// ModelCachePersistence selects whether this InferenceService keeps its model
+// weights on a cache volume across restarts.
+//
+// Deliberately NOT named "mode": the operator already has a --model-cache-mode
+// flag (shared / perService) that selects WHICH cache PVC is used. This field
+// answers a different question, whether there is a cache PVC at all, and one
+// field named "mode" sitting next to another named "mode" on a different axis
+// is a footgun.
+// +kubebuilder:validation:Enum=Cached;Ephemeral
+type ModelCachePersistence string
+
+const (
+	// ModelCachePersistenceCached keeps weights on the model cache PVC. The
+	// default, and what an empty value resolves to.
+	ModelCachePersistenceCached ModelCachePersistence = "Cached"
+
+	// ModelCachePersistenceEphemeral downloads into an emptyDir that dies with
+	// the Pod, so no cache PVC is created or mounted.
+	ModelCachePersistenceEphemeral ModelCachePersistence = "Ephemeral"
+)
+
+// +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.claimName))",message="claimName cannot be set when persistence is Ephemeral: one names a cache volume to use, the other declines to use any"
 type ModelCacheSpec struct {
+	// Persistence selects whether weights survive a Pod restart.
+	//
+	// Cached (the default) downloads into the model cache PVC, so a restart
+	// reuses the bytes already on the node. Ephemeral declines the cache
+	// entirely: weights land in an emptyDir and are re-downloaded every time
+	// the Pod starts. No cache PVC is created, mounted, or required.
+	//
+	// Ephemeral is for two situations.
+	//
+	// A model origin fast enough that the cache does not earn its keep. Pulling
+	// from an in-cluster or on-LAN object store can be quick enough that a
+	// per-service volume on every GPU node costs more than the occasional
+	// re-download, particularly since perService caches are node-local and are
+	// never shared between services.
+	//
+	// Clusters where a cache PVC is impractical for this workload: no suitable
+	// StorageClass for the nodes it must run on, or a local-volume provisioner
+	// that creates volumes through a helper Pod pinned to the target node and
+	// so cannot serve a node whose taints that helper does not tolerate. That
+	// last case can fail silently, leaving the Pod waiting on a volume that
+	// will never bind. It does not arise on provisioners that create volumes
+	// through a control-plane API call rather than an on-node Pod, which is how
+	// most managed-cloud CSI drivers work.
+	//
+	// Two costs, both paid later than the decision. The first request after ANY
+	// restart waits for a full re-download, and with more than one replica every
+	// replica downloads its own copy. Prefer Cached unless one of the situations
+	// above applies.
+	//
+	// Pair this with resources.ephemeralStorage. Weights land on node local
+	// disk, and without a declared budget the scheduler cannot account for the
+	// download and the kubelet has no per-pod ceiling to enforce; the operator
+	// emits an UnboundedEphemeralCache warning when it is unset.
+	//
+	// Mutually exclusive with claimName, which names a cache volume to use.
+	// +optional
+	Persistence ModelCachePersistence `json:"persistence,omitempty"`
+
 	// ClaimName names a pre-existing PersistentVolumeClaim in the
 	// InferenceService's namespace to use as the writable model cache volume.
 	// Weights land under the usual <cacheKey>/ subdirectory of the claim, so
@@ -800,6 +860,34 @@ type InferenceResourceRequirements struct {
 	// which can lead to OOM kills after model load.
 	// +optional
 	HostMemory string `json:"hostMemory,omitempty"`
+
+	// EphemeralStorage is the node local-disk budget for this pod (e.g. "40Gi").
+	// Translated to BOTH requests and limits for ephemeral-storage, and, when
+	// modelCache.persistence is Ephemeral, to the sizeLimit of the emptyDir the
+	// weights download into.
+	//
+	// Set this whenever weights land on node disk rather than a cache PVC.
+	// Without it the scheduler has no visibility into a download that can run to
+	// tens of gigabytes and will place further pods on a node that is about to
+	// fill, and the kubelet has no per-pod ceiling to enforce: the node crosses
+	// its DiskPressure threshold instead, and eviction then proceeds by QoS
+	// class, which can remove unrelated workloads before this one. The request
+	// makes the download visible to scheduling; the limit keeps an overrun
+	// charged to this pod.
+	//
+	// Size it above the model on disk with room for the partial file during
+	// download. Node disk capacity varies by an order of magnitude across
+	// distributions and machine types, so there is no default that is safe
+	// everywhere and none is applied.
+	//
+	// The pattern is the Kubernetes quantity format, so a malformed value is
+	// rejected at admission. The sibling quantity fields above predate this and
+	// carry no pattern; they reach resource.MustParse, which panics on
+	// malformed input and takes the controller down for every workload rather
+	// than failing the one object at fault.
+	// +kubebuilder:validation:Pattern=`^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$`
+	// +optional
+	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
 
 	// GPUMemory is recorded on the object and has no effect. It sets no pod
 	// resource request, does not influence scheduling, and is not validated;

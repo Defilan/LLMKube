@@ -223,7 +223,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		desiredReplicas = 0
 	}
 
-	if modelNeedsCachePVC(model, r.ModelCachePath) {
+	if modelNeedsCachePVC(model, inferenceService, r.ModelCachePath) {
 		if err := r.ensureModelCachePVC(ctx, inferenceService); err != nil {
 			log.Error(err, "Failed to ensure model cache PVC exists", "namespace", inferenceService.Namespace)
 			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, desiredReplicas, "",
@@ -232,6 +232,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	r.warnIgnoredModelCacheClaim(inferenceService, model)
+	r.warnUnboundedEphemeralCache(inferenceService)
 
 	isMetal := isMetalModel(model)
 

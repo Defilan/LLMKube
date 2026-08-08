@@ -118,6 +118,31 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheClaim(
 	}
 }
 
+// warnUnboundedEphemeralCache emits a warning when a service opts out of the
+// cache but declares no ephemeral-storage budget, leaving the emptyDir the
+// weights land in unbounded.
+//
+// Not a hard failure: refusing to reconcile would take down a workload that
+// runs perfectly well on a node with room, and how much room a node has varies
+// by an order of magnitude across distributions and machine types. But it is
+// silent otherwise, and it is only visible once a node fills and the kubelet
+// starts evicting by QoS class, potentially removing unrelated workloads first.
+func (r *InferenceServiceReconciler) warnUnboundedEphemeralCache(
+	isvc *inferencev1alpha1.InferenceService,
+) {
+	if r.Recorder == nil || !modelCacheIsEphemeral(isvc) {
+		return
+	}
+	if isvc.Spec.Resources != nil && isvc.Spec.Resources.EphemeralStorage != "" {
+		return
+	}
+	r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "UnboundedEphemeralCache", "Reconcile",
+		"modelCache.persistence is Ephemeral but spec.resources.ephemeralStorage is unset: "+
+			"model weights download to node local disk with no size limit and no scheduler "+
+			"accounting. Set spec.resources.ephemeralStorage above the model size so an "+
+			"overrun evicts this pod rather than filling the node")
+}
+
 // modelNeedsCachePVC reports whether the operator should provision a model
 // cache PVC for this reconcile. Caching must be enabled on the operator
 // (modelCachePath set) and the model must have a cache key. It must NOT be a
@@ -126,10 +151,74 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheClaim(
 // cache), so provisioning a cache PVC for them only leaves an unused,
 // ISVC-owned claim. Kept as its own predicate so the mount side (isPVCSource
 // in buildModelStorageConfig) and the provisioning side agree on pvc://.
-func modelNeedsCachePVC(model *inferencev1alpha1.Model, modelCachePath string) bool {
+func modelNeedsCachePVC(
+	model *inferencev1alpha1.Model,
+	isvc *inferencev1alpha1.InferenceService,
+	modelCachePath string,
+) bool {
+	return modelWantsCacheVolume(model, isvc, modelCachePath) &&
+		!isPVCSource(model.Spec.Source)
+}
+
+// modelWantsCacheVolume reports whether this workload should download into the
+// model cache volume rather than an ephemeral emptyDir. It is the MOUNT-side
+// question, and modelNeedsCachePVC (the provisioning side) is defined in terms
+// of it so the two cannot drift: a mount without a claim leaves the Pod Pending
+// on a volume nobody creates, and a claim without a mount leaves an orphaned,
+// ISVC-owned PVC behind.
+//
+// The pvc:// exclusion lives only on the provisioning side because those
+// sources are dispatched to buildPVCStorageConfig, which never consults this.
+func modelWantsCacheVolume(
+	model *inferencev1alpha1.Model,
+	isvc *inferencev1alpha1.InferenceService,
+	modelCachePath string,
+) bool {
 	return modelCachePath != "" &&
 		effectiveModelCacheKey(model) != "" &&
-		!isPVCSource(model.Spec.Source)
+		!modelCacheIsEphemeral(isvc)
+}
+
+// ephemeralCacheSizeLimit returns the sizeLimit to put on the emptyDir that
+// backs an ephemeral model cache, or nil to leave it unbounded.
+//
+// Bounded is strongly preferred. An emptyDir with no sizeLimit is written to
+// the node's ephemeral storage, where the kubelet will not charge it to this
+// Pod alone: a multi-gigabyte model on a node with a small boot disk crosses
+// the node's DiskPressure threshold, and eviction then proceeds by QoS class,
+// which can remove unrelated workloads before this one. With a sizeLimit the
+// kubelet evicts the Pod that actually overran.
+//
+// nil when the user declared no budget. Guessing is worse than not bounding:
+// the model's size on disk is not reliably known (Status.Size comes from the
+// GGUF metadata range read, which only runs for remote http(s) sources, so it
+// is absent for s3:// among others), and a guess that lands under the real size
+// evicts the Pod for exceeding a number nobody chose.
+func ephemeralCacheSizeLimit(isvc *inferencev1alpha1.InferenceService) *resource.Quantity {
+	if !modelCacheIsEphemeral(isvc) || isvc.Spec.Resources == nil {
+		return nil
+	}
+	if isvc.Spec.Resources.EphemeralStorage == "" {
+		return nil
+	}
+	q, err := resource.ParseQuantity(isvc.Spec.Resources.EphemeralStorage)
+	if err != nil {
+		// A CRD pattern rejects malformed values at admission, so this is not
+		// reachable through the API. Handled rather than asserted anyway: an
+		// unbounded emptyDir still serves, while panicking would take the
+		// controller down for every workload.
+		return nil
+	}
+	return &q
+}
+
+// modelCacheIsEphemeral reports whether the InferenceService declined the cache
+// (#1451). Only an explicit Ephemeral opts out: a nil isvc, an absent
+// modelCache block, and an empty persistence all resolve to Cached, so the
+// default behaviour is unchanged.
+func modelCacheIsEphemeral(isvc *inferencev1alpha1.InferenceService) bool {
+	return isvc != nil && isvc.Spec.ModelCache != nil &&
+		isvc.Spec.ModelCache.Persistence == inferencev1alpha1.ModelCachePersistenceEphemeral
 }
 
 // modelCachePVCName returns the name of the model cache PVC for the given mode.
@@ -710,8 +799,10 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		initVolumeMounts := []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}}
 		volumes := []corev1.Volume{
 			{
-				Name:         "model-storage",
-				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				Name: "model-storage",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: ephemeralCacheSizeLimit(isvc),
+				}},
 			},
 		}
 
@@ -739,8 +830,10 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	initVolumeMounts := []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}}
 	volumes := []corev1.Volume{
 		{
-			Name:         "model-storage",
-			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			Name: "model-storage",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				SizeLimit: ephemeralCacheSizeLimit(isvc),
+			}},
 		},
 	}
 

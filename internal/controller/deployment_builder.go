@@ -352,7 +352,10 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	var storageConfig modelStorageConfig
 	var modelPath string
 	if backend.NeedsModelInit() && !skipInit {
-		useCache := effectiveModelCacheKey(model) != "" && r.ModelCachePath != ""
+		// Same predicate as the provisioning side (modelNeedsCachePVC), so a
+		// service that declined the cache mounts an emptyDir instead of a claim
+		// nobody created (#1451).
+		useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
 		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
 		modelPath = servedModelPath(isvc, model, storageConfig)
 	}
@@ -581,6 +584,21 @@ func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *in
 			res.Requests[corev1.ResourceMemory] = resource.MustParse(isvc.Spec.Resources.HostMemory)
 		} else if isvc.Spec.Resources.Memory != "" {
 			res.Requests[corev1.ResourceMemory] = resource.MustParse(isvc.Spec.Resources.Memory)
+		}
+		// Request AND limit. The request is what the scheduler reserves, so it
+		// stops placing further pods on a node this download is about to fill.
+		// The limit is what keeps an overrun charged to this pod: without one
+		// the node crosses its DiskPressure threshold instead and eviction
+		// proceeds by QoS class, which can remove unrelated workloads first.
+		// ParseQuantity, not MustParse: a CRD pattern rejects malformed values at
+		// admission, but MustParse panics, and a panic here takes the controller
+		// down for every workload rather than failing the one object at fault.
+		// Not worth that blast radius to save an error check.
+		if isvc.Spec.Resources.EphemeralStorage != "" {
+			if q, err := resource.ParseQuantity(isvc.Spec.Resources.EphemeralStorage); err == nil {
+				res.Requests[corev1.ResourceEphemeralStorage] = q
+				res.Limits[corev1.ResourceEphemeralStorage] = q
+			}
 		}
 	}
 
