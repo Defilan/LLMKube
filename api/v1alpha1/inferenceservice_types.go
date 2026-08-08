@@ -66,6 +66,7 @@ type SpeculativeDecodingType string
 // runtime. It maps to --spec-type (Type) and --spec-draft-n-max (NDraftMax).
 // Only the "llamacpp" runtime supports this field; other runtimes must not
 // set it.
+// +kubebuilder:validation:XValidation:rule="self.type != 'draft'",message="type \"draft\" is not supported: there is no draft-model field to name the draft weights; use type \"mtp\" for self-speculation instead"
 type SpeculativeDecodingSpec struct {
 	// Type is the speculative decoding method (--spec-type). "mtp" maps to
 	// draft-mtp, "draft" maps to draft-simple, and "disabled" (or omitting the
