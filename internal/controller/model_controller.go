@@ -609,6 +609,20 @@ func (r *ModelReconciler) reconcileBySourceType(
 			ctx, model, computeCacheKey(model.Spec.Source))
 		return true, result, err
 
+	// S3: the InferenceService Pod's init container fetches the object with a
+	// sigv4-signed curl (see buildS3DownloadCommand). Deferred to the workload
+	// for the same reason as remote HTTP — a controller-side download lands on
+	// the operator-namespace PVC that inference Pods cannot mount — and for one
+	// more: the credentials live in the Model's sourceSecretRef, which is
+	// projected into the init container and never resolved by the controller.
+	// Without this case s3:// matched nothing here and fell through to the
+	// controller-side fetch, where net/http rejects the scheme and the Model
+	// wedges in Downloading with "unsupported protocol scheme".
+	case isS3Source(model.Spec.Source):
+		result, err = r.reconcileRuntimeResolvedSource(
+			ctx, model, computeCacheKey(model.Spec.Source))
+		return true, result, err
+
 	// Metal-accelerated models with a local-path source live on the Metal
 	// node's own filesystem and are loaded directly by the host metal-agent.
 	// The in-cluster controller cannot see that path, so it neither downloads
