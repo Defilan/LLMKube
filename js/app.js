@@ -5,6 +5,7 @@
   'use strict';
 
   var Greenhouse = window.Greenhouse;
+  var PlantSystem = window.PlantSystem;
 
   var App = function () {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
@@ -15,7 +16,7 @@
     document.body.appendChild(this.renderer.domElement);
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2(0x05080c, 0.04);
+    this.scene.fog = new THREE.FogExp2(0x05080c, 0.06);
 
     this.camera = new THREE.PerspectiveCamera(
       55, window.innerWidth / window.innerHeight, 0.1, 200
@@ -29,42 +30,58 @@
   App.prototype.init = function () {
     this.buildLighting();
     this.buildGreenhouse();
+    this.buildPlants();
     this.setupControls();
     this.setupResize();
   };
 
+  App.prototype.buildPlants = function () {
+    this.plantSystem = new PlantSystem(this.scene);
+    this.plantSystem.init();
+  };
+
   App.prototype.buildLighting = function () {
     // Ambient: deep teal fill
-    var ambient = new THREE.AmbientLight(0x0a2a3a, 0.4);
+    var ambient = new THREE.AmbientLight(0x0a2a3a, 0.3);
     this.scene.add(ambient);
 
-    // Moonlight: cool directional from above
-    var moon = new THREE.DirectionalLight(0x6688aa, 0.8);
+    // Moonlight: cool indigo directional from above
+    var moon = new THREE.DirectionalLight(0x2a1a5e, 0.6);
     moon.position.set(3, 10, -5);
     this.scene.add(moon);
 
-    // Warm interior pool lights
-    var warm1 = new THREE.PointLight(0xffaa44, 8, 12, 2);
+    // Warm amber interior pool lights
+    var warm1 = new THREE.PointLight(0xffaa33, 12, 15, 2);
     warm1.position.set(0, 3.5, 0);
     this.scene.add(warm1);
 
-    var warm2 = new THREE.PointLight(0xff8833, 5, 10, 2);
+    var warm2 = new THREE.PointLight(0xffcc44, 8, 12, 2);
     warm2.position.set(-2, 3, -3);
     this.scene.add(warm2);
 
-    var warm3 = new THREE.PointLight(0xff8833, 5, 10, 2);
+    var warm3 = new THREE.PointLight(0xffcc44, 8, 12, 2);
     warm3.position.set(2, 3, 3);
     this.scene.add(warm3);
 
-    // Subtle magenta accent
-    var magenta = new THREE.PointLight(0xcc44aa, 3, 8, 2);
+    // Soft magenta accent
+    var magenta = new THREE.PointLight(0xcc44aa, 6, 10, 2);
     magenta.position.set(0, 1.5, -3.5);
     this.scene.add(magenta);
 
     // Amber accent near floor
-    var amber = new THREE.PointLight(0xffcc44, 4, 6, 2);
+    var amber = new THREE.PointLight(0xffaa33, 6, 8, 2);
     amber.position.set(0, 0.5, 0);
     this.scene.add(amber);
+
+    // Teal fill from below
+    var teal = new THREE.PointLight(0x0a6e6e, 4, 10, 2);
+    teal.position.set(0, 0.3, 2);
+    this.scene.add(teal);
+
+    // Indigo accent
+    var indigo = new THREE.PointLight(0x2a1a5e, 5, 10, 2);
+    indigo.position.set(0, 2, 3.5);
+    this.scene.add(indigo);
   };
 
   App.prototype.buildGreenhouse = function () {
@@ -100,7 +117,11 @@
     (function loop() {
       requestAnimationFrame(loop);
       var delta = self.clock.getDelta();
+      var time = self.clock.getElapsedTime();
       self.controls.update();
+      if (self.plantSystem) {
+        self.plantSystem.update(delta, time);
+      }
       self.renderer.render(self.scene, self.camera);
       if (++self.frames === 2) {
         var boot = document.getElementById('boot');
