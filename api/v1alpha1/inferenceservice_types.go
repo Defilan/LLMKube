@@ -85,7 +85,53 @@ type SpeculativeDecodingSpec struct {
 // mounts and populates the claim through the same prep + download init
 // containers as the built-in cache, but never creates, mutates, or deletes it;
 // the user owns the PVC end-to-end.
+// ModelCachePersistence selects whether this InferenceService keeps its model
+// weights on a cache volume across restarts.
+//
+// Deliberately NOT named "mode": the operator already has a --model-cache-mode
+// flag (shared / perService) that selects WHICH cache PVC is used. This field
+// answers a different question, whether there is a cache PVC at all, and one
+// field named "mode" sitting next to another named "mode" on a different axis
+// is a footgun.
+// +kubebuilder:validation:Enum=Cached;Ephemeral
+type ModelCachePersistence string
+
+const (
+	// ModelCachePersistenceCached keeps weights on the model cache PVC. The
+	// default, and what an empty value resolves to.
+	ModelCachePersistenceCached ModelCachePersistence = "Cached"
+
+	// ModelCachePersistenceEphemeral downloads into an emptyDir that dies with
+	// the Pod, so no cache PVC is created or mounted.
+	ModelCachePersistenceEphemeral ModelCachePersistence = "Ephemeral"
+)
+
+// +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.claimName))",message="claimName cannot be set when persistence is Ephemeral: one names a cache volume to use, the other declines to use any"
 type ModelCacheSpec struct {
+	// Persistence selects whether weights survive a Pod restart.
+	//
+	// Cached (the default) downloads into the model cache PVC, so a restart
+	// reuses the bytes already on the node. Ephemeral declines the cache
+	// entirely: weights land in an emptyDir and are re-downloaded every time
+	// the Pod starts. No cache PVC is created, mounted, or required.
+	//
+	// Ephemeral is for two situations. First, nodes where dynamic provisioning
+	// is not available: a provisioner whose volume-creation helper cannot
+	// tolerate the node's taints will never bind the claim, and with
+	// microk8s-hostpath that failure is silent, so the Pod waits forever on a
+	// volume that will never arrive. Second, a fast local origin, where the
+	// cache does not earn its keep: pulling from an on-LAN object store can be
+	// quick enough that a per-service volume on every GPU node costs more than
+	// the occasional re-download.
+	//
+	// The trade is paid at a time far removed from the decision: the first
+	// request after any restart waits for a full re-download. Prefer Cached
+	// unless one of the situations above applies.
+	//
+	// Mutually exclusive with claimName, which names a cache volume to use.
+	// +optional
+	Persistence ModelCachePersistence `json:"persistence,omitempty"`
+
 	// ClaimName names a pre-existing PersistentVolumeClaim in the
 	// InferenceService's namespace to use as the writable model cache volume.
 	// Weights land under the usual <cacheKey>/ subdirectory of the claim, so

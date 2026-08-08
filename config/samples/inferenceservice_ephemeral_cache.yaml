@@ -1,0 +1,35 @@
+# InferenceService that declines the model cache PVC (#1451).
+#
+# Weights download into an emptyDir that dies with the Pod, so no cache PVC is
+# created, mounted, or required. Two situations call for this:
+#
+#   1. Nodes where dynamic provisioning is unavailable. A provisioner whose
+#      volume-creation helper cannot tolerate the node's taints will never bind
+#      the claim, and with microk8s-hostpath that failure is silent: the Pod
+#      waits forever on a volume that will never arrive.
+#
+#   2. A fast local origin. Pulling from an on-LAN object store can be quick
+#      enough that a per-service volume on every GPU node costs more than the
+#      occasional re-download. Measured on one fleet, the same 15.65 GB GGUF
+#      took 4m22s at 61 MB/s from Hugging Face and 2m52s at 93 MB/s from an
+#      in-cluster MinIO.
+#
+# The cost is paid at a time far removed from the decision: the first request
+# after ANY restart waits for a full re-download. Prefer the default (Cached)
+# unless one of the above applies.
+#
+# persistence is mutually exclusive with claimName, which names a cache volume
+# to use; the CRD rejects setting both.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: inferenceservice-ephemeral-cache
+spec:
+  modelRef: model-sample
+  runtime: llamacpp
+  replicas: 1
+  modelCache:
+    persistence: Ephemeral
+  resources:
+    cpu: "4"
+    memory: 8Gi

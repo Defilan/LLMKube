@@ -126,10 +126,41 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheClaim(
 // cache), so provisioning a cache PVC for them only leaves an unused,
 // ISVC-owned claim. Kept as its own predicate so the mount side (isPVCSource
 // in buildModelStorageConfig) and the provisioning side agree on pvc://.
-func modelNeedsCachePVC(model *inferencev1alpha1.Model, modelCachePath string) bool {
+func modelNeedsCachePVC(
+	model *inferencev1alpha1.Model,
+	isvc *inferencev1alpha1.InferenceService,
+	modelCachePath string,
+) bool {
+	return modelWantsCacheVolume(model, isvc, modelCachePath) &&
+		!isPVCSource(model.Spec.Source)
+}
+
+// modelWantsCacheVolume reports whether this workload should download into the
+// model cache volume rather than an ephemeral emptyDir. It is the MOUNT-side
+// question, and modelNeedsCachePVC (the provisioning side) is defined in terms
+// of it so the two cannot drift: a mount without a claim leaves the Pod Pending
+// on a volume nobody creates, and a claim without a mount leaves an orphaned,
+// ISVC-owned PVC behind.
+//
+// The pvc:// exclusion lives only on the provisioning side because those
+// sources are dispatched to buildPVCStorageConfig, which never consults this.
+func modelWantsCacheVolume(
+	model *inferencev1alpha1.Model,
+	isvc *inferencev1alpha1.InferenceService,
+	modelCachePath string,
+) bool {
 	return modelCachePath != "" &&
 		effectiveModelCacheKey(model) != "" &&
-		!isPVCSource(model.Spec.Source)
+		!modelCacheIsEphemeral(isvc)
+}
+
+// modelCacheIsEphemeral reports whether the InferenceService declined the cache
+// (#1451). Only an explicit Ephemeral opts out: a nil isvc, an absent
+// modelCache block, and an empty persistence all resolve to Cached, so the
+// default behaviour is unchanged.
+func modelCacheIsEphemeral(isvc *inferencev1alpha1.InferenceService) bool {
+	return isvc != nil && isvc.Spec.ModelCache != nil &&
+		isvc.Spec.ModelCache.Persistence == inferencev1alpha1.ModelCachePersistenceEphemeral
 }
 
 // modelCachePVCName returns the name of the model cache PVC for the given mode.

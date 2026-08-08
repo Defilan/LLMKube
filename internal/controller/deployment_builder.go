@@ -352,7 +352,10 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	var storageConfig modelStorageConfig
 	var modelPath string
 	if backend.NeedsModelInit() && !skipInit {
-		useCache := effectiveModelCacheKey(model) != "" && r.ModelCachePath != ""
+		// Same predicate as the provisioning side (modelNeedsCachePVC), so a
+		// service that declined the cache mounts an emptyDir instead of a claim
+		// nobody created (#1451).
+		useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
 		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
 		modelPath = servedModelPath(isvc, model, storageConfig)
 	}
