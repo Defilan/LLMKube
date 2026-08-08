@@ -5263,6 +5263,11 @@ spec:
                 required:
                 - type
                 type: object
+                x-kubernetes-validations:
+                - message: 'type "draft" is not supported: there is no draft-model
+                    field to name the draft weights; use type "mtp" for self-speculation
+                    instead'
+                  rule: self.type != 'draft'
               suspend:
                 default: false
                 description: |-
