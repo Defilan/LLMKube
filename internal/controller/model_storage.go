@@ -557,7 +557,30 @@ type modelStorageConfig struct {
 	volumeMounts   []corev1.VolumeMount
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, allowedHostPathRoots []string) modelStorageConfig {
+// applyInitContainerDiagnostics makes every generated init container report its
+// own fatal error, mirroring what #1425 did for the runtime container.
+//
+// On a fresh deploy the downloader is the container most likely to fail (bad
+// credentials, a 404, a full disk, eviction for exceeding an emptyDir
+// sizeLimit) and it wrote nothing to the termination message, so the failure
+// surfaced only as a non-zero exit code. FallbackToLogsOnError makes the log
+// tail the termination message on failure.
+//
+// Applying it to every container the operator generates also removes the
+// asymmetry that forced normalizeContainers to strip the field: when the
+// operator sets it everywhere, desired and live agree and there is nothing to
+// normalise away.
+func applyInitContainerDiagnostics(containers []corev1.Container) {
+	for i := range containers {
+		containers[i].TerminationMessagePolicy = corev1.TerminationMessageFallbackToLogsOnError
+	}
+}
+
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, allowedHostPathRoots []string) (cfg modelStorageConfig) {
+	// Stamp crash diagnostics on whatever the branches below return. Done
+	// once here rather than at each construction site so a future storage
+	// path cannot be added without it (#1437).
+	defer func() { applyInitContainerDiagnostics(cfg.initContainers) }()
 	// Host-path allowlist gate (GHSA-jw3m-8q7m-f35r), belt-and-suspenders to
 	// the upfront check in the InferenceService reconcile: a local source
 	// outside the allowed roots must never yield a HostPathVolumeSource, even
