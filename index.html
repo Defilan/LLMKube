@@ -40,64 +40,414 @@
 
 <script>
 /*
- * BOOTSTRAP ONLY. Replace the contents of this script with the real
- * application; keep the script tags above and the file:// constraint.
+ * Stage 1: Greenhouse shell, lighting, camera, render loop.
  *
- * What is here now exists to prove the vendored libraries load and a frame
- * actually reaches the screen. It renders a slowly rotating placeholder so
- * that "the canvas is black" is unambiguously a failure rather than an
- * ambiguous empty scene.
+ * Architecture:
+ *   Greenhouse – builds the greenhouse structure (glass, framework, floor, interior).
+ *   App        – owns renderer, scene, camera, controls, and the render loop.
  *
- * window.__greenhouse is read by the headless smoke test. Whatever the final
- * architecture, keep exposing an object with at least { ready: true } once the
- * first frame has rendered, or the smoke test cannot tell a working build from
- * a broken one.
+ * window.__greenhouse is set once the first frame has drawn.
  */
 (function () {
   'use strict';
 
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  document.body.appendChild(renderer.domElement);
+  /* ------------------------------------------------------------------ */
+  /*  Greenhouse                                                         */
+  /* ------------------------------------------------------------------ */
 
-  const scene = new THREE.Scene();
-  scene.fog = new THREE.FogExp2(0x05080c, 0.035);
+  var Greenhouse = function (scene) {
+    this.scene = scene;
+  };
 
-  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200);
-  camera.position.set(0, 1.6, 6);
+  Greenhouse.prototype.build = function () {
+    this.buildFloor();
+    this.buildFramework();
+    this.buildGlass();
+    this.buildInterior();
+  };
 
-  scene.add(new THREE.AmbientLight(0x2a4a5a, 0.6));
-  const key = new THREE.PointLight(0xffb060, 12, 30);
-  key.position.set(2, 3, 2);
-  scene.add(key);
+  /* -- Floor -- */
+  Greenhouse.prototype.buildFloor = function () {
+    var geo = new THREE.PlaneGeometry(12, 16);
+    var mat = new THREE.MeshStandardMaterial({
+      color: 0x1a2a2a,
+      roughness: 0.85,
+      metalness: 0.05
+    });
+    var floor = new THREE.Mesh(geo, mat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.position.y = 0;
+    this.scene.add(floor);
+  };
 
-  const placeholder = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(1, 1),
-    new THREE.MeshStandardMaterial({ color: 0x1f6f6a, emissive: 0x0a3a44, roughness: 0.4, metalness: 0.1, flatShading: true })
-  );
-  scene.add(placeholder);
+  /* -- Metal framework (posts, beams, glazing bars) -- */
+  Greenhouse.prototype.buildFramework = function () {
+    var mat = new THREE.MeshStandardMaterial({
+      color: 0x2a3a3a,
+      roughness: 0.3,
+      metalness: 0.8
+    });
 
-  addEventListener('resize', function () {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-  }, { passive: true });
+    var W = 6, D = 8, H = 4, roofH = 2;
+    var halfW = W / 2, halfD = D / 2;
 
-  let frames = 0;
-  const clock = new THREE.Clock();
-  (function loop() {
-    requestAnimationFrame(loop);
-    const t = clock.getElapsedTime();
-    placeholder.rotation.y = t * 0.4;
-    placeholder.rotation.x = Math.sin(t * 0.3) * 0.2;
-    renderer.render(scene, camera);
-    if (++frames === 2) {
-      const boot = document.getElementById('boot');
-      if (boot) boot.remove();
-      window.__greenhouse = { ready: true, stage: 'bootstrap', frames: frames };
-    }
-  })();
+    // Vertical posts at corners and midpoints
+    var postPositions = [
+      [-halfW, 0, -halfD], [halfW, 0, -halfD],
+      [-halfW, 0, halfD],  [halfW, 0, halfD],
+      [-halfW, 0, 0],     [halfW, 0, 0],
+      [0, 0, -halfD],     [0, 0, halfD]
+    ];
+
+    var postGeo = new THREE.BoxGeometry(0.08, H, 0.08);
+    postPositions.forEach(function (p) {
+      var post = new THREE.Mesh(postGeo, mat);
+      post.position.set(p[0], H / 2, p[2]);
+      this.scene.add(post);
+    }, this);
+
+    // Ridge posts (taller, at the roof peak)
+    var ridgePostGeo = new THREE.BoxGeometry(0.08, roofH, 0.08);
+    var ridgePositions = [
+      [-halfW, H, 0], [halfW, H, 0],
+      [0, H, -halfD], [0, H, halfD]
+    ];
+    ridgePositions.forEach(function (p) {
+      var post = new THREE.Mesh(ridgePostGeo, mat);
+      post.position.set(p[0], H + roofH / 2, p[2]);
+      this.scene.add(post);
+    }, this);
+
+    // Horizontal beams along walls (top of walls)
+    var beamGeoW = new THREE.BoxGeometry(W, 0.06, 0.06);
+    var beamGeoD = new THREE.BoxGeometry(0.06, 0.06, D);
+
+    // Top beams on long walls
+    var b1 = new THREE.Mesh(beamGeoW, mat);
+    b1.position.set(0, H, -halfD);
+    this.scene.add(b1);
+    var b2 = new THREE.Mesh(beamGeoW, mat);
+    b2.position.set(0, H, halfD);
+    this.scene.add(b2);
+
+    // Top beams on short walls
+    var b3 = new THREE.Mesh(beamGeoD, mat);
+    b3.position.set(-halfW, H, 0);
+    this.scene.add(b3);
+    var b4 = new THREE.Mesh(beamGeoD, mat);
+    b4.position.set(halfW, H, 0);
+    this.scene.add(b4);
+
+    // Mid-height beams
+    var b5 = new THREE.Mesh(beamGeoW, mat);
+    b5.position.set(0, H * 0.5, -halfD);
+    this.scene.add(b5);
+    var b6 = new THREE.Mesh(beamGeoW, mat);
+    b6.position.set(0, H * 0.5, halfD);
+    this.scene.add(b6);
+
+    // Ridge beam
+    var ridgeGeo = new THREE.BoxGeometry(W, 0.06, 0.06);
+    var ridge = new THREE.Mesh(ridgeGeo, mat);
+    ridge.position.set(0, H + roofH, 0);
+    this.scene.add(ridge);
+
+    // Roof slope beams (from wall top to ridge)
+    var slopeLen = Math.sqrt(halfD * halfD + roofH * roofH);
+    var slopeAngle = Math.atan2(roofH, halfD);
+    var slopeGeo = new THREE.BoxGeometry(0.06, slopeLen, 0.06);
+
+    var slopePositions = [
+      { x: -halfW, z: 0, side: -1 },
+      { x: halfW, z: 0, side: -1 },
+      { x: -halfW, z: 0, side: 1 },
+      { x: halfW, z: 0, side: 1 },
+      { x: 0, z: 0, side: -1 },
+      { x: 0, z: 0, side: 1 }
+    ];
+
+    slopePositions.forEach(function (s) {
+      var beam = new THREE.Mesh(slopeGeo, mat);
+      var midZ = s.side * halfD / 2;
+      var midY = H + roofH / 2;
+      beam.position.set(s.x, midY, midZ);
+      beam.rotation.x = -s.side * slopeAngle;
+      this.scene.add(beam);
+    }, this);
+
+    // Glazing bars (horizontal dividers on walls)
+    var barGeoW = new THREE.BoxGeometry(W, 0.04, 0.04);
+    var barGeoD = new THREE.BoxGeometry(0.04, 0.04, D);
+
+    [H * 0.25, H * 0.75].forEach(function (y) {
+      var bar1 = new THREE.Mesh(barGeoW, mat);
+      bar1.position.set(0, y, -halfD);
+      this.scene.add(bar1);
+      var bar2 = new THREE.Mesh(barGeoW, mat);
+      bar2.position.set(0, y, halfD);
+      this.scene.add(bar2);
+    }, this);
+
+    [-halfW, halfW].forEach(function (x) {
+      [D / 3, -D / 3].forEach(function (z) {
+        var bar = new THREE.Mesh(barGeoD, mat);
+        bar.position.set(x, H * 0.5, z);
+        this.scene.add(bar);
+      }, this);
+    }, this);
+  };
+
+  /* -- Glass walls and roof -- */
+  Greenhouse.prototype.buildGlass = function () {
+    var glassMat = new THREE.MeshPhysicalMaterial({
+      color: 0x88ccdd,
+      transmission: 0.92,
+      opacity: 1,
+      metalness: 0,
+      roughness: 0.05,
+      ior: 1.5,
+      thickness: 0.01,
+      transparent: true,
+      side: THREE.DoubleSide
+    });
+
+    var W = 6, D = 8, H = 4, roofH = 2;
+    var halfW = W / 2, halfD = D / 2;
+
+    // Side walls (long walls)
+    var wallGeo = new THREE.PlaneGeometry(W, H);
+    var wall1 = new THREE.Mesh(wallGeo, glassMat);
+    wall1.position.set(0, H / 2, -halfD);
+    this.scene.add(wall1);
+    var wall2 = new THREE.Mesh(wallGeo, glassMat);
+    wall2.position.set(0, H / 2, halfD);
+    wall2.rotation.y = Math.PI;
+    this.scene.add(wall2);
+
+    // End walls (short walls)
+    var endGeo = new THREE.PlaneGeometry(D, H);
+    var end1 = new THREE.Mesh(endGeo, glassMat);
+    end1.position.set(-halfW, H / 2, 0);
+    end1.rotation.y = Math.PI / 2;
+    this.scene.add(end1);
+    var end2 = new THREE.Mesh(endGeo, glassMat);
+    end2.position.set(halfW, H / 2, 0);
+    end2.rotation.y = -Math.PI / 2;
+    this.scene.add(end2);
+
+    // Roof panels (two sloped planes)
+    var slopeLen = Math.sqrt(halfD * halfD + roofH * roofH);
+    var roofGeo = new THREE.PlaneGeometry(W, slopeLen);
+
+    var roof1 = new THREE.Mesh(roofGeo, glassMat);
+    roof1.position.set(0, H + roofH / 2, -halfD / 2);
+    roof1.rotation.x = Math.atan2(roofH, halfD);
+    this.scene.add(roof1);
+
+    var roof2 = new THREE.Mesh(roofGeo, glassMat);
+    roof2.position.set(0, H + roofH / 2, halfD / 2);
+    roof2.rotation.x = -Math.atan2(roofH, halfD);
+    this.scene.add(roof2);
+  };
+
+  /* -- Interior: benches, planters, pots -- */
+  Greenhouse.prototype.buildInterior = function () {
+    var woodMat = new THREE.MeshStandardMaterial({
+      color: 0x3a2a1a,
+      roughness: 0.7,
+      metalness: 0.05
+    });
+    var potMat = new THREE.MeshStandardMaterial({
+      color: 0x5a3a2a,
+      roughness: 0.6,
+      metalness: 0.05
+    });
+
+    // Center bench
+    var benchTop = new THREE.Mesh(
+      new THREE.BoxGeometry(4, 0.08, 0.8),
+      woodMat
+    );
+    benchTop.position.set(0, 0.9, 0);
+    this.scene.add(benchTop);
+
+    // Bench legs
+    var legGeo = new THREE.BoxGeometry(0.08, 0.9, 0.08);
+    [[-1.8, 0.45, -0.3], [1.8, 0.45, -0.3],
+     [-1.8, 0.45, 0.3], [1.8, 0.45, 0.3]].forEach(function (p) {
+      var leg = new THREE.Mesh(legGeo, woodMat);
+      leg.position.set(p[0], p[1], p[2]);
+      this.scene.add(leg);
+    }, this);
+
+    // Side benches
+    [-2.2, 2.2].forEach(function (x) {
+      var top = new THREE.Mesh(
+        new THREE.BoxGeometry(0.6, 0.08, 5),
+        woodMat
+      );
+      top.position.set(x, 0.7, 0);
+      this.scene.add(top);
+
+      [[x - 0.2, 0.35, -2], [x + 0.2, 0.35, -2],
+       [x - 0.2, 0.35, 2], [x + 0.2, 0.35, 2]].forEach(function (p) {
+        var leg = new THREE.Mesh(legGeo, woodMat);
+        leg.position.set(p[0], p[1], p[2]);
+        this.scene.add(leg);
+      }, this);
+    }, this);
+
+    // Planters along the back wall
+    var planterGeo = new THREE.BoxGeometry(2, 0.5, 0.5);
+    [-1.5, 1.5].forEach(function (x) {
+      var planter = new THREE.Mesh(planterGeo, woodMat);
+      planter.position.set(x, 0.25, -3.5);
+      this.scene.add(planter);
+    }, this);
+
+    // Pots on the center bench
+    var potGeo = new THREE.CylinderGeometry(0.15, 0.12, 0.25, 8);
+    [-1.2, -0.4, 0.4, 1.2].forEach(function (x) {
+      var pot = new THREE.Mesh(potGeo, potMat);
+      pot.position.set(x, 1.05, 0);
+      this.scene.add(pot);
+    }, this);
+
+    // Pots on side benches
+    [-2.2, 2.2].forEach(function (x) {
+      [-1.5, -0.5, 0.5, 1.5].forEach(function (z) {
+        var pot = new THREE.Mesh(potGeo, potMat);
+        pot.position.set(x, 0.85, z);
+        this.scene.add(pot);
+      }, this);
+    }, this);
+
+    // Large planter pots on the floor
+    var bigPotGeo = new THREE.CylinderGeometry(0.3, 0.25, 0.5, 8);
+    [[-2.5, 0.25, -3], [2.5, 0.25, -3],
+     [-2.5, 0.25, 3], [2.5, 0.25, 3]].forEach(function (p) {
+      var pot = new THREE.Mesh(bigPotGeo, potMat);
+      pot.position.set(p[0], p[1], p[2]);
+      this.scene.add(pot);
+    }, this);
+  };
+
+  /* ------------------------------------------------------------------ */
+  /*  App                                                                */
+  /* ------------------------------------------------------------------ */
+
+  var App = function () {
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setSize(window.innerWidth, window.innerHeight);
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.0;
+    document.body.appendChild(this.renderer.domElement);
+
+    this.scene = new THREE.Scene();
+    this.scene.fog = new THREE.FogExp2(0x05080c, 0.04);
+
+    this.camera = new THREE.PerspectiveCamera(
+      55, window.innerWidth / window.innerHeight, 0.1, 200
+    );
+    this.camera.position.set(0, 2.5, 7);
+
+    this.clock = new THREE.Clock();
+    this.frames = 0;
+  };
+
+  App.prototype.init = function () {
+    this.buildLighting();
+    this.buildGreenhouse();
+    this.setupControls();
+    this.setupResize();
+  };
+
+  App.prototype.buildLighting = function () {
+    // Ambient: deep teal fill
+    var ambient = new THREE.AmbientLight(0x0a2a3a, 0.4);
+    this.scene.add(ambient);
+
+    // Moonlight: cool directional from above
+    var moon = new THREE.DirectionalLight(0x6688aa, 0.8);
+    moon.position.set(3, 10, -5);
+    this.scene.add(moon);
+
+    // Warm interior pool lights
+    var warm1 = new THREE.PointLight(0xffaa44, 8, 12, 2);
+    warm1.position.set(0, 3.5, 0);
+    this.scene.add(warm1);
+
+    var warm2 = new THREE.PointLight(0xff8833, 5, 10, 2);
+    warm2.position.set(-2, 3, -3);
+    this.scene.add(warm2);
+
+    var warm3 = new THREE.PointLight(0xff8833, 5, 10, 2);
+    warm3.position.set(2, 3, 3);
+    this.scene.add(warm3);
+
+    // Subtle magenta accent
+    var magenta = new THREE.PointLight(0xcc44aa, 3, 8, 2);
+    magenta.position.set(0, 1.5, -3.5);
+    this.scene.add(magenta);
+
+    // Amber accent near floor
+    var amber = new THREE.PointLight(0xffcc44, 4, 6, 2);
+    amber.position.set(0, 0.5, 0);
+    this.scene.add(amber);
+  };
+
+  App.prototype.buildGreenhouse = function () {
+    this.greenhouse = new Greenhouse(this.scene);
+    this.greenhouse.build();
+  };
+
+  App.prototype.setupControls = function () {
+    this.controls = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true;
+    this.controls.dampingFactor = 0.08;
+    this.controls.target.set(0, 2, 0);
+    this.controls.minDistance = 2;
+    this.controls.maxDistance = 15;
+    this.controls.minPolarAngle = 0.1;
+    this.controls.maxPolarAngle = Math.PI / 2 - 0.05;
+    this.controls.maxAzimuthAngle = Math.PI * 0.45;
+    this.controls.minAzimuthAngle = -Math.PI * 0.45;
+    this.controls.update();
+  };
+
+  App.prototype.setupResize = function () {
+    var self = this;
+    addEventListener('resize', function () {
+      self.camera.aspect = window.innerWidth / window.innerHeight;
+      self.camera.updateProjectionMatrix();
+      self.renderer.setSize(window.innerWidth, window.innerHeight);
+    }, { passive: true });
+  };
+
+  App.prototype.start = function () {
+    var self = this;
+    (function loop() {
+      requestAnimationFrame(loop);
+      var delta = self.clock.getDelta();
+      self.controls.update();
+      self.renderer.render(self.scene, self.camera);
+      if (++self.frames === 2) {
+        var boot = document.getElementById('boot');
+        if (boot) boot.remove();
+        window.__greenhouse = { ready: true, stage: 'greenhouse', frames: self.frames };
+      }
+    })();
+  };
+
+  /* ------------------------------------------------------------------ */
+  /*  Bootstrap                                                          */
+  /* ------------------------------------------------------------------ */
+
+  var app = new App();
+  app.init();
+  app.start();
+
 })();
 </script>
 </body>
