@@ -263,6 +263,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// natively), so the pod scan is skipped there.
 	if !isMetal {
 		r.reconcileDriverCompatCondition(ctx, inferenceService)
+		// Sibling diagnosis for the containers that stage weights. Scans init
+		// containers only, as the driver diagnosis scans the runtime container
+		// only, so one failure never collects two contradictory diagnoses.
+		r.reconcileModelTransferCondition(ctx, inferenceService)
 	}
 
 	endpoint := r.constructEndpoint(inferenceService, service)
