@@ -585,6 +585,16 @@ func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *in
 		} else if isvc.Spec.Resources.Memory != "" {
 			res.Requests[corev1.ResourceMemory] = resource.MustParse(isvc.Spec.Resources.Memory)
 		}
+		// Request AND limit. The request is what the scheduler reserves, so it
+		// stops placing further pods on a node this download is about to fill.
+		// The limit is what keeps an overrun charged to this pod: without one
+		// the node crosses its DiskPressure threshold instead and eviction
+		// proceeds by QoS class, which can remove unrelated workloads first.
+		if isvc.Spec.Resources.EphemeralStorage != "" {
+			q := resource.MustParse(isvc.Spec.Resources.EphemeralStorage)
+			res.Requests[corev1.ResourceEphemeralStorage] = q
+			res.Limits[corev1.ResourceEphemeralStorage] = q
+		}
 	}
 
 	return res

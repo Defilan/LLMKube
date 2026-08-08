@@ -115,18 +115,32 @@ type ModelCacheSpec struct {
 	// entirely: weights land in an emptyDir and are re-downloaded every time
 	// the Pod starts. No cache PVC is created, mounted, or required.
 	//
-	// Ephemeral is for two situations. First, nodes where dynamic provisioning
-	// is not available: a provisioner whose volume-creation helper cannot
-	// tolerate the node's taints will never bind the claim, and with
-	// microk8s-hostpath that failure is silent, so the Pod waits forever on a
-	// volume that will never arrive. Second, a fast local origin, where the
-	// cache does not earn its keep: pulling from an on-LAN object store can be
-	// quick enough that a per-service volume on every GPU node costs more than
-	// the occasional re-download.
+	// Ephemeral is for two situations.
 	//
-	// The trade is paid at a time far removed from the decision: the first
-	// request after any restart waits for a full re-download. Prefer Cached
-	// unless one of the situations above applies.
+	// A model origin fast enough that the cache does not earn its keep. Pulling
+	// from an in-cluster or on-LAN object store can be quick enough that a
+	// per-service volume on every GPU node costs more than the occasional
+	// re-download, particularly since perService caches are node-local and are
+	// never shared between services.
+	//
+	// Clusters where a cache PVC is impractical for this workload: no suitable
+	// StorageClass for the nodes it must run on, or a local-volume provisioner
+	// that creates volumes through a helper Pod pinned to the target node and
+	// so cannot serve a node whose taints that helper does not tolerate. That
+	// last case can fail silently, leaving the Pod waiting on a volume that
+	// will never bind. It does not arise on provisioners that create volumes
+	// through a control-plane API call rather than an on-node Pod, which is how
+	// most managed-cloud CSI drivers work.
+	//
+	// Two costs, both paid later than the decision. The first request after ANY
+	// restart waits for a full re-download, and with more than one replica every
+	// replica downloads its own copy. Prefer Cached unless one of the situations
+	// above applies.
+	//
+	// Pair this with resources.ephemeralStorage. Weights land on node local
+	// disk, and without a declared budget the scheduler cannot account for the
+	// download and the kubelet has no per-pod ceiling to enforce; the operator
+	// emits an UnboundedEphemeralCache warning when it is unset.
 	//
 	// Mutually exclusive with claimName, which names a cache volume to use.
 	// +optional
@@ -846,6 +860,27 @@ type InferenceResourceRequirements struct {
 	// which can lead to OOM kills after model load.
 	// +optional
 	HostMemory string `json:"hostMemory,omitempty"`
+
+	// EphemeralStorage is the node local-disk budget for this pod (e.g. "40Gi").
+	// Translated to BOTH requests and limits for ephemeral-storage, and, when
+	// modelCache.persistence is Ephemeral, to the sizeLimit of the emptyDir the
+	// weights download into.
+	//
+	// Set this whenever weights land on node disk rather than a cache PVC.
+	// Without it the scheduler has no visibility into a download that can run to
+	// tens of gigabytes and will place further pods on a node that is about to
+	// fill, and the kubelet has no per-pod ceiling to enforce: the node crosses
+	// its DiskPressure threshold instead, and eviction then proceeds by QoS
+	// class, which can remove unrelated workloads before this one. The request
+	// makes the download visible to scheduling; the limit keeps an overrun
+	// charged to this pod.
+	//
+	// Size it above the model on disk with room for the partial file during
+	// download. Node disk capacity varies by an order of magnitude across
+	// distributions and machine types, so there is no default that is safe
+	// everywhere and none is applied.
+	// +optional
+	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
 
 	// GPUMemory is recorded on the object and has no effect. It sets no pod
 	// resource request, does not influence scheduling, and is not validated;

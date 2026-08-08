@@ -232,6 +232,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	r.warnIgnoredModelCacheClaim(inferenceService, model)
+	r.warnUnboundedEphemeralCache(inferenceService)
 
 	isMetal := isMetalModel(model)
 

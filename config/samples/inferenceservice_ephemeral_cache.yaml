@@ -3,23 +3,39 @@
 # Weights download into an emptyDir that dies with the Pod, so no cache PVC is
 # created, mounted, or required. Two situations call for this:
 #
-#   1. Nodes where dynamic provisioning is unavailable. A provisioner whose
-#      volume-creation helper cannot tolerate the node's taints will never bind
-#      the claim, and with microk8s-hostpath that failure is silent: the Pod
-#      waits forever on a volume that will never arrive.
+#   1. A model origin fast enough that the cache does not earn its keep.
+#      Pulling from an in-cluster or on-LAN object store can be quick enough
+#      that a per-service volume on every GPU node costs more than the
+#      occasional re-download, and perService caches are node-local so they are
+#      never shared between services anyway. Measured on one fleet, the same
+#      15.65 GB GGUF took 4m22s at 61 MB/s from a public origin over the
+#      internet and 2m52s at 93 MB/s from an in-cluster object store.
 #
-#   2. A fast local origin. Pulling from an on-LAN object store can be quick
-#      enough that a per-service volume on every GPU node costs more than the
-#      occasional re-download. Measured on one fleet, the same 15.65 GB GGUF
-#      took 4m22s at 61 MB/s from Hugging Face and 2m52s at 93 MB/s from an
-#      in-cluster MinIO.
+#   2. Clusters where a cache PVC is impractical for this workload: no suitable
+#      StorageClass for the nodes it must run on, or a local-volume provisioner
+#      that creates volumes through a helper Pod pinned to the target node and
+#      therefore cannot serve a node whose taints that helper does not
+#      tolerate. That case can fail silently, leaving the Pod waiting on a
+#      volume that never binds. It does not arise on provisioners that create
+#      volumes through a control-plane API call rather than an on-node Pod,
+#      which is how most managed-cloud CSI drivers work.
 #
-# The cost is paid at a time far removed from the decision: the first request
-# after ANY restart waits for a full re-download. Prefer the default (Cached)
-# unless one of the above applies.
+# Two costs, both paid later than the decision: the first request after ANY
+# restart waits for a full re-download, and with more than one replica every
+# replica downloads its own copy. Prefer the default (Cached) unless one of the
+# above applies.
 #
 # persistence is mutually exclusive with claimName, which names a cache volume
 # to use; the CRD rejects setting both.
+#
+# ALWAYS pair Ephemeral with spec.resources.ephemeralStorage. Weights land on
+# node local disk, and without a declared budget the scheduler cannot see the
+# download coming (so it keeps placing pods on a node that is about to fill) and
+# the kubelet has no per-pod ceiling to enforce (so the node crosses its
+# DiskPressure threshold and evicts by QoS class, which can remove unrelated
+# workloads first). Node disk capacity varies by an order of magnitude across
+# distributions and machine types, so no default is safe everywhere and none is
+# applied; the operator emits an UnboundedEphemeralCache warning if it is unset.
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService
 metadata:
@@ -33,3 +49,7 @@ spec:
   resources:
     cpu: "4"
     memory: 8Gi
+    # Above the model's size on disk, with room for the partial file while it
+    # downloads. Becomes both the ephemeral-storage request/limit and the
+    # sizeLimit of the emptyDir the weights land in.
+    ephemeralStorage: 40Gi
