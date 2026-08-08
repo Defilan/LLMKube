@@ -28,7 +28,7 @@ limitations under the License.
 //   - Title + body + state + reviews + review_comments + check_runs. The
 //     model can pull more via `bash` if it really needs it (it almost
 //     never does).
-//   - Best-effort. A failed fetch logs and the executor keeps the existing
+//   - Best-effort. A failed sub-fetch is recorded in Warnings and the executor keeps the existing
 //     empty-body behavior; the loop runs with whatever buildUserPrompt
 //     produces from the (empty) payload prompt.
 package githubprfetch
@@ -59,13 +59,21 @@ const DefaultTimeout = 10 * time.Second
 // needs. State is included so a model handed a closed PR can decide to
 // NO-GO immediately rather than re-implement a fix that already shipped.
 type PullRequest struct {
-	Number         int             `json:"number"`
-	Title          string          `json:"title"`
-	Body           string          `json:"body"`
-	State          string          `json:"state"`
-	Merged         bool            `json:"merged"`
-	HeadRef        string          `json:"head_ref"`
-	BaseRef        string          `json:"base_ref"`
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	Body    string `json:"body"`
+	State   string `json:"state"`
+	Merged  bool   `json:"merged"`
+	HeadRef string `json:"head_ref"`
+	// HeadSHA is the head commit. Needed because check runs are addressed per
+	// commit ref, not per pull request.
+	HeadSHA string `json:"head_sha"`
+	BaseRef string `json:"base_ref"`
+	// Warnings records sub-fetches that failed. The whole fetch is
+	// best-effort, so a missing section must be distinguishable from a section
+	// that is genuinely empty; without this the coder cannot tell "no review
+	// comments" from "review comments could not be read".
+	Warnings       []string        `json:"warnings,omitempty"`
 	Reviews        []Review        `json:"reviews,omitempty"`
 	ReviewComments []ReviewComment `json:"review_comments,omitempty"`
 	CheckRuns      []CheckRun      `json:"check_runs,omitempty"`
@@ -144,14 +152,25 @@ func (c *Client) Fetch(ctx context.Context, owner, repo string, number int, toke
 		return nil, err
 	}
 
-	// Fetch reviews (best-effort; a failure here does not abort the whole fetch).
-	pr.Reviews, _ = c.fetchReviews(ctx, base, owner, repo, number, token)
-
-	// Fetch review comments (best-effort).
-	pr.ReviewComments, _ = c.fetchReviewComments(ctx, base, owner, repo, number, token)
-
-	// Fetch check runs (best-effort).
-	pr.CheckRuns, _ = c.fetchCheckRuns(ctx, base, owner, repo, number, token)
+	// The sections below are best-effort: a failure degrades the result rather
+	// than aborting the fetch. Each failure is recorded, though. Discarding the
+	// error made a permanently broken sub-fetch indistinguishable from an empty
+	// section, which is how the check-runs endpoint stayed wrong and silent.
+	var warnErr error
+	if pr.Reviews, warnErr = c.fetchReviews(ctx, base, owner, repo, number, token); warnErr != nil {
+		pr.Warnings = append(pr.Warnings, fmt.Sprintf("reviews unavailable: %v", warnErr))
+	}
+	if pr.ReviewComments, warnErr = c.fetchReviewComments(ctx, base, owner, repo, number, token); warnErr != nil {
+		pr.Warnings = append(pr.Warnings, fmt.Sprintf("review comments unavailable: %v", warnErr))
+	}
+	// Check runs hang off the head commit, not the pull request.
+	if pr.HeadSHA != "" {
+		if pr.CheckRuns, warnErr = c.fetchCheckRuns(ctx, base, owner, repo, pr.HeadSHA, token); warnErr != nil {
+			pr.Warnings = append(pr.Warnings, fmt.Sprintf("check runs unavailable: %v", warnErr))
+		}
+	} else {
+		pr.Warnings = append(pr.Warnings, "check runs unavailable: no head SHA in the pull request response")
+	}
 
 	return pr, nil
 }
@@ -186,14 +205,23 @@ func (c *Client) fetchPR(
 		return nil, &HTTPError{StatusCode: resp.StatusCode, URL: url}
 	}
 
+	// head and base are nested objects on the GitHub API; there are no
+	// top-level head_ref/base_ref fields. Decoding them as top-level silently
+	// yields empty strings against the real API while a mock that invents the
+	// flat shape passes, which is exactly how this shipped.
 	var raw struct {
-		Number  int    `json:"number"`
-		Title   string `json:"title"`
-		Body    string `json:"body"`
-		State   string `json:"state"`
-		Merged  bool   `json:"merged"`
-		HeadRef string `json:"head_ref"`
-		BaseRef string `json:"base_ref"`
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		Body   string `json:"body"`
+		State  string `json:"state"`
+		Merged bool   `json:"merged"`
+		Head   struct {
+			Ref string `json:"ref"`
+			SHA string `json:"sha"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("githubprfetch: decode: %w", err)
@@ -205,15 +233,19 @@ func (c *Client) fetchPR(
 		Body:    truncateBody(raw.Body, c.BodyCap),
 		State:   raw.State,
 		Merged:  raw.Merged,
-		HeadRef: raw.HeadRef,
-		BaseRef: raw.BaseRef,
+		HeadRef: raw.Head.Ref,
+		HeadSHA: raw.Head.SHA,
+		BaseRef: raw.Base.Ref,
 	}, nil
 }
 
 func (c *Client) fetchReviews(
 	ctx context.Context, base, owner, repo string, number int, token string,
 ) ([]Review, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews", base, owner, repo, number)
+	// per_page=100 is the API maximum. This does not follow Link headers, so a
+	// pull request with more than 100 reviews is still truncated.
+	// TODO: follow rel="next" if that ceiling is ever reached in practice.
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/reviews?per_page=100", base, owner, repo, number)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -262,7 +294,8 @@ func (c *Client) fetchReviews(
 func (c *Client) fetchReviewComments(
 	ctx context.Context, base, owner, repo string, number int, token string,
 ) ([]ReviewComment, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments", base, owner, repo, number)
+	// See the pagination note in fetchReviews; same ceiling applies.
+	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/comments?per_page=100", base, owner, repo, number)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -310,10 +343,13 @@ func (c *Client) fetchReviewComments(
 	return out, nil
 }
 
+// fetchCheckRuns lists the check runs for the pull request's head commit.
+// Check runs are addressed per commit ref: /repos/{o}/{r}/pulls/{n}/check-runs
+// does not exist and returns 404 against the real API.
 func (c *Client) fetchCheckRuns(
-	ctx context.Context, base, owner, repo string, number int, token string,
+	ctx context.Context, base, owner, repo, sha, token string,
 ) ([]CheckRun, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d/check-runs", base, owner, repo, number)
+	url := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs", base, owner, repo, sha)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

@@ -166,6 +166,10 @@ func (t *FetchPullRequestTool) Execute(ctx context.Context, args json.RawMessage
 			"reviews":         pr.Reviews,
 			"review_comments": pr.ReviewComments,
 			"check_runs":      pr.CheckRuns,
+			// Surfaced to the coder, not just logged: it is the coder that
+			// acts on this context, and it must be able to tell an empty
+			// section from one that could not be read.
+			"warnings": pr.Warnings,
 		},
 	}, nil
 }

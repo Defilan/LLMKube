@@ -49,8 +49,8 @@ func TestClient_Fetch_HappyPath(t *testing.T) {
 		  "body": "PR body text",
 		  "state": "open",
 		  "merged": false,
-		  "head_ref": "fix/something",
-		  "base_ref": "main"
+		  "head": {"ref": "fix/something", "sha": "abc123def456"},
+		  "base": {"ref": "main"}
 		}`)
 		case strings.Contains(r.URL.Path, "/reviews"):
 			w.Header().Set("Content-Type", "application/json")
@@ -62,7 +62,11 @@ func TestClient_Fetch_HappyPath(t *testing.T) {
 			_, _ = fmt.Fprintf(w, `[{"user":{"login":"reviewer1"},`+
 				`"path":"pkg/foo.go","line":10,`+
 				`"original_line":10,"body":"fix this"}]`)
-		case strings.Contains(r.URL.Path, "/check-runs"):
+		// Only the real endpoint shape is answered: check runs hang off a
+		// commit ref, so /pulls/{n}/check-runs must 404 here exactly as it
+		// does on GitHub. A mock that answers any URL cannot catch a wrong
+		// endpoint, which is how the original shipped.
+		case strings.Contains(r.URL.Path, "/commits/") && strings.Contains(r.URL.Path, "/check-runs"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"check_runs":[{"name":"lint",`+
 				`"conclusion":"success",`+
@@ -166,15 +170,19 @@ func TestClient_Fetch_BestEffortSubFetches(t *testing.T) {
 		  "body": "PR body text",
 		  "state": "open",
 		  "merged": false,
-		  "head_ref": "fix/something",
-		  "base_ref": "main"
+		  "head": {"ref": "fix/something", "sha": "abc123def456"},
+		  "base": {"ref": "main"}
 		}`)
 		case strings.Contains(r.URL.Path, "/reviews"):
 			w.WriteHeader(http.StatusInternalServerError)
 		case strings.Contains(r.URL.Path, "/comments"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `[]`)
-		case strings.Contains(r.URL.Path, "/check-runs"):
+		// Only the real endpoint shape is answered: check runs hang off a
+		// commit ref, so /pulls/{n}/check-runs must 404 here exactly as it
+		// does on GitHub. A mock that answers any URL cannot catch a wrong
+		// endpoint, which is how the original shipped.
+		case strings.Contains(r.URL.Path, "/commits/") && strings.Contains(r.URL.Path, "/check-runs"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"check_runs":[]}`)
 		}
@@ -290,5 +298,60 @@ func TestTruncateBody(t *testing.T) {
 	got2 := truncateBody(long, 0)
 	if len(got2) > DefaultBodyCap {
 		t.Errorf("zero cap body too long: %d bytes", len(got2))
+	}
+}
+
+// The two contract bugs this package shipped with, pinned explicitly rather
+// than left to the happy-path mock: head/base arrive as nested objects, and
+// check runs are addressed per commit ref. Both passed review and a full test
+// suite because the mock answered whatever URL it was given and invented a flat
+// PR shape. Asserting the request the client actually makes is the only thing
+// that catches that class of error without calling GitHub.
+func TestClient_UsesRealGitHubContract(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch {
+		case strings.Contains(r.URL.Path, "/check-runs"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"check_runs":[{"name":"lint","conclusion":"success"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/reviews"), strings.HasSuffix(r.URL.Path, "/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[]`)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"number":7,"title":"t","body":"b","state":"open",
+			  "head":{"ref":"feature","sha":"deadbeef"},"base":{"ref":"main"}}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+	pr, err := c.Fetch(context.Background(), "o", "r", 7, "tok")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	// Nested head/base must be read; the flat spelling yields empty strings.
+	if pr.HeadRef != "feature" || pr.BaseRef != "main" || pr.HeadSHA != "deadbeef" {
+		t.Errorf("head/base not parsed from the nested objects: ref=%q base=%q sha=%q",
+			pr.HeadRef, pr.BaseRef, pr.HeadSHA)
+	}
+
+	// Check runs must be requested per commit ref, never per pull request.
+	var checkPath string
+	for _, p := range paths {
+		if strings.Contains(p, "/check-runs") {
+			checkPath = p
+		}
+	}
+	if checkPath == "" {
+		t.Fatal("no check-runs request was made")
+	}
+	if !strings.Contains(checkPath, "/commits/deadbeef/check-runs") {
+		t.Errorf("check runs requested at %q, want /commits/{head sha}/check-runs", checkPath)
+	}
+	if strings.Contains(checkPath, "/pulls/") {
+		t.Errorf("check runs requested under /pulls/, which returns 404 on GitHub: %q", checkPath)
 	}
 }

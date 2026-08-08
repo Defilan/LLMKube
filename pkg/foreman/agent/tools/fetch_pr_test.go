@@ -75,8 +75,8 @@ func TestFetchPullRequestTool_HappyPath(t *testing.T) {
 		  "body": %q,
 		  "state": "open",
 		  "merged": false,
-		  "head_ref": "fix/host-ip",
-		  "base_ref": "main"
+		  "head": {"ref": "fix/host-ip", "sha": "abc123def456"},
+		  "base": {"ref": "main"}
 		}`, body)
 		case strings.Contains(r.URL.Path, "/reviews"):
 			w.Header().Set("Content-Type", "application/json")
@@ -88,7 +88,11 @@ func TestFetchPullRequestTool_HappyPath(t *testing.T) {
 			_, _ = fmt.Fprintf(w, `[{"user":{"login":"reviewer1"},`+
 				`"path":"pkg/foo.go","line":10,`+
 				`"original_line":10,"body":"fix this"}]`)
-		case strings.Contains(r.URL.Path, "/check-runs"):
+		// Only the real endpoint shape is answered: check runs hang off a
+		// commit ref, so /pulls/{n}/check-runs must 404 here exactly as it
+		// does on GitHub. A mock that answers any URL cannot catch a wrong
+		// endpoint, which is how the original shipped.
+		case strings.Contains(r.URL.Path, "/commits/") && strings.Contains(r.URL.Path, "/check-runs"):
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprintf(w, `{"check_runs":[{"name":"lint",`+
 				`"conclusion":"success",`+
