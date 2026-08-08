@@ -879,6 +879,13 @@ type InferenceResourceRequirements struct {
 	// download. Node disk capacity varies by an order of magnitude across
 	// distributions and machine types, so there is no default that is safe
 	// everywhere and none is applied.
+	//
+	// The pattern is the Kubernetes quantity format, so a malformed value is
+	// rejected at admission. The sibling quantity fields above predate this and
+	// carry no pattern; they reach resource.MustParse, which panics on
+	// malformed input and takes the controller down for every workload rather
+	// than failing the one object at fault.
+	// +kubebuilder:validation:Pattern=`^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$`
 	// +optional
 	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
 

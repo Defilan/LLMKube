@@ -590,10 +590,15 @@ func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *in
 		// The limit is what keeps an overrun charged to this pod: without one
 		// the node crosses its DiskPressure threshold instead and eviction
 		// proceeds by QoS class, which can remove unrelated workloads first.
+		// ParseQuantity, not MustParse: a CRD pattern rejects malformed values at
+		// admission, but MustParse panics, and a panic here takes the controller
+		// down for every workload rather than failing the one object at fault.
+		// Not worth that blast radius to save an error check.
 		if isvc.Spec.Resources.EphemeralStorage != "" {
-			q := resource.MustParse(isvc.Spec.Resources.EphemeralStorage)
-			res.Requests[corev1.ResourceEphemeralStorage] = q
-			res.Limits[corev1.ResourceEphemeralStorage] = q
+			if q, err := resource.ParseQuantity(isvc.Spec.Resources.EphemeralStorage); err == nil {
+				res.Requests[corev1.ResourceEphemeralStorage] = q
+				res.Limits[corev1.ResourceEphemeralStorage] = q
+			}
 		}
 	}
 

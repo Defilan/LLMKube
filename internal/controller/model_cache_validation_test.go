@@ -91,6 +91,33 @@ var _ = Describe("InferenceService modelCache CRD validation", func() {
 			"claimName cannot be set when persistence is Ephemeral"))
 	})
 
+	// The quantity pattern exists because the value reaches resource parsing.
+	// Its sibling fields (cpu, memory, hostMemory) carry no pattern and reach
+	// resource.MustParse, which panics on malformed input and takes the
+	// controller down for every workload rather than failing the one object at
+	// fault. Rejecting at admission keeps that blast radius at zero here.
+	It("admits a well-formed ephemeralStorage quantity", func() {
+		isvc := newISvc("mc-valid-storage", &inferencev1alpha1.ModelCacheSpec{
+			Persistence: inferencev1alpha1.ModelCachePersistenceEphemeral,
+		})
+		isvc.Spec.Resources = &inferencev1alpha1.InferenceResourceRequirements{
+			EphemeralStorage: "40Gi",
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
+	It("rejects a malformed ephemeralStorage quantity", func() {
+		isvc := newISvc("mc-invalid-storage", &inferencev1alpha1.ModelCacheSpec{
+			Persistence: inferencev1alpha1.ModelCachePersistenceEphemeral,
+		})
+		isvc.Spec.Resources = &inferencev1alpha1.InferenceResourceRequirements{
+			EphemeralStorage: "40GB",
+		}
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+	})
+
 	It("rejects an unknown persistence value", func() {
 		isvc := newISvc("mc-invalid-enum", &inferencev1alpha1.ModelCacheSpec{
 			Persistence: inferencev1alpha1.ModelCachePersistence("Sometimes"),

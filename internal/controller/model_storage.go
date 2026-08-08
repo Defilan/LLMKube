@@ -203,9 +203,10 @@ func ephemeralCacheSizeLimit(isvc *inferencev1alpha1.InferenceService) *resource
 	}
 	q, err := resource.ParseQuantity(isvc.Spec.Resources.EphemeralStorage)
 	if err != nil {
-		// The CRD validates the format, so this is unreachable via the API. Do
-		// not fail the build over it: an unbounded emptyDir still serves, while
-		// refusing to construct the Pod would take the workload down.
+		// A CRD pattern rejects malformed values at admission, so this is not
+		// reachable through the API. Handled rather than asserted anyway: an
+		// unbounded emptyDir still serves, while panicking would take the
+		// controller down for every workload.
 		return nil
 	}
 	return &q
