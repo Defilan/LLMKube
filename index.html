@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Digital Greenhouse</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05080c; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #boot {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #7fe3d4; background: #05080c; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="boot">loading…</div>
+
+<!--
+  Three.js r147, vendored. Deliberately the UMD build with examples/js addons
+  rather than ES modules: this page must open straight from file:// and browsers
+  block ES module imports over that protocol. Do NOT convert these to
+  <script type="module"> or add an importmap; it will work over http and break
+  the moment someone double-clicks the file, which is the stated requirement.
+  Do NOT add a CDN link. The page must run with no network at all.
+-->
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script src="vendor/CopyShader.js"></script>
+<script src="vendor/LuminosityHighPassShader.js"></script>
+<script src="vendor/FilmShader.js"></script>
+<script src="vendor/RGBShiftShader.js"></script>
+<script src="vendor/EffectComposer.js"></script>
+<script src="vendor/RenderPass.js"></script>
+<script src="vendor/ShaderPass.js"></script>
+<script src="vendor/UnrealBloomPass.js"></script>
+<script src="vendor/FilmPass.js"></script>
+
+<script>
+/*
+ * BOOTSTRAP ONLY. Replace the contents of this script with the real
+ * application; keep the script tags above and the file:// constraint.
+ *
+ * What is here now exists to prove the vendored libraries load and a frame
+ * actually reaches the screen. It renders a slowly rotating placeholder so
+ * that "the canvas is black" is unambiguously a failure rather than an
+ * ambiguous empty scene.
+ *
+ * window.__greenhouse is read by the headless smoke test. Whatever the final
+ * architecture, keep exposing an object with at least { ready: true } once the
+ * first frame has rendered, or the smoke test cannot tell a working build from
+ * a broken one.
+ */
+(function () {
+  'use strict';
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x05080c, 0.035);
+
+  const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200);
+  camera.position.set(0, 1.6, 6);
+
+  scene.add(new THREE.AmbientLight(0x2a4a5a, 0.6));
+  const key = new THREE.PointLight(0xffb060, 12, 30);
+  key.position.set(2, 3, 2);
+  scene.add(key);
+
+  const placeholder = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(1, 1),
+    new THREE.MeshStandardMaterial({ color: 0x1f6f6a, emissive: 0x0a3a44, roughness: 0.4, metalness: 0.1, flatShading: true })
+  );
+  scene.add(placeholder);
+
+  addEventListener('resize', function () {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  }, { passive: true });
+
+  let frames = 0;
+  const clock = new THREE.Clock();
+  (function loop() {
+    requestAnimationFrame(loop);
+    const t = clock.getElapsedTime();
+    placeholder.rotation.y = t * 0.4;
+    placeholder.rotation.x = Math.sin(t * 0.3) * 0.2;
+    renderer.render(scene, camera);
+    if (++frames === 2) {
+      const boot = document.getElementById('boot');
+      if (boot) boot.remove();
+      window.__greenhouse = { ready: true, stage: 'bootstrap', frames: frames };
+    }
+  })();
+})();
+</script>
+</body>
+</html>
