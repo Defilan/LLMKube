@@ -841,6 +841,32 @@ var _ = Describe("podTemplatesDiffer input immutability (#922)", func() {
 	It("reports no difference for identical templates", func() {
 		Expect(podTemplatesDiffer(newPrepTemplate(), newPrepTemplate())).To(BeFalse())
 	})
+
+	It("detects drift when TerminationMessagePolicy differs (#1437)", func() {
+		existing := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:                     "runtime",
+					Image:                    "ghcr.io/ggml-org/llama.cpp:server",
+					TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+				}},
+			},
+		}
+		desired := corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name:                     "runtime",
+					Image:                    "ghcr.io/ggml-org/llama.cpp:server",
+					TerminationMessagePolicy: "File",
+				}},
+			},
+		}
+		// The operator deliberately sets TerminationMessagePolicy as part of
+		// crash diagnosis (#1425), so a change in this field must be detected
+		// as drift — normalizeContainers must not blank it.
+		Expect(podTemplatesDiffer(existing, desired)).To(BeTrue(),
+			"TerminationMessagePolicy drift must be detected")
+	})
 })
 
 var _ = Describe("LlamaCppBackend.IdleProbe", func() {

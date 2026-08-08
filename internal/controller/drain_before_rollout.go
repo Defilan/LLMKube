@@ -487,7 +487,6 @@ func normalizeContainers(containers []corev1.Container) {
 	for i := range containers {
 		c := &containers[i]
 		c.TerminationMessagePath = ""
-		c.TerminationMessagePolicy = ""
 		c.ImagePullPolicy = ""
 		c.WorkingDir = ""
 		if c.SecurityContext != nil {
