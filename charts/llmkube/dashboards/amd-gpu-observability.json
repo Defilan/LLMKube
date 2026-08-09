@@ -234,7 +234,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_gpu_busy_percent{card=\"card0\"}",
+          "expr": "amdgpu_gpu_busy_percent{card=\"card0\"} or drm_engine_utilization_ratio{engine=\"gpu\"} * 100",
           "legendFormat": "GPU busy",
           "refId": "A"
         }
@@ -295,7 +295,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_clock_hertz{card=\"card0\", sensor=\"sclk\"} / 1000000",
+          "expr": "(amdgpu_clock_hertz{card=\"card0\", sensor=\"sclk\"} or drm_frequency_hertz{domain=\"sclk\", kind=\"actual\"}) / 1000000",
           "legendFormat": "SCLK",
           "refId": "A"
         }
@@ -377,7 +377,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_gtt_used_bytes{card=\"card0\"}",
+          "expr": "amdgpu_gtt_used_bytes{card=\"card0\"} or node_drm_memory_gtt_used_bytes",
           "legendFormat": "GTT used",
           "refId": "A"
         }
@@ -446,7 +446,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_vram_used_bytes{card=\"card0\"}",
+          "expr": "amdgpu_vram_used_bytes{card=\"card0\"} or drm_memory_used_bytes{pool=\"vram\"}",
           "legendFormat": "VRAM used",
           "refId": "A"
         }
@@ -506,7 +506,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_vram_total_bytes{card=\"card0\"}",
+          "expr": "amdgpu_vram_total_bytes{card=\"card0\"} or drm_memory_total_bytes{pool=\"vram\"}",
           "legendFormat": "VRAM total",
           "refId": "A"
         }
@@ -808,7 +808,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_gpu_busy_percent{card=\"card0\"}",
+          "expr": "amdgpu_gpu_busy_percent{card=\"card0\"} or drm_engine_utilization_ratio{engine=\"gpu\"} * 100",
           "legendFormat": "GPU busy",
           "refId": "A"
         }
@@ -903,7 +903,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_gtt_used_bytes{card=\"card0\"}",
+          "expr": "amdgpu_gtt_used_bytes{card=\"card0\"} or node_drm_memory_gtt_used_bytes",
           "legendFormat": "GTT used",
           "refId": "A"
         },
@@ -912,7 +912,7 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "amdgpu_vram_used_bytes{card=\"card0\"}",
+          "expr": "amdgpu_vram_used_bytes{card=\"card0\"} or drm_memory_used_bytes{pool=\"vram\"}",
           "legendFormat": "VRAM used",
           "refId": "B"
         }
