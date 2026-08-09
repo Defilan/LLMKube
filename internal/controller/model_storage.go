@@ -245,8 +245,21 @@ func isLocalModelSource(source string) bool {
 }
 
 // addCACertVolume appends the custom CA cert volume and volume mount to the
-// given slices, and prefixes the command with the CURL_CA_BUNDLE export.
+// given slices, and prefixes the command with a CURL_CA_BUNDLE export.
 // No-op when caCertConfigMap is empty.
+//
+// The bundle is ADDITIVE: the system trust store is concatenated with the
+// custom CA into a scratch file, and CURL_CA_BUNDLE points at that. Setting
+// CURL_CA_BUNDLE to the custom cert alone REPLACES the system roots, so
+// enabling this flag for one private endpoint silently breaks every public
+// source on the fleet. Observed 2026-08-09: a Hugging Face pull failed with
+// "unable to get local issuer certificate" while private-endpoint downloads
+// kept working, which is what made it hard to spot.
+//
+// Written to /tmp rather than over /etc/ssl/certs: the init container may run
+// read-only or as a non-root user, and a download command should not mutate
+// the image's trust store. The system bundle is globbed rather than assumed,
+// so an image that keeps its roots elsewhere still gets the custom CA.
 func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd *string, caCertConfigMap string) {
 	if caCertConfigMap == "" {
 		return
@@ -264,7 +277,13 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 		MountPath: "/custom-certs",
 		ReadOnly:  true,
 	})
-	*cmd = fmt.Sprintf("export CURL_CA_BUNDLE=/custom-certs/$(ls /custom-certs | grep -v '^\\.' | head -n 1) && %s", *cmd)
+	// cat both into a scratch bundle; the || keeps a missing system store from
+	// failing the download, since the custom CA alone is still better than none.
+	const caPrelude = "export LLMKUBE_CA_BUNDLE=/tmp/llmkube-ca-bundle.crt && " +
+		"cat /etc/ssl/certs/ca-certificates.crt /custom-certs/* > \"$LLMKUBE_CA_BUNDLE\" 2>/dev/null || " +
+		"cat /custom-certs/* > \"$LLMKUBE_CA_BUNDLE\" && " +
+		"export CURL_CA_BUNDLE=\"$LLMKUBE_CA_BUNDLE\" && "
+	*cmd = caPrelude + *cmd
 }
 
 // All transfers write to "$MODEL_PATH.tmp" and mv onto "$MODEL_PATH" on

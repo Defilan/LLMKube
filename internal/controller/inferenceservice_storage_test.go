@@ -108,7 +108,11 @@ var _ = Describe("buildCachedStorageConfig", func() {
 			}
 		}
 		Expect(found).To(BeTrue())
-		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE=/custom-certs/"))
+		// Additive, not a replacement: the system roots must survive so
+		// public sources keep verifying (see addCACertVolume).
+		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE"))
+		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("/etc/ssl/certs/ca-certificates.crt"))
+		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("/custom-certs/"))
 	})
 })
 
@@ -291,7 +295,11 @@ var _ = Describe("buildCachedStorageConfig multi-file staging", func() {
 			}
 		}
 		Expect(foundCA).To(BeTrue())
-		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE=/custom-certs/"))
+		// Additive, not a replacement: the system roots must survive so
+		// public sources keep verifying (see addCACertVolume).
+		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE"))
+		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("/etc/ssl/certs/ca-certificates.crt"))
+		Expect(config.initContainers[1].Command[2]).To(ContainSubstring("/custom-certs/"))
 	})
 
 	It("uses OnChange per-file HEAD revalidation for multi-file model", func() {
@@ -601,7 +609,11 @@ var _ = Describe("buildEmptyDirStorageConfig", func() {
 			}
 		}
 		Expect(found).To(BeTrue())
-		Expect(config.initContainers[0].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE=/custom-certs/"))
+		// Additive, not a replacement: the system roots must survive so
+		// public sources keep verifying (see addCACertVolume).
+		Expect(config.initContainers[0].Command[2]).To(ContainSubstring("CURL_CA_BUNDLE"))
+		Expect(config.initContainers[0].Command[2]).To(ContainSubstring("/etc/ssl/certs/ca-certificates.crt"))
+		Expect(config.initContainers[0].Command[2]).To(ContainSubstring("/custom-certs/"))
 	})
 
 	It("should inherit runAsUser/runAsGroup in emptyDir storage", func() {
