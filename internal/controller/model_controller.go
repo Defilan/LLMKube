@@ -433,8 +433,20 @@ func (r *ModelReconciler) validateMultiFileStagingSource(ctx context.Context, mo
 	if valErr := validateHFRepoSource(model.Spec.Source); valErr != nil {
 		return true, r.failInvalidFileSet(ctx, model, valErr.Error())
 	}
-	if !isHFRepoSource(model.Spec.Source) {
-		msg := fmt.Sprintf("multi-file staging requires a HuggingFace repo source, but got: %s", model.Spec.Source)
+	// Multi-file staging fetches each artifact individually from the init
+	// container, so it works for any source that can address one object per
+	// file. That is the HF repo path and, since #1465, s3:// object stores,
+	// where buildMultiFileInitCommand signs a per-file request.
+	//
+	// This gate is why signing alone did not fix #1465: it runs in the
+	// reconciler, well before storage config is built, so an s3:// Model with
+	// mmproj set failed here and the download code was never reached. Verified
+	// on the fleet against a real MinIO, where the Model went straight to
+	// Failed/InvalidFileSet while both objects were fetchable by hand.
+	if !isHFRepoSource(model.Spec.Source) && !isS3Source(model.Spec.Source) {
+		msg := fmt.Sprintf(
+			"multi-file staging requires a HuggingFace repo or s3:// source, but got: %s",
+			model.Spec.Source)
 		return true, r.failInvalidFileSet(ctx, model, msg)
 	}
 	return false, ctrl.Result{}

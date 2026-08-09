@@ -1459,6 +1459,89 @@ var _ = Describe("Multi-File Staging Reconcile", func() {
 		Expect(hasInvalidFileSet).To(BeTrue())
 	})
 
+	// The regression for #1465. Signing the multi-file download was necessary
+	// but not sufficient: this validation rejected every non-HuggingFace source
+	// before the storage config was ever built, so the signed command could not
+	// be reached. Caught only by running it against a real object store, since
+	// the unit tests call buildMultiFileInitCommand directly and never pass
+	// through the reconciler.
+	It("should accept multi-file staging from an s3:// source", func() {
+		modelName := "model-multifile-s3"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "s3://models/KyleHessling1/Qwopus3.6-27B-Fusion-GGUF",
+				Files:  []string{"Qwopus3.6-27B-Fusion-Q4_K_M.gguf"},
+				Mmproj: "Qwopus3.6-27B-Fusion-mmproj-Q8_0.gguf",
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+
+		for _, cond := range updated.Status.Conditions {
+			if cond.Type == ConditionDegraded && cond.Reason == "InvalidFileSet" {
+				Fail("s3:// multi-file staging was rejected: " + cond.Message)
+			}
+		}
+		Expect(updated.Status.Phase).NotTo(Equal(PhaseFailed))
+		// The file set still resolves, so the init container knows what to pull.
+		Expect(updated.Status.StagedFiles).To(ContainElement("Qwopus3.6-27B-Fusion-mmproj-Q8_0.gguf"))
+	})
+
+	// A source that genuinely cannot address one object per file must still be
+	// refused, or relaxing the gate would turn a clear failure into a confusing
+	// one deep inside the init container.
+	It("should still reject multi-file staging from an unsupported source", func() {
+		modelName := "model-multifile-unsupported"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/models/single-file.gguf",
+				Files:  []string{"a.gguf"},
+				Mmproj: "mmproj-F16.gguf",
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseFailed))
+	})
+
 	It("should fail with InvalidFileSet when files contains directory escape", func() {
 		modelName := "model-files-escape"
 		model := &inferencev1alpha1.Model{
