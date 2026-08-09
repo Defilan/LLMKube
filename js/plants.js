@@ -333,6 +333,8 @@
   };
 
   Plant.prototype.update = function (delta, time) {
+    var sp = this.species;
+
     // Growth
     if (this.currentHeight < this.targetHeight) {
       this.currentHeight = Math.min(
