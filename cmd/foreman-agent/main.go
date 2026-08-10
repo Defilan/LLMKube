@@ -72,7 +72,6 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/agent/codehost"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubpr"
-	"github.com/defilantech/llmkube/pkg/foreman/agent/githubprfetch"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/mcp"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/repo"
 	foremantools "github.com/defilantech/llmkube/pkg/foreman/agent/tools"
@@ -789,55 +788,17 @@ func makeRegistryFactory(
 		if bashTimeout <= 0 {
 			bashTimeout = 30 * time.Second
 		}
-		native := []foremantools.Tool{
-			&foremantools.ReadFileTool{Workspace: workspace},
-			&foremantools.WriteFileTool{Workspace: workspace},
-			&foremantools.StrReplaceTool{Workspace: workspace},
-			&foremantools.GrepTool{Workspace: workspace},
-			&foremantools.BashTool{Workspace: workspace, Timeout: bashTimeout},
-			foremantools.SubmitResultTool{},
-			&foremantools.RunGateJobTool{
-				Client: kc,
-				Cfg: foremantools.RunGateJobToolConfig{
-					Namespace: foremanNamespace,
-					LogTailFn: logTail,
-				},
-			},
-			// fetch_issue: read-only GitHub issue surface for the
-			// reviewer. The same token the foreman-agent already
-			// loads at startup (via repo.TokenFromEnvOrFile) reaches
-			// GitHub through one bounded Go-side call instead of
-			// being inherited by every bash subprocess via $GH_TOKEN.
-			// Closes #580.
-			&foremantools.FetchIssueTool{
-				Fetcher: githubissue.NewClient(),
-				Token:   repo.TokenFromEnvOrFile,
-			},
-			// fetch_pull_request: read-only GitHub PR surface for the
-			// coder. The same token the foreman-agent already loads
-			// at startup (via repo.TokenFromEnvOrFile) reaches GitHub
-			// through one bounded Go-side call instead of being
-			// inherited by every bash subprocess via $GH_TOKEN.
-			// Closes #1434.
-			&foremantools.FetchPullRequestTool{
-				Fetcher: githubprfetch.NewClient(),
-				Token:   repo.TokenFromEnvOrFile,
-			},
-			// run_integrate: deterministic tool for a sliced Workload's
-			// integrate step. Unions the disjoint slice branches onto the
-			// current base and pushes the integration branch (#1033).
-			&foremantools.RunIntegrateTool{
-				Workspace: workspace,
-				Token:     repo.TokenFromEnvOrFile,
-			},
-			// run_reconcile: deterministic tool for a sliced Workload's
-			// reconcile step. Checks the integrated union against the pinned
-			// shared identifiers for cross-slice interface drift (#1033).
-			&foremantools.RunReconcileTool{
-				Workspace: workspace,
-				Token:     repo.TokenFromEnvOrFile,
-			},
-		}
+		// Constructed in pkg/foreman/agent/tools so there is exactly one list.
+		// Keeping it here made a third copy that drifted from the webhook
+		// allow-list, shipping three tools registered but unusable (#1482).
+		native := foremantools.BuildAll(foremantools.ToolDeps{
+			Workspace:        workspace,
+			BashTimeout:      bashTimeout,
+			Client:           kc,
+			ForemanNamespace: foremanNamespace,
+			LogTailFn:        logTail,
+			Token:            repo.TokenFromEnvOrFile,
+		})
 
 		var mcpTools []foremantools.Tool
 		// Gate-decision log (fires for EVERY run, both kinds) so we can see

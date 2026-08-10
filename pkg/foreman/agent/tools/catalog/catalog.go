@@ -29,15 +29,26 @@ limitations under the License.
 // "names cannot silently drift from the registry" contract.
 package catalog
 
-// canonicalToolNames is the sorted set of every tool name the v0.1 surface
-// exposes. Keep it sorted and in sync with the real tool constructors in
-// the parent package (enforced by catalog_drift_test.go there).
+// canonicalToolNames is the sorted set of every tool name the agent exposes.
+//
+// Keep it sorted. It is checked against the real constructors in
+// tools.BuildAll by TestBuildAllMatchesCatalog, which derives its side of the
+// comparison from that function rather than from a hand-written mirror. Three
+// tools once shipped registered-but-unusable because the previous guard
+// compared two mirrors and neither had been updated (#1482).
+//
+// This package deliberately imports nothing: the operator's Agent admission
+// webhook links it to validate spec.tools, and must not pull in Kubernetes
+// clients, GitHub clients or the slicer.
 var canonicalToolNames = []string{
 	"bash",
 	"fetch_issue",
+	"fetch_pull_request",
 	"grep",
 	"read_file",
 	"run_gate_job",
+	"run_integrate",
+	"run_reconcile",
 	"str_replace",
 	"submit_result",
 	"write_file",
