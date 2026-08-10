@@ -36,23 +36,70 @@ import (
 // pattern if it wants more.
 const defaultGrepMaxMatches = 200
 
+// defaultGrepMaxLineChars bounds the text of a single match.
+//
+// Capping the match COUNT alone does not bound the output, because nothing
+// bounded a match's length: the scanner accepts lines up to 1 MiB, so 200
+// matches could return ~200 MiB and the result still reported
+// "truncated": false, since truncated only ever described the match count.
+//
+// Minified bundles make that the common case rather than a corner case. A
+// coder searching a repo with a vendored three.min.js for "stats" got back
+// 649,467 bytes from a handful of matches, because the whole bundle is one
+// line. That single tool result pushed the transcript past the stuck-loop
+// detector's 140k hard cap and the run was force-terminated at turn 8 with
+// verdict INCOMPLETE, having never found the file it was looking for.
+//
+// 512 chars is far more than enough to identify a hit and decide whether to
+// read the file, and it bounds a full result at roughly 200*512 = 100 KiB.
+const defaultGrepMaxLineChars = 512
+
 // GrepTool runs a regex search across files under a workspace subtree.
 // Skips .git aggressively (only directory, not the .gitignore file).
 type GrepTool struct {
 	Workspace  string
 	MaxMatches int // 0 falls back to defaultGrepMaxMatches
+	// MaxLineChars bounds each match's text. 0 falls back to
+	// defaultGrepMaxLineChars.
+	MaxLineChars int
+}
+
+// clipMatchText shortens a match line to at most maxChars characters and
+// reports whether it did. The marker matters: an unmarked clip is
+// indistinguishable from a genuinely short line, and a model that cannot see
+// that its evidence was cut will reason from a partial line as if it were
+// whole.
+//
+// Counts runes rather than bytes so a cut never lands mid-character and hands
+// the model invalid UTF-8.
+func clipMatchText(s string, maxChars int) (string, bool) {
+	if maxChars <= 0 {
+		maxChars = defaultGrepMaxLineChars
+	}
+	runes := []rune(s)
+	if len(runes) <= maxChars {
+		return s, false
+	}
+	return fmt.Sprintf("%s... [clipped, line is %d chars]",
+		string(runes[:maxChars]), len(runes)), true
 }
 
 type grepArgs struct {
 	Pattern string `json:"pattern"`
 	Path    string `json:"path"`
 	Max     int    `json:"max"`
+	// MaxLineChars lets the model widen the per-line cap when it genuinely
+	// needs more of a long line, rather than being stuck with the default.
+	MaxLineChars int `json:"maxLineChars"`
 }
 
 type grepMatch struct {
 	File string `json:"file"`
 	Line int    `json:"line"`
 	Text string `json:"text"`
+	// Clipped marks this individual match as shortened, so a model reading
+	// one match in isolation is not misled by the aggregate count.
+	Clipped bool `json:"clipped,omitempty"`
 }
 
 // Name returns the tool name as advertised to the model.
@@ -68,7 +115,8 @@ func (t *GrepTool) Schema() oai.ToolSchemaDef {
 "properties": {
   "pattern": {"type": "string", "description": "Go regexp syntax."},
   "path":    {"type": "string", "description": "Workspace-relative root to search (default \".\")."},
-  "max":     {"type": "integer", "minimum": 1, "description": "Cap on returned matches."}
+  "max":     {"type": "integer", "minimum": 1, "description": "Cap on returned matches."},
+  "maxLineChars": {"type": "integer", "minimum": 1, "description": "Cap on each match's text length (default 512). Long lines are clipped and marked."}
 },
 "required": ["pattern"]
 }`),
@@ -108,7 +156,15 @@ func (t *GrepTool) Execute(ctx context.Context, args json.RawMessage) (*agent.To
 			limit = defaultGrepMaxMatches
 		}
 	}
+	lineLimit := a.MaxLineChars
+	if lineLimit <= 0 {
+		lineLimit = t.MaxLineChars
+		if lineLimit <= 0 {
+			lineLimit = defaultGrepMaxLineChars
+		}
+	}
 	matches := make([]grepMatch, 0, limit)
+	clipped := 0
 
 	walkErr := filepath.WalkDir(root, func(p string, d fs.DirEntry, inErr error) error {
 		if inErr != nil {
@@ -139,7 +195,11 @@ func (t *GrepTool) Execute(ctx context.Context, args json.RawMessage) (*agent.To
 		for sc.Scan() {
 			lineNo++
 			if re.Match(sc.Bytes()) {
-				matches = append(matches, grepMatch{File: rel, Line: lineNo, Text: sc.Text()})
+				text, wasClipped := clipMatchText(sc.Text(), lineLimit)
+				if wasClipped {
+					clipped++
+				}
+				matches = append(matches, grepMatch{File: rel, Line: lineNo, Text: text, Clipped: wasClipped})
 				if len(matches) >= limit {
 					return errStopWalk
 				}
@@ -152,9 +212,14 @@ func (t *GrepTool) Execute(ctx context.Context, args json.RawMessage) (*agent.To
 	}
 	return &agent.ToolResult{
 		Output: map[string]any{
-			"pattern":   a.Pattern,
-			"matches":   matches,
-			"truncated": len(matches) >= limit,
+			"pattern": a.Pattern,
+			"matches": matches,
+			// truncated keeps its original meaning: the match LIST was cut
+			// short. clippedLines is reported separately so a model can tell
+			// "there are more matches" from "these matches are abridged",
+			// which call for different next steps.
+			"truncated":    len(matches) >= limit,
+			"clippedLines": clipped,
 		},
 	}, nil
 }
