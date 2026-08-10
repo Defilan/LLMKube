@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -38,8 +39,14 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
 	configHash string,
+	hasPools bool,
 ) error {
-	desired := r.newRouterDeployment(mr, configHash)
+	if hasPools && mr.Spec.Proxy != nil && mr.Spec.Proxy.Replicas != nil && *mr.Spec.Proxy.Replicas > 1 {
+		logf.FromContext(ctx).Info(
+			"pinning router-proxy to a single replica: ModelPool activation requires one proxy; ignoring spec.proxy.replicas",
+			"requestedReplicas", *mr.Spec.Proxy.Replicas)
+	}
+	desired := r.newRouterDeployment(mr, configHash, hasPools)
 	if err := setControllerReferenceUnblocked(mr, desired, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on router Deployment: %w", err)
 	}
@@ -83,12 +90,14 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 func (r *ModelRouterReconciler) newRouterDeployment(
 	mr *inferencev1alpha1.ModelRouter,
 	configHash string,
+	hasPools bool,
 ) *appsv1.Deployment {
 	replicas := int32(1)
 	image := r.routerProxyImage()
 	var resources corev1.ResourceRequirements
 	var imagePullSecrets []corev1.LocalObjectReference
 	var revisionHistoryLimit *int32
+	var nodeSelector map[string]string
 
 	if mr.Spec.Proxy != nil {
 		if mr.Spec.Proxy.Replicas != nil {
@@ -102,6 +111,14 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 			resources = *mr.Spec.Proxy.Resources
 		}
 		imagePullSecrets = mr.Spec.Proxy.ImagePullSecrets
+		nodeSelector = mr.Spec.Proxy.NodeSelector
+	}
+	// A pooled router must run exactly one proxy replica: ModelPool activation
+	// serializes swaps through a single in-process lock, so a second replica
+	// would race it and thrash the shared GPU slot. Pin to 1 regardless of
+	// spec.proxy.replicas until cross-replica swap coordination lands.
+	if hasPools {
+		replicas = 1
 	}
 	if resources.Requests == nil && resources.Limits == nil {
 		resources = defaultRouterProxyResources()
@@ -115,6 +132,16 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		// changes. controller-runtime's CreateOrUpdate doesn't trigger
 		// a rollout on its own; the hash annotation does.
 		routerProxyConfigHashAnnotation: configHash,
+	}
+
+	// Activation-enabled proxies run under a dedicated ServiceAccount bound to
+	// a Role that can scale pooled InferenceServices; unpooled routers keep the
+	// namespace default SA and no API access.
+	serviceAccountName := ""
+	env := []corev1.EnvVar{}
+	if hasPools {
+		serviceAccountName = routerProxyResourceName(mr.Name)
+		env = append(env, corev1.EnvVar{Name: "ROUTER_NAME", Value: mr.Name})
 	}
 
 	return &appsv1.Deployment{
@@ -133,14 +160,16 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
-					SecurityContext:  routerProxyPodSecurityContext(),
-					ImagePullSecrets: imagePullSecrets,
+					ServiceAccountName: serviceAccountName,
+					SecurityContext:    routerProxyPodSecurityContext(),
+					ImagePullSecrets:   imagePullSecrets,
+					NodeSelector:       nodeSelector,
 					Containers: []corev1.Container{
 						{
 							Name:            routerProxyContainerName,
 							Image:           image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args:            routerProxyArgs(mr),
+							Args:            routerProxyArgs(mr, hasPools),
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "http",
@@ -153,6 +182,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 									Protocol:      corev1.ProtocolTCP,
 								},
 							},
+							Env:     env,
 							EnvFrom: envFrom,
 							VolumeMounts: []corev1.VolumeMount{
 								{
@@ -276,7 +306,7 @@ func routerProxyProbe(initialDelay, periodSeconds int32) *corev1.Probe {
 // driven by ModelRouter.spec.proxy.* only land when the user
 // explicitly set them, so the proxy keeps its compiled-in defaults
 // otherwise.
-func routerProxyArgs(mr *inferencev1alpha1.ModelRouter) []string {
+func routerProxyArgs(mr *inferencev1alpha1.ModelRouter, hasPools bool) []string {
 	args := []string{
 		"--config", routerProxyConfigMountPath + "/" + routerProxyConfigKey,
 		"--listen", fmt.Sprintf(":%d", routerProxyPort),
@@ -290,6 +320,9 @@ func routerProxyArgs(mr *inferencev1alpha1.ModelRouter) []string {
 	if mr.Spec.Proxy != nil && mr.Spec.Proxy.ResponseHeaderTimeout != nil {
 		args = append(args, "--response-header-timeout",
 			mr.Spec.Proxy.ResponseHeaderTimeout.Duration.String())
+	}
+	if hasPools {
+		args = append(args, "--enable-activation")
 	}
 	return args
 }

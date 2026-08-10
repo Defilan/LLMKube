@@ -573,6 +573,13 @@ type RouterProxySpec struct {
 	// The proxy is stateless for routing decisions; budget and SLO
 	// counters live in memory and reset on pod restart until the
 	// persistence feature lands.
+	//
+	// When any backend resolves to a ModelPool member, the operator pins
+	// this to 1 regardless of the value set here: ModelPool activation
+	// serializes swaps through a single in-process lock, so a second proxy
+	// replica would race it and thrash the shared GPU slot. Multi-replica
+	// pooled routers need cross-replica swap coordination (a lease), tracked
+	// as a follow-up.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=10
 	// +optional
@@ -618,6 +625,13 @@ type RouterProxySpec struct {
 	// but cannot extend it beyond this cap.
 	// +optional
 	ResponseHeaderTimeout *metav1.Duration `json:"responseHeaderTimeout,omitempty"`
+
+	// NodeSelector pins the router-proxy pod to nodes matching these labels.
+	// Use it when the proxy image is only present on specific nodes (for
+	// example a node-local registry) or to co-locate the proxy with its
+	// backends. Passthrough to the Pod spec.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the
