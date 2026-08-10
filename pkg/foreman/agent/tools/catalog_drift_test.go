@@ -50,15 +50,11 @@ func TestCatalogNamesMatchConstructors(t *testing.T) {
 // mirroring makeRegistryFactory in cmd/foreman-agent. The constructors
 // take a zero workspace + nil collaborators on purpose: this set exists
 // only to read Name() for the drift check above, never to Dispatch().
+// canonicalToolSet is now derived from the same function production uses.
+//
+// It was previously a hand-written list, which is why the drift guard passed
+// while three tools shipped unusable: it compared this mirror against catalog,
+// and the real registration lived in a third copy in cmd/foreman-agent (#1482).
 func canonicalToolSet() []Tool {
-	return []Tool{
-		&ReadFileTool{},
-		&WriteFileTool{},
-		&StrReplaceTool{},
-		&GrepTool{},
-		&BashTool{},
-		SubmitResultTool{},
-		&RunGateJobTool{},
-		&FetchIssueTool{},
-	}
+	return BuildAll(ToolDeps{})
 }
