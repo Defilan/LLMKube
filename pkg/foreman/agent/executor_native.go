@@ -540,6 +540,57 @@ func setupTaskBranch(
 				"to rebuild from %s and overwrite the prior attempt", ref, baseBranch)
 	}
 
+	// A reviewer or verifier ADOPTS the branch under examination; neither
+	// cuts one.
+	//
+	// The base-cut below ends in `checkout -B <branch> FETCH_HEAD`, which
+	// force-moves the branch ref onto the base. For an issue-fix that is the
+	// point: start clean from base so a retry cannot carry stale work. For a
+	// review it destroys the thing being reviewed. The reviewer ends up with a
+	// working tree identical to base, DiffNameOnly against base returns empty,
+	// and the model is asked to judge a change that is not in front of it.
+	//
+	// Observed live: a coder produced a correct two-line fix and reported GO,
+	// and the reviewer returned GO describing the BASE commit's contents
+	// instead of the fix. Both stages green; the review meaningless. This is
+	// the likely mechanism behind reviewers "rubber-stamping on an empty diff",
+	// which had been read as a model-quality problem.
+	//
+	// Verify carries the same shape: the Workload sets Payload.Branch to the
+	// coder's branch and makes the step depend on the coder, so a verifier
+	// reset to base runs its gate against code the coder never wrote.
+	if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindReview ||
+		task.Spec.Kind == foremanv1alpha1.AgenticTaskKindVerify {
+		found, err := repo.CreateBranchFromRemoteRef(ctx, repo.RemoteRefBranchOptions{
+			Workspace: workspace,
+			Branch:    branch,
+			Remote:    "origin",
+			Ref:       branch,
+			Auth:      auth,
+		})
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+		// Review fails closed. Falling through to the base-cut is exactly the
+		// silent failure above: it yields a green review of an empty diff. A
+		// missing branch means the coder never pushed, the ref was pruned, or
+		// the push remote is not the one the coder wrote to (#1464) - all
+		// conditions to surface, never to paper over.
+		if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindReview {
+			return fmt.Errorf(
+				"review: branch %q not found on the push remote; refusing to review the "+
+					"base branch as though it were the change", branch)
+		}
+		// Verify deliberately keeps the historical fallback for now. Adopting
+		// the branch when it exists is a strict improvement and fixes the real
+		// case; making a missing branch terminal would change the gate stage's
+		// failure semantics fleet-wide, which wants a deliberate decision
+		// rather than a drive-by one. Tracked in the PR discussion.
+	}
+
 	if upstreamURL := resolveUpstream(task.Spec.Payload.Repo); upstreamURL != "" {
 		return repo.CreateBranchFromUpstream(ctx, repo.UpstreamBranchOptions{
 			Workspace:   workspace,
