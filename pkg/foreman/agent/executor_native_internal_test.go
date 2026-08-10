@@ -2858,3 +2858,74 @@ func TestSetupTaskBranch_VerifyStartsAtCoderCommitNotBase(t *testing.T) {
 			got, coderSHA)
 	}
 }
+
+// crossProjectRemoteMismatch contract for #1464.
+//
+// The fork deployment is legitimate: --git-remote-url names a fork of
+// payload.repo, so the OWNER differs while the repo NAME matches. A differing
+// repo name is never a fork relationship; it is a misconfiguration that sends a
+// coder's work into an unrelated repository while it reports GO.
+//
+// The whole value of the guard is where it draws the line between those two,
+// so the table drives the real helper rather than a copy of its logic.
+func TestCrossProjectRemoteMismatch(t *testing.T) {
+	cases := []struct {
+		name      string
+		remoteURL string
+		taskRepo  string
+		wantErr   bool
+	}{
+		{
+			name:      "fork of the same project is allowed",
+			remoteURL: "https://github.com/Defilan/LLMKube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "same repo entirely is allowed",
+			remoteURL: "https://github.com/defilantech/LLMKube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "case differences do not make it a different project",
+			remoteURL: "https://github.com/defilan/llmkube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "scp-like fork URL is allowed",
+			remoteURL: "git@github.com:Defilan/LLMKube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "different project is rejected (the #1464 shape)",
+			remoteURL: "https://github.com/Defilan/LLMKube.git",
+			taskRepo:  "Defilan/greenhouse-demo",
+			wantErr:   true,
+		},
+		{
+			name:      "scp-like different project is rejected",
+			remoteURL: "git@github.com:Defilan/LLMKube.git",
+			taskRepo:  "Defilan/greenhouse-demo",
+			wantErr:   true,
+		},
+		// Local bare-repo paths are what envtest injects. The guard must stay
+		// off for them or it breaks the harness rather than the bug.
+		{name: "local path remote is not guarded", remoteURL: "/tmp/origin.git", taskRepo: "a/b"},
+		{name: "file:// remote is not guarded", remoteURL: "file:///tmp/origin.git", taskRepo: "a/b"},
+		{name: "empty remote is not guarded", remoteURL: "", taskRepo: "a/b"},
+		{name: "empty task repo is not guarded", remoteURL: "https://github.com/o/r.git", taskRepo: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := crossProjectRemoteMismatch(tc.remoteURL, tc.taskRepo)
+			if tc.wantErr && got == "" {
+				t.Errorf("remote %q with task repo %q must be rejected: work would be "+
+					"pushed into an unrelated repository and still report GO",
+					tc.remoteURL, tc.taskRepo)
+			}
+			if !tc.wantErr && got != "" {
+				t.Errorf("remote %q with task repo %q must be allowed, got: %s",
+					tc.remoteURL, tc.taskRepo, got)
+			}
+		})
+	}
+}
