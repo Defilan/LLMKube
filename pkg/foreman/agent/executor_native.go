@@ -401,6 +401,9 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 		if cloneURL == "" {
 			cloneURL = resolveUpstream(task.Spec.Payload.Repo)
 		}
+		if msg := crossProjectRemoteMismatch(e.GitRemoteURL, task.Spec.Payload.Repo); msg != "" {
+			return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured, msg), nil
+		}
 		if cloneURL == "" {
 			return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured,
 				"no --git-remote-url configured and task payload.repo is empty or invalid; cannot clone"), nil
@@ -538,6 +541,57 @@ func setupTaskBranch(
 			"revision restore failed: reviseFromBranch %q not found on push remote "+
 				"(pruned, never pushed, or racing a concurrent fix attempt); refusing "+
 				"to rebuild from %s and overwrite the prior attempt", ref, baseBranch)
+	}
+
+	// A reviewer or verifier ADOPTS the branch under examination; neither
+	// cuts one.
+	//
+	// The base-cut below ends in `checkout -B <branch> FETCH_HEAD`, which
+	// force-moves the branch ref onto the base. For an issue-fix that is the
+	// point: start clean from base so a retry cannot carry stale work. For a
+	// review it destroys the thing being reviewed. The reviewer ends up with a
+	// working tree identical to base, DiffNameOnly against base returns empty,
+	// and the model is asked to judge a change that is not in front of it.
+	//
+	// Observed live: a coder produced a correct two-line fix and reported GO,
+	// and the reviewer returned GO describing the BASE commit's contents
+	// instead of the fix. Both stages green; the review meaningless. This is
+	// the likely mechanism behind reviewers "rubber-stamping on an empty diff",
+	// which had been read as a model-quality problem.
+	//
+	// Verify carries the same shape: the Workload sets Payload.Branch to the
+	// coder's branch and makes the step depend on the coder, so a verifier
+	// reset to base runs its gate against code the coder never wrote.
+	if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindReview ||
+		task.Spec.Kind == foremanv1alpha1.AgenticTaskKindVerify {
+		found, err := repo.CreateBranchFromRemoteRef(ctx, repo.RemoteRefBranchOptions{
+			Workspace: workspace,
+			Branch:    branch,
+			Remote:    "origin",
+			Ref:       branch,
+			Auth:      auth,
+		})
+		if err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+		// Review fails closed. Falling through to the base-cut is exactly the
+		// silent failure above: it yields a green review of an empty diff. A
+		// missing branch means the coder never pushed, the ref was pruned, or
+		// the push remote is not the one the coder wrote to (#1464) - all
+		// conditions to surface, never to paper over.
+		if task.Spec.Kind == foremanv1alpha1.AgenticTaskKindReview {
+			return fmt.Errorf(
+				"review: branch %q not found on the push remote; refusing to review the "+
+					"base branch as though it were the change", branch)
+		}
+		// Verify deliberately keeps the historical fallback for now. Adopting
+		// the branch when it exists is a strict improvement and fixes the real
+		// case; making a missing branch terminal would change the gate stage's
+		// failure semantics fleet-wide, which wants a deliberate decision
+		// rather than a drive-by one. Tracked in the PR discussion.
 	}
 
 	if upstreamURL := resolveUpstream(task.Spec.Payload.Repo); upstreamURL != "" {
@@ -2373,6 +2427,43 @@ var cloneURLResolver codehost.CodeHost = codehost.NewGitHubCodeHost(nil)
 // with or without the .git suffix. Anything else (local paths, file://
 // remotes used in tests, bare hosts) yields "", "" so callers fall back
 // to same-repo behavior.
+// crossProjectRemoteMismatch reports why a static --git-remote-url must not be
+// used for this task, or "" when it is fine (#1464).
+//
+// The fork deployment is legitimate and must keep working: --git-remote-url
+// names a fork of payload.repo, so the OWNER differs while the repo NAME is the
+// same (defilantech/LLMKube -> Defilan/LLMKube). A differing repo NAME is never
+// a fork relationship. It is a misconfiguration whose consequences are silent:
+// the coder reads the right issue, does correct work, pushes it into an
+// unrelated repository, and reports GO. Nothing downstream notices, because the
+// reviewer is handed the same wrong remote.
+//
+// Compared on names rather than by asking the codehost whether one repo is a
+// fork of the other: that would be a network call on every task and
+// provider-specific, while the name comparison already separates "fork of the
+// same project" from "entirely different project".
+//
+// Returns "" for remotes that are not owner/repo shaped (local bare-repo paths
+// in tests), so the guard cannot fire on them.
+func crossProjectRemoteMismatch(remoteURL, taskRepo string) string {
+	if remoteURL == "" || taskRepo == "" {
+		return ""
+	}
+	_, remoteName := gitRemoteOwnerRepo(remoteURL)
+	if remoteName == "" {
+		return ""
+	}
+	_, taskName, ok := codehost.SplitRepoSlug(taskRepo)
+	if !ok || strings.EqualFold(remoteName, taskName) {
+		return ""
+	}
+	return fmt.Sprintf(
+		"--git-remote-url names repository %q but the task targets %q; a fork must "+
+			"share the repo name (only the owner differs). Refusing to clone and push "+
+			"work for %q into %q",
+		remoteName, taskRepo, taskRepo, remoteName)
+}
+
 func gitRemoteOwnerRepo(remoteURL string) (owner, name string) {
 	remoteURL = strings.TrimSpace(remoteURL)
 	var path string

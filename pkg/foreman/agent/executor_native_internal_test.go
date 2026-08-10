@@ -2668,3 +2668,264 @@ func TestMaxTokensPerTurnForAgent(t *testing.T) {
 		})
 	}
 }
+
+// reviewTask builds a review-shaped task: payload.Branch names the branch the
+// coder already pushed, and BaseBranch is the base the change is measured
+// against. No ReviseFromBranch, because a reviewer is not restoring a prior
+// attempt; it is reading one that already exists on the remote.
+func reviewTask(branch string) *foremanv1alpha1.AgenticTask {
+	return &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindReview,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:       "defilantech/LLMKube",
+				Issue:      641,
+				Branch:     branch,
+				BaseBranch: "main",
+			},
+		},
+	}
+}
+
+// A reviewer must end up on the coder's commit, not on the base branch.
+//
+// setupTaskBranch's base-cut path runs `checkout -B <branch> FETCH_HEAD` after
+// fetching the BASE. For an issue-fix that is exactly right: cut a fresh branch
+// from base. For a review it is destructive, because -B force-moves the branch
+// ref off the coder's pushed commit and onto base. The reviewer then holds a
+// working tree identical to base, its diff against base is empty, and it
+// reasons about code the coder never wrote.
+//
+// Observed live: a coder produced a correct two-line fix and reported GO, and
+// the reviewer returned GO describing the base commit's contents ("adds
+// particles, fireflies, weather") rather than the fix. Both stages green, the
+// review meaningless.
+func TestSetupTaskBranch_ReviewStartsAtCoderCommitNotBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	bare, mainSHA := seededRemote(t, dir)
+	const branch = "foreman/wl/issue-641"
+
+	// The coder's branch, already pushed.
+	coder := filepath.Join(dir, "coder")
+	gitIn(t, "", "clone", bare, coder)
+	gitIn(t, coder, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(coder, "fix.txt"), []byte("the fix\n"), 0o644); err != nil {
+		t.Fatalf("write fix.txt: %v", err)
+	}
+	gitIn(t, coder, "add", "fix.txt")
+	gitIn(t, coder, "commit", "-m", "fix: the change under review")
+	gitIn(t, coder, "push", "origin", branch)
+	coderSHA := gitIn(t, coder, "rev-parse", "HEAD")
+
+	// The reviewer's fresh workspace clone.
+	ws := filepath.Join(dir, "review-ws")
+	gitIn(t, "", "clone", bare, ws)
+
+	if err := setupTaskBranch(context.Background(), reviewTask(branch), ws, branch, "main",
+		func(string) string { return bare }, nil, logr.Discard()); err != nil {
+		t.Fatalf("setupTaskBranch: %v", err)
+	}
+
+	if got := gitIn(t, ws, "rev-parse", "HEAD"); got != coderSHA {
+		t.Errorf("HEAD = %s, want the coder's commit %s (base is %s).\n"+
+			"A reviewer reset to base reviews an empty diff and approves work it never saw.",
+			got, coderSHA, mainSHA)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "fix.txt")); err != nil {
+		t.Errorf("the change under review must be present in the working tree: %v", err)
+	}
+}
+
+// The issue-fix base-cut must keep working: a coder branch is cut fresh from
+// the current base so a retry cannot carry stale work. Guarding the review case
+// must not weaken this.
+func TestSetupTaskBranch_IssueFixStillCutsFromBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	bare, mainSHA := seededRemote(t, dir)
+	const branch = "foreman/wl/issue-900"
+
+	// A stale branch of the same name exists on the remote. An issue-fix must
+	// ignore it and start from base.
+	stale := filepath.Join(dir, "stale")
+	gitIn(t, "", "clone", bare, stale)
+	gitIn(t, stale, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(stale, "stale.txt"), []byte("stale\n"), 0o644); err != nil {
+		t.Fatalf("write stale.txt: %v", err)
+	}
+	gitIn(t, stale, "add", "stale.txt")
+	gitIn(t, stale, "commit", "-m", "stale work")
+	gitIn(t, stale, "push", "origin", branch)
+
+	ws := filepath.Join(dir, "coder-ws")
+	gitIn(t, "", "clone", bare, ws)
+
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo: "defilantech/LLMKube", Issue: 900, BaseBranch: "main",
+			},
+		},
+	}
+	if err := setupTaskBranch(context.Background(), task, ws, branch, "main",
+		func(string) string { return bare }, nil, logr.Discard()); err != nil {
+		t.Fatalf("setupTaskBranch: %v", err)
+	}
+	if got := gitIn(t, ws, "rev-parse", "HEAD"); got != mainSHA {
+		t.Errorf("HEAD = %s, want base %s: an issue-fix must cut fresh from base", got, mainSHA)
+	}
+	if _, err := os.Stat(filepath.Join(ws, "stale.txt")); err == nil {
+		t.Error("stale remote branch content must not be carried into a fresh issue-fix")
+	}
+}
+
+// A review whose branch is missing from the push remote must fail, not quietly
+// review the base.
+//
+// This is the fail-closed half of the fix. The dangerous outcome is not an
+// error, it is a green GO on an empty diff: falling back to a base-cut produces
+// a working tree that looks perfectly valid and a review that means nothing.
+// The three ways to get here (the coder never pushed, the ref was pruned, or
+// the push remote is not the one the coder wrote to, as in #1464) are all
+// conditions an operator needs to see.
+func TestSetupTaskBranch_ReviewMissingBranchFailsLoud(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	bare, _ := seededRemote(t, dir)
+	const branch = "foreman/wl/issue-641"
+
+	ws := filepath.Join(dir, "review-ws")
+	gitIn(t, "", "clone", bare, ws)
+
+	err := setupTaskBranch(context.Background(), reviewTask(branch), ws, branch, "main",
+		func(string) string { return bare }, nil, logr.Discard())
+	if err == nil {
+		t.Fatal("a review with no branch on the remote must fail; falling back to base " +
+			"yields a GO on an empty diff, which is worse than an error")
+	}
+	if !strings.Contains(err.Error(), "refusing") {
+		t.Errorf("error must explain the refusal, got: %v", err)
+	}
+}
+
+// A verifier must run its gate against the coder's commit when that branch
+// exists, for the same reason a reviewer must read it.
+//
+// The Workload sets Payload.Branch to the coder's branch and makes the verify
+// step depend on the coder, so this path has the identical shape to review. A
+// verifier reset to base runs the gate on code the coder never wrote and
+// reports a pass, which is worse than a review rubber-stamp: the gate is the
+// stage that is supposed to be mechanical and trustworthy.
+func TestSetupTaskBranch_VerifyStartsAtCoderCommitNotBase(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	bare, _ := seededRemote(t, dir)
+	const branch = "foreman/wl/issue-641"
+
+	coder := filepath.Join(dir, "coder")
+	gitIn(t, "", "clone", bare, coder)
+	gitIn(t, coder, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(coder, "fix.txt"), []byte("the fix\n"), 0o644); err != nil {
+		t.Fatalf("write fix.txt: %v", err)
+	}
+	gitIn(t, coder, "add", "fix.txt")
+	gitIn(t, coder, "commit", "-m", "fix: the change under verification")
+	gitIn(t, coder, "push", "origin", branch)
+	coderSHA := gitIn(t, coder, "rev-parse", "HEAD")
+
+	ws := filepath.Join(dir, "verify-ws")
+	gitIn(t, "", "clone", bare, ws)
+
+	task := reviewTask(branch)
+	task.Spec.Kind = foremanv1alpha1.AgenticTaskKindVerify
+
+	if err := setupTaskBranch(context.Background(), task, ws, branch, "main",
+		func(string) string { return bare }, nil, logr.Discard()); err != nil {
+		t.Fatalf("setupTaskBranch: %v", err)
+	}
+	if got := gitIn(t, ws, "rev-parse", "HEAD"); got != coderSHA {
+		t.Errorf("HEAD = %s, want the coder's commit %s: a gate run against base proves nothing",
+			got, coderSHA)
+	}
+}
+
+// crossProjectRemoteMismatch contract for #1464.
+//
+// The fork deployment is legitimate: --git-remote-url names a fork of
+// payload.repo, so the OWNER differs while the repo NAME matches. A differing
+// repo name is never a fork relationship; it is a misconfiguration that sends a
+// coder's work into an unrelated repository while it reports GO.
+//
+// The whole value of the guard is where it draws the line between those two,
+// so the table drives the real helper rather than a copy of its logic.
+func TestCrossProjectRemoteMismatch(t *testing.T) {
+	cases := []struct {
+		name      string
+		remoteURL string
+		taskRepo  string
+		wantErr   bool
+	}{
+		{
+			name:      "fork of the same project is allowed",
+			remoteURL: "https://github.com/Defilan/LLMKube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "same repo entirely is allowed",
+			remoteURL: "https://github.com/defilantech/LLMKube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "case differences do not make it a different project",
+			remoteURL: "https://github.com/defilan/llmkube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "scp-like fork URL is allowed",
+			remoteURL: "git@github.com:Defilan/LLMKube.git",
+			taskRepo:  "defilantech/LLMKube",
+		},
+		{
+			name:      "different project is rejected (the #1464 shape)",
+			remoteURL: "https://github.com/Defilan/LLMKube.git",
+			taskRepo:  "Defilan/greenhouse-demo",
+			wantErr:   true,
+		},
+		{
+			name:      "scp-like different project is rejected",
+			remoteURL: "git@github.com:Defilan/LLMKube.git",
+			taskRepo:  "Defilan/greenhouse-demo",
+			wantErr:   true,
+		},
+		// Local bare-repo paths are what envtest injects. The guard must stay
+		// off for them or it breaks the harness rather than the bug.
+		{name: "local path remote is not guarded", remoteURL: "/tmp/origin.git", taskRepo: "a/b"},
+		{name: "file:// remote is not guarded", remoteURL: "file:///tmp/origin.git", taskRepo: "a/b"},
+		{name: "empty remote is not guarded", remoteURL: "", taskRepo: "a/b"},
+		{name: "empty task repo is not guarded", remoteURL: "https://github.com/o/r.git", taskRepo: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := crossProjectRemoteMismatch(tc.remoteURL, tc.taskRepo)
+			if tc.wantErr && got == "" {
+				t.Errorf("remote %q with task repo %q must be rejected: work would be "+
+					"pushed into an unrelated repository and still report GO",
+					tc.remoteURL, tc.taskRepo)
+			}
+			if !tc.wantErr && got != "" {
+				t.Errorf("remote %q with task repo %q must be allowed, got: %s",
+					tc.remoteURL, tc.taskRepo, got)
+			}
+		})
+	}
+}
