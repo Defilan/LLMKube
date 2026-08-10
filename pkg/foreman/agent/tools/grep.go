@@ -116,7 +116,10 @@ func (t *GrepTool) Schema() oai.ToolSchemaDef {
   "pattern": {"type": "string", "description": "Go regexp syntax."},
   "path":    {"type": "string", "description": "Workspace-relative root to search (default \".\")."},
   "max":     {"type": "integer", "minimum": 1, "description": "Cap on returned matches."},
-  "maxLineChars": {"type": "integer", "minimum": 1, "description": "Cap on each match's text length (default 512). Long lines are clipped and marked."}
+  "maxLineChars": {
+    "type": "integer", "minimum": 1,
+    "description": "Cap on each match's text length (default 512). Long lines are clipped and marked."
+  }
 },
 "required": ["pattern"]
 }`),
