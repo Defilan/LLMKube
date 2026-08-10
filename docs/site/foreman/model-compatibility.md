@@ -1,6 +1,6 @@
 # Foreman model compatibility
 
-The Foreman v0.1 native agent loop assumes the inference endpoint
+The Foreman native agent loop assumes the inference endpoint
 behind every Agent speaks **OpenAI-style function calling**: it
 emits structured `tool_calls` in chat-completions responses, the
 loop parses them, dispatches the named tool, and feeds the result
@@ -32,15 +32,89 @@ welcome.
   reconciler does.
 - **Notes:** observed quirks worth documenting.
 
-## Tested matrix (v0.4 reviewer release)
+## What "verified" means here
 
-| Model | Quant | Host | Role | Tool protocol | Confab | Notes |
-|---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B (Carnice MoE) | Q8_0 | M5 Max 128GB | coder | ✓ | low | Reference coder. Verified end-to-end on real LLMKube issues. |
-| Qwen3.6-35B-A3B | Q8_0 | M5 Max 128GB | reviewer | ✓ | low | Same model serves as same-family reviewer. Catches Section G (godoc/code consistency) reliably. |
-| Devstral-Small-2 24B-Instruct-2512 | Q6_K | Mac Studio 36GB | reviewer | ✓ | high | Tools all dispatch correctly; terminal `submit_result.extra.issueAsk` and `filesTouched` frequently confabulated on multi-file diffs. Harness reconciles both server-side. |
-| Gemma 3 27B-it | Q6_K | Mac Studio 36GB | reviewer | ✗ | n/a | **Does not currently work.** Emits tool invocations as Google's native markdown `\`\`\`tool_code` blocks rather than OAI `tool_calls`. The loop sees zero tool_calls on turn 1 and force-terminates as `ModelMisunderstood`. Tracked as [#589](https://github.com/defilantech/LLMKube/issues/589); fixed when the `toolProtocol` adapter work lands in v0.5. |
-| Mistral-Small-3.2 24B-Instruct-2506 | Q6_K | Mac Studio 36GB | reviewer | ⚠️ | n/a | **Under investigation.** First chat-completions request hangs indefinitely (llama-server health endpoint stays OK, CPU drops to 1.3%, no client-side timeout fires). May be a Metal-perf path issue specific to this model or an HTTP-streaming-shape issue. Tracked as [#590](https://github.com/defilantech/LLMKube/issues/590). |
+Every row below was produced by running the model as a Foreman agent against
+**real issues in this repository**, not a synthetic benchmark. The counts are
+actual `AgenticTask` outcomes from the fleet.
+
+Read them carefully, because a `GO` verdict is a narrower claim than it looks:
+
+- **`GO`** means the loop reached `submit_result`, produced a diff, and the
+  model believed the work was done. It does **not** mean the change was
+  correct. A change can pass the coder, the deterministic gate, and a reviewer
+  and still be wrong; we have shipped one that was unreachable at runtime.
+- **`INCOMPLETE`** means the loop ran out of turns or gave up. This is the
+  number to watch when judging a model: it is the honest measure of whether a
+  model can hold an agentic task together.
+- **`NO-GO`** means the model declined the issue. Often correct behaviour.
+- **`Failed`** is an infrastructure or harness error, not a model judgement.
+
+Small sample sizes are marked. Treat single-digit counts as "it works" rather
+than as a quality ranking.
+
+## Hardware classes
+
+Foreman is not Apple-only, and has not been for some time. All three of these
+run coders and reviewers today:
+
+| Class | Reference host | Runtime | Notes |
+|---|---|---|---|
+| **Apple Silicon (Metal)** | M5 Max 128GB, Mac Studio 36GB | `llama-server`, `mlx-server` | Agent runs as a native binary via launchd, registers a FleetNode |
+| **AMD (Vulkan)** | Ryzen AI MAX+ 395 / Radeon 8060S (gfx1151), 128GB unified | `llamacpp` (Vulkan/RADV) | Needs `amdgpu.lockup_timeout=20000` for stability under long agentic runs |
+| **NVIDIA (CUDA)** | DGX Spark (GB10 Grace Blackwell), 128GB unified, **aarch64** | `llamacpp` | aarch64 host; any sidecar or third-party image must be multi-arch |
+
+The practical floor is a **27B-class model at Q4_K_M with a working tool-call
+implementation**, which is roughly 17GB of weights. That fits comfortably on a
+single 128GB unified-memory box of any of the three vendors, and on a 24GB
+discrete GPU with a shorter context.
+
+## Coders
+
+| Model | Quant | Host / class | Tool protocol | Observed | Notes |
+|---|---|---|---|---|---|
+| **Qwopus3.6-27B-Fusion** | Q4_K_M | DGX Spark, CUDA aarch64 | ✓ | 13 GO, 1 INCOMPLETE (n=14, two nodes) | Cleanest coder results on the fleet. 27.8B dense, ~17GB on disk |
+| **Qwopus3.6-27B-Fusion** | Q4_K_M | Strix Halo, Vulkan | ✓ | 9 GO, 3 INCOMPLETE, 3 NO-GO (n=15) | Same weights, same behaviour, different vendor |
+| **Laguna-S-2.1** | Q4_K_M | Strix Halo, Vulkan | ✓ | production coder for several weeks | 118B total / 8B active MoE, ~65GB. Needs `ctx-size 131072`; agents declare 90k-120k windows |
+| **Carnice Qwen3.6-35B-A3B (MoE, MTP)** | Q8_0 | Apple Silicon Metal | ✓ | 13 GO, **37 INCOMPLETE**, 4 NO-GO (n=60) | Works, but the INCOMPLETE rate is the highest measured. Not recommended as a primary coder |
+
+### Measured throughput, AMD Strix Halo, 2026-08-01
+
+Both models on the same GPU, one at a time (they do not fit simultaneously):
+
+| | Qwopus Fusion + MTP | Fusion, no spec | Laguna |
+|---|---|---|---|
+| Decode, short ctx | **30.1 tok/s** | 12.7 tok/s | 24.7 tok/s |
+| Decode, warm ~48k ctx | **24.3 tok/s** | | 20.0 tok/s |
+| Prefill | 294 tok/s | 294 tok/s | **307 tok/s** |
+| Weights on disk | **~17 GB** | | ~65 GB |
+
+The gap comes almost entirely from speculative decoding: Fusion's GGUF carries a
+working MTP head and Laguna's does not. Without MTP a dense 27B loses badly to an
+8B-active MoE, as the middle column shows. If you are choosing between them,
+Fusion wins on throughput and memory; check whether your GGUF actually has a
+usable MTP head before assuming the numbers transfer.
+
+## Reviewers
+
+Reviewers are judged differently from coders. A reviewer that returns `GO` on
+everything is worthless, so a healthy reviewer shows a mix.
+
+| Model | Quant | Host / class | Tool protocol | Observed | Notes |
+|---|---|---|---|---|---|
+| **Nemotron-49B** | Q4_K_M | Strix Halo, Vulkan | ✓ | 9 GO, 4 NO-GO (n=22) | Currently the default reviewer. Discriminates rather than rubber-stamps |
+| **Devstral-Small-2 24B-Instruct-2512** | Q6_K | Mac Studio 36GB | ✓ | 9 GO, 12 NO-GO (n=36) | Dispatches tools correctly; confabulates `submit_result.extra.issueAsk` and `filesTouched` on multi-file diffs. The harness reconciles both server-side |
+| **Gemma 4** | not recorded | Metal | ✓ | 1 GO, 2 NO-GO (n=4, small) | Reaches `submit_result`. Note this is Gemma **4**; Gemma 3 does not work, see below |
+| **Mellum2-12B** | not recorded | Metal | ✓ | 2 GO, 1 NO-GO, 2 INCOMPLETE (n=5, small) | Works at a small size |
+| **North Mini Code** | UD-Q4_K_M | Metal | ✓ | **6 NO-GO**, 2 INCOMPLETE, 0 GO (n=9) | Tool protocol fine, but rejected everything it saw. Thinking model; see hybrid-thinking below |
+| **Qwen3.6-35B-A3B** | Q8_0 | Metal | ✓ | 5 GO, 3 NO-GO, **10 INCOMPLETE** (n=27) | High INCOMPLETE rate as a reviewer |
+
+## Known not to work
+
+| Model | Symptom |
+|---|---|
+| **Gemma 3 27B-it** | Emits tool invocations as Google's markdown ` ```tool_code ` blocks rather than OAI `tool_calls`. The loop sees zero tool calls on turn 1. Observed: 3 tasks, all INCOMPLETE. Tracked as [#589](https://github.com/defilantech/LLMKube/issues/589) |
+| **Mistral-Small-3.2 24B-Instruct-2506** | First chat-completions request hangs indefinitely; health endpoint stays OK, CPU drops to idle, no client timeout fires. Tracked as [#590](https://github.com/defilantech/LLMKube/issues/590) |
 
 ## How the harness handles confabulation
 
@@ -114,30 +188,17 @@ reasoning disabled via
 `InferenceService.spec.extraArgs: ["--reasoning-budget", "0"]`,
 which degrades models trained to reason before acting.
 
-## What v0.5 changes
+## Tool protocol is not yet declarable
 
-The current `Agent` CRD shape doesn't carry an explicit tool
-protocol field. That makes the Gemma 3 finding above a footgun: a
-user can apply an Agent CR pointing at a Gemma 3 InferenceService
-and watch every AgenticTask fail as `ModelMisunderstood` without
-the operator catching the misconfiguration ahead of time.
+The `Agent` CRD still has no tool-protocol field. The adapter work proposed in
+[#589](https://github.com/defilantech/LLMKube/issues/589) has not landed, so the
+Gemma 3 case above remains a footgun: you can apply an Agent pointing at a
+Gemma 3 InferenceService and watch every task fail without the operator warning
+you first.
 
-The v0.5 plan ([#589](https://github.com/defilantech/LLMKube/issues/589))
-adds:
-
-- `Agent.spec.toolProtocol`: an enum (`oai-function-calling`,
-  `google-tool-code-blocks`, `anthropic-xml`, `text-marker`) that
-  declares which protocol shape the executor should expect.
-- Adapters in `pkg/foreman/agent/oai/` that translate non-OAI
-  protocols into the loop's internal `tool_calls` shape.
-- A pre-flight validation on `Agent` reconcile that probes the
-  referenced InferenceService and flags a misconfigured
-  `toolProtocol` before any AgenticTask binds to it.
-
-Until that lands, the practical advice is: stick to models in the
-"tested ✓" rows above for v0.4. The Qwen and Mistral families
-broadly work in llama.cpp's OAI tool-calls implementation; the
-Gemma and (currently) Mistral-Small-3.2 paths don't.
+Until it does, the practical advice is to pick from the verified rows above. The
+Qwen, Nemotron, Devstral and Gemma-4 families work with llama.cpp's OAI
+tool-calls implementation. Gemma 3 and Mistral-Small-3.2 do not.
 
 ## Contributing entries
 
