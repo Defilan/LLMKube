@@ -132,7 +132,7 @@ func main() {
 	var metricsSrv *http.Server
 	if *metricsListen != "" {
 		metricsMux := http.NewServeMux()
-		metricsMux.Handle("GET /metrics", promhttp.HandlerFor(ctrlmetrics.Registry, promhttp.HandlerOpts{}))
+		metricsMux.Handle("GET /metrics", newMetricsHandler())
 		metricsSrv = &http.Server{
 			Addr:              *metricsListen,
 			Handler:           metricsMux,
@@ -216,4 +216,21 @@ func newActivator(baseCtx context.Context, logger *slog.Logger) (*router.Activat
 // Activator falls back to "default".
 func routerNameFromEnv() string {
 	return os.Getenv("ROUTER_NAME")
+}
+
+// newMetricsHandler serves controller-runtime's registry, NOT the Prometheus
+// default one.
+//
+// Every llmkube collector, llmkube_router_* and llmkube_modelpool_* alike, is
+// registered into ctrlmetrics.Registry by internal/metrics' init().
+// promhttp.Handler() serves prometheus.DefaultGatherer, a different registry,
+// so using it here returns HTTP 200 carrying Go runtime and process metrics and
+// none of the series this endpoint exists for. That failure is silent: the
+// scrape succeeds, the PodMonitor reports a healthy target, and the dashboards
+// are simply empty.
+//
+// Extracted from main() purely so it can be asserted on; see the regression
+// test alongside this file.
+func newMetricsHandler() http.Handler {
+	return promhttp.HandlerFor(ctrlmetrics.Registry, promhttp.HandlerOpts{})
 }
