@@ -363,7 +363,23 @@ func (r *ModelPoolReconciler) memberIdle(ctx context.Context, isvc *inferencev1a
 		}
 		baseURL = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", sanitizeDNSName(isvc.Name), isvc.Namespace, port)
 	}
-	return detector.IdleProbe(isvc, r.HTTPClient)(ctx, baseURL)
+	// HTTPClient is optional on the struct and is not wired at any construction
+	// site, so it is nil in the running operator. Passing nil straight through
+	// panics inside net/http.(*Client).do the first time a swap needs an idle
+	// check, which takes the whole reconcile down and wedges the pool in
+	// Swapping: every request against it then burns the full swapBudget and
+	// returns 503.
+	//
+	// It also defeats the fail-closed contract this function documents. The
+	// probe cannot defer a swap if it panics before it can return an error.
+	//
+	// Same guard the rollout drain already uses (drain_before_rollout.go), and
+	// the same default timeout, so both users of this probe behave alike.
+	httpClient := r.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 5 * time.Second}
+	}
+	return detector.IdleProbe(isvc, httpClient)(ctx, baseURL)
 }
 
 // metalMembers returns the names of members whose referenced Model targets a
