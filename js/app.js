@@ -244,8 +244,8 @@
     // Project mouse into world space at a reasonable depth
     this._mouseVec2.set(this.mouse.x, this.mouse.y);
     this.raycaster.setFromCamera(this._mouseVec2, this.camera);
-    this.raycaster.ray.intersectPlane(this._rayPlane, this._rayTarget);
-    if (this._rayTarget) {
+    var hit = this.raycaster.ray.intersectPlane(this._rayPlane, this._rayTarget);
+    if (hit) {
       this.cursorWorld.copy(this._rayTarget);
     }
   };
