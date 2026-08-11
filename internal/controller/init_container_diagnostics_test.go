@@ -108,6 +108,42 @@ func TestNormalizeContainersKeepsTerminationMessagePolicy(t *testing.T) {
 // desired template compared against itself must report no drift. If the
 // operator ever leaves the policy unset on a container it generates, the live
 // object gets the API-server default and every reconcile sees a difference.
+// normalizeContainers must not strip SecurityContext fields the operator owns.
+// Two containers differing only in an operator-owned SecurityContext field must
+// still compare as different after normalization. Under the old code they
+// normalised to equal (the bug); this test fails if the stripping block is
+// restored. See #1462.
+func TestNormalizeContainersKeepsSecurityContextDifferences(t *testing.T) {
+	// inferContainerSecurityContext sets AllowPrivilegeEscalation and Capabilities;
+	// initContainerSecurityContext also sets ReadOnlyRootFilesystem and
+	// RunAsUser/RunAsGroup. Use those fields in the test.
+	containers := []corev1.Container{
+		{
+			Name: "c1",
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: boolPtr(false),
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		},
+		{
+			Name: "c2",
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: boolPtr(true), // differs from c1
+				Capabilities: &corev1.Capabilities{
+					Drop: []corev1.Capability{"ALL"},
+				},
+			},
+		},
+	}
+	normalizeContainers(containers)
+
+	if containers[0].SecurityContext.AllowPrivilegeEscalation == containers[1].SecurityContext.AllowPrivilegeEscalation {
+		t.Error("AllowPrivilegeEscalation difference was normalised away: the operator-owned field was stripped")
+	}
+}
+
 func TestPodTemplatesDoNotDifferFromThemselves(t *testing.T) {
 	cfg := buildModelStorageConfig(
 		storageConfigModel("https://example.com/model.gguf"), nil, "default", true,

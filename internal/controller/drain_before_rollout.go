@@ -493,17 +493,12 @@ func normalizeContainers(containers []corev1.Container) {
 		// API-server defaulting, and drift in it should be comparable.
 		c.ImagePullPolicy = ""
 		c.WorkingDir = ""
-		if c.SecurityContext != nil {
-			c.SecurityContext.Privileged = nil
-			c.SecurityContext.RunAsUser = nil
-			c.SecurityContext.RunAsGroup = nil
-			c.SecurityContext.RunAsNonRoot = nil
-			c.SecurityContext.ReadOnlyRootFilesystem = nil
-			c.SecurityContext.AllowPrivilegeEscalation = nil
-			c.SecurityContext.SeccompProfile = nil
-			c.SecurityContext.Capabilities = nil
-			c.SecurityContext.ProcMount = nil
-		}
+		// SecurityContext is NOT stripped: the operator sets AllowPrivilegeEscalation,
+		// Capabilities, and (for init containers) ReadOnlyRootFilesystem and
+		// RunAsUser/RunAsGroup. An empty SecurityContext submitted to the API server
+		// comes back unchanged, so removing this stripping does not introduce phantom
+		// drift. Keeping it comparable means real drift in operator-owned fields is
+		// detected rather than normalised away. See #1462.
 		for j := range c.Ports {
 			if c.Ports[j].Protocol == "" {
 				c.Ports[j].Protocol = corev1.ProtocolTCP
