@@ -44,6 +44,13 @@ type Result struct {
 	Created bool
 }
 
+// prInfo carries the data returned by findByHead.
+type prInfo struct {
+	Number  int
+	HTMLURL string
+	State   string // "open" or "closed"
+}
+
 // Ensurer is the interface the executor consumes; tests substitute it.
 type Ensurer interface {
 	// EnsurePR's head is a bare branch name for a same-repo PR, or a
@@ -69,9 +76,10 @@ func NewClient() *Client {
 }
 
 // EnsurePR makes sure a pull request exists for head → base, creating
-// it if absent. Idempotent: an existing PR (any state) for the head
-// branch is returned rather than duplicated, and losing a create race
-// (GitHub 422 "already exists") resolves to the winner's PR.
+// it if absent. Idempotent: an existing open PR for the head branch is
+// returned rather than duplicated, and losing a create race (GitHub 422
+// "already exists") resolves to the winner's PR. A closed unmerged PR
+// is reopened; if reopen fails, a new PR is created.
 func (c *Client) EnsurePR(
 	ctx context.Context, owner, repo, head, base, title, body, token string,
 ) (*Result, error) {
@@ -84,8 +92,16 @@ func (c *Client) EnsurePR(
 
 	if existing, err := c.findByHead(ctx, owner, repo, head, token); err != nil {
 		return nil, err
-	} else if existing != "" {
-		return &Result{URL: existing, Created: false}, nil
+	} else if existing != nil {
+		if existing.State == "open" {
+			return &Result{URL: existing.HTMLURL, Created: false}, nil
+		}
+		// Closed unmerged PR: try to reopen it.
+		reopened, reopenErr := c.reopen(ctx, owner, repo, existing.Number, token)
+		if reopenErr == nil {
+			return &Result{URL: reopened, Created: false}, nil
+		}
+		// Reopen failed (e.g. branch deleted); fall through to create.
 	}
 
 	created, err := c.create(ctx, owner, repo, head, base, title, body, token)
@@ -97,8 +113,8 @@ func (c *Client) EnsurePR(
 	// GitHub answers 422; resolve to the winner's PR.
 	var httpErr *HTTPError
 	if isAlreadyExists(err, &httpErr) {
-		if existing, findErr := c.findByHead(ctx, owner, repo, head, token); findErr == nil && existing != "" {
-			return &Result{URL: existing, Created: false}, nil
+		if existing, findErr := c.findByHead(ctx, owner, repo, head, token); findErr == nil && existing != nil {
+			return &Result{URL: existing.HTMLURL, Created: false}, nil
 		}
 	}
 	return nil, err
@@ -128,7 +144,7 @@ func (c *Client) base() string {
 	return "https://api.github.com"
 }
 
-func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string) (string, error) {
+func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string) (*prInfo, error) {
 	// A cross-fork head arrives pre-qualified ("forkOwner:branch") and is
 	// used verbatim; a same-repo head is qualified with the base owner so
 	// the filter cannot match another fork's identically-named branch.
@@ -139,23 +155,26 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 	target := fmt.Sprintf("%s/repos/%s/%s/pulls?state=all&head=%s",
 		c.base(), owner, repo, url.QueryEscape(filter))
 	var prs []struct {
+		Number  int    `json:"number"`
 		HTMLURL string `json:"html_url"`
 		State   string `json:"state"`
 	}
 	if err := c.getJSON(ctx, target, token, &prs); err != nil {
-		return "", fmt.Errorf("githubpr: list by head: %w", err)
+		return nil, fmt.Errorf("githubpr: list by head: %w", err)
 	}
 	// state=all carries no open-first ordering guarantee; when a closed
 	// PR and an open one share the head, the open one is the artifact.
 	for _, pr := range prs {
 		if pr.State == "open" {
-			return pr.HTMLURL, nil
+			return &prInfo{Number: pr.Number, HTMLURL: pr.HTMLURL, State: "open"}, nil
 		}
 	}
 	if len(prs) == 0 {
-		return "", nil
+		return nil, nil
 	}
-	return prs[0].HTMLURL, nil
+	// Only closed PRs exist for this head; return the first one so
+	// EnsurePR can attempt to reopen it.
+	return &prInfo{Number: prs[0].Number, HTMLURL: prs[0].HTMLURL, State: "closed"}, nil
 }
 
 func (c *Client) create(ctx context.Context, owner, repo, head, base, title, body, token string) (string, error) {
@@ -188,6 +207,41 @@ func (c *Client) create(ctx context.Context, owner, repo, head, base, title, bod
 	}
 	if err := json.Unmarshal(raw, &pr); err != nil {
 		return "", fmt.Errorf("githubpr: decode created PR: %w", err)
+	}
+	return pr.HTMLURL, nil
+}
+
+// reopen sends a PATCH to GitHub to reopen a closed PR and returns its
+// html_url. On any failure it returns an error so the caller can fall
+// through to create a new PR.
+func (c *Client) reopen(ctx context.Context, owner, repo string, number int, token string) (string, error) {
+	target := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", c.base(), owner, repo, number)
+	payload, err := json.Marshal(map[string]string{"state": "open"})
+	if err != nil {
+		return "", fmt.Errorf("githubpr: marshal reopen: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, target, bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("githubpr: build reopen request: %w", err)
+	}
+	c.headers(req, token)
+	resp, err := c.client().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("githubpr: http: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return "", fmt.Errorf("githubpr: read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", &HTTPError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	var pr struct {
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return "", fmt.Errorf("githubpr: decode reopened PR: %w", err)
 	}
 	return pr.HTMLURL, nil
 }

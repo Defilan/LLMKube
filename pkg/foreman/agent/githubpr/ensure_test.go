@@ -37,7 +37,7 @@ func prServer(t *testing.T, existing []string, createStatus int, createBody stri
 		}
 		items := make([]map[string]string, 0, len(existing))
 		for _, u := range existing {
-			items = append(items, map[string]string{"html_url": u})
+			items = append(items, map[string]string{"html_url": u, "state": "open"})
 		}
 		_ = json.NewEncoder(w).Encode(items)
 	})
@@ -262,5 +262,72 @@ func TestHeadCommitSubject_EmptyOnFailure(t *testing.T) {
 	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 	if got := c.HeadCommitSubject(context.Background(), "o", "r", "b", "t"); got != "" {
 		t.Fatalf("want empty on 404, got %q", got)
+	}
+}
+
+// TestEnsurePR_ReopensClosedPR verifies that a closed unmerged PR is
+// reopened rather than silently treated as "ensured" (#1476).
+func TestEnsurePR_ReopensClosedPR(t *testing.T) {
+	var reopened bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"number":444,"html_url":"https://github.com/o/r/pull/444","state":"closed"}]`))
+	})
+	mux.HandleFunc("PATCH /repos/o/r/pulls/444", func(w http.ResponseWriter, r *http.Request) {
+		reopened = true
+		_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/pull/444","state":"open"}`))
+	})
+	mux.HandleFunc("POST /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("must not POST when reopen succeeds")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+
+	res, err := c.EnsurePR(context.Background(), "o", "r",
+		"foreman/wl-x/issue-7", "main", "t", "b", "tok")
+	if err != nil {
+		t.Fatalf("EnsurePR: %v", err)
+	}
+	if res.Created {
+		t.Fatal("want Created=false (reopened, not created)")
+	}
+	if res.URL != "https://github.com/o/r/pull/444" {
+		t.Fatalf("want reopened PR 444, got %q", res.URL)
+	}
+	if !reopened {
+		t.Fatal("PATCH reopen was not called")
+	}
+}
+
+// TestEnsurePR_CreatesNewWhenReopenFails verifies that when a closed PR
+// cannot be reopened (e.g. branch was deleted), a new PR is created.
+func TestEnsurePR_CreatesNewWhenReopenFails(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`[{"number":444,"html_url":"https://github.com/o/r/pull/444","state":"closed"}]`))
+	})
+	mux.HandleFunc("PATCH /repos/o/r/pulls/444", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+	})
+	mux.HandleFunc("POST /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/pull/500"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+
+	res, err := c.EnsurePR(context.Background(), "o", "r",
+		"foreman/wl-x/issue-7", "main", "t", "b", "tok")
+	if err != nil {
+		t.Fatalf("EnsurePR: %v", err)
+	}
+	if !res.Created {
+		t.Fatal("want Created=true (new PR after reopen failure)")
+	}
+	if res.URL != "https://github.com/o/r/pull/500" {
+		t.Fatalf("want new PR 500, got %q", res.URL)
 	}
 }
