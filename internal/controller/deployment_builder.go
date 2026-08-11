@@ -468,6 +468,11 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	}
 	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, isvc.Spec.ExtraVolumes...)
 
+	// GPU-only scheduling: the device taint toleration and the shared-pool
+	// selector. Both are meaningless without a GPU request, so they stay gated.
+	var gpuTolerations []corev1.Toleration
+	gpuNodeSelector := map[string]string{}
+
 	if gpuCount > 0 {
 		// Use Recreate strategy for GPU workloads to prevent deadlock:
 		// RollingUpdate requires the new pod to be Ready before terminating the old,
@@ -476,7 +481,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 			Type: appsv1.RecreateDeploymentStrategyType,
 		}
 
-		tolerations := []corev1.Toleration{
+		gpuTolerations = []corev1.Toleration{
 			{
 				// Keyed off the sharing-resolved name so a partitioned pod
 				// tolerates the MIG resource's taint, not the whole-GPU one.
@@ -487,25 +492,40 @@ func (r *InferenceServiceReconciler) constructDeployment(
 			},
 		}
 
-		if len(isvc.Spec.Tolerations) > 0 {
-			tolerations = append(tolerations, isvc.Spec.Tolerations...)
+		// The pool label steers shared pods away from exclusive nodes that
+		// advertise the same extended resource.
+		for k, v := range sharing.nodeSelector {
+			gpuNodeSelector[k] = v
 		}
+	}
 
+	// The user's own nodeSelector and tolerations are general pod-scheduling
+	// passthrough with no GPU semantics, so they apply to EVERY service.
+	//
+	// They used to live inside the gpuCount > 0 branch above, which meant a CPU
+	// or Vulkan-served model silently got neither: the field was accepted,
+	// stored, visible in `kubectl get isvc -o yaml`, and dropped (#1503). The
+	// pod then scheduled anywhere, and the scheduler's failure message named
+	// nodes the user had never asked for. TopologySpreadConstraints and Affinity
+	// just below were already unconditional for exactly this reason.
+	//
+	// GPU-specific entries go first so the user's win on key conflict, matching
+	// the previous behaviour for GPU workloads.
+	tolerations := append([]corev1.Toleration{}, gpuTolerations...)
+	tolerations = append(tolerations, isvc.Spec.Tolerations...)
+	if len(tolerations) > 0 {
 		deployment.Spec.Template.Spec.Tolerations = tolerations
+	}
 
-		// Shared-pool selector first, then the user's own nodeSelector so the
-		// user wins on key conflict; the pool label steers shared pods away
-		// from exclusive nodes that advertise the same extended resource.
-		if len(sharing.nodeSelector) > 0 || len(isvc.Spec.NodeSelector) > 0 {
-			nodeSelector := make(map[string]string, len(sharing.nodeSelector)+len(isvc.Spec.NodeSelector))
-			for k, v := range sharing.nodeSelector {
-				nodeSelector[k] = v
-			}
-			for k, v := range isvc.Spec.NodeSelector {
-				nodeSelector[k] = v
-			}
-			deployment.Spec.Template.Spec.NodeSelector = nodeSelector
+	if len(gpuNodeSelector) > 0 || len(isvc.Spec.NodeSelector) > 0 {
+		nodeSelector := make(map[string]string, len(gpuNodeSelector)+len(isvc.Spec.NodeSelector))
+		for k, v := range gpuNodeSelector {
+			nodeSelector[k] = v
 		}
+		for k, v := range isvc.Spec.NodeSelector {
+			nodeSelector[k] = v
+		}
+		deployment.Spec.Template.Spec.NodeSelector = nodeSelector
 	}
 
 	// DRA: apply nodeSelector and tolerations (no auto GPU taint for DRA)
