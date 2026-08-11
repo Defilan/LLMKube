@@ -104,10 +104,6 @@ func TestNormalizeContainersKeepsTerminationMessagePolicy(t *testing.T) {
 	}
 }
 
-// The property that keeping the field comparable could plausibly break: a
-// desired template compared against itself must report no drift. If the
-// operator ever leaves the policy unset on a container it generates, the live
-// object gets the API-server default and every reconcile sees a difference.
 // normalizeContainers must not strip SecurityContext fields the operator owns.
 // Two containers differing only in an operator-owned SecurityContext field must
 // still compare as different after normalization. Under the old code they
@@ -144,6 +140,10 @@ func TestNormalizeContainersKeepsSecurityContextDifferences(t *testing.T) {
 	}
 }
 
+// The property that keeping the field comparable could plausibly break: a
+// desired template compared against itself must report no drift. If the
+// operator ever leaves the policy unset on a container it generates, the live
+// object gets the API-server default and every reconcile sees a difference.
 func TestPodTemplatesDoNotDifferFromThemselves(t *testing.T) {
 	cfg := buildModelStorageConfig(
 		storageConfigModel("https://example.com/model.gguf"), nil, "default", true,
