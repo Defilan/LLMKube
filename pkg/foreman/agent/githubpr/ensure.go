@@ -138,9 +138,16 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 	}
 	target := fmt.Sprintf("%s/repos/%s/%s/pulls?state=all&head=%s",
 		c.base(), owner, repo, url.QueryEscape(filter))
+	// merged_at, not merged: the LIST endpoint returns GitHub's
+	// "pull request simple" object, which carries merged_at but has no
+	// merged field at all. Decoding `merged` here always yields false, so
+	// every merged PR would fall through to the closed-unmerged path and
+	// be duplicated. Verified against the live API: /pulls?state=all has
+	// merged_at and no merged key; only /pulls/{number} carries merged.
 	var prs []struct {
-		HTMLURL string `json:"html_url"`
-		State   string `json:"state"`
+		HTMLURL  string  `json:"html_url"`
+		State    string  `json:"state"`
+		MergedAt *string `json:"merged_at"`
 	}
 	if err := c.getJSON(ctx, target, token, &prs); err != nil {
 		return "", fmt.Errorf("githubpr: list by head: %w", err)
@@ -152,10 +159,15 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 			return pr.HTMLURL, nil
 		}
 	}
-	if len(prs) == 0 {
-		return "", nil
+	// A merged PR is a terminal artifact — nothing to do.
+	for _, pr := range prs {
+		if pr.MergedAt != nil {
+			return pr.HTMLURL, nil
+		}
 	}
-	return prs[0].HTMLURL, nil
+	// Only closed-unmerged PRs exist; treat as absent so EnsurePR
+	// creates a fresh PR (the branch still exists, so GitHub allows it).
+	return "", nil
 }
 
 func (c *Client) create(ctx context.Context, owner, repo, head, base, title, body, token string) (string, error) {

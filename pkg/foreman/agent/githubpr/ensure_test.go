@@ -37,7 +37,7 @@ func prServer(t *testing.T, existing []string, createStatus int, createBody stri
 		}
 		items := make([]map[string]string, 0, len(existing))
 		for _, u := range existing {
-			items = append(items, map[string]string{"html_url": u})
+			items = append(items, map[string]string{"html_url": u, "state": "open"})
 		}
 		_ = json.NewEncoder(w).Encode(items)
 	})
@@ -136,37 +136,73 @@ func TestEnsurePR_ForkQualifiedHeadUsedVerbatim(t *testing.T) {
 	}
 }
 
-// TestEnsurePR_FindByHeadPrefersOpen: state=all carries no open-first
-// ordering guarantee; when a closed PR and an open one share the head,
-// the open one is the artifact to link.
-func TestEnsurePR_FindByHeadPrefersOpen(t *testing.T) {
-	var posts int
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`[
-			{"html_url":"https://github.com/o/r/pull/3","state":"closed"},
-			{"html_url":"https://github.com/o/r/pull/8","state":"open"}
-		]`))
-	})
-	mux.HandleFunc("POST /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
-		posts++
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+// TestEnsurePR_FindByHeadStateLogic covers the three-way state logic:
+// open PR preferred, merged PR reused, closed-unmerged triggers a new PR.
+func TestEnsurePR_FindByHeadStateLogic(t *testing.T) {
+	tests := []struct {
+		name        string
+		listBody    string
+		wantURL     string
+		wantCreated bool
+		wantPosts   int
+	}{
+		{
+			name: "open preferred over closed",
+			listBody: `[
+				{"html_url":"https://github.com/o/r/pull/3","state":"closed"},
+				{"html_url":"https://github.com/o/r/pull/8","state":"open"}
+			]`,
+			wantURL:     "https://github.com/o/r/pull/8",
+			wantCreated: false,
+			wantPosts:   0,
+		},
+		{
+			name: "merged reused",
+			listBody: `[
+				{"html_url":"https://github.com/o/r/pull/42","state":"closed","merged_at":"2026-07-30T00:00:00Z"}
+			]`,
+			wantURL:     "https://github.com/o/r/pull/42",
+			wantCreated: false,
+			wantPosts:   0,
+		},
+		{
+			name: "closed unmerged creates new",
+			listBody: `[
+				{"html_url":"https://github.com/o/r/pull/444","state":"closed","merged_at":null}
+			]`,
+			wantURL:     "https://github.com/o/r/pull/500",
+			wantCreated: true,
+			wantPosts:   1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var posts int
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tt.listBody))
+			})
+			mux.HandleFunc("POST /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+				posts++
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/pull/500"}`))
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+			c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 
-	res, err := c.EnsurePR(context.Background(), "o", "r",
-		"foreman/wl-x/issue-7", "main", "t", "b", "tok")
-	if err != nil {
-		t.Fatalf("EnsurePR: %v", err)
-	}
-	if res.Created || res.URL != "https://github.com/o/r/pull/8" {
-		t.Fatalf("want open PR 8 preferred over closed PR 3, got %+v", res)
-	}
-	if posts != 0 {
-		t.Fatalf("must not POST when a PR exists; got %d posts", posts)
+			res, err := c.EnsurePR(context.Background(), "o", "r",
+				"foreman/wl-x/issue-7", "main", "t", "b", "tok")
+			if err != nil {
+				t.Fatalf("EnsurePR: %v", err)
+			}
+			if res.Created != tt.wantCreated || res.URL != tt.wantURL {
+				t.Fatalf("got %+v, want Created=%v URL=%s", res, tt.wantCreated, tt.wantURL)
+			}
+			if posts != tt.wantPosts {
+				t.Fatalf("want %d create POSTs, got %d", tt.wantPosts, posts)
+			}
+		})
 	}
 }
 
@@ -181,7 +217,7 @@ func TestEnsurePR_ResolvesCreateRace(t *testing.T) {
 			_, _ = w.Write([]byte("[]"))
 			return
 		}
-		_, _ = w.Write([]byte(`[{"html_url":"https://github.com/o/r/pull/11"}]`))
+		_, _ = w.Write([]byte(`[{"html_url":"https://github.com/o/r/pull/11","state":"open","merged":false}]`))
 	})
 	mux.HandleFunc("POST /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnprocessableEntity)
@@ -262,5 +298,46 @@ func TestHeadCommitSubject_EmptyOnFailure(t *testing.T) {
 	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 	if got := c.HeadCommitSubject(context.Background(), "o", "r", "b", "t"); got != "" {
 		t.Fatalf("want empty on 404, got %q", got)
+	}
+}
+
+// TestEnsurePR_MergedPRUsesMergedAtNotMerged pins the field the LIST endpoint
+// actually returns. GitHub's "pull request simple" object (what
+// GET /repos/{o}/{r}/pulls returns) carries merged_at and has NO merged key;
+// only GET /repos/{o}/{r}/pulls/{number} carries merged. Decoding `merged`
+// from the list response silently yields false for every merged PR, which
+// sends it down the closed-unmerged path and duplicates finished work.
+//
+// The fixture below deliberately omits `merged` exactly as the real API does.
+func TestEnsurePR_MergedPRUsesMergedAtNotMerged(t *testing.T) {
+	created := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"html_url":"https://github.com/o/r/pull/444",` +
+				`"state":"closed","merged_at":"2026-07-30T00:00:00Z"}]`))
+		case http.MethodPost:
+			created = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/pull/999"}`))
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL}
+	res, err := c.EnsurePR(context.Background(), "o", "r", "branch", "main", "t", "b", "tok")
+	if err != nil {
+		t.Fatalf("EnsurePR: %v", err)
+	}
+	if created {
+		t.Error("a merged PR was duplicated into a new PR; merged_at was not honoured")
+	}
+	if res.URL != "https://github.com/o/r/pull/444" {
+		t.Errorf("want the merged PR URL, got %s", res.URL)
+	}
+	if res.Created {
+		t.Error("Created should be false for an existing merged PR")
 	}
 }
