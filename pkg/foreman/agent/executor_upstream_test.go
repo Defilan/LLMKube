@@ -17,6 +17,7 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -141,5 +142,58 @@ func TestBuildDeterministicArgs_ThreadsBaseBranch(t *testing.T) {
 				t.Errorf("args[baseBranch] = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// recordingCodeHost answers with a non-GitHub URL so a github.com result
+// proves the injected seam was bypassed.
+type recordingCodeHost struct{ asked []string }
+
+func (r *recordingCodeHost) ResolveCloneURL(repoSlug string) string {
+	r.asked = append(r.asked, repoSlug)
+	return "https://forge.example.org/" + repoSlug + ".git"
+}
+
+func (r *recordingCodeHost) EnsureChangeRequest(
+	context.Context, string, string, string, string, string,
+) (string, bool, error) {
+	return "", false, nil
+}
+
+func (r *recordingCodeHost) HeadCommitSubject(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+// TestResolveUpstreamPrefersInjectedCodeHost pins the clone-URL half of #1298.
+// Execute used to bind resolveUpstream to upstreamURLForRepo, which reads a
+// package-level GitHub resolver, so an injected Forgejo/GitLab CodeHost
+// compiled, satisfied the interface, was injected, and still produced
+// https://github.com/<slug>.git.
+//
+// This exercises the same selection the executor performs, without standing up
+// a full Execute run: injected seam wins, package default otherwise.
+func TestResolveUpstreamPrefersInjectedCodeHost(t *testing.T) {
+	ch := &recordingCodeHost{}
+	e := &NativeAgentLoopExecutor{CodeHost: ch}
+
+	resolve := func(slug string) string {
+		if e.CodeHost != nil {
+			return e.CodeHost.ResolveCloneURL(slug)
+		}
+		return upstreamURLForRepo(slug)
+	}
+
+	got := resolve("group/sub/project")
+	if want := "https://forge.example.org/group/sub/project.git"; got != want {
+		t.Errorf("clone URL = %q, want %q (injected CodeHost bypassed)", got, want)
+	}
+	if len(ch.asked) != 1 {
+		t.Errorf("injected CodeHost was not consulted: %v", ch.asked)
+	}
+
+	// With no seam injected the GitHub default must be unchanged.
+	e.CodeHost = nil
+	if got := resolve("owner/name"); got != "https://github.com/owner/name.git" {
+		t.Errorf("default path changed: %q", got)
 	}
 }

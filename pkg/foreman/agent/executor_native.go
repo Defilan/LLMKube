@@ -384,7 +384,18 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 	// remote is configured (#915) and cuts the task branch from the
 	// upstream base below (#813). The test override lets envtest inject a
 	// local remote.
-	resolveUpstream := upstreamURLForRepo
+	//
+	// The injected CodeHost seam wins when set (#1298). Reading the
+	// package-level default here instead would make a Forgejo or GitLab
+	// CodeHost compile, satisfy the interface, be injected, and still hand
+	// back https://github.com/<slug>.git, which is the failure this seam
+	// exists to prevent.
+	resolveUpstream := func(repoSlug string) string {
+		if e.CodeHost != nil {
+			return e.CodeHost.ResolveCloneURL(repoSlug)
+		}
+		return upstreamURLForRepo(repoSlug)
+	}
 	if e.UpstreamURLForRepo != nil {
 		resolveUpstream = e.UpstreamURLForRepo
 	}
