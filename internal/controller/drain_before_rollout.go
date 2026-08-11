@@ -493,17 +493,10 @@ func normalizeContainers(containers []corev1.Container) {
 		// API-server defaulting, and drift in it should be comparable.
 		c.ImagePullPolicy = ""
 		c.WorkingDir = ""
-		if c.SecurityContext != nil {
-			c.SecurityContext.Privileged = nil
-			c.SecurityContext.RunAsUser = nil
-			c.SecurityContext.RunAsGroup = nil
-			c.SecurityContext.RunAsNonRoot = nil
-			c.SecurityContext.ReadOnlyRootFilesystem = nil
-			c.SecurityContext.AllowPrivilegeEscalation = nil
-			c.SecurityContext.SeccompProfile = nil
-			c.SecurityContext.Capabilities = nil
-			c.SecurityContext.ProcMount = nil
-		}
+		// SecurityContext fields are NOT stripped: the operator sets them on
+		// every container it generates (inferContainerSecurityContext and
+		// initContainerSecurityContext), so they are owned values rather than
+		// API-server defaulting, and drift in them should be comparable.
 		for j := range c.Ports {
 			if c.Ports[j].Protocol == "" {
 				c.Ports[j].Protocol = corev1.ProtocolTCP
