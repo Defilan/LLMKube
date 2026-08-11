@@ -22,8 +22,10 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/defilantech/llmkube/pkg/foreman/agent/codehost"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubprfetch"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/worktracker"
 )
 
 // BuildAll is the single place the agent's native tool set is constructed.
@@ -57,6 +59,7 @@ func BuildAll(deps ToolDeps) []Tool {
 			Cfg: RunGateJobToolConfig{
 				Namespace: deps.ForemanNamespace,
 				LogTailFn: deps.LogTailFn,
+				CodeHost:  deps.CodeHost,
 			},
 		},
 		// fetch_issue: read-only GitHub issue surface for the reviewer. The
@@ -64,8 +67,11 @@ func BuildAll(deps ToolDeps) []Tool {
 		// through one bounded Go-side call instead of being inherited by every
 		// bash subprocess via $GH_TOKEN. Closes #580.
 		&FetchIssueTool{
-			Fetcher: githubissue.NewClient(),
-			Token:   deps.Token,
+			// WorkItems wins when injected; Fetcher/Token remain the
+			// GitHub default so nothing changes for a GitHub fleet.
+			WorkItems: deps.WorkItems,
+			Fetcher:   githubissue.NewClient(),
+			Token:     deps.Token,
 		},
 		// fetch_pull_request: read-only GitHub PR surface for the coder, same
 		// reasoning as fetch_issue. Closes #1434.
@@ -112,4 +118,15 @@ type ToolDeps struct {
 	// Token resolves the GitHub credential at call time rather than at
 	// startup, so a rotated token is picked up without restarting the agent.
 	Token func() (string, error)
+
+	// WorkItems is the provider-neutral work-item seam (#1158). Nil keeps
+	// the GitHub default. Set it and fetch_issue reaches the injected
+	// provider instead of holding its own GitHub client, which is the tool
+	// half of #1298.
+	WorkItems worktracker.WorkItems
+
+	// CodeHost is the provider-neutral code-host seam (#1158). Nil keeps
+	// the GitHub default. run_gate_job derives its clone URL from this
+	// rather than a hardcoded https://github.com.
+	CodeHost codehost.CodeHost
 }

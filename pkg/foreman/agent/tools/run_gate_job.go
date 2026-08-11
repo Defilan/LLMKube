@@ -36,6 +36,8 @@ import (
 
 	"github.com/defilantech/llmkube/pkg/foreman/agent"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
+
+	"github.com/defilantech/llmkube/pkg/foreman/agent/codehost"
 )
 
 // gateJobTemplate is the YAML template the tool renders for each call.
@@ -117,6 +119,14 @@ type RunGateJobToolConfig struct {
 	// Image is the container image the Job runs. Defaults to
 	// "golang:1.26". Override for offline mirrors or pinned shas.
 	Image string
+
+	// CodeHost is the provider-neutral seam (#1158). When set, the gate
+	// Job's clone URL is derived from it rather than from CloneURLBase, so
+	// a Forgejo or GitLab fleet clones from its own host. Nil keeps the
+	// GitHub default below. This is the gate-Job half of #1298: the seam
+	// was injectable everywhere except here, so a third-party CodeHost
+	// still produced a github.com clone inside the Job.
+	CodeHost codehost.CodeHost
 
 	// CloneURLBase is prepended to {repo}.git when the Job clones the
 	// fork. Defaults to "https://github.com". Override for GHE or
@@ -316,7 +326,7 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 		MemRequest:              cfg.MemRequest,
 		MemLimit:                cfg.MemLimit,
 		CloneURLBase:            cfg.CloneURLBase,
-		CloneURL:                a.CloneURL,
+		CloneURL:                resolveGateCloneURL(cfg, a.Repo, a.CloneURL),
 		UpstreamURL:             a.UpstreamURL,
 		TaskNamespace:           a.TaskRef.Namespace,
 		TaskName:                a.TaskRef.Name,
@@ -522,6 +532,27 @@ func renderGateJob(in rendererInput) (*batchv1.Job, error) {
 
 // applyConfigDefaults fills in every empty field with the documented
 // default. Kept separate from the struct definition so the zero-value
+// resolveGateCloneURL picks the URL the gate Job clones from.
+//
+// Precedence: an explicit cloneURL argument wins (it is how a fork-style push
+// target reaches the Job), then the injected CodeHost seam, then the template's
+// CloneURLBase + repo fallback, which is GitHub.
+//
+// The seam returns a whole URL rather than a base because provider URL shapes
+// differ: a nested Forgejo or GitLab path is not "base/owner/name.git", so
+// composing one from a base would be wrong for exactly the providers this seam
+// exists to support. Returning "" leaves the template on its CloneURLBase path
+// so a malformed slug degrades to today's behavior rather than an empty clone.
+func resolveGateCloneURL(cfg RunGateJobToolConfig, repoSlug, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if cfg.CodeHost == nil {
+		return ""
+	}
+	return cfg.CodeHost.ResolveCloneURL(repoSlug)
+}
+
 // RunGateJobToolConfig stays trivially constructable in tests; tests
 // only override the fields they care about.
 func applyConfigDefaults(c RunGateJobToolConfig) RunGateJobToolConfig {

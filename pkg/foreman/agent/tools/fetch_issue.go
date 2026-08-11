@@ -17,6 +17,8 @@ limitations under the License.
 package tools
 
 import (
+	"strconv"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +27,7 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/agent"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/worktracker"
 )
 
 // TokenSource resolves a GitHub PAT at FetchIssueTool.Execute time.
@@ -72,9 +75,16 @@ type TokenSource func() (string, error)
 //     instead of also a per-user `gh` config or per-process env var
 //     inherited by every bash subprocess.
 type FetchIssueTool struct {
-	// Fetcher is the GitHub client. Required. Production wires
-	// githubissue.NewClient(); tests pass a fake or an httptest-backed
-	// Client.
+	// WorkItems is the provider-neutral seam (#1158). When set it is used
+	// verbatim and Fetcher/Token are ignored for the fetch itself: a
+	// Forgejo or GitLab implementation carries its own auth. Injecting it
+	// is the only way a non-GitHub provider reaches this tool, which is
+	// what #1298 fixes.
+	WorkItems worktracker.WorkItems
+
+	// Fetcher is the GitHub client backing the default seam when WorkItems
+	// is not injected. Production wires githubissue.NewClient(); tests pass
+	// a fake or an httptest-backed Client.
 	Fetcher githubissue.Fetcher
 	// Token resolves the GitHub PAT at Execute time. Required.
 	Token TokenSource
@@ -123,11 +133,28 @@ func (t *FetchIssueTool) Schema() oai.ToolSchemaDef {
 //     or out of scope.
 //   - 5xx / network: generic transient failure; the model can retry
 //     once or call submit_result with verdict=ERROR.
-func (t *FetchIssueTool) Execute(ctx context.Context, args json.RawMessage) (*agent.ToolResult, error) {
-	if t.Fetcher == nil {
-		return nil, fmt.Errorf("fetch_issue: tool not configured (Fetcher is nil)")
+//
+// workItems returns the effective WorkItems seam: the injected one when set,
+// else a GitHubWorkItems built from Fetcher and the just-resolved token. The
+// token is resolved per call rather than baked in at construction so a rotated
+// credential is picked up without restarting the agent, which is why this
+// cannot simply be a field set in BuildAll. Mirrors the executor's accessor of
+// the same name.
+func (t *FetchIssueTool) workItems(token string) worktracker.WorkItems {
+	if t.WorkItems != nil {
+		return t.WorkItems
 	}
-	if t.Token == nil {
+	if t.Fetcher != nil {
+		return &worktracker.GitHubWorkItems{Fetcher: t.Fetcher, Token: token}
+	}
+	return nil
+}
+
+func (t *FetchIssueTool) Execute(ctx context.Context, args json.RawMessage) (*agent.ToolResult, error) {
+	if t.WorkItems == nil && t.Fetcher == nil {
+		return nil, fmt.Errorf("fetch_issue: tool not configured (WorkItems and Fetcher are both nil)")
+	}
+	if t.WorkItems == nil && t.Token == nil {
 		return nil, fmt.Errorf("fetch_issue: tool not configured (Token resolver is nil)")
 	}
 	var a fetchIssueArgs
@@ -140,18 +167,24 @@ func (t *FetchIssueTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 	if a.Number <= 0 {
 		return nil, fmt.Errorf("fetch_issue: number must be a positive integer (got %d)", a.Number)
 	}
-	owner, name, err := githubissue.ParseRepo(a.Repo)
-	if err != nil {
+	if _, _, err := githubissue.ParseRepo(a.Repo); err != nil {
 		return nil, fmt.Errorf("fetch_issue: %w", err)
 	}
-	token, err := t.Token()
-	if err != nil {
-		return nil, fmt.Errorf(
-			"fetch_issue: no GitHub token "+
-				"(set GITHUB_TOKEN env or populate "+
-				"~/.config/foreman/github-token on the FleetNode): %w", err)
+	// Only the default GitHub seam needs a token here; an injected
+	// WorkItems carries its own auth, so a non-GitHub provider must not be
+	// blocked by a missing GITHUB_TOKEN.
+	var token string
+	if t.WorkItems == nil {
+		var err error
+		token, err = t.Token()
+		if err != nil {
+			return nil, fmt.Errorf(
+				"fetch_issue: no GitHub token "+
+					"(set GITHUB_TOKEN env or populate "+
+					"~/.config/foreman/github-token on the FleetNode): %w", err)
+		}
 	}
-	issue, err := t.Fetcher.Fetch(ctx, owner, name, a.Number, token)
+	item, err := t.workItems(token).Get(ctx, a.Repo, strconv.Itoa(a.Number))
 	if err != nil {
 		var herr *githubissue.HTTPError
 		if errors.As(err, &herr) {
@@ -171,11 +204,11 @@ func (t *FetchIssueTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 	return &agent.ToolResult{
 		Output: map[string]any{
 			"repo":   a.Repo,
-			"number": issue.Number,
-			"title":  issue.Title,
-			"body":   issue.Body,
-			"state":  issue.State,
-			"labels": issue.Labels,
+			"number": a.Number,
+			"title":  item.Title,
+			"body":   item.Body,
+			"state":  item.State,
+			"labels": item.Labels,
 		},
 	}, nil
 }

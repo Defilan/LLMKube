@@ -201,7 +201,14 @@ func TestFetchIssueTool_NilDepsFailLoud(t *testing.T) {
 		tool *FetchIssueTool
 		want string
 	}{
-		{"nil-fetcher", &FetchIssueTool{Fetcher: nil, Token: staticToken("t")}, "Fetcher is nil"},
+		// The tool now accepts either a provider-neutral WorkItems seam or
+		// the GitHub Fetcher (#1298), so "unconfigured" means neither is
+		// present rather than Fetcher alone.
+		{
+			"no-source",
+			&FetchIssueTool{Fetcher: nil, WorkItems: nil, Token: staticToken("t")},
+			"WorkItems and Fetcher are both nil",
+		},
 		{"nil-token", &FetchIssueTool{Fetcher: &fakeFetcher{}, Token: nil}, "Token resolver is nil"},
 	}
 	for _, tc := range cases {
