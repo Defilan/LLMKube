@@ -121,6 +121,94 @@ co-scheduling for workloads that already trust each other, and reach for
 `partitioned` when you need a boundary that holds between tenants, since a
 MIG partition is enforced by the hardware.
 
+## ModelPool: many models, one slot
+
+`exclusive`, `partitioned` and `shared` all divide a device between workloads
+that run *at the same time*. A ModelPool solves the opposite problem: several
+models that each want the whole slot, but are not needed simultaneously. At most
+one member is resident; the rest are held at `Stopped` with `replicas: 0`, and
+the slot changes hands on demand.
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelPool
+metadata:
+  name: coder-pool
+spec:
+  gpu: 1
+  nodeSelector:
+    kubernetes.io/hostname: gpu-node-1
+  swapPolicy: sticky
+  swapBudget: 300s
+  default: coder-small
+  members:
+    - inferenceServiceRef: {name: coder-small}
+    - inferenceServiceRef: {name: coder-large}
+```
+
+Each member is an ordinary single-model InferenceService with its own image,
+context size and runtime. `spec.gpu` is informational: members declare their own
+resource requests, and this only records the slot size so the pool invariant is
+visible at a glance. `nodeSelector` pins the slot, and every member is expected
+to land on that node so they genuinely contend for the same device memory.
+
+### What it looks like when it is working
+
+```
+$ kubectl get modelpool coder-pool
+NAME          POLICY   RESIDENT      PHASE   AGE
+coder-pool    sticky   coder-small   Ready   4m
+
+$ kubectl get isvc coder-small coder-large
+NAME          PHASE     ...
+coder-small   Ready               # owns the slot, replicas 1
+coder-large   Stopped             # held by the operator, replicas 0
+```
+
+The operator sets `replicas: 0` on the non-resident members itself. Do not
+"fix" a member that shows `Stopped`: in a pool that is the normal held state,
+not a failure.
+
+Four conditions report the pool's health:
+
+| Condition | Meaning |
+| --- | --- |
+| `MembersValid` | every `inferenceServiceRef` resolves. `False` / `MissingMembers` lists the names that do not exist, and the pool sits `Degraded` |
+| `SlotAllocated` | `True` / `Resident` names the owner. `False` / `Swapping` means no member is resident yet |
+| `SwapDeferred` | a swap is being held off rather than performed |
+| `MetalSupported` | whether the members are Kubernetes GPU-gated or Apple-metal backed |
+
+### Sticky is the only policy, and it means what it says
+
+`swapPolicy: sticky` (the default and the only value in v1) keeps the incumbent
+until a *different* member is requested. A priority-based reclaim policy is a
+planned follow-up.
+
+One consequence surprises operators, so it is worth stating plainly: **editing
+`spec.default` on a warm pool does not move the slot.** `default` names the
+member to warm on a *cold* pool, before anything has picked an owner. Once a
+member is resident, sticky keeps it there and the `default` edit is inert until
+the pool next goes cold. Verified on-cluster: after repointing `default` at the
+other member, the incumbent still owned the slot two minutes later.
+
+### swapBudget, and why it is separate from the request timeout
+
+`swapBudget` (default `300s`) bounds how long the router holds a cross-model
+request open while it drains the incumbent and cold-loads the target. It is
+deliberately decoupled from the router's response-header timeout so a large
+model can take minutes to load without loosening the per-request generation cap
+for every request on the fleet. If the budget elapses before the target is
+resident, the held request fails with `503` and a `Retry-After`; the caller can
+retry, and the now-warm member serves the next one.
+
+### A pooled router runs one replica
+
+When any backend resolves to a ModelPool member, the operator pins the router
+to a single replica regardless of what the spec asks for. Pool activation
+serialises swaps through an in-process lock, so a second proxy replica would
+race it and thrash the slot. Cross-replica swap coordination is a follow-up, so
+do not plan a highly-available pooled router yet.
+
 ## Fleet configuration
 
 GPU sharing requires fleet-level configuration so the operator knows where
@@ -331,6 +419,12 @@ mode with separate nodes.
 - **No automatic profile selection**: the operator does not choose a MIG
   profile for you; you must declare it explicitly in the InferenceService
   spec.
-- **No dynamic pool rebalancing**: the shared pool is static. If you need
-  to move workloads between pools, update the node labels and the chart
-  value, then restart affected InferenceServices.
+- **No dynamic pool rebalancing in `shared` mode**: the shared pool is
+  static. If you need to move workloads between pools, update the node
+  labels and the chart value, then restart affected InferenceServices.
+  Note this is a limitation of `shared` mode specifically. If what you
+  want is several models taking turns on one slot rather than co-resident
+  workloads, that is a [ModelPool](#modelpool-many-models-one-slot).
+- **Pooled routers are single-replica**: a router with any ModelPool
+  member as a backend is pinned to one replica, because swap activation
+  serialises through an in-process lock.
