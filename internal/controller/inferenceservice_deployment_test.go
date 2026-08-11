@@ -183,6 +183,69 @@ var _ = Describe("Multi-GPU Deployment Construction", func() {
 			}
 		})
 
+		// #1503: spec.nodeSelector and spec.tolerations lived inside the
+		// gpuCount > 0 branch, so a service that requested no GPU silently got
+		// neither. The field was accepted, stored, and dropped, and the pod then
+		// scheduled anywhere. These pin both halves: the user's constraints
+		// always apply, and the GPU-only pieces stay GPU-only.
+		It("applies nodeSelector and tolerations to a non-GPU service", func() {
+			model = &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "cpu-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf", Format: "gguf", Quantization: "Q4_K_M",
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: "Ready", Path: "/tmp/m.gguf"},
+			}
+			replicas := int32(1)
+			isvc = &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "cpu-service", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:     "cpu-model",
+					Replicas:     &replicas,
+					NodeSelector: map[string]string{"accelerator": "amd"},
+					Tolerations: []corev1.Toleration{{
+						Key: "devic.es/dri-render", Operator: corev1.TolerationOpExists,
+						Effect: corev1.TaintEffectNoSchedule,
+					}},
+				},
+			}
+
+			deployment := reconciler.constructDeployment(isvc, model, 0)
+
+			Expect(deployment.Spec.Template.Spec.NodeSelector).To(
+				HaveKeyWithValue("accelerator", "amd"),
+				"a service with no GPU request must still get its nodeSelector")
+			Expect(deployment.Spec.Template.Spec.Tolerations).To(HaveLen(1),
+				"a service with no GPU request must still get its tolerations")
+			Expect(deployment.Spec.Template.Spec.Tolerations[0].Key).To(Equal("devic.es/dri-render"))
+		})
+
+		It("does not add the GPU taint toleration to a non-GPU service", func() {
+			model = &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "cpu-model-2", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf", Format: "gguf", Quantization: "Q4_K_M",
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: "Ready", Path: "/tmp/m.gguf"},
+			}
+			replicas := int32(1)
+			isvc = &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "cpu-service-2", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "cpu-model-2", Replicas: &replicas,
+				},
+			}
+
+			deployment := reconciler.constructDeployment(isvc, model, 0)
+
+			for _, tol := range deployment.Spec.Template.Spec.Tolerations {
+				Expect(tol.Key).NotTo(ContainSubstring("nvidia.com/gpu"),
+					"the GPU taint toleration is meaningless without a GPU request")
+			}
+			Expect(deployment.Spec.Strategy.Type).NotTo(Equal(appsv1.RecreateDeploymentStrategyType),
+				"Recreate exists to avoid GPU-hold deadlock and should stay GPU-only")
+		})
+
 		It("should include multi-GPU args for 2 GPU model", func() {
 			model = &inferencev1alpha1.Model{
 				ObjectMeta: metav1.ObjectMeta{
