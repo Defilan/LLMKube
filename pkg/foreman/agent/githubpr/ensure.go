@@ -141,6 +141,7 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 	var prs []struct {
 		HTMLURL string `json:"html_url"`
 		State   string `json:"state"`
+		Merged  bool   `json:"merged"`
 	}
 	if err := c.getJSON(ctx, target, token, &prs); err != nil {
 		return "", fmt.Errorf("githubpr: list by head: %w", err)
@@ -152,10 +153,15 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 			return pr.HTMLURL, nil
 		}
 	}
-	if len(prs) == 0 {
-		return "", nil
+	// A merged PR is a terminal artifact — nothing to do.
+	for _, pr := range prs {
+		if pr.Merged {
+			return pr.HTMLURL, nil
+		}
 	}
-	return prs[0].HTMLURL, nil
+	// Only closed-unmerged PRs exist; treat as absent so EnsurePR
+	// creates a fresh PR (the branch still exists, so GitHub allows it).
+	return "", nil
 }
 
 func (c *Client) create(ctx context.Context, owner, repo, head, base, title, body, token string) (string, error) {
