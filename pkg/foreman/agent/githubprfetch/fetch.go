@@ -51,6 +51,12 @@ import (
 // with a marker so the model knows there is more.
 const DefaultBodyCap = 16 * 1024
 
+// DefaultOutputCap bounds each check-run output field (title, summary, text)
+// so a chatty CI runner does not bloat the tool result. 4 KiB per field is
+// enough for the actual error message and annotated lines from common CI
+// setups (Go test annotations, pytest summaries, linters, scanners).
+const DefaultOutputCap = 4 * 1024
+
 // DefaultTimeout caps a single fetch. The GitHub API is fast; if the
 // network is slow we'd rather skip the fetch than hold up the loop.
 const DefaultTimeout = 10 * time.Second
@@ -96,11 +102,15 @@ type ReviewComment struct {
 	Body         string `json:"body"`
 }
 
-// CheckRun is a single check run result.
+// CheckRun is a single check run result. Output fields are populated only
+// for non-success conclusions so a green PR does not bloat the tool result.
 type CheckRun struct {
-	Name       string `json:"name"`
-	Conclusion string `json:"conclusion"`
-	DetailsURL string `json:"details_url"`
+	Name          string `json:"name"`
+	Conclusion    string `json:"conclusion"`
+	DetailsURL    string `json:"details_url"`
+	OutputTitle   string `json:"output_title,omitempty"`
+	OutputSummary string `json:"output_summary,omitempty"`
+	OutputText    string `json:"output_text,omitempty"`
 }
 
 // Fetcher is the seam between the executor and the GitHub API. The
@@ -376,6 +386,11 @@ func (c *Client) fetchCheckRuns(
 			Name       string `json:"name"`
 			Conclusion string `json:"conclusion"`
 			DetailsURL string `json:"details_url"`
+			Output     struct {
+				Title   string `json:"title"`
+				Summary string `json:"summary"`
+				Text    string `json:"text"`
+			} `json:"output"`
 		} `json:"check_runs"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
@@ -384,11 +399,19 @@ func (c *Client) fetchCheckRuns(
 
 	out := make([]CheckRun, 0, len(raw.CheckRuns))
 	for _, r := range raw.CheckRuns {
-		out = append(out, CheckRun{
+		cr := CheckRun{
 			Name:       r.Name,
 			Conclusion: r.Conclusion,
 			DetailsURL: r.DetailsURL,
-		})
+		}
+		// Populate output fields only for non-success conclusions so a green
+		// PR does not bloat the tool result.
+		if !isSuccessConclusion(r.Conclusion) {
+			cr.OutputTitle = truncateOutput(r.Output.Title, DefaultOutputCap)
+			cr.OutputSummary = truncateOutput(r.Output.Summary, DefaultOutputCap)
+			cr.OutputText = truncateOutput(r.Output.Text, DefaultOutputCap)
+		}
+		out = append(out, cr)
 	}
 	return out, nil
 }
@@ -442,6 +465,27 @@ func truncateBody(body string, cap int) string {
 		keep = 0
 	}
 	return body[:keep] + marker
+}
+
+// isSuccessConclusion returns true when the check run conclusion indicates
+// success. Only non-success conclusions carry output fields so a green PR
+// does not bloat the tool result.
+func isSuccessConclusion(conclusion string) bool {
+	return conclusion == "success" || conclusion == "skipped" || conclusion == "neutral"
+}
+
+// truncateOutput bounds a single check-run output field. The marker is
+// parseable by both humans and models: a clear note that more text exists.
+func truncateOutput(s string, cap int) string {
+	if len(s) <= cap {
+		return s
+	}
+	const marker = "\n... [output truncated]"
+	keep := cap - len(marker)
+	if keep < 0 {
+		keep = 0
+	}
+	return s[:keep] + marker
 }
 
 // ParseRepo splits a repo slug into its owner (namespace) and repo
