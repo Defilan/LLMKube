@@ -715,6 +715,24 @@ func TestResolveRuntimeImageNVIDIAAndOverrides(t *testing.T) {
 	})
 }
 
+func TestNonGPUNodeSelector(t *testing.T) {
+	isvc := &inferencev1alpha1.InferenceService{
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			NodeSelector: map[string]string{"kubernetes.io/hostname": "shadowstrix"},
+		},
+	}
+	model := &inferencev1alpha1.Model{}
+	reconciler := &InferenceServiceReconciler{}
+	deployment := reconciler.constructDeployment(isvc, model, 1)
+
+	if deployment.Spec.Template.Spec.NodeSelector == nil {
+		t.Fatal("expected nodeSelector to be set on non-GPU deployment")
+	}
+	if deployment.Spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != "shadowstrix" {
+		t.Fatalf("expected nodeSelector kubernetes.io/hostname=shadowstrix, got %v", deployment.Spec.Template.Spec.NodeSelector)
+	}
+}
+
 func TestParseRuntimeImageOverrides(t *testing.T) {
 	t.Run("empty means none", func(t *testing.T) {
 		got, err := ParseRuntimeImageOverrides("  ")

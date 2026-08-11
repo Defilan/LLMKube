@@ -506,6 +506,14 @@ func (r *InferenceServiceReconciler) constructDeployment(
 			}
 			deployment.Spec.Template.Spec.NodeSelector = nodeSelector
 		}
+	} else {
+		// Non-GPU workloads: apply user nodeSelector and tolerations.
+		if len(isvc.Spec.NodeSelector) > 0 {
+			deployment.Spec.Template.Spec.NodeSelector = isvc.Spec.NodeSelector
+		}
+		if len(isvc.Spec.Tolerations) > 0 {
+			deployment.Spec.Template.Spec.Tolerations = isvc.Spec.Tolerations
+		}
 	}
 
 	// DRA: apply nodeSelector and tolerations (no auto GPU taint for DRA)
