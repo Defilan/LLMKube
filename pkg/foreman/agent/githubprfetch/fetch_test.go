@@ -301,6 +301,119 @@ func TestTruncateBody(t *testing.T) {
 	}
 }
 
+func TestCheckRun_OutputFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case isPRDetailsPath(r.URL.Path):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{
+		  "number": 42,
+		  "title": "fix: something",
+		  "body": "PR body text",
+		  "state": "open",
+		  "merged": false,
+		  "head": {"ref": "fix/something", "sha": "abc123def456"},
+		  "base": {"ref": "main"}
+		}`)
+		case strings.Contains(r.URL.Path, "/reviews"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[]`)
+		case strings.Contains(r.URL.Path, "/comments"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `[]`)
+		case strings.Contains(r.URL.Path, "/check-runs"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{
+		  "check_runs": [
+		    {
+		      "name": "lint",
+		      "conclusion": "success",
+		      "details_url": "https://example.com/lint",
+		      "output": {"title": "Lint passed", "summary": "", "text": ""}
+		    },
+		    {
+		      "name": "test",
+		      "conclusion": "failure",
+		      "details_url": "https://example.com/test",
+		      "output": {
+		        "title": "Test failure",
+		        "summary": "1 test failed",
+		        "text": "--- FAIL: TestFoo (0.01s)\n    foo_test.go:42: expected 1, got 2"
+		      }
+		    },
+		    {
+		      "name": "security",
+		      "conclusion": "timed_out",
+		      "details_url": "https://example.com/security",
+		      "output": {"title": "Timeout", "summary": "", "text": ""}
+		    }
+		  ]
+		}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL}
+	pr, err := c.Fetch(context.Background(), "defilantech", "LLMKube", 42, "t")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	if len(pr.CheckRuns) != 3 {
+		t.Fatalf("CheckRuns: want 3 got %d", len(pr.CheckRuns))
+	}
+
+	// Successful run: output fields must be empty (omitted).
+	lint := pr.CheckRuns[0]
+	if lint.Name != "lint" || lint.Conclusion != "success" {
+		t.Errorf("lint: name=%q conclusion=%q", lint.Name, lint.Conclusion)
+	}
+	if lint.OutputTitle != "" || lint.OutputSummary != "" || lint.OutputText != "" {
+		t.Errorf("lint output should be empty for success: %v", lint)
+	}
+
+	// Failed run: output fields must be populated.
+	test := pr.CheckRuns[1]
+	if test.Name != "test" || test.Conclusion != "failure" {
+		t.Errorf("test: name=%q conclusion=%q", test.Name, test.Conclusion)
+	}
+	if test.OutputTitle != "Test failure" {
+		t.Errorf("test OutputTitle: want 'Test failure' got %q", test.OutputTitle)
+	}
+	if test.OutputSummary != "1 test failed" {
+		t.Errorf("test OutputSummary: want '1 test failed' got %q", test.OutputSummary)
+	}
+	if !strings.Contains(test.OutputText, "TestFoo") {
+		t.Errorf("test OutputText should contain 'TestFoo': %q", test.OutputText)
+	}
+
+	// Timed out run: output fields populated even when summary/text are empty.
+	sec := pr.CheckRuns[2]
+	if sec.Name != "security" || sec.Conclusion != "timed_out" {
+		t.Errorf("security: name=%q conclusion=%q", sec.Name, sec.Conclusion)
+	}
+	if sec.OutputTitle != "Timeout" {
+		t.Errorf("security OutputTitle: want 'Timeout' got %q", sec.OutputTitle)
+	}
+}
+
+func TestTruncateOutput(t *testing.T) {
+	// Short output: no truncation.
+	short := "short output"
+	if got := truncateOutput(short, 1024); got != short {
+		t.Errorf("short output: got %q, want %q", got, short)
+	}
+	// Long output: truncated with marker.
+	long := strings.Repeat("x", 8192)
+	got := truncateOutput(long, 4096)
+	if len(got) > 4096 {
+		t.Errorf("truncated output too long: %d bytes", len(got))
+	}
+	if !strings.Contains(got, "[output truncated]") {
+		t.Errorf("truncated output missing marker: %q", got)
+	}
+}
+
 // The two contract bugs this package shipped with, pinned explicitly rather
 // than left to the happy-path mock: head/base arrive as nested objects, and
 // check runs are addressed per commit ref. Both passed review and a full test
