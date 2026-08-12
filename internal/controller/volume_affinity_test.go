@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -168,5 +169,70 @@ func TestGetPodSchedulingInfoReportsUnbindableModelCache(t *testing.T) {
 	// what the user is left holding.
 	if strings.Contains(info.Message, "no matching NodeSelectorTerms") {
 		t.Fatalf("Message = %q, should not pass through the raw scheduler text", info.Message)
+	}
+}
+
+// Regression for the gap that shipped in #1511: getPodSchedulingInfo classified
+// the failure correctly, but determinePhase forwarded scheduling info only for
+// InsufficientGPU, so the diagnosis was computed and then dropped. Asserting at
+// the determinePhase level is what catches that; the earlier test could not.
+func TestDeterminePhaseSurfacesUnbindableModelCache(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme: %v", err)
+	}
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("appsv1.AddToScheme: %v", err)
+	}
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("inferencev1alpha1.AddToScheme: %v", err)
+	}
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "spark-svc", Namespace: "default"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "spark-svc-abc",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                           "spark-svc",
+				"inference.llmkube.dev/service": "spark-svc",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{{
+				Name: "model-cache",
+				VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+						ClaimName: "spark-svc-model-cache",
+					},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:   corev1.PodScheduled,
+				Status: corev1.ConditionFalse,
+				Reason: "SchedulerError",
+				Message: `running PreBind plugin "VolumeBinding": binding volumes: ` +
+					`pv "pvc-7d8e47dd" node affinity doesn't match node "ahazidgx2": no matching NodeSelectorTerms`,
+			}},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc, pod).Build()
+	r := &InferenceServiceReconciler{Client: c, Scheme: scheme}
+
+	_, info := r.determinePhase(context.Background(), isvc, 0, 1, false, &appsv1.Deployment{}, nil)
+	if info == nil {
+		t.Fatalf("determinePhase() scheduling info = nil; the diagnosis was computed and dropped")
+	}
+	if info.Status != "UnbindableModelCache" {
+		t.Fatalf("Status = %q, want %q", info.Status, "UnbindableModelCache")
+	}
+	if !strings.Contains(info.Message, "spark-svc-model-cache") {
+		t.Fatalf("Message = %q, want it to name the claim", info.Message)
 	}
 }
