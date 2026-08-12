@@ -152,7 +152,7 @@ func (r *InferenceServiceReconciler) getPodSchedulingInfo(ctx context.Context, i
 						gpuCount = isvc.Spec.Resources.GPU
 					}
 					info.WaitingFor = fmt.Sprintf("%s: %d", gpuResourceName, gpuCount)
-				} else if pvName, nodeName, ok := detectUnbindableVolume(condition.Message); ok {
+				} else if pvName, nodeName, ok := r.classifyUnbindableVolume(ctx, &pod, condition.Message); ok {
 					// Checked before the generic "Insufficient" branch: this
 					// message contains neither that word nor anything else that
 					// hints at storage, so it would otherwise reach the user as
