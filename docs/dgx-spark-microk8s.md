@@ -35,6 +35,22 @@ microk8s status --wait-ready
 microk8s enable dns hostpath-storage helm3
 ```
 
+> **If you taint this node for GPU workloads, do not leave `hostpath-storage` as
+> the class backing model caches.** Its provisioner runs a per-node helper pod
+> that carries only the default not-ready/unreachable tolerations, and the
+> helper template is built into the image, so no configuration can add the GPU
+> toleration. On a `NoSchedule`-tainted node the helper never runs, but a
+> PersistentVolume is still published with an affinity matching no node, and
+> every pod that binds it stays `Pending` while the PVC reports `Bound`.
+>
+> Install a provisioner whose helper you can configure (for example
+> `rancher.io/local-path`, whose `helperPod.yaml` ConfigMap key accepts
+> tolerations) and set `modelCache.storageClass` to it. See
+> [Persistent Model Cache](MODEL-CACHE.md#choosing-a-provisioner-that-tolerates-taints).
+>
+> This applies only if you taint the node. An untainted single-node Spark is
+> unaffected.
+
 ## 2b. GPU support: install the NVIDIA GPU Operator via Helm (NOT the addon)
 
 > **Do not use `microk8s enable gpu` on the DGX Spark.** The MicroK8s `gpu` /

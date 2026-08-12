@@ -207,6 +207,102 @@ Strict-taint choices:
 - Use a provisioner whose helper configuration supports the taint.
 - Apply a narrowly scoped cluster-level policy maintained by the cluster administrator.
 
+#### Recognising a volume the provisioner never stamped
+
+The failure above is worth calling out separately because it does not look like a
+storage failure. Some provisioners publish a PersistentVolume even when their
+helper never ran, carrying a node affinity that no node satisfies:
+
+```console
+$ kubectl get pv <pv> -o jsonpath='{.spec.nodeAffinity}'
+{"required":{"nodeSelectorTerms":[{"matchExpressions":[
+  {"key":"kubernetes.io/hostname","operator":"In","values":[""]}]}]}}
+```
+
+An empty value in that `In` term is the fingerprint: node label values are never
+empty, so the volume can never be scheduled anywhere. The PVC still reports
+`Bound`, which is why this reads as success.
+
+The consuming pod then sits `Pending` forever, and the scheduler describes it in
+one of two ways depending on whether the pod had already been assigned a node:
+
+```text
+0/4 nodes are available: 1 node(s) didn't match PersistentVolume's node affinity
+```
+
+```text
+running PreBind plugin "VolumeBinding": binding volumes: pv "pvc-..."
+node affinity doesn't match node "gpu-node-1": no matching NodeSelectorTerms
+```
+
+Both name node affinity, which sends you to the scheduler. The scheduler is not
+at fault: it chose correctly, and the PVC's `volume.kubernetes.io/selected-node`
+annotation agrees with it. Provisioning is what failed.
+
+LLMKube reports this directly rather than passing the scheduler's wording
+through:
+
+```console
+$ kubectl get inferenceservice <name> -o jsonpath='{.status.schedulingStatus}'
+UnbindableModelCache
+
+$ kubectl get inferenceservice <name> -o jsonpath='{.status.schedulingMessage}'
+model cache volume was never provisioned: PersistentVolume "pvc-..." has a node
+affinity that matches no node. Claim: <name>-model-cache. ...
+```
+
+To recover, delete the claim so its volume is released, then provision on a
+storage class whose helper can run on the tainted node. Which objects you have to
+remove depends on the cache mode:
+
+| Cache mode | Deleting the InferenceService clears it |
+| --- | --- |
+| `perService` (default) | Yes, the claim is owner-ref'd and garbage-collected with it |
+| `shared` | No, the shared claim intentionally outlives any one service |
+| `claimName` (bring your own) | No, LLMKube never deletes a user-owned claim |
+
+In the latter two cases the unusable volume survives the InferenceService, so
+delete the claim explicitly before retrying. Recreating the service against a
+claim that is still bound to a broken volume reproduces the same `Pending` state.
+
+#### Choosing a provisioner that tolerates taints
+
+Whether this is fixable by configuration depends on the provisioner:
+
+| Provisioner | Helper tolerations configurable |
+| --- | --- |
+| `rancher.io/local-path` | Yes, via `helperPod.yaml` in its ConfigMap |
+| `microk8s.io/hostpath` | No, the helper template is built into the image |
+
+For `local-path`, add tolerations to the helper template so it can run wherever a
+volume is legitimately requested. This mirrors what a CSI node plugin does:
+
+```yaml
+# local-path-config ConfigMap, helperPod.yaml key
+apiVersion: v1
+kind: Pod
+metadata:
+  name: helper-pod
+spec:
+  priorityClassName: system-node-critical
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: helper-pod
+      image: busybox
+```
+
+Then point model caches at it:
+
+```yaml
+modelCache:
+  storageClass: local-path
+```
+
+`microk8s.io/hostpath` exposes no equivalent knob, so on a tainted node the
+remaining options are the pre-provisioned `claimName` route above or a different
+storage class.
+
 ### Per-InferenceService Cache PVC (Bring Your Own)
 
 The cache backend above is an operator-global choice. To point a *single*
