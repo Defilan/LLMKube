@@ -85,8 +85,19 @@ func (r *InferenceServiceReconciler) determinePhase(ctx context.Context, isvc *i
 		if err != nil {
 			log.Error(err, "Failed to get pod scheduling info")
 		}
-		if schedulingInfo != nil && schedulingInfo.Status == "InsufficientGPU" {
-			return PhaseWaitingForGPU, schedulingInfo
+		if schedulingInfo != nil {
+			switch schedulingInfo.Status {
+			case "InsufficientGPU":
+				return PhaseWaitingForGPU, schedulingInfo
+			case "UnbindableModelCache":
+				// Phase stays Creating: the deployment is healthy and nothing
+				// about the InferenceService is wrong, so calling it Failed
+				// would misattribute a storage fault and change how rollout
+				// treats it. The diagnosis rides the message instead, which is
+				// the part that was missing -- this branch previously fell
+				// through and dropped it.
+				return PhaseCreating, schedulingInfo
+			}
 		}
 	}
 	if isMetal {
