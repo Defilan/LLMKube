@@ -74,6 +74,17 @@ rules:
   - patch
   - update
   - watch
+# Read-only, and only to tell a volume the provisioner never stamped from one
+# that is legitimately pinned elsewhere: both produce the same scheduler
+# wording, and the operator should not assert a cause it has not established.
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumes
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
