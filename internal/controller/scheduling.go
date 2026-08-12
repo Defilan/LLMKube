@@ -141,6 +141,14 @@ func (r *InferenceServiceReconciler) getPodSchedulingInfo(ctx context.Context, i
 						gpuCount = isvc.Spec.Resources.GPU
 					}
 					info.WaitingFor = fmt.Sprintf("%s: %d", gpuResourceName, gpuCount)
+				} else if pvName, nodeName, ok := detectUnbindableVolume(condition.Message); ok {
+					// Checked before the generic "Insufficient" branch: this
+					// message contains neither that word nor anything else that
+					// hints at storage, so it would otherwise reach the user as
+					// the scheduler's raw text, which blames node affinity and
+					// sends you looking at the scheduler. See #1509.
+					info.Status = "UnbindableModelCache"
+					info.Message = unbindableVolumeMessage(pvName, nodeName, podModelCacheClaim(&pod))
 				} else if strings.Contains(condition.Message, "Insufficient") {
 					info.Status = "InsufficientResources"
 				}
