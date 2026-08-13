@@ -469,7 +469,7 @@ func TestVLLMBuildArgs(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "isvc-" + strings.ReplaceAll(tc.name, " ", "-"), Namespace: "default"},
 				Spec:       *tc.spec,
 			}
-			args := backend.BuildArgs(isvc, tc.model, modelPath, port)
+			args := backend.BuildArgs(isvc, tc.model, modelPath, "", port)
 			for _, fc := range tc.contains {
 				if !containsArg(args, fc.flag, fc.value) {
 					t.Errorf("expected %q %q in args, got: %v", fc.flag, fc.value, args)
@@ -505,9 +505,9 @@ func TestVLLMBuildArgsDeterministic(t *testing.T) {
 		},
 	}
 
-	first := backend.BuildArgs(isvc, model, "/models/x", 8000)
+	first := backend.BuildArgs(isvc, model, "/models/x", "", 8000)
 	for i := 0; i < 10; i++ {
-		got := backend.BuildArgs(isvc, model, "/models/x", 8000)
+		got := backend.BuildArgs(isvc, model, "/models/x", "", 8000)
 		if len(got) != len(first) {
 			t.Fatalf("iteration %d: length differs: got %d want %d", i, len(got), len(first))
 		}

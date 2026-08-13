@@ -80,7 +80,7 @@ func TestSGLangBuildArgs_NilConfig(t *testing.T) {
 			ModelRef: "test-model",
 		},
 	}
-	args := backend.BuildArgs(isvc, model, "/models/test", 30000)
+	args := backend.BuildArgs(isvc, model, "/models/test", "", 30000)
 
 	mustContain := []FlagCheck{
 		{"--model-path", "/models/test"},
@@ -115,7 +115,7 @@ func TestSGLangBuildArgs_EmptyConfig(t *testing.T) {
 			SGLangConfig: &inferencev1alpha1.SGLangConfig{},
 		},
 	}
-	args := backend.BuildArgs(isvc, model, "/models/test", 30000)
+	args := backend.BuildArgs(isvc, model, "/models/test", "", 30000)
 
 	for _, fc := range []FlagCheck{{"--model-path", "/models/test"}, {"--host", "::"}, {"--port", "30000"}, {"--enable-metrics", ""}} {
 		if !containsArg(args, fc.flag, fc.value) {
@@ -631,7 +631,7 @@ func TestSGLangBuildArgs(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Name: "isvc", Namespace: "default"},
 				Spec:       *tc.spec,
 			}
-			args := backend.BuildArgs(isvc, tc.model, modelPath, port)
+			args := backend.BuildArgs(isvc, tc.model, modelPath, "", port)
 			for _, fc := range tc.contains {
 				if !containsArg(args, fc.flag, fc.value) {
 					t.Errorf("expected %q %q in args, got: %v", fc.flag, fc.value, args)
@@ -666,9 +666,9 @@ func TestSGLangBuildArgsDeterministic(t *testing.T) {
 			},
 		},
 	}
-	first := backend.BuildArgs(isvc, model, "/models/x", 30000)
+	first := backend.BuildArgs(isvc, model, "/models/x", "", 30000)
 	for i := 0; i < 10; i++ {
-		got := backend.BuildArgs(isvc, model, "/models/x", 30000)
+		got := backend.BuildArgs(isvc, model, "/models/x", "", 30000)
 		if len(got) != len(first) {
 			t.Fatalf("iteration %d: length differs: got %d want %d", i, len(got), len(first))
 		}

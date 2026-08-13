@@ -23,9 +23,10 @@ type RuntimeBackend interface {
 	// DefaultPort returns the default container port.
 	DefaultPort() int32
 
-	// BuildArgs generates the container arguments from the InferenceService,
-	// Model, model file path, and container port.
-	BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string
+	// BuildArgs renders the runtime's argv. draftPath is the in-container path
+	// to speculative-decoding draft weights, or "" when the service configures
+	// none; only LlamaCppBackend consumes it.
+	BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, draftPath string, port int32) []string
 
 	// BuildProbes returns startup, liveness, and readiness probes.
 	BuildProbes(port int32) (startup, liveness, readiness *corev1.Probe)

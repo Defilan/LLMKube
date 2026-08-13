@@ -360,7 +360,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		modelPath = servedModelPath(isvc, model, storageConfig)
 	}
 
-	args := backend.BuildArgs(isvc, model, modelPath, port)
+	args := backend.BuildArgs(isvc, model, modelPath, "", port)
 
 	startupProbe, livenessProbe, readinessProbe := backend.BuildProbes(port)
 	if isvc.Spec.ProbeOverrides != nil {

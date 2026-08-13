@@ -101,8 +101,8 @@ func TestVLLMBuildArgsHFURLServesBareRepoID(t *testing.T) {
 	isvc := &inferencev1alpha1.InferenceService{}
 	b := &VLLMBackend{}
 
-	bareArgs := b.BuildArgs(isvc, bare, "", 8000)
-	urlArgs := b.BuildArgs(isvc, url, "", 8000)
+	bareArgs := b.BuildArgs(isvc, bare, "", "", 8000)
+	urlArgs := b.BuildArgs(isvc, url, "", "", 8000)
 	if len(bareArgs) == 0 || len(urlArgs) == 0 {
 		t.Fatalf("BuildArgs returned no args (bare=%v url=%v)", bareArgs, urlArgs)
 	}

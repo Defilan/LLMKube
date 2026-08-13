@@ -646,7 +646,7 @@ func TestLlamaCppRouterBackend_BuildArgs(t *testing.T) {
 		Spec: inferencev1alpha1.InferenceServiceSpec{},
 	}
 	model := &inferencev1alpha1.Model{}
-	args := backend.BuildArgs(isvc, model, "", 8080)
+	args := backend.BuildArgs(isvc, model, "", "", 8080)
 
 	// Router mode should use --models-dir instead of --model
 	if !containsArg(args, "--models-dir", "/models") {
@@ -906,15 +906,15 @@ func TestBindAddressAcrossRuntimes(t *testing.T) {
 			var args []string
 			switch tc.runtime {
 			case "llamacpp":
-				args = (&LlamaCppBackend{}).BuildArgs(isvc, model, modelPath, port)
+				args = (&LlamaCppBackend{}).BuildArgs(isvc, model, modelPath, "", port)
 			case "llamacpp-router":
-				args = (&LlamaCppRouterBackend{}).BuildArgs(isvc, model, modelPath, port)
+				args = (&LlamaCppRouterBackend{}).BuildArgs(isvc, model, modelPath, "", port)
 			case "vllm":
-				args = (&VLLMBackend{}).BuildArgs(isvc, model, modelPath, port)
+				args = (&VLLMBackend{}).BuildArgs(isvc, model, modelPath, "", port)
 			case "sglang":
-				args = (&SGLangBackend{}).BuildArgs(isvc, model, modelPath, port)
+				args = (&SGLangBackend{}).BuildArgs(isvc, model, modelPath, "", port)
 			case "tgi":
-				args = (&TGIBackend{}).BuildArgs(isvc, model, modelPath, port)
+				args = (&TGIBackend{}).BuildArgs(isvc, model, modelPath, "", port)
 			default:
 				t.Fatalf("unknown runtime %q", tc.runtime)
 			}
@@ -970,7 +970,7 @@ func TestExtraArgsAppendedExactlyOnce(t *testing.T) {
 			model := &inferencev1alpha1.Model{
 				Spec: inferencev1alpha1.ModelSpec{Source: "hf://org/model"},
 			}
-			args := tc.backend.BuildArgs(isvc, model, "/models/model.gguf", 8080)
+			args := tc.backend.BuildArgs(isvc, model, "/models/model.gguf", "", 8080)
 
 			for _, want := range extra {
 				n := 0

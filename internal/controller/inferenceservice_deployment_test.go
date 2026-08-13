@@ -3780,13 +3780,13 @@ var _ = Describe("RuntimeBackend interface", func() {
 					Args: []string{"--quantize-4bit", "--ssl", "/app/ssl"},
 				},
 			}
-			args := backend.BuildArgs(isvc, nil, "", 0)
+			args := backend.BuildArgs(isvc, nil, "", "", 0)
 			Expect(args).To(Equal([]string{"--quantize-4bit", "--ssl", "/app/ssl"}))
 		})
 
 		It("should return nil args when none specified", func() {
 			isvc := &inferencev1alpha1.InferenceService{}
-			args := backend.BuildArgs(isvc, nil, "", 0)
+			args := backend.BuildArgs(isvc, nil, "", "", 0)
 			Expect(args).To(BeNil())
 		})
 	})
@@ -3874,7 +3874,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			// vLLM v0.20+ uses model as a positional argument (args[0]); the
 			// deprecated --model flag must not appear.
 			Expect(args[0]).To(Equal("/models/llama3"))
@@ -3899,7 +3899,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			Expect(args).To(ContainElement("--enable-prefix-caching"))
 			Expect(args).To(ContainElements("--gpu-memory-utilization", "0.9"))
 		})
@@ -3909,7 +3909,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				Spec: inferencev1alpha1.InferenceServiceSpec{},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			// Model path is positional (args[0]) per vLLM v0.20+; --model is
 			// deprecated and intentionally omitted.
 			Expect(args[0]).To(Equal("/models/llama3"))
@@ -3933,7 +3933,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			tpIdx := -1
 			extraIdx := -1
 			for i, a := range args {
@@ -3956,7 +3956,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			Expect(args).To(ContainElement("--enable-prefix-caching"))
 		})
 
@@ -3967,7 +3967,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			Expect(args).NotTo(ContainElement("--enable-prefix-caching"))
 		})
 
@@ -3979,7 +3979,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			Expect(args).NotTo(ContainElement("--enable-prefix-caching"))
 		})
 
@@ -3990,7 +3990,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			Expect(args).To(ContainElements("--attention-backend", "flashinfer"))
 		})
 
@@ -4003,7 +4003,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 					},
 				}
 				model := &inferencev1alpha1.Model{}
-				args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+				args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 				Expect(args).To(ContainElements("--attention-backend", b))
 			}
 		})
@@ -4015,7 +4015,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 				},
 			}
 			model := &inferencev1alpha1.Model{}
-			args := backend.BuildArgs(isvc, model, "/models/llama3", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/llama3", "", 8000)
 			Expect(args).NotTo(ContainElement("--attention-backend"))
 		})
 	})
@@ -4050,7 +4050,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 			model := &inferencev1alpha1.Model{
 				Spec: inferencev1alpha1.ModelSpec{Source: "meta-llama/Llama-3-8B"},
 			}
-			args := backend.BuildArgs(isvc, model, "", 80)
+			args := backend.BuildArgs(isvc, model, "", "", 80)
 			Expect(args).To(ContainElements("--model-id", "meta-llama/Llama-3-8B"))
 			Expect(args).To(ContainElements("--quantize", "bitsandbytes"))
 			Expect(args).To(ContainElements("--max-input-length", "2048"))
@@ -4091,7 +4091,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 					},
 				},
 			}
-			args := backend.BuildArgs(isvc, nil, "", 0)
+			args := backend.BuildArgs(isvc, nil, "", "", 0)
 			Expect(args).To(ContainElement("--ssl"))
 			Expect(args).To(ContainElement("--quantize-4bit"))
 			Expect(args).To(ContainElement("--cpu-offload"))
@@ -4099,7 +4099,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 
 		It("should build minimal args without config", func() {
 			isvc := &inferencev1alpha1.InferenceService{}
-			args := backend.BuildArgs(isvc, nil, "", 0)
+			args := backend.BuildArgs(isvc, nil, "", "", 0)
 			Expect(args).To(Equal([]string{"--ssl", "/app/ssl"}))
 		})
 
@@ -4663,7 +4663,7 @@ var _ = Describe("constructDeployment Regression Tests", func() {
 				},
 			}
 
-			args := backend.BuildArgs(isvc, model, "/models/vllm-full", 8000)
+			args := backend.BuildArgs(isvc, model, "/models/vllm-full", "", 8000)
 
 			By("verifying tensor parallel size")
 			Expect(args).To(ContainElements("--tensor-parallel-size", "2"))

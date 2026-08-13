@@ -66,7 +66,7 @@ func (b *LlamaCppBackend) DefaultPort() int32 {
 func (b *LlamaCppBackend) NeedsModelInit() bool     { return true }
 func (b *LlamaCppBackend) DefaultHPAMetric() string { return "llamacpp:requests_processing" }
 
-func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
+func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, draftPath string, port int32) []string {
 	args := []string{
 		"--model", modelPath,
 		"--port", fmt.Sprintf("%d", port),
@@ -138,7 +138,7 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 	args = appendBatchSizeArgs(args, isvc.Spec.BatchSize)
 	args = appendUBatchSizeArgs(args, isvc.Spec.UBatchSize)
 	args = appendNoWarmupArgs(args, isvc.Spec.NoWarmup)
-	args = appendSpeculativeDecodingArgs(args, isvc.Spec.SpeculativeDecoding, "")
+	args = appendSpeculativeDecodingArgs(args, isvc.Spec.SpeculativeDecoding, draftPath)
 	args = appendReasoningBudgetArgs(args, isvc.Spec.ReasoningBudget, isvc.Spec.ReasoningBudgetMessage)
 	if model != nil && model.Spec.Mmproj != "" && modelPath != "" {
 		if plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil); err == nil && plan != nil && plan.Primary != "" {
