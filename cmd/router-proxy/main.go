@@ -23,6 +23,7 @@ import (
 	"errors"
 	"flag"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,8 +50,9 @@ func main() {
 	metricsListen := flag.String("metrics-bind-address", ":9090",
 		"Address the Prometheus metrics server binds to (host:port). Serves "+
 			"the controller-runtime registry at /metrics, including the ModelPool "+
-			"swap/residency/hold metrics. Empty or 0 disables the metrics "+
-			"server, matching the manager's --metrics-bind-address.")
+			"swap/residency/hold metrics. Empty, 0 or none disables the metrics "+
+			"server, matching the manager's --metrics-bind-address. Must not "+
+			"resolve to the same address as --listen.")
 	logFormat := flag.String("log-format", "json",
 		"Structured log format: json or text.")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second,
@@ -77,6 +79,17 @@ func main() {
 
 	logger := newLogger(*logFormat)
 	slog.SetDefault(logger)
+
+	// Checked before anything binds. Two listeners on one address is otherwise
+	// a race whose outcome depends on which one loses, so the same flags can
+	// produce either a crash-loop or a running proxy with no metrics. Failing
+	// here makes it one deterministic error that names the conflict.
+	if !metricsDisabled(*metricsListen) {
+		if err := listenConflict(*listen, *metricsListen); err != nil {
+			logger.Error("invalid listener configuration", "error", err)
+			os.Exit(1)
+		}
+	}
 
 	cfg, err := router.LoadConfig(*configPath)
 	if err != nil {
@@ -129,10 +142,10 @@ func main() {
 	// held-request depth) are registered on the controller-runtime registry
 	// from internal/metrics; without this endpoint they are collected but never
 	// scrapeable. A separate port keeps metrics off the inference listener and
-	// lets a ServiceMonitor target it independently. Empty or 0 disables the
-	// server, so the value the manager uses to turn metrics off works here too.
+	// lets a ServiceMonitor target it independently. Empty, "0" or "none"
+	// disables the server; see metricsDisabled for why "0" is accepted.
 	var metricsSrv *http.Server
-	if addr := *metricsListen; addr != "" && addr != "0" {
+	if addr := *metricsListen; !metricsDisabled(addr) {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("GET /metrics", newMetricsHandler())
 		metricsSrv = &http.Server{
@@ -140,12 +153,30 @@ func main() {
 			Handler:           metricsMux,
 			ReadHeaderTimeout: 5 * time.Second,
 		}
-		go func() {
-			logger.Info("starting metrics server", "address", addr)
-			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("metrics server failed", "error", err)
-			}
-		}()
+		// Bind synchronously rather than letting ListenAndServe do it inside
+		// the goroutine. The bind is the step that fails, and doing it here
+		// means the success line is logged only once the port is actually
+		// held. It also lets the log name the resolved address, so a ":0"
+		// request reports the port it actually got instead of ":0".
+		metricsLn, lnErr := net.Listen("tcp", addr)
+		if lnErr != nil {
+			// Not fatal, deliberately: metrics are observability, and killing
+			// the data plane because a scrape endpoint could not bind would
+			// trade a monitoring gap for an outage. The conflict that used to
+			// land here most often is now caught by listenConflict above.
+			logger.Error("metrics server failed to bind; continuing without metrics",
+				"address", addr, "error", lnErr)
+			metricsSrv = nil
+		} else {
+			logger.Info("metrics server listening", "address", metricsLn.Addr().String())
+			go func() {
+				if err := metricsSrv.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					logger.Error("metrics server failed", "error", err)
+				}
+			}()
+		}
+	} else {
+		logger.Info("metrics server disabled", "metrics-bind-address", addr)
 	}
 
 	// Run the data-plane server in a goroutine so the main goroutine can wait
