@@ -353,6 +353,25 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	return model, modelReady, nil, nil
 }
 
+// draftModelRefFor returns the name of the draft Model this InferenceService
+// actually resolves, or "" when it configures none (no speculativeDecoding
+// block, a spec type that carries its own speculation, or an empty ref).
+//
+// Single source of truth for the resolver below and for the Model watch
+// mapping. They MUST agree: the resolver fails closed on a draft that is not
+// yet Ready, so a mapping that does not enqueue on that same draft leaves the
+// service Pending until the next full resync.
+func draftModelRefFor(isvc *inferencev1alpha1.InferenceService) string {
+	if isvc == nil {
+		return ""
+	}
+	sd := isvc.Spec.SpeculativeDecoding
+	if sd == nil || !specTypeNeedsDraftWeights(sd.Type) {
+		return ""
+	}
+	return sd.DraftModelRef
+}
+
 // getDraftModelForInferenceService resolves spec.speculativeDecoding.draftModelRef
 // the same way getModelForInferenceService resolves spec.modelRef, and fails
 // closed for the same reasons: a draft that is missing or not Ready must block
@@ -367,19 +386,19 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 ) (*inferencev1alpha1.Model, bool, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	sd := isvc.Spec.SpeculativeDecoding
-	if sd == nil || !specTypeNeedsDraftWeights(sd.Type) || sd.DraftModelRef == "" {
+	ref := draftModelRefFor(isvc)
+	if ref == "" {
 		return nil, true, nil, nil
 	}
 
 	draft := &inferencev1alpha1.Model{}
-	name := types.NamespacedName{Name: sd.DraftModelRef, Namespace: isvc.Namespace}
+	name := types.NamespacedName{Name: ref, Namespace: isvc.Namespace}
 	if err := r.Get(ctx, name, draft); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("Referenced draft Model not found", "draftModel", sd.DraftModelRef)
+			log.Info("Referenced draft Model not found", "draftModel", ref)
 			result, updateErr := r.updateStatusWithSchedulingInfo(
 				ctx, isvc, PhaseFailed, false, 0, 0, "",
-				fmt.Sprintf("Draft model %q not found", sd.DraftModelRef), nil)
+				fmt.Sprintf("Draft model %q not found", ref), nil)
 			return nil, false, &result, updateErr
 		}
 		log.Error(err, "Failed to get draft Model")
@@ -978,7 +997,12 @@ func (r *InferenceServiceReconciler) findInferenceServicesForModel(ctx context.C
 
 	var requests []reconcile.Request
 	for _, isvc := range inferenceServiceList.Items {
-		if isvc.Spec.ModelRef == model.Name {
+		// The draft ref matters as much as the target ref: the draft gate in
+		// getDraftModelForInferenceService fails closed, so a service whose
+		// draft is still downloading is Pending until something enqueues it.
+		// Without this arm nothing does, and the ~10h default resync is the
+		// only thing that eventually would (#1528).
+		if isvc.Spec.ModelRef == model.Name || draftModelRefFor(&isvc) == model.Name {
 			requests = append(requests, reconcile.Request{
 				NamespacedName: types.NamespacedName{
 					Name:      isvc.Name,

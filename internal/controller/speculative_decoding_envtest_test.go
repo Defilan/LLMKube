@@ -164,6 +164,60 @@ var _ = Describe("InferenceService draft-model speculative decoding", func() {
 			Expect(progressing).NotTo(BeNil(), "expected a Progressing condition while waiting on the draft Model")
 			Expect(progressing.Message).To(ContainSubstring(draftModel.Name))
 		})
+
+		// The gate above fails closed and returns a zero ctrl.Result, so
+		// nothing re-reconciles the service on a timer: the Model watch is the
+		// only thing that will notice the draft going Ready. A mapping that
+		// looks at spec.modelRef alone leaves the service Pending until the
+		// ~10h default resync (#1528).
+		It("enqueues the service when its draft Model changes", func() {
+			draftModel := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "specdec-watch-draft", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/draft.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, draftModel)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, draftModel) })
+
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "draft-watcher", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					// Deliberately a DIFFERENT target: only the draft ref can
+					// match this Model.
+					ModelRef: "some-other-target",
+					Runtime:  "llamacpp",
+					SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+						Type: "draft-dspark", DraftModelRef: draftModel.Name,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, isvc) })
+
+			Expect(reconciler.findInferenceServicesForModel(ctx, draftModel)).To(ContainElement(
+				reconcile.Request{NamespacedName: types.NamespacedName{
+					Name: "draft-watcher", Namespace: "default"}}))
+		})
+
+		// draft-mtp is self-speculation carried by the target model, so its
+		// draftModelRef is inert. The mapping must agree with the resolver
+		// about that, or a Model sharing the name would enqueue services that
+		// never consult it.
+		It("ignores a draftModelRef on a spec type that needs no draft weights", func() {
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "mtp-no-draft", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: "some-other-target",
+					Runtime:  "llamacpp",
+					SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+						Type: "draft-mtp",
+					},
+				},
+			}
+			Expect(draftModelRefFor(isvc)).To(BeEmpty())
+		})
 	})
 
 	// Ground truth for the pod-shape invariants: the apiserver's own
