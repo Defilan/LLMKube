@@ -19,12 +19,19 @@ package agent
 import (
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 
 	"github.com/go-logr/logr"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
+
+// lineSuffixPattern matches the trailing line citation on a file reference
+// (`main.go:135`, `main.go:49-63`). path.Ext reads such a token's extension
+// as ".go:135", so the suffix has to come off before the extension lookup
+// or every line-cited reference is invisible to the extractor.
+var lineSuffixPattern = regexp.MustCompile(`:\d+(?:-\d+)?$`)
 
 // pathRefExtensions are the file extensions a token must carry to count
 // as a concrete path reference in an issue body. The set is deliberately
@@ -43,7 +50,17 @@ import (
 var pathRefExtensions = map[string]bool{
 	"go": true, "md": true, "yaml": true, "yml": true, "sh": true,
 	"json": true, "mod": true, "sum": true, "tmpl": true, "proto": true,
-	"toml": true, "mk": true,
+	"toml": true, "mk": true, "txt": true, "hcl": true,
+}
+
+// bareSourceFilenames are build files an issue cites by name because they
+// carry no extension, so path.Ext yields "" and the extension lookup can
+// never admit them. Kept to unambiguous, conventionally-capitalized build
+// entrypoints: a token like "Makefile" in an issue body is a file, not
+// prose, whereas a general "capitalized word" rule would admit sentences.
+var bareSourceFilenames = map[string]bool{
+	"Dockerfile": true, "Makefile": true, "Justfile": true,
+	"Containerfile": true, "Earthfile": true,
 }
 
 // extensionSet normalizes a GateProfile SourceExtensions list (".gd",
@@ -89,6 +106,12 @@ func extractIssuePathRefs(body string, sourceExtensions []string) []string {
 	seen := map[string]bool{}
 	for _, tok := range strings.Fields(normalized) {
 		tok = strings.Trim(tok, ".:!?")
+		// Strip the line citation before the extension lookup, and keep the
+		// bare path: refs are matched against the diff by exact path or
+		// basename, neither of which a ":135" suffix would survive. Dedup
+		// runs on the stripped form so repeated cites of the same file at
+		// different lines collapse to one ref.
+		tok = lineSuffixPattern.ReplaceAllString(tok, "")
 		if tok == "" || seen[tok] {
 			continue
 		}
@@ -124,7 +147,7 @@ func hasSourceFile(paths []string, exts []string) bool {
 // language-agnostic pathRefExtensions base.
 func isPathRef(tok string, extraExts map[string]bool) bool {
 	ext := strings.ToLower(strings.TrimPrefix(path.Ext(tok), "."))
-	if !pathRefExtensions[ext] && !extraExts[ext] {
+	if !pathRefExtensions[ext] && !extraExts[ext] && !bareSourceFilenames[path.Base(tok)] {
 		return false
 	}
 	for _, seg := range strings.Split(tok, "/") {
