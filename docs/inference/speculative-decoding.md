@@ -54,8 +54,8 @@ Both models share the InferenceService's model cache, each under its own
 subdirectory. Size the cache for the sum. A cache too small for both surfaces
 as a failed download init container, not as silent truncation.
 
-When the two models do not resolve to the same volume — a `pvc://` draft
+When the two models do not resolve to the same volume (a `pvc://` draft
 against a `pvc://` target on a different claim, or a draft with no cache key
-under a cached target — the draft's storage is mounted separately, under
+under a cached target) the draft's storage is mounted separately, under
 `/draft`, and its download init containers are named `draft-*`. `-md` follows
 the mount, so nothing about the `Model` specs changes.
