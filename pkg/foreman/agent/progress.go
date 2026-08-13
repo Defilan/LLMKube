@@ -49,6 +49,25 @@ type ProgressConfig struct {
 	// Zero disables the signal.
 	EditFreeTurnsLimit int
 
+	// UnverifiedEditResetCap bounds how many CONSECUTIVE edit-free resets may
+	// be earned from bash commands that only LOOK like writes, before those
+	// resets stop being honoured.
+	//
+	// bashLikelyMutatesWorkspace is a substring heuristic biased toward
+	// detecting a write, because a false negative force-terminates a model
+	// editing through the shell (#982, #896). That bias is right, but it was
+	// unbounded: a command containing a matching token every turn resets the
+	// streak every turn, so EditFreeTurnsLimit becomes unreachable and the
+	// detector cannot fire at all. Observed in #1520: 85 minutes, tens of
+	// thousands of model operations, a verifiably clean worktree, and no nudge.
+	//
+	// A real edit tool (write_file / str_replace / submit_result) clears this
+	// counter, so a model that edits through tools is never affected. Only a
+	// model whose sole evidence of progress is bash-shaped strings is bounded.
+	//
+	// 0 disables the bound, restoring the pre-#1520 behaviour.
+	UnverifiedEditResetCap int
+
 	// ContextSoftCap and ContextHardCap are token-budget guards.
 	// Crossing the soft cap nudges the model to wrap up; crossing the
 	// hard cap force-terminates regardless of model behavior.
@@ -78,10 +97,11 @@ type ProgressConfig struct {
 // the way through MaxTurns without ever editing. Caps are sized for
 // a 64k-window model with headroom.
 var DefaultProgressConfig = ProgressConfig{
-	RepeatedToolThreshold: 5,
-	EditFreeTurnsLimit:    15,
-	ContextSoftCap:        90000,
-	ContextHardCap:        140000,
+	RepeatedToolThreshold:  5,
+	EditFreeTurnsLimit:     15,
+	UnverifiedEditResetCap: 20,
+	ContextSoftCap:         90000,
+	ContextHardCap:         140000,
 }
 
 // ProgressAction is the recommendation the monitor returns after each
@@ -136,6 +156,11 @@ type LoopProgressMonitor struct {
 	// observing a wide-enough window to detect the pattern.
 	recentCallHashes []string
 	editFreeStreak   int // turns since last edit/submit
+	// unverifiedResets counts consecutive edit-free resets earned from
+	// bash-shaped writes since the last real edit-tool call. Bounded by
+	// UnverifiedEditResetCap so unverifiable evidence cannot hold the streak
+	// at zero forever (#1520).
+	unverifiedResets int
 	// groundedFiles is the set of distinct files read_file'd since the last
 	// edit. Each distinct file beyond the first raises the effective edit-free
 	// limit (grounding-aware guard, #1066): reading real source to ground the
@@ -499,11 +524,23 @@ func (m *LoopProgressMonitor) recordCalls(calls []oai.ToolCall) {
 // commits with `git add -A`, so those changes are real progress.
 func (m *LoopProgressMonitor) updateEditFreeStreak(calls []oai.ToolCall) {
 	for _, tc := range calls {
+		// A real edit tool is self-evidencing: the tool contract says a file was
+		// written. It resets the streak unconditionally and clears the
+		// unverified budget, so a model that edits through tools is never
+		// subject to the bound below.
 		if _, ok := editProducingTools[tc.Function.Name]; ok {
+			m.unverifiedResets = 0
 			m.resetEditFreeStreak()
 			return
 		}
+		// A bash command is only string evidence that a write happened. Honour
+		// it, but not indefinitely: past the cap the streak is allowed to
+		// advance so the detector can still reach its limit (#1520).
 		if tc.Function.Name == "bash" && bashCallMutatesWorkspace(tc.Function.Arguments) {
+			if m.cfg.UnverifiedEditResetCap > 0 && m.unverifiedResets >= m.cfg.UnverifiedEditResetCap {
+				break
+			}
+			m.unverifiedResets++
 			m.resetEditFreeStreak()
 			return
 		}
