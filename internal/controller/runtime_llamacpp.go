@@ -138,7 +138,7 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 	args = appendBatchSizeArgs(args, isvc.Spec.BatchSize)
 	args = appendUBatchSizeArgs(args, isvc.Spec.UBatchSize)
 	args = appendNoWarmupArgs(args, isvc.Spec.NoWarmup)
-	args = appendSpeculativeDecodingArgs(args, isvc.Spec.SpeculativeDecoding)
+	args = appendSpeculativeDecodingArgs(args, isvc.Spec.SpeculativeDecoding, "")
 	args = appendReasoningBudgetArgs(args, isvc.Spec.ReasoningBudget, isvc.Spec.ReasoningBudgetMessage)
 	if model != nil && model.Spec.Mmproj != "" && modelPath != "" {
 		if plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil); err == nil && plan != nil && plan.Primary != "" {

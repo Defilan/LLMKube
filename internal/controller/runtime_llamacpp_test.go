@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -748,5 +749,72 @@ func TestLlamaCppMetricsNotDuplicated(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAppendSpeculativeDecodingArgs(t *testing.T) {
+	n := func(i int32) *int32 { return &i }
+	p := func(f float64) *float64 { return &f }
+
+	cases := []struct {
+		name      string
+		spec      *inferencev1alpha1.SpeculativeDecodingSpec
+		draftPath string
+		want      []string
+	}{
+		{name: "nil spec emits nothing", spec: nil, want: nil},
+		{
+			name: "disabled alias emits nothing",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{Type: "disabled"},
+			want: nil,
+		},
+		{
+			name: "none emits nothing",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{Type: "none"},
+			want: nil,
+		},
+		{
+			name: "mtp alias resolves to draft-mtp and takes no -md",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{Type: "mtp"},
+			want: []string{"--spec-type", "draft-mtp"},
+		},
+		{
+			name: "draft alias resolves to draft-simple and takes -md",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft", DraftModelRef: "d",
+			},
+			draftPath: "/models/d/model.gguf",
+			want:      []string{"--spec-type", "draft-simple", "-md", "/models/d/model.gguf"},
+		},
+		{
+			name: "literal draft-dspark passes through with every knob",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft-dspark", DraftModelRef: "d", NDraftMax: n(3), PMin: p(0),
+			},
+			draftPath: "/models/d/model.gguf",
+			want: []string{
+				"--spec-type", "draft-dspark",
+				"-md", "/models/d/model.gguf",
+				"--spec-draft-n-max", "3",
+				"--spec-draft-p-min", "0",
+			},
+		},
+		{
+			name: "ngram type passes through and takes no -md even if a path is present",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "ngram-cache", NDraftMax: n(2),
+			},
+			draftPath: "/models/stale/model.gguf",
+			want:      []string{"--spec-type", "ngram-cache", "--spec-draft-n-max", "2"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := appendSpeculativeDecodingArgs(nil, tc.spec, tc.draftPath)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("args = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

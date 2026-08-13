@@ -19,6 +19,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"strconv"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -207,20 +208,57 @@ func appendModeArgs(args []string, mode string, extraArgs []string) []string {
 	return args
 }
 
-func appendSpeculativeDecodingArgs(args []string, spec *inferencev1alpha1.SpeculativeDecodingSpec) []string {
-	if spec == nil || spec.Type == "" || spec.Type == "disabled" {
+// specTypeAliases maps the pre-#1528 friendly names onto llama.cpp's own
+// --spec-type spellings. Literal values are passed through untouched.
+var specTypeAliases = map[string]string{
+	"mtp":      "draft-mtp",
+	"draft":    "draft-simple",
+	"disabled": "none",
+}
+
+// draftWeightSpecTypes are the resolved --spec-type values that need a
+// separate draft model on disk. draft-mtp is absent on purpose: MTP is
+// self-speculation carried by the target model.
+var draftWeightSpecTypes = map[string]struct{}{
+	"draft-simple": {},
+	"draft-eagle3": {},
+	"draft-dflash": {},
+	"draft-dspark": {},
+}
+
+// resolveSpecType maps an alias to its llama.cpp spelling, or returns the
+// value unchanged when it is already literal.
+func resolveSpecType(t inferencev1alpha1.SpeculativeDecodingType) string {
+	if mapped, ok := specTypeAliases[string(t)]; ok {
+		return mapped
+	}
+	return string(t)
+}
+
+// specTypeNeedsDraftWeights reports whether a resolved --spec-type value
+// requires -md. Exported-shaped helper so the storage side (deployment
+// builder) and the arg side cannot drift on the answer.
+func specTypeNeedsDraftWeights(t inferencev1alpha1.SpeculativeDecodingType) bool {
+	_, ok := draftWeightSpecTypes[resolveSpecType(t)]
+	return ok
+}
+
+func appendSpeculativeDecodingArgs(
+	args []string,
+	spec *inferencev1alpha1.SpeculativeDecodingSpec,
+	draftPath string,
+) []string {
+	if spec == nil || spec.Type == "" {
 		return args
 	}
-	var specType string
-	switch spec.Type {
-	case "mtp":
-		specType = "draft-mtp"
-	case "draft":
-		specType = "draft-simple"
-	default:
+	specType := resolveSpecType(spec.Type)
+	if specType == "none" {
 		return args
 	}
 	args = append(args, "--spec-type", specType)
+	if specTypeNeedsDraftWeights(spec.Type) && draftPath != "" {
+		args = append(args, "-md", draftPath)
+	}
 	if spec.NDraftMax != nil && *spec.NDraftMax > 0 {
 		// --spec-draft-n-max, not --draft-n-max: llama.cpp has never accepted
 		// the latter. Its removed aliases are --draft, --draft-n and
@@ -229,6 +267,9 @@ func appendSpeculativeDecodingArgs(args []string, spec *inferencev1alpha1.Specul
 		// server at startup, so any InferenceService setting nDraftMax
 		// crashlooped (#1382).
 		args = append(args, "--spec-draft-n-max", fmt.Sprintf("%d", *spec.NDraftMax))
+	}
+	if spec.PMin != nil {
+		args = append(args, "--spec-draft-p-min", strconv.FormatFloat(*spec.PMin, 'g', -1, 64))
 	}
 	return args
 }
