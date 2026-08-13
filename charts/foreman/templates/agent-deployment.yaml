@@ -23,7 +23,7 @@ metadata:
   name: {{ include "foreman.agent.resourceName" $ctx }}
   namespace: {{ include "foreman.namespace" $ }}
   labels:
-    {{- include "foreman.agent.labels" $ | nindent 4 }}
+    {{- include "foreman.agent.poolLabels" $ctx | nindent 4 }}
 spec:
   replicas: {{ $agent.replicaCount }}
   # Each foreman-agent claims one task at a time. The Recreate
@@ -31,9 +31,12 @@ spec:
   # that race for the same Scheduled tasks.
   strategy:
     type: Recreate
+  # Pool-scoped, via $ctx rather than the chart root: passing $ here gave
+  # every pool the same selector, so each Deployment adopted the others'
+  # pods and fought them over replicaCount (#1523).
   selector:
     matchLabels:
-      {{- include "foreman.agent.labels" $ | nindent 6 }}
+      {{- include "foreman.agent.poolLabels" $ctx | nindent 6 }}
   template:
     metadata:
       annotations:
@@ -42,7 +45,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       labels:
-        {{- include "foreman.agent.labels" $ | nindent 8 }}
+        {{- include "foreman.agent.poolLabels" $ctx | nindent 8 }}
         {{- with $agent.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

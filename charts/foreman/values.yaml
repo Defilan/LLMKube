@@ -125,6 +125,25 @@ foreman:
 # Setting `agents:` opts you OUT of the implicit legacy agent: render
 # path; if you need a "default" fleet alongside custom ones, list it
 # explicitly under `agents:` with the name `default` (or any other key).
+#
+# UPGRADE NOTE, existing `agents:` users only (#1523). Every pool's
+# Deployment now carries `foreman.llmkube.dev/agent-pool: <key>` in its
+# selector. Before this, all pools rendered the SAME selector, so each
+# Deployment adopted the others' pods and the controllers fought over
+# replicaCount. A Deployment's selector is immutable, so `helm upgrade`
+# on a release created before this change fails with:
+#
+#   spec.selector: Invalid value: {...}: field is immutable
+#
+# Agent Deployments are stateless, so the fix is to delete them and let
+# the upgrade recreate them. In-flight tasks are re-claimed by a sibling:
+#
+#   kubectl -n <namespace> delete deploy -l app.kubernetes.io/component=agent
+#   helm upgrade ...
+#
+# Installs on the legacy `agent:` block are unaffected: that path renders
+# under the "_implicit_" sentinel with no pool label and its selector is
+# byte-identical across this change.
 
 operator:
   enabled: true

@@ -68,10 +68,39 @@ app.kubernetes.io/component: operator
 
 {{/*
 Agent pod labels = base selector + component=agent.
+
+Release-scoped, NOT pool-scoped: the agent ServiceAccount/RBAC and the
+gate-cache PVC are per-release objects and must keep these labels stable.
+Anything that needs to tell one agent pool from another wants
+foreman.agent.poolLabels instead.
 */}}
 {{- define "foreman.agent.labels" -}}
 {{ include "foreman.selectorLabels" . }}
 app.kubernetes.io/component: agent
+{{- end }}
+
+{{/*
+Agent Deployment labels, selector and pod-template labels, scoped to one pool.
+
+Takes the per-agent context ($ctx) built by agent-deployment.yaml, so it can
+read .agentName. Every pool in the multi-fleet form gets an agent-pool label,
+which is what keeps two Deployments from selecting each other's pods (#1523):
+foreman.agent.labels alone is identical for every pool, so without this the
+controllers each count the other's replicas toward their own replicaCount and
+scale down what the other scales up.
+
+The legacy single-agent form is deliberately left alone. Its config is wrapped
+under the "_implicit_" sentinel and renders exactly one Deployment, so there is
+nothing to collide with, and a Deployment's selector is immutable: adding a
+label there would break `helm upgrade` on every existing install. Migrating
+from agent: to agents: already renames the object (foreman-agent becomes
+foreman-<pool>-agent), so the new selector lands on a new object.
+*/}}
+{{- define "foreman.agent.poolLabels" -}}
+{{ include "foreman.agent.labels" . }}
+{{- if ne .agentName "_implicit_" }}
+{{ printf "foreman.llmkube.dev/agent-pool: %s" .agentName }}
+{{- end }}
 {{- end }}
 
 {{/*

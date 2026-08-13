@@ -409,3 +409,44 @@ tests:
       - equal:
           path: metadata.labels.grafana_dashboard
           value: "true"
+  # ---- #1523: pools must not select each other's pods ----
+
+  - it: each agents entry gets a pool-scoped selector, so pools cannot adopt each other's pods
+    template: agent-deployment.yaml
+    values:
+      - values-multi.yaml
+    asserts:
+      # documentIndex 0 = the "default" pool, 1 = "llmkube-fork" (map order is
+      # alphabetical). Before #1523 both rendered the identical selector
+      # {name, instance, part-of, component}, so each Deployment counted the
+      # other's replicas toward its own replicaCount.
+      - equal:
+          path: spec.selector.matchLabels["foreman.llmkube.dev/agent-pool"]
+          value: default
+        documentIndex: 0
+      - equal:
+          path: spec.selector.matchLabels["foreman.llmkube.dev/agent-pool"]
+          value: llmkube-fork
+        documentIndex: 1
+      # The pod template must carry the same pool label, or the selector
+      # matches nothing and the Deployment never becomes available.
+      - equal:
+          path: spec.template.metadata.labels["foreman.llmkube.dev/agent-pool"]
+          value: default
+        documentIndex: 0
+      - equal:
+          path: spec.template.metadata.labels["foreman.llmkube.dev/agent-pool"]
+          value: llmkube-fork
+        documentIndex: 1
+
+  - it: the legacy single-agent selector is left alone, since Deployment selectors are immutable
+    template: agent-deployment.yaml
+    set:
+      agent.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - notExists:
+          path: spec.selector.matchLabels["foreman.llmkube.dev/agent-pool"]
+      - notExists:
+          path: spec.template.metadata.labels["foreman.llmkube.dev/agent-pool"]
