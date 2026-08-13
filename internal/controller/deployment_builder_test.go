@@ -17,9 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -742,4 +744,58 @@ func TestParseRuntimeImageOverrides(t *testing.T) {
 			t.Fatal("expected error for missing separator")
 		}
 	})
+}
+
+func TestBuildDeployment_MountsDraftModelAndEmitsMd(t *testing.T) {
+	n := func(i int32) *int32 { return &i }
+	// Status.CacheKey must be set on both models: buildCachedStorageConfig
+	// (internal/controller/model_storage.go) only mounts the "model-cache"
+	// volume when effectiveModelCacheKey(model) is non-empty, which resolves
+	// from Status.CacheKey (or multi-file staging, neither of which applies
+	// here). Every sibling perService-cache test in this package sets it the
+	// same way; the brief's literal snippet omitted it.
+	target := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "target", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/target.gguf"},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: "target-cache-key"},
+	}
+	draft := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "dspark", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/dspark.gguf"},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: "dspark-cache-key"},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "target",
+			Runtime:  "llamacpp",
+			SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft-dspark", DraftModelRef: "dspark", NDraftMax: n(3),
+			},
+		},
+	}
+
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	dep := r.constructDeployment(isvc, target, draft, 1)
+
+	pod := dep.Spec.Template.Spec
+	var cacheVolumes int
+	for _, v := range pod.Volumes {
+		if v.Name == "model-cache" {
+			cacheVolumes++
+		}
+	}
+	if cacheVolumes != 1 {
+		t.Errorf("model-cache volumes = %d, want exactly 1", cacheVolumes)
+	}
+	if len(pod.InitContainers) < 2 {
+		t.Errorf("initContainers = %d, want at least 2 (one download per model)", len(pod.InitContainers))
+	}
+	joined := strings.Join(pod.Containers[0].Args, " ")
+	if !strings.Contains(joined, "-md ") {
+		t.Errorf("argv missing -md; got %s", joined)
+	}
+	if !strings.Contains(joined, "--spec-type draft-dspark") {
+		t.Errorf("argv missing --spec-type draft-dspark; got %s", joined)
+	}
 }

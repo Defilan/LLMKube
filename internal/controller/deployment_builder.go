@@ -324,6 +324,7 @@ func servedModelPath(isvc *inferencev1alpha1.InferenceService, model *inferencev
 func (r *InferenceServiceReconciler) constructDeployment(
 	isvc *inferencev1alpha1.InferenceService,
 	model *inferencev1alpha1.Model,
+	draftModel *inferencev1alpha1.Model,
 	replicas int32,
 ) *appsv1.Deployment {
 	backend := resolveBackend(isvc)
@@ -360,7 +361,16 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		modelPath = servedModelPath(isvc, model, storageConfig)
 	}
 
-	args := backend.BuildArgs(isvc, model, modelPath, "", port)
+	draftPath := ""
+	if draftModel != nil {
+		draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
+		draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
+			r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
+		draftPath = servedModelPath(isvc, draftModel, draftStorage)
+		storageConfig = mergeStorageConfigs(storageConfig, draftStorage)
+	}
+
+	args := backend.BuildArgs(isvc, model, modelPath, draftPath, port)
 
 	startupProbe, livenessProbe, readinessProbe := backend.BuildProbes(port)
 	if isvc.Spec.ProbeOverrides != nil {

@@ -199,6 +199,14 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	draftModel, draftReady, draftResult, err := r.getDraftModelForInferenceService(ctx, inferenceService)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !draftReady {
+		return *draftResult, nil
+	}
+
 	// Host-path allowlist gate (GHSA-jw3m-8q7m-f35r): a local model source
 	// outside the operator-configured roots must never produce a
 	// HostPathVolumeSource in a generated pod. Block the InferenceService
@@ -240,7 +248,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	r.emitSpecAdvisoryEvents(inferenceService, model)
 
-	deployment, readyReplicas, metalSnap, result, err := r.reconcileDeployment(ctx, inferenceService, model, desiredReplicas, modelReady, isMetal)
+	deployment, readyReplicas, metalSnap, result, err := r.reconcileDeployment(ctx, inferenceService, model, draftModel, desiredReplicas, modelReady, isMetal)
 	if err != nil || result != nil {
 		if result != nil {
 			return *result, err
@@ -345,13 +353,57 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	return model, modelReady, nil, nil
 }
 
+// getDraftModelForInferenceService resolves spec.speculativeDecoding.draftModelRef
+// the same way getModelForInferenceService resolves spec.modelRef, and fails
+// closed for the same reasons: a draft that is missing or not Ready must block
+// serving rather than silently degrade to unspeculated decoding. Silent
+// performance loss is the failure mode we are least able to notice; on GB10
+// the difference is 18% of decode throughput (#1423).
+//
+// Returns (nil, true, nil, nil) when the service configures no draft weights,
+// which is the common case.
+func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService,
+) (*inferencev1alpha1.Model, bool, *ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	sd := isvc.Spec.SpeculativeDecoding
+	if sd == nil || !specTypeNeedsDraftWeights(sd.Type) || sd.DraftModelRef == "" {
+		return nil, true, nil, nil
+	}
+
+	draft := &inferencev1alpha1.Model{}
+	name := types.NamespacedName{Name: sd.DraftModelRef, Namespace: isvc.Namespace}
+	if err := r.Get(ctx, name, draft); err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Info("Referenced draft Model not found", "draftModel", sd.DraftModelRef)
+			result, updateErr := r.updateStatusWithSchedulingInfo(
+				ctx, isvc, PhaseFailed, false, 0, 0, "",
+				fmt.Sprintf("Draft model %q not found", sd.DraftModelRef), nil)
+			return nil, false, &result, updateErr
+		}
+		log.Error(err, "Failed to get draft Model")
+		return nil, false, nil, err
+	}
+
+	if draft.Status.Phase != PhaseReady {
+		log.Info("Draft Model not ready yet", "draftModel", draft.Name, "phase", draft.Status.Phase)
+		result, updateErr := r.updateStatusWithSchedulingInfo(
+			ctx, isvc, "Pending", false, 0, 0, "",
+			fmt.Sprintf("Waiting for draft model %q to be Ready", draft.Name), nil)
+		return nil, false, &result, updateErr
+	}
+
+	return draft, true, nil, nil
+}
+
 // reconcileDeployment coordinates several independent concerns (metal snapshot,
 // rollout-policy idle gating, HPA replica ownership, and retry-on-conflict update
 // for concurrent ModelPool replica scaling), which keeps it over the gocyclo
 // threshold; splitting it further would fragment one linear reconcile step.
 //
 //nolint:gocyclo
-func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, int32, *metalSnapshot, *ctrl.Result, error) {
+func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, int32, *metalSnapshot, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if isMetal {
@@ -394,7 +446,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		return nil, 0, nil, &result, updateErr
 	}
 
-	deployment := r.constructDeployment(isvc, model, desiredReplicas)
+	deployment := r.constructDeployment(isvc, model, draftModel, desiredReplicas)
 	if err := setControllerReferenceUnblocked(isvc, deployment, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for Deployment")
 		return nil, 0, nil, nil, err

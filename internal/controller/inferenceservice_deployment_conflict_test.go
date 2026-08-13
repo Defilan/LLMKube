@@ -116,7 +116,7 @@ func TestReconcileDeploymentRetriesOnConflict(t *testing.T) {
 		InitContainerImage: "docker.io/curlimages/curl:8.18.0",
 	}
 
-	if _, _, _, _, err := r.reconcileDeployment(context.Background(), isvc, model, 1, true, false); err != nil {
+	if _, _, _, _, err := r.reconcileDeployment(context.Background(), isvc, model, nil, 1, true, false); err != nil {
 		t.Fatalf("reconcileDeployment surfaced a conflict instead of retrying: %v", err)
 	}
 

@@ -340,7 +340,7 @@ func TestConstructDeploymentSetsTerminationMessagePolicy(t *testing.T) {
 	isvc := sharingISvc(1, nil)
 	model := sharingModel(&inferencev1alpha1.GPUSpec{Enabled: true, Vendor: "nvidia"})
 
-	deployment := r.constructDeployment(isvc, model, 1)
+	deployment := r.constructDeployment(isvc, model, nil, 1)
 
 	c := deployment.Spec.Template.Spec.Containers[0]
 	if c.TerminationMessagePolicy != corev1.TerminationMessageFallbackToLogsOnError {
