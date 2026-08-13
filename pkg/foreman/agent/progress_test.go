@@ -704,3 +704,76 @@ func TestProgressMonitor_EditDisarmsNudgedRepeatedTool(t *testing.T) {
 		t.Fatalf("edit-free defiance must still terminate; got %+v", d)
 	}
 }
+
+// TestProgressMonitor_UnverifiedBashResetsAreBounded reproduces #1520: a model
+// whose every turn contains a bash command matching the write heuristic held
+// editFreeStreak at zero indefinitely, so EditFreeTurnsLimit was unreachable
+// and the detector never fired. Observed in the field as 85 minutes and tens of
+// thousands of model operations against a verifiably clean worktree.
+//
+// Each turn here varies the filename so RepeatedToolThreshold does not fire
+// first; the signal under test is the edit-free one alone.
+func TestProgressMonitor_UnverifiedBashResetsAreBounded(t *testing.T) {
+	mon := NewLoopProgressMonitor(ProgressConfig{
+		EditFreeTurnsLimit:     5,
+		UnverifiedEditResetCap: 3,
+	})
+	transcript := []oai.Message{{Role: oai.RoleSystem, Content: "sys"}}
+
+	fired := 0
+	for turn := 1; turn <= 40; turn++ {
+		args := fmt.Sprintf(`{"command":"cp scratch-%d.txt /tmp/x"}`, turn)
+		d := mon.Observe(turn, []oai.ToolCall{makeCall("t", "bash", args)}, transcript)
+		if d.Action != ProgressContinue {
+			fired = turn
+			break
+		}
+	}
+	if fired == 0 {
+		t.Fatal("edit-free signal never fired across 40 bash-shaped turns; " +
+			"unverified resets are still unbounded (#1520)")
+	}
+	// 3 resets are honoured, then the streak advances to the limit of 5.
+	if fired > 12 {
+		t.Errorf("signal fired at turn %d, later than the cap should allow", fired)
+	}
+}
+
+// A model that edits through real tools must be unaffected by the bound: the
+// tool contract is self-evidencing, so its budget resets every time.
+func TestProgressMonitor_RealEditToolClearsUnverifiedBudget(t *testing.T) {
+	mon := NewLoopProgressMonitor(ProgressConfig{
+		EditFreeTurnsLimit:     5,
+		UnverifiedEditResetCap: 3,
+	})
+	transcript := []oai.Message{{Role: oai.RoleSystem, Content: "sys"}}
+
+	// Alternate bash-shaped writes with a genuine str_replace. The real edit
+	// clears the unverified budget, so the cap is never reached.
+	for turn := 1; turn <= 40; turn++ {
+		var call oai.ToolCall
+		if turn%3 == 0 {
+			call = makeCall("e", "str_replace", `{"path":"a.go","old":"x","new":"y"}`)
+		} else {
+			call = makeCall("t", "bash", fmt.Sprintf(`{"command":"cp s-%d.txt /tmp/x"}`, turn))
+		}
+		if d := mon.Observe(turn, []oai.ToolCall{call}, transcript); d.Action != ProgressContinue {
+			t.Fatalf("turn %d: a model making real edits must not be flagged; got %+v", turn, d)
+		}
+	}
+}
+
+// Cap 0 restores the pre-#1520 behaviour, so an operator can opt out.
+func TestProgressMonitor_UnverifiedResetCapZeroIsUnbounded(t *testing.T) {
+	mon := NewLoopProgressMonitor(ProgressConfig{
+		EditFreeTurnsLimit:     5,
+		UnverifiedEditResetCap: 0,
+	})
+	transcript := []oai.Message{{Role: oai.RoleSystem, Content: "sys"}}
+	for turn := 1; turn <= 40; turn++ {
+		args := fmt.Sprintf(`{"command":"cp scratch-%d.txt /tmp/x"}`, turn)
+		if d := mon.Observe(turn, []oai.ToolCall{makeCall("t", "bash", args)}, transcript); d.Action != ProgressContinue {
+			t.Fatalf("turn %d: cap 0 must keep the old unbounded behaviour; got %+v", turn, d)
+		}
+	}
+}
