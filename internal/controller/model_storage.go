@@ -953,6 +953,51 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	}
 }
 
+// mergeStorageConfigs folds a draft model's storage into the target model's so
+// one pod can carry both sets of weights.
+//
+// Volumes and mounts are deduplicated by Name, and that is correct rather than
+// defensive: when both models use the per-service cache they resolve to the
+// same "model-cache" volume mounted once at /models, with the two models
+// already separated by effectiveModelCacheKey subdirectories. A draft from a
+// different source (a pvc:// model, say) yields a differently-named volume and
+// both survive.
+//
+// The returned modelPath and stagedDir are the TARGET's. The draft's path is
+// read from the draft config by the caller before merging.
+func mergeStorageConfigs(target, draft modelStorageConfig) modelStorageConfig {
+	out := target
+	out.initContainers = append(append([]corev1.Container{}, target.initContainers...), draft.initContainers...)
+
+	haveVolume := make(map[string]struct{}, len(target.volumes))
+	for _, v := range target.volumes {
+		haveVolume[v.Name] = struct{}{}
+	}
+	out.volumes = append([]corev1.Volume{}, target.volumes...)
+	for _, v := range draft.volumes {
+		if _, dup := haveVolume[v.Name]; dup {
+			continue
+		}
+		haveVolume[v.Name] = struct{}{}
+		out.volumes = append(out.volumes, v)
+	}
+
+	haveMount := make(map[string]struct{}, len(target.volumeMounts))
+	for _, m := range target.volumeMounts {
+		haveMount[m.Name] = struct{}{}
+	}
+	out.volumeMounts = append([]corev1.VolumeMount{}, target.volumeMounts...)
+	for _, m := range draft.volumeMounts {
+		if _, dup := haveMount[m.Name]; dup {
+			continue
+		}
+		haveMount[m.Name] = struct{}{}
+		out.volumeMounts = append(out.volumeMounts, m)
+	}
+
+	return out
+}
+
 // ensureModelCachePVC creates the model cache PVC for an InferenceService if it
 // does not already exist.
 //

@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"testing"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
@@ -201,3 +203,63 @@ var _ = Describe("modelEnvFrom", func() {
 		Expect(envFrom[0].SecretRef.Name).To(Equal("s3-credentials"))
 	})
 })
+
+func TestMergeStorageConfigs(t *testing.T) {
+	// Both models on the per-service cache: the PVC is mounted once at
+	// /models and each model already lives under its own
+	// effectiveModelCacheKey subdirectory, so the merged pod must carry ONE
+	// model-cache volume and BOTH download init containers.
+	t.Run("same cache volume is deduplicated", func(t *testing.T) {
+		cache := corev1.Volume{Name: "model-cache"}
+		mount := corev1.VolumeMount{Name: "model-cache", MountPath: "/models"}
+		target := modelStorageConfig{
+			modelPath:      "/models/target/model.gguf",
+			initContainers: []corev1.Container{{Name: "model-downloader"}},
+			volumes:        []corev1.Volume{cache},
+			volumeMounts:   []corev1.VolumeMount{mount},
+		}
+		draft := modelStorageConfig{
+			modelPath:      "/models/draft/model.gguf",
+			initContainers: []corev1.Container{{Name: "draft-model-downloader"}},
+			volumes:        []corev1.Volume{cache},
+			volumeMounts:   []corev1.VolumeMount{mount},
+		}
+
+		got := mergeStorageConfigs(target, draft)
+
+		if len(got.volumes) != 1 {
+			t.Errorf("volumes = %d, want 1 (the shared model-cache)", len(got.volumes))
+		}
+		if len(got.volumeMounts) != 1 {
+			t.Errorf("volumeMounts = %d, want 1", len(got.volumeMounts))
+		}
+		if len(got.initContainers) != 2 {
+			t.Errorf("initContainers = %d, want 2 (one download per model)", len(got.initContainers))
+		}
+		if got.modelPath != "/models/target/model.gguf" {
+			t.Errorf("modelPath = %q, want the target's path unchanged", got.modelPath)
+		}
+	})
+
+	// A draft from a different source (say a pvc:// model) brings its own
+	// volume, which must survive alongside the target's.
+	t.Run("distinct volumes both survive", func(t *testing.T) {
+		target := modelStorageConfig{
+			volumes:      []corev1.Volume{{Name: "model-cache"}},
+			volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models"}},
+		}
+		draft := modelStorageConfig{
+			volumes:      []corev1.Volume{{Name: "draft-pvc"}},
+			volumeMounts: []corev1.VolumeMount{{Name: "draft-pvc", MountPath: "/draft"}},
+		}
+
+		got := mergeStorageConfigs(target, draft)
+
+		if len(got.volumes) != 2 {
+			t.Errorf("volumes = %d, want 2", len(got.volumes))
+		}
+		if len(got.volumeMounts) != 2 {
+			t.Errorf("volumeMounts = %d, want 2", len(got.volumeMounts))
+		}
+	})
+}
