@@ -1,5 +1,5 @@
 /*
-Copyright 2025.
+Copyright 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -90,6 +90,14 @@ var _ = Describe("speculativeDecoding CRD validation", func() {
 	It("admits an ngram type alone", func() {
 		isvc := newSpecISvc("sd-ngram-alone", &inferencev1alpha1.SpeculativeDecodingSpec{
 			Type: "ngram-cache",
+		})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
+	It("admits type disabled", func() {
+		isvc := newSpecISvc("sd-disabled", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "disabled",
 		})
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
