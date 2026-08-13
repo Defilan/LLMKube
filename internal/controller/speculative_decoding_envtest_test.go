@@ -165,4 +165,63 @@ var _ = Describe("InferenceService draft-model speculative decoding", func() {
 			Expect(progressing.Message).To(ContainSubstring(draftModel.Name))
 		})
 	})
+
+	// Ground truth for the pod-shape invariants: the apiserver's own
+	// validation, not our reading of it. Duplicate init container names and
+	// duplicate mount paths are both rejected at admission, and both were
+	// produced by every draft-enabled Deployment before #1528's merge was
+	// fixed:
+	//
+	//	spec.template.spec.initContainers[2].name: Duplicate value: "model-cache-prep"
+	//	spec.template.spec.containers[0].volumeMounts[1].mountPath: Invalid value: "/models": must be unique
+	Context("the built Deployment", func() {
+		type combo struct {
+			name          string
+			target, draft *inferencev1alpha1.Model
+		}
+		cached := func(name, key string) *inferencev1alpha1.Model {
+			return &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/" + name + ".gguf"},
+				Status:     inferencev1alpha1.ModelStatus{CacheKey: key},
+			}
+		}
+		uncached := func(name string) *inferencev1alpha1.Model {
+			m := cached(name, "")
+			return m
+		}
+		pvc := func(name, claim string) *inferencev1alpha1.Model {
+			m := cached(name, name+"-key")
+			m.Spec.Source = "pvc://" + claim + "/model.gguf"
+			return m
+		}
+
+		for _, tc := range []combo{
+			{"cached-cached", cached("t1", "t1-key"), cached("d1", "d1-key")},
+			{"cached-uncached", cached("t2", "t2-key"), uncached("d2")},
+			{"pvc-pvc", pvc("t3", "target-claim"), pvc("d3", "draft-claim")},
+			{"pvc-cached", pvc("t4", "target-claim"), cached("d4", "d4-key")},
+		} {
+			It("is accepted by the apiserver: "+tc.name, func() {
+				isvc := &inferencev1alpha1.InferenceService{
+					ObjectMeta: metav1.ObjectMeta{Name: "sd-" + tc.name, Namespace: "default"},
+					Spec: inferencev1alpha1.InferenceServiceSpec{
+						ModelRef: tc.target.Name,
+						Runtime:  "llamacpp",
+						SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+							Type: "draft-dspark", DraftModelRef: tc.draft.Name,
+						},
+					},
+				}
+				r := &InferenceServiceReconciler{
+					Client: k8sClient, Scheme: k8sClient.Scheme(),
+					ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService,
+					InitContainerImage: "curlimages/curl:latest",
+				}
+				dep := r.constructDeployment(isvc, tc.target, tc.draft, 1)
+				Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+			})
+		}
+	})
 })

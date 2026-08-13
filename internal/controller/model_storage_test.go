@@ -204,28 +204,42 @@ var _ = Describe("modelEnvFrom", func() {
 	})
 })
 
+// These exercise the merge's own logic. The invariants that make the resulting
+// pod acceptable to the apiserver are asserted at constructDeployment level in
+// deployment_builder_test.go, where the inputs come from the real storage
+// builders rather than from fixtures that can invent names production never
+// emits.
 func TestMergeStorageConfigs(t *testing.T) {
+	pvcVolume := func(name, claim string) corev1.Volume {
+		return corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+			},
+		}
+	}
+
 	// Both models on the per-service cache: the PVC is mounted once at
 	// /models and each model already lives under its own
 	// effectiveModelCacheKey subdirectory, so the merged pod must carry ONE
 	// model-cache volume and BOTH download init containers.
-	t.Run("same cache volume is deduplicated", func(t *testing.T) {
-		cache := corev1.Volume{Name: "model-cache"}
+	t.Run("the same cache volume is shared", func(t *testing.T) {
+		cache := pvcVolume("model-cache", "svc-model-cache")
 		mount := corev1.VolumeMount{Name: "model-cache", MountPath: "/models"}
 		target := modelStorageConfig{
 			modelPath:      "/models/target/model.gguf",
-			initContainers: []corev1.Container{{Name: "model-downloader"}},
+			initContainers: []corev1.Container{{Name: "model-downloader", Image: "curl"}},
 			volumes:        []corev1.Volume{cache},
 			volumeMounts:   []corev1.VolumeMount{mount},
 		}
 		draft := modelStorageConfig{
 			modelPath:      "/models/draft/model.gguf",
-			initContainers: []corev1.Container{{Name: "draft-model-downloader"}},
+			initContainers: []corev1.Container{{Name: "model-downloader", Image: "curl", Env: []corev1.EnvVar{{Name: "MODEL_PATH"}}}},
 			volumes:        []corev1.Volume{cache},
 			volumeMounts:   []corev1.VolumeMount{mount},
 		}
 
-		got := mergeStorageConfigs(target, draft)
+		got, placed := mergeStorageConfigs(target, draft)
 
 		if len(got.volumes) != 1 {
 			t.Errorf("volumes = %d, want 1 (the shared model-cache)", len(got.volumes))
@@ -236,30 +250,151 @@ func TestMergeStorageConfigs(t *testing.T) {
 		if len(got.initContainers) != 2 {
 			t.Errorf("initContainers = %d, want 2 (one download per model)", len(got.initContainers))
 		}
+		if got.initContainers[1].Name != "draft-model-downloader" {
+			t.Errorf("draft init container name = %q, want %q (both builders emit the fixed name %q)",
+				got.initContainers[1].Name, "draft-model-downloader", "model-downloader")
+		}
 		if got.modelPath != "/models/target/model.gguf" {
 			t.Errorf("modelPath = %q, want the target's path unchanged", got.modelPath)
 		}
+		if placed.modelPath != "/models/draft/model.gguf" {
+			t.Errorf("placed draft modelPath = %q, want it unchanged under the shared mount", placed.modelPath)
+		}
 	})
 
-	// A draft from a different source (say a pvc:// model) brings its own
-	// volume, which must survive alongside the target's.
-	t.Run("distinct volumes both survive", func(t *testing.T) {
+	// Two pvc:// models both arrive as a volume named "model-source" mounted
+	// at /model-source. Name-only dedup dropped the draft's claim and left -md
+	// pointing into the target's.
+	t.Run("a colliding volume with a different source is renamed and remounted", func(t *testing.T) {
+		target := modelStorageConfig{
+			modelPath:    "/model-source/model.gguf",
+			volumes:      []corev1.Volume{pvcVolume("model-source", "target-claim")},
+			volumeMounts: []corev1.VolumeMount{{Name: "model-source", MountPath: "/model-source"}},
+		}
+		draft := modelStorageConfig{
+			modelPath:    "/model-source/model.gguf",
+			volumes:      []corev1.Volume{pvcVolume("model-source", "draft-claim")},
+			volumeMounts: []corev1.VolumeMount{{Name: "model-source", MountPath: "/model-source"}},
+		}
+
+		got, placed := mergeStorageConfigs(target, draft)
+
+		if len(got.volumes) != 2 {
+			t.Fatalf("volumes = %d, want 2 (the claims differ)", len(got.volumes))
+		}
+		if got.volumes[1].Name != "draft-model-source" {
+			t.Errorf("draft volume name = %q, want draft-model-source", got.volumes[1].Name)
+		}
+		if got.volumes[1].PersistentVolumeClaim.ClaimName != "draft-claim" {
+			t.Errorf("draft claim = %q, want draft-claim", got.volumes[1].PersistentVolumeClaim.ClaimName)
+		}
+		if got.volumeMounts[1].MountPath != "/draft/model-source" {
+			t.Errorf("draft mountPath = %q, want /draft/model-source", got.volumeMounts[1].MountPath)
+		}
+		if placed.modelPath != "/draft/model-source/model.gguf" {
+			t.Errorf("placed draft modelPath = %q, want it rewritten onto the new mount", placed.modelPath)
+		}
+	})
+
+	// A draft whose volume name does not collide but whose mount path does.
+	t.Run("a colliding mount path is remounted under /draft", func(t *testing.T) {
+		target := modelStorageConfig{
+			modelPath:    "/models/target-key/target.gguf",
+			volumes:      []corev1.Volume{pvcVolume("model-cache", "svc-model-cache")},
+			volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models"}},
+		}
+		draft := modelStorageConfig{
+			modelPath: "/models/default-dspark.gguf",
+			stagedDir: "/models",
+			volumes: []corev1.Volume{{
+				Name:         "model-storage",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}},
+			volumeMounts: []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}},
+		}
+
+		got, placed := mergeStorageConfigs(target, draft)
+
+		if len(got.volumes) != 2 {
+			t.Fatalf("volumes = %d, want 2", len(got.volumes))
+		}
+		if got.volumes[1].Name != "model-storage" {
+			t.Errorf("draft volume name = %q, want model-storage (no name collision to resolve)", got.volumes[1].Name)
+		}
+		if got.volumeMounts[1].MountPath != "/draft/models" {
+			t.Errorf("draft mountPath = %q, want /draft/models", got.volumeMounts[1].MountPath)
+		}
+		if placed.modelPath != "/draft/models/default-dspark.gguf" {
+			t.Errorf("placed draft modelPath = %q, want it rewritten", placed.modelPath)
+		}
+		if placed.stagedDir != "/draft/models" {
+			t.Errorf("placed draft stagedDir = %q, want /draft/models", placed.stagedDir)
+		}
+	})
+
+	// A draft from a different source brings its own volume at its own path,
+	// which must survive untouched alongside the target's.
+	t.Run("distinct volumes both survive unchanged", func(t *testing.T) {
 		target := modelStorageConfig{
 			volumes:      []corev1.Volume{{Name: "model-cache"}},
 			volumeMounts: []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models"}},
 		}
 		draft := modelStorageConfig{
+			modelPath:    "/draft-pvc/model.gguf",
 			volumes:      []corev1.Volume{{Name: "draft-pvc"}},
-			volumeMounts: []corev1.VolumeMount{{Name: "draft-pvc", MountPath: "/draft"}},
+			volumeMounts: []corev1.VolumeMount{{Name: "draft-pvc", MountPath: "/draft-pvc"}},
 		}
 
-		got := mergeStorageConfigs(target, draft)
+		got, placed := mergeStorageConfigs(target, draft)
 
 		if len(got.volumes) != 2 {
 			t.Errorf("volumes = %d, want 2", len(got.volumes))
 		}
 		if len(got.volumeMounts) != 2 {
 			t.Errorf("volumeMounts = %d, want 2", len(got.volumeMounts))
+		}
+		if placed.modelPath != "/draft-pvc/model.gguf" {
+			t.Errorf("placed draft modelPath = %q, want it unchanged", placed.modelPath)
+		}
+	})
+
+	// The inputs are the caller's; the merge must not write through them.
+	t.Run("neither input is mutated", func(t *testing.T) {
+		target := modelStorageConfig{
+			initContainers: []corev1.Container{{Name: "model-downloader"}},
+			volumes:        []corev1.Volume{pvcVolume("model-source", "target-claim")},
+			volumeMounts:   []corev1.VolumeMount{{Name: "model-source", MountPath: "/model-source"}},
+		}
+		draft := modelStorageConfig{
+			modelPath: "/model-source/draft.gguf",
+			initContainers: []corev1.Container{{
+				Name:         "model-downloader",
+				Image:        "curl",
+				VolumeMounts: []corev1.VolumeMount{{Name: "model-source", MountPath: "/model-source"}},
+			}},
+			volumes:      []corev1.Volume{pvcVolume("model-source", "draft-claim")},
+			volumeMounts: []corev1.VolumeMount{{Name: "model-source", MountPath: "/model-source"}},
+		}
+
+		_, _ = mergeStorageConfigs(target, draft)
+
+		if draft.initContainers[0].Name != "model-downloader" {
+			t.Errorf("draft init container was renamed in place: %q", draft.initContainers[0].Name)
+		}
+		if draft.initContainers[0].VolumeMounts[0].Name != "model-source" {
+			t.Errorf("draft init container mount was rewritten in place: %q", draft.initContainers[0].VolumeMounts[0].Name)
+		}
+		if draft.volumes[0].Name != "model-source" {
+			t.Errorf("draft volume was renamed in place: %q", draft.volumes[0].Name)
+		}
+		if draft.volumeMounts[0].MountPath != "/model-source" {
+			t.Errorf("draft mount was remounted in place: %q", draft.volumeMounts[0].MountPath)
+		}
+		if draft.modelPath != "/model-source/draft.gguf" {
+			t.Errorf("draft modelPath was rewritten in place: %q", draft.modelPath)
+		}
+		if len(target.initContainers) != 1 || len(target.volumes) != 1 || len(target.volumeMounts) != 1 {
+			t.Errorf("target was appended to in place")
 		}
 	})
 }

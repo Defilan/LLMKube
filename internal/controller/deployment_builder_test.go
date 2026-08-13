@@ -788,8 +788,13 @@ func TestBuildDeployment_MountsDraftModelAndEmitsMd(t *testing.T) {
 	if cacheVolumes != 1 {
 		t.Errorf("model-cache volumes = %d, want exactly 1", cacheVolumes)
 	}
-	if len(pod.InitContainers) < 2 {
-		t.Errorf("initContainers = %d, want at least 2 (one download per model)", len(pod.InitContainers))
+	// Exactly three, not "at least two": the shared cache needs ONE
+	// model-cache-prep (an idempotent chown of the one mount), plus one
+	// downloader per model. "At least two" was satisfied by the four
+	// duplicate-named containers the apiserver rejected outright.
+	if len(pod.InitContainers) != 3 {
+		t.Errorf("initContainers = %v, want [model-cache-prep model-downloader draft-model-downloader]",
+			containerNames(pod.InitContainers))
 	}
 	joined := strings.Join(pod.Containers[0].Args, " ")
 	if !strings.Contains(joined, "-md ") {
@@ -798,4 +803,278 @@ func TestBuildDeployment_MountsDraftModelAndEmitsMd(t *testing.T) {
 	if !strings.Contains(joined, "--spec-type draft-dspark") {
 		t.Errorf("argv missing --spec-type draft-dspark; got %s", joined)
 	}
+}
+
+func containerNames(containers []corev1.Container) []string {
+	names := make([]string, 0, len(containers))
+	for _, c := range containers {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+// argValue returns the value following flag in an argv, or "" when absent.
+func argValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// pathIsUnder reports whether p lies at or below dir.
+func pathIsUnder(p, dir string) bool {
+	return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, "/")+"/")
+}
+
+func cachedGGUFModel(name, cacheKey string) *inferencev1alpha1.Model {
+	return &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/" + name + ".gguf"},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: cacheKey},
+	}
+}
+
+// uncachedGGUFModel has no Status.CacheKey, so effectiveModelCacheKey is empty
+// and its storage falls to buildEmptyDirStorageConfig — the "model-storage"
+// emptyDir, also mounted at /models.
+func uncachedGGUFModel(name string) *inferencev1alpha1.Model {
+	return &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/" + name + ".gguf"},
+	}
+}
+
+func pvcGGUFModel(name, claim, file string) *inferencev1alpha1.Model {
+	return &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "pvc://" + claim + "/" + file},
+		Status:     inferencev1alpha1.ModelStatus{CacheKey: name + "-cache-key"},
+	}
+}
+
+// TestConstructDeployment_DraftPodIsWellFormed asserts the pod-validity
+// invariants at the level the apiserver judges them — the built Deployment —
+// rather than at mergeStorageConfigs, where a hand-written fixture can invent
+// resources no storage builder ever emits (a "draft-model-downloader" init
+// container, say) and pass while production is rejected on every apply.
+//
+// Every source combination is covered because each one collides differently:
+// cached/cached shares a volume, cached/uncached collides on mountPath only,
+// pvc/pvc collides on volume name with DIFFERENT claims, and pvc/cached
+// collides on neither but still on init container names.
+func TestConstructDeployment_DraftPodIsWellFormed(t *testing.T) {
+	cases := []struct {
+		name          string
+		target, draft *inferencev1alpha1.Model
+		wantVolumes   int
+		wantInitNames []string
+		wantModelPath string
+		wantDraftPath string
+	}{
+		{
+			// The design's central case: one cache PVC, mounted once, the two
+			// models separated by their effectiveModelCacheKey subdirectories.
+			name:          "cached target, cached draft",
+			target:        cachedGGUFModel("target", "target-key"),
+			draft:         cachedGGUFModel("dspark", "dspark-key"),
+			wantVolumes:   1,
+			wantInitNames: []string{"model-cache-prep", "model-downloader", "draft-model-downloader"},
+			wantModelPath: "/models/target-key/target.gguf",
+			wantDraftPath: "/models/dspark-key/dspark.gguf",
+		},
+		{
+			// Differently-named volumes, both wanting /models.
+			name:          "cached target, uncached draft",
+			target:        cachedGGUFModel("target", "target-key"),
+			draft:         uncachedGGUFModel("dspark"),
+			wantVolumes:   2,
+			wantInitNames: []string{"model-cache-prep", "model-downloader", "draft-model-downloader"},
+			wantModelPath: "/models/target-key/target.gguf",
+			wantDraftPath: "/draft/models/default-dspark.gguf",
+		},
+		{
+			// Same volume name, same mount path, DIFFERENT claims, and the
+			// same basename inside each: name-only dedup dropped the draft's
+			// claim and pointed -md at a file in the target's (#1528 I2).
+			name:          "pvc target, pvc draft",
+			target:        pvcGGUFModel("target", "target-claim", "model.gguf"),
+			draft:         pvcGGUFModel("dspark", "draft-claim", "model.gguf"),
+			wantVolumes:   2,
+			wantInitNames: nil,
+			wantModelPath: "/model-source/model.gguf",
+			wantDraftPath: "/draft/model-source/model.gguf",
+		},
+		{
+			// No volume or path collision at all; only the init container
+			// names collide with nothing, and must still be unambiguous.
+			name:          "pvc target, cached draft",
+			target:        pvcGGUFModel("target", "target-claim", "target.gguf"),
+			draft:         cachedGGUFModel("dspark", "dspark-key"),
+			wantVolumes:   2,
+			wantInitNames: []string{"draft-model-cache-prep", "draft-model-downloader"},
+			wantModelPath: "/model-source/target.gguf",
+			wantDraftPath: "/models/dspark-key/dspark.gguf",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: tc.target.Name,
+					Runtime:  "llamacpp",
+					SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+						Type: "draft-dspark", DraftModelRef: tc.draft.Name,
+					},
+				},
+			}
+			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+			pod := r.constructDeployment(isvc, tc.target, tc.draft, 1).Spec.Template.Spec
+
+			// Container names are unique across initContainers AND containers:
+			// Kubernetes rejects the whole Deployment otherwise.
+			seenContainer := map[string]bool{}
+			for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+				if seenContainer[c.Name] {
+					t.Errorf("duplicate container name %q (init=%v)", c.Name, containerNames(pod.InitContainers))
+				}
+				seenContainer[c.Name] = true
+			}
+			if got := containerNames(pod.InitContainers); !equalStrings(got, tc.wantInitNames) {
+				t.Errorf("initContainers = %v, want %v", got, tc.wantInitNames)
+			}
+
+			// Volume names are unique, and every mount resolves to one.
+			volumes := map[string]bool{}
+			for _, v := range pod.Volumes {
+				if volumes[v.Name] {
+					t.Errorf("duplicate volume name %q", v.Name)
+				}
+				volumes[v.Name] = true
+			}
+			if len(pod.Volumes) != tc.wantVolumes {
+				t.Errorf("volumes = %d %v, want %d", len(pod.Volumes), volumeNames(pod.Volumes), tc.wantVolumes)
+			}
+
+			// Mount paths are unique within each container.
+			var mountPaths []string
+			for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {
+				seenPath := map[string]bool{}
+				for _, m := range c.VolumeMounts {
+					if seenPath[m.MountPath] {
+						t.Errorf("container %q mounts %q twice", c.Name, m.MountPath)
+					}
+					seenPath[m.MountPath] = true
+					if !volumes[m.Name] {
+						t.Errorf("container %q mounts volume %q, which the pod does not declare", c.Name, m.Name)
+					}
+				}
+			}
+			for _, m := range pod.Containers[0].VolumeMounts {
+				mountPaths = append(mountPaths, m.MountPath)
+			}
+
+			// Both weights must be reachable in the SERVING container: a path
+			// that no mount covers is a file the runtime cannot open, and a
+			// draft path that silently resolves inside the target's volume is
+			// worse than a rejected pod.
+			args := pod.Containers[0].Args
+			gotModel, gotDraft := argValue(args, "--model"), argValue(args, "-md")
+			if gotModel != tc.wantModelPath {
+				t.Errorf("-m = %q, want %q", gotModel, tc.wantModelPath)
+			}
+			if gotDraft != tc.wantDraftPath {
+				t.Errorf("-md = %q, want %q", gotDraft, tc.wantDraftPath)
+			}
+			if gotDraft == gotModel {
+				t.Errorf("-md == -m (%q): the draft resolves to the target's own weights", gotDraft)
+			}
+			for _, p := range []struct{ flag, path string }{{"--model", gotModel}, {"-md", gotDraft}} {
+				covered := false
+				for _, mp := range mountPaths {
+					if pathIsUnder(p.path, mp) {
+						covered = true
+						break
+					}
+				}
+				if !covered {
+					t.Errorf("%s %q lies under no mountPath of the serving container %v", p.flag, p.path, mountPaths)
+				}
+			}
+		})
+	}
+}
+
+// TestConstructDeployment_DraftStorageHonoursTheInitGate covers I3: the draft
+// block used to sit outside the NeedsModelInit/skipModelInit gate, so a
+// llamacpp-router service (which documents that it does NOT auto-mount /models)
+// or one with skipModelInit had a cache volume and two init containers injected
+// behind its back.
+func TestConstructDeployment_DraftStorageHonoursTheInitGate(t *testing.T) {
+	target := cachedGGUFModel("target", "target-key")
+	draft := cachedGGUFModel("dspark", "dspark-key")
+
+	newISvc := func(runtime string, skip *bool) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:      "target",
+				Runtime:       runtime,
+				SkipModelInit: skip,
+				SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+					Type: "draft-dspark", DraftModelRef: "dspark",
+				},
+			},
+		}
+	}
+	skip := true
+
+	for _, tc := range []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+	}{
+		{"llamacpp-router does not auto-mount /models", newISvc("llamacpp-router", nil)},
+		{"skipModelInit opts out entirely", newISvc("llamacpp", &skip)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+			pod := r.constructDeployment(tc.isvc, target, draft, 1).Spec.Template.Spec
+
+			if len(pod.InitContainers) != 0 {
+				t.Errorf("initContainers = %v, want none", containerNames(pod.InitContainers))
+			}
+			if len(pod.Volumes) != 0 {
+				t.Errorf("volumes = %v, want none", volumeNames(pod.Volumes))
+			}
+			if len(pod.Containers[0].VolumeMounts) != 0 {
+				t.Errorf("volumeMounts = %d, want none", len(pod.Containers[0].VolumeMounts))
+			}
+			if md := argValue(pod.Containers[0].Args, "-md"); md != "" {
+				t.Errorf("-md = %q, want it omitted: no draft storage was mounted", md)
+			}
+		})
+	}
+}
+
+func volumeNames(volumes []corev1.Volume) []string {
+	names := make([]string, 0, len(volumes))
+	for _, v := range volumes {
+		names = append(names, v.Name)
+	}
+	return names
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

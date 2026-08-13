@@ -352,6 +352,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 
 	var storageConfig modelStorageConfig
 	var modelPath string
+	draftPath := ""
 	if backend.NeedsModelInit() && !skipInit {
 		// Same predicate as the provisioning side (modelNeedsCachePVC), so a
 		// service that declined the cache mounts an emptyDir instead of a claim
@@ -359,15 +360,23 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
 		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
 		modelPath = servedModelPath(isvc, model, storageConfig)
-	}
 
-	draftPath := ""
-	if draftModel != nil {
-		draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
-		draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
-			r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
-		draftPath = servedModelPath(isvc, draftModel, draftStorage)
-		storageConfig = mergeStorageConfigs(storageConfig, draftStorage)
+		// The draft's weights ride in the same pod, under the SAME gate as the
+		// target's. A runtime that does not auto-mount /models (the llamacpp
+		// router documents exactly that) or a service that set skipModelInit
+		// must not have a cache volume and two init containers injected behind
+		// its back just because a draft model is referenced.
+		if draftModel != nil {
+			draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
+			draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
+				r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
+			// The path comes from the merge's rewritten draft config, not from
+			// draftStorage: the merge may have remounted the draft's volume to
+			// clear a collision with the target's, and -md must follow it.
+			var placedDraft modelStorageConfig
+			storageConfig, placedDraft = mergeStorageConfigs(storageConfig, draftStorage)
+			draftPath = servedModelPath(isvc, draftModel, placedDraft)
+		}
 	}
 
 	args := backend.BuildArgs(isvc, model, modelPath, draftPath, port)
