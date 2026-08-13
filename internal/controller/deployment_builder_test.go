@@ -837,7 +837,7 @@ func cachedGGUFModel(name, cacheKey string) *inferencev1alpha1.Model {
 }
 
 // uncachedGGUFModel has no Status.CacheKey, so effectiveModelCacheKey is empty
-// and its storage falls to buildEmptyDirStorageConfig — the "model-storage"
+// and its storage falls to buildEmptyDirStorageConfig, so the "model-storage"
 // emptyDir, also mounted at /models.
 func uncachedGGUFModel(name string) *inferencev1alpha1.Model {
 	return &inferencev1alpha1.Model{
@@ -855,7 +855,7 @@ func pvcGGUFModel(name, claim, file string) *inferencev1alpha1.Model {
 }
 
 // TestConstructDeployment_DraftPodIsWellFormed asserts the pod-validity
-// invariants at the level the apiserver judges them — the built Deployment —
+// invariants at the level the apiserver judges them, on the built Deployment,
 // rather than at mergeStorageConfigs, where a hand-written fixture can invent
 // resources no storage builder ever emits (a "draft-model-downloader" init
 // container, say) and pass while production is rejected on every apply.

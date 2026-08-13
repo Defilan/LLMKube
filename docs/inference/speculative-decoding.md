@@ -36,7 +36,7 @@ layer-split over RDMA, single stream (defilantech/LLMKube#1423):
 
 | nDraftMax | decode tok/s | vs no speculation |
 | --- | --- | --- |
-| none | 16.13 | — |
+| none | 16.13 | n/a |
 | 1 | 15.98 | -0.9% |
 | 2 | 17.54 | +8.7% |
 | 3 | 19.01 | +17.9% |

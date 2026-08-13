@@ -1020,7 +1020,7 @@ func hasEquivalentContainer(existing []corev1.Container, c corev1.Container) boo
 // mergeStorageConfigs folds a draft model's storage into the target model's so
 // one pod can carry both sets of weights. It returns the merged pod-level
 // config and the draft's own config REWRITTEN to describe where its weights
-// actually land in that pod — callers must read the draft's path from the
+// actually land in that pod. Callers must read the draft's path from the
 // second return value, never from the config they passed in.
 //
 // The draft shares the target's resources exactly where sharing is correct and
@@ -1045,7 +1045,7 @@ func hasEquivalentContainer(existing []corev1.Container, c corev1.Container) boo
 //     that is identical to one the target already runs (the shared cache's
 //     prep, an idempotent chown of the same mount) is dropped rather than run
 //     twice. Init containers each have their own mount namespace, so their
-//     mount PATHS are left alone — the download commands bake them in — and
+//     mount PATHS are left alone (the download commands bake them in), and
 //     only volume NAMES are rewritten, to follow a renamed volume.
 //
 // Neither input is mutated: every appended or rewritten value is a copy.
