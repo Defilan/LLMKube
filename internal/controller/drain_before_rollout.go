@@ -122,6 +122,28 @@ func collectReadyReplicaURLs(slices *discoveryv1.EndpointSliceList, port int32) 
 	return urls
 }
 
+// collectNotReadyReplicaURLs builds a list of "http://<addr>:<port>" URLs from
+// the not-ready endpoints in the given EndpointSliceList. Per Kubernetes
+// convention, an endpoint with Conditions.Ready == nil is treated as ready, so
+// only endpoints explicitly marked not-ready are collected here. A not-ready
+// pod has been removed from Service endpoints (so new requests stop arriving)
+// but generations already accepted keep running, so it must still be probed.
+func collectNotReadyReplicaURLs(slices *discoveryv1.EndpointSliceList, port int32) []string {
+	var urls []string
+	for i := range slices.Items {
+		for j := range slices.Items[i].Endpoints {
+			ep := &slices.Items[i].Endpoints[j]
+			if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
+				continue
+			}
+			for _, addr := range ep.Addresses {
+				urls = append(urls, fmt.Sprintf("http://%s:%d", addr, port))
+			}
+		}
+	}
+	return urls
+}
+
 // checkServiceIdle checks whether the InferenceService Service currently routes
 // to idle backends. It resolves the backend for the given InferenceService,
 // type-asserts to IdleDetector, and probes each Ready replica via EndpointSlices
@@ -170,8 +192,19 @@ func (r *InferenceServiceReconciler) checkServiceIdle(ctx context.Context, isvc 
 		return idle, nil
 	}
 
+	// Probe both ready and not-ready endpoints. A not-ready pod has been
+	// removed from Service endpoints so new requests stop arriving, but
+	// generations already accepted keep running, so it must still be probed
+	// rather than inferred idle from its readiness.
 	replicaURLs := collectReadyReplicaURLs(slices, port)
+	replicaURLs = append(replicaURLs, collectNotReadyReplicaURLs(slices, port)...)
 	if len(replicaURLs) == 0 {
+		// Nothing reachable: no ready and no not-ready addresses at all.
+		// This is the genuine crashloop / scale-to-zero case (#1250), but we
+		// cannot distinguish "unreachable, so nothing to protect" from "unready
+		// but still working" here, so we do NOT silently proceed. Report not
+		// idle (fail-closed) and let the caller defer rather than roll over
+		// in-flight work on an undetermined state.
 		return false, nil
 	}
 
@@ -251,20 +284,13 @@ func (r *InferenceServiceReconciler) reconcileRolloutPolicy(
 	existingCond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionRolloutDeferred)
 	now := metav1.Now()
 
-	// Check old-generation pod readiness before probing idle slots.
-	// If pods exist but none are Ready, there is no in-flight work to
-	// protect — proceed immediately instead of deferring forever.
+	// Count old-generation pods for the mixed-state reason below. Readiness is
+	// NOT used as a proxy for idleness: a pod with PodReady=False has been
+	// removed from Service endpoints so new requests stop arriving, but
+	// generations already accepted keep running. checkServiceIdle probes both
+	// ready and not-ready endpoints, so we always consult it rather than
+	// proceeding on the basis of readiness alone.
 	totalPods, readyPods := r.countOldPods(ctx, isvc)
-	if totalPods > 0 && readyPods == 0 {
-		log.Info("All old-generation pods are unready; no work to protect, proceeding with rollout")
-		if existingCond != nil {
-			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionRolloutDeferred)
-			if updateErr := r.Status().Update(ctx, isvc); updateErr != nil {
-				return ctrl.Result{}, fmt.Errorf("failed to clear RolloutDeferred condition: %w", updateErr)
-			}
-		}
-		return ctrl.Result{}, nil
-	}
 
 	idle, checkErr := r.checkServiceIdle(ctx, isvc, svc)
 

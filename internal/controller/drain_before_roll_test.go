@@ -1270,6 +1270,72 @@ func TestCollectReadyReplicaURLs(t *testing.T) {
 	}
 }
 
+func TestCollectNotReadyReplicaURLs(t *testing.T) {
+	trueVal := true
+	falseVal := false
+	tests := []struct {
+		name string
+		list *discoveryv1.EndpointSliceList
+		port int32
+		want []string
+	}{
+		{
+			name: "not ready endpoints",
+			list: &discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{{
+					Endpoints: []discoveryv1.Endpoint{{
+						Addresses:  []string{"10.0.0.3"},
+						Conditions: discoveryv1.EndpointConditions{Ready: &falseVal},
+					}},
+				}},
+			},
+			port: 8080,
+			want: []string{"http://10.0.0.3:8080"},
+		},
+		{
+			name: "ready skipped",
+			list: &discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{{
+					Endpoints: []discoveryv1.Endpoint{{
+						Addresses:  []string{"10.0.0.1"},
+						Conditions: discoveryv1.EndpointConditions{Ready: &trueVal},
+					}},
+				}},
+			},
+			port: 8080,
+			want: nil,
+		},
+		{
+			name: "nil ready treated as ready and skipped",
+			list: &discoveryv1.EndpointSliceList{
+				Items: []discoveryv1.EndpointSlice{{
+					Endpoints: []discoveryv1.Endpoint{{
+						Addresses:  []string{"10.0.0.2"},
+						Conditions: discoveryv1.EndpointConditions{Ready: nil},
+					}},
+				}},
+			},
+			port: 8080,
+			want: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := collectNotReadyReplicaURLs(tc.list, tc.port)
+			if len(got) != len(tc.want) {
+				t.Errorf("got %d URLs, want %d: %v", len(got), len(tc.want), got)
+				return
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("url[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 func TestErrIdleUnsupported(t *testing.T) {
 	if errIdleUnsupported == nil {
 		t.Error("errIdleUnsupported must not be nil")
@@ -1901,6 +1967,275 @@ var _ = Describe("Multi-replica drain-before-roll", func() {
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 	})
 
+	It("should defer when no pod is Ready but a not-ready endpoint is busy", func() {
+		modelName := "model-no-ready-busy"
+		isvcName := "isvc-no-ready-busy"
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		replicas := int32(2)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: modelName,
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				RolloutPolicy: &inferencev1alpha1.RolloutPolicySpec{
+					WaitForIdle:        true,
+					IdleTimeoutSeconds: 30,
+					Force:              false,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, isvc)
+			dep := &appsv1.Deployment{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+				_ = k8sClient.Delete(ctx, dep)
+			}
+			svc := &corev1.Service{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+				_ = k8sClient.Delete(ctx, svc)
+			}
+		}()
+
+		reconciler := &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+
+		// Create old-generation pods that are Running but NOT Ready. This is
+		// exactly the state the old early-return treated as "no work to
+		// protect" and rolled straight through.
+		for i := 0; i < 2; i++ {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      isvcName + "-unready-" + string(rune('a'+i)),
+					Namespace: "default",
+					Labels: map[string]string{
+						"app":                           isvcName,
+						"inference.llmkube.dev/service": isvcName,
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: isvcName, Image: "dummy"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status = corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"},
+				},
+				ContainerStatuses: []corev1.ContainerStatus{
+					{Name: isvcName, Ready: false, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+				},
+			}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+
+		// Not-ready EndpointSlices: the pods are removed from Service endpoints
+		// but still processing accepted generations, so they must be probed.
+		notReady := false
+		svcLabel := sanitizeDNSName(isvcName)
+		for _, addr := range []string{"10.0.0.1", "10.0.0.2"} {
+			eslice := &discoveryv1.EndpointSlice{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "eslice-",
+					Namespace:    "default",
+					Labels: map[string]string{
+						"kubernetes.io/service-name": svcLabel,
+					},
+				},
+				AddressType: discoveryv1.AddressTypeIPv4,
+				Endpoints: []discoveryv1.Endpoint{{
+					Addresses:  []string{addr},
+					Conditions: discoveryv1.EndpointConditions{Ready: &notReady},
+				}},
+			}
+			Expect(k8sClient.Create(ctx, eslice)).To(Succeed())
+		}
+
+		// Stub the llama.cpp /slots endpoint as busy on both not-ready replicas.
+		reconciler.HTTPClient = &http.Client{
+			Transport: &addressAwareRoundTripper{
+				responses: map[string]string{
+					"10.0.0.1:8080": `[{"id":0,"is_processing":true}]`,
+					"10.0.0.2:8080": `[{"id":0,"is_processing":true}]`,
+				},
+			},
+			Timeout: 5 * time.Second,
+		}
+
+		updated := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+		updated.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server-v2"
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+		deferredISVC := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, deferredISVC)).To(Succeed())
+		cond := findRolloutDeferredCondition(deferredISVC.Status.Conditions)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	It("should defer when no endpoint is reachable at all", func() {
+		modelName := "model-no-reachable"
+		isvcName := "isvc-no-reachable"
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: modelName,
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				RolloutPolicy: &inferencev1alpha1.RolloutPolicySpec{
+					WaitForIdle:        true,
+					IdleTimeoutSeconds: 30,
+					Force:              false,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		defer func() {
+			_ = k8sClient.Delete(ctx, isvc)
+			dep := &appsv1.Deployment{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+				_ = k8sClient.Delete(ctx, dep)
+			}
+			svc := &corev1.Service{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+				_ = k8sClient.Delete(ctx, svc)
+			}
+		}()
+
+		reconciler := &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+
+		// Old-generation pod that is Running but NOT Ready.
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      isvcName + "-unready",
+				Namespace: "default",
+				Labels: map[string]string{
+					"app":                           isvcName,
+					"inference.llmkube.dev/service": isvcName,
+				},
+			},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: isvcName, Image: "dummy"}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		pod.Status = corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionFalse, Reason: "ContainersNotReady"},
+			},
+			ContainerStatuses: []corev1.ContainerStatus{
+				{Name: isvcName, Ready: false, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}},
+			},
+		}
+		Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+		// A not-ready EndpointSlice whose address is unreachable (the probe
+		// transport returns 404 for it, which surfaces as a probe error).
+		notReady := false
+		svcLabel := sanitizeDNSName(isvcName)
+		eslice := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "eslice-",
+				Namespace:    "default",
+				Labels: map[string]string{
+					"kubernetes.io/service-name": svcLabel,
+				},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Endpoints: []discoveryv1.Endpoint{{
+				Addresses:  []string{"10.0.0.9"},
+				Conditions: discoveryv1.EndpointConditions{Ready: &notReady},
+			}},
+		}
+		Expect(k8sClient.Create(ctx, eslice)).To(Succeed())
+
+		// No address is reachable: the transport has no response for the
+		// endpoint, so the probe errors. This must NOT silently proceed — the
+		// state is undetermined, so the rollout defers (fail-closed).
+		reconciler.HTTPClient = &http.Client{
+			Transport: &addressAwareRoundTripper{
+				responses: map[string]string{},
+			},
+			Timeout: 5 * time.Second,
+		}
+
+		updated := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+		updated.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server-v2"
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+
+		deferredISVC := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, deferredISVC)).To(Succeed())
+		cond := findRolloutDeferredCondition(deferredISVC.Status.Conditions)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
 	It("should set IdleCheckUnsupported for personaplex runtime", func() {
 		modelName := "model-personaplex-unsupported"
 		isvcName := "isvc-personaplex-unsupported"
@@ -2169,7 +2504,7 @@ var _ = Describe("RolloutPolicy crashlooping pods", func() {
 	ctx := context.Background()
 
 	Context("when all old-generation pods are crashlooping", func() {
-		It("should proceed with rollout because there is no work to protect", func() {
+		It("should defer rollout because nothing is reachable (undetermined)", func() {
 			// Names must be unique across the shared "default" namespace: envtest
 			// has no pod GC, and this spec's crashlooping pods would otherwise
 			// leak into the countOldPods unit spec that reuses this label
@@ -2280,23 +2615,27 @@ var _ = Describe("RolloutPolicy crashlooping pods", func() {
 			updated.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server-v2"
 			Expect(k8sClient.Update(ctx, updated)).To(Succeed())
 
-			// Second reconcile: all pods crashlooping → proceed
+			// Second reconcile: all pods crashlooping and nothing reachable.
+			// The state is undetermined — the pods are not Ready but may still
+			// be processing accepted generations — so the rollout must NOT
+			// silently proceed. It defers (fail-closed) instead.
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
 			})
 			Expect(err).NotTo(HaveOccurred())
-			Expect(result.RequeueAfter).To(BeZero())
+			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
-			// Verify deployment WAS updated (image changed)
+			// Verify deployment was NOT updated (image unchanged)
 			finalDep := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, finalDep)).To(Succeed())
-			Expect(finalDep.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/ggml-org/llama.cpp:server-v2"))
+			Expect(finalDep.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/ggml-org/llama.cpp:server"))
 
-			// Verify RolloutDeferred condition is NOT set
+			// Verify RolloutDeferred condition IS set
 			finalISVC := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, finalISVC)).To(Succeed())
 			cond := findRolloutDeferredCondition(finalISVC.Status.Conditions)
-			Expect(cond).To(BeNil())
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		})
 	})
 
