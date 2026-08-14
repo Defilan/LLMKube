@@ -60,3 +60,17 @@ Strict-taint users can use `spec.modelCache.claimName` with a pre-provisioned, n
 ## Metadata
 
 In `perService` mode the operator reads GGUF metadata (architecture, layer count, context length, etc.) for `Model.Status` by reading **only the file header** over HTTP range requests — it never downloads the whole model itself. The full model bytes are fetched only by the init container, on the serving node. `pvc://` and HuggingFace-repo sources are resolved at pod runtime and are unaffected.
+
+## Multi-artifact staging
+
+`spec.source` may name a repository or bucket **prefix** rather than a single object. In that case `spec.files` selects which artifacts to stage from it, and `files[0]` is the primary file handed to the runtime. This is how a sharded GGUF, an `mmproj`, or draft weights are expressed. All listed files land in **one cache directory**, so a sharded GGUF resolves its siblings by path.
+
+```yaml
+source: s3://models/org/Repo-GGUF
+files:
+  - Model-00001-of-00002.gguf
+  - Model-00002-of-00002.gguf
+mmproj: mmproj-model-f16.gguf
+```
+
+When `spec.files` is empty, `spec.source` must name a single object directly.

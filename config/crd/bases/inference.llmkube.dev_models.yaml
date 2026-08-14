@@ -62,7 +62,8 @@ spec:
                 description: |-
                   Files lists model weight artifacts to stage from Source. Entries are
                   repo-relative for repository sources. The first entry is the primary model
-                  file passed to the runtime.
+                  file passed to the runtime. When Files is empty, Source must name a single
+                  object directly.
                 items:
                   type: string
                 type: array
@@ -388,6 +389,16 @@ spec:
                     - pvc://my-models-pvc/path/to/model.gguf (pre-staged on a PersistentVolumeClaim)
                     - s3://my-bucket/models/llama-3.1-8b-q4_k_m.gguf (S3-compatible object store)
                     - /mnt/models/Llama-3.2-3B-Instruct-4bit (MLX model directory)
+
+                  Source may also name a repository or bucket PREFIX rather than a single
+                  object. In that case spec.files selects which artifacts to stage from it,
+                  and files[0] is the primary file handed to the runtime. This is how a
+                  sharded GGUF, an mmproj, or draft weights are expressed. Example:
+
+                    source: s3://models/org/Repo-GGUF
+                    files:
+                      - Model-00001-of-00002.gguf
+                      - Model-00002-of-00002.gguf
 
                   file:// caveat for hybrid topologies: the controller pod must be
                   able to read the path. In Mac kind / k3s / GKE deployments where
