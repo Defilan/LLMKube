@@ -1892,6 +1892,22 @@ func TestNativeExecutor_JobModeDispatchesToCoderJob(t *testing.T) {
 	if sub.gotReq.ActiveDeadlineSeconds == nil || *sub.gotReq.ActiveDeadlineSeconds != deadline {
 		t.Errorf("request deadline: got %v", sub.gotReq.ActiveDeadlineSeconds)
 	}
+	// The Job must carry an ownerReference to its AgenticTask so Kubernetes
+	// GC reclaims it when the task is deleted (#1535). This exercises the
+	// boolPtr helper used to set Controller / BlockOwnerDeletion.
+	if sub.gotReq.OwnerReference == nil {
+		t.Fatalf("request ownerReference: expected one, got nil")
+	}
+	ref := sub.gotReq.OwnerReference
+	if ref.Kind != "AgenticTask" || ref.Name != task.Name || ref.UID != task.UID {
+		t.Errorf("request ownerReference: got %+v", ref)
+	}
+	if ref.Controller == nil || !*ref.Controller {
+		t.Errorf("request ownerReference.Controller: want true, got %v", ref.Controller)
+	}
+	if ref.BlockOwnerDeletion == nil || !*ref.BlockOwnerDeletion {
+		t.Errorf("request ownerReference.BlockOwnerDeletion: want true, got %v", ref.BlockOwnerDeletion)
+	}
 	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("Verdict: want GO got %s", res.Verdict)
 	}

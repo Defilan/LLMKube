@@ -30,6 +30,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -179,6 +180,12 @@ type RunCoderJobArgs struct {
 	// TaskNamespace is the AgenticTask namespace passed to
 	// run-task --namespace. Defaults to "default" when empty.
 	TaskNamespace string
+
+	// OwnerReference is the AgenticTask the Job belongs to. When non-nil
+	// it is stamped onto the Job's ownerReferences so Kubernetes GC
+	// reclaims the Job (and its pods) when the AgenticTask is deleted
+	// (#1535).
+	OwnerReference *metav1.OwnerReference
 }
 
 // CoderJobResult is the parsed outcome of a coder Job run. It maps the
@@ -269,8 +276,9 @@ func (r *RunCoderJob) Submit(ctx context.Context, req agent.CoderJobRequest) (ag
 	}
 
 	res, err := sub.Run(ctx, RunCoderJobArgs{
-		TaskName:      req.TaskName,
-		TaskNamespace: req.TaskNamespace,
+		TaskName:       req.TaskName,
+		TaskNamespace:  req.TaskNamespace,
+		OwnerReference: req.OwnerReference,
 	})
 	if err != nil {
 		return agent.CoderJobResult{}, err
@@ -329,9 +337,22 @@ func (r *RunCoderJob) Run(ctx context.Context, args RunCoderJobArgs) (CoderJobRe
 		CommitCommitterName:     cfg.CommitCommitterName,
 		CommitCommitterEmail:    cfg.CommitCommitterEmail,
 		Resources:               cfg.Resources,
+		OwnerReference:          args.OwnerReference,
 	})
 	if err != nil {
 		return r.errorResult(jobName, cfg.Namespace, "render: "+err.Error(), ""), nil
+	}
+
+	// Re-dispatch path (#1535): a task that is re-dispatched (e.g. after a
+	// claim expires and the task lands on a surviving node) must not leave
+	// its previous Job running alongside the new one. Reap any existing
+	// Job for this task before creating the new one, so exactly one Job per
+	// AgenticTask is active at any time. The task-name label is set on every
+	// coder Job at creation, so it is the reliable selector. We delete with
+	// propagation so the orphan's pods go too, rather than relying on GC
+	// timing alone.
+	if err := r.reapPreviousJobs(ctx, cfg.Namespace, args.TaskName); err != nil {
+		return r.errorResult(jobName, cfg.Namespace, "reap previous jobs: "+err.Error(), ""), nil
 	}
 
 	if err := r.Client.Create(ctx, rendered); err != nil {
@@ -453,6 +474,35 @@ func (r *RunCoderJob) errorResult(jobName, namespace, reason, logTail string) Co
 	}
 }
 
+// reapPreviousJobs deletes any existing coder Job for the given task so a
+// re-dispatch does not leave the previous Job running alongside the new one
+// (#1535). Every coder Job carries the foreman.llmkube.dev/task-name label,
+// so it is the reliable selector. Deletion uses background propagation so
+// the orphan's pods are removed too, rather than relying on GC timing alone.
+func (r *RunCoderJob) reapPreviousJobs(ctx context.Context, namespace, taskName string) error {
+	var jobs batchv1.JobList
+	if err := r.Client.List(ctx, &jobs, client.InNamespace(namespace),
+		client.MatchingLabels{taskNameLabel: taskName}); err != nil {
+		return err
+	}
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if err := r.Client.Delete(ctx, job,
+			client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// taskNameLabel is the label every coder Job carries identifying the
+// AgenticTask it runs. It is set in coder_job_template.yaml at creation and
+// is what reapPreviousJobs selects on.
+const taskNameLabel = "foreman.llmkube.dev/task-name"
+
 // --- result parsing -------------------------------------------------------
 
 // parseRunTaskLog scans a pod log tail for the RunTask result line
@@ -517,6 +567,11 @@ type coderRendererInput struct {
 	// so a partially-specified ResourceRequirements still keeps the
 	// defaults for the fields it omits.
 	Resources *corev1.ResourceRequirements
+
+	// OwnerReference, when non-nil, is stamped onto the Job's
+	// ownerReferences so Kubernetes GC reclaims the Job (and its pods)
+	// when the owning AgenticTask is deleted (#1535).
+	OwnerReference *metav1.OwnerReference
 }
 
 func renderCoderJob(in coderRendererInput) (*batchv1.Job, error) {
@@ -542,6 +597,9 @@ func renderCoderJob(in coderRendererInput) (*batchv1.Job, error) {
 		return nil, fmt.Errorf("unmarshal job: %w", err)
 	}
 	applyResourceOverrides(&job, in.Resources)
+	if in.OwnerReference != nil {
+		job.OwnerReferences = []metav1.OwnerReference{*in.OwnerReference}
+	}
 	return &job, nil
 }
 

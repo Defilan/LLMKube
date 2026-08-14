@@ -21,6 +21,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
@@ -56,6 +57,13 @@ type CoderJobRequest struct {
 
 	// ServiceAccountName runs the Job pod under a least-privilege SA.
 	ServiceAccountName string
+
+	// OwnerReference is the AgenticTask the Job belongs to. The submitter
+	// stamps it onto the Job's ownerReferences so Kubernetes garbage
+	// collection reclaims the Job (and its pods) when the AgenticTask is
+	// deleted, and so the re-dispatch path can identify + reap the
+	// previous Job for the same task.
+	OwnerReference *metav1.OwnerReference
 
 	// ActiveDeadlineSeconds bounds the Job wall-clock. nil lets the
 	// submitter default it.
@@ -130,6 +138,14 @@ func (e *NativeAgentLoopExecutor) executeCoderJob(
 	req := CoderJobRequest{
 		TaskName:      task.Name,
 		TaskNamespace: task.Namespace,
+		OwnerReference: &metav1.OwnerReference{
+			APIVersion:         foremanv1alpha1.GroupVersion.String(),
+			Kind:               "AgenticTask",
+			Name:               task.Name,
+			UID:                task.UID,
+			Controller:         boolPtr(true),
+			BlockOwnerDeletion: boolPtr(true),
+		},
 	}
 	if agent.Spec.Execution != nil {
 		req.Image = agent.Spec.Execution.Image
@@ -172,6 +188,12 @@ func jobExtra(cjr CoderJobResult, supervisor map[string]any) map[string]any {
 		extra[k] = v
 	}
 	return extra
+}
+
+// boolPtr returns a pointer to b, for the pointer-to-bool fields on
+// metav1.OwnerReference.
+func boolPtr(b bool) *bool {
+	return &b
 }
 
 func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *Result {
