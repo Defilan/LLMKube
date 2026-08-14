@@ -113,7 +113,10 @@ type RunGateJobToolConfig struct {
 
 	// PVCName is the persistent volume claim mounted at /cache for
 	// GOMODCACHE / GOCACHE / XDG_DATA_HOME reuse across runs. Empty
-	// disables the volume mount. Defaults to "foreman-gate-cache".
+	// disables the volume mount entirely: the Job renders no cache
+	// volume and no /cache volumeMount, so the gate runs cold rather
+	// than mounting a claim nobody created. There is deliberately NO
+	// default -- a hardcoded name is what #1538 was about.
 	// The foreman-agent threads the submitting agent's per-agent claim
 	// (foreman.gateCache.pvcName) here via --gate-cache-pvc so named
 	// agent pools mount the PVC the chart actually creates (#1538).
@@ -561,9 +564,6 @@ func resolveGateCloneURL(cfg RunGateJobToolConfig, repoSlug, explicit string) st
 func applyConfigDefaults(c RunGateJobToolConfig) RunGateJobToolConfig {
 	if c.Namespace == "" {
 		c.Namespace = "foreman-system"
-	}
-	if c.PVCName == "" {
-		c.PVCName = "foreman-gate-cache"
 	}
 	if c.Image == "" {
 		c.Image = "golang:1.26"

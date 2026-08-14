@@ -311,9 +311,11 @@ spec:
               value: /cache/gobuild
             - name: XDG_DATA_HOME
               value: /cache/xdg
+          {{- if .PVCName }}
           volumeMounts:
             - name: cache
               mountPath: /cache
+          {{- end }}
           resources:
             requests:
               cpu: "{{ .CPURequest }}"
@@ -321,7 +323,9 @@ spec:
             limits:
               cpu: "{{ .CPULimit }}"
               memory: {{ .MemLimit }}
+      {{- if .PVCName }}
       volumes:
         - name: cache
           persistentVolumeClaim:
             claimName: {{ .PVCName }}
+      {{- end }}
