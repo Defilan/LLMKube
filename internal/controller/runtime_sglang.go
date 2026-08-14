@@ -64,11 +64,17 @@ const sglangROCmImage = "lmsysorg/sglang:v0.5.15-rocm720-mi30x"
 // server (https://github.com/sgl-project/sglang).
 type SGLangBackend struct{}
 
-func (b *SGLangBackend) ContainerName() string    { return "sglang" }
-func (b *SGLangBackend) DefaultImage() string     { return sglangCUDAImage }
-func (b *SGLangBackend) DefaultPort() int32       { return 30000 }
-func (b *SGLangBackend) NeedsModelInit() bool     { return true }
-func (b *SGLangBackend) DefaultHPAMetric() string { return "sglang:num_running_reqs" }
+func (b *SGLangBackend) ContainerName() string { return "sglang" }
+func (b *SGLangBackend) DefaultImage() string  { return sglangCUDAImage }
+func (b *SGLangBackend) DefaultPort() int32    { return 30000 }
+
+// SupportedArchitectures reports the architectures the operator-chosen SGLang
+// image supports. The default CUDA/ROCm images are amd64-only, but the operator
+// cannot verify a single arch list across every variant it may pick, so it
+// declines to guess (#1479).
+func (b *SGLangBackend) SupportedArchitectures() []string { return nil }
+func (b *SGLangBackend) NeedsModelInit() bool             { return true }
+func (b *SGLangBackend) DefaultHPAMetric() string         { return "sglang:num_running_reqs" }
 
 // BuildArgs generates the SGLang server CLI arguments. Order:
 //  1. --model-path, --host, --port (always)

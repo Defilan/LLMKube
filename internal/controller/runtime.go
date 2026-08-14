@@ -34,6 +34,14 @@ type RuntimeBackend interface {
 	// NeedsModelInit returns true if this runtime needs an init container
 	// to download the model file.
 	NeedsModelInit() bool
+
+	// SupportedArchitectures returns the CPU architectures the backend's
+	// operator-chosen image supports, as kubernetes.io/arch label values
+	// (e.g. "amd64"). An empty/nil result means the image is genuinely
+	// multi-arch (or unknown), so no architecture constraint is applied.
+	// A user-supplied spec.image always bypasses this constraint, since the
+	// operator cannot know what a custom image supports (#1479).
+	SupportedArchitectures() []string
 }
 
 // resolveBackend returns the RuntimeBackend for the given InferenceService.
@@ -76,7 +84,8 @@ type IdleDetector interface {
 }
 
 // resolveBackend returns the RuntimeBackend for the given InferenceService.
-func resolveBackend(isvc *inferencev1alpha1.InferenceService) RuntimeBackend {
+// Declared as a var so tests can stub it.
+var resolveBackend = func(isvc *inferencev1alpha1.InferenceService) RuntimeBackend {
 	switch isvc.Spec.Runtime {
 	case "personaplex":
 		return &PersonaPlexBackend{}

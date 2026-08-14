@@ -60,6 +60,11 @@ func (b *LlamaCppRouterBackend) DefaultPort() int32 {
 	return 8080
 }
 
+// SupportedArchitectures reports the architectures the operator-chosen llama.cpp
+// router image supports. The default :server tag is published for both amd64 and
+// arm64, so no constraint is applied (#1479).
+func (b *LlamaCppRouterBackend) SupportedArchitectures() []string { return nil }
+
 func (b *LlamaCppRouterBackend) NeedsModelInit() bool {
 	// Router mode does not need a model init container because models are loaded
 	// dynamically from the models directory at runtime.

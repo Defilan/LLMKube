@@ -27,6 +27,11 @@ func (b *GenericBackend) DefaultPort() int32 {
 	return 8080
 }
 
+// SupportedArchitectures reports the architectures the operator-chosen image
+// supports. Generic requires spec.image by contract, and a user-supplied image
+// always bypasses the architecture constraint, so no constraint is applied (#1479).
+func (b *GenericBackend) SupportedArchitectures() []string { return nil }
+
 func (b *GenericBackend) NeedsModelInit() bool     { return false }
 func (b *GenericBackend) DefaultHPAMetric() string { return "" }
 

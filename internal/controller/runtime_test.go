@@ -987,3 +987,53 @@ func TestExtraArgsAppendedExactlyOnce(t *testing.T) {
 		})
 	}
 }
+
+// TestBackendDefaultHPAMetric covers DefaultHPAMetric for every backend,
+// including the generic and personaplex backends whose metric is empty.
+func TestBackendDefaultHPAMetric(t *testing.T) {
+	cases := []struct {
+		name     string
+		backend  RuntimeBackend
+		expected string
+	}{
+		{"llamacpp", &LlamaCppBackend{}, "llamacpp:requests_processing"},
+		{"llamacpp-router", &LlamaCppRouterBackend{}, "llamacpp:requests_processing"},
+		{"vllm", &VLLMBackend{}, "vllm:num_requests_running"},
+		{"tgi", &TGIBackend{}, "tgi:queue_size"},
+		{"sglang", &SGLangBackend{}, "sglang:num_running_reqs"},
+		{"generic", &GenericBackend{}, ""},
+		{"personaplex", &PersonaPlexBackend{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, ok := tc.backend.(HPAMetricProvider)
+			if !ok {
+				t.Fatalf("%T does not implement HPAMetricProvider", tc.backend)
+			}
+			if got := p.DefaultHPAMetric(); got != tc.expected {
+				t.Errorf("DefaultHPAMetric() = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+// TestBackendSupportedArchitectures covers SupportedArchitectures for every
+// backend. All built-in backends return nil (no architecture constraint)
+// because their operator-chosen images are genuinely multi-arch or cannot be
+// verified across every variant the operator may pick (#1479).
+func TestBackendSupportedArchitectures(t *testing.T) {
+	backends := []RuntimeBackend{
+		&LlamaCppBackend{},
+		&LlamaCppRouterBackend{},
+		&VLLMBackend{},
+		&TGIBackend{},
+		&SGLangBackend{},
+		&GenericBackend{},
+		&PersonaPlexBackend{},
+	}
+	for _, b := range backends {
+		if got := b.SupportedArchitectures(); got != nil {
+			t.Errorf("%T.SupportedArchitectures() = %v, want nil", b, got)
+		}
+	}
+}
