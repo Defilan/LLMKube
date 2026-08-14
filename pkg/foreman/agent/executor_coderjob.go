@@ -89,6 +89,8 @@ type CoderJobResult struct {
 	FailureReason string
 	LogTail       string
 	JobName       string
+	// Namespace is the namespace the Job was submitted to.
+	Namespace string
 	// ResultExtra is the in-pod executor Result's full Extra map (already
 	// outcome-promoted by the native executor); see the field of the same
 	// name on tools.CoderJobResult (#1077).
@@ -206,6 +208,7 @@ func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *R
 			"commitMessage": cjr.CommitMessage,
 			"executionMode": "Job",
 			"jobName":       cjr.JobName,
+			"namespace":     cjr.Namespace,
 			"logTail":       cjr.LogTail,
 		})
 		if _, ok := r.Extra["outcome"]; !ok {
@@ -218,6 +221,7 @@ func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *R
 			"intendedBranch": cjr.Branch,
 			"executionMode":  "Job",
 			"jobName":        cjr.JobName,
+			"namespace":      cjr.Namespace,
 			"logTail":        cjr.LogTail,
 		})
 		// Preserve the envelope's promoted outcome (ALREADY-RESOLVED /
@@ -244,6 +248,7 @@ func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *R
 			"intendedBranch": cjr.Branch,
 			"executionMode":  "Job",
 			"jobName":        cjr.JobName,
+			"namespace":      cjr.Namespace,
 			"logTail":        cjr.LogTail,
 		}
 		return r
@@ -261,6 +266,7 @@ func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *R
 			"outcome":       "JOB-ERROR",
 			"executionMode": "Job",
 			"jobName":       cjr.JobName,
+			"namespace":     cjr.Namespace,
 			"reason":        cjr.FailureReason,
 			"logTail":       cjr.LogTail,
 		}

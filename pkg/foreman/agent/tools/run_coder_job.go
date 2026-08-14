@@ -292,6 +292,7 @@ func (r *RunCoderJob) Submit(ctx context.Context, req agent.CoderJobRequest) (ag
 		FailureReason: res.FailureReason,
 		LogTail:       res.LogTail,
 		JobName:       res.JobName,
+		Namespace:     res.Namespace,
 		ResultExtra:   res.ResultExtra,
 	}, nil
 }

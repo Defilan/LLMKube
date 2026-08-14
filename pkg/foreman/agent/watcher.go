@@ -501,6 +501,12 @@ func (w *AgenticTaskWatcher) patchTerminal(
 	if res.Extra != nil {
 		fresh.Status.Branch = firstStringField(res.Extra, "branch", "intendedBranch")
 		fresh.Status.CommitSHA = stringField(res.Extra, "commitSHA")
+		// #1535: lift the coder Job name out of the Result envelope onto
+		// status so operators and downstream tooling can identify which
+		// Job ran this task. The Job-mode executor (coderJobResultToResult)
+		// stamps "jobName" into Extra on every verdict path; the in-process
+		// path never sets it, so this stays empty there.
+		fresh.Status.JobName = stringField(res.Extra, "jobName")
 	}
 	raw, err := json.Marshal(res)
 	if err != nil {
