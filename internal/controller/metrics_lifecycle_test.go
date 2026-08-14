@@ -225,7 +225,7 @@ var _ = Describe("Operator state metrics lifecycle", func() {
 			// Seeding the Deployment the controller would build puts
 			// reconcileDeployment on its in-place Update path, which is where the
 			// live failure lands; the interceptor then rejects that Update.
-			deployment := reconciler.constructDeployment(isvc, model, 2)
+			deployment := reconciler.constructDeployment(isvc, model, nil, 2)
 			reconciler.Client = fake.NewClientBuilder().
 				WithScheme(k8sClient.Scheme()).
 				WithObjects(model, isvc, deployment).

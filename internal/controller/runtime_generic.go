@@ -30,7 +30,7 @@ func (b *GenericBackend) DefaultPort() int32 {
 func (b *GenericBackend) NeedsModelInit() bool     { return false }
 func (b *GenericBackend) DefaultHPAMetric() string { return "" }
 
-func (b *GenericBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, _ *inferencev1alpha1.Model, _ string, _ int32) []string {
+func (b *GenericBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, _ *inferencev1alpha1.Model, _ string, _ string, _ int32) []string {
 	return isvc.Spec.Args
 }
 

@@ -30,7 +30,7 @@ func (b *TGIBackend) DefaultPort() int32       { return 80 }
 func (b *TGIBackend) NeedsModelInit() bool     { return false }
 func (b *TGIBackend) DefaultHPAMetric() string { return "tgi:queue_size" }
 
-func (b *TGIBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
+func (b *TGIBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, _ string, port int32) []string {
 	source := modelPath
 	if source == "" {
 		// Serve path: hand TGI the bare "org/name[@rev]" repo id, not a resolve

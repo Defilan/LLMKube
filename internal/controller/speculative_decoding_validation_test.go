@@ -21,53 +21,85 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
-// These specs exercise the InferenceService CRD's server-side validation for
-// spec.speculativeDecoding: the CEL rule that rejects type "draft" because
-// there is no draft-model field to name the draft weights. They run against
-// the envtest apiserver, so a failure here means the generated CRD schema
-// does not enforce what the type claims.
-var _ = Describe("InferenceService speculativeDecoding CRD validation", func() {
+// newSpecISvc builds a minimal InferenceService carrying only the speculative
+// decoding shape under test.
+func newSpecISvc(name string, sd *inferencev1alpha1.SpeculativeDecodingSpec) *inferencev1alpha1.InferenceService {
+	return &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:            "target-model",
+			Runtime:             "llamacpp",
+			SpeculativeDecoding: sd,
+		},
+	}
+}
+
+var _ = Describe("speculativeDecoding CRD validation", func() {
 	ctx := context.Background()
 
-	newISvc := func(name string, sd *inferencev1alpha1.SpeculativeDecodingSpec) *inferencev1alpha1.InferenceService {
-		return &inferencev1alpha1.InferenceService{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
-			Spec: inferencev1alpha1.InferenceServiceSpec{
-				ModelRef:            "specdec-cel-model",
-				SpeculativeDecoding: sd,
-			},
-		}
-	}
+	It("rejects a draft-model type with no draftModelRef", func() {
+		isvc := newSpecISvc("sd-dspark-nodraft", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "draft-dspark",
+		})
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("needs draft weights"))
+	})
 
-	It("admits type mtp (self-speculation)", func() {
-		isvc := newISvc("sd-valid-mtp", &inferencev1alpha1.SpeculativeDecodingSpec{
+	It("admits a draft-model type with a draftModelRef", func() {
+		isvc := newSpecISvc("sd-dspark-ok", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "draft-dspark", DraftModelRef: "dspark-draft",
+		})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
+	It("rejects draftModelRef on a type that needs no draft weights", func() {
+		isvc := newSpecISvc("sd-ngram-withdraft", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "ngram-cache", DraftModelRef: "dspark-draft",
+		})
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("only valid for the draft-model types"))
+	})
+
+	// draft-mtp is self-speculation carried by the target model. Requiring
+	// draftModelRef here would break every existing mtp InferenceService on
+	// upgrade, which is the regression this pair of cases exists to catch.
+	It("admits draft-mtp with no draftModelRef", func() {
+		isvc := newSpecISvc("sd-draftmtp", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "draft-mtp",
+		})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
+	It("admits the legacy mtp alias with no draftModelRef", func() {
+		isvc := newSpecISvc("sd-mtp-alias", &inferencev1alpha1.SpeculativeDecodingSpec{
 			Type: "mtp",
 		})
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
 
-	It("admits type disabled", func() {
-		isvc := newISvc("sd-valid-disabled", &inferencev1alpha1.SpeculativeDecodingSpec{
-			Type: "disabled",
+	It("admits an ngram type alone", func() {
+		isvc := newSpecISvc("sd-ngram-alone", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "ngram-cache",
 		})
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
 
-	It("rejects type draft with a helpful message", func() {
-		isvc := newISvc("sd-invalid-draft", &inferencev1alpha1.SpeculativeDecodingSpec{
-			Type: "draft",
+	It("admits type disabled", func() {
+		isvc := newSpecISvc("sd-disabled", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "disabled",
 		})
-		err := k8sClient.Create(ctx, isvc)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("type \"draft\" is not supported"))
-		Expect(err.Error()).To(ContainSubstring("use type \"mtp\""))
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
 })

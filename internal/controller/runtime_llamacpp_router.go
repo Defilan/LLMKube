@@ -82,7 +82,7 @@ func (b *LlamaCppRouterBackend) DefaultHPAMetric() string {
 // Router mode intentionally emits NO GPU flags (--n-gpu-layers, --tensor-split):
 // different models may need different GPU configs, so those are left to per-model INI
 // presets or user ExtraArgs. When GPU resources are present a warning is logged.
-func (b *LlamaCppRouterBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
+func (b *LlamaCppRouterBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, _ string, port int32) []string {
 	// Router mode uses --models-dir to point at the /models directory. NOTE: unlike the
 	// single-model runtime, router mode does NOT auto-mount /models -- NeedsModelInit is
 	// false, so the operator builds no model volume/mount (see deployment_builder.go,

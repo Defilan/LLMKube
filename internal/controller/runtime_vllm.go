@@ -77,7 +77,7 @@ func (b *VLLMBackend) DisableServiceLinks() bool { return true }
 // whose zero value matches vLLM's own default are only emitted when the user
 // set them to true. This keeps generated pod specs minimal and lets us track
 // vLLM upstream default changes without needing an operator release.
-func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
+func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, _ string, port int32) []string {
 	source := modelPath
 	if source == "" {
 		// Serve path: hand vLLM the bare "org/name[@rev]" repo id, not a resolve

@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -672,7 +673,7 @@ func TestLlamaCppBuildArgs(t *testing.T) {
 			if mp == "" {
 				mp = modelPath
 			}
-			args := backend.BuildArgs(isvc, tc.model, mp, port)
+			args := backend.BuildArgs(isvc, tc.model, mp, "", port)
 			for _, fc := range tc.contains {
 				if !containsArg(args, fc.flag, fc.value) {
 					t.Errorf("expected %q %q in args, got: %v", fc.flag, fc.value, args)
@@ -725,10 +726,10 @@ func TestLlamaCppMetricsNotDuplicated(t *testing.T) {
 			args func(*inferencev1alpha1.InferenceService) []string
 		}{
 			{"single-model", func(isvc *inferencev1alpha1.InferenceService) []string {
-				return (&LlamaCppBackend{}).BuildArgs(isvc, model, "/models/m.gguf", 8080)
+				return (&LlamaCppBackend{}).BuildArgs(isvc, model, "/models/m.gguf", "", 8080)
 			}},
 			{"router", func(isvc *inferencev1alpha1.InferenceService) []string {
-				return (&LlamaCppRouterBackend{}).BuildArgs(isvc, model, "/models/m.gguf", 8080)
+				return (&LlamaCppRouterBackend{}).BuildArgs(isvc, model, "/models/m.gguf", "", 8080)
 			}},
 		} {
 			t.Run(backend.name+": "+tc.name, func(t *testing.T) {
@@ -747,6 +748,112 @@ func TestLlamaCppMetricsNotDuplicated(t *testing.T) {
 					t.Errorf("bare --metrics appeared %d times, want %d; args: %v", got, tc.want, args)
 				}
 			})
+		}
+	}
+}
+
+func TestAppendSpeculativeDecodingArgs(t *testing.T) {
+	n := func(i int32) *int32 { return &i }
+	p := func(f float64) *float64 { return &f }
+
+	cases := []struct {
+		name      string
+		spec      *inferencev1alpha1.SpeculativeDecodingSpec
+		draftPath string
+		want      []string
+	}{
+		{name: "nil spec emits nothing", spec: nil, want: nil},
+		{
+			name: "disabled alias emits nothing",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{Type: "disabled"},
+			want: nil,
+		},
+		{
+			name: "none emits nothing",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{Type: "none"},
+			want: nil,
+		},
+		{
+			name: "mtp alias resolves to draft-mtp and takes no -md",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{Type: "mtp"},
+			want: []string{"--spec-type", "draft-mtp"},
+		},
+		{
+			name: "draft alias resolves to draft-simple and takes -md",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft", DraftModelRef: "d",
+			},
+			draftPath: "/models/d/model.gguf",
+			want:      []string{"--spec-type", "draft-simple", "-md", "/models/d/model.gguf"},
+		},
+		{
+			name: "literal draft-dspark passes through with every knob",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft-dspark", DraftModelRef: "d", NDraftMax: n(3), PMin: p(0),
+			},
+			draftPath: "/models/d/model.gguf",
+			want: []string{
+				"--spec-type", "draft-dspark",
+				"-md", "/models/d/model.gguf",
+				"--spec-draft-n-max", "3",
+				"--spec-draft-p-min", "0",
+			},
+		},
+		{
+			name: "ngram type passes through and takes no -md even if a path is present",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "ngram-cache", NDraftMax: n(2),
+			},
+			draftPath: "/models/stale/model.gguf",
+			want:      []string{"--spec-type", "ngram-cache", "--spec-draft-n-max", "2"},
+		},
+		{
+			name:      "mtp alias takes no -md even if a path is present",
+			spec:      &inferencev1alpha1.SpeculativeDecodingSpec{Type: "mtp"},
+			draftPath: "/models/stale/model.gguf",
+			want:      []string{"--spec-type", "draft-mtp"},
+		},
+		{
+			name:      "literal draft-mtp takes no -md even if a path is present",
+			spec:      &inferencev1alpha1.SpeculativeDecodingSpec{Type: "draft-mtp"},
+			draftPath: "/models/stale/model.gguf",
+			want:      []string{"--spec-type", "draft-mtp"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := appendSpeculativeDecodingArgs(nil, tc.spec, tc.draftPath)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("args = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLlamaCppBuildArgs_EmitsDraftModelPath(t *testing.T) {
+	n := func(i int32) *int32 { return &i }
+	isvc := &inferencev1alpha1.InferenceService{
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime: "llamacpp",
+			SpeculativeDecoding: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft-dspark", DraftModelRef: "dspark", NDraftMax: n(3),
+			},
+		},
+	}
+	model := &inferencev1alpha1.Model{Spec: inferencev1alpha1.ModelSpec{Format: "gguf"}}
+
+	got := (&LlamaCppBackend{}).BuildArgs(
+		isvc, model, "/models/target/model.gguf", "/models/dspark/model.gguf", 8080)
+
+	joined := strings.Join(got, " ")
+	for _, want := range []string{
+		"--spec-type draft-dspark",
+		"-md /models/dspark/model.gguf",
+		"--spec-draft-n-max 3",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q; got %s", want, joined)
 		}
 	}
 }

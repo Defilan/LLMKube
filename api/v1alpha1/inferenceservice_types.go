@@ -57,28 +57,58 @@ type RopeScalingSpec struct {
 	OriginalContext *int32 `json:"originalContext,omitempty"`
 }
 
-// SpeculativeDecodingType selects the speculative decoding method for
-// llama.cpp MTP/draft decoding.
-// +kubebuilder:validation:Enum=mtp;draft;disabled
+// SpeculativeDecodingType selects the speculative decoding method for the
+// llama.cpp runtime. Values are llama.cpp's own --spec-type spellings so they
+// can be copied directly from its docs; "mtp", "draft" and "disabled" are
+// retained as aliases for the names this field used before #1528.
+// +kubebuilder:validation:Enum=none;disabled;mtp;draft;draft-simple;draft-eagle3;draft-mtp;draft-dflash;draft-dspark;ngram-simple;ngram-map-k;ngram-map-k4v;ngram-mod;ngram-cache
 type SpeculativeDecodingType string
 
 // SpeculativeDecodingSpec configures speculative decoding for the llama.cpp
-// runtime. It maps to --spec-type (Type) and --spec-draft-n-max (NDraftMax).
-// Only the "llamacpp" runtime supports this field; other runtimes must not
-// set it.
-// +kubebuilder:validation:XValidation:rule="self.type != 'draft'",message="type \"draft\" is not supported: there is no draft-model field to name the draft weights; use type \"mtp\" for self-speculation instead"
+// runtime. It maps to --spec-type (Type), --spec-draft-n-max (NDraftMax),
+// --spec-draft-p-min (PMin) and -md (DraftModelRef). Only the "llamacpp"
+// runtime supports this field; other runtimes must not set it.
+//
+// The draft-model types need weights and so require DraftModelRef. draft-mtp
+// does not: MTP is self-speculation carried by the target model itself. The
+// ngram-* family speculates from the prompt and likewise needs no weights.
+// +kubebuilder:validation:XValidation:rule="!(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark']) || (has(self.draftModelRef) && self.draftModelRef.size() > 0)",message="this speculative decoding type needs draft weights: set draftModelRef to a Model in the same namespace"
+// +kubebuilder:validation:XValidation:rule="(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark']) || !has(self.draftModelRef) || self.draftModelRef.size() == 0",message="draftModelRef is only valid for the draft-model types (draft-simple, draft-eagle3, draft-dflash, draft-dspark); draft-mtp is self-speculation and the ngram types need no draft weights"
 type SpeculativeDecodingSpec struct {
-	// Type is the speculative decoding method (--spec-type). "mtp" maps to
-	// draft-mtp, "draft" maps to draft-simple, and "disabled" (or omitting the
-	// entire SpeculativeDecoding block) means no speculative decoding.
+	// Type is the speculative decoding method (--spec-type). The aliases map
+	// as: "mtp" to draft-mtp, "draft" to draft-simple, and "disabled" to no
+	// speculative decoding (as does omitting the whole block, or "none").
 	Type SpeculativeDecodingType `json:"type"`
+
+	// DraftModelRef names the Model CR holding the draft weights, resolved in
+	// the InferenceService's own namespace and mounted into the serving pod
+	// alongside the target model. Required for the draft-model types.
+	//
+	// Deliberately a Model reference rather than the raw in-container path
+	// SGLang's block uses (SpeculativeConfig.DraftModelPath): the operator
+	// downloads and caches the draft exactly like the target model, and a path
+	// has no readiness to gate on.
+	// +optional
+	DraftModelRef string `json:"draftModelRef,omitempty"`
 
 	// NDraftMax is the maximum number of draft tokens to propose per step
 	// (--spec-draft-n-max). Only emitted when set; llama.cpp uses its own default
 	// otherwise.
+	//
+	// The optimum is per-model and per-topology and must be measured, not
+	// copied. On two GB10 Sparks serving DeepSeek-V4-Flash MXFP4, 3 was optimal
+	// at 19.01 tok/s and 4 was worse than disabling speculation entirely
+	// (14.89 against a 16.13 baseline). See defilantech/LLMKube#1423.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	NDraftMax *int32 `json:"nDraftMax,omitempty"`
+
+	// PMin is the minimum probability a drafted token needs for the draft to
+	// continue (--spec-draft-p-min). Only emitted when set.
+	// +kubebuilder:validation:Minimum=0.0
+	// +kubebuilder:validation:Maximum=1.0
+	// +optional
+	PMin *float64 `json:"pMin,omitempty"`
 }
 
 // ModelCacheSpec points this InferenceService's model cache at a user-managed

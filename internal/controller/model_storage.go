@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -951,6 +952,193 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		volumes:      volumes,
 		volumeMounts: []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models", ReadOnly: true}},
 	}
+}
+
+// Namespacing applied to a draft model's pod resources when they would
+// otherwise collide with the target model's. See mergeStorageConfigs.
+const (
+	draftResourcePrefix  = "draft-"
+	draftMountPathPrefix = "/draft"
+)
+
+// pathRewrite records that everything under `from` in the draft's own view of
+// its storage is reachable at `to` in the merged pod.
+type pathRewrite struct {
+	from string
+	to   string
+}
+
+// rewritePath maps a path produced by a storage builder onto where it lands in
+// the merged pod. The longest matching rewrite wins so a nested mount cannot be
+// rewritten by its parent. An empty path (no staged directory) passes through.
+func rewritePath(p string, rewrites []pathRewrite) string {
+	if p == "" {
+		return p
+	}
+	from, to := "", ""
+	for _, rw := range rewrites {
+		if p != rw.from && !strings.HasPrefix(p, rw.from+"/") {
+			continue
+		}
+		if len(rw.from) > len(from) {
+			from, to = rw.from, rw.to
+		}
+	}
+	if from == "" {
+		return p
+	}
+	return to + p[len(from):]
+}
+
+// uniqueName returns candidate, or candidate with the lowest numeric suffix
+// that is not already taken.
+func uniqueName(candidate string, taken map[string]struct{}) string {
+	if _, dup := taken[candidate]; !dup {
+		return candidate
+	}
+	for i := 2; ; i++ {
+		next := fmt.Sprintf("%s-%d", candidate, i)
+		if _, dup := taken[next]; !dup {
+			return next
+		}
+	}
+}
+
+// hasEquivalentContainer reports whether existing already contains a container
+// that differs from c only in its name.
+func hasEquivalentContainer(existing []corev1.Container, c corev1.Container) bool {
+	probe := c
+	for _, e := range existing {
+		probe.Name = e.Name
+		if apiequality.Semantic.DeepEqual(e, probe) {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeStorageConfigs folds a draft model's storage into the target model's so
+// one pod can carry both sets of weights. It returns the merged pod-level
+// config and the draft's own config REWRITTEN to describe where its weights
+// actually land in that pod. Callers must read the draft's path from the
+// second return value, never from the config they passed in.
+//
+// The draft shares the target's resources exactly where sharing is correct and
+// gets its own namespace everywhere else:
+//
+//   - A volume is shared only when the target has one of the same name AND the
+//     two VolumeSources are semantically identical. That is the design's
+//     central case: both models on the same cache PVC resolve to one
+//     "model-cache" volume, mounted once at /models, with the models already
+//     separated by effectiveModelCacheKey subdirectories. Name-only dedup would
+//     also collapse two DIFFERENT claims that both arrive as "model-source"
+//     (every pvc:// model does), silently pointing -md into the target's claim.
+//   - Mount paths must be unique within a container, so a draft mount landing
+//     on a path the target already occupies (a non-cached draft's emptyDir at
+//     /models under a cached target) is remounted under /draft, and the draft's
+//     modelPath and stagedDir are rewritten to match. Remounting without
+//     rewriting the path would trade a rejected pod for one that quietly loads
+//     the wrong weights.
+//   - Container names must be unique across initContainers and containers, and
+//     both storage builders emit FIXED names ("model-cache-prep",
+//     "model-downloader"), so the draft's are prefixed. A draft init container
+//     that is identical to one the target already runs (the shared cache's
+//     prep, an idempotent chown of the same mount) is dropped rather than run
+//     twice. Init containers each have their own mount namespace, so their
+//     mount PATHS are left alone (the download commands bake them in), and
+//     only volume NAMES are rewritten, to follow a renamed volume.
+//
+// Neither input is mutated: every appended or rewritten value is a copy.
+func mergeStorageConfigs(target, draft modelStorageConfig) (modelStorageConfig, modelStorageConfig) {
+	merged := target
+	placed := draft
+
+	// Volumes: share the identical ones, rename the colliding ones.
+	targetVolumes := make(map[string]corev1.Volume, len(target.volumes))
+	volumeNames := make(map[string]struct{}, len(target.volumes))
+	for _, v := range target.volumes {
+		targetVolumes[v.Name] = v
+		volumeNames[v.Name] = struct{}{}
+	}
+	renamedVolumes := make(map[string]string)
+	merged.volumes = append([]corev1.Volume{}, target.volumes...)
+	placed.volumes = make([]corev1.Volume, 0, len(draft.volumes))
+	for _, v := range draft.volumes {
+		if tv, ok := targetVolumes[v.Name]; ok && apiequality.Semantic.DeepEqual(tv.VolumeSource, v.VolumeSource) {
+			placed.volumes = append(placed.volumes, tv)
+			continue
+		}
+		name := v.Name
+		if _, clash := volumeNames[name]; clash {
+			name = uniqueName(draftResourcePrefix+v.Name, volumeNames)
+			renamedVolumes[v.Name] = name
+		}
+		volumeNames[name] = struct{}{}
+		nv := *v.DeepCopy()
+		nv.Name = name
+		merged.volumes = append(merged.volumes, nv)
+		placed.volumes = append(placed.volumes, nv)
+	}
+
+	// Serving mounts: follow the renames, then move any path collision under
+	// /draft and record the move so the draft's paths can follow it.
+	mountPaths := make(map[string]struct{}, len(target.volumeMounts))
+	mountKeys := make(map[string]struct{}, len(target.volumeMounts))
+	mountKey := func(m corev1.VolumeMount) string { return m.Name + "\x00" + m.MountPath }
+	for _, m := range target.volumeMounts {
+		mountPaths[m.MountPath] = struct{}{}
+		mountKeys[mountKey(m)] = struct{}{}
+	}
+	var rewrites []pathRewrite
+	merged.volumeMounts = append([]corev1.VolumeMount{}, target.volumeMounts...)
+	placed.volumeMounts = make([]corev1.VolumeMount, 0, len(draft.volumeMounts))
+	for _, m := range draft.volumeMounts {
+		nm := m
+		if name, ok := renamedVolumes[nm.Name]; ok {
+			nm.Name = name
+		}
+		if _, dup := mountKeys[mountKey(nm)]; dup {
+			// Same volume, same path: the target already mounts it.
+			placed.volumeMounts = append(placed.volumeMounts, nm)
+			continue
+		}
+		if _, clash := mountPaths[nm.MountPath]; clash {
+			to := uniqueName(draftMountPathPrefix+nm.MountPath, mountPaths)
+			rewrites = append(rewrites, pathRewrite{from: nm.MountPath, to: to})
+			nm.MountPath = to
+		}
+		mountPaths[nm.MountPath] = struct{}{}
+		mountKeys[mountKey(nm)] = struct{}{}
+		merged.volumeMounts = append(merged.volumeMounts, nm)
+		placed.volumeMounts = append(placed.volumeMounts, nm)
+	}
+	placed.modelPath = rewritePath(draft.modelPath, rewrites)
+	placed.stagedDir = rewritePath(draft.stagedDir, rewrites)
+
+	// Init containers: unique names, volume references following the renames.
+	initNames := make(map[string]struct{}, len(target.initContainers))
+	for _, c := range target.initContainers {
+		initNames[c.Name] = struct{}{}
+	}
+	merged.initContainers = append([]corev1.Container{}, target.initContainers...)
+	placed.initContainers = make([]corev1.Container, 0, len(draft.initContainers))
+	for _, c := range draft.initContainers {
+		nc := *c.DeepCopy()
+		for i := range nc.VolumeMounts {
+			if name, ok := renamedVolumes[nc.VolumeMounts[i].Name]; ok {
+				nc.VolumeMounts[i].Name = name
+			}
+		}
+		if hasEquivalentContainer(merged.initContainers, nc) {
+			continue
+		}
+		nc.Name = uniqueName(draftResourcePrefix+c.Name, initNames)
+		initNames[nc.Name] = struct{}{}
+		merged.initContainers = append(merged.initContainers, nc)
+		placed.initContainers = append(placed.initContainers, nc)
+	}
+
+	return merged, placed
 }
 
 // ensureModelCachePVC creates the model cache PVC for an InferenceService if it

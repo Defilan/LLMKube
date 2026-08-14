@@ -79,7 +79,7 @@ func (b *SGLangBackend) DefaultHPAMetric() string { return "sglang:num_running_r
 //  6. spec.extraArgs last (user wins on collision)
 //
 // GPU-only flags (memFractionStatic) log a warning when set on a CPU model.
-func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, port int32) []string {
+func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, _ string, port int32) []string {
 	source := modelPath
 	if source == "" {
 		// Serve path: hand SGLang the bare "org/name[@rev]" repo id, not a
