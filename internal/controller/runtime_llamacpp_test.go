@@ -808,16 +808,24 @@ func TestAppendSpeculativeDecodingArgs(t *testing.T) {
 			want:      []string{"--spec-type", "ngram-cache", "--spec-draft-n-max", "2"},
 		},
 		{
-			name:      "mtp alias takes no -md even if a path is present",
+			name:      "mtp alias with no draft takes no -md",
 			spec:      &inferencev1alpha1.SpeculativeDecodingSpec{Type: "mtp"},
-			draftPath: "/models/stale/model.gguf",
+			draftPath: "",
 			want:      []string{"--spec-type", "draft-mtp"},
 		},
 		{
-			name:      "literal draft-mtp takes no -md even if a path is present",
+			name:      "literal draft-mtp with no draft takes no -md",
 			spec:      &inferencev1alpha1.SpeculativeDecodingSpec{Type: "draft-mtp"},
-			draftPath: "/models/stale/model.gguf",
+			draftPath: "",
 			want:      []string{"--spec-type", "draft-mtp"},
+		},
+		{
+			name: "literal draft-mtp with a resolved draft emits -md",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type: "draft-mtp", DraftModelRef: "d",
+			},
+			draftPath: "/models/d/model.gguf",
+			want:      []string{"--spec-type", "draft-mtp", "-md", "/models/d/model.gguf"},
 		},
 	}
 

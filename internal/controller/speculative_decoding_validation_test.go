@@ -87,6 +87,17 @@ var _ = Describe("speculativeDecoding CRD validation", func() {
 		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
 
+	// Some MTP heads ship as a separate GGUF (e.g. ggml-org/Qwen3.8-27B-GGUF),
+	// so draft-mtp must also accept an explicit draftModelRef. draft-mtp is the
+	// one type where the field is genuinely optional.
+	It("admits draft-mtp with a draftModelRef", func() {
+		isvc := newSpecISvc("sd-draftmtp-withdraft", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "draft-mtp", DraftModelRef: "mtp-draft",
+		})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
 	It("admits an ngram type alone", func() {
 		isvc := newSpecISvc("sd-ngram-alone", &inferencev1alpha1.SpeculativeDecodingSpec{
 			Type: "ngram-cache",
