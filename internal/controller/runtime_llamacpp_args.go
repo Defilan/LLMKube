@@ -216,14 +216,17 @@ var specTypeAliases = map[string]string{
 	"disabled": "none",
 }
 
-// draftWeightSpecTypes are the resolved --spec-type values that need a
-// separate draft model on disk. draft-mtp is absent on purpose: MTP is
-// self-speculation carried by the target model.
+// draftWeightSpecTypes are the resolved --spec-type values that can take a
+// separate draft model on disk. draft-mtp is included because some MTP heads
+// ship as a separate GGUF; whether -md is actually emitted is decided by the
+// resolved draft being non-nil, not by membership here (see
+// appendSpeculativeDecodingArgs).
 var draftWeightSpecTypes = map[string]struct{}{
 	"draft-simple": {},
 	"draft-eagle3": {},
 	"draft-dflash": {},
 	"draft-dspark": {},
+	"draft-mtp":    {},
 }
 
 // resolveSpecType maps an alias to its llama.cpp spelling, or returns the

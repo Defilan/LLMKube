@@ -73,7 +73,7 @@ type SpeculativeDecodingType string
 // does not: MTP is self-speculation carried by the target model itself. The
 // ngram-* family speculates from the prompt and likewise needs no weights.
 // +kubebuilder:validation:XValidation:rule="!(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark']) || (has(self.draftModelRef) && self.draftModelRef.size() > 0)",message="this speculative decoding type needs draft weights: set draftModelRef to a Model in the same namespace"
-// +kubebuilder:validation:XValidation:rule="(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark']) || !has(self.draftModelRef) || self.draftModelRef.size() == 0",message="draftModelRef is only valid for the draft-model types (draft-simple, draft-eagle3, draft-dflash, draft-dspark); draft-mtp is self-speculation and the ngram types need no draft weights"
+// +kubebuilder:validation:XValidation:rule="(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark','draft-mtp']) || !has(self.draftModelRef) || self.draftModelRef.size() == 0",message="draftModelRef is only valid for the draft-model types (draft-simple, draft-eagle3, draft-dflash, draft-dspark, draft-mtp); the ngram types need no draft weights"
 type SpeculativeDecodingSpec struct {
 	// Type is the speculative decoding method (--spec-type). The aliases map
 	// as: "mtp" to draft-mtp, "draft" to draft-simple, and "disabled" to no
