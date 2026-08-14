@@ -114,6 +114,9 @@ type RunGateJobToolConfig struct {
 	// PVCName is the persistent volume claim mounted at /cache for
 	// GOMODCACHE / GOCACHE / XDG_DATA_HOME reuse across runs. Empty
 	// disables the volume mount. Defaults to "foreman-gate-cache".
+	// The foreman-agent threads the submitting agent's per-agent claim
+	// (foreman.gateCache.pvcName) here via --gate-cache-pvc so named
+	// agent pools mount the PVC the chart actually creates (#1538).
 	PVCName string
 
 	// Image is the container image the Job runs. Defaults to
