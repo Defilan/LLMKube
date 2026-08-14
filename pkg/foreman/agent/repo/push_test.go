@@ -120,6 +120,43 @@ func TestPush_CleanPush_NeverForces(t *testing.T) {
 	}
 }
 
+// TestRemoteURL reads the URL of a named remote (default "origin") from a
+// workspace, backing the assert-after-push guard (#1464).
+func TestRemoteURL(t *testing.T) {
+	dir := t.TempDir()
+	bare := initBareOrigin(t, dir)
+	seedOrigin(t, bare)
+	work := filepath.Join(dir, "work")
+	mustGit(t, "", "clone", bare, work)
+
+	got, err := RemoteURL(context.Background(), work, "")
+	if err != nil {
+		t.Fatalf("RemoteURL(origin): %v", err)
+	}
+	if got != bare {
+		t.Errorf("RemoteURL(origin) = %q, want %q", got, bare)
+	}
+
+	// A named remote resolves too.
+	mustGit(t, work, "remote", "add", "fork", "https://github.com/Defilan/LLMKube.git")
+	got, err = RemoteURL(context.Background(), work, "fork")
+	if err != nil {
+		t.Fatalf("RemoteURL(fork): %v", err)
+	}
+	if got != "https://github.com/Defilan/LLMKube.git" {
+		t.Errorf("RemoteURL(fork) = %q, want the fork URL", got)
+	}
+
+	// A missing remote is an error.
+	if _, err := RemoteURL(context.Background(), work, "nope"); err == nil {
+		t.Error("RemoteURL of a missing remote must error")
+	}
+	// An empty workspace is an error.
+	if _, err := RemoteURL(context.Background(), "", "origin"); err == nil {
+		t.Error("RemoteURL with empty workspace must error")
+	}
+}
+
 // mustGitOut runs git and returns trimmed stdout, failing the test on error.
 func mustGitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()

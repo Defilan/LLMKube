@@ -112,7 +112,7 @@ func TestMaybeOpenPullRequest_Gating(t *testing.T) {
 			task := reviewTaskForPR(tc.kind, tc.openPR)
 			r := &Result{Extra: map[string]any{}}
 
-			e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil, tc.verdict, r, "", "", nil)
+			e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil, tc.verdict, r, "", "", nil, "")
 
 			if called := len(fe.ensures) > 0; called != tc.wantCalled {
 				t.Fatalf("EnsurePR called=%v, want %v (calls=%+v)", called, tc.wantCalled, fe.ensures)
@@ -131,7 +131,7 @@ func TestMaybeOpenPullRequest_NilEnsurerIsDisabled(t *testing.T) {
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
 	r := &Result{Extra: map[string]any{}}
 	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil)
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 	if len(r.Extra) != 0 {
 		t.Fatalf("nil ensurer must be a no-op; extra=%+v", r.Extra)
 	}
@@ -150,7 +150,7 @@ func TestMaybeOpenPullRequest_BodyCarriesReviewSummary(t *testing.T) {
 	}
 
 	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil)
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 
 	if len(fe.ensures) != 1 {
 		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
@@ -182,7 +182,7 @@ func TestMaybeOpenPullRequest_ForkRemoteQualifiesHead(t *testing.T) {
 	r := &Result{Extra: map[string]any{}}
 
 	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil)
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 
 	if len(fe.ensures) != 1 {
 		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
@@ -224,7 +224,7 @@ func TestMaybeOpenPullRequest_SameRepoRemoteKeepsBareHead(t *testing.T) {
 		r := &Result{Extra: map[string]any{}}
 
 		e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-			foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil)
+			foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 
 		if len(fe.ensures) != 1 {
 			t.Fatalf("remote %q: want 1 EnsurePR call, got %+v", remote, fe.ensures)
@@ -292,7 +292,7 @@ func TestMaybeOpenPullRequest_BodyFlagsUngroundedClaim(t *testing.T) {
 	r := &Result{Summary: summary, Extra: map[string]any{}}
 
 	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-		foremanv1alpha1.AgenticTaskVerdictGo, r, t.TempDir(), "main", []string{"bridge/app.py"})
+		foremanv1alpha1.AgenticTaskVerdictGo, r, t.TempDir(), "main", []string{"bridge/app.py"}, "")
 
 	if len(fe.ensures) != 1 {
 		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
@@ -334,7 +334,7 @@ func TestMaybeOpenPullRequest_GroundedSummaryUntouched(t *testing.T) {
 	r := &Result{Summary: summary, Extra: map[string]any{}}
 
 	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-		foremanv1alpha1.AgenticTaskVerdictGo, r, t.TempDir(), "main", []string{"bridge/app.py"})
+		foremanv1alpha1.AgenticTaskVerdictGo, r, t.TempDir(), "main", []string{"bridge/app.py"}, "")
 
 	body := fe.ensures[0].body
 	if strings.Contains(body, "Unverified claims") {
@@ -369,7 +369,7 @@ func TestMaybeOpenPullRequest_NoDiffSkipsGrounding(t *testing.T) {
 			r := &Result{Summary: summary, Extra: map[string]any{}}
 
 			e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
-				foremanv1alpha1.AgenticTaskVerdictGo, r, tc.workspace, tc.base, nil)
+				foremanv1alpha1.AgenticTaskVerdictGo, r, tc.workspace, tc.base, nil, "")
 
 			if body := fe.ensures[0].body; strings.Contains(body, "Unverified claims") {
 				t.Errorf("no ground truth must mean no note; got %q", body)

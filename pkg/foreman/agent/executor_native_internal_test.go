@@ -2929,3 +2929,53 @@ func TestCrossProjectRemoteMismatch(t *testing.T) {
 		})
 	}
 }
+
+// isForkOf contract for #1464: a fork shares the repo NAME (owner may
+// differ); a differing repo name is an unrelated repository, not a fork.
+func TestIsForkOf(t *testing.T) {
+	cases := []struct {
+		name      string
+		remoteURL string
+		taskRepo  string
+		want      bool
+	}{
+		{name: "fork of same project", remoteURL: "https://github.com/Defilan/LLMKube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "same repo", remoteURL: "https://github.com/defilantech/LLMKube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "case-insensitive name", remoteURL: "https://github.com/Defilan/llmkube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "scp-like fork", remoteURL: "git@github.com:Defilan/LLMKube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "different project is not a fork", remoteURL: "https://github.com/Defilan/LLMKube.git", taskRepo: "Defilan/greenhouse-demo", want: false},
+		{name: "local path is not a fork", remoteURL: "/tmp/origin.git", taskRepo: "a/b", want: false},
+		{name: "file:// is not a fork", remoteURL: "file:///tmp/origin.git", taskRepo: "a/b", want: false},
+		{name: "empty remote", remoteURL: "", taskRepo: "a/b", want: false},
+		{name: "empty task repo", remoteURL: "https://github.com/o/r.git", taskRepo: "", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isForkOf(tc.remoteURL, tc.taskRepo); got != tc.want {
+				t.Errorf("isForkOf(%q, %q) = %v, want %v", tc.remoteURL, tc.taskRepo, got, tc.want)
+			}
+		})
+	}
+}
+
+// pushedRemoteMismatch reads the workspace's origin after a push and flags a
+// branch that landed in a repository other than the task's payload.repo.
+func TestPushedRemoteMismatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	bare := filepath.Join(dir, "origin.git")
+	gitIn(t, "", "init", "--bare", bare)
+	ws := filepath.Join(dir, "ws")
+	gitIn(t, "", "clone", bare, ws)
+
+	// Local bare path is not owner/repo shaped -> no mismatch flagged.
+	if msg := pushedRemoteMismatch(context.Background(), ws, "defilantech/LLMKube"); msg != "" {
+		t.Errorf("local bare remote must not be flagged, got: %s", msg)
+	}
+	// Empty task repo -> no mismatch flagged.
+	if msg := pushedRemoteMismatch(context.Background(), ws, ""); msg != "" {
+		t.Errorf("empty task repo must not be flagged, got: %s", msg)
+	}
+}
