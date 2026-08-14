@@ -355,33 +355,46 @@ func TestProgressMonitor_EditResetsStreak(t *testing.T) {
 	}
 }
 
-// TestProgressMonitor_BashFileWriteResetsStreak verifies that creating
-// or editing a workspace file through the bash tool (cat heredoc, sed
-// -i, etc.) counts as an edit. Models commonly write files via the
-// shell instead of the dedicated write_file/str_replace tools; without
-// this the EditFreeStreak detector force-terminates a run that is
-// actually making changes (observed with Gemma 4 on issue #522).
-func TestProgressMonitor_BashFileWriteResetsStreak(t *testing.T) {
+// TestProgressMonitor_BashFileWriteDoesNotResetStreak verifies that a bash
+// command that merely LOOKS like a write (cat heredoc, sed -i, etc.) does NOT
+// reset the edit-free streak. bashLikelyMutatesWorkspace is a substring
+// heuristic biased toward detecting a write, so it false-positives on common
+// tokens (go install, cp in a scratch step, any > redirection); honouring it
+// let a model that never edits hold the streak at zero forever and made
+// EditFreeTurnsLimit unreachable (#1520). Only a real edit tool resets the
+// streak, so a bash-shaped write still trips the detector.
+func TestProgressMonitor_BashFileWriteDoesNotResetStreak(t *testing.T) {
 	mon := NewLoopProgressMonitor(ProgressConfig{EditFreeTurnsLimit: 3})
 	transcript := []oai.Message{}
 
-	// 2 reads, then a bash heredoc that writes a new file, then 2 reads:
-	// the streak must reset on the bash write so it does NOT trip.
+	// 2 reads, then a bash heredoc that writes a new file: the streak must NOT
+	// reset on the bash write, so it trips at the limit.
 	_ = mon.Observe(1, []oai.ToolCall{makeCall("a", "read_file", `{}`)}, transcript)
 	_ = mon.Observe(2, []oai.ToolCall{makeCall("b", "read_file", `{}`)}, transcript)
 	heredoc := `{"command":"cat <<EOF > charts/foreman/templates/network-policy.yaml\nkind: NetworkPolicy\nEOF"}`
 	d := mon.Observe(3, []oai.ToolCall{makeCall("c", "bash", heredoc)}, transcript)
-	if d.Action != ProgressContinue {
-		t.Fatalf("turn 3 (bash heredoc write): expected Continue; got %+v", d)
+	if d.Signal != "EditFreeStreak" {
+		t.Fatalf("turn 3 (bash heredoc write): expected EditFreeStreak; got %+v", d)
 	}
-	d = mon.Observe(4, []oai.ToolCall{makeCall("d", "read_file", `{}`)}, transcript)
+	// A real edit tool still resets the streak.
+	d = mon.Observe(4, []oai.ToolCall{makeCall("d", "write_file", `{"path":"x.yaml","content":"x"}`)}, transcript)
 	if d.Action != ProgressContinue {
-		t.Fatalf("turn 4: expected Continue (streak reset by bash write); got %+v", d)
+		t.Fatalf("turn 4 (write_file): expected Continue; got %+v", d)
 	}
+	// After the reset, bash-shaped writes must NOT reset the streak again, so
+	// it trips at the limit (3) once more.
 	sedCmd := `{"command":"sed -i 's/a/b/' charts/foreman/values.yaml"}`
 	d = mon.Observe(5, []oai.ToolCall{makeCall("e", "bash", sedCmd)}, transcript)
 	if d.Action != ProgressContinue {
 		t.Fatalf("turn 5 (sed -i): expected Continue; got %+v", d)
+	}
+	d = mon.Observe(6, []oai.ToolCall{makeCall("f", "bash", sedCmd)}, transcript)
+	if d.Action != ProgressContinue {
+		t.Fatalf("turn 6 (sed -i): expected Continue; got %+v", d)
+	}
+	d = mon.Observe(7, []oai.ToolCall{makeCall("g", "bash", sedCmd)}, transcript)
+	if d.Signal != "EditFreeStreak" {
+		t.Fatalf("turn 7 (sed -i): expected EditFreeStreak; got %+v", d)
 	}
 }
 
@@ -705,18 +718,19 @@ func TestProgressMonitor_EditDisarmsNudgedRepeatedTool(t *testing.T) {
 	}
 }
 
-// TestProgressMonitor_UnverifiedBashResetsAreBounded reproduces #1520: a model
-// whose every turn contains a bash command matching the write heuristic held
-// editFreeStreak at zero indefinitely, so EditFreeTurnsLimit was unreachable
-// and the detector never fired. Observed in the field as 85 minutes and tens of
-// thousands of model operations against a verifiably clean worktree.
+// TestProgressMonitor_BashShapedWritesDoNotResetStreak reproduces #1520: a
+// model whose every turn contains a bash command matching the write heuristic
+// held editFreeStreak at zero indefinitely, so EditFreeTurnsLimit was
+// unreachable and the detector never fired. Observed in the field as 85
+// minutes and tens of thousands of model operations against a verifiably clean
+// worktree. bash-shaped writes are only string evidence of a write, so they
+// must NOT reset the streak; only a real edit tool may.
 //
 // Each turn here varies the filename so RepeatedToolThreshold does not fire
 // first; the signal under test is the edit-free one alone.
-func TestProgressMonitor_UnverifiedBashResetsAreBounded(t *testing.T) {
+func TestProgressMonitor_BashShapedWritesDoNotResetStreak(t *testing.T) {
 	mon := NewLoopProgressMonitor(ProgressConfig{
-		EditFreeTurnsLimit:     5,
-		UnverifiedEditResetCap: 3,
+		EditFreeTurnsLimit: 5,
 	})
 	transcript := []oai.Message{{Role: oai.RoleSystem, Content: "sys"}}
 
@@ -729,27 +743,24 @@ func TestProgressMonitor_UnverifiedBashResetsAreBounded(t *testing.T) {
 			break
 		}
 	}
-	if fired == 0 {
-		t.Fatal("edit-free signal never fired across 40 bash-shaped turns; " +
-			"unverified resets are still unbounded (#1520)")
-	}
-	// 3 resets are honoured, then the streak advances to the limit of 5.
-	if fired > 12 {
-		t.Errorf("signal fired at turn %d, later than the cap should allow", fired)
+	// The streak advances every turn (no reset), so it trips exactly at the
+	// limit of 5.
+	if fired != 5 {
+		t.Fatalf("edit-free signal fired at turn %d, want 5 (bash-shaped writes must not reset the streak; #1520)", fired)
 	}
 }
 
-// A model that edits through real tools must be unaffected by the bound: the
-// tool contract is self-evidencing, so its budget resets every time.
-func TestProgressMonitor_RealEditToolClearsUnverifiedBudget(t *testing.T) {
+// A model that edits through real tools must be unaffected: the tool contract
+// is self-evidencing, so a real edit resets the streak and the detector never
+// fires.
+func TestProgressMonitor_RealEditToolResetsStreak(t *testing.T) {
 	mon := NewLoopProgressMonitor(ProgressConfig{
-		EditFreeTurnsLimit:     5,
-		UnverifiedEditResetCap: 3,
+		EditFreeTurnsLimit: 5,
 	})
 	transcript := []oai.Message{{Role: oai.RoleSystem, Content: "sys"}}
 
 	// Alternate bash-shaped writes with a genuine str_replace. The real edit
-	// clears the unverified budget, so the cap is never reached.
+	// resets the streak, so the detector never fires.
 	for turn := 1; turn <= 40; turn++ {
 		var call oai.ToolCall
 		if turn%3 == 0 {
@@ -759,21 +770,6 @@ func TestProgressMonitor_RealEditToolClearsUnverifiedBudget(t *testing.T) {
 		}
 		if d := mon.Observe(turn, []oai.ToolCall{call}, transcript); d.Action != ProgressContinue {
 			t.Fatalf("turn %d: a model making real edits must not be flagged; got %+v", turn, d)
-		}
-	}
-}
-
-// Cap 0 restores the pre-#1520 behaviour, so an operator can opt out.
-func TestProgressMonitor_UnverifiedResetCapZeroIsUnbounded(t *testing.T) {
-	mon := NewLoopProgressMonitor(ProgressConfig{
-		EditFreeTurnsLimit:     5,
-		UnverifiedEditResetCap: 0,
-	})
-	transcript := []oai.Message{{Role: oai.RoleSystem, Content: "sys"}}
-	for turn := 1; turn <= 40; turn++ {
-		args := fmt.Sprintf(`{"command":"cp scratch-%d.txt /tmp/x"}`, turn)
-		if d := mon.Observe(turn, []oai.ToolCall{makeCall("t", "bash", args)}, transcript); d.Action != ProgressContinue {
-			t.Fatalf("turn %d: cap 0 must keep the old unbounded behaviour; got %+v", turn, d)
 		}
 	}
 }

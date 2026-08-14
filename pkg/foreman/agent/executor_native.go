@@ -3257,17 +3257,6 @@ func progressConfigFromAgent(agent *foremanv1alpha1.Agent) ProgressConfig {
 			EditFreeTurnsLimit:    int(s.EditFreeTurnsLimit),
 			ContextSoftCap:        int(s.ContextSoftCap),
 			ContextHardCap:        int(s.ContextHardCap),
-			// Not yet an Agent CR field, so it is taken from the defaults
-			// rather than left at zero. Zero means "unbounded", which is the
-			// pre-#1520 behaviour, and an Agent that sets stuckLoopDetection
-			// at all would otherwise silently opt out of the bound while
-			// appearing to have tightened its detection. The agent in #1520
-			// was exactly that shape: an explicit editFreeTurnsLimit of 30,
-			// and a detector that could never reach it.
-			//
-			// Inert when the edit-free signal is off (EditFreeTurnsLimit 0),
-			// so `stuckLoopDetection: {}` still disables the whole signal.
-			UnverifiedEditResetCap: DefaultProgressConfig.UnverifiedEditResetCap,
 		}
 	}
 	// Role-aware override: reviewers are read-only by design (tool
