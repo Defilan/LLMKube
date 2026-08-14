@@ -198,6 +198,13 @@ func findModelTransferFailure(pods []corev1.Pod) (nodeName, reason, matchedLine 
 			if !isGeneratedInitContainer(cs.Name) {
 				continue
 			}
+			// A container whose CURRENT termination is success has staged its
+			// weights. LastTerminationState still holds any earlier failed attempt
+			// for the life of the pod, so consulting it here would pin the
+			// condition False forever after a retry that succeeded (#1536).
+			if cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0 {
+				continue
+			}
 			for _, term := range []*corev1.ContainerStateTerminated{
 				cs.State.Terminated,
 				cs.LastTerminationState.Terminated,

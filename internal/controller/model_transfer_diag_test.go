@@ -179,4 +179,47 @@ func TestFindModelTransferFailure(t *testing.T) {
 			t.Error("a completed init container must not be reported as failing")
 		}
 	})
+
+	// A retried download that has since succeeded keeps the failed attempt in
+	// LastTerminationState for the life of the pod. The current state is exit 0,
+	// so the stale failure must not pin the condition False forever (#1536).
+	t.Run("ignores a recovered retry whose last termination still failed", func(t *testing.T) {
+		cs := terminatedInit("model-downloader", 0, "")
+		cs.LastTerminationState = corev1.ContainerState{
+			Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1,
+				Message:  "curl: (7) Failed to connect to 10.0.0.5 port 9000: Connection refused",
+			},
+		}
+		pods := []corev1.Pod{initPod("node-a", cs)}
+		if _, _, _, found := findModelTransferFailure(pods); found {
+			t.Error("a container whose current termination is success must not be diagnosed from its last termination")
+		}
+	})
+
+	// The crash-loop path the last-termination scan exists for must keep
+	// working: current state is NOT a successful termination, so the failed
+	// last termination is still a live signal.
+	t.Run("still diagnoses a genuine crash loop from last termination", func(t *testing.T) {
+		cs := corev1.ContainerStatus{
+			Name: "model-downloader",
+			State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"},
+			},
+			LastTerminationState: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 1,
+					Message:  "curl: (7) Failed to connect to 10.0.0.5 port 9000: Connection refused",
+				},
+			},
+		}
+		pods := []corev1.Pod{initPod("node-b", cs)}
+		node, reason, line, found := findModelTransferFailure(pods)
+		if !found {
+			t.Fatal("a crash-looping container must still be diagnosed from its last termination")
+		}
+		if node != "node-b" || reason != ReasonModelSourceUnreachable || line == "" {
+			t.Errorf("got node=%q reason=%q line=%q", node, reason, line)
+		}
+	})
 }
