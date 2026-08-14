@@ -1071,10 +1071,107 @@ func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := range a {
+	for i := 0; i < len(a); i++ {
 		if a[i] != b[i] {
 			return false
 		}
 	}
 	return true
+}
+
+// archAwareBackend is a test RuntimeBackend that declares a single supported
+// architecture, exercising the architecture-aware placement path.
+type archAwareBackend struct{}
+
+func (b *archAwareBackend) ContainerName() string { return "arch-aware" }
+func (b *archAwareBackend) DefaultImage() string  { return "example/arch-aware:amd64-only" }
+func (b *archAwareBackend) DefaultPort() int32    { return 8080 }
+func (b *archAwareBackend) BuildArgs(*inferencev1alpha1.InferenceService, *inferencev1alpha1.Model, string, string, int32) []string {
+	return nil
+}
+func (b *archAwareBackend) BuildProbes(int32) (*corev1.Probe, *corev1.Probe, *corev1.Probe) {
+	return nil, nil, nil
+}
+func (b *archAwareBackend) NeedsModelInit() bool             { return false }
+func (b *archAwareBackend) SupportedArchitectures() []string { return []string{"amd64"} }
+
+// archAffinityTerms returns the kubernetes.io/arch In values in the pod's
+// required node affinity, or nil when none is present.
+func archAffinityTerms(pod corev1.PodSpec) []string {
+	if pod.Affinity == nil || pod.Affinity.NodeAffinity == nil ||
+		pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return nil
+	}
+	for _, term := range pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == corev1.LabelArchStable && expr.Operator == corev1.NodeSelectorOpIn {
+				return expr.Values
+			}
+		}
+	}
+	return nil
+}
+
+func TestConstructDeployment_ArchAffinity(t *testing.T) {
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/m.gguf"},
+	}
+
+	// A backend that declares a supported architecture must get a
+	// kubernetes.io/arch nodeAffinity when the operator chose the image.
+	t.Run("operator image gets arch affinity", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: "llamacpp"},
+		}
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		// Force the arch-aware backend by stubbing resolveBackend.
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		got := archAffinityTerms(pod)
+		if !equalStrings(got, []string{"amd64"}) {
+			t.Errorf("arch affinity values = %v, want [amd64]", got)
+		}
+	})
+
+	// A user-supplied spec.image must bypass the constraint entirely.
+	t.Run("user image bypasses arch affinity", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime: "llamacpp",
+				Image:   "custom/whatever:latest",
+			},
+		}
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		if got := archAffinityTerms(pod); got != nil {
+			t.Errorf("arch affinity values = %v, want none for user-supplied image", got)
+		}
+	})
+
+	// A backend with no declared architectures must not add a constraint.
+	t.Run("no declared arch means no constraint", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: "llamacpp"},
+		}
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &LlamaCppBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		if got := archAffinityTerms(pod); got != nil {
+			t.Errorf("arch affinity values = %v, want none for multi-arch backend", got)
+		}
+	})
 }

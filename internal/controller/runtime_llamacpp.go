@@ -63,6 +63,13 @@ func (b *LlamaCppBackend) DefaultPort() int32 {
 	return 8080
 }
 
+// SupportedArchitectures reports the architectures the operator-chosen llama.cpp
+// image supports. The default CPU-only :server tag is published for both amd64
+// and arm64, so no constraint is applied (nil). The GPU variants selected by
+// resolveRuntimeImage are amd64-only, but the operator cannot verify a single
+// arch list across every variant it may pick, so it declines to guess (#1479).
+func (b *LlamaCppBackend) SupportedArchitectures() []string { return nil }
+
 func (b *LlamaCppBackend) NeedsModelInit() bool     { return true }
 func (b *LlamaCppBackend) DefaultHPAMetric() string { return "llamacpp:requests_processing" }
 

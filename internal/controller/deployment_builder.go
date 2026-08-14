@@ -562,7 +562,66 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		deployment.Spec.Template.Spec.Affinity = isvc.Spec.Affinity
 	}
 
+	applyArchAffinity(deployment, backend, isvc)
+
 	return deployment
+}
+
+// applyArchAffinity applies architecture-aware placement (#1479). When the
+// operator chose the image (no user-supplied spec.image) and the backend
+// declares a non-empty set of supported architectures, it constrains the pod to
+// nodes of those architectures via a kubernetes.io/arch nodeAffinity. A
+// user-supplied image bypasses this entirely, since the operator cannot know
+// what a custom image supports and must not guess.
+func applyArchAffinity(deployment *appsv1.Deployment, backend RuntimeBackend, isvc *inferencev1alpha1.InferenceService) {
+	if isvc.Spec.Image != "" {
+		return
+	}
+	if archs := backend.SupportedArchitectures(); len(archs) > 0 {
+		applyArchNodeAffinity(deployment, archs)
+	}
+}
+
+// applyArchNodeAffinity adds a required kubernetes.io/arch nodeAffinity term to
+// the pod spec, restricting scheduling to nodes whose architecture is in archs.
+// It merges into any existing affinity (user-provided or otherwise) rather than
+// overwriting it, so the user's other affinity rules keep applying.
+func applyArchNodeAffinity(deployment *appsv1.Deployment, archs []string) {
+	affinity := deployment.Spec.Template.Spec.Affinity
+	if affinity == nil {
+		affinity = &corev1.Affinity{}
+	}
+	if affinity.NodeAffinity == nil {
+		affinity.NodeAffinity = &corev1.NodeAffinity{}
+	}
+	if affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{}
+	}
+
+	values := make([]string, 0, len(archs))
+	for _, a := range archs {
+		if a != "" {
+			values = append(values, a)
+		}
+	}
+	if len(values) == 0 {
+		return
+	}
+
+	term := corev1.NodeSelectorTerm{
+		MatchExpressions: []corev1.NodeSelectorRequirement{
+			{
+				Key:      corev1.LabelArchStable,
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   values,
+			},
+		},
+	}
+	affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(
+		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
+		term,
+	)
+	deployment.Spec.Template.Spec.Affinity = affinity
 }
 
 // applyDRAPodScheduling configures pod-level scheduling for a DRA workload.

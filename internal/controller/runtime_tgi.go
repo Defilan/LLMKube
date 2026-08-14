@@ -26,9 +26,14 @@ func (b *TGIBackend) ContainerName() string { return "tgi" }
 func (b *TGIBackend) DefaultImage() string {
 	return "ghcr.io/huggingface/text-generation-inference:3.3.7"
 }
-func (b *TGIBackend) DefaultPort() int32       { return 80 }
-func (b *TGIBackend) NeedsModelInit() bool     { return false }
-func (b *TGIBackend) DefaultHPAMetric() string { return "tgi:queue_size" }
+func (b *TGIBackend) DefaultPort() int32   { return 80 }
+func (b *TGIBackend) NeedsModelInit() bool { return false }
+
+// SupportedArchitectures reports the architectures the operator-chosen TGI image
+// supports. The pinned ghcr.io/huggingface/text-generation-inference image is
+// published for both amd64 and arm64, so no constraint is applied (#1479).
+func (b *TGIBackend) SupportedArchitectures() []string { return nil }
+func (b *TGIBackend) DefaultHPAMetric() string         { return "tgi:queue_size" }
 
 func (b *TGIBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath string, _ string, port int32) []string {
 	source := modelPath

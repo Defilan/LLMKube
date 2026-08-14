@@ -23,6 +23,11 @@ func (b *PersonaPlexBackend) DefaultPort() int32 {
 	return 8998
 }
 
+// SupportedArchitectures reports the architectures the operator-chosen image
+// supports. PersonaPlex requires spec.image by contract, and a user-supplied
+// image always bypasses the architecture constraint, so no constraint is applied (#1479).
+func (b *PersonaPlexBackend) SupportedArchitectures() []string { return nil }
+
 func (b *PersonaPlexBackend) NeedsModelInit() bool     { return false }
 func (b *PersonaPlexBackend) DefaultHPAMetric() string { return "" }
 
