@@ -594,6 +594,13 @@ spec:
                   or fail).
                 format: date-time
                 type: string
+              jobName:
+                description: |-
+                  JobName is the name of the Kubernetes Job currently running this
+                  task, set at dispatch for Job-mode Agents so operators and
+                  downstream tooling can identify the live Job while it runs (not
+                  just after completion) (#1535).
+                type: string
               phase:
                 description: Phase is the current lifecycle phase.
                 enum:

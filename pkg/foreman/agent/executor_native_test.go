@@ -35,6 +35,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
@@ -1827,10 +1828,16 @@ type fakeCoderJobSubmitter struct {
 }
 
 func (f *fakeCoderJobSubmitter) Submit(
-	_ context.Context, req foremanagent.CoderJobRequest,
+	ctx context.Context, req foremanagent.CoderJobRequest,
 ) (foremanagent.CoderJobResult, error) {
 	f.called = true
 	f.gotReq = req
+	// Mirror the real submitter: once the Job "exists", fire the
+	// on-job-created hook so tests can assert status.jobName is stamped for
+	// the running window (#1535).
+	if req.OnJobCreated != nil {
+		req.OnJobCreated(ctx, f.result.JobName)
+	}
 	return f.result, f.err
 }
 
@@ -1892,6 +1899,26 @@ func TestNativeExecutor_JobModeDispatchesToCoderJob(t *testing.T) {
 	if sub.gotReq.ActiveDeadlineSeconds == nil || *sub.gotReq.ActiveDeadlineSeconds != deadline {
 		t.Errorf("request deadline: got %v", sub.gotReq.ActiveDeadlineSeconds)
 	}
+	// The Job must carry an ownerReference to its AgenticTask so Kubernetes
+	// GC reclaims it when the task is deleted (#1535). This exercises the
+	// boolPtr helper used to set Controller.
+	if sub.gotReq.OwnerReference == nil {
+		t.Fatalf("request ownerReference: expected one, got nil")
+	}
+	ref := sub.gotReq.OwnerReference
+	if ref.Kind != "AgenticTask" || ref.Name != task.Name || ref.UID != task.UID {
+		t.Errorf("request ownerReference: got %+v", ref)
+	}
+	if ref.Controller == nil || !*ref.Controller {
+		t.Errorf("request ownerReference.Controller: want true, got %v", ref.Controller)
+	}
+	// BlockOwnerDeletion is deliberately unset: it would require the agent
+	// to hold `update` on the AgenticTask's `finalizers` subresource, which
+	// the agent Role does not grant. Cascading GC still reclaims the Job
+	// when the task is deleted, so we omit it rather than widen RBAC (#1535).
+	if ref.BlockOwnerDeletion != nil {
+		t.Errorf("request ownerReference.BlockOwnerDeletion: want nil (unset), got %v", *ref.BlockOwnerDeletion)
+	}
 	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("Verdict: want GO got %s", res.Verdict)
 	}
@@ -1903,6 +1930,145 @@ func TestNativeExecutor_JobModeDispatchesToCoderJob(t *testing.T) {
 	}
 	if got, _ := res.Extra["executionMode"].(string); got != "Job" {
 		t.Errorf("Extra.executionMode: got %v", res.Extra["executionMode"])
+	}
+}
+
+// TestNativeExecutor_JobModeStampsJobNameWhileRunning asserts the RUNNING
+// case that the terminal-only lift in patchTerminal missed (#1535): when the
+// coder Job is created, the executor stamps status.jobName onto the
+// AgenticTask while it is still in phase=Running, so an operator or a
+// downstream reaper can tell which Job belongs to a live task. We capture the
+// task's phase at the exact moment the on-job-created hook fires (before
+// Submit returns, i.e. before any terminal patch) and assert it is Running
+// with a non-empty jobName.
+func TestNativeExecutor_JobModeStampsJobNameWhileRunning(t *testing.T) {
+	agent, task := taskAndAgent("job-stamp")
+	agent.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+		Mode:  foremanv1alpha1.ExecutionModeJob,
+		Image: "ghcr.io/defilantech/foreman-agent:dev",
+	}
+	// Start the task in the Running phase the way the watcher's claim leaves
+	// it, so the assertion is about a genuinely live task, not a fresh one.
+	claimedAt := metav1.Now()
+	task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+	task.Status.AssignedNode = "coder"
+	task.Status.ClaimedAt = &claimedAt
+	task.Status.StartedAt = &claimedAt
+
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(agent, task).
+		WithStatusSubresource(&foremanv1alpha1.AgenticTask{}).
+		Build()
+
+	const wantJobName = "foreman-coder-job-stamp-1786665563449"
+
+	// captureSubmitter mirrors the real submitter's ordering: it records the
+	// task phase right before and right after the on-job-created hook fires,
+	// so we can prove the hook ran while the task was still Running.
+	cap := &jobCreatedCapture{}
+	sub := &capturingCoderJobSubmitter{
+		result: foremanagent.CoderJobResult{
+			Verdict: "GO",
+			Summary: "fixed in a Job",
+			JobName: wantJobName,
+		},
+		capture: cap,
+		client:  c,
+		taskKey: types.NamespacedName{Namespace: task.Namespace, Name: task.Name},
+	}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:            c,
+		CoderJobSubmitter: sub,
+		RegistryFactory: func(
+			_ context.Context, _ string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			t.Fatalf("RegistryFactory must NOT be called on the Job path")
+			return nil, nil
+		},
+	}
+
+	if _, err := e.Execute(context.Background(), task); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// The hook must have fired while the task was still Running, and it must
+	// be the hook that set the field: before the hook fired, jobName was
+	// empty (the terminal-only design left it unset during the run); after
+	// the hook fired, it carried the Job name.
+	if cap.phaseBefore != foremanv1alpha1.AgenticTaskPhaseRunning {
+		t.Fatalf("phase at job-created hook = %q, want Running (the running-window case #1535)", cap.phaseBefore)
+	}
+	if cap.jobNameBefore != "" {
+		t.Fatalf("status.jobName before the hook = %q, want empty (the hook populates it while running)",
+			cap.jobNameBefore)
+	}
+	if cap.jobNameAfter != wantJobName {
+		t.Fatalf("status.jobName after the job-created hook = %q, want %q", cap.jobNameAfter, wantJobName)
+	}
+	// The stamp must not have clobbered the phase: it is a status merge
+	// patch touching only jobName.
+	if cap.phaseAfter != foremanv1alpha1.AgenticTaskPhaseRunning {
+		t.Errorf("phase after hook = %q, want Running (stamp must not clobber phase)", cap.phaseAfter)
+	}
+
+	// And it must persist on the stored object, independent of the terminal
+	// result (which the fake submitter never writes back to the client).
+	var got foremanv1alpha1.AgenticTask
+	gotKey := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
+	if err := c.Get(context.Background(), gotKey, &got); err != nil {
+		t.Fatalf("get %s: %v", task.Name, err)
+	}
+	if got.Status.JobName != wantJobName {
+		t.Errorf("stored status.jobName = %q, want %q", got.Status.JobName, wantJobName)
+	}
+}
+
+// jobCreatedCapture records the AgenticTask's phase and jobName around the
+// on-job-created hook so a test can assert the hook ran for the running
+// window (#1535).
+type jobCreatedCapture struct {
+	phaseBefore   foremanv1alpha1.AgenticTaskPhase
+	jobNameBefore string
+	phaseAfter    foremanv1alpha1.AgenticTaskPhase
+	jobNameAfter  string
+}
+
+// capturingCoderJobSubmitter is a CoderJobSubmitter test double that, around
+// the on-job-created hook, records the AgenticTask's phase and jobName.
+type capturingCoderJobSubmitter struct {
+	result  foremanagent.CoderJobResult
+	capture *jobCreatedCapture
+	client  client.Client
+	taskKey types.NamespacedName
+}
+
+func (f *capturingCoderJobSubmitter) Submit(
+	ctx context.Context, req foremanagent.CoderJobRequest,
+) (foremanagent.CoderJobResult, error) {
+	f.readCapture(ctx, true)
+	if req.OnJobCreated != nil {
+		req.OnJobCreated(ctx, f.result.JobName)
+	}
+	f.readCapture(ctx, false)
+	return f.result, nil
+}
+
+func (f *capturingCoderJobSubmitter) readCapture(ctx context.Context, before bool) {
+	if f.capture == nil || f.client == nil {
+		return
+	}
+	var cur foremanv1alpha1.AgenticTask
+	if err := f.client.Get(ctx, f.taskKey, &cur); err != nil {
+		return
+	}
+	if before {
+		f.capture.phaseBefore = cur.Status.Phase
+		f.capture.jobNameBefore = cur.Status.JobName
+	} else {
+		f.capture.phaseAfter = cur.Status.Phase
+		f.capture.jobNameAfter = cur.Status.JobName
 	}
 }
 

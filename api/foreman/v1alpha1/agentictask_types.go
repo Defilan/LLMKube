@@ -647,6 +647,13 @@ type AgenticTaskStatus struct {
 	// +optional
 	CommitSHA string `json:"commitSHA,omitempty"`
 
+	// JobName is the name of the Kubernetes Job currently running this
+	// task, set at dispatch for Job-mode Agents so operators and
+	// downstream tooling can identify the live Job while it runs (not
+	// just after completion) (#1535).
+	// +optional
+	JobName string `json:"jobName,omitempty"`
+
 	// TranscriptRef points to where the agent's full transcript was stored
 	// (typically a ConfigMap in the operator's namespace).
 	// +optional
