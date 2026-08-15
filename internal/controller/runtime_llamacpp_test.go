@@ -865,3 +865,122 @@ func TestLlamaCppBuildArgs_EmitsDraftModelPath(t *testing.T) {
 		}
 	}
 }
+
+// TestLlamaCppBuildArgs_FileBasedDraftModel covers the file-based draft path
+// (#1495): spec.speculativeDecoding.draftModel names a companion file in
+// Model.files (e.g. a dflash drafter) and the operator resolves its staged
+// in-container path the way it does for Model.mmproj, so the manifest never
+// names a content-hash cache directory.
+func TestLlamaCppBuildArgs_FileBasedDraftModel(t *testing.T) {
+	n := func(i int32) *int32 { return &i }
+	backend := &LlamaCppBackend{}
+
+	cases := []struct {
+		name        string
+		modelSpec   inferencev1alpha1.ModelSpec
+		modelPath   string
+		spec        *inferencev1alpha1.SpeculativeDecodingSpec
+		contains    []FlagCheck
+		notContains []string
+	}{
+		{
+			name: "draft-dflash companion file emits resolved -md",
+			modelSpec: inferencev1alpha1.ModelSpec{
+				Format: "gguf",
+				Files:  []string{"main.gguf", "dflash-kquant.gguf"},
+			},
+			modelPath: "/models/main.gguf",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type:       "draft-dflash",
+				DraftModel: "dflash-kquant.gguf",
+				NDraftMax:  n(3),
+			},
+			contains: []FlagCheck{
+				{"--spec-type", "draft-dflash"},
+				{"-md", "/models/dflash-kquant.gguf"},
+				{"--spec-draft-n-max", "3"},
+			},
+		},
+		{
+			name: "draft file in subdirectory resolves against cache root",
+			modelSpec: inferencev1alpha1.ModelSpec{
+				Format: "gguf",
+				Files:  []string{"subdir/main.gguf", "subdir/dflash.gguf"},
+			},
+			modelPath: "/models/cache/subdir/main.gguf",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type:       "draft-dflash",
+				DraftModel: "subdir/dflash.gguf",
+			},
+			contains: []FlagCheck{
+				{"--spec-type", "draft-dflash"},
+				{"-md", "/models/cache/subdir/dflash.gguf"},
+			},
+		},
+		{
+			name: "draftModel without files does not emit -md (cannot resolve)",
+			modelSpec: inferencev1alpha1.ModelSpec{
+				Format: "gguf",
+			},
+			modelPath: "/models/main.gguf",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type:       "draft-dflash",
+				DraftModel: "dflash.gguf",
+			},
+			contains:    []FlagCheck{{"--spec-type", "draft-dflash"}},
+			notContains: []string{"-md"},
+		},
+		{
+			name: "draftModel not emitted for ngram type (needs no weights)",
+			modelSpec: inferencev1alpha1.ModelSpec{
+				Format: "gguf",
+				Files:  []string{"main.gguf", "dflash.gguf"},
+			},
+			modelPath: "/models/main.gguf",
+			spec: &inferencev1alpha1.SpeculativeDecodingSpec{
+				Type:       "ngram-cache",
+				DraftModel: "dflash.gguf",
+				NDraftMax:  n(2),
+			},
+			contains: []FlagCheck{
+				{"--spec-type", "ngram-cache"},
+				{"--spec-draft-n-max", "2"},
+			},
+			notContains: []string{"-md"},
+		},
+		{
+			name: "draftModel not emitted for mtp (self-speculation)",
+			modelSpec: inferencev1alpha1.ModelSpec{
+				Format: "gguf",
+				Files:  []string{"main.gguf"},
+			},
+			modelPath: "/models/main.gguf",
+			spec:      &inferencev1alpha1.SpeculativeDecodingSpec{Type: "mtp"},
+			contains:  []FlagCheck{{"--spec-type", "draft-mtp"}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "isvc-" + strings.ReplaceAll(tc.name, " ", "-"), Namespace: "default"},
+				Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: "llamacpp", SpeculativeDecoding: tc.spec},
+			}
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-model", Namespace: "default"},
+				Spec:       tc.modelSpec,
+			}
+			args := backend.BuildArgs(isvc, model, tc.modelPath, "", 8080)
+			for _, fc := range tc.contains {
+				if !containsArg(args, fc.flag, fc.value) {
+					t.Errorf("expected %q %q in args, got: %v", fc.flag, fc.value, args)
+				}
+			}
+			for _, f := range tc.notContains {
+				if containsArg(args, f, "") {
+					t.Errorf("expected %q NOT in args, got: %v", f, args)
+				}
+			}
+		})
+	}
+}

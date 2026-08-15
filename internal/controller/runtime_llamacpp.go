@@ -145,18 +145,11 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 	args = appendBatchSizeArgs(args, isvc.Spec.BatchSize)
 	args = appendUBatchSizeArgs(args, isvc.Spec.UBatchSize)
 	args = appendNoWarmupArgs(args, isvc.Spec.NoWarmup)
+	draftPath, mmprojPath := resolveStagedCompanions(isvc, model, modelPath, draftPath)
+
 	args = appendSpeculativeDecodingArgs(args, isvc.Spec.SpeculativeDecoding, draftPath)
 	args = appendReasoningBudgetArgs(args, isvc.Spec.ReasoningBudget, isvc.Spec.ReasoningBudgetMessage)
-	if model != nil && model.Spec.Mmproj != "" && modelPath != "" {
-		if plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil); err == nil && plan != nil && plan.Primary != "" {
-			mmprojDir := path.Dir(modelPath)
-			suffix := "/" + plan.Primary
-			if strings.HasSuffix(modelPath, suffix) {
-				mmprojDir = modelPath[:len(modelPath)-len(suffix)]
-			}
-			args = appendMmprojArgs(args, stagedCachePath(mmprojDir, model.Spec.Mmproj), isvc.Spec.ExtraArgs)
-		}
-	}
+	args = appendMmprojArgs(args, mmprojPath, isvc.Spec.ExtraArgs)
 	args = appendMetadataOverrideArgs(args, isvc.Spec.MetadataOverrides)
 	args = appendModeArgs(args, isvc.Spec.Mode, isvc.Spec.ExtraArgs)
 	if len(isvc.Spec.ExtraArgs) > 0 {
@@ -173,6 +166,48 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 	}
 
 	return args
+}
+
+// resolveStagedCompanions resolves the absolute in-container paths of the two
+// companion files the operator stages alongside the primary model: the
+// multimodal projector (Model.mmproj) and a file-based draft
+// (spec.speculativeDecoding.draftModel, #1495). Both resolve against the
+// model's cache base dir — the directory holding the primary file — so the
+// manifest never names a content-hash path that is unknowable before the
+// first reconcile.
+//
+// It returns the draft path to hand to appendSpeculativeDecodingArgs and the
+// mmproj path to hand to appendMmprojArgs. The draft path is left as passed
+// when a Model-CR draft (draftModelRef) already supplied one; a file-based
+// draft only fills the gap when the base dir is resolvable. Each path is ""
+// when its source is unset or the file set is invalid, in which case the
+// corresponding append* helper emits nothing.
+func resolveStagedCompanions(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelPath, draftPath string) (draftPathOut, mmprojPath string) {
+	draftPathOut = draftPath
+	if model == nil || modelPath == "" {
+		return
+	}
+
+	baseDir := ""
+	if plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil); err == nil && plan != nil && plan.Primary != "" {
+		baseDir = path.Dir(modelPath)
+		if suffix := "/" + plan.Primary; strings.HasSuffix(modelPath, suffix) {
+			baseDir = modelPath[:len(modelPath)-len(suffix)]
+		}
+	}
+	if baseDir == "" {
+		return
+	}
+
+	if model.Spec.Mmproj != "" {
+		mmprojPath = stagedCachePath(baseDir, model.Spec.Mmproj)
+	}
+	if draftPathOut == "" {
+		if sd := isvc.Spec.SpeculativeDecoding; sd != nil && sd.DraftModel != "" {
+			draftPathOut = stagedCachePath(baseDir, sd.DraftModel)
+		}
+	}
+	return
 }
 
 func (b *LlamaCppBackend) BuildProbes(port int32) (startup, liveness, readiness *corev1.Probe) {
