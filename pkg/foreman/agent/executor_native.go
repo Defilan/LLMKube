@@ -813,6 +813,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// instead of resolving and shelling out for them a second time.
 		var reviewBase string
 		var reviewDiff []string
+		// reviewerErrorReason carries the ModelReportedError a reviewer rail
+		// remapped into an ERROR verdict (#1552); attached to the Result after
+		// modelDecidedResult so the branch routes to a human.
+		var reviewerErrorReason foremanv1alpha1.AgenticTaskFailureReason
 		if agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer &&
 			loopRes.Terminal != nil {
 			// Ground-truth filesTouched against the actual diff before
@@ -841,6 +845,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// below (grounded-finding + scope-overlap).
 			var reviewDiffErr error
 			reviewDiff, reviewDiffErr = repo.DiffNameOnly(ctx, workspace, reviewBase)
+			// Empty-claim rail (#1552): an unsupported branch-emptiness /
+			// unreadability NO-GO (contradicted by a non-empty ground-truth
+			// diff, with no grounded finding) is remapped to ERROR so it
+			// routes to a human instead of burning review iterations. Runs
+			// BEFORE the grounded-finding demote rail, which would otherwise
+			// turn the ungrounded NO-GO into GO and defeat the remap.
+			verdict, reviewerErrorReason = runEmptyClaimRail(ctx, log, workspace,
+				reviewBase, reviewDiff, reviewDiffErr, loopRes.Terminal.Extra,
+				loopRes.Terminal.Summary, verdict)
 			// Grounded-finding rail: a NO-GO must be earned by >=1 blocking
 			// finding citing a line the diff changed; otherwise demote it to GO
 			// and archive the rejected findings. Mirror of scope-overlap, in the
@@ -899,8 +912,12 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// modelDecidedResult() and here sets r.FailureReason today, but
 		// future reason-setting paths (e.g. additional enforcement passes)
 		// should not be silently clobbered.
-		if normalizedReason != "" && r.FailureReason == "" {
-			r.FailureReason = normalizedReason
+		if r.FailureReason == "" {
+			if reviewerErrorReason != "" {
+				r.FailureReason = reviewerErrorReason
+			} else if normalizedReason != "" {
+				r.FailureReason = normalizedReason
+			}
 		}
 		return r, nil
 	}
