@@ -552,14 +552,17 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		Spec: deployment.Spec.Template.Spec,
 	}
 
-	// Use annotation-based hash comparison to avoid false positives from
-	// API-server-applied defaults that differ between in-memory and persisted objects.
+	// Use annotation-based hash comparison to detect real changes. A missing
+	// stored hash (a legacy Deployment that predates the annotation) is
+	// treated as changed: draining unnecessarily costs a little latency, while
+	// skipping a needed drain drops in-flight requests. After the first
+	// reconcile the annotation is stamped and the hash path takes over.
 	desiredHash := desiredTemplateHash(desiredPodTemplate)
 	storedHash := ""
 	if existingDeployment.Annotations != nil {
 		storedHash = existingDeployment.Annotations[AnnotationDesiredTemplateHash]
 	}
-	templateChanged := podTemplatesDiffer(existingDeployment.Spec.Template, desiredPodTemplate)
+	templateChanged := true
 	if storedHash != "" {
 		templateChanged = desiredHash != storedHash
 	}
