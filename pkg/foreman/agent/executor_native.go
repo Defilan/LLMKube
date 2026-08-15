@@ -880,6 +880,12 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the model paraphrased the issue ask (#744).
 			verdict = enforceReviewerIssueAsk(log, loopRes.Terminal.Extra, verdict,
 				scopeDriftDetected, scopeMatched)
+			// Demote a surviving GO whose summary states the reviewer could not
+			// verify the change (#1454). Runs LAST: an earlier rail may
+			// legitimately demote or promote the verdict, and this rail only ever
+			// acts on a GO that survived them.
+			verdict = enforceReviewerUnverifiedClaim(log, loopRes.Terminal.Extra,
+				loopRes.Terminal.Summary, verdict)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 		}
 		r := e.modelDecidedResult(start, transcriptRef, loopRes, verdict)
