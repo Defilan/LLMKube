@@ -2494,43 +2494,6 @@ var cloneURLResolver codehost.CodeHost = codehost.NewGitHubCodeHost(nil)
 // with or without the .git suffix. Anything else (local paths, file://
 // remotes used in tests, bare hosts) yields "", "" so callers fall back
 // to same-repo behavior.
-// crossProjectRemoteMismatch reports why a static --git-remote-url must not be
-// used for this task, or "" when it is fine (#1464).
-//
-// The fork deployment is legitimate and must keep working: --git-remote-url
-// names a fork of payload.repo, so the OWNER differs while the repo NAME is the
-// same (defilantech/LLMKube -> Defilan/LLMKube). A differing repo NAME is never
-// a fork relationship. It is a misconfiguration whose consequences are silent:
-// the coder reads the right issue, does correct work, pushes it into an
-// unrelated repository, and reports GO. Nothing downstream notices, because the
-// reviewer is handed the same wrong remote.
-//
-// Compared on names rather than by asking the codehost whether one repo is a
-// fork of the other: that would be a network call on every task and
-// provider-specific, while the name comparison already separates "fork of the
-// same project" from "entirely different project".
-//
-// Returns "" for remotes that are not owner/repo shaped (local bare-repo paths
-// in tests), so the guard cannot fire on them.
-func crossProjectRemoteMismatch(remoteURL, taskRepo string) string {
-	if remoteURL == "" || taskRepo == "" {
-		return ""
-	}
-	_, remoteName := gitRemoteOwnerRepo(remoteURL)
-	if remoteName == "" {
-		return ""
-	}
-	_, taskName, ok := codehost.SplitRepoSlug(taskRepo)
-	if !ok || strings.EqualFold(remoteName, taskName) {
-		return ""
-	}
-	return fmt.Sprintf(
-		"--git-remote-url names repository %q but the task targets %q; a fork must "+
-			"share the repo name (only the owner differs). Refusing to clone and push "+
-			"work for %q into %q",
-		remoteName, taskRepo, taskRepo, remoteName)
-}
-
 // isForkOf reports whether remoteURL names a fork of taskRepo: the repo NAME
 // matches (case-insensitively) while the OWNER may differ. A fork shares the
 // repo name by definition, so a name match is the fork relationship; a name
