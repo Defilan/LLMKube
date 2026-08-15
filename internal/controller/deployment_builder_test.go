@@ -1175,3 +1175,79 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		}
 	})
 }
+
+// TestInferPodSecurityContext_VulkanDRIRenderGID pins the #1560 fix at the
+// function level: the DRI render GID is injected into supplementalGroups only
+// on the Vulkan path, and fsGroup behaviour is unchanged in both cases. This
+// is a pure-function unit test so it runs without envtest (unlike the Ginkgo
+// suite, which needs etcd).
+func TestInferPodSecurityContext_VulkanDRIRenderGID(t *testing.T) {
+	const (
+		defaultFSGroup = int64(102)
+		renderGID      = int64(991)
+	)
+	emptyISVC := &inferencev1alpha1.InferenceService{}
+
+	t.Run("vulkan adds the render GID to supplementalGroups", func(t *testing.T) {
+		psc := inferPodSecurityContext(emptyISVC, defaultFSGroup, renderGID, true)
+		if psc == nil {
+			t.Fatal("inferPodSecurityContext returned nil")
+		}
+		if psc.SupplementalGroups == nil {
+			t.Fatal("vulkan: SupplementalGroups is nil; want it to contain the render GID")
+		}
+		found := false
+		for _, g := range psc.SupplementalGroups {
+			if g == renderGID {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("vulkan: SupplementalGroups = %v, want it to contain %d", psc.SupplementalGroups, renderGID)
+		}
+	})
+
+	t.Run("vulkan keeps fsGroup unchanged", func(t *testing.T) {
+		psc := inferPodSecurityContext(emptyISVC, defaultFSGroup, renderGID, true)
+		if psc.FSGroup == nil || *psc.FSGroup != defaultFSGroup {
+			t.Errorf("vulkan: FSGroup = %v, want %d", psc.FSGroup, defaultFSGroup)
+		}
+	})
+
+	t.Run("cuda does not add the render GID", func(t *testing.T) {
+		psc := inferPodSecurityContext(emptyISVC, defaultFSGroup, renderGID, false)
+		if psc.SupplementalGroups != nil {
+			t.Errorf("cuda: SupplementalGroups = %v, want empty/nil", psc.SupplementalGroups)
+		}
+	})
+
+	t.Run("cuda keeps fsGroup unchanged", func(t *testing.T) {
+		psc := inferPodSecurityContext(emptyISVC, defaultFSGroup, renderGID, false)
+		if psc.FSGroup == nil || *psc.FSGroup != defaultFSGroup {
+			t.Errorf("cuda: FSGroup = %v, want %d", psc.FSGroup, defaultFSGroup)
+		}
+	})
+
+	t.Run("vulkan with render GID disabled (0) adds nothing", func(t *testing.T) {
+		psc := inferPodSecurityContext(emptyISVC, defaultFSGroup, 0, true)
+		if psc.SupplementalGroups != nil {
+			t.Errorf("disabled: SupplementalGroups = %v, want empty/nil", psc.SupplementalGroups)
+		}
+	})
+
+	t.Run("user-supplied podSecurityContext is returned verbatim (vulkan)", func(t *testing.T) {
+		user := &corev1.PodSecurityContext{SupplementalGroups: []int64{777}}
+		got := inferPodSecurityContext(&inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{PodSecurityContext: user},
+		}, defaultFSGroup, renderGID, true)
+		if got != user {
+			t.Errorf("user-supplied PodSecurityContext not returned verbatim: got %v, want %v", got, user)
+		}
+		// The operator's render GID must not be merged into a user override.
+		for _, g := range got.SupplementalGroups {
+			if g == renderGID {
+				t.Errorf("user override must not gain the operator render GID %d", renderGID)
+			}
+		}
+	})
+}

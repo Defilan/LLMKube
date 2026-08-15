@@ -5080,6 +5080,169 @@ var _ = Describe("AMD Vulkan Deployment Construction", func() {
 	})
 })
 
+var _ = Describe("Vulkan DRI render GID in supplementalGroups (#1560)", func() {
+	var (
+		reconciler *InferenceServiceReconciler
+		replicas   int32
+	)
+
+	BeforeEach(func() {
+		// DRIRenderGID 991 mirrors the node in the #1560 report (a non-default
+		// render GID), so the test proves the operator flag value is what lands
+		// in the pod, not an assumption.
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+			DRIRenderGID:       991,
+		}
+		replicas = 1
+	})
+
+	vulkanModel := func() *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://example.com/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					GPU: &inferencev1alpha1.GPUSpec{
+						Enabled: true,
+						Count:   1,
+						Vendor:  "amd",
+						Runtime: "vulkan",
+					},
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{
+				Phase: "Ready",
+				Path:  "/tmp/llmkube/models/test-model.gguf",
+			},
+		}
+	}
+
+	cudaModel := func() *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "cuda-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:       "https://example.com/model.gguf",
+				Format:       "gguf",
+				Quantization: "Q4_K_M",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cuda",
+					GPU: &inferencev1alpha1.GPUSpec{
+						Enabled: true,
+						Count:   1,
+						Vendor:  "nvidia",
+					},
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{
+				Phase: "Ready",
+				Path:  "/tmp/llmkube/models/test-model.gguf",
+			},
+		}
+	}
+
+	It("adds the DRI render GID to supplementalGroups on a Vulkan service", func() {
+		model := vulkanModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-sg", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1)
+		podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+		Expect(podSecCtx).NotTo(BeNil())
+		// The render GID the operator flagged must be a supplementary group so
+		// the container can open /dev/dri/renderD128 (fsGroup does not do this).
+		Expect(podSecCtx.SupplementalGroups).To(ContainElement(int64(991)))
+		// fsGroup behaviour is unchanged: the cache-volume default is still set.
+		Expect(podSecCtx.FSGroup).NotTo(BeNil())
+		Expect(*podSecCtx.FSGroup).To(Equal(int64(102)))
+	})
+
+	It("does not add the DRI render GID to supplementalGroups on a CUDA service", func() {
+		model := cudaModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "cuda-sg", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "cuda-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1)
+		podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+		Expect(podSecCtx).NotTo(BeNil())
+		// CUDA does not request the DRI render node, so no render GID is added.
+		Expect(podSecCtx.SupplementalGroups).NotTo(ContainElement(int64(991)))
+		// fsGroup behaviour is unchanged: the cache-volume default is still set.
+		Expect(podSecCtx.FSGroup).NotTo(BeNil())
+		Expect(*podSecCtx.FSGroup).To(Equal(int64(102)))
+	})
+
+	It("omits the DRI render GID when --dri-render-gid is 0 (disabled)", func() {
+		// Mirrors the OpenShift case: the operator disables the default and lets
+		// the SCC / a per-service override supply the render group.
+		disabledReconciler := &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:     102,
+			DRIRenderGID:       0,
+		}
+		model := vulkanModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-sg-disabled", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+			},
+		}
+
+		deployment := disabledReconciler.constructDeployment(isvc, model, nil, 1)
+		podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+		Expect(podSecCtx).NotTo(BeNil())
+		Expect(podSecCtx.SupplementalGroups).To(BeEmpty())
+		// fsGroup is unaffected by disabling the render GID.
+		Expect(podSecCtx.FSGroup).NotTo(BeNil())
+		Expect(*podSecCtx.FSGroup).To(Equal(int64(102)))
+	})
+
+	It("does not override a user-supplied PodSecurityContext on a Vulkan service", func() {
+		model := vulkanModel()
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vulkan-sg-override", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:  "vulkan-model",
+				Replicas:  &replicas,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+				// Per-service workaround for a node whose render GID differs from
+				// the operator default (#1560): the user owns supplementalGroups.
+				PodSecurityContext: &corev1.PodSecurityContext{
+					SupplementalGroups: []int64{777},
+				},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1)
+		podSecCtx := deployment.Spec.Template.Spec.SecurityContext
+		Expect(podSecCtx).NotTo(BeNil())
+		// The user's group is respected verbatim; the operator's default is not
+		// merged in.
+		Expect(podSecCtx.SupplementalGroups).To(Equal([]int64{777}))
+	})
+})
+
 var _ = Describe("constructDeployment model cache PVC wiring (#728, Task 3)", func() {
 	newModel := func() *inferencev1alpha1.Model {
 		return &inferencev1alpha1.Model{

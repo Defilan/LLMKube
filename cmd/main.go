@@ -127,6 +127,7 @@ func main() {
 	var caCertConfigMap string
 	var initContainerImage string
 	var defaultFSGroup int64
+	var driRenderGID int64
 	var emitScrapeAnnotations bool
 	var routerProxyImage string
 	var defaultLiteLLMURL string
@@ -184,6 +185,17 @@ func main() {
 			"write to a freshly-provisioned PVC. Set to 0 to disable on OpenShift, "+
 			"where the restricted-v2 SCC injects fsGroup from the namespace's allocated "+
 			"range and rejects pods with explicit values outside that range.")
+	flag.Int64Var(&driRenderGID, "dri-render-gid", 44,
+		"GID of the node's DRI render group (the group that owns /dev/dri/renderD128), "+
+			"added to a Vulkan InferenceService pod's supplementalGroups so the serving "+
+			"container can open the render node. fsGroup does nothing for device access, "+
+			"so without this the Vulkan container cannot open /dev/dri/renderD128 and "+
+			"llama.cpp fails open, serving from CPU at roughly half speed with no status "+
+			"condition (#1560). The GID is node-local and not knowable at admission, so it "+
+			"is a single operator-wide value: set it to the render GID of your GPU nodes. "+
+			"44 is the conventional Linux render group; set to 0 to disable (e.g. on "+
+			"OpenShift). Applied only on the Vulkan path, never to a user-supplied "+
+			"Spec.PodSecurityContext.")
 	flag.StringVar(&routerProxyImage, "router-proxy-image", "",
 		"Default container image for ModelRouter-managed router-proxy pods. "+
 			"Empty falls back to the controller's compiled-in default. "+
@@ -449,6 +461,7 @@ func main() {
 		CACertConfigMap:       caCertConfigMap,
 		InitContainerImage:    initContainerImage,
 		DefaultFSGroup:        defaultFSGroup,
+		DRIRenderGID:          driRenderGID,
 		EmitScrapeAnnotations: emitScrapeAnnotations,
 		AllowedHostPathRoots:  allowedHostPathRootList,
 		GPUSharingSharedPool:  gpuSharingSharedPool,
