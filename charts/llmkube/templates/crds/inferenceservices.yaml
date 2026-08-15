@@ -5838,6 +5838,37 @@ spec:
           status:
             description: status defines the observed state of InferenceService
             properties:
+              acceleration:
+                description: |-
+                  Acceleration reports the offload result the serving engine (llama.cpp)
+                  produced at load time: which device actually served the model and how
+                  many of its layers were offloaded onto it. This makes a silent CPU
+                  fallback visible in the API: a service that requested an accelerator but
+                  ended up with zero offloaded layers is otherwise indistinguishable from
+                  a healthy GPU service in status. Optional and additive: an absent value
+                  means the offload result is unknown (e.g. CPU-only serving or a runtime
+                  that does not report it).
+                properties:
+                  device:
+                    description: |-
+                      Device is the device that served the model, as the engine reported it,
+                      e.g. "Vulkan0 (AMD Radeon 8060S)" or "CPU". Empty when the offload
+                      result is unknown.
+                    type: string
+                  layersOffloaded:
+                    description: |-
+                      LayersOffloaded is how many of the model's layers the engine offloaded
+                      onto an accelerator. 0 means every layer ran on CPU, which is a silent
+                      fallback when an accelerator was requested.
+                    format: int32
+                    type: integer
+                  layersTotal:
+                    description: |-
+                      LayersTotal is the model's total layer count. Compared against
+                      LayersOffloaded to express the offload as a fraction (e.g. 63/63).
+                    format: int32
+                    type: integer
+                type: object
               conditions:
                 description: |-
                   conditions represent the current state of the InferenceService resource.
