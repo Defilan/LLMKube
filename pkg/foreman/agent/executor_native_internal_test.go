@@ -46,6 +46,7 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/repo"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/worktracker"
 )
 
@@ -2859,73 +2860,76 @@ func TestSetupTaskBranch_VerifyStartsAtCoderCommitNotBase(t *testing.T) {
 	}
 }
 
-// crossProjectRemoteMismatch contract for #1464.
-//
-// The fork deployment is legitimate: --git-remote-url names a fork of
-// payload.repo, so the OWNER differs while the repo NAME matches. A differing
-// repo name is never a fork relationship; it is a misconfiguration that sends a
-// coder's work into an unrelated repository while it reports GO.
-//
-// The whole value of the guard is where it draws the line between those two,
-// so the table drives the real helper rather than a copy of its logic.
-func TestCrossProjectRemoteMismatch(t *testing.T) {
+// isForkOf contract for #1464: a fork shares the repo NAME (owner may
+// differ); a differing repo name is an unrelated repository, not a fork.
+func TestIsForkOf(t *testing.T) {
 	cases := []struct {
 		name      string
 		remoteURL string
 		taskRepo  string
-		wantErr   bool
+		want      bool
 	}{
-		{
-			name:      "fork of the same project is allowed",
-			remoteURL: "https://github.com/Defilan/LLMKube.git",
-			taskRepo:  "defilantech/LLMKube",
-		},
-		{
-			name:      "same repo entirely is allowed",
-			remoteURL: "https://github.com/defilantech/LLMKube.git",
-			taskRepo:  "defilantech/LLMKube",
-		},
-		{
-			name:      "case differences do not make it a different project",
-			remoteURL: "https://github.com/defilan/llmkube.git",
-			taskRepo:  "defilantech/LLMKube",
-		},
-		{
-			name:      "scp-like fork URL is allowed",
-			remoteURL: "git@github.com:Defilan/LLMKube.git",
-			taskRepo:  "defilantech/LLMKube",
-		},
-		{
-			name:      "different project is rejected (the #1464 shape)",
-			remoteURL: "https://github.com/Defilan/LLMKube.git",
-			taskRepo:  "Defilan/greenhouse-demo",
-			wantErr:   true,
-		},
-		{
-			name:      "scp-like different project is rejected",
-			remoteURL: "git@github.com:Defilan/LLMKube.git",
-			taskRepo:  "Defilan/greenhouse-demo",
-			wantErr:   true,
-		},
-		// Local bare-repo paths are what envtest injects. The guard must stay
-		// off for them or it breaks the harness rather than the bug.
-		{name: "local path remote is not guarded", remoteURL: "/tmp/origin.git", taskRepo: "a/b"},
-		{name: "file:// remote is not guarded", remoteURL: "file:///tmp/origin.git", taskRepo: "a/b"},
-		{name: "empty remote is not guarded", remoteURL: "", taskRepo: "a/b"},
-		{name: "empty task repo is not guarded", remoteURL: "https://github.com/o/r.git", taskRepo: ""},
+		{name: "fork of same project", remoteURL: "https://github.com/Defilan/LLMKube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "same repo", remoteURL: "https://github.com/defilantech/LLMKube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "case-insensitive name", remoteURL: "https://github.com/Defilan/llmkube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "scp-like fork", remoteURL: "git@github.com:Defilan/LLMKube.git", taskRepo: "defilantech/LLMKube", want: true},
+		{name: "different project is not a fork", remoteURL: "https://github.com/Defilan/LLMKube.git", taskRepo: "Defilan/greenhouse-demo", want: false},
+		{name: "local path is not a fork", remoteURL: "/tmp/origin.git", taskRepo: "a/b", want: false},
+		{name: "file:// is not a fork", remoteURL: "file:///tmp/origin.git", taskRepo: "a/b", want: false},
+		{name: "empty remote", remoteURL: "", taskRepo: "a/b", want: false},
+		{name: "empty task repo", remoteURL: "https://github.com/o/r.git", taskRepo: "", want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := crossProjectRemoteMismatch(tc.remoteURL, tc.taskRepo)
-			if tc.wantErr && got == "" {
-				t.Errorf("remote %q with task repo %q must be rejected: work would be "+
-					"pushed into an unrelated repository and still report GO",
-					tc.remoteURL, tc.taskRepo)
-			}
-			if !tc.wantErr && got != "" {
-				t.Errorf("remote %q with task repo %q must be allowed, got: %s",
-					tc.remoteURL, tc.taskRepo, got)
+			if got := isForkOf(tc.remoteURL, tc.taskRepo); got != tc.want {
+				t.Errorf("isForkOf(%q, %q) = %v, want %v", tc.remoteURL, tc.taskRepo, got, tc.want)
 			}
 		})
+	}
+}
+
+// pushedRemoteMismatch reads the workspace's origin after a push and flags a
+// branch that landed in a repository other than the task's payload.repo.
+func TestPushedRemoteMismatch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	bare := filepath.Join(dir, "origin.git")
+	gitIn(t, "", "init", "--bare", bare)
+	ws := filepath.Join(dir, "ws")
+	gitIn(t, "", "clone", bare, ws)
+
+	// Local bare path is not owner/repo shaped -> no mismatch flagged.
+	if msg := pushedRemoteMismatch(context.Background(), ws, "defilantech/LLMKube"); msg != "" {
+		t.Errorf("local bare remote must not be flagged, got: %s", msg)
+	}
+	// Empty task repo -> no mismatch flagged.
+	if msg := pushedRemoteMismatch(context.Background(), ws, ""); msg != "" {
+		t.Errorf("empty task repo must not be flagged, got: %s", msg)
+	}
+
+	// Positive case (#1464): the pushed remote genuinely disagrees with
+	// payload.repo. Point origin at a differently-named repository and assert
+	// the mismatch is flagged. If pushedRemoteMismatch unconditionally returned
+	// "" this would fail, which is exactly the regression that would
+	// reintroduce #1464 (a push to an unrelated repo reported as GO).
+	if err := repo.SetRemote(context.Background(), ws, "origin",
+		"https://github.com/Defilan/greenhouse-demo.git"); err != nil {
+		t.Fatalf("SetRemote origin to a differently-named repo: %v", err)
+	}
+	if msg := pushedRemoteMismatch(context.Background(), ws, "defilantech/LLMKube"); msg == "" {
+		t.Fatalf("remote greenhouse-demo vs task repo defilantech/LLMKube must be " +
+			"flagged as a mismatch; got an empty message")
+	}
+
+	// Control: a fork (same repo name, different owner) is NOT a mismatch —
+	// the legitimate fork deployment must stay off this guard.
+	if err := repo.SetRemote(context.Background(), ws, "origin",
+		"https://github.com/Defilan/LLMKube.git"); err != nil {
+		t.Fatalf("SetRemote origin to a fork of the task repo: %v", err)
+	}
+	if msg := pushedRemoteMismatch(context.Background(), ws, "defilantech/LLMKube"); msg != "" {
+		t.Errorf("a fork of the task repo must not be flagged, got: %s", msg)
 	}
 }
