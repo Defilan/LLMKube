@@ -21,7 +21,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
@@ -64,6 +67,15 @@ type CoderJobRequest struct {
 	// deleted, and so the re-dispatch path can identify + reap the
 	// previous Job for the same task.
 	OwnerReference *metav1.OwnerReference
+
+	// OnJobCreated, when non-nil, is invoked once the submitter has
+	// successfully created the Job (before it blocks polling for terminal
+	// status). The executor uses it to stamp status.jobName on the
+	// AgenticTask while the task is RUNNING, so an operator or a downstream
+	// reaper can tell which Job belongs to a live task (#1535). It receives
+	// the created Job's name. A nil value (tests, the in-pod run-task path)
+	// simply skips the status write.
+	OnJobCreated func(ctx context.Context, jobName string)
 
 	// ActiveDeadlineSeconds bounds the Job wall-clock. nil lets the
 	// submitter default it.
@@ -140,13 +152,34 @@ func (e *NativeAgentLoopExecutor) executeCoderJob(
 	req := CoderJobRequest{
 		TaskName:      task.Name,
 		TaskNamespace: task.Namespace,
+		// Controller=true ties the Job to the AgenticTask so Kubernetes GC
+		// cascades the Job (and its pods) when the task is deleted (#1535).
+		//
+		// BlockOwnerDeletion is deliberately NOT set: it would require the
+		// agent to hold `update` on the AgenticTask's `finalizers`
+		// subresource, which the agent Role does not grant (only the operator
+		// does). The codebase already settles this in the other direction in
+		// internal/controller/ownerref.go, which clears BlockOwnerDeletion for
+		// the same reason: cascading GC still reclaims the child when the
+		// owner is deleted, and the "block" semantics only matter for
+		// finalizer-based cleanup workflows LLMKube does not use. Omitting it
+		// keeps the create working under the agent's current RBAC.
 		OwnerReference: &metav1.OwnerReference{
-			APIVersion:         foremanv1alpha1.GroupVersion.String(),
-			Kind:               "AgenticTask",
-			Name:               task.Name,
-			UID:                task.UID,
-			Controller:         boolPtr(true),
-			BlockOwnerDeletion: boolPtr(true),
+			APIVersion: foremanv1alpha1.GroupVersion.String(),
+			Kind:       "AgenticTask",
+			Name:       task.Name,
+			UID:        task.UID,
+			Controller: boolPtr(true),
+		},
+		// Submit blocks until the Job reaches a terminal phase, so the
+		// executor cannot learn the Job name from the return value while the
+		// task is still RUNNING. The submitter fires this callback the moment
+		// the Job exists, letting us stamp status.jobName for the running
+		// window (#1535). Best-effort: a patch failure is logged, not
+		// fatal. The terminal patch re-lifts the name, so a missed write here
+		// still lands on completion.
+		OnJobCreated: func(ctx context.Context, jobName string) {
+			e.stampJobName(ctx, task, jobName)
 		},
 	}
 	if agent.Spec.Execution != nil {
@@ -190,6 +223,40 @@ func jobExtra(cjr CoderJobResult, supervisor map[string]any) map[string]any {
 		extra[k] = v
 	}
 	return extra
+}
+
+// stampJobName writes status.jobName on the AgenticTask the moment its coder
+// Job is created, so the field is populated for the RUNNING window, not just
+// at completion (#1535). It refetches the task first (the watcher's claim
+// patch may have bumped the resourceVersion since Execute began) and applies
+// a status merge patch that touches only jobName, so it cannot clobber
+// phase/verdict/conditions. Best-effort: a refetch that finds no task (it was
+// deleted) or a patch failure is logged and swallowed; the terminal patch
+// re-lifts the name, so a miss here still lands on completion.
+func (e *NativeAgentLoopExecutor) stampJobName(ctx context.Context, task *foremanv1alpha1.AgenticTask, jobName string) {
+	if e.Client == nil || jobName == "" {
+		return
+	}
+	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
+
+	var fresh foremanv1alpha1.AgenticTask
+	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Name}
+	if err := e.Client.Get(ctx, key, &fresh); err != nil {
+		if apierrors.IsNotFound(err) {
+			return // task gone; nothing to stamp.
+		}
+		log.Error(err, "stamping status.jobName: refetch failed")
+		return
+	}
+	if fresh.Status.JobName == jobName {
+		return // already set (e.g. a duplicate callback); no-op.
+	}
+	patch := client.MergeFrom(fresh.DeepCopy())
+	fresh.Status.JobName = jobName
+	if err := e.Client.Status().Patch(ctx, &fresh, patch); err != nil {
+		// Not fatal: the terminal patch re-lifts jobName from Result.Extra.
+		log.Error(err, "stamping status.jobName: patch failed")
+	}
 }
 
 // boolPtr returns a pointer to b, for the pointer-to-bool fields on

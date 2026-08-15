@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -457,6 +458,59 @@ func TestRunCoderJob_GitRemoteFlowsThroughRun(t *testing.T) {
 	}
 	if !strings.Contains(args, "--commit-committer-name=Jory Dogfood") {
 		t.Errorf("Args missing --commit-committer-name:\n%s", args)
+	}
+}
+
+// TestRunCoderJob_FiresOnJobCreatedAfterCreate asserts the submitter fires
+// the on-job-created hook the moment the Job exists (after Client.Create,
+// before it blocks polling for terminal status), with the created Job's
+// name (#1535). This is the seam the executor's OnJobCreated relies on to
+// stamp status.jobName while the task is running; without it the field would
+// only be set at completion.
+func TestRunCoderJob_FiresOnJobCreatedAfterCreate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	jobName := "foreman-coder-callback"
+	c := fake.NewClientBuilder().
+		WithScheme(gateScheme(t)).
+		WithStatusSubresource(&batchv1.Job{}).
+		Build()
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	var mu sync.Mutex
+	var called bool
+	var gotName string
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn:    func(context.Context, string, string) string { return "" },
+		},
+	}
+	_, err := tool.Run(ctx, RunCoderJobArgs{
+		TaskName:      "callback",
+		TaskNamespace: "default",
+		OnJobCreated: func(_ context.Context, name string) {
+			mu.Lock()
+			called = true
+			gotName = name
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !called {
+		t.Fatalf("on-job-created hook was not fired; status.jobName could not be stamped while running (#1535)")
+	}
+	if gotName != jobName {
+		t.Errorf("hook job name = %q, want %q", gotName, jobName)
 	}
 }
 

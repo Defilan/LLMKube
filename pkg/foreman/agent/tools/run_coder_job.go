@@ -186,6 +186,12 @@ type RunCoderJobArgs struct {
 	// reclaims the Job (and its pods) when the AgenticTask is deleted
 	// (#1535).
 	OwnerReference *metav1.OwnerReference
+
+	// OnJobCreated, when non-nil, is invoked once the Job is successfully
+	// created (before Run blocks polling for terminal status). The executor
+	// uses it to stamp status.jobName on the AgenticTask for the running
+	// window (#1535); the Job name is the one argument. Nil skips it.
+	OnJobCreated func(ctx context.Context, jobName string)
 }
 
 // CoderJobResult is the parsed outcome of a coder Job run. It maps the
@@ -279,6 +285,7 @@ func (r *RunCoderJob) Submit(ctx context.Context, req agent.CoderJobRequest) (ag
 		TaskName:       req.TaskName,
 		TaskNamespace:  req.TaskNamespace,
 		OwnerReference: req.OwnerReference,
+		OnJobCreated:   req.OnJobCreated,
 	})
 	if err != nil {
 		return agent.CoderJobResult{}, err
@@ -358,6 +365,14 @@ func (r *RunCoderJob) Run(ctx context.Context, args RunCoderJobArgs) (CoderJobRe
 
 	if err := r.Client.Create(ctx, rendered); err != nil {
 		return r.errorResult(jobName, cfg.Namespace, "create job: "+err.Error(), ""), nil
+	}
+
+	// The Job exists now; let the caller record it before we block polling
+	// for terminal status, so status.jobName is set for the running window
+	// (#1535). Best-effort and non-fatal: a callback error must not fail the
+	// run.
+	if args.OnJobCreated != nil {
+		args.OnJobCreated(ctx, jobName)
 	}
 
 	jobVerdict, jobReason := r.pollForTerminal(ctx, cfg, jobName)
