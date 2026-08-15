@@ -282,6 +282,15 @@ type AgentSpec struct {
 	// +optional
 	MaxOutputTokens int32 `json:"maxOutputTokens,omitempty"`
 
+	// MaxConcurrentTasks bounds how many of this Agent's tasks may be in
+	// flight at once. When set, the AgenticTask controller does not claim
+	// an (N+1)th task for this Agent until one of its in-flight tasks
+	// completes; excess tasks stay Pending for the next pass. Unset means
+	// unbounded (today's behavior).
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxConcurrentTasks *int32 `json:"maxConcurrentTasks,omitempty"`
+
 	// ChatTemplateKwargs is a free-form map of template-specific keyword
 	// arguments forwarded verbatim on every chat-completions request as
 	// chat_template_kwargs. Each value is a raw JSON blob so booleans stay

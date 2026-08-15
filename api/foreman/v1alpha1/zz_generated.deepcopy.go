@@ -282,6 +282,11 @@ func (in *AgentSpec) DeepCopyInto(out *AgentSpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.MaxConcurrentTasks != nil {
+		in, out := &in.MaxConcurrentTasks, &out.MaxConcurrentTasks
+		*out = new(int32)
+		**out = **in
+	}
 	if in.ChatTemplateKwargs != nil {
 		in, out := &in.ChatTemplateKwargs, &out.ChatTemplateKwargs
 		*out = make(map[string]apiextensionsv1.JSON, len(*in))
