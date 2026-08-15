@@ -660,6 +660,175 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhasePending))
 		Expect(fresh.Status.AssignedNode).To(BeEmpty())
 	})
+
+	It("leaves a task Pending when the Agent's maxConcurrentTasks is reached", func() {
+		// An Agent pinned to 1 in-flight task must not claim a second one:
+		// the second task stays Pending for the next pass even though a
+		// Ready FleetNode is free.
+		limit := int32(1)
+		agent := newAgent("bounded-coder")
+		agent.Spec.MaxConcurrentTasks = &limit
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		// One in-flight (Running) task already occupies the Agent's single slot.
+		inflight := newTask("bounded-inflight")
+		inflight.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, inflight)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, inflight) })
+		setPhase(inflight, foremanv1alpha1.AgenticTaskPhaseRunning)
+
+		// A second Pending task for the same Agent.
+		task := newTask("bounded-second")
+		task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		node := newFleetNode("bounded-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator:    foremanv1alpha1.FleetNodeAccelerator("metal"),
+			TotalRAMGB:     128,
+			AvailableRAMGB: 96,
+		})
+
+		res, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhasePending))
+		Expect(fresh.Status.AssignedNode).To(BeEmpty())
+	})
+
+	It("schedules a task when the Agent's maxConcurrentTasks has headroom", func() {
+		// With the bound unset (unbounded) or above the current in-flight
+		// count, the task schedules normally.
+		limit := int32(2)
+		agent := newAgent("headroom-coder")
+		agent.Spec.MaxConcurrentTasks = &limit
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		// One in-flight task, bound is 2: headroom remains.
+		inflight := newTask("headroom-inflight")
+		inflight.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, inflight)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, inflight) })
+		setPhase(inflight, foremanv1alpha1.AgenticTaskPhaseRunning)
+
+		task := newTask("headroom-second")
+		task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		node := newFleetNode("headroom-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator:    foremanv1alpha1.FleetNodeAccelerator("metal"),
+			TotalRAMGB:     128,
+			AvailableRAMGB: 96,
+		})
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(fresh.Status.AssignedNode).To(Equal(node.Name))
+	})
+
+	It("does not count terminal tasks toward maxConcurrentTasks", func() {
+		// A Succeeded task no longer occupies an in-flight slot, so a new
+		// task for the same Agent schedules even at bound=1.
+		limit := int32(1)
+		agent := newAgent("terminal-coder")
+		agent.Spec.MaxConcurrentTasks = &limit
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		done := newTask("terminal-done")
+		done.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, done)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, done) })
+		setPhase(done, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+
+		task := newTask("terminal-next")
+		task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		node := newFleetNode("terminal-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator:    foremanv1alpha1.FleetNodeAccelerator("metal"),
+			TotalRAMGB:     128,
+			AvailableRAMGB: 96,
+		})
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(fresh.Status.AssignedNode).To(Equal(node.Name))
+	})
+
+	It("admits a task when the Agent's other tasks are all Pending (they hold no slot)", func() {
+		// Pending is the state a task waits in while awaiting THIS dispatch
+		// decision; it does not hold a slot. A batch of Pending tasks queued
+		// behind a small bound must not deadlock: with bound=2 and four
+		// Pending siblings, reconciling any one of them sees zero in-flight
+		// siblings and admits it (the others wait for the next pass).
+		//
+		// This is the shape that a "count non-terminal tasks" predicate
+		// deadlocks: four non-terminal siblings >= 2 bound -> every task
+		// declines on every pass and nothing ever starts.
+		limit := int32(2)
+		agent := newAgent("pending-batch-coder")
+		agent.Spec.MaxConcurrentTasks = &limit
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		// Four Pending tasks for the same Agent.
+		for _, name := range []string{"pending-batch-a", "pending-batch-b", "pending-batch-c", "pending-batch-d"} {
+			t := newTask(name)
+			t.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+			Expect(k8sClient.Create(ctx, t)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, t) })
+			setPhase(t, foremanv1alpha1.AgenticTaskPhasePending)
+		}
+
+		// A free, capable node so the bound (not node fit) is the thing under test.
+		node := newFleetNode("pending-batch-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator:    foremanv1alpha1.FleetNodeAccelerator("metal"),
+			TotalRAMGB:     128,
+			AvailableRAMGB: 96,
+		})
+
+		task := newTask("pending-batch-a")
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		// Admitted: Pending tasks hold no slot, so the task is scheduled,
+		// not left Pending (which would mean the bound deadlocked the batch).
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(fresh.Status.AssignedNode).To(Equal(node.Name))
+	})
 })
 
 var _ = Describe("capabilitySatisfies jobMode", func() {
