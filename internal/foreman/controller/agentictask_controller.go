@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -35,6 +36,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
@@ -113,6 +115,15 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// then nothing left to do.
 	if task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
 		task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
+		// Emit the operator-side outcome metrics once, gated on the same
+		// audited annotation RecordTerminal stamps, so a task that stays
+		// terminal across reconciles is counted exactly once (#1491). The
+		// guard runs before RecordTerminal: if the annotation is already set
+		// we have emitted (or the audit wrote) before, so skip.
+		if task.Annotations[audit.AuditedAnnotation] != "true" {
+			agent, kind, verdict, outcome, elapsedSec, turns := taskOutcomeLabels(&task)
+			llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
+		}
 		if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
 			log.Error(err, "audit: failed to record terminal run (continuing)")
 		}
@@ -205,6 +216,40 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// taskOutcomeLabels extracts the bounded label values the operator emits for a
+// terminal Foreman task (#1491): the Agent name (from spec.agentRef; "" when
+// unset), the task kind, the verdict, and the machine outcome carried at
+// result.extra.outcome ("" when the run has none). It also returns the
+// executor's elapsedSec and the agent-loop turn count from result.extra.
+//
+// The task NAME is deliberately never a label: it is unbounded and would break
+// cardinality. A missing or unparseable result envelope yields zero elapsedSec
+// and zero turns (RecordTaskOutcome skips observing zeros) and an empty
+// outcome — never a fabricated value.
+func taskOutcomeLabels(task *foremanv1alpha1.AgenticTask) (agent, kind, verdict, outcome string, elapsedSec float64, turns int) {
+	agent = ""
+	if task.Spec.AgentRef != nil {
+		agent = task.Spec.AgentRef.Name
+	}
+	kind = string(task.Spec.Kind)
+	verdict = string(task.Status.Verdict)
+	if task.Status.Result != nil && len(task.Status.Result.Raw) > 0 {
+		var env struct {
+			ElapsedSec float64 `json:"elapsedSec"`
+			Extra      struct {
+				Outcome   string `json:"outcome"`
+				TurnCount int    `json:"turnCount"`
+			} `json:"extra"`
+		}
+		if err := json.Unmarshal(task.Status.Result.Raw, &env); err == nil {
+			outcome = env.Extra.Outcome
+			elapsedSec = env.ElapsedSec
+			turns = env.Extra.TurnCount
+		}
+	}
+	return agent, kind, verdict, outcome, elapsedSec, turns
 }
 
 // effectiveRequiredCapability returns the capability the scheduler should

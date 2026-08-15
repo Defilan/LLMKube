@@ -34,6 +34,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // WorkloadReconciler turns a Workload into a set of AgenticTask objects
@@ -575,12 +576,27 @@ func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Work
 	patch := client.MergeFrom(w.DeepCopy())
 	now := metav1.Now()
 
+	// Capture the prior phase before computeTerminalState mutates it, so the
+	// outcome metric fires exactly once per terminal transition (#1491) and
+	// not on every steady-state re-reconcile of an already-terminal Workload.
+	prevPhase := w.Status.Phase
+
 	w.Status.SucceededTasks = cls.succeeded
 	w.Status.FailedTasks = cls.failed
 	w.Status.IncompleteTasks = cls.incomplete
 
 	computeTerminalState(w, cls, now)
 	r.emitAlreadyResolvedCondition(w, cls, now)
+
+	if (w.Status.Phase == foremanv1alpha1.WorkloadPhaseCompleted ||
+		w.Status.Phase == foremanv1alpha1.WorkloadPhaseFailed) &&
+		w.Status.Phase != prevPhase {
+		outcome := "completed"
+		if w.Status.Phase == foremanv1alpha1.WorkloadPhaseFailed {
+			outcome = "failed"
+		}
+		llmkubemetrics.RecordWorkloadOutcome(outcome)
+	}
 
 	if err := r.Status().Patch(ctx, w, patch); err != nil {
 		return ctrl.Result{}, fmt.Errorf("patch workload status during rollup: %w", err)
