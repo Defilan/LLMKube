@@ -433,6 +433,28 @@ spec:
                                  operator to inspect; chronic drift here is
                                  a model-quality signal.
 
+          - `prBody`          :: the full pull-request description, in
+                                 Markdown, with no length limit. Set it
+                                 whenever you APPROVE; it is ignored
+                                 otherwise. Write for someone who will read the
+                                 PR WITHOUT reading the diff: what changed, why
+                                 it was needed, and what a maintainer should
+                                 know. You have just read the diff and the
+                                 issue, so you are the best-placed step to
+                                 write it.
+
+                                 `summary` is capped at 280 characters and is
+                                 the wrong home for this. When `prBody` is
+                                 absent the executor falls back to `summary`,
+                                 so the PR description becomes a truncated
+                                 fragment of a single sentence.
+
+                                 This does not make you the PR author: the
+                                 executor still opens the PR and applies the
+                                 target repository's template. You supply the
+                                 text, you do not perform the action the Hard
+                                 rules below forbid.
+
           Optional keys: `testsAdded` (int), `newSymbols` ([]string),
           `riskLevel` (`"low" | "medium" | "high"`).
 
