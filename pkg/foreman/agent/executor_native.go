@@ -1900,7 +1900,7 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	if prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, cloneURL); prErr != nil {
+	if prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra, cloneURL); prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
 			"repo", task.Spec.Payload.Repo, "branch", task.Spec.Payload.Branch)
 		r.Extra["pullRequestError"] = prErr.Error()
@@ -1967,7 +1967,9 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 // owner — or one that is not an owner/repo-shaped URL at all (local
 // paths in tests) — keeps the same-repo shape.
 func (e *NativeAgentLoopExecutor) openPullRequest(
-	ctx context.Context, task *foremanv1alpha1.AgenticTask, auth *repo.Auth, workspace, summaryBody, cloneURL string,
+	ctx context.Context, task *foremanv1alpha1.AgenticTask,
+	auth *repo.Auth, workspace, summaryBody string, extra map[string]any,
+	cloneURL string,
 ) (string, error) {
 	p := task.Spec.Payload
 	owner, _, ok := codehost.SplitRepoSlug(p.Repo)
@@ -1995,11 +1997,19 @@ func (e *NativeAgentLoopExecutor) openPullRequest(
 	if title == "" {
 		title = fmt.Sprintf("Fix #%d", p.Issue)
 	}
-	// Body: honour the target repo's PR template when it has one (#1541),
-	// else Foreman's own shape — the reviewer's diff-grounded summary
-	// (#1411), the issue link, and provenance. PRBody keeps the no-template
-	// path byte-for-byte identical to the pre-#1541 output.
-	body := githubpr.PRBody(githubpr.FindTemplate(workspace), summaryBody,
+	// Body: the PR description has its own home (#1568). summary is a
+	// one-sentence outcome line capped at 280 bytes (logs, status, audit);
+	// the reviewer authors the full body in extra["prBody"], which passes
+	// through submit_result uncapped. Prefer it when present and non-empty,
+	// else fall back to summaryBody so existing agents that only set a
+	// summary keep working. The chosen body still flows through PRBody so
+	// the target repo's PR template is honoured (#1541); PRBody keeps the
+	// no-template path byte-for-byte identical to the pre-#1541 output.
+	body := summaryBody
+	if pb, ok := extra["prBody"].(string); ok && strings.TrimSpace(pb) != "" {
+		body = pb
+	}
+	body = githubpr.PRBody(githubpr.FindTemplate(workspace), body,
 		p.Issue, task.Labels["foreman.llmkube.dev/workload"])
 	prURL, _, err := ch.EnsureChangeRequest(ctx, p.Repo, head,
 		baseBranchOrDefault(p.BaseBranch), title, body)

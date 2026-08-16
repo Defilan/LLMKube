@@ -377,3 +377,102 @@ func TestMaybeOpenPullRequest_NoDiffSkipsGrounding(t *testing.T) {
 		})
 	}
 }
+
+// TestOpenPullRequest_PrBodyPreferred is the #1568 fix: the full PR
+// description is authored in extra["prBody"] (which submit_result passes
+// through uncapped) rather than smuggled through summary, a field capped at
+// 280 bytes. openPullRequest prefers prBody when present and non-empty, and
+// falls back to the summaryBody parameter when it is absent, empty, the wrong
+// type, or when extra itself is nil — the fallback is what keeps existing
+// agents that only set a summary working unchanged.
+func TestOpenPullRequest_PrBodyPreferred(t *testing.T) {
+	longBody := strings.TrimSpace(
+		"## What\n" + strings.Repeat("A structured pull request description that far exceeds the 280-byte summary cap. ", 8))
+	if len(longBody) <= 280 {
+		t.Fatalf("test body must exceed 280 bytes to prove the cap is bypassed; got %d", len(longBody))
+	}
+	const summary = "Short one-sentence summary."
+	cases := []struct {
+		name    string
+		extra   map[string]any
+		wantIn  string
+		wantOut string // substring that must NOT appear
+	}{
+		{name: "prBody present and non-empty wins over summary",
+			extra:  map[string]any{"prBody": longBody},
+			wantIn: longBody, wantOut: summary},
+		{name: "prBody absent falls back to summary",
+			extra:  map[string]any{"unrelated": 1},
+			wantIn: summary},
+		{name: "prBody empty string falls back to summary",
+			extra:  map[string]any{"prBody": ""},
+			wantIn: summary},
+		{name: "prBody whitespace-only falls back to summary",
+			extra:  map[string]any{"prBody": "   "},
+			wantIn: summary},
+		{name: "prBody wrong type falls back to summary",
+			extra:  map[string]any{"prBody": 42},
+			wantIn: summary},
+		{name: "nil extra map does not panic and falls back to summary",
+			extra:  nil,
+			wantIn: summary},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1568"}
+			e := &NativeAgentLoopExecutor{PREnsurer: fe}
+			task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+			got, err := e.openPullRequest(context.Background(), task, nil, "", summary, tc.extra, "")
+			if err != nil {
+				t.Fatalf("openPullRequest() error = %v", err)
+			}
+			if got == "" {
+				t.Fatalf("openPullRequest() returned empty PR URL")
+			}
+			if len(fe.ensures) != 1 {
+				t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+			}
+			body := fe.ensures[0].body
+			if !strings.Contains(body, tc.wantIn) {
+				t.Errorf("body must contain %q; got %q", tc.wantIn, body)
+			}
+			if tc.wantOut != "" && strings.Contains(body, tc.wantOut) {
+				t.Errorf("body must NOT contain the summary %q when prBody is preferred; got %q", tc.wantOut, body)
+			}
+		})
+	}
+}
+
+// TestOpenPullRequest_PrBodyLongSurvivesIntact is the point of the #1568
+// change: a body longer than the 280-byte summary cap survives byte-for-byte
+// when supplied via extra["prBody"]. Had it been routed through summary it
+// would be truncated to 280 bytes; the PR description must not be.
+func TestOpenPullRequest_PrBodyLongSurvivesIntact(t *testing.T) {
+	const sentence = "This sentence is part of a much longer, structured pull request body. "
+	var sb strings.Builder
+	for i := 0; i < 20; i++ {
+		sb.WriteString(sentence)
+	}
+	longBody := sb.String()
+	if len(longBody) <= 280 {
+		t.Fatalf("test body must exceed 280 bytes; got %d", len(longBody))
+	}
+
+	fe := &fakePREnsurer{subject: "fix: long body", url: "https://example/pr/1568"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	if _, err := e.openPullRequest(context.Background(), task, nil, "", "short",
+		map[string]any{"prBody": longBody}, ""); err != nil {
+		t.Fatalf("openPullRequest() error = %v", err)
+	}
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	body := fe.ensures[0].body
+	// PRBody trims the summary's surrounding whitespace but keeps its interior
+	// intact, so the rendered body must contain the trimmed long body.
+	if want := strings.TrimSpace(longBody); !strings.Contains(body, want) {
+		t.Errorf("long prBody must survive intact (not truncated at 280); len(body)=%d, wanted %d bytes",
+			len(body), len(want))
+	}
+}
