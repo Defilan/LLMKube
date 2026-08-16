@@ -75,6 +75,17 @@ type InferenceServiceReconciler struct {
 	// on OpenShift, where the restricted-v2 SCC injects fsGroup from the
 	// namespace's allocated range). Set via --default-fsgroup; default 102.
 	DefaultFSGroup int64
+	// DRIRenderGID is the node-local GID of the DRI render group
+	// (/dev/dri/renderD128) added to a Vulkan InferenceService pod's
+	// supplementalGroups so the container can open the render node; without it
+	// llama.cpp fails open and serves from CPU at roughly half speed with no
+	// status condition (#1560). The GID is node-local and not knowable at
+	// admission, so it comes from the operator's --dri-render-gid flag. Values
+	// <= 0 disable the default (e.g. on OpenShift); the field applies only on
+	// the Vulkan path and never to a user-supplied Spec.PodSecurityContext.
+	// Set via --dri-render-gid; default 44 (the conventional Linux render
+	// group).
+	DRIRenderGID int64
 	// EmitScrapeAnnotations, when true, adds Prometheus annotation-discovery
 	// hints (prometheus.io/scrape, /path, /port) to every inference Pod, with
 	// port set to the resolved endpoint port, so annotation-based scrapers

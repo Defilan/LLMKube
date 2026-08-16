@@ -168,10 +168,24 @@ func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 // the namespace's allocated range and rejects pods with explicit values
 // outside that range.
 //
+// Vulkan render GID. fsGroup is a cache-volume-ownership control and does
+// nothing for device access: a Vulkan serving container must also carry the
+// node's render GID in supplementalGroups to open /dev/dri/renderD128, or
+// llama.cpp fails open and serves from CPU at roughly half speed with no
+// status condition (#1560). When the resolved runtime is Vulkan (vulkan) and
+// driRenderGID > 0, that GID is appended to supplementalGroups. The GID is
+// node-local and not knowable at admission, so it comes from the operator's
+// --dri-render-gid flag (default 44, the conventional Linux render group; set
+// to 0 to disable, e.g. on OpenShift). This is applied only on the Vulkan
+// path; the CUDA and Metal paths are untouched. A user-supplied
+// Spec.PodSecurityContext is returned as-is, so setting it takes full
+// ownership of supplementalGroups (the per-service workaround for a node
+// whose render GID differs from the operator default).
+//
 // Operators using a custom init container image (--init-container-image) with
 // a different UID/GID should override Spec.PodSecurityContext or set
 // --default-fsgroup to match the new image's group.
-func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService, defaultFSGroup int64) *corev1.PodSecurityContext {
+func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService, defaultFSGroup, driRenderGID int64, vulkan bool) *corev1.PodSecurityContext {
 	if isvc.Spec.PodSecurityContext != nil {
 		return isvc.Spec.PodSecurityContext
 	}
@@ -183,6 +197,9 @@ func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService, defaultFS
 	if defaultFSGroup > 0 {
 		fsGroup := defaultFSGroup
 		psc.FSGroup = &fsGroup
+	}
+	if vulkan && driRenderGID > 0 {
+		psc.SupplementalGroups = append(psc.SupplementalGroups, driRenderGID)
 	}
 	return psc
 }
@@ -449,6 +466,13 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	}
 	gpuResourceName := sharing.resourceName
 
+	// The Vulkan path requests the generic-device-plugin /dev/dri resource
+	// (devic.es/dri-render). The container still needs the host render GID in
+	// supplementalGroups to open /dev/dri/renderD128, so the security context
+	// injects it only when this service schedules that resource. CUDA and Metal
+	// request other resources (or none) and are left untouched (#1560).
+	vulkan := gpuResourceName == vulkanDRIResourceName
+
 	container.Resources = buildContainerResources(isvc, model, gpuCount, gpuResourceName)
 
 	deployment := &appsv1.Deployment{
@@ -472,7 +496,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 					Annotations: buildPodAnnotations(isvc, r.EmitScrapeAnnotations, port),
 				},
 				Spec: corev1.PodSpec{
-					SecurityContext:    inferPodSecurityContext(isvc, r.DefaultFSGroup),
+					SecurityContext:    inferPodSecurityContext(isvc, r.DefaultFSGroup, r.DRIRenderGID, vulkan),
 					InitContainers:     storageConfig.initContainers,
 					Containers:         []corev1.Container{container},
 					Volumes:            storageConfig.volumes,
