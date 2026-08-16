@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -35,6 +36,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
@@ -113,8 +115,28 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// then nothing left to do.
 	if task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
 		task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
-		if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
-			log.Error(err, "audit: failed to record terminal run (continuing)")
+		// Emit the operator-side outcome metric exactly once, gated on the
+		// audited annotation actually being PERSISTED by RecordTerminal
+		// (#1491). RecordTerminal returns nil in two cases: it just wrote the
+		// record and stamped the annotation (first terminal reconcile), or the
+		// annotation was already set and it was a no-op (a later reconcile of
+		// an already-counted task). We only emit on the first case — the
+		// annotation was unset on entry AND RecordTerminal succeeded — so a
+		// failed audit write means no metric rather than a metric that a later
+		// reconcile (periodic resync or any update) would pass the guard and
+		// repeat. Under-counting on that rare failure path is the better
+		// trade: rates stay correct, whereas a repeated increment would inflate
+		// exactly the agents that are having trouble.
+		firstTerminal := task.Annotations[audit.AuditedAnnotation] != "true"
+		if firstTerminal {
+			if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
+				// The dedup marker was not persisted, so the metric must not
+				// be emitted either: a later reconcile will retry both.
+				log.Error(err, "audit: failed to record terminal run; skipping outcome metric (continuing)")
+			} else {
+				agent, kind, verdict, outcome, elapsedSec, turns := taskOutcomeLabels(&task)
+				llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
+			}
 		}
 		// Release the node reservation so the scheduler can dispatch the next
 		// task there. Guarded on taskKey, so a node already reserved for a
@@ -217,6 +239,40 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
+}
+
+// taskOutcomeLabels extracts the bounded label values the operator emits for a
+// terminal Foreman task (#1491): the Agent name (from spec.agentRef; "" when
+// unset), the task kind, the verdict, and the machine outcome carried at
+// result.extra.outcome ("" when the run has none). It also returns the
+// executor's elapsedSec and the agent-loop turn count from result.extra.
+//
+// The task NAME is deliberately never a label: it is unbounded and would break
+// cardinality. A missing or unparseable result envelope yields zero elapsedSec
+// and zero turns (RecordTaskOutcome skips observing zeros) and an empty
+// outcome — never a fabricated value.
+func taskOutcomeLabels(task *foremanv1alpha1.AgenticTask) (agent, kind, verdict, outcome string, elapsedSec float64, turns int) {
+	agent = ""
+	if task.Spec.AgentRef != nil {
+		agent = task.Spec.AgentRef.Name
+	}
+	kind = string(task.Spec.Kind)
+	verdict = string(task.Status.Verdict)
+	if task.Status.Result != nil && len(task.Status.Result.Raw) > 0 {
+		var env struct {
+			ElapsedSec float64 `json:"elapsedSec"`
+			Extra      struct {
+				Outcome   string `json:"outcome"`
+				TurnCount int    `json:"turnCount"`
+			} `json:"extra"`
+		}
+		if err := json.Unmarshal(task.Status.Result.Raw, &env); err == nil {
+			outcome = env.Extra.Outcome
+			elapsedSec = env.ElapsedSec
+			turns = env.Extra.TurnCount
+		}
+	}
+	return agent, kind, verdict, outcome, elapsedSec, turns
 }
 
 // effectiveRequiredCapability returns the capability the scheduler should
