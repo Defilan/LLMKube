@@ -29,7 +29,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -40,20 +39,23 @@ import (
 )
 
 // AnnotationDesiredTemplateHash stores a SHA-256 hash of the desired pod template
-// on the Deployment. The reconciler uses this to detect meaningful template changes
-// without being fooled by API-server-applied defaults that differ between the
-// in-memory object and the persisted object.
+// on the Deployment. The reconciler stamps the hash of the freshly built desired
+// template and compares it against the stored value on each reconcile to detect
+// operator-driven changes. Both sides are derived from the desired template (not
+// the persisted live object), so API-server defaulting on the live object cannot
+// produce a false positive. A Deployment missing the annotation predates it and
+// is treated as changed (drain before roll).
 const AnnotationDesiredTemplateHash = "llmkube.ai/desired-template-hash"
 
 var errIdleUnsupported = errors.New("runtime does not implement idle detection")
 
 // desiredTemplateHash computes a deterministic hash of the pod template for the
-// purpose of detecting operator-driven changes. It serializes the normalized
-// template to JSON and hashes it, so API-server defaulting differences don't
-// produce false positives on subsequent reconciles.
+// purpose of detecting operator-driven changes. It serializes the template to
+// JSON and hashes it. The reconciler stamps this hash on the Deployment and
+// compares it against a freshly computed hash to detect real changes; a missing
+// stored hash means the pre-annotation legacy path and is treated as changed.
 func desiredTemplateHash(template corev1.PodTemplateSpec) string {
-	normalized := computePodTemplateForComparison(template)
-	data, _ := json.Marshal(normalized)
+	data, _ := json.Marshal(template)
 	h := sha256.Sum256(data)
 	return fmt.Sprintf("%x", h[:8])
 }
@@ -383,165 +385,4 @@ func (r *InferenceServiceReconciler) reconcileRolloutPolicy(
 
 	log.Info("Deferring rollout, backend slots are busy", "requeueAfter", requeueAfter)
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
-}
-
-// computePodTemplateForComparison returns the PodTemplateSpec for comparison
-// purposes. Exposed as a function so the comparison logic in the reconciler
-// remains readable and can be extended if needed (e.g., stripping transient
-// fields injected by the API server).
-func computePodTemplateForComparison(t corev1.PodTemplateSpec) corev1.PodTemplateSpec {
-	return t
-}
-
-// podTemplatesDiffer reports whether two PodTemplateSpecs differ in fields
-// that would trigger a Deployment rollout. It compares operator-controlled
-// fields (containers, init containers, volumes, labels, annotations, and
-// scheduling fields) while ignoring API-server-applied defaults like
-// TerminationGracePeriodSeconds that cause false positives on full DeepEqual.
-func podTemplatesDiffer(existing, desired corev1.PodTemplateSpec) bool {
-	// Deep-copy both templates up front. The normalization below mutates
-	// container SecurityContexts and other fields in place, and a shallow
-	// struct copy still shares the underlying slices and pointers with the
-	// caller's templates. Without this, normalizing `desired` for comparison
-	// nils out the real desired template's SecurityContext (e.g. the
-	// model-cache-prep init container's RunAsUser/Capabilities), which then
-	// gets applied to the Deployment. See #922.
-	existing = *existing.DeepCopy()
-	desired = *desired.DeepCopy()
-	if !apiequality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(existing.Annotations, desired.Annotations) {
-		return true
-	}
-	a, b := existing.Spec, desired.Spec
-	// Compare fields the operator controls and that trigger rollouts.
-	// Skip server-side defaulted fields that cause false positives:
-	//   TerminationGracePeriodSeconds (default 30s), DNSPolicy (default ClusterFirst),
-	//   RestartPolicy (default Always), ServiceAccountName (default "default"),
-	//   AutomountServiceAccountToken, SchedulerName (default "default-scheduler").
-	a.TerminationGracePeriodSeconds = nil
-	b.TerminationGracePeriodSeconds = nil
-	a.DNSPolicy = ""
-	b.DNSPolicy = ""
-	a.RestartPolicy = ""
-	b.RestartPolicy = ""
-	a.ServiceAccountName = ""
-	b.ServiceAccountName = ""
-	a.AutomountServiceAccountToken = nil
-	b.AutomountServiceAccountToken = nil
-	a.SchedulerName = ""
-	b.SchedulerName = ""
-	// Additional pod-level fields defaulted by the API server.
-	a.HostNetwork = false
-	b.HostNetwork = false
-	a.HostPID = false
-	b.HostPID = false
-	a.HostIPC = false
-	b.HostIPC = false
-	a.ShareProcessNamespace = nil
-	b.ShareProcessNamespace = nil
-	a.Hostname = ""
-	b.Hostname = ""
-	a.Subdomain = ""
-	b.Subdomain = ""
-	a.SetHostnameAsFQDN = nil
-	b.SetHostnameAsFQDN = nil
-	a.DNSConfig = nil
-	b.DNSConfig = nil
-	a.ImagePullSecrets = nil
-	b.ImagePullSecrets = nil
-	a.HostAliases = nil
-	b.HostAliases = nil
-	// Normalize pod-level SecurityContext (API server defaults seccompProfile).
-	if a.SecurityContext != nil {
-		a.SecurityContext.SeccompProfile = nil
-	}
-	if b.SecurityContext != nil {
-		b.SecurityContext.SeccompProfile = nil
-	}
-	// Normalize containers to strip API-server-applied defaults.
-	normalizeContainers(a.Containers)
-	normalizeContainers(b.Containers)
-	normalizeContainers(a.InitContainers)
-	normalizeContainers(b.InitContainers)
-	if !apiequality.Semantic.DeepEqual(a.Containers, b.Containers) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.InitContainers, b.InitContainers) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.EphemeralContainers, b.EphemeralContainers) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.Volumes, b.Volumes) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.SecurityContext, b.SecurityContext) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.EnableServiceLinks, b.EnableServiceLinks) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.NodeSelector, b.NodeSelector) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.Tolerations, b.Tolerations) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.Affinity, b.Affinity) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.TopologySpreadConstraints, b.TopologySpreadConstraints) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.PriorityClassName, b.PriorityClassName) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.RuntimeClassName, b.RuntimeClassName) {
-		return true
-	}
-	if !apiequality.Semantic.DeepEqual(a.ResourceClaims, b.ResourceClaims) {
-		return true
-	}
-	return false
-}
-
-// normalizeContainers strips API-server-applied defaults from container fields
-// so that comparison doesn't produce false positives.
-func normalizeContainers(containers []corev1.Container) {
-	for i := range containers {
-		c := &containers[i]
-		c.TerminationMessagePath = ""
-		// TerminationMessagePolicy is NOT stripped: the operator sets it on
-		// every container it generates (runtime container since #1425, init
-		// containers since #1437), so it is an owned field rather than
-		// API-server defaulting, and drift in it should be comparable.
-		c.ImagePullPolicy = ""
-		c.WorkingDir = ""
-		// SecurityContext is NOT stripped: the operator sets AllowPrivilegeEscalation,
-		// Capabilities, and (for init containers) ReadOnlyRootFilesystem and
-		// RunAsUser/RunAsGroup. An empty SecurityContext submitted to the API server
-		// comes back unchanged, so removing this stripping does not introduce phantom
-		// drift. Keeping it comparable means real drift in operator-owned fields is
-		// detected rather than normalised away. See #1462.
-		for j := range c.Ports {
-			if c.Ports[j].Protocol == "" {
-				c.Ports[j].Protocol = corev1.ProtocolTCP
-			}
-		}
-		// Normalize resource requirements: empty and nil are semantically identical.
-		if len(c.Resources.Limits) == 0 {
-			c.Resources.Limits = nil
-		}
-		if len(c.Resources.Requests) == 0 {
-			c.Resources.Requests = nil
-		}
-		// Normalize env var field/ref defaults (FieldPath API version).
-		for j := range c.Env {
-			if c.Env[j].ValueFrom != nil && c.Env[j].ValueFrom.FieldRef != nil {
-				c.Env[j].ValueFrom.FieldRef.APIVersion = ""
-			}
-		}
-	}
 }
