@@ -123,7 +123,8 @@ func (SubmitResultTool) Schema() oai.ToolSchemaDef {
     "description":
       "Full commit message: subject, body, and Fixes #N if applicable. The executor commits your edits with it."},
   "extra": {"type": "object",
-    "description": "Structured extra fields the executor may surface in status.result.extra."}
+    "description":
+      "Structured extra fields the executor may surface in status.result.extra. Reviewers: set \"prBody\" to the full pull-request description (Markdown, no length limit) when approving; unlike summary it is not truncated, and the executor prefers it over summary when opening the PR."}
 },
 "required": ["verdict", "summary", "commit_message"]
 }`),
