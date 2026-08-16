@@ -120,7 +120,49 @@ func extractIssuePathRefs(body string, sourceExtensions []string) []string {
 			refs = append(refs, tok)
 		}
 	}
-	return refs
+	return dedupRefs(refs)
+}
+
+// dedupRefs collapses refs that resolve to the same file so the count of
+// issue-named files is not inflated (#1447). A bare filename that is a path
+// suffix of a fuller ref (automation-sync.ts vs src/lib/automation-sync.ts)
+// names the same module and must not be counted as two distinct files; the
+// more specific (longer) ref is kept. Refs that are not suffix-related (e.g.
+// a/foo.ts and b/foo.ts) are distinct and are all preserved.
+func dedupRefs(refs []string) []string {
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		replaced := false
+		for i, k := range out {
+			if samePathRef(k, r) {
+				// Prefer the more specific (longer) of the two.
+				if len(r) > len(k) {
+					out[i] = r
+				}
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// samePathRef reports whether two refs resolve to the same file: either they
+// are equal, or one is a path suffix of the other aligned on a path boundary
+// (a bare filename that ends a fuller path, or vice versa). The "/" boundary
+// guard keeps, e.g., x-automation-sync.ts from matching automation-sync.ts.
+func samePathRef(a, b string) bool {
+	if a == b {
+		return true
+	}
+	full, short := a, b
+	if len(full) < len(short) {
+		full, short = short, full
+	}
+	return len(short) < len(full) && strings.HasSuffix(full, "/"+short)
 }
 
 // hasSourceFile reports whether any path in paths ends with one of the
@@ -159,6 +201,67 @@ func isPathRef(tok string, extraExts map[string]bool) bool {
 		}
 	}
 	return true
+}
+
+// joinDir recombines a path.Dir result with a basename without emitting a
+// redundant "/." for bare filenames.
+func joinDir(dir, base string) string {
+	if dir == "." || dir == "" {
+		return base
+	}
+	return dir + "/" + base
+}
+
+// testTargetsForPath returns the module path(s) a diff path could be testing.
+// A diff that creates or edits a test file counts as touching the module
+// under test (#1447): an "add tests for X" issue names X.ts, the correct
+// change creates X.test.ts, and without this mapping the scope-overlap rail
+// reports the diff touches none of the named files and the issue is
+// unwinnable.
+//
+// The directory is preserved; only the basename is mapped. Recognized
+// conventions:
+//   - X.test.{ts,tsx,js,jsx} -> X.{ts,tsx,js,jsx}
+//   - X.spec.{ts,tsx,js,jsx} -> X.{ts,tsx,js,jsx}
+//   - X_test.go              -> X.go
+//   - test_X.py              -> X.py
+//   - X_test.py              -> X.py
+//
+// Returns nil when the path is not a test file under any of those
+// conventions.
+func testTargetsForPath(p string) []string {
+	base := path.Base(p)
+	ext := path.Ext(base)
+	if ext == "" {
+		return nil
+	}
+	stem := strings.TrimSuffix(base, ext)
+	dir := path.Dir(p)
+
+	// JS/TS: X.test.ts / X.spec.ts -> X.ts (extension preserved).
+	for _, marker := range []string{".test", ".spec"} {
+		if strings.HasSuffix(stem, marker) {
+			module := strings.TrimSuffix(stem, marker) + ext
+			return []string{joinDir(dir, module)}
+		}
+	}
+	// Go: X_test.go -> X.go.
+	if ext == ".go" && strings.HasSuffix(stem, "_test") {
+		module := strings.TrimSuffix(stem, "_test") + ext
+		return []string{joinDir(dir, module)}
+	}
+	// Python: test_X.py -> X.py and X_test.py -> X.py.
+	if ext == ".py" {
+		var modules []string
+		if strings.HasPrefix(stem, "test_") {
+			modules = append(modules, joinDir(dir, strings.TrimPrefix(stem, "test_")+ext))
+		}
+		if strings.HasSuffix(stem, "_test") {
+			modules = append(modules, joinDir(dir, strings.TrimSuffix(stem, "_test")+ext))
+		}
+		return modules
+	}
+	return nil
 }
 
 // enforceReviewerScopeOverlap is the computable half of scope-drift
@@ -201,9 +304,22 @@ func enforceReviewerScopeOverlap(
 	for _, f := range diffFiles {
 		diffPaths[f] = true
 		diffBases[path.Base(f)] = true
+		// A test file also counts as touching the module it tests (#1447).
+		// Index the mapped target under both full path and basename so a
+		// ref that names either the module's directory or just its file
+		// matches the test file that covers it.
+		for _, t := range testTargetsForPath(f) {
+			diffPaths[t] = true
+			diffBases[path.Base(t)] = true
+		}
 	}
 	matched := []string{}
 	for _, r := range refs {
+		// A ref is satisfied when the diff touches the module it names
+		// directly, or when the diff touches a test file that targets it:
+		// testTargetsForPath has folded each test file's subject into
+		// diffPaths/diffBases, so an "add tests for X" issue (naming X)
+		// matches the X.test file the diff creates (#1447).
 		if diffPaths[r] || diffBases[path.Base(r)] {
 			matched = append(matched, r)
 		}

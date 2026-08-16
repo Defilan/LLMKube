@@ -456,3 +456,152 @@ func TestExtractIssuePathRefs_ProseIsNotAPathRef(t *testing.T) {
 		t.Errorf("prose must not extract as path refs; got %v", got)
 	}
 }
+
+// --- Issue #1447: test-coverage issues must be winnable. -------------------
+// The scope-overlap rail demoted a GO when the diff touched none of the
+// files the issue names literally. For "add tests for X" that is
+// unsatisfiable: the issue names X, the correct change creates X.test, and
+// the check reported the diff touched none of them. Two defects were fixed:
+// (1) a test file now maps to the module it covers, and (2) a bare filename
+// and its full path no longer both count as distinct files.
+
+// TestTestTargetsForPath is the pure helper that maps a diff path to the
+// module(s) it tests, across the conventions the repo cares about.
+func TestTestTargetsForPath(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{in: "src/lib/automation-sync.test.ts", want: []string{"src/lib/automation-sync.ts"}},
+		{in: "src/lib/resolve-actor.spec.ts", want: []string{"src/lib/resolve-actor.ts"}},
+		{in: "src/lib/Component.test.tsx", want: []string{"src/lib/Component.tsx"}},
+		{in: "src/lib/widget.test.js", want: []string{"src/lib/widget.js"}},
+		{in: "src/lib/widget.test.jsx", want: []string{"src/lib/widget.jsx"}},
+		{in: "internal/foo/bar_test.go", want: []string{"internal/foo/bar.go"}},
+		{in: "pkg/agent/loop_test.go", want: []string{"pkg/agent/loop.go"}},
+		{in: "src/calculators/test_math.py", want: []string{"src/calculators/math.py"}},
+		{in: "src/calculators/math_test.py", want: []string{"src/calculators/math.py"}},
+		// Non-test files map to nothing.
+		{in: "src/lib/automation-sync.ts", want: nil},
+		{in: "internal/foo/bar.go", want: nil},
+		{in: "src/math.py", want: nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := testTargetsForPath(tt.in); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("testTargetsForPath(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractIssuePathRefs_DedupsBasenameAndFullPath is defect (2) in #1447:
+// an issue that names a module both bare and by path reported six files
+// instead of three. Dedup by resolved path must collapse each pair to one,
+// keeping the more specific (full) ref.
+func TestExtractIssuePathRefs_DedupsBasenameAndFullPath(t *testing.T) {
+	body := "Add unit tests covering the main execution paths for " +
+		"`automation-sync.ts`, `groomer-lock.ts`, and `resolve-actor.ts` " +
+		"(see `src/lib/automation-sync.ts`, `src/lib/groomer/groomer-lock.ts`, " +
+		"and `src/lib/resolve-actor.ts`)."
+	got := extractIssuePathRefs(body, []string{".ts"})
+	want := []string{
+		"src/lib/automation-sync.ts",
+		"src/lib/groomer/groomer-lock.ts",
+		"src/lib/resolve-actor.ts",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("dedup extraction = %v, want %v", got, want)
+	}
+}
+
+// TestExtractIssuePathRefs_DistinctSameBasenameKept guards the boundary of
+// the dedup: two files with the same basename in DIFFERENT directories are
+// distinct modules and must both survive. The "/"+short boundary check keeps
+// x-automation-sync.ts from matching automation-sync.ts too.
+func TestExtractIssuePathRefs_DistinctSameBasenameKept(t *testing.T) {
+	body := "Compare `a/foo.ts` and `b/foo.ts` before refactoring."
+	got := extractIssuePathRefs(body, []string{".ts"})
+	want := []string{"a/foo.ts", "b/foo.ts"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("distinct same-basename refs must both survive; got %v, want %v", got, want)
+	}
+}
+
+// TestEnforceReviewerScopeOverlap_TestFileMapsToModule is defect (1) in
+// #1447: the diff creates the test files for the modules the issue names, so
+// the verdict must stay GO (not be demoted as scope drift).
+func TestEnforceReviewerScopeOverlap_TestFileMapsToModule(t *testing.T) {
+	body := "Add unit tests covering the main execution paths and error " +
+		"conditions for `src/lib/automation-sync.ts`."
+	diff := []string{"src/lib/automation-sync.test.ts"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"})
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("a diff that creates the test for the named module must not demote; got %v", got)
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); v {
+		t.Errorf("scopeDriftDetected should be false when the test file maps to the named module")
+	}
+	if v, _ := extra["verdictDemoted"].(bool); v {
+		t.Errorf("must not claim demotion for a test-coverage diff")
+	}
+	matched, _ := extra["scopeMatched"].([]string)
+	if !reflect.DeepEqual(matched, []string{"src/lib/automation-sync.ts"}) {
+		t.Errorf("scopeMatched = %v, want the module the test covers", matched)
+	}
+}
+
+// TestEnforceReviewerScopeOverlap_GoTestFileMapsToModule is the Go-flavored
+// version of the same case: a diff that adds `bar_test.go` satisfies an
+// issue naming `bar.go`.
+func TestEnforceReviewerScopeOverlap_GoTestFileMapsToModule(t *testing.T) {
+	body := "Add tests for `internal/foo/bar.go` covering the error path."
+	diff := []string{"internal/foo/bar_test.go"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("a diff adding bar_test.go must not demote an issue naming bar.go; got %v", got)
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); v {
+		t.Errorf("scopeDriftDetected should be false for a _test.go diff covering the named .go file")
+	}
+}
+
+// TestEnforceReviewerScopeOverlap_TestFileBareRefMapsToModule covers the
+// direction where the issue names the module bare and the diff path is
+// fully-qualified: `bar.go` must still match `internal/foo/bar_test.go`.
+func TestEnforceReviewerScopeOverlap_TestFileBareRefMapsToModule(t *testing.T) {
+	body := "Add tests for `bar.go`."
+	diff := []string{"internal/foo/bar_test.go"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("a bare ref to bar.go must match the bar_test.go diff; got %v", got)
+	}
+}
+
+// TestEnforceReviewerScopeOverlap_RealDriftStillBitesAfterFix is the
+// regression guard for #1447: a diff that touches none of the modules the
+// issue names — and is not a test file mapping to any of them — must STILL
+// be flagged as scope drift and demote a GO. The fix must not disable the
+// rail.
+func TestEnforceReviewerScopeOverlap_RealDriftStillBitesAfterFix(t *testing.T) {
+	body := "Tighten error handling in `a.ts`."
+	diff := []string{"totally-unrelated.ts"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"})
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("genuine drift must still demote GO; got %v", got)
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); !v {
+		t.Errorf("scopeDriftDetected must be true for genuine drift")
+	}
+	if v, _ := extra["verdictDemoted"].(bool); !v {
+		t.Errorf("genuine drift must set verdictDemoted")
+	}
+}
