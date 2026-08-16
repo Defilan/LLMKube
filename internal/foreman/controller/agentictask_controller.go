@@ -408,6 +408,14 @@ func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *fore
 // is an optimistic-lock status patch, so at most one wins; the loser (Conflict,
 // or a node already reserved for a live task) falls through to the next
 // candidate. Without this, every task funnels onto one node. See #977.
+//
+// In Job mode the task's work runs in an ephemeral Job pod, not on the claiming
+// node, so the node must NOT be reserved: stamping CurrentTask would hold a
+// one-task-per-node slot for the Job's whole lifetime while the node itself
+// does nothing but wait, starving in-process tasks that could run there. A
+// Job-mode task is still assigned to a node (so the Job is created there), but
+// the node's CurrentTask is left untouched and stays free for in-process work.
+// See #1496.
 func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *foremanv1alpha1.AgenticTask, required foremanv1alpha1.RequiredCapability, requiredModel string, jobMode bool) (string, error) {
 	var nodes foremanv1alpha1.FleetNodeList
 	if err := r.List(ctx, &nodes); err != nil {
@@ -425,6 +433,13 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		}
 		if !capabilitySatisfies(required, requiredModel, n, jobMode) {
 			continue
+		}
+		if jobMode {
+			// Job-mode work runs in an ephemeral Job pod, not on this node, so
+			// the node must not be claimed. Pick the first eligible node and
+			// leave its CurrentTask untouched so it stays free for in-process
+			// tasks. See #1496.
+			return n.Name, nil
 		}
 		reserved, err := r.reserveNode(ctx, n, key)
 		if err != nil {

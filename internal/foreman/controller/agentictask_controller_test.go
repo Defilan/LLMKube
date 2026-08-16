@@ -445,6 +445,63 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 			To(ConsistOf("default/spread-t1", "default/spread-t2"))
 	})
 
+	It("schedules a Job-mode task without reserving the node's CurrentTask", func() {
+		// Regression for defilantech/LLMKube#1496: a Job-mode task's work runs
+		// in an ephemeral Job pod, not on the claiming node, so the node must
+		// not be claimed via Status.CurrentTask. The node stays free so an
+		// in-process task can still be dispatched to it while the Job runs.
+		agent := newAgent("job-coder")
+		agent.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+			Mode: foremanv1alpha1.ExecutionModeJob,
+		}
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		task := newTask("job-target")
+		task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		node := newFleetNode("job-node")
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+		setNodeReady(node, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(fresh.Status.AssignedNode).To(Equal(node.Name))
+
+		// The node must NOT be claimed by the Job-mode task.
+		var unclaimed foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, &unclaimed)).To(Succeed())
+		Expect(unclaimed.Status.CurrentTask).To(BeEmpty())
+
+		// An in-process task can still be dispatched to the same node while
+		// the Job-mode task is assigned to it.
+		ipTask := newTask("job-inprocess")
+		Expect(k8sClient.Create(ctx, ipTask)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, ipTask) })
+		setPhase(ipTask, foremanv1alpha1.AgenticTaskPhasePending)
+		_, err = reconciler.Reconcile(ctx, reqFor(ipTask))
+		Expect(err).NotTo(HaveOccurred())
+
+		var ipFresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(ipTask), &ipFresh)).To(Succeed())
+		Expect(ipFresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+		Expect(ipFresh.Status.AssignedNode).To(Equal(node.Name))
+
+		var claimed foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, &claimed)).To(Succeed())
+		Expect(claimed.Status.CurrentTask).To(Equal("default/job-inprocess"))
+	})
+
 	It("leaves a second task Pending when the only matching node is busy", func() {
 		// One node, two tasks: the second must wait (requeue) rather than
 		// double-book the node.
