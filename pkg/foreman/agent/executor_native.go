@@ -1900,7 +1900,7 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	if prURL, prErr := e.openPullRequest(ctx, task, auth, body, cloneURL); prErr != nil {
+	if prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, cloneURL); prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
 			"repo", task.Spec.Payload.Repo, "branch", task.Spec.Payload.Branch)
 		r.Extra["pullRequestError"] = prErr.Error()
@@ -1967,7 +1967,7 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 // owner — or one that is not an owner/repo-shaped URL at all (local
 // paths in tests) — keeps the same-repo shape.
 func (e *NativeAgentLoopExecutor) openPullRequest(
-	ctx context.Context, task *foremanv1alpha1.AgenticTask, auth *repo.Auth, summaryBody, cloneURL string,
+	ctx context.Context, task *foremanv1alpha1.AgenticTask, auth *repo.Auth, workspace, summaryBody, cloneURL string,
 ) (string, error) {
 	p := task.Spec.Payload
 	owner, _, ok := codehost.SplitRepoSlug(p.Repo)
@@ -1995,18 +1995,12 @@ func (e *NativeAgentLoopExecutor) openPullRequest(
 	if title == "" {
 		title = fmt.Sprintf("Fix #%d", p.Issue)
 	}
-	// Body: the reviewer's own summary of the change (it read the full diff
-	// against the issue to reach GO), already diff-grounded by groundPRSummary
-	// (#1411), then the issue link and provenance. Falls back to just the link
-	// when the reviewer returned no summary.
-	var bodyB strings.Builder
-	if s := strings.TrimSpace(summaryBody); s != "" {
-		bodyB.WriteString(s)
-		bodyB.WriteString("\n\n")
-	}
-	fmt.Fprintf(&bodyB, "Fixes #%d\n\n_Opened by foreman on review GO (workload %s)._",
+	// Body: honour the target repo's PR template when it has one (#1541),
+	// else Foreman's own shape — the reviewer's diff-grounded summary
+	// (#1411), the issue link, and provenance. PRBody keeps the no-template
+	// path byte-for-byte identical to the pre-#1541 output.
+	body := githubpr.PRBody(githubpr.FindTemplate(workspace), summaryBody,
 		p.Issue, task.Labels["foreman.llmkube.dev/workload"])
-	body := bodyB.String()
 	prURL, _, err := ch.EnsureChangeRequest(ctx, p.Repo, head,
 		baseBranchOrDefault(p.BaseBranch), title, body)
 	if err != nil {
