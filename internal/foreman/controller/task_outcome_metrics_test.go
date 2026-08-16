@@ -17,12 +17,19 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"testing"
 
+	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // TestTaskOutcomeLabels verifies the bounded label extraction the operator uses
@@ -95,4 +102,79 @@ func TestTaskOutcomeLabels(t *testing.T) {
 				outcome, elapsed, turns)
 		}
 	})
+}
+
+// TestTerminalMetricEmittedAtMostOnceOnAuditFailure proves the "exactly once"
+// guarantee holds on the audit FAILURE path, not only the happy path (#1491).
+// The metric must be emitted only when the dedup marker (the audited
+// annotation) is actually persisted by RecordTerminal. When the audit write
+// fails the marker is never stamped, so a later reconcile of the same terminal
+// task (periodic resync or any update) would otherwise pass the guard and
+// increment the counter a second time. A failed audit write therefore means no
+// metric (under-count: rates stay correct) rather than a repeating one
+// (double-count: inflates exactly the agents that are having trouble).
+//
+// This test must FAIL against the ordering where the metric is emitted before
+// RecordTerminal: there, both reconciles pass the unset-annotation guard and
+// each emits, so the counter moves by 2 across the two passes.
+func TestTerminalMetricEmittedAtMostOnceOnAuditFailure(t *testing.T) {
+	// Foreman-only scheme (no corev1.ConfigMap registered). This is deliberate:
+	// audit.RecordTerminal writes its durable record to a ConfigMap, and with
+	// the type absent from the scheme that write fails ("no kind registered
+	// for v1.ConfigMap"), so RecordTerminal returns an error and never stamps
+	// the audited annotation — exactly the audit-failure path under test.
+	scheme := runtime.NewScheme()
+	if err := foremanv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add foreman scheme: %v", err)
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	task := newTask("dedup-audit-fail")
+	task.Spec.Kind = foremanv1alpha1.AgenticTaskKindIssueFix
+	task.Spec.AgentRef = &corev1.LocalObjectReference{Name: "dedup-agent"}
+	// Terminal state the FleetAgent would have written. A populated result
+	// envelope makes the emitted labels deterministic and distinct from the
+	// label set used by TestTaskOutcomeLabels.
+	finished := metav1.Now()
+	task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+	task.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictGo
+	task.Status.FinishedAt = &finished
+	task.Status.Result = &runtime.RawExtension{Raw: []byte(
+		`{"elapsedSec":42.5,"extra":{"outcome":"MODEL-DECIDED","turnCount":17}}`)}
+	// No audited annotation: this is the first terminal reconcile.
+	if err := fakeClient.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	r := &AgenticTaskReconciler{Client: fakeClient, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(task)}
+
+	labels := []string{"dedup-agent", "issue-fix", "GO", "MODEL-DECIDED"}
+	readCounter := func() float64 {
+		t.Helper()
+		var m dto.Metric
+		if err := llmkubemetrics.ForemanTaskCompletedTotal.WithLabelValues(labels...).Write(&m); err != nil {
+			t.Fatalf("read counter: %v", err)
+		}
+		return m.GetCounter().GetValue()
+	}
+
+	before := readCounter()
+
+	// First terminal reconcile: the audit write fails, so the metric must not
+	// be emitted (the dedup marker is never persisted).
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("first reconcile returned an error: %v", err)
+	}
+	// Second reconcile of the same terminal task (periodic resync / update).
+	// The annotation is still unset, so without the fix this pass re-emits.
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("second reconcile returned an error: %v", err)
+	}
+
+	after := readCounter()
+	if got := after - before; got > 1 {
+		t.Errorf("counter must increment at most once across both passes, got +%v (audit write failed both times)", got)
+	}
 }

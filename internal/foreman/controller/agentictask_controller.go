@@ -115,17 +115,28 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// then nothing left to do.
 	if task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
 		task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
-		// Emit the operator-side outcome metrics once, gated on the same
-		// audited annotation RecordTerminal stamps, so a task that stays
-		// terminal across reconciles is counted exactly once (#1491). The
-		// guard runs before RecordTerminal: if the annotation is already set
-		// we have emitted (or the audit wrote) before, so skip.
-		if task.Annotations[audit.AuditedAnnotation] != "true" {
-			agent, kind, verdict, outcome, elapsedSec, turns := taskOutcomeLabels(&task)
-			llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
-		}
-		if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
-			log.Error(err, "audit: failed to record terminal run (continuing)")
+		// Emit the operator-side outcome metric exactly once, gated on the
+		// audited annotation actually being PERSISTED by RecordTerminal
+		// (#1491). RecordTerminal returns nil in two cases: it just wrote the
+		// record and stamped the annotation (first terminal reconcile), or the
+		// annotation was already set and it was a no-op (a later reconcile of
+		// an already-counted task). We only emit on the first case — the
+		// annotation was unset on entry AND RecordTerminal succeeded — so a
+		// failed audit write means no metric rather than a metric that a later
+		// reconcile (periodic resync or any update) would pass the guard and
+		// repeat. Under-counting on that rare failure path is the better
+		// trade: rates stay correct, whereas a repeated increment would inflate
+		// exactly the agents that are having trouble.
+		firstTerminal := task.Annotations[audit.AuditedAnnotation] != "true"
+		if firstTerminal {
+			if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
+				// The dedup marker was not persisted, so the metric must not
+				// be emitted either: a later reconcile will retry both.
+				log.Error(err, "audit: failed to record terminal run; skipping outcome metric (continuing)")
+			} else {
+				agent, kind, verdict, outcome, elapsedSec, turns := taskOutcomeLabels(&task)
+				llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
+			}
 		}
 		// Release the node reservation so the scheduler can dispatch the next
 		// task there. Guarded on taskKey, so a node already reserved for a
