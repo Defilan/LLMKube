@@ -154,6 +154,7 @@ func main() {
 
 		// M4 gate-tool flags
 		foremanNamespace     string
+		gateCachePVC         string
 		commitAuthorName     string
 		commitAuthorEmail    string
 		commitCommitterName  string
@@ -239,6 +240,10 @@ func main() {
 		"Preserve the per-task clone workspace after the run. Useful for debugging; default removes it.")
 	flag.StringVar(&foremanNamespace, "foreman-namespace", "foreman-system",
 		"Namespace the M4 run_gate_job tool submits gate Jobs into. Defaults to foreman-system.")
+	flag.StringVar(&gateCachePVC, "gate-cache-pvc", "",
+		"Name of the gate-cache PVC the run_gate_job tool mounts at /cache. Empty disables the "+
+			"volume mount. The chart renders the per-agent claim (foreman.gateCache.pvcName) here "+
+			"so named agent pools mount the PVC that actually exists (#1538).")
 	flag.StringVar(&coderGitSecret, "coder-git-secret", "foreman-git-credentials",
 		"Name of the Secret the coder Job projects as GITHUB_TOKEN for the clone + push (#620). "+
 			"Point this at an existing git Secret (e.g. foreman-github) to reuse it instead of "+
@@ -436,7 +441,7 @@ func main() {
 				Email: committerEmail(commitCommitterEmail, commitAuthorEmail),
 			},
 			KeepWorkspace:   keepWorkspace,
-			RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace),
+			RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace, gateCachePVC),
 			CodeHost:        githubCodeHost(),
 			WorkItems:       githubWorkItems(),
 			ChangePolicy:    changepolicy.NewDefaultPolicy(),
@@ -537,6 +542,7 @@ func runTaskCommand(args []string) {
 		commitCommitterName      string
 		commitCommitterEmail     string
 		foremanNamespace         string
+		gateCachePVC             string
 		keepWorkspace            bool
 	)
 	fs.StringVar(&taskName, "task", "",
@@ -566,6 +572,9 @@ func runTaskCommand(args []string) {
 			"--commit-author-email so existing deployments are unchanged.")
 	fs.StringVar(&foremanNamespace, "foreman-namespace", "foreman-system",
 		"Namespace deterministic tools (e.g. run_gate_job) submit Jobs into.")
+	fs.StringVar(&gateCachePVC, "gate-cache-pvc", "",
+		"Name of the gate-cache PVC the run_gate_job tool mounts at /cache. Empty disables the "+
+			"volume mount (#1538).")
 	fs.BoolVar(&keepWorkspace, "keep-workspace", false,
 		"Preserve the per-task clone workspace after the run.")
 
@@ -614,7 +623,7 @@ func runTaskCommand(args []string) {
 			Email: committerEmail(commitCommitterEmail, commitAuthorEmail),
 		},
 		KeepWorkspace:   keepWorkspace,
-		RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace),
+		RegistryFactory: makeRegistryFactory(kc, kcs, foremanNamespace, gateCachePVC),
 		CodeHost:        githubCodeHost(),
 		WorkItems:       githubWorkItems(),
 		ChangePolicy:    changepolicy.NewDefaultPolicy(),
@@ -776,7 +785,7 @@ func assembleAgentRegistry(
 // gate being closed runs the loop with native tools only, exactly like
 // before MCP existed.
 func makeRegistryFactory(
-	kc client.Client, kcs kubernetes.Interface, foremanNamespace string,
+	kc client.Client, kcs kubernetes.Interface, foremanNamespace, gateCachePVC string,
 ) func(
 	ctx context.Context, workspace string, ag *foremanv1alpha1.Agent, workloadMCPEnabled bool,
 ) (foremanagent.ToolRegistry, error) {
@@ -796,6 +805,7 @@ func makeRegistryFactory(
 			BashTimeout:      bashTimeout,
 			Client:           kc,
 			ForemanNamespace: foremanNamespace,
+			GateCachePVC:     gateCachePVC,
 			LogTailFn:        logTail,
 			Token:            repo.TokenFromEnvOrFile,
 		})

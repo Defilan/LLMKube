@@ -211,6 +211,34 @@ tests:
           content:
             name: GITHUB_TOKEN
 
+  # ---- #1538: gate-cache PVC threaded to the agent flag ----
+
+  - it: --gate-cache-pvc renders from the same helper that names the PVC
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-default-agent
+      matchMany: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --gate-cache-pvc=RELEASE-NAME-foreman-default-gate-cache
+
+  - it: --gate-cache-pvc is absent when gateCache.enabled is false
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-llmkube-fork-agent
+      matchMany: false
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --gate-cache-pvc=
+
   # ---- Accelerator flag (#1242) ----
 
   - it: --accelerator flag renders when agent.accelerator is set
