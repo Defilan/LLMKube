@@ -1277,6 +1277,18 @@ type TGIConfig struct {
 
 // InferenceServiceStatus defines the observed state of InferenceService.
 type InferenceServiceStatus struct {
+	// Acceleration reports the offload result the serving engine (llama.cpp)
+	// produced at load time: which device actually served the model and how
+	// many of its layers were offloaded onto it. This makes a silent CPU
+	// fallback visible in the API: a service that requested an accelerator but
+	// ended up with zero offloaded layers is otherwise indistinguishable from
+	// a healthy GPU service in status. Optional and additive: an absent value
+	// means the offload result is unknown (e.g. CPU-only serving or a runtime
+	// that does not report it).
+	// +optional
+	// +kubebuilder:validation:Optional
+	Acceleration *AccelerationStatus `json:"acceleration,omitempty"`
+
 	// Phase represents the current lifecycle phase of the InferenceService.
 	// Possible values: Pending, Creating, Progressing, Ready, WaitingForGPU,
 	// Stopped, Suspended, Failed. Stopped is the terminal state when
@@ -1391,6 +1403,32 @@ type GatewayStatus struct {
 	// ModelRouter dataPlane: Gateway path; false when no auth is configured.
 	// +optional
 	AuthEnabled bool `json:"authEnabled,omitempty"`
+}
+
+// AccelerationStatus reports the offload result the serving engine produced
+// at load time. llama.cpp logs the device it assigned and how many layers it
+// offloaded onto that device; the operator reads that at readiness and stamps
+// it here so a silent CPU fallback (Ready while every layer runs on CPU) is
+// visible in the API. It is additive and optional: an absent block means the
+// offload result is unknown (CPU-only serving or a runtime that does not
+// report it).
+type AccelerationStatus struct {
+	// Device is the device that served the model, as the engine reported it,
+	// e.g. "Vulkan0 (AMD Radeon 8060S)" or "CPU". Empty when the offload
+	// result is unknown.
+	// +optional
+	Device string `json:"device,omitempty"`
+
+	// LayersOffloaded is how many of the model's layers the engine offloaded
+	// onto an accelerator. 0 means every layer ran on CPU, which is a silent
+	// fallback when an accelerator was requested.
+	// +optional
+	LayersOffloaded *int32 `json:"layersOffloaded,omitempty"`
+
+	// LayersTotal is the model's total layer count. Compared against
+	// LayersOffloaded to express the offload as a fraction (e.g. 63/63).
+	// +optional
+	LayersTotal *int32 `json:"layersTotal,omitempty"`
 }
 
 // +kubebuilder:object:root=true
