@@ -128,7 +128,7 @@ func enforceReviewerGroundedFindings(
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if groundedFindingsDisabled() ||
 		verdict != foremanv1alpha1.AgenticTaskVerdictNoGo ||
-		extra == nil || changedLines == nil {
+		extra == nil {
 		return verdict
 	}
 
@@ -138,6 +138,39 @@ func enforceReviewerGroundedFindings(
 	}
 
 	findings, _ := reviewer.ParseFindings(extra)
+
+	// A rejection carrying NO findings at all is unearned whether or not the
+	// diff is readable: there is nothing to ground, so grounding data cannot
+	// change the answer. This runs BEFORE the changedLines guard on purpose.
+	//
+	// #1570: one upstream failure (the branch diff unavailable at review time)
+	// does two things at once. It starves the reviewer, so it judges from
+	// partial file reads, AND it nils changedLines, which used to no-op this
+	// rail. The safety net was disabled by the same condition that created the
+	// hazard. Observed on wl-1447-review-1447-0, which returned NO-GO with
+	// result.extra = [outcome, transcriptRef, turnCount] -- not one cited line
+	// -- and stood, costing a retry cycle that regenerated correct work.
+	if len(findings) == 0 {
+		extra["groundedFindingDemotion"] = true
+		extra["groundedFindingReason"] =
+			"NO-GO demoted to GO: the rejection cited no findings at all"
+		log.Info("reviewer grounded-finding: NO-GO demoted to GO; rejection cited no findings")
+		return foremanv1alpha1.AgenticTaskVerdictGo
+	}
+
+	// Past this point grounding requires the diff. When it is unavailable the
+	// verdict stands, but say so in extra: a verdict that could not be checked
+	// must be distinguishable afterwards from one that was checked and passed.
+	// Silently returning the model's verdict is what made #1570 hard to see.
+	if changedLines == nil {
+		extra["groundingUnavailable"] = true
+		extra["groundingUnavailableReason"] =
+			"branch diff unavailable; grounded-finding rail could not evaluate this NO-GO"
+		log.Info("reviewer grounded-finding: branch diff unavailable; verdict left unchecked",
+			"findingCount", len(findings))
+		return verdict
+	}
+
 	grounded, ungrounded := groundedBlockingFindings(findings, changedLines)
 
 	if len(grounded) >= 1 {

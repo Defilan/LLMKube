@@ -481,3 +481,72 @@ func TestGroundedBlockingFindings_PathNormalization(t *testing.T) {
 		})
 	}
 }
+
+// --- #1570: the rail must not be disabled by the same failure it guards ---
+//
+// The branch diff being unavailable at review time starves the reviewer AND
+// nils changedLines. Before this fix the nil no-oped the whole rail, so an
+// evidence-free NO-GO stood unchallenged. Observed on wl-1447-review-1447-0.
+
+func TestGroundedFindings_NoFindingsDemotesEvenWithoutDiff(t *testing.T) {
+	// The exact production shape: extra carries no findings key at all, and
+	// the diff is unavailable so changedLines is nil.
+	extra := map[string]any{"outcome": "MODEL-DECIDED", "turnCount": 3}
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("a NO-GO citing no findings is unearned regardless of diff availability; got %s", got)
+	}
+	if demoted, _ := extra["groundedFindingDemotion"].(bool); !demoted {
+		t.Error("demotion must be recorded in extra for auditability")
+	}
+}
+
+func TestGroundedFindings_NoFindingsDemotesWithDiff(t *testing.T) {
+	// Same rejection, diff available: the answer must not depend on that.
+	extra := map[string]any{"outcome": "MODEL-DECIDED"}
+	fix := map[string]map[int]bool{"pkg/cli/cache.go": {42: true}}
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, changed(fix))
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("no-findings NO-GO must demote with the diff too, got %s", got)
+	}
+}
+
+func TestGroundedFindings_UncheckableNoGoIsRecorded(t *testing.T) {
+	// Findings exist but the diff is unavailable, so grounding cannot be
+	// judged. The verdict stands (no overreach) but must be marked so a
+	// verdict that could not be checked is distinguishable afterwards.
+	extra := findingExtra("blocker", "pkg/cli/cache.go", 42)
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("an uncheckable NO-GO carrying findings must stand, got %s", got)
+	}
+	if unavailable, _ := extra["groundingUnavailable"].(bool); !unavailable {
+		t.Error("an unchecked verdict must be marked groundingUnavailable")
+	}
+	if _, demoted := extra["groundedFindingDemotion"]; demoted {
+		t.Error("an uncheckable verdict must not be reported as a demotion")
+	}
+}
+
+func TestGroundedFindings_RejectExemptionSurvivesNilDiff(t *testing.T) {
+	// A do-not-retry rejection stays NO-GO even with no findings and no diff:
+	// the new zero-findings path must not overturn the REJECT exemption.
+	extra := map[string]any{"reviewOutcome": "REJECT"}
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictNoGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("REJECT must stay NO-GO, got %s", got)
+	}
+}
+
+func TestGroundedFindings_GoWithNilDiffUntouched(t *testing.T) {
+	// The rail only ever acts on NO-GO. A GO with no diff is left alone and
+	// must not be marked, or every clean review would carry the flag.
+	extra := map[string]any{"outcome": "MODEL-DECIDED"}
+	got := enforceReviewerGroundedFindings(logr.Discard(), extra, foremanv1alpha1.AgenticTaskVerdictGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("GO must be untouched, got %s", got)
+	}
+	if _, marked := extra["groundingUnavailable"]; marked {
+		t.Error("a GO must not be marked groundingUnavailable")
+	}
+}
