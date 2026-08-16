@@ -105,6 +105,12 @@ type InferenceServiceReconciler struct {
 	// Empty means no shared pool exists and gpuSharing mode shared is
 	// rejected at reconcile time.
 	GPUSharingSharedPool map[string]string
+	// PodLogReader reads a serving pod's container log so the operator can
+	// surface the engine's offload result on status.acceleration (#1385).
+	// Nil leaves status.acceleration unset (the read is advisory and best-
+	// effort); the production operator wires a kubernetes-clientset-backed
+	// reader.
+	PodLogReader PodLogReader
 }
 
 func sanitizeDNSName(name string) string {
@@ -156,6 +162,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods/eviction,verbs=create
+// +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=persistentvolumes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;list;watch
@@ -281,6 +288,13 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	endpoint := r.constructEndpoint(inferenceService, service)
 	phase, schedulingInfo := r.determinePhase(ctx, inferenceService, readyReplicas, desiredReplicas, isMetal, deployment, metalSnap)
+
+	// Surface the engine's offload result before the status write persists it
+	// with the phase. Deployment path only: the metal path runs the engine
+	// natively with no serving pod to read.
+	if !isMetal {
+		r.reconcileAccelerationStatus(ctx, inferenceService)
+	}
 
 	finalResult, statusErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, phase, modelReady, readyReplicas, desiredReplicas, endpoint, "", schedulingInfo)
 	if statusErr != nil {
@@ -552,14 +566,17 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		Spec: deployment.Spec.Template.Spec,
 	}
 
-	// Use annotation-based hash comparison to avoid false positives from
-	// API-server-applied defaults that differ between in-memory and persisted objects.
+	// Use annotation-based hash comparison to detect real changes. A missing
+	// stored hash (a legacy Deployment that predates the annotation) is
+	// treated as changed: draining unnecessarily costs a little latency, while
+	// skipping a needed drain drops in-flight requests. After the first
+	// reconcile the annotation is stamped and the hash path takes over.
 	desiredHash := desiredTemplateHash(desiredPodTemplate)
 	storedHash := ""
 	if existingDeployment.Annotations != nil {
 		storedHash = existingDeployment.Annotations[AnnotationDesiredTemplateHash]
 	}
-	templateChanged := podTemplatesDiffer(existingDeployment.Spec.Template, desiredPodTemplate)
+	templateChanged := true
 	if storedHash != "" {
 		templateChanged = desiredHash != storedHash
 	}

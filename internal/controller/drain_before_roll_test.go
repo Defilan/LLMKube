@@ -405,8 +405,9 @@ var _ = Describe("RolloutPolicy drain-before-rollout", func() {
 			mu.Lock()
 			callsAfterSecond := idleCheckCalled
 			mu.Unlock()
-			// podTemplatesDiffer should report no change for an unchanged InferenceService,
-			// so no idle check should fire on second reconcile.
+			// The stored desired-template-hash matches the freshly computed one,
+			// so no template change is detected and no idle check should fire on
+			// the second reconcile.
 			Expect(callsAfterSecond).To(Equal(callsAfterFirst))
 		})
 
@@ -477,6 +478,83 @@ var _ = Describe("RolloutPolicy drain-before-rollout", func() {
 			calls := idleCheckCalled
 			mu.Unlock()
 			Expect(calls).To(BeNumerically(">", 0))
+		})
+
+		It("should treat a missing desired-template-hash as changed and drain", func() {
+			// A legacy Deployment that predates the annotation has no stored hash.
+			// The reconciler must treat that as changed (assume changed, drain)
+			// rather than unchanged, so the idle check fires on that reconcile.
+			modelName := "model-missing-hash"
+			isvcName := "isvc-missing-hash"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server",
+					RolloutPolicy: &inferencev1alpha1.RolloutPolicySpec{
+						WaitForIdle:        true,
+						IdleTimeoutSeconds: 30,
+						Force:              false,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, isvc) }()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+				RolloutIdleBaseURL: testServer.URL,
+			}
+
+			// First reconcile creates the Deployment and stamps the hash.
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			Expect(dep.Annotations[AnnotationDesiredTemplateHash]).NotTo(BeEmpty())
+
+			// Simulate a legacy Deployment: strip the annotation so the next
+			// reconcile has no stored hash to compare against.
+			delete(dep.Annotations, AnnotationDesiredTemplateHash)
+			Expect(k8sClient.Update(ctx, dep)).To(Succeed())
+
+			mu.Lock()
+			callsBefore := idleCheckCalled
+			mu.Unlock()
+
+			// With no stored hash the template is treated as changed, so the
+			// idle check must fire (drain before roll).
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			mu.Lock()
+			calls := idleCheckCalled
+			mu.Unlock()
+			Expect(calls).To(BeNumerically(">", callsBefore),
+				"missing desired-template-hash must be treated as changed and drain")
 		})
 	})
 
@@ -674,8 +752,9 @@ var _ = Describe("RolloutPolicy drain-before-rollout", func() {
 
 			countBeforeSecond := idleCheckCount
 
-			// Second reconcile: InferenceService spec unchanged, podTemplatesDiffer
-			// should report no change after normalization. No idle check needed.
+			// Second reconcile: InferenceService spec unchanged, the stored
+			// desired-template-hash still matches the freshly computed one, so no
+			// template change is detected. No idle check needed.
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
 			})
@@ -797,49 +876,6 @@ var _ = Describe("RolloutPolicy drain-before-rollout", func() {
 			}
 			Expect(isvc.ShouldDeferRollout()).To(BeTrue())
 		})
-	})
-})
-
-var _ = Describe("podTemplatesDiffer input immutability (#922)", func() {
-	newPrepTemplate := func() corev1.PodTemplateSpec {
-		root := int64(0)
-		return corev1.PodTemplateSpec{
-			Spec: corev1.PodSpec{
-				InitContainers: []corev1.Container{{
-					Name:  "model-cache-prep",
-					Image: "curl:8.18.0",
-					SecurityContext: &corev1.SecurityContext{
-						RunAsUser: &root,
-						Capabilities: &corev1.Capabilities{
-							Add:  []corev1.Capability{"CHOWN", "FOWNER"},
-							Drop: []corev1.Capability{"ALL"},
-						},
-					},
-				}},
-			},
-		}
-	}
-
-	It("does not mutate the desired template's init container SecurityContext", func() {
-		desired := newPrepTemplate()
-		existing := newPrepTemplate()
-		// A rollout-worthy difference so the function runs its full
-		// normalization path before returning.
-		existing.Spec.InitContainers[0].Image = "curl:8.17.0"
-
-		changed := podTemplatesDiffer(existing, desired)
-
-		Expect(changed).To(BeTrue(), "an image change should still be detected")
-		sc := desired.Spec.InitContainers[0].SecurityContext
-		Expect(sc).NotTo(BeNil())
-		Expect(sc.RunAsUser).NotTo(BeNil(), "RunAsUser must survive the diff (see #922)")
-		Expect(*sc.RunAsUser).To(Equal(int64(0)))
-		Expect(sc.Capabilities).NotTo(BeNil())
-		Expect(sc.Capabilities.Add).To(ContainElement(corev1.Capability("CHOWN")))
-	})
-
-	It("reports no difference for identical templates", func() {
-		Expect(podTemplatesDiffer(newPrepTemplate(), newPrepTemplate())).To(BeFalse())
 	})
 })
 

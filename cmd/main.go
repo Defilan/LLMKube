@@ -36,8 +36,10 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -70,6 +72,32 @@ func init() {
 	utilruntime.Must(inferencev1alpha1.AddToScheme(scheme))
 	utilruntime.Must(federationv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
+}
+
+// clientsetPodLogReader reads a serving pod's container log through the
+// kubernetes clientset. It backs controller.PodLogReader in the production
+// operator so the engine's offload result can be surfaced on
+// status.acceleration (#1385).
+type clientsetPodLogReader struct {
+	cs kubernetes.Interface
+}
+
+// ReadPodLogs tails a ready container's log. Errors are returned verbatim so
+// the reconcile path can treat a failed read as "unknown" without clobbering
+// a previously-observed acceleration.
+func (r *clientsetPodLogReader) ReadPodLogs(
+	ctx context.Context,
+	namespace, podName, containerName string,
+	tailLines int64,
+) (string, error) {
+	stream, err := r.cs.CoreV1().Pods(namespace).GetLogs(podName, &v1.PodLogOptions{
+		Container: containerName,
+		TailLines: &tailLines,
+	}).DoRaw(ctx)
+	if err != nil {
+		return "", err
+	}
+	return string(stream), nil
 }
 
 // initTracer initializes an OTLP trace exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set.
@@ -396,7 +424,8 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgrCfg := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(mgrCfg, ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -419,6 +448,16 @@ func main() {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+
+	// A clientset for pod-log reads, backing the offload surface on
+	// status.acceleration (#1385). The controller-runtime client cannot read
+	// pod logs, so build a thin clientset for that single verb.
+	k8sClientset, err := kubernetes.NewForConfig(mgrCfg)
+	if err != nil {
+		setupLog.Error(err, "unable to build clientset for offload log reads")
+		os.Exit(1)
+	}
+	podLogReader := &clientsetPodLogReader{cs: k8sClientset}
 
 	if err := (&controller.ModelReconciler{
 		Client:               mgr.GetClient(),
@@ -453,6 +492,7 @@ func main() {
 		AllowedHostPathRoots:  allowedHostPathRootList,
 		GPUSharingSharedPool:  gpuSharingSharedPool,
 		RuntimeImageOverrides: runtimeImageOverrides,
+		PodLogReader:          podLogReader,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
 		os.Exit(1)

@@ -236,6 +236,16 @@ spec:
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
+              maxConcurrentTasks:
+                description: |-
+                  MaxConcurrentTasks bounds how many of this Agent's tasks may be in
+                  flight at once. When set, the AgenticTask controller does not claim
+                  an (N+1)th task for this Agent until one of its in-flight tasks
+                  completes; excess tasks stay Pending for the next pass. Unset means
+                  unbounded (today's behavior).
+                format: int32
+                minimum: 1
+                type: integer
               maxEnvtestIterations:
                 description: |-
                   MaxEnvtestIterations bounds how many times the executor re-runs a

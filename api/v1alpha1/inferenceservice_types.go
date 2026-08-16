@@ -66,14 +66,17 @@ type SpeculativeDecodingType string
 
 // SpeculativeDecodingSpec configures speculative decoding for the llama.cpp
 // runtime. It maps to --spec-type (Type), --spec-draft-n-max (NDraftMax),
-// --spec-draft-p-min (PMin) and -md (DraftModelRef). Only the "llamacpp"
-// runtime supports this field; other runtimes must not set it.
+// --spec-draft-p-min (PMin) and -md (DraftModelRef / DraftModel). Only the
+// "llamacpp" runtime supports this field; other runtimes must not set it.
 //
-// The draft-model types need weights and so require DraftModelRef. draft-mtp
-// does not: MTP is self-speculation carried by the target model itself. The
-// ngram-* family speculates from the prompt and likewise needs no weights.
-// +kubebuilder:validation:XValidation:rule="!(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark']) || (has(self.draftModelRef) && self.draftModelRef.size() > 0)",message="this speculative decoding type needs draft weights: set draftModelRef to a Model in the same namespace"
-// +kubebuilder:validation:XValidation:rule="(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark','draft-mtp']) || !has(self.draftModelRef) || self.draftModelRef.size() == 0",message="draftModelRef is only valid for the draft-model types (draft-simple, draft-eagle3, draft-dflash, draft-dspark, draft-mtp); the ngram types need no draft weights"
+// The draft-model types need weights and so require exactly one of DraftModelRef
+// (a separate Model CR) or DraftModel (a companion file staged alongside the
+// target in Model.files). draft-mtp does not require weights: MTP is
+// self-speculation carried by the target model itself. The ngram-* family
+// speculates from the prompt and likewise needs no weights.
+// +kubebuilder:validation:XValidation:rule="!(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark']) || ((has(self.draftModelRef) && self.draftModelRef.size() > 0) || (has(self.draftModel) && self.draftModel.size() > 0))",message="this speculative decoding type needs draft weights: set draftModelRef to a Model in the same namespace, or draftModel to a file in Model.files"
+// +kubebuilder:validation:XValidation:rule="(self.type in ['draft','draft-simple','draft-eagle3','draft-dflash','draft-dspark','draft-mtp']) || ((!has(self.draftModelRef) || self.draftModelRef.size() == 0) && (!has(self.draftModel) || self.draftModel.size() == 0))",message="draft weights (draftModelRef or draftModel) are only valid for the draft-model types (draft-simple, draft-eagle3, draft-dflash, draft-dspark, draft-mtp); the ngram types need no draft weights"
+// +kubebuilder:validation:XValidation:rule="!((has(self.draftModelRef) && self.draftModelRef.size() > 0) && (has(self.draftModel) && self.draftModel.size() > 0))",message="set only one of draftModelRef (a separate Model CR) and draftModel (a file in Model.files), not both"
 type SpeculativeDecodingSpec struct {
 	// Type is the speculative decoding method (--spec-type). The aliases map
 	// as: "mtp" to draft-mtp, "draft" to draft-simple, and "disabled" to no
@@ -82,7 +85,8 @@ type SpeculativeDecodingSpec struct {
 
 	// DraftModelRef names the Model CR holding the draft weights, resolved in
 	// the InferenceService's own namespace and mounted into the serving pod
-	// alongside the target model. Required for the draft-model types.
+	// alongside the target model. Required for the draft-model types when the
+	// drafter ships as its own model rather than a companion file.
 	//
 	// Deliberately a Model reference rather than the raw in-container path
 	// SGLang's block uses (SpeculativeConfig.DraftModelPath): the operator
@@ -90,6 +94,22 @@ type SpeculativeDecodingSpec struct {
 	// has no readiness to gate on.
 	// +optional
 	DraftModelRef string `json:"draftModelRef,omitempty"`
+
+	// DraftModel names a file already present in the target model's spec.files
+	// that holds the draft weights (e.g. the dflash-kquant.gguf companion
+	// drafter Meta ships next to the main GGUF for Muse Glimmer). The operator
+	// resolves its staged in-container path the same way it does for
+	// Model.mmproj and passes it to llama.cpp as -md, so the manifest never
+	// has to name a content-hash cache directory that is unknowable before the
+	// first reconcile and moves whenever the file set changes (#1495).
+	//
+	// Use DraftModel when the drafter is a companion file in the same Model and
+	// DraftModelRef when it is a separate Model CR; the two are mutually
+	// exclusive.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +optional
+	DraftModel string `json:"draftModel,omitempty"`
 
 	// NDraftMax is the maximum number of draft tokens to propose per step
 	// (--spec-draft-n-max). Only emitted when set; llama.cpp uses its own default
@@ -1257,6 +1277,18 @@ type TGIConfig struct {
 
 // InferenceServiceStatus defines the observed state of InferenceService.
 type InferenceServiceStatus struct {
+	// Acceleration reports the offload result the serving engine (llama.cpp)
+	// produced at load time: which device actually served the model and how
+	// many of its layers were offloaded onto it. This makes a silent CPU
+	// fallback visible in the API: a service that requested an accelerator but
+	// ended up with zero offloaded layers is otherwise indistinguishable from
+	// a healthy GPU service in status. Optional and additive: an absent value
+	// means the offload result is unknown (e.g. CPU-only serving or a runtime
+	// that does not report it).
+	// +optional
+	// +kubebuilder:validation:Optional
+	Acceleration *AccelerationStatus `json:"acceleration,omitempty"`
+
 	// Phase represents the current lifecycle phase of the InferenceService.
 	// Possible values: Pending, Creating, Progressing, Ready, WaitingForGPU,
 	// Stopped, Suspended, Failed. Stopped is the terminal state when
@@ -1371,6 +1403,32 @@ type GatewayStatus struct {
 	// ModelRouter dataPlane: Gateway path; false when no auth is configured.
 	// +optional
 	AuthEnabled bool `json:"authEnabled,omitempty"`
+}
+
+// AccelerationStatus reports the offload result the serving engine produced
+// at load time. llama.cpp logs the device it assigned and how many layers it
+// offloaded onto that device; the operator reads that at readiness and stamps
+// it here so a silent CPU fallback (Ready while every layer runs on CPU) is
+// visible in the API. It is additive and optional: an absent block means the
+// offload result is unknown (CPU-only serving or a runtime that does not
+// report it).
+type AccelerationStatus struct {
+	// Device is the device that served the model, as the engine reported it,
+	// e.g. "Vulkan0 (AMD Radeon 8060S)" or "CPU". Empty when the offload
+	// result is unknown.
+	// +optional
+	Device string `json:"device,omitempty"`
+
+	// LayersOffloaded is how many of the model's layers the engine offloaded
+	// onto an accelerator. 0 means every layer ran on CPU, which is a silent
+	// fallback when an accelerator was requested.
+	// +optional
+	LayersOffloaded *int32 `json:"layersOffloaded,omitempty"`
+
+	// LayersTotal is the model's total layer count. Compared against
+	// LayersOffloaded to express the offload as a fraction (e.g. 63/63).
+	// +optional
+	LayersTotal *int32 `json:"layersTotal,omitempty"`
 }
 
 // +kubebuilder:object:root=true

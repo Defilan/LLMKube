@@ -113,4 +113,45 @@ var _ = Describe("speculativeDecoding CRD validation", func() {
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
+
+	// draftModel is the file-based draft path (#1495): a companion file in
+	// Model.files (e.g. a dflash drafter) rather than a separate Model CR.
+	It("admits a draft-model type with a draftModel file", func() {
+		isvc := newSpecISvc("sd-dflash-file", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type:       "draft-dflash",
+			DraftModel: "dflash-kquant.gguf",
+		})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+
+	It("rejects a draft-model type with neither draftModelRef nor draftModel", func() {
+		isvc := newSpecISvc("sd-dflash-nodeither", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type: "draft-dflash",
+		})
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("needs draft weights"))
+	})
+
+	It("rejects setting both draftModelRef and draftModel", func() {
+		isvc := newSpecISvc("sd-dflash-both", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type:          "draft-dflash",
+			DraftModelRef: "dflash-model",
+			DraftModel:    "dflash-kquant.gguf",
+		})
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("only one of"))
+	})
+
+	It("rejects a draftModel file on a type that needs no draft weights", func() {
+		isvc := newSpecISvc("sd-ngram-file", &inferencev1alpha1.SpeculativeDecodingSpec{
+			Type:       "ngram-cache",
+			DraftModel: "dflash.gguf",
+		})
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("only valid for the draft-model types"))
+	})
 })

@@ -401,19 +401,19 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 	}
 
 	branch := branchNameForTask(task)
+	// Resolve the clone+push target ONCE so every downstream caller — the
+	// clone itself, the deterministic gate path, the post-push envtest gate,
+	// and PR opening — uses the SAME repository the Workload asked for
+	// (#1464). Precedence: payload.repo wins when set (a single agent serves
+	// many repos instead of being pinned to one --git-remote-url); the
+	// statically configured fork remote is the fallback, and stays the target
+	// when it is a fork of payload.repo (same repo name, different owner): the
+	// fork deployment pushes to the fork, not upstream (#915).
+	cloneURL := ""
 	if needsRepo {
-		// Clone target: the statically configured fork remote when set,
-		// otherwise the task's own repo (#915). Deriving the clone+push
-		// target from payload.repo lets a single agent serve many repos
-		// instead of being pinned to one --git-remote-url; the branch
-		// still pushes to this clone's origin, which in that case is the
-		// task's repo itself.
-		cloneURL := e.GitRemoteURL
-		if cloneURL == "" {
-			cloneURL = resolveUpstream(task.Spec.Payload.Repo)
-		}
-		if msg := crossProjectRemoteMismatch(e.GitRemoteURL, task.Spec.Payload.Repo); msg != "" {
-			return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured, msg), nil
+		cloneURL = resolveUpstream(task.Spec.Payload.Repo)
+		if cloneURL == "" || isForkOf(e.GitRemoteURL, task.Spec.Payload.Repo) {
+			cloneURL = e.GitRemoteURL
 		}
 		if cloneURL == "" {
 			return e.failResult(start, foremanv1alpha1.FailureGitRemoteNotConfigured,
@@ -452,13 +452,13 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 	// first tool directly with the task payload as JSON arguments. The
 	// gate Agent uses this; M5+ reviewer agents use the LLM path.
 	if deterministic {
-		return e.executeDeterministic(ctx, task, &agent, branch, registry, start), nil
+		return e.executeDeterministic(ctx, task, &agent, branch, registry, cloneURL, start), nil
 	}
 
 	// 6+. LLM-driven path: extracted to keep Execute below the
 	// cyclomatic-complexity threshold. runLLMPath owns OAI + loop +
 	// transcript + commit/push.
-	return e.runLLMPath(ctx, task, &agent, endpoint, workspace, branch, registry, auth, needsRepo, start)
+	return e.runLLMPath(ctx, task, &agent, endpoint, workspace, branch, registry, auth, needsRepo, cloneURL, start)
 }
 
 // setupTaskBranch cuts the task's working branch in the freshly cloned
@@ -631,6 +631,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	registry ToolRegistry,
 	auth *repo.Auth,
 	needsRepo bool,
+	cloneURL string,
 	start time.Time,
 ) (*Result, error) {
 	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
@@ -813,6 +814,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// instead of resolving and shelling out for them a second time.
 		var reviewBase string
 		var reviewDiff []string
+		// reviewerErrorReason carries the ModelReportedError a reviewer rail
+		// remapped into an ERROR verdict (#1552); attached to the Result after
+		// modelDecidedResult so the branch routes to a human.
+		var reviewerErrorReason foremanv1alpha1.AgenticTaskFailureReason
 		if agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer &&
 			loopRes.Terminal != nil {
 			// Ground-truth filesTouched against the actual diff before
@@ -841,6 +846,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// below (grounded-finding + scope-overlap).
 			var reviewDiffErr error
 			reviewDiff, reviewDiffErr = repo.DiffNameOnly(ctx, workspace, reviewBase)
+			// Empty-claim rail (#1552): an unsupported branch-emptiness /
+			// unreadability NO-GO (contradicted by a non-empty ground-truth
+			// diff, with no grounded finding) is remapped to ERROR so it
+			// routes to a human instead of burning review iterations. Runs
+			// BEFORE the grounded-finding demote rail, which would otherwise
+			// turn the ungrounded NO-GO into GO and defeat the remap.
+			verdict, reviewerErrorReason = runEmptyClaimRail(ctx, log, workspace,
+				reviewBase, reviewDiff, reviewDiffErr, loopRes.Terminal.Extra,
+				loopRes.Terminal.Summary, verdict)
 			// Grounded-finding rail: a NO-GO must be earned by >=1 blocking
 			// finding citing a line the diff changed; otherwise demote it to GO
 			// and archive the rejected findings. Mirror of scope-overlap, in the
@@ -891,7 +905,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// record it under r.Extra. Coder-role only (reviewers are read-only).
 		e.maybePreserveGateFailedBranch(ctx, log, agent, task, workspace, branch, auth, loopRes, r)
 		e.maybeOpenPullRequest(ctx, log, task, auth, verdict, r,
-			workspace, reviewBase, reviewDiff)
+			workspace, reviewBase, reviewDiff, cloneURL)
 		// Attach the normalized failure reason from the model-to-CRD
 		// mapping (e.g. ERROR→INCOMPLETE + ModelReportedError for #649). Only
 		// set when the normalizer produced a reason AND the result does
@@ -899,8 +913,12 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// modelDecidedResult() and here sets r.FailureReason today, but
 		// future reason-setting paths (e.g. additional enforcement passes)
 		// should not be silently clobbered.
-		if normalizedReason != "" && r.FailureReason == "" {
-			r.FailureReason = normalizedReason
+		if r.FailureReason == "" {
+			if reviewerErrorReason != "" {
+				r.FailureReason = reviewerErrorReason
+			} else if normalizedReason != "" {
+				r.FailureReason = normalizedReason
+			}
 		}
 		return r, nil
 	}
@@ -939,7 +957,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// coder with feedback.
 		settled, done, feedback := e.postPushGateDecision(
 			ctx, envtestTouched, task, branch, sha, attempt, maxEnvtestIters,
-			start, transcriptRef, loopRes, gateAdvisories)
+			start, transcriptRef, loopRes, gateAdvisories, cloneURL)
 		if settled {
 			break
 		}
@@ -969,7 +987,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		verdict, normReason := normalizeModelVerdict(loopRes.Terminal.Verdict)
 		if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
 			return e.retryCoderTerminalResult(ctx, log, agent, task,
-				workspace, branch, auth, start, transcriptRef, loopRes, verdict, normReason), nil
+				workspace, branch, auth, start, transcriptRef, loopRes, verdict, normReason, cloneURL), nil
 		}
 	}
 
@@ -1018,12 +1036,12 @@ func (e *NativeAgentLoopExecutor) postPushGateDecision(
 	ctx context.Context, envtestTouched bool, task *foremanv1alpha1.AgenticTask,
 	branch, sha string, attempt, maxEnvtestIters int,
 	start time.Time, transcriptRef corev1.ObjectReference, loopRes *LoopResult,
-	gateAdvisories *[]advisory,
+	gateAdvisories *[]advisory, cloneURL string,
 ) (settled bool, done *Result, feedback string) {
 	gate, fb := evaluatePostPushEnvtest(
 		ctx, envtestTouched, e.EnvtestJobRunner,
 		task.Namespace, task.Name,
-		task.Spec.Payload.Repo, branch, e.GitRemoteURL,
+		task.Spec.Payload.Repo, branch, cloneURL,
 	)
 	if gate == envtestGateOK || (gate == envtestGateUnverified && attempt == 0) {
 		return true, nil, ""
@@ -1138,6 +1156,17 @@ func (e *NativeAgentLoopExecutor) commitPushAttempt(
 		return sha, envtestTouched, e.pushFailedResult(start, tref, lr, branch, sha, err)
 	}
 
+	// Assert-after-push guard (#1464): the branch must have landed on the
+	// repository the Workload asked for, not an unrelated one the static
+	// --git-remote-url happened to name. The clone+push target is derived
+	// from payload.repo above, so this is a belt-and-suspenders check that
+	// the push remote matches the task's repo when both are known. A push
+	// to an unexpected repository must never be reportable as GO.
+	if msg := pushedRemoteMismatch(ctx, workspace, task.Spec.Payload.Repo); msg != "" {
+		return sha, envtestTouched, e.pushFailedResult(start, tref, lr, branch, sha,
+			fmt.Errorf("%s", msg))
+	}
+
 	return sha, envtestTouched, nil
 }
 
@@ -1179,13 +1208,14 @@ func (e *NativeAgentLoopExecutor) retryCoderTerminalResult(
 	workspace, branch string, auth *repo.Auth,
 	start time.Time, tref corev1.ObjectReference, lr *LoopResult,
 	verdict foremanv1alpha1.AgenticTaskVerdict, normReason foremanv1alpha1.AgenticTaskFailureReason,
+	cloneURL string,
 ) *Result {
 	r := e.modelDecidedResult(start, tref, lr, verdict)
 	e.maybePreserveGateFailedBranch(ctx, log, agent, task, workspace, branch, auth, lr, r)
 	// No reviewer rails ran on this path, so there is no resolved review base
 	// to ground the summary against; #1411's check degrades open on the empty
 	// base rather than grounding against a base it had to guess at.
-	e.maybeOpenPullRequest(ctx, log, task, auth, verdict, r, workspace, "", nil)
+	e.maybeOpenPullRequest(ctx, log, task, auth, verdict, r, workspace, "", nil, cloneURL)
 	if normReason != "" && r.FailureReason == "" {
 		r.FailureReason = normReason
 	}
@@ -1444,6 +1474,7 @@ func (e *NativeAgentLoopExecutor) executeDeterministic(
 	agent *foremanv1alpha1.Agent,
 	branch string,
 	registry ToolRegistry,
+	cloneURL string,
 	start time.Time,
 ) *Result {
 	toolName := pickDeterministicTool(agent.Spec.Tools)
@@ -1455,11 +1486,11 @@ func (e *NativeAgentLoopExecutor) executeDeterministic(
 	// The task payload becomes the tool's arguments. For the gate
 	// Agent's run_gate_job tool, this means {repo, branch, checks,
 	// cloneURL} surface from spec.payload via well-known fields. The
-	// cloneURL override carries the executor's --git-remote-url so the
-	// gate Job clones from the fork the upstream coder pushed to,
-	// rather than the upstream payload.repo where the branch does not
-	// yet exist.
-	args := buildDeterministicArgs(task, branch, e.GitRemoteURL)
+	// cloneURL override carries the resolved clone+push target (the
+	// repository the Workload asked for, #1464) so the gate Job clones
+	// from the same repo the coder pushed to, rather than the upstream
+	// payload.repo where the branch does not yet exist.
+	args := buildDeterministicArgs(task, branch, cloneURL)
 
 	result, dispatchErr := registry.Dispatch(ctx, toolName, args)
 	if dispatchErr != nil {
@@ -1526,13 +1557,13 @@ func pickDeterministicTool(tools []string) string {
 // {repo, branch, cloneURL} from this; other deterministic tools can
 // extend the shape as needed.
 //
-// cloneURL is the executor's --git-remote-url passed through verbatim.
-// When set, the gate Job clones from this URL instead of constructing
-// one from CloneURLBase + payload.repo. v0.1 needs this because the
-// upstream coder task pushes to a fork (the foreman-agent's
-// --git-remote-url) and the gate must verify that branch on the fork,
-// not on the upstream payload.repo where the branch does not yet
-// exist. Empty cloneURL preserves the M4 default (upstream + repo).
+// cloneURL is the resolved clone+push target (the repository the Workload
+// asked for, #1464). When set, the gate Job clones from this URL instead of
+// constructing one from CloneURLBase + payload.repo. v0.1 needs this because
+// the upstream coder task pushes to a fork (the foreman-agent's
+// --git-remote-url) and the gate must verify that branch on the fork, not on
+// the upstream payload.repo where the branch does not yet exist. Empty
+// cloneURL preserves the M4 default (upstream + repo).
 func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL string) json.RawMessage {
 	// Resolve once. Resolve() is nil-safe: a nil GateProfile yields the go
 	// preset (image golang:1.26, the make-target checks), so a Go task stays
@@ -1860,7 +1891,7 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 	ctx context.Context, log logr.Logger,
 	task *foremanv1alpha1.AgenticTask, auth *repo.Auth,
 	verdict foremanv1alpha1.AgenticTaskVerdict, r *Result,
-	workspace, reviewBase string, reviewDiff []string,
+	workspace, reviewBase string, reviewDiff []string, cloneURL string,
 ) {
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo ||
 		task.Spec.Kind != foremanv1alpha1.AgenticTaskKindReview ||
@@ -1869,7 +1900,7 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	if prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body); prErr != nil {
+	if prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, cloneURL); prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
 			"repo", task.Spec.Payload.Repo, "branch", task.Spec.Payload.Branch)
 		r.Extra["pullRequestError"] = prErr.Error()
@@ -1936,7 +1967,7 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 // owner — or one that is not an owner/repo-shaped URL at all (local
 // paths in tests) — keeps the same-repo shape.
 func (e *NativeAgentLoopExecutor) openPullRequest(
-	ctx context.Context, task *foremanv1alpha1.AgenticTask, auth *repo.Auth, workspace, summaryBody string,
+	ctx context.Context, task *foremanv1alpha1.AgenticTask, auth *repo.Auth, workspace, summaryBody, cloneURL string,
 ) (string, error) {
 	p := task.Spec.Payload
 	owner, _, ok := codehost.SplitRepoSlug(p.Repo)
@@ -1944,12 +1975,18 @@ func (e *NativeAgentLoopExecutor) openPullRequest(
 		return "", fmt.Errorf("openPullRequest: payload.repo %q is not a valid repo slug", p.Repo)
 	}
 	ch := e.codeHost(authToken(auth))
-	// The coder pushed the branch to e.GitRemoteURL, which may be a fork of
-	// payload.repo. For a cross-fork PR the head is qualified "forkOwner:branch"
-	// and the head commit is read from the fork (headSlug), where the ref lives.
+	// The coder pushed the branch to the resolved clone+push target, which may
+	// be a fork of payload.repo. For a cross-fork PR the head is qualified
+	// "forkOwner:branch" and the head commit is read from the fork (headSlug),
+	// where the ref lives. cloneURL is the resolved target; when it is empty
+	// (e.g. a caller that did not resolve one) fall back to the static
+	// --git-remote-url so the fork deployment keeps working.
+	if cloneURL == "" {
+		cloneURL = e.GitRemoteURL
+	}
 	head := p.Branch
 	headSlug := p.Repo
-	if forkOwner, forkRepo := gitRemoteOwnerRepo(e.GitRemoteURL); forkOwner != "" &&
+	if forkOwner, forkRepo := gitRemoteOwnerRepo(cloneURL); forkOwner != "" &&
 		!strings.EqualFold(forkOwner, owner) {
 		head = forkOwner + ":" + p.Branch
 		headSlug = forkOwner + "/" + forkRepo
@@ -2468,26 +2505,41 @@ var cloneURLResolver codehost.CodeHost = codehost.NewGitHubCodeHost(nil)
 // with or without the .git suffix. Anything else (local paths, file://
 // remotes used in tests, bare hosts) yields "", "" so callers fall back
 // to same-repo behavior.
-// crossProjectRemoteMismatch reports why a static --git-remote-url must not be
-// used for this task, or "" when it is fine (#1464).
-//
-// The fork deployment is legitimate and must keep working: --git-remote-url
-// names a fork of payload.repo, so the OWNER differs while the repo NAME is the
-// same (defilantech/LLMKube -> Defilan/LLMKube). A differing repo NAME is never
-// a fork relationship. It is a misconfiguration whose consequences are silent:
-// the coder reads the right issue, does correct work, pushes it into an
-// unrelated repository, and reports GO. Nothing downstream notices, because the
-// reviewer is handed the same wrong remote.
-//
-// Compared on names rather than by asking the codehost whether one repo is a
-// fork of the other: that would be a network call on every task and
-// provider-specific, while the name comparison already separates "fork of the
-// same project" from "entirely different project".
-//
-// Returns "" for remotes that are not owner/repo shaped (local bare-repo paths
-// in tests), so the guard cannot fire on them.
-func crossProjectRemoteMismatch(remoteURL, taskRepo string) string {
+// isForkOf reports whether remoteURL names a fork of taskRepo: the repo NAME
+// matches (case-insensitively) while the OWNER may differ. A fork shares the
+// repo name by definition, so a name match is the fork relationship; a name
+// mismatch is an unrelated repository (#1464). Returns false for remotes that
+// are not owner/repo shaped (local bare-repo paths in tests) or when either
+// input is empty, so the fork deployment and the multi-repo mode both fall
+// through to the normal precedence.
+func isForkOf(remoteURL, taskRepo string) bool {
 	if remoteURL == "" || taskRepo == "" {
+		return false
+	}
+	_, remoteName := gitRemoteOwnerRepo(remoteURL)
+	if remoteName == "" {
+		return false
+	}
+	_, taskName, ok := codehost.SplitRepoSlug(taskRepo)
+	if !ok {
+		return false
+	}
+	return strings.EqualFold(remoteName, taskName)
+}
+
+// pushedRemoteMismatch reports why the branch's push remote does not match the
+// task's payload.repo, or "" when it does (or cannot be determined). It reads
+// the workspace's origin URL after a push and compares its repo name against
+// the task's repo name, so a push that landed in an unrelated repository is
+// caught even though git push exited 0 (#1464). Returns "" when the remote is
+// not owner/repo shaped (local bare-repo paths in tests) or when either side is
+// empty, so the multi-repo and fork deployments are not falsely flagged.
+func pushedRemoteMismatch(ctx context.Context, workspace, taskRepo string) string {
+	if taskRepo == "" {
+		return ""
+	}
+	remoteURL, err := repo.RemoteURL(ctx, workspace, "origin")
+	if err != nil {
 		return ""
 	}
 	_, remoteName := gitRemoteOwnerRepo(remoteURL)
@@ -2499,10 +2551,9 @@ func crossProjectRemoteMismatch(remoteURL, taskRepo string) string {
 		return ""
 	}
 	return fmt.Sprintf(
-		"--git-remote-url names repository %q but the task targets %q; a fork must "+
-			"share the repo name (only the owner differs). Refusing to clone and push "+
-			"work for %q into %q",
-		remoteName, taskRepo, taskRepo, remoteName)
+		"pushed branch to repository %q but the task targets %q; a push to an "+
+			"unexpected repository must not be reported as GO",
+		remoteName, taskRepo)
 }
 
 func gitRemoteOwnerRepo(remoteURL string) (owner, name string) {

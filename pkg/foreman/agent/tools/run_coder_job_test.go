@@ -21,12 +21,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -458,6 +461,59 @@ func TestRunCoderJob_GitRemoteFlowsThroughRun(t *testing.T) {
 	}
 }
 
+// TestRunCoderJob_FiresOnJobCreatedAfterCreate asserts the submitter fires
+// the on-job-created hook the moment the Job exists (after Client.Create,
+// before it blocks polling for terminal status), with the created Job's
+// name (#1535). This is the seam the executor's OnJobCreated relies on to
+// stamp status.jobName while the task is running; without it the field would
+// only be set at completion.
+func TestRunCoderJob_FiresOnJobCreatedAfterCreate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	jobName := "foreman-coder-callback"
+	c := fake.NewClientBuilder().
+		WithScheme(gateScheme(t)).
+		WithStatusSubresource(&batchv1.Job{}).
+		Build()
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	var mu sync.Mutex
+	var called bool
+	var gotName string
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn:    func(context.Context, string, string) string { return "" },
+		},
+	}
+	_, err := tool.Run(ctx, RunCoderJobArgs{
+		TaskName:      "callback",
+		TaskNamespace: "default",
+		OnJobCreated: func(_ context.Context, name string) {
+			mu.Lock()
+			called = true
+			gotName = name
+			mu.Unlock()
+		},
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !called {
+		t.Fatalf("on-job-created hook was not fired; status.jobName could not be stamped while running (#1535)")
+	}
+	if gotName != jobName {
+		t.Errorf("hook job name = %q, want %q", gotName, jobName)
+	}
+}
+
 // TestRenderCoderJob_AppliesResources asserts CoderJobRequest-supplied
 // resources land on the container, and that the gate-matching defaults
 // apply when the renderer input carries the default strings (#620 N1).
@@ -837,6 +893,143 @@ func TestCoderJobNamePreservesUniquenessSuffixWhenTruncated(t *testing.T) {
 	}
 	if n1 == n2 {
 		t.Fatalf("two submissions of the same long task name collide: %q", n1)
+	}
+}
+
+// TestRenderCoderJob_OwnerReference asserts a supplied OwnerReference is
+// stamped onto the rendered Job's ownerReferences so Kubernetes GC reclaims
+// the Job (and its pods) when the owning AgenticTask is deleted (#1535).
+func TestRenderCoderJob_OwnerReference(t *testing.T) {
+	job, err := renderCoderJob(coderRendererInput{
+		Name:                  "foreman-coder-ownerref",
+		Namespace:             "foreman-system",
+		Image:                 "img",
+		TaskName:              "ownerref",
+		TaskNamespace:         "default",
+		ActiveDeadlineSeconds: 3600,
+		CPURequest:            "2",
+		CPULimit:              "4",
+		MemRequest:            "4Gi",
+		MemLimit:              "8Gi",
+		GitCredentialsSecret:  "foreman-git-credentials",
+		OwnerReference: &metav1.OwnerReference{
+			APIVersion: "foreman.llmkube.dev/v1alpha1",
+			Kind:       "AgenticTask",
+			Name:       "ownerref",
+			UID:        "task-uid-123",
+		},
+	})
+	if err != nil {
+		t.Fatalf("renderCoderJob: %v", err)
+	}
+	if len(job.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 ownerReference; got %#v", job.OwnerReferences)
+	}
+	ref := job.OwnerReferences[0]
+	if ref.Kind != "AgenticTask" || ref.Name != "ownerref" || ref.UID != "task-uid-123" {
+		t.Errorf("ownerReference mismatch: %#v", ref)
+	}
+	if ref.APIVersion != "foreman.llmkube.dev/v1alpha1" {
+		t.Errorf("ownerReference apiVersion: %q", ref.APIVersion)
+	}
+}
+
+// TestRunCoderJob_ReDispatchReapsPreviousJob asserts that when a task is
+// re-dispatched, the previous Job for the same task (matched by the
+// foreman.llmkube.dev/task-name label) is deleted before the new one is
+// created, so exactly one Job per AgenticTask is active at any time (#1535).
+func TestRunCoderJob_ReDispatchReapsPreviousJob(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+
+	// Seed a previous Job for the same task, still active.
+	oldJob := &batchv1.Job{}
+	oldJob.Name = "foreman-coder-task-old"
+	oldJob.Namespace = "foreman-system"
+	oldJob.Labels = map[string]string{taskNameLabel: "task"}
+	if err := c.Create(ctx, oldJob); err != nil {
+		t.Fatalf("seed previous Job: %v", err)
+	}
+
+	jobName := "foreman-coder-task-new"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn:    func(context.Context, string, string) string { return "" },
+		},
+	}
+	if _, err := tool.Run(ctx, RunCoderJobArgs{TaskName: "task", TaskNamespace: "default"}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// The previous Job must be gone.
+	var old batchv1.Job
+	oldKey := types.NamespacedName{Namespace: "foreman-system", Name: "foreman-coder-task-old"}
+	if err := c.Get(ctx, oldKey, &old); err == nil {
+		t.Errorf("previous Job should have been reaped; still present: %#v", old)
+	} else if !apierrors.IsNotFound(err) {
+		t.Errorf("Get previous Job: %v", err)
+	}
+
+	// The new Job must exist.
+	var new batchv1.Job
+	if err := c.Get(ctx, key, &new); err != nil {
+		t.Fatalf("new Job should exist: %v", err)
+	}
+}
+
+// TestRunCoderJob_OwnerReferenceFlowsThroughRun asserts the executor's
+// CoderJobRequest.OwnerReference reaches the rendered Job's ownerReferences
+// via Submit (#1535).
+func TestRunCoderJob_OwnerReferenceFlowsThroughRun(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-coder-ownerflow"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+	go flipStatusOnce(ctx, c, key, 1, 0)
+
+	tool := &RunCoderJob{
+		Client: c,
+		Cfg: RunCoderJobConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn:    func(context.Context, string, string) string { return "" },
+		},
+	}
+	req := foremanagent.CoderJobRequest{
+		TaskName:      "ownerflow",
+		TaskNamespace: "default",
+		OwnerReference: &metav1.OwnerReference{
+			APIVersion: "foreman.llmkube.dev/v1alpha1",
+			Kind:       "AgenticTask",
+			Name:       "ownerflow",
+			UID:        "task-uid-456",
+		},
+	}
+	if _, err := tool.Submit(ctx, req); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	var job batchv1.Job
+	if err := c.Get(ctx, key, &job); err != nil {
+		t.Fatalf("Job should exist: %v", err)
+	}
+	if len(job.OwnerReferences) != 1 {
+		t.Fatalf("expected 1 ownerReference; got %#v", job.OwnerReferences)
+	}
+	ref := job.OwnerReferences[0]
+	if ref.Kind != "AgenticTask" || ref.Name != "ownerflow" || ref.UID != "task-uid-456" {
+		t.Errorf("ownerReference mismatch: %#v", ref)
 	}
 }
 

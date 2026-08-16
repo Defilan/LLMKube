@@ -58,6 +58,7 @@ func BuildAll(deps ToolDeps) []Tool {
 			Client: deps.Client,
 			Cfg: RunGateJobToolConfig{
 				Namespace: deps.ForemanNamespace,
+				PVCName:   deps.GateCachePVC,
 				LogTailFn: deps.LogTailFn,
 				CodeHost:  deps.CodeHost,
 			},
@@ -111,6 +112,12 @@ type ToolDeps struct {
 	// Job in the operator's namespace.
 	Client           client.Client
 	ForemanNamespace string
+
+	// GateCachePVC is the submitting agent's gate-cache PVC name, threaded
+	// from --gate-cache-pvc so the gate Job mounts the per-agent claim the
+	// chart creates (foreman.gateCache.pvcName). Empty keeps the historical
+	// "no volume mount" behavior (#1538).
+	GateCachePVC string
 
 	// LogTailFn reads a finished gate Job's pod logs back for the model.
 	LogTailFn func(ctx context.Context, namespace, jobName string) string

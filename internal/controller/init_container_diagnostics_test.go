@@ -33,10 +33,9 @@ import (
 // container most likely to fail (bad credentials, 404, disk full, evicted for
 // exceeding an emptyDir sizeLimit), and it reported nothing.
 //
-// Setting it on every generated init container also removes the asymmetry that
-// made normalizeContainers unable to stop stripping the field: with the
-// operator setting it everywhere it generates a container, desired and live
-// agree and there is nothing to normalise away.
+// Setting it on every generated init container makes the policy self-describing
+// everywhere, so a failed downloader is diagnosable the same way the runtime
+// container is.
 
 func storageConfigModel(source string) *inferencev1alpha1.Model {
 	m := &inferencev1alpha1.Model{
@@ -77,98 +76,5 @@ func TestInitContainersCarryTerminationMessagePolicy(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// normalizeContainers must stop blanking the field, so drift in something the
-// operator now sets deliberately is comparable rather than normalised away.
-func TestNormalizeContainersKeepsTerminationMessagePolicy(t *testing.T) {
-	containers := []corev1.Container{{
-		Name:                     "c",
-		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-		TerminationMessagePath:   "/dev/termination-log",
-		ImagePullPolicy:          corev1.PullAlways,
-	}}
-	normalizeContainers(containers)
-
-	if got := containers[0].TerminationMessagePolicy; got != corev1.TerminationMessageFallbackToLogsOnError {
-		t.Errorf("TerminationMessagePolicy = %q, want it preserved", got)
-	}
-	// The genuinely-defaulted neighbours must still be stripped; this is the
-	// line between "the operator sets it" and "the API server defaults it".
-	if containers[0].TerminationMessagePath != "" {
-		t.Error("TerminationMessagePath should still be normalised away")
-	}
-	if containers[0].ImagePullPolicy != "" {
-		t.Error("ImagePullPolicy should still be normalised away")
-	}
-}
-
-// normalizeContainers must not strip SecurityContext fields the operator owns.
-// Two containers differing only in an operator-owned SecurityContext field must
-// still compare as different after normalization. Under the old code they
-// normalised to equal (the bug); this test fails if the stripping block is
-// restored. See #1462.
-func TestNormalizeContainersKeepsSecurityContextDifferences(t *testing.T) {
-	// inferContainerSecurityContext sets AllowPrivilegeEscalation and Capabilities;
-	// initContainerSecurityContext also sets ReadOnlyRootFilesystem and
-	// RunAsUser/RunAsGroup. Use those fields in the test.
-	containers := []corev1.Container{
-		{
-			Name: "c1",
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: boolPtr(false),
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
-		},
-		{
-			Name: "c2",
-			SecurityContext: &corev1.SecurityContext{
-				AllowPrivilegeEscalation: boolPtr(true), // differs from c1
-				Capabilities: &corev1.Capabilities{
-					Drop: []corev1.Capability{"ALL"},
-				},
-			},
-		},
-	}
-	normalizeContainers(containers)
-
-	if containers[0].SecurityContext.AllowPrivilegeEscalation == containers[1].SecurityContext.AllowPrivilegeEscalation {
-		t.Error("AllowPrivilegeEscalation difference was normalised away: the operator-owned field was stripped")
-	}
-}
-
-// The property that keeping the field comparable could plausibly break: a
-// desired template compared against itself must report no drift. If the
-// operator ever leaves the policy unset on a container it generates, the live
-// object gets the API-server default and every reconcile sees a difference.
-func TestPodTemplatesDoNotDifferFromThemselves(t *testing.T) {
-	cfg := buildModelStorageConfig(
-		storageConfigModel("https://example.com/model.gguf"), nil, "default", true,
-		ModelCacheModeShared, "", "docker.io/curlimages/curl:8.18.0", 102, nil)
-
-	// Live objects come back from the API server with the policy defaulted on
-	// any container that did not set one. Simulate that on a copy.
-	desired := corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-		InitContainers: append([]corev1.Container(nil), cfg.initContainers...),
-		Containers:     []corev1.Container{{Name: "server", TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError}},
-	}}
-	live := *desired.DeepCopy()
-	for i := range live.Spec.InitContainers {
-		if live.Spec.InitContainers[i].TerminationMessagePolicy == "" {
-			live.Spec.InitContainers[i].TerminationMessagePolicy = corev1.TerminationMessageReadFile
-		}
-	}
-	for i := range live.Spec.Containers {
-		if live.Spec.Containers[i].TerminationMessagePolicy == "" {
-			live.Spec.Containers[i].TerminationMessagePolicy = corev1.TerminationMessageReadFile
-		}
-	}
-
-	if podTemplatesDiffer(live, desired) {
-		t.Error("a template differs from itself once the API server defaults " +
-			"TerminationMessagePolicy: the operator left it unset on a container it generates")
 	}
 }

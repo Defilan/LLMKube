@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
@@ -35,6 +36,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
@@ -113,8 +115,28 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// then nothing left to do.
 	if task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded ||
 		task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
-		if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
-			log.Error(err, "audit: failed to record terminal run (continuing)")
+		// Emit the operator-side outcome metric exactly once, gated on the
+		// audited annotation actually being PERSISTED by RecordTerminal
+		// (#1491). RecordTerminal returns nil in two cases: it just wrote the
+		// record and stamped the annotation (first terminal reconcile), or the
+		// annotation was already set and it was a no-op (a later reconcile of
+		// an already-counted task). We only emit on the first case — the
+		// annotation was unset on entry AND RecordTerminal succeeded — so a
+		// failed audit write means no metric rather than a metric that a later
+		// reconcile (periodic resync or any update) would pass the guard and
+		// repeat. Under-counting on that rare failure path is the better
+		// trade: rates stay correct, whereas a repeated increment would inflate
+		// exactly the agents that are having trouble.
+		firstTerminal := task.Annotations[audit.AuditedAnnotation] != "true"
+		if firstTerminal {
+			if err := audit.RecordTerminal(ctx, r.Client, &task, r.AuditNamespace, log); err != nil {
+				// The dedup marker was not persisted, so the metric must not
+				// be emitted either: a later reconcile will retry both.
+				log.Error(err, "audit: failed to record terminal run; skipping outcome metric (continuing)")
+			} else {
+				agent, kind, verdict, outcome, elapsedSec, turns := taskOutcomeLabels(&task)
+				llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
+			}
 		}
 		// Release the node reservation so the scheduler can dispatch the next
 		// task there. Guarded on taskKey, so a node already reserved for a
@@ -182,6 +204,18 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// Enforce the per-Agent in-flight bound. When the referenced Agent sets
+	// spec.maxConcurrentTasks, count its in-flight tasks in this namespace
+	// (those holding a slot: Scheduled / Running / Verifying) and decline to
+	// claim an (N+1)th one; the task stays Pending for the next pass, exactly
+	// as it does when no node matches. Unset = unbounded.
+	if atLimit, err := r.agentAtConcurrencyLimit(ctx, &task); err != nil {
+		return ctrl.Result{}, err
+	} else if atLimit {
+		log.Info("agent at maxConcurrentTasks; leaving task Pending", "task", task.Name)
+		return ctrl.Result{RequeueAfter: requeueNoFit}, nil
+	}
+
 	// Find a Ready FleetNode that satisfies the effective RequiredCapability
 	// and atomically reserve it. The reservation (stamping the node's
 	// CurrentTask) is what enforces one-task-per-node and spreads work across
@@ -207,6 +241,40 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
+// taskOutcomeLabels extracts the bounded label values the operator emits for a
+// terminal Foreman task (#1491): the Agent name (from spec.agentRef; "" when
+// unset), the task kind, the verdict, and the machine outcome carried at
+// result.extra.outcome ("" when the run has none). It also returns the
+// executor's elapsedSec and the agent-loop turn count from result.extra.
+//
+// The task NAME is deliberately never a label: it is unbounded and would break
+// cardinality. A missing or unparseable result envelope yields zero elapsedSec
+// and zero turns (RecordTaskOutcome skips observing zeros) and an empty
+// outcome — never a fabricated value.
+func taskOutcomeLabels(task *foremanv1alpha1.AgenticTask) (agent, kind, verdict, outcome string, elapsedSec float64, turns int) {
+	agent = ""
+	if task.Spec.AgentRef != nil {
+		agent = task.Spec.AgentRef.Name
+	}
+	kind = string(task.Spec.Kind)
+	verdict = string(task.Status.Verdict)
+	if task.Status.Result != nil && len(task.Status.Result.Raw) > 0 {
+		var env struct {
+			ElapsedSec float64 `json:"elapsedSec"`
+			Extra      struct {
+				Outcome   string `json:"outcome"`
+				TurnCount int    `json:"turnCount"`
+			} `json:"extra"`
+		}
+		if err := json.Unmarshal(task.Status.Result.Raw, &env); err == nil {
+			outcome = env.Extra.Outcome
+			elapsedSec = env.ElapsedSec
+			turns = env.Extra.TurnCount
+		}
+	}
+	return agent, kind, verdict, outcome, elapsedSec, turns
+}
+
 // effectiveRequiredCapability returns the capability the scheduler should
 // match against. When spec.agentRef is set the Agent's capability wins;
 // otherwise the task's own. NotFound on AgentRef is propagated so the
@@ -228,6 +296,75 @@ func (r *AgenticTaskReconciler) effectiveRequiredCapability(ctx context.Context,
 	}
 	jobMode := agent.Spec.Execution != nil && agent.Spec.Execution.Mode == foremanv1alpha1.ExecutionModeJob
 	return agent.Spec.RequiredCapability, agentModelIdentity(&agent), jobMode, nil
+}
+
+// agentAtConcurrencyLimit reports whether the task's referenced Agent has
+// reached its spec.maxConcurrentTasks bound. When the Agent sets no bound
+// (nil) the answer is always false (unbounded, today's behavior). Otherwise
+// it lists the Agent's in-flight tasks in the same namespace — those whose
+// phase actually holds a slot (Scheduled / Running / Verifying), not merely
+// those that have not finished — and returns true when their count is
+// already at or above the bound, so the caller leaves this task Pending for
+// the next pass.
+func (r *AgenticTaskReconciler) agentAtConcurrencyLimit(ctx context.Context, task *foremanv1alpha1.AgenticTask) (bool, error) {
+	if task.Spec.AgentRef == nil || task.Spec.AgentRef.Name == "" {
+		return false, nil
+	}
+	var agent foremanv1alpha1.Agent
+	key := types.NamespacedName{Namespace: task.Namespace, Name: task.Spec.AgentRef.Name}
+	if err := r.Get(ctx, key, &agent); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The Agent is missing; effectiveRequiredCapability fails the task
+			// with AgentNotFound before this point is reached, so treat as
+			// unbounded here.
+			return false, nil
+		}
+		return false, err
+	}
+	if agent.Spec.MaxConcurrentTasks == nil {
+		return false, nil
+	}
+	var tasks foremanv1alpha1.AgenticTaskList
+	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
+		return false, err
+	}
+	inFlight := 0
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.AgentRef == nil || t.Spec.AgentRef.Name != agent.Name {
+			continue
+		}
+		// The task being reconciled is still Pending and not yet in flight;
+		// it must not count against the bound it is trying to claim into.
+		if t.Name == task.Name {
+			continue
+		}
+		if !holdsInFlightSlot(t.Status.Phase) {
+			continue
+		}
+		inFlight++
+	}
+	return inFlight >= int(*agent.Spec.MaxConcurrentTasks), nil
+}
+
+// holdsInFlightSlot reports whether a task phase actually occupies an
+// in-flight slot on its Agent. Only Scheduled, Running and Verifying hold a
+// slot: Pending does NOT, by definition — it is the state a task sits in
+// while waiting for this very dispatch decision. Counting Pending against
+// the bound would deadlock a queued batch: with N Pending tasks and a bound
+// of N or fewer, every task would see the others as "in flight", decline,
+// and nothing would ever start. Counting "what holds a slot" (rather than
+// "what has not finished") matches the field's godoc: the bound caps how
+// many tasks may be *in flight* at once.
+func holdsInFlightSlot(phase foremanv1alpha1.AgenticTaskPhase) bool {
+	switch phase {
+	case foremanv1alpha1.AgenticTaskPhaseScheduled,
+		foremanv1alpha1.AgenticTaskPhaseRunning,
+		foremanv1alpha1.AgenticTaskPhaseVerifying:
+		return true
+	default:
+		return false
+	}
 }
 
 // agentModelIdentity returns the model name used to test installedModels
@@ -327,6 +464,14 @@ func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *fore
 // is an optimistic-lock status patch, so at most one wins; the loser (Conflict,
 // or a node already reserved for a live task) falls through to the next
 // candidate. Without this, every task funnels onto one node. See #977.
+//
+// In Job mode the task's work runs in an ephemeral Job pod, not on the claiming
+// node, so the node must NOT be reserved: stamping CurrentTask would hold a
+// one-task-per-node slot for the Job's whole lifetime while the node itself
+// does nothing but wait, starving in-process tasks that could run there. A
+// Job-mode task is still assigned to a node (so the Job is created there), but
+// the node's CurrentTask is left untouched and stays free for in-process work.
+// See #1496.
 func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *foremanv1alpha1.AgenticTask, required foremanv1alpha1.RequiredCapability, requiredModel string, jobMode bool) (string, error) {
 	var nodes foremanv1alpha1.FleetNodeList
 	if err := r.List(ctx, &nodes); err != nil {
@@ -344,6 +489,13 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		}
 		if !capabilitySatisfies(required, requiredModel, n, jobMode) {
 			continue
+		}
+		if jobMode {
+			// Job-mode work runs in an ephemeral Job pod, not on this node, so
+			// the node must not be claimed. Pick the first eligible node and
+			// leave its CurrentTask untouched so it stays free for in-process
+			// tasks. See #1496.
+			return n.Name, nil
 		}
 		reserved, err := r.reserveNode(ctx, n, key)
 		if err != nil {

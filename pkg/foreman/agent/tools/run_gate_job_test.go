@@ -306,8 +306,16 @@ func TestRunGateJob_DuplicateCreateProducesGATEERROR(t *testing.T) {
 
 func TestApplyConfigDefaults_FillsEveryField(t *testing.T) {
 	c := applyConfigDefaults(RunGateJobToolConfig{})
-	if c.Namespace == "" || c.PVCName == "" || c.Image == "" || c.CloneURLBase == "" {
+	if c.Namespace == "" || c.Image == "" || c.CloneURLBase == "" {
 		t.Errorf("string defaults missing: %#v", c)
+	}
+	// PVCName is deliberately NOT defaulted (#1538). A hardcoded claim name
+	// is what broke named agent pools: the chart creates the claim per agent
+	// as foreman-<agentKey>-gate-cache, so any fixed fallback names a claim
+	// that need not exist. Empty means "no cache volume", which the renderer
+	// honours, and the chart supplies the real name via --gate-cache-pvc.
+	if c.PVCName != "" {
+		t.Errorf("PVCName must not be defaulted, got %q", c.PVCName)
 	}
 	if c.ActiveDeadlineSeconds == 0 || c.TTLSecondsAfterFinished == 0 {
 		t.Errorf("deadline defaults missing: %#v", c)
@@ -1217,5 +1225,84 @@ func TestNeedsHelm(t *testing.T) {
 	}
 	if !needsHelm(DefaultGateChecks) {
 		t.Error("DefaultGateChecks must include the chart check (#1441)")
+	}
+}
+
+// TestGateJobCacheVolumeOmittedWhenPVCNameEmpty asserts that an empty PVCName
+// renders NO cache volume and NO /cache volumeMount.
+//
+// Regression for #1538. The field's contract has always said "empty disables
+// the volume mount", but the template rendered `claimName: {{ .PVCName }}`
+// unconditionally and the config defaulted an empty name back to a hardcoded
+// "foreman-gate-cache". With named agent pools that claim does not exist, so
+// the Job mounted a PVC nobody created: the pod never binds, never schedules,
+// and the Job dies at activeDeadlineSeconds looking like a slow gate rather
+// than a misconfigured one.
+func TestGateJobCacheVolumeOmittedWhenPVCNameEmpty(t *testing.T) {
+	job, err := renderGateJob(rendererInput{
+		Name:                    "foreman-gate-nocache",
+		Namespace:               "foreman-system",
+		Image:                   "golang:1.26",
+		Repo:                    "defilantech/LLMKube",
+		Branch:                  "foreman/issue-1538",
+		Checks:                  []string{"fmt"},
+		ActiveDeadlineSeconds:   1800,
+		TTLSecondsAfterFinished: 86400,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		CloneURLBase:            "https://github.com",
+		PVCName:                 "",
+	})
+	if err != nil {
+		t.Fatalf("renderGateJob: %v", err)
+	}
+	if n := len(job.Spec.Template.Spec.Volumes); n != 0 {
+		t.Errorf("empty PVCName must render no volumes, got %d: %+v",
+			n, job.Spec.Template.Spec.Volumes)
+	}
+	for _, m := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if m.MountPath == "/cache" {
+			t.Errorf("empty PVCName must render no /cache volumeMount, got %+v", m)
+		}
+	}
+}
+
+// TestGateJobCacheVolumeUsesGivenPVCName is the positive half: a set PVCName
+// mounts exactly that claim, and never a hardcoded fallback (#1538).
+func TestGateJobCacheVolumeUsesGivenPVCName(t *testing.T) {
+	job, err := renderGateJob(rendererInput{
+		Name:                    "foreman-gate-cached",
+		Namespace:               "foreman-system",
+		Image:                   "golang:1.26",
+		Repo:                    "defilantech/LLMKube",
+		Branch:                  "foreman/issue-1538",
+		Checks:                  []string{"fmt"},
+		ActiveDeadlineSeconds:   1800,
+		TTLSecondsAfterFinished: 86400,
+		CPURequest:              "2",
+		CPULimit:                "4",
+		MemRequest:              "4Gi",
+		MemLimit:                "8Gi",
+		CloneURLBase:            "https://github.com",
+		PVCName:                 "foreman-multirepo-gate-cache",
+	})
+	if err != nil {
+		t.Fatalf("renderGateJob: %v", err)
+	}
+	vols := job.Spec.Template.Spec.Volumes
+	if len(vols) != 1 || vols[0].PersistentVolumeClaim == nil ||
+		vols[0].PersistentVolumeClaim.ClaimName != "foreman-multirepo-gate-cache" {
+		t.Fatalf("want the per-agent claim mounted, got %+v", vols)
+	}
+	var found bool
+	for _, m := range job.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if m.MountPath == "/cache" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a set PVCName must render the /cache volumeMount")
 	}
 }

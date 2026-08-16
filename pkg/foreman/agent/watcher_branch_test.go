@@ -85,6 +85,35 @@ func TestPatchTerminal_LiftsBranchAndCommitOnGo(t *testing.T) {
 	}
 }
 
+// patchTerminal must lift the coder Job name out of the Result envelope and
+// onto AgenticTask.status.jobName so operators and downstream tooling can
+// identify which Job ran a Job-mode task while it is live, not just after
+// completion (#1535). The Job-mode executor (coderJobResultToResult) stamps
+// "jobName" into Extra on every verdict path; the in-process path never sets
+// it, so status.jobName stays empty there.
+func TestPatchTerminal_LiftsJobName(t *testing.T) {
+	c := newRecoveryClient(t, pendingTask("code-1535"))
+	w := &AgenticTaskWatcher{Client: c, NodeName: "coder", Namespace: "default"}
+
+	res := NewResult("issue-fix", foremanv1alpha1.AgenticTaskVerdictGo,
+		"fixed in a Job", time.Second)
+	res.Extra = map[string]any{
+		"outcome":   "",
+		"branch":    "foreman/issue-1535",
+		"commitSHA": "abc1234def5678",
+		"jobName":   "foreman-coder-code-1535-1786665563449",
+	}
+
+	if err := w.patchTerminal(context.Background(), pendingTask("code-1535"), res, nil); err != nil {
+		t.Fatalf("patchTerminal: %v", err)
+	}
+
+	got := getTask(t, c, "code-1535")
+	if got.Status.JobName != "foreman-coder-code-1535-1786665563449" {
+		t.Fatalf("status.jobName = %q, want %q", got.Status.JobName, "foreman-coder-code-1535-1786665563449")
+	}
+}
+
 // A non-GO terminal outcome carries only an intendedBranch (no push happened),
 // so status.commitSHA stays empty. status.branch reflects the branch the run
 // targeted so an operator can still locate the intended work.

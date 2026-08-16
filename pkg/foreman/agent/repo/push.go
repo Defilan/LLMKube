@@ -126,6 +126,24 @@ func replaceRemoteBranch(ctx context.Context, workspace string, env []string, re
 	return err
 }
 
+// RemoteURL returns the URL of the named remote (default "origin") in the
+// workspace, or an error if the remote does not exist or cannot be read.
+// Callers use it to assert, after a push, that the branch landed on the
+// repository the Workload asked for rather than an unrelated one (#1464).
+func RemoteURL(ctx context.Context, workspace, remote string) (string, error) {
+	if workspace == "" {
+		return "", fmt.Errorf("RemoteURL: Workspace is required")
+	}
+	if remote == "" {
+		remote = "origin"
+	}
+	out, err := runGit(ctx, workspace, baseEnv(), "remote", "get-url", remote)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // SetRemote adds (or updates) a git remote. Used by callers that clone
 // from upstream and push to a fork: clone with one remote name, then
 // AddRemote("fork", forkURL), then Push(Remote="fork").
