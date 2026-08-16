@@ -24,6 +24,7 @@ package agent
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -581,6 +582,105 @@ func TestEnforceReviewerScopeOverlap_TestFileBareRefMapsToModule(t *testing.T) {
 		foremanv1alpha1.AgenticTaskVerdictGo, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a bare ref to bar.go must match the bar_test.go diff; got %v", got)
+	}
+}
+
+// issue654Ask mirrors misospace/dispatch#654 ("[P3] Add tests for high-risk
+// untested modules"), the concrete run that motivated #1447: the issueAsk
+// names three modules, each once bare and once with its path, and the
+// correct diff creates the three test files. Pre-fix this demoted a GO
+// ("the issue names 6 file(s) ... and the diff touches none of them").
+const issue654Ask = "Add unit tests covering the main execution paths and error " +
+	"conditions for these three modules. See `automation-sync.ts`, `groomer-lock.ts`, " +
+	"and `resolve-actor.ts` (the full paths are `src/lib/automation-sync.ts`, " +
+	"`src/lib/groomer/groomer-lock.ts`, and `src/lib/resolve-actor.ts`)."
+
+// issue654Diff is the finished, correct diff from #654: one new test file per
+// module. Each is a test file that maps to the module it covers.
+var issue654Diff = []string{
+	"src/lib/automation-sync.test.ts",
+	"src/lib/groomer/groomer-lock.test.ts",
+	"src/lib/resolve-actor.test.ts",
+}
+
+// TestEnforceReviewerScopeOverlap_Issue654ConcreteExample is the end-to-end
+// reproduction of the exact run that motivated #1447. The issue names all
+// three modules (six raw refs, deduplicated to three) and the diff creates
+// the three test files. After the fix: the GO stands, scopeDriftDetected is
+// false, all three modules are matched via their test files, and the
+// extracted ref list carries three entries (not the inflated six).
+func TestEnforceReviewerScopeOverlap_Issue654ConcreteExample(t *testing.T) {
+	// Defect (2): the issue names each module bare and by path; the
+	// extracted list must deduplicate to the three modules.
+	refs := extractIssuePathRefs(issue654Ask, []string{".ts"})
+	if want := []string{
+		"src/lib/automation-sync.ts",
+		"src/lib/groomer/groomer-lock.ts",
+		"src/lib/resolve-actor.ts",
+	}; !reflect.DeepEqual(refs, want) {
+		t.Fatalf("the #654 issue must dedup to 3 refs; got %v", refs)
+	}
+
+	// Defect (1): each test file maps to the module it covers, so the GO
+	// stands and all three modules match.
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue654Ask, issue654Diff,
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"})
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("the #654 test-coverage diff must not demote a GO; got %v (reason: %v)",
+			got, extra["demotionReason"])
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); v {
+		t.Errorf("scopeDriftDetected should be false for the #654 diff")
+	}
+	if v, _ := extra["verdictDemoted"].(bool); v {
+		t.Errorf("the #654 diff must not be demoted")
+	}
+	if v, _ := extra["demotionReason"].(string); v != "" {
+		t.Errorf("the #654 diff must not carry a demotion reason; got %q", v)
+	}
+	savedRefs, _ := extra["scopeRefs"].([]string)
+	if len(savedRefs) != 3 {
+		t.Errorf("scopeRefs should carry 3 deduplicated refs, not 6; got %v", savedRefs)
+	}
+	matched, _ := extra["scopeMatched"].([]string)
+	if !reflect.DeepEqual(matched, []string{
+		"src/lib/automation-sync.ts",
+		"src/lib/groomer/groomer-lock.ts",
+		"src/lib/resolve-actor.ts",
+	}) {
+		t.Errorf("scopeMatched = %v, want the three modules the test files cover", matched)
+	}
+}
+
+// TestEnforceReviewerScopeOverlap_Issue654ModulesDriftStillDemotes is the
+// #654-specific scope-drift guard: the same issueAsk that names all three
+// modules, but a diff that touches none of them (and no test file mapping
+// to any of them) is genuine drift and must still demote a GO. This is the
+// flip side of TestEnforceReviewerScopeOverlap_Issue654ConcreteExample and
+// proves the test-file mapping does not let an unrelated change ride along.
+func TestEnforceReviewerScopeOverlap_Issue654ModulesDriftStillDemotes(t *testing.T) {
+	// A diff with a .ts source file (so hasSourceFile admits the check) but
+	// that touches none of the three named modules — not even their tests.
+	diff := []string{"src/lib/unrelated-helper.ts"}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue654Ask, diff,
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"})
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("a diff touching none of the #654 modules must still demote GO; got %v", got)
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); !v {
+		t.Errorf("scopeDriftDetected must be true when the diff touches none of the named modules")
+	}
+	if v, _ := extra["verdictDemoted"].(bool); !v {
+		t.Errorf("genuine #654 drift must set verdictDemoted")
+	}
+	if reason, _ := extra["demotionReason"].(string); !strings.Contains(reason, "3 file(s)") {
+		t.Errorf("demotionReason should name the 3 deduplicated files; got %q", reason)
+	}
+	matched, _ := extra["scopeMatched"].([]string)
+	if len(matched) != 0 {
+		t.Errorf("scopeMatched should be empty for a diff touching none of the named modules; got %v", matched)
 	}
 }
 
