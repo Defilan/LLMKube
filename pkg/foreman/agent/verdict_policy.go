@@ -69,7 +69,7 @@ const alreadyResolvedOutcome = "ALREADY-RESOLVED"
 // task.Spec.VerdictPolicy.Resolve(), which falls back to the same value
 // when a Workload never set spec.verdictPolicy; this var remains for the
 // tests in this package that exercise applyVerdictPolicy directly.
-var defaultSelfGO = foremanv1alpha1.DefaultSelfGO
+var defaultSelfGO = foremanv1alpha1.DefaultSelfGO //nolint:unused // test-only by design (see above)
 
 // unverifiedClaimReason and unverifiedClaimHowTo are the fixed
 // whyItMatters/howToVerify strings attached to every claim-evidence
