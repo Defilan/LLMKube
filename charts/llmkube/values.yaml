@@ -90,6 +90,27 @@ controllerManager:
     # values outside that range.
     defaultFSGroup: 102
 
+  # GID of your GPU nodes' DRI render group: the group that owns
+  # /dev/dri/renderD128. It is added to a Vulkan InferenceService pod's
+  # supplementalGroups so the serving container can open the render node.
+  # fsGroup does nothing for device access, so without this llama.cpp cannot
+  # open the render node, fails open, and serves from CPU at roughly half
+  # speed with no status condition (#1560).
+  #
+  # Defaults to 0 (disabled) because there is no portable value. The `render`
+  # group is allocated dynamically and differs per host: it is 991 on Ubuntu
+  # 26.04, and elsewhere something else again. GID 44 is NOT the render group,
+  # it is `video`, which owns card0 rather than the render node (#1572).
+  #
+  # Read the real value from one of your GPU nodes:
+  #
+  #   stat -c '%g' /dev/dri/renderD128
+  #
+  # Only applies on the Vulkan path, and never overrides a service that sets
+  # its own spec.podSecurityContext. On a fleet whose nodes disagree, set this
+  # to the majority value and override the outliers per service.
+  driRenderGID: 0
+
   # Additional environment variables
   env: []
 

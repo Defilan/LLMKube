@@ -175,8 +175,9 @@ func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 // status condition (#1560). When the resolved runtime is Vulkan (vulkan) and
 // driRenderGID > 0, that GID is appended to supplementalGroups. The GID is
 // node-local and not knowable at admission, so it comes from the operator's
-// --dri-render-gid flag (default 44, the conventional Linux render group; set
-// to 0 to disable, e.g. on OpenShift). This is applied only on the Vulkan
+// --dri-render-gid flag, which defaults to 0 (disabled): `render` is allocated
+// dynamically and differs per host, so there is no portable default to ship
+// (#1572). This is applied only on the Vulkan
 // path; the CUDA and Metal paths are untouched. A user-supplied
 // Spec.PodSecurityContext is returned as-is, so setting it takes full
 // ownership of supplementalGroups (the per-service workaround for a node
