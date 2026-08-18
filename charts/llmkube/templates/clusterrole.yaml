@@ -233,4 +233,26 @@ rules:
   - get
   - list
   - watch
+# Model prefetch (#904) creates and polls a batch Job per prefetching Model.
+# Without this the controller-runtime cache cannot start its Job informer, the
+# reflector retries the cluster-scoped list forever, and prefetch is dead with
+# only a "Failed to watch" line to show for it (#1593).
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+# Read by the offload log reader (clientsetPodLogReader in cmd/main.go), which
+# parses a ready pod's serving log to populate status.acceleration.
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
 {{- end }}
