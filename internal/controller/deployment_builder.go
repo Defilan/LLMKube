@@ -606,12 +606,36 @@ func applyArchAffinity(deployment *appsv1.Deployment, backend RuntimeBackend, is
 	}
 }
 
-// applyArchNodeAffinity adds a required kubernetes.io/arch nodeAffinity term to
-// the pod spec, restricting scheduling to nodes whose architecture is in archs.
-// It merges into any existing affinity (user-provided or otherwise) rather than
-// overwriting it, so the user's other affinity rules keep applying.
+// applyArchNodeAffinity restricts scheduling to nodes whose architecture is in
+// archs, ANDing that requirement into whatever nodeAffinity is already present.
+//
+// nodeSelectorTerms are ORed and the matchExpressions within a single term are
+// ANDed, so the architecture requirement has to go *into* each existing term.
+// Appending a term of its own would widen placement instead of narrowing it:
+// the user's spec.affinity would become one of two alternatives and the pod
+// could schedule on any node of the right architecture, ignoring their pin
+// (#1583). preferredDuringScheduling is deliberately untouched, since it
+// expresses a preference rather than a constraint.
 func applyArchNodeAffinity(deployment *appsv1.Deployment, archs []string) {
-	affinity := deployment.Spec.Template.Spec.Affinity
+	values := make([]string, 0, len(archs))
+	for _, a := range archs {
+		if a != "" {
+			values = append(values, a)
+		}
+	}
+	if len(values) == 0 {
+		return
+	}
+	req := corev1.NodeSelectorRequirement{
+		Key:      corev1.LabelArchStable,
+		Operator: corev1.NodeSelectorOpIn,
+		Values:   values,
+	}
+
+	// Deep-copy before mutating: the pod spec's Affinity is assigned straight
+	// from isvc.Spec.Affinity, so editing terms in place would write into the
+	// cached InferenceService and re-append this requirement on every reconcile.
+	affinity := deployment.Spec.Template.Spec.Affinity.DeepCopy()
 	if affinity == nil {
 		affinity = &corev1.Affinity{}
 	}
@@ -622,29 +646,19 @@ func applyArchNodeAffinity(deployment *appsv1.Deployment, archs []string) {
 		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{}
 	}
 
-	values := make([]string, 0, len(archs))
-	for _, a := range archs {
-		if a != "" {
-			values = append(values, a)
+	selector := affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+	if len(selector.NodeSelectorTerms) == 0 {
+		// No terms means every node qualifies, so the requirement stands alone
+		// as the only term. This still narrows rather than widens.
+		selector.NodeSelectorTerms = []corev1.NodeSelectorTerm{
+			{MatchExpressions: []corev1.NodeSelectorRequirement{req}},
+		}
+	} else {
+		for i := range selector.NodeSelectorTerms {
+			selector.NodeSelectorTerms[i].MatchExpressions = append(
+				selector.NodeSelectorTerms[i].MatchExpressions, req)
 		}
 	}
-	if len(values) == 0 {
-		return
-	}
-
-	term := corev1.NodeSelectorTerm{
-		MatchExpressions: []corev1.NodeSelectorRequirement{
-			{
-				Key:      corev1.LabelArchStable,
-				Operator: corev1.NodeSelectorOpIn,
-				Values:   values,
-			},
-		},
-	}
-	affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(
-		affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms,
-		term,
-	)
 	deployment.Spec.Template.Spec.Affinity = affinity
 }
 
