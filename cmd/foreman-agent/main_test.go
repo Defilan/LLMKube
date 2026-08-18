@@ -67,7 +67,7 @@ func schemaNames(t *testing.T, r agent.ToolRegistry) []string {
 // for the v0.3 Foreman MCP fix: a non-empty Agent.spec.tools whitelist
 // must not drop MCP tools. Before the fix, makeRegistryFactory appended
 // MCP tools to the native slice and then ran Filter(ag.Spec.Tools) over
-// the combined set -- since MCP tool names (mcp/<server>/<tool>) are
+// the combined set -- since MCP tool names (mcp__<server>__<tool>) are
 // dynamic, no real whitelist ever names one, so Filter silently removed
 // every MCP tool. This test builds a whitelist that keeps read_file and
 // drops bash, and asserts the MCP tool survives regardless.
@@ -78,7 +78,7 @@ func TestAssembleAgentRegistry_MCPBypassesWhitelist(t *testing.T) {
 	}
 	whitelist := []string{"read_file"}
 	mcpTools := []foremantools.Tool{
-		&fakeAssembleTool{name: "mcp/context7/get-docs"},
+		&fakeAssembleTool{name: "mcp__context7__get-docs"},
 	}
 
 	r, err := assembleAgentRegistry(logr.Discard(), native, whitelist, mcpTools)
@@ -87,7 +87,7 @@ func TestAssembleAgentRegistry_MCPBypassesWhitelist(t *testing.T) {
 	}
 
 	got := schemaNames(t, r)
-	want := []string{"mcp/context7/get-docs", "read_file"}
+	want := []string{"mcp__context7__get-docs", "read_file"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("advertised tools = %v, want %v (bash must be filtered by the whitelist; "+
 			"the MCP tool must survive despite not being named in it)", got, want)
@@ -99,12 +99,12 @@ func TestAssembleAgentRegistry_MCPBypassesWhitelist(t *testing.T) {
 	}
 
 	// The MCP tool must be reachable, not just advertised.
-	res, err := r.Dispatch(context.Background(), "mcp/context7/get-docs", json.RawMessage(`{}`))
+	res, err := r.Dispatch(context.Background(), "mcp__context7__get-docs", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("Dispatch(mcp tool): %v", err)
 	}
-	if res.Output != "mcp/context7/get-docs result" {
-		t.Fatalf("Dispatch(mcp tool).Output = %q, want %q", res.Output, "mcp/context7/get-docs result")
+	if res.Output != "mcp__context7__get-docs result" {
+		t.Fatalf("Dispatch(mcp tool).Output = %q, want %q", res.Output, "mcp__context7__get-docs result")
 	}
 }
 
@@ -117,7 +117,7 @@ func TestAssembleAgentRegistry_EmptyWhitelistKeepsAllPlusMCP(t *testing.T) {
 		&fakeAssembleTool{name: "bash"},
 	}
 	mcpTools := []foremantools.Tool{
-		&fakeAssembleTool{name: "mcp/context7/get-docs"},
+		&fakeAssembleTool{name: "mcp__context7__get-docs"},
 	}
 
 	r, err := assembleAgentRegistry(logr.Discard(), native, nil, mcpTools)
@@ -126,7 +126,7 @@ func TestAssembleAgentRegistry_EmptyWhitelistKeepsAllPlusMCP(t *testing.T) {
 	}
 
 	got := schemaNames(t, r)
-	want := []string{"bash", "mcp/context7/get-docs", "read_file"}
+	want := []string{"bash", "mcp__context7__get-docs", "read_file"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("advertised tools = %v, want %v", got, want)
 	}

@@ -16,9 +16,9 @@ func TestContext7Evidence_CollectsMCPToolResults(t *testing.T) {
 		{Role: oai.RoleUser, Content: "fix it"},
 		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{
 			{ID: "c1", Type: "function",
-				Function: oai.ToolCallFunction{Name: "mcp/context7/query-docs"}},
+				Function: oai.ToolCallFunction{Name: "mcp__context7__query-docs"}},
 		}},
-		{Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp/context7/query-docs",
+		{Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp__context7__query-docs",
 			Content: "vllm:request_success_total{finished_reason}"},
 		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{
 			{ID: "c2", Type: "function", Function: oai.ToolCallFunction{Name: "read_file"}},
@@ -37,7 +37,7 @@ func TestContext7Evidence_CollectsMCPToolResults(t *testing.T) {
 func TestContext7Evidence_CorrelatesByToolCallIDWhenNameEmpty(t *testing.T) {
 	tr := []oai.Message{
 		{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{
-			{ID: "c1", Type: "function", Function: oai.ToolCallFunction{Name: "mcp/context7/resolve-library-id"}},
+			{ID: "c1", Type: "function", Function: oai.ToolCallFunction{Name: "mcp__context7__resolve-library-id"}},
 		}},
 		{Role: oai.RoleTool, ToolCallID: "c1", Content: "/websites/vllm"},
 	}
@@ -118,13 +118,13 @@ func TestApplyCoderGroundingRail_RecordsViolation(t *testing.T) {
 	}
 	queryCall := oai.ToolCall{
 		ID: "c1", Type: "function",
-		Function: oai.ToolCallFunction{Name: "mcp/context7/query-docs"},
+		Function: oai.ToolCallFunction{Name: "mcp__context7__query-docs"},
 	}
 	lr := &LoopResult{
 		Transcript: []oai.Message{
 			{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{queryCall}},
 			{
-				Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp/context7/query-docs",
+				Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp__context7__query-docs",
 				Content: "vllm:request_success_total{finished_reason}",
 			},
 		},
@@ -155,10 +155,10 @@ func TestApplyCoderGroundingRailForTask_GatesOnIssueFixKind(t *testing.T) {
 		return &LoopResult{
 			Transcript: []oai.Message{
 				{Role: oai.RoleAssistant, ToolCalls: []oai.ToolCall{
-					{ID: "c1", Type: "function", Function: oai.ToolCallFunction{Name: "mcp/context7/query-docs"}},
+					{ID: "c1", Type: "function", Function: oai.ToolCallFunction{Name: "mcp__context7__query-docs"}},
 				}},
 				{
-					Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp/context7/query-docs",
+					Role: oai.RoleTool, ToolCallID: "c1", Name: "mcp__context7__query-docs",
 					Content: "vllm:request_success_total{finished_reason}",
 				},
 			},

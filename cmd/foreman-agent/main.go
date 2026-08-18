@@ -739,7 +739,7 @@ func clampInt32(n int) int32 {
 // (best-effort), never fatal.
 //
 // Ordering matters: Filter is an allow-list intersection, and MCP tools
-// are named dynamically (mcp/<server>/<tool>), so no real Agent's
+// are named dynamically (mcp__<server>__<tool>), so no real Agent's
 // spec.tools whitelist ever names one. Filtering the MCP tools alongside
 // the native ones (the pre-fix behavior) silently dropped every MCP tool
 // for every agent -- the feature was inert. Filtering native first, then

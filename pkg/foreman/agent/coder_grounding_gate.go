@@ -58,10 +58,11 @@ type groundingViolation struct {
 	RetrievedAlternatives []string
 }
 
-// context7Evidence gathers the content of every mcp/* tool result in the
-// transcript into an evidence corpus. The tool message's Name is the function
-// name; when a backend leaves Name empty we recover it from the assistant's
-// tool_call by ToolCallID.
+// context7Evidence gathers the content of every MCP tool result in the
+// transcript into an evidence corpus, matching on MCPToolNamePrefix so this
+// cannot drift from the name the mcp package actually registers. The tool
+// message's Name is the function name; when a backend leaves Name empty we
+// recover it from the assistant's tool_call by ToolCallID.
 func context7Evidence(transcript []oai.Message) []string {
 	callName := make(map[string]string)
 	for _, m := range transcript {
@@ -80,7 +81,7 @@ func context7Evidence(transcript []oai.Message) []string {
 		if name == "" {
 			name = callName[m.ToolCallID]
 		}
-		if strings.HasPrefix(name, "mcp/") {
+		if strings.HasPrefix(name, MCPToolNamePrefix) {
 			ev = append(ev, m.Content)
 		}
 	}

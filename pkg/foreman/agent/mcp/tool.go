@@ -115,11 +115,11 @@ func newTools(
 	return out
 }
 
-// nameSeparator joins the namespace segments. It is "__" rather than "/"
-// because the OAI tool-call spec constrains function.name to
-// ^[a-zA-Z0-9_-]+$: a "/" makes every request carrying an MCP tool
-// malformed, and providers that validate reject it before the model runs.
-const nameSeparator = "__"
+// nameSeparator joins the namespace segments. It is defined in the agent
+// package, not here, so that transcript consumers there (the coder grounding
+// rail) match on the same prefix this builds rather than a hand-copied
+// literal that can drift out of step (#1527).
+const nameSeparator = agent.MCPNameSeparator
 
 // sanitizeNameSegment maps any character outside the OAI function-name set
 // to an underscore, so a server or tool advertising a dot, slash or space
@@ -142,7 +142,7 @@ func sanitizeNameSegment(s string) string {
 // used as the registry key. The remote tool is still called by its bare
 // name; see Execute.
 func (t *mcpTool) Name() string {
-	return "mcp" + nameSeparator + sanitizeNameSegment(t.server) +
+	return agent.MCPToolNamePrefix + sanitizeNameSegment(t.server) +
 		nameSeparator + sanitizeNameSegment(t.toolName)
 }
 

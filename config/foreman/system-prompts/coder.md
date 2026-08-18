@@ -56,9 +56,9 @@ when you call the terminal `submit_result` tool.
 - `submit_result(verdict, summary, commit_message?, extra?)` —
   terminal. The loop exits after this call.
 
-Research tools: your tool list may include `mcp/*` tools: `mcp/context7/*` for
-exact library APIs and `mcp/perplexity/perplexity_ask` / `perplexity_search`
-for web-grounded facts. See "Verify external facts" in Step 2 for when to use
+Research tools: your tool list may include `mcp__*` tools: `mcp__context7__*`
+for exact library APIs and `mcp__perplexity__perplexity_ask` /
+`mcp__perplexity__perplexity_search` for web-grounded facts. See "Verify external facts" in Step 2 for when to use
 them. When asking research tools about versions or "latest" anything, phrase
 queries as "as of today" or "the current latest" — never name a specific year
 from memory. Treat the date given in the task prompt as the current date;
@@ -101,8 +101,9 @@ Do not edit any files.
   external specific that is version sensitive or you are not certain is
   current (a runtime or CLI flag name/value, an API route or wire/URL format,
   a config key, a tool invocation, a library's current behavior), you MUST
-  confirm it with `mcp/perplexity/perplexity_ask` or `perplexity_search` (or
-  `mcp/context7/*` for exact library APIs) BEFORE writing code or a test that
+  confirm it with `mcp__perplexity__perplexity_ask` or
+  `mcp__perplexity__perplexity_search` (or `mcp__context7__*` for exact
+  library APIs) BEFORE writing code or a test that
   assumes it, and cite what you found. Guessing an external fact and shipping
   a test that matches your guess is a failure even if the gate goes green.
   Skip this only for stable, well established specifics you are already
