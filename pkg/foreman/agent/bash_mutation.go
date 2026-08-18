@@ -102,29 +102,70 @@ func segmentWrites(seg string) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	// Skip leading VAR=... assignments to find the real command word (e.g.
-	// FOO=bar sed -i ...). Without an assignment the word is the first field.
-	word := fields[0]
-	for _, f := range fields {
-		if !isEnvAssignment(f) {
-			word = f
-			break
-		}
+	// Resolve the real command word, stepping over leading VAR=... assignments
+	// and any `env` prefix (e.g. `env FOO=bar sed -i ...`).
+	idx := commandWordIndex(fields)
+	if idx < 0 {
+		// No command word at all (a bare `env`, or only assignments). A
+		// redirection is still a write.
+		return hasWritingRedirection(seg)
 	}
 	// Use the base name of the command word so /usr/bin/sed still counts.
-	base := commandBaseName(word)
+	base := commandBaseName(fields[idx])
+	args := fields[idx:]
 
+	// Decide on the command word, then FALL THROUGH to the redirection check.
+	// The sed and git arms must not return early: a segment whose command word
+	// does not itself write can still write by redirecting its output into a
+	// file (`git diff > patch.diff`, `sed -n p f.go > out.go`). Returning here
+	// made hasWritingRedirection unreachable for exactly those two words.
+	writes := false
 	switch base {
 	case "sed":
-		return hasFlag(fields, "-i")
+		writes = hasInPlaceFlag(args)
 	case "git":
-		return isGitApply(fields)
+		writes = isGitApply(args)
+	default:
+		writes = writingCommands[base]
 	}
-	if writingCommands[base] {
+	if writes {
 		return true
 	}
 	// Any output redirection to a real file makes the segment a write.
 	return hasWritingRedirection(seg)
+}
+
+// commandWordIndex returns the index of the real command word in fields,
+// stepping over leading VAR=value assignments and any `env` prefix together
+// with env's own options, so `env FOO=bar sed -i f.go` decides on sed rather
+// than on env. It returns -1 when there is no command word, e.g. a bare `env`
+// or a segment that is only assignments.
+func commandWordIndex(fields []string) int {
+	i := 0
+	for {
+		for i < len(fields) && isEnvAssignment(fields[i]) {
+			i++
+		}
+		if i >= len(fields) {
+			return -1
+		}
+		if commandBaseName(fields[i]) != "env" {
+			return i
+		}
+		// Step over `env` itself and its own options. -u and -C take a
+		// separate argument, so they consume one extra field.
+		i++
+		for i < len(fields) && strings.HasPrefix(fields[i], "-") {
+			if fields[i] == "--" {
+				i++
+				break
+			}
+			if fields[i] == "-u" || fields[i] == "-C" {
+				i++
+			}
+			i++
+		}
+	}
 }
 
 // commandBaseName returns the final path component of a command word.
@@ -143,13 +184,35 @@ func isEnvAssignment(f string) bool {
 		(f[eq-1] >= 'a' && f[eq-1] <= 'z'))
 }
 
-// hasFlag reports whether any field after the command word is the given short
-// flag. It matches the flag exactly (e.g. `-i`) or the flag followed by an
-// inline option (e.g. `-i.bak`, the coreutils in-place backup form), so
-// `sed -i.bak` still counts as a write.
-func hasFlag(fields []string, flag string) bool {
-	for _, f := range fields[1:] {
-		if f == flag || strings.HasPrefix(f, flag+".") {
+// hasInPlaceFlag reports whether args carry sed's in-place flag in any of the
+// forms coders actually emit: the exact short flag (`-i`), the backup-suffix
+// form (`-i.bak`), a clustered short-flag group containing i (`-ie`, `-ni`),
+// or the GNU long flag (`--in-place`, `--in-place=.bak`). args[0] is the
+// command word and is not examined.
+//
+// Matching only `-i` and `-i.` missed the clustered and long forms, which the
+// substring predicate this replaced happened to catch for `-ie`.
+func hasInPlaceFlag(args []string) bool {
+	for _, f := range args[1:] {
+		if strings.HasPrefix(f, "--") {
+			name := strings.TrimPrefix(f, "--")
+			if eq := strings.Index(name, "="); eq >= 0 {
+				name = name[:eq]
+			}
+			if name == "in-place" {
+				return true
+			}
+			continue
+		}
+		if !strings.HasPrefix(f, "-") || f == "-" {
+			continue
+		}
+		// A short-flag group, up to any inline suffix such as -i.bak.
+		group := f[1:]
+		if dot := strings.Index(group, "."); dot >= 0 {
+			group = group[:dot]
+		}
+		if strings.ContainsRune(group, 'i') {
 			return true
 		}
 	}
