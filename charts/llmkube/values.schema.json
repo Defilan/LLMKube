@@ -98,6 +98,11 @@
             }
           }
         },
+        "driRenderGID": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "GID of the GPU nodes' DRI render group (owner of /dev/dri/renderD128), added to Vulkan InferenceService pods' supplementalGroups so the serving container can open the render node. 0 disables. No portable default exists: render is allocated dynamically (991 on Ubuntu 26.04) and GID 44 is video, which owns card0 rather than the render node. Read it with: stat -c '%g' /dev/dri/renderD128"
+        },
         "env": {
           "type": "array",
           "items": {

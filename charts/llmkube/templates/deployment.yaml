@@ -91,6 +91,12 @@ spec:
         # re-replace the OpenShift preset's deliberate 0 with 102 and break
         # SCC compatibility. Schema in values.schema.json enforces integer >= 0.
         - --default-fsgroup={{ .Values.controllerManager.initContainer.defaultFSGroup }}
+        {{- if .Values.controllerManager.driRenderGID }}
+        # Node-local render GID for Vulkan pods (#1572). Omitted entirely when
+        # 0/unset so the operator's own default (disabled) applies, rather than
+        # passing a value that cannot be correct on an unknown host.
+        - --dri-render-gid={{ .Values.controllerManager.driRenderGID }}
+        {{- end }}
         - --router-proxy-image={{ include "llmkube.routerProxyImage" . }}
         {{- with .Values.controllerManager.routerProxy.defaultLiteLLMURL }}
         - --default-litellm-url={{ . }}

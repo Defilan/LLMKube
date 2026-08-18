@@ -1,0 +1,42 @@
+suite: dri-render-gid operator flag
+templates:
+  - deployment.yaml
+
+tests:
+  # The default must stay off. There is no portable render GID, so shipping a
+  # value here would put a GID that cannot be correct on an unknown host into
+  # every Vulkan pod's supplementalGroups, where the failure is silent CPU
+  # fallback rather than an error (#1560, #1572).
+  - it: does not render --dri-render-gid by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --dri-render-gid=
+
+  - it: renders --dri-render-gid when the node's render group is set
+    set:
+      controllerManager.driRenderGID: 991
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --dri-render-gid=991
+
+  # An explicit 0 means "disabled" and must behave exactly like unset, not
+  # render --dri-render-gid=0.
+  - it: treats an explicit 0 as disabled
+    set:
+      controllerManager.driRenderGID: 0
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --dri-render-gid=0
+
+  # 44 is `video`, not `render`. The chart does not stop an operator setting
+  # it, but it must pass through verbatim rather than being special-cased.
+  - it: passes a non-default GID through verbatim
+    set:
+      controllerManager.driRenderGID: 44
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --dri-render-gid=44

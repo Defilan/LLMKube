@@ -83,8 +83,8 @@ type InferenceServiceReconciler struct {
 	// admission, so it comes from the operator's --dri-render-gid flag. Values
 	// <= 0 disable the default (e.g. on OpenShift); the field applies only on
 	// the Vulkan path and never to a user-supplied Spec.PodSecurityContext.
-	// Set via --dri-render-gid; default 44 (the conventional Linux render
-	// group).
+	// Set via --dri-render-gid; defaults to 0 (disabled) because `render` is
+	// dynamically allocated and has no portable value (#1572).
 	DRIRenderGID int64
 	// EmitScrapeAnnotations, when true, adds Prometheus annotation-discovery
 	// hints (prometheus.io/scrape, /path, /port) to every inference Pod, with

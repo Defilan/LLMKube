@@ -291,6 +291,48 @@ lsmod | grep amdgpu
 dmesg | grep amdgpu
 ```
 
+### Ready, but serving from CPU at roughly half speed
+
+The pod is Ready and reports no error, but throughput is about half what the
+GPU should deliver. The serving container could not open `/dev/dri/renderD128`,
+so llama.cpp fell back to CPU without failing.
+
+`fsGroup` does nothing for device access. The container must carry the node's
+**render** group in `supplementalGroups`. Read the real GID from the node:
+
+```bash
+stat -c '%g' /dev/dri/renderD128
+```
+
+Then set it cluster-wide:
+
+```yaml
+# values.yaml
+controllerManager:
+  driRenderGID: 991   # whatever the command above printed
+```
+
+The GID is node-local and has no portable value, so this defaults to `0`
+(disabled). Two traps worth knowing:
+
+- **44 is not the render group.** It is `video`, which owns `card0`, not the
+  render node. Setting 44 grants access to the wrong device.
+- **`render` is dynamically allocated**, so it differs per host (991 on Ubuntu
+  26.04, other values elsewhere). Always read it rather than assuming.
+
+Confirm it took effect on a running pod:
+
+```bash
+kubectl get pod <pod> -o jsonpath='{.spec.securityContext.supplementalGroups}'
+kubectl exec <pod> -- ls -ln /dev/dri/
+```
+
+The GID in `supplementalGroups` must match the group shown against
+`renderD128`. On a fleet whose nodes disagree, set the chart value to the
+majority and override the outliers with `spec.podSecurityContext` on the
+individual InferenceService, which takes full ownership of
+`supplementalGroups`.
+
 ### Insufficient amd.com/gpu
 
 Device plugin or operator not running on the Strix Halo node. Check pod logs:
