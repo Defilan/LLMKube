@@ -436,6 +436,59 @@ spec:
 			Expect(output).To(Equal("True"))
 		})
 
+		// Regression cover for #1593: charts/llmkube shipped without the
+		// batch/jobs grant, so a Helm-installed controller could not list Jobs
+		// and prefetch was dead in v0.9.18. Nothing caught it, because envtest
+		// runs as cluster-admin and no e2e exercised prefetch (#1596).
+		//
+		// Asserts the Job is CREATED, not that it completes: creating it is the
+		// step RBAC blocks, and reconcilePrefetch reads the Job before starting
+		// any download, so a 403 surfaces here without waiting on a transfer.
+		It("should create a prefetch Job for a prefetch-enabled Model", func() {
+			By("applying a Model CR with prefetch enabled")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: prefetch-model
+  namespace: %s
+spec:
+  source: "%s"
+  prefetch: true
+`, crTestNs, testModelServerURL))
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to apply prefetch Model CR")
+
+			By("waiting for the prefetch Job to be created")
+			verifyPrefetchJob := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "job", "prefetch-model-prefetch",
+					"-n", crTestNs, "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(),
+					"prefetch Job was never created; check the controller's RBAC for batch/jobs")
+				g.Expect(output).To(Equal("prefetch-model-prefetch"))
+			}
+			Eventually(verifyPrefetchJob, 2*time.Minute).Should(Succeed())
+
+			By("verifying the controller never reported a Jobs permission error")
+			// The RBAC failure mode is a reflector loop, not a reconcile error,
+			// so it shows up only in the log. Assert on it directly: a rule that
+			// exists but is bound to the wrong subject would still fail here.
+			// Selected by label rather than the suite's shared controllerPodName,
+			// so this spec does not depend on which earlier spec last set it.
+			cmd = exec.Command("kubectl", "logs",
+				"-l", "control-plane=controller-manager", "-n", namespace, "--tail=-1")
+			logs, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(logs).NotTo(ContainSubstring("cannot list resource \"jobs\""),
+				"controller lacks batch/jobs; charts/llmkube ClusterRole has drifted from the kubebuilder markers")
+
+			By("cleaning up the prefetch Model")
+			cmd = exec.Command("kubectl", "delete", "model", "prefetch-model",
+				"-n", crTestNs, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
+
 		It("should keep an HTTP-sourced Model Ready across a controller restart", func() {
 			// HTTP(S) sources are deferred to the InferenceService Pod's init
 			// container (issue #363) — the Model controller doesn't manage
