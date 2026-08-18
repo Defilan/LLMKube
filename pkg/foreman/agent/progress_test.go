@@ -406,7 +406,7 @@ func TestProgressMonitor_ReadOnlyBashStillTripsStreak(t *testing.T) {
 	}
 }
 
-func TestBashLikelyMutatesWorkspace(t *testing.T) {
+func TestBashWritesWorkspace_Legacy(t *testing.T) {
 	cases := []struct {
 		cmd  string
 		want bool
@@ -436,17 +436,17 @@ func TestBashLikelyMutatesWorkspace(t *testing.T) {
 		{"rm -rf x && tee y.txt", true},
 	}
 	for _, c := range cases {
-		if got := bashLikelyMutatesWorkspace(c.cmd); got != c.want {
-			t.Errorf("bashLikelyMutatesWorkspace(%q)=%v want %v", c.cmd, got, c.want)
+		if got := bashWritesWorkspace(c.cmd); got != c.want {
+			t.Errorf("bashWritesWorkspace(%q)=%v want %v", c.cmd, got, c.want)
 		}
 	}
 }
 
-// TestBashLikelyMutatesWorkspace_GitApplyAdded verifies that git apply commands
-// are now detected as workspace mutations by bashLikelyMutatesWorkspace. This
+// TestBashWritesWorkspace_GitApplyAdded verifies that git apply commands
+// are detected as workspace mutations by bashWritesWorkspace. This
 // closes a gap identified in #982 where models editing via `git apply` would
 // never reset the EditFreeStreak counter, causing force-terminate mid-edit.
-func TestBashLikelyMutatesWorkspace_GitApplyAdded(t *testing.T) {
+func TestBashWritesWorkspace_GitApplyAdded(t *testing.T) {
 	tests := []struct {
 		name     string
 		command  string
@@ -475,9 +475,9 @@ func TestBashLikelyMutatesWorkspace_GitApplyAdded(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := bashLikelyMutatesWorkspace(tt.command)
+			result := bashWritesWorkspace(tt.command)
 			if result != tt.expected {
-				t.Errorf("bashLikelyMutatesWorkspace(%q) = %v, want %v",
+				t.Errorf("bashWritesWorkspace(%q) = %v, want %v",
 					tt.command, result, tt.expected)
 			}
 		})

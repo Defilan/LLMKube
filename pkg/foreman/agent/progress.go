@@ -53,10 +53,10 @@ type ProgressConfig struct {
 	// be earned from bash commands that only LOOK like writes, before those
 	// resets stop being honoured.
 	//
-	// bashLikelyMutatesWorkspace is a substring heuristic biased toward
-	// detecting a write, because a false negative force-terminates a model
-	// editing through the shell (#982, #896). That bias is right, but it was
-	// unbounded: a command containing a matching token every turn resets the
+	// bashWritesWorkspace is a heuristic biased toward detecting a write,
+	// because a false negative force-terminates a model editing through the
+	// shell (#982, #896). That bias is right, but its old substring form was
+	// unbounded: a command containing a matching token every turn reset the
 	// streak every turn, so EditFreeTurnsLimit becomes unreachable and the
 	// detector cannot fire at all. Observed in #1520: 85 minutes, tens of
 	// thousands of model operations, a verifiably clean worktree, and no nudge.
@@ -588,21 +588,6 @@ func (m *LoopProgressMonitor) resetEditFreeStreak() {
 	m.lastReadFileKey = ""
 }
 
-// fileWritingBashTokens are substrings that indicate a bash command
-// mutates files in place or writes new ones.
-var fileWritingBashTokens = []string{
-	"sed -i", "tee ", "mv ", "cp ", "patch ", "dd ", "truncate ", "install ",
-	// git apply modifies source files directly without output redirection, so it
-	// needs an explicit token — the redirect parser in bashRedirectsToFile won't
-	// catch it. Added for #982: models editing via `git apply` were not resetting
-	// the EditFreeStreak counter, causing force-terminate mid-edit.
-	// NOTE: substring match — also matches `git apply --check/--stat/--numstat`,
-	// which are read-only but still safely counted as "edits here" for streak
-	// purposes (false positives reset the streak; the only failure mode is a
-	// false force-terminate, which this over-match biases away from).
-	"git apply",
-}
-
 // bashCallMutatesWorkspace parses a bash tool call's JSON arguments and
 // reports whether the command likely writes a workspace file. Malformed
 // arguments are treated as non-mutating (no reset).
@@ -613,86 +598,7 @@ func bashCallMutatesWorkspace(arguments string) bool {
 	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
 		return false
 	}
-	return bashLikelyMutatesWorkspace(args.Command)
-}
-
-// bashLikelyMutatesWorkspace reports whether a bash command probably
-// writes or edits a file. It is a heuristic: the EditFreeStreak signal
-// is an early warning, not a security control, so the bias is toward
-// detecting a write. A false positive merely delays the signal; a false
-// negative force-terminates a model that is legitimately editing through
-// the shell.
-func bashLikelyMutatesWorkspace(command string) bool {
-	for _, tok := range fileWritingBashTokens {
-		if containsTokenAtWordBoundary(command, tok) {
-			return true
-		}
-	}
-	return bashRedirectsToFile(command)
-}
-
-// containsTokenAtWordBoundary reports whether tok occurs in command at a word
-// boundary: either at the start of the string or immediately after a non-word
-// character. Every token in fileWritingBashTokens begins with the command name
-// (dd, mv, cp, tee, ...), so a boundary check on the leading char prevents
-// matching a token embedded inside an unrelated word. Without it, "git add "
-// matches "dd " and "scp x" matches "cp " (#896 secondary).
-func containsTokenAtWordBoundary(command, tok string) bool {
-	from := 0
-	for {
-		i := strings.Index(command[from:], tok)
-		if i < 0 {
-			return false
-		}
-		abs := from + i
-		if abs == 0 || !isWordByte(command[abs-1]) {
-			return true
-		}
-		from = abs + 1
-	}
-}
-
-// isWordByte reports whether b is an ASCII letter, digit, or underscore, i.e.
-// part of a shell word. The boundary check treats anything else (space, &, |,
-// ;, /, quotes, start-of-string) as a separator.
-func isWordByte(b byte) bool {
-	return b == '_' ||
-		(b >= 'a' && b <= 'z') ||
-		(b >= 'A' && b <= 'Z') ||
-		(b >= '0' && b <= '9')
-}
-
-// bashRedirectsToFile reports whether the command contains an output
-// redirection ('>' or '>>') whose target is a real file, ignoring
-// /dev/{null,stdout,stderr} and file-descriptor duplications (2>&1, >&2).
-func bashRedirectsToFile(command string) bool {
-	for i := 0; i < len(command); i++ {
-		if command[i] != '>' {
-			continue
-		}
-		j := i + 1
-		for j < len(command) && command[j] == '>' { // collapse '>>'
-			j++
-		}
-		for j < len(command) && (command[j] == ' ' || command[j] == '\t') {
-			j++
-		}
-		if j >= len(command) || command[j] == '&' {
-			// End of string or fd duplication like '>&2'; not a file write.
-			continue
-		}
-		k := j
-		for k < len(command) && !strings.ContainsRune(" \t\n;|&)", rune(command[k])) {
-			k++
-		}
-		switch command[j:k] {
-		case "/dev/null", "/dev/stdout", "/dev/stderr":
-			continue
-		default:
-			return true
-		}
-	}
-	return false
+	return bashWritesWorkspace(args.Command)
 }
 
 // findRepeatedCall scans the recentCallHashes buffer for any hash
