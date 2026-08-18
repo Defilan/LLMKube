@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1172,6 +1173,168 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
 		if got := archAffinityTerms(pod); got != nil {
 			t.Errorf("arch affinity values = %v, want none for multi-arch backend", got)
+		}
+	})
+
+	// nodeSelectorTerms are ORed, so the arch requirement must be ANDed into
+	// each of the user's existing terms as a matchExpression. Appending a term
+	// instead would make the user's own pin one of two alternatives and let the
+	// pod schedule anywhere of the right architecture (#1583).
+	t.Run("arch requirement is ANDed into the user's own affinity", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime: "llamacpp",
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+								MatchExpressions: []corev1.NodeSelectorRequirement{{
+									Key:      "nodepool",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"gpu-dedicated"},
+								}},
+							}},
+						},
+					},
+				},
+			},
+		}
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(terms) != 1 {
+			t.Fatalf("nodeSelectorTerms = %d, want 1; extra terms are ORed and make the "+
+				"user's nodepool pin optional: %+v", len(terms), terms)
+		}
+		var gotPool, gotArch bool
+		for _, expr := range terms[0].MatchExpressions {
+			switch expr.Key {
+			case "nodepool":
+				gotPool = true
+			case corev1.LabelArchStable:
+				gotArch = true
+				if !equalStrings(expr.Values, []string{"amd64"}) {
+					t.Errorf("arch values = %v, want [amd64]", expr.Values)
+				}
+			}
+		}
+		if !gotPool || !gotArch {
+			t.Errorf("term must AND both requirements; nodepool=%v arch=%v, expressions=%+v",
+				gotPool, gotArch, terms[0].MatchExpressions)
+		}
+	})
+
+	// With no user affinity there is nothing to AND into, so the constraint
+	// still has to materialise as its own term.
+	t.Run("arch requirement stands alone when the user set no affinity", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: "llamacpp"},
+		}
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 ||
+			terms[0].MatchExpressions[0].Key != corev1.LabelArchStable {
+			t.Fatalf("want a single term carrying only the arch expression, got %+v", terms)
+		}
+	})
+
+	// A user who pins placement with two alternative pools must keep both
+	// alternatives, each independently narrowed to the supported architecture.
+	t.Run("every user term is narrowed, not just the first", func(t *testing.T) {
+		userTerm := func(pool string) corev1.NodeSelectorTerm {
+			return corev1.NodeSelectorTerm{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key: "nodepool", Operator: corev1.NodeSelectorOpIn, Values: []string{pool},
+				}},
+			}
+		}
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime: "llamacpp",
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{userTerm("pool-a"), userTerm("pool-b")},
+						},
+					},
+				},
+			},
+		}
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+		if len(terms) != 2 {
+			t.Fatalf("nodeSelectorTerms = %d, want the user's 2 alternatives preserved: %+v", len(terms), terms)
+		}
+		for i, term := range terms {
+			var hasArch bool
+			for _, expr := range term.MatchExpressions {
+				if expr.Key == corev1.LabelArchStable {
+					hasArch = true
+				}
+			}
+			if !hasArch {
+				t.Errorf("term[%d] has no arch requirement, so it is an unconstrained "+
+					"alternative: %+v", i, term.MatchExpressions)
+			}
+		}
+	})
+
+	// The pod spec's Affinity is assigned straight from isvc.Spec.Affinity, so
+	// ANDing the requirement in place would write into the cached
+	// InferenceService and stack another copy on every reconcile.
+	t.Run("does not mutate the InferenceService across repeated builds", func(t *testing.T) {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime: "llamacpp",
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+								MatchExpressions: []corev1.NodeSelectorRequirement{{
+									Key:      "nodepool",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"gpu-dedicated"},
+								}},
+							}},
+						},
+					},
+				},
+			},
+		}
+		want := isvc.Spec.Affinity.DeepCopy()
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		orig := resolveBackend
+		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
+		defer func() { resolveBackend = orig }()
+
+		for i := range 3 {
+			pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+			terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+			if len(terms) != 1 || len(terms[0].MatchExpressions) != 2 {
+				t.Fatalf("build %d: want 1 term of 2 expressions, got %+v", i+1, terms)
+			}
+		}
+		if !reflect.DeepEqual(isvc.Spec.Affinity, want) {
+			t.Errorf("constructDeployment mutated isvc.Spec.Affinity:\n got %+v\nwant %+v",
+				isvc.Spec.Affinity, want)
 		}
 	})
 }
