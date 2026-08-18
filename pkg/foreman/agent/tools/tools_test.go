@@ -34,7 +34,7 @@ import (
 )
 
 // fakeMCPTool is a minimal Tool double standing in for a dynamically
-// discovered MCP tool (mcp/<server>/<tool>) in registry tests that
+// discovered MCP tool (mcp__<server>__<tool>) in registry tests that
 // exercise Add() without dialing a real MCP server.
 type fakeMCPTool struct {
 	name string
@@ -182,7 +182,7 @@ func TestRegistry_Dispatch_UnfilteredRegistryNoFalsePositives(t *testing.T) {
 // TestRegistry_FilterThenAdd pins the v0.3 Foreman MCP fix: MCP tools
 // must be appended AFTER the Agent.spec.tools whitelist Filter, not
 // before it. Filter is an allow-list intersection, and MCP tools are
-// named dynamically (mcp/<server>/<tool>), so no real Agent's
+// named dynamically (mcp__<server>__<tool>), so no real Agent's
 // spec.tools whitelist ever names one -- filtering them would silently
 // drop every MCP tool for every agent. Add() is the bypass: it's called
 // on the already-filtered registry, so MCP tools reach the model
@@ -201,13 +201,13 @@ func TestRegistry_FilterThenAdd(t *testing.T) {
 	}
 
 	// MCP tool is added AFTER Filter, so it bypasses the whitelist.
-	mcpTool := &fakeMCPTool{name: "mcp/context7/get-docs"}
+	mcpTool := &fakeMCPTool{name: "mcp__context7__get-docs"}
 	if err := filtered.Add(mcpTool); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 
 	got := filtered.Names()
-	want := []string{"mcp/context7/get-docs", "read_file", "submit_result"}
+	want := []string{"mcp__context7__get-docs", "read_file", "submit_result"}
 	if len(got) != len(want) {
 		t.Fatalf("Names() = %v, want %v", got, want)
 	}
@@ -226,7 +226,7 @@ func TestRegistry_FilterThenAdd(t *testing.T) {
 
 	// The mcp tool must actually be dispatchable, not just visible in
 	// Names() -- Add wires it into the same tools map Dispatch reads.
-	res, err := filtered.Dispatch(context.Background(), "mcp/context7/get-docs", json.RawMessage(`{}`))
+	res, err := filtered.Dispatch(context.Background(), "mcp__context7__get-docs", json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatalf("Dispatch(mcp tool): %v", err)
 	}
@@ -247,7 +247,7 @@ func TestRegistry_Add_SkipsDuplicatesReportsError(t *testing.T) {
 	}
 
 	dup := &fakeMCPTool{name: "read_file"} // collides with the native tool
-	fresh := &fakeMCPTool{name: "mcp/context7/get-docs"}
+	fresh := &fakeMCPTool{name: "mcp__context7__get-docs"}
 
 	err = r.Add(dup, fresh)
 	if err == nil {
@@ -260,7 +260,7 @@ func TestRegistry_Add_SkipsDuplicatesReportsError(t *testing.T) {
 	names := r.Names()
 	foundFresh := false
 	for _, n := range names {
-		if n == "mcp/context7/get-docs" {
+		if n == "mcp__context7__get-docs" {
 			foundFresh = true
 		}
 	}

@@ -448,3 +448,16 @@ func TestToolNameSanitisesSegments(t *testing.T) {
 		t.Errorf("Name() = %q, want %q", got, want)
 	}
 }
+
+// The coder grounding rail in the agent package identifies MCP results by
+// MCPToolNamePrefix. #1527 changed the separator here and left that literal
+// behind, so the rail matched nothing and silently collected no evidence on
+// every run. Pin the two together so a future rename cannot go one-sided.
+func TestToolNameCarriesAgentPackagePrefix(t *testing.T) {
+	tl := newTool(nil, "context7", "query-docs", Options{}, nil)
+	if got := tl.Name(); !strings.HasPrefix(got, agent.MCPToolNamePrefix) {
+		t.Errorf("Name() = %q, want prefix %q; transcript consumers in the agent "+
+			"package will not recognise this as an MCP tool result",
+			got, agent.MCPToolNamePrefix)
+	}
+}

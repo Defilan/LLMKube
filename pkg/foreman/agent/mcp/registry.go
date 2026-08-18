@@ -31,7 +31,7 @@ import (
 // enabled is false or servers is empty, it returns base unchanged and a
 // no-op closer. The per-call record hook is built internally from log
 // (V(1) debug visibility); the authoritative audit is the run transcript,
-// where every MCP call already appears as a normal mcp/<server>/<tool> call.
+// where every MCP call already appears as a normal mcp__<server>__<tool> call.
 func Register(
 	ctx context.Context, log logr.Logger, base []tools.Tool, servers []ServerConfig, opts Options, enabled bool,
 ) (all []tools.Tool, closer func() error) {
