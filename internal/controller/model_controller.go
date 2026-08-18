@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -113,6 +114,9 @@ type ModelReconciler struct {
 	// RevalidateInterval is the minimum time between upstream revalidation
 	// checks for a Model. Zero means DefaultRevalidateInterval.
 	RevalidateInterval time.Duration
+	// PrefetchJobReadTimeout bounds the read of a prefetch Job. Zero means
+	// DefaultPrefetchJobReadTimeout. See reconcilePrefetch (#1597).
+	PrefetchJobReadTimeout time.Duration
 	// AllowedHostPathRoots is the operator-configured allowlist of absolute
 	// path prefixes under which local (/abs and file://) model sources are
 	// permitted. Empty (the secure default) disables all local sources; see
@@ -1418,9 +1422,22 @@ func computeFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// ModelReconcileConcurrency is how many Models reconcile at once. The
+// controller-runtime default is 1, which makes every slow reconcile a
+// head-of-line block for every other Model: a Model waiting on a network
+// metadata read, or on a dependency that cannot be read at all (#1597),
+// stalls the queue behind it.
+//
+// Safe to raise here: controller-runtime never reconciles the same object
+// concurrently, and ModelReconciler carries no mutable shared state. Its
+// fields are configuration set once at startup, and the one lazily-built
+// value (metadataHTTPClient) is guarded by a sync.Once.
+const ModelReconcileConcurrency = 4
+
 func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.Model{}).
 		Named("model").
+		WithOptions(controller.Options{MaxConcurrentReconciles: ModelReconcileConcurrency}).
 		Complete(r)
 }

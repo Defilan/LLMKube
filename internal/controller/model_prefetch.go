@@ -84,6 +84,20 @@ func prefetchEligible(model *inferencev1alpha1.Model) bool {
 	return hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://")
 }
 
+// DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job. Generous
+// enough that a legitimate first-time informer sync on a cluster with many
+// Jobs completes well inside it, short enough that a permanently unsyncable
+// informer cannot monopolise a reconcile worker (#1597).
+const DefaultPrefetchJobReadTimeout = 30 * time.Second
+
+// prefetchJobReadTimeout returns the configured bound, or the default.
+func (r *ModelReconciler) prefetchJobReadTimeout() time.Duration {
+	if r.PrefetchJobReadTimeout > 0 {
+		return r.PrefetchJobReadTimeout
+	}
+	return DefaultPrefetchJobReadTimeout
+}
+
 // reconcilePrefetch drives the prefetch state machine. handled=true means
 // the prefetch path owns this reconcile and Reconcile should return its
 // result; handled=false means fall through to the normal source dispatch
@@ -102,8 +116,20 @@ func (r *ModelReconciler) reconcilePrefetch(ctx context.Context, model *inferenc
 
 	logger := logf.FromContext(ctx)
 
+	// Bounded read. The controller does not watch Jobs (see the polling
+	// comment below), so this is the first touch of the type and
+	// controller-runtime starts the informer lazily and waits for it to sync.
+	// When that informer can never list -- an RBAC denial like #1593, a
+	// partitioned API server -- the reflector retries forever and an unbounded
+	// Get holds the worker. The Model controller's workers are a shared
+	// resource, so that stalls every other Model, not just this one (#1597).
+	// A timeout turns it into a prompt error and an ordinary backoff requeue,
+	// which self-heals once the informer can sync.
+	getCtx, cancel := context.WithTimeout(ctx, r.prefetchJobReadTimeout())
+	defer cancel()
+
 	job := &batchv1.Job{}
-	err := r.Get(ctx, types.NamespacedName{Name: prefetchJobName(model), Namespace: model.Namespace}, job)
+	err := r.Get(getCtx, types.NamespacedName{Name: prefetchJobName(model), Namespace: model.Namespace}, job)
 	switch {
 	case apierrors.IsNotFound(err):
 		result, startErr := r.startPrefetch(ctx, model)
