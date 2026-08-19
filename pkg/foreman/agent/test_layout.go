@@ -3,6 +3,8 @@ package agent
 import (
 	"path"
 	"strings"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
 // TestLayout describes a repository's test-layout convention: where test
@@ -23,6 +25,13 @@ import (
 type TestLayout struct {
 	TestRoot   string
 	SourceRoot string
+}
+
+// testLayoutFrom converts the GateProfile's declared layout into the value the
+// path-folding helpers take. Kept as a conversion rather than using the CRD
+// type directly so the folding logic stays independent of the API shape.
+func testLayoutFrom(l foremanv1alpha1.TestLayout) TestLayout {
+	return TestLayout{TestRoot: l.TestRoot, SourceRoot: l.SourceRoot}
 }
 
 // IsZero reports whether the layout is unset: both roots are empty after
@@ -116,14 +125,20 @@ func stripTestDecoration(base string) string {
 		return strings.TrimPrefix(stem, "test_") + ext
 	}
 	// Go: X_test.go -> X.go (and Python X_test.py -> X.py).
-	if strings.HasSuffix(stem, "_test") {
-		return strings.TrimSuffix(stem, "_test") + ext
+	// Ruby RSpec: foo_spec.rb -> foo.rb.
+	for _, suffix := range []string{"_test", "_spec"} {
+		if strings.HasSuffix(stem, suffix) {
+			return strings.TrimSuffix(stem, suffix) + ext
+		}
 	}
-	// Java: FooTest.java -> Foo.java. Only reached when the stem carries none
-	// of the decorations above, so a dotted stem like "foo.test" can never be
-	// mis-stripped of its ".test".
-	if len(stem) > len("Test") && strings.HasSuffix(stem, "Test") {
-		return strings.TrimSuffix(stem, "Test") + ext
+	// CamelCase suffix forms: FooTest.java, FooTests.cs, FooSpec.scala.
+	// Only reached when the stem carries none of the decorations above, so a
+	// dotted stem like "foo.test" can never be mis-stripped of its ".test".
+	// Longest first, so "FooTests" is not left as "FooTest" by a shorter rule.
+	for _, suffix := range []string{"Tests", "Test", "Spec"} {
+		if len(stem) > len(suffix) && strings.HasSuffix(stem, suffix) {
+			return strings.TrimSuffix(stem, suffix) + ext
+		}
 	}
 	return ""
 }

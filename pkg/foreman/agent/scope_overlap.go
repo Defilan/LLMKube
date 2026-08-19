@@ -290,6 +290,7 @@ func enforceReviewerScopeOverlap(
 	diffFiles []string,
 	verdict foremanv1alpha1.AgenticTaskVerdict,
 	sourceExtensions []string,
+	testLayout TestLayout,
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if extra == nil {
 		return verdict
@@ -324,7 +325,7 @@ func enforceReviewerScopeOverlap(
 		// Index the mapped target under both full path and basename so a
 		// ref that names either the module's directory or just its file
 		// matches the test file that covers it.
-		for _, t := range testTargetsForPath(f) {
+		for _, t := range testTargetsWithLayout(f, testLayout) {
 			diffPaths[t] = true
 			diffBases[path.Base(t)] = true
 		}

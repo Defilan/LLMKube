@@ -151,6 +151,14 @@ func (SubmitResultTool) Execute(_ context.Context, args json.RawMessage) (*agent
 	if len(a.Summary) > MaxSubmitSummaryLen {
 		a.Summary = truncateRuneSafe(a.Summary, MaxSubmitSummaryLen)
 	}
+	// Never publish a nil Extra. Every verdict rail records its evidence, or
+	// its inability to run, into this map, and every rail nil-guards rather
+	// than panics, so a nil here silently disables all of them at once (the
+	// #1570 starved-extra signature). The rails' observability must not
+	// depend on whether the model bothered to send the optional field.
+	if a.Extra == nil {
+		a.Extra = map[string]any{}
+	}
 	return &agent.ToolResult{
 		Terminal:      true,
 		Verdict:       a.Verdict,

@@ -77,10 +77,43 @@ type GateProfile struct {
 	// +optional
 	SourceExtensions []string `json:"sourceExtensions,omitempty"`
 
+	// TestLayout declares where this repository's tests live relative to the
+	// code they cover, so the reviewer's scope-overlap check can map a test
+	// file back to the module it covers. Leave unset when tests sit beside
+	// the code, which is the common case and the built-in behaviour.
+	// +optional
+	TestLayout TestLayout `json:"testLayout,omitempty"`
+
 	// Commands overrides the preset commands. Only non-empty fields
 	// replace the preset; empty fields keep the preset value.
 	// +optional
 	Commands GateCommands `json:"commands,omitempty"`
+}
+
+// TestLayout declares a repository's parallel test-tree convention: the
+// directory tests live under, and the directory holding the code they cover.
+// Both are repo-relative. The zero value means tests sit beside the code.
+//
+// An "add tests for X" issue names X, and the correct change creates a test
+// file. Without this the scope-overlap rail reports the diff touches none of
+// the named files and the issue is unwinnable for any repository whose tests
+// live in a separate tree (#1447, #1579).
+type TestLayout struct {
+	// TestRoot is the directory tests live under, e.g. "src/test/java"
+	// for Maven/Gradle, or "spec" for a Ruby project.
+	// +optional
+	TestRoot string `json:"testRoot,omitempty"`
+
+	// SourceRoot is the directory the code under test lives under,
+	// e.g. "src/main/java" for Maven/Gradle, or "lib" for Ruby.
+	// +optional
+	SourceRoot string `json:"sourceRoot,omitempty"`
+}
+
+// IsZero reports whether no layout is declared, i.e. tests sit beside the
+// code they cover.
+func (l TestLayout) IsZero() bool {
+	return l.TestRoot == "" && l.SourceRoot == ""
 }
 
 // ResolvedGate is the concrete gate configuration after merging a
@@ -92,6 +125,10 @@ type ResolvedGate struct {
 	// SourceExtensions lists the file extensions the gate should
 	// consider as source files.
 	SourceExtensions []string `json:"sourceExtensions"`
+
+	// TestLayout is the resolved test-layout convention. The zero value
+	// means tests sit beside the code they cover.
+	TestLayout TestLayout `json:"testLayout,omitempty"`
 
 	// Format is the command that checks source formatting.
 	Format string `json:"format"`
@@ -180,6 +217,7 @@ func (p *GateProfile) Resolve() ResolvedGate {
 	resolved := ResolvedGate{
 		Image:            preset.Image,
 		SourceExtensions: preset.SourceExtensions,
+		TestLayout:       preset.TestLayout,
 		Format:           preset.Commands.Format,
 		Lint:             preset.Commands.Lint,
 		Build:            preset.Commands.Build,
@@ -197,6 +235,9 @@ func (p *GateProfile) Resolve() ResolvedGate {
 	}
 	if len(p.SourceExtensions) > 0 {
 		resolved.SourceExtensions = p.SourceExtensions
+	}
+	if !p.TestLayout.IsZero() {
+		resolved.TestLayout = p.TestLayout
 	}
 	if p.Commands.Format != "" {
 		resolved.Format = p.Commands.Format
