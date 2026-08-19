@@ -142,7 +142,15 @@ func enforceReviewerEmptyClaim(
 ) (foremanv1alpha1.AgenticTaskVerdict, foremanv1alpha1.AgenticTaskFailureReason) {
 	if emptyClaimDisabled() ||
 		verdict != foremanv1alpha1.AgenticTaskVerdictNoGo ||
-		extra == nil || changedLines == nil {
+		extra == nil {
+		return verdict, ""
+	}
+	// Without the diff this rail cannot separate an unsupported emptiness
+	// claim from a supported one, so the NO-GO it exists to remap stands.
+	// Record it (#1605): the rail built because an unverifiable claim should
+	// not be a NO-GO must not itself fail open silently.
+	if changedLines == nil {
+		recordRailSkipped(extra, railEmptyClaim, skipReasonNoDiff)
 		return verdict, ""
 	}
 	if !assertsEmptyBranch(emptyClaimTexts(summary, extra)...) {

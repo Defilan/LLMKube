@@ -291,7 +291,19 @@ func enforceReviewerScopeOverlap(
 	verdict foremanv1alpha1.AgenticTaskVerdict,
 	sourceExtensions []string,
 ) foremanv1alpha1.AgenticTaskVerdict {
-	if extra == nil || issueBody == "" || len(diffFiles) == 0 {
+	if extra == nil {
+		return verdict
+	}
+	// Each short-circuit below is a case where the rail cannot answer, not one
+	// where it answered "no drift". Record which, so a verdict produced without
+	// the check is distinguishable afterwards from one that earned it (#1605).
+	// Returning the model's verdict silently is what let this go unseen.
+	if issueBody == "" {
+		recordRailSkipped(extra, railScopeOverlap, skipReasonNoIssueBody)
+		return verdict
+	}
+	if len(diffFiles) == 0 {
+		recordRailSkipped(extra, railScopeOverlap, skipReasonNoDiffFiles)
 		return verdict
 	}
 	refs := extractIssuePathRefs(issueBody, sourceExtensions)

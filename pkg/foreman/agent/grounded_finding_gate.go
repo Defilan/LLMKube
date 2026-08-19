@@ -164,6 +164,7 @@ func enforceReviewerGroundedFindings(
 	// Silently returning the model's verdict is what made #1570 hard to see.
 	if changedLines == nil {
 		extra["groundingUnavailable"] = true
+		recordRailSkipped(extra, railGroundedFinding, skipReasonNoDiff)
 		extra["groundingUnavailableReason"] =
 			"branch diff unavailable; grounded-finding rail could not evaluate this NO-GO"
 		log.Info("reviewer grounded-finding: branch diff unavailable; verdict left unchecked",

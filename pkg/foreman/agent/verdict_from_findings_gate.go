@@ -61,7 +61,15 @@ func enforceReviewerVerdictFromFindings(
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if verdictFromFindingsDisabled() ||
 		verdict != foremanv1alpha1.AgenticTaskVerdictGo ||
-		extra == nil || changedLines == nil {
+		extra == nil {
+		return verdict
+	}
+	// The diff is this rail's only input. Without it nothing can be grounded,
+	// so a GO carrying a real blocking finding stands and opens a PR. Record
+	// that nothing checked it (#1605) instead of returning the model's verdict
+	// silently; the verdict is deliberately left alone.
+	if changedLines == nil {
+		recordRailSkipped(extra, railVerdictFromFindings, skipReasonNoDiff)
 		return verdict
 	}
 
