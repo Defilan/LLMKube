@@ -31,6 +31,18 @@ const (
 	skipReasonNoDiff      = "diff-unavailable"
 	skipReasonNoIssueBody = "no-issue-body"
 	skipReasonNoDiffFiles = "no-diff-files"
+	// skipReasonNoPathRefs is the likeliest of the four in practice: it fires
+	// for any issue citing no extractable file paths, which hand-written
+	// issues routinely do not.
+	skipReasonNoPathRefs = "no-path-refs-in-issue"
+)
+
+// Reasons the scope rail detected drift and then declined to act on it. These
+// are not skips: the rail ran and answered. They are recorded because
+// scopeDriftDetected alone cannot say which branch declined.
+const (
+	scopeNotDemotedNoSourceFile = "diff-has-no-source-file"
+	scopeNotDemotedAlreadyNonGo = "verdict-already-non-go"
 )
 
 // recordRailSkipped appends a rail's inability to run, and why, to extra.

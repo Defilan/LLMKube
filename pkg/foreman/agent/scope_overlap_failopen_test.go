@@ -80,3 +80,51 @@ func TestScopeOverlap_NilExtraDoesNotPanic(t *testing.T) {
 		t.Errorf("verdict must not change, got %v", got)
 	}
 }
+
+// Review of #1606: len(refs) == 0 was the fourth unrecorded short-circuit and
+// likely the most frequent, since it fires for any issue citing no file paths,
+// which hand-written issues routinely do not.
+func TestScopeOverlap_NoPathRefsIsRecorded(t *testing.T) {
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra,
+		"Make the reviewer stop approving work it never looked at.",
+		[]string{"pkg/foreman/agent/foo.go"},
+		foremanv1alpha1.AgenticTaskVerdictGo, nil)
+
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Errorf("verdict must not change, got %v", got)
+	}
+	reason, ok := skippedFor(extra, railScopeOverlap)
+	if !ok {
+		t.Fatalf("want %s recorded, extra=%v", railScopeOverlap, extra)
+	}
+	if reason != skipReasonNoPathRefs {
+		t.Errorf("want reason %q, got %q", skipReasonNoPathRefs, reason)
+	}
+}
+
+// The two branches that detect drift and then decline to demote must say which
+// one happened. They already leave scopeDriftDetected behind, so they are not
+// silent, but reading extra you cannot tell them apart.
+func TestScopeOverlap_DriftNotDemotedRecordsWhich(t *testing.T) {
+	// Docs-only diff: drift is real but a docs change is not scope drift.
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra,
+		"Fix `pkg/foreman/agent/executor_native.go`.", []string{"README.md"},
+		foremanv1alpha1.AgenticTaskVerdictGo, nil)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Errorf("docs-only diff must not demote, got %v", got)
+	}
+	if r, _ := extra["scopeDriftNotDemoted"].(string); r != scopeNotDemotedNoSourceFile {
+		t.Errorf("want %q, got %q (extra=%v)", scopeNotDemotedNoSourceFile, r, extra)
+	}
+
+	// Already non-GO: nothing to demote.
+	extra = map[string]any{}
+	enforceReviewerScopeOverlap(logr.Discard(), extra,
+		"Fix `pkg/foreman/agent/executor_native.go`.", []string{"pkg/foreman/agent/other.go"},
+		foremanv1alpha1.AgenticTaskVerdictNoGo, nil)
+	if r, _ := extra["scopeDriftNotDemoted"].(string); r != scopeNotDemotedAlreadyNonGo {
+		t.Errorf("want %q, got %q (extra=%v)", scopeNotDemotedAlreadyNonGo, r, extra)
+	}
+}
