@@ -49,8 +49,13 @@ var agentRoleRequiredTools = map[AgentRole][]string{
 // an empty system message while task prompts said "follow Step 1 of your
 // system prompt", and every verdict it minted was uninstructed with
 // nothing anywhere saying so.
+//
+// A deterministic Agent (isSingleNonTerminalTool) never renders a prompt:
+// the executor dispatches its single tool directly with no model loop
+// (#1613), so the NoSystemPrompt requirement does not apply to it.
 func (s *AgentSpec) ConfigFloor() (ok bool, reason, message string) {
-	if strings.TrimSpace(s.SystemPrompt) == "" {
+	deterministic := s.isSingleNonTerminalTool()
+	if !deterministic && strings.TrimSpace(s.SystemPrompt) == "" {
 		return false, AgentConfigReasonNoSystemPrompt,
 			"spec.systemPrompt is empty: the model runs uninstructed while task prompts reference its steps"
 	}
@@ -61,5 +66,20 @@ func (s *AgentSpec) ConfigFloor() (ok bool, reason, message string) {
 					s.Role, required, s.Role)
 		}
 	}
+	if deterministic {
+		return true, AgentConfigReasonComplete,
+			"deterministic single-tool spec: no model loop renders a systemPrompt"
+	}
 	return true, AgentConfigReasonComplete, "systemPrompt present and role-required tools advertised"
+}
+
+// isSingleNonTerminalTool reports whether spec.tools names exactly one
+// tool and it is not the terminal submit_result: the canonical
+// deterministic shape (the gate verifier with tools: [run_gate_job]). The
+// executor routes this shape through its model-free path
+// (executeDeterministic + pickDeterministicTool), where no model loop runs
+// and no systemPrompt is ever rendered (#1613). An LLM-path spec advertises
+// multiple tools (or only submit_result), so it is never reported here.
+func (s *AgentSpec) isSingleNonTerminalTool() bool {
+	return len(s.Tools) == 1 && s.Tools[0] != "" && s.Tools[0] != "submit_result"
 }
