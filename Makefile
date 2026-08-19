@@ -162,6 +162,11 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	$(GOLANGCI_LINT) config verify
+	$(GOLANGCI_LINT) config verify -c .golangci-deadcode.yml
+
+.PHONY: lint-deadcode
+lint-deadcode: golangci-lint ## Fail on production code referenced only by its own tests.
+	$(GOLANGCI_LINT) run -c .golangci-deadcode.yml ./...
 
 .PHONY: validate-samples
 validate-samples: ## Validate config/samples against CRD schemas (catch hallucinated manifests).
