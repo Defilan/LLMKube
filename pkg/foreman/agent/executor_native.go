@@ -785,6 +785,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			"loop returned nil error but no terminal result"), nil
 	}
 
+	// Stamp the record when this agent runs below its role's config floor
+	// (#1609), before any rail reads or writes extra.
+	stampAgentConfigWarnings(loopRes.Terminal, &agent.Spec)
+
 	verdict, normalizedReason := normalizeModelVerdict(loopRes.Terminal.Verdict)
 
 	// 9. Non-GO verdicts: no commit, no push, just record the model's

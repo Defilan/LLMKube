@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -62,9 +64,38 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"toolCount", len(agent.Spec.Tools),
 	)
 
-	// M3 stub: no status mutation. The scheduler reads Agent.spec
-	// directly when an AgenticTask references it; status fields are
-	// reserved for v0.2.
+	// Publish the config floor as the Validated condition the M3 stub
+	// reserved (#1609). Warn, do not refuse: an Agent that fails the floor
+	// still schedules, but its state is visible in status and in
+	// `kubectl get agents` instead of only in the verdicts it mints. The
+	// incident behind this: a hand-created reviewer Agent ran for days
+	// with no systemPrompt and no fetch_issue tool, and every review it
+	// produced was uninstructed with nothing anywhere saying so.
+	valid, reason, message := validateAgentConfig(&agent.Spec)
+	condStatus := metav1.ConditionTrue
+	if !valid {
+		condStatus = metav1.ConditionFalse
+		log.Info("Agent config below the role floor",
+			"agent", agent.Name, "reason", reason, "message", message)
+	}
+	// SetStatusCondition reports whether anything changed, so a no-op
+	// reconcile writes nothing.
+	changed := apimeta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               conditionValidated,
+		Status:             condStatus,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: agent.Generation,
+	})
+	if agent.Status.ObservedGeneration != agent.Generation {
+		agent.Status.ObservedGeneration = agent.Generation
+		changed = true
+	}
+	if changed {
+		if err := r.Status().Update(ctx, &agent); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	return ctrl.Result{}, nil
 }
 
