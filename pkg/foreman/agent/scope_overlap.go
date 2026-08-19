@@ -264,6 +264,48 @@ func testTargetsForPath(p string) []string {
 	return nil
 }
 
+// testContentReferencesModule reports whether any of the diff-ADDED test files
+// whose content can be read references modulePath. It is the content-based
+// half of the #1610 vouch: name-based folding (testTargetsForPath /
+// testTargetsWithLayout) folds the test file's NAME to its subject, which
+// fails for a test named after a feature or behaviour. This instead reads the
+// file's body and asks whether it imports the module under test
+// (contentReferencesModule), which is the deterministic, model-free signal
+// that a feature-named test really does cover the module.
+//
+// Only addedFiles are read — a test the branch created is the one whose
+// coverage we are vouching for, and reading them bounds the work to the diff.
+// A file whose content cannot be read is simply not a vouch: a read failure
+// must never flip a ref from unmatched to matched, so the rail degrades to
+// name-based behaviour rather than inventing coverage it cannot verify.
+func testContentReferencesModule(addedFiles []string, modulePath string, readFile func(string) ([]byte, error)) bool {
+	for _, f := range addedFiles {
+		if !isTestFile(f) {
+			continue
+		}
+		content, err := readFile(f)
+		if err != nil {
+			continue
+		}
+		if contentReferencesModule(string(content), modulePath) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTestFile reports whether p is a test file under any of the recognized
+// conventions. The content vouch only reads test files: a source file importing
+// a module is not evidence a test covers it, so restricting to test files keeps
+// the vouch scoped to test-coverage issues. It delegates to stripTestDecoration
+// (the broadest recognizer, covering the beside-the-code conventions plus the
+// parallel-tree forms like foo_spec.rb and FooTest.java) rather than
+// testTargetsForPath, so a feature-named test in a parallel tree is still read
+// for its content even when name-folding would not have folded it.
+func isTestFile(p string) bool {
+	return stripTestDecoration(path.Base(p)) != ""
+}
+
 // enforceReviewerScopeOverlap is the computable half of scope-drift
 // detection (#647). The issue body names concrete files; the ground-truth
 // diff says which files actually changed. When the issue names at least
@@ -283,6 +325,13 @@ func testTargetsForPath(p string) []string {
 // Matching is generous on purpose (exact path or basename equality):
 // a false drift flag costs one escalation review, while a missed match
 // would demote a legitimate branch.
+// addedFiles carries the subset of the branch's diff that was ADDED (git
+// status "A"), and readFile resolves a workspace-relative diff path to its
+// bytes. Both are only used by the content-based vouch (#1610): a test file
+// named for a feature (test_dedup.py) defeats name-based folding, but its body
+// imports the module it covers, and reading that import is the deterministic
+// signal name-folding cannot express. Pass nil for both to disable the vouch
+// and keep the pure name-based behaviour (every existing test does).
 func enforceReviewerScopeOverlap(
 	log logr.Logger,
 	extra map[string]any,
@@ -291,6 +340,8 @@ func enforceReviewerScopeOverlap(
 	verdict foremanv1alpha1.AgenticTaskVerdict,
 	sourceExtensions []string,
 	testLayout TestLayout,
+	addedFiles []string,
+	readFile func(relPath string) ([]byte, error),
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if extra == nil {
 		return verdict
@@ -331,6 +382,7 @@ func enforceReviewerScopeOverlap(
 		}
 	}
 	matched := []string{}
+	matchedByName := map[string]bool{}
 	for _, r := range refs {
 		// A ref is satisfied when the diff touches the module it names
 		// directly, or when the diff touches a test file that targets it:
@@ -339,6 +391,33 @@ func enforceReviewerScopeOverlap(
 		// matches the X.test file the diff creates (#1447).
 		if diffPaths[r] || diffBases[path.Base(r)] {
 			matched = append(matched, r)
+			matchedByName[r] = true
+		}
+	}
+
+	// Content-based vouch (#1610): name-based folding fails for a test file
+	// named for a feature or behaviour (test_dedup.py,
+	// test_platform_gh_api_forgejo.py) because its name does not derive from
+	// the module it covers. For each ref the name fold left unmatched, fall
+	// back to reading the diff-ADDED test files: a file whose content imports
+	// the module it covers vouches for it. Ordering is load-bearing — the
+	// content check runs only on the refs name matching left unmatched, so a
+	// path match is never re-derived from content, and the two signals stay
+	// distinguishable in the record.
+	if len(matched) < len(refs) && len(addedFiles) > 0 && readFile != nil {
+		for _, r := range refs {
+			if matchedByName[r] {
+				continue
+			}
+			if testContentReferencesModule(addedFiles, r, readFile) {
+				matched = append(matched, r)
+				matchedByName[r] = true
+				if extra[scopeMatchedViaContentKey] == nil {
+					extra[scopeMatchedViaContentKey] = []string{r}
+				} else {
+					extra[scopeMatchedViaContentKey] = append(extra[scopeMatchedViaContentKey].([]string), r)
+				}
+			}
 		}
 	}
 

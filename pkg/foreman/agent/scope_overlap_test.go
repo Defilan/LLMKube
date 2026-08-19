@@ -151,7 +151,7 @@ func TestEnforceReviewerScopeOverlap_GodotRefMatchVouches(t *testing.T) {
 	diff := []string{"scripts/main.gd", "tests/test_tick_integration.gd"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, godotIssueBody, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".gd"}, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".gd"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a diff touching issue-named .gd files must not demote; got %v", got)
 	}
@@ -172,7 +172,7 @@ func TestEnforceReviewerScopeOverlap_GodotBlindWithoutExtensions(t *testing.T) {
 	diff := []string{"scripts/main.gd", "tests/test_tick_integration.gd"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, godotIssueBody, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("no refs must pass through; got %v", got)
 	}
@@ -189,7 +189,7 @@ func TestEnforceReviewerScopeOverlap_Issue379DriftDemotesGo(t *testing.T) {
 	}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("zero scope overlap on GO must demote to NO-GO; got %v", got)
 	}
@@ -219,7 +219,7 @@ func TestEnforceReviewerScopeOverlap_MatchedRefStands(t *testing.T) {
 	diff := []string{"AGENTS.md"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue510Body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a diff touching a referenced file must not demote; got %v", got)
 	}
@@ -239,7 +239,7 @@ func TestEnforceReviewerScopeOverlap_BasenameMatch(t *testing.T) {
 	diff := []string{"config/rbac/role.yaml"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("basename match must not demote; got %v", got)
 	}
@@ -250,7 +250,7 @@ func TestEnforceReviewerScopeOverlap_NoRefsObserveOnly(t *testing.T) {
 	diff := []string{"pkg/agent/agent.go"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("no path refs in issue must not demote; got %v", got)
 	}
@@ -263,7 +263,7 @@ func TestEnforceReviewerScopeOverlap_DriftOnNoGoAnnotatesOnly(t *testing.T) {
 	diff := []string{"internal/foreman/controller/agentictask_controller.go"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
-		foremanv1alpha1.AgenticTaskVerdictNoGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictNoGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("NO-GO must stay NO-GO; got %v", got)
 	}
@@ -283,7 +283,7 @@ func TestEnforceReviewerScopeOverlap_ZeroGoFilesSkipsScopeCheck(t *testing.T) {
 	diff := []string{"README.md", "config/crd/bases/inference.llmkube.dev_models.yaml"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("zero-Go-file diff must not demote GO; got %v", got)
 	}
@@ -300,7 +300,7 @@ func TestEnforceReviewerScopeOverlap_RealDriftStillBites(t *testing.T) {
 	diff := []string{"internal/foreman/controller/agentictask_controller.go"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("real drift with Go files must still demote GO; got %v", got)
 	}
@@ -311,13 +311,13 @@ func TestEnforceReviewerScopeOverlap_RealDriftStillBites(t *testing.T) {
 
 func TestEnforceReviewerScopeOverlap_NilOrEmptyInputsPassThrough(t *testing.T) {
 	got := enforceReviewerScopeOverlap(logr.Discard(), nil, issue379Body,
-		[]string{"x.go"}, foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		[]string{"x.go"}, foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("nil extra must pass through; got %v", got)
 	}
 	extra := map[string]any{}
 	if got := enforceReviewerScopeOverlap(logr.Discard(), extra, "", nil,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}); got != foremanv1alpha1.AgenticTaskVerdictGo {
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil); got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("empty body and diff must pass through; got %v", got)
 	}
 }
@@ -385,7 +385,7 @@ func TestEnforceReviewerScopeOverlap_PythonExtensions(t *testing.T) {
 	diff := []string{"README.md", "docs/guide.md"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue379Body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"}, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("with .py extensions and no .py diff, scope check should skip; got %v", got)
 	}
@@ -426,7 +426,7 @@ func TestEnforceReviewerScopeOverlap_LineCitedRefVouches(t *testing.T) {
 	extra := map[string]any{}
 	body := "Buffered alerts are dropped on restart; see `main.go:135` and `main.go:80`."
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body,
-		[]string{"main.go", "main_test.go"}, foremanv1alpha1.AgenticTaskVerdictGo, []string{".go"}, TestLayout{})
+		[]string{"main.go", "main_test.go"}, foremanv1alpha1.AgenticTaskVerdictGo, []string{".go"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("a diff touching the line-cited file must keep GO, got %v", got)
 	}
@@ -539,7 +539,7 @@ func TestEnforceReviewerScopeOverlap_TestFileMapsToModule(t *testing.T) {
 	diff := []string{"src/lib/automation-sync.test.ts"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a diff that creates the test for the named module must not demote; got %v", got)
 	}
@@ -563,7 +563,7 @@ func TestEnforceReviewerScopeOverlap_GoTestFileMapsToModule(t *testing.T) {
 	diff := []string{"internal/foo/bar_test.go"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a diff adding bar_test.go must not demote an issue naming bar.go; got %v", got)
 	}
@@ -580,7 +580,7 @@ func TestEnforceReviewerScopeOverlap_TestFileBareRefMapsToModule(t *testing.T) {
 	diff := []string{"internal/foo/bar_test.go"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, nil, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a bare ref to bar.go must match the bar_test.go diff; got %v", got)
 	}
@@ -626,7 +626,7 @@ func TestEnforceReviewerScopeOverlap_Issue654ConcreteExample(t *testing.T) {
 	// stands and all three modules match.
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue654Ask, issue654Diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("the #654 test-coverage diff must not demote a GO; got %v (reason: %v)",
 			got, extra["demotionReason"])
@@ -666,7 +666,7 @@ func TestEnforceReviewerScopeOverlap_Issue654ModulesDriftStillDemotes(t *testing
 	diff := []string{"src/lib/unrelated-helper.ts"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, issue654Ask, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("a diff touching none of the #654 modules must still demote GO; got %v", got)
 	}
@@ -695,7 +695,7 @@ func TestEnforceReviewerScopeOverlap_RealDriftStillBitesAfterFix(t *testing.T) {
 	diff := []string{"totally-unrelated.ts"}
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{})
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{}, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("genuine drift must still demote GO; got %v", got)
 	}

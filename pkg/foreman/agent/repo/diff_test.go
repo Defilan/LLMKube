@@ -27,6 +27,54 @@ import (
 	"testing"
 )
 
+func TestParseNameStatusAdded(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"blank-only", "\n  \n", nil},
+		{
+			"single-add",
+			"A\ttests/test_dedup.py\n",
+			[]string{"tests/test_dedup.py"},
+		},
+		{
+			"add-among-modify",
+			"M\tsrc/app.py\nA\ttests/test_dedup.py\nM\tREADME.md\nD\told/gone.py\n",
+			[]string{"tests/test_dedup.py"},
+		},
+		{
+			"multiple-adds",
+			"A\ttests/test_a.py\nA\ttests/test_b.py\nM\tsrc/app.py\n",
+			[]string{"tests/test_a.py", "tests/test_b.py"},
+		},
+		{
+			"rename-and-copy-excluded",
+			"A\ttests/test_a.py\nR100\told/test_b.py\tnew/test_b.py\nC75\tsrc/x.py\tsrc/y.py\n",
+			[]string{"tests/test_a.py"},
+		},
+		{
+			"malformed-rows-skipped",
+			"A\ttests/test_a.py\nnotabline\nM\tsrc/app.py\n",
+			[]string{"tests/test_a.py"},
+		},
+		{
+			"crlf-tolerant",
+			"A\ttests/test_a.py\r\nM\tsrc/app.py\r\n",
+			[]string{"tests/test_a.py"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseNameStatusAdded(tc.in); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("parseNameStatusAdded(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseNameOnly(t *testing.T) {
 	cases := []struct {
 		name string
@@ -69,6 +117,88 @@ func TestDiffNameOnly_RejectsEmptyArgs(t *testing.T) {
 	}
 	if _, err := DiffNameOnly(ctx, "/tmp", ""); err == nil {
 		t.Error("DiffNameOnly: empty base should error")
+	}
+}
+
+func TestDiffAdded_RejectsEmptyArgs(t *testing.T) {
+	ctx := context.Background()
+	if _, err := DiffAdded(ctx, "", "main"); err == nil {
+		t.Error("DiffAdded: empty workspace should error")
+	}
+	if _, err := DiffAdded(ctx, "/tmp", ""); err == nil {
+		t.Error("DiffAdded: empty base should error")
+	}
+}
+
+// TestDiffAdded_RoundTrip exercises DiffAdded against a real bare git
+// workspace: init a repo with one file on main, branch off, then modify the
+// existing file, add two new files, and assert DiffAdded returns exactly the
+// two additions — not the modification. This is the export the content-based
+// vouch (#1610) reads, so the happy path and the modify-exclusion must both
+// be proven end to end. Skipped if `git` is not on PATH.
+func TestDiffAdded_RoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	ws := t.TempDir()
+	ctx := context.Background()
+
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := runGit(ctx, ws, baseEnv(), args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	mustWrite := func(rel, content string) {
+		t.Helper()
+		full := filepath.Join(ws, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdirall %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	// init repo + initial commit on main
+	run("init", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	mustWrite("app.py", "print('v1')\n")
+	run("add", ".")
+	run("commit", "-m", "initial")
+
+	// branch off: modify app.py, add two test files (leave nothing deleted)
+	run("checkout", "-b", "feature")
+	mustWrite("app.py", "print('v2')\n")
+	mustWrite("tests/test_dedup.py", "from app import dedup\n")
+	mustWrite("tests/test_other.py", "def test_x():\n    pass\n")
+	run("add", ".")
+	run("commit", "-m", "feature work")
+
+	got, err := DiffAdded(ctx, ws, "main")
+	if err != nil {
+		t.Fatalf("DiffAdded: %v", err)
+	}
+	want := map[string]bool{"tests/test_dedup.py": true, "tests/test_other.py": true}
+	if len(got) != len(want) {
+		t.Fatalf("DiffAdded = %v, want exactly the two added files (no modify)", got)
+	}
+	for _, p := range got {
+		if !want[p] {
+			t.Errorf("unexpected path %q in added set (a modify must not be added)", p)
+		}
+	}
+
+	// Back on main, HEAD == base, so nothing was added.
+	run("checkout", "main")
+	empty, err := DiffAdded(ctx, ws, "main")
+	if err != nil {
+		t.Fatalf("DiffAdded main vs HEAD: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Errorf("HEAD == base should yield no added files; got %v", empty)
 	}
 }
 

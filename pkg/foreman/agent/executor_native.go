@@ -883,10 +883,19 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			var scopeMatched []string
 			if reviewDiffErr == nil {
 				resolvedGate := task.Spec.GateProfile.Resolve()
+				// The content-based vouch (#1610) reads diff-ADDED test files
+				// from the workspace checkout. A failure to compute the added
+				// set or to read a file degrades the vouch to name-only — the
+				// rail must never demote on a read error, so this stays best-effort.
+				scopeAdded, _ := repo.DiffAdded(ctx, workspace, reviewBase)
+				scopeReadFile := func(relPath string) ([]byte, error) {
+					return os.ReadFile(filepath.Join(workspace, relPath))
+				}
 				verdict = enforceReviewerScopeOverlap(log, loopRes.Terminal.Extra,
 					extractFetchIssueBody(loopRes.Transcript), reviewDiff, verdict,
 					resolvedGate.SourceExtensions,
-					testLayoutFrom(resolvedGate.TestLayout))
+					testLayoutFrom(resolvedGate.TestLayout),
+					scopeAdded, scopeReadFile)
 				scopeDriftDetected, _ = loopRes.Terminal.Extra["scopeDriftDetected"].(bool)
 				scopeMatched, _ = loopRes.Terminal.Extra["scopeMatched"].([]string)
 			} else {
