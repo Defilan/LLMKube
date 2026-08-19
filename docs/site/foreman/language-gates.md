@@ -32,6 +32,9 @@ spec:
     language: python          # selects a built-in preset
     image: python:3.13        # container image the gate Job runs in
     sourceExtensions: [".py"] # extensions the scope guard treats as source
+    testLayout:               # where tests live, when not beside the code
+      testRoot: tests
+      sourceRoot: src
     commands:                 # overrides; empty fields keep the preset value
       format: "ruff format --check ."
       lint: "ruff check ."
@@ -67,6 +70,54 @@ spec:
 For a mixed-language pipeline, `pipeline[].gateProfile` overrides the
 workload-level default for that step only. Resolution is step → workload →
 Go preset.
+
+### Declaring where tests live (`testLayout`)
+
+The reviewer's scope-overlap check verifies that a diff touches the files an
+issue names. For "add tests for X" issues, a test file counts as touching the
+module it covers, but only when the check can fold the test file's path back
+to that module. Out of the box it folds the beside-the-code conventions:
+`x.test.ts` and `x.spec.ts` beside `x.ts`, `x_test.go` beside `x.go`,
+`test_x.py` and `x_test.py` beside `x.py`.
+
+That folding preserves the directory, so it cannot express a **parallel test
+tree**, where the directory differs too. `testLayout` declares the
+convention:
+
+```yaml
+gateProfile:
+  language: generic
+  sourceExtensions: [".java"]
+  testLayout:
+    testRoot: src/test/java     # where the tests live
+    sourceRoot: src/main/java   # where the code they cover lives
+```
+
+With a layout declared, a path under `testRoot` is folded by rewriting the
+root and stripping the test decoration from the basename, including the
+suffix forms the beside-the-code rules do not know:
+
+| repository style | test file | folds to |
+|---|---|---|
+| Maven / Gradle | `src/test/java/a/FooTest.java` | `src/main/java/a/Foo.java` |
+| Ruby RSpec | `spec/relnotes_spec.rb` (`testRoot: spec`, `sourceRoot: scripts`) | `scripts/relnotes.rb` |
+| pytest tree | `tests/test_relnotes.py` (`testRoot: tests`, `sourceRoot: scripts`) | `scripts/relnotes.py` |
+| C# / NUnit | `tests/FooTests.cs` (`testRoot: tests`, `sourceRoot: src`) | `src/Foo.cs` |
+
+Without the declaration, each of those diffs reads as touching none of the
+files the issue names: a correct "add tests for X" branch is demoted for
+scope drift and the task burns its attempt budget with no PR
+([#1447](https://github.com/defilantech/LLMKube/issues/1447)). Both fields
+are optional; an unset `testLayout` keeps the beside-the-code behaviour
+exactly, and a path outside `testRoot` falls back to it.
+
+Two boundaries worth knowing. Declaring a layout changes nothing until the
+profile carrying it reaches the task, so a bridge that maintains its own
+gate-profile map must add the field per repository. And the folding is
+name-based: a test file named after a **feature** rather than its module
+(`tests/test_dedup.py` covering `app.py`) cannot be expressed by any layout;
+that class is tracked in
+[#1610](https://github.com/defilantech/LLMKube/issues/1610).
 
 ### Built-in presets
 
