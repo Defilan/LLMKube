@@ -39,8 +39,6 @@ linters:
         linters: [unused]
       - path: pkg/foreman/agent/reviewer_diff_gate\.go # Refs #1570
         linters: [unused]
-      - path: pkg/foreman/agent/test_layout\.go # Refs #1579
-        linters: [unused]
       # Whole file is unreferenced: the proposal-1075 work-class buckets
       # (classifyFile, classifyFootprint and their tables) landed in #1254
       # and nothing calls them.
