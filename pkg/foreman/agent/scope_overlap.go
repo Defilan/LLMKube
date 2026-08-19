@@ -291,11 +291,27 @@ func enforceReviewerScopeOverlap(
 	verdict foremanv1alpha1.AgenticTaskVerdict,
 	sourceExtensions []string,
 ) foremanv1alpha1.AgenticTaskVerdict {
-	if extra == nil || issueBody == "" || len(diffFiles) == 0 {
+	if extra == nil {
+		return verdict
+	}
+	// Each short-circuit below is a case where the rail cannot answer, not one
+	// where it answered "no drift". Record which, so a verdict produced without
+	// the check is distinguishable afterwards from one that earned it (#1605).
+	// Returning the model's verdict silently is what let this go unseen.
+	if issueBody == "" {
+		recordRailSkipped(extra, railScopeOverlap, skipReasonNoIssueBody)
+		return verdict
+	}
+	if len(diffFiles) == 0 {
+		recordRailSkipped(extra, railScopeOverlap, skipReasonNoDiffFiles)
 		return verdict
 	}
 	refs := extractIssuePathRefs(issueBody, sourceExtensions)
 	if len(refs) == 0 {
+		// The issue named nothing checkable, so the rail cannot answer. Record
+		// it like the other short-circuits: a GO that passed through here did
+		// not earn a scope vouch, and nothing else says so.
+		recordRailSkipped(extra, railScopeOverlap, skipReasonNoPathRefs)
 		return verdict
 	}
 
@@ -337,10 +353,12 @@ func enforceReviewerScopeOverlap(
 	// legitimate docs- or YAML-only change (#800). Skip the scope check
 	// so the run proceeds.
 	if !hasSourceFile(diffFiles, sourceExtensions) {
+		extra["scopeDriftNotDemoted"] = scopeNotDemotedNoSourceFile
 		return verdict
 	}
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		extra["scopeDriftNotDemoted"] = scopeNotDemotedAlreadyNonGo
 		log.Info("reviewer scope: diff touches none of the files the issue names; verdict already non-GO, annotating only",
 			"verdict", verdict, "scopeRefs", refs)
 		return verdict

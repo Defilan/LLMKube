@@ -884,6 +884,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 				scopeDriftDetected, _ = loopRes.Terminal.Extra["scopeDriftDetected"].(bool)
 				scopeMatched, _ = loopRes.Terminal.Extra["scopeMatched"].([]string)
 			} else {
+				// A log line is not a record (#1605). Mark the skip in extra so a
+				// verdict produced without the scope check is distinguishable
+				// afterwards from one that earned it.
+				recordRailSkipped(loopRes.Terminal.Extra, railScopeOverlap, skipReasonNoDiff)
 				log.Info("reviewer scope: ground-truth diff unavailable; skipping scope check",
 					"err", reviewDiffErr.Error())
 			}
