@@ -273,6 +273,50 @@ via self-increment, but never emitted by any production path. The
 dashboard shows a permanent flat zero. This is the exact escape in
 issue #786.
 
+### K. Verify by execution, not inspection
+
+Reading a diff tells you what the code says. Only running it tells
+you what the code does. Two escapes this section exists to prevent:
+a rail merged whose central guard was reachable but never fired on
+the case its own PR cited, and a PR that claimed two reproductions
+fixed when its code structurally excluded one of them. Both passed
+gate and read-only review; both fell in minutes to a reviewer who
+executed the change instead of reading it.
+
+Do these two runs. They are cheap and they are mandatory whenever
+the diff touches `.go` files:
+
+1. **Run the diff's own new tests, narrowly.**
+   `bash("go test ./<package-of-touched-files>/ -run '<NewTestName>' -count=1")`
+   for the most load-bearing new test. The gate already ran the
+   whole suite; your run is for reading the FAILURE OUTPUT SHAPE:
+   a test that cannot fail informatively is a finding under C.
+
+2. **Probe one near-miss the diff does NOT test.** Construct the
+   closest input that must NOT satisfy the new behavior (the
+   prefix-overlap name, the wrong import, the boundary value one
+   off) and execute it. Without write tools, use bash: heredoc a
+   small `_probe_test.go` into the package, `go test -run` it,
+   then `rm` it. One probe, chosen adversarially, beats ten read
+   the code again passes. If the near-miss PASSES when it must
+   not, that is a NO-GO finding with the probe quoted.
+
+Then two audits that need no execution:
+
+3. **Claim-scope audit.** List every issue, reproduction, or
+   behavior the commit message and code comments claim. Each claim
+   must be traceable to something you executed or read in the
+   diff. A claim you cannot trace is a finding; a claim the code
+   structurally cannot satisfy is a finding EVEN WHEN YOU APPROVE,
+   because the next person hitting that case will conclude the
+   code is broken rather than the claim was loose.
+
+4. **Rationale audit.** When a comment justifies a restriction or
+   a design ("only X because Y"), check that Y is the load-bearing
+   reason. A guard justified by cost that actually exists for
+   soundness will be deleted by the first optimizer who disproves
+   the cost.
+
 ## Step 3 :: Report
 
 Call `submit_result` exactly once. Required fields:
@@ -296,6 +340,13 @@ Call `submit_result` exactly once. Required fields:
   REQUEST-CHANGES. False negatives (humans re-review approvals) are
   cheap; false positives (auto-merging a wrong-scope diff) are
   expensive.
+
+- In `extra`, set `onTrust` :: a short list of what you did NOT
+  verify and why ("full suite not run, exceeds my turn budget;
+  taking the gate's pass on trust"). An empty list claims you
+  verified everything, so leave it empty only when that is true.
+  A review that cannot say what it skipped is claiming an
+  exhaustiveness no bounded review has.
 
 - `summary` :: one-sentence outcome, 280 characters or fewer. This
   becomes `AgenticTask.status.result.summary` and the human-readable
