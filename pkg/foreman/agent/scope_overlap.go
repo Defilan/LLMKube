@@ -273,8 +273,18 @@ func testTargetsForPath(p string) []string {
 // (contentReferencesModule), which is the deterministic, model-free signal
 // that a feature-named test really does cover the module.
 //
-// Only addedFiles are read — a test the branch created is the one whose
-// coverage we are vouching for, and reading them bounds the work to the diff.
+// Only addedFiles are read, and the reason is soundness, not cost: a test
+// file this branch merely MODIFIED may have imported the module long before
+// the branch touched it, so vouching on a modified file's whole content
+// would let a coder earn a scope pass by editing any test that happens to
+// import the named module, without adding coverage for it. Restricting to
+// files the branch created means the import evidence cannot predate the
+// work. The price is a real out-of-scope class: a branch that APPENDS tests
+// to an existing test file is not vouched even when the appended lines
+// import the module (misospace/pr-reviewer-action#438 is exactly this
+// shape). Covering it needs the added LINES as the discriminator, not the
+// file: see the follow-up filed from the #1614 review.
+//
 // A file whose content cannot be read is simply not a vouch: a read failure
 // must never flip a ref from unmatched to matched, so the rail degrades to
 // name-based behaviour rather than inventing coverage it cannot verify.
