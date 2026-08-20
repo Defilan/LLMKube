@@ -1482,6 +1482,13 @@ func (in *ModelSpec) DeepCopyInto(out *ModelSpec) {
 		*out = new(corev1.LocalObjectReference)
 		**out = **in
 	}
+	if in.PrefetchTolerations != nil {
+		in, out := &in.PrefetchTolerations, &out.PrefetchTolerations
+		*out = make([]corev1.Toleration, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.Hardware != nil {
 		in, out := &in.Hardware, &out.Hardware
 		*out = new(HardwareSpec)

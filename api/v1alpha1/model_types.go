@@ -103,6 +103,16 @@ type ModelSpec struct {
 	// +optional
 	Prefetch bool `json:"prefetch,omitempty"`
 
+	// PrefetchTolerations are applied to the prefetch Job's pod, and govern
+	// nothing else: they say where the download may run, not where the model
+	// will be served. A fleet whose GPU nodes are tainted needs the prefetch
+	// download to schedule onto those nodes when the shared cache lives on
+	// node-local storage (#1621). Inheriting from an InferenceService would
+	// be ill-defined here: prefetch runs before the first InferenceService
+	// exists by design.
+	// +optional
+	PrefetchTolerations []corev1.Toleration `json:"prefetchTolerations,omitempty"`
+
 	// Format specifies the model file format.
 	// "gguf" is used with the llama-server runtime; "mlx" is used with the oMLX runtime;
 	// "safetensors", "pytorch", and "custom" are used with the generic runtime.

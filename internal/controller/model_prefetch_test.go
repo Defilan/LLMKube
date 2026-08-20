@@ -89,6 +89,36 @@ var _ = Describe("Model Prefetch", func() {
 		})
 	})
 
+	Describe("buildPrefetchJob scheduling", func() {
+		// #1621: a fleet whose GPU nodes are tainted needs the prefetch Job
+		// to tolerate them, because the shared cache can live on node-local
+		// storage pinned to exactly those nodes. The Model carries its own
+		// tolerations: inheriting from an InferenceService is ill-defined
+		// here, since prefetch runs before the first one exists by design.
+		It("carries the Model's tolerations onto the Job pod", func() {
+			m := newPrefetchModel("tolerated")
+			m.Spec.PrefetchTolerations = []corev1.Toleration{{
+				Key:      "nvidia.com/gpu",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "present",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}}
+			seedPrefetchCacheKey(m)
+			job, err := prefetchReconciler().buildPrefetchJob(m)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.Tolerations).To(HaveLen(1))
+			Expect(job.Spec.Template.Spec.Tolerations[0].Key).To(Equal("nvidia.com/gpu"))
+		})
+
+		It("emits no tolerations when the Model declares none", func() {
+			m := newPrefetchModel("plain")
+			seedPrefetchCacheKey(m)
+			job, err := prefetchReconciler().buildPrefetchJob(m)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.Tolerations).To(BeEmpty())
+		})
+	})
+
 	Describe("reconcilePrefetch", func() {
 		It("does not handle models without prefetch", func() {
 			m := newPrefetchModel("no-prefetch")
@@ -222,3 +252,8 @@ var _ = Describe("Model Prefetch", func() {
 		})
 	})
 })
+
+// #1621: a fleet whose GPU nodes are tainted needs the prefetch Job to
+// tolerate them. Inheriting from an InferenceService is ill-defined here,
+// because prefetch runs BEFORE the first InferenceService by design, so the
+// Model carries its own tolerations and the Job inherits those.
