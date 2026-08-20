@@ -63,9 +63,16 @@ spec:
       command: ["/app/ggml-rpc-server"]
       args: ["-H", "10.10.10.2", "-p", "50052"]
       resources:
-        limits:
-          nvidia.com/gpu: 1
+        requests: { memory: "116Gi", cpu: "4", nvidia.com/gpu: 1 }
+        limits:   { memory: "118Gi", nvidia.com/gpu: 1 }
 ```
+
+The memory bounds are not optional. On unified-memory hardware the worker's
+tensor allocations are ordinary node RAM; an unbounded worker receiving half
+of a very large model rides the node into kubelet eviction, and the failure
+arrives on the MAIN side as `send failed ... Remote RPC server crashed`,
+which reads as a network fault. A bounded worker dies a clean cgroup OOM
+instead, and the node survives to report it.
 
 Confirm it is listening on the fabric address and nothing else:
 `ss -tlnp | grep 50052` on ahazidgx2 must show `10.10.10.2:50052`, not `*:50052`.
@@ -87,10 +94,25 @@ spec:
   image: ghcr.io/defilantech/llmkube-llama-cuda-gb10:candidate-2a9f99817fda084a9c59b0df6943cd29ad683cc3
   nodeSelector:
     kubernetes.io/hostname: ahazidgx1
+  resources:
+    cpu: "8"
+    gpu: 1
+    memory: "118Gi"
   extraArgs:
     - "--rpc"
     - "10.10.10.2:50052"
+    - "--no-mmap"
+    - "--ctx-size"
+    - "8192"
 ```
+
+`spec.resources.gpu` is what makes the operator add the GPU-taint
+toleration; omit it and the pod sits Pending with a misleading affinity
+message. `--no-mmap` is mandatory at this scale on unified memory: mmap
+pages the whole artifact through the page cache ON TOP of the node's UMA
+share of the weights, which is a 2x memory demand on the main node. The
+same lesson as the Strix >64GB rule, at twice the size. Keep the first
+bring-up's context small; grow it only after the fit is proven.
 
 The corresponding Model stages from MinIO; multi-artifact via `spec.files`:
 
@@ -150,6 +172,14 @@ models with small active sets.
 - New architectures need a runtime image whose llama.cpp knows them: a
   day-zero model (e.g. `qwen35moe`) requires a `cuda-gb10` rebuild before
   any of this applies.
+- Budget with the REAL denominator: k8s allocatable minus system overhead
+  is ~118GiB per Spark, not 128. A 224GiB artifact leaves ~4-6GiB of margin
+  per node with nothing to spare; the first bring-up attempt without these
+  bounds took a node down hard enough to kill ssh. If a quant near 190-200GiB
+  exists, prefer it for the first proof and step up after.
+- When one side dies mid-transfer, the surviving rpc-server can block in an
+  uninterruptible send to its dead peer: the pod hangs in Terminating until
+  TCP gives up. Expect worker restarts to be slow after a peer crash.
 - Operator gaps this runbook papers over, tracked in [#1423]: the worker pod
   is hand-placed and unmonitored, the pair has no shared health, and a
   worker restart mid-serve is undetected until requests fail.
