@@ -150,6 +150,17 @@ type readErr struct{ path string }
 
 func (e *readErr) Error() string { return "fakeReader: no such file " + e.path }
 
+// fakeAddedLines backs the readAddedLines seam with an in-memory map of
+// modified-test-file path -> added lines, so the modified-file vouch (#1616)
+// tests need no workspace. A path with no entry returns an empty string and
+// no error, mirroring repo.DiffAddedLines on a file with no additions (the
+// caller treats an empty result as "no vouch from this probe").
+type fakeAddedLines map[string]string
+
+func (f fakeAddedLines) lines(relPath string) (string, error) {
+	return f[relPath], nil
+}
+
 // TestScopeOverlap_ContentVouchFeatureNamedTestIs the end-to-end #1610 case:
 // the issue names pr_reviewer/platform.py, the diff adds a test named for the
 // feature (test_platform_gh_api_forgejo.py) that does not fold to the module,
@@ -171,7 +182,7 @@ func TestScopeOverlap_ContentVouchFeatureNamedTest(t *testing.T) {
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, added,
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
 		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
-		added, reader.read)
+		added, reader.read, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a feature-named test whose body imports the named module must keep GO; got %v (reason: %v)",
 			got, extra["demotionReason"])
@@ -210,7 +221,7 @@ func TestScopeOverlap_ContentVouchNoMatchingImportStillDemotes(t *testing.T) {
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, added,
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
 		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
-		added, reader.read)
+		added, reader.read, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("a feature-named test that imports a different module must not vouch; got %v", got)
 	}
@@ -240,7 +251,7 @@ func TestScopeOverlap_ContentVouchOnlyReadsAddedTestFiles(t *testing.T) {
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
 		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
 		[]string{}, // nothing added: the vouch cannot read anything
-		reader.read)
+		reader.read, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("a test file outside the added set must not vouch; got %v", got)
 	}
@@ -262,7 +273,7 @@ func TestScopeOverlap_ContentVouchReadErrorDegradesToName(t *testing.T) {
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, added,
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
 		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
-		added, reader.read)
+		added, reader.read, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("an unreadable test file must not vouch; got %v", got)
 	}
@@ -288,7 +299,7 @@ func TestScopeOverlap_NameMatchNotReattributedToContent(t *testing.T) {
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, added,
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
 		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
-		added, reader.read)
+		added, reader.read, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Fatalf("a name match must keep GO; got %v", got)
 	}
@@ -311,7 +322,7 @@ func TestScopeOverlap_NilAddedOrReaderKeepsNameBehaviour(t *testing.T) {
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, added,
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"}, TestLayout{},
-		nil, reader.read)
+		nil, reader.read, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("nil added set must keep name-only behaviour (demote); got %v", got)
 	}
@@ -323,11 +334,147 @@ func TestScopeOverlap_NilAddedOrReaderKeepsNameBehaviour(t *testing.T) {
 	extra = map[string]any{}
 	got = enforceReviewerScopeOverlap(logr.Discard(), extra, body, added,
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"}, TestLayout{},
-		added, nil)
+		added, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("nil reader must keep name-only behaviour (demote); got %v", got)
 	}
 	if _, ok := extra[scopeMatchedViaContentKey]; ok {
 		t.Errorf("nil reader must not record a content vouch; extra=%v", extra)
+	}
+}
+
+// TestScopeOverlap_ContentVouchModifiedTestAddedLinesVouch is the positive
+// case of the #1616 extension: a test file the branch MODIFIED (it is in the
+// diff but not in the added set) vouches when the lines this branch ADDED to
+// it import the named module. The file is probed on its added lines, not its
+// whole body.
+func TestScopeOverlap_ContentVouchModifiedTestAddedLinesVouch(t *testing.T) {
+	body := "Add Forgejo API support to `pr_reviewer/platform.py` and cover it with tests."
+	// The test file is MODIFIED: it is in the diff, but not in the added set.
+	modified := "tests/test_platform_gh_api_forgejo.py"
+	// The lines the branch appended import the module under test.
+	addedLines := fakeAddedLines{
+		modified: "from pr_reviewer.platform import ForgejoClient\n\ndef test_forgejo_round_trip():\n    pass\n",
+	}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body,
+		[]string{modified}, // the diff touches the modified test file only
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
+		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
+		[]string{}, // nothing added: the only probe is the modified file's added lines
+		nil, addedLines.lines)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("a modified test whose added lines import the named module must keep GO; got %v (reason: %v)",
+			got, extra["demotionReason"])
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); v {
+		t.Errorf("scopeDriftDetected must be false when the modified test vouches by added lines; extra=%v", extra)
+	}
+	via, ok := extra[scopeMatchedViaContentKey].([]string)
+	if !ok || len(via) != 1 || via[0] != "pr_reviewer/platform.py" {
+		t.Errorf("scopeMatchedViaContent = %v, want the module vouched by the modified test's added lines", via)
+	}
+}
+
+// TestScopeOverlap_ContentVouchModifiedTestPreExistingImportDoesNotVouch is the
+// soundness case the #1616 design exists for: a test file the branch MODIFIED
+// may have imported the module BEFORE the branch touched it. When the import
+// lives only in UNCHANGED lines (the added lines do not import the module),
+// the vouch must not fire, so a GO on a diff that touches none of the named
+// files is still demoted.
+func TestScopeOverlap_ContentVouchModifiedTestPreExistingImportDoesNotVouch(t *testing.T) {
+	body := "Add Forgejo API support to `pr_reviewer/platform.py` and cover it with tests."
+	modified := "tests/test_platform_gh_api_forgejo.py"
+	// The WHOLE file imports the module (an unchanged line present on base), so
+	// whole-content matching would vouch. But the lines this branch ADDED only
+	// add an unrelated test — they do not import the module. Probing a modified
+	// file on added lines only must therefore not vouch, even though the whole
+	// file would: that is the false-positive class the design rejects.
+	reader := fakeReader{
+		modified: "from pr_reviewer.platform import ForgejoClient\n\n\ndef test_preexisting():\n    pass\n",
+	}
+	addedLines := fakeAddedLines{
+		modified: "def test_new_unrelated():\n    pass\n",
+	}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body,
+		[]string{modified},
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
+		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
+		[]string{},
+		reader.read, addedLines.lines)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("a modified test whose import predates the branch must NOT vouch; got %v", got)
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); !v {
+		t.Errorf("scopeDriftDetected must be true when the modified test does not vouch; extra=%v", extra)
+	}
+	if _, ok := extra[scopeMatchedViaContentKey]; ok {
+		t.Errorf("scopeMatchedViaContent must not be recorded for a pre-existing import; extra=%v", extra)
+	}
+}
+
+// TestScopeOverlap_ContentVouchAddedFileWholeContentNoRegression locks in that
+// the #1616 change did not disturb the #1610 added-file path: a test file the
+// branch ADDED is still vouched on its whole content, and the vouch fires
+// even when no modified-file probe is available (readAddedLines nil).
+func TestScopeOverlap_ContentVouchAddedFileWholeContentNoRegression(t *testing.T) {
+	body := "Add Forgejo API support to `pr_reviewer/platform.py` and cover it with tests."
+	added := "tests/test_platform_gh_api_forgejo.py"
+	reader := fakeReader{
+		added: "from pr_reviewer.platform import ForgejoClient\n\n\ndef test_forgejo_round_trip():\n    pass\n",
+	}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body,
+		[]string{added},
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
+		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
+		[]string{added},
+		reader.read, nil) // readAddedLines nil: the added-file probe still fires
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("an ADDED test whose body imports the module must still vouch (no regression); got %v", got)
+	}
+	via, ok := extra[scopeMatchedViaContentKey].([]string)
+	if !ok || len(via) != 1 || via[0] != "pr_reviewer/platform.py" {
+		t.Errorf("scopeMatchedViaContent = %v, want the module vouched by the added test's whole content", via)
+	}
+}
+
+// TestScopeOverlap_ContentVouchModifiedTest438Repro is the end-to-end
+// misospace/pr-reviewer-action#438 shape the #1616 slice exists to win: the
+// correct diff APPENDS import lines to an existing test file, touching nothing
+// else. Name-based folding cannot match the feature-named test file, so without
+// the added-lines vouch the GO would be demoted as scope drift. With it, the
+// GO stands and the vouch is recorded under scopeMatchedViaContent.
+func TestScopeOverlap_ContentVouchModifiedTest438Repro(t *testing.T) {
+	body := "Cover `pr_reviewer/platform.py`'s Forgejo API handling with tests."
+	testFile := "tests/test_platform_gh_api_forgejo.py"
+	// The diff touches ONLY the existing test file (an append), not the module —
+	// exactly the "unwinnable" shape: the module is named but the diff does not
+	// touch it.
+	appended := "from pr_reviewer.platform import ForgejoClient\n" +
+		"\n\ndef test_forgejo_round_trip():\n" +
+		"    client = ForgejoClient()\n    assert client is not None\n"
+	addedLines := fakeAddedLines{testFile: appended}
+	extra := map[string]any{}
+	got := enforceReviewerScopeOverlap(logr.Discard(), extra, body,
+		[]string{testFile},
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".py"},
+		TestLayout{TestRoot: "tests", SourceRoot: "pr_reviewer"},
+		[]string{},
+		nil, addedLines.lines)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("the #438 append-to-existing-test-file shape must keep GO; got %v (reason: %v)",
+			got, extra["demotionReason"])
+	}
+	if v, _ := extra["scopeDriftDetected"].(bool); v {
+		t.Errorf("scopeDriftDetected must be false for the #438 append shape; extra=%v", extra)
+	}
+	if v, _ := extra["verdictDemoted"].(bool); v {
+		t.Errorf("the #438 append shape must not be demoted; extra=%v", extra)
+	}
+	via, ok := extra[scopeMatchedViaContentKey].([]string)
+	if !ok || len(via) != 1 || via[0] != "pr_reviewer/platform.py" {
+		t.Errorf("scopeMatchedViaContent = %v, want the module vouched by the appended import lines", via)
 	}
 }

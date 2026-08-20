@@ -264,44 +264,86 @@ func testTargetsForPath(p string) []string {
 	return nil
 }
 
-// testContentReferencesModule reports whether any of the diff-ADDED test files
-// whose content can be read references modulePath. It is the content-based
-// half of the #1610 vouch: name-based folding (testTargetsForPath /
-// testTargetsWithLayout) folds the test file's NAME to its subject, which
-// fails for a test named after a feature or behaviour. This instead reads the
-// file's body and asks whether it imports the module under test
-// (contentReferencesModule), which is the deterministic, model-free signal
-// that a feature-named test really does cover the module.
+// contentProbe pairs a test file's workspace-relative diff path with the
+// content to check: the file's whole body when the branch ADDED it, or only
+// the lines the branch added when it merely MODIFIED it.
+type contentProbe struct {
+	path    string
+	content string
+}
+
+// testContentReferencesModule reports whether any probe's content references
+// modulePath. It is the content-based half of the #1610 vouch: name-based
+// folding (testTargetsForPath / testTargetsWithLayout) folds the test file's
+// NAME to its subject, which fails for a test named after a feature or
+// behaviour. This instead checks the test's content and asks whether it
+// imports the module under test (contentReferencesModule), the deterministic,
+// model-free signal that a feature-named test really does cover the module.
 //
-// Only addedFiles are read, and the reason is soundness, not cost: a test
-// file this branch merely MODIFIED may have imported the module long before
-// the branch touched it, so vouching on a modified file's whole content
-// would let a coder earn a scope pass by editing any test that happens to
-// import the named module, without adding coverage for it. Restricting to
-// files the branch created means the import evidence cannot predate the
-// work. The price is a real out-of-scope class: a branch that APPENDS tests
-// to an existing test file is not vouched even when the appended lines
-// import the module (misospace/pr-reviewer-action#438 is exactly this
-// shape). Covering it needs the added LINES as the discriminator, not the
-// file: see the follow-up filed from the #1614 review.
+// The probe content is chosen for soundness, not cost. A test file this branch
+// ADDED is checked on its whole body: a new test's imports cannot predate the
+// work. A test file this branch merely MODIFIED is checked on its added LINES
+// ONLY (#1616): the file may have imported the module long before the branch
+// touched it, so vouching on its whole content would let a coder earn a scope
+// pass by editing any test that happens to import the named module, without
+// adding coverage for it. The added lines are the sound discriminator — a test
+// that gains `from pkg.module import ...` in this diff is evidence; one that
+// merely already contained it is not. This now covers the append-to-an-existing
+// test-file shape (misospace/pr-reviewer-action#438) the #1614 slice left out.
 //
-// A file whose content cannot be read is simply not a vouch: a read failure
-// must never flip a ref from unmatched to matched, so the rail degrades to
-// name-based behaviour rather than inventing coverage it cannot verify.
-func testContentReferencesModule(addedFiles []string, modulePath string, readFile func(string) ([]byte, error)) bool {
-	for _, f := range addedFiles {
-		if !isTestFile(f) {
+// A probe whose content is empty (an unreadable added file, a modified file
+// with no added lines) is simply not a vouch: a read failure must never flip a
+// ref from unmatched to matched, so the rail degrades to name-based behaviour
+// rather than inventing coverage it cannot verify.
+func testContentReferencesModule(probes []contentProbe, modulePath string) bool {
+	for _, p := range probes {
+		if !isTestFile(p.path) {
 			continue
 		}
-		content, err := readFile(f)
-		if err != nil {
-			continue
-		}
-		if contentReferencesModule(string(content), modulePath) {
+		if contentReferencesModule(p.content, modulePath) {
 			return true
 		}
 	}
 	return false
+}
+
+// buildContentProbes assembles the content probes for the vouch. diff-ADDED
+// test files are probed on their whole body (readFile); diff-MODIFIED test
+// files are probed on their added lines only (readAddedLines). A nil readFile
+// disables the added-file probes and a nil readAddedLines disables the
+// modified-file probes, so passing nil for both reproduces the pre-#1616
+// name-only behaviour exactly.
+func buildContentProbes(
+	diffFiles, addedFiles []string,
+	readFile func(relPath string) ([]byte, error),
+	readAddedLines func(relPath string) (string, error),
+) []contentProbe {
+	added := make(map[string]bool, len(addedFiles))
+	for _, f := range addedFiles {
+		added[f] = true
+	}
+	var probes []contentProbe
+	if readFile != nil {
+		for _, f := range addedFiles {
+			if !isTestFile(f) {
+				continue
+			}
+			if content, err := readFile(f); err == nil {
+				probes = append(probes, contentProbe{path: f, content: string(content)})
+			}
+		}
+	}
+	if readAddedLines != nil {
+		for _, f := range diffFiles {
+			if !isTestFile(f) || added[f] {
+				continue
+			}
+			if lines, err := readAddedLines(f); err == nil {
+				probes = append(probes, contentProbe{path: f, content: lines})
+			}
+		}
+	}
+	return probes
 }
 
 // isTestFile reports whether p is a test file under any of the recognized
@@ -336,12 +378,16 @@ func isTestFile(p string) bool {
 // a false drift flag costs one escalation review, while a missed match
 // would demote a legitimate branch.
 // addedFiles carries the subset of the branch's diff that was ADDED (git
-// status "A"), and readFile resolves a workspace-relative diff path to its
-// bytes. Both are only used by the content-based vouch (#1610): a test file
-// named for a feature (test_dedup.py) defeats name-based folding, but its body
-// imports the module it covers, and reading that import is the deterministic
-// signal name-folding cannot express. Pass nil for both to disable the vouch
-// and keep the pure name-based behaviour (every existing test does).
+// status "A"), readFile resolves an ADDED workspace-relative diff path to its
+// bytes, and readAddedLines resolves a MODIFIED workspace-relative diff path
+// to the lines the branch added to it (via repo.DiffAddedLines). All three
+// are only used by the content-based vouch (#1610, extended to modified files
+// in #1616): a test file named for a feature (test_dedup.py) defeats name-based
+// folding, but its body — or, for a modified file, the lines this branch added
+// to it — imports the module it covers, and reading that import is the
+// deterministic signal name-folding cannot express. Pass nil for all three to
+// disable the vouch and keep the pure name-based behaviour (every existing
+// name-only test does).
 func enforceReviewerScopeOverlap(
 	log logr.Logger,
 	extra map[string]any,
@@ -352,6 +398,7 @@ func enforceReviewerScopeOverlap(
 	testLayout TestLayout,
 	addedFiles []string,
 	readFile func(relPath string) ([]byte, error),
+	readAddedLines func(relPath string) (string, error),
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if extra == nil {
 		return verdict
@@ -405,21 +452,23 @@ func enforceReviewerScopeOverlap(
 		}
 	}
 
-	// Content-based vouch (#1610): name-based folding fails for a test file
-	// named for a feature or behaviour (test_dedup.py,
-	// test_platform_gh_api_forgejo.py) because its name does not derive from
-	// the module it covers. For each ref the name fold left unmatched, fall
-	// back to reading the diff-ADDED test files: a file whose content imports
-	// the module it covers vouches for it. Ordering is load-bearing — the
-	// content check runs only on the refs name matching left unmatched, so a
-	// path match is never re-derived from content, and the two signals stay
-	// distinguishable in the record.
-	if len(matched) < len(refs) && len(addedFiles) > 0 && readFile != nil {
+	// Content-based vouch (#1610, extended to modified files in #1616):
+	// name-based folding fails for a test file named for a feature or
+	// behaviour (test_dedup.py, test_platform_gh_api_forgejo.py) because its
+	// name does not derive from the module it covers. For each ref the name
+	// fold left unmatched, fall back to checking the test content probes: an
+	// ADDED test file probed on its whole body, or a MODIFIED test file probed
+	// on its added lines, vouches when it imports the module it covers.
+	// Ordering is load-bearing — the content check runs only on the refs name
+	// matching left unmatched, so a path match is never re-derived from
+	// content, and the two signals stay distinguishable in the record.
+	probes := buildContentProbes(diffFiles, addedFiles, readFile, readAddedLines)
+	if len(matched) < len(refs) && len(probes) > 0 {
 		for _, r := range refs {
 			if matchedByName[r] {
 				continue
 			}
-			if testContentReferencesModule(addedFiles, r, readFile) {
+			if testContentReferencesModule(probes, r) {
 				matched = append(matched, r)
 				matchedByName[r] = true
 				if extra[scopeMatchedViaContentKey] == nil {

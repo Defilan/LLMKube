@@ -75,6 +75,69 @@ func TestParseNameStatusAdded(t *testing.T) {
 	}
 }
 
+func TestParseAddedLines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{
+			"single-add",
+			"diff --git a/tests/test_x.py b/tests/test_x.py\n" +
+				"index 000..111 100644\n" +
+				"--- a/tests/test_x.py\n" +
+				"+++ b/tests/test_x.py\n" +
+				"@@ -0,0 +1,1 @@\n" +
+				"+from pr_reviewer.platform import Client\n",
+			"from pr_reviewer.platform import Client",
+		},
+		{
+			"header-and-minus-ignored",
+			"--- a/f.py\n" +
+				"+++ b/f.py\n" +
+				"@@ -1 +1,2 @@\n" +
+				"-old line\n" +
+				"+new line one\n" +
+				"+new line two\n",
+			"new line one\nnew line two",
+		},
+		{
+			"added-line-whose-content-starts-with-plus",
+			"+++ b/f.py\n" +
+				"@@ -1,0 +1 @@\n" +
+				"++ not a header line\n",
+			"+ not a header line",
+		},
+		{"no-additions-pure-deletion", "--- a/f.py\n+++ b/f.py\n@@ -1 +0 @@\n-removed\n", ""},
+		{
+			"trailing-newline-normalized",
+			"+++ b/f.py\n@@ -0,0 +1 @@\n+only line\n\n",
+			"only line",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseAddedLines(tc.in); got != tc.want {
+				t.Errorf("parseAddedLines(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDiffAddedLines_RejectsEmptyArgs(t *testing.T) {
+	ctx := context.Background()
+	if _, err := DiffAddedLines(ctx, "", "main", "f.py"); err == nil {
+		t.Error("DiffAddedLines: empty workspace should error")
+	}
+	if _, err := DiffAddedLines(ctx, "/tmp", "", "f.py"); err == nil {
+		t.Error("DiffAddedLines: empty base should error")
+	}
+	if _, err := DiffAddedLines(ctx, "/tmp", "main", ""); err == nil {
+		t.Error("DiffAddedLines: empty file should error")
+	}
+}
+
 func TestParseNameOnly(t *testing.T) {
 	cases := []struct {
 		name string
@@ -199,6 +262,84 @@ func TestDiffAdded_RoundTrip(t *testing.T) {
 	}
 	if len(empty) != 0 {
 		t.Errorf("HEAD == base should yield no added files; got %v", empty)
+	}
+}
+
+// TestDiffAddedLines_RoundTrip exercises DiffAddedLines against a real git
+// workspace: a test file already present on main gains appended import lines
+// on a feature branch, and DiffAddedLines must return exactly those added
+// lines — not the pre-existing body, not the removed line. This is the
+// content source for the modified-file half of the content vouch (#1616), so
+// the append shape (the #438 reproduction) must be proven end to end. Skipped
+// if `git` is not on PATH.
+func TestDiffAddedLines_RoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	ws := t.TempDir()
+	ctx := context.Background()
+
+	run := func(args ...string) {
+		t.Helper()
+		if _, err := runGit(ctx, ws, baseEnv(), args...); err != nil {
+			t.Fatalf("git %v: %v", args, err)
+		}
+	}
+
+	mustWrite := func(rel, content string) {
+		t.Helper()
+		full := filepath.Join(ws, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdirall %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	// init repo + initial commit on main with an existing test file.
+	run("init", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	mustWrite("tests/test_platform.py", "import base_module\n\n\ndef test_existing():\n    pass\n")
+	run("add", ".")
+	run("commit", "-m", "initial")
+
+	// branch off and APPEND import lines to the existing test file, removing
+	// one line so the minus side is present and must be excluded.
+	run("checkout", "-b", "feature")
+	featureBody := "import base_module\n" +
+		"from pr_reviewer.platform import ForgejoClient\n\n\n" +
+		"def test_existing():\n    pass\n"
+	mustWrite("tests/test_platform.py", featureBody)
+	run("add", ".")
+	run("commit", "-m", "append import")
+
+	got, err := DiffAddedLines(ctx, ws, "main", "tests/test_platform.py")
+	if err != nil {
+		t.Fatalf("DiffAddedLines: %v", err)
+	}
+	if want := "from pr_reviewer.platform import ForgejoClient"; got != want {
+		t.Errorf("DiffAddedLines = %q, want exactly the appended import line %q", got, want)
+	}
+
+	// A file the branch did not touch yields no additions (not an error).
+	untouched, err := DiffAddedLines(ctx, ws, "main", "README.md")
+	if err != nil {
+		t.Fatalf("DiffAddedLines on untouched path: %v", err)
+	}
+	if untouched != "" {
+		t.Errorf("untouched file should yield no added lines; got %q", untouched)
+	}
+
+	// Back on main, HEAD == base, so nothing was added to the file.
+	run("checkout", "main")
+	empty, err := DiffAddedLines(ctx, ws, "main", "tests/test_platform.py")
+	if err != nil {
+		t.Fatalf("DiffAddedLines main vs HEAD: %v", err)
+	}
+	if empty != "" {
+		t.Errorf("HEAD == base should yield no added lines; got %q", empty)
 	}
 }
 
