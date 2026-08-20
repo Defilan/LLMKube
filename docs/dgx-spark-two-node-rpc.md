@@ -83,7 +83,7 @@ kind: InferenceService
 metadata:
   name: ornith-397b-2spark
 spec:
-  modelRef: { name: ornith-397b }
+  modelRef: ornith-397b
   image: ghcr.io/defilantech/llmkube-llama-cuda-gb10:candidate-2a9f99817fda084a9c59b0df6943cd29ad683cc3
   nodeSelector:
     kubernetes.io/hostname: ahazidgx1
