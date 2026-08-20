@@ -55,6 +55,57 @@ func DiffNameOnly(ctx context.Context, workspace, base string) ([]string, error)
 	return parseNameOnly(out), nil
 }
 
+// DiffAdded returns the subset of the branch's diff whose status is ADDED
+// (git status "A"), using `git diff --name-status base...HEAD`. The three-dot
+// form matches DiffNameOnly, so the two agree on which files the branch
+// touched; this only narrows to the additions.
+//
+// The content-based test-coverage vouch (#1610) reads the body of a diff-ADDED
+// test file to check it imports the module it covers. Reading only added files
+// keeps the vouch scoped to what this branch created — a test the branch added
+// is the coverage we are vouching for — and bounds the file reads to the diff
+// rather than the whole tree. An empty result is not an error.
+func DiffAdded(ctx context.Context, workspace, base string) ([]string, error) {
+	if workspace == "" {
+		return nil, fmt.Errorf("DiffAdded: workspace is required")
+	}
+	if base == "" {
+		return nil, fmt.Errorf("DiffAdded: base ref is required")
+	}
+	out, err := runGit(ctx, workspace, baseEnv(), "diff", "--name-status", base+"...HEAD")
+	if err != nil {
+		return nil, err
+	}
+	return parseNameStatusAdded(out), nil
+}
+
+// parseNameStatusAdded keeps only the ADDED ("A") paths from tab-separated
+// `git diff --name-status` output. Rename/copy rows ("R..", "C..") are not
+// additions of a new path and are excluded: a renamed test file's coverage was
+// already present on the base, so it is not the new coverage the vouch targets.
+// Returns nil (not []string{}) when nothing was added, so a DeepEqual against
+// a nil expectation works in callers and tests.
+func parseNameStatusAdded(out string) []string {
+	if out == "" {
+		return nil
+	}
+	var added []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) < 2 {
+			continue
+		}
+		if f[0] == "A" {
+			added = append(added, f[len(f)-1])
+		}
+	}
+	return added
+}
+
 // parseNameOnly splits a `git diff --name-only` output into a clean
 // slice of paths. Strips empty lines and trims surrounding whitespace
 // off each entry. Returns nil (not []string{}) when the output yields
