@@ -271,7 +271,11 @@ func (r *ModelReconciler) buildPrefetchJob(model *inferencev1alpha1.Model) (*bat
 				Spec: corev1.PodSpec{
 					RestartPolicy:   corev1.RestartPolicyNever,
 					SecurityContext: podSecurity,
-					InitContainers:  storage.initContainers,
+					// The Model's own tolerations, so the download can reach
+					// tainted nodes whose local storage backs the shared
+					// cache (#1621).
+					Tolerations:    model.Spec.PrefetchTolerations,
+					InitContainers: storage.initContainers,
 					Containers: []corev1.Container{{
 						Name:    "prefetch-done",
 						Image:   image,
