@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,10 +53,15 @@ func TestValidateAgentConfig(t *testing.T) {
 			wantValid: true,
 		},
 		{
+			// An LLM agent (endpoint set) still needs a prompt; the
+			// NoSystemPrompt floor applies to the model path, not the
+			// deterministic path (#1613).
 			name: "empty systemPrompt fails for any role",
 			spec: foremanv1alpha1.AgentSpec{
-				Role:  "coder",
-				Tools: []string{"read_file", "bash", "submit_result"},
+				Role:                "coder",
+				Provider:            foremanv1alpha1.AgentProviderLocal,
+				InferenceServiceRef: corev1.LocalObjectReference{Name: "svc"},
+				Tools:               []string{"read_file", "bash", "submit_result"},
 			},
 			wantValid:  false,
 			wantReason: foremanv1alpha1.AgentConfigReasonNoSystemPrompt,
@@ -63,9 +69,11 @@ func TestValidateAgentConfig(t *testing.T) {
 		{
 			name: "whitespace-only systemPrompt fails",
 			spec: foremanv1alpha1.AgentSpec{
-				Role:         "reviewer",
-				SystemPrompt: "  \n\t ",
-				Tools:        []string{"fetch_issue", "submit_result"},
+				Role:                "reviewer",
+				Provider:            foremanv1alpha1.AgentProviderLocal,
+				InferenceServiceRef: corev1.LocalObjectReference{Name: "svc"},
+				SystemPrompt:        "  \n\t ",
+				Tools:               []string{"fetch_issue", "submit_result"},
 			},
 			wantValid:  false,
 			wantReason: foremanv1alpha1.AgentConfigReasonNoSystemPrompt,
@@ -81,10 +89,14 @@ func TestValidateAgentConfig(t *testing.T) {
 			wantReason: foremanv1alpha1.AgentConfigReasonMissingRoleTools,
 		},
 		{
+			// LLM reviewer (endpoint set) missing both prompt and
+			// fetch_issue: the prompt failure is reported first.
 			name: "missing prompt reported before missing tools",
 			spec: foremanv1alpha1.AgentSpec{
-				Role:  "reviewer",
-				Tools: []string{"bash", "submit_result"},
+				Role:                "reviewer",
+				Provider:            foremanv1alpha1.AgentProviderLocal,
+				InferenceServiceRef: corev1.LocalObjectReference{Name: "svc"},
+				Tools:               []string{"bash", "submit_result"},
 			},
 			wantValid:  false,
 			wantReason: foremanv1alpha1.AgentConfigReasonNoSystemPrompt,
@@ -130,11 +142,18 @@ func TestAgentReconcilerWritesValidatedCondition(t *testing.T) {
 	if err := foremanv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	// The incident: a hand-created LLM reviewer ran with no systemPrompt
+	// and no fetch_issue, so every verdict it minted was uninstructed and
+	// it could not read the issue under review (#1609). An LLM reviewer
+	// (endpoint set), not a deterministic one, so the prompt requirement
+	// applies (#1613).
 	agent := &foremanv1alpha1.Agent{
 		ObjectMeta: metav1.ObjectMeta{Name: "blind-reviewer", Namespace: "default", Generation: 3},
 		Spec: foremanv1alpha1.AgentSpec{
-			Role:  "reviewer",
-			Tools: []string{"read_file", "grep", "bash", "submit_result"},
+			Role:                "reviewer",
+			Provider:            foremanv1alpha1.AgentProviderLocal,
+			InferenceServiceRef: corev1.LocalObjectReference{Name: "svc"},
+			Tools:               []string{"read_file", "grep", "bash", "submit_result"},
 		},
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).
