@@ -38,7 +38,7 @@ func TestScopeLayout_LanguageConventions(t *testing.T) {
 			extra := map[string]any{}
 			got := enforceReviewerScopeOverlap(logr.Discard(), extra,
 				"Add tests for `"+c.issueRef+"`.", []string{c.testFile},
-				foremanv1alpha1.AgenticTaskVerdictGo, []string{c.ext}, c.layout, nil, nil)
+				foremanv1alpha1.AgenticTaskVerdictGo, []string{c.ext}, c.layout, nil, nil, nil)
 			if got != foremanv1alpha1.AgenticTaskVerdictGo {
 				t.Errorf("%s demoted: matched=%v refs=%v", c.lang,
 					extra["scopeMatched"], extra["scopeRefs"])
@@ -52,7 +52,7 @@ func TestScopeLayout_ZeroLayoutPreservesBesideTheCode(t *testing.T) {
 	extra := map[string]any{}
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra,
 		"Add tests for `src/lib/foo.ts`.", []string{"src/lib/foo.test.ts"},
-		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{}, nil, nil)
+		foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, TestLayout{}, nil, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictGo {
 		t.Errorf("beside-the-code must still match, matched=%v", extra["scopeMatched"])
 	}
@@ -70,7 +70,7 @@ func TestScopeLayout_Issue1447StaysGreen(t *testing.T) {
 	for _, l := range []TestLayout{{}, {TestRoot: "tests", SourceRoot: "src"}} {
 		extra := map[string]any{}
 		got := enforceReviewerScopeOverlap(logr.Discard(), extra, body, diff,
-			foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, l, nil, nil)
+			foremanv1alpha1.AgenticTaskVerdictGo, []string{".ts"}, l, nil, nil, nil)
 		if got != foremanv1alpha1.AgenticTaskVerdictGo {
 			t.Errorf("#1447 regressed with layout %+v: matched=%v", l, extra["scopeMatched"])
 		}
@@ -83,7 +83,7 @@ func TestScopeLayout_RealDriftStillDemotes(t *testing.T) {
 	got := enforceReviewerScopeOverlap(logr.Discard(), extra,
 		"Fix `src/main/java/Foo.java`.", []string{"src/main/java/Unrelated.java"},
 		foremanv1alpha1.AgenticTaskVerdictGo, []string{".java"},
-		TestLayout{TestRoot: "src/test/java", SourceRoot: "src/main/java"}, nil, nil)
+		TestLayout{TestRoot: "src/test/java", SourceRoot: "src/main/java"}, nil, nil, nil)
 	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Errorf("real drift must demote, got %v", got)
 	}

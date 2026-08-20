@@ -891,11 +891,19 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 				scopeReadFile := func(relPath string) ([]byte, error) {
 					return os.ReadFile(filepath.Join(workspace, relPath))
 				}
+				// The modified-file vouch (#1616) checks a modified test file on
+				// the lines this branch ADDED to it, so a test that gained the
+				// import vouches while one that merely already had it does not.
+				// Like scopeAdded, a failure degrades the probe to absent — the
+				// rail never demotes on a read error, so this stays best-effort.
+				scopeReadAddedLines := func(relPath string) (string, error) {
+					return repo.DiffAddedLines(ctx, workspace, reviewBase, relPath)
+				}
 				verdict = enforceReviewerScopeOverlap(log, loopRes.Terminal.Extra,
 					extractFetchIssueBody(loopRes.Transcript), reviewDiff, verdict,
 					resolvedGate.SourceExtensions,
 					testLayoutFrom(resolvedGate.TestLayout),
-					scopeAdded, scopeReadFile)
+					scopeAdded, scopeReadFile, scopeReadAddedLines)
 				scopeDriftDetected, _ = loopRes.Terminal.Extra["scopeDriftDetected"].(bool)
 				scopeMatched, _ = loopRes.Terminal.Extra["scopeMatched"].([]string)
 			} else {

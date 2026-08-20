@@ -79,6 +79,59 @@ func DiffAdded(ctx context.Context, workspace, base string) ([]string, error) {
 	return parseNameStatusAdded(out), nil
 }
 
+// DiffAddedLines returns the lines the branch ADDED to a single file, using
+// `git diff -U0 base...HEAD -- file`. It is the content source for the
+// modified-file half of the content-based test-coverage vouch (#1616): a test
+// file this branch merely modified may have imported the module under test
+// long before the branch touched it, so the file's whole content is not
+// evidence of new coverage. The added LINES are: a test that gains
+// `from pkg.module import ...` in this diff is evidence; one that merely
+// already contained it is not.
+//
+// The three-dot form matches DiffNameOnly / DiffAdded, so the base boundary
+// agrees. `-U0` drops context lines so the result is exactly the additions.
+// Each `+` line is stripped of its leading `+`; the `+++ b/<file>` header is
+// skipped. Returns the added lines joined by newlines ("" when the file has
+// no additions, e.g. a pure deletion). An empty result is not an error.
+func DiffAddedLines(ctx context.Context, workspace, base, file string) (string, error) {
+	if workspace == "" {
+		return "", fmt.Errorf("DiffAddedLines: workspace is required")
+	}
+	if base == "" {
+		return "", fmt.Errorf("DiffAddedLines: base ref is required")
+	}
+	if file == "" {
+		return "", fmt.Errorf("DiffAddedLines: file path is required")
+	}
+	out, err := runGit(ctx, workspace, baseEnv(), "diff", "-U0", base+"...HEAD", "--", file)
+	if err != nil {
+		return "", err
+	}
+	return parseAddedLines(out), nil
+}
+
+// parseAddedLines collects the added lines from a unified diff: every line
+// starting with `+` (minus the `+++` new-file header), with the leading `+`
+// removed and CRLF line endings normalized. Returns "" when there are no
+// additions.
+func parseAddedLines(diff string) string {
+	if diff == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(diff, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, "+++") {
+			continue
+		}
+		if len(line) > 1 && strings.HasPrefix(line, "+") {
+			b.WriteString(line[1:])
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
 // parseNameStatusAdded keeps only the ADDED ("A") paths from tab-separated
 // `git diff --name-status` output. Rename/copy rows ("R..", "C..") are not
 // additions of a new path and are excluded: a renamed test file's coverage was
