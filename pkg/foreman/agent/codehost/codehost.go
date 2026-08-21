@@ -78,8 +78,11 @@ func SplitRepoSlug(slug string) (namespace, name string, ok bool) {
 type CodeHost interface {
 	// ResolveCloneURL derives the HTTPS git clone URL from a repo slug
 	// like "owner/name" (GitHub) or "group/subgroup/project" (GitLab /
-	// nested Forgejo). Returns "" for an empty or malformed slug so
-	// callers fall back to the cloned fork's HEAD.
+	// nested Forgejo). Returns "" for an empty or malformed slug; the
+	// executor's fork-HEAD fallback then applies to freeform tasks
+	// (which carry no slug by design), while repo-bearing kinds (issue-
+	// fix, verify, review) refuse an empty slug as a configuration
+	// error (#1625) rather than basing on a possibly-stale fork HEAD.
 	ResolveCloneURL(repoSlug string) string
 
 	// EnsureChangeRequest ensures a pull request exists for head → base,
