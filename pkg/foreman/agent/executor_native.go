@@ -479,7 +479,11 @@ func (e *NativeAgentLoopExecutor) Execute(ctx context.Context, task *foremanv1al
 //     base ref from the upstream project and branch from that (the reset path),
 //     so a stale fork default branch cannot produce a stale-base branch. Origin
 //     stays the fork; the branch still pushes there.
-//  3. Clone-HEAD checkout for freeform tasks without a repo slug.
+//  3. Repo-bearing kind (issue-fix, verify, review) WITHOUT a repo slug:
+//     a configuration error (#1625). The fork-HEAD fallback below is
+//     unsafe for these kinds — it bases on a fork tip that drifts from
+//     upstream — so the missing slug is refused, not papered over.
+//  4. Clone-HEAD checkout for freeform tasks without a repo slug.
 func setupTaskBranch(
 	ctx context.Context,
 	task *foremanv1alpha1.AgenticTask,
@@ -613,6 +617,31 @@ func setupTaskBranch(
 			BaseBranch:  baseBranch,
 			Auth:        auth,
 		})
+	}
+	// Repo-bearing kinds (issue-fix, verify, review) must cut from the
+	// current upstream tip (#813). An empty or malformed payload.repo
+	// resolves no upstream, and falling through to the cloned fork's
+	// HEAD here is exactly the hazard #813 removed: a fork's default
+	// branch drifts from upstream silently, so the task branch (and any
+	// diff or claim-evidence anchor built on it) bases on a stale tip
+	// with nothing to surface it (#1625). The fix is the payload, not a
+	// workaround, so fail the task instead of guessing a base. This
+	// keys on the SLUG, not the resolved URL: a valid slug whose
+	// resolver (test override or degraded host) yields "" is a distinct,
+	// deliberately fail-open path (see
+	// TestNativeExecutor_WorkClassPolicy_FailsOpenWhenBaseUnresolved),
+	// not the stale-fork hazard. Freeform tasks carry no repo slug by
+	// design (ResolveCloneURL contract) and keep the fork-HEAD fallback.
+	if !codehost.IsValidRepoSlug(task.Spec.Payload.Repo) {
+		switch task.Spec.Kind {
+		case foremanv1alpha1.AgenticTaskKindIssueFix,
+			foremanv1alpha1.AgenticTaskKindVerify,
+			foremanv1alpha1.AgenticTaskKindReview:
+			return fmt.Errorf(
+				"task %s: payload.repo is empty but this task kind (%s) requires an upstream base; "+
+					"set payload.repo so the branch bases on the current upstream tip",
+				task.Name, task.Spec.Kind)
+		}
 	}
 	return repo.CreateAndCheckoutBranch(ctx, workspace, branch)
 }
@@ -2306,9 +2335,11 @@ func (e *NativeAgentLoopExecutor) resolveUpstreamForRun(task *foremanv1alpha1.Ag
 // origin/<baseBranch>` inside the workspace: in a fork-based deployment
 // origin can lag the upstream project the branch was actually cut from by
 // an arbitrary amount (setupTaskBranch always cuts from the CURRENT
-// upstream tip, #813), so that derivation swept the whole upstream lag
-// delta into the diff as unproven "claims," and failed closed outright
-// when origin/<baseBranch> was absent (an unsynced release branch).
+// upstream tip, #813, and refuses an empty payload.repo for repo-bearing
+// kinds rather than falling back to the fork's HEAD, #1625), so that
+// derivation swept the whole upstream lag delta into the diff as unproven
+// "claims," and failed closed outright when origin/<baseBranch> was absent
+// (an unsynced release branch).
 // Resolving the literal SHA here, once, from a real fetch against the
 // upstream project (not the fork), and holding it in memory removes both
 // failure modes: gate time now runs `git merge-base HEAD <this literal
