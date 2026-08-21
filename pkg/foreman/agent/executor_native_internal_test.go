@@ -2860,6 +2860,155 @@ func TestSetupTaskBranch_VerifyStartsAtCoderCommitNotBase(t *testing.T) {
 	}
 }
 
+// #1625: an issue-fix task with an empty payload.repo used to fall through
+// to the cloned fork's HEAD, silently basing on a fork tip that drifts from
+// upstream. The task must now fail with a configuration error and create
+// NO branch: the fix is the payload (set payload.repo), not a guess at a
+// base, and the claim-evidence gate's anchor assumption (#813) must hold.
+func TestSetupTaskBranch_IssueFixEmptyRepoRefusesStaleForkHead(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	seededRemote(t, dir) // upstream main at A
+	const branch = "foreman/wl/issue-641"
+
+	// A STALE fork clone taken before upstream advanced: its local "main"
+	// is the pre-advance tip — exactly what the old fallback would base on.
+	ws := filepath.Join(dir, "fork-ws")
+	gitIn(t, "", "clone", filepath.Join(dir, "origin.git"), ws)
+	forkSHA := gitIn(t, ws, "rev-parse", "HEAD")
+
+	// Advance upstream AFTER the fork was cloned, so the fork is stale.
+	adv := filepath.Join(dir, "adv")
+	gitIn(t, "", "clone", filepath.Join(dir, "origin.git"), adv)
+	if err := os.WriteFile(filepath.Join(adv, "UPSTREAM.md"), []byte("intervening upstream delta\n"), 0o644); err != nil {
+		t.Fatalf("write UPSTREAM.md: %v", err)
+	}
+	gitIn(t, adv, "add", "UPSTREAM.md")
+	gitIn(t, adv, "commit", "-m", "intervening upstream commit")
+	gitIn(t, adv, "push", "origin", "main")
+	upstreamSHA := gitIn(t, adv, "rev-parse", "HEAD")
+	if forkSHA == upstreamSHA {
+		t.Fatal("test setup wrong: the fork tip must predate the upstream advance")
+	}
+
+	// Empty Repo: the #1625 hazard. The default resolver yields "" for it.
+	task := &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "code-641"},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{Issue: 641},
+		},
+	}
+	err := setupTaskBranch(context.Background(), task, ws, branch, "main",
+		upstreamURLForRepo, nil, logr.Discard())
+	if err == nil {
+		t.Fatal("an issue-fix with an empty payload.repo must fail, not fall back to the fork HEAD")
+	}
+	for _, want := range []string{"payload.repo", "set payload.repo", "current upstream tip"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name the remedy (%q), got: %v", want, err)
+		}
+	}
+	// No branch was created: the workspace is still on its original branch,
+	// and the refused branch does not exist locally.
+	if got := gitIn(t, ws, "branch", "--show-current"); got != "main" {
+		t.Errorf("current branch = %q, want the fork's original branch (no branch may be cut)", got)
+	}
+	// show-ref --verify --quiet exits non-zero when the ref is ABSENT, which
+	// is the desired outcome here; gitIn would fatal on that exit code, so
+	// probe with exec directly. A zero exit means the branch was created —
+	// the bug we are guarding against.
+	probe := exec.Command("git", "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	probe.Dir = ws
+	if probe.Run() == nil {
+		t.Errorf("branch %q unexpectedly exists after refusal", branch)
+	}
+}
+
+// #1625: a freeform task with an empty payload.repo keeps the fork-HEAD
+// fallback — freeform tasks carry no repo slug by design (the
+// ResolveCloneURL contract), so nothing has drifted by construction.
+func TestSetupTaskBranch_FreeformEmptyRepoKeepsForkHeadFallback(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	_, mainSHA := seededRemote(t, dir)
+	const branch = "foreman/freeform"
+
+	ws := filepath.Join(dir, "ws")
+	gitIn(t, "", "clone", filepath.Join(dir, "origin.git"), ws)
+
+	task := &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "freeform-1"},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind:    foremanv1alpha1.AgenticTaskKindFreeform,
+			Payload: foremanv1alpha1.AgenticTaskPayload{Prompt: "just do a thing"},
+		},
+	}
+	if err := setupTaskBranch(context.Background(), task, ws, branch, "main",
+		upstreamURLForRepo, nil, logr.Discard()); err != nil {
+		t.Fatalf("freeform with an empty payload.repo must keep the fork-HEAD fallback: %v", err)
+	}
+	if got := gitIn(t, ws, "branch", "--show-current"); got != branch {
+		t.Errorf("current branch = %q, want %q", got, branch)
+	}
+	if got := gitIn(t, ws, "rev-parse", "HEAD"); got != mainSHA {
+		t.Errorf("HEAD = %s, want the fork HEAD %s", got, mainSHA)
+	}
+}
+
+// #1625: an issue-fix task with a valid payload.repo still takes the
+// CreateBranchFromUpstream path, basing on the CURRENT upstream tip even
+// though the fork clone is stale.
+func TestSetupTaskBranch_IssueFixValidRepoBasesOnUpstreamTip(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	_, forkSHA := seededRemote(t, dir)
+	const branch = "foreman/wl/issue-641"
+
+	ws := filepath.Join(dir, "fork-ws")
+	gitIn(t, "", "clone", filepath.Join(dir, "origin.git"), ws)
+
+	// Upstream advances AFTER the fork was cloned, so the fork is stale.
+	adv := filepath.Join(dir, "adv")
+	gitIn(t, "", "clone", filepath.Join(dir, "origin.git"), adv)
+	if err := os.WriteFile(filepath.Join(adv, "UPSTREAM.md"), []byte("intervening upstream delta\n"), 0o644); err != nil {
+		t.Fatalf("write UPSTREAM.md: %v", err)
+	}
+	gitIn(t, adv, "add", "UPSTREAM.md")
+	gitIn(t, adv, "commit", "-m", "intervening upstream commit")
+	gitIn(t, adv, "push", "origin", "main")
+	upstreamSHA := gitIn(t, adv, "rev-parse", "HEAD")
+	if upstreamSHA == forkSHA {
+		t.Fatal("test setup wrong: upstream tip must differ from the fork tip")
+	}
+
+	// A valid slug resolves an upstream URL; the branch must land on the
+	// upstream tip, not the stale fork HEAD.
+	task := &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{Name: "code-641"},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{Repo: "defilantech/LLMKube", Issue: 641},
+		},
+	}
+	if err := setupTaskBranch(context.Background(), task, ws, branch, "main",
+		func(string) string { return filepath.Join(dir, "origin.git") }, nil, logr.Discard()); err != nil {
+		t.Fatalf("setupTaskBranch with a valid slug: %v", err)
+	}
+	if got := gitIn(t, ws, "rev-parse", "HEAD"); got != upstreamSHA {
+		t.Errorf("HEAD = %s, want the upstream tip %s (not the stale fork tip %s)", got, upstreamSHA, forkSHA)
+	}
+	if got := gitIn(t, ws, "branch", "--show-current"); got != branch {
+		t.Errorf("current branch = %q, want %q", got, branch)
+	}
+}
+
 // isForkOf contract for #1464: a fork shares the repo NAME (owner may
 // differ); a differing repo name is an unrelated repository, not a fork.
 func TestIsForkOf(t *testing.T) {

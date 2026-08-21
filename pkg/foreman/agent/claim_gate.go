@@ -77,7 +77,9 @@ var claimDocsPathspec = []string{"*.md", "docs", "examples"}
 //   - Fork-lag false positive: in a fork-based deployment, --git-remote-url
 //     points origin at a fork that can lag the upstream project by an
 //     arbitrary amount, while setupTaskBranch always cuts the task branch
-//     from the CURRENT upstream tip (repo.CreateBranchFromUpstream, #813).
+//     from the CURRENT upstream tip (repo.CreateBranchFromUpstream, #813) —
+//     for repo-bearing kinds an empty payload.repo is now a configuration
+//     error (#1625), so the stale fork-HEAD fallback cannot produce one.
 //     Deriving the anchor from `git merge-base HEAD origin/<baseBranch>`
 //     inside the workspace landed on the STALE fork tip, so AddedLines swept
 //     the entire upstream lag delta into the diff and flagged other
