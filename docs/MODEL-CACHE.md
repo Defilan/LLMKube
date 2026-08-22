@@ -257,8 +257,8 @@ remove depends on the cache mode:
 
 | Cache mode | Deleting the InferenceService clears it |
 | --- | --- |
-| `perService` (default) | Yes, the claim is owner-ref'd and garbage-collected with it |
-| `shared` | No, the shared claim intentionally outlives any one service |
+| `perService` | Yes, the claim is owner-ref'd and garbage-collected with it |
+| `shared` (default) | No, the shared claim intentionally outlives any one service |
 | `claimName` (bring your own) | No, LLMKube never deletes a user-owned claim |
 
 In the latter two cases the unusable volume survives the InferenceService, so
@@ -415,19 +415,47 @@ For air-gapped environments:
    llmkube cache preload mistral-7b
    ```
 
-2. **Export the PVC** (or use external storage):
-   ```bash
-   # Option 1: Copy from PVC to local storage
-   kubectl cp llmkube-system/llmkube-controller-manager:/models ./model-cache
+2. **Export the PVC.** The weights live in the cache PVC of the namespace you
+   preloaded into, not in the controller pod. The controller's own `/models` is
+   scratch space, and it never mounts a workload namespace's claim, so copying
+   out of `llmkube-system` cannot reach them.
 
-   # Option 2: Use a storage system that can be transported
+   Find the claim first. In `shared` mode (the default) it is
+   `llmkube-model-cache`; in `perService` mode it is `<inferenceservice>-model-cache`:
+
+   ```bash
+   kubectl -n <namespace> get pvc
    ```
 
-3. **On the air-gapped cluster**, import the cache:
+   Then mount it in a throwaway pod and copy from there:
+
    ```bash
-   # Copy to the new PVC
-   kubectl cp ./model-cache llmkube-system/llmkube-controller-manager:/models
+   kubectl -n <namespace> run cache-export --restart=Never --image=busybox:1.36 \
+     --overrides='{"spec":{"containers":[{"name":"cache-export","image":"busybox:1.36","command":["sleep","3600"],"volumeMounts":[{"name":"cache","mountPath":"/models"}]}],"volumes":[{"name":"cache","persistentVolumeClaim":{"claimName":"llmkube-model-cache"}}]}}'
+
+   kubectl -n <namespace> wait --for=condition=Ready pod/cache-export --timeout=120s
+   kubectl cp <namespace>/cache-export:/models ./model-cache
+   kubectl -n <namespace> delete pod cache-export
    ```
+
+   A ReadWriteOnce claim can only be mounted where it is already attached, so
+   scale the InferenceService to zero first if the export pod will not schedule.
+
+3. **On the air-gapped cluster**, import the cache by reversing the copy against
+   a helper pod mounting the destination claim:
+
+   ```bash
+   kubectl -n <namespace> run cache-import --restart=Never --image=busybox:1.36 \
+     --overrides='{"spec":{"containers":[{"name":"cache-import","image":"busybox:1.36","command":["sleep","3600"],"volumeMounts":[{"name":"cache","mountPath":"/models"}]}],"volumes":[{"name":"cache","persistentVolumeClaim":{"claimName":"llmkube-model-cache"}}]}}'
+
+   kubectl -n <namespace> wait --for=condition=Ready pod/cache-import --timeout=120s
+   kubectl cp ./model-cache/. <namespace>/cache-import:/models
+   kubectl -n <namespace> delete pod cache-import
+   ```
+
+   The destination claim must exist before the copy. Deploy the model once and
+   let it fail to download, or create the PVC yourself, so the operator has a
+   claim to bind.
 
 4. **Deploy models** (they'll be found in cache):
    ```bash

@@ -109,8 +109,10 @@ helm install llmkube ./llmkube \
 The `initContainer.repository` / `initContainer.tag` overrides
 matter: by default the InferenceService Pod schedules an init
 container that pulls model weights via HTTP(S). In an air-gapped
-environment that container still runs (even when reading from a
-`pvc://` or local file source — it sets up the on-disk layout). If
+environment that container still runs for every source that has to
+be fetched or staged, including a `file://` path on the node. A
+`pvc://` source is the exception: those weights are pre-staged and
+mounted read-only, so no downloader runs at all. If
 your registry mirror requires a different image (your own distroless
 curl, for example), point it here. The chart consumes these as two
 separate fields, not a single `image` value (see
@@ -268,18 +270,46 @@ selector, taint/toleration, or affinity). The operator does not
 distribute the file across nodes; that's the operator's
 responsibility.
 
-### Option D: HuggingFace repo ID (Ollama / vLLM only)
+### Option D: `s3://` internal object store
 
-vLLM and Ollama runtimes can resolve HF repo IDs at runtime from a
-mirror. Point your runtime image's `HF_ENDPOINT` environment
-variable at your internal mirror (e.g. an Artifactory or Sonatype
-Nexus repository) and use:
+If you already run MinIO, Ceph RGW, or any S3-compatible store
+inside the perimeter, point the Model at it directly. Credentials
+and the endpoint come from a Secret in the Model's namespace, wired
+into the downloader as env:
+
+```bash
+kubectl -n default create secret generic minio-creds \
+  --from-literal=AWS_ACCESS_KEY_ID=<key> \
+  --from-literal=AWS_SECRET_ACCESS_KEY=<secret> \
+  --from-literal=AWS_REGION=us-east-1 \
+  --from-literal=AWS_ENDPOINT_URL=https://minio.internal:9000
+```
 
 ```yaml
 spec:
-  source: meta-llama/Meta-Llama-3.1-8B-Instruct
-  format: hf-repo
+  source: s3://models/meta-llama/Llama-3.1-8B-Instruct-GGUF/Llama-3.1-8B-Instruct-Q4_K_M.gguf
+  format: gguf
+  sourceSecretRef:
+    name: minio-creds
 ```
+
+`spec.source` may also name a bucket **prefix** instead of a single
+object, in which case `spec.files` selects which artifacts to stage
+and `files[0]` is the primary file handed to the runtime. That is how
+a sharded GGUF, an `mmproj`, or draft weights are expressed:
+
+```yaml
+spec:
+  source: s3://models/org/Repo-GGUF
+  files:
+    - Model-00001-of-00002.gguf
+    - Model-00002-of-00002.gguf
+  mmproj: mmproj-model-f16.gguf
+```
+
+> There is no HuggingFace-repo-ID source format. `spec.format` accepts
+> `gguf`, `mlx`, `safetensors`, `pytorch`, or `custom`, and a Model that
+> sets anything else is rejected at apply time.
 
 ## Step 5: Verify
 

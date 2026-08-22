@@ -196,11 +196,13 @@ spec:
   source: https://huggingface.co/microsoft/Phi-4-mini-instruct-gguf/resolve/main/Phi-4-mini-instruct-q4_0.gguf
   format: gguf
   hardware:
-    accelerator: amd
+    accelerator: vulkan
     gpu:
       enabled: true
       count: 1
       vendor: amd
+      runtime: vulkan
+      resourceName: amd.com/gpu
       layers: -1
   resources:
     cpu: "2"
@@ -223,6 +225,25 @@ spec:
     runAsGroup: 0
     fsGroup: 0
 ```
+
+Three fields here are load-bearing and easy to get wrong:
+
+- `accelerator: vulkan`. The enum is `cpu;metal;cuda;rocm;intel;vulkan`. There
+  is no `amd` value, so a Model that sets one is rejected at apply time.
+- `gpu.runtime: vulkan`. This, together with `vendor: amd`, is what selects
+  LLMKube's hardware-validated Vulkan image. With the runtime left unset the
+  Model still applies and the pod still reaches Ready, but it is served by the
+  upstream CPU-only `llama.cpp:server` tag, so none of the `Vulkan0` log
+  markers in Step 5 appear and throughput is roughly half what the GPU
+  delivers.
+- `gpu.resourceName: amd.com/gpu`. Setting `runtime: vulkan` normally switches
+  the request to the shared `devic.es/dri-render` resource, which the device
+  plugin installed in Step 2 does not advertise, so the pod would sit Pending.
+  An explicit `resourceName` always wins, and keeps this guide on the
+  `amd.com/gpu` plugin it just set up. On a cluster running the generic
+  device plugin instead, drop this field and see the
+  [AMD ROCm quickstart](amd-rocm-quickstart.md) for the `devic.es/dri-render`
+  path.
 
 Apply:
 

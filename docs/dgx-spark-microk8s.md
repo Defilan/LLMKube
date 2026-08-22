@@ -153,9 +153,12 @@ The community has working Dockerfiles; see the upstream
 and the NVIDIA developer forum thread
 [Building llama.cpp container images for Spark/GB10](https://forums.developer.nvidia.com/t/building-llama-cpp-container-images-for-spark-gb10/353664).
 
-Either way, set the image explicitly on the `InferenceService` (the operator's
-default serving image is not the CUDA-13 tag, so a GPU model with no `image` set
-will not accelerate here):
+Either way, set the image explicitly on the `InferenceService`. A GPU Model
+with no `image` set does not fall back to a CPU tag: the operator substitutes
+`ghcr.io/ggml-org/llama.cpp:server-cuda-b10068` for NVIDIA Models. That build
+carries no `sm_121` cubins, so on GB10 it works but pays a one-time JIT
+compile on first load. Pinning `image` yourself is how you choose a build that
+targets `sm_121` directly:
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -163,7 +166,7 @@ kind: InferenceService
 metadata:
   name: llama-3b
 spec:
-  modelRef: llama-3-2-3b
+  modelRef: llama-3.2-3b
   replicas: 1
   image: ghcr.io/ggml-org/llama.cpp:server-cuda13   # or your GB10-built image if this fails
   resources:

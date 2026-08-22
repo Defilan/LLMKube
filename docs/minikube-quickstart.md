@@ -188,7 +188,7 @@ llmkube deploy tinyllama \
 llmkube list services
 
 # Check detailed status
-llmkube status tinyllama-service
+llmkube status tinyllama
 ```
 
 ### Option B: Using kubectl (Advanced)
@@ -259,6 +259,11 @@ kubectl logs $POD -c llama-server -f       # Server startup
 ```
 
 ## Step 4: Test the Inference Endpoint
+
+> **Which name?** The commands below use `tinyllama-service`, the name from
+> Option B. If you deployed with the CLI in Option A, every resource is named
+> after the argument you passed, so the Service is `tinyllama`. Substitute
+> accordingly, or run `kubectl get svc` to see which one you have.
 
 ### Port Forward to Access API
 

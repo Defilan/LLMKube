@@ -28,7 +28,7 @@ Honest comparison, not a sales pitch. We use vLLM, llama.cpp, and TGI as runtime
 
 | Project | K8s-native | Apple Silicon | Memory-pressure protection | Engines | Multi-GPU | License |
 |---|---|---|---|---|---|---|
-| **LLMKube** | ✓ operator + Model and InferenceService CRDs | ✓ native via the metal-agent (no containers) | ✓ watchdog, priority-based eviction, per-service opt-out | llama.cpp, vLLM, TGI, oMLX, Ollama | Layer-based sharding across GPUs on a node | Apache 2.0 |
+| **LLMKube** | ✓ operator + Model and InferenceService CRDs | ✓ native via the metal-agent (no containers) | ✓ watchdog, priority-based eviction, per-service opt-out | llama.cpp, vLLM, SGLang, TGI, PersonaPlex, generic; llama-server / mlx-server / vllm-swift via the metal-agent | Layer-based sharding across GPUs on a node | Apache 2.0 |
 | **KubeAI** | ✓ operator + Model CRD | — Linux containers only | — | vLLM, Ollama, Faster-Whisper, Infinity (embeddings) | Multi-GPU pods via `resourceProfile`, tensor-parallel args passed to vLLM | Apache 2.0 |
 | **llm-d** | ✓ Helm + Gateway API + `InferencePool` | — datacenter accelerators only (NVIDIA, AMD, Intel, TPU) | — | vLLM (primary), SGLang | Wide expert parallelism + disaggregated multi-node serving | Apache 2.0 |
 | **Ollama** | — single binary on a host | ✓ native (its sweet spot) | — | Forked llama.cpp (GGUF), MLX engine (Safetensors, macOS) | Automatic spreading across GPUs on one node | MIT |
@@ -40,7 +40,7 @@ Verified against project repos and official docs. If you spot anything inaccurat
 
 **Pick Ollama if** you have one developer machine, you want chat in 90 seconds, and you don't need Kubernetes-style operations (RBAC, NetworkPolicy, multi-tenant namespaces, a Service mesh, a fleet of nodes). Ollama is the right answer here and we use it during development. It also now ships an MLX engine for Safetensor models on Apple Silicon and a hosted-cloud option for models that don't fit locally.
 
-**Pick llm-d if** you're standing up a multi-node vLLM serving fleet with disaggregated prefill/decode, wide expert parallelism, or tiered KV-cache offload, and you want the Red Hat / IBM / Google production lineage. llm-d's prefill-decode disaggregation, KV-cache tiering, and inference-aware routing are deeper than what we offer for that specific topology. We're the better answer for mixed runtimes (llama.cpp + vLLM + Ollama under one CRD) and for Apple Silicon.
+**Pick llm-d if** you're standing up a multi-node vLLM serving fleet with disaggregated prefill/decode, wide expert parallelism, or tiered KV-cache offload, and you want the Red Hat / IBM / Google production lineage. llm-d's prefill-decode disaggregation, KV-cache tiering, and inference-aware routing are deeper than what we offer for that specific topology. We're the better answer for mixed runtimes (llama.cpp + vLLM + SGLang under one CRD) and for Apple Silicon.
 
 **Pick KubeAI if** you want a Kubernetes operator that ships with embeddings (Infinity), reranking, speech (Faster-Whisper), and LoRA hot-loading alongside LLM serving, and you don't need Apple Silicon or per-process memory protection. KubeAI's scale-to-zero with request queuing, prefix-hash load balancing for KV-cache locality, and Kafka-trigger autoscaling are more operationally polished than ours today.
 

@@ -33,7 +33,7 @@ For most chat workloads at 8K to 16K context, **add 20 to 30 percent to the file
 | 5: Workstation | 96 to 128 GB | MacBook Pro M3/M4 Max 96/128GB, Mac Studio M2 Ultra, 2x RTX 4090/5090, RTX 6000 Pro 96GB |
 | 6: Multi-GPU / Ultra | 192 GB and up | Mac Studio M3/M4 Ultra 192/256/512GB, 4x RTX 5090, multi-RTX 6000 Pro, DGX-class |
 
-In LLMKube specifically, **multi-GPU sharding** lets you span tiers by adding GPUs. A 70B at Q4_K_M (about 40 GB) does not fit a single 24 GB RTX 4090, but it shards cleanly across 2x RTX 4090 with `gpuCount: 2`. See [Multi-GPU sharding](/docs/guides/multi-gpu).
+In LLMKube specifically, **multi-GPU sharding** lets you span tiers by adding GPUs. A 70B at Q4_K_M (about 40 GB) does not fit a single 24 GB RTX 4090, but it shards cleanly across 2x RTX 4090 with `hardware.gpu.count: 2` on the Model. See [Multi-GPU sharding](/docs/guides/multi-gpu).
 
 ## Mac unified memory: usable vs advertised
 
@@ -91,7 +91,7 @@ LLMKube exposes the KV cache dtype as a Model CRD field; see [KV cache types](/d
 
 ## Multi-GPU notes
 
-llama.cpp supports multi-GPU inference via layer splitting. LLMKube wraps that with `gpuCount` on the Model CRD.
+llama.cpp supports multi-GPU inference via layer splitting. LLMKube wraps that with `spec.hardware.gpu.count` on the Model CRD.
 
 - **Two 12 GB cards** can run a 20B to 24B model (10 to 12 GB of weights per GPU plus KV).
 - **Two 24 GB cards** comfortably hold a 70B at Q4_K_M (about 40 GB of weights split across two devices).
