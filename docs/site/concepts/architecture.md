@@ -24,8 +24,9 @@ All three live in `inference.llmkube.dev/v1alpha1`.
   what runtime can consume it, and any hardware preferences
   (Metal vs CUDA, multi-GPU sharding hints).
 - **`InferenceService`** declares a serving deployment: a
-  reference to a `Model`, a runtime (`llamacpp`, `vllm`, `tgi`,
-  `ollama`), replicas, resources, an OpenAI-compatible endpoint.
+  reference to a `Model`, a runtime (`llamacpp`, `vllm`, `sglang`,
+  `tgi`, `generic`), replicas, resources, an OpenAI-compatible
+  endpoint.
   Two `InferenceService` objects can share a `Model`.
 - **`ModelRouter`** declares a policy-aware HTTP router in front
   of one or more `InferenceService` and / or external
@@ -54,7 +55,7 @@ model.
 │   Runtime pods (NVIDIA / CPU)         router-proxy Deployment   │
 │   ┌─────────────────┐                  ┌─────────────────┐      │
 │   │ llama.cpp / vLLM│  ◄──policy──     │  ModelRouter    │      │
-│   │ TGI / Ollama    │                  │  data plane     │      │
+│   │ TGI / SGLang    │                  │  data plane     │      │
 │   └─────────────────┘                  └─────────────────┘      │
 └─────────────────────────────────────────────────────────────────┘
                                           ▲

@@ -245,7 +245,7 @@ Defaults are tuned by total system RAM:
 | 36 GB | 67% | ~24.1 GB |
 | 48 GB | 75% | 36 GB |
 | 64 GB | 75% | 48 GB |
-| 128 GB | 90% | 115 GB |
+| 128 GB | 75% | 96 GB |
 
 Override the fraction with `--memory-fraction 0.9` for a dedicated
 inference machine, or `0.5` if the Mac is also your daily-driver

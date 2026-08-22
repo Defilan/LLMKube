@@ -104,12 +104,9 @@ spec:
   modelRef: llama-3-8b
   runtime: llamacpp
   resources:
-    limits:
-      nvidia.com/gpu: "1"
-    requests:
-      nvidia.com/gpu: "1"
-      memory: "16Gi"
-      cpu: "4"
+    gpu: 1
+    memory: "16Gi"
+    cpu: "4"
   tolerations:
     - key: nvidia.com/gpu
       operator: Equal

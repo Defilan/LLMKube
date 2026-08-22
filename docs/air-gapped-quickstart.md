@@ -12,7 +12,7 @@ Deploy LLMKube in environments without internet access. This guide covers deploy
 
 ## Prerequisites
 
-- Kubernetes cluster (v1.11.3+) with no internet access
+- Kubernetes cluster (v1.25+) with no internet access. The CRDs carry CEL validation rules, which need 1.25 or newer to be enforced
 - LLMKube operator installed (see [offline installation](#offline-operator-installation))
 - Pre-downloaded GGUF model file(s)
 - `llmkube` CLI installed on a workstation with cluster access
@@ -201,13 +201,22 @@ python3 -m http.server 8080
 
 ```bash
 # Pull images
-docker pull ghcr.io/defilantech/llmkube:v0.4.9
-docker pull ghcr.io/ggml-org/llama.cpp:server-cuda13
+docker pull ghcr.io/defilantech/llmkube-controller:v0.9.19
+docker pull ghcr.io/ggml-org/llama.cpp:server-cuda-b10068
+docker pull ghcr.io/ggml-org/llama.cpp:server
 
 # Save to tar files
-docker save ghcr.io/defilantech/llmkube:v0.4.9 > llmkube-controller.tar
-docker save ghcr.io/ggml-org/llama.cpp:server-cuda13 > llama-server-cuda.tar
+docker save ghcr.io/defilantech/llmkube-controller:v0.9.19 > llmkube-controller.tar
+docker save ghcr.io/ggml-org/llama.cpp:server-cuda-b10068 > llama-server-cuda.tar
+docker save ghcr.io/ggml-org/llama.cpp:server > llama-server-cpu.tar
 ```
+
+`server-cuda-b10068` is the tag the operator substitutes for NVIDIA GPU Models
+when the InferenceService sets no `image`, so a YAML-driven GPU deploy fails to
+pull without it. `:server` is the CPU-only default for Models with no GPU
+section. AMD and Intel tiers pull different images again: see
+[amd-rocm-quickstart.md](amd-rocm-quickstart.md) and
+[intel-gpu-quickstart.md](intel-gpu-quickstart.md).
 
 2. Transfer tar files to the air-gapped environment
 
@@ -217,11 +226,12 @@ docker save ghcr.io/ggml-org/llama.cpp:server-cuda13 > llama-server-cuda.tar
 # Load directly on nodes
 docker load < llmkube-controller.tar
 docker load < llama-server-cuda.tar
+docker load < llama-server-cpu.tar
 
 # Or push to private registry
 docker load < llmkube-controller.tar
-docker tag ghcr.io/defilantech/llmkube:v0.4.9 registry.internal/llmkube:v0.4.9
-docker push registry.internal/llmkube:v0.4.9
+docker tag ghcr.io/defilantech/llmkube-controller:v0.9.19 registry.internal/llmkube-controller:v0.9.19
+docker push registry.internal/llmkube-controller:v0.9.19
 ```
 
 ### Option 2: Helm with Private Registry

@@ -76,8 +76,20 @@ The chart bundles the CRDs in `templates/crds/`, so CRD updates ride the chart u
 
 If the release notes call out an out-of-band CRD update (e.g., a hotfix that changes only the CRD), apply just the CRDs first, verify, then run the standard chart upgrade:
 
+`raw.githubusercontent.com` serves files, not directories, so pointing `-f` at
+`config/crd/bases/` returns a 404. Fetch the chart's CRD templates from the
+release you are moving to and apply the ones you need:
+
 ```bash
-kubectl apply --server-side -f https://raw.githubusercontent.com/defilantech/LLMKube/v<target>/config/crd/bases/
+helm pull llmkube/llmkube --version <target-version> --untar --untardir /tmp/llmkube-crds
+kubectl apply --server-side -f /tmp/llmkube-crds/llmkube/templates/crds/
+```
+
+To pin a single CRD, apply it by name from the tag instead:
+
+```bash
+kubectl apply --server-side \
+  -f https://raw.githubusercontent.com/defilantech/LLMKube/v<target>/config/crd/bases/inference.llmkube.dev_models.yaml
 ```
 
 ## Verify the upgrade
@@ -104,19 +116,23 @@ kubectl apply --server-side -f https://raw.githubusercontent.com/defilantech/LLM
      | grep -E "Reconciling|ERROR" | head -20
    ```
 
-   Look for `Reconciling Model` / `Reconciling InferenceService` lines without `ERROR` companions.
+   Look for `Reconciling Model` lines without `ERROR` companions. The InferenceService controller does not log a matching `Reconciling` line, so judge it by the absence of errors and by the phases in step 2 rather than by a positive log signal.
 
-4. **Functional smoke: deploy a TinyLlama and hit the endpoint.**
+4. **Functional smoke: deploy the smallest catalog model and hit the endpoint.**
+
+   `llmkube deploy` takes a catalog id. `tinyllama-1.1b` is not one; run
+   `llmkube catalog list` to see the 17 that ship. `llama-3.2-3b` is the
+   smallest and is the cheapest smoke test:
 
    ```bash
-   llmkube deploy tinyllama-1.1b
-   # wait for Ready, then:
-   kubectl port-forward svc/tinyllama-1.1b 8080:8080 &
+   llmkube deploy llama-3.2-3b
+   # wait for Ready, then (dots become dashes in the Service name):
+   kubectl port-forward svc/llama-3-2-3b 8080:8080 &
    curl -s http://localhost:8080/v1/chat/completions \
      -H 'Content-Type: application/json' \
-     -d '{"model":"tinyllama-1.1b","messages":[{"role":"user","content":"hi"}],"max_tokens":16}' \
+     -d '{"model":"llama-3.2-3b","messages":[{"role":"user","content":"hi"}],"max_tokens":16}' \
      | jq '.choices[0].message.content'
-   llmkube delete tinyllama-1.1b
+   llmkube delete llama-3.2-3b
    ```
 
 5. **Helm history reflects the new revision.**
@@ -148,9 +164,13 @@ Some failure modes need extra cleanup:
 
 - **CRD storage version regression** (the new minor changed the storage version and the rollback target predates that change): apply the older CRDs back from the git tag of the rollback target and run a `kubectl get inferenceservice -A` to confirm `spec` parses correctly.
 
+  Same directory-URL caveat as above: pull the rollback target's chart and
+  apply its CRD templates.
+
   ```bash
+  helm pull llmkube/llmkube --version <rollback-target> --untar --untardir /tmp/llmkube-rollback-crds
   kubectl apply --server-side --force-conflicts \
-    -f https://raw.githubusercontent.com/defilantech/LLMKube/v<rollback-target>/config/crd/bases/
+    -f /tmp/llmkube-rollback-crds/llmkube/templates/crds/
   ```
 
 - **Webhook config left from the new version**: if the new version installed a validating or mutating admission webhook the older version did not have, `helm rollback` may not remove the webhook config. Manually delete:

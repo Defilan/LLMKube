@@ -8,7 +8,11 @@ The LLMKube controller-manager pod is consuming an entire CPU core continuously 
 
 One or more of:
 
-- Alert: `ControllerHighCPU` on the LLMKube controller-manager Deployment (sustained > 80% CPU on a single replica for > 5 minutes)
+- Alert: none. The chart's `PrometheusRule` ships `ControllerDown` and
+  `ControllerMetricsMissing`, but no controller CPU alert, so a hot-spin does
+  not page on its own. If you want one, add a rule on
+  `rate(process_cpu_seconds_total{job="llmkube-controller"}[5m])`;
+  otherwise this is caught by the two signals below
 - Operator notices: `kubectl --context <ctx> top pods -n llmkube-system` shows controller-manager CPU > 1000m steady
 - Log signal: the controller-manager log shows the same `Reconciler error` repeating thousands of times per second:
 

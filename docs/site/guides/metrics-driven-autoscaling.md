@@ -75,26 +75,36 @@ pod metrics.
 
 ### Expose the metrics to the HPA
 
-The llama.cpp server exposes raw Prometheus gauges with underscores
-(`llamacpp_requests_processing`, etc.). `prometheus-adapter` maps them
-to the colon-form names the HPA expects. Add these rules to your
-`prometheus-adapter` ConfigMap:
+The llama.cpp server already emits colon-form names
+(`llamacpp:requests_processing`, `llamacpp:prompt_tokens_total`, and so
+on), which is exactly what the HPA metric refers to, so no renaming rule
+is needed. vLLM and SGLang are the same: `vllm:num_requests_running` and
+`sglang:num_running_reqs` are the names those servers publish.
+
+What `prometheus-adapter` does provide is the `custom.metrics.k8s.io` API
+itself. Without it the HPA has nowhere to read a Pods metric from and
+reports `FailedGetPodsMetric`.
+
+Expose the series as-is:
 
 ```yaml
 rules:
-  - seriesQuery: '{__name__=~"llamacpp_.+",namespace!="",pod!=""}'
+  - seriesQuery: '{__name__=~"llamacpp:.+",namespace!="",pod!=""}'
     resources:
       overrides:
         namespace: {resource: namespace}
         pod: {resource: pod}
     name:
-      matches: "^llamacpp_(.*)$"
-      as: "llamacpp:$1"
+      matches: "^(.*)$"
+      as: "$1"
     metricsQuery: sum(<<.Series>>{<<.LabelMatchers>>}) by (<<.GroupBy>>)
 ```
 
-The managed `spec.autoscaling` path does not need this — the
-controller handles the mapping internally.
+The managed `spec.autoscaling` path needs this too. The controller
+writes the HPA object and fills in the runtime's default metric name;
+it does not serve the metric, so `prometheus-adapter` (or another
+custom-metrics API provider) still has to be installed and scraping
+the inference pods.
 
 ### Hand-authored HPAs (advanced / custom metrics)
 
@@ -143,8 +153,16 @@ default for each runtime backend:
 |-----------|------------------------------|----------------------------------------------------|
 | `llamacpp`| `llamacpp:requests_processing`| Requests currently in flight on the llama.cpp pod. |
 | `vllm`    | `vllm:num_requests_running`   | Requests currently in flight on the vLLM pod.      |
-| `tgi`     | `tgi_batch_current_size`      | Tokens currently in the TGI batch.                 |
+| `tgi`     | `tgi:queue_size`              | See the TGI caveat below.                          |
 | `sglang`  | `sglang:num_running_reqs`     | Requests currently in flight on the SGLang pod.    |
+
+> **TGI caveat.** Unlike the other three, TGI does not publish a
+> `tgi:queue_size` series; its own gauge is `tgi_batch_current_size`
+> (which is what the drain-before-roll idle check reads). If you scale a
+> TGI service on the default metric, add a `prometheus-adapter` rule that
+> renames or computes `tgi:queue_size`, or set an explicit metric name in
+> `spec.autoscaling.metrics[]`, otherwise the HPA reports
+> `FailedGetPodsMetric`.
 
 For SGLang, the controller also emits `--enable-metrics` and the
 inference-pod template's port is named `http`, so the chart's
