@@ -1,17 +1,22 @@
 # Multi-GPU Deployment Guide
 
-Complete guide for deploying and testing multi-GPU support (Issue #2).
+Running a model across two or more GPUs on a single node, using LLMKube's
+layer-based sharding.
 
 ## Overview
 
 This guide walks you through:
 1. Deploying a GKE cluster with 2 GPUs per node
-2. Building and deploying the multi-GPU controller
-3. Testing with Llama 2 13B model
-4. Validating performance (target: >40 tok/s)
+2. Installing the operator
+3. Deploying Llama 2 13B across both GPUs
+4. Confirming the layers actually landed on both
+
+The GKE steps are one worked example. Multi-GPU sharding is cloud-agnostic:
+anywhere a node advertises two or more `nvidia.com/gpu`, steps 2 onward apply
+unchanged. `config/samples/` also ships AKS, EKS, and GKE spot variants.
 
 **Estimated Time**: 30-45 minutes
-**Estimated Cost**: ~$1-3 for testing session (with spot instances and teardown)
+**Estimated Cost**: ~$1-3 on GKE spot instances, if you tear down afterwards
 
 ---
 
@@ -38,7 +43,7 @@ This guide walks you through:
 cd terraform/gke
 
 # Use the multi-GPU configuration
-cp multi-gpu.tfvars terraform.tfvars
+cp multi-gpu.tfvars.example terraform.tfvars
 
 # Edit and set your project ID
 nano terraform.tfvars
@@ -131,29 +136,14 @@ kubectl delete pod multi-gpu-test
 
 ---
 
-## Step 2: Build and Deploy Multi-GPU Controller
+## Step 2: Install the Operator
 
-### 2.1 Build Controller Image
-
-```bash
-cd /Users/defilan/stuffy/code/ai/llmkube
-
-# Set your image name
-export IMG=gcr.io/$(gcloud config get-value project)/llmkube-controller:v0.3.0-multi-gpu
-
-# Build and push
-make docker-build IMG=$IMG
-make docker-push IMG=$IMG
-```
-
-### 2.2 Install CRDs and Deploy Controller
+Multi-GPU sharding ships in the released operator; there is nothing special to
+build for it.
 
 ```bash
-# Install CRDs
-make install
-
-# Deploy controller
-make deploy IMG=$IMG
+helm repo add llmkube https://defilantech.github.io/LLMKube
+helm install llmkube llmkube/llmkube --namespace llmkube-system --create-namespace
 
 # Verify controller is running
 kubectl get pods -n llmkube-system
@@ -163,6 +153,22 @@ kubectl get pods -n llmkube-system
 kubectl logs -n llmkube-system deployment/llmkube-controller-manager --tail=50
 ```
 
+<details>
+<summary>Building from source instead (contributors)</summary>
+
+From a clone of the repo:
+
+```bash
+export IMG=gcr.io/$(gcloud config get-value project)/llmkube-controller:dev
+
+make docker-build IMG=$IMG
+make docker-push IMG=$IMG
+make install          # CRDs
+make deploy IMG=$IMG  # controller
+```
+
+</details>
+
 ---
 
 ## Step 3: Deploy Multi-GPU Model
@@ -170,9 +176,7 @@ kubectl logs -n llmkube-system deployment/llmkube-controller-manager --tail=50
 ### 3.1 Deploy Llama 2 13B with 2 GPUs
 
 ```bash
-cd /Users/defilan/stuffy/code/ai/llmkube
-
-# Deploy multi-GPU model
+# Deploy multi-GPU model (from a clone of the repo, or use the raw URL)
 kubectl apply -f config/samples/multi-gpu-llama-13b-model.yaml
 
 # Monitor deployment
@@ -291,11 +295,12 @@ done
 
 ---
 
-## Step 5: Validate Success Criteria
+## Step 5: Confirm the Shard Is Real
 
-### Success Checklist (from Issue #2)
+A model can be Ready, serving, and still running on one GPU. These five checks
+distinguish "it works" from "it sharded".
 
-- [ ] **Controller generates correct args**:
+- [ ] **Controller generated the sharding args**:
   ```bash
   kubectl get pod $POD -o jsonpath='{.spec.containers[*].args}' | grep tensor-split
   # Should see: --tensor-split 1,1
@@ -313,9 +318,11 @@ done
   # Should see: "offloaded X/X layers to GPU"
   ```
 
-- [ ] **Performance target met**:
-  - Token generation: **>40 tok/s** (target from Issue #2)
-  - Latency: <2s for 100-token completion
+- [ ] **Throughput is in the expected range**: the reference figure recorded in
+  `test/e2e/multi-gpu-test-plan.md` is above 40 tok/s for 13B on 2x L4. T4s are
+  slower. Landing far below the figure for your hardware usually means one GPU
+  is doing the work, so check the utilization item below before hunting
+  elsewhere.
 
 - [ ] **Both GPUs utilized**:
   - nvidia-smi shows >70% utilization on both GPUs during inference
@@ -386,7 +393,7 @@ kubectl logs $POD | grep "offloaded"
 
 ### Poor Performance
 
-If performance is below target (40 tok/s):
+If throughput is well below the range in Step 5:
 
 ```bash
 # Check actual GPU utilization
@@ -411,23 +418,32 @@ kubectl logs $POD | grep -i "out of memory"
 
 ## Next Steps
 
-After successful validation:
-
-1. **Document Performance**: Record tok/s, latency, GPU utilization
-2. **Update Issue #2**: Add test results and mark success criteria as complete
-3. **Test 4-GPU**: If cluster supports it, try 4-GPU configuration
-4. **Update Roadmap**: Mark Phase 2-3 as complete
-5. **Create PR**: Merge multi-GPU support to main branch
+1. **Scale past 2 GPUs.** `hardware.gpu.count` is not limited to 2. Raise it
+   and the controller recalculates `--tensor-split` for you.
+2. **Try a larger model.** `config/samples/multi-gpu-llama-70b-model.yaml` is
+   the 70B version of this walkthrough.
+3. **Tune the split.** `hardware.gpu.sharding.strategy` accepts
+   `layer;tensor;row;pipeline;none` and defaults to `layer`. Two of those are
+   not what the name suggests: `tensor` is an alias for `row`, and `pipeline`
+   falls back to `layer`, because llama.cpp has no pipeline split mode. Only
+   `none` suppresses `--tensor-split` entirely. `layerSplit` takes explicit
+   per-GPU ranges when the automatic even split is not what you want.
+4. **Put it behind an SLO.** See the GPU sharing and observability guides for
+   quotas, `ModelPool`, and dashboards once more than one workload competes for
+   the same GPUs.
 
 ---
 
 ## Reference
 
-- **Implementation**: `internal/controller/inferenceservice_controller.go`
-- **Test Plan**: `test/e2e/multi-gpu-test-plan.md`
-- **Examples**: `config/samples/multi-gpu-llama-13b-model.yaml`
-- **Issue**: #2 - Multi-GPU single-node support
-- **Roadmap**: Phase 2-3 (Multi-GPU & Platform Support)
+- **Implementation**: `internal/controller/gpu_sharding.go` (split mode and
+  tensor-split calculation), `internal/controller/runtime_llamacpp.go` (arg
+  construction)
+- **Test plan**: `test/e2e/multi-gpu-test-plan.md`
+- **Examples**: `config/samples/multi-gpu-llama-13b-model.yaml`,
+  `multi-gpu-llama-70b-model.yaml`, plus `multi-gpu-{gke,eks,azure}-spot.yaml`
+- **Terraform**: `terraform/gke/multi-gpu.tfvars.example` and
+  `terraform/gke/multi-gpu-quick-start.sh`
 
 ---
 
