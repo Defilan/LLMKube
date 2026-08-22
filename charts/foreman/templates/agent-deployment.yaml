@@ -30,7 +30,15 @@ spec:
   # strategy stops a rolling update from briefly running two agents
   # that race for the same Scheduled tasks.
   strategy:
-    type: Recreate
+    type: {{ $agent.strategy.type }}
+    {{- if eq (upper $agent.strategy.type) "ROLLINGUPDATE" }}
+    {{- /* Safe defaults when rollingUpdate is unset: maxSurge 0 preserves the
+           no-two-agents invariant, maxUnavailable 1 drains one replica at a time. */}}
+    {{- $ru := default (dict "maxSurge" 0 "maxUnavailable" 1) $agent.strategy.rollingUpdate }}
+    rollingUpdate:
+      maxSurge: {{ $ru.maxSurge | default 0 }}
+      maxUnavailable: {{ $ru.maxUnavailable | default 1 }}
+    {{- end }}
   # Pool-scoped, via $ctx rather than the chart root: passing $ here gave
   # every pool the same selector, so each Deployment adopted the others'
   # pods and fought them over replicaCount (#1523).
@@ -162,6 +170,6 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ $agent.terminationGracePeriodSeconds }}
 {{- end }}
 {{- end }}

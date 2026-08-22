@@ -278,6 +278,26 @@ agent:
   enabled: true
   replicaCount: 1
 
+  # How long the kubelet waits for the agent to finish in-flight work
+  # after sending SIGTERM before force-killing the pod. In-process
+  # (execution.image unset) tasks die with the SIGTERM — the agent has
+  # no drain hook yet — so raising this buys a longer window for a
+  # slow local-model turn to be interrupted cleanly by the scheduler's
+  # retry path. The default of 30s reproduces the previous hardcoded
+  # value so an existing install is unchanged until it opts in.
+  terminationGracePeriodSeconds: 30
+
+  # Pod rollout strategy for the agent Deployment. Recreate exists
+  # because each foreman-agent claims one task at a time, and a rolling
+  # update can briefly run two agents that race for the same Scheduled
+  # tasks. RollingUpdate with maxSurge 0 and maxUnavailable 1 trades that
+  # race risk for draining one replica at a time: an image bump then
+  # replaces agents one by one instead of tearing the whole pool down.
+  # maxSurge MUST stay 0 — any surge would momentarily run two agents for
+  # the same pool, recreating the race Recreate exists to prevent.
+  strategy:
+    type: Recreate
+
   image:
     # registry: ghcr.io
     # Default: the lean runtime image (alpine + git). To run a coder-enabled

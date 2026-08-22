@@ -1,0 +1,164 @@
+suite: agent rollout strategy + terminationGracePeriodSeconds (#1438 chart half)
+templates:
+  - agent-deployment.yaml
+
+tests:
+  # ---- Defaults reproduce the previous hardcoded output exactly ----
+
+  - it: default agent renders Recreate and a 30s grace period (no change on upgrade)
+    template: agent-deployment.yaml
+    set:
+      agent.enabled: true
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      # Recreate has no rollingUpdate knobs; the field must be absent, not 0.
+      - notExists:
+          path: spec.strategy.rollingUpdate
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+
+  - it: default multi-pool install renders Recreate and 30s for the default pool
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-default-agent
+      matchMany: false
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      - notExists:
+          path: spec.strategy.rollingUpdate
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+
+  - it: default multi-pool install renders Recreate and 30s for the fork pool
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-llmkube-fork-agent
+      matchMany: false
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      - notExists:
+          path: spec.strategy.rollingUpdate
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+
+  # ---- Opting into RollingUpdate ----
+
+  - it: a pool opting into RollingUpdate renders the rollingUpdate block and its raised grace period
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    set:
+      agents.default.strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 0
+          maxUnavailable: 1
+      agents.default.terminationGracePeriodSeconds: 180
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-default-agent
+      matchMany: false
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: RollingUpdate
+      # maxSurge MUST stay 0 to preserve the no-two-agents invariant;
+      # assert on the rendered value, not a regex, so it cannot pass vacuously.
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 0
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 1
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 180
+
+  - it: RollingUpdate with only type set still renders the rollingUpdate block with safe defaults
+    template: agent-deployment.yaml
+    set:
+      agent.enabled: true
+      agent.strategy:
+        type: RollingUpdate
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: RollingUpdate
+      # maxSurge defaults to 0 (no two agents) even when omitted.
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 0
+      - equal:
+          path: spec.strategy.rollingUpdate.maxUnavailable
+          value: 1
+
+  # ---- #1523 regression: per-pool rollout values must not leak across pools ----
+  # Pin the rollingUpdate absence with a documentSelector on the fork pool so
+  # it cannot pass vacuously on the pool that DOES render one.
+
+  - it: a pool opting into RollingUpdate leaves the sibling pool on Recreate with no rollingUpdate block
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    set:
+      # Only the default pool opts in; the fork pool must keep the defaults.
+      agents.default.strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 0
+          maxUnavailable: 1
+      agents.default.terminationGracePeriodSeconds: 180
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-llmkube-fork-agent
+      matchMany: false
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: Recreate
+      - notExists:
+          path: spec.strategy.rollingUpdate
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 30
+
+  - it: the opting-in pool still carries its raised grace period when a sibling opts in
+    template: agent-deployment.yaml
+    values:
+      - ./values-multi.yaml
+    set:
+      agents.default.strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 0
+          maxUnavailable: 1
+      agents.default.terminationGracePeriodSeconds: 180
+    documentSelector:
+      path: metadata.name
+      value: RELEASE-NAME-foreman-default-agent
+      matchMany: false
+    asserts:
+      - equal:
+          path: spec.strategy.type
+          value: RollingUpdate
+      - equal:
+          path: spec.strategy.rollingUpdate.maxSurge
+          value: 0
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 180
