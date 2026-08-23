@@ -537,6 +537,26 @@ func TestRunCommand_ReportsWhatIsWrongWithTheQueue(t *testing.T) {
 			t.Errorf("err = %v, want it to name %q", err, missing)
 		}
 	})
+	t.Run("a queue that is not YAML", func(t *testing.T) {
+		queue, _ := runQueueFixture(t)
+		// An unbalanced bracket: a parse failure, not a schema complaint, so
+		// this exercises ParseQueue's own error path rather than its
+		// validation. Nothing else in the CLI tests reaches it.
+		body := "repo: defilantech/LLMKube\nitems:\n  - issue: 1602\n    intent: [oops\n"
+		if err := os.WriteFile(queue, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		out, err := foremanExec(t, "run", "--queue", queue, "--coder-agent", "coder-metal")
+		if err == nil {
+			t.Fatal("Execute() = nil, want a malformed queue refused")
+		}
+		if !strings.Contains(err.Error(), "parse queue") {
+			t.Errorf("err = %v, want the parse failure surfaced, not swallowed", err)
+		}
+		if out != "" {
+			t.Errorf("stdout = %q, want no plan printed for a queue that would not parse", out)
+		}
+	})
 	t.Run("an intent that is not there", func(t *testing.T) {
 		queue, intent := runQueueFixture(t)
 		if err := os.Remove(intent); err != nil {

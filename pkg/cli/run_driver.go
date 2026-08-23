@@ -19,8 +19,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"io"
-	"os"
 	"time"
 )
 
@@ -243,54 +241,4 @@ func driveLoop(
 		}
 		stage = t.Next
 	}
-}
-
-// printRunPlan loads the queue the human prepared, checks every intent is
-// readable, and prints what a run would do.
-//
-// A live run is refused rather than half-attempted: the cluster-backed Effects
-// (dispatch, watch, verify, kill) are a follow-up to this plan, so there is
-// nothing to drive the loop with yet. Validating the queue is real work that
-// needs no cluster and it catches the mistakes a human actually makes, so it
-// happens BEFORE the refusal: answering a queue with a missing intent by
-// talking about unwired effects helps nobody.
-func printRunPlan(w io.Writer, opts *runOptions) error {
-	data, err := os.ReadFile(opts.queueFile)
-	if err != nil {
-		return fmt.Errorf("read queue: %w", err)
-	}
-	q, err := ParseQueue(data)
-	if err != nil {
-		return err
-	}
-	intents := make([]string, len(q.Items))
-	for i, item := range q.Items {
-		s, err := q.IntentFor(item)
-		if err != nil {
-			return err
-		}
-		intents[i] = s
-	}
-	if !opts.dryRun {
-		return fmt.Errorf("the queue is valid, but a live run cannot start yet: dispatch, "+
-			"watch and verify against the cluster are not wired up. Re-run with --dry-run "+
-			"to see what %d item(s) would do", len(q.Items))
-	}
-	// Labelled with the flag names that produced them, so the plan reads back
-	// as the command that made it.
-	fprintln(w, "dry run, nothing is applied.")
-	fprintf(w, "queue: %s\n", opts.queueFile)
-	fprintf(w, "coder-agent: %s\n", opts.coderAgent)
-	fprintf(w, "namespace: %s\n", opts.namespace)
-	fprintf(w, "decisions-dir: %s\n", opts.decisionsDir)
-	fprintf(w, "stall-factor: %g\n", opts.stallFactor)
-	fprintf(w, "items: %d\n", len(q.Items))
-	for i, item := range q.Items {
-		// The reserved name: nothing has dispatched, so there is no returned
-		// Workload name to build the branch from.
-		fprintf(w, "  issue %d (%s): branch %s, intent %s (%d bytes)\n",
-			item.Issue, item.Repo, taskBranch(plannedWorkloadName(item.Issue), item.Issue),
-			item.IntentPath, len(intents[i]))
-	}
-	return nil
 }
