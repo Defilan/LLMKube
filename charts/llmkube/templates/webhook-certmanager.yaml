@@ -1,0 +1,87 @@
+{{- if .Values.webhook.enabled }}
+{{- $cm := (.Values.webhook.certManager | default dict).enabled | default false }}
+{{- if $cm }}
+{{- /*
+cert-manager owns the webhook serving cert. Rendered only when
+webhook.certManager.enabled, which is mutually exclusive with the chart's
+self-generated cert: webhook.yaml skips its cert Secret + lookup in this mode
+and cert-manager injects the CA bundle via annotation instead.
+
+The Certificate's secretName is the SAME Secret the deployment mounts
+(llmkube.webhook.secretName), so the controller needs no change: cert-manager
+populates tls.crt + tls.key there and the serving webhook picks them up.
+*/}}
+{{- if not (.Capabilities.APIVersions.Has "cert-manager.io/v1") }}
+{{- fail "webhook.certManager.enabled=true but cert-manager.io/v1 is not installed in this cluster. Install cert-manager first, or leave webhook.certManager.enabled=false to use the chart's self-signed cert." }}
+{{- end }}
+{{- $svc := include "llmkube.webhook.serviceName" . }}
+{{- $ns := include "llmkube.namespace" . }}
+{{- /* A user writing `issuerRef:` with nothing under it deletes the chart
+       default, so `index` on it fails the whole render with a raw nil
+       pointer error. Normalise to a dict once, here. */}}
+{{- $issuerRef := .Values.webhook.certManager.issuerRef | default dict }}
+{{- $altNames := list (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) }}
+{{- if and (not (empty $issuerRef)) (not $issuerRef.name) }}
+{{- fail "webhook.certManager.issuerRef requires a name. Setting only kind/group leaves the Certificate pointing at the chart's self-signed Issuer, which is not rendered when issuerRef is set, so cert-manager reports IssuerNotFound and the webhook never gets a cert." }}
+{{- end }}
+{{- if empty $issuerRef }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "llmkube.webhook.issuerName" . }}
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "llmkube.webhook.certName" . }}
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+spec:
+  # Same Secret name webhook.yaml's chart-generated cert used, so the
+  # deployment's volume mount is unchanged across modes.
+  secretName: {{ include "llmkube.webhook.secretName" . }}
+  {{- /* No commonName: it is capped at 64 bytes by X.509 and cert-manager
+         enforces it, and a 53-character release name (Helm's documented
+         maximum) already overflows. The dnsNames below carry the identity
+         the API server validates against, which is why the kubebuilder
+         scaffold omits commonName too. */}}
+  dnsNames:
+    {{- range $altNames }}
+    - {{ . }}
+    {{- end }}
+  {{- /* Honour webhook.certValidityDays here too. Without it the knob stays
+         settable and documented while cert-manager silently issues its own
+         90-day default. renewBefore is a third of the lifetime. */}}
+  duration: {{ mul .Values.webhook.certValidityDays 24 }}h
+  renewBefore: {{ div (mul .Values.webhook.certValidityDays 24) 3 }}h
+  {{- /* Keep the Secret owned by Helm so `helm uninstall` removes it.
+         cert-manager only sets an owner reference with
+         --enable-certificate-owner-ref (off by default), so without this the
+         Secret outlives the release and blocks a later reinstall in the
+         chart-generated mode with "exists and cannot be imported". */}}
+  secretTemplate:
+    labels:
+      {{- include "llmkube.labels" . | nindent 6 }}
+    annotations:
+      meta.helm.sh/release-name: {{ .Release.Name | quote }}
+      meta.helm.sh/release-namespace: {{ include "llmkube.namespace" . | quote }}
+  issuerRef:
+    name: {{ $issuerRef.name | default (include "llmkube.webhook.issuerName" .) }}
+    {{- with $issuerRef.kind }}
+    kind: {{ . }}
+    {{- end }}
+    {{- /* group defaults to cert-manager.io; an external issuer (AWS PCA,
+           google-cas, step, Venafi) lives in its own API group and is
+           unreachable without it. */}}
+    {{- with $issuerRef.group }}
+    group: {{ . }}
+    {{- end }}
+{{- end }}
+{{- end }}

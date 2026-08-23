@@ -179,6 +179,25 @@ ValidatingWebhookConfiguration name.
 {{- end }}
 
 {{/*
+cert-manager Certificate name (webhook.certManager.enabled). Its spec.secretName
+points at llmkube.webhook.secretName, so the deployment mount is unchanged, and
+the webhook configs' cert-manager.io/inject-ca-from annotation references
+<namespace>/<this name>.
+*/}}
+{{- define "llmkube.webhook.certName" -}}
+{{- printf "%s-webhook-cert" (include "llmkube.fullname" .) -}}
+{{- end }}
+
+{{/*
+Self-signed cert-manager Issuer name, rendered only when
+webhook.certManager.issuerRef is empty. Skipped when the operator brings their
+own Issuer or ClusterIssuer via issuerRef.
+*/}}
+{{- define "llmkube.webhook.issuerName" -}}
+{{- printf "%s-webhook-issuer" (include "llmkube.fullname" .) -}}
+{{- end }}
+
+{{/*
 llmkube.webhook.certs resolves the serving cert + CA bundle for the webhook,
 reusing the existing Secret's material when present so the cert and the injected
 caBundle stay STABLE across `helm upgrade`. Returns a dict with keys "ca",

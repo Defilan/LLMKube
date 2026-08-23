@@ -307,6 +307,18 @@ hand-imported.
 |-----------|-------------|---------|
 | `pyrra.enabled` | Enable Pyrra SLO integration | `false` |
 
+### Webhook Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `webhook.enabled` | Render all webhook resources (cert Secret, Service, `ValidatingWebhookConfiguration`) and start the operator's webhook server. | `true` |
+| `webhook.failurePolicy` | What happens when the webhook is unreachable. `Fail` rejects the apply; `Ignore` admits unvalidated. | `Fail` |
+| `webhook.port` | Port the webhook server listens on. | `9443` |
+| `webhook.certValidityDays` | Serving-cert lifetime. Applies to both certificate sources: the chart-generated cert, and the cert-manager `Certificate`'s `duration` (with `renewBefore` at a third of it). | `3650` |
+| `webhook.certManager.enabled` | Hand the webhook serving cert to cert-manager instead of the chart's self-generated one. Needed for ArgoCD, which does not support Helm lookups (see #1601). The render fails with an actionable message if cert-manager is not installed. See `values.yaml` for the install-order caveat with slow external issuers. | `false` |
+| `webhook.certManager.issuerRef` | cert-manager `ObjectReference` for the signing issuer: `{name, kind, group}`. Empty renders the chart's own self-signed `Issuer`. `name` is required once any field is set. | `{}` |
+| `webhook.certManager.issuerRef.group` | API group of the issuer. Defaults to `cert-manager.io`; required for an external issuer (AWS PCA, google-cas, step, Venafi). | unset |
+
 ## Examples
 
 ### Basic Installation
