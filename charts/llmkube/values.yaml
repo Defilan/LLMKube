@@ -485,6 +485,25 @@ webhook:
   # force regeneration before expiry).
   certValidityDays: 3650
 
+  # certManager hands the webhook serving cert to cert-manager instead of the
+  # chart's self-generated one (#1601). Required for ArgoCD: ArgoCD does not
+  # support Helm lookups, so every re-render ran the lookup-reuse path and
+  # regenerated the cert, and ArgoCD's server-side-apply dry-run against the API
+  # server (webhook active) then failed the sync until the operator reloaded.
+  # With this on, the chart renders a cert-manager Certificate that populates the
+  # SAME Secret the deployment mounts (so the controller needs no change), and
+  # the webhook configurations' CA bundle is injected via the
+  # cert-manager.io/inject-ca-from annotation instead of a chart-generated
+  # caBundle. The chart-generated cert Secret is NOT rendered in this mode.
+  # Defaults false: the self-generated path (no cert-manager dependency) stays
+  # the default. Requires cert-manager to be installed.
+  certManager:
+    enabled: false
+    # issuerRef names the cert-manager Issuer or ClusterIssuer the Certificate
+    # is signed by. Empty (default) renders the chart's own self-signed Issuer;
+    # set name (and optionally kind: ClusterIssuer) to use your own.
+    issuerRef: {}
+
 # multitenancy gates the opt-in multi-tenant admission + RBAC surface (#416).
 # Default off: the InferenceService quota ValidatingWebhookConfiguration entry is
 # NOT rendered (so InferenceService admission is never intercepted) and no tenant

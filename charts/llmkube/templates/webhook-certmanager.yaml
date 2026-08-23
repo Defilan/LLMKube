@@ -1,0 +1,51 @@
+{{- if .Values.webhook.enabled }}
+{{- $cm := (.Values.webhook.certManager | default dict).enabled | default false }}
+{{- if $cm }}
+{{- /*
+cert-manager owns the webhook serving cert. Rendered only when
+webhook.certManager.enabled, which is mutually exclusive with the chart's
+self-generated cert: webhook.yaml skips its cert Secret + lookup in this mode
+and cert-manager injects the CA bundle via annotation instead.
+
+The Certificate's secretName is the SAME Secret the deployment mounts
+(llmkube.webhook.secretName), so the controller needs no change: cert-manager
+populates tls.crt + tls.key there and the serving webhook picks them up.
+*/}}
+{{- $svc := include "llmkube.webhook.serviceName" . }}
+{{- $ns := include "llmkube.namespace" . }}
+{{- $altNames := list (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) }}
+{{- if empty .Values.webhook.certManager.issuerRef }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "llmkube.webhook.issuerName" . }}
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "llmkube.webhook.certName" . }}
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+spec:
+  # Same Secret name webhook.yaml's chart-generated cert used, so the
+  # deployment's volume mount is unchanged across modes.
+  secretName: {{ include "llmkube.webhook.secretName" . }}
+  commonName: {{ $svc }}
+  dnsNames:
+    {{- range $altNames }}
+    - {{ . }}
+    {{- end }}
+  issuerRef:
+    name: {{ index .Values.webhook.certManager.issuerRef "name" | default (include "llmkube.webhook.issuerName" .) }}
+    {{- if index .Values.webhook.certManager.issuerRef "kind" }}
+    kind: {{ index .Values.webhook.certManager.issuerRef "kind" }}
+    {{- end }}
+{{- end }}
+{{- end }}

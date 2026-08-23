@@ -1,4 +1,7 @@
 {{- if .Values.webhook.enabled }}
+{{- $cm := (.Values.webhook.certManager | default dict).enabled | default false }}
+{{- $certs := dict }}
+{{- if not $cm }}
 {{- /*
 Compute the serving cert + CA bundle ONCE so the Secret and the
 ValidatingWebhookConfiguration below are guaranteed to use matching material.
@@ -6,7 +9,20 @@ llmkube.webhook.certs reuses the existing Secret on upgrade (lookup-reuse), so
 the cert stays stable and the injected caBundle never drifts from the served
 cert.
 */}}
-{{- $certs := include "llmkube.webhook.certs" . | fromYaml }}
+{{- $certs = include "llmkube.webhook.certs" . | fromYaml }}
+{{- else }}
+{{- /*
+cert-manager owns the webhook serving cert (#1601). The chart does NOT
+self-generate it and does NOT call llmkube.webhook.certs, whose lookup-reuse is
+exactly what breaks ArgoCD syncs: ArgoCD does not support Helm lookups, so every
+re-render regenerated the cert, and ArgoCD's server-side-apply dry-run against
+the API server (with the webhook active) then failed the sync. Instead the
+Certificate in webhook-certmanager.yaml populates the SAME Secret the deployment
+mounts, and the CA bundle is injected into the webhook configurations below via
+the cert-manager.io/inject-ca-from annotation (leaving caBundle unset).
+*/}}
+{{- end }}
+{{- if not $cm }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -20,6 +36,7 @@ data:
   tls.key: {{ $certs.key }}
   ca.crt: {{ $certs.ca }}
 ---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -42,6 +59,10 @@ metadata:
   name: {{ include "llmkube.webhook.configName" . }}
   labels:
     {{- include "llmkube.labels" . | nindent 4 }}
+  {{- if $cm }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ include "llmkube.namespace" . }}/{{ include "llmkube.webhook.certName" . }}
+  {{- end }}
 webhooks:
   - name: vmodelrouter.inference.llmkube.dev
     admissionReviewVersions: ["v1"]
@@ -52,7 +73,9 @@ webhooks:
         name: {{ include "llmkube.webhook.serviceName" . }}
         namespace: {{ include "llmkube.namespace" . }}
         path: /validate-inference-llmkube-dev-v1alpha1-modelrouter
+      {{- if not $cm }}
       caBundle: {{ $certs.ca }}
+      {{- end }}
     rules:
       - apiGroups: ["inference.llmkube.dev"]
         apiVersions: ["v1alpha1"]
@@ -69,7 +92,9 @@ webhooks:
         name: {{ include "llmkube.webhook.serviceName" . }}
         namespace: {{ include "llmkube.namespace" . }}
         path: /validate-inference-llmkube-dev-v1alpha1-inferenceservice-quota
+      {{- if not $cm }}
       caBundle: {{ $certs.ca }}
+      {{- end }}
     rules:
       - apiGroups: ["inference.llmkube.dev"]
         apiVersions: ["v1alpha1"]
@@ -84,6 +109,10 @@ metadata:
   name: {{ include "llmkube.webhook.configName" . }}-mutating
   labels:
     {{- include "llmkube.labels" . | nindent 4 }}
+  {{- if $cm }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ include "llmkube.namespace" . }}/{{ include "llmkube.webhook.certName" . }}
+  {{- end }}
 webhooks:
   - name: mmodel.inference.llmkube.dev
     admissionReviewVersions: ["v1"]
@@ -96,7 +125,9 @@ webhooks:
         name: {{ include "llmkube.webhook.serviceName" . }}
         namespace: {{ include "llmkube.namespace" . }}
         path: /mutate-inference-llmkube-dev-v1alpha1-model
+      {{- if not $cm }}
       caBundle: {{ $certs.ca }}
+      {{- end }}
     rules:
       - apiGroups: ["inference.llmkube.dev"]
         apiVersions: ["v1alpha1"]

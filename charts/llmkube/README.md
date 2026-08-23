@@ -307,6 +307,16 @@ hand-imported.
 |-----------|-------------|---------|
 | `pyrra.enabled` | Enable Pyrra SLO integration | `false` |
 
+### Webhook Parameters
+
+The `webhook.*` values are documented inline in `values.yaml`; the cert-manager
+option is added here so it is discoverable from this table.
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `webhook.certManager.enabled` | Hand the webhook serving cert to cert-manager instead of the chart's self-generated one. Needed for ArgoCD, which does not support Helm lookups (see #1601). Requires cert-manager to be installed. | `false` |
+| `webhook.certManager.issuerRef` | cert-manager `Issuer`/`ClusterIssuer` the Certificate is signed by. Empty renders the chart's own self-signed `Issuer`; set `name` (and optionally `kind: ClusterIssuer`) to use your own. | `{}` |
+
 ## Examples
 
 ### Basic Installation

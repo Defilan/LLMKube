@@ -1,17 +1,32 @@
 suite: modelrouter validating webhook
+# Two mutually exclusive certificate sources (#1601): the chart self-generates
+# a stable serving cert by default, or cert-manager owns it. Every test scopes
+# to a single template and pins that template's document set (hasDocuments) so
+# an absence claim cannot pass vacuously — the pinned count is what makes the
+# notExists assertions meaningful.
 templates:
   - webhook.yaml
+  - webhook-certmanager.yaml
 
 tests:
   # Default ON: the chart self-generates a stable serving cert, so the webhook
-  # is wired by default (matches foreman). Four documents: cert Secret, webhook
-  # Service, and the validating + mutating configurations.
+  # is wired by default (matches foreman). webhook.yaml renders four documents:
+  # cert Secret, webhook Service, and the validating + mutating configurations.
+  # cert-manager resources are NOT rendered in this mode.
   - it: should render Secret + Service + both webhook configurations by default
+    template: webhook.yaml
     asserts:
       - hasDocuments:
           count: 4
 
+  - it: should render no cert-manager resources by default
+    template: webhook-certmanager.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
   - it: should render a kubernetes.io/tls cert Secret
+    template: webhook.yaml
     documentIndex: 0
     asserts:
       - isKind:
@@ -27,6 +42,7 @@ tests:
           path: data["ca.crt"]
 
   - it: should render a webhook Service exposing the named webhook port
+    template: webhook.yaml
     documentIndex: 1
     asserts:
       - isKind:
@@ -39,6 +55,7 @@ tests:
           value: webhook
 
   - it: should render a ValidatingWebhookConfiguration for modelrouters
+    template: webhook.yaml
     documentIndex: 2
     asserts:
       - isKind:
@@ -64,8 +81,14 @@ tests:
       - equal:
           path: webhooks[0].failurePolicy
           value: Fail
+      # The default mode injects the chart CA bundle, not a cert-manager annotation.
+      - isNotNullOrEmpty:
+          path: webhooks[0].clientConfig.caBundle
+      - notExists:
+          path: metadata.annotations["cert-manager.io/inject-ca-from"]
 
   - it: should render a MutatingWebhookConfiguration for models
+    template: webhook.yaml
     documentIndex: 3
     asserts:
       - isKind:
@@ -83,9 +106,15 @@ tests:
       - equal:
           path: webhooks[0].failurePolicy
           value: Ignore
+      # The default mode injects the chart CA bundle, not a cert-manager annotation.
+      - isNotNullOrEmpty:
+          path: webhooks[0].clientConfig.caBundle
+      - notExists:
+          path: metadata.annotations["cert-manager.io/inject-ca-from"]
 
   # failurePolicy is wired from values.
   - it: should honor a custom failurePolicy
+    template: webhook.yaml
     set:
       webhook.failurePolicy: Ignore
     documentIndex: 2
@@ -94,11 +123,151 @@ tests:
           path: webhooks[0].failurePolicy
           value: Ignore
 
-  # Disabled renders NOTHING: existing installs that set webhook.enabled=false
-  # are completely unaffected.
+  # Disabled renders NOTHING from either template: existing installs that set
+  # webhook.enabled=false are completely unaffected.
   - it: should render nothing when the webhook is disabled
+    template: webhook.yaml
     set:
       webhook.enabled: false
     asserts:
       - hasDocuments:
           count: 0
+
+  - it: should render no cert-manager resources when the webhook is disabled
+    template: webhook-certmanager.yaml
+    set:
+      webhook.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # --- cert-manager mode (#1601) ---
+  # webhook.certManager.enabled=true is mutually exclusive with the chart's
+  # self-generated cert: webhook.yaml renders the Service + both webhook
+  # configurations (NO cert Secret, NO caBundle) and cert-manager injects the
+  # CA bundle via the cert-manager.io/inject-ca-from annotation; the
+  # Certificate populates the SAME Secret the deployment mounts.
+
+  - it: should skip the chart-generated cert Secret when cert-manager is enabled
+    template: webhook.yaml
+    set:
+      webhook.certManager.enabled: true
+    asserts:
+      # Three docs (Service, validating, mutating) — the cert Secret is gone.
+      - hasDocuments:
+          count: 3
+
+  - it: should render a self-signed Issuer + Certificate when cert-manager is enabled
+    template: webhook-certmanager.yaml
+    set:
+      webhook.certManager.enabled: true
+    asserts:
+      # Two docs: the self-signed Issuer (issuerRef empty) + the Certificate.
+      - hasDocuments:
+          count: 2
+
+  - it: should name the Certificate after the chart's serving Secret
+    template: webhook-certmanager.yaml
+    set:
+      webhook.certManager.enabled: true
+    documentSelector:
+      path: kind
+      value: Certificate
+    asserts:
+      - isKind:
+          of: Certificate
+      - isAPIVersion:
+          of: cert-manager.io/v1
+      # Same Secret the deployment mounts, so the controller needs no change.
+      - equal:
+          path: spec.secretName
+          value: RELEASE-NAME-llmkube-webhook-cert
+      # Empty issuerRef renders the chart's own self-signed Issuer.
+      - equal:
+          path: spec.issuerRef.name
+          value: RELEASE-NAME-llmkube-webhook-issuer
+
+  - it: should render a self-signed Issuer by default in cert-manager mode
+    template: webhook-certmanager.yaml
+    set:
+      webhook.certManager.enabled: true
+    documentSelector:
+      path: kind
+      value: Issuer
+    asserts:
+      - isKind:
+          of: Issuer
+      - isAPIVersion:
+          of: cert-manager.io/v1
+      - equal:
+          path: spec.selfSigned
+          value: {}
+
+  # The cert-manager.io/inject-ca-from value is <namespace>/<certificate name>.
+  # The namespace defaults to the release namespace; pin it so the assertion is
+  # deterministic (the chart's values.yaml sets it to llmkube-system in practice).
+  - it: should inject the cert-manager CA via annotation on both webhook configs
+    template: webhook.yaml
+    set:
+      webhook.certManager.enabled: true
+    release:
+      namespace: llmkube-system
+    documentSelector:
+      path: kind
+      value: ValidatingWebhookConfiguration
+    asserts:
+      - equal:
+          path: metadata.annotations["cert-manager.io/inject-ca-from"]
+          value: llmkube-system/RELEASE-NAME-llmkube-webhook-cert
+      - notExists:
+          path: webhooks[0].clientConfig.caBundle
+
+  - it: should leave caBundle unset on the mutating webhook in cert-manager mode
+    template: webhook.yaml
+    set:
+      webhook.certManager.enabled: true
+    release:
+      namespace: llmkube-system
+    documentSelector:
+      path: kind
+      value: MutatingWebhookConfiguration
+    asserts:
+      - equal:
+          path: metadata.annotations["cert-manager.io/inject-ca-from"]
+          value: llmkube-system/RELEASE-NAME-llmkube-webhook-cert
+      - notExists:
+          path: webhooks[0].clientConfig.caBundle
+
+  # A set issuerRef skips the chart's self-signed Issuer and references the
+  # operator's own Issuer or ClusterIssuer instead.
+  - it: should skip the self-signed Issuer when issuerRef is set
+    template: webhook-certmanager.yaml
+    set:
+      webhook.certManager.enabled: true
+      webhook.certManager.issuerRef.name: my-issuer
+      webhook.certManager.issuerRef.kind: ClusterIssuer
+    asserts:
+      # One doc: only the Certificate (the self-signed Issuer is skipped).
+      - hasDocuments:
+          count: 1
+
+  - it: should reference the operator's ClusterIssuer when issuerRef is set
+    template: webhook-certmanager.yaml
+    set:
+      webhook.certManager.enabled: true
+      webhook.certManager.issuerRef.name: my-issuer
+      webhook.certManager.issuerRef.kind: ClusterIssuer
+    documentSelector:
+      path: kind
+      value: Certificate
+    asserts:
+      - equal:
+          path: spec.issuerRef.name
+          value: my-issuer
+      - equal:
+          path: spec.issuerRef.kind
+          value: ClusterIssuer
+      # The Secret the deployment mounts is unchanged regardless of issuer.
+      - equal:
+          path: spec.secretName
+          value: RELEASE-NAME-llmkube-webhook-cert

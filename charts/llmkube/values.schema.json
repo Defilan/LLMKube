@@ -467,6 +467,23 @@
         "certValidityDays": {
           "type": "integer",
           "minimum": 1
+        },
+        "certManager": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Hand the webhook serving cert to cert-manager instead of the chart's self-generated one (#1601).",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "issuerRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Issuer or ClusterIssuer to sign with; empty renders the chart's self-signed Issuer.",
+              "properties": {
+                "name": { "type": "string" },
+                "kind": { "type": "string" }
+              }
+            }
+          }
         }
       }
     },
