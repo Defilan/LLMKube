@@ -59,11 +59,27 @@ func ParkDecision(dir string, d Decision) (string, error) {
 	// destroy typed input. The item genuinely is parked either way, so leaving
 	// it alone is not an error for the caller. An unanswered decision is still
 	// refreshed with the current reason and evidence.
-	if existing, err := os.ReadFile(p); err == nil {
+	//
+	// This narrows the window, it does not close it: a human answering at the
+	// same instant as a park can still lose the answer. That is acceptable for
+	// a single-process loop and is not what this guard claims to prevent.
+	//
+	// A decision that cannot be read or parsed is never overwritten. The
+	// likeliest way one gets truncated is an interrupted write, and the answer
+	// may well still be sitting in it in plain text. Refusing until a human
+	// looks at the file beats destroying what is left of it.
+	existing, err := os.ReadFile(p)
+	switch {
+	case err == nil:
 		var prev Decision
-		if err := yaml.Unmarshal(existing, &prev); err == nil && prev.Answer != "" {
+		if err := yaml.Unmarshal(existing, &prev); err != nil {
+			return "", fmt.Errorf("refusing to overwrite unparseable decision %s: %w", p, err)
+		}
+		if prev.Answer != "" {
 			return p, nil
 		}
+	case !os.IsNotExist(err):
+		return "", fmt.Errorf("refusing to overwrite unreadable decision %s: %w", p, err)
 	}
 	if d.Opened.IsZero() {
 		d.Opened = time.Now().UTC()

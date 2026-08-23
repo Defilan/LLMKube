@@ -347,3 +347,55 @@ func TestParkDecision_WritesTheFileUserReadWriteOnly(t *testing.T) {
 		t.Errorf("mode = %04o, want 0600", got)
 	}
 }
+
+func TestParkDecision_RefusesToOverwriteAnUnparseableDecision(t *testing.T) {
+	// A half-written decision still has the answer in it in plain text. The
+	// likeliest way it got that way is an interrupted write of the answer.
+	dir := t.TempDir()
+	p := filepath.Join(dir, "1602-adjudicate.yaml")
+	truncated := "answer: revise\noptions: [accept, revise\n"
+	if err := os.WriteFile(p, []byte(truncated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate", Reason: "second pass found more issues",
+	}); err == nil {
+		t.Error("want an error rather than an overwrite of an unparseable decision")
+	}
+	after, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != truncated {
+		t.Errorf("file = %q, want the damaged original left alone", string(after))
+	}
+}
+
+func TestParkDecision_RefusesToOverwriteAnUnreadableDecision(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root, permission bits do not apply")
+	}
+	dir, p := decisionFixtureDir(t)
+	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o200); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(p, 0o600) })
+	if _, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate", Reason: "second pass found more issues",
+	}); err == nil {
+		t.Error("want an error rather than an overwrite of an unreadable decision")
+	}
+	if err := os.Chmod(p, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ListDecisions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Answer != "revise" {
+		t.Errorf("got %+v, want the answer still on disk", got)
+	}
+}
