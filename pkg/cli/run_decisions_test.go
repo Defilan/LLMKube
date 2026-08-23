@@ -626,3 +626,40 @@ func TestAnswerDecision_RejectsAnEmptyAnswer(t *testing.T) {
 		t.Errorf("Answer = %q, want the decision still unanswered", got[0].Answer)
 	}
 }
+
+func TestDecisionWritesStageInTheDecisionsDir(t *testing.T) {
+	// The staged file has to be a sibling of the target, not a file in TMPDIR.
+	// os.Rename across filesystems returns EXDEV, and a decisions dir under a
+	// home directory against a /var/folders TMPDIR is exactly that arrangement
+	// on macOS, so staging in TMPDIR would fail every write on a real box while
+	// passing every test on a box where the two happen to share a filesystem.
+	// Pointing TMPDIR at somewhere that does not exist stands in for that: a
+	// write that needs TMPDIR breaks, a write that stages beside the target
+	// does not care.
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", filepath.Join(dir, "no-such-tmpdir"))
+	p, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate", Options: []string{"accept", "revise"},
+	})
+	if err != nil {
+		t.Fatalf("ParkDecision with TMPDIR pointing nowhere: %v", err)
+	}
+	if got := filepath.Dir(p); got != dir {
+		t.Errorf("decision at %s, want it in %s", got, dir)
+	}
+	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err != nil {
+		t.Fatalf("AnswerDecision with TMPDIR pointing nowhere: %v", err)
+	}
+}
+
+func TestParkDecision_ChecksTheKindBeforeTouchingTheDisk(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "decisions")
+	if _, err := ParkDecision(dir, Decision{Issue: 1602, Kind: "../x"}); err == nil {
+		t.Fatal("want an error for a kind containing a path separator")
+	}
+	// Rejecting the kind only after MkdirAll would leave the directory behind.
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("%s exists, want nothing created for a rejected kind", dir)
+	}
+}
