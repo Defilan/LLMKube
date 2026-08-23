@@ -564,3 +564,63 @@ func TestRegistrar_Run_DrainsAndExitsOnCancel(t *testing.T) {
 		t.Errorf("final phase = %q, want Draining", got.Status.Phase)
 	}
 }
+
+// The #1640 decision: FleetNode identity is the agent process, and the
+// physical machine is a reported PROPERTY. status.kubernetesNode is where
+// that property lands for in-cluster agents (fed from the FLEET_NODE_NAME
+// downward-API env var, which was previously set by the chart but read by
+// nothing).
+func TestRegistrar_PatchHeartbeat_StampsKubernetesNode(t *testing.T) {
+	kc := newFakeClient(t)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "coder-agent-abc12",
+		Spec: foremanv1alpha1.FleetNodeSpec{
+			NodeName: "coder-agent-abc12",
+			Roles:    []string{"coder"},
+		},
+		Provider:       &fixedCapability{},
+		KubernetesNode: "ahazidgx1",
+	}
+	if err := r.Upsert(context.Background()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "coder-agent-abc12"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.KubernetesNode != "ahazidgx1" {
+		t.Errorf("Status.KubernetesNode = %q, want %q", got.Status.KubernetesNode, "ahazidgx1")
+	}
+}
+
+// Off-cluster agents (the metal Macs) have no Kubernetes node and leave the
+// field empty; an empty value must not be stamped as anything.
+func TestRegistrar_PatchHeartbeat_OmitsKubernetesNodeWhenUnset(t *testing.T) {
+	kc := newFakeClient(t)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "mac-studio-reviewer",
+		Spec: foremanv1alpha1.FleetNodeSpec{
+			NodeName: "mac-studio-reviewer",
+			Roles:    []string{"reviewer"},
+		},
+		Provider: &fixedCapability{},
+	}
+	if err := r.Upsert(context.Background()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "mac-studio-reviewer"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.KubernetesNode != "" {
+		t.Errorf("Status.KubernetesNode = %q, want empty", got.Status.KubernetesNode)
+	}
+}

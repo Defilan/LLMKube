@@ -95,8 +95,13 @@ type FleetNodeCapability struct {
 // FleetNode object. Most of the resource's interesting fields live in Status,
 // which the FleetAgent updates on every heartbeat.
 type FleetNodeSpec struct {
-	// NodeName is the human-readable identity of the worker. Conventionally
-	// matches metadata.name; required for the scheduler to address it.
+	// NodeName is the human-readable identity of the WORKER — the agent
+	// process, not the machine it runs on (#1640). Conventionally matches
+	// metadata.name; required for the scheduler to address it. For an
+	// in-cluster agent this is the pod name (the agent falls back to
+	// os.Hostname()); off-cluster agents set it via --fleet-node-name. The
+	// Kubernetes node a pod is scheduled on is reported separately at
+	// status.kubernetesNode.
 	// +kubebuilder:validation:Required
 	NodeName string `json:"nodeName"`
 
@@ -182,6 +187,15 @@ type FleetNodeStatus struct {
 	// (runtime.GOARCH). Used alongside OS for platform artifact selection.
 	// +optional
 	Arch string `json:"arch,omitempty"`
+
+	// KubernetesNode is the Kubernetes node the agent pod is scheduled on,
+	// reported by the agent on heartbeat from the FLEET_NODE_NAME downward-API
+	// env var (fieldRef: spec.nodeName). It is a PROPERTY of the worker, not
+	// its identity: FleetNode identity is the agent process (#1640), and
+	// spec.nodeName holds the worker's own name. Off-cluster agents (metal
+	// Macs) have no Kubernetes node and leave this empty.
+	// +optional
+	KubernetesNode string `json:"kubernetesNode,omitempty"`
 
 	// UpdateRequest is written by the AgentReleaseReconciler when a new
 	// agent version is ready for this node to install. The agent reads
