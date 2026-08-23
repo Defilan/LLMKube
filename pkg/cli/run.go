@@ -19,6 +19,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -90,6 +91,12 @@ Example:
 // happens BEFORE the refusal: answering a queue with a missing intent by
 // talking about unwired effects helps nobody.
 func printRunPlan(w io.Writer, opts *runOptions) error {
+	// Before the queue: a bad --stall-factor is a typo in the command that was
+	// just typed, and reporting a queue problem first would have the human
+	// editing a file when the fix is on the command line.
+	if err := checkStallFactor(opts.stallFactor); err != nil {
+		return err
+	}
 	data, err := os.ReadFile(opts.queueFile)
 	if err != nil {
 		return fmt.Errorf("read queue: %w", err)
@@ -126,6 +133,24 @@ func printRunPlan(w io.Writer, opts *runOptions) error {
 		fprintf(w, "  issue %d (%s): branch %s, intent %s (%d bytes)\n",
 			item.Issue, item.Repo, taskBranch(plannedWorkloadName(item.Issue), item.Issue),
 			item.IntentPath, len(intents[i]))
+	}
+	return nil
+}
+
+// checkStallFactor refuses a stall budget that would kill every run.
+//
+// pflag parses the value with strconv.ParseFloat, which happily accepts "NaN",
+// "Inf" and "-1", and IsStalled compares elapsed against factor x baseline: at
+// zero or below the threshold is zero or negative and the first watch tick
+// declares a run that has been going for a second stalled, and NaN converts to
+// a Duration that every elapsed time is greater than, which does the same. The
+// flag is the place to say so, because the human can see which flag is wrong
+// before anything is dispatched. IsStalled defends itself as well, for callers
+// that never went through this command.
+func checkStallFactor(f float64) error {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f <= 0 {
+		return fmt.Errorf("--stall-factor must be a finite number greater than 0, got %g: "+
+			"anything else kills every run on its first watch tick", f)
 	}
 	return nil
 }

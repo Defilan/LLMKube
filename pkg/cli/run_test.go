@@ -522,6 +522,35 @@ func TestRunCommand_UsesTheOptionsItWasGiven(t *testing.T) {
 	}
 }
 
+// pflag parses --stall-factor with strconv.ParseFloat, which accepts "0",
+// "-1", "NaN" and "Inf" as readily as "2.5". Every one of those makes IsStalled
+// declare a run stalled on its first watch tick and kill it, which is harmless
+// today only because a live run is refused: the flag has to be refused before
+// the Effects that would act on it are wired up.
+//
+// Each case is a valid queue with --dry-run, the one combination that otherwise
+// succeeds and prints a plan, so the error cannot be arriving from anywhere but
+// the guard. The empty-stdout assertion is what pins that: without the check
+// the command prints "stall-factor: 0" and exits 0.
+func TestRunCommand_RefusesAStallFactorThatWouldKillEveryRun(t *testing.T) {
+	for _, factor := range []string{"0", "-1", "-2.5", "NaN", "Inf", "-Inf"} {
+		t.Run(factor, func(t *testing.T) {
+			queue, _ := runQueueFixture(t)
+			out, err := foremanExec(t, "run", "--dry-run",
+				"--queue", queue, "--coder-agent", "coder-metal", "--stall-factor", factor)
+			if err == nil {
+				t.Fatalf("Execute() = nil, want --stall-factor %s refused", factor)
+			}
+			if !strings.Contains(err.Error(), "--stall-factor") {
+				t.Errorf("err = %v, want it to name the flag that is wrong", err)
+			}
+			if out != "" {
+				t.Errorf("stdout = %q, want no plan printed for a run that cannot watch", out)
+			}
+		})
+	}
+}
+
 // A live run has no cluster-backed effects behind it yet, so it must say so
 // rather than print a plan and exit 0 as though something ran.
 func TestRunCommand_RefusesALiveRunRatherThanPretending(t *testing.T) {

@@ -16,7 +16,10 @@ limitations under the License.
 
 package cli
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 const (
 	// DefaultStallFactor multiplies the baseline to get the stall threshold.
@@ -39,9 +42,23 @@ type StallInput struct {
 // IsStalled reports whether a run should be killed: nothing pushed, and
 // elapsed past factor x baseline. A run that has pushed a branch is making
 // progress regardless of how long it is taking.
+//
+// A factor that is not a positive finite number falls back to the default, the
+// same way a missing baseline does. It is not a theoretical input: the value
+// comes from --stall-factor, which the flag layer checks, but IsStalled is
+// exported and DriveItem forwards whatever factor its caller passed, so the
+// predicate that decides whether to destroy a run in progress does not take
+// that on trust. Zero or negative puts the threshold at or below zero and NaN
+// converts to a Duration below every elapsed time, so both make the first watch
+// tick kill the run. NaN is tested separately because NaN <= 0 is false.
+// Falling back beats returning false: a bogus factor should not quietly disable
+// stall detection either.
 func IsStalled(in StallInput, factor float64) bool {
 	if in.BranchPushed {
 		return false
+	}
+	if math.IsNaN(factor) || math.IsInf(factor, 0) || factor <= 0 {
+		factor = DefaultStallFactor
 	}
 	base := in.Baseline
 	if base <= 0 {

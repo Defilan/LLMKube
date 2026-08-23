@@ -17,6 +17,8 @@ limitations under the License.
 package cli
 
 import (
+	"fmt"
+	"math"
 	"testing"
 	"time"
 )
@@ -43,6 +45,34 @@ func TestIsStalled(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := IsStalled(tc.in, DefaultStallFactor); got != tc.want {
 				t.Errorf("IsStalled(%v) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// A factor that is not a positive finite number puts the stall threshold at or
+// below zero, and NaN converts to a Duration below every elapsed time, so every
+// run is declared stalled on its first watch tick and killed. --stall-factor is
+// checked at the flag, but IsStalled is exported and DriveItem forwards
+// whatever factor its caller handed it.
+//
+// Both arms are load-bearing. The "not stalled" arm alone would still pass if
+// the guard just returned false for a bad factor, which turns stall detection
+// off rather than correcting it; the "stalled" arm pins that the fallback is
+// the default factor and the predicate still does its job.
+func TestIsStalled_ABadFactorFallsBackToTheDefault(t *testing.T) {
+	base := 60 * time.Minute
+	for _, factor := range []float64{0, -1, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		t.Run(fmt.Sprintf("factor %g", factor), func(t *testing.T) {
+			// Inside the default threshold of 2.5 x 60m.
+			if IsStalled(StallInput{100 * time.Minute, base, false}, factor) {
+				t.Errorf("100m into a 60m baseline reads as stalled at factor %g: "+
+					"every run would be killed on its first watch tick", factor)
+			}
+			// And well past it.
+			if !IsStalled(StallInput{4 * time.Hour, base, false}, factor) {
+				t.Errorf("4h into a 60m baseline does not read as stalled at factor %g: "+
+					"stall detection is off, not corrected", factor)
 			}
 		})
 	}
