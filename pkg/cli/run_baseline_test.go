@@ -38,9 +38,14 @@ func baselineCMIn(t *testing.T, namespace, name, agent, kind, verdict string, el
 	rec := audit.Record{
 		SchemaVersion: "foreman.audit.v1",
 		Verdict:       verdict,
-		ElapsedSec:    elapsed,
-		Agent:         &audit.AgentRef{Name: agent},
-		Task:          audit.TaskRef{Name: name, Kind: kind},
+		// BuildRecord derives this from AgenticTask.SucceededOnTarget(),
+		// which is true exactly for a Succeeded task whose verdict is GO
+		// or GATE-PASS. Keep the fixture consistent with the verdict so it
+		// still describes a record the writer could actually emit.
+		SucceededOnTarget: verdict == "GO" || verdict == "GATE-PASS",
+		ElapsedSec:        elapsed,
+		Agent:             &audit.AgentRef{Name: agent},
+		Task:              audit.TaskRef{Name: name, Kind: kind},
 	}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -160,7 +165,7 @@ func TestBaselineFor_FiltersAreLoadBearing(t *testing.T) {
 		},
 		{
 			name:     "unsuccessful verdicts are excluded",
-			mutation: "delete the verdict guard",
+			mutation: "delete the !rec.SucceededOnTarget guard",
 			objs: []client.Object{
 				baselineCM(t, "mine", agent, "issue-fix", "GO", 3600),
 				baselineCM(t, "x1", agent, "issue-fix", "NO-GO", 60),
@@ -171,7 +176,7 @@ func TestBaselineFor_FiltersAreLoadBearing(t *testing.T) {
 		},
 		{
 			name:     "GATE-PASS counts as cleanly successful",
-			mutation: "narrow the verdict guard to GO only",
+			mutation: "replace rec.SucceededOnTarget with rec.Verdict == GO",
 			objs: []client.Object{
 				baselineCM(t, "gp", agent, "issue-fix", "GATE-PASS", 1800),
 			},
@@ -212,11 +217,55 @@ func TestBaselineFor_FiltersAreLoadBearing(t *testing.T) {
 			// 60/3600/36000: mean is 13220s, so a mean would fail here, and
 			// so would picking the min or the max.
 			name:     "the middle value is taken, not the mean or an end",
-			mutation: "replace secs[len(secs)/2] with the mean, secs[0], or secs[len(secs)-1]",
+			mutation: "replace secs[n/2] with the mean, secs[0], or secs[len(secs)-1]",
 			objs: []client.Object{
 				baselineCM(t, "m1", agent, "issue-fix", "GO", 36000),
 				baselineCM(t, "m2", agent, "issue-fix", "GO", 60),
 				baselineCM(t, "m3", agent, "issue-fix", "GO", 3600),
+			},
+			want: 3600 * time.Second,
+		},
+		{
+			// Two records is the NORMAL state for a freshly-added agent,
+			// which is exactly when the baseline is load-bearing. The
+			// upper-middle element would return 36000 here, and at
+			// DefaultStallFactor that is a 25-hour stall threshold bought
+			// by one pathological run. The lower-middle would return 60.
+			name:     "an even count averages the middle two, it does not pick a side",
+			mutation: "use secs[len/2] or secs[(len-1)/2] instead of averaging on even n",
+			objs: []client.Object{
+				baselineCM(t, "e1", agent, "issue-fix", "GO", 60),
+				baselineCM(t, "e2", agent, "issue-fix", "GO", 36000),
+			},
+			want: 18030 * time.Second,
+		},
+		{
+			// Four records: upper-middle gives 3600, lower-middle 3000,
+			// the true median 3300. Pins the even branch at a length where
+			// both off-by-one variants are still plausible-looking.
+			name:     "an even count of four averages the middle two",
+			mutation: "use secs[len/2] or secs[(len-1)/2] instead of averaging on even n",
+			objs: []client.Object{
+				baselineCM(t, "f1", agent, "issue-fix", "GO", 60),
+				baselineCM(t, "f2", agent, "issue-fix", "GO", 3000),
+				baselineCM(t, "f3", agent, "issue-fix", "GO", 3600),
+				baselineCM(t, "f4", agent, "issue-fix", "GO", 9000),
+			},
+			want: 3300 * time.Second,
+		},
+		{
+			// The reason SucceededOnTarget beats a Verdict string compare:
+			// a GO verdict on a task that never reached Phase == Succeeded
+			// is not a completed run, and its elapsed time is not evidence
+			// of how long the agent takes. The old string check let these
+			// in. See AgenticTask.SucceededOnTarget().
+			name:     "a GO verdict on a task that never succeeded is excluded",
+			mutation: "replace rec.SucceededOnTarget with the old GO/GATE-PASS string compare",
+			objs: []client.Object{
+				baselineCM(t, "mine", agent, "issue-fix", "GO", 3600),
+				baselineUnfinishedCM(t, "u1", agent, "issue-fix", "GO", 60),
+				baselineUnfinishedCM(t, "u2", agent, "issue-fix", "GO", 60),
+				baselineUnfinishedCM(t, "u3", agent, "issue-fix", "GATE-PASS", 60),
 			},
 			want: 3600 * time.Second,
 		},
@@ -261,20 +310,37 @@ func TestBaselineFor_FiltersAreLoadBearing(t *testing.T) {
 	}
 }
 
-// agentlessCM builds an audit record with no agent block at all, which is
-// what the writer emits when the Agent could not be resolved.
-func baselineAgentlessCM(t *testing.T, name, kind, verdict string, elapsed float64) *corev1.ConfigMap {
+// baselineUnfinishedCM builds a record whose Verdict reads as a success but
+// whose task never reached Phase == Succeeded, so BuildRecord would have set
+// SucceededOnTarget false. This is the case the verdict-string check got
+// wrong and the record's own flag gets right.
+func baselineUnfinishedCM(t *testing.T, name, agent, kind, verdict string, elapsed float64) *corev1.ConfigMap {
 	t.Helper()
-	cm := baselineCM(t, name, "", kind, verdict, elapsed)
+	cm := baselineCM(t, name, agent, kind, verdict, elapsed)
+	patchRecord(t, cm, func(rec *audit.Record) { rec.SucceededOnTarget = false })
+	return cm
+}
+
+// patchRecord rewrites the audit.json payload of cm through mutate.
+func patchRecord(t *testing.T, cm *corev1.ConfigMap, mutate func(*audit.Record)) {
+	t.Helper()
 	var rec audit.Record
 	if err := json.Unmarshal([]byte(cm.Data["audit.json"]), &rec); err != nil {
 		t.Fatal(err)
 	}
-	rec.Agent = nil
+	mutate(&rec)
 	b, err := json.Marshal(rec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cm.Data["audit.json"] = string(b)
+}
+
+// agentlessCM builds an audit record with no agent block at all, which is
+// what the writer emits when the Agent could not be resolved.
+func baselineAgentlessCM(t *testing.T, name, kind, verdict string, elapsed float64) *corev1.ConfigMap {
+	t.Helper()
+	cm := baselineCM(t, name, "", kind, verdict, elapsed)
+	patchRecord(t, cm, func(rec *audit.Record) { rec.Agent = nil })
 	return cm
 }
