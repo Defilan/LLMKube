@@ -73,6 +73,39 @@ host runs the native Go loop against the local inference endpoint.
 Verdicts cascade to the parent Workload. Fork branches land on
 GitHub for human review.
 
+### How many tasks a node runs at once
+
+A FleetNode runs **one in-process task at a time**. That task executes the
+native Go loop inside the foreman-agent process: it clones, runs the host's
+toolchain and drives the inference endpoint from this process, so a second
+concurrent run would compete for the same host CPU and RAM and the same
+toolchain. Workspaces are not the reason — each run gets its own
+(`<workspace-root>/<namespace>/<task-name>`, reset before the run and torn
+down after), so two in-process runs would not collide on a directory.
+
+An Agent with `spec.execution.mode: Job` is different. Its loop runs in an
+ephemeral Job pod, and the agent process only submits the Job, polls its
+status and tails its logs. Those tasks are therefore accounted separately and
+several can be supervised concurrently, bounded by `--max-supervised-tasks`
+(default 4). The bound exists because each supervised task is an outstanding
+Job competing for pods, cache volumes and inference capacity — not because the
+agent is busy.
+
+The two limits are independent: a node supervising Job-mode tasks can still
+pick up an in-process review or gate task. Note that `FleetNode.status.currentTask`
+reports only the in-process task, so a node supervising Jobs looks idle in
+`kubectl get fleetnode`.
+
+`--max-supervised-tasks` is per node. `Agent.spec.maxConcurrentTasks` is per
+Agent and enforced by the controller before a task is ever `Scheduled` — use
+that one to protect an inference backend shared with other consumers. When both
+are set, whichever is tighter wins.
+
+Set the per-node bound through the chart with `agent.maxSupervisedTasks` (or
+`agents.<pool>.maxSupervisedTasks` for one pool). `0` means unset and keeps the
+default of 4 — to serialize Job-mode work the way it behaved before this split,
+pass `1`.
+
 ## Pipeline shape (v0.1)
 
 v0.1 ships the linear pipeline:
