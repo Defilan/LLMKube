@@ -29,14 +29,29 @@ spec:
   # Each foreman-agent claims one task at a time. The Recreate
   # strategy stops a rolling update from briefly running two agents
   # that race for the same Scheduled tasks.
+  {{- /* The values doc states maxSurge MUST stay 0 and only Recreate /
+         RollingUpdate are valid types; enforce both here so a bad value fails
+         the render instead of shipping a manifest the API server would
+         reject (or, for a surge, a Deployment that breaks the invariant).
+         The type check is case-EXACT: the API server rejects "rollingUpdate"
+         (lowercase) even though it is a valid strategy, so a case-variant
+         typo must fail the render, not be normalised and shipped. */}}
+  {{- $st := toString $agent.strategy.type }}
+  {{- if and (ne $st "Recreate") (ne $st "RollingUpdate") }}
+  {{- fail (printf "agent.strategy.type: %q is not allowed; use \"Recreate\" or \"RollingUpdate\"" $st) }}
+  {{- end }}
   strategy:
-    type: {{ $agent.strategy.type }}
-    {{- if eq (upper $agent.strategy.type) "ROLLINGUPDATE" }}
+    type: {{ $st }}
+    {{- if eq $st "RollingUpdate" }}
     {{- /* Safe defaults when rollingUpdate is unset: maxSurge 0 preserves the
            no-two-agents invariant, maxUnavailable 1 drains one replica at a time. */}}
     {{- $ru := default (dict "maxSurge" 0 "maxUnavailable" 1) $agent.strategy.rollingUpdate }}
+    {{- $surge := $ru.maxSurge | default 0 }}
+    {{- if ne (int $surge) 0 }}
+    {{- fail (printf "agent.strategy.rollingUpdate.maxSurge must be 0 (got %s): a surge momentarily runs two agents for the same pool, recreating the race Recreate exists to prevent" (toString $surge)) }}
+    {{- end }}
     rollingUpdate:
-      maxSurge: {{ $ru.maxSurge | default 0 }}
+      maxSurge: {{ $surge }}
       maxUnavailable: {{ $ru.maxUnavailable | default 1 }}
     {{- end }}
   # Pool-scoped, via $ctx rather than the chart root: passing $ here gave

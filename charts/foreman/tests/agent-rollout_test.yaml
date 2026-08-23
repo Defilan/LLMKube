@@ -162,3 +162,30 @@ tests:
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
           value: 180
+
+  # ---- Validation: a documented MUST that nothing enforced would silently ship ----
+  # The values doc says maxSurge MUST stay 0 and only Recreate / RollingUpdate
+  # are valid types; the template must fail the render, not ship a manifest the
+  # API server would reject (or a surge that breaks the no-two-agents invariant).
+
+  - it: a non-zero maxSurge fails the render, naming the invariant and the value
+    template: agent-deployment.yaml
+    set:
+      agent.enabled: true
+      agent.strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxSurge: 1
+          maxUnavailable: 1
+    asserts:
+      - failedTemplate:
+          errorPattern: 'agent\.strategy\.rollingUpdate\.maxSurge must be 0 \(got 1\).*recreating the race Recreate exists to prevent'
+
+  - it: an invalid strategy type fails the render, naming the allowed values
+    template: agent-deployment.yaml
+    set:
+      agent.enabled: true
+      agent.strategy.type: Rolling
+    asserts:
+      - failedTemplate:
+          errorPattern: 'agent\.strategy\.type: "Rolling" is not allowed; use "Recreate" or "RollingUpdate"'
