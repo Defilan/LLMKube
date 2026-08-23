@@ -19,6 +19,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -87,6 +88,16 @@ func newDecisionsCommand() *cobra.Command {
 		// queue is listed, which reads as "nothing matched".
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// A missing default directory means nothing has parked yet,
+			// which is the normal state and not worth an error. A missing
+			// directory the human typed is a typo, and answering a typo with
+			// "No parked decisions." turns it into a confident "nothing to
+			// do" while the real queue sits unread somewhere else.
+			if cmd.Flags().Changed("decisions-dir") {
+				if _, err := os.Stat(dir); err != nil {
+					return fmt.Errorf("--decisions-dir %s: %w", dir, err)
+				}
+			}
 			ds, err := ListDecisions(dir)
 			// Render first. ListDecisions returns what it could parse
 			// alongside an error naming what it could not, and this command

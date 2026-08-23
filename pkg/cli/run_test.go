@@ -249,6 +249,48 @@ func TestDecisionsCommand_DoesNotClaimEmptyWhenNothingWasListed(t *testing.T) {
 	}
 }
 
+// An empty queue is a real answer and has to be said out loud.
+func TestDecisionsCommand_EmptyDirSaysSo(t *testing.T) {
+	out, err := foremanExec(t, "decisions", "--decisions-dir", t.TempDir())
+	if err != nil {
+		t.Fatalf("Execute() = %v, want no error for an empty decisions dir", err)
+	}
+	if !strings.Contains(out, "No parked decisions.") {
+		t.Errorf("stdout = %q, want the empty queue said out loud", out)
+	}
+}
+
+func TestDecisionsCommand_MissingDir(t *testing.T) {
+	// A directory the human typed and got wrong. Answering a typo with "No
+	// parked decisions." turns it into a confident "nothing to do".
+	t.Run("typed and absent is an error", func(t *testing.T) {
+		typo := filepath.Join(t.TempDir(), "no-such-dir")
+		out, err := foremanExec(t, "decisions", "--decisions-dir", typo)
+		if err == nil {
+			t.Fatal("Execute() = nil, want a typo'd --decisions-dir to be refused")
+		}
+		if !strings.Contains(err.Error(), typo) {
+			t.Errorf("err = %v, want it to name %q", err, typo)
+		}
+		if out != "" {
+			t.Errorf("stdout = %q, want nothing printed for a directory that is not there", out)
+		}
+	})
+	// The default is different: nothing has parked yet is the normal state
+	// on a fresh checkout, and erroring on it would make the command unusable
+	// before the first run.
+	t.Run("the default being absent is not", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		out, err := foremanExec(t, "decisions")
+		if err != nil {
+			t.Fatalf("Execute() = %v, want an absent default dir to be the normal empty state", err)
+		}
+		if !strings.Contains(out, "No parked decisions.") {
+			t.Errorf("stdout = %q, want the empty queue said out loud", out)
+		}
+	})
+}
+
 func TestDecisionsCommand_RejectsStrayArguments(t *testing.T) {
 	_, err := foremanExec(t, "decisions", "1602", "--decisions-dir", t.TempDir())
 	if err == nil {
