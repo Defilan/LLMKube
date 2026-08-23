@@ -23,7 +23,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -451,45 +450,104 @@ func TestRunCommand_RequiresQueueAndCoderAgent(t *testing.T) {
 	}
 }
 
-// The driver lands in task 8. Until then run must say so rather than do half
-// a dispatch: this test is expected to be replaced, not kept.
-func TestRunCommand_ReportsNotImplemented(t *testing.T) {
-	out, err := foremanExec(t, "run", "--queue", "queue.yaml", "--coder-agent", "coder-metal")
-	if err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("Execute() = %v, want a not-implemented error", err)
+// The old TestRunCommand_FlagDefaults read DefValue and ShorthandLookup and
+// never touched the bound variable, so swapping which struct field --queue and
+// --coder-agent bind to survived the whole package. These run the command and
+// read every option back out of what it did.
+
+// runQueueFixture writes a one-item queue and its intent, and returns both
+// paths.
+func runQueueFixture(t *testing.T) (queuePath, intentPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	intentPath = filepath.Join(dir, "1602.md")
+	if err := os.WriteFile(intentPath, []byte(runFixtureIntent), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if out != "" {
-		t.Errorf("stdout = %q, want nothing printed by a command that does nothing", out)
+	queuePath = filepath.Join(dir, "queue.yaml")
+	body := "repo: defilantech/LLMKube\nitems:\n  - issue: 1602\n    intent: " + intentPath + "\n"
+	if err := os.WriteFile(queuePath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return queuePath, intentPath
+}
+
+const runFixtureIntent = "fix the thing"
+
+// Every value is distinct and none is a flag default, so a flag bound to the
+// wrong field lands somewhere the assertions can see. The whole labelled line
+// is asserted rather than the bare value, so two options swapping places is a
+// failure and not a coincidence.
+func TestRunCommand_UsesTheOptionsItWasGiven(t *testing.T) {
+	queue, intent := runQueueFixture(t)
+	parked := filepath.Join(t.TempDir(), "parked-here")
+	out, err := foremanExec(t, "run", "--dry-run",
+		"--queue", queue,
+		"--coder-agent", "coder-metal",
+		"--namespace", "foreman-ns",
+		"--decisions-dir", parked,
+		"--stall-factor", "3.5")
+	if err != nil {
+		t.Fatalf("Execute() = %v, want a dry run to succeed", err)
+	}
+	want := []string{
+		"queue: " + queue,
+		"coder-agent: coder-metal",
+		"namespace: foreman-ns",
+		"decisions-dir: " + parked,
+		"stall-factor: 3.5",
+		"items: 1",
+		"issue 1602 (defilantech/LLMKube): branch foreman/wl-1602/issue-1602, intent " +
+			intent + " (13 bytes)",
+	}
+	for _, w := range want {
+		if !strings.Contains(out, w) {
+			t.Errorf("plan missing %q:\n%s", w, out)
+		}
 	}
 }
 
-// The remaining run flags have no consumer until task 8, so this pins the
-// surface a human types and nothing more. It is a registration assertion, not
-// a behavioural one, and task 8 must REPLACE it with one that runs the driver
-// and observes the effect: swapping which field --queue binds to survives it.
-func TestRunCommand_FlagDefaults(t *testing.T) {
-	cmd := newRunCommand()
-	cases := []struct {
-		flag, want string
-	}{
-		{flag: "queue", want: ""},
-		{flag: "decisions-dir", want: defaultDecisionsDir},
-		{flag: "namespace", want: "default"},
-		{flag: "coder-agent", want: ""},
-		{flag: "stall-factor", want: strconv.FormatFloat(DefaultStallFactor, 'g', -1, 64)},
-		{flag: "dry-run", want: "false"},
+// A live run has no cluster-backed effects behind it yet, so it must say so
+// rather than print a plan and exit 0 as though something ran.
+func TestRunCommand_RefusesALiveRunRatherThanPretending(t *testing.T) {
+	queue, _ := runQueueFixture(t)
+	out, err := foremanExec(t, "run", "--queue", queue, "--coder-agent", "coder-metal")
+	if err == nil {
+		t.Fatal("Execute() = nil, want a live run refused while the effects are unwired")
 	}
-	for _, tc := range cases {
-		f := cmd.Flags().Lookup(tc.flag)
-		if f == nil {
-			t.Errorf("--%s is not registered", tc.flag)
-			continue
+	if !strings.Contains(err.Error(), "--dry-run") {
+		t.Errorf("err = %v, want it to name the flag that does work today", err)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want no plan printed by a run that refused", out)
+	}
+}
+
+// The queue is the human's input and it is where the mistakes are. Both cases
+// run WITHOUT --dry-run: validation has to happen before the run is refused,
+// or `run` answers a broken queue with a message about unwired effects.
+func TestRunCommand_ReportsWhatIsWrongWithTheQueue(t *testing.T) {
+	t.Run("a queue that is not there", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "no-queue.yaml")
+		_, err := foremanExec(t, "run", "--queue", missing, "--coder-agent", "coder-metal")
+		if err == nil {
+			t.Fatal("Execute() = nil, want a missing queue refused")
 		}
-		if f.DefValue != tc.want {
-			t.Errorf("--%s default = %q, want %q", tc.flag, f.DefValue, tc.want)
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("err = %v, want it to name %q", err, missing)
 		}
-	}
-	if sh := cmd.Flags().ShorthandLookup("n"); sh == nil || sh.Name != "namespace" {
-		t.Errorf("-n shorthand = %v, want it bound to --namespace", sh)
-	}
+	})
+	t.Run("an intent that is not there", func(t *testing.T) {
+		queue, intent := runQueueFixture(t)
+		if err := os.Remove(intent); err != nil {
+			t.Fatal(err)
+		}
+		_, err := foremanExec(t, "run", "--queue", queue, "--coder-agent", "coder-metal")
+		if err == nil {
+			t.Fatal("Execute() = nil, want an unreadable intent refused")
+		}
+		if !strings.Contains(err.Error(), intent) {
+			t.Errorf("err = %v, want it to name %q", err, intent)
+		}
+	})
 }

@@ -60,8 +60,8 @@ Intents are yours to write; the queue points at them.
 Example:
 
   llmkube foreman run --queue queue.yaml --coder-agent qwen38-coder`, defaultDecisionsDir),
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return fmt.Errorf("not implemented: the driver lands in task 8")
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return printRunPlan(cmd.OutOrStdout(), opts)
 		},
 	}
 	f := cmd.Flags()
