@@ -88,9 +88,12 @@ func optionsFor(kind string) []string {
 	if kind == ParkEscalate {
 		return []string{"requeue", "hand-fix", "drop"}
 	}
-	// The escalate answer asks for exactly what a ParkEscalate park gets, so it
-	// spells the kind rather than a lookalike of it.
-	return []string{"accept", "revise", ParkEscalate, "drop"}
+	// A literal, NOT ParkEscalate. These are answers a human may type, not park
+	// kinds, and the two vocabularies coincide on "escalate" by coincidence.
+	// Coupling them would make renaming the park kind silently change the
+	// option set that already-parked decisions were written with, and
+	// AnswerDecision validates a typed answer against exactly that stored set.
+	return []string{"accept", "revise", "escalate", "drop"}
 }
 
 // maxStageTransitions bounds one item's trip through the loop.
