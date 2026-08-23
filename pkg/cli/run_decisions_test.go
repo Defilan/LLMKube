@@ -663,3 +663,28 @@ func TestParkDecision_ChecksTheKindBeforeTouchingTheDisk(t *testing.T) {
 		t.Errorf("%s exists, want nothing created for a rejected kind", dir)
 	}
 }
+
+func TestListDecisions_IgnoresALeakedStageFile(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := ParkDecision(dir, Decision{Issue: 1602, Kind: "adjudicate"}); err != nil {
+		t.Fatal(err)
+	}
+	// What a process killed between the create and the rename leaves behind.
+	// Half-written, so if ListDecisions ever looks at it, it does not merely
+	// show up as an extra decision, it becomes a parse error the human cannot
+	// clear without knowing what the file is.
+	leaked := filepath.Join(dir, strings.Replace(decisionStagePattern, "*", "3901215257", 1))
+	if err := os.WriteFile(leaked, []byte("issue: 1602\noptions: [accept, revise\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ListDecisions(dir)
+	if err != nil {
+		t.Errorf("ListDecisions: %v, want a leaked stage file to be invisible", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want just the parked decision: %v", len(got), decisionDirNames(t, dir))
+	}
+	if got[0].Issue != 1602 {
+		t.Errorf("Issue = %d, want 1602", got[0].Issue)
+	}
+}

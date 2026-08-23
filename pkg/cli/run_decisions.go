@@ -65,13 +65,22 @@ func decisionPath(dir string, issue int32, kind string) string {
 	return filepath.Join(dir, fmt.Sprintf("%d-%s.yaml", issue, kind))
 }
 
+// decisionStagePattern names the file writeDecisionFile stages before renaming
+// it into place. The suffix is load-bearing rather than decorative: a process
+// killed between the create and the rename, which is precisely the crash atomic
+// writes exist for, leaks one of these next to the real decisions, and
+// ListDecisions ignores it only because the extension is not ".yaml". Give it a
+// .yaml name and every such leftover becomes a permanent parse error in the
+// human's queue view, now that a bad file is deliberately surfaced there.
+const decisionStagePattern = ".decision-*.tmp"
+
 // writeDecisionFile replaces p with b atomically. A decision file is
 // human-owned: a truncating write that is interrupted by a crash or a full
 // disk leaves a half-written answer behind, which is exactly the damage the
 // park guard then has to refuse to touch. Staging in the same directory and
 // renaming means a reader sees either the whole old file or the whole new one.
 func writeDecisionFile(p string, b []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(p), ".decision-*.tmp")
+	f, err := os.CreateTemp(filepath.Dir(p), decisionStagePattern)
 	if err != nil {
 		return fmt.Errorf("write decision %s: %w", p, err)
 	}
