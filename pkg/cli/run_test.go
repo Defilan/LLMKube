@@ -164,9 +164,9 @@ func TestFlattenCell(t *testing.T) {
 }
 
 // A cell carrying a newline or a tab does not just mangle its own row, it
-// shifts every row after it. Task 8 fills Reason from verify output and stall
-// evidence, which is exactly where multi-line strings come from, and Answer
-// is a shell argument.
+// shifts every row after it. The driver fills Reason from verify output and
+// stall evidence, which is exactly where multi-line strings come from, and
+// Answer is a shell argument.
 func TestRenderDecisions_FlattensCellsThatWouldBreakTheTable(t *testing.T) {
 	opened := time.Date(2026, 8, 23, 4, 12, 0, 0, time.UTC)
 	clean := Decision{Issue: 1601, Kind: "escalate", Reason: "stalled", Opened: opened, Answer: "drop"}

@@ -45,16 +45,17 @@ type Decision struct {
 	Answer string `json:"answer,omitempty"`
 }
 
-// checkDecisionKind rejects a kind that would steer the path out of dir. Task 7
-// takes the kind from the command line, so this is reachable input, and it is
-// not a privilege boundary so much as a way to avoid silently destroying an
-// unrelated file: a kind with a ".." in it makes ParkDecision write outside the
-// decisions directory, and makes AnswerDecision rewrite whatever YAML it lands
-// on as a Decision, dropping every key it did not recognise.
+// checkDecisionKind rejects a kind that would steer the path out of dir.
+// `foreman decisions answer ISSUE KIND ANSWER` takes the kind straight off the
+// command line, so this is reachable input, and it is not a privilege boundary
+// so much as a way to avoid silently destroying an unrelated file: a kind with
+// a ".." in it makes ParkDecision write outside the decisions directory, and
+// makes AnswerDecision rewrite whatever YAML it lands on as a Decision,
+// dropping every key it did not recognise.
 func checkDecisionKind(kind string) error {
-	// Task 7 feeds this from --kind, and Decision.Kind is not omitempty, so an
-	// empty kind parks a file named "1602-.yaml" carrying a decision with no
-	// kind at all.
+	// A kind typed as a positional argument reaches here, and Decision.Kind is
+	// not omitempty, so an empty kind parks a file named "1602-.yaml" carrying
+	// a decision with no kind at all.
 	if kind == "" {
 		return fmt.Errorf("decision kind must not be empty")
 	}
