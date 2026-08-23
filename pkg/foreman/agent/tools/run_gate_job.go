@@ -65,9 +65,17 @@ const MaxLogTailBytes = 32 * 1024
 // DefaultGateChecks is the make-target list every gate run executes
 // when the caller does not override it. Mirrors what the autofix gate
 // pipeline ran across hundreds of coder-to-verifier runs.
+//
+// It must remain a SUPERSET of what CI blocks on. A GATE-PASS is read by
+// operators, and by the verdict and escalation machinery, as "this branch
+// is expected to pass CI"; that claim only holds while this list covers
+// every check a pull request has to clear. TestDefaultGateChecksCoverCI
+// pins that against .github/workflows, and gateExemptCIChecks records the
+// deliberate omissions with their reasons (#1637).
 var DefaultGateChecks = []string{
-	"fmt", "vet", "lint", "test",
-	"manifests", "chart-crds", "foreman-chart-crds", ChartCheck,
+	"fmt", "vet", "lint", "lint-deadcode", "test",
+	"generate", "manifests", "chart-crds", "foreman-chart-crds",
+	"check-helm-rbac", "check-reviewer-prompts", ChartCheck,
 }
 
 // ChartCheck is the make target that lints and unit-tests the Helm charts.
