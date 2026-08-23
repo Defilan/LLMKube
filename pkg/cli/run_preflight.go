@@ -24,6 +24,13 @@ import (
 // PreflightProbe is the forge-side reads preflight needs. Kept as an
 // interface so the loop is testable without network and so a non-GitHub
 // forge can satisfy it later (#1158).
+//
+// Implementations must return an error, never a zero value, when the repo
+// slug is empty or unresolvable or the query otherwise could not be answered.
+// Preflight reads a zero value as "nothing found" and dispatches, so an
+// implementation that folds a bad slug into ("", nil) or (false, nil)
+// silently defeats the fail-closed guarantee below: an empty slug that
+// answers "no open PR" is how #1625 duplicated work already in flight.
 type PreflightProbe interface {
 	// OpenPRForIssue returns the URL of an open PR referencing the issue,
 	// or "" when there is none.
