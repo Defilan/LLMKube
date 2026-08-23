@@ -102,6 +102,7 @@ type fakeEffects struct {
 	calls      map[string]driveCall
 	dispatched int
 	killed     int
+	watched    int
 }
 
 func (f *fakeEffects) record(site string, c driveCall) {
@@ -134,6 +135,7 @@ func (f *fakeEffects) Dispatch(ctx context.Context, item QueueItem, intent strin
 func (f *fakeEffects) Watch(ctx context.Context, workload string, baseline time.Duration,
 	factor float64) (WatchResult, error) {
 	f.record("watch", driveCall{ctx: ctx, workload: workload, baseline: baseline, factor: factor})
+	f.watched++
 	return f.watch, f.watchErr
 }
 
@@ -403,6 +405,53 @@ func TestDriveItem_RefusesAnEmptyWorkloadNameFromDispatch(t *testing.T) {
 		}
 	}
 	// And it is a broken effect, not a judgment call for a human.
+	noDecisions(t, dir)
+}
+
+// The stage machine already contains a cycle: NextStage(StageFeedback) returns
+// StageWatch, and it is saved today only by nothing routing INTO feedback. The
+// day a `case StageFeedback:` lands that does not re-dispatch, watch -> verify
+// -> feedback -> watch spins with Attempts frozen at 1, so maxAttempts never
+// fires and the CLI hangs, looking exactly like a slow agent.
+//
+// No input reaches that shape through the real NextStage, which is precisely
+// why the backstop needs a test of its own: an untested guard against a hang is
+// not a guard. Hence driveLoop taking the machine as a parameter.
+func TestDriveLoop_StopsRatherThanSpinningOnACycle(t *testing.T) {
+	cycle := func(cur Stage, _ Facts) Transition {
+		switch cur {
+		case StagePreflight:
+			return Transition{Next: StageDispatch}
+		case StageDispatch, StageFeedback:
+			return Transition{Next: StageWatch}
+		case StageWatch:
+			return Transition{Next: StageVerify}
+		}
+		return Transition{Next: StageFeedback}
+	}
+	dir := t.TempDir()
+	e := &fakeEffects{}
+	got, err := driveLoop(context.Background(), e,
+		QueueItem{Issue: driveIssue, Repo: driveRepo, IntentPath: "intent.md"},
+		driveIntent, dir, driveBaseline, driveFactor, cycle)
+	if err == nil {
+		t.Fatal("driveLoop = nil, want a cycling machine refused rather than spun on")
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Errorf("err = %v, want it to name what went wrong", err)
+	}
+	if got == StageDone || got == StageParked {
+		t.Errorf("stage = %q, want a non-terminal stage: nothing finished", got)
+	}
+	// It really did loop, and it really did stop.
+	if e.watched < 2 {
+		t.Errorf("watch ran %d times, want the loop to have actually cycled", e.watched)
+	}
+	if e.watched >= maxStageTransitions {
+		t.Errorf("watch ran %d times, want the %d-transition bound to have cut it short",
+			e.watched, maxStageTransitions)
+	}
+	// A loop that gave up is not a judgment call for a human.
 	noDecisions(t, dir)
 }
 
