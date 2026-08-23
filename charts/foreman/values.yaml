@@ -278,6 +278,48 @@ agent:
   enabled: true
   replicaCount: 1
 
+  # How long the kubelet waits for the agent to finish in-flight work
+  # after sending SIGTERM before force-killing the pod. In-process
+  # (execution.image unset) tasks die with the SIGTERM — the agent has
+  # no drain hook yet — so raising this buys a longer window for a
+  # slow local-model turn to be interrupted cleanly by the scheduler's
+  # retry path. The default of 30s reproduces the previous hardcoded
+  # value so an existing install is unchanged until it opts in.
+  # Must be a non-negative integer; the chart fails the render otherwise,
+  # rather than shipping a manifest the API server rejects.
+  terminationGracePeriodSeconds: 30
+
+  # Pod rollout strategy for this agent Deployment.
+  #
+  # Recreate (default) tears the pool down before starting replacements, so it
+  # never runs two agents for the pool at once. RollingUpdate replaces them one
+  # at a time, so an image bump does not stop the whole pool.
+  #
+  # On the "two agents would race for the same task" reasoning, which the older
+  # comment here stated as fact: that race is currently UNREACHABLE, and only
+  # because of a bug. agent-deployment.yaml sets FLEET_NODE_NAME from
+  # spec.nodeName (the Kubernetes NODE), but no Go code reads it, so the agent
+  # falls back to os.Hostname() -- the POD name -- and each replica registers
+  # its own FleetNode. pollOnce then claims only tasks whose
+  # status.assignedNode matches its own node, so two pods are never offered the
+  # same task. Under the INTENDED node-scoped identity they would share one
+  # FleetNode and the race would be real. Tracked as #1640.
+  #
+  # So maxSurge 0 is the conservative default, not an enforced invariant: the
+  # chart will not hard-fail a non-zero surge, because that would be an
+  # unbypassable policy ruling resting on a bug staying unfixed. Raise it
+  # knowingly, and re-read #1640 first if it has been resolved.
+  #
+  # Worth knowing before opting in: with the chart's default replicaCount of 1,
+  # RollingUpdate with maxSurge 0 is behaviourally IDENTICAL to Recreate. The
+  # pool must scale to zero before the new pod starts, because it can never
+  # exceed `replicas`. This option only buys you anything at replicaCount > 1.
+  #
+  # maxUnavailable may not be 0 when maxSurge is 0; the Deployment validator
+  # rejects that pair and the chart fails the render rather than the apply.
+  strategy:
+    type: Recreate
+
   image:
     # registry: ghcr.io
     # Default: the lean runtime image (alpine + git). To run a coder-enabled

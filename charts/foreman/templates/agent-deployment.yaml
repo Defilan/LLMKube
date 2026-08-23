@@ -26,14 +26,69 @@ metadata:
     {{- include "foreman.agent.poolLabels" $ctx | nindent 4 }}
 spec:
   replicas: {{ $agent.replicaCount }}
-  # Recreate: never runs two agents for this pool at once. Note the blast
-  # radius: an agent holds one in-process task plus up to
-  # --max-supervised-tasks Job-mode supervisions (#1559), and on restart
-  # recoverOrphanedTasks resets EVERY Running task on the node back to
-  # Pending, so an upgrade can yank back more than one run at a time and
-  # each is re-dispatched from the start.
+  {{- /* Recreate is the conservative default: it never runs two agents for a
+         pool at once. The comment this replaced said that stopped them racing
+         for the same Scheduled task; that race is currently unreachable, and
+         only because of a bug. FLEET_NODE_NAME is set from spec.nodeName (the
+         Kubernetes NODE) but read by nothing, so the agent falls back to
+         os.Hostname() -- the POD name -- and pollOnce claims only tasks whose
+         status.assignedNode matches its own FleetNode. Under the intended
+         node-scoped identity two pods on one node WOULD share an identity and
+         race. Tracked as #1640; do not restate the race as a present-tense
+         fact either way. */}}
+  {{- /* Blast radius of replacing an agent, from #1635, and it matters more
+         now that RollingUpdate is selectable rather than less: an agent holds
+         one in-process task plus up to --max-supervised-tasks Job-mode
+         supervisions (#1559), so an upgrade yanks back more than one run at a
+         time and each is re-dispatched from the start. Which mechanism does
+         the yanking depends on how the agent went away. An in-place container
+         restart keeps the hostname, so recoverOrphanedTasks matches
+         status.assignedNode and resets every Running task on the node back to
+         Pending. A Deployment pod replacement mints a new pod name, so that
+         path never matches and it is the operator's claim expiry
+         (agentictask_controller.go) that releases the tasks once the heartbeat
+         goes stale, spending a strike each time. */}}
+  {{- /* `strategy:` written with nothing under it is a null, not a dict, so
+         dereferencing .type panics the render. Normalise once. */}}
+  {{- $strategy := $agent.strategy | default dict }}
+  {{- $st := $strategy.type | default "Recreate" }}
+  {{- if eq $st "Recreate" }}
+  # Recreate: never runs two agents for this pool at once. The conservative
+  # default; see agents.<pool>.strategy in values.yaml for the tradeoff.
+  {{- else }}
+  # RollingUpdate: replaces this pool's agents one at a time instead of
+  # tearing the pool down. See agents.<pool>.strategy in values.yaml.
+  {{- end }}
+  {{- if and (ne $st "Recreate") (ne $st "RollingUpdate") }}
+  {{- fail (printf "agents.%s.strategy.type: %q is not a valid Deployment strategy; use \"Recreate\" or \"RollingUpdate\" (the API server rejects anything else, including case variants like \"rollingUpdate\")" $name $st) }}
+  {{- end }}
+  {{- $tgps := $agent.terminationGracePeriodSeconds | default 30 }}
+  {{- if or (not (kindIs "float64" $tgps)) (lt (float64 $tgps) 0.0) }}
+  {{- fail (printf "agents.%s.terminationGracePeriodSeconds: %v must be a non-negative integer (the API server rejects anything else)" $name $tgps) }}
+  {{- end }}
   strategy:
-    type: Recreate
+    type: {{ $st }}
+    {{- if eq $st "RollingUpdate" }}
+    {{- $ru := $strategy.rollingUpdate | default dict }}
+    {{- /* hasKey, not `default`: Go templates treat 0 as empty, so `| default`
+           silently rewrites a deliberately configured 0 to the fallback. */}}
+    {{- $surge := 0 }}
+    {{- if hasKey $ru "maxSurge" }}{{ $surge = $ru.maxSurge }}{{ end }}
+    {{- $unavail := 1 }}
+    {{- if hasKey $ru "maxUnavailable" }}{{ $unavail = $ru.maxUnavailable }}{{ end }}
+    {{- /* maxSurge 0 with maxUnavailable 0 is rejected by the Deployment
+           validator ("may not be 0 when maxSurge is 0"), so fail at render
+           rather than at apply. Both accept the IntOrString percentage form,
+           which is why this compares the rendered strings. */}}
+    {{- $surgeZero := or (eq (toString $surge) "0") (eq (toString $surge) "0%") }}
+    {{- $unavailZero := or (eq (toString $unavail) "0") (eq (toString $unavail) "0%") }}
+    {{- if and $surgeZero $unavailZero }}
+    {{- fail (printf "agents.%s.strategy.rollingUpdate: maxUnavailable may not be 0 when maxSurge is 0; the Deployment validator rejects that pair" $name) }}
+    {{- end }}
+    rollingUpdate:
+      maxSurge: {{ $surge }}
+      maxUnavailable: {{ $unavail }}
+    {{- end }}
   # Pool-scoped, via $ctx rather than the chart root: passing $ here gave
   # every pool the same selector, so each Deployment adopted the others'
   # pods and fought them over replicaCount (#1523).
@@ -168,6 +223,6 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: {{ $tgps | int64 }}
 {{- end }}
 {{- end }}

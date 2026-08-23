@@ -1,0 +1,7 @@
+# "leave this at the default", written the natural way. Helm treats the empty
+# key as a deletion, so dereferencing .type used to nil-pointer the render.
+agents:
+  p1:
+    enabled: true
+    roles: [worker]
+    strategy:
