@@ -65,7 +65,7 @@ func TestBaselineFor_MediansSuccessfulIssueFixRuns(t *testing.T) {
 	c := fake.NewClientBuilder().WithObjects(
 		baselineCM(t, "a", "qwen38-coder", "issue-fix", "GO", 3000),
 		baselineCM(t, "b", "qwen38-coder", "issue-fix", "GO", 3600),
-		baselineCM(t, "c", "qwen38-coder", "issue-fix", "GO", 4200),
+		baselineCM(t, "c", "qwen38-coder", "issue-fix", "GO", 9000),
 		// Excluded: different agent, non-terminal-good verdict, wrong kind.
 		baselineCM(t, "d", "other-coder", "issue-fix", "GO", 60),
 		baselineCM(t, "e", "qwen38-coder", "issue-fix", "NO-GO", 60),
@@ -77,7 +77,7 @@ func TestBaselineFor_MediansSuccessfulIssueFixRuns(t *testing.T) {
 		t.Fatalf("BaselineFor: %v", err)
 	}
 	if got != 3600*time.Second {
-		t.Errorf("BaselineFor = %v, want %v (median of 3000/3600/4200)", got, 3600*time.Second)
+		t.Errorf("BaselineFor = %v, want %v (median of 3000/3600/9000, mean would be 5200)", got, 3600*time.Second)
 	}
 }
 
