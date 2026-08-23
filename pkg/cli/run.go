@@ -194,7 +194,8 @@ func newDecisionsCommand() *cobra.Command {
 // flattenCell keeps one table cell on one line. Reason arrives from verify
 // output and stall evidence and Answer from a shell argument, so either can
 // carry a newline or a tab, and either one shifts every row that follows it
-// out of alignment.
+// out of alignment. Every cell goes through it rather than only those two: a
+// decision file is human-editable YAML, so any field can come back mangled.
 func flattenCell(s string) string {
 	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(s)
 }
@@ -213,28 +214,44 @@ func decisionOptions(d Decision) string {
 	return strings.Join(d.Options, "|")
 }
 
+// orDash renders an empty cell as a dash. tabwriter pads an empty cell out to
+// the column width, so an omitted value is indistinguishable from a row that
+// has slipped a column; a dash says "nothing here" out loud.
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
 // renderDecisions prints the parked-decision queue as a table.
 //
-// OPTIONS is the column that makes the listing actionable: without it the
-// only way to learn what an answer may be is to read the YAML or guess and
+// WORKLOAD is the only column that says which run to go and look at: ISSUE
+// names the work, but a human wanting the logs, the branch or the transcript
+// needs the Workload, and without the column the only way to get it is to open
+// the YAML. OPTIONS is the column that makes the listing actionable: without it
+// the only way to learn what an answer may be is to read the YAML or guess and
 // wait for the rejection. REASON comes last because it is the one free-form
 // column, and leading with it would push the actionable ones off the right
 // of a narrow terminal.
+//
+// Decision.Stage is deliberately NOT a column. Every park the machine produces
+// today already names its stage in REASON ("stalled" only comes from watch,
+// both verify reasons say "verify"), so a STAGE column would spend width
+// repeating what the row already says and push the actionable columns further
+// right. The field stays in the YAML for anyone who needs it.
 func renderDecisions(w io.Writer, ds []Decision) {
 	if len(ds) == 0 {
 		fprintln(w, "No parked decisions.")
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fprintln(tw, "ISSUE\tKIND\tOPENED\tOPTIONS\tANSWER\tREASON")
+	fprintln(tw, "ISSUE\tWORKLOAD\tKIND\tOPENED\tOPTIONS\tANSWER\tREASON")
 	for _, d := range ds {
-		answer := d.Answer
-		if answer == "" {
-			answer = "-"
-		}
-		fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
-			d.Issue, flattenCell(d.Kind), d.Opened.Format("2006-01-02 15:04"),
-			flattenCell(decisionOptions(d)), flattenCell(answer), flattenCell(d.Reason))
+		fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			d.Issue, flattenCell(orDash(d.Workload)), flattenCell(d.Kind),
+			d.Opened.Format("2006-01-02 15:04"),
+			flattenCell(decisionOptions(d)), flattenCell(orDash(d.Answer)), flattenCell(d.Reason))
 	}
 	_ = tw.Flush()
 }

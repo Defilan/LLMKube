@@ -73,14 +73,20 @@ func tableCells(row string) []string {
 func TestRenderDecisions(t *testing.T) {
 	var buf bytes.Buffer
 	renderDecisions(&buf, []Decision{
-		{Issue: 1602, Kind: "adjudicate", Reason: "verify found issues",
+		// Every Workload is distinct and none is derivable from the issue, so
+		// a column filled from any other field is visible rather than
+		// accidentally right.
+		{Issue: 1602, Kind: "adjudicate", Reason: "verify found issues", Workload: "wl-test",
 			Opened:  time.Date(2026, 8, 23, 4, 12, 0, 0, time.UTC),
 			Options: []string{"accept", "revise"}},
-		{Issue: 1601, Kind: "escalate", Reason: "stalled",
+		{Issue: 1601, Kind: "escalate", Reason: "stalled", Workload: "coder-1601-retry-7",
 			Opened: time.Date(2026, 8, 23, 5, 0, 0, 0, time.UTC), Answer: "drop"},
+		// No Workload: a hand-written decision, or one from before the driver
+		// recorded it. The cell must say so rather than go blank, which
+		// tabwriter pads out into a row that has slipped a column.
 		{Issue: 1600, Kind: "unblock", Reason: "needs a human",
 			Opened: time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)},
-		{Issue: 1603, Kind: "revise", Reason: "coder pushed a fix",
+		{Issue: 1603, Kind: "revise", Reason: "coder pushed a fix", Workload: "wl-1603-b",
 			Opened:  time.Date(2026, 8, 23, 6, 0, 0, 0, time.UTC),
 			Options: []string{"accept", "revise"}, Answer: "accept"},
 	})
@@ -89,23 +95,26 @@ func TestRenderDecisions(t *testing.T) {
 		lead  string
 		cells []string
 	}{
-		{lead: "ISSUE", cells: []string{"ISSUE", "KIND", "OPENED", "OPTIONS", "ANSWER", "REASON"}},
+		{lead: "ISSUE", cells: []string{
+			"ISSUE", "WORKLOAD", "KIND", "OPENED", "OPTIONS", "ANSWER", "REASON"}},
 		// Unanswered with options: the human can read the valid answers off
 		// the table instead of guessing and reading the rejection.
 		{lead: "1602", cells: []string{
-			"1602", "adjudicate", "2026-08-23 04:12", "accept|revise", "-", "verify found issues"}},
+			"1602", "wl-test", "adjudicate", "2026-08-23 04:12", "accept|revise", "-",
+			"verify found issues"}},
 		// Answered with no options: nothing to suppress.
 		{lead: "1601", cells: []string{
-			"1601", "escalate", "2026-08-23 05:00", "-", "drop", "stalled"}},
+			"1601", "coder-1601-retry-7", "escalate", "2026-08-23 05:00", "-", "drop", "stalled"}},
 		// Answered WITH options, the normal end state of an adjudicate: the
 		// answer is the news and the options are spent. Without this row the
 		// answered arm is only ever exercised on the option-less path, and
 		// suppressing spent options is untested.
 		{lead: "1603", cells: []string{
-			"1603", "revise", "2026-08-23 06:00", "-", "accept", "coder pushed a fix"}},
-		// Unanswered with no options: AnswerDecision accepts anything here.
+			"1603", "wl-1603-b", "revise", "2026-08-23 06:00", "-", "accept", "coder pushed a fix"}},
+		// Unanswered with no options and no workload: AnswerDecision accepts
+		// anything here, and there is no run to point at.
 		{lead: "1600", cells: []string{
-			"1600", "unblock", "2026-08-23 03:00", "any", "-", "needs a human"}},
+			"1600", "-", "unblock", "2026-08-23 03:00", "any", "-", "needs a human"}},
 	}
 	for _, tc := range want {
 		row := decisionRow(out, tc.lead)
@@ -197,6 +206,12 @@ func TestRenderDecisions_FlattensCellsThatWouldBreakTheTable(t *testing.T) {
 			mangled: Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "stalled",
 				Options: []string{"acc\nept", "revise"}},
 			wantFlat: "acc ept|revise",
+		},
+		{
+			name: "a newline in WORKLOAD",
+			mangled: Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "stalled",
+				Workload: "wl\n1602"},
+			wantFlat: "wl 1602",
 		},
 	}
 	for _, tc := range cases {
