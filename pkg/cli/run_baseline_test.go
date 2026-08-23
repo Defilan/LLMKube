@@ -30,7 +30,7 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
-// auditCMIn builds an audit-record ConfigMap in the given namespace, shaped
+// baselineCMIn builds an audit-record ConfigMap in the given namespace, shaped
 // the way pkg/foreman/audit's writer shapes it: the audit label, plus the
 // JSON Record under the audit.json data key.
 func baselineCMIn(t *testing.T, namespace, name, agent, kind, verdict string, elapsed float64) *corev1.ConfigMap {
@@ -100,10 +100,11 @@ func TestBaselineFor_NoHistoryReturnsDefault(t *testing.T) {
 // TestBaselineFor_FiltersAreLoadBearing pins each selection rule on its own.
 //
 // The happy-path test above cannot do this: its three excluded records all
-// carry elapsed=60, and adding one 60 to {3000,3600,4200} leaves the median
-// at 3600, so dropping any single filter still passes it. Every case here is
-// built so that removing exactly one rule from BaselineFor changes the
-// answer. Each case names the mutation it exists to catch.
+// carry elapsed=60, and adding a single 60 to its included {3000,3600,9000}
+// leaves the median at 3600, so dropping any one filter still passes it.
+// Every case here is built so that removing exactly one rule from
+// BaselineFor changes the answer, using three excluded records rather than
+// one so the median actually moves. Each case names the mutation it catches.
 func TestBaselineFor_FiltersAreLoadBearing(t *testing.T) {
 	const agent = "qwen38-coder"
 
@@ -157,20 +158,25 @@ func TestBaselineFor_FiltersAreLoadBearing(t *testing.T) {
 			mutation: "delete the rec.Agent == nil guard",
 			objs: []client.Object{
 				baselineCM(t, "mine", agent, "issue-fix", "GO", 3600),
-				baselineAgentlessCM(t, "n1", "issue-fix", "GO", 60),
-				baselineAgentlessCM(t, "n2", "issue-fix", "GO", 60),
-				baselineAgentlessCM(t, "n3", "issue-fix", "GO", 60),
+				// 12000 appears in no other case, so if these ever leak in
+				// the failure message names them rather than reading like
+				// any other excluded-record leak.
+				baselineAgentlessCM(t, "n1", "issue-fix", "GO", 12000),
+				baselineAgentlessCM(t, "n2", "issue-fix", "GO", 12000),
+				baselineAgentlessCM(t, "n3", "issue-fix", "GO", 12000),
 			},
 			want: 3600 * time.Second,
 		},
 		{
 			name:     "unsuccessful verdicts are excluded",
 			mutation: "delete the !rec.SucceededOnTarget guard",
+			// All three are real AgenticTaskVerdict values. INCOMPLETE is
+			// the common coder failure.
 			objs: []client.Object{
 				baselineCM(t, "mine", agent, "issue-fix", "GO", 3600),
 				baselineCM(t, "x1", agent, "issue-fix", "NO-GO", 60),
-				baselineCM(t, "x2", agent, "issue-fix", "CODER-GATE-FAILED", 60),
-				baselineCM(t, "x3", agent, "issue-fix", "NEEDS-VERIFICATION", 60),
+				baselineCM(t, "x2", agent, "issue-fix", "INCOMPLETE", 60),
+				baselineCM(t, "x3", agent, "issue-fix", "GATE-FAIL", 60),
 			},
 			want: 3600 * time.Second,
 		},
@@ -336,7 +342,7 @@ func patchRecord(t *testing.T, cm *corev1.ConfigMap, mutate func(*audit.Record))
 	cm.Data["audit.json"] = string(b)
 }
 
-// agentlessCM builds an audit record with no agent block at all, which is
+// baselineAgentlessCM builds an audit record with no agent block at all, which is
 // what the writer emits when the Agent could not be resolved.
 func baselineAgentlessCM(t *testing.T, name, kind, verdict string, elapsed float64) *corev1.ConfigMap {
 	t.Helper()
