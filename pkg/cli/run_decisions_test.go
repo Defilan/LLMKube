@@ -688,3 +688,21 @@ func TestListDecisions_IgnoresALeakedStageFile(t *testing.T) {
 		t.Errorf("Issue = %d, want 1602", got[0].Issue)
 	}
 }
+
+func TestParkDecision_DoesNotClaimACorruptDecisionWhenNoneExists(t *testing.T) {
+	// A name too long is a read error that is not "no such file", so it lands
+	// in the same refusal branch as a genuinely unreadable decision. It still
+	// has to fail safely, but it must not send a human hunting for a corrupt
+	// file that was never there.
+	dir := t.TempDir()
+	_, err := ParkDecision(dir, Decision{Issue: 1602, Kind: strings.Repeat("k", 300)})
+	if err == nil {
+		t.Fatal("want an error for a decision path that cannot be read or written")
+	}
+	if strings.Contains(err.Error(), "overwrite") {
+		t.Errorf("err = %v, want no claim that an existing decision is in the way", err)
+	}
+	if names := decisionDirNames(t, dir); len(names) != 0 {
+		t.Errorf("dir = %v, want nothing written", names)
+	}
+}

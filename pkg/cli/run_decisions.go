@@ -129,6 +129,14 @@ func ParkDecision(dir string, d Decision) (string, error) {
 	// likeliest way one gets truncated is an interrupted write, and the answer
 	// may well still be sitting in it in plain text. Refusing until a human
 	// looks at the file beats destroying what is left of it.
+	//
+	// Every read error other than "no such file" refuses, not just permission
+	// denied: an I/O error on a real file is also a decision that exists and
+	// cannot be read, and falling through on that would overwrite exactly what
+	// this guard is for. The cost is that errors meaning "nothing is there at
+	// all", a name that is too long or a directory sitting at the path, land
+	// here too, so the message names what failed rather than asserting there is
+	// a corrupt decision to go and look at.
 	existing, err := os.ReadFile(p)
 	switch {
 	case err == nil:
@@ -140,7 +148,7 @@ func ParkDecision(dir string, d Decision) (string, error) {
 			return p, nil
 		}
 	case !os.IsNotExist(err):
-		return "", fmt.Errorf("refusing to overwrite unreadable decision %s: %w", p, err)
+		return "", fmt.Errorf("cannot check for an existing decision at %s, refusing to write: %w", p, err)
 	}
 	if d.Opened.IsZero() {
 		d.Opened = time.Now().UTC()
