@@ -81,6 +81,9 @@ func TestRenderDecisions(t *testing.T) {
 			Opened: time.Date(2026, 8, 23, 5, 0, 0, 0, time.UTC), Answer: "drop"},
 		{Issue: 1600, Kind: "unblock", Reason: "needs a human",
 			Opened: time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)},
+		{Issue: 1603, Kind: "revise", Reason: "coder pushed a fix",
+			Opened:  time.Date(2026, 8, 23, 6, 0, 0, 0, time.UTC),
+			Options: []string{"accept", "revise"}, Answer: "accept"},
 	})
 	out := buf.String()
 	want := []struct {
@@ -92,9 +95,15 @@ func TestRenderDecisions(t *testing.T) {
 		// the table instead of guessing and reading the rejection.
 		{lead: "1602", cells: []string{
 			"1602", "adjudicate", "2026-08-23 04:12", "accept|revise", "-", "verify found issues"}},
-		// Answered: the answer is the news, the options are spent.
+		// Answered with no options: nothing to suppress.
 		{lead: "1601", cells: []string{
 			"1601", "escalate", "2026-08-23 05:00", "-", "drop", "stalled"}},
+		// Answered WITH options, the normal end state of an adjudicate: the
+		// answer is the news and the options are spent. Without this row the
+		// answered arm is only ever exercised on the option-less path, and
+		// suppressing spent options is untested.
+		{lead: "1603", cells: []string{
+			"1603", "revise", "2026-08-23 06:00", "-", "accept", "coder pushed a fix"}},
 		// Unanswered with no options: AnswerDecision accepts anything here.
 		{lead: "1600", cells: []string{
 			"1600", "unblock", "2026-08-23 03:00", "any", "-", "needs a human"}},
@@ -116,6 +125,33 @@ func TestRenderDecisions_EmptySaysSo(t *testing.T) {
 	renderDecisions(&buf, nil)
 	if !strings.Contains(strings.ToLower(buf.String()), "no parked decisions") {
 		t.Errorf("want an explicit empty message, got %q", buf.String())
+	}
+}
+
+// The table-level flatten test catches a tab only because tabwriter pads with
+// two spaces, so a single space between words cannot be padding. That couples
+// the invariant to a rendering constant: drop the tab arm and set padding to 1
+// and the table test goes quiet. Hold the invariant here, where nothing about
+// the table can reach it.
+func TestFlattenCell(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{name: "a tab", in: "verify\tfailed", want: "verify failed"},
+		{name: "a newline", in: "verify\nfailed", want: "verify failed"},
+		{name: "a carriage return", in: "verify\rfailed", want: "verify failed"},
+		// Documenting current behaviour, not requiring it: each control
+		// character maps to its own space, so CRLF widens to two. Harmless in
+		// a table, and the same reason a tab followed by a space widens.
+		{name: "a CRLF becomes two spaces", in: "verify\r\nfailed", want: "verify  failed"},
+		{name: "text with nothing to flatten", in: "verify failed", want: "verify failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := flattenCell(tc.in); got != tc.want {
+				t.Errorf("flattenCell(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
