@@ -186,9 +186,19 @@ func ListDecisions(dir string) ([]Decision, error) {
 
 // AnswerDecision records a human's answer. The answer must be one of the
 // options the decision offered, so a typo cannot silently become an action.
+//
+// The answer is trimmed, and an answer that is empty once trimmed is rejected:
+// returning nil having recorded nothing reads as success to the human while
+// every consumer still sees the decision as unanswered, and a stored answer of
+// pure whitespace is worse still, since it satisfies the park guard forever and
+// the decision can never be refreshed again.
 func AnswerDecision(dir string, issue int32, kind, answer string) error {
 	if err := checkDecisionKind(kind); err != nil {
 		return err
+	}
+	answer = strings.TrimSpace(answer)
+	if answer == "" {
+		return fmt.Errorf("decision answer must not be empty")
 	}
 	p := decisionPath(dir, issue, kind)
 	b, err := os.ReadFile(p)

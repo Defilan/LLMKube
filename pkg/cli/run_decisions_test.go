@@ -575,3 +575,54 @@ func TestListDecisions_ReturnsTheGoodOnesAndNamesTheBad(t *testing.T) {
 		t.Errorf("Issue = %d, want 1602", got[0].Issue)
 	}
 }
+
+func TestAnswerDecision_TrimsTheAnswer(t *testing.T) {
+	dir, _ := decisionFixtureDir(t)
+	if err := AnswerDecision(dir, 1602, "adjudicate", "  revise\n"); err != nil {
+		t.Fatalf("AnswerDecision with surrounding whitespace: %v", err)
+	}
+	got, err := ListDecisions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Answer != "revise" {
+		t.Errorf("Answer = %q, want it trimmed", got[0].Answer)
+	}
+
+	// Without options there is no membership check to do the trimming for us,
+	// so this pins the stored value on its own.
+	loose := t.TempDir()
+	if _, err := ParkDecision(loose, Decision{Issue: 1700, Kind: "adjudicate"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := AnswerDecision(loose, 1700, "adjudicate", "  accept  "); err != nil {
+		t.Fatal(err)
+	}
+	got, err = ListDecisions(loose)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Answer != "accept" {
+		t.Errorf("Answer = %q, want it trimmed", got[0].Answer)
+	}
+}
+
+func TestAnswerDecision_RejectsAnEmptyAnswer(t *testing.T) {
+	// No options, so the permissive branch would otherwise accept anything.
+	dir := t.TempDir()
+	if _, err := ParkDecision(dir, Decision{Issue: 1602, Kind: "adjudicate"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, answer := range []string{"", "   ", "\t\n"} {
+		if err := AnswerDecision(dir, 1602, "adjudicate", answer); err == nil {
+			t.Errorf("AnswerDecision(%q) = nil, want an error", answer)
+		}
+	}
+	got, err := ListDecisions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Answer != "" {
+		t.Errorf("Answer = %q, want the decision still unanswered", got[0].Answer)
+	}
+}
