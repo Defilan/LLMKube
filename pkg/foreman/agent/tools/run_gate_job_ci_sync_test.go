@@ -27,13 +27,23 @@ import (
 // workflowDir is the CI definition this gate is meant to mirror.
 const workflowDir = "../../../../.github/workflows"
 
+// workflowGlob matches both spellings GitHub honours. A workflow file
+// named .yaml runs exactly like a .yml one, so a glob that saw only
+// *.yml would let an entire file of CI checks pass these tests unread.
+const workflowGlob = "*.y*ml"
+
 // gateExemptCIChecks are make targets CI runs that DefaultGateChecks
 // deliberately omits. Each entry is a DECISION with a stated reason, not
 // a formality: an unexplained omission is how a gate quietly stops
 // meaning what its name says (#1637).
 var gateExemptCIChecks = map[string]string{
-	"validate-samples": "requires python3 + the jsonschema package; the gate image is a plain golang " +
-		"image and the target hard-exits when they are absent, so adding it would fail every gate run",
+	"validate-samples": "hard-exits when the third-party python3 modules jsonschema and pyyaml are " +
+		"absent; python3 itself IS in the gate image, but it is a plain golang image with no pip3 " +
+		"to add them, so adding this target would fail every gate run",
+	"check-helm-rbac": "scripts/check-helm-rbac.sh exits 2 unless `python3 -c 'import yaml'` " +
+		"succeeds; the gate image is a plain golang image that ships python3 but neither PyYAML " +
+		"nor pip3, so adding this target would fail every gate run. CI clears it only because " +
+		"helm-chart.yml installs PyYAML in a step of its own beforehand",
 	"setup-test-e2e":                "provisions an e2e cluster; lifecycle, not a branch check",
 	"cleanup-test-e2e":              "tears down an e2e cluster; lifecycle, not a branch check",
 	"test-e2e":                      "needs a live cluster the gate Job does not own",
@@ -45,9 +55,13 @@ var gateExemptCIChecks = map[string]string{
 // golangciConfigTargets maps a golangci-lint --config= value used by a
 // workflow to the make target that runs the same check, so a
 // GitHub-Action-invoked lint is compared against the gate like any other.
+//
+// Only a config some workflow actually names with --config= belongs
+// here. lint.yml's plain lint step passes no args at all, so an entry
+// for .golangci.yml would translate nothing and could never be caught
+// being wrong. TestGolangciConfigTargetsAreLive holds that line.
 var golangciConfigTargets = map[string]string{
 	".golangci-deadcode.yml": "lint-deadcode",
-	".golangci.yml":          "lint",
 }
 
 var (
@@ -75,16 +89,24 @@ func makeTargetsIn(tail string) []string {
 	return out
 }
 
-// ciBlockingChecks returns every make target CI invokes across all
-// workflow files, plus the make-target equivalent of any golangci-lint
-// action run with an explicit config.
-func ciBlockingChecks(t *testing.T) map[string]string {
+// workflowLine is one non-comment line of one workflow file, tagged with
+// the file it came from so a failure can name the workflow.
+type workflowLine struct {
+	workflow string
+	text     string
+}
+
+// workflowLines reads every workflow file once and returns their
+// non-comment lines. One reader and one glob for every test in this
+// file: a test that widened its own view of CI would otherwise leave the
+// others reading a smaller CI than the one that runs.
+func workflowLines(t *testing.T) []workflowLine {
 	t.Helper()
-	entries, err := filepath.Glob(filepath.Join(workflowDir, "*.yml"))
+	entries, err := filepath.Glob(filepath.Join(workflowDir, workflowGlob))
 	if err != nil || len(entries) == 0 {
 		t.Fatalf("no workflow files under %s (err=%v)", workflowDir, err)
 	}
-	found := map[string]string{}
+	var out []workflowLine
 	for _, f := range entries {
 		buf, err := os.ReadFile(f)
 		if err != nil {
@@ -98,25 +120,44 @@ func ciBlockingChecks(t *testing.T) map[string]string {
 			if strings.HasPrefix(trimmed, "#") {
 				continue
 			}
-			if m := makeLineRe.FindStringSubmatch(trimmed); m != nil {
-				for _, target := range makeTargetsIn(m[1]) {
-					found[target] = base
-				}
+			out = append(out, workflowLine{workflow: base, text: trimmed})
+		}
+	}
+	return out
+}
+
+// ciBlockingChecks returns every make target CI invokes across all
+// workflow files, plus the make-target equivalent of any golangci-lint
+// action run with an explicit config.
+//
+// It sees make targets and golangci configs, and nothing else. A CI step
+// that runs a tool directly (security.yml's `run: govulncheck ./...`, or
+// helm-chart.yml's helm and ct steps) is invisible here, so every test
+// built on this function bounds its claim to the make-invoked subset.
+func ciBlockingChecks(t *testing.T) map[string]string {
+	t.Helper()
+	found := map[string]string{}
+	for _, wl := range workflowLines(t) {
+		if m := makeLineRe.FindStringSubmatch(wl.text); m != nil {
+			for _, target := range makeTargetsIn(m[1]) {
+				found[target] = wl.workflow
 			}
-			for _, m := range golangciRe.FindAllStringSubmatch(trimmed, -1) {
-				if target, ok := golangciConfigTargets[m[1]]; ok {
-					found[target] = base
-				}
+		}
+		for _, m := range golangciRe.FindAllStringSubmatch(wl.text, -1) {
+			if target, ok := golangciConfigTargets[m[1]]; ok {
+				found[target] = wl.workflow
 			}
 		}
 	}
 	return found
 }
 
-// TestDefaultGateChecksCoverCI pins the Foreman gate against CI. A
-// GATE-PASS is read by operators, and by the verdict machinery, as "this
-// branch is expected to pass CI"; that is only true while the gate's
-// check list is a superset of what CI blocks on.
+// TestDefaultGateChecksCoverCI pins the Foreman gate against the
+// make-invoked subset of CI. A GATE-PASS is read by operators, and by the
+// verdict machinery, as "this branch is expected to pass CI"; that is
+// only true while the gate's check list covers the CI checks this test
+// can see. Checks CI runs as direct `run:` steps are outside its reach,
+// so a green run here is not a promise the pull request is green.
 func TestDefaultGateChecksCoverCI(t *testing.T) {
 	gate := map[string]bool{}
 	for _, c := range DefaultGateChecks {
@@ -141,11 +182,42 @@ func TestDefaultGateChecksCoverCI(t *testing.T) {
 
 // TestGateExemptionsAreLive stops the exemption list from outliving the
 // CI steps it excuses. A stale entry silently widens the next real gap.
+//
+// It is load-bearing for a second reason that is easy to destroy while
+// tidying up. docker-build, docker-build-foreman-agent,
+// docker-build-foreman-operator, test-e2e and setup-test-e2e appear in
+// the workflows ONLY as bare lines inside a `run: |` block, so they are
+// reachable only through makeLineRe's optional `run:` prefix. Drop that
+// half of the pattern and ciBlockingChecks returns a smaller CI:
+// TestDefaultGateChecksCoverCI would still pass, on a gate that had
+// quietly stopped looking. This test fails loudly instead. Keep the
+// block form when simplifying the matcher.
 func TestGateExemptionsAreLive(t *testing.T) {
 	ci := ciBlockingChecks(t)
 	for target := range gateExemptCIChecks {
 		if _, ok := ci[target]; !ok {
 			t.Errorf("gateExemptCIChecks has %q but no workflow runs it; drop the stale exemption", target)
+		}
+	}
+}
+
+// TestGolangciConfigTargetsAreLive applies TestGateExemptionsAreLive's
+// rule to the other hand-maintained map. An entry whose config no
+// workflow passes with --config= translates nothing: it cannot make the
+// coverage test stricter and it can never be caught being wrong, so it
+// reads as coverage these tests do not have. .golangci.yml was exactly
+// that entry until #1642, because lint.yml runs the linter with no args.
+func TestGolangciConfigTargetsAreLive(t *testing.T) {
+	seen := map[string]bool{}
+	for _, wl := range workflowLines(t) {
+		for _, m := range golangciRe.FindAllStringSubmatch(wl.text, -1) {
+			seen[m[1]] = true
+		}
+	}
+	for cfg := range golangciConfigTargets {
+		if !seen[cfg] {
+			t.Errorf("golangciConfigTargets maps %q but no workflow passes --config=%s; "+
+				"the entry matches nothing, drop it", cfg, cfg)
 		}
 	}
 }

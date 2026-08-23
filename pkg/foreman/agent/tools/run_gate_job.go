@@ -66,16 +66,23 @@ const MaxLogTailBytes = 32 * 1024
 // when the caller does not override it. Mirrors what the autofix gate
 // pipeline ran across hundreds of coder-to-verifier runs.
 //
-// It must remain a SUPERSET of what CI blocks on. A GATE-PASS is read by
-// operators, and by the verdict and escalation machinery, as "this branch
-// is expected to pass CI"; that claim only holds while this list covers
-// every check a pull request has to clear. TestDefaultGateChecksCoverCI
-// pins that against .github/workflows, and gateExemptCIChecks records the
-// deliberate omissions with their reasons (#1637).
+// A GATE-PASS is read by operators, and by the verdict and escalation
+// machinery, as "this branch is expected to pass CI". This list is what
+// backs that reading, and it must remain a superset of the make-invoked
+// subset of CI, plus the golangci configs a workflow names explicitly
+// with --config=. TestDefaultGateChecksCoverCI pins exactly that against
+// .github/workflows, and gateExemptCIChecks records the deliberate
+// omissions from it with their reasons (#1637).
+//
+// The claim stops there. A CI check added as a direct `run:` step is NOT
+// covered by that test: security.yml runs `govulncheck ./...` on every
+// pull request and the test does not see it, and most of helm-chart.yml
+// drives helm and ct the same way. Widening the gate to such a check is
+// a manual decision; nothing here will prompt for it.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds",
-	"check-helm-rbac", "check-reviewer-prompts", ChartCheck,
+	"check-reviewer-prompts", ChartCheck,
 }
 
 // ChartCheck is the make target that lints and unit-tests the Helm charts.
