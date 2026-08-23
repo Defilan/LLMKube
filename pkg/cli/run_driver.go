@@ -129,6 +129,15 @@ func DriveItem(
 			if err != nil {
 				return stage, err
 			}
+			// An empty name is the one answer the "trust what Dispatch
+			// returns" contract cannot absorb: it makes the branch
+			// "foreman//issue-<n>", points watch, kill and verify at nothing,
+			// and parks a decision whose Workload field is blank, which is
+			// the only thing telling a human which run to go and look at.
+			// A Workload that cannot be named was not created.
+			if w == "" {
+				return stage, fmt.Errorf("dispatch for issue %d reported no workload name", item.Issue)
+			}
 			workload = w
 			// The branch follows the Workload that actually exists, not the
 			// name reserved for the probe above.

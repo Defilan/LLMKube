@@ -89,6 +89,9 @@ type fakeEffects struct {
 	// dispatchWorkload is the Workload name Dispatch reports creating.
 	// Empty means driveWorkload.
 	dispatchWorkload string
+	// dispatchNoName makes Dispatch report ("", nil): it claims to have
+	// created a Workload and does not say which.
+	dispatchNoName bool
 
 	preflightErr error
 	dispatchErr  error
@@ -118,6 +121,9 @@ func (f *fakeEffects) Dispatch(ctx context.Context, item QueueItem, intent strin
 	f.dispatched++
 	if f.dispatchErr != nil {
 		return "", f.dispatchErr
+	}
+	if f.dispatchNoName {
+		return "", nil
 	}
 	if f.dispatchWorkload != "" {
 		return f.dispatchWorkload, nil
@@ -370,6 +376,34 @@ func TestDriveItem_TakesTheBranchFromTheWorkloadDispatchCreated(t *testing.T) {
 	if got := e.calls["preflight"].branch; got != drivePlannedBranch {
 		t.Errorf("Preflight branch = %q, want %q", got, drivePlannedBranch)
 	}
+}
+
+// Dispatch returning ("", nil) is the one input the "trust the name Dispatch
+// returns" contract cannot absorb. Unguarded it is silent: the branch becomes
+// "foreman//issue-1602", watch and verify act on nothing, and the item parks a
+// decision whose Workload field, the one thing telling a human which run to go
+// look at, is blank.
+func TestDriveItem_RefusesAnEmptyWorkloadNameFromDispatch(t *testing.T) {
+	dir := t.TempDir()
+	e := &fakeEffects{dispatchNoName: true}
+	got, err := driveItemUnderTest(context.Background(), e, dir)
+	if err == nil {
+		t.Fatal("DriveItem = nil, want a Workload with no name refused")
+	}
+	if !strings.Contains(err.Error(), "workload") {
+		t.Errorf("err = %v, want it to say the workload name is missing", err)
+	}
+	if got != StageDispatch {
+		t.Errorf("stage = %q, want %q", got, StageDispatch)
+	}
+	// Nothing downstream may run against a name that is not there.
+	for _, site := range []string{"watch", "kill", "verify"} {
+		if _, ran := e.calls[site]; ran {
+			t.Errorf("%s ran against a Workload with no name", site)
+		}
+	}
+	// And it is a broken effect, not a judgment call for a human.
+	noDecisions(t, dir)
 }
 
 // A broken effect is not a judgment call: it must abort the item, name the
