@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"sigs.k8s.io/yaml"
@@ -41,6 +42,22 @@ type Decision struct {
 	Options  []string          `json:"options,omitempty"`
 	// Answer is empty until a human answers it.
 	Answer string `json:"answer,omitempty"`
+}
+
+// checkDecisionKind rejects a kind that would steer the path out of dir. Task 7
+// takes the kind from the command line, so this is reachable input, and it is
+// not a privilege boundary so much as a way to avoid silently destroying an
+// unrelated file: a kind with a ".." in it makes ParkDecision write outside the
+// decisions directory, and makes AnswerDecision rewrite whatever YAML it lands
+// on as a Decision, dropping every key it did not recognise.
+func checkDecisionKind(kind string) error {
+	if strings.ContainsAny(kind, `/\`) {
+		return fmt.Errorf("decision kind %q must not contain a path separator", kind)
+	}
+	if kind == "." || kind == ".." {
+		return fmt.Errorf("decision kind %q must be a name, not a path segment", kind)
+	}
+	return nil
 }
 
 func decisionPath(dir string, issue int32, kind string) string {
@@ -81,6 +98,9 @@ func writeDecisionFile(p string, b []byte) error {
 // ParkDecision writes a decision and returns its path. Parking is how the
 // loop declines to block: the caller records this and moves to the next item.
 func ParkDecision(dir string, d Decision) (string, error) {
+	if err := checkDecisionKind(d.Kind); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create decisions dir: %w", err)
 	}
@@ -158,6 +178,9 @@ func ListDecisions(dir string) ([]Decision, error) {
 // AnswerDecision records a human's answer. The answer must be one of the
 // options the decision offered, so a typo cannot silently become an action.
 func AnswerDecision(dir string, issue int32, kind, answer string) error {
+	if err := checkDecisionKind(kind); err != nil {
+		return err
+	}
 	p := decisionPath(dir, issue, kind)
 	b, err := os.ReadFile(p)
 	if err != nil {

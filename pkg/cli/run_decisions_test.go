@@ -489,3 +489,55 @@ func decisionDirNames(t *testing.T, dir string) []string {
 	}
 	return names
 }
+
+func TestParkDecision_RejectsAKindThatEscapesTheDir(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sub", "decisions")
+	// "1602-.." is one path element, so it takes three to climb out of dir.
+	if _, err := ParkDecision(dir, Decision{Issue: 1602, Kind: "../../../x"}); err == nil {
+		t.Error("want an error for a kind that climbs out of the decisions dir")
+	}
+	escaped := filepath.Join(base, "sub", "x.yaml")
+	if _, err := os.Stat(escaped); !os.IsNotExist(err) {
+		t.Errorf("%s exists, want nothing written outside the decisions dir", escaped)
+	}
+}
+
+func TestParkDecision_RejectsAKindWithAPathSeparator(t *testing.T) {
+	dir := t.TempDir()
+	// The subdirectory exists, so without the check this park would succeed
+	// and file the decision somewhere ListDecisions never looks.
+	if err := os.Mkdir(filepath.Join(dir, "1602-nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParkDecision(dir, Decision{Issue: 1602, Kind: "nested/x"}); err == nil {
+		t.Error("want an error for a kind containing a path separator")
+	}
+	buried := filepath.Join(dir, "1602-nested", "x.yaml")
+	if _, err := os.Stat(buried); !os.IsNotExist(err) {
+		t.Errorf("%s exists, want no decision filed in a subdirectory", buried)
+	}
+}
+
+func TestAnswerDecision_RejectsAKindThatEscapesTheDir(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "sub", "decisions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(base, "sub", "victim.yaml")
+	const unrelated = "unrelated: keep me\n"
+	if err := os.WriteFile(victim, []byte(unrelated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := AnswerDecision(dir, 1602, "../../../victim", "revise"); err == nil {
+		t.Error("want an error for a kind that climbs out of the decisions dir")
+	}
+	after, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != unrelated {
+		t.Errorf("victim = %q, want the unrelated file untouched", string(after))
+	}
+}
