@@ -163,6 +163,9 @@ data:
                     current_task: [status, currentTask]
                     version: [status, agentVersion]
                     agent_kind: [status, agentKind]
+                    # The machine as a property, not the identity (#1640).
+                    # Empty for off-cluster agents.
+                    kubernetes_node: [status, kubernetesNode]
 
             # foreman_fleetnode_role_info{name,node,role} -- ONE SERIES PER
             # ROLE. spec.roles is a list, so the Info metric targets the array
