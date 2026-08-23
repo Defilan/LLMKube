@@ -60,7 +60,7 @@ data:
           "title": "Ready Nodes",
           "type": "stat",
           "targets": [
-            { "expr": "sum(foreman_fleetnode_phase{phase=\"ready\"})", "refId": "A" }
+            { "expr": "sum(foreman_fleetnode_phase{phase=\"Ready\"})", "refId": "A" }
           ]
         },
         {
@@ -85,7 +85,7 @@ data:
           "title": "Draining Nodes",
           "type": "stat",
           "targets": [
-            { "expr": "sum(foreman_fleetnode_phase{phase=\"draining\"})", "refId": "A" }
+            { "expr": "sum(foreman_fleetnode_phase{phase=\"Draining\"})", "refId": "A" }
           ]
         },
         {
@@ -109,7 +109,7 @@ data:
           "title": "NotReady Nodes",
           "type": "stat",
           "targets": [
-            { "expr": "sum(foreman_fleetnode_phase{phase=\"not-ready\"})", "refId": "A" }
+            { "expr": "sum(foreman_fleetnode_phase{phase=\"NotReady\"})", "refId": "A" }
           ]
         },
         {
@@ -272,7 +272,7 @@ data:
           "title": "Stuck Tasks (Running > 1h)",
           "type": "stat",
           "targets": [
-            { "expr": "count(foreman_agentictask_phase{phase=\"running\"}) > 0", "refId": "A" }
+            { "expr": "count(foreman_agentictask_phase{phase=\"Running\"}) > 0", "refId": "A" }
           ]
         },
         {
@@ -297,7 +297,7 @@ data:
           "title": "Succeeded Tasks",
           "type": "stat",
           "targets": [
-            { "expr": "sum(foreman_agentictask_phase{phase=\"succeeded\"})", "refId": "A" }
+            { "expr": "sum(foreman_agentictask_phase{phase=\"Succeeded\"})", "refId": "A" }
           ]
         },
         {
@@ -321,7 +321,7 @@ data:
           "title": "Failed Tasks",
           "type": "stat",
           "targets": [
-            { "expr": "sum(foreman_agentictask_phase{phase=\"failed\"})", "refId": "A" }
+            { "expr": "sum(foreman_agentictask_phase{phase=\"Failed\"})", "refId": "A" }
           ]
         },
         {
@@ -345,7 +345,7 @@ data:
           "title": "Incomplete Tasks",
           "type": "stat",
           "targets": [
-            { "expr": "sum(foreman_agentictask_verdict{verdict=\"incomplete\"})", "refId": "A" }
+            { "expr": "sum(foreman_agentictask_verdict{verdict=\"INCOMPLETE\"})", "refId": "A" }
           ]
         }
       ],
