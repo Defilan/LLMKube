@@ -45,11 +45,13 @@ func newRunCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Drive a queue of issues through Foreman unattended",
-		Long: `Drive a prepared queue of issues through the Foreman pipeline.
+		// The default directory is interpolated rather than spelled out, so
+		// the help cannot drift from the flag.
+		Long: fmt.Sprintf(`Drive a prepared queue of issues through the Foreman pipeline.
 
 The loop does the mechanical work (preflight skips, dispatch, watching for
 stalls, independent verification, finalizing a PR) and parks judgment calls
-as files under .foreman/decisions for you to review with
+as files under %s for you to review with
 'llmkube foreman decisions'. It never blocks: a parked decision releases the
 slot and the loop moves to the next item.
 
@@ -57,7 +59,7 @@ Intents are yours to write; the queue points at them.
 
 Example:
 
-  llmkube foreman run --queue queue.yaml --coder-agent qwen38-coder`,
+  llmkube foreman run --queue queue.yaml --coder-agent qwen38-coder`, defaultDecisionsDir),
 		RunE: func(_ *cobra.Command, _ []string) error {
 			return fmt.Errorf("not implemented: the driver lands in task 8")
 		},

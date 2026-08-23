@@ -186,24 +186,25 @@ func TestRenderDecisions_FlattensCellsThatWouldBreakTheTable(t *testing.T) {
 	}
 }
 
-func TestForemanCommand_RegistersRunAndDecisions(t *testing.T) {
-	cases := []struct {
-		sub, wantInHelp string
-	}{
-		// A flag only the run command declares.
-		{sub: "run", wantInHelp: "--stall-factor"},
-		// The answer subcommand's own Short, which the parent's Short does
-		// not repeat: "answer" alone would match either.
-		{sub: "decisions", wantInHelp: "Answer one parked decision"},
+// Asserts on registered names rather than help text, so rewording a Short
+// does not fail a test about wiring. The two pre-existing registrations are
+// covered here too; nothing else pins them.
+func TestForemanCommand_RegistersItsSubcommands(t *testing.T) {
+	paths := [][]string{
+		{"dispatch"},
+		{"slice"},
+		{"run"},
+		{"decisions"},
+		{"decisions", "answer"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.sub, func(t *testing.T) {
-			out, err := foremanExec(t, tc.sub, "--help")
+	for _, path := range paths {
+		t.Run(strings.Join(path, " "), func(t *testing.T) {
+			c, _, err := NewForemanCommand().Find(path)
 			if err != nil {
-				t.Fatalf("foreman %s --help: %v", tc.sub, err)
+				t.Fatalf("foreman %s: %v", strings.Join(path, " "), err)
 			}
-			if !strings.Contains(out, tc.wantInHelp) {
-				t.Errorf("help for %q missing %q:\n%s", tc.sub, tc.wantInHelp, out)
+			if want := path[len(path)-1]; c.Name() != want {
+				t.Errorf("foreman %s resolved to %q, want %q", strings.Join(path, " "), c.Name(), want)
 			}
 		})
 	}
@@ -316,6 +317,14 @@ func TestDecisionsAnswerCommand(t *testing.T) {
 			wantAnswer: "accept",
 		},
 		{
+			// The confirmation names the decision that was written, not the
+			// string that was typed.
+			name:       "confirms with the parsed issue",
+			args:       []string{"+1602", "adjudicate", "accept"},
+			wantOut:    "answered 1602/adjudicate: accept",
+			wantAnswer: "accept",
+		},
+		{
 			name:    "refuses an option that was not offered",
 			args:    []string{"1602", "adjudicate", "maybe"},
 			wantErr: "is not one of",
@@ -329,6 +338,11 @@ func TestDecisionsAnswerCommand(t *testing.T) {
 			name:    "refuses an issue with trailing garbage",
 			args:    []string{"1602x", "adjudicate", "accept"},
 			wantErr: "ISSUE must be a number",
+		},
+		{
+			name:    "refuses a fourth argument",
+			args:    []string{"1602", "adjudicate", "accept", "revise"},
+			wantErr: "accepts 3 arg(s), received 4",
 		},
 	}
 	for _, tc := range cases {
@@ -363,6 +377,29 @@ func TestDecisionsAnswerCommand(t *testing.T) {
 				t.Errorf("recorded answer = %q, want %q", ds[0].Answer, tc.wantAnswer)
 			}
 		})
+	}
+}
+
+// The loop parks where --decisions-dir says and the human answers where
+// --decisions-dir says, but those are two separate registrations. If their
+// defaults ever drift, the loop parks somewhere the human is not looking.
+func TestDecisionsDirIsNamedInOnePlace(t *testing.T) {
+	run := newRunCommand()
+	runFlag := run.Flags().Lookup("decisions-dir")
+	decFlag := newDecisionsCommand().PersistentFlags().Lookup("decisions-dir")
+	if runFlag == nil || decFlag == nil {
+		t.Fatalf("--decisions-dir registered on run = %v, on decisions = %v", runFlag, decFlag)
+	}
+	if runFlag.DefValue != decFlag.DefValue {
+		t.Errorf("run defaults to %q but decisions defaults to %q; the loop would park "+
+			"where the human is not looking", runFlag.DefValue, decFlag.DefValue)
+	}
+	if runFlag.DefValue != defaultDecisionsDir {
+		t.Errorf("--decisions-dir default = %q, want the package constant %q", runFlag.DefValue, defaultDecisionsDir)
+	}
+	if !strings.Contains(run.Long, defaultDecisionsDir) {
+		t.Errorf("run --help does not name %q, so the help can drift from the flag:\n%s",
+			defaultDecisionsDir, run.Long)
 	}
 }
 
