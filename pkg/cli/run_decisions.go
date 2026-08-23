@@ -17,6 +17,7 @@ limitations under the License.
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -148,6 +149,11 @@ func ParkDecision(dir string, d Decision) (string, error) {
 // ListDecisions reads every decision in dir, oldest first. A missing
 // directory is an empty list, not an error: no parked decisions is the
 // normal state.
+//
+// One unreadable file does not hide the rest. The decisions that parsed come
+// back along with an error naming the ones that did not, because the caller is
+// the command whose whole job is showing a human what is parked, and showing
+// nothing at all is the worst answer it can give.
 func ListDecisions(dir string) ([]Decision, error) {
 	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
@@ -157,22 +163,25 @@ func ListDecisions(dir string) ([]Decision, error) {
 		return nil, fmt.Errorf("read decisions dir: %w", err)
 	}
 	var out []Decision
+	var bad []error
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".yaml" {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", e.Name(), err)
+			bad = append(bad, fmt.Errorf("read %s: %w", e.Name(), err))
+			continue
 		}
 		var d Decision
 		if err := yaml.Unmarshal(b, &d); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", e.Name(), err)
+			bad = append(bad, fmt.Errorf("parse %s: %w", e.Name(), err))
+			continue
 		}
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Opened.Before(out[j].Opened) })
-	return out, nil
+	return out, errors.Join(bad...)
 }
 
 // AnswerDecision records a human's answer. The answer must be one of the

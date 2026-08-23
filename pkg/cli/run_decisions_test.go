@@ -541,3 +541,37 @@ func TestAnswerDecision_RejectsAKindThatEscapesTheDir(t *testing.T) {
 		t.Errorf("victim = %q, want the unrelated file untouched", string(after))
 	}
 }
+
+func TestListDecisions_ReturnsTheGoodOnesAndNamesTheBad(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := ParkDecision(dir, Decision{Issue: 1602, Kind: "adjudicate"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "1500-adjudicate.yaml"),
+		[]byte("answer: revise\noptions: [accept, revise\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unreadable := os.Getuid() != 0
+	if unreadable {
+		if err := os.WriteFile(filepath.Join(dir, "1400-adjudicate.yaml"), []byte("issue: 1400\n"), 0o200); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := ListDecisions(dir)
+	if err == nil {
+		t.Fatal("want an error naming the decisions that could not be read")
+	}
+	if !strings.Contains(err.Error(), "1500-adjudicate.yaml") {
+		t.Errorf("err = %v, want it to name 1500-adjudicate.yaml", err)
+	}
+	if unreadable && !strings.Contains(err.Error(), "1400-adjudicate.yaml") {
+		t.Errorf("err = %v, want it to name 1400-adjudicate.yaml", err)
+	}
+	// The point of the change: the human still sees what is parked.
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want the one decision that parsed", len(got))
+	}
+	if got[0].Issue != 1602 {
+		t.Errorf("Issue = %d, want 1602", got[0].Issue)
+	}
+}
