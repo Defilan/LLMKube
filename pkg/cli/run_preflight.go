@@ -31,6 +31,8 @@ import (
 // implementation that folds a bad slug into ("", nil) or (false, nil)
 // silently defeats the fail-closed guarantee below: an empty slug that
 // answers "no open PR" is how #1625 duplicated work already in flight.
+// Preflight will not hand an implementation an empty slug or branch, but
+// implementations still owe this for every other unresolvable query.
 type PreflightProbe interface {
 	// OpenPRForIssue returns the URL of an open PR referencing the issue,
 	// or "" when there is none.
@@ -40,10 +42,22 @@ type PreflightProbe interface {
 }
 
 // Preflight returns a non-empty skip reason when the item should not be
-// dispatched. It fails CLOSED: a probe error is returned as an error, never
-// treated as "nothing found", because dispatching on a failed lookup risks
-// duplicating work already in flight.
+// dispatched.
+//
+// The item's repo slug and the branch must both be non-empty, and Preflight
+// enforces that before making any forge call: an empty slug or branch probes
+// nothing, and "nothing found" reads as a green light to dispatch (#1625).
+//
+// It fails CLOSED: a probe error is returned as an error, never treated as
+// "nothing found", because dispatching on a failed lookup risks duplicating
+// work already in flight.
 func Preflight(ctx context.Context, p PreflightProbe, item QueueItem, branch string) (string, error) {
+	if item.Repo == "" {
+		return "", fmt.Errorf("preflight: issue %d has no repo slug", item.Issue)
+	}
+	if branch == "" {
+		return "", fmt.Errorf("preflight: issue %d has no branch", item.Issue)
+	}
 	url, err := p.OpenPRForIssue(ctx, item.Repo, item.Issue)
 	if err != nil {
 		return "", fmt.Errorf("preflight: open-PR probe for issue %d: %w", item.Issue, err)

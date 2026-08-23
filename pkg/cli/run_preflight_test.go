@@ -186,3 +186,54 @@ func TestPreflight_ProbesRunOnTheCallersContext(t *testing.T) {
 		t.Errorf("skipReason = %q, want empty alongside an error", got)
 	}
 }
+
+// Preflight validates its own inputs before making live forge calls. An empty
+// repo slug or branch cannot produce a meaningful probe: the query matches
+// nothing, "nothing found" reads as a green light (#1625), and an empty branch
+// additionally yields a reason naming a branch nobody asked about. ParseQueue
+// rejects an empty slug today, but Preflight is exported and takes the item by
+// value, so it owes its own guard.
+func TestPreflight_RejectsEmptyRepoAndBranchBeforeProbing(t *testing.T) {
+	cases := []struct {
+		name   string
+		item   QueueItem
+		branch string
+		// probe expects exactly the arguments unguarded code would send and
+		// answers with errProbeDown, so reaching a probe at all is visible in
+		// the returned error rather than through a call recorder.
+		probe     fakeProbe
+		wantField string
+	}{
+		{
+			name:      "no repo slug",
+			item:      QueueItem{Issue: preflightIssue, IntentPath: "x.md"},
+			branch:    preflightBranch,
+			probe:     fakeProbe{wantIssue: preflightIssue, wantBranch: preflightBranch, prErr: errProbeDown},
+			wantField: "repo",
+		},
+		{
+			name:      "no branch",
+			item:      preflightItem(),
+			branch:    "",
+			probe:     fakeProbe{wantRepo: preflightRepo, wantIssue: preflightIssue, branchErr: errProbeDown},
+			wantField: "branch",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Preflight(context.Background(), tc.probe, tc.item, tc.branch)
+			if err == nil {
+				t.Fatalf("want an error when the %s is empty", tc.wantField)
+			}
+			if errors.Is(err, errProbeDown) {
+				t.Errorf("err = %v, want validation to reject before any probe runs", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantField) {
+				t.Errorf("err = %v, want it to name the empty field %q", err, tc.wantField)
+			}
+			if got != "" {
+				t.Errorf("skipReason = %q, want empty alongside an error", got)
+			}
+		})
+	}
+}
