@@ -300,16 +300,40 @@ func decisionFixtureDir(t *testing.T) (string, string) {
 	return dir, p
 }
 
+// A mistyped ISSUE or KIND is the ordinary way to reach this, so the error has
+// to lead with the decision it went looking for. It is asserted as a PREFIX on
+// purpose: os.ReadFile's own PathError already carries the path, so a bare
+// "read decision: %w" still ends up mentioning the file somewhere inside "open
+// ...: no such file or directory", and any Contains assertion passes without
+// the fix. What changes is what the human reads first, the decision that is not
+// parked or a syscall that failed.
 func TestAnswerDecision_ErrorsWhenThereIsNoSuchDecision(t *testing.T) {
 	dir, _ := decisionFixtureDir(t)
-	if err := AnswerDecision(dir, 9999, "adjudicate", "revise"); err == nil {
-		t.Error("want an error for an issue with no parked decision")
+	cases := []struct {
+		name     string
+		dir      string
+		issue    int32
+		kind     string
+		wantName string
+	}{
+		{"an issue with nothing parked", dir, 9999, "adjudicate", "9999-adjudicate.yaml"},
+		{"a kind with nothing parked", dir, 1602, "triage", "1602-triage.yaml"},
+		{
+			"a decisions dir that was never created",
+			filepath.Join(t.TempDir(), "never-created"), 1602, "adjudicate", "1602-adjudicate.yaml",
+		},
 	}
-	if err := AnswerDecision(dir, 1602, "triage", "revise"); err == nil {
-		t.Error("want an error for a kind with no parked decision")
-	}
-	if err := AnswerDecision(filepath.Join(t.TempDir(), "never-created"), 1602, "adjudicate", "revise"); err == nil {
-		t.Error("want an error when the decisions dir does not exist")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := AnswerDecision(tc.dir, tc.issue, tc.kind, "revise")
+			if err == nil {
+				t.Fatalf("AnswerDecision = nil, want an error naming %s", tc.wantName)
+			}
+			want := "read decision " + filepath.Join(tc.dir, tc.wantName) + ":"
+			if !strings.HasPrefix(err.Error(), want) {
+				t.Errorf("err = %v, want it to lead with %q", err, want)
+			}
+		})
 	}
 }
 

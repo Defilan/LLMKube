@@ -226,7 +226,11 @@ func AnswerDecision(dir string, issue int32, kind, answer string) error {
 	p := decisionPath(dir, issue, kind)
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return fmt.Errorf("read decision: %w", err)
+		// Named, like every other error here: the common way to reach this is
+		// a mistyped ISSUE or KIND, and "read decision: ... no such file"
+		// without the path reads as an I/O fault rather than "nothing is
+		// parked under that name".
+		return fmt.Errorf("read decision %s: %w", p, err)
 	}
 	var d Decision
 	if err := yaml.Unmarshal(b, &d); err != nil {
