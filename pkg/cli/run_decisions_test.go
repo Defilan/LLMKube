@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -327,8 +328,12 @@ func TestAnswerDecision_ErrorsWhenTheWriteFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
-	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err == nil {
+	err := AnswerDecision(dir, 1602, "adjudicate", "revise")
+	if err == nil {
 		t.Fatal("want an error when the decision cannot be written")
+	}
+	if !strings.HasPrefix(err.Error(), "write decision") {
+		t.Errorf("err = %v, want it wrapped like the file's other errors", err)
 	}
 }
 
@@ -398,4 +403,89 @@ func TestParkDecision_RefusesToOverwriteAnUnreadableDecision(t *testing.T) {
 	if len(got) != 1 || got[0].Answer != "revise" {
 		t.Errorf("got %+v, want the answer still on disk", got)
 	}
+}
+
+func TestDecisionWritesReplaceRatherThanTruncate(t *testing.T) {
+	// An in-place truncating write is the mechanism behind a half-written
+	// answer. A staged write plus rename leaves a different file behind, which
+	// is the observable difference between the two.
+	dir, p := decisionFixtureDir(t)
+	before, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err != nil {
+		t.Fatal(err)
+	}
+	afterAnswer, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, afterAnswer) {
+		t.Error("AnswerDecision rewrote the file in place, want an atomic replace")
+	}
+
+	dir2, p2 := decisionFixtureDir(t)
+	before2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParkDecision(dir2, Decision{
+		Issue: 1602, Kind: "adjudicate", Reason: "refreshed",
+		Options: []string{"accept", "revise"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	after2, err := os.Stat(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before2, after2) {
+		t.Error("ParkDecision rewrote the file in place, want an atomic replace")
+	}
+}
+
+func TestDecisionWritesLeaveNoTempFiles(t *testing.T) {
+	dir, _ := decisionFixtureDir(t)
+	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "1602-adjudicate.yaml" {
+		t.Errorf("dir = %v, want just the decision file", decisionDirNames(t, dir))
+	}
+
+	// The failing path is the one that matters: a staged file that never got
+	// renamed must not be left lying around for the next run to trip over.
+	blocked := t.TempDir()
+	target := filepath.Join(blocked, "1602-adjudicate.yaml")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "child"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDecisionFile(target, []byte("issue: 1602\n")); err == nil {
+		t.Fatal("want an error when the staged file cannot be renamed into place")
+	}
+	names := decisionDirNames(t, blocked)
+	if len(names) != 1 || names[0] != "1602-adjudicate.yaml" {
+		t.Errorf("dir = %v, want no staged leftovers", names)
+	}
+}
+
+func decisionDirNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }

@@ -47,6 +47,37 @@ func decisionPath(dir string, issue int32, kind string) string {
 	return filepath.Join(dir, fmt.Sprintf("%d-%s.yaml", issue, kind))
 }
 
+// writeDecisionFile replaces p with b atomically. A decision file is
+// human-owned: a truncating write that is interrupted by a crash or a full
+// disk leaves a half-written answer behind, which is exactly the damage the
+// park guard then has to refuse to touch. Staging in the same directory and
+// renaming means a reader sees either the whole old file or the whole new one.
+func writeDecisionFile(p string, b []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(p), ".decision-*.tmp")
+	if err != nil {
+		return fmt.Errorf("write decision %s: %w", p, err)
+	}
+	tmp := f.Name()
+	// A no-op once the rename has happened.
+	defer func() { _ = os.Remove(tmp) }()
+	// Pinned here rather than left to how the temp file happened to be made.
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write decision %s: %w", p, err)
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write decision %s: %w", p, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write decision %s: %w", p, err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		return fmt.Errorf("write decision %s: %w", p, err)
+	}
+	return nil
+}
+
 // ParkDecision writes a decision and returns its path. Parking is how the
 // loop declines to block: the caller records this and moves to the next item.
 func ParkDecision(dir string, d Decision) (string, error) {
@@ -88,8 +119,8 @@ func ParkDecision(dir string, d Decision) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal decision: %w", err)
 	}
-	if err := os.WriteFile(p, b, 0o600); err != nil {
-		return "", fmt.Errorf("write decision: %w", err)
+	if err := writeDecisionFile(p, b); err != nil {
+		return "", err
 	}
 	return p, nil
 }
@@ -151,5 +182,5 @@ func AnswerDecision(dir string, issue int32, kind, answer string) error {
 	if err != nil {
 		return fmt.Errorf("marshal decision: %w", err)
 	}
-	return os.WriteFile(p, out, 0o600)
+	return writeDecisionFile(p, out)
 }
