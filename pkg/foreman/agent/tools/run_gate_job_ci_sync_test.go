@@ -27,9 +27,12 @@ import (
 // workflowDir is the CI definition this gate is meant to mirror.
 const workflowDir = "../../../../.github/workflows"
 
-// workflowGlob matches both spellings GitHub honours. A workflow file
-// named .yaml runs exactly like a .yml one, so a glob that saw only
-// *.yml would let an entire file of CI checks pass these tests unread.
+// workflowGlob is deliberately *.y*ml and not the tidier *.yml. GitHub
+// honours .yaml and .yml equally, so a workflow named .yaml runs its
+// checks exactly like any other. Narrowing this pattern does not fail
+// anything: it makes that entire file invisible to the tests below, which
+// keep passing while covering less CI than they claim to. If you are here
+// to simplify it, that is the failure you would be introducing.
 const workflowGlob = "*.y*ml"
 
 // gateExemptCIChecks are make targets CI runs that DefaultGateChecks
@@ -197,6 +200,27 @@ func TestGateExemptionsAreLive(t *testing.T) {
 	for target := range gateExemptCIChecks {
 		if _, ok := ci[target]; !ok {
 			t.Errorf("gateExemptCIChecks has %q but no workflow runs it; drop the stale exemption", target)
+		}
+	}
+}
+
+// TestGateChecksAndExemptionsAreDisjoint catches the inverse of the gap
+// TestDefaultGateChecksCoverCI looks for. That test only asks whether a CI
+// target is missing from the gate, so a target listed in BOTH
+// DefaultGateChecks and gateExemptCIChecks passes every test in this file
+// while the two lists say opposite things about it: one runs the check,
+// the other records a reason it cannot be run. That is the same shape of
+// bug as #1637 itself, a gate configuration that reads plausibly and is
+// wrong with nothing to catch it. check-helm-rbac is the live example: it
+// is exempt because the gate image has no PyYAML, and adding it back to
+// DefaultGateChecks without removing the exemption would turn every gate
+// run red again, silently.
+func TestGateChecksAndExemptionsAreDisjoint(t *testing.T) {
+	for _, c := range DefaultGateChecks {
+		if reason, ok := gateExemptCIChecks[c]; ok {
+			t.Errorf("%q is in DefaultGateChecks AND in gateExemptCIChecks (%q): a target is "+
+				"either gated or exempt, never both. Run it and drop the exemption, or keep the "+
+				"exemption and drop it from DefaultGateChecks.", c, reason)
 		}
 	}
 }
