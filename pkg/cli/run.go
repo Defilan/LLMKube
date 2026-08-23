@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -117,6 +118,8 @@ func newDecisionsCommand() *cobra.Command {
 			if err := AnswerDecision(dir, int32(issue), args[1], args[2]); err != nil {
 				return err
 			}
+			// The parsed issue, not the argument: the confirmation should
+			// name the decision that was actually written.
 			fprintf(cmd.OutOrStdout(), "answered %d/%s: %s\n", issue, args[1], args[2])
 			return nil
 		},
@@ -125,21 +128,50 @@ func newDecisionsCommand() *cobra.Command {
 	return cmd
 }
 
+// flattenCell keeps one table cell on one line. Reason arrives from verify
+// output and stall evidence and Answer from a shell argument, so either can
+// carry a newline or a tab, and either one shifts every row that follows it
+// out of alignment.
+func flattenCell(s string) string {
+	return strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(s)
+}
+
+// decisionOptions renders the answers a decision will accept. An unanswered
+// decision that offers no options accepts anything, since AnswerDecision only
+// enforces the list when there is one, and saying so beats a bare placeholder
+// that reads as "nothing you can do here".
+func decisionOptions(d Decision) string {
+	if d.Answer != "" {
+		return "-"
+	}
+	if len(d.Options) == 0 {
+		return "any"
+	}
+	return strings.Join(d.Options, "|")
+}
+
 // renderDecisions prints the parked-decision queue as a table.
+//
+// OPTIONS is the column that makes the listing actionable: without it the
+// only way to learn what an answer may be is to read the YAML or guess and
+// wait for the rejection. REASON comes last because it is the one free-form
+// column, and leading with it would push the actionable ones off the right
+// of a narrow terminal.
 func renderDecisions(w io.Writer, ds []Decision) {
 	if len(ds) == 0 {
 		fprintln(w, "No parked decisions.")
 		return
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	fprintln(tw, "ISSUE\tKIND\tOPENED\tREASON\tANSWER")
+	fprintln(tw, "ISSUE\tKIND\tOPENED\tOPTIONS\tANSWER\tREASON")
 	for _, d := range ds {
 		answer := d.Answer
 		if answer == "" {
 			answer = "-"
 		}
-		fprintf(tw, "%d\t%s\t%s\t%s\t%s\n",
-			d.Issue, d.Kind, d.Opened.Format("2006-01-02 15:04"), d.Reason, answer)
+		fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\n",
+			d.Issue, flattenCell(d.Kind), d.Opened.Format("2006-01-02 15:04"),
+			flattenCell(decisionOptions(d)), flattenCell(answer), flattenCell(d.Reason))
 	}
 	_ = tw.Flush()
 }

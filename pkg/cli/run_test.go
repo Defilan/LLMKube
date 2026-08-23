@@ -21,6 +21,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -49,14 +51,24 @@ func foremanExec(t *testing.T, args ...string) (string, error) {
 	return out.String(), err
 }
 
-// decisionRow returns the rendered table row for an issue, or "".
-func decisionRow(out, issue string) string {
+// decisionRow returns the rendered table row that starts with lead, or "".
+func decisionRow(out, lead string) string {
 	for _, l := range strings.Split(out, "\n") {
-		if strings.HasPrefix(l, issue) {
+		if strings.HasPrefix(l, lead) {
 			return l
 		}
 	}
 	return ""
+}
+
+var tableGap = regexp.MustCompile(` {2,}`)
+
+// tableCells splits a rendered row into its columns. tabwriter pads every
+// aligned cell with at least two spaces, so a run of two or more spaces is a
+// column break while a single space inside a cell survives. Comparing whole
+// rows this way pins column order and content without hand-computing padding.
+func tableCells(row string) []string {
+	return tableGap.Split(strings.TrimRight(row, " "), -1)
 }
 
 func TestRenderDecisions(t *testing.T) {
@@ -67,24 +79,35 @@ func TestRenderDecisions(t *testing.T) {
 			Options: []string{"accept", "revise"}},
 		{Issue: 1601, Kind: "escalate", Reason: "stalled",
 			Opened: time.Date(2026, 8, 23, 5, 0, 0, 0, time.UTC), Answer: "drop"},
+		{Issue: 1600, Kind: "unblock", Reason: "needs a human",
+			Opened: time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)},
 	})
 	out := buf.String()
-	wants := []string{
-		"ISSUE", "KIND", "OPENED", "REASON", "ANSWER",
-		"1602", "adjudicate", "verify found issues", "2026-08-23 04:12",
-		"1601", "escalate", "stalled", "2026-08-23 05:00", "drop",
+	want := []struct {
+		lead  string
+		cells []string
+	}{
+		{lead: "ISSUE", cells: []string{"ISSUE", "KIND", "OPENED", "OPTIONS", "ANSWER", "REASON"}},
+		// Unanswered with options: the human can read the valid answers off
+		// the table instead of guessing and reading the rejection.
+		{lead: "1602", cells: []string{
+			"1602", "adjudicate", "2026-08-23 04:12", "accept|revise", "-", "verify found issues"}},
+		// Answered: the answer is the news, the options are spent.
+		{lead: "1601", cells: []string{
+			"1601", "escalate", "2026-08-23 05:00", "-", "drop", "stalled"}},
+		// Unanswered with no options: AnswerDecision accepts anything here.
+		{lead: "1600", cells: []string{
+			"1600", "unblock", "2026-08-23 03:00", "any", "-", "needs a human"}},
 	}
-	for _, want := range wants {
-		if !strings.Contains(out, want) {
-			t.Errorf("output missing %q:\n%s", want, out)
+	for _, tc := range want {
+		row := decisionRow(out, tc.lead)
+		if row == "" {
+			t.Errorf("no rendered row leading with %q:\n%s", tc.lead, out)
+			continue
 		}
-	}
-	row := decisionRow(out, "1602")
-	if row == "" {
-		t.Fatalf("no rendered row for issue 1602:\n%s", out)
-	}
-	if f := strings.Fields(row); f[len(f)-1] != "-" {
-		t.Errorf("unanswered row = %q, want a placeholder in the ANSWER column", row)
+		if got := tableCells(row); !slices.Equal(got, tc.cells) {
+			t.Errorf("row %q cells = %q, want %q", tc.lead, got, tc.cells)
+		}
 	}
 }
 
@@ -93,6 +116,73 @@ func TestRenderDecisions_EmptySaysSo(t *testing.T) {
 	renderDecisions(&buf, nil)
 	if !strings.Contains(strings.ToLower(buf.String()), "no parked decisions") {
 		t.Errorf("want an explicit empty message, got %q", buf.String())
+	}
+}
+
+// A cell carrying a newline or a tab does not just mangle its own row, it
+// shifts every row after it. Task 8 fills Reason from verify output and stall
+// evidence, which is exactly where multi-line strings come from, and Answer
+// is a shell argument.
+func TestRenderDecisions_FlattensCellsThatWouldBreakTheTable(t *testing.T) {
+	opened := time.Date(2026, 8, 23, 4, 12, 0, 0, time.UTC)
+	clean := Decision{Issue: 1601, Kind: "escalate", Reason: "stalled", Opened: opened, Answer: "drop"}
+	cases := []struct {
+		name     string
+		mangled  Decision
+		wantFlat string
+	}{
+		{
+			name:     "a newline in REASON",
+			mangled:  Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "verify failed\nrerun it"},
+			wantFlat: "verify failed rerun it",
+		},
+		{
+			name:     "a tab in REASON",
+			mangled:  Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "verify\tfailed"},
+			wantFlat: "verify failed",
+		},
+		{
+			name:     "a carriage return in REASON",
+			mangled:  Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "verify\rfailed"},
+			wantFlat: "verify failed",
+		},
+		{
+			name: "a newline in ANSWER",
+			mangled: Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "stalled",
+				Answer: "no\nmaybe"},
+			wantFlat: "no maybe",
+		},
+		{
+			name:     "a newline in KIND",
+			mangled:  Decision{Issue: 1602, Kind: "adjud\nicate", Opened: opened, Reason: "stalled"},
+			wantFlat: "adjud icate",
+		},
+		{
+			name: "a newline in OPTIONS",
+			mangled: Decision{Issue: 1602, Kind: "adjudicate", Opened: opened, Reason: "stalled",
+				Options: []string{"acc\nept", "revise"}},
+			wantFlat: "acc ept|revise",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			renderDecisions(&buf, []Decision{tc.mangled, clean})
+			out := buf.String()
+			lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+			if len(lines) != 3 {
+				t.Fatalf("got %d lines, want a header and one line per decision:\n%s", len(lines), out)
+			}
+			if !strings.Contains(out, tc.wantFlat) {
+				t.Errorf("flattened cell %q missing from:\n%s", tc.wantFlat, out)
+			}
+			// The row after the mangled one must still sit under the header.
+			kind := strings.Index(lines[0], "KIND")
+			row := decisionRow(out, "1601")
+			if len(row) <= kind || !strings.HasPrefix(row[kind:], "escalate") {
+				t.Errorf("the row after the mangled cell is out of alignment:\n%s", out)
+			}
+		})
 	}
 }
 
@@ -260,7 +350,8 @@ func TestRunCommand_ReportsNotImplemented(t *testing.T) {
 
 // The remaining run flags have no consumer until task 8, so this pins the
 // surface a human types and nothing more. It is a registration assertion, not
-// a behavioural one, and it should grow teeth when the driver reads them.
+// a behavioural one, and task 8 must REPLACE it with one that runs the driver
+// and observes the effect: swapping which field --queue binds to survives it.
 func TestRunCommand_FlagDefaults(t *testing.T) {
 	cmd := newRunCommand()
 	cases := []struct {
