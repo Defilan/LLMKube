@@ -37,6 +37,7 @@ func TestIsStalled(t *testing.T) {
 		{"exactly at the factor is not yet stalled", StallInput{150 * time.Minute, base, false}, false},
 		{"just past the factor", StallInput{151 * time.Minute, base, false}, true},
 		{"zero baseline falls back to the default", StallInput{4 * time.Hour, 0, false}, true},
+		{"zero baseline uses the default threshold, not zero", StallInput{100 * time.Minute, 0, false}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
