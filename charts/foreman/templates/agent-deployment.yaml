@@ -63,7 +63,22 @@ spec:
   {{- fail (printf "agents.%s.strategy.type: %q is not a valid Deployment strategy; use \"Recreate\" or \"RollingUpdate\" (the API server rejects anything else, including case variants like \"rollingUpdate\")" $name $st) }}
   {{- end }}
   {{- $tgps := $agent.terminationGracePeriodSeconds | default 30 }}
-  {{- if or (not (kindIs "float64" $tgps)) (lt (float64 $tgps) 0.0) }}
+  {{- /* Kind, not a single kind: the same value reaches this line as
+         different Go types depending on how it was supplied. Everything
+         routed through `include "foreman.agents" | fromYaml` is float64,
+         but $defaults above is a deepCopy of .Values.agent that is never
+         round-tripped through YAML, and Helm's --set (strvals) parses a
+         bare integer as int64. A float64-only type check therefore passed
+         every helm-unittest case (its `set:` round-trips through YAML) and
+         failed the real `--set agent.terminationGracePeriodSeconds=N`
+         render on any release using the agents: map. Accept every numeric
+         kind here and let the arms below do the actual validation. */}}
+  {{- $tgpsNum := or (kindIs "float64" $tgps) (kindIs "int64" $tgps) (kindIs "int" $tgps) }}
+  {{- $tgpsF := float64 $tgps }}
+  {{- /* Fractions are rejected rather than truncated: terminationGracePeriodSeconds
+         is an int64 in the pod spec, and `| int64` below would silently ship 30 for
+         an input of 30.5, which is a value the operator never asked for. */}}
+  {{- if or (not $tgpsNum) (lt $tgpsF 0.0) (ne $tgpsF (floor $tgpsF)) }}
   {{- fail (printf "agents.%s.terminationGracePeriodSeconds: %v must be a non-negative integer (the API server rejects anything else)" $name $tgps) }}
   {{- end }}
   strategy:
@@ -76,6 +91,14 @@ spec:
     {{- if hasKey $ru "maxSurge" }}{{ $surge = $ru.maxSurge }}{{ end }}
     {{- $unavail := 1 }}
     {{- if hasKey $ru "maxUnavailable" }}{{ $unavail = $ru.maxUnavailable }}{{ end }}
+    {{- /* Same %v exponent trap the grace period hit: values arriving via
+           fromYaml are float64, and fmt switches to exponent form at 1e6, so
+           `maxSurge: 1000000` rendered as `1e+06`, which YAML 1.1 does not
+           resolve as a number. Narrow to int64 for the numeric forms only;
+           the IntOrString percentage form ("25%") is a string and must pass
+           through untouched, because sprig's int64 casts it to 0. */}}
+    {{- if not (kindIs "string" $surge) }}{{ $surge = int64 $surge }}{{ end }}
+    {{- if not (kindIs "string" $unavail) }}{{ $unavail = int64 $unavail }}{{ end }}
     {{- /* maxSurge 0 with maxUnavailable 0 is rejected by the Deployment
            validator ("may not be 0 when maxSurge is 0"), so fail at render
            rather than at apply. Both accept the IntOrString percentage form,
