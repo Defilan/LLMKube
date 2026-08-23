@@ -58,6 +58,12 @@ func TestShouldEscalateCoder(t *testing.T) {
 		{"model gave up / stuck (like #921)", foremanv1alpha1.AgenticTaskVerdictIncomplete, "MODEL-DECIDED", "", false},
 		{"stuck-loop detected", foremanv1alpha1.AgenticTaskVerdictIncomplete, "STUCK-LOOP-DETECTED", "", false},
 		{"NO-GO but no-changes (trivial)", foremanv1alpha1.AgenticTaskVerdictNoGo, "NO-CHANGES", "", false},
+		{"NO-GO + ERROR (not a base capability failure)", foremanv1alpha1.AgenticTaskVerdictNoGo, "ERROR", "", false},
+		// A legacy task, or one whose status.result is nil/unparseable so
+		// coderTerminalOutcome returns empty strings. Without this row a
+		// `verdict == NoGo -> true` default would make every task with an
+		// unreadable envelope escalate to the larger model, silently.
+		{"NO-GO + empty outcome (legacy/unparseable envelope)", foremanv1alpha1.AgenticTaskVerdictNoGo, "", "", false},
 		{"GO", foremanv1alpha1.AgenticTaskVerdictGo, "", "", false},
 	}
 	for _, tc := range cases {
@@ -86,6 +92,7 @@ func TestShouldEscalateCoderOnFailure(t *testing.T) {
 		{"NO-GO + MODEL-DECIDED (capability failure, not opt-in)", foremanv1alpha1.AgenticTaskVerdictNoGo, "MODEL-DECIDED", "", false},
 		{"GO", foremanv1alpha1.AgenticTaskVerdictGo, "", "", false},
 		{"NO-CHANGES", foremanv1alpha1.AgenticTaskVerdictNoGo, "NO-CHANGES", "", false},
+		{"GO + NEEDS-VERIFICATION (defensive, never escalate)", foremanv1alpha1.AgenticTaskVerdictGo, "NEEDS-VERIFICATION", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,34 +482,6 @@ func TestIsAlreadyResolvedCoder(t *testing.T) {
 			}
 			if got := isAlreadyResolvedCoder(task); got != tc.want {
 				t.Errorf("isAlreadyResolvedCoder() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestIsNeedsVerificationCoder(t *testing.T) {
-	cases := []struct {
-		name       string
-		verdict    foremanv1alpha1.AgenticTaskVerdict
-		topOutcome string
-		want       bool
-	}{
-		{"NO-GO + NEEDS-VERIFICATION", foremanv1alpha1.AgenticTaskVerdictNoGo, "NEEDS-VERIFICATION", true},
-		{"NO-GO + MODEL-DECIDED (capability failure)", foremanv1alpha1.AgenticTaskVerdictNoGo, "MODEL-DECIDED", false},
-		{"NO-GO + ALREADY-RESOLVED (different outcome)", foremanv1alpha1.AgenticTaskVerdictNoGo, "ALREADY-RESOLVED", false},
-		{"NO-GO + empty outcome (legacy)", foremanv1alpha1.AgenticTaskVerdictNoGo, "", false},
-		{"INCOMPLETE + NEEDS-VERIFICATION (not a NO-GO)", foremanv1alpha1.AgenticTaskVerdictIncomplete, "NEEDS-VERIFICATION", false},
-		{"GO + NEEDS-VERIFICATION (impossible combo, defensive)", foremanv1alpha1.AgenticTaskVerdictGo, "NEEDS-VERIFICATION", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			task := &foremanv1alpha1.AgenticTask{}
-			task.Status.Verdict = tc.verdict
-			if tc.topOutcome != "" {
-				task.Status.Result = resultRaw(tc.topOutcome, "", "", "")
-			}
-			if got := isNeedsVerificationCoder(task); got != tc.want {
-				t.Errorf("isNeedsVerificationCoder() = %v, want %v", got, tc.want)
 			}
 		})
 	}

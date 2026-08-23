@@ -165,29 +165,7 @@ func TestBuildTask(t *testing.T) {
 	}
 }
 
-func TestTaskSucceededAndExitErr(t *testing.T) {
-	mk := func(phase aPhase, v aVerdict) *foremanv1alpha1.AgenticTask {
-		return &foremanv1alpha1.AgenticTask{Status: foremanv1alpha1.AgenticTaskStatus{Phase: phase, Verdict: v}}
-	}
-	cases := []struct {
-		name   string
-		task   *foremanv1alpha1.AgenticTask
-		wantOK bool
-	}{
-		{"succeeded GO", mk(phSucceeded, vGo), true},
-		{"succeeded GATE-PASS", mk(phSucceeded, vGatePass), true},
-		{"succeeded NO-GO", mk(phSucceeded, vNoGo), false},
-		{"succeeded INCOMPLETE", mk(phSucceeded, vIncomplete), false},
-		{"failed", mk(phFailed, ""), false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := taskSucceeded(tc.task); got != tc.wantOK {
-				t.Fatalf("taskSucceeded got %v want %v", got, tc.wantOK)
-			}
-		})
-	}
-
+func TestExitErr(t *testing.T) {
 	// All-good batch -> nil; any bad -> error naming the issue.
 	good := []taskResult{
 		{Issue: 1, Phase: phSucceeded, Verdict: vGo},
@@ -196,13 +174,40 @@ func TestTaskSucceededAndExitErr(t *testing.T) {
 	if err := exitErrFromResults(good); err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
+	// Every non-clean-success shape must be flagged, and each conjunct of
+	// the predicate has a row that fails without it. Verified by deleting
+	// each conjunct in turn and observing which issues stop being named:
+	//
+	//   drop `Phase == Succeeded`  -> #6 escapes  (#3 #4 #5 still caught)
+	//   drop the verdict check     -> #3, #5 escape (#4 #6 still caught)
+	//
+	// So #3 and #5 pin the verdict side, #6 pins the phase side, and #4
+	// (Failed, no verdict) is caught by either and pins neither on its own.
+	// Row #6 is the load-bearing one: a task that reached a non-Succeeded
+	// phase carrying a stale GO verdict. Without the phase conjunct it
+	// flips to good, so a dispatch batch containing a Failed task exits 0
+	// and a CI script gating on the exit code reports green.
 	mixed := []taskResult{
 		{Issue: 1, Phase: phSucceeded, Verdict: vGo},
 		{Issue: 3, Phase: phSucceeded, Verdict: vNoGo},
+		{Issue: 4, Phase: phFailed},
+		{Issue: 5, Phase: phSucceeded, Verdict: vIncomplete},
+		{Issue: 6, Phase: phFailed, Verdict: vGo},
 	}
 	err := exitErrFromResults(mixed)
-	if err == nil || !strings.Contains(err.Error(), "#3") {
-		t.Fatalf("expected error naming #3, got %v", err)
+	if err == nil {
+		t.Fatalf("expected an error for a mixed batch, got nil")
+	}
+	for _, want := range []string{"#3", "#4", "#5", "#6"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error naming %s, got %v", want, err)
+		}
+	}
+	// ...and the clean row must NOT be named. Without this an inverted or
+	// over-broad predicate still satisfies every Contains above, and only
+	// the `good` slice above catches it.
+	if strings.Contains(err.Error(), "#1") {
+		t.Fatalf("clean task #1 must not be reported as failed, got %v", err)
 	}
 }
 
