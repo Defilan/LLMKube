@@ -220,6 +220,7 @@ type FleetNodeStatus struct {
 // +kubebuilder:printcolumn:name="Accelerator",type=string,JSONPath=`.status.capability.accelerator`
 // +kubebuilder:printcolumn:name="RAM",type=integer,JSONPath=`.status.capability.availableRAMGB`
 // +kubebuilder:printcolumn:name="Current Task",type=string,JSONPath=`.status.currentTask`
+// +kubebuilder:printcolumn:name="K8s Node",type=string,JSONPath=`.status.kubernetesNode`
 // +kubebuilder:printcolumn:name="Heartbeat",type=date,JSONPath=`.status.lastHeartbeatTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

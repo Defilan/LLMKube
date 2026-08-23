@@ -32,6 +32,9 @@ spec:
     - jsonPath: .status.currentTask
       name: Current Task
       type: string
+    - jsonPath: .status.kubernetesNode
+      name: K8s Node
+      type: string
     - jsonPath: .status.lastHeartbeatTime
       name: Heartbeat
       type: date
