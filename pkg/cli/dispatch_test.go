@@ -47,7 +47,6 @@ const (
 	vGo         = foremanv1alpha1.AgenticTaskVerdictGo
 	vGatePass   = foremanv1alpha1.AgenticTaskVerdictGatePass
 	vNoGo       = foremanv1alpha1.AgenticTaskVerdictNoGo
-	vIncomplete = foremanv1alpha1.AgenticTaskVerdictIncomplete
 )
 
 func TestParseIssues(t *testing.T) {
@@ -165,29 +164,7 @@ func TestBuildTask(t *testing.T) {
 	}
 }
 
-func TestTaskSucceededAndExitErr(t *testing.T) {
-	mk := func(phase aPhase, v aVerdict) *foremanv1alpha1.AgenticTask {
-		return &foremanv1alpha1.AgenticTask{Status: foremanv1alpha1.AgenticTaskStatus{Phase: phase, Verdict: v}}
-	}
-	cases := []struct {
-		name   string
-		task   *foremanv1alpha1.AgenticTask
-		wantOK bool
-	}{
-		{"succeeded GO", mk(phSucceeded, vGo), true},
-		{"succeeded GATE-PASS", mk(phSucceeded, vGatePass), true},
-		{"succeeded NO-GO", mk(phSucceeded, vNoGo), false},
-		{"succeeded INCOMPLETE", mk(phSucceeded, vIncomplete), false},
-		{"failed", mk(phFailed, ""), false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := taskSucceeded(tc.task); got != tc.wantOK {
-				t.Fatalf("taskSucceeded got %v want %v", got, tc.wantOK)
-			}
-		})
-	}
-
+func TestExitErr(t *testing.T) {
 	// All-good batch -> nil; any bad -> error naming the issue.
 	good := []taskResult{
 		{Issue: 1, Phase: phSucceeded, Verdict: vGo},

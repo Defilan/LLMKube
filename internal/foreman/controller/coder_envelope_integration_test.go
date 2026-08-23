@@ -80,10 +80,10 @@ func TestRealAgentEnvelope_DrivesClassifiers(t *testing.T) {
 			"modelExtra": map[string]any{"outcome": "NEEDS-VERIFICATION"},
 		}
 		task := realEnvelopeTask(t, r)
-		if !isNeedsVerificationCoder(task) {
-			t.Fatal("real NEEDS-VERIFICATION envelope not recognized")
-		}
 		v, top, model := coderTerminalOutcome(task)
+		if top != "NEEDS-VERIFICATION" {
+			t.Fatalf("real NEEDS-VERIFICATION envelope not recognized: top-level outcome %q", top)
+		}
 		if shouldEscalateCoder(v, top, model) {
 			t.Fatal("NEEDS-VERIFICATION must not escalate")
 		}

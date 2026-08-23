@@ -778,9 +778,8 @@ type metalSnapshot struct {
 
 // metalEndpointSnapshot lists the EndpointSlices for isvc and returns a
 // metalSnapshot summarising both the ready-replica count and the heartbeat
-// state. It is the single source of truth for the metal path; both
-// metalReadyEndpoints and metalHeartbeatRequeueDuration are thin wrappers
-// around it.
+// state. It is the single source of truth for the metal path;
+// metalHeartbeatRequeueDuration is a thin wrapper around it.
 //
 // Slices are listed by the well-known kubernetes.io/service-name label rather
 // than fetched by name because there can be more than one: the metal-agent
@@ -873,13 +872,6 @@ func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, 
 		kind = metalHBFresh
 	}
 	return &metalSnapshot{ReadyReplicas: ready, Kind: kind, RawHeartbeat: rawHeartbeat}
-}
-
-// metalReadyEndpoints is a convenience wrapper that returns only the
-// ready-replica count for callers that do not need the full snapshot (e.g.,
-// unit tests). Production reconcile paths use metalEndpointSnapshot directly.
-func (r *InferenceServiceReconciler) metalReadyEndpoints(ctx context.Context, isvc *inferencev1alpha1.InferenceService) int32 {
-	return r.metalEndpointSnapshot(ctx, isvc).ReadyReplicas
 }
 
 // metalHeartbeatRequeueDuration returns the RequeueAfter duration to use after

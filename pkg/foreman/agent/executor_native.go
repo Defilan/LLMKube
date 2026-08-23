@@ -2170,10 +2170,10 @@ func (e *NativeAgentLoopExecutor) modelDecidedResult(
 // promoteTerminalOutcome lifts a terminal, non-escalating machine outcome
 // from the loop terminal's Extra (nested under "modelExtra" in the Result)
 // to the Result's top-level Extra["outcome"]. The controller's
-// isNeedsVerificationCoder and isAlreadyResolvedCoder (see
+// isAlreadyResolvedCoder (see
 // internal/foreman/controller/workload_coder_escalation.go; NOT imported
 // here, per the needsVerificationOutcome doc comment in verdict_policy.go)
-// read the TOP-LEVEL outcome to decide whether to skip escalation, so a
+// reads the TOP-LEVEL outcome to decide whether to skip escalation, so a
 // NEEDS-VERIFICATION or ALREADY-RESOLVED terminal buried under modelExtra
 // would still classify as a generic MODEL-DECIDED NO-GO and escalate; that
 // gap predates #1075 Task 5 (#970/#1033 shipped with the model-emitted

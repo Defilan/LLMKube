@@ -920,7 +920,7 @@ func executeCoderTask(
 // executor with a model-emitted NO-GO whose terminal extra carries
 // outcome=NEEDS-VERIFICATION (#1033) plus an unverified list, and asserts
 // the executor promotes both to the TOP-LEVEL Result.Extra, where the
-// controller's isNeedsVerificationCoder (see coderTerminalOutcome in
+// controller's escalation classifier (see shouldEscalateCoder in
 // internal/foreman/controller/workload_coder_escalation.go, not imported
 // here) reads them to skip escalation. Without the promotion the outcome
 // stayed buried under modelExtra and the task classified as a generic

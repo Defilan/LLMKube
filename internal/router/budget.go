@@ -17,8 +17,6 @@ limitations under the License.
 package router
 
 import (
-	"fmt"
-	"math"
 	"sync"
 	"time"
 )
@@ -255,24 +253,4 @@ func (s *BudgetStore) charge(sk string, now time.Time, window time.Duration, tok
 		})
 	}
 	s.buckets[sk] = bkts
-}
-
-// parseMaxUSD converts a MaxUSD string (e.g. "1.50") to a float64.
-// Returns an error if the string is not a valid non-negative decimal.
-func parseMaxUSD(s string) (float64, error) {
-	if s == "" {
-		return 0, nil
-	}
-	var f float64
-	if _, err := fmt.Sscanf(s, "%f", &f); err != nil {
-		return 0, fmt.Errorf("parse MaxUSD %q: %w", s, err)
-	}
-	if f < 0 {
-		return 0, fmt.Errorf("MaxUSD must be non-negative, got %s", s)
-	}
-	// Guard against NaN/Inf from malformed input.
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0, fmt.Errorf("MaxUSD must be finite, got %s", s)
-	}
-	return f, nil
 }

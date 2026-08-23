@@ -378,21 +378,6 @@ func isTerminalPhase(p foremanv1alpha1.AgenticTaskPhase) bool {
 	return p == foremanv1alpha1.AgenticTaskPhaseSucceeded || p == foremanv1alpha1.AgenticTaskPhaseFailed
 }
 
-// taskSucceeded reports whether a terminal task is a clean success: it reached
-// Succeeded with a GO or GATE-PASS verdict. Anything else (Failed, NO-GO,
-// INCOMPLETE, GATE-FAIL, GATE-ERROR) is a failure for exit-code purposes.
-func taskSucceeded(t *foremanv1alpha1.AgenticTask) bool {
-	if t.Status.Phase != foremanv1alpha1.AgenticTaskPhaseSucceeded {
-		return false
-	}
-	switch t.Status.Verdict {
-	case foremanv1alpha1.AgenticTaskVerdictGo, foremanv1alpha1.AgenticTaskVerdictGatePass:
-		return true
-	default:
-		return false
-	}
-}
-
 // resultFromTask snapshots a task's terminal status into a taskResult.
 func resultFromTask(t *foremanv1alpha1.AgenticTask) taskResult {
 	r := taskResult{
