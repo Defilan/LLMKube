@@ -256,15 +256,19 @@ func TestParkDecision_KeepsAnAnsweredDecision(t *testing.T) {
 
 func TestParkDecision_RefreshesAnUnansweredDecision(t *testing.T) {
 	// The guard is about answers, not about existence: an unanswered decision
-	// still picks up the current reason.
+	// still picks up the current reason. Options are set here to match the
+	// answered case exactly, so the only difference between the two tests is
+	// the answer itself and the guard cannot be satisfied by anything else.
 	dir := t.TempDir()
 	if _, err := ParkDecision(dir, Decision{
 		Issue: 1602, Kind: "adjudicate", Reason: "verify found issues",
+		Options: []string{"accept", "revise"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ParkDecision(dir, Decision{
 		Issue: 1602, Kind: "adjudicate", Reason: "second pass found more issues",
+		Options: []string{"accept", "revise"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -277,5 +281,69 @@ func TestParkDecision_RefreshesAnUnansweredDecision(t *testing.T) {
 	}
 	if got[0].Reason != "second pass found more issues" {
 		t.Errorf("Reason = %q, want the refreshed reason", got[0].Reason)
+	}
+}
+
+// answeredDecisionDir parks one answerable decision and returns its directory
+// and file path. Named for this file to avoid colliding with the package's
+// other test helpers.
+func decisionFixtureDir(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	p, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate", Options: []string{"accept", "revise"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir, p
+}
+
+func TestAnswerDecision_ErrorsWhenThereIsNoSuchDecision(t *testing.T) {
+	dir, _ := decisionFixtureDir(t)
+	if err := AnswerDecision(dir, 9999, "adjudicate", "revise"); err == nil {
+		t.Error("want an error for an issue with no parked decision")
+	}
+	if err := AnswerDecision(dir, 1602, "triage", "revise"); err == nil {
+		t.Error("want an error for a kind with no parked decision")
+	}
+	if err := AnswerDecision(filepath.Join(t.TempDir(), "never-created"), 1602, "adjudicate", "revise"); err == nil {
+		t.Error("want an error when the decisions dir does not exist")
+	}
+}
+
+func TestAnswerDecision_ErrorsWhenTheWriteFails(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root, permission bits do not apply")
+	}
+	dir, p := decisionFixtureDir(t)
+	// Read-only file and read-only directory: an in-place rewrite and a
+	// staged replace both have to fail, and the answer must not be reported
+	// as recorded when it was not.
+	if err := os.Chmod(p, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err == nil {
+		t.Fatal("want an error when the decision cannot be written")
+	}
+}
+
+func TestParkDecision_WritesTheFileUserReadWriteOnly(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root, permission bits do not apply")
+	}
+	_, p := decisionFixtureDir(t)
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A decision can carry evidence paths and a human's answer. Nothing else
+	// on the box needs to read it.
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("mode = %04o, want 0600", got)
 	}
 }
