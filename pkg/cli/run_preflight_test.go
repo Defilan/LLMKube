@@ -23,27 +23,71 @@ import (
 	"testing"
 )
 
+const (
+	preflightRepo   = "defilantech/LLMKube"
+	preflightBranch = "foreman/wl/issue-1602"
+	preflightPRURL  = "https://github.com/x/y/pull/9"
+)
+
+const preflightIssue = int32(1602)
+
+// errProbeDown is the transport failure a probe reports when the forge is
+// unreachable. Preflight must wrap it rather than flatten it, so a caller can
+// tell a forge outage from a policy decision.
+var errProbeDown = errors.New("api down")
+
+func preflightItem() QueueItem {
+	return QueueItem{Issue: preflightIssue, Repo: preflightRepo, IntentPath: "x.md"}
+}
+
+// fakeProbe answers only when Preflight forwards the arguments it expects. A
+// mismatch yields the zero value with a nil error, which is what a real forge
+// returns when asked about a repo, issue, or branch that does not exist. That
+// makes argument forwarding observable through Preflight's return value: a
+// dropped or blanked argument turns a skip into a proceed, which the ordinary
+// assertions already catch. No call recording, and nothing asserts on the
+// fake's own state.
 type fakeProbe struct {
+	wantRepo   string
+	wantIssue  int32
+	wantBranch string
+
 	pr        string
 	prErr     error
 	branch    bool
 	branchErr error
 }
 
-func (f fakeProbe) OpenPRForIssue(_ context.Context, _ string, _ int32) (string, error) {
+// probeExpecting fills in the arguments Preflight must forward, so each case
+// declares only the answers it wants back.
+func probeExpecting(answers fakeProbe) fakeProbe {
+	answers.wantRepo = preflightRepo
+	answers.wantIssue = preflightIssue
+	answers.wantBranch = preflightBranch
+	return answers
+}
+
+func (f fakeProbe) OpenPRForIssue(ctx context.Context, repoSlug string, issue int32) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if repoSlug != f.wantRepo || issue != f.wantIssue {
+		return "", nil
+	}
 	return f.pr, f.prErr
 }
-func (f fakeProbe) BranchExists(_ context.Context, _, _ string) (bool, error) {
+
+func (f fakeProbe) BranchExists(ctx context.Context, repoSlug, branch string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if repoSlug != f.wantRepo || branch != f.wantBranch {
+		return false, nil
+	}
 	return f.branch, f.branchErr
 }
 
-const (
-	preflightBranch = "foreman/wl/issue-1602"
-	preflightPRURL  = "https://github.com/x/y/pull/9"
-)
-
 func TestPreflight(t *testing.T) {
-	item := QueueItem{Issue: 1602, Repo: "defilantech/LLMKube", IntentPath: "x.md"}
 	cases := []struct {
 		name     string
 		probe    fakeProbe
@@ -58,12 +102,13 @@ func TestPreflight(t *testing.T) {
 		// The open PR is decided before the branch is probed, so a broken
 		// branch probe cannot turn a settled skip into a run-ending error.
 		{"open PR short circuits a broken branch probe",
-			fakeProbe{pr: preflightPRURL, branchErr: errors.New("api down")},
+			fakeProbe{pr: preflightPRURL, branchErr: errProbeDown},
 			"open PR", preflightPRURL},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := Preflight(context.Background(), tc.probe, item, preflightBranch)
+			got, err := Preflight(context.Background(), probeExpecting(tc.probe),
+				preflightItem(), preflightBranch)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -72,6 +117,11 @@ func TestPreflight(t *testing.T) {
 					t.Errorf("skipReason = %q, want empty", got)
 				}
 				return
+			}
+			// Guard against a future edit reintroducing a vacuous case:
+			// strings.Contains is trivially true for an empty needle.
+			if tc.wantDetail == "" {
+				t.Fatal("test bug: a skip case must name the detail its reason has to carry")
 			}
 			if !strings.Contains(got, tc.wantSkip) {
 				t.Errorf("skipReason = %q, want it to mention %q", got, tc.wantSkip)
@@ -86,21 +136,53 @@ func TestPreflight(t *testing.T) {
 // Preflight must fail closed: a probe error is not "no open PR". Dispatching
 // on a failed lookup risks duplicating work already in flight.
 func TestPreflight_ProbeErrorIsAnErrorNotAGreenLight(t *testing.T) {
-	item := QueueItem{Issue: 1602, Repo: "defilantech/LLMKube", IntentPath: "x.md"}
-	_, err := Preflight(context.Background(),
-		fakeProbe{prErr: errors.New("api down")}, item, preflightBranch)
+	got, err := Preflight(context.Background(),
+		probeExpecting(fakeProbe{prErr: errProbeDown}), preflightItem(), preflightBranch)
 	if err == nil {
 		t.Fatal("want an error when the PR probe fails")
+	}
+	if !errors.Is(err, errProbeDown) {
+		t.Errorf("err = %v, want it to wrap the probe's own error", err)
+	}
+	// A caller that logs the reason before checking err would otherwise
+	// report a skip that never happened.
+	if got != "" {
+		t.Errorf("skipReason = %q, want empty alongside an error", got)
 	}
 }
 
 // The branch probe fails closed for the same reason: a lookup that did not
 // answer is not an answer of "no such branch".
 func TestPreflight_BranchProbeErrorIsAnErrorNotAGreenLight(t *testing.T) {
-	item := QueueItem{Issue: 1602, Repo: "defilantech/LLMKube", IntentPath: "x.md"}
-	_, err := Preflight(context.Background(),
-		fakeProbe{branchErr: errors.New("api down")}, item, preflightBranch)
+	got, err := Preflight(context.Background(),
+		probeExpecting(fakeProbe{branchErr: errProbeDown}), preflightItem(), preflightBranch)
 	if err == nil {
 		t.Fatal("want an error when the branch probe fails")
+	}
+	if !errors.Is(err, errProbeDown) {
+		t.Errorf("err = %v, want it to wrap the probe's own error", err)
+	}
+	if got != "" {
+		t.Errorf("skipReason = %q, want empty alongside an error", got)
+	}
+}
+
+// Probes must run on the caller's context. The run loop cancels on its stall
+// deadline, and a probe handed context.Background() outlives the run it
+// belongs to.
+func TestPreflight_ProbesRunOnTheCallersContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// Answers that would otherwise be a clean proceed, so cancellation
+	// reaching the probe is the only thing that can produce an error.
+	got, err := Preflight(ctx, probeExpecting(fakeProbe{}), preflightItem(), preflightBranch)
+	if err == nil {
+		t.Fatal("want the caller's cancellation to reach the probe")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if got != "" {
+		t.Errorf("skipReason = %q, want empty alongside an error", got)
 	}
 }
