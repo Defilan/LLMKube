@@ -28,11 +28,17 @@ import (
 )
 
 const (
-	driveIssue    = int32(1602)
-	driveRepo     = "defilantech/LLMKube"
-	driveIntent   = "fix the thing"
+	driveIssue  = int32(1602)
+	driveRepo   = "defilantech/LLMKube"
+	driveIntent = "fix the thing"
+	// The name Dispatch returns. Deliberately not "wl-1602": a driver that
+	// derives the branch from the issue instead of from this cannot be told
+	// apart from a correct one when the two happen to agree.
 	driveWorkload = "wl-test"
-	driveBranch   = "foreman/wl-1602/issue-1602"
+	// What preflight probes, before any Workload exists.
+	drivePlannedBranch = "foreman/wl-1602/issue-1602"
+	// What every stage after dispatch acts on.
+	driveDispatchedBranch = "foreman/wl-test/issue-1602"
 	// Realistic gate output: multi-line, with runs of two spaces. Nothing here
 	// asserts on it through the rendered table, whose column splitter treats
 	// two spaces as a break.
@@ -80,6 +86,9 @@ type fakeEffects struct {
 	watch          WatchResult
 	verifyClean    bool
 	verifyEvidence string
+	// dispatchWorkload is the Workload name Dispatch reports creating.
+	// Empty means driveWorkload.
+	dispatchWorkload string
 
 	preflightErr error
 	dispatchErr  error
@@ -109,6 +118,9 @@ func (f *fakeEffects) Dispatch(ctx context.Context, item QueueItem, intent strin
 	f.dispatched++
 	if f.dispatchErr != nil {
 		return "", f.dispatchErr
+	}
+	if f.dispatchWorkload != "" {
+		return f.dispatchWorkload, nil
 	}
 	return driveWorkload, nil
 }
@@ -300,13 +312,14 @@ func TestDriveItem_ForwardsWhatEachStageNeeds(t *testing.T) {
 			t.Errorf("%s got a context that is not the caller's, so cancellation cannot reach it", site)
 		}
 	}
-	// The branch preflight cleared has to be the branch verify inspects, or
-	// the loop clears one branch and judges another.
-	if got := e.calls["preflight"].branch; got != driveBranch {
-		t.Errorf("Preflight branch = %q, want %q", got, driveBranch)
+	// Preflight runs before any Workload exists, so it probes the name the
+	// driver reserves. Verify runs after, so it acts on the name Dispatch
+	// reported. The two differ here on purpose.
+	if got := e.calls["preflight"].branch; got != drivePlannedBranch {
+		t.Errorf("Preflight branch = %q, want %q", got, drivePlannedBranch)
 	}
-	if got := e.calls["verify"].branch; got != driveBranch {
-		t.Errorf("Verify branch = %q, want %q", got, driveBranch)
+	if got := e.calls["verify"].branch; got != driveDispatchedBranch {
+		t.Errorf("Verify branch = %q, want %q", got, driveDispatchedBranch)
 	}
 	if got := e.calls["preflight"].item.Issue; got != driveIssue {
 		t.Errorf("Preflight issue = %d, want %d", got, driveIssue)
@@ -334,6 +347,28 @@ func TestDriveItem_ForwardsWhatEachStageNeeds(t *testing.T) {
 	}
 	if got := e.calls["watch"].factor; got != driveFactor {
 		t.Errorf("Watch factor = %v, want %v", got, driveFactor)
+	}
+}
+
+// Dispatch returns the Workload name it created precisely so the caller does
+// not have to guess it. A retry suffix, a collision-avoiding name or a slug
+// carrying the repo all produce something other than "wl-<issue>", and a driver
+// that derived the branch from the issue instead would watch and verify a
+// branch nobody pushed, then report a clean verify against work that is not
+// there. Silent, and wrong in the direction that matters.
+func TestDriveItem_TakesTheBranchFromTheWorkloadDispatchCreated(t *testing.T) {
+	e := &fakeEffects{dispatchWorkload: "coder-1602-retry-7", verifyClean: true}
+	if _, err := driveItemUnderTest(context.Background(), e, t.TempDir()); err != nil {
+		t.Fatalf("DriveItem: %v", err)
+	}
+	const want = "foreman/coder-1602-retry-7/issue-1602"
+	if got := e.calls["verify"].branch; got != want {
+		t.Errorf("Verify branch = %q, want %q", got, want)
+	}
+	// The reserved name is only ever an assumption for the one call that has
+	// to happen before the Workload exists.
+	if got := e.calls["preflight"].branch; got != drivePlannedBranch {
+		t.Errorf("Preflight branch = %q, want %q", got, drivePlannedBranch)
 	}
 }
 

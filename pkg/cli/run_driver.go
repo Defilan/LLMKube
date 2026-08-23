@@ -50,16 +50,30 @@ type Effects interface {
 	Verify(ctx context.Context, workload, branch string) (clean bool, evidence string, err error)
 }
 
-// taskBranch is the branch Foreman's coder pushes for an item.
+// taskBranch is the branch Foreman's coder pushes for a Workload. It mirrors
+// the controller's own convention, which builds the name from the Workload and
+// the issue: workload_controller.go:379 is "foreman/<workload>/issue-<n>".
 //
-// It has to be derivable BEFORE dispatch, because preflight probes it, so the
-// driver reserves the Workload name "wl-<issue>" and builds the controller's
-// own branch convention on top of it: workload_controller.go:379 names the
-// branch "foreman/<workload>/issue-<n>". Dispatch owes it to preflight to
-// create the Workload under that name; a Dispatch that names it something else
-// makes the loop clear one branch and judge another.
-func taskBranch(issue int32) string {
-	return fmt.Sprintf("foreman/wl-%d/issue-%d", issue, issue)
+// The workload name is a parameter and not derived from the issue on purpose.
+// Effects.Dispatch RETURNS the name it created precisely so the caller does not
+// have to guess it, and a production Dispatch has every reason to return
+// something other than the reserved name: a retry suffix, a collision-avoiding
+// name, a slug carrying the repo. A driver that rebuilt the branch from the
+// issue would then watch and verify a branch nobody pushed and call the verify
+// clean, which is a silent wrong answer in the direction that matters.
+func taskBranch(workload string, issue int32) string {
+	return fmt.Sprintf("foreman/%s/issue-%d", workload, issue)
+}
+
+// plannedWorkloadName is the Workload name the driver reserves for an item.
+//
+// Preflight probes the task branch before any Workload exists, so that one call
+// has no returned name to work from and has to assume this. It is the only
+// place the assumption is unavoidable, and it is a probe rather than a
+// judgment: an open PR on the issue is the stronger of preflight's two signals
+// and does not depend on the name at all.
+func plannedWorkloadName(issue int32) string {
+	return fmt.Sprintf("wl-%d", issue)
 }
 
 // optionsFor is the answer set a parked decision offers. Every park sets one:
@@ -89,7 +103,9 @@ func DriveItem(
 	baseline time.Duration,
 	factor float64,
 ) (Stage, error) {
-	branch := taskBranch(item.Issue)
+	// Preflight has no Workload to name yet; every stage after dispatch uses
+	// the name Dispatch reported.
+	branch := taskBranch(plannedWorkloadName(item.Issue), item.Issue)
 	var workload, evidence string
 	// attempts is inert in v1: nothing routes to StageFeedback, so verify is
 	// only ever reached on the first attempt and NextStage's one-pass rule is
@@ -114,6 +130,9 @@ func DriveItem(
 				return stage, err
 			}
 			workload = w
+			// The branch follows the Workload that actually exists, not the
+			// name reserved for the probe above.
+			branch = taskBranch(workload, item.Issue)
 			attempts++
 		case StageWatch:
 			res, err := e.Watch(ctx, workload, baseline, factor)
@@ -206,8 +225,11 @@ func printRunPlan(w io.Writer, opts *runOptions) error {
 	fprintf(w, "stall-factor: %g\n", opts.stallFactor)
 	fprintf(w, "items: %d\n", len(q.Items))
 	for i, item := range q.Items {
+		// The reserved name: nothing has dispatched, so there is no returned
+		// Workload name to build the branch from.
 		fprintf(w, "  issue %d (%s): branch %s, intent %s (%d bytes)\n",
-			item.Issue, item.Repo, taskBranch(item.Issue), item.IntentPath, len(intents[i]))
+			item.Issue, item.Repo, taskBranch(plannedWorkloadName(item.Issue), item.Issue),
+			item.IntentPath, len(intents[i]))
 	}
 	return nil
 }
