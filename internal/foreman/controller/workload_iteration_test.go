@@ -46,10 +46,31 @@ func iterationWorkload(issues []int32, reviewers int, maxIter *int32) *foremanv1
 	return w
 }
 
+// demotedNoGoChild is a terminal NO-GO review child whose NO-GO was
+// MANUFACTURED by a harness rail rather than asserted by the reviewer:
+// extra.verdictDemoted marks the rewrite (see applyIssueAskIntegrity in
+// pkg/foreman/agent). findingsJSON lets a case carry real findings or
+// none, which is the distinction that decides whether a fix iteration
+// has anything to act on (#1636).
+func demotedNoGoChild(summary, findingsJSON string) foremanv1alpha1.AgenticTask {
+	c := child(reviewStep, foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo)
+	raw := `{"schemaVersion":"foreman.v1","kind":"review","verdict":"NO-GO","summary":"` + summary + `",` +
+		`"extra":{"verdictDemoted":true,"verdictClaimed":"GO",` +
+		`"demotionReason":"issueAsk could not be verified as covering the fetched issue body",` +
+		`"modelExtra":{"findings":` + findingsJSON + `}}}`
+	c.Status.Result = &runtime.RawExtension{Raw: []byte(raw)}
+	return c
+}
+
+// reviewStep is the single reviewer's step label used throughout these
+// tests. Both review-child builders below stamp it, so it lives here
+// rather than being threaded through every call site.
+const reviewStep = "review-641-0"
+
 // noGoChild is a terminal NO-GO review child carrying a structured
 // review result so the feedback-prompt path is exercised end to end.
-func noGoChild(step, summary, findingsJSON string) foremanv1alpha1.AgenticTask {
-	c := child(step, foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo)
+func noGoChild(summary, findingsJSON string) foremanv1alpha1.AgenticTask {
+	c := child(reviewStep, foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo)
 	raw := `{"schemaVersion":"foreman.v1","kind":"review","verdict":"NO-GO","summary":"` + summary + `",` +
 		`"extra":{"outcome":"MODEL-DECIDED","modelExtra":{"findings":` + findingsJSON + `}}}`
 	c.Status.Result = &runtime.RawExtension{Raw: []byte(raw)}
@@ -91,6 +112,47 @@ func TestReviewIterationSteps(t *testing.T) {
 			name:     "reviewer GO converges: no iteration",
 			w:        iterationWorkload([]int32{641}, 1, nil),
 			children: baseRound(goVerdict),
+		},
+		{
+			// #1636: the issueAsk rail rewrites an approved verdict to
+			// NO-GO. With no findings the coder is handed a rejection it
+			// cannot act on, and re-running cannot make an unverifiable
+			// issueAsk verify, so the loop has no terminating condition.
+			name: "demoted NO-GO carrying no findings does not iterate",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				demotedNoGoChild("APPROVE: changes are minimal and well-tested", `[]`),
+			},
+		},
+		{
+			// Narrowness guard: a demotion is only inert when it carries
+			// nothing to fix. Real findings still deserve an iteration.
+			name: "demoted NO-GO carrying findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				demotedNoGoChild("mixed",
+					`[{"severity":"major","area":"correctness","message":"nil deref on empty strategy"}]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
+		},
+		{
+			// Narrowness guard: an UNdemoted NO-GO is the reviewer's own
+			// judgement. Absent structured findings it still iterates, as
+			// it did before #1636; the summary carries the feedback.
+			name: "genuine NO-GO with no findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				noGoChild("rejected: the fix does not address the issue", `[]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
 		},
 		{
 			name: "waits for every reviewer in the round to be terminal",
@@ -278,7 +340,7 @@ func TestReviewIterationCoderRef(t *testing.T) {
 }
 
 func TestReviewFeedbackPrompt(t *testing.T) {
-	structured := noGoChild("review-641-0", "scope creep beyond the issue ask",
+	structured := noGoChild("scope creep beyond the issue ask",
 		`[{"severity":"blocker","area":"scope","message":"reduces ACCESS_TOKEN_EXPIRE_MINUTES from 10080 to 30, unrelated to the issue","file":"config/auth.py","line":12,"suggestion":"revert the unrelated change"}]`)
 	prompt := reviewFeedbackPrompt([]*foremanv1alpha1.AgenticTask{&structured})
 	for _, want := range []string{
@@ -304,7 +366,7 @@ func TestReviewFeedbackPrompt(t *testing.T) {
 	// Legacy map-shaped findings (the boolean + *_details shape from the
 	// issue report) fail the strict schema and must fall back to raw JSON
 	// rather than vanishing.
-	legacy := noGoChild("review-641-0", "missing tests",
+	legacy := noGoChild("missing tests",
 		`{"missing_tests":true,"missing_tests_details":"no unit test covers the new branch"}`)
 	prompt = reviewFeedbackPrompt([]*foremanv1alpha1.AgenticTask{&legacy})
 	if !strings.Contains(prompt, "no unit test covers the new branch") {

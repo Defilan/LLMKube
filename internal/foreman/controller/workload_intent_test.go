@@ -107,7 +107,7 @@ func TestReviewIterationSteps_CarriesIntent(t *testing.T) {
 	children := []foremanv1alpha1.AgenticTask{
 		child("code-641", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictGo),
 		child("verify-641", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictGatePass),
-		noGoChild("review-641-0", "needs work", "[]"),
+		noGoChild("needs work", "[]"),
 	}
 
 	steps, _ := reviewIterationSteps(w, children)

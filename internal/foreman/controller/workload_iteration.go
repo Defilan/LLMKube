@@ -136,6 +136,57 @@ func issueStepIteration(step string, n int32) (int, bool) {
 	return reviewIterationOf(step, n)
 }
 
+// isInertDemotion reports whether a NO-GO was manufactured by a harness
+// rail rather than asserted by the reviewer, AND carries nothing to act
+// on (#1636).
+//
+// applyIssueAskIntegrity (pkg/foreman/agent) rewrites a reviewer's GO to
+// NO-GO when it cannot verify that the stated issue ask covers the
+// fetched issue body, stamping extra.verdictDemoted. That is a statement
+// about verification confidence, not about the change. Treating it as a
+// rejection opens a fix iteration whose feedback body is the reviewer's
+// own approval followed by an empty findings list, and re-running the
+// coder cannot make an unverifiable issueAsk verify, so the loop has no
+// terminating condition.
+//
+// The predicate is deliberately narrow: a demotion that DOES carry
+// findings still iterates, because those findings are real work, and an
+// undemoted NO-GO always iterates, because that is the reviewer's own
+// judgement. Only the empty-handed rewrite is suppressed.
+func isInertDemotion(t *foremanv1alpha1.AgenticTask) bool {
+	if t.Status.Result == nil || len(t.Status.Result.Raw) == 0 {
+		return false
+	}
+	var envelope struct {
+		Extra struct {
+			VerdictDemoted bool           `json:"verdictDemoted"`
+			ModelExtra     map[string]any `json:"modelExtra"`
+		} `json:"extra"`
+	}
+	// Malformed results are not our call to suppress; let them iterate.
+	if err := json.Unmarshal(t.Status.Result.Raw, &envelope); err != nil {
+		return false
+	}
+	if !envelope.Extra.VerdictDemoted {
+		return false
+	}
+	if findings, _ := reviewer.ParseFindings(envelope.Extra.ModelExtra); len(findings) > 0 {
+		return false
+	}
+	// Mirror reviewFeedbackSection's fallback: a non-conforming findings
+	// shape still reaches the coder as raw JSON, so it is not inert.
+	if raw, ok := envelope.Extra.ModelExtra["findings"]; ok {
+		if buf, err := json.Marshal(raw); err == nil {
+			switch string(buf) {
+			case "null", "[]", "{}", "":
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // noGoReviewRound inspects issue n's reviewer fan-out for fix
 // iteration k. It returns the NO-GO review tasks when the round is
 // complete — at least one review child exists, every one is terminal
@@ -161,7 +212,8 @@ func noGoReviewRound(
 			phase == foremanv1alpha1.AgenticTaskPhaseFailed {
 			terminal++
 		}
-		if children[i].Status.Verdict == foremanv1alpha1.AgenticTaskVerdictNoGo {
+		if children[i].Status.Verdict == foremanv1alpha1.AgenticTaskVerdictNoGo &&
+			!isInertDemotion(&children[i]) {
 			noGo = append(noGo, &children[i])
 		}
 	}
