@@ -53,6 +53,18 @@ func ParkDecision(dir string, d Decision) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create decisions dir: %w", err)
 	}
+	p := decisionPath(dir, d.Issue, d.Kind)
+	// An answer already on disk is the human's, and nothing consumes it before
+	// the loop re-parks the same item, so writing over it would silently
+	// destroy typed input. The item genuinely is parked either way, so leaving
+	// it alone is not an error for the caller. An unanswered decision is still
+	// refreshed with the current reason and evidence.
+	if existing, err := os.ReadFile(p); err == nil {
+		var prev Decision
+		if err := yaml.Unmarshal(existing, &prev); err == nil && prev.Answer != "" {
+			return p, nil
+		}
+	}
 	if d.Opened.IsZero() {
 		d.Opened = time.Now().UTC()
 	}
@@ -60,7 +72,6 @@ func ParkDecision(dir string, d Decision) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal decision: %w", err)
 	}
-	p := decisionPath(dir, d.Issue, d.Kind)
 	if err := os.WriteFile(p, b, 0o600); err != nil {
 		return "", fmt.Errorf("write decision: %w", err)
 	}

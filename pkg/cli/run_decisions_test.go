@@ -210,3 +210,72 @@ func TestListDecisions_OldestFirst(t *testing.T) {
 		t.Errorf("order = [%d %d], want [1602 1500] (oldest first)", got[0].Issue, got[1].Issue)
 	}
 }
+
+func TestParkDecision_KeepsAnAnsweredDecision(t *testing.T) {
+	// The driver parks unconditionally and nothing reads a decision before
+	// re-parking it, so a second run of the same item must not overwrite an
+	// answer a human already typed.
+	dir := t.TempDir()
+	first, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate",
+		Reason:  "verify found issues",
+		Options: []string{"accept", "revise"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AnswerDecision(dir, 1602, "adjudicate", "revise"); err != nil {
+		t.Fatal(err)
+	}
+	again, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate",
+		Reason:   "second pass found more issues",
+		Evidence: map[string]string{"verify": "./evidence/1602-verify-2.txt"},
+		Options:  []string{"accept", "revise"},
+	})
+	if err != nil {
+		t.Fatalf("re-park an answered decision: %v", err)
+	}
+	if again != first {
+		t.Errorf("path = %q, want the existing %q", again, first)
+	}
+	got, err := ListDecisions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if got[0].Answer != "revise" {
+		t.Errorf("Answer = %q, want revise to survive the re-park", got[0].Answer)
+	}
+	if got[0].Reason != "verify found issues" {
+		t.Errorf("Reason = %q, want the answered decision left intact", got[0].Reason)
+	}
+}
+
+func TestParkDecision_RefreshesAnUnansweredDecision(t *testing.T) {
+	// The guard is about answers, not about existence: an unanswered decision
+	// still picks up the current reason.
+	dir := t.TempDir()
+	if _, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate", Reason: "verify found issues",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParkDecision(dir, Decision{
+		Issue: 1602, Kind: "adjudicate", Reason: "second pass found more issues",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ListDecisions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if got[0].Reason != "second pass found more issues" {
+		t.Errorf("Reason = %q, want the refreshed reason", got[0].Reason)
+	}
+}
