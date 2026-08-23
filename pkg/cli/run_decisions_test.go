@@ -324,10 +324,10 @@ func TestAnswerDecision_ErrorsWhenTheWriteFails(t *testing.T) {
 	if err := os.Chmod(p, 0o400); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(dir, 0o500); err != nil { //nolint:gosec // G302: a directory mode, and the test needs the dir non-writable
+	if err := os.Chmod(dir, 0o500); err != nil { //nolint:gosec // G302: directory mode
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // G302: a directory mode, restored so TempDir cleanup works
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // G302: directory mode
 	err := AnswerDecision(dir, 1602, "adjudicate", "revise")
 	if err == nil {
 		t.Fatal("want an error when the decision cannot be written")
