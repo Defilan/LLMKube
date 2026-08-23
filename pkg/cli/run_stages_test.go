@@ -61,11 +61,11 @@ func TestNextStage_NeverMakesASecondFeedbackAttempt(t *testing.T) {
 	if got.Next != StageParked || got.Park != "escalate" {
 		t.Fatalf("second dirty verify = (%q,%q), want (parked,escalate)", got.Next, got.Park)
 	}
-	// And no attempt count beyond that reopens feedback.
+	// And no attempt count beyond that must always escalate, never adjudicate.
 	for n := 3; n < 10; n++ {
 		g := NextStage(StageVerify, Facts{VerifyClean: false, Attempts: n})
-		if g.Next == StageFeedback {
-			t.Fatalf("attempts=%d reopened feedback", n)
+		if g.Next != StageParked || g.Park != "escalate" {
+			t.Fatalf("attempts=%d = (%q,%q), want (parked,escalate)", n, g.Next, g.Park)
 		}
 	}
 }
