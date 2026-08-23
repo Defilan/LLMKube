@@ -85,10 +85,12 @@ func plannedWorkloadName(issue int32) string {
 // `foreman decisions` renders that as "any", so an option-less park hands the
 // human a free-text prompt instead of the answers the loop understands.
 func optionsFor(kind string) []string {
-	if kind == "escalate" {
+	if kind == ParkEscalate {
 		return []string{"requeue", "hand-fix", "drop"}
 	}
-	return []string{"accept", "revise", "escalate", "drop"}
+	// The escalate answer asks for exactly what a ParkEscalate park gets, so it
+	// spells the kind rather than a lookalike of it.
+	return []string{"accept", "revise", ParkEscalate, "drop"}
 }
 
 // maxStageTransitions bounds one item's trip through the loop.

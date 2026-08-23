@@ -30,6 +30,17 @@ const (
 	StageDone      Stage = "done"
 )
 
+// The kinds a park can carry. Transition.Park and Decision.Kind stay plain
+// strings (Decision.Kind is serialised to YAML and names the file on disk), so
+// nothing but a shared constant keeps the two ends spelling a kind alike:
+// optionsFor keys the answer set a human is offered off this exact value, and a
+// kind introduced here that optionsFor does not recognise silently gets the
+// adjudicate answer set instead of its own.
+const (
+	ParkEscalate   = "escalate"
+	ParkAdjudicate = "adjudicate"
+)
+
 // maxAttempts is the structural one-pass rule: one original attempt plus at
 // most one automatic feedback pass. A third is never reached by any input.
 const maxAttempts = 2
@@ -69,7 +80,7 @@ func NextStage(cur Stage, f Facts) Transition {
 		return Transition{Next: StageWatch}
 	case StageWatch:
 		if f.Stalled {
-			return Transition{Next: StageParked, Park: "escalate", Reason: "stalled"}
+			return Transition{Next: StageParked, Park: ParkEscalate, Reason: "stalled"}
 		}
 		return Transition{Next: StageVerify}
 	case StageVerify:
@@ -77,9 +88,9 @@ func NextStage(cur Stage, f Facts) Transition {
 			return Transition{Next: StageFinalize}
 		}
 		if f.Attempts >= maxAttempts {
-			return Transition{Next: StageParked, Park: "escalate", Reason: "verify failed after the feedback pass"}
+			return Transition{Next: StageParked, Park: ParkEscalate, Reason: "verify failed after the feedback pass"}
 		}
-		return Transition{Next: StageParked, Park: "adjudicate", Reason: "verify found issues"}
+		return Transition{Next: StageParked, Park: ParkAdjudicate, Reason: "verify found issues"}
 	case StageFeedback:
 		return Transition{Next: StageWatch}
 	case StageFinalize:
