@@ -110,7 +110,7 @@ func TestReviewIterationSteps_CarriesIntent(t *testing.T) {
 		noGoChild("needs work", "[]"),
 	}
 
-	steps, _ := reviewIterationSteps(w, children)
+	steps, _, _ := reviewIterationSteps(w, children)
 
 	var found bool
 	for _, s := range steps {

@@ -199,6 +199,14 @@ func TestEnforceReviewerScopeOverlap_Issue379DriftDemotesGo(t *testing.T) {
 	if v, _ := extra["verdictDemoted"].(bool); !v {
 		t.Errorf("demotion must set verdictDemoted=true")
 	}
+	// #1636: the controller suppresses the empty fix iteration that follows
+	// an issueAsk demotion but must still iterate on scope drift, which is
+	// actionable. It tells them apart by this marker alone, so a scope
+	// demotion that does not name itself is silently swallowed downstream.
+	if extra["verdictDemotedBy"] != railScopeOverlap {
+		t.Errorf("scope demotion must set verdictDemotedBy=%q; got %v",
+			railScopeOverlap, extra["verdictDemotedBy"])
+	}
 	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
 		t.Errorf("verdictClaimed should archive GO; got %v", extra["verdictClaimed"])
 	}

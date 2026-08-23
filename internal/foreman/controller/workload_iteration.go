@@ -40,6 +40,14 @@ import (
 // chained behind it.
 const conditionTypeReviewIterationTriggered = "ReviewIterationTriggered"
 
+// conditionTypeReviewIterationSuppressed reports that a terminal NO-GO did
+// NOT open a fix iteration because the issueAsk rail manufactured it out of
+// the reviewer's own GO and it carries no findings (#1636). The demoted
+// NO-GO still counts as incomplete in the rollup, so without this the
+// operator sees a Failed Workload on a branch the reviewer approved and
+// nothing anywhere says why no iteration ran.
+const conditionTypeReviewIterationSuppressed = "ReviewIterationSuppressed"
+
 // defaultMaxReviewIterations is the per-issue fix-iteration bound when
 // Workload.spec.maxReviewIterations is unset. One iteration mirrors
 // what a human does with a single request-changes round; an explicit 0
@@ -136,55 +144,97 @@ func issueStepIteration(step string, n int32) (int, bool) {
 	return reviewIterationOf(step, n)
 }
 
-// isInertDemotion reports whether a NO-GO was manufactured by a harness
-// rail rather than asserted by the reviewer, AND carries nothing to act
-// on (#1636).
+// suppressedDemotion records one review child whose inert demotion kept a
+// fix iteration from opening, so emitReviewIterations can say so. Without
+// it the demoted NO-GO still lands in the incomplete bucket
+// (classifyChildren, workload_controller.go) and rolls the Workload to
+// Failed on a branch the reviewer approved, with nothing anywhere
+// explaining why no iteration ran (#1636).
+type suppressedDemotion struct {
+	// step is the review child's step label (e.g. review-641-0), falling
+	// back to its object name when the label is missing.
+	step string
+	// reason is the rail's demotionReason, verbatim.
+	reason string
+}
+
+// taskStepLabel names a child for operator-facing prose: its step label
+// when it carries one, its object name otherwise.
+func taskStepLabel(t *foremanv1alpha1.AgenticTask) string {
+	if label := t.Labels[labelStep]; label != "" {
+		return label
+	}
+	return t.Name
+}
+
+// inertDemotion reports whether a NO-GO was manufactured by the issueAsk
+// rail rather than asserted by the reviewer, AND carries nothing to act on
+// (#1636). It returns the rail's demotionReason so the caller can record
+// why the fix iteration did not run.
 //
-// applyIssueAskIntegrity (pkg/foreman/agent) rewrites a reviewer's GO to
-// NO-GO when it cannot verify that the stated issue ask covers the
-// fetched issue body, stamping extra.verdictDemoted. That is a statement
-// about verification confidence, not about the change. Treating it as a
-// rejection opens a fix iteration whose feedback body is the reviewer's
-// own approval followed by an empty findings list, and re-running the
-// coder cannot make an unverifiable issueAsk verify, so the loop has no
-// terminating condition.
+// enforceReviewerIssueAsk (pkg/foreman/agent/executor_native.go) rewrites a
+// reviewer's GO to NO-GO when it cannot verify that the stated issue ask
+// covers the fetched issue body. That is a statement about verification
+// confidence, not about the change. Treating it as a rejection opens a fix
+// iteration whose feedback body is the reviewer's own approval followed by
+// an empty findings list, and re-running the coder cannot make an
+// unverifiable issueAsk verify, so the loop has no terminating condition.
 //
-// The predicate is deliberately narrow: a demotion that DOES carry
-// findings still iterates, because those findings are real work, and an
-// undemoted NO-GO always iterates, because that is the reviewer's own
-// judgement. Only the empty-handed rewrite is suppressed.
-func isInertDemotion(t *foremanv1alpha1.AgenticTask) bool {
+// Three conditions are required, and each one excludes a NO-GO the coder
+// CAN act on:
+//
+//   - verdictDemotedBy is the issueAsk rail. enforceReviewerScopeOverlap
+//     (scope_overlap.go) also demotes, but its verdict says the diff
+//     touches none of the files the issue names, which is real work.
+//     Keying off the bare verdictDemoted flag would suppress those too.
+//   - verdictClaimed is GO, i.e. the rail really did rewrite the verdict.
+//     enforceReviewerIssueAsk stamps the demotion fields on a path where
+//     it does NOT: an unverified non-GO review is marked untrusted and the
+//     reviewer's OWN NO-GO is returned. Suppressing that would discard a
+//     genuine rejection whose feedback lives in the summary.
+//   - no findings. A demotion carrying findings is real work either way.
+//
+// Every field is read from extra.modelExtra. The executor's
+// modelDecidedResult nests the rails' whole map there and
+// promoteTerminalOutcome lifts only outcome / unverified / resolvedBy to
+// the top level, so reading these keys from extra directly (as this
+// predicate first shipped) never matched anything the executor emits.
+func inertDemotion(t *foremanv1alpha1.AgenticTask) (reason string, inert bool) {
 	if t.Status.Result == nil || len(t.Status.Result.Raw) == 0 {
-		return false
+		return "", false
 	}
 	var envelope struct {
 		Extra struct {
-			VerdictDemoted bool           `json:"verdictDemoted"`
-			ModelExtra     map[string]any `json:"modelExtra"`
+			ModelExtra map[string]any `json:"modelExtra"`
 		} `json:"extra"`
 	}
 	// Malformed results are not our call to suppress; let them iterate.
 	if err := json.Unmarshal(t.Status.Result.Raw, &envelope); err != nil {
-		return false
+		return "", false
 	}
-	if !envelope.Extra.VerdictDemoted {
-		return false
+	modelExtra := envelope.Extra.ModelExtra
+	if by, _ := modelExtra["verdictDemotedBy"].(string); by != reviewer.RailIssueAsk {
+		return "", false
 	}
-	if findings, _ := reviewer.ParseFindings(envelope.Extra.ModelExtra); len(findings) > 0 {
-		return false
+	if claimed, _ := modelExtra["verdictClaimed"].(string); claimed != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+		return "", false
+	}
+	if findings, _ := reviewer.ParseFindings(modelExtra); len(findings) > 0 {
+		return "", false
 	}
 	// Mirror reviewFeedbackSection's fallback: a non-conforming findings
 	// shape still reaches the coder as raw JSON, so it is not inert.
-	if raw, ok := envelope.Extra.ModelExtra["findings"]; ok {
+	if raw, ok := modelExtra["findings"]; ok {
 		if buf, err := json.Marshal(raw); err == nil {
 			switch string(buf) {
 			case "null", "[]", "{}", "":
 			default:
-				return false
+				return "", false
 			}
 		}
 	}
-	return true
+	reason, _ = modelExtra["demotionReason"].(string)
+	return reason, true
 }
 
 // noGoReviewRound inspects issue n's reviewer fan-out for fix
@@ -196,11 +246,18 @@ func isInertDemotion(t *foremanv1alpha1.AgenticTask) bool {
 // triggers a fix iteration. Scanning what exists (rather than the
 // expected reviewer count) keeps cloud-suppressed reviewers from
 // permanently blocking the trigger, mirroring escalationSteps.
+//
+// The second return carries the round's inert demotions (#1636): NO-GO
+// children this function refused to count, so the caller can report them
+// instead of leaving the Workload to fail unexplained. It is populated
+// only once the round is complete, because an in-flight round may still
+// produce a NO-GO that iterates anyway.
 func noGoReviewRound(
 	children []foremanv1alpha1.AgenticTask, n int32, k int,
-) []*foremanv1alpha1.AgenticTask {
+) ([]*foremanv1alpha1.AgenticTask, []suppressedDemotion) {
 	var total, terminal int
 	var noGo []*foremanv1alpha1.AgenticTask
+	var suppressed []suppressedDemotion
 	for i := range children {
 		iter, ok := reviewIterationOf(children[i].Labels[labelStep], n)
 		if !ok || iter != k {
@@ -212,15 +269,25 @@ func noGoReviewRound(
 			phase == foremanv1alpha1.AgenticTaskPhaseFailed {
 			terminal++
 		}
-		if children[i].Status.Verdict == foremanv1alpha1.AgenticTaskVerdictNoGo &&
-			!isInertDemotion(&children[i]) {
-			noGo = append(noGo, &children[i])
+		if children[i].Status.Verdict != foremanv1alpha1.AgenticTaskVerdictNoGo {
+			continue
 		}
+		if reason, inert := inertDemotion(&children[i]); inert {
+			suppressed = append(suppressed, suppressedDemotion{
+				step:   taskStepLabel(&children[i]),
+				reason: reason,
+			})
+			continue
+		}
+		noGo = append(noGo, &children[i])
 	}
-	if total == 0 || terminal < total || len(noGo) == 0 {
-		return nil
+	if total == 0 || terminal < total {
+		return nil, nil
 	}
-	return noGo
+	if len(noGo) == 0 {
+		return nil, suppressed
+	}
+	return noGo, suppressed
 }
 
 // reviewIterationSteps decides which code-<n>-r<k> / verify-<n>-r<k> /
@@ -249,19 +316,23 @@ func noGoReviewRound(
 // forcing profile — and falls back to spec.coderAgentRef otherwise
 // (the caller emits the RevisionUnderIssueFixProfile warning).
 //
+// The third return lists the NO-GO reviews whose inert demotion (#1636)
+// kept a round from iterating, for the caller to report; see
+// suppressedDemotion.
+//
 // Pure function: no API calls, no status writes. The caller owns
 // MaxTasks accounting, sovereignty filtering, and creation, and must
 // restrict invocation to issue-batch mode (user-authored Pipeline step
 // names could false-match the synthesized naming scheme).
 func reviewIterationSteps(
 	w *foremanv1alpha1.Workload, children []foremanv1alpha1.AgenticTask,
-) (steps []foremanv1alpha1.PipelineStep, iterated []int32) {
+) (steps []foremanv1alpha1.PipelineStep, iterated []int32, suppressed []suppressedDemotion) {
 	maxIter := effectiveMaxReviewIterations(w)
 	if maxIter <= 0 ||
 		len(w.Spec.ReviewerAgentRefs) == 0 ||
 		len(w.Spec.Issues) == 0 ||
 		w.Spec.CoderAgentRef == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	existing := make(map[string]struct{}, len(children))
@@ -280,7 +351,8 @@ func reviewIterationSteps(
 		branch := fmt.Sprintf("foreman/%s/issue-%d", w.Name, n)
 		issueIterated := false
 		for k := 1; k <= maxIter; k++ {
-			noGo := noGoReviewRound(children, n, k-1)
+			noGo, inert := noGoReviewRound(children, n, k-1)
+			suppressed = append(suppressed, inert...)
 			if len(noGo) == 0 {
 				break
 			}
@@ -352,12 +424,20 @@ func reviewIterationSteps(
 				})
 				issueIterated = true
 			}
+			if k == maxIter {
+				// Last round in the budget: no k+1 pass will ever look at
+				// the reviews this round produces, so scan them here or an
+				// inert demotion in the FINAL round goes unreported and the
+				// Workload fails unexplained after all.
+				_, inert := noGoReviewRound(children, n, k)
+				suppressed = append(suppressed, inert...)
+			}
 		}
 		if issueIterated {
 			iterated = append(iterated, n)
 		}
 	}
-	return steps, iterated
+	return steps, iterated, suppressed
 }
 
 // reviewFeedbackPrompt distills the NO-GO reviewers' structured
@@ -395,10 +475,7 @@ func reviewFeedbackPrompt(noGo []*foremanv1alpha1.AgenticTask) string {
 // legacy map-shaped findings ("scope_creep" + "*_details" keys) still
 // reach the coder, and a result-less task degrades to a one-liner.
 func reviewFeedbackSection(t *foremanv1alpha1.AgenticTask) string {
-	label := t.Labels[labelStep]
-	if label == "" {
-		label = t.Name
-	}
+	label := taskStepLabel(t)
 
 	var envelope struct {
 		Summary string `json:"summary"`
@@ -533,6 +610,63 @@ func countReviewIterations(w *foremanv1alpha1.Workload, stepNames map[string]str
 	return total
 }
 
+// recordSuppressedDemotions reports the inert demotions that kept a fix
+// iteration from opening (#1636), naming each review task and the rail's
+// demotionReason. Same contract as the MaxTasks cap twenty lines below: no
+// silent skip. The Workload still rolls to Failed on the demoted NO-GO, so
+// the condition is what turns "Failed with no explanation" into "Failed
+// because the issueAsk rail could not verify the reviewer read the issue".
+//
+// The condition carries the record because it survives; the paired event
+// surfaces it in `kubectl describe` while the operator is looking. Both are
+// skipped when the stored condition already says exactly this, so a
+// steady-state reconcile neither churns LastTransitionTime nor re-fires the
+// event.
+func (r *WorkloadReconciler) recordSuppressedDemotions(
+	ctx context.Context, w *foremanv1alpha1.Workload, suppressed []suppressedDemotion,
+) error {
+	if len(suppressed) == 0 {
+		return nil
+	}
+
+	parts := make([]string, 0, len(suppressed))
+	for _, s := range suppressed {
+		if s.reason == "" {
+			parts = append(parts, s.step)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", s.step, s.reason))
+	}
+	msg := fmt.Sprintf(
+		"no fix iteration for %d NO-GO review task(s): the issueAsk rail rewrote the reviewer's GO and the review carries no findings, so the iteration would hand the coder an approval it cannot act on (%s)",
+		len(suppressed), strings.Join(parts, "; "))
+
+	cond := metav1.Condition{
+		Type:    conditionTypeReviewIterationSuppressed,
+		Status:  metav1.ConditionTrue,
+		Reason:  "InertDemotion",
+		Message: msg,
+	}
+	if existing := apimeta.FindStatusCondition(
+		w.Status.Conditions, conditionTypeReviewIterationSuppressed,
+	); existing != nil && existing.Status == cond.Status &&
+		existing.Reason == cond.Reason && existing.Message == cond.Message {
+		return nil
+	}
+	cond.LastTransitionTime = metav1.Now()
+
+	patch := client.MergeFrom(w.DeepCopy())
+	setCondition(&w.Status.Conditions, cond)
+	if err := r.Status().Patch(ctx, w, patch); err != nil {
+		return fmt.Errorf("patch review-iteration suppression condition: %w", err)
+	}
+	if r.Recorder != nil {
+		r.Recorder.Eventf(w, nil, corev1.EventTypeWarning,
+			conditionTypeReviewIterationSuppressed, "Reconcile", "%s", msg)
+	}
+	return nil
+}
+
 // emitReviewIterations is the fix-iteration emission hook (#946):
 // called from Reconcile's children-exist branch after the advisory
 // wiring and before escalation + rollup. Synthesizes the due
@@ -554,7 +688,15 @@ func (r *WorkloadReconciler) emitReviewIterations(
 		return children, nil
 	}
 
-	steps, iterated := reviewIterationSteps(w, children)
+	steps, iterated, inert := reviewIterationSteps(w, children)
+
+	// Before the no-op short-circuit: a round that suppressed an inert
+	// demotion usually emits NO steps at all, and that is exactly the case
+	// an operator needs told about.
+	if err := r.recordSuppressedDemotions(ctx, w, inert); err != nil {
+		return children, err
+	}
+
 	if len(steps) == 0 {
 		return children, nil
 	}

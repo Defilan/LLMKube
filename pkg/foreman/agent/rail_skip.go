@@ -1,5 +1,7 @@
 package agent
 
+import "github.com/defilantech/llmkube/pkg/foreman/agent/reviewer"
+
 // Rail-skip observability (#1605).
 //
 // A single `repo.DiffNameOnly` call feeds four reviewer rails. When it fails
@@ -18,9 +20,14 @@ package agent
 // this verdict?" and answering it should not require knowing every rail's name.
 const railsSkippedKey = "railsSkipped"
 
-// Rail names used in railsSkipped entries.
+// Rail names. Used in railsSkipped entries and, for the two rails that can
+// rewrite a verdict, in the verdictDemotedBy marker those rails stamp. The
+// demoting rails take their names from pkg/foreman/agent/reviewer so the
+// controller, which reads verdictDemotedBy back out of the result envelope
+// and cannot import this package, compares against the same strings (#1636).
 const (
-	railScopeOverlap        = "scope-overlap"
+	railIssueAsk            = reviewer.RailIssueAsk
+	railScopeOverlap        = reviewer.RailScopeOverlap
 	railVerdictFromFindings = "verdict-from-findings"
 	railEmptyClaim          = "empty-claim"
 	railGroundedFinding     = "grounded-finding"
