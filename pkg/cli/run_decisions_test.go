@@ -706,3 +706,16 @@ func TestParkDecision_DoesNotClaimACorruptDecisionWhenNoneExists(t *testing.T) {
 		t.Errorf("dir = %v, want nothing written", names)
 	}
 }
+
+func TestDecisionKindMustNotBeEmpty(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := ParkDecision(dir, Decision{Issue: 1602}); err == nil {
+		t.Error("want an error for an empty kind")
+	}
+	if names := decisionDirNames(t, dir); len(names) != 0 {
+		t.Errorf("dir = %v, want no decision parked without a kind", names)
+	}
+	if err := AnswerDecision(dir, 1602, "", "revise"); err == nil {
+		t.Error("want an error for an empty kind")
+	}
+}

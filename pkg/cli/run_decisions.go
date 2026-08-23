@@ -52,6 +52,12 @@ type Decision struct {
 // decisions directory, and makes AnswerDecision rewrite whatever YAML it lands
 // on as a Decision, dropping every key it did not recognise.
 func checkDecisionKind(kind string) error {
+	// Task 7 feeds this from --kind, and Decision.Kind is not omitempty, so an
+	// empty kind parks a file named "1602-.yaml" carrying a decision with no
+	// kind at all.
+	if kind == "" {
+		return fmt.Errorf("decision kind must not be empty")
+	}
 	if strings.ContainsAny(kind, `/\`) {
 		return fmt.Errorf("decision kind %q must not contain a path separator", kind)
 	}
