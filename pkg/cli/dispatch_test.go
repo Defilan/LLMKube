@@ -47,6 +47,7 @@ const (
 	vGo         = foremanv1alpha1.AgenticTaskVerdictGo
 	vGatePass   = foremanv1alpha1.AgenticTaskVerdictGatePass
 	vNoGo       = foremanv1alpha1.AgenticTaskVerdictNoGo
+	vIncomplete = foremanv1alpha1.AgenticTaskVerdictIncomplete
 )
 
 func TestParseIssues(t *testing.T) {
@@ -173,13 +174,30 @@ func TestExitErr(t *testing.T) {
 	if err := exitErrFromResults(good); err != nil {
 		t.Fatalf("expected nil, got %v", err)
 	}
+	// Every non-clean-success shape must be flagged. Rows #4 (Failed) and
+	// #5 (Succeeded + INCOMPLETE) pin the verdict side; row #6 is what pins
+	// the PHASE side: a task that reached a non-Succeeded phase carries a
+	// stale/good verdict, and exitErrFromResults must still reject it
+	// because the phase gate is load-bearing — the verdict is model-emitted
+	// and the CLI does not trust it in isolation. Without the
+	// "Phase == Succeeded" conjunct, row #6 flips to good and a Failed
+	// dispatch task would exit 0, so a CI script gating on the exit code
+	// would report green.
 	mixed := []taskResult{
 		{Issue: 1, Phase: phSucceeded, Verdict: vGo},
 		{Issue: 3, Phase: phSucceeded, Verdict: vNoGo},
+		{Issue: 4, Phase: phFailed},
+		{Issue: 5, Phase: phSucceeded, Verdict: vIncomplete},
+		{Issue: 6, Phase: phFailed, Verdict: vGo},
 	}
 	err := exitErrFromResults(mixed)
-	if err == nil || !strings.Contains(err.Error(), "#3") {
-		t.Fatalf("expected error naming #3, got %v", err)
+	if err == nil {
+		t.Fatalf("expected an error for a mixed batch, got nil")
+	}
+	for _, want := range []string{"#3", "#4", "#5", "#6"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error naming %s, got %v", want, err)
+		}
 	}
 }
 

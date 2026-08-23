@@ -8,7 +8,7 @@
 #
 # Run it with `make lint-deadcode`.
 #
-# The register below is debt, not policy. It should shrink to empty.
+# The two registers below are debt, not policy. Both should shrink to empty.
 version: "2"
 run:
   # The whole point. Test-only references must not count as uses.
@@ -43,4 +43,22 @@ linters:
       # (classifyFile, classifyFootprint and their tables) landed in #1254
       # and nothing calls them.
       - path: pkg/foreman/agent/workclass\.go # Refs #1075
+        linters: [unused]
+
+      # ---------------------------------------------------------------
+      # REGISTER B: pre-existing dead symbols found when this guard was
+      # introduced. Each needs a decision (delete, or wire up); none has
+      # been made yet. Tracked for triage in #1602 rather than silently
+      # deleted. Removing an entry here is the deliverable of that issue.
+      # ---------------------------------------------------------------
+      # The whole budget engine (BudgetRule, BudgetStore, NewBudgetStore,
+      # Charge, and the parseMaxUSD parser) is staged for the ModelRouter
+      # budget work (#434, #440): nothing in production constructs a
+      # router.BudgetRule, so the entire file is dead. We suppress the
+      # FILE, not a single symbol, on purpose: parseMaxUSD was the file's
+      # last unexported symbol, and the `unused` linter does not report
+      # exported identifiers, so deleting it would hide the whole file's
+      # dead-ness instead of making it visible. It stays suppressed until
+      # #434/#440 wire the engine in or the file is deleted.
+      - path: internal/router/budget\.go  # Refs #434, #440
         linters: [unused]

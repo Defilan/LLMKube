@@ -473,6 +473,38 @@ func TestRetryAfterIsPositive(t *testing.T) {
 	}
 }
 
+func TestParseMaxUSD(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    float64
+		wantErr bool
+	}{
+		{"", 0, false},
+		{"1.50", 1.5, false},
+		{"0", 0, false},
+		{"100", 100, false},
+		{"0.01", 0.01, false},
+		{"-1", 0, true},
+		{"abc", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := parseMaxUSD(tt.input)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseMaxUSD(%q) expected error, got nil", tt.input)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseMaxUSD(%q): unexpected error: %v", tt.input, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("parseMaxUSD(%q) = %f, want %f", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestConcurrentChargeAndAllowed(t *testing.T) {
 	t0 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
 	nowFn, _ := nowFn(t0)

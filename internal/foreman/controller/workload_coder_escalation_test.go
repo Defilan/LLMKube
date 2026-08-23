@@ -58,6 +58,7 @@ func TestShouldEscalateCoder(t *testing.T) {
 		{"model gave up / stuck (like #921)", foremanv1alpha1.AgenticTaskVerdictIncomplete, "MODEL-DECIDED", "", false},
 		{"stuck-loop detected", foremanv1alpha1.AgenticTaskVerdictIncomplete, "STUCK-LOOP-DETECTED", "", false},
 		{"NO-GO but no-changes (trivial)", foremanv1alpha1.AgenticTaskVerdictNoGo, "NO-CHANGES", "", false},
+		{"NO-GO + ERROR (not a base capability failure)", foremanv1alpha1.AgenticTaskVerdictNoGo, "ERROR", "", false},
 		{"GO", foremanv1alpha1.AgenticTaskVerdictGo, "", "", false},
 	}
 	for _, tc := range cases {
@@ -86,6 +87,7 @@ func TestShouldEscalateCoderOnFailure(t *testing.T) {
 		{"NO-GO + MODEL-DECIDED (capability failure, not opt-in)", foremanv1alpha1.AgenticTaskVerdictNoGo, "MODEL-DECIDED", "", false},
 		{"GO", foremanv1alpha1.AgenticTaskVerdictGo, "", "", false},
 		{"NO-CHANGES", foremanv1alpha1.AgenticTaskVerdictNoGo, "NO-CHANGES", "", false},
+		{"GO + NEEDS-VERIFICATION (defensive, never escalate)", foremanv1alpha1.AgenticTaskVerdictGo, "NEEDS-VERIFICATION", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,37 +477,6 @@ func TestIsAlreadyResolvedCoder(t *testing.T) {
 			}
 			if got := isAlreadyResolvedCoder(task); got != tc.want {
 				t.Errorf("isAlreadyResolvedCoder() = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestNeedsVerificationEscalationSkip pins the NEEDS-VERIFICATION escalation
-// skip (#1033): a NO-GO whose terminal outcome is NEEDS-VERIFICATION must not
-// escalate, in both the base and the opt-in failure classifiers. This is the
-// behavior the removed isNeedsVerificationCoder helper provided, now inlined
-// in shouldEscalateCoder and shouldEscalateCoderOnFailure.
-func TestNeedsVerificationEscalationSkip(t *testing.T) {
-	cases := []struct {
-		name        string
-		verdict     foremanv1alpha1.AgenticTaskVerdict
-		topOutcome  string
-		wantBase    bool
-		wantFailure bool
-	}{
-		{"NO-GO + NEEDS-VERIFICATION does not escalate", foremanv1alpha1.AgenticTaskVerdictNoGo, "NEEDS-VERIFICATION", false, false},
-		{"NO-GO + MODEL-DECIDED escalates (base only)", foremanv1alpha1.AgenticTaskVerdictNoGo, "MODEL-DECIDED", true, false},
-		{"NO-GO + ERROR escalates (failure only)", foremanv1alpha1.AgenticTaskVerdictNoGo, "ERROR", false, true},
-		{"INCOMPLETE + MODEL-DECIDED escalates (failure)", foremanv1alpha1.AgenticTaskVerdictIncomplete, "MODEL-DECIDED", false, true},
-		{"GO + NEEDS-VERIFICATION (defensive)", foremanv1alpha1.AgenticTaskVerdictGo, "NEEDS-VERIFICATION", false, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldEscalateCoder(tc.verdict, tc.topOutcome, ""); got != tc.wantBase {
-				t.Errorf("shouldEscalateCoder() = %v, want %v", got, tc.wantBase)
-			}
-			if got := shouldEscalateCoderOnFailure(tc.verdict, tc.topOutcome); got != tc.wantFailure {
-				t.Errorf("shouldEscalateCoderOnFailure() = %v, want %v", got, tc.wantFailure)
 			}
 		})
 	}

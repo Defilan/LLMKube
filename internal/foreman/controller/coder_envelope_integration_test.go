@@ -81,11 +81,22 @@ func TestRealAgentEnvelope_DrivesClassifiers(t *testing.T) {
 		}
 		task := realEnvelopeTask(t, r)
 		v, top, model := coderTerminalOutcome(task)
-		if top != "NEEDS-VERIFICATION" {
+		// Assert BOTH halves of the classifier's predicate, not just the
+		// outcome string: shouldEscalateCoder also returns false for GO,
+		// INCOMPLETE and an empty verdict, so checking only the top-level
+		// outcome would let this pass vacuously if the verdict ever stops
+		// propagating.
+		if v != foremanv1alpha1.AgenticTaskVerdictNoGo {
+			t.Fatalf("real NEEDS-VERIFICATION envelope: verdict = %s, want NoGo", v)
+		}
+		if top != needsVerificationOutcome {
 			t.Fatalf("real NEEDS-VERIFICATION envelope not recognized: top-level outcome %q", top)
 		}
 		if shouldEscalateCoder(v, top, model) {
 			t.Fatal("NEEDS-VERIFICATION must not escalate")
+		}
+		if shouldEscalateCoderOnFailure(v, top) {
+			t.Fatal("NEEDS-VERIFICATION must not escalate on failure either")
 		}
 	})
 
