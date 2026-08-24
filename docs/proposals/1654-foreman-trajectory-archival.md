@@ -1,6 +1,7 @@
 # Foreman trajectory archival
 
-**Status:** proposed
+**Status:** Implemented. This document has been reconciled against what shipped;
+the sections below marked "as built" record design that moved during review.
 **Issue:** #1654
 **Scope:** sub-project 1 of 4 in the lab model-training effort. This proposal
 covers durable capture only. Dataset building, training, and A/B evaluation are
@@ -116,6 +117,61 @@ builder would later have to dedupe.
 Both objects originate as ConfigMaps, so a bundle is bounded at roughly 1 MB by
 construction. No multipart, no streaming, no chunking: a plain PUT is the entire
 write path.
+
+## As built: what moved during implementation
+
+Five review rounds changed the design in ways this document originally did not
+describe. They are recorded here rather than left as a gap between the proposal
+and the code.
+
+**Path containment is a real check, not a lexical one.** The original design
+implied a lexical containment test. That is insufficient: a symlink planted on
+an intermediate path segment let a write land outside the archive root and
+return success. The shipped writer resolves the root with `filepath.EvalSymlinks`,
+uses `filepath.Rel` rather than a string prefix, and **re-verifies containment
+after `MkdirAll`**, because a pre-create check cannot see a symlink planted on a
+segment it has not created yet. Containment runs before any bytes are written,
+so a refused bundle never receives content. This mirrors `resolveInside` in
+`pkg/foreman/agent/tools/workspace.go`; the duplication is deliberate for now,
+since that function sits in the coder's live write path and lifting it into a
+shared helper is its own change.
+
+**The bundle key falls back to the task UID.** `RecordedAt` is only populated
+when `task.Status.FinishedAt` is non-nil, and an empty value made the key
+constant across retries, so the skip check made the first attempt win
+permanently. The key now falls back to `Task.UID`, and refuses when both are
+empty. Note the limit: a Kubernetes object UID is constant for an object's
+lifetime, so a re-run of the same task object under the fallback reuses its key.
+
+**`meta.json` is a completion sentinel.** `writeAll` writes it last, so its
+presence means the bundle finished. Without it, a directory created by a process
+that died between `MkdirAll` and the first write would be read as a finished
+bundle forever, losing that record on every subsequent reconcile. An incomplete
+directory is now removed and rewritten rather than skipped or refused: refusing
+would make the debris permanent, which is the same loss by another route. Only a
+**completed** bundle is immutable, and the sentinel is what distinguishes the two.
+
+**Key fields are validated.** An empty or `.`-cleaning `Repo` normalises to a
+`no-repo` segment, mirroring `no-issue`, so the repo portion is the slug verbatim
+or `no-repo` and a reader should expect variable depth. NUL bytes and an empty
+`Task.Name` are rejected at construction rather than failing later with an opaque
+`invalid argument`.
+
+**Archival runs on every terminal reconcile, not only the first.** `WriteBundle`
+skips a complete bundle, so the repeat costs one `stat` and gives a failed write
+a free retry. Gating it on the first terminal pass would turn a transient failure
+into permanent loss for that task.
+
+**Known residual.** An empty regular `meta.json`, produced by a torn write of
+the sentinel itself, passes the completion check but cannot be parsed. The window
+is a crash during the write of a small final file. Closing it means writing the
+sentinel atomically via temp-and-rename.
+
+**Layering.** `pkg/foreman/archive` takes no direct `k8s.io`, `sigs.k8s.io` or
+`internal/` import. A transitive check cannot hold: the package consumes
+`audit.Record`, and `pkg/foreman/audit` already imports controller-runtime, so
+roughly 170 Kubernetes packages arrive transitively regardless. The constraint
+that is enforced, and the one that matters, is on direct imports.
 
 ## Opt-in
 
