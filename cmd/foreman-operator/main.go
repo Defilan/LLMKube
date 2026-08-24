@@ -71,6 +71,7 @@ func main() {
 	var webhookPort int
 	var auditRetention time.Duration
 	var auditRetentionInterval time.Duration
+	var archiveDir string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8081",
 		"The address the metrics endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8082",
@@ -105,6 +106,12 @@ func main() {
 		"How often the audit reaper sweeps. Defaults to 1h. Lower values are "+
 			"only useful in tests; raising it past a few hours delays the "+
 			"first cleanup pass proportionally.")
+	flag.StringVar(&archiveDir, "archive-dir", "",
+		"Directory for terminal-task archive bundles. Empty (the default) "+
+			"disables archival entirely. Bundles contain the audit record and "+
+			"the agent transcript, which include source code, issue text, and "+
+			"tool output; enabling this writes all of that to the mounted "+
+			"volume in plain text.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -147,8 +154,9 @@ func main() {
 	}
 
 	if err := (&foremancontroller.AgenticTaskReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		ArchiveDir: archiveDir,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AgenticTask")
 		os.Exit(1)

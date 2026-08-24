@@ -1,0 +1,122 @@
+suite: foreman operator terminal-task archival (#1654)
+templates:
+  - operator-deployment.yaml
+
+tests:
+  # ---- Off by default ----
+  #
+  # Archival writes source code, issue text and tool output to a volume,
+  # so a default install must render byte-identically to what it rendered
+  # before this feature existed. The operator's own default is the empty
+  # string, and the chart expresses "off" by omitting the flag entirely
+  # rather than passing --archive-dir="".
+
+  - it: renders no archive flag, mount or volume when disabled
+    asserts:
+      # NOTE: do NOT reach for notMatchRegexRaw here. On a template that
+      # parses as a k8s manifest, helm-unittest hands the *Raw matchers a
+      # nil document, so matchRegexRaw always fails and notMatchRegexRaw
+      # always passes. It is a vacuous assertion, not a strong one.
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --archive-dir=/var/lib/foreman/archive
+      # Pins the arg COUNT so an unguarded flag is caught even if it
+      # renders a value this suite does not name (a bare --archive-dir=,
+      # say). Adding an unrelated operator flag will fail this line: that
+      # is deliberate, bump the number in the same commit.
+      - lengthEqual:
+          path: spec.template.spec.containers[0].args
+          count: 9
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: archive
+      - notContains:
+          path: spec.template.spec.volumes
+          any: true
+          content:
+            name: archive
+
+  - it: leaves the pre-existing tmp volume and mount untouched when disabled
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tmp
+            mountPath: /tmp
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir: {}
+
+  # ---- On ----
+
+  - it: renders the flag, the mount and the volume when enabled
+    set:
+      foreman.archive.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --archive-dir=/var/lib/foreman/archive
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: archive
+            mountPath: /var/lib/foreman/archive
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: archive
+            emptyDir: {}
+
+  # This case exists because the two above would both pass if the template
+  # hardcoded the default path and ignored `dir`. The flag the operator
+  # reads and the path the volume is mounted at must move together: a
+  # bundle written to an unmounted path is lost on pod restart.
+
+  - it: mounts the volume at the configured dir, not the default
+    set:
+      foreman.archive.enabled: true
+      foreman.archive.dir: /mnt/elsewhere
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --archive-dir=/mnt/elsewhere
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: archive
+            mountPath: /mnt/elsewhere
+      # The default path must be gone from BOTH places, not just present
+      # at the new one: a template that renders the flag from `dir` but
+      # hardcodes the mount (or vice versa) still splits them apart.
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --archive-dir=/var/lib/foreman/archive
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: archive
+            mountPath: /var/lib/foreman/archive
+
+  # The emptyDir default is a safety floor, not the intended production
+  # source. If the template hardcoded emptyDir instead of passing the
+  # value through, every enabled install would silently lose its bundles
+  # on pod restart and the two enabled cases above would still pass.
+
+  - it: passes the volume source through verbatim so any volume type works
+    set:
+      foreman.archive.enabled: true
+      foreman.archive.volume:
+        emptyDir: null
+        persistentVolumeClaim:
+          claimName: foreman-archive
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: archive
+            persistentVolumeClaim:
+              claimName: foreman-archive

@@ -65,6 +65,14 @@ spec:
             # reaper entirely without redeploying.
             - --audit-retention={{ .Values.operator.audit.retention }}
             - --audit-retention-interval={{ .Values.operator.audit.interval }}
+            {{- if .Values.foreman.archive.enabled }}
+            # Terminal-task archival (#1654). One flag carries both the
+            # switch and the destination: empty (the default, rendered
+            # by omitting the flag entirely) disables archival in the
+            # operator. Bundles hold source code, issue text and tool
+            # output, so this is opt-in only.
+            - --archive-dir={{ .Values.foreman.archive.dir }}
+            {{- end }}
           ports:
             - name: health
               containerPort: {{ .Values.operator.health.port }}
@@ -110,6 +118,10 @@ spec:
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
             {{- end }}
+            {{- if .Values.foreman.archive.enabled }}
+            - name: archive
+              mountPath: {{ .Values.foreman.archive.dir }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -117,6 +129,10 @@ spec:
         - name: webhook-certs
           secret:
             secretName: {{ include "foreman.webhook.secretName" . }}
+        {{- end }}
+        {{- if .Values.foreman.archive.enabled }}
+        - name: archive
+          {{- toYaml .Values.foreman.archive.volume | nindent 10 }}
         {{- end }}
       {{- with .Values.operator.nodeSelector }}
       nodeSelector:

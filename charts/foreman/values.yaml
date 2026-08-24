@@ -89,6 +89,34 @@ foreman:
       additionalLabels:
         prometheus: kube-prometheus-stack-prometheus
 
+  # Terminal-task archival (#1654). Off by default.
+  #
+  # When enabled the operator writes one immutable bundle per terminal
+  # task to `dir`, containing the audit record and the agent transcript.
+  # READ THIS BEFORE ENABLING: those two artifacts contain source code,
+  # issue text, and whatever appeared in tool output, so turning this on
+  # writes all of that to the volume below, in plain text, outside the
+  # 7 day audit retention window. That is a deliberate operator decision
+  # about where your code and issue text come to rest, not a detail.
+  #
+  # The operator only writes files. Getting bundles off the node is a
+  # separate concern: run a CronJob that syncs `dir` to durable storage.
+  # Both storage classes in a typical install are RWO and reclaim with
+  # Delete, so a bundle that is never shipped is one PVC deletion from
+  # gone.
+  archive:
+    enabled: false
+    # Absolute path the operator writes bundles to, and the mount path of
+    # the volume below. The two are always the same path by construction.
+    dir: /var/lib/foreman/archive
+    # Volume mounted at `dir` when enabled. Any volume source works; the
+    # operator never learns what is behind it. The emptyDir default keeps
+    # a mistaken `enabled: true` from silently filling a node disk that
+    # something else depends on, but it also means bundles die with the
+    # pod: point this at a persistentVolumeClaim for real use.
+    volume:
+      emptyDir: {}
+
 # agents is the multi-fleet map (#994). Leave it UNSET for a single
 # agent (the legacy `agent:` block above is used as-is and renders
 # exactly the resources it always has, so an existing install is
