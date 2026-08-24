@@ -104,19 +104,50 @@ foreman:
   # Both storage classes in a typical install are RWO and reclaim with
   # Delete, so a bundle that is never shipped is one PVC deletion from
   # gone.
+  #
+  # AGENT VERSION SKEW: archival captures transcripts only from agents at
+  # the same version as this chart. The `transcriptRef` lift that
+  # publishes a transcript ships in foreman-agent; the archiver that reads
+  # it ships in foreman-operator. Metal agents are commonly updated out of
+  # band from the chart, so skew is normal. Against an older agent
+  # `status.transcriptRef` stays empty, the archiver takes neither the
+  # transcript_read nor the transcript_empty branch, every bundle records
+  # `hasTranscript: false`, and foreman_archive_failures_total stays at
+  # zero. That is indistinguishable from a fleet of deterministic runs, so
+  # there is no failure signal at all: bring the agents to this version
+  # before you trust a transcript to be there.
+  #
+  # ROLLBACK: use `helm rollback` (or `kubectl rollout undo`), which
+  # reverts the operator's args and its image together. Rolling the image
+  # back on its own while this stays enabled, as in
+  # `helm upgrade --set operator.image.tag=<old>`, crashloops the
+  # operator: the older binary does not define -archive-dir, Go's flag
+  # package exits 2 on a flag it does not know, and the pod lands in
+  # CrashLoopBackOff. Set `enabled: false` in the same command if you
+  # really must roll only the image.
   archive:
     enabled: false
     # Absolute path the operator writes bundles to, and the mount path of
     # the volume below. The two are always the same path by construction.
     dir: /var/lib/foreman/archive
     # Volume mounted at `dir` when enabled. Any volume source works; the
-    # operator never learns what is behind it. The emptyDir default keeps
-    # a mistaken `enabled: true` from silently filling a node disk that
-    # something else depends on, but it also means bundles die with the
-    # pod: point this at a persistentVolumeClaim for real use. Read the
+    # operator never learns what is behind it. Empty here on purpose: the
+    # chart renders `emptyDir: {}` when you name no source, which keeps a
+    # mistaken `enabled: true` from silently filling a node disk that
+    # something else depends on. It also means bundles die with the pod,
+    # so point this at a persistentVolumeClaim for real use. Read the
     # fsGroup note below before you do.
-    volume:
-      emptyDir: {}
+    #
+    #   volume:
+    #     persistentVolumeClaim:
+    #       claimName: foreman-archive
+    #
+    # Do NOT put `emptyDir: {}` back here as the default. Helm deep-merges
+    # your values onto the chart's, so a default source is ADDED to the one
+    # you name rather than replaced, and a Volume carrying two sources is
+    # rejected by the API server with "may not specify more than 1 volume
+    # type": helm upgrade fails and nothing rolls out.
+    volume: {}
     # fsGroup applied to the operator pod, but ONLY while archival is
     # enabled, so a default install's pod security context is unchanged.
     #

@@ -149,7 +149,23 @@ spec:
         {{- end }}
         {{- if .Values.foreman.archive.enabled }}
         - name: archive
+          {{- /*
+            The emptyDir fallback lives HERE, not in values.yaml, because Helm
+            deep-merges an operator's values onto the chart's. A chart default
+            of {emptyDir: {}} can never be replaced, only added to:
+            --set foreman.archive.volume.persistentVolumeClaim.claimName=x
+            rendered emptyDir AND the claim, and the API server refuses that
+            with "may not specify more than 1 volume type", so helm upgrade
+            failed and no rollout happened. hostPath behaved the same way.
+            That is the exact path values.yaml tells operators to take, so the
+            default has to be an empty map and the safety floor has to be a
+            template branch (#1654).
+          */}}
+          {{- if .Values.foreman.archive.volume }}
           {{- toYaml .Values.foreman.archive.volume | nindent 10 }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         {{- end }}
       {{- with .Values.operator.nodeSelector }}
       nodeSelector:

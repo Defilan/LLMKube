@@ -190,6 +190,22 @@ byte-indistinguishable from a fleet of deterministic runs. Fixed at the root, in
 the watcher, beside the three existing lifts; `audit.Record.TranscriptRef`, empty
 since the field was introduced, is repaired as a side effect.
 
+**That silence returns under agent version skew, and it is not fixed here.** The
+`transcriptRef` lift ships in `foreman-agent`; the archiver that reads it ships
+in `foreman-operator`. Metal agents in this fleet are updated out of band from
+the chart, so a new operator running against older agents is a normal state, not
+an edge case. Those agents never populate `status.transcriptRef`, so the
+archiver enters neither the `transcript_read` nor the `transcript_empty` branch:
+every bundle records `hasTranscript: false` and `foreman_archive_failures_total`
+stays flat. That is exactly the indistinguishable-from-deterministic failure the
+`transcript_empty` branch was added to prevent, reached by a route no counter
+covers, because an absent reference is the deterministic-run path this design
+deliberately made silent. Archival therefore requires agents at the operator's
+version to capture transcripts at all, and the chart's `foreman.archive` block
+says so where an operator enabling it will read. Detecting skew from the
+operator side needs an agent version on the AgenticTask or the FleetNode that
+the archiver can compare against; that is a follow-up, not a v1 behaviour.
+
 **The node reservation is released before archival, not after.** Archival writes
 to a mounted volume and takes no timeout, and the AgenticTask controller runs
 with concurrency 1. An archive stalled on a hung mount ahead of the release would
