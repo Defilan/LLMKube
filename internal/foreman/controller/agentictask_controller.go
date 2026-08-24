@@ -145,14 +145,23 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
 			}
 		}
-		r.archiveTerminalTask(ctx, &task, log)
 		// Release the node reservation so the scheduler can dispatch the next
 		// task there. Guarded on taskKey, so a node already reserved for a
 		// different task is untouched.
+		//
+		// This runs BEFORE archival, and the order is load-bearing. Archival
+		// writes to a mounted volume and takes no timeout: a hung NFS or CSI
+		// mount blocks os.MkdirAll indefinitely. This controller runs with
+		// concurrency 1, so an archive stalled ahead of the release would hold
+		// the node reserved for a task that has already finished AND wedge
+		// every other AgenticTask reconcile behind it. Releasing first bounds
+		// a stalled mount to "no bundles are being written" instead of "the
+		// fleet stops scheduling".
 		if err := r.clearNodeCurrentTask(ctx, task.Status.AssignedNode, taskKey(&task)); err != nil {
 			log.Error(err, "failed to release node reservation on terminal task",
 				"node", task.Status.AssignedNode, "task", task.Name)
 		}
+		r.archiveTerminalTask(ctx, &task, log)
 		return ctrl.Result{}, nil
 	}
 

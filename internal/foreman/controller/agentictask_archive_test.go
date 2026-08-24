@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
@@ -53,6 +54,12 @@ import (
 // regression from scattering bundles through the source tree.
 func TestArchiveTerminalTask_DisabledWritesNothing(t *testing.T) {
 	root := t.TempDir()
+	// Safe only as a package-wide invariant: t.Chdir refuses to run in a test
+	// that has called t.Parallel, but it cannot see a t.Parallel anywhere ELSE
+	// in internal/foreman/controller. A parallel test added to this package
+	// would silently run against this directory, and envtest resolves its CRD
+	// paths relative to the working directory, so the failure would land far
+	// from its cause. Nothing in this package is parallel today; keep it so.
 	t.Chdir(root)
 
 	task := terminalTask()
@@ -316,12 +323,96 @@ func TestArchiveTerminalTask_TranscriptPresentButKeyMissingIsCounted(t *testing.
 	}
 }
 
+// TestReconcile_ReleasesTheNodeBeforeArchiving pins the ORDER of the two side
+// effects a terminal reconcile performs.
+//
+// Archival writes to a mounted volume and takes no timeout, so a hung NFS or
+// CSI mount blocks os.MkdirAll indefinitely. This controller runs with
+// concurrency 1 (SetupWithManager sets no MaxConcurrentReconciles), so an
+// archive stalled ahead of the release would hold the node reserved for a task
+// that has already finished AND wedge every other AgenticTask reconcile behind
+// it: one bad mount stops the fleet scheduling. Releasing first bounds the
+// damage to "no bundles are being written".
+//
+// The assertion is made from INSIDE the archive path rather than after
+// Reconcile returns, because both orders leave the same end state and an
+// after-the-fact check would pass either way. The interceptor fires on the
+// transcript ConfigMap read, which is the first thing archiveTerminalTask
+// does, and reads the FleetNode at that instant: the reservation must already
+// be gone.
+func TestReconcile_ReleasesTheNodeBeforeArchiving(t *testing.T) {
+	root := t.TempDir()
+	task := terminalTask()
+	// firstTerminal=false so audit.RecordTerminal is skipped and the only
+	// ConfigMap read on this path is the archiver's transcript fetch.
+	task.Annotations = map[string]string{audit.AuditedAnnotation: "true"}
+	task.Status.AssignedNode = archiveNodeName
+	task.Status.TranscriptRef = "foreman-transcript-archive-me"
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: task.Status.TranscriptRef, Namespace: task.Namespace},
+		Data:       map[string]string{transcriptDataKey: `{"turns":[]}`},
+	}
+	node := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: archiveNodeName},
+		Status:     foremanv1alpha1.FleetNodeStatus{CurrentTask: taskKey(task)},
+	}
+
+	var (
+		archiveRan      bool
+		reservationSeen string
+	)
+	c := interceptor.NewClient(fakeClientWithTask(t, task, cm, node), interceptor.Funcs{
+		Get: func(
+			ctx context.Context,
+			inner client.WithWatch,
+			key client.ObjectKey,
+			obj client.Object,
+			opts ...client.GetOption,
+		) error {
+			if _, isCM := obj.(*corev1.ConfigMap); isCM {
+				archiveRan = true
+				var n foremanv1alpha1.FleetNode
+				if err := inner.Get(ctx, client.ObjectKey{Name: archiveNodeName}, &n); err != nil {
+					t.Errorf("reading the node from inside the archive path: %v", err)
+				}
+				reservationSeen = n.Status.CurrentTask
+			}
+			return inner.Get(ctx, key, obj, opts...)
+		},
+	})
+
+	r := &AgenticTaskReconciler{Client: c, ArchiveDir: root}
+	if _, err := r.Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKeyFromObject(task)}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	if !archiveRan {
+		t.Fatal("the archiver never read the transcript, so this test observed nothing")
+	}
+	if reservationSeen != "" {
+		t.Errorf("FleetNode.status.currentTask = %q when archival began, want empty: "+
+			"a stalled mount would hold the node reserved and wedge the controller", reservationSeen)
+	}
+
+	// The release must not have cost the bundle.
+	dir, err := archive.BundleDir(root, audit.BuildRecord(task, nil))
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "audit.json")); err != nil {
+		t.Errorf("releasing the node first must not skip the bundle: %v", err)
+	}
+}
+
 // --- archive test helpers ---
 
 const (
 	archiveAgentName     = "archive-coder"
 	archiveAgentModel    = "qwopus-fusion-27b"
 	archiveAgentEndpoint = "http://foundation-router.lan:4000/v1"
+	archiveNodeName      = "archive-coder-node"
 )
 
 // terminalTask returns a Succeeded AgenticTask carrying exactly the fields the
@@ -374,7 +465,7 @@ func fakeClientWithTask(
 	t *testing.T,
 	task *foremanv1alpha1.AgenticTask,
 	extra ...client.Object,
-) client.Client {
+) client.WithWatch {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := foremanv1alpha1.AddToScheme(scheme); err != nil {
@@ -387,7 +478,11 @@ func fakeClientWithTask(
 	if ref := task.Spec.AgentRef; ref != nil && ref.Name != "" {
 		objs = append(objs, archiveAgent(ref.Name, task.Namespace))
 	}
-	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	return fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(objs...).
+		WithStatusSubresource(&foremanv1alpha1.FleetNode{}).
+		Build()
 }
 
 // archiveAgent is the Agent terminalTask points at. It is a cloud-proxy agent
