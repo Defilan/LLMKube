@@ -127,3 +127,81 @@ func TestCoderJobResultToResult_PreservesPromotedOutcome(t *testing.T) {
 		}
 	})
 }
+
+// #1656: every terminal branch must carry the in-pod extras, not just the
+// two that already did. transcriptRef is the field that made this visible:
+// the operator archives a bundle per terminal task and reaches the
+// transcript through status.transcriptRef, which watcher.go lifts out of
+// Result.Extra. A branch that rebuilds Extra from scratch drops it, and the
+// loss is silent because an absent transcriptRef is also the legitimate
+// deterministic-run shape.
+func TestCoderJobResultToResult_CarriesResultExtraOnEveryBranch(t *testing.T) {
+	start := time.Now()
+
+	transcript := map[string]any{
+		"kind":       "ConfigMap",
+		"apiVersion": "v1",
+		"namespace":  "default",
+		"name":       "foreman-transcript-coder-1656",
+	}
+
+	cases := []struct {
+		name    string
+		verdict string
+	}{
+		{"GO", string(foremanv1alpha1.AgenticTaskVerdictGo)},
+		{"NO-GO", string(foremanv1alpha1.AgenticTaskVerdictNoGo)},
+		{"INCOMPLETE", string(foremanv1alpha1.AgenticTaskVerdictIncomplete)},
+		{"ERROR", "ERROR"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name+" carries transcriptRef", func(t *testing.T) {
+			cjr := CoderJobResult{
+				Verdict: tc.verdict,
+				JobName: "coder-job-1656",
+				ResultExtra: map[string]any{
+					"transcriptRef": transcript,
+					"turnCount":     42,
+				},
+			}
+			r := coderJobResultToResult("issue-fix", start, cjr)
+
+			ref, ok := r.Extra["transcriptRef"].(map[string]any)
+			if !ok {
+				t.Fatalf("transcriptRef dropped on the %s branch: Extra = %v", tc.name, r.Extra)
+			}
+			if ref["name"] != "foreman-transcript-coder-1656" {
+				t.Errorf("transcriptRef.name = %v, want the transcript ConfigMap name", ref["name"])
+			}
+			if r.Extra["turnCount"] != 42 {
+				t.Errorf("turnCount dropped on the %s branch: %v", tc.name, r.Extra["turnCount"])
+			}
+			// The supervisor's own stamps must still win over anything of the
+			// same name in ResultExtra.
+			if r.Extra["executionMode"] != "Job" || r.Extra["jobName"] != "coder-job-1656" {
+				t.Errorf("supervisor fields missing on the %s branch: %v", tc.name, r.Extra)
+			}
+		})
+	}
+
+	// Only these two branches force an outcome of their own; GO and NO-GO
+	// deliberately let the pod's envelope win, which #1077 already pins.
+	t.Run("the supervisor's forced outcome still overrides the pod's", func(t *testing.T) {
+		forced := map[string]string{
+			string(foremanv1alpha1.AgenticTaskVerdictIncomplete): "INCOMPLETE",
+			"ERROR": "JOB-ERROR",
+		}
+		for verdict, want := range forced {
+			cjr := CoderJobResult{
+				Verdict:     verdict,
+				ResultExtra: map[string]any{"outcome": "MODEL-DECIDED"},
+			}
+			r := coderJobResultToResult("issue-fix", start, cjr)
+			if r.Extra["outcome"] != want {
+				t.Errorf("verdict %s: outcome = %v, want %q to win over the pod's MODEL-DECIDED",
+					verdict, r.Extra["outcome"], want)
+			}
+		}
+	})
+}

@@ -327,14 +327,20 @@ func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *R
 		} else {
 			r.FailureReason = foremanv1alpha1.FailureMaxTurnsExhausted
 		}
-		r.Extra = map[string]any{
+		// jobExtra, not a fresh map: the in-pod run's extras must survive every
+		// terminal branch, not only GO and NO-GO (#1656). transcriptRef is the
+		// one that bites, since watcher.go lifts it onto status and the archiver
+		// reaches the transcript through it; dropping it is silent because an
+		// absent ref is also the legitimate deterministic-run shape. The
+		// supervisor keys below still win, so the forced outcome stands.
+		r.Extra = jobExtra(cjr, map[string]any{
 			"outcome":        "INCOMPLETE",
 			"intendedBranch": cjr.Branch,
 			"executionMode":  "Job",
 			"jobName":        cjr.JobName,
 			"namespace":      cjr.Namespace,
 			"logTail":        cjr.LogTail,
-		}
+		})
 		return r
 	default:
 		// "ERROR" or any unrecognized verdict: the Job failed before
@@ -346,14 +352,17 @@ func coderJobResultToResult(kind string, start time.Time, cjr CoderJobResult) *R
 		}
 		r := NewResult(kind, foremanv1alpha1.AgenticTaskVerdictNoGo, summary, time.Since(start))
 		r.FailureReason = foremanv1alpha1.FailureInfrastructureError
-		r.Extra = map[string]any{
+		// jobExtra for the same reason as the INCOMPLETE branch above: a Job
+		// that died after the model wrote its envelope still carries extras
+		// worth keeping, and the supervisor keys below still override them.
+		r.Extra = jobExtra(cjr, map[string]any{
 			"outcome":       "JOB-ERROR",
 			"executionMode": "Job",
 			"jobName":       cjr.JobName,
 			"namespace":     cjr.Namespace,
 			"reason":        cjr.FailureReason,
 			"logTail":       cjr.LogTail,
-		}
+		})
 		return r
 	}
 }
