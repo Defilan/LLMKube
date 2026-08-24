@@ -39,12 +39,16 @@ func testRecord() audit.Record {
 }
 
 func TestBundleDir_LayoutAndTimestampSanitising(t *testing.T) {
+	// "/arch" is absolute and does not exist, so Abs is a no-op and the root is
+	// never symlink-resolved. The full path can therefore be pinned exactly,
+	// which keeps the root prefix and the number of path levels under test.
 	got, err := BundleDir("/arch", testRecord())
 	if err != nil {
 		t.Fatalf("BundleDir: %v", err)
 	}
-	if !strings.HasSuffix(got, "defilantech/LLMKube/1602/wl-1602-code-2026-08-23T18-44-22Z") {
-		t.Errorf("BundleDir = %q, want suffix %q", got, "defilantech/LLMKube/1602/wl-1602-code-2026-08-23T18-44-22Z")
+	want := "/arch/defilantech/LLMKube/1602/wl-1602-code-2026-08-23T18-44-22Z"
+	if got != want {
+		t.Errorf("BundleDir = %q, want %q", got, want)
 	}
 }
 
@@ -123,27 +127,33 @@ func TestBundleDir_RejectsEmptyRecordedAtAndUID(t *testing.T) {
 	}
 }
 
-func TestBundleDir_RejectsNULInRepo(t *testing.T) {
+func TestBundleDir_RejectsEmptyTaskName(t *testing.T) {
 	rec := testRecord()
-	rec.Repo = "foo\x00bar"
+	rec.Task.Name = ""
 	if _, err := BundleDir("/arch", rec); err == nil {
-		t.Fatal("BundleDir with NUL in repo = nil error, want a rejection")
+		t.Fatal("BundleDir with an empty task name = nil error, want a rejection; " +
+			"the key would degenerate to a leading-dash segment such as -2026-08-23T18-44-22Z")
 	}
 }
 
-func TestBundleDir_RejectsNULInTaskName(t *testing.T) {
-	rec := testRecord()
-	rec.Task.Name = "task\x00name"
-	if _, err := BundleDir("/arch", rec); err == nil {
-		t.Fatal("BundleDir with NUL in task name = nil error, want a rejection")
+func TestBundleDir_RejectsNULInKeyFields(t *testing.T) {
+	// Every field that becomes a path component must be checked: a NUL reaches
+	// the syscall layer and fails there with an opaque "invalid argument",
+	// which is exactly what this validation exists to turn into a real message.
+	cases := map[string]func(*audit.Record){
+		"repo":       func(r *audit.Record) { r.Repo = "foo\x00bar" },
+		"task name":  func(r *audit.Record) { r.Task.Name = "task\x00name" },
+		"task UID":   func(r *audit.Record) { r.RecordedAt = ""; r.Task.UID = "uid\x00evil" },
+		"recordedAt": func(r *audit.Record) { r.RecordedAt = "2026-08-23T18:44:22\x00Z" },
 	}
-}
-
-func TestBundleDir_RejectsNULInRecordedAt(t *testing.T) {
-	rec := testRecord()
-	rec.RecordedAt = "2026-08-23T18:44:22\x00Z"
-	if _, err := BundleDir("/arch", rec); err == nil {
-		t.Fatal("BundleDir with NUL in recordedAt = nil error, want a rejection")
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			rec := testRecord()
+			mutate(&rec)
+			if _, err := BundleDir("/arch", rec); err == nil {
+				t.Errorf("BundleDir with a NUL byte in %s = nil error, want a rejection", name)
+			}
+		})
 	}
 }
 
@@ -187,12 +197,51 @@ func TestWriteBundle_WritesAuditTranscriptAndMeta(t *testing.T) {
 	}
 }
 
+func TestWriteBundle_JSONByteFormatIsPinned(t *testing.T) {
+	// The bundle is immutable and an external reader may checksum it, so the
+	// on-disk encoding is part of the contract, not an implementation detail.
+	// Without this, swapping MarshalIndent for Marshal survives the suite.
+	root := t.TempDir()
+	if err := WriteBundle(root, testRecord(), []byte(`{"x":1}`)); err != nil {
+		t.Fatalf("WriteBundle: %v", err)
+	}
+	dir, err := BundleDir(root, testRecord())
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, "meta.json"))
+	if err != nil {
+		t.Fatalf("read meta.json: %v", err)
+	}
+	want := `{
+  "schemaVersion": "foreman.archive.v1",
+  "taskName": "wl-1602-code",
+  "recordedAt": "2026-08-23T18:44:22Z",
+  "hasTranscript": true
+}`
+	if string(got) != want {
+		t.Errorf("meta.json bytes =\n%s\n\nwant\n%s", got, want)
+	}
+
+	auditBytes, err := os.ReadFile(filepath.Join(dir, "audit.json"))
+	if err != nil {
+		t.Fatalf("read audit.json: %v", err)
+	}
+	if !strings.HasPrefix(string(auditBytes), "{\n  \"schemaVersion\": \"foreman.audit.v1\",\n") {
+		t.Errorf("audit.json is not two-space-indented JSON:\n%s", auditBytes)
+	}
+}
+
 func TestWriteBundle_NoTranscriptStillArchivesTheRecord(t *testing.T) {
 	root := t.TempDir()
 	if err := WriteBundle(root, testRecord(), nil); err != nil {
 		t.Fatalf("WriteBundle: %v", err)
 	}
-	dir, _ := BundleDir(root, testRecord())
+	dir, err := BundleDir(root, testRecord())
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "audit.json")); err != nil {
 		t.Errorf("audit.json missing for a transcript-less run: %v", err)
 	}
@@ -214,7 +263,10 @@ func TestWriteBundle_ExistingBundleIsNotRewritten(t *testing.T) {
 	if err := WriteBundle(root, testRecord(), []byte(`REPLACED`)); err != nil {
 		t.Fatalf("second WriteBundle: %v", err)
 	}
-	dir, _ := BundleDir(root, testRecord())
+	dir, err := BundleDir(root, testRecord())
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
 	tr, err := os.ReadFile(filepath.Join(dir, "transcript.json"))
 	if err != nil {
 		t.Fatalf("read transcript.json: %v", err)
@@ -227,7 +279,10 @@ func TestWriteBundle_ExistingBundleIsNotRewritten(t *testing.T) {
 func TestWriteBundle_StrayFileRefusesBundle(t *testing.T) {
 	root := t.TempDir()
 	rec := testRecord()
-	dir, _ := BundleDir(root, rec)
+	dir, err := BundleDir(root, rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -276,26 +331,175 @@ func TestWriteBundle_FileModes(t *testing.T) {
 	if err := WriteBundle(root, testRecord(), []byte("test")); err != nil {
 		t.Fatalf("WriteBundle: %v", err)
 	}
-	dir, _ := BundleDir(root, testRecord())
+	dir, err := BundleDir(root, testRecord())
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
 
-	// Check directory mode.
-	dirInfo, _ := os.Stat(dir)
-	dirMode := dirInfo.Mode().Perm()
-	if dirMode != 0o750 {
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat bundle dir: %v", err)
+	}
+	if dirMode := dirInfo.Mode().Perm(); dirMode != 0o750 {
 		t.Errorf("bundle dir mode = %03o, want 0750", dirMode)
 	}
 
-	// Check file modes.
+	// This record was written with a transcript, so all three files must exist.
+	// Skipping a missing one would let a lost file pass as a clean loop.
 	for _, name := range []string{"audit.json", "transcript.json", "meta.json"} {
 		path := filepath.Join(dir, name)
 		fi, err := os.Stat(path)
 		if err != nil {
-			continue // transcript might not exist for some tests
+			t.Errorf("stat %s: %v", name, err)
+			continue
 		}
-		fileMode := fi.Mode().Perm()
-		if fileMode != 0o640 {
+		if fileMode := fi.Mode().Perm(); fileMode != 0o640 {
 			t.Errorf("%s mode = %03o, want 0640", name, fileMode)
 		}
+	}
+}
+
+// TestWriteBundle_RefusesASymlinkAtTheBundlePath covers the skip check reading
+// through a symlink. The symlink target is inside the archive root, so the
+// containment check alone cannot catch it: only refusing a non-directory at the
+// bundle path does. os.Stat here means WriteBundle returns nil having archived
+// nothing, permanently, because the retry hits the same check.
+func TestWriteBundle_RefusesASymlinkAtTheBundlePath(t *testing.T) {
+	root := t.TempDir()
+	rec := testRecord()
+	dir, err := BundleDir(root, rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+
+	decoy := filepath.Join(root, "decoy")
+	if err := os.Mkdir(decoy, 0o750); err != nil {
+		t.Fatalf("mkdir decoy: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o750); err != nil {
+		t.Fatalf("mkdir bundle parents: %v", err)
+	}
+	mustSymlink(t, decoy, dir)
+
+	if err := WriteBundle(root, rec, []byte(`{"x":1}`)); err == nil {
+		t.Fatal("WriteBundle onto a symlinked bundle path = nil error; " +
+			"the record was silently dropped and every retry drops it too")
+	}
+	entries, err := os.ReadDir(decoy)
+	if err != nil {
+		t.Fatalf("read decoy: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("wrote %d entries through the symlink into %q, want none", len(entries), decoy)
+	}
+}
+
+// TestWriteBundle_RefusesASymlinkedSegmentHoldingTheBundle covers the shape the
+// leaf check cannot see: an intermediate segment is a symlink whose target
+// already holds the matching sub-path, so the leaf really is a directory and
+// the write is skipped without the containment check ever running.
+func TestWriteBundle_RefusesASymlinkedSegmentHoldingTheBundle(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	rec := testRecord()
+	dir, err := BundleDir(root, rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+
+	// Reproduce the bundle's sub-path under the symlink target, so a stat
+	// through the symlink reports a finished bundle.
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve root: %v", err)
+	}
+	rel, err := filepath.Rel(filepath.Join(resolvedRoot, "defilantech"), dir)
+	if err != nil {
+		t.Fatalf("rel: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(outside, rel), 0o750); err != nil {
+		t.Fatalf("mkdir outside: %v", err)
+	}
+	mustSymlink(t, outside, filepath.Join(root, "defilantech"))
+
+	if err := WriteBundle(root, rec, []byte(`{"x":1}`)); err == nil {
+		t.Fatal("WriteBundle through a symlinked segment holding the bundle = nil error, want a refusal")
+	}
+	assertNoFilesUnder(t, outside)
+}
+
+// TestWriteBundle_RefusesASymlinkedSegment is the plain escape: an intermediate
+// symlink sends MkdirAll outside the archive root entirely.
+func TestWriteBundle_RefusesASymlinkedSegment(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	mustSymlink(t, outside, filepath.Join(root, "defilantech"))
+
+	if err := WriteBundle(root, testRecord(), []byte(`{"x":1}`)); err == nil {
+		t.Fatal("WriteBundle through a symlinked segment = nil error, want a refusal")
+	}
+	assertNoFilesUnder(t, outside)
+}
+
+// TestVerifyContained_RefusesAPathItCannotResolve pins the failure direction of
+// the containment verdict. filepath.EvalSymlinks and filepath.Rel both return a
+// value that passes a naive check when they fail (Rel returns ""), so
+// discarding their errors turns the security check of this file into a no-op.
+func TestVerifyContained_RefusesAPathItCannotResolve(t *testing.T) {
+	root := t.TempDir()
+	if err := verifyContained(root, filepath.Join(root, "never-created")); err == nil {
+		t.Fatal("verifyContained on a path it cannot resolve = nil error; " +
+			"a containment check that cannot answer must refuse, never pass")
+	}
+}
+
+// TestContained_RefusesWhenItCannotRelateThePaths forces the filepath.Rel
+// failure on its own. Rel yields "" alongside its error, and "" is neither ".."
+// nor ".."-prefixed, so discarding that error turns the escape test into a
+// guaranteed pass.
+func TestContained_RefusesWhenItCannotRelateThePaths(t *testing.T) {
+	if err := contained("/arch", "relative/path"); err == nil {
+		t.Fatal("contained on paths it cannot relate = nil error, want a refusal")
+	}
+}
+
+func TestVerifyContained_RefusesAnUnresolvableRoot(t *testing.T) {
+	base := t.TempDir()
+	loop := filepath.Join(base, "loop")
+	mustSymlink(t, loop, loop)
+
+	if err := verifyContained(loop, filepath.Join(loop, "bundle")); err == nil {
+		t.Fatal("verifyContained with an unresolvable root = nil error, want a refusal")
+	}
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		// Not a skip. These are the only regression tests for the symlink
+		// escape, and a silent skip reads exactly like a pass.
+		t.Fatalf("symlink %q -> %q: %v; this platform cannot run the symlink "+
+			"containment regression tests, which must not be mistaken for them passing", link, target, err)
+	}
+}
+
+func assertNoFilesUnder(t *testing.T, dir string) {
+	t.Helper()
+	var leaked []string
+	if err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			leaked = append(leaked, p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("walk %s: %v", dir, err)
+	}
+	if len(leaked) != 0 {
+		t.Errorf("files written outside the archive root: %v", leaked)
 	}
 }
 
@@ -307,31 +511,5 @@ func readJSON(t *testing.T, path string, v any) {
 	}
 	if err := json.Unmarshal(b, v); err != nil {
 		t.Fatalf("unmarshal %s: %v", path, err)
-	}
-}
-
-func TestWriteBundle_RefusesASymlinkedSegment(t *testing.T) {
-	root := t.TempDir()
-	outside := t.TempDir()
-
-	// The bundle path starts <root>/defilantech/LLMKube/... , so a symlink at
-	// the first segment sends MkdirAll outside the archive root entirely.
-	if err := os.Symlink(outside, filepath.Join(root, "defilantech")); err != nil {
-		t.Skipf("symlink creation failed: %v (platform limitation)", err)
-	}
-
-	if err := WriteBundle(root, testRecord(), []byte(`{"x":1}`)); err == nil {
-		t.Fatal("WriteBundle through a symlinked segment = nil error, want a refusal")
-	}
-
-	var leaked []string
-	_ = filepath.WalkDir(outside, func(p string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			leaked = append(leaked, p)
-		}
-		return nil
-	})
-	if len(leaked) != 0 {
-		t.Errorf("files written outside the archive root: %v", leaked)
 	}
 }
