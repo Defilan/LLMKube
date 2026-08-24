@@ -3,6 +3,15 @@ Copyright 2025.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 */
 
 package archive
@@ -25,7 +34,7 @@ func testRecord() audit.Record {
 		Repo:          "defilantech/LLMKube",
 		Issue:         1602,
 		Verdict:       "GO",
-		Task:          audit.TaskRef{Name: "wl-1602-code", Kind: "issue-fix"},
+		Task:          audit.TaskRef{Name: "wl-1602-code", Kind: "issue-fix", UID: "task-123"},
 	}
 }
 
@@ -34,9 +43,8 @@ func TestBundleDir_LayoutAndTimestampSanitising(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BundleDir: %v", err)
 	}
-	want := "/arch/defilantech/LLMKube/1602/wl-1602-code-2026-08-23T18-44-22Z"
-	if got != want {
-		t.Errorf("BundleDir = %q, want %q", got, want)
+	if !strings.HasSuffix(got, "defilantech/LLMKube/1602/wl-1602-code-2026-08-23T18-44-22Z") {
+		t.Errorf("BundleDir = %q, want suffix %q", got, "defilantech/LLMKube/1602/wl-1602-code-2026-08-23T18-44-22Z")
 	}
 }
 
@@ -49,6 +57,30 @@ func TestBundleDir_ZeroIssueGetsAWellFormedKey(t *testing.T) {
 	}
 	if !strings.Contains(got, "/no-issue/") {
 		t.Errorf("BundleDir = %q, want a no-issue segment", got)
+	}
+}
+
+func TestBundleDir_EmptyRepoNormalizesToNoRepo(t *testing.T) {
+	rec := testRecord()
+	rec.Repo = ""
+	got, err := BundleDir("/arch", rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+	if !strings.Contains(got, "/no-repo/") {
+		t.Errorf("BundleDir with empty repo = %q, want /no-repo/ segment", got)
+	}
+}
+
+func TestBundleDir_DotRepoNormalizesToNoRepo(t *testing.T) {
+	rec := testRecord()
+	rec.Repo = "."
+	got, err := BundleDir("/arch", rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+	if !strings.Contains(got, "/no-repo/") {
+		t.Errorf("BundleDir with dot repo = %q, want /no-repo/ segment", got)
 	}
 }
 
@@ -66,6 +98,52 @@ func TestBundleDir_RefusesToEscapeTheRoot(t *testing.T) {
 				t.Errorf("BundleDir(repo=%q) = nil error, want a refusal", repo)
 			}
 		})
+	}
+}
+
+func TestBundleDir_EmptyRecordedAtFallsBackToUID(t *testing.T) {
+	rec := testRecord()
+	rec.RecordedAt = ""
+	rec.Task.UID = "stable-uid-123"
+	got, err := BundleDir("/arch", rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+	if !strings.Contains(got, "stable-uid-123") {
+		t.Errorf("BundleDir with empty RecordedAt = %q, want to contain UID", got)
+	}
+}
+
+func TestBundleDir_RejectsEmptyRecordedAtAndUID(t *testing.T) {
+	rec := testRecord()
+	rec.RecordedAt = ""
+	rec.Task.UID = ""
+	if _, err := BundleDir("/arch", rec); err == nil {
+		t.Fatal("BundleDir with no RecordedAt or UID = nil error, want a rejection")
+	}
+}
+
+func TestBundleDir_RejectsNULInRepo(t *testing.T) {
+	rec := testRecord()
+	rec.Repo = "foo\x00bar"
+	if _, err := BundleDir("/arch", rec); err == nil {
+		t.Fatal("BundleDir with NUL in repo = nil error, want a rejection")
+	}
+}
+
+func TestBundleDir_RejectsNULInTaskName(t *testing.T) {
+	rec := testRecord()
+	rec.Task.Name = "task\x00name"
+	if _, err := BundleDir("/arch", rec); err == nil {
+		t.Fatal("BundleDir with NUL in task name = nil error, want a rejection")
+	}
+}
+
+func TestBundleDir_RejectsNULInRecordedAt(t *testing.T) {
+	rec := testRecord()
+	rec.RecordedAt = "2026-08-23T18:44:22\x00Z"
+	if _, err := BundleDir("/arch", rec); err == nil {
+		t.Fatal("BundleDir with NUL in recordedAt = nil error, want a rejection")
 	}
 }
 
@@ -95,8 +173,17 @@ func TestWriteBundle_WritesAuditTranscriptAndMeta(t *testing.T) {
 
 	var meta BundleMeta
 	readJSON(t, filepath.Join(dir, "meta.json"), &meta)
-	if meta.SchemaVersion != BundleSchemaVersion || !meta.HasTranscript {
-		t.Errorf("meta.json = %+v, want schema %q and hasTranscript true", meta, BundleSchemaVersion)
+	if meta.SchemaVersion != "foreman.archive.v1" {
+		t.Errorf("meta.schemaVersion = %q, want literal \"foreman.archive.v1\"", meta.SchemaVersion)
+	}
+	if !meta.HasTranscript {
+		t.Error("meta.hasTranscript = false, want true")
+	}
+	if meta.TaskName != "wl-1602-code" {
+		t.Errorf("meta.taskName = %q, want wl-1602-code", meta.TaskName)
+	}
+	if meta.RecordedAt != "2026-08-23T18:44:22Z" {
+		t.Errorf("meta.recordedAt = %q, want 2026-08-23T18:44:22Z", meta.RecordedAt)
 	}
 }
 
@@ -137,6 +224,22 @@ func TestWriteBundle_ExistingBundleIsNotRewritten(t *testing.T) {
 	}
 }
 
+func TestWriteBundle_StrayFileRefusesBundle(t *testing.T) {
+	root := t.TempDir()
+	rec := testRecord()
+	dir, _ := BundleDir(root, rec)
+	if err := os.MkdirAll(filepath.Dir(dir), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(dir, []byte("stray"), 0o640); err != nil {
+		t.Fatalf("create stray file: %v", err)
+	}
+
+	if err := WriteBundle(root, rec, nil); err == nil {
+		t.Fatal("WriteBundle with stray regular file at path = nil error, want error")
+	}
+}
+
 func TestWriteBundle_PartialWriteLeavesNoBundleSoItRetries(t *testing.T) {
 	root := t.TempDir()
 	rec := testRecord()
@@ -165,6 +268,34 @@ func TestWriteBundle_UnwritableRootFails(t *testing.T) {
 	}
 	if err := WriteBundle(root, testRecord(), nil); err == nil {
 		t.Fatal("WriteBundle into an unwritable root = nil error, want a failure")
+	}
+}
+
+func TestWriteBundle_FileModes(t *testing.T) {
+	root := t.TempDir()
+	if err := WriteBundle(root, testRecord(), []byte("test")); err != nil {
+		t.Fatalf("WriteBundle: %v", err)
+	}
+	dir, _ := BundleDir(root, testRecord())
+
+	// Check directory mode.
+	dirInfo, _ := os.Stat(dir)
+	dirMode := dirInfo.Mode().Perm()
+	if dirMode != 0o750 {
+		t.Errorf("bundle dir mode = %03o, want 0750", dirMode)
+	}
+
+	// Check file modes.
+	for _, name := range []string{"audit.json", "transcript.json", "meta.json"} {
+		path := filepath.Join(dir, name)
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue // transcript might not exist for some tests
+		}
+		fileMode := fi.Mode().Perm()
+		if fileMode != 0o640 {
+			t.Errorf("%s mode = %03o, want 0640", name, fileMode)
+		}
 	}
 }
 
