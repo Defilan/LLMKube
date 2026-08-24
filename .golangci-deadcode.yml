@@ -46,20 +46,31 @@ linters:
         linters: [unused]
 
       # ---------------------------------------------------------------
-      # REGISTER B: pre-existing dead symbols found when this guard was
-      # introduced. Each needs a decision (delete, or wire up); none has
-      # been made yet. Tracked for triage in #1602 rather than silently
-      # deleted. Removing an entry here is the deliverable of that issue.
+      # REGISTER B: symbols the guard reports that are staged rather than
+      # reachable. #1602 triaged the four originally recorded here:
+      # metalReadyEndpoints, isNeedsVerificationCoder and taskSucceeded
+      # were deleted (each duplicated logic already inlined at its call
+      # site, or was test-only by construction); parseMaxUSD stays, below.
       # ---------------------------------------------------------------
-      - path: internal/controller/inferenceservice_controller\.go
-        linters: [unused]
-        text: metalReadyEndpoints
-      - path: internal/foreman/controller/workload_coder_escalation\.go
-        linters: [unused]
-        text: isNeedsVerificationCoder
-      - path: internal/router/budget\.go
+      # internal/router/budget.go is an entirely dead file: nothing in
+      # production constructs a router.BudgetRule, so BudgetStore,
+      # NewBudgetStore and Charge have no non-test callers. It is staged
+      # for the ModelRouter budget work (#434, #440).
+      #
+      # parseMaxUSD is the only symbol in it the `unused` linter reports.
+      # The file's other unexported symbols (bucket, bucketDuration,
+      # usedInWindow, charge) are reachable from the exported entry points,
+      # so the linter counts them used even though nothing outside the file
+      # calls those either. Do NOT delete parseMaxUSD to clear this entry:
+      # `unused` does not report exported identifiers, so removing the one
+      # symbol it does report would leave the whole dead file invisible.
+      #
+      # Scoped to the SYMBOL, not the file, on purpose. Verified: with a
+      # file-wide rule, adding a dead unexported helper to budget.go gives
+      # 0 issues; with this symbol-scoped rule it is reported. A file-wide
+      # suppression would swallow exactly the debt this guard exists to
+      # surface, for instance a helper left dead when #434/#440 partially
+      # wires the engine.
+      - path: internal/router/budget\.go  # Refs #434, #440
         linters: [unused]
         text: parseMaxUSD
-      - path: pkg/cli/dispatch\.go
-        linters: [unused]
-        text: taskSucceeded

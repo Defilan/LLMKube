@@ -108,17 +108,6 @@ const alreadyResolvedOutcome = "ALREADY-RESOLVED"
 // ground truth (hardware, a live system's output) either.
 const needsVerificationOutcome = "NEEDS-VERIFICATION"
 
-// isNeedsVerificationCoder reports whether the task ended NO-GO because the
-// coder could not ground a load-bearing external fact (extra.outcome ==
-// needsVerificationOutcome). Used by shouldEscalateCoder to skip escalation.
-func isNeedsVerificationCoder(task *foremanv1alpha1.AgenticTask) bool {
-	if task == nil {
-		return false
-	}
-	verdict, topOutcome, _ := coderTerminalOutcome(task)
-	return verdict == foremanv1alpha1.AgenticTaskVerdictNoGo && topOutcome == needsVerificationOutcome
-}
-
 // isAlreadyResolvedCoder reports whether the task ended in the
 // machine outcome for "work is already on the branch/base". Used by
 // shouldEscalateCoder (to skip escalation) and rollup (to keep the

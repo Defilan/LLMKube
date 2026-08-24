@@ -67,7 +67,7 @@ func metalEndpoints(name, heartbeat string) *discoveryv1.EndpointSlice {
 	return slice
 }
 
-var _ = Describe("metalReadyEndpoints heartbeat expiry", func() {
+var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 	var (
 		reconciler *InferenceServiceReconciler
 		ctx        context.Context
@@ -82,7 +82,7 @@ var _ = Describe("metalReadyEndpoints heartbeat expiry", func() {
 		}
 	})
 
-	Context("direct unit tests of metalReadyEndpoints", func() {
+	Context("direct unit tests of metalEndpointSnapshot ready replicas", func() {
 		const namespace = "default"
 
 		It("should return 1 for Endpoints with a fresh heartbeat annotation", func() {
@@ -95,7 +95,13 @@ var _ = Describe("metalReadyEndpoints heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			Expect(reconciler.metalReadyEndpoints(ctx, isvc)).To(Equal(int32(1)))
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			Expect(snap.ReadyReplicas).To(Equal(int32(1)))
+			// Kind, not just the count: it selects the requeue interval
+			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
+			// message. Stale and unparseable both report 0 ready, so the
+			// count alone cannot tell them apart.
+			Expect(snap.Kind).To(Equal(metalHBFresh))
 		})
 
 		It("should return 0 for Endpoints with a stale heartbeat annotation (10 minutes old)", func() {
@@ -108,7 +114,13 @@ var _ = Describe("metalReadyEndpoints heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			Expect(reconciler.metalReadyEndpoints(ctx, isvc)).To(Equal(int32(0)))
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			Expect(snap.ReadyReplicas).To(Equal(int32(0)))
+			// Kind, not just the count: it selects the requeue interval
+			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
+			// message. Stale and unparseable both report 0 ready, so the
+			// count alone cannot tell them apart.
+			Expect(snap.Kind).To(Equal(metalHBStale))
 		})
 
 		It("should return 0 for Endpoints with an unparseable heartbeat annotation", func() {
@@ -120,7 +132,13 @@ var _ = Describe("metalReadyEndpoints heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			Expect(reconciler.metalReadyEndpoints(ctx, isvc)).To(Equal(int32(0)))
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			Expect(snap.ReadyReplicas).To(Equal(int32(0)))
+			// Kind, not just the count: it selects the requeue interval
+			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
+			// message. Stale and unparseable both report 0 ready, so the
+			// count alone cannot tell them apart.
+			Expect(snap.Kind).To(Equal(metalHBUnparseable))
 		})
 
 		It("should return 1 for Endpoints WITHOUT the annotation (legacy agent exemption)", func() {
@@ -132,7 +150,13 @@ var _ = Describe("metalReadyEndpoints heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			Expect(reconciler.metalReadyEndpoints(ctx, isvc)).To(Equal(int32(1)))
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			Expect(snap.ReadyReplicas).To(Equal(int32(1)))
+			// Kind, not just the count: it selects the requeue interval
+			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
+			// message. Stale and unparseable both report 0 ready, so the
+			// count alone cannot tell them apart.
+			Expect(snap.Kind).To(Equal(metalHBLegacy))
 		})
 	})
 

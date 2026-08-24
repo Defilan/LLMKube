@@ -2203,10 +2203,14 @@ func (e *NativeAgentLoopExecutor) modelDecidedResult(
 // promoteTerminalOutcome lifts a terminal, non-escalating machine outcome
 // from the loop terminal's Extra (nested under "modelExtra" in the Result)
 // to the Result's top-level Extra["outcome"]. The controller's
-// isNeedsVerificationCoder and isAlreadyResolvedCoder (see
+// shouldEscalateCoder, shouldEscalateCoderOnFailure and
+// isAlreadyResolvedCoder (see
 // internal/foreman/controller/workload_coder_escalation.go; NOT imported
 // here, per the needsVerificationOutcome doc comment in verdict_policy.go)
-// read the TOP-LEVEL outcome to decide whether to skip escalation, so a
+// read the TOP-LEVEL outcome. The first two decide whether to skip
+// escalation; isAlreadyResolvedCoder additionally drives the Workload
+// rollup's alreadyResolved bucket (workload_controller.go) and the
+// Skipped cascade for dependents (agentictask_controller.go), so a
 // NEEDS-VERIFICATION or ALREADY-RESOLVED terminal buried under modelExtra
 // would still classify as a generic MODEL-DECIDED NO-GO and escalate; that
 // gap predates #1075 Task 5 (#970/#1033 shipped with the model-emitted
@@ -2215,10 +2219,12 @@ func (e *NativeAgentLoopExecutor) modelDecidedResult(
 // loop.go).
 //
 // Only the two known terminal non-failure outcomes are promoted; every
-// other terminal keeps the top-level "MODEL-DECIDED". The paired fields
-// the controller and the Workload rollup read alongside each outcome are
-// promoted with it: "unverified" (needs-verification) and "resolvedBy"
-// (already-resolved). The full modelExtra nesting is left untouched for
+// other terminal keeps the top-level "MODEL-DECIDED". The paired field of
+// each outcome is promoted with it: "unverified" (needs-verification) and
+// "resolvedBy" (already-resolved). Of the two, only "resolvedBy" is read
+// by the controller, via coderResolvedBy in workload_controller.go;
+// "unverified" is promoted for parity and observability, and its readers
+// are all in this package (loop.go, verdict_policy.go). The full modelExtra nesting is left untouched for
 // observability (terminalExtra is the same map referenced there).
 func promoteTerminalOutcome(extra, terminalExtra map[string]any) {
 	outcome, _ := terminalExtra["outcome"].(string)
