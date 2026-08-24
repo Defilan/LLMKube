@@ -1100,6 +1100,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// as the grounding rail; records-and-logs, never changes the verdict.
 	applyNoFunctionalChangeForTask(ctx, log, task, workspace, loopRes)
 
+	// Deleted-reference rail (#1553, non-blocking): flag a GO whose committed
+	// diff removes code citing an issue/PR number (a "this exists because of
+	// #N" comment), so the removal of tracked work is stated, not silent.
+	// Same after-commit requirement as the two rails above -- it reads the
+	// committed base...HEAD diff and reuses the diff that path already
+	// computes, so it does not shell out for a second one. Records-and-logs
+	// onto loopRes.Terminal.Extra; never changes the verdict.
+	applyDeletedReferenceRailForTask(ctx, task, workspace, loopRes)
+
 	r := e.goResult(start, transcriptRef, loopRes, branch, sha)
 	attachGateAdvisories(r.Extra, gateAdvisories)
 	r = e.applyWorkClassPolicyForTask(ctx, log, task, agent, workspace, evidenceBaseSHA, loopRes, r)
