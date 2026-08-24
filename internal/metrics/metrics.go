@@ -333,6 +333,18 @@ var (
 		},
 		[]string{"outcome"},
 	)
+
+	// ForemanArchiveFailuresTotal counts bundles that could not be written.
+	// Archival is deliberately non-fatal, so this counter is the only signal
+	// that it is broken: without it, a misconfigured or full volume looks
+	// exactly like a cluster that has had no terminal tasks.
+	ForemanArchiveFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "foreman_archive_failures_total",
+			Help: "Total task-archive bundles that failed to write, by reason.",
+		},
+		[]string{"reason"},
+	)
 )
 
 // AllCollectors is every metric this operator registers. init() registers
@@ -370,6 +382,7 @@ var AllCollectors = []prometheus.Collector{
 	ForemanTaskDurationSeconds,
 	ForemanTaskTurns,
 	ForemanWorkloadCompletedTotal,
+	ForemanArchiveFailuresTotal,
 }
 
 func init() {
@@ -492,4 +505,11 @@ func RecordTaskOutcome(agent, kind, verdict, outcome string, elapsedSec float64,
 // terminal transition by the caller, which guards on phase change.
 func RecordWorkloadOutcome(outcome string) {
 	ForemanWorkloadCompletedTotal.WithLabelValues(outcome).Inc()
+}
+
+// RecordArchiveFailure counts one failed archive write. Reason is a bounded
+// classification (for example "transcript_read", "write"), never an error
+// string: error text is unbounded and would break cardinality.
+func RecordArchiveFailure(reason string) {
+	ForemanArchiveFailuresTotal.WithLabelValues(reason).Inc()
 }
