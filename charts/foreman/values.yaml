@@ -89,6 +89,82 @@ foreman:
       additionalLabels:
         prometheus: kube-prometheus-stack-prometheus
 
+  # Terminal-task archival (#1654). Off by default.
+  #
+  # When enabled the operator writes one immutable bundle per terminal
+  # task to `dir`, containing the audit record and the agent transcript.
+  # READ THIS BEFORE ENABLING: those two artifacts contain source code,
+  # issue text, and whatever appeared in tool output, so turning this on
+  # writes all of that to the volume below, in plain text, outside the
+  # 7 day audit retention window. That is a deliberate operator decision
+  # about where your code and issue text come to rest, not a detail.
+  #
+  # The operator only writes files. Getting bundles off the node is a
+  # separate concern: run a CronJob that syncs `dir` to durable storage.
+  # Both storage classes in a typical install are RWO and reclaim with
+  # Delete, so a bundle that is never shipped is one PVC deletion from
+  # gone.
+  #
+  # AGENT VERSION SKEW: archival captures transcripts only from agents at
+  # the same version as this chart. The `transcriptRef` lift that
+  # publishes a transcript ships in foreman-agent; the archiver that reads
+  # it ships in foreman-operator. Metal agents are commonly updated out of
+  # band from the chart, so skew is normal. Against an older agent
+  # `status.transcriptRef` stays empty, the archiver takes neither the
+  # transcript_read nor the transcript_empty branch, every bundle records
+  # `hasTranscript: false`, and foreman_archive_failures_total stays at
+  # zero. That is indistinguishable from a fleet of deterministic runs, so
+  # there is no failure signal at all: bring the agents to this version
+  # before you trust a transcript to be there.
+  #
+  # ROLLBACK: use `helm rollback` (or `kubectl rollout undo`), which
+  # reverts the operator's args and its image together. Rolling the image
+  # back on its own while this stays enabled, as in
+  # `helm upgrade --set operator.image.tag=<old>`, crashloops the
+  # operator: the older binary does not define -archive-dir, Go's flag
+  # package exits 2 on a flag it does not know, and the pod lands in
+  # CrashLoopBackOff. Set `enabled: false` in the same command if you
+  # really must roll only the image.
+  archive:
+    enabled: false
+    # Absolute path the operator writes bundles to, and the mount path of
+    # the volume below. The two are always the same path by construction.
+    dir: /var/lib/foreman/archive
+    # Volume mounted at `dir` when enabled. Any volume source works; the
+    # operator never learns what is behind it. Empty here on purpose: the
+    # chart renders `emptyDir: {}` when you name no source, which keeps a
+    # mistaken `enabled: true` from silently filling a node disk that
+    # something else depends on. It also means bundles die with the pod,
+    # so point this at a persistentVolumeClaim for real use. Read the
+    # fsGroup note below before you do.
+    #
+    #   volume:
+    #     persistentVolumeClaim:
+    #       claimName: foreman-archive
+    #
+    # Do NOT put `emptyDir: {}` back here as the default. Helm deep-merges
+    # your values onto the chart's, so a default source is ADDED to the one
+    # you name rather than replaced, and a Volume carrying two sources is
+    # rejected by the API server with "may not specify more than 1 volume
+    # type": helm upgrade fails and nothing rolls out.
+    volume: {}
+    # fsGroup applied to the operator pod, but ONLY while archival is
+    # enabled, so a default install's pod security context is unchanged.
+    #
+    # This is what makes the persistentVolumeClaim above actually usable.
+    # The operator image runs as UID 65532 with runAsNonRoot, and most
+    # provisioners hand out a freshly-bound PVC owned root:root 0755. With
+    # no fsGroup the operator cannot create its bundle directory, every
+    # terminal task increments
+    # foreman_archive_failures_total{reason="write"}, and not one bundle is
+    # written. The emptyDir default hides this completely, because the
+    # kubelet creates an emptyDir already owned by the pod.
+    #
+    # Set to 0 to render no fsGroup at all. That is what OpenShift needs:
+    # the restricted-v2 SCC injects fsGroup from the namespace's allocated
+    # range and rejects a pod that names a value outside it.
+    fsGroup: 65532
+
 # agents is the multi-fleet map (#994). Leave it UNSET for a single
 # agent (the legacy `agent:` block above is used as-is and renders
 # exactly the resources it always has, so an existing install is

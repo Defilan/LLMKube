@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,6 +39,7 @@ import (
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
+	"github.com/defilantech/llmkube/pkg/foreman/archive"
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
@@ -69,6 +72,10 @@ type AgenticTaskReconciler struct {
 	// AuditNamespace is where durable audit-record ConfigMaps are written.
 	// Empty means each record lands in its task's own namespace.
 	AuditNamespace string
+
+	// ArchiveDir is where terminal-task bundles are written. Empty disables
+	// archival entirely: no directory is created and no work is done.
+	ArchiveDir string
 }
 
 // requeueNoFit is the backoff when no FleetNode satisfies the task's
@@ -141,10 +148,20 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// Release the node reservation so the scheduler can dispatch the next
 		// task there. Guarded on taskKey, so a node already reserved for a
 		// different task is untouched.
+		//
+		// This runs BEFORE archival, and the order is load-bearing. Archival
+		// writes to a mounted volume and takes no timeout: a hung NFS or CSI
+		// mount blocks os.MkdirAll indefinitely. This controller runs with
+		// concurrency 1, so an archive stalled ahead of the release would hold
+		// the node reserved for a task that has already finished AND wedge
+		// every other AgenticTask reconcile behind it. Releasing first bounds
+		// a stalled mount to "no bundles are being written" instead of "the
+		// fleet stops scheduling".
 		if err := r.clearNodeCurrentTask(ctx, task.Status.AssignedNode, taskKey(&task)); err != nil {
 			log.Error(err, "failed to release node reservation on terminal task",
 				"node", task.Status.AssignedNode, "task", task.Name)
 		}
+		r.archiveTerminalTask(ctx, &task, log)
 		return ctrl.Result{}, nil
 	}
 
@@ -1006,4 +1023,61 @@ func (r *AgenticTaskReconciler) fleetNodeEnqueues(ctx context.Context, obj clien
 		}
 	}
 	return requests
+}
+
+// transcriptDataKey is the ConfigMap data key the transcript is stored under.
+// It is the only key read, so a producer that renames it silently drops every
+// transcript in the fleet. That is why a ConfigMap which resolves but carries
+// nothing under this key is counted below rather than quietly recorded as a
+// run that produced no transcript.
+const transcriptDataKey = "transcript.json"
+
+// archiveTerminalTask writes one immutable bundle for a terminal task.
+//
+// Deliberately not gated on firstTerminal. WriteBundle skips a bundle that
+// already exists, so calling this on every terminal reconcile costs one stat
+// and gives a failed write a free retry: a failure leaves no directory behind.
+// Gating on firstTerminal would turn a transient ENOSPC into permanent data
+// loss for that task.
+//
+// Every failure path is non-fatal and counted. Archival must never change a
+// verdict; the harness is the source of truth and this is a side effect.
+func (r *AgenticTaskReconciler) archiveTerminalTask(
+	ctx context.Context,
+	task *foremanv1alpha1.AgenticTask,
+	log logr.Logger,
+) {
+	if r.ArchiveDir == "" {
+		return
+	}
+	rec := audit.BuildRecord(task, audit.ResolveAgent(ctx, r.Client, task, log))
+
+	var transcript []byte
+	if ref := task.Status.TranscriptRef; ref != "" {
+		var cm corev1.ConfigMap
+		key := client.ObjectKey{Namespace: task.Namespace, Name: ref}
+		if err := r.Get(ctx, key, &cm); err != nil {
+			// A deterministic run writes no transcript, and a transcript can be
+			// collected before this runs. Neither is a reason to drop the record.
+			log.V(1).Info("archive: transcript not readable; archiving record only",
+				"transcriptRef", ref, "err", err.Error())
+			llmkubemetrics.RecordArchiveFailure("transcript_read")
+		} else if body := cm.Data[transcriptDataKey]; body == "" {
+			// The ConfigMap resolved but holds nothing we can read. Without
+			// this branch the bundle records hasTranscript:false, which is
+			// indistinguishable from a deterministic run that legitimately
+			// produced no transcript, so a producer-side key rename would
+			// drop every transcript in the fleet with no signal at all.
+			log.V(1).Info("archive: transcript configmap holds no transcript; archiving record only",
+				"transcriptRef", ref, "key", transcriptDataKey)
+			llmkubemetrics.RecordArchiveFailure("transcript_empty")
+		} else {
+			transcript = []byte(body)
+		}
+	}
+
+	if err := archive.WriteBundle(r.ArchiveDir, rec, transcript); err != nil {
+		log.Error(err, "archive: failed to write bundle (continuing)", "task", task.Name)
+		llmkubemetrics.RecordArchiveFailure("write")
+	}
 }

@@ -40,6 +40,28 @@ const (
 // AuditConfigMapName returns the ConfigMap name for a task's audit record.
 func AuditConfigMapName(taskName string) string { return auditNamePrefix + taskName }
 
+// ResolveAgent returns the task's Agent, or nil when there is no agentRef or
+// the object cannot be read. A missing Agent is not an error: the record is
+// written without the agent block rather than lost.
+func ResolveAgent(
+	ctx context.Context,
+	c client.Client,
+	task *foremanv1alpha1.AgenticTask,
+	log logr.Logger,
+) *foremanv1alpha1.Agent {
+	if task.Spec.AgentRef == nil || task.Spec.AgentRef.Name == "" {
+		return nil
+	}
+	var a foremanv1alpha1.Agent
+	key := client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.AgentRef.Name}
+	if err := c.Get(ctx, key, &a); err != nil {
+		log.Info("audit: agent not resolvable; recording without agent block",
+			"agent", task.Spec.AgentRef.Name, "err", err.Error())
+		return nil
+	}
+	return &a
+}
+
 // WriteRecord upserts a durable, NON-owner-ref'd ConfigMap holding rec, plus
 // emits the record as a single structured log line. The absence of an owner
 // reference is deliberate: the record must outlive the AgenticTask so it
@@ -111,17 +133,7 @@ func RecordTerminal(
 		ns = task.Namespace
 	}
 
-	var agent *foremanv1alpha1.Agent
-	if task.Spec.AgentRef != nil && task.Spec.AgentRef.Name != "" {
-		var a foremanv1alpha1.Agent
-		key := client.ObjectKey{Namespace: task.Namespace, Name: task.Spec.AgentRef.Name}
-		if err := c.Get(ctx, key, &a); err == nil {
-			agent = &a
-		} else {
-			log.Info("audit: agent not resolvable; recording without agent block",
-				"agent", task.Spec.AgentRef.Name, "err", err.Error())
-		}
-	}
+	agent := ResolveAgent(ctx, c, task, log)
 
 	rec := BuildRecord(task, agent)
 	if err := WriteRecord(ctx, c, ns, rec, log); err != nil {

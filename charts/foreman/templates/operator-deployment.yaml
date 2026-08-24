@@ -29,8 +29,25 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "foreman.operator.serviceAccountName" . }}
+      {{- /*
+        Archival (#1654) is the only thing the operator writes to a volume it
+        does not own, so fsGroup is added ONLY when archival is enabled and
+        only from the archive block. The operator image runs as 65532 with
+        runAsNonRoot, and a PVC arrives root-owned on most provisioners, so
+        without a matching fsGroup every terminal task increments
+        foreman_archive_failures_total{reason="write"} and no bundle lands.
+        Applying it unconditionally would change the pod security context of
+        every install, archival or not, and OpenShift's restricted-v2 SCC
+        rejects a pod naming an fsGroup outside the namespace's allocated
+        range. archive.fsGroup: 0 renders none at all, which is what that SCC
+        needs. An fsGroup the operator sets itself in podSecurityContext wins.
+      */}}
+      {{- $podSecurityContext := deepCopy (default dict .Values.operator.podSecurityContext) }}
+      {{- if and .Values.foreman.archive.enabled (gt (int (default 0 .Values.foreman.archive.fsGroup)) 0) }}
+      {{- $podSecurityContext = merge $podSecurityContext (dict "fsGroup" (int .Values.foreman.archive.fsGroup)) }}
+      {{- end }}
       securityContext:
-        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
+        {{- toYaml $podSecurityContext | nindent 8 }}
       containers:
         - name: manager
           image: {{ include "foreman.operator.image" . }}
@@ -65,6 +82,14 @@ spec:
             # reaper entirely without redeploying.
             - --audit-retention={{ .Values.operator.audit.retention }}
             - --audit-retention-interval={{ .Values.operator.audit.interval }}
+            {{- if .Values.foreman.archive.enabled }}
+            # Terminal-task archival (#1654). One flag carries both the
+            # switch and the destination: empty (the default, rendered
+            # by omitting the flag entirely) disables archival in the
+            # operator. Bundles hold source code, issue text and tool
+            # output, so this is opt-in only.
+            - --archive-dir={{ .Values.foreman.archive.dir }}
+            {{- end }}
           ports:
             - name: health
               containerPort: {{ .Values.operator.health.port }}
@@ -110,6 +135,10 @@ spec:
               mountPath: /tmp/k8s-webhook-server/serving-certs
               readOnly: true
             {{- end }}
+            {{- if .Values.foreman.archive.enabled }}
+            - name: archive
+              mountPath: {{ .Values.foreman.archive.dir }}
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -117,6 +146,26 @@ spec:
         - name: webhook-certs
           secret:
             secretName: {{ include "foreman.webhook.secretName" . }}
+        {{- end }}
+        {{- if .Values.foreman.archive.enabled }}
+        - name: archive
+          {{- /*
+            The emptyDir fallback lives HERE, not in values.yaml, because Helm
+            deep-merges an operator's values onto the chart's. A chart default
+            of {emptyDir: {}} can never be replaced, only added to:
+            --set foreman.archive.volume.persistentVolumeClaim.claimName=x
+            rendered emptyDir AND the claim, and the API server refuses that
+            with "may not specify more than 1 volume type", so helm upgrade
+            failed and no rollout happened. hostPath behaved the same way.
+            That is the exact path values.yaml tells operators to take, so the
+            default has to be an empty map and the safety floor has to be a
+            template branch (#1654).
+          */}}
+          {{- if .Values.foreman.archive.volume }}
+          {{- toYaml .Values.foreman.archive.volume | nindent 10 }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
         {{- end }}
       {{- with .Values.operator.nodeSelector }}
       nodeSelector:
