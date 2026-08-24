@@ -64,27 +64,24 @@ func TestBundleDir_ZeroIssueGetsAWellFormedKey(t *testing.T) {
 	}
 }
 
-func TestBundleDir_EmptyRepoNormalizesToNoRepo(t *testing.T) {
-	rec := testRecord()
-	rec.Repo = ""
-	got, err := BundleDir("/arch", rec)
-	if err != nil {
-		t.Fatalf("BundleDir: %v", err)
-	}
-	if !strings.Contains(got, "/no-repo/") {
-		t.Errorf("BundleDir with empty repo = %q, want /no-repo/ segment", got)
-	}
-}
-
-func TestBundleDir_DotRepoNormalizesToNoRepo(t *testing.T) {
-	rec := testRecord()
-	rec.Repo = "."
-	got, err := BundleDir("/arch", rec)
-	if err != nil {
-		t.Fatalf("BundleDir: %v", err)
-	}
-	if !strings.Contains(got, "/no-repo/") {
-		t.Errorf("BundleDir with dot repo = %q, want /no-repo/ segment", got)
+func TestBundleDir_RepoThatNamesNothingNormalizesToNoRepo(t *testing.T) {
+	// Every one of these cleans to ".". A literal `repo == "" || repo == "."`
+	// lets the rest through, which drops the repo level entirely and lands the
+	// bundle at <root>/<issue>/<leaf>, where they all collide with each other.
+	repos := []string{"", ".", "./", "./.", "a/..", "./x/.."}
+	want := "/arch/no-repo/1602/wl-1602-code-2026-08-23T18-44-22Z"
+	for _, repo := range repos {
+		t.Run("repo="+repo, func(t *testing.T) {
+			rec := testRecord()
+			rec.Repo = repo
+			got, err := BundleDir("/arch", rec)
+			if err != nil {
+				t.Fatalf("BundleDir: %v", err)
+			}
+			if got != want {
+				t.Errorf("BundleDir(repo=%q) = %q, want %q", repo, got, want)
+			}
+		})
 	}
 }
 
@@ -469,8 +466,147 @@ func TestVerifyContained_RefusesAnUnresolvableRoot(t *testing.T) {
 	loop := filepath.Join(base, "loop")
 	mustSymlink(t, loop, loop)
 
-	if err := verifyContained(loop, filepath.Join(loop, "bundle")); err == nil {
+	// The bundle path given here resolves cleanly, so root resolution is the
+	// only thing that can fail. Passing a path under the loop instead would let
+	// this pass through the EvalSymlinks(dir) guard without ever reaching the
+	// root.
+	if err := verifyContained(loop, base); err == nil {
 		t.Fatal("verifyContained with an unresolvable root = nil error, want a refusal")
+	}
+}
+
+func TestResolveRoot_RefusesARootItCannotResolve(t *testing.T) {
+	base := t.TempDir()
+	loop := filepath.Join(base, "loop")
+	mustSymlink(t, loop, loop)
+
+	if _, err := resolveRoot(loop); err == nil {
+		t.Fatal("resolveRoot on a symlink loop = nil error; EvalSymlinks returns \"\" " +
+			"with its error, and \"\" as a root passes every containment test")
+	}
+}
+
+// TestContained_RefusesNonAbsolutePaths pins the layered guard. resolveRoot and
+// EvalSymlinks both hand back "" with their errors, so if either error were
+// dropped upstream this function would be asked to relate "" to "", which
+// filepath.Rel answers with ".", nil: containment would pass for everything.
+func TestContained_RefusesNonAbsolutePaths(t *testing.T) {
+	cases := map[string][2]string{
+		"both empty":    {"", ""},
+		"empty root":    {"", "/arch/bundle"},
+		"empty path":    {"/arch", ""},
+		"relative root": {"arch", "/arch/bundle"},
+	}
+	for name, pair := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := contained(pair[0], pair[1]); err == nil {
+				t.Errorf("contained(%q, %q) = nil error, want a refusal", pair[0], pair[1])
+			}
+		})
+	}
+}
+
+// TestWriteBundle_IncompleteDirectoryIsRewritten covers the failure mode of
+// Critical 1 reached without a symlink. A crash between MkdirAll and the last
+// write leaves a directory with no cleanup, and treating any directory as a
+// finished bundle drops the record on that reconcile and on every one after it.
+func TestWriteBundle_IncompleteDirectoryIsRewritten(t *testing.T) {
+	debris := map[string][]string{
+		"empty leaf":               nil,
+		"audit.json but no meta":   {"audit.json"},
+		"audit and transcript":     {"audit.json", "transcript.json"},
+		"meta.json is a directory": {"meta.json/"},
+	}
+	for name, files := range debris {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			rec := testRecord()
+			dir, err := BundleDir(root, rec)
+			if err != nil {
+				t.Fatalf("BundleDir: %v", err)
+			}
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				t.Fatalf("mkdir leaf: %v", err)
+			}
+			for _, f := range files {
+				if strings.HasSuffix(f, "/") {
+					if err := os.Mkdir(filepath.Join(dir, strings.TrimSuffix(f, "/")), 0o750); err != nil {
+						t.Fatalf("mkdir %s: %v", f, err)
+					}
+					continue
+				}
+				if err := os.WriteFile(filepath.Join(dir, f), []byte("debris"), 0o640); err != nil {
+					t.Fatalf("write %s: %v", f, err)
+				}
+			}
+
+			if err := WriteBundle(root, rec, []byte(`{"truncated":true}`)); err != nil {
+				t.Fatalf("WriteBundle over %s: %v", name, err)
+			}
+
+			var meta BundleMeta
+			readJSON(t, filepath.Join(dir, metaFile), &meta)
+			if meta.SchemaVersion != BundleSchemaVersion || !meta.HasTranscript {
+				t.Errorf("meta.json = %+v, want a completed bundle", meta)
+			}
+			tr, err := os.ReadFile(filepath.Join(dir, "transcript.json"))
+			if err != nil {
+				t.Fatalf("read transcript.json: %v", err)
+			}
+			if string(tr) != `{"truncated":true}` {
+				t.Errorf("transcript.json = %q, want the record we passed; the debris was not replaced", tr)
+			}
+		})
+	}
+}
+
+// TestWriteBundle_RepeatedReconcilesOverDebrisDoNotLoseTheRecord is the shape
+// the reviewer ran: three consecutive reconciles against a pre-created empty
+// leaf. All three returning nil means the record is gone for good.
+func TestWriteBundle_RepeatedReconcilesOverDebrisDoNotLoseTheRecord(t *testing.T) {
+	root := t.TempDir()
+	rec := testRecord()
+	dir, err := BundleDir(root, rec)
+	if err != nil {
+		t.Fatalf("BundleDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("mkdir leaf: %v", err)
+	}
+
+	for i := 1; i <= 3; i++ {
+		if err := WriteBundle(root, rec, []byte(`original`)); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, metaFile)); err != nil {
+		t.Fatalf("no bundle after three reconciles over an empty leaf: %v", err)
+	}
+	// The first reconcile completed the bundle; the two after it must respect
+	// immutability rather than rewriting it.
+	tr, err := os.ReadFile(filepath.Join(dir, "transcript.json"))
+	if err != nil {
+		t.Fatalf("read transcript.json: %v", err)
+	}
+	if string(tr) != "original" {
+		t.Errorf("transcript.json = %q, want the completed bundle left alone", tr)
+	}
+}
+
+// TestWriteAll_MetaIsWrittenLast pins the ordering the sentinel depends on. If
+// meta.json were written first, an interrupted write would leave a directory
+// that WriteBundle reads as a finished bundle, which is the whole defect.
+func TestWriteAll_MetaIsWrittenLast(t *testing.T) {
+	dir := t.TempDir()
+	rec := testRecord()
+	rec.ElapsedSec = math.Inf(1) // audit.json, the first write, fails to marshal
+
+	if err := writeAll(dir, rec, []byte(`{"x":1}`)); err == nil {
+		t.Fatal("writeAll with a non-finite ElapsedSec = nil error, want a marshal failure")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, metaFile)); !os.IsNotExist(err) {
+		t.Errorf("%s exists after an interrupted writeAll (err=%v); it is the completion "+
+			"sentinel and must be written last", metaFile, err)
 	}
 }
 

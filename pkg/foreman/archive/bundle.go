@@ -33,6 +33,11 @@ import (
 // a change a reader cannot handle transparently.
 const BundleSchemaVersion = "foreman.archive.v1"
 
+// metaFile is written last by writeAll, which makes its presence the sentinel
+// for a completed bundle. A directory without it is crash debris, not an
+// archive. Keep it last.
+const metaFile = "meta.json"
+
 // BundleMeta is meta.json. It carries only what the writer can know without
 // reaching outside its arguments, so the writer stays a pure function.
 type BundleMeta struct {
@@ -70,8 +75,12 @@ func BundleDir(root string, rec audit.Record) (string, error) {
 		issue = fmt.Sprintf("%d", rec.Issue)
 	}
 
+	// Clean, not a literal comparison: "", ".", "./", "./.", "a/.." and
+	// "./x/.." all name the same nothing, and any of them slipping past this
+	// would drop the repo level entirely and collide with each other under
+	// <root>/<issue>/<leaf>.
 	repo := rec.Repo
-	if repo == "" || repo == "." {
+	if filepath.Clean(repo) == "." {
 		repo = "no-repo"
 	}
 
@@ -104,12 +113,23 @@ func BundleDir(root string, rec audit.Record) (string, error) {
 // Kubernetes object UID is constant for the object's lifetime, so a re-run of
 // the same task object reuses the key and the first bundle stands.
 //
+// "Existing" means complete, not merely present. meta.json is written last, so
+// a directory without it is the debris of an interrupted write rather than a
+// bundle, and it is removed and rewritten. The alternative, refusing it, would
+// reproduce the exact failure this check was hardened against: the debris is
+// permanent, so every retry would fail on it and the record would be lost.
+// Nothing readable is discarded, because a bundle with no meta.json cannot be
+// read as one.
+//
 // A failed write removes the partial directory, so the next reconcile is not
 // suppressed by a half-written bundle that the skip check would mistake for a
 // finished one. A partial MkdirAll failure can leave empty parent directories
-// behind, but never the leaf, so the retry is not suppressed there either.
-// Whether that retry then succeeds depends on the cause: a permission error or
-// a full disk fails again. What is guaranteed is only that it is attempted.
+// behind, but never the leaf, so the retry is not suppressed there either. A
+// crash between MkdirAll and the last write, by SIGKILL, eviction or a node
+// reboot, gets no cleanup at all and does leave the leaf: that is the case the
+// meta.json sentinel covers. Whether the retry then succeeds depends on the
+// cause: a permission error or a full disk fails again. What is guaranteed is
+// only that it is attempted.
 func WriteBundle(root string, rec audit.Record, transcript []byte) error {
 	dir, err := BundleDir(root, rec)
 	if err != nil {
@@ -135,9 +155,18 @@ func WriteBundle(root string, rec audit.Record, transcript []byte) error {
 		if err := verifyContained(root, dir); err != nil {
 			return err
 		}
-		return nil
-	}
-	if !os.IsNotExist(err) {
+		complete, err := isComplete(dir)
+		if err != nil {
+			return err
+		}
+		if complete {
+			return nil
+		}
+		// Incomplete: crash debris. Clear it and write the bundle properly.
+		if err := os.RemoveAll(dir); err != nil {
+			return fmt.Errorf("archive: remove incomplete bundle %q: %w", dir, err)
+		}
+	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("archive: stat bundle dir %q: %w", dir, err)
 	}
 
@@ -148,6 +177,14 @@ func WriteBundle(root string, rec audit.Record, transcript []byte) error {
 	// Re-check containment against the filesystem as it actually is, before any
 	// bytes are written: filepath.Join cleans lexically and cannot see a
 	// symlink planted on any segment of the path.
+	//
+	// Known and accepted: this check is path-based, so between it and writeAll
+	// another writer on the same mount could swap the leaf for a symlink. The
+	// archive root is a shared PVC or hostPath, so the window is real, but
+	// closing it needs openat2(RESOLVE_BENEATH) or an O_NOFOLLOW walk held open
+	// across every write, which is a larger change than this writer justifies
+	// and is not portable to the Metal agent's darwin path. It is recorded here
+	// so the next reader knows it was weighed rather than missed.
 	if err := verifyContained(root, dir); err != nil {
 		_ = os.RemoveAll(dir)
 		return err
@@ -160,6 +197,21 @@ func WriteBundle(root string, rec audit.Record, transcript []byte) error {
 		return err
 	}
 	return nil
+}
+
+// isComplete reports whether dir holds a finished bundle, which is to say a
+// regular meta.json. Anything else (an empty directory, an audit.json with no
+// meta.json, a meta.json that is a symlink or a directory) is the debris of an
+// interrupted write and must not be mistaken for an archived record.
+func isComplete(dir string) (bool, error) {
+	fi, err := os.Lstat(filepath.Join(dir, metaFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("archive: stat %s in %q: %w", metaFile, dir, err)
+	}
+	return fi.Mode().IsRegular(), nil
 }
 
 // resolveRoot returns root as an absolute, symlink-free path. A root that does
@@ -201,6 +253,14 @@ func verifyContained(root, dir string) error {
 // already be absolute. Every failure is a refusal, never a pass: filepath.Rel
 // yields "" on error, and "" would satisfy the ".." test below.
 func contained(resolvedRoot, path string) error {
+	// Layer the guard. resolveRoot and EvalSymlinks both yield "" alongside
+	// their errors, so if either error were ever dropped upstream this function
+	// would be handed "" and filepath.Rel(".", ".") would answer ".", nil: a
+	// containment check that passes everything. An empty or relative argument
+	// here means the caller does not actually know where the path is.
+	if !filepath.IsAbs(resolvedRoot) || !filepath.IsAbs(path) {
+		return fmt.Errorf("archive: containment needs absolute paths, got root %q and path %q", resolvedRoot, path)
+	}
 	rel, err := filepath.Rel(resolvedRoot, path)
 	if err != nil {
 		return fmt.Errorf("archive: cannot relate bundle path %q to root %q: %w", path, resolvedRoot, err)
@@ -245,7 +305,9 @@ func writeAll(dir string, rec audit.Record, transcript []byte) error {
 			return fmt.Errorf("archive: write %s: %w", p, err)
 		}
 	}
-	return writeJSON(filepath.Join(dir, "meta.json"), BundleMeta{
+	// meta.json last, always: WriteBundle reads its presence as the proof that
+	// this function ran to completion.
+	return writeJSON(filepath.Join(dir, metaFile), BundleMeta{
 		SchemaVersion: BundleSchemaVersion,
 		TaskName:      rec.Task.Name,
 		RecordedAt:    rec.RecordedAt,
