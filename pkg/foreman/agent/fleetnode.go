@@ -83,6 +83,12 @@ type Registrar struct {
 	Labels   map[string]string
 	Interval time.Duration // zero defaults to DefaultHeartbeatInterval
 
+	// KubernetesNode is the Kubernetes node this agent's pod runs on, from
+	// the FLEET_NODE_NAME downward-API env var. Reported on FleetNode.status
+	// as a property of the worker; empty off-cluster. Never part of the
+	// FleetNode's identity (#1640).
+	KubernetesNode string
+
 	// Version is the agent binary's version string (e.g. "v0.8.4").
 	// Set from the build-time ldflags var and stamped on FleetNode.status
 	// every heartbeat so the cluster can observe which version is running.
@@ -243,6 +249,9 @@ func (r *Registrar) PatchHeartbeat(ctx context.Context, phase foremanv1alpha1.Fl
 	}
 	if r.Arch != "" {
 		node.Status.Arch = r.Arch
+	}
+	if r.KubernetesNode != "" {
+		node.Status.KubernetesNode = r.KubernetesNode
 	}
 	if err := r.Client.Status().Patch(ctx, &node, patch); err != nil {
 		return nil, fmt.Errorf("patch FleetNode status: %w", err)

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"sort"
@@ -310,3 +311,44 @@ func TestCommitterName_FallbackToAuthor(t *testing.T) {
 		})
 	}
 }
+
+// The identity-source contract from #1640: FleetNode identity is the agent
+// PROCESS. The --fleet-node-name flag wins when set; otherwise identity is the
+// sanitized OS hostname, which in a pod is the POD name. The FLEET_NODE_NAME
+// env var (the Kubernetes node, via downward API) is deliberately NOT an
+// input here — it feeds status.kubernetesNode, never the identity.
+func TestResolveFleetNodeName(t *testing.T) {
+	cases := []struct {
+		name     string
+		flag     string
+		hostname string
+		hostErr  error
+		want     string
+		wantErr  bool
+	}{
+		{"flag wins over hostname", "m5max-coder", "ignored-host", nil, "m5max-coder", false},
+		{"flag is sanitized to a DNS-1123 label", "My_Agent", "ignored", nil, "my-agent", false},
+		{"empty flag falls back to sanitized hostname", "", "coder-agent-ABC12", nil, "coder-agent-abc12", false},
+		{"no flag and no hostname is an error", "", "", nil, "", true},
+		{"hostname error surfaces", "", "", errHostname, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveFleetNodeName(tc.flag, func() (string, error) { return tc.hostname, tc.hostErr })
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("resolveFleetNodeName(%q) = %q, want %q", tc.flag, got, tc.want)
+			}
+		})
+	}
+}
+
+var errHostname = errors.New("hostname unavailable")

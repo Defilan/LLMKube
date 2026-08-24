@@ -564,3 +564,115 @@ func TestRegistrar_Run_DrainsAndExitsOnCancel(t *testing.T) {
 		t.Errorf("final phase = %q, want Draining", got.Status.Phase)
 	}
 }
+
+// The #1640 decision: FleetNode identity is the agent process, and the
+// physical machine is a reported PROPERTY. status.kubernetesNode is where
+// that property lands for in-cluster agents (fed from the FLEET_NODE_NAME
+// downward-API env var, which was previously set by the chart but read by
+// nothing).
+func TestRegistrar_PatchHeartbeat_StampsKubernetesNode(t *testing.T) {
+	kc := newFakeClient(t)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "coder-agent-abc12",
+		Spec: foremanv1alpha1.FleetNodeSpec{
+			NodeName: "coder-agent-abc12",
+			Roles:    []string{"coder"},
+		},
+		Provider:       &fixedCapability{},
+		KubernetesNode: "ahazidgx1",
+	}
+	if err := r.Upsert(context.Background()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "coder-agent-abc12"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.KubernetesNode != "ahazidgx1" {
+		t.Errorf("Status.KubernetesNode = %q, want %q", got.Status.KubernetesNode, "ahazidgx1")
+	}
+}
+
+// Off-cluster agents (the metal Macs) have no Kubernetes node, so a node
+// that has never been stamped stays empty. This case alone cannot tell the
+// r.KubernetesNode != "" guard apart from its absence (an unconditional ""
+// write is indistinguishable on a fresh node); the sticky-value test below
+// is the one that pins the guard down.
+func TestRegistrar_PatchHeartbeat_OmitsKubernetesNodeWhenUnset(t *testing.T) {
+	kc := newFakeClient(t)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "mac-studio-reviewer",
+		Spec: foremanv1alpha1.FleetNodeSpec{
+			NodeName: "mac-studio-reviewer",
+			Roles:    []string{"reviewer"},
+		},
+		Provider: &fixedCapability{},
+	}
+	if err := r.Upsert(context.Background()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "mac-studio-reviewer"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.KubernetesNode != "" {
+		t.Errorf("Status.KubernetesNode = %q, want empty", got.Status.KubernetesNode)
+	}
+}
+
+// A Registrar with KubernetesNode empty must not erase a value that is
+// already on status. This is the case that separates the
+// r.KubernetesNode != "" guard from its absence: without the guard, an
+// unconditional "" assignment plus the field's json omitempty tag makes
+// the MergeFrom patch emit kubernetesNode: null and the stored value is
+// lost. The guard makes the property sticky, matching how OS and Arch
+// already behave, so a stamped node keeps its last known machine even if
+// the agent restarts without the FLEET_NODE_NAME downward-API env var.
+func TestRegistrar_PatchHeartbeat_KeepsExistingKubernetesNodeWhenUnset(t *testing.T) {
+	kc := newFakeClient(t)
+	spec := foremanv1alpha1.FleetNodeSpec{
+		NodeName: "coder-agent-abc12",
+		Roles:    []string{"coder"},
+	}
+	stamped := &Registrar{
+		Client:         kc,
+		NodeName:       "coder-agent-abc12",
+		Spec:           spec,
+		Provider:       &fixedCapability{},
+		KubernetesNode: "ahazidgx1",
+	}
+	if err := stamped.Upsert(context.Background()); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	if _, err := stamped.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat (stamped): %v", err)
+	}
+
+	// A second Registrar for the same FleetNode with the env var absent.
+	unset := &Registrar{
+		Client:   kc,
+		NodeName: "coder-agent-abc12",
+		Spec:     spec,
+		Provider: &fixedCapability{},
+	}
+	if _, err := unset.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat (unset): %v", err)
+	}
+
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "coder-agent-abc12"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.KubernetesNode != "ahazidgx1" {
+		t.Errorf("Status.KubernetesNode = %q, want %q (empty Registrar must not clear a stamped value)",
+			got.Status.KubernetesNode, "ahazidgx1")
+	}
+}

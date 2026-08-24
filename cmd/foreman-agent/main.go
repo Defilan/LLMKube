@@ -282,22 +282,16 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
-	if fleetNodeName == "" {
-		host, err := os.Hostname()
-		if err != nil || host == "" {
-			setupLog.Error(err, "--fleet-node-name is required; OS hostname unavailable")
-			os.Exit(1)
-		}
-		fleetNodeName = sanitizeName(host)
-	} else {
-		// User-supplied name still needs to be a valid DNS-1123 label.
-		clean := sanitizeName(fleetNodeName)
-		if clean != fleetNodeName {
-			setupLog.Info("fleet-node-name sanitized for DNS-1123 compliance",
-				"input", fleetNodeName, "result", clean)
-			fleetNodeName = clean
-		}
+	resolved, err := resolveFleetNodeName(fleetNodeName, os.Hostname)
+	if err != nil {
+		setupLog.Error(err, "--fleet-node-name is required; OS hostname unavailable")
+		os.Exit(1)
 	}
+	if fleetNodeName != "" && resolved != fleetNodeName {
+		setupLog.Info("fleet-node-name sanitized for DNS-1123 compliance",
+			"input", fleetNodeName, "result", resolved)
+	}
+	fleetNodeName = resolved
 
 	if agentMode == "stub" && workspaceDir == "" && opencodeBin == "" {
 		setupLog.Info(
@@ -416,7 +410,12 @@ func main() {
 		Kind:     "foreman-agent",
 		OS:       goruntime.GOOS,
 		Arch:     goruntime.GOARCH,
-		Updater:  updater,
+		// The chart sets FLEET_NODE_NAME from the downward API
+		// (fieldRef: spec.nodeName). It reports which Kubernetes node this
+		// pod runs on; it is NOT the FleetNode's identity (#1640). Empty
+		// off-cluster.
+		KubernetesNode: os.Getenv("FLEET_NODE_NAME"),
+		Updater:        updater,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -911,6 +910,26 @@ func makePodLogTailFn(kcs kubernetes.Interface) func(ctx context.Context, namesp
 }
 
 var dns1123Bad = regexp.MustCompile(`[^a-z0-9-]+`)
+
+// resolveFleetNodeName resolves this process's FleetNode identity: the
+// --fleet-node-name flag when set, otherwise the OS hostname (which in a pod
+// is the POD name). Both are sanitized to a DNS-1123 label. The
+// FLEET_NODE_NAME env var — the Kubernetes node, via the downward API — is
+// deliberately not an input: FleetNode identity is the agent process (#1640),
+// and the node it runs on is reported separately at status.kubernetesNode.
+func resolveFleetNodeName(flagValue string, hostname func() (string, error)) (string, error) {
+	if flagValue != "" {
+		return sanitizeName(flagValue), nil
+	}
+	host, err := hostname()
+	if err != nil {
+		return "", fmt.Errorf("resolve fleet node name: %w", err)
+	}
+	if host == "" {
+		return "", fmt.Errorf("resolve fleet node name: empty hostname")
+	}
+	return sanitizeName(host), nil
+}
 
 func sanitizeName(s string) string {
 	s = strings.ToLower(s)

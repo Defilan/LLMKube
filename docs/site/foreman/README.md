@@ -55,7 +55,7 @@ Four CRDs make up the Foreman surface:
 | `Workload` | namespaced | The user-facing intent ("fix these eight issues in this repo"). The reconciler decomposes it into a pipeline of AgenticTasks. |
 | `AgenticTask` | namespaced | One dispatchable unit of work. References an Agent + a payload. The scheduler claims it for a FleetNode whose capability matches. |
 | `Agent` | namespaced | A reusable role definition: system prompt, tool whitelist, model endpoint, required capability. The same Agent can drive many AgenticTasks. |
-| `FleetNode` | cluster-scoped | A node in the fleet. The foreman-agent on each host self-registers and advertises its capability (accelerator family, RAM, context window, roles). |
+| `FleetNode` | cluster-scoped | A worker in the fleet. Identity is the foreman-agent *process*, not the machine: each agent self-registers one FleetNode and advertises its capability (accelerator family, RAM, context window, roles). A host running two agents therefore has two FleetNodes; the machine an in-cluster agent landed on is reported as a property on `status.kubernetesNode`. |
 
 The minimal lifecycle:
 
@@ -146,8 +146,10 @@ helm install foreman llmkube/foreman \
 ```
 
 That installs the foreman-operator (controllers for the four CRDs),
-plus a foreman-agent Deployment that registers a FleetNode for the
-gate-runner role on the Linux/K8s host. Apple Silicon coder /
+plus a foreman-agent Deployment for the gate-runner role on the
+Linux/K8s host. Each agent replica registers its own FleetNode, so a
+pool with `replicaCount: 2` produces two FleetNodes on that one host,
+each reporting the same `status.kubernetesNode`. Apple Silicon coder /
 reviewer nodes run the foreman-agent binary directly via launchd;
 see [the M3 runbook](/docs/foreman/runbook-m3) and
 [the M4 runbook](/docs/foreman/runbook-m4) for hosts-side install.
