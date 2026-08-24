@@ -25,7 +25,7 @@ go when the task goes.
 
 Audit records are deliberately owner-unbound so they outlive their task, but
 `--audit-retention` defaults to seven days
-(`cmd/foreman-operator/main.go:99`).
+(`cmd/foreman-operator/main.go:101`).
 
 Git keeps the destination but not the journey. A merged diff shows what landed;
 it cannot show that the first attempt failed `go vet`, what the coder did next,
@@ -50,14 +50,16 @@ that no longer exists and cannot be reconstructed.
 ### Hook point: `audit.RecordTerminal`
 
 The archiver runs where `audit.RecordTerminal` is already called, in
-`internal/foreman/controller/agentictask_controller.go:132`.
+`internal/foreman/controller/agentictask_controller.go:139`.
 
 That instant is the only one where everything needed is simultaneously true:
 
 - the verdict is final;
 - the audit record is fully populated, including the `Gate`, `ScopeGuard`,
   `IssueAsk` and `Reviewer` outcome structs;
-- `TranscriptRef` still resolves, because the task has not been deleted;
+- `TranscriptRef` still resolves, because the task has not been deleted (this
+  turned out to require a fix; see "The transcript reference was never on
+  status" below);
 - `Branch`, `CommitSHA` and `Issue` are set, which are the join keys into git.
 
 Archiving here needs no finalizer and races nothing. An archiver that instead
@@ -67,8 +69,8 @@ race. A stuck finalizer blocks task deletion indefinitely, which is a worse
 failure than a missed archive.
 
 Note that the transcript is written by a different process at a different time:
-the agent writes it during execution (`pkg/foreman/agent/executor_native.go:800`
-and `:1031`). The controller is the only party that later sees both halves.
+the agent writes it during execution (`pkg/foreman/agent/executor_native.go:833`
+and `:1064`). The controller is the only party that later sees both halves.
 
 ### Bundle layout
 
@@ -98,7 +100,7 @@ failed attempt is training data in its own right, and re-running a task must
 never destroy the evidence of why it was re-run.
 
 **A missing transcript is normal, not an error.** A deterministic run writes no
-transcript at all (`pkg/foreman/agent/executor_native.go:1524`). The archiver
+transcript at all (`pkg/foreman/agent/executor_native.go:1557`). The archiver
 records the audit half and moves on, without logging an error for every
 deterministic task.
 
@@ -120,7 +122,7 @@ write path.
 
 ## As built: what moved during implementation
 
-Five review rounds changed the design in ways this document originally did not
+Review rounds changed the design in ways this document originally did not
 describe. They are recorded here rather than left as a gap between the proposal
 and the code.
 
@@ -131,10 +133,22 @@ return success. The shipped writer resolves the root with `filepath.EvalSymlinks
 uses `filepath.Rel` rather than a string prefix, and **re-verifies containment
 after `MkdirAll`**, because a pre-create check cannot see a symlink planted on a
 segment it has not created yet. Containment runs before any bytes are written,
-so a refused bundle never receives content. This mirrors `resolveInside` in
-`pkg/foreman/agent/tools/workspace.go`; the duplication is deliberate for now,
-since that function sits in the coder's live write path and lifting it into a
-shared helper is its own change.
+so a refused bundle never receives content.
+
+The archive check is **stronger than** `resolveInside` in
+`pkg/foreman/agent/tools/workspace.go`, not a copy of it. `resolveInside` skips
+symlink resolution entirely when the target does not yet exist
+(`workspace.go:85`), which is the normal case for a file the coder is about to
+create, and `write_file.go` then calls `os.MkdirAll` (`:74`) and `os.WriteFile`
+(`:79`) with no re-check. A symlinked ancestor inside the workspace is followed
+out. The archive writer re-verifies after `MkdirAll` (`pkg/foreman/archive/bundle.go:173`),
+which is exactly the hole `resolveInside` leaves open.
+
+So unification must go **upward**: lifting `resolveInside` into a shared helper
+as-is would regress the archive to the weaker check. If the two are ever merged,
+the archive's post-`MkdirAll` re-verification is the behaviour that has to
+survive, and moving it into the coder's live write path is its own change with
+its own risk.
 
 **The bundle key falls back to the task UID.** `RecordedAt` is only populated
 when `task.Status.FinishedAt` is non-nil, and an empty value made the key
@@ -161,6 +175,26 @@ or `no-repo` and a reader should expect variable depth. NUL bytes and an empty
 skips a complete bundle, so the repeat costs one `stat` and gives a failed write
 a free retry. Gating it on the first terminal pass would turn a transient failure
 into permanent loss for that task.
+
+**The transcript reference was never on status.** This proposal assumed
+`Status.TranscriptRef` was populated. It was not, and never had been:
+`pkg/foreman/agent/watcher.go` lifted `branch`, `commitSHA` and `jobName` out of
+the executor's `Result.Extra` but not `transcriptRef`, which the executor stamps
+there as an `ObjectReference` map. The field therefore had one reader and zero
+assignments across the whole repository. Left unfixed, the archiver would have
+gated its entire transcript path on an always-empty field: every bundle
+`hasTranscript:false`, both transcript failure counters flat, and nothing logged,
+because an empty reference is the deterministic-run path this design deliberately
+made silent. A fleet dropping every transcript would have been
+byte-indistinguishable from a fleet of deterministic runs. Fixed at the root, in
+the watcher, beside the three existing lifts; `audit.Record.TranscriptRef`, empty
+since the field was introduced, is repaired as a side effect.
+
+**The node reservation is released before archival, not after.** Archival writes
+to a mounted volume and takes no timeout, and the AgenticTask controller runs
+with concurrency 1. An archive stalled on a hung mount ahead of the release would
+hold a finished task's node reserved and wedge every other AgenticTask reconcile
+behind it. Releasing first bounds a bad mount to "no bundles are being written".
 
 **Known residual.** An empty regular `meta.json`, produced by a torn write of
 the sentinel itself, passes the completion check but cannot be parsed. The window
@@ -288,12 +322,16 @@ remains the source of truth; the archive is a side effect.
 But non-blocking plus log-only means discovering six weeks later that there is no
 data. So failures are counted and surfaced:
 
-- a Prometheus counter, `foreman_archive_failures_total`, labelled by reason;
-- an event on the AgenticTask.
+- a Prometheus counter, `foreman_archive_failures_total`, labelled by reason.
 
 That makes "archival has been failing for 15m" a single recording rule away, in
 a chart that already alerts on this shape, and turns silent data loss into a
 page.
+
+An earlier draft of this section also promised an event on the AgenticTask.
+Nothing emits one: `AgenticTaskReconciler` has no `Recorder` field and
+`archiveTerminalTask` does not record events. The counter is the whole of the
+failure signal today. See "Follow-ups".
 
 ## Retention stays independent
 
@@ -337,6 +375,10 @@ edge nodes.
    archived lossy.
 2. **Backfill from git.** Merged issue-to-PR pairs are permanent and can be
    harvested retroactively at any time, independent of this proposal.
+3. **An event on the AgenticTask for an archive failure.** Promised by an
+   earlier draft of "Failure handling" and never built. It needs a `Recorder`
+   on `AgenticTaskReconciler`, which no Foreman controller has today, so it is
+   a wiring change of its own rather than a line in the archiver.
 
 ## Testing
 
