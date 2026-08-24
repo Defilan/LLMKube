@@ -35,6 +35,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -153,11 +154,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := (&foremancontroller.AgenticTaskReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		ArchiveDir: archiveDir,
-	}).SetupWithManager(mgr); err != nil {
+	if err := agenticTaskReconciler(mgr.GetClient(), mgr.GetScheme(), archiveDir).
+		SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AgenticTask")
 		os.Exit(1)
 	}
@@ -252,4 +250,21 @@ func webhookCertsPresent(certDir string) bool {
 		}
 	}
 	return true
+}
+
+// agenticTaskReconciler builds the AgenticTask reconciler. It exists as a
+// seam so a test can assert that archiveDir actually reaches
+// AgenticTaskReconciler.ArchiveDir. Without it, dropping the ArchiveDir
+// assignment still compiles, vets and passes every test in the repo while
+// silently making archival inert on a real cluster: the operator would log
+// nothing, the chart would render the flag and the volume, and no bundle
+// would ever be written.
+func agenticTaskReconciler(
+	c client.Client, s *runtime.Scheme, archiveDir string,
+) *foremancontroller.AgenticTaskReconciler {
+	return &foremancontroller.AgenticTaskReconciler{
+		Client:     c,
+		Scheme:     s,
+		ArchiveDir: archiveDir,
+	}
 }

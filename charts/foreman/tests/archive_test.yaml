@@ -101,6 +101,44 @@ tests:
             name: archive
             mountPath: /var/lib/foreman/archive
 
+  # Archival must not be coupled to any OTHER flag's guard. webhook.enabled
+  # false is a documented, supported install (values.yaml:24), and under it
+  # a mount guard that also tested .Values.webhook.enabled would render the
+  # --archive-dir flag with NO volume behind it: the operator would then
+  # write bundles into the container's writable layer, where they die with
+  # the pod. Green chart, zero archives. Assert the webhook-certs entries
+  # are actually gone too, otherwise a `set:` that silently failed would
+  # make this case a duplicate of the plain enabled case above.
+
+  - it: renders the mount and the volume even when the webhook is disabled
+    set:
+      webhook.enabled: false
+      foreman.archive.enabled: true
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: webhook-certs
+      - notContains:
+          path: spec.template.spec.volumes
+          any: true
+          content:
+            name: webhook-certs
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --archive-dir=/var/lib/foreman/archive
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: archive
+            mountPath: /var/lib/foreman/archive
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: archive
+            emptyDir: {}
+
   # The emptyDir default is a safety floor, not the intended production
   # source. If the template hardcoded emptyDir instead of passing the
   # value through, every enabled install would silently lose its bundles
