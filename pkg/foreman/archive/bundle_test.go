@@ -314,12 +314,19 @@ func TestWriteBundle_PartialWriteLeavesNoBundleSoItRetries(t *testing.T) {
 }
 
 func TestWriteBundle_UnwritableRootFails(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "read-only")
-	if err := os.Mkdir(root, 0o500); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	// A regular file standing where the root directory should be, rather than
+	// a chmod 0500 directory. Root ignores POSIX permission bits, so a mode-
+	// based unwritable directory is writable for uid 0 and this assertion
+	// inverted under any root container: CI runs unprivileged and stayed
+	// green while the Foreman gate Job, which runs as root, failed every run.
+	// ENOTDIR is refused for every uid, so the test now means the same thing
+	// wherever it runs.
+	root := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(root, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
 	}
 	if err := WriteBundle(root, testRecord(), nil); err == nil {
-		t.Fatal("WriteBundle into an unwritable root = nil error, want a failure")
+		t.Fatal("WriteBundle into a root that is not a directory = nil error, want a failure")
 	}
 }
 

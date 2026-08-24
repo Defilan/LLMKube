@@ -172,9 +172,13 @@ func TestArchiveTerminalTask_MissingTranscriptStillArchives(t *testing.T) {
 // dropping records, which makes counting the failure load-bearing rather than
 // decorative.
 func TestArchiveTerminalTask_FailureDoesNotPanicAndCounts(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "ro")
-	if err := os.Mkdir(root, 0o500); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	// A regular file, not a chmod 0500 directory: root ignores permission
+	// bits, so a mode-based unwritable root is writable for uid 0 and the
+	// write this test needs to fail would succeed. See the note in
+	// pkg/foreman/archive/bundle_test.go.
+	root := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(root, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
 	}
 	before := archiveFailureCount(t, "write")
 	task := terminalTask()
