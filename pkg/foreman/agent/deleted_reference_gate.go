@@ -117,9 +117,11 @@ func recordDeletedIssueReferences(extra map[string]any, unifiedDiff string) {
 // cyclomatic-complexity budget stays untouched (the stated reason the siblings
 // are wrapped rather than inlined).
 //
-// It must run after repo.Commit, reading the committed base...HEAD diff, and it
-// reuses branchDiffText -- the same `git diff base...HEAD` the grounding rail
-// scans -- so this rail does not shell out for a second diff. It is a flag,
+// It must run after repo.Commit, reading the committed base...HEAD diff via
+// branchDiffText, the same helper the grounding rail uses. Note that this is a
+// separate `git diff` invocation, not a reused result: branchDiffText does not
+// memoize and no diff is in scope at the call site. The cost is one extra diff
+// per coder task, which is cheap next to the run itself. It is a flag,
 // not a block: it records the removed-line issue references onto the task's
 // extra map and never changes the verdict. The extra map is ensured non-nil
 // (the sibling rails do the same before writing) so the flag is recorded even
