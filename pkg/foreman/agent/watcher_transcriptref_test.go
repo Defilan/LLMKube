@@ -162,19 +162,22 @@ func TestPatchTerminal_LiftsTranscriptRefAfterJSONRoundTrip(t *testing.T) {
 // task never reaches a terminal phase at all.
 func TestPatchTerminal_TranscriptRefEmptyWhenAbsentOrMalformed(t *testing.T) {
 	cases := []struct {
-		name  string
+		// task is also the subtest name, so each case gets its own fake
+		// client and the six cannot share state.
+		task  string
+		why   string
 		extra map[string]any
 	}{
-		{"deterministic run: no key at all", map[string]any{"outcome": ""}},
-		{"explicit nil, as objRefAsMap returns for an unnamed ref", map[string]any{"transcriptRef": nil}},
-		{"flattened to a scalar", map[string]any{"transcriptRef": "foreman-transcript-code-x"}},
-		{"map with no name field", map[string]any{"transcriptRef": map[string]any{"kind": "ConfigMap"}}},
-		{"name is not a string", map[string]any{"transcriptRef": map[string]any{"name": 42}}},
-		{"nil Extra entirely", nil},
+		{"det-absent", "deterministic run: no key at all", map[string]any{"outcome": ""}},
+		{"det-nil", "explicit nil, as objRefAsMap returns for an unnamed ref", map[string]any{"transcriptRef": nil}},
+		{"det-scalar", "flattened to a scalar", map[string]any{"transcriptRef": "foreman-transcript-code-x"}},
+		{"det-nokey", "map with no name field", map[string]any{"transcriptRef": map[string]any{"kind": "ConfigMap"}}},
+		{"det-nonstring", "name is not a string", map[string]any{"transcriptRef": map[string]any{"name": 42}}},
+		{"det-noextra", "nil Extra entirely", nil},
 	}
-	for i, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			name := taskNameForCase(i)
+	for _, tc := range cases {
+		t.Run(tc.task, func(t *testing.T) {
+			name := tc.task
 			c := newRecoveryClient(t, pendingTask(name))
 			w := &AgenticTaskWatcher{Client: c, NodeName: "coder", Namespace: "default"}
 
@@ -186,14 +189,8 @@ func TestPatchTerminal_TranscriptRefEmptyWhenAbsentOrMalformed(t *testing.T) {
 				t.Fatalf("patchTerminal: %v", err)
 			}
 			if got := getTask(t, c, name).Status.TranscriptRef; got != "" {
-				t.Errorf("status.transcriptRef = %q, want empty", got)
+				t.Errorf("status.transcriptRef = %q, want empty (%s)", got, tc.why)
 			}
 		})
 	}
-}
-
-// taskNameForCase gives each subtest its own task so the fake clients cannot
-// share state.
-func taskNameForCase(i int) string {
-	return "det-" + string(rune('a'+i))
 }
