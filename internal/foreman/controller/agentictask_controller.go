@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -37,6 +39,7 @@ import (
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
+	"github.com/defilantech/llmkube/pkg/foreman/archive"
 	"github.com/defilantech/llmkube/pkg/foreman/audit"
 )
 
@@ -69,6 +72,10 @@ type AgenticTaskReconciler struct {
 	// AuditNamespace is where durable audit-record ConfigMaps are written.
 	// Empty means each record lands in its task's own namespace.
 	AuditNamespace string
+
+	// ArchiveDir is where terminal-task bundles are written. Empty disables
+	// archival entirely: no directory is created and no work is done.
+	ArchiveDir string
 }
 
 // requeueNoFit is the backoff when no FleetNode satisfies the task's
@@ -138,6 +145,7 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				llmkubemetrics.RecordTaskOutcome(agent, kind, verdict, outcome, elapsedSec, turns)
 			}
 		}
+		r.archiveTerminalTask(ctx, &task, log)
 		// Release the node reservation so the scheduler can dispatch the next
 		// task there. Guarded on taskKey, so a node already reserved for a
 		// different task is untouched.
@@ -1006,4 +1014,45 @@ func (r *AgenticTaskReconciler) fleetNodeEnqueues(ctx context.Context, obj clien
 		}
 	}
 	return requests
+}
+
+// archiveTerminalTask writes one immutable bundle for a terminal task.
+//
+// Deliberately not gated on firstTerminal. WriteBundle skips a bundle that
+// already exists, so calling this on every terminal reconcile costs one stat
+// and gives a failed write a free retry: a failure leaves no directory behind.
+// Gating on firstTerminal would turn a transient ENOSPC into permanent data
+// loss for that task.
+//
+// Every failure path is non-fatal and counted. Archival must never change a
+// verdict; the harness is the source of truth and this is a side effect.
+func (r *AgenticTaskReconciler) archiveTerminalTask(
+	ctx context.Context,
+	task *foremanv1alpha1.AgenticTask,
+	log logr.Logger,
+) {
+	if r.ArchiveDir == "" {
+		return
+	}
+	rec := audit.BuildRecord(task, audit.ResolveAgent(ctx, r.Client, task, log))
+
+	var transcript []byte
+	if ref := task.Status.TranscriptRef; ref != "" {
+		var cm corev1.ConfigMap
+		key := client.ObjectKey{Namespace: task.Namespace, Name: ref}
+		if err := r.Get(ctx, key, &cm); err != nil {
+			// A deterministic run writes no transcript, and a transcript can be
+			// collected before this runs. Neither is a reason to drop the record.
+			log.V(1).Info("archive: transcript not readable; archiving record only",
+				"transcriptRef", ref, "err", err.Error())
+			llmkubemetrics.RecordArchiveFailure("transcript_read")
+		} else {
+			transcript = []byte(cm.Data["transcript.json"])
+		}
+	}
+
+	if err := archive.WriteBundle(r.ArchiveDir, rec, transcript); err != nil {
+		log.Error(err, "archive: failed to write bundle (continuing)", "task", task.Name)
+		llmkubemetrics.RecordArchiveFailure("write")
+	}
 }
