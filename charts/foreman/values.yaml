@@ -113,9 +113,26 @@ foreman:
     # operator never learns what is behind it. The emptyDir default keeps
     # a mistaken `enabled: true` from silently filling a node disk that
     # something else depends on, but it also means bundles die with the
-    # pod: point this at a persistentVolumeClaim for real use.
+    # pod: point this at a persistentVolumeClaim for real use. Read the
+    # fsGroup note below before you do.
     volume:
       emptyDir: {}
+    # fsGroup applied to the operator pod, but ONLY while archival is
+    # enabled, so a default install's pod security context is unchanged.
+    #
+    # This is what makes the persistentVolumeClaim above actually usable.
+    # The operator image runs as UID 65532 with runAsNonRoot, and most
+    # provisioners hand out a freshly-bound PVC owned root:root 0755. With
+    # no fsGroup the operator cannot create its bundle directory, every
+    # terminal task increments
+    # foreman_archive_failures_total{reason="write"}, and not one bundle is
+    # written. The emptyDir default hides this completely, because the
+    # kubelet creates an emptyDir already owned by the pod.
+    #
+    # Set to 0 to render no fsGroup at all. That is what OpenShift needs:
+    # the restricted-v2 SCC injects fsGroup from the namespace's allocated
+    # range and rejects a pod that names a value outside it.
+    fsGroup: 65532
 
 # agents is the multi-fleet map (#994). Leave it UNSET for a single
 # agent (the legacy `agent:` block above is used as-is and renders

@@ -29,8 +29,25 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "foreman.operator.serviceAccountName" . }}
+      {{- /*
+        Archival (#1654) is the only thing the operator writes to a volume it
+        does not own, so fsGroup is added ONLY when archival is enabled and
+        only from the archive block. The operator image runs as 65532 with
+        runAsNonRoot, and a PVC arrives root-owned on most provisioners, so
+        without a matching fsGroup every terminal task increments
+        foreman_archive_failures_total{reason="write"} and no bundle lands.
+        Applying it unconditionally would change the pod security context of
+        every install, archival or not, and OpenShift's restricted-v2 SCC
+        rejects a pod naming an fsGroup outside the namespace's allocated
+        range. archive.fsGroup: 0 renders none at all, which is what that SCC
+        needs. An fsGroup the operator sets itself in podSecurityContext wins.
+      */}}
+      {{- $podSecurityContext := deepCopy (default dict .Values.operator.podSecurityContext) }}
+      {{- if and .Values.foreman.archive.enabled (gt (int (default 0 .Values.foreman.archive.fsGroup)) 0) }}
+      {{- $podSecurityContext = merge $podSecurityContext (dict "fsGroup" (int .Values.foreman.archive.fsGroup)) }}
+      {{- end }}
       securityContext:
-        {{- toYaml .Values.operator.podSecurityContext | nindent 8 }}
+        {{- toYaml $podSecurityContext | nindent 8 }}
       containers:
         - name: manager
           image: {{ include "foreman.operator.image" . }}
