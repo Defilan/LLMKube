@@ -99,6 +99,14 @@ func TestArchiveTerminalTask_WritesABundle(t *testing.T) {
 // the transcript bytes live under the "transcript.json" data key. Reading any
 // other key yields an empty transcript, which WriteBundle silently declines to
 // write, so the loss would be invisible without this test.
+//
+// The fixture sets Status.TranscriptRef by hand, which is safe ONLY because a
+// producer-side test now pins that the field is populated at all:
+// TestPatchTerminal_LiftsTranscriptRef in pkg/foreman/agent. Until #1654 it was
+// not, and this file's hand-set field was manufacturing an input production
+// never supplied -- green tests over a feature that archived zero transcripts.
+// The ConfigMap name here is transcriptName(task.Name), the same one
+// pkg/foreman/agent/transcript.go mints, so the two ends stay comparable.
 func TestArchiveTerminalTask_WritesTranscriptFromConfigMap(t *testing.T) {
 	root := t.TempDir()
 	task := terminalTask()

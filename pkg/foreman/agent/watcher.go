@@ -675,6 +675,21 @@ func (w *AgenticTaskWatcher) patchTerminal(
 		// stamps "jobName" into Extra on every verdict path; the in-process
 		// path never sets it, so this stays empty there.
 		fresh.Status.JobName = stringField(res.Extra, "jobName")
+		// #1654: lift the transcript ConfigMap's NAME out of the Result
+		// envelope onto status. Every executor path that ran a model loop
+		// stamps the reference into Extra["transcriptRef"] as the map
+		// objRefAsMap builds (kind/apiVersion/namespace/name); nothing
+		// wrote status.transcriptRef, so the field had been empty since it
+		// was introduced and every consumer of it -- the audit record, and
+		// now the archiver -- saw a fleet that looked entirely
+		// deterministic. Status.TranscriptRef is a bare name resolved
+		// against the task's own namespace, so only "name" is lifted.
+		//
+		// A deterministic run writes no transcript and leaves the key
+		// absent, which correctly leaves the field empty; so does any
+		// malformed value, because nestedStringField refuses rather than
+		// panicking on a status-write path that must not take the run down.
+		fresh.Status.TranscriptRef = nestedStringField(res.Extra, "transcriptRef", "name")
 	}
 	raw, err := json.Marshal(res)
 	if err != nil {

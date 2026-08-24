@@ -292,6 +292,26 @@ func stringField(extra map[string]any, key string) string {
 	return ""
 }
 
+// nestedStringField returns extra[key][field] as a string. It is the
+// accessor for the Extra values that are themselves small maps rather than
+// scalars: objRefAsMap stamps an ObjectReference under a key as a
+// map[string]any of kind/apiVersion/namespace/name, so stringField, which
+// only ever sees a scalar, returns "" for it.
+//
+// Every malformed shape yields "" rather than a panic: an absent key, an
+// explicit nil, a scalar where a map was expected, an absent field, or a
+// non-string field. That matters because the map arrives two ways -- built
+// in-process by objRefAsMap, and decoded from JSON after a Job hop, where
+// json.Unmarshal also produces map[string]any but any producer-side drift
+// shows up here as a wrong-shaped value rather than a type error.
+func nestedStringField(extra map[string]any, key, field string) string {
+	inner, ok := extra[key].(map[string]any)
+	if !ok {
+		return ""
+	}
+	return stringField(inner, field)
+}
+
 // firstStringField returns the first non-empty string value among the
 // given keys.
 func firstStringField(extra map[string]any, keys ...string) string {
