@@ -309,3 +309,29 @@ func readJSON(t *testing.T, path string, v any) {
 		t.Fatalf("unmarshal %s: %v", path, err)
 	}
 }
+
+func TestWriteBundle_RefusesASymlinkedSegment(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	// The bundle path starts <root>/defilantech/LLMKube/... , so a symlink at
+	// the first segment sends MkdirAll outside the archive root entirely.
+	if err := os.Symlink(outside, filepath.Join(root, "defilantech")); err != nil {
+		t.Skipf("symlink creation failed: %v (platform limitation)", err)
+	}
+
+	if err := WriteBundle(root, testRecord(), []byte(`{"x":1}`)); err == nil {
+		t.Fatal("WriteBundle through a symlinked segment = nil error, want a refusal")
+	}
+
+	var leaked []string
+	_ = filepath.WalkDir(outside, func(p string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			leaked = append(leaked, p)
+		}
+		return nil
+	})
+	if len(leaked) != 0 {
+		t.Errorf("files written outside the archive root: %v", leaked)
+	}
+}
