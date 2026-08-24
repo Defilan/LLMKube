@@ -1016,6 +1016,13 @@ func (r *AgenticTaskReconciler) fleetNodeEnqueues(ctx context.Context, obj clien
 	return requests
 }
 
+// transcriptDataKey is the ConfigMap data key the transcript is stored under.
+// It is the only key read, so a producer that renames it silently drops every
+// transcript in the fleet. That is why a ConfigMap which resolves but carries
+// nothing under this key is counted below rather than quietly recorded as a
+// run that produced no transcript.
+const transcriptDataKey = "transcript.json"
+
 // archiveTerminalTask writes one immutable bundle for a terminal task.
 //
 // Deliberately not gated on firstTerminal. WriteBundle skips a bundle that
@@ -1046,8 +1053,17 @@ func (r *AgenticTaskReconciler) archiveTerminalTask(
 			log.V(1).Info("archive: transcript not readable; archiving record only",
 				"transcriptRef", ref, "err", err.Error())
 			llmkubemetrics.RecordArchiveFailure("transcript_read")
+		} else if body := cm.Data[transcriptDataKey]; body == "" {
+			// The ConfigMap resolved but holds nothing we can read. Without
+			// this branch the bundle records hasTranscript:false, which is
+			// indistinguishable from a deterministic run that legitimately
+			// produced no transcript, so a producer-side key rename would
+			// drop every transcript in the fleet with no signal at all.
+			log.V(1).Info("archive: transcript configmap holds no transcript; archiving record only",
+				"transcriptRef", ref, "key", transcriptDataKey)
+			llmkubemetrics.RecordArchiveFailure("transcript_empty")
 		} else {
-			transcript = []byte(cm.Data["transcript.json"])
+			transcript = []byte(body)
 		}
 	}
 
