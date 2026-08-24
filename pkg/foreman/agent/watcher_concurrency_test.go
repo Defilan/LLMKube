@@ -466,6 +466,102 @@ func TestLaunchExecutor_ReleasesSlotOnError(t *testing.T) {
 	}
 }
 
+// TestPollOnce_ClaimsAcrossSlotsInOnePass: in-process and Job-mode runs draw
+// on different slots, so a node with free capacity in both must fill them in a
+// SINGLE pollOnce pass instead of claiming one task and leaving the rest idle
+// for a whole poll interval (#1638). Regression: the loop used to return after
+// the first successful claim, so this pass would claim only one.
+func TestPollOnce_ClaimsAcrossSlotsInOnePass(t *testing.T) {
+	inproc := taskForAgent("inproc", "local", 3*time.Hour)
+	jobA := taskForAgent("job-a", "coder", 2*time.Hour)
+	jobB := taskForAgent("job-b", "coder", time.Hour)
+	exec := newModeExecutor(t, map[string]bool{"coder": true})
+	w := &AgenticTaskWatcher{
+		Client: newRecoveryClient(t,
+			inproc, jobA, jobB, agentCR("local", false), agentCR("coder", true)),
+		NodeName:             "node-1",
+		TaskLivenessInterval: time.Hour, // no watchdog interference
+		Executor:             exec,
+		MaxSupervisedTasks:   2,
+	}
+
+	if err := w.pollOnce(context.Background(), "default"); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+
+	if got := countPhase(t, w, foremanv1alpha1.AgenticTaskPhaseRunning,
+		"inproc", "job-a", "job-b"); got != 3 {
+		t.Fatalf("Running tasks after one pass: want 3 (one in-process, two job-mode) got %d", got)
+	}
+	exec.waitStarted(t, 3)
+}
+
+// TestPollOnce_InProcessSlotStillSerializes: continuing the candidate loop
+// after a claim must not let the single in-process slot be double-booked -- a
+// second in-process candidate in a pass where the slot is already held stays
+// Scheduled, while a job-mode candidate in the same pass is still claimed.
+func TestPollOnce_InProcessSlotStillSerializes(t *testing.T) {
+	inproc1 := taskForAgent("inproc1", "local", 3*time.Hour)
+	inproc2 := taskForAgent("inproc2", "local", 2*time.Hour)
+	job := taskForAgent("job", "coder", time.Hour)
+	exec := newModeExecutor(t, map[string]bool{"coder": true})
+	w := &AgenticTaskWatcher{
+		Client: newRecoveryClient(t,
+			inproc1, inproc2, job, agentCR("local", false), agentCR("coder", true)),
+		NodeName:             "node-1",
+		TaskLivenessInterval: time.Hour, // no watchdog interference
+		Executor:             exec,
+	}
+
+	// One pass must claim inproc1 and job, but leave inproc2 Scheduled: the
+	// in-process slot was taken by inproc1 earlier in the same pass, so the
+	// per-candidate check holds it back, while the job-mode candidate still
+	// draws on its (separate) supervision slot.
+	if err := w.pollOnce(context.Background(), "default"); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+
+	if got := getTask(t, w.Client, "inproc2").Status.Phase; got != foremanv1alpha1.AgenticTaskPhaseScheduled {
+		t.Fatalf("second in-process task while the slot is held: want Scheduled got %s", got)
+	}
+	if got := getTask(t, w.Client, "job").Status.Phase; got != foremanv1alpha1.AgenticTaskPhaseRunning {
+		t.Fatalf("job-mode task should have been claimed in the same pass: want Running got %s", got)
+	}
+	exec.waitStarted(t, 2)
+}
+
+// TestPollOnce_SupervisionBoundEnforcedInOnePass: the supervision budget caps
+// how many job-mode tasks a pass claims -- once it is spent, the remaining
+// job-mode candidates stay Scheduled even though the loop keeps scanning them
+// in the same pass (#1638).
+func TestPollOnce_SupervisionBoundEnforcedInOnePass(t *testing.T) {
+	jobA := taskForAgent("job-a", "coder", 3*time.Hour)
+	jobB := taskForAgent("job-b", "coder", 2*time.Hour)
+	jobC := taskForAgent("job-c", "coder", time.Hour)
+	exec := newModeExecutor(t, map[string]bool{"coder": true})
+	w := &AgenticTaskWatcher{
+		Client: newRecoveryClient(t,
+			jobA, jobB, jobC, agentCR("coder", true)),
+		NodeName:             "node-1",
+		TaskLivenessInterval: time.Hour, // no watchdog interference
+		Executor:             exec,
+		MaxSupervisedTasks:   2,
+	}
+
+	if err := w.pollOnce(context.Background(), "default"); err != nil {
+		t.Fatalf("pollOnce: %v", err)
+	}
+
+	if got := countPhase(t, w, foremanv1alpha1.AgenticTaskPhaseRunning,
+		"job-a", "job-b", "job-c"); got != 2 {
+		t.Fatalf("Running tasks after one pass: want 2 (the budget) got %d", got)
+	}
+	if got := getTask(t, w.Client, "job-c").Status.Phase; got != foremanv1alpha1.AgenticTaskPhaseScheduled {
+		t.Fatalf("third job-mode task over the budget: want Scheduled got %s", got)
+	}
+	exec.waitStarted(t, 2)
+}
+
 // TestPollOnce_MixedExecutionModes is the case the slot split exists for, and
 // the one a uniform fleet cannot show: the two modes draw on DIFFERENT slots,
 // so a busy one must not block the other. Both directions are asserted --

@@ -427,10 +427,21 @@ func (w *AgenticTaskWatcher) pollOnce(ctx context.Context, namespace string) err
 			logf.FromContext(ctx).WithName("agentictask-watcher").Error(err, "claim failed", "task", t.Name)
 			continue
 		}
-		// Took it. Launch the executor and return to the polling loop;
-		// the next poll re-checks capacity before claiming anything else.
+		// Took it. Launch the executor and keep scanning the rest of the
+		// candidates in this same pass instead of returning: in-process and
+		// Job-mode runs draw on different slots, so a node with free capacity
+		// in more than one of them would otherwise leave the others idle for
+		// a whole poll interval (#1638). Continuing is safe because
+		// launchExecutor reserves the slot it takes SYNCHRONOUSLY -- it
+		// takes inflightMu and sets inflight / increments supervised before
+		// the goroutine is even started -- so the hasCapacityFor check at the
+		// top of the next iteration already observes the slot the previous
+		// iteration reserved, and the loop stops claiming on its own once the
+		// relevant slot is full and falls out when the candidate list is
+		// exhausted. Run calls pollOnce sequentially and the executor
+		// goroutines only ever release, so this longer pass does not break
+		// the check-then-reserve invariant above.
 		w.launchExecutor(ctx, t, res.agent, res.supervise)
-		return nil
 	}
 	return nil
 }
