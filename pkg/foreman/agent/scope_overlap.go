@@ -502,7 +502,11 @@ func enforceReviewerScopeOverlap(
 			"verdict", verdict, "scopeRefs", refs)
 		return verdict
 	}
+	// Named alongside the flag so a consumer can tell this demotion apart
+	// from the issueAsk rail's (#1636): scope drift is a statement about the
+	// diff, which a fix iteration can act on.
 	extra["verdictDemoted"] = true
+	extra["verdictDemotedBy"] = railScopeOverlap
 	extra["verdictClaimed"] = string(verdict)
 	extra["demotionReason"] = fmt.Sprintf(
 		"scope drift: the issue names %d file(s) (%s) and the diff touches none of them",

@@ -162,7 +162,7 @@ func TestReviewIterationSteps_GatelessReviewDependsOnCode(t *testing.T) {
 		child("review-641-0", foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo),
 	}
 
-	steps, iterated := reviewIterationSteps(w, children)
+	steps, iterated, _ := reviewIterationSteps(w, children)
 	want := []string{"code-641-r1", "review-641-0-r1"}
 	if len(steps) != len(want) {
 		t.Fatalf("got %d steps, want %d (%v)", len(steps), len(want), want)

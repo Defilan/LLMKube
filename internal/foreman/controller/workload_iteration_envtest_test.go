@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/reviewer"
 )
 
 // Reviewer NO-GO fix iteration (#946): instead of terminally failing
@@ -74,6 +75,23 @@ var _ = Describe("WorkloadReconciler review fix iteration (#946)", func() {
 		`"summary":"scope creep beyond the issue ask","extra":{"outcome":"MODEL-DECIDED","modelExtra":{"findings":` +
 		`[{"severity":"blocker","area":"scope","message":"reduces ACCESS_TOKEN_EXPIRE_MINUTES from 10080 to 30",` +
 		`"file":"config/auth.py","line":12,"suggestion":"revert the unrelated change"}]}}}`
+
+	// The result an issueAsk demotion really produces: the reviewer's own
+	// APPROVE summary, no findings, and the rails' markers nested under
+	// extra.modelExtra where modelDecidedResult puts them. Built through
+	// reviewResultRaw (workload_iteration_test.go) so the shape comes from
+	// the real agent.Result rather than a hand-written string (#1641).
+	inertDemotedResult := string(reviewResultRaw(
+		foremanv1alpha1.AgenticTaskVerdictNoGo,
+		"APPROVE: the change is minimal and matches the issue",
+		map[string]any{
+			"issueAskVerified": false,
+			"verdictDemoted":   true,
+			"verdictDemotedBy": reviewer.RailIssueAsk,
+			"verdictClaimed":   string(foremanv1alpha1.AgenticTaskVerdictGo),
+			"demotionReason":   demotionReasonIssueAsk,
+			"findings":         []any{},
+		}).Raw)
 
 	It("re-dispatches the coder with the review feedback on NO-GO and completes when the retry converges", func() {
 		wl := newWorkload("iterate-happy", foremanv1alpha1.WorkloadSpec{
@@ -263,6 +281,73 @@ var _ = Describe("WorkloadReconciler review fix iteration (#946)", func() {
 		Expect(completed).NotTo(BeNil())
 		Expect(completed.Reason).To(Equal("ChildrenIncomplete"))
 		Expect(fresh.Status.ReviewIterations).To(Equal(int32(1)))
+	})
+
+	// #1636/#1641: the issueAsk rail rewrote the reviewer's GO into a NO-GO
+	// carrying no findings. No fix iteration opens (the coder would be handed
+	// an approval it cannot act on), but the demoted NO-GO still counts as
+	// incomplete and fails the Workload. The suppression therefore has to be
+	// recorded, or the operator sees a Failed Workload on a branch the
+	// reviewer approved with nothing anywhere saying why.
+	It("records the suppression when an inert issueAsk demotion blocks the iteration", func() {
+		wl := newWorkload("iterate-inert", foremanv1alpha1.WorkloadSpec{
+			Intent:           "inert demotion suppression",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{753},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+			ReviewerAgentRefs: []corev1.LocalObjectReference{
+				{Name: "reviewer"},
+			},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		reconcile(wl)
+		markTerminal("iterate-inert-code-753", foremanv1alpha1.AgenticTaskVerdictGo, "")
+		markTerminal("iterate-inert-verify-753", foremanv1alpha1.AgenticTaskVerdictGatePass, "")
+		markTerminal("iterate-inert-review-753-0",
+			foremanv1alpha1.AgenticTaskVerdictNoGo, inertDemotedResult)
+		reconcile(wl)
+
+		var r1 foremanv1alpha1.AgenticTask
+		err := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "iterate-inert-code-753-r1"}, &r1)
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+			"an empty-handed issueAsk demotion must not open a fix iteration")
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.WorkloadPhaseFailed),
+			"the demoted NO-GO still rolls the Workload to Failed; that is what needs explaining")
+
+		suppressed := findCondition(fresh.Status.Conditions, conditionTypeReviewIterationSuppressed)
+		Expect(suppressed).NotTo(BeNil(),
+			"a skipped fix iteration must be reported, not silent")
+		Expect(suppressed.Status).To(Equal(metav1.ConditionTrue))
+		Expect(suppressed.Reason).To(Equal("InertDemotion"))
+		Expect(suppressed.Message).To(ContainSubstring("review-753-0"),
+			"the condition must name the review task it suppressed")
+		Expect(suppressed.Message).To(ContainSubstring(demotionReasonIssueAsk),
+			"the condition must carry the rail's demotionReason")
+
+		Expect(recorder.Events).To(Receive(And(
+			ContainSubstring("Warning"),
+			ContainSubstring(conditionTypeReviewIterationSuppressed),
+			ContainSubstring("review-753-0"),
+		)))
+
+		// Steady state: a re-reconcile must not churn the condition or
+		// re-fire the event on every pass.
+		before := *suppressed
+		reconcile(wl)
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		after := findCondition(fresh.Status.Conditions, conditionTypeReviewIterationSuppressed)
+		Expect(after).NotTo(BeNil())
+		Expect(after.LastTransitionTime).To(Equal(before.LastTransitionTime))
+		Expect(recorder.Events).NotTo(Receive())
 	})
 
 	It("does not iterate when the reviewer says GO", func() {

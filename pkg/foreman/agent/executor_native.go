@@ -3166,7 +3166,14 @@ func enforceReviewerIssueAsk(
 		return verdict
 	}
 
+	// verdictDemotedBy is written with the flag, never apart from it: a
+	// consumer that finds verdictDemoted must always be able to ask which
+	// rail set it (#1636). It says the issueAsk rail ACTED on this verdict,
+	// not that the verdict changed: the two branches below stamp the same
+	// marker while returning the reviewer's own verdict. verdictClaimed is
+	// what distinguishes an actual GO to NO-GO rewrite from those.
 	extra["verdictDemoted"] = true
+	extra["verdictDemotedBy"] = railIssueAsk
 	extra["verdictClaimed"] = string(verdict)
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {

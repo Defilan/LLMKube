@@ -17,14 +17,18 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/reviewer"
 )
 
 // iterationWorkload builds the issue-batch spec reviewIterationSteps
@@ -46,13 +50,108 @@ func iterationWorkload(issues []int32, reviewers int, maxIter *int32) *foremanv1
 	return w
 }
 
+// reviewStep is the single reviewer's step label used throughout these
+// tests. Every review-child builder below stamps it, so it lives here
+// rather than being threaded through every call site.
+const reviewStep = "review-641-0"
+
+// demotionReasonIssueAsk / demotionReasonScopeDrift are the two rails'
+// demotionReason strings, copied from enforceReviewerIssueAsk
+// (pkg/foreman/agent/executor_native.go) and enforceReviewerScopeOverlap
+// (pkg/foreman/agent/scope_overlap.go). Only the prose is copied; the
+// verdictDemotedBy values that actually drive the predicate come from the
+// shared reviewer constants both sides compile against.
+const (
+	demotionReasonIssueAsk = "issueAsk could not be verified as covering the " +
+		"fetched issue body; review verdict is untrusted"
+	demotionReasonScopeDrift = "scope drift: the issue names 1 file(s) " +
+		"(internal/foreman/controller/workload_iteration.go) and the diff touches none of them"
+)
+
+// reviewResultRaw renders the status.result a reviewer task really carries,
+// by marshalling an actual agent.Result rather than hand-writing JSON. The
+// Extra map mirrors NativeAgentLoopExecutor.modelDecidedResult
+// (pkg/foreman/agent/executor_native.go): the rails stamp their keys into
+// LoopResult.Terminal.Extra, and modelDecidedResult nests that WHOLE map one
+// level down under "modelExtra", promoting only outcome / unverified /
+// resolvedBy to the top level. modelDecidedResult is an unexported method,
+// so the controller test cannot call it; the nesting is pinned against the
+// real executor by TestIssueAskDemotionLandsUnderModelExtra in
+// pkg/foreman/agent, which runs the actual rail and the actual
+// modelDecidedResult and asserts the JSON path this predicate reads.
+//
+// #1641: the first cut of these fixtures hand-wrote verdictDemoted as a
+// SIBLING of modelExtra, a shape the executor never emits, so the suppression
+// predicate passed its tests and did nothing in production.
+func reviewResultRaw(
+	verdict foremanv1alpha1.AgenticTaskVerdict, summary string, modelExtra map[string]any,
+) *runtime.RawExtension {
+	res := agent.NewResult("review", verdict, summary, 42*time.Second)
+	res.Extra = map[string]any{
+		"outcome":       "MODEL-DECIDED",
+		"transcriptRef": map[string]any{"kind": "ConfigMap", "name": "wl-" + reviewStep + "-transcript"},
+		"turnCount":     7,
+		"modelExtra":    modelExtra,
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		panic("marshal review result fixture: " + err.Error())
+	}
+	return &runtime.RawExtension{Raw: raw}
+}
+
+// railDemotedNoGoChild is a terminal NO-GO review child whose NO-GO a
+// harness rail MANUFACTURED rather than the reviewer asserting it: the rail
+// stamped verdictDemoted plus verdictDemotedBy naming itself, and
+// verdictClaimed archiving the verdict it rewrote (#1636).
+//
+// rail and claimed are parameters because the predicate turns on both: only
+// the issueAsk rail rewriting a GO is inert. findingsJSON decides whether the
+// demotion carries anything the coder could act on.
+func railDemotedNoGoChild(
+	rail, claimed, reason, summary, findingsJSON string,
+) foremanv1alpha1.AgenticTask {
+	c := child(reviewStep, foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo)
+	var findings any
+	if err := json.Unmarshal([]byte(findingsJSON), &findings); err != nil {
+		panic("bad findings fixture JSON: " + err.Error())
+	}
+	c.Status.Result = reviewResultRaw(foremanv1alpha1.AgenticTaskVerdictNoGo, summary, map[string]any{
+		"issueAskVerified": false,
+		"verdictDemoted":   true,
+		"verdictDemotedBy": rail,
+		"verdictClaimed":   claimed,
+		"demotionReason":   reason,
+		"findings":         findings,
+	})
+	return c
+}
+
+// demotedNoGoChild is the inert case: the issueAsk rail rewrote the
+// reviewer's GO.
+func demotedNoGoChild(summary, findingsJSON string) foremanv1alpha1.AgenticTask {
+	return railDemotedNoGoChild(reviewer.RailIssueAsk, string(foremanv1alpha1.AgenticTaskVerdictGo),
+		demotionReasonIssueAsk, summary, findingsJSON)
+}
+
+// withStep re-labels a review child for a later fix iteration, so a case can
+// place one of the builders above in round r1 instead of the base round.
+func withStep(c foremanv1alpha1.AgenticTask, step string) foremanv1alpha1.AgenticTask {
+	c.Name = "wl-" + step
+	c.Labels[labelStep] = step
+	return c
+}
+
 // noGoChild is a terminal NO-GO review child carrying a structured
 // review result so the feedback-prompt path is exercised end to end.
-func noGoChild(step, summary, findingsJSON string) foremanv1alpha1.AgenticTask {
-	c := child(step, foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo)
-	raw := `{"schemaVersion":"foreman.v1","kind":"review","verdict":"NO-GO","summary":"` + summary + `",` +
-		`"extra":{"outcome":"MODEL-DECIDED","modelExtra":{"findings":` + findingsJSON + `}}}`
-	c.Status.Result = &runtime.RawExtension{Raw: []byte(raw)}
+func noGoChild(summary, findingsJSON string) foremanv1alpha1.AgenticTask {
+	c := child(reviewStep, foremanv1alpha1.AgenticTaskPhaseSucceeded, foremanv1alpha1.AgenticTaskVerdictNoGo)
+	var findings any
+	if err := json.Unmarshal([]byte(findingsJSON), &findings); err != nil {
+		panic("bad findings fixture JSON: " + err.Error())
+	}
+	c.Status.Result = reviewResultRaw(foremanv1alpha1.AgenticTaskVerdictNoGo, summary,
+		map[string]any{"findings": findings})
 	return c
 }
 
@@ -79,6 +178,9 @@ func TestReviewIterationSteps(t *testing.T) {
 		children     []foremanv1alpha1.AgenticTask
 		wantSteps    []string // expected step names, in order
 		wantIterated []int32
+		// wantSuppressed lists the step labels reviewIterationSteps must
+		// report as inert demotions, in order. nil asserts none.
+		wantSuppressed []string
 	}{
 		{
 			name:         "reviewer NO-GO triggers the full r1 triple",
@@ -91,6 +193,84 @@ func TestReviewIterationSteps(t *testing.T) {
 			name:     "reviewer GO converges: no iteration",
 			w:        iterationWorkload([]int32{641}, 1, nil),
 			children: baseRound(goVerdict),
+		},
+		{
+			// #1636: the issueAsk rail rewrites an approved verdict to
+			// NO-GO. With no findings the coder is handed a rejection it
+			// cannot act on, and re-running cannot make an unverifiable
+			// issueAsk verify, so the loop has no terminating condition.
+			name: "issueAsk demotion of a GO carrying no findings does not iterate",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				demotedNoGoChild("APPROVE: changes are minimal and well-tested", `[]`),
+			},
+			wantSuppressed: []string{reviewStep},
+		},
+		{
+			// Narrowness guard: a demotion is only inert when it carries
+			// nothing to fix. Real findings still deserve an iteration.
+			name: "issueAsk demotion carrying findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				demotedNoGoChild("mixed",
+					`[{"severity":"major","area":"scope","message":"nil deref on empty strategy"}]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
+		},
+		{
+			// Rail-identity guard (#1641): enforceReviewerScopeOverlap also
+			// demotes a GO to NO-GO and also stamps verdictDemoted, but its
+			// verdict says the diff touches none of the files the issue
+			// names. That IS actionable, so it must iterate even with no
+			// structured findings. A predicate keyed off the bare
+			// verdictDemoted flag would swallow it.
+			name: "scope-overlap demotion of a GO with no findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				railDemotedNoGoChild(reviewer.RailScopeOverlap, string(goVerdict),
+					demotionReasonScopeDrift, "APPROVE: looks good to me", `[]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
+		},
+		{
+			// Claimed-verdict guard (#1641): enforceReviewerIssueAsk stamps
+			// the demotion fields on the path where it does NOT rewrite the
+			// verdict, marking an unverified NON-GO review untrusted and
+			// returning the reviewer's own NO-GO (verdictClaimed=NO-GO).
+			// That is a genuine rejection whose feedback lives in the
+			// summary; suppressing it would discard the reviewer's prose.
+			name: "issueAsk marking an untrusted NO-GO it did not rewrite still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				railDemotedNoGoChild(reviewer.RailIssueAsk, string(noGo),
+					demotionReasonIssueAsk, "REJECT: the fix papers over the race instead of fixing it", `[]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
+		},
+		{
+			// Narrowness guard: an UNdemoted NO-GO is the reviewer's own
+			// judgement. Absent structured findings it still iterates, as
+			// it did before #1636; the summary carries the feedback.
+			name: "genuine NO-GO with no findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				noGoChild("rejected: the fix does not address the issue", `[]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
 		},
 		{
 			name: "waits for every reviewer in the round to be terminal",
@@ -147,6 +327,20 @@ func TestReviewIterationSteps(t *testing.T) {
 			),
 		},
 		{
+			// The LAST round in the budget is never revisited by a k+1 walk,
+			// so its suppression has to be scanned where the walk ends or the
+			// Workload fails with no explanation after all (#1636).
+			name: "inert demotion in the final round is still reported",
+			w:    iterationWorkload([]int32{641}, 1, nil), // nil -> 1 iteration
+			children: append(baseRound(noGo),
+				child("code-641-r1", succeeded, goVerdict),
+				child("verify-641-r1", succeeded, gatePass),
+				withStep(demotedNoGoChild("APPROVE: the revision addresses every point", `[]`),
+					"review-641-0-r1"),
+			),
+			wantSuppressed: []string{"review-641-0-r1"},
+		},
+		{
 			name:     "explicit 0 disables iteration",
 			w:        iterationWorkload([]int32{641}, 1, ptr.To(int32(0))),
 			children: baseRound(noGo),
@@ -179,7 +373,25 @@ func TestReviewIterationSteps(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			steps, iterated := reviewIterationSteps(tc.w, tc.children)
+			steps, iterated, suppressed := reviewIterationSteps(tc.w, tc.children)
+
+			var gotSuppressed []string
+			for _, s := range suppressed {
+				gotSuppressed = append(gotSuppressed, s.step)
+				// A suppression the controller cannot explain is the gap
+				// #1636 opened: the demoted NO-GO still fails the Workload.
+				if s.reason == "" {
+					t.Errorf("suppressed %s carries no demotionReason; the condition would name no cause", s.step)
+				}
+			}
+			if len(gotSuppressed) != len(tc.wantSuppressed) {
+				t.Fatalf("suppressed = %v, want %v", gotSuppressed, tc.wantSuppressed)
+			}
+			for i := range tc.wantSuppressed {
+				if gotSuppressed[i] != tc.wantSuppressed[i] {
+					t.Fatalf("suppressed = %v, want %v", gotSuppressed, tc.wantSuppressed)
+				}
+			}
 
 			var gotNames []string
 			for _, s := range steps {
@@ -259,7 +471,7 @@ func TestReviewIterationCoderRef(t *testing.T) {
 			w := iterationWorkload([]int32{641}, 1, nil)
 			w.Spec.RevisionCoderAgentRef = tc.revisionRef
 
-			steps, _ := reviewIterationSteps(w, noGoRound)
+			steps, _, _ := reviewIterationSteps(w, noGoRound)
 			refs := map[string]string{}
 			for _, s := range steps {
 				refs[s.Name] = s.AgentRef.Name
@@ -278,7 +490,7 @@ func TestReviewIterationCoderRef(t *testing.T) {
 }
 
 func TestReviewFeedbackPrompt(t *testing.T) {
-	structured := noGoChild("review-641-0", "scope creep beyond the issue ask",
+	structured := noGoChild("scope creep beyond the issue ask",
 		`[{"severity":"blocker","area":"scope","message":"reduces ACCESS_TOKEN_EXPIRE_MINUTES from 10080 to 30, unrelated to the issue","file":"config/auth.py","line":12,"suggestion":"revert the unrelated change"}]`)
 	prompt := reviewFeedbackPrompt([]*foremanv1alpha1.AgenticTask{&structured})
 	for _, want := range []string{
@@ -304,7 +516,7 @@ func TestReviewFeedbackPrompt(t *testing.T) {
 	// Legacy map-shaped findings (the boolean + *_details shape from the
 	// issue report) fail the strict schema and must fall back to raw JSON
 	// rather than vanishing.
-	legacy := noGoChild("review-641-0", "missing tests",
+	legacy := noGoChild("missing tests",
 		`{"missing_tests":true,"missing_tests_details":"no unit test covers the new branch"}`)
 	prompt = reviewFeedbackPrompt([]*foremanv1alpha1.AgenticTask{&legacy})
 	if !strings.Contains(prompt, "no unit test covers the new branch") {

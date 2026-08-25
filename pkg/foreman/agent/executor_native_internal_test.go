@@ -1481,6 +1481,10 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoDemotedToNoGo(t *testing.T) {
 	if v, _ := extra["verdictDemoted"].(bool); !v {
 		t.Errorf("demotion must set verdictDemoted=true; got %v", extra["verdictDemoted"])
 	}
+	if extra["verdictDemotedBy"] != railIssueAsk {
+		t.Errorf("demotion must name this rail in verdictDemotedBy=%q; got %v",
+			railIssueAsk, extra["verdictDemotedBy"])
+	}
 	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
 		t.Errorf("verdictClaimed should archive the original GO; got %v", extra["verdictClaimed"])
 	}
@@ -1498,8 +1502,94 @@ func TestEnforceReviewerIssueAsk_UnverifiedNoGoKeptButMarked(t *testing.T) {
 	if v, _ := extra["verdictDemoted"].(bool); !v {
 		t.Errorf("unverified NO-GO must still be marked verdictDemoted=true so the escalation reviewer knows the base verdict is untrusted")
 	}
+	// verdictDemotedBy travels with the flag on every path that sets it, or
+	// a consumer finding verdictDemoted cannot say which rail set it. On THIS
+	// path the rail marked the verdict without rewriting it; verdictClaimed
+	// is what records that, and the controller's inertDemotion keys off it so
+	// this genuine rejection still opens a fix iteration (#1636).
+	if extra["verdictDemotedBy"] != railIssueAsk {
+		t.Errorf("marker must name this rail in verdictDemotedBy=%q; got %v",
+			railIssueAsk, extra["verdictDemotedBy"])
+	}
 	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictNoGo) {
 		t.Errorf("verdictClaimed should archive the original NO-GO; got %v", extra["verdictClaimed"])
+	}
+}
+
+// TestIssueAskDemotionLandsUnderModelExtra is the cross-package shape
+// contract for #1636/#1641. It drives the REAL rail and the REAL envelope
+// builder (enforceReviewerIssueAsk stamps LoopResult.Terminal.Extra, and
+// modelDecidedResult wraps it into the Result the watcher stores in
+// AgenticTask.status.result), then asserts the JSON path the
+// controller's inertDemotion (internal/foreman/controller/
+// workload_iteration.go, not imported here) reads.
+//
+// The bug this pins: modelDecidedResult nests the rails' WHOLE map one
+// level down under "modelExtra", and promoteTerminalOutcome lifts only
+// outcome / unverified / resolvedBy to the top level. The suppression
+// predicate shipped reading extra.verdictDemoted, a key nothing ever
+// writes, so it returned false on every production result while its own
+// hand-written fixture (extra.verdictDemoted as a sibling of modelExtra)
+// made it look correct. Any future change to the nesting fails here.
+func TestIssueAskDemotionLandsUnderModelExtra(t *testing.T) {
+	// What the reviewer's submit_result carried, before the rails ran: an
+	// approval the harness could not tie back to the fetched issue body.
+	terminalExtra := map[string]any{"issueAskVerified": false}
+	verdict := enforceReviewerIssueAsk(logr.Discard(), terminalExtra,
+		foremanv1alpha1.AgenticTaskVerdictGo, true, nil)
+	if verdict != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("precondition: rail must demote GO to NO-GO; got %v", verdict)
+	}
+
+	lr := &LoopResult{
+		Terminal: &ToolResult{
+			Terminal: true,
+			Verdict:  string(foremanv1alpha1.AgenticTaskVerdictGo),
+			Summary:  "APPROVE: the change is minimal and well covered",
+			Extra:    terminalExtra,
+		},
+		Turns: 7,
+	}
+	e := &NativeAgentLoopExecutor{}
+	res := e.modelDecidedResult(time.Now(), corev1.ObjectReference{Name: "t"}, lr, verdict)
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal result: %v", err)
+	}
+
+	// Mirrors inertDemotion's envelope, plus the top-level keys it must NOT
+	// find, so a regression that flattens the nesting is caught here too.
+	var envelope struct {
+		Extra struct {
+			VerdictDemoted   bool           `json:"verdictDemoted"`
+			VerdictDemotedBy string         `json:"verdictDemotedBy"`
+			ModelExtra       map[string]any `json:"modelExtra"`
+		} `json:"extra"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+
+	if envelope.Extra.ModelExtra["verdictDemotedBy"] != railIssueAsk {
+		t.Errorf("extra.modelExtra.verdictDemotedBy = %v, want %q (the path the controller reads)",
+			envelope.Extra.ModelExtra["verdictDemotedBy"], railIssueAsk)
+	}
+	if envelope.Extra.ModelExtra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+		t.Errorf("extra.modelExtra.verdictClaimed = %v, want GO",
+			envelope.Extra.ModelExtra["verdictClaimed"])
+	}
+	if v, _ := envelope.Extra.ModelExtra["verdictDemoted"].(bool); !v {
+		t.Errorf("extra.modelExtra.verdictDemoted = %v, want true",
+			envelope.Extra.ModelExtra["verdictDemoted"])
+	}
+	if reason, _ := envelope.Extra.ModelExtra["demotionReason"].(string); reason == "" {
+		t.Error("extra.modelExtra.demotionReason is empty; the controller's suppression condition would name no cause")
+	}
+	if envelope.Extra.VerdictDemoted || envelope.Extra.VerdictDemotedBy != "" {
+		t.Errorf("the demotion markers must NOT appear at the TOP level of extra "+
+			"(promoteTerminalOutcome lifts only outcome/unverified/resolvedBy); "+
+			"got verdictDemoted=%v verdictDemotedBy=%q",
+			envelope.Extra.VerdictDemoted, envelope.Extra.VerdictDemotedBy)
 	}
 }
 
