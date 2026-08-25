@@ -983,6 +983,16 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the model paraphrased the issue ask (#744).
 			verdict = enforceReviewerIssueAsk(log, loopRes.Terminal.Extra, verdict,
 				scopeDriftDetected, scopeMatched)
+			// Ungrounded-review rail (#1570): a GO whose transcript carries no
+			// evidence the reviewer ever obtained the branch diff is uncorrelated
+			// with the code it approves. This is a FLAG, not a block: it records
+			// the finding on the result's extra (surfacing in status.result) and
+			// logs it; the verdict stands as the model returned it. It runs after
+			// the demote rails (empty-claim, grounded-finding, verdict-from-
+			// findings, scope-overlap, issueAsk) so it reports on the verdict
+			// those rails produced, and it is the last reviewer rail before the
+			// findings summary so its log line is the last rail signal recorded.
+			applyReviewerDiffGateForTask(log, loopRes, verdict)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 		}
 		r := e.modelDecidedResult(start, transcriptRef, loopRes, verdict)
@@ -3305,6 +3315,42 @@ func logReviewerFindings(log logr.Logger, extra map[string]any) {
 		"minor", counts[reviewer.SeverityMinor],
 		"hasBlockers", reviewer.HasBlockers(findings),
 	)
+}
+
+// applyReviewerDiffGateForTask runs the ungrounded-review rail (#1570) over
+// the reviewer's stored transcript and records the finding on the terminal
+// result when the reviewer returned GO without ever obtaining the branch
+// diff. It is a FLAG, not a block: the verdict is passed through unchanged
+// (ungroundedReviewFinding returns a finding + note, not a verdict rewrite),
+// so a GO that never read the diff stands as GO but is visibly marked
+// ungroundedReview=true with the reason, and the finding is logged. The
+// marker lives in status.result so operators and any downstream consumer
+// (escalation, PR, audit) can tell the approval was ungrounded. It runs
+// after the demote rails in the reviewer settle path so it reports on the
+// verdict those rails produced, and before logReviewerFindings so the rail's
+// log line precedes the findings summary.
+//
+// The finding is written onto loopRes.Terminal.Extra (the same map the other
+// reviewer rails mutate), which modelDecidedResult nests under "modelExtra"
+// in the Result, so it lands in AgenticTask.status.result. It is extracted
+// out of runLLMPath so the call site there is a single statement rather than
+// a branch, keeping runLLMPath's cyclomatic complexity budget untouched
+// (mirrors applyCoderGroundingRailForTask).
+func applyReviewerDiffGateForTask(log logr.Logger, loopRes *LoopResult, verdict foremanv1alpha1.AgenticTaskVerdict) {
+	if loopRes == nil || loopRes.Terminal == nil {
+		return
+	}
+	failed, note := ungroundedReviewFinding(loopRes.Transcript, string(verdict))
+	if !failed {
+		return
+	}
+	log.Info("reviewer diff gate: GO returned without ever obtaining the branch diff; marking ungrounded (verdict stands)",
+		"note", note)
+	if loopRes.Terminal.Extra == nil {
+		loopRes.Terminal.Extra = map[string]any{}
+	}
+	loopRes.Terminal.Extra["ungroundedReview"] = true
+	loopRes.Terminal.Extra["ungroundedReviewReason"] = note
 }
 
 // fetchIssueBodyIfNeeded populates task.Spec.Payload.Prompt from the
