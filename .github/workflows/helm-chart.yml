@@ -872,6 +872,36 @@ jobs:
           fi
           echo "✅ verifier-node overrides render correctly"
 
+      - name: Template foreman multi-pool with a --set numeric override
+        # helm unittest cannot catch this class of bug. Its `set:` block
+        # round-trips values through YAML, so every number reaches the
+        # template as a float64. A real `--set k=60` goes through Helm's
+        # strvals parser and arrives as an int64, and agent-deployment.yaml
+        # deep-copies .Values.agent into each pool WITHOUT a YAML round
+        # trip. A template guard that type-checks for float64 alone
+        # therefore passes the whole unit suite and hard-fails the render
+        # for anyone on the agents: map (#1438 review). Only a real
+        # `helm template --set` bites, so run one here.
+        run: |
+          set -euo pipefail
+          helm template foreman charts/foreman \
+            --namespace foreman-system \
+            -f charts/foreman/tests/values-multi.yaml \
+            --set agent.terminationGracePeriodSeconds=45 \
+            --set agent.strategy.type=RollingUpdate \
+            --set agent.strategy.rollingUpdate.maxSurge=1 \
+            > foreman-multi-set.yaml
+
+          if ! grep -q "terminationGracePeriodSeconds: 45" foreman-multi-set.yaml; then
+            echo "❌ --set grace period did not survive the multi-pool merge"
+            exit 1
+          fi
+          if ! grep -q "maxSurge: 1$" foreman-multi-set.yaml; then
+            echo "❌ --set maxSurge did not survive the multi-pool merge"
+            exit 1
+          fi
+          echo "✅ --set numeric overrides survive the multi-pool merge"
+
       - name: Cache kubeconform schemas
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

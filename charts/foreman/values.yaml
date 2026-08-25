@@ -354,6 +354,82 @@ agent:
   enabled: true
   replicaCount: 1
 
+  # How long the kubelet waits after sending SIGTERM before force-killing
+  # the agent pod.
+  #
+  # Raising this does NOT currently lengthen anything. On SIGTERM the
+  # watcher's poll loop returns straight away on ctx.Done()
+  # (pkg/foreman/agent/watcher.go), an in-process task's executor runs in
+  # a goroutine that nothing waits on, and the FleetNode registrar's drain
+  # patch is capped at its own 5s timeout (pkg/foreman/agent/fleetnode.go),
+  # so the process is gone within a few seconds whatever this is set to.
+  # There is no drain hook yet. Treat the knob as forward-wiring for the
+  # drain work tracked in #1438, plus a way to LOWER the value on a pool
+  # that should die fast. It does not buy a slow local-model turn a longer
+  # window to finish or to be interrupted cleanly.
+  #
+  # What recovers the killed task is the operator, not the agent. It is
+  # NOT recoverOrphanedTasks: that matches only tasks whose
+  # status.assignedNode equals the agent's own FleetNode name, and the
+  # replacement pod registers under a different name (the agent falls back
+  # to os.Hostname(), the POD name; see the strategy note below), so it
+  # never sees the dead pod's work. It is checkClaimExpiry in
+  # internal/foreman/controller/agentictask_controller.go, which releases
+  # the task back to Pending once the assigned FleetNode's heartbeat goes
+  # stale and terminal-fails it on the third expiry. The cost is real: a
+  # rollout during a long run spends one of that task's three strikes, so
+  # repeated rollouts can fail a task outright rather than re-queue it.
+  #
+  # Must be a non-negative whole number of seconds. The chart fails the
+  # render on a negative, non-numeric or fractional value, rather than
+  # shipping a manifest the API server rejects or silently truncating a
+  # 30.5 to 30. The default of 30 reproduces the previous hardcoded value
+  # so an existing install is unchanged until it opts in.
+  terminationGracePeriodSeconds: 30
+
+  # Pod rollout strategy for this agent Deployment.
+  #
+  # Recreate (default) tears the pool down before starting replacements, so it
+  # never runs two agents for the pool at once. RollingUpdate replaces them one
+  # at a time, so an image bump does not stop the whole pool.
+  #
+  # On the "two agents would race for the same task" reasoning, which the older
+  # comment here stated as fact: that race is currently UNREACHABLE, and only
+  # because of a bug. agent-deployment.yaml sets FLEET_NODE_NAME from
+  # spec.nodeName (the Kubernetes NODE), but no Go code reads it, so the agent
+  # falls back to os.Hostname() -- the POD name -- and each replica registers
+  # its own FleetNode. pollOnce then claims only tasks whose
+  # status.assignedNode matches its own node, so two pods are never offered the
+  # same task. Under the INTENDED node-scoped identity they would share one
+  # FleetNode and the race would be real. Tracked as #1640.
+  #
+  # So maxSurge 0 is the conservative default, not an enforced invariant: the
+  # chart will not hard-fail a non-zero surge, because that would be an
+  # unbypassable policy ruling resting on a bug staying unfixed. Raise it
+  # knowingly, and re-read #1640 first if it has been resolved.
+  #
+  # Know what "knowingly" costs. The sharper hazard is not the lost Scheduled
+  # claim, it is recoverOrphanedTasks (pkg/foreman/agent/watcher.go): it runs
+  # once at agent startup and resets EVERY task in phase=Running assigned to
+  # its own FleetNode back to Pending. A surging pod that shared a node-scoped
+  # identity with its still-running sibling would reset that sibling's
+  # in-flight work at boot, the scheduler would re-dispatch a task that is
+  # still executing, and two agents would end up pushing the same branch.
+  # That is worse than losing a Scheduled claim. It is unreachable today for
+  # the same reason the claim race is (the two pods register separate
+  # FleetNodes under pod-name identity), and #1640 is what would make it
+  # reachable.
+  #
+  # Worth knowing before opting in: with the chart's default replicaCount of 1,
+  # RollingUpdate with maxSurge 0 is behaviourally IDENTICAL to Recreate. The
+  # pool must scale to zero before the new pod starts, because it can never
+  # exceed `replicas`. This option only buys you anything at replicaCount > 1.
+  #
+  # maxUnavailable may not be 0 when maxSurge is 0; the Deployment validator
+  # rejects that pair and the chart fails the render rather than the apply.
+  strategy:
+    type: Recreate
+
   image:
     # registry: ghcr.io
     # Default: the lean runtime image (alpine + git). To run a coder-enabled
