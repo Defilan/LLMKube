@@ -499,6 +499,11 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 	})
 	now := time.Now()
 	key := taskKey(task)
+	// eligible holds the sorted indices of nodes that are schedulable and
+	// satisfy the capability. A first pass collects them so the jobMode
+	// branch can index into the eligible list directly (the index of the
+	// eligible node being considered must be known before it is returned).
+	var eligible []int
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
 		if !nodeSchedulable(n, now) {
@@ -507,13 +512,26 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		if !capabilitySatisfies(required, requiredModel, n, jobMode) {
 			continue
 		}
-		if jobMode {
-			// Job-mode work runs in an ephemeral Job pod, not on this node, so
-			// the node must not be claimed. Pick the first eligible node and
-			// leave its CurrentTask untouched so it stays free for in-process
-			// tasks. See #1496.
-			return n.Name, nil
+		eligible = append(eligible, i)
+	}
+	if jobMode {
+		// Job-mode work runs in an ephemeral Job pod, not on this node, so
+		// the node must not be claimed: leave its CurrentTask untouched so
+		// it stays free for in-process tasks. See #1496.
+		//
+		// The eligible list is sorted by name, so pick the eligible node at
+		// the round-robin index (live job-mode task count mod eligible
+		// count). Reserving would undo #1496, but the reservation is what
+		// used to make the scan advance; without a rotation every Job-mode
+		// task lands on the alphabetically first node, so a fleet of N nodes
+		// can supervise only one Job at a time. See #1634.
+		if len(eligible) == 0 {
+			return "", nil
 		}
+		return nodes.Items[eligible[r.jobModeRotation(ctx, eligible, task)]].Name, nil
+	}
+	for _, i := range eligible {
+		n := &nodes.Items[i]
 		reserved, err := r.reserveNode(ctx, n, key)
 		if err != nil {
 			return "", err
@@ -525,6 +543,49 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		// first; try the next candidate.
 	}
 	return "", nil
+}
+
+// jobModeRotation returns the eligible-node index to dispatch a Job-mode task
+// to, so successive assignments rotate across the eligible nodes instead of
+// always landing on the alphabetically first one (see #1634). eligible is the
+// eligible-node index slice as built by reserveFirstFitNode (sorted by name);
+// the caller guarantees it is non-empty.
+func (r *AgenticTaskReconciler) jobModeRotation(ctx context.Context, eligible []int, task *foremanv1alpha1.AgenticTask) int {
+	return r.liveJobModeTasks(ctx, task) % len(eligible)
+}
+
+// liveJobModeTasks counts the in-flight Job-mode AgenticTasks for the given
+// task's agent in the same namespace: those with a Scheduled (or later) phase
+// and an AssignedNode, regardless of whether the node is reserved. Job-mode
+// tasks are never reserved (#1496), so they cannot be counted by CurrentTask;
+// the assigned-node assignment is the only durable record of which Job a node
+// currently supervises. The count is a proxy for "how far round the rotation we
+// are" — exactly enough state for round-robin, and nothing least-loaded needs
+// (which would require a real load signal the controller does not have for
+// Job-mode work). The task being scheduled is still Pending, so it does not
+// count against itself.
+func (r *AgenticTaskReconciler) liveJobModeTasks(ctx context.Context, task *foremanv1alpha1.AgenticTask) int {
+	var tasks foremanv1alpha1.AgenticTaskList
+	// A failing list must not wedge scheduling; fall back to zero (the first
+	// eligible node) so the task still dispatches rather than stalling.
+	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
+		return 0
+	}
+	count := 0
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if t.Spec.AgentRef == nil || t.Spec.AgentRef.Name != task.Spec.AgentRef.Name {
+			continue
+		}
+		if !holdsInFlightSlot(t.Status.Phase) {
+			continue
+		}
+		if t.Status.AssignedNode == "" {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 // reserveNode stamps node.Status.CurrentTask with taskKey via an optimistic-
