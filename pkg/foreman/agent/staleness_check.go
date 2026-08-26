@@ -219,13 +219,20 @@ func applyStalenessCheckForTask(
 	// case (the issue is not cited in live code), not a failure, so its
 	// output is empty rather than a reason to skip. Anything else is logged
 	// and skipped so an unexpected git error never blocks the task.
+	//
+	// --include=*.go is load-bearing and matches the sibling rails
+	// (caller_impact_gate.go, grounding/inert.go). Unscoped, this grep also
+	// reads .golangci-deadcode.yml, whose entries cite "# Refs #N" for every
+	// rail that is NOT yet wired -- exactly the issues a staleness check must
+	// not call stale. Scoping to Go source keeps the register out of the
+	// signal.
 	gitArgs := []string{"log", "--oneline", "--grep=#" + strconv.Itoa(issue), base}
 	gitLog, gitErr := execCommandRunner(ctx, workspace, nil, "git", gitArgs...)
 	if gitErr != nil {
 		log.Info("staleness pre-flight: git log failed; skipping", "issue", issue, "err", gitErr.Error())
 		return
 	}
-	grep, grepErr := execCommandRunner(ctx, workspace, nil, "grep", "-rn", "#"+strconv.Itoa(issue), ".")
+	grep, grepErr := execCommandRunner(ctx, workspace, nil, "grep", "-rn", "--include=*.go", "#"+strconv.Itoa(issue), ".")
 	if grepErr != nil {
 		if exitErr, ok := grepErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			grepErr = nil
