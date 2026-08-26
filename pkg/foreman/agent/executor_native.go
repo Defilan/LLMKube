@@ -1003,6 +1003,11 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// findings summary so its log line is the last rail signal recorded.
 			applyReviewerDiffGateForTask(log, loopRes, verdict)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
+			// Per-clause coverage rail (#1554): require the reviewer to have
+			// covered each behaviour clause the issue enumerated, or flag the
+			// gap as a finding. Runs last so it sees the reviewer's full set
+			// of findings; records-and-logs, never changes the verdict.
+			applyIssueClauseCoverageForTask(log, task, loopRes)
 		}
 		r := e.modelDecidedResult(start, transcriptRef, loopRes, verdict)
 		// #1109: preserve a coder's near-complete work when its in-loop
@@ -2774,6 +2779,14 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		}
 		if p.Prompt != "" {
 			fmt.Fprintf(&b, "Issue context:\n%s\n\n", p.Prompt)
+		}
+		// Per-clause checklist: extract the behaviour clauses the issue
+		// enumerated under "Expected Behavior" / "Acceptance Criteria" and
+		// paste them as an unchecked checklist so the coder must address
+		// each named case, not just the primary path it first landed on.
+		// Degrades to a no-op for an issue with no enumerated clauses.
+		if checklist := clauseChecklist(extractClauses(p.Prompt)); checklist != "" {
+			fmt.Fprintf(&b, "\nRequired behaviours to cover:\n%s\n", checklist)
 		}
 		b.WriteString("The repository is checked out in the workspace at the current branch.\n")
 		b.WriteString("Make the minimum change that addresses the issue, then call submit_result.\n")
