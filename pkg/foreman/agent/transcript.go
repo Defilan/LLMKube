@@ -109,7 +109,18 @@ func WriteTranscript(
 		return corev1.ObjectReference{}, fmt.Errorf("WriteTranscript: marshal: %w", err)
 	}
 	if len(docBytes) > transcriptCapBytes {
-		doc.Messages = truncateMessages(doc.Messages, loopResult.Turns)
+		// fits reports whether the document would still be under the cap
+		// with this message set. Marshalling the real doc (rather than
+		// summing message sizes) keeps the envelope, escaping and the
+		// marker in the accounting, so the search cannot overshoot.
+		fits := func(candidate []oai.Message) bool {
+			probe := doc
+			probe.Messages = candidate
+			probe.Truncated = true
+			b, err := json.Marshal(probe)
+			return err == nil && len(b) <= transcriptCapBytes
+		}
+		doc.Messages = truncateMessages(doc.Messages, loopResult.Turns, fits)
 		doc.Truncated = true
 		docBytes, err = json.Marshal(doc)
 		if err != nil {
@@ -199,31 +210,68 @@ func ownerRefForTask(task *foremanv1alpha1.AgenticTask) metav1.OwnerReference {
 	}
 }
 
-// truncateMessages keeps the first message (system prompt) and as much
-// of the tail as fits. It inserts a synthetic system marker noting how
-// many turns were dropped so a reader can tell at a glance.
+// truncateMessages keeps the head (system prompt + first user message), a
+// marker naming how much was dropped, and the LARGEST tail that still fits
+// under the caller's budget.
 //
-// v0.1 uses a fixed split: keep system + first user message + last 10
-// messages. That covers the typical "what was the task" + "how did it
-// end" pair and is bounded regardless of input size.
-func truncateMessages(msgs []oai.Message, totalTurns int) []oai.Message {
+// It used to keep a fixed last-10 tail regardless of budget, so a transcript
+// one byte over the cap was cut to 13 messages and stored ~1% of the space it
+// was allowed (#1672). Only long runs exceed the cap and long runs are
+// disproportionately the failures, so the fixed split gutted exactly the
+// transcripts worth keeping.
+//
+// fits reports whether a candidate message set still fits; the caller supplies
+// it so the real document envelope is what gets measured. minTailMessages is
+// the floor: this never retains less than the old fixed split did, so a
+// pathological transcript degrades to the previous behaviour rather than worse.
+// The head-and-tail shape is deliberate -- the start ("what was the task") and
+// the end ("how did it finish", where submit_result lives) are the high-signal
+// parts, and the middle is what a reader can most afford to lose.
+func truncateMessages(msgs []oai.Message, totalTurns int, fits func([]oai.Message) bool) []oai.Message {
 	if len(msgs) <= 12 {
 		// Nothing meaningful to drop.
 		return msgs
 	}
+	const minTailMessages = 10
 	head := msgs[:2] // system + first user prompt
-	tail := msgs[len(msgs)-10:]
-	dropped := len(msgs) - len(head) - len(tail)
-	marker := oai.Message{
-		Role: oai.RoleSystem,
-		Content: fmt.Sprintf(
-			"[transcript truncated: %d middle messages dropped to fit "+
-				"the 1 MiB ConfigMap budget; %d turns total]",
-			dropped, totalTurns),
+
+	build := func(tailN int) []oai.Message {
+		if tailN > len(msgs)-len(head) {
+			tailN = len(msgs) - len(head)
+		}
+		tail := msgs[len(msgs)-tailN:]
+		dropped := len(msgs) - len(head) - len(tail)
+		if dropped < 0 {
+			dropped = 0
+		}
+		marker := oai.Message{
+			Role: oai.RoleSystem,
+			Content: fmt.Sprintf(
+				"[transcript truncated: %d middle messages dropped to fit "+
+					"the 1 MiB ConfigMap budget; %d turns total]",
+				dropped, totalTurns),
+		}
+		out := make([]oai.Message, 0, len(head)+1+len(tail))
+		out = append(out, head...)
+		out = append(out, marker)
+		out = append(out, tail...)
+		return out
 	}
-	out := make([]oai.Message, 0, len(head)+1+len(tail))
-	out = append(out, head...)
-	out = append(out, marker)
-	out = append(out, tail...)
-	return out
+
+	// Binary search the largest tail that fits. Falling back to the floor
+	// when even that is over budget preserves the old behaviour; the caller's
+	// final guard handles the pathological single-huge-message case.
+	best := build(minTailMessages)
+	lo, hi := minTailMessages+1, len(msgs)-len(head)
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		candidate := build(mid)
+		if fits(candidate) {
+			best = candidate
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
 }
