@@ -1308,6 +1308,75 @@ func TestNativeExecutor_ReviewerGoIsApproveNotCommit(t *testing.T) {
 	}
 }
 
+// TestNativeExecutor_ReviewerGoWithoutDiffIsFlaggedUngrounded drives the
+// PRODUCTION reviewer settle path (NativeAgentLoopExecutor.Execute) for the
+// #1570 rail. The reviewer returns GO but its transcript contains no
+// tool result carrying a diff (it only called submit_result, like the
+// observed runs that ran `ls -l` + read a Dockerfile), so the
+// ungrounded-review rail must mark the result. It is a FLAG, not a block:
+// the verdict stays GO, but modelExtra must carry ungroundedReview=true and
+// a non-empty reason. Commenting out the applyReviewerDiffGateForTask call
+// site makes this fail: the flag would be absent.
+func TestNativeExecutor_ReviewerGoWithoutDiffIsFlaggedUngrounded(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+	oaiSrv := scriptedOAI(t, []string{submitGoBody})
+
+	agent, task := reviewerTaskAndAgent("ungrounded-go")
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	// The reviewer's only tool call is submit_result: no bash tool result
+	// carries a diff, so the transcript is ungrounded.
+	reg := &fakeRegistry{
+		results: map[string]*foremanagent.ToolResult{
+			"submit_result": {
+				Terminal: true,
+				Verdict:  "GO",
+				Summary:  "APPROVE: looks fine.",
+				Extra:    map[string]any{"reviewOutcome": "APPROVE"},
+			},
+		},
+	}
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Bot", Email: "b@x"},
+		CommitCommitter:          repo.Identity{Name: "Bot", Email: "b@x"},
+		RegistryFactory: func(
+			_ context.Context, _ string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+	res, err := execWithAgent(t, e, task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// It is a FLAG, not a block: the verdict stands as the model returned it.
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("verdict must stay GO (the rail is a flag, not a block); got %s; result=%+v", res.Verdict, res)
+	}
+
+	// The finding must land on modelExtra (the path the controller reads).
+	mx, ok := res.Extra["modelExtra"].(map[string]any)
+	if !ok {
+		t.Fatalf("modelExtra: missing or wrong type; res.Extra=%+v", res.Extra)
+	}
+	if got := mx["ungroundedReview"]; got != true {
+		t.Errorf("ungroundedReview: want true (GO without any diff in the transcript) got %v; modelExtra=%+v",
+			mx["ungroundedReview"], mx)
+	}
+	if reason, _ := mx["ungroundedReviewReason"].(string); strings.TrimSpace(reason) == "" {
+		t.Errorf("ungroundedReviewReason: want a non-empty explanation, got %q", mx["ungroundedReviewReason"])
+	}
+}
+
 // TestNativeExecutor_ReviewerERRORMapsToIncompleteWithModelReportedError checks
 // that a reviewer-role Agent emitting verdict=ERROR is correctly wired
 // through normalizeModelVerdict. The CRD has no ERROR verdict; the harness
