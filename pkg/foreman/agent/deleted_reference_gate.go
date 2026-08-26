@@ -38,11 +38,14 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
 // deletedIssueRefRe matches a full owner/repo#N reference first (so the full
@@ -104,4 +107,37 @@ func recordDeletedIssueReferences(extra map[string]any, unifiedDiff string) {
 	extra["deletedReferenceNote"] = fmt.Sprintf(
 		"diff removes code citing issue/PR reference(s) %s; state whether the removal is intentional",
 		strings.Join(refs, ", "))
+}
+
+// applyDeletedReferenceRailForTask is the production entry point that wires the
+// deleted-reference rail (#1553) into the coder GO-settle path. It gates the
+// rail to issue-fix coder tasks and resolves the base branch, mirroring the
+// sibling rails applyCoderGroundingRailForTask and applyNoFunctionalChangeForTask,
+// so the call site in runLLMPath is a single statement and that function's
+// cyclomatic-complexity budget stays untouched (the stated reason the siblings
+// are wrapped rather than inlined).
+//
+// It must run after repo.Commit, reading the committed base...HEAD diff via
+// branchDiffText, the same helper the grounding rail uses. Note that this is a
+// separate `git diff` invocation, not a reused result: branchDiffText does not
+// memoize and no diff is in scope at the call site. The cost is one extra diff
+// per coder task, which is cheap next to the run itself. It is a flag,
+// not a block: it records the removed-line issue references onto the task's
+// extra map and never changes the verdict. The extra map is ensured non-nil
+// (the sibling rails do the same before writing) so the flag is recorded even
+// when the model's submit_result carried no extra.
+func applyDeletedReferenceRailForTask(
+	ctx context.Context, task *foremanv1alpha1.AgenticTask, workspace string, loopRes *LoopResult,
+) {
+	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
+		return
+	}
+	if loopRes == nil || loopRes.Terminal == nil {
+		return
+	}
+	if loopRes.Terminal.Extra == nil {
+		loopRes.Terminal.Extra = map[string]any{}
+	}
+	recordDeletedIssueReferences(loopRes.Terminal.Extra,
+		branchDiffText(ctx, workspace, baseBranchOrDefault(task.Spec.Payload.BaseBranch), execCommandRunner))
 }
