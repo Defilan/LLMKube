@@ -29,9 +29,6 @@ linters:
         linters: [unused]
       - path: pkg/foreman/agent/cross_stage\.go # Refs #1549
         linters: [unused]
-
-      - path: pkg/foreman/agent/issue_clauses\.go # Refs #1554
-        linters: [unused]
       - path: pkg/foreman/agent/mutation_check\.go # Refs #1555
         linters: [unused]
       # Whole file is unreferenced: the proposal-1075 work-class buckets

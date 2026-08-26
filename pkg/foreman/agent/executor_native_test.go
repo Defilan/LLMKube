@@ -2594,3 +2594,142 @@ func TestSupervisesAgent(t *testing.T) {
 		})
 	}
 }
+
+// TestNativeExecutor_ReviewerClauseCoverage drives the production reviewer-rail
+// path (Execute -> runLLMPath -> the per-clause coverage rail) and asserts both
+// directions of the rail:
+//
+//  1. A reviewer that paraphrases a clause's key terms (rather than echoing a
+//     verbatim 60-character prefix) still counts as covering that clause, so no
+//     gap finding is appended. This is the fix for #1554: the old prefix-
+//     substring matcher required a near-verbatim echo, which reproduced the
+//     exact defect the issue exists to replace.
+//  2. A clause the reviewer genuinely never mentions is still flagged, so a fix
+//     that satisfies one named case and leaves another broken cannot pass
+//     review.
+//
+// The positive assertion (the uncited clause IS flagged) is the mutation guard:
+// deleting the applyIssueClauseCoverageForTask call site makes it fail.
+func TestNativeExecutor_ReviewerClauseCoverage(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+	oaiSrv := scriptedOAI(t, []string{submitGoBody})
+
+	agent, task := reviewerTaskAndAgent("clause-cov")
+	// The reviewer rails run only for issue-fix review runs.
+	task.Spec.Kind = foremanv1alpha1.AgenticTaskKindIssueFix
+	task.Spec.Payload.Prompt = "## Acceptance Criteria\n\n" +
+		"1. the enabled path applies the new default\n" +
+		"2. the disabled path preserves the original no-side-effect behaviour\n" +
+		"3. the issue clauses are wired into the coder prompt\n" +
+		"4. the reviewer workflow cites each clause\n"
+
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	// The reviewer's summary paraphrases clauses 1, 3 and 4 (their key terms
+	// all appear in the summary) but never mentions clause 2 (the disabled
+	// path), so exactly one gap must be flagged.
+	reg := &fakeRegistry{
+		results: map[string]*foremanagent.ToolResult{
+			"submit_result": {
+				Terminal: true,
+				Verdict:  "GO",
+				Summary: "APPROVE: diff addresses #1554's ask for per-clause " +
+					"coverage by wiring issue clauses into coder prompt and reviewer " +
+					"workflow, and the enabled path applies the new default.",
+				Extra: map[string]any{
+					"reviewOutcome": "APPROVE",
+					// issueAskVerified=true keeps the issueAsk rail from
+					// demoting the GO; the scope rail short-circuits because
+					// the issue body names no file paths.
+					"issueAskVerified": true,
+					"findings":         []any{},
+				},
+			},
+		},
+	}
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Bot", Email: "b@x"},
+		CommitCommitter:          repo.Identity{Name: "Bot", Email: "b@x"},
+		RegistryFactory: func(
+			_ context.Context, _ string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+	res, err := execWithAgent(t, e, task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("verdict: want GOT got %s", res.Verdict)
+	}
+	findings := extraFindings(res, "findings")
+
+	// Direction 2 (positive, mutation-guarding): the uncited disabled-path
+	// clause must be flagged.
+	disabledFlagged := false
+	for _, msg := range findings {
+		if strings.Contains(msg, "the disabled path preserves the original no-side-effect behaviour") {
+			disabledFlagged = true
+			break
+		}
+	}
+	if !disabledFlagged {
+		t.Fatalf("expected a gap finding for the uncited disabled-path clause, findings: %v", findings)
+	}
+
+	// Direction 1 (negative): the three paraphrased clauses must NOT be
+	// flagged.
+	for _, clause := range []string{
+		"the enabled path applies the new default",
+		"the issue clauses are wired into the coder prompt",
+		"the reviewer workflow cites each clause",
+	} {
+		for _, msg := range findings {
+			if strings.Contains(msg, clause) {
+				t.Fatalf("expected no gap finding for the paraphrased clause %q, findings: %v", clause, findings)
+			}
+		}
+	}
+	// Exactly one gap (the disabled path) must have been appended.
+	if len(findings) != 1 {
+		t.Fatalf("expected exactly one gap finding, got %d: %v", len(findings), findings)
+	}
+}
+
+// extraFindings pulls the finding messages out of a Result's modelExtra
+// findings payload, or nil when the model-decided envelope is absent.
+func extraFindings(res *foremanagent.Result, key string) []string {
+	if res == nil || res.Extra == nil {
+		return nil
+	}
+	modelExtra, ok := res.Extra["modelExtra"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, ok := modelExtra[key]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, item := range list {
+		if m, ok := item.(map[string]any); ok {
+			if msg, ok := m["message"].(string); ok {
+				out = append(out, msg)
+			}
+		}
+	}
+	return out
+}
