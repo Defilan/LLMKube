@@ -742,6 +742,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// "#510" with no knowledge of what #510 is about. Best-effort: a
 	// failed fetch logs and the loop runs with the pre-#571 behavior.
 	fetchIssueBodyIfNeeded(ctx, e.workItems(authToken(auth)), task, log)
+	// Staleness pre-flight (#1550): before the coder starts, cheaply check
+	// whether the tree already addresses this issue. The pure check takes
+	// git-log and grep output as strings (see staleness_check.go); here we
+	// run those two commands once in the task workspace against the base
+	// branch the executor just cut, and prepend the returned note to the
+	// prompt so the coder reads the citing code before editing. Runs before
+	// buildUserPrompt so the note is in the coder's first turn. Best-effort:
+	// a git/grep error logs and skips, never blocking the task.
+	applyStalenessCheckForTask(ctx, log, task, workspace)
 	userPrompt := buildUserPrompt(task)
 	// issueText ranks files for both the repo-map prefix (coder Agents) and the
 	// scope-overlap guard in the coder gate verifier (#782).

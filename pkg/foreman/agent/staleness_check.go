@@ -36,10 +36,17 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/go-logr/logr"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
 // stalenessToggleEnv toggles the pre-flight staleness check off. Setting it to
@@ -178,6 +185,68 @@ func checkStaleness(issue int, gitLogOutput, grepOutput string) string {
 		return ""
 	}
 	return stalenessNote(gatherStaleness(issue, gitLogOutput, grepOutput))
+}
+
+// applyStalenessCheckForTask is the production entry point that wires the
+// pre-flight staleness check (#1550) into the coder's pre-dispatch path. It is
+// the command seam between the pure checkStaleness entry point and the real
+// workspace: it gathers the two text inputs the check needs by shelling out
+// once (git log on the base branch, grep across the tree), feeds them to
+// checkStaleness, and, when the check found something, prepends the returned
+// note to the task's prompt so the coder reads the citing code before editing.
+//
+// It runs once per issue-fix task, before buildUserPrompt assembles the prompt,
+// so the note lands in the coder's first turn rather than after a model has
+// already started (and could delete the very fix it should have left alone).
+// The git log and grep are run in the task workspace against the branch the
+// executor just cut from the base, so `git log --grep` sees the base branch's
+// history and `grep -rn` sees the live tree. Best-effort: any git/grep error
+// is logged and the check is skipped, so an unreachable repo never blocks a
+// task. It gates to issue-fix tasks (the only kind that carries an issue
+// number worth checking), mirroring the sibling apply*ForTask wrappers.
+func applyStalenessCheckForTask(
+	ctx context.Context, log logr.Logger, task *foremanv1alpha1.AgenticTask, workspace string,
+) {
+	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
+		return
+	}
+	if task.Spec.Payload.Issue <= 0 {
+		return
+	}
+	issue := int(task.Spec.Payload.Issue)
+	base := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+	// grep exits 1 when it finds no matches; that is the common, healthy
+	// case (the issue is not cited in live code), not a failure, so its
+	// output is empty rather than a reason to skip. Anything else is logged
+	// and skipped so an unexpected git error never blocks the task.
+	//
+	// --include=*.go is load-bearing and matches the sibling rails
+	// (caller_impact_gate.go, grounding/inert.go). Unscoped, this grep also
+	// reads .golangci-deadcode.yml, whose entries cite "# Refs #N" for every
+	// rail that is NOT yet wired -- exactly the issues a staleness check must
+	// not call stale. Scoping to Go source keeps the register out of the
+	// signal.
+	gitArgs := []string{"log", "--oneline", "--grep=#" + strconv.Itoa(issue), base}
+	gitLog, gitErr := execCommandRunner(ctx, workspace, nil, "git", gitArgs...)
+	if gitErr != nil {
+		log.Info("staleness pre-flight: git log failed; skipping", "issue", issue, "err", gitErr.Error())
+		return
+	}
+	grep, grepErr := execCommandRunner(ctx, workspace, nil, "grep", "-rn", "--include=*.go", "#"+strconv.Itoa(issue), ".")
+	if grepErr != nil {
+		if exitErr, ok := grepErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			grepErr = nil
+		} else {
+			log.Info("staleness pre-flight: grep failed; skipping", "issue", issue, "err", grepErr.Error())
+			return
+		}
+	}
+	note := checkStaleness(issue, gitLog, grep)
+	if note == "" {
+		return
+	}
+	log.Info("staleness pre-flight: tree may already address this issue", "issue", issue)
+	task.Spec.Payload.PromptPrefix = note + "\n\n" + task.Spec.Payload.PromptPrefix
 }
 
 // stalenessNote renders the signals into a short human-readable note suitable
