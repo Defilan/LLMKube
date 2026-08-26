@@ -1,0 +1,8 @@
+# The natural way to copy the documented block from values.yaml and leave it
+# blank: an explicit `issuerRef:` with nothing under it. Helm treats that as a
+# key DELETION, removing the chart's `issuerRef: {}` default, so any `index`
+# on it fails the whole render with a raw nil-pointer error naming no pool.
+webhook:
+  certManager:
+    enabled: true
+    issuerRef:

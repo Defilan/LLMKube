@@ -485,6 +485,54 @@ webhook:
   # force regeneration before expiry).
   certValidityDays: 3650
 
+  # certManager hands the webhook serving cert to cert-manager instead of the
+  # chart's self-generated one (#1601). Required for ArgoCD: ArgoCD does not
+  # support Helm lookups, so every re-render ran the lookup-reuse path and
+  # regenerated the cert, and ArgoCD's server-side-apply dry-run against the API
+  # server (webhook active) then failed the sync until the operator reloaded.
+  # With this on, the chart renders a cert-manager Certificate that populates the
+  # SAME Secret the deployment mounts (so the controller needs no change), and
+  # the webhook configurations' CA bundle is injected via the
+  # cert-manager.io/inject-ca-from annotation instead of a chart-generated
+  # caBundle. The chart-generated cert Secret is NOT rendered in this mode.
+  # Defaults false: the self-generated path (no cert-manager dependency) stays
+  # the default. Requires cert-manager to be installed.
+  certManager:
+    # Hand the webhook serving cert to cert-manager instead of the chart's
+    # self-generated one. Requires cert-manager to be installed; the chart
+    # fails the render with an actionable message if cert-manager.io/v1 is
+    # not present, rather than applying half the release and then hitting an
+    # unknown-kind error.
+    #
+    # certValidityDays above applies in this mode too: it is rendered as the
+    # Certificate's duration, with renewBefore at a third of it.
+    #
+    # INSTALL ORDER, worth knowing before you use an external issuer. The
+    # controller mounts the serving Secret as a REQUIRED volume, because a
+    # webhook with no cert cannot serve and the operator only registers the
+    # webhook when the cert is present. cert-manager creates that Secret
+    # asynchronously, AFTER this release applies, so on a first install the
+    # controller pod sits in ContainerCreating until issuance completes.
+    # With the chart's self-signed Issuer that is seconds. With a slow
+    # external issuer (ACME, AWS PCA, Venafi, step) it can be minutes, and
+    # `helm install --wait --atomic` will time out and roll back, deleting
+    # the Certificate so the install can never converge. Either drop
+    # --atomic on the first install, raise --timeout past your issuer's
+    # issuance time, or pre-create the Certificate.
+    #
+    # The volume is deliberately NOT optional: marking it optional would let
+    # the controller start with admission silently disabled, which is worse
+    # than a pod that visibly waits.
+    enabled: false
+    # issuerRef is cert-manager's ObjectReference: {name, kind, group}.
+    # Empty (default) renders the chart's own self-signed Issuer. name is
+    # REQUIRED once any field is set, otherwise the Certificate points at the
+    # self-signed Issuer's name while that Issuer is not rendered, and
+    # cert-manager reports IssuerNotFound forever. group defaults to
+    # cert-manager.io and must be set for an external issuer, e.g.
+    #   issuerRef: {name: pca, kind: AWSPCAClusterIssuer, group: awspca.cert-manager.io}
+    issuerRef: {}
+
 # multitenancy gates the opt-in multi-tenant admission + RBAC surface (#416).
 # Default off: the InferenceService quota ValidatingWebhookConfiguration entry is
 # NOT rendered (so InferenceService admission is never intercepted) and no tenant
