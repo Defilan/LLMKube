@@ -519,16 +519,20 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		// the node must not be claimed: leave its CurrentTask untouched so
 		// it stays free for in-process tasks. See #1496.
 		//
-		// The eligible list is sorted by name, so pick the eligible node at
-		// the round-robin index (live job-mode task count mod eligible
-		// count). Reserving would undo #1496, but the reservation is what
-		// used to make the scan advance; without a rotation every Job-mode
-		// task lands on the alphabetically first node, so a fleet of N nodes
-		// can supervise only one Job at a time. See #1634.
+		// Reserving would undo #1496, but the reservation is what used to
+		// make the scan advance; without it every Job-mode task lands on the
+		// alphabetically first node, so a fleet of N nodes can supervise only
+		// one Job at a time. See #1634.
+		//
+		// Pick the eligible node currently supervising the fewest live
+		// Job-mode tasks. An earlier revision rotated on a scalar count of
+		// live tasks (count % len(eligible)); that spreads a burst but
+		// collapses to index 0 -- first-fit -- whenever nothing else is in
+		// flight, which is the common serial case.
 		if len(eligible) == 0 {
 			return "", nil
 		}
-		return nodes.Items[eligible[r.jobModeRotation(ctx, eligible, task)]].Name, nil
+		return nodes.Items[r.leastLoadedJobModeNode(ctx, nodes.Items, eligible, task)].Name, nil
 	}
 	for _, i := range eligible {
 		n := &nodes.Items[i]
@@ -545,47 +549,64 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 	return "", nil
 }
 
-// jobModeRotation returns the eligible-node index to dispatch a Job-mode task
-// to, so successive assignments rotate across the eligible nodes instead of
-// always landing on the alphabetically first one (see #1634). eligible is the
-// eligible-node index slice as built by reserveFirstFitNode (sorted by name);
-// the caller guarantees it is non-empty.
-func (r *AgenticTaskReconciler) jobModeRotation(ctx context.Context, eligible []int, task *foremanv1alpha1.AgenticTask) int {
-	return r.liveJobModeTasks(ctx, task) % len(eligible)
+// leastLoadedJobModeNode returns the index into nodes of the eligible node
+// supervising the fewest live Job-mode tasks, so successive assignments spread
+// across the fleet instead of stacking on the alphabetically first node
+// (see #1634). eligible is the eligible-node index slice built by
+// reserveFirstFitNode (sorted by name); the caller guarantees it is non-empty.
+//
+// Ties break toward the earlier eligible node, so with an idle fleet this is
+// still deterministic. Unlike a scalar rotation it cannot collapse to index 0
+// when nothing is in flight, and it distinguishes a node already supervising
+// three Jobs from an idle one.
+func (r *AgenticTaskReconciler) leastLoadedJobModeNode(
+	ctx context.Context, nodes []foremanv1alpha1.FleetNode, eligible []int, task *foremanv1alpha1.AgenticTask,
+) int {
+	load := r.jobModeLoadByNode(ctx, task)
+	best := eligible[0]
+	bestLoad := load[nodes[best].Name]
+	for _, i := range eligible[1:] {
+		if l := load[nodes[i].Name]; l < bestLoad {
+			best, bestLoad = i, l
+		}
+	}
+	return best
 }
 
-// liveJobModeTasks counts the in-flight Job-mode AgenticTasks for the given
-// task's agent in the same namespace: those with a Scheduled (or later) phase
-// and an AssignedNode, regardless of whether the node is reserved. Job-mode
-// tasks are never reserved (#1496), so they cannot be counted by CurrentTask;
-// the assigned-node assignment is the only durable record of which Job a node
-// currently supervises. The count is a proxy for "how far round the rotation we
-// are" — exactly enough state for round-robin, and nothing least-loaded needs
-// (which would require a real load signal the controller does not have for
-// Job-mode work). The task being scheduled is still Pending, so it does not
-// count against itself.
-func (r *AgenticTaskReconciler) liveJobModeTasks(ctx context.Context, task *foremanv1alpha1.AgenticTask) int {
+// jobModeLoadByNode tallies the in-flight Job-mode AgenticTasks in the task's
+// namespace per assigned node: those in a Scheduled (or later) phase that carry
+// an AssignedNode, regardless of whether the node is reserved. Job-mode tasks
+// are never reserved (#1496), so they cannot be counted via CurrentTask; the
+// assigned-node stamp is the only durable record of which Jobs a node currently
+// supervises, and it is a real per-node load signal.
+//
+// Every agent's Job-mode work counts toward a node's load, not just the
+// scheduling task's own agent: two agents dispatching concurrently are
+// competing for the same node capacity, and filtering by AgentRef would let
+// each of them independently pick the same "idle" node.
+//
+// The task being scheduled is still Pending, so it does not count against
+// itself.
+func (r *AgenticTaskReconciler) jobModeLoadByNode(ctx context.Context, task *foremanv1alpha1.AgenticTask) map[string]int {
+	load := map[string]int{}
 	var tasks foremanv1alpha1.AgenticTaskList
-	// A failing list must not wedge scheduling; fall back to zero (the first
-	// eligible node) so the task still dispatches rather than stalling.
+	// A failing list must not wedge scheduling; an empty tally falls back to
+	// the first eligible node so the task still dispatches rather than
+	// stalling.
 	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
-		return 0
+		return load
 	}
-	count := 0
 	for i := range tasks.Items {
 		t := &tasks.Items[i]
-		if t.Spec.AgentRef == nil || t.Spec.AgentRef.Name != task.Spec.AgentRef.Name {
-			continue
-		}
 		if !holdsInFlightSlot(t.Status.Phase) {
 			continue
 		}
 		if t.Status.AssignedNode == "" {
 			continue
 		}
-		count++
+		load[t.Status.AssignedNode]++
 	}
-	return count
+	return load
 }
 
 // reserveNode stamps node.Status.CurrentTask with taskKey via an optimistic-
