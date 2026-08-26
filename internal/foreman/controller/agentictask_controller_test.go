@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -500,6 +501,210 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		var claimed foremanv1alpha1.FleetNode
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: node.Name}, &claimed)).To(Succeed())
 		Expect(claimed.Status.CurrentTask).To(Equal("default/job-inprocess"))
+	})
+
+	// Regression for defilantech/LLMKube#1634. Without a rotation the
+	// jobMode branch of reserveFirstFitNode returns the alphabetically first
+	// eligible node every time, so every Job-mode task lands on the same
+	// node. This drives the production path (Reconcile) with several Job-mode
+	// tasks over several eligible nodes and asserts the assignments rotate
+	// across the nodes rather than repeating one.
+	It("rotates Job-mode assignments across eligible nodes (#1634)", func() {
+		// Three eligible nodes, created out of alphabetical order so the
+		// scheduler's sort-by-name actually orders them a/b/c.
+		nodeC := newFleetNode("zzz-c")
+		Expect(k8sClient.Create(ctx, nodeC)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeC) })
+		setNodeReady(nodeC, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+		nodeA := newFleetNode("aaa-a")
+		Expect(k8sClient.Create(ctx, nodeA)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeA) })
+		setNodeReady(nodeA, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+		nodeB := newFleetNode("mmm-b")
+		Expect(k8sClient.Create(ctx, nodeB)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeB) })
+		setNodeReady(nodeB, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+
+		// A Job-mode agent: the eligible set is derived from the agent's
+		// RequiredCapability, and jobMode is read from its execution mode.
+		agent := newAgent("job-coder-rot")
+		agent.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+			Mode: foremanv1alpha1.ExecutionModeJob,
+		}
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		const n = 5
+		assigned := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			task := newTask(fmt.Sprintf("job-rot-%d", i))
+			task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+			Expect(k8sClient.Create(ctx, task)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+			setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+			_, err := reconciler.Reconcile(ctx, reqFor(task))
+			Expect(err).NotTo(HaveOccurred())
+
+			var fresh foremanv1alpha1.AgenticTask
+			Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+			Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseScheduled))
+			assigned = append(assigned, fresh.Status.AssignedNode)
+
+			// The node must never be claimed by a Job-mode task.
+			var node foremanv1alpha1.FleetNode
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: fresh.Status.AssignedNode}, &node)).To(Succeed())
+			Expect(node.Status.CurrentTask).To(BeEmpty())
+		}
+
+		// Spread across the three nodes rather than all on the first.
+		unique := map[string]bool{}
+		for _, a := range assigned {
+			Expect(a).NotTo(BeEmpty())
+			unique[a] = true
+		}
+		Expect(len(unique)).To(BeNumerically(">", 1))
+		// Five tasks over three nodes: no node can carry more than two.
+		for _, a := range assigned {
+			count := 0
+			for _, b := range assigned {
+				if a == b {
+					count++
+				}
+			}
+			Expect(count).To(BeNumerically("<=", 2))
+		}
+	})
+
+	// Raised in review of PR #1669 (thanks @joryirving). The first fix
+	// rotated on a SCALAR count of the scheduling agent's own live Job-mode
+	// tasks: index = count % len(eligible). Two consequences that a scalar
+	// cannot express, each covered by a spec below.
+	//
+	// Note the serial trickle -- every task finishing before the next is
+	// scheduled -- is deliberately NOT asserted on. With nothing in flight
+	// every node is genuinely idle, so landing on the first one is correct,
+	// not a regression. What matters is that a node already carrying Jobs is
+	// not treated the same as an idle one.
+	It("prefers an idle node over one already supervising Jobs (#1634)", func() {
+		nodeA := newFleetNode("dep-aaa-a")
+		Expect(k8sClient.Create(ctx, nodeA)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeA) })
+		setNodeReady(nodeA, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+		nodeB := newFleetNode("dep-mmm-b")
+		Expect(k8sClient.Create(ctx, nodeB)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeB) })
+		setNodeReady(nodeB, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+		nodeC := newFleetNode("dep-zzz-c")
+		Expect(k8sClient.Create(ctx, nodeC)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeC) })
+		setNodeReady(nodeC, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+
+		agent := newAgent("job-coder-depth")
+		agent.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+			Mode: foremanv1alpha1.ExecutionModeJob,
+		}
+		Expect(k8sClient.Create(ctx, agent)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agent) })
+
+		// Stack three live Job-mode tasks on nodeA. Three is chosen so the
+		// old scalar rotation computes 3 % 3 == 0 and returns eligible[0],
+		// which IS nodeA -- the most loaded node in the fleet.
+		for i := 0; i < 3; i++ {
+			t := newTask(fmt.Sprintf("job-depth-live-%d", i))
+			t.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+			Expect(k8sClient.Create(ctx, t)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, t) })
+			setPhase(t, foremanv1alpha1.AgenticTaskPhasePending)
+			var live foremanv1alpha1.AgenticTask
+			Expect(k8sClient.Get(ctx, nn(t), &live)).To(Succeed())
+			live.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+			live.Status.AssignedNode = nodeA.Name
+			Expect(k8sClient.Status().Update(ctx, &live)).To(Succeed())
+		}
+
+		task := newTask("job-depth-next")
+		task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agent.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.AssignedNode).NotTo(Equal(nodeA.Name),
+			"scheduled onto the node already supervising three Jobs while two sat idle")
+	})
+
+	It("counts another agent's Job-mode load on a node (#1634)", func() {
+		nodeA := newFleetNode("xag-aaa-a")
+		Expect(k8sClient.Create(ctx, nodeA)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeA) })
+		setNodeReady(nodeA, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+		nodeB := newFleetNode("xag-mmm-b")
+		Expect(k8sClient.Create(ctx, nodeB)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, nodeB) })
+		setNodeReady(nodeB, foremanv1alpha1.FleetNodeCapability{
+			Accelerator: foremanv1alpha1.FleetNodeAccelerator("metal"),
+		})
+
+		agentOne := newAgent("job-coder-x1")
+		agentOne.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+			Mode: foremanv1alpha1.ExecutionModeJob,
+		}
+		Expect(k8sClient.Create(ctx, agentOne)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentOne) })
+		agentTwo := newAgent("job-coder-x2")
+		agentTwo.Spec.Execution = &foremanv1alpha1.ExecutionSpec{
+			Mode: foremanv1alpha1.ExecutionModeJob,
+		}
+		Expect(k8sClient.Create(ctx, agentTwo)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, agentTwo) })
+
+		// agentOne is already supervising a Job on nodeA (the alphabetically
+		// first eligible node). The old count filtered by AgentRef, so
+		// agentTwo saw zero live tasks, computed index 0, and landed on the
+		// very node agentOne was using.
+		busy := newTask("job-x1-live")
+		busy.Spec.AgentRef = &corev1.LocalObjectReference{Name: agentOne.Name}
+		Expect(k8sClient.Create(ctx, busy)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, busy) })
+		setPhase(busy, foremanv1alpha1.AgenticTaskPhasePending)
+		var live foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(busy), &live)).To(Succeed())
+		live.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+		live.Status.AssignedNode = nodeA.Name
+		Expect(k8sClient.Status().Update(ctx, &live)).To(Succeed())
+
+		task := newTask("job-x2-next")
+		task.Spec.AgentRef = &corev1.LocalObjectReference{Name: agentTwo.Name}
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(task))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(task), &fresh)).To(Succeed())
+		Expect(fresh.Status.AssignedNode).To(Equal(nodeB.Name),
+			"a second Job-mode agent ignored the first agent's load and reused its node")
 	})
 
 	It("leaves a second task Pending when the only matching node is busy", func() {

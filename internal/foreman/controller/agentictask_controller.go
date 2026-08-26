@@ -499,6 +499,11 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 	})
 	now := time.Now()
 	key := taskKey(task)
+	// eligible holds the sorted indices of nodes that are schedulable and
+	// satisfy the capability. A first pass collects them so the jobMode
+	// branch can index into the eligible list directly (the index of the
+	// eligible node being considered must be known before it is returned).
+	var eligible []int
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
 		if !nodeSchedulable(n, now) {
@@ -507,13 +512,30 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		if !capabilitySatisfies(required, requiredModel, n, jobMode) {
 			continue
 		}
-		if jobMode {
-			// Job-mode work runs in an ephemeral Job pod, not on this node, so
-			// the node must not be claimed. Pick the first eligible node and
-			// leave its CurrentTask untouched so it stays free for in-process
-			// tasks. See #1496.
-			return n.Name, nil
+		eligible = append(eligible, i)
+	}
+	if jobMode {
+		// Job-mode work runs in an ephemeral Job pod, not on this node, so
+		// the node must not be claimed: leave its CurrentTask untouched so
+		// it stays free for in-process tasks. See #1496.
+		//
+		// Reserving would undo #1496, but the reservation is what used to
+		// make the scan advance; without it every Job-mode task lands on the
+		// alphabetically first node, so a fleet of N nodes can supervise only
+		// one Job at a time. See #1634.
+		//
+		// Pick the eligible node currently supervising the fewest live
+		// Job-mode tasks. An earlier revision rotated on a scalar count of
+		// live tasks (count % len(eligible)); that spreads a burst but
+		// collapses to index 0 -- first-fit -- whenever nothing else is in
+		// flight, which is the common serial case.
+		if len(eligible) == 0 {
+			return "", nil
 		}
+		return nodes.Items[r.leastLoadedJobModeNode(ctx, nodes.Items, eligible, task)].Name, nil
+	}
+	for _, i := range eligible {
+		n := &nodes.Items[i]
 		reserved, err := r.reserveNode(ctx, n, key)
 		if err != nil {
 			return "", err
@@ -525,6 +547,66 @@ func (r *AgenticTaskReconciler) reserveFirstFitNode(ctx context.Context, task *f
 		// first; try the next candidate.
 	}
 	return "", nil
+}
+
+// leastLoadedJobModeNode returns the index into nodes of the eligible node
+// supervising the fewest live Job-mode tasks, so successive assignments spread
+// across the fleet instead of stacking on the alphabetically first node
+// (see #1634). eligible is the eligible-node index slice built by
+// reserveFirstFitNode (sorted by name); the caller guarantees it is non-empty.
+//
+// Ties break toward the earlier eligible node, so with an idle fleet this is
+// still deterministic. Unlike a scalar rotation it cannot collapse to index 0
+// when nothing is in flight, and it distinguishes a node already supervising
+// three Jobs from an idle one.
+func (r *AgenticTaskReconciler) leastLoadedJobModeNode(
+	ctx context.Context, nodes []foremanv1alpha1.FleetNode, eligible []int, task *foremanv1alpha1.AgenticTask,
+) int {
+	load := r.jobModeLoadByNode(ctx, task)
+	best := eligible[0]
+	bestLoad := load[nodes[best].Name]
+	for _, i := range eligible[1:] {
+		if l := load[nodes[i].Name]; l < bestLoad {
+			best, bestLoad = i, l
+		}
+	}
+	return best
+}
+
+// jobModeLoadByNode tallies the in-flight Job-mode AgenticTasks in the task's
+// namespace per assigned node: those in a Scheduled (or later) phase that carry
+// an AssignedNode, regardless of whether the node is reserved. Job-mode tasks
+// are never reserved (#1496), so they cannot be counted via CurrentTask; the
+// assigned-node stamp is the only durable record of which Jobs a node currently
+// supervises, and it is a real per-node load signal.
+//
+// Every agent's Job-mode work counts toward a node's load, not just the
+// scheduling task's own agent: two agents dispatching concurrently are
+// competing for the same node capacity, and filtering by AgentRef would let
+// each of them independently pick the same "idle" node.
+//
+// The task being scheduled is still Pending, so it does not count against
+// itself.
+func (r *AgenticTaskReconciler) jobModeLoadByNode(ctx context.Context, task *foremanv1alpha1.AgenticTask) map[string]int {
+	load := map[string]int{}
+	var tasks foremanv1alpha1.AgenticTaskList
+	// A failing list must not wedge scheduling; an empty tally falls back to
+	// the first eligible node so the task still dispatches rather than
+	// stalling.
+	if err := r.List(ctx, &tasks, client.InNamespace(task.Namespace)); err != nil {
+		return load
+	}
+	for i := range tasks.Items {
+		t := &tasks.Items[i]
+		if !holdsInFlightSlot(t.Status.Phase) {
+			continue
+		}
+		if t.Status.AssignedNode == "" {
+			continue
+		}
+		load[t.Status.AssignedNode]++
+	}
+	return load
 }
 
 // reserveNode stamps node.Status.CurrentTask with taskKey via an optimistic-
