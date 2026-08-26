@@ -2092,6 +2092,166 @@ func TestBuildUserPrompt_ReviewerAppendsAdvisories(t *testing.T) {
 	}
 }
 
+// TestBuildUserPrompt_PerClauseChecklist wires the issue-clauses rail into the
+// production prompt path: the behaviours an issue enumerates under "Expected
+// Behavior" must resurface as an unchecked checklist in the coder's prompt, so
+// a coder that implements the one path its first test happens to cover cannot
+// slip past without the other named case being visible. This drives the
+// production entry point (buildUserPrompt), not the extractor in isolation, so
+// a no-op in the wiring (rather than a broken extractor) is what this catches.
+func TestBuildUserPrompt_PerClauseChecklist(t *testing.T) {
+	body := "## Expected Behavior\n\n" +
+		"- the enabled path applies the new default\n" +
+		"- the disabled path preserves the original no-side-effect behaviour\n"
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  1554,
+				Prompt: body,
+			},
+		},
+	}
+	got := buildUserPrompt(task)
+	for _, clause := range []string{
+		"the enabled path applies the new default",
+		"the disabled path preserves the original no-side-effect behaviour",
+	} {
+		if !strings.Contains(got, clause) {
+			t.Errorf("expected per-clause checklist to surface %q in the coder prompt:\n%s", clause, got)
+		}
+	}
+}
+
+// TestBuildUserPrompt_NoClausesIsNoOp confirms the rail degrades to a no-op
+// when an issue enumerates no behaviour clauses: an issue body with only prose
+// (no "Expected Behavior" / "Acceptance Criteria" sections) must not inject a
+// checklist block, so a clause-less issue is unaffected rather than errored.
+func TestBuildUserPrompt_NoClausesIsNoOp(t *testing.T) {
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  1554,
+				Prompt: "There is a mismatch between two components. Nothing enumerated here.\n",
+			},
+		},
+	}
+	got := buildUserPrompt(task)
+	if strings.Contains(got, "Required behaviours to cover") {
+		t.Errorf("expected no checklist block for a clause-less issue, got:\n%s", got)
+	}
+}
+
+// TestApplyIssueClauseCoverageForTask_DrivesProductionPath drives the
+// production review-rail entry point (applyIssueClauseCoverageForTask) rather
+// than the extractor in isolation. It asserts the rail's actual effect: a GO
+// whose reviewer findings omit a clause the issue enumerated gets a major
+// finding appended for that clause, so the gap surfaces instead of being
+// silently omitted. This drives the production entry point, so a no-op in the
+// wiring (the defect this task fixes) is what the test catches.
+func TestApplyIssueClauseCoverageForTask_DrivesProductionPath(t *testing.T) {
+	body := "## Expected Behavior\n\n" +
+		"- the enabled path applies the new default\n" +
+		"- the disabled path preserves the original no-side-effect behaviour\n"
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  1554,
+				Prompt: body,
+			},
+		},
+	}
+	extra := map[string]any{
+		"reviewOutcome": "APPROVE",
+		// The reviewer cited only the enabled path; the disabled clause is
+		// never addressed, so it must be flagged.
+		"findings": []any{
+			map[string]any{
+				"severity": "major",
+				"area":     "scope",
+				"message":  "the enabled path applies the new default",
+			},
+		},
+	}
+	lr := &LoopResult{
+		Transcript: nil,
+		Terminal:   &ToolResult{Extra: extra},
+	}
+	applyIssueClauseCoverageForTask(logr.Discard(), task, lr)
+
+	raw, ok := extra["findings"].([]any)
+	if !ok {
+		t.Fatalf("expected findings appended to extra, got %T", extra["findings"])
+	}
+	var messages []string
+	for _, f := range raw {
+		m, _ := f.(map[string]any)
+		if msg, ok := m["message"].(string); ok {
+			messages = append(messages, msg)
+		}
+	}
+	found := false
+	for _, m := range messages {
+		if strings.Contains(m, "the disabled path preserves the original no-side-effect behaviour") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected a finding appended for the uncited disabled clause, findings:\n%v", messages)
+	}
+}
+
+// TestApplyIssueClauseCoverageForTask_AllClausesCitedIsNoOp confirms the rail
+// leaves the findings untouched when the reviewer cited every clause, so a
+// thorough review is not penalised by a false-positive gap.
+func TestApplyIssueClauseCoverageForTask_AllClausesCitedIsNoOp(t *testing.T) {
+	body := "## Expected Behavior\n\n" +
+		"- the enabled path applies the new default\n" +
+		"- the disabled path preserves the original no-side-effect behaviour\n"
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  1554,
+				Prompt: body,
+			},
+		},
+	}
+	orig := []any{
+		map[string]any{
+			"severity": "major",
+			"area":     "scope",
+			"message":  "the enabled path applies the new default",
+		},
+		map[string]any{
+			"severity": "major",
+			"area":     "scope",
+			"message":  "the disabled path preserves the original no-side-effect behaviour",
+		},
+	}
+	extra := map[string]any{
+		"reviewOutcome": "APPROVE",
+		"findings":      orig,
+	}
+	lr := &LoopResult{
+		Transcript: nil,
+		Terminal:   &ToolResult{Extra: extra},
+	}
+	applyIssueClauseCoverageForTask(logr.Discard(), task, lr)
+
+	raw, ok := extra["findings"].([]any)
+	if !ok || len(raw) != len(orig) {
+		t.Fatalf("expected findings unchanged when all clauses cited, got %v", extra["findings"])
+	}
+}
+
 // TestBuildUserPrompt_ReviewerOmitsAdvisoryBlockWhenNone verifies that the
 // advisory block is silently absent when the payload carries no advisories,
 // so the prompt stays clean for tasks where the coder gate found nothing.

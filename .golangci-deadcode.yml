@@ -33,8 +33,6 @@ linters:
         linters: [unused]
       - path: pkg/foreman/agent/deleted_reference_gate\.go # Refs #1553
         linters: [unused]
-      - path: pkg/foreman/agent/issue_clauses\.go # Refs #1554
-        linters: [unused]
       - path: pkg/foreman/agent/mutation_check\.go # Refs #1555
         linters: [unused]
       - path: pkg/foreman/agent/reviewer_diff_gate\.go # Refs #1570
