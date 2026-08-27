@@ -485,7 +485,21 @@ func (e *NativeAgentLoopExecutor) Execute(
 	// first tool directly with the task payload as JSON arguments. The
 	// gate Agent uses this; M5+ reviewer agents use the LLM path.
 	if deterministic {
-		return e.executeDeterministic(ctx, task, agent, branch, registry, cloneURL, start), nil
+		r := e.executeDeterministic(ctx, task, agent, branch, registry, cloneURL, start)
+		// Cross-stage contradiction check at the verify (gate) stage's
+		// terminal (#1674): the gate passes on the adopted coder branch;
+		// compare its verdict against the ground-truth diff so a trivial
+		// GATE-PASS on an empty branch (checks passed with no change to
+		// judge) is recorded, not silently trusted. Mirrors
+		// applyCrossStageContradictionsForTask in the reviewer path;
+		// records-and-logs, never changes the verdict.
+		if r != nil {
+			gateBase := e.reviewerDiffBase(ctx, log, task, workspace)
+			gateDiff, gateDiffErr := repo.DiffNameOnly(ctx, workspace, gateBase)
+			applyCrossStageContradictionsForGate(ctx, log, workspace, gateBase,
+				gateDiff, gateDiffErr, r, r.Verdict)
+		}
+		return r, nil
 	}
 
 	// 6+. LLM-driven path: extracted to keep Execute below the
