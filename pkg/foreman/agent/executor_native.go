@@ -1008,6 +1008,18 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// gap as a finding. Runs last so it sees the reviewer's full set
 			// of findings; records-and-logs, never changes the verdict.
 			applyIssueClauseCoverageForTask(log, task, loopRes)
+			// Cross-stage contradiction check (#1549): the reviewer asserts
+			// checkable facts about the branch; compare them against the
+			// ground-truth facts resolved above (reviewBase + reviewDiff). A
+			// disagreement -- e.g. the reviewer claims an empty branch that is
+			// demonstrably non-empty -- is recorded on the terminal result so
+			// the next pipeline step or a human can escalate instead of letting
+			// the last-spoken stage decide. Records-and-logs; never changes the
+			// verdict. Mirrors applyCoderGroundingRailForTask /
+			// applyNoFunctionalChangeForTask: a small wrapper beside the
+			// existing ones so runLLMPath's complexity budget is untouched.
+			applyCrossStageContradictionsForTask(ctx, log, workspace, reviewBase,
+				reviewDiff, reviewDiffErr, loopRes, verdict)
 		}
 		r := e.modelDecidedResult(start, transcriptRef, loopRes, verdict)
 		// #1109: preserve a coder's near-complete work when its in-loop
