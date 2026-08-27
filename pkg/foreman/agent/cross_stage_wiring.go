@@ -191,3 +191,46 @@ func applyCrossStageContradictionsForCoderTask(
 	}
 	extra["crossStageContradictions"] = cs
 }
+
+// applyCrossStageContradictionsForGate is the production wiring for the
+// cross-stage contradiction detector (cross_stage.go) at the verify (gate)
+// stage's terminal. It builds a StageClaim carrying the gate's Verdict
+// ("GATE-PASS") and a BranchFacts from the ground-truth diff the caller
+// resolved, then records every contradiction the detector reports onto the
+// terminal result so the next pipeline step (or a human) sees that the gate
+// passed on a branch carrying no change -- the checks passed trivially, so
+// the verdict carries no information about the change (Rule 4).
+//
+// Non-blocking: it never changes the verdict; it only surfaces the
+// contradiction under Extra["crossStageContradictions"] and logs each one.
+// It degrades open -- a missing ground-truth diff (diffErr non-nil) means
+// the detector cannot separate a supported claim from an unsupported one,
+// so it steps aside, exactly like the other diff-anchored rails.
+//
+// It runs in the verify path of Execute, after the gate tool dispatches,
+// where the gate's workspace (the adopted coder branch) and base are in
+// scope. Mirrors applyCrossStageContradictionsForTask; the gate is
+// deterministic and makes no prose claims, so only Rule 4 can fire.
+func applyCrossStageContradictionsForGate(
+	ctx context.Context, log logr.Logger, workspace, base string,
+	diff []string, diffErr error, r *Result,
+	verdict foremanv1alpha1.AgenticTaskVerdict,
+) {
+	if r == nil || r.Extra == nil || diffErr != nil {
+		return
+	}
+	facts := branchFactsFromBranch(ctx, workspace, base, execCommandRunner, diff)
+	claim := StageClaim{
+		Stage:   "gate",
+		Verdict: string(verdict),
+	}
+	cs := contradictions(claim, facts)
+	if !shouldEscalate(cs) {
+		return
+	}
+	for _, c := range cs {
+		log.Info("cross-stage: gate claim contradicts the ground-truth branch facts",
+			"contradiction", c)
+	}
+	r.Extra["crossStageContradictions"] = cs
+}
