@@ -256,11 +256,11 @@ var _ = Describe("Model Prefetch", func() {
 		// Prefetch must stage into the PVC the InferenceService will actually
 		// read, not always the shared cache.
 
-		newIsvc := func(name, claim string) *inferencev1alpha1.InferenceService {
+		newIsvc := func(modelName, name, claim string) *inferencev1alpha1.InferenceService {
 			return &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 				Spec: inferencev1alpha1.InferenceServiceSpec{
-					ModelRef: "per-service-model",
+					ModelRef: modelName,
 					ModelCache: &inferencev1alpha1.ModelCacheSpec{
 						ClaimName: claim,
 					},
@@ -286,7 +286,7 @@ var _ = Describe("Model Prefetch", func() {
 		It("mounts the single referencing service's claimName PVC", func() {
 			m := newPrefetchModel("per-service-model")
 			seedPrefetchCacheKey(m)
-			Expect(k8sClient.Create(ctx, newIsvc("svc-a", "llmkube-node-a-cache"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, newIsvc("per-service-model", "svc-a", "llmkube-node-a-cache"))).To(Succeed())
 
 			// The bug: buildPrefetchJob hardcodes a nil isvc and the shared
 			// cache, so the per-service claim is never consulted.
@@ -311,7 +311,7 @@ var _ = Describe("Model Prefetch", func() {
 			r := prefetchReconciler()
 			m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "resolve-model", Namespace: ns}}
 
-			Expect(k8sClient.Create(ctx, newIsvc("svc-a", "llmkube-cache-a"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, newIsvc("resolve-model", "svc-a", "llmkube-cache-a"))).To(Succeed())
 			target, reason := r.resolvePrefetchTarget(ctx, m)
 			Expect(reason).To(BeEmpty())
 			Expect(target).NotTo(BeNil())
@@ -323,8 +323,8 @@ var _ = Describe("Model Prefetch", func() {
 			r := prefetchReconciler()
 			m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "conflict-model", Namespace: ns}}
 
-			Expect(k8sClient.Create(ctx, newIsvc("svc-a", "llmkube-cache-a"))).To(Succeed())
-			Expect(k8sClient.Create(ctx, newIsvc("svc-b", "llmkube-cache-b"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, newIsvc("conflict-model", "svc-a", "llmkube-cache-a"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, newIsvc("conflict-model", "svc-b", "llmkube-cache-b"))).To(Succeed())
 
 			target, reason := r.resolvePrefetchTarget(ctx, m)
 			Expect(target).To(BeNil())
@@ -336,7 +336,7 @@ var _ = Describe("Model Prefetch", func() {
 			m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "no-svc-model", Namespace: ns}}
 
 			// A service that references a different model must not match.
-			Expect(k8sClient.Create(ctx, newIsvc("other-model", "llmkube-cache-a"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, newIsvc("other-model", "svc-other", "llmkube-cache-a"))).To(Succeed())
 
 			target, reason := r.resolvePrefetchTarget(ctx, m)
 			Expect(target).To(BeNil())
