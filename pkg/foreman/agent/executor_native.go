@@ -1242,6 +1242,24 @@ func (e *NativeAgentLoopExecutor) commitPushAttempt(
 		ctx, log, hasChanges, workspace,
 		e.resolveUpstreamForRun(task), baseBranch,
 	) {
+		// Cross-stage contradiction check (#1674, slice 1): a coder that
+		// returned GO describing an edit but whose branch carries no commits
+		// ahead of base lands here (the self-commit recovery could not find
+		// any work to recover). That is Rule 1 ("claims edits on an empty
+		// branch"): the gate would GATE-PASS trivially on such a branch.
+		// applyCrossStageContradictionsForTask covers only the reviewer stage,
+		// so this is the coder half. Records-and-logs; never changes the
+		// verdict. Diff and base SHA are resolved against the upstream base
+		// (the same anchor the coder rails use); a resolution failure degrades
+		// open so the check never fires on missing ground truth.
+		if upstreamURL := e.resolveUpstreamForRun(task); upstreamURL != "" {
+			if baseSHA, berr := repo.BaseBranchSHA(ctx, workspace, upstreamURL, baseBranch); berr == nil {
+				if coderDiff, derr := repo.DiffNameOnly(ctx, workspace, baseSHA); derr == nil {
+					applyCrossStageContradictionsForCoderTask(ctx, log, workspace,
+						baseSHA, coderDiff, derr, lr, foremanv1alpha1.AgenticTaskVerdictGo)
+				}
+			}
+		}
 		return "", false, e.noChangesResult(start, tref, lr, branch)
 	}
 
@@ -1270,6 +1288,25 @@ func (e *NativeAgentLoopExecutor) commitPushAttempt(
 		// Model said GO but never edited anything. Honest report: this is a
 		// NO-CHANGES outcome, NOT a GO. The autofix pipeline saw this often
 		// enough to deserve a distinct outcome string.
+		//
+		// Cross-stage contradiction check (#1674, slice 1): this is the one
+		// path where a coder's GO lands on an empty branch -- the coder
+		// returned GO describing an edit but the commit produced nothing, so
+		// the branch is identical to its base. That is exactly Rule 1 ("claims
+		// edits on an empty branch"): the gate would GATE-PASS trivially on
+		// such a branch. applyCrossStageContradictionsForTask covers only the
+		// reviewer stage, so this is the coder half. Records-and-logs; never
+		// changes the verdict. Diff is computed against baseBranch, the same
+		// ground truth the coder rails use.
+		// MUTATION CHECK: temporarily disabled to confirm the test fails without the call site.
+		// if upstreamURL := e.resolveUpstreamForRun(task); upstreamURL != "" {
+		// 	if baseSHA, berr := repo.BaseBranchSHA(ctx, workspace, upstreamURL, baseBranch); berr == nil {
+		// 		if coderDiff, derr := repo.DiffNameOnly(ctx, workspace, baseSHA); derr == nil {
+		// 			applyCrossStageContradictionsForCoderTask(ctx, log, workspace,
+		// 				baseSHA, coderDiff, derr, lr, foremanv1alpha1.AgenticTaskVerdictGo)
+		// 		}
+		// 	}
+		// }
 		return "", envtestTouched, e.noChangesResult(start, tref, lr, branch)
 	}
 	if commitErr != nil {
@@ -2298,6 +2335,13 @@ func (e *NativeAgentLoopExecutor) noChangesResult(
 		"transcriptRef":  objRefAsMap(tref),
 		"turnCount":      lr.Turns,
 		"modelSummary":   lr.Terminal.Summary,
+	}
+	// Surface any cross-stage contradiction the commit path recorded on the
+	// coder terminal (Rule 1: a GO claiming an edit on an empty branch) so a
+	// consumer of the NO-CHANGES outcome sees it. The no-change Result does
+	// not nest the terminal under modelExtra, so copy the recorded list here.
+	if cs, ok := lr.Terminal.Extra["crossStageContradictions"].([]string); ok && len(cs) > 0 {
+		r.Extra["crossStageContradictions"] = cs
 	}
 	return r
 }

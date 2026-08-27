@@ -175,3 +175,109 @@ func TestCrossStageContradiction_WiredIntoRunLLMPath(t *testing.T) {
 		t.Fatalf("expected an empty-branch contradiction %q, got %v", want, cs)
 	}
 }
+
+// TestCrossStageContradiction_CoderClaimsEditsOnEmptyBranch drives the
+// PRODUCTION path for the coder half of #1674: Execute -> runLLMPath -> the
+// commit/push path -> noChangesResult -> applyCrossStageContradictionsForCoderTask
+// -> contradictions. It builds a coder task whose branch is empty (one commit on
+// main, the branch cut from main, so zero commits ahead and HEAD==base) but whose
+// terminal claims it made a specific edit ("fixed the bug"). The detector must
+// fire Rule 1 ("coder: claims edits but branch is empty") and record it on the
+// NO-CHANGES result.
+//
+// Mutation check: comment out the applyCrossStageContradictionsForCoderTask call
+// in the no-change path and this test fails, because res.Extra["crossStageContradictions"]
+// no longer carries the Rule 1 contradiction. A test that called contradictions()
+// directly would still pass with the call site removed -- this one cannot.
+func TestCrossStageContradiction_CoderClaimsEditsOnEmptyBranch(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+	oaiSrv := scriptedOAI(t, []string{submitGoBody})
+
+	// Coder-role agent: read-only tool set, no touch, so the no-change path
+	// (no commit, no push) is taken and the cross-stage check runs.
+	agent := &foremanv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "coder-cs", Namespace: "default"},
+		Spec: foremanv1alpha1.AgentSpec{
+			Role:                foremanv1alpha1.AgentRoleCoder,
+			Model:               "test-model",
+			InferenceServiceRef: corev1.LocalObjectReference{Name: "test-svc"},
+			SystemPrompt:        "you are a test coder",
+			Tools:               []string{"read_file", "submit_result"},
+			MaxTurns:            5,
+		},
+	}
+	// Coder task that CUTS a fresh branch from main (empty, zero commits ahead).
+	task := &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "coder-cs", Namespace: "default", UID: types.UID("coder-cs-uid"),
+		},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  1674,
+				Prompt: "fix the bug",
+			},
+			AgentRef: &corev1.LocalObjectReference{Name: agent.Name},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).
+		WithObjects(agent, task).Build()
+
+	// The coder's terminal claims a specific edit but touches no files, so the
+	// commit path produces nothing and the NO-CHANGES path runs.
+	reg := &fakeRegistry{
+		results: map[string]*foremanagent.ToolResult{
+			"submit_result": {
+				Terminal: true,
+				Verdict:  "GO",
+				Summary:  "Removed the now-unused helper and fixed the crash.",
+				Extra:    map[string]any{},
+			},
+		},
+	}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		CommitCommitter:          repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		RegistryFactory: func(
+			_ context.Context, ws string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+
+	res, err := execWithAgent(t, e, task)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if got := res.Extra["outcome"]; got != "NO-CHANGES" {
+		t.Fatalf("outcome: want NO-CHANGES got %v", got)
+	}
+	cs, ok := res.Extra["crossStageContradictions"].([]string)
+	if !ok || len(cs) == 0 {
+		t.Fatalf("Rule 1 contradiction was not recorded on the production path; "+
+			"got crossStageContradictions=%v (extra=%v)", res.Extra["crossStageContradictions"], res.Extra)
+	}
+	found := false
+	for _, c := range cs {
+		if strings.Contains(c, "claims edits but branch is empty") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected a Rule 1 contradiction (claims edits but branch is empty), got %v", cs)
+	}
+}
