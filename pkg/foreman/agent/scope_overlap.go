@@ -507,7 +507,15 @@ func enforceReviewerScopeOverlap(
 	// diff, which a fix iteration can act on.
 	extra["verdictDemoted"] = true
 	extra["verdictDemotedBy"] = railScopeOverlap
-	extra["verdictClaimed"] = string(verdict)
+	// First-writer-wins for the claimed verdict: the scope rail runs before
+	// the issueAsk rail, so once it archives the reviewer's original verdict
+	// the second rail must not overwrite it with the already-demoted value
+	// (#1678). The archived value has to be the pre-demotion verdict for
+	// inertDemotion to tell a real GO->NO-GO rewrite apart from a rail that
+	// merely re-annotated.
+	if _, ok := extra["verdictClaimed"]; !ok {
+		extra["verdictClaimed"] = string(verdict)
+	}
 	extra["demotionReason"] = fmt.Sprintf(
 		"scope drift: the issue names %d file(s) (%s) and the diff touches none of them",
 		len(refs), strings.Join(refs, ", "))
