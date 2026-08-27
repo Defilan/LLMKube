@@ -18,6 +18,7 @@ package agent_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -174,4 +175,68 @@ func TestCrossStageContradiction_WiredIntoRunLLMPath(t *testing.T) {
 	if !found {
 		t.Fatalf("expected an empty-branch contradiction %q, got %v", want, cs)
 	}
+
+	// #1674: the evidence behind the contradiction must round-trip. The claim
+	// and facts that were evaluated come back with the same field values that
+	// went in, and the old crossStageContradictions key is left exactly as it
+	// was (this only added a key, it did not replace one). The evidence is a
+	// small flat struct; unmarshal the stored JSON into a local mirror of that
+	// shape and assert on its fields. This proves both the round-trip and that
+	// the JSON tags are the ones a downstream reader would key on.
+	var stored crossStageEvidenceJSON
+	raw, _ := json.Marshal(me["crossStageEvidence"])
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		t.Fatalf("unmarshal crossStageEvidence: %v\nraw=%s", err, raw)
+	}
+	if stored.Claim.Stage != "reviewer" {
+		t.Fatalf("evidence claim stage = %q, want reviewer", stored.Claim.Stage)
+	}
+	if !stored.Claim.ClaimsEmptyBranch {
+		t.Fatalf("evidence claim claimsEmptyBranch = false, want true")
+	}
+	if stored.Claim.NamedFiles[0] != "fix.go" {
+		t.Fatalf("evidence claim namedFiles = %v, want [fix.go]", stored.Claim.NamedFiles)
+	}
+	if stored.Facts.CommitsAhead != 1 {
+		t.Fatalf("evidence facts commitsAhead = %d, want 1", stored.Facts.CommitsAhead)
+	}
+	if stored.Facts.FilesChanged[0] != "fix.go" {
+		t.Fatalf("evidence facts filesChanged = %v, want [fix.go]", stored.Facts.FilesChanged)
+	}
+	if stored.Facts.HeadSHA == "" || stored.Facts.BaseSHA == "" {
+		t.Fatalf("evidence facts missing git-resolved SHAs: %+v", stored.Facts)
+	}
+	if stored.Facts.HeadSHA == stored.Facts.BaseSHA {
+		t.Fatalf("evidence facts headSHA == baseSHA %q on a one-commit branch", stored.Facts.HeadSHA)
+	}
+	if len(stored.Contradictions) != len(cs) {
+		t.Fatalf("evidence contradictions len = %d, want %d", len(stored.Contradictions), len(cs))
+	}
+	for i := range cs {
+		if stored.Contradictions[i] != cs[i] {
+			t.Fatalf("evidence contradiction[%d] = %q, want %q", i, stored.Contradictions[i], cs[i])
+		}
+	}
+}
+
+// crossStageEvidenceJSON mirrors the JSON shape the production path records
+// under Extra["crossStageEvidence"], so the external test package can decode it
+// without naming the unexported types. Field order + tags must match
+// cross_stage.go's crossStageEvidence.
+type crossStageEvidenceJSON struct {
+	Claim struct {
+		Stage             string   `json:"stage"`
+		Verdict           string   `json:"verdict"`
+		ClaimsEdits       bool     `json:"claimsEdits"`
+		ClaimsEmptyBranch bool     `json:"claimsEmptyBranch"`
+		NamedFiles        []string `json:"namedFiles"`
+	} `json:"claim"`
+	Facts struct {
+		CommitsAhead int      `json:"commitsAhead"`
+		FilesChanged []string `json:"filesChanged"`
+		NetLineDelta int      `json:"netLineDelta"`
+		HeadSHA      string   `json:"headSHA"`
+		BaseSHA      string   `json:"baseSHA"`
+	} `json:"facts"`
+	Contradictions []string `json:"contradictions"`
 }
