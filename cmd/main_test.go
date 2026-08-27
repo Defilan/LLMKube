@@ -19,6 +19,8 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,8 +48,8 @@ func TestClientsetPodLogReader_ReadPodLogs(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadPodLogs returned error: %v", err)
 		}
-		if got != "fake logs" {
-			t.Errorf("ReadPodLogs = %q, want %q", got, "fake logs")
+		if got != "fake logs\n" {
+			t.Errorf("ReadPodLogs = %q, want %q", got, "fake logs\n")
 		}
 	})
 
@@ -68,7 +70,11 @@ func TestClientsetPodLogReader_ReadPodLogs(t *testing.T) {
 		}
 	})
 
-	t.Run("passes the container and tail options through", func(t *testing.T) {
+	t.Run("reads the head, never the tail", func(t *testing.T) {
+		// #1585: the engine's load-time offload result is the first thing in the
+		// log, so a pod that has served traffic loses it through a TailLines
+		// read. Asserting the absence of TailLines is what keeps this from
+		// regressing back; TestReadPodLogsTruncatesToTheHead covers the size.
 		cs := fakeclientset.NewSimpleClientset()
 		r := &clientsetPodLogReader{cs: cs}
 
@@ -90,8 +96,54 @@ func TestClientsetPodLogReader_ReadPodLogs(t *testing.T) {
 		if opts.Container != container {
 			t.Errorf("PodLogOptions.Container = %q, want %q", opts.Container, container)
 		}
-		if opts.TailLines == nil || *opts.TailLines != 2048 {
-			t.Errorf("PodLogOptions.TailLines = %v, want 2048", opts.TailLines)
+		if opts.TailLines != nil {
+			t.Errorf("PodLogOptions.TailLines = %v, want unset: a tail window loses "+
+				"the load-time offload line (#1585)", *opts.TailLines)
 		}
 	})
+}
+
+// TestReadPodLogsTruncatesToTheHead feeds a serving log far longer than the
+// requested window through the production reader and checks it hands back the
+// first lines — including the load-time offload line — rather than the last.
+// The fake clientset's log reactor returns the whole body, so this exercises the
+// reader's own head truncation and stream close.
+func TestReadPodLogsTruncatesToTheHead(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("0.00.025.305 I   - Vulkan0 : Radeon 8060S Graphics (RADV STRIX_HALO) (133120 MiB, 132954 MiB free)\n")
+	b.WriteString("0.05.998.410 I load_tensors: offloaded 63/63 layers to GPU\n")
+	const window = 64
+	for i := 1; i <= window*3; i++ {
+		fmt.Fprintf(&b, "0.%02d.%03d.000 I srv  log_server_r: request: POST /v1/chat/completions 10.244.0.7 %d\n",
+			i%60, i%1000, 200)
+	}
+
+	cs := fakeclientset.NewSimpleClientset()
+	logs := b.String()
+	cs.PrependReactor("get", "pods", func(clientgotesting.Action) (bool, runtime.Object, error) {
+		return true, &runtime.Unknown{Raw: []byte(logs)}, nil
+	})
+	r := &clientsetPodLogReader{cs: cs}
+
+	got, err := r.ReadPodLogs(context.Background(), "default", "svc-1", "llama-server", window)
+	if err != nil {
+		t.Fatalf("ReadPodLogs: %v", err)
+	}
+	if !strings.HasPrefix(got, "0.00.025.305 I   - Vulkan0") {
+		t.Errorf("reader did not start at the log's head; got %q", firstLine(got))
+	}
+	if !strings.Contains(got, "offloaded 63/63 layers to GPU") {
+		t.Error("reader lost the load-time offload line")
+	}
+	if n := strings.Count(got, "\n"); n != window {
+		t.Errorf("reader returned %d lines, want the requested window of %d", n, window)
+	}
+}
+
+// firstLine returns s's first line, for a readable failure message.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
