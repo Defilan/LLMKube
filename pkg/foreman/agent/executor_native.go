@@ -3266,7 +3266,15 @@ func enforceReviewerIssueAsk(
 	// what distinguishes an actual GO to NO-GO rewrite from those.
 	extra["verdictDemoted"] = true
 	extra["verdictDemotedBy"] = railIssueAsk
-	extra["verdictClaimed"] = string(verdict)
+	// First-writer-wins for the claimed verdict: the scope rail runs before
+	// this rail, so once it archives the reviewer's original verdict the
+	// issueAsk rail must not overwrite it with the already-demoted value
+	// (#1678). The archived value has to be the pre-demotion verdict for
+	// inertDemotion to tell a real GO->NO-GO rewrite apart from a rail that
+	// merely re-annotated.
+	if _, ok := extra["verdictClaimed"]; !ok {
+		extra["verdictClaimed"] = string(verdict)
+	}
 
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
 		extra["demotionReason"] = "issueAsk could not be verified as covering the " +
