@@ -17,11 +17,11 @@ import (
 // caller. It is a plain data struct so the detector below stays a pure function
 // of (claim, facts).
 type BranchFacts struct {
-	CommitsAhead int
-	FilesChanged []string
-	NetLineDelta int
-	HeadSHA      string
-	BaseSHA      string
+	CommitsAhead int      `json:"commitsAhead"`
+	FilesChanged []string `json:"filesChanged"`
+	NetLineDelta int      `json:"netLineDelta"`
+	HeadSHA      string   `json:"headSHA"`
+	BaseSHA      string   `json:"baseSHA"`
 }
 
 // BranchIsEmpty reports whether the branch carries no change relative to its
@@ -35,11 +35,22 @@ func (f BranchFacts) BranchIsEmpty() bool {
 
 // StageClaim captures what a single pipeline stage asserted about the branch.
 type StageClaim struct {
-	Stage             string
-	Verdict           string
-	ClaimsEdits       bool
-	ClaimsEmptyBranch bool
-	NamedFiles        []string
+	Stage             string   `json:"stage"`
+	Verdict           string   `json:"verdict"`
+	ClaimsEdits       bool     `json:"claimsEdits"`
+	ClaimsEmptyBranch bool     `json:"claimsEmptyBranch"`
+	NamedFiles        []string `json:"namedFiles"`
+}
+
+// crossStageEvidence preserves what a stage claimed and the ground facts it was
+// checked against, so a human or a later stage can see WHAT disagreed with WHAT
+// rather than only that something did. The contradictions slice is the same
+// human-readable list recorded under Extra["crossStageContradictions"]; the
+// claim and facts are the structured inputs that produced it.
+type crossStageEvidence struct {
+	Claim          StageClaim  `json:"claim"`
+	Facts          BranchFacts `json:"facts"`
+	Contradictions []string    `json:"contradictions"`
 }
 
 // contradictions reports every way the claim disagrees with the ground facts.

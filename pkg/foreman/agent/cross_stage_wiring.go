@@ -131,6 +131,18 @@ func applyCrossStageContradictionsForTask(
 		loopRes.Terminal.Extra = extra
 	}
 	extra["crossStageContradictions"] = cs
+	// Preserve the structured evidence behind the contradiction strings: the
+	// claim that was evaluated, the ground facts it was checked against, and
+	// the contradictions themselves (#1674). The strings alone say *that*
+	// something disagreed; the claim + facts say *what* disagreed with *what*,
+	// so a human or a later stage can judge whether the disagreement is real
+	// without re-deriving the inputs. Extra["crossStageContradictions"] is
+	// left exactly as it was -- this only adds a key, it does not replace one.
+	extra["crossStageEvidence"] = crossStageEvidence{
+		Claim:          claim,
+		Facts:          facts,
+		Contradictions: cs,
+	}
 }
 
 // applyCrossStageContradictionsForCoderTask is the production wiring for the
