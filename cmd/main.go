@@ -17,6 +17,8 @@ limitations under the License.
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"flag"
@@ -74,6 +76,12 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
+// maxPodLogLineBytes bounds one line read from a container log. llama.cpp's
+// own lines are short, but a scanner's default 64 KiB cap would abort the read
+// on an unusually long line (a dumped request body, a stack trace) and turn a
+// readable log into an "unknown" offload result.
+const maxPodLogLineBytes = 1024 * 1024
+
 // clientsetPodLogReader reads a serving pod's container log through the
 // kubernetes clientset. It backs controller.PodLogReader in the production
 // operator so the engine's offload result can be surfaced on
@@ -82,22 +90,40 @@ type clientsetPodLogReader struct {
 	cs kubernetes.Interface
 }
 
-// ReadPodLogs tails a ready container's log. Errors are returned verbatim so
-// the reconcile path can treat a failed read as "unknown" without clobbering
-// a previously-observed acceleration.
+// ReadPodLogs returns a container log's load-time window. Errors are returned
+// verbatim so the reconcile path can treat a failed read as "unknown" without
+// clobbering a previously-observed acceleration.
+//
+// The head is what matters and the kubelet offers no head option, so the stream
+// is read until headLines is in hand and then closed rather than asking for
+// TailLines: the offload result llama.cpp prints at load time is the first thing
+// in the log, and a tail window loses it on any pod that has served real traffic
+// (#1585 — the measured pod was 11k lines). Reading the whole log instead would
+// be simpler but unbounded.
 func (r *clientsetPodLogReader) ReadPodLogs(
 	ctx context.Context,
 	namespace, podName, containerName string,
-	tailLines int64,
+	headLines int64,
 ) (string, error) {
 	stream, err := r.cs.CoreV1().Pods(namespace).GetLogs(podName, &v1.PodLogOptions{
 		Container: containerName,
-		TailLines: &tailLines,
-	}).DoRaw(ctx)
+	}).Stream(ctx)
 	if err != nil {
 		return "", err
 	}
-	return string(stream), nil
+	defer func() { _ = stream.Close() }()
+
+	var kept bytes.Buffer
+	scanned := bufio.NewScanner(stream)
+	scanned.Buffer(make([]byte, 0, 64*1024), maxPodLogLineBytes)
+	for lines := int64(0); lines < headLines && scanned.Scan(); lines++ {
+		kept.WriteString(scanned.Text())
+		kept.WriteByte('\n')
+	}
+	if err := scanned.Err(); err != nil {
+		return "", err
+	}
+	return kept.String(), nil
 }
 
 // initTracer initializes an OTLP trace exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set.
