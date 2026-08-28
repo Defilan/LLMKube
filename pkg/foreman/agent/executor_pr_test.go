@@ -32,6 +32,7 @@ import (
 // prEnsureCall records one EnsurePR invocation on the fake.
 type prEnsureCall struct {
 	owner, repo, head, base, title, body string
+	draft                                bool
 }
 
 // prSubjectCall records one HeadCommitSubject invocation on the fake.
@@ -51,9 +52,9 @@ type fakePREnsurer struct {
 }
 
 func (f *fakePREnsurer) EnsurePR(
-	_ context.Context, owner, repo, head, base, title, body, _ string,
+	_ context.Context, owner, repo, head, base, title, body string, draft bool, _ string,
 ) (*githubpr.Result, error) {
-	f.ensures = append(f.ensures, prEnsureCall{owner, repo, head, base, title, body})
+	f.ensures = append(f.ensures, prEnsureCall{owner, repo, head, base, title, body, draft})
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -192,6 +193,7 @@ func TestMaybeOpenPullRequest_ForkRemoteQualifiesHead(t *testing.T) {
 	want := prEnsureCall{
 		owner: "defilantech", repo: "LLMKube",
 		head: "Defilan:foreman/wl-x/issue-7", base: "main", title: "fix: the thing",
+		draft: true,
 	}
 	if got != want {
 		t.Errorf("EnsurePR args:\n got %+v\nwant %+v", got, want)
@@ -422,7 +424,7 @@ func TestOpenPullRequest_PrBodyPreferred(t *testing.T) {
 			fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1568"}
 			e := &NativeAgentLoopExecutor{PREnsurer: fe}
 			task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
-			got, err := e.openPullRequest(context.Background(), task, nil, "", summary, tc.extra, "")
+			got, err := e.openPullRequest(context.Background(), task, nil, "", summary, tc.extra, true, "")
 			if err != nil {
 				t.Fatalf("openPullRequest() error = %v", err)
 			}
@@ -462,7 +464,7 @@ func TestOpenPullRequest_PrBodyLongSurvivesIntact(t *testing.T) {
 	e := &NativeAgentLoopExecutor{PREnsurer: fe}
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
 	if _, err := e.openPullRequest(context.Background(), task, nil, "", "short",
-		map[string]any{"prBody": longBody}, ""); err != nil {
+		map[string]any{"prBody": longBody}, true, ""); err != nil {
 		t.Fatalf("openPullRequest() error = %v", err)
 	}
 	if len(fe.ensures) != 1 {

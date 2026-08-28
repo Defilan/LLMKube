@@ -86,10 +86,12 @@ type CodeHost interface {
 	ResolveCloneURL(repoSlug string) string
 
 	// EnsureChangeRequest ensures a pull request exists for head → base,
-	// creating it if absent. Returns the PR URL and whether it was
-	// created (true) or already existed (false).
+	// creating it if absent. draft opens the PR as a work-in-progress
+	// draft (a human reads it and marks it ready) rather than straight
+	// for review; the executor passes true so a Foreman PR is reviewable
+	// on arrival.
 	EnsureChangeRequest(ctx context.Context, repoSlug, headBranch,
-		baseBranch, title, body string) (url string, created bool, err error)
+		baseBranch, title, body string, draft bool) (url string, created bool, err error)
 
 	// HeadCommitSubject returns the first line of the branch head's commit
 	// message — the natural PR title (the coder writes a conventional
@@ -127,15 +129,18 @@ func (g *GitHubCodeHost) ResolveCloneURL(repoSlug string) string {
 }
 
 // EnsureChangeRequest ensures a pull request exists for head → base,
-// creating it if absent. Returns the PR URL and whether it was created.
+// creating it if absent. draft opens the PR as a work-in-progress draft
+// (a human reads it and marks it ready) rather than straight for review,
+// so a Foreman PR is reviewable on arrival. Returns the PR URL and
+// whether it was created (true) or already existed (false).
 func (g *GitHubCodeHost) EnsureChangeRequest(
-	ctx context.Context, repoSlug, headBranch, baseBranch, title, body string,
+	ctx context.Context, repoSlug, headBranch, baseBranch, title, body string, draft bool,
 ) (string, bool, error) {
 	owner, name, ok := SplitRepoSlug(repoSlug)
 	if !ok {
 		return "", false, nil
 	}
-	res, err := g.Ensurer.EnsurePR(ctx, owner, name, headBranch, baseBranch, title, body, g.Token)
+	res, err := g.Ensurer.EnsurePR(ctx, owner, name, headBranch, baseBranch, title, body, draft, g.Token)
 	if err != nil {
 		return "", false, err
 	}
