@@ -29,6 +29,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -208,6 +209,18 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	} else if depName != "" {
 		return r.skipTask(ctx, &task, depName, fmt.Sprintf("contradiction: %s", contradiction), true)
+	}
+
+	// Cascade-fail if any dependency is still absent once the task's
+	// TimeoutSeconds budget has elapsed. A dep absent for less than the
+	// budget is legal to wait for (the create-ordering race), so this
+	// defers to allDepsSucceeded, which surfaces the wait. Runs before
+	// cascadeFailIfDepFailed so the missing-dep reason is distinct from a
+	// dependency that failed. See #1687.
+	if missingMsg, err := r.cascadeFailIfMissing(ctx, &task); err != nil {
+		return ctrl.Result{}, err
+	} else if missingMsg != "" {
+		return r.failTask(ctx, &task, "MissingDependency", missingMsg)
 	}
 
 	// Cascade-fail if any dependency has Failed.
@@ -469,6 +482,14 @@ func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task
 // the same namespace AND is on-target (Phase=Succeeded AND verdict in
 // {GO, GATE-PASS}).
 //
+// A dependency that has not yet appeared is legal to wait for (a
+// dependent can be created before its dependency in the ordering race the
+// cascade-fail loop's IsNotFound branch tolerates). This records a
+// DepWaitStarted condition so the stall is diagnosable; the budget check
+// that actually cascade-fails an expired wait lives in cascadeFailIfMissing.
+// Without #1687 a missing dep left the task Pending forever with no
+// condition, event, or timeout.
+//
 // Previously gated on Phase=Succeeded alone, allowing INCOMPLETE /
 // GATE-FAIL deps to unblock dependents. Fixes defilantech/LLMKube#541.
 func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *foremanv1alpha1.AgenticTask) (bool, error) {
@@ -476,7 +497,13 @@ func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *fore
 		var dep foremanv1alpha1.AgenticTask
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: depName}, &dep); err != nil {
 			if apierrors.IsNotFound(err) {
-				return false, nil // wait for the dep to appear
+				// Surface the wait; a budget-expired dep is cascade-failed
+				// by cascadeFailIfMissing, so this keeps waiting for the
+				// dep to appear within budget. See #1687.
+				if err := r.recordMissingDepCondition(ctx, task, depName); err != nil {
+					return false, err
+				}
+				return false, nil
 			}
 			return false, err
 		}
@@ -485,6 +512,92 @@ func (r *AgenticTaskReconciler) allDepsSucceeded(ctx context.Context, task *fore
 		}
 	}
 	return true, nil
+}
+
+// cascadeFailIfMissing returns a non-empty message if any dependency is
+// still absent (not found) and the task's wait for it has outlasted the
+// TimeoutSeconds budget; otherwise it returns "" so the caller keeps
+// waiting. The missing-dep cascade-fail is checked before
+// cascadeFailIfDepFailed so the Failed condition carries the distinct
+// MissingDependency reason (#1687).
+func (r *AgenticTaskReconciler) cascadeFailIfMissing(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, error) {
+	for _, depName := range task.Spec.DependsOn {
+		var dep foremanv1alpha1.AgenticTask
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: depName}, &dep); err != nil {
+			if apierrors.IsNotFound(err) {
+				if depWaitExpired(task) {
+					return fmt.Sprintf("dependency %q never appeared within TimeoutSeconds=%d; cascade-failing",
+						depName, task.Spec.TimeoutSeconds), nil
+				}
+				continue
+			}
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+// recordMissingDepCondition writes a DepWaitStarted condition on the task
+// naming the absent dependency, so the wait is diagnosable via
+// kubectl describe. It patches only when the condition is not already
+// recorded with the same shape (Type/Status/Reason), so a dep that stays
+// absent does not wedge the reconciler in a per-reconcile status-patch
+// loop. The caller keeps waiting (returns false, nil) for the dep to
+// appear. See #1687.
+func (r *AgenticTaskReconciler) recordMissingDepCondition(ctx context.Context, task *foremanv1alpha1.AgenticTask, depName string) error {
+	depWait := metav1.Condition{
+		Type:               "DepWaitStarted",
+		Status:             metav1.ConditionTrue,
+		Reason:             "DependencyAbsent",
+		Message:            fmt.Sprintf("dependency %q not found; waiting for it to be created", depName),
+		LastTransitionTime: metav1.Now(),
+	}
+	if hasCondition(task.Status.Conditions, depWait) {
+		return nil
+	}
+	// Capture the merge base BEFORE mutating, so the computed diff actually
+	// carries the newly added condition to the API server. Capturing after
+	// setCondition would make the base already contain it, so the merge
+	// patch would see no diff and the condition would never persist.
+	patch := client.MergeFrom(task.DeepCopy())
+	setCondition(&task.Status.Conditions, depWait)
+	return r.Status().Patch(ctx, task, patch)
+}
+
+// depWaitExpired reports whether the task's wait for an absent dependency
+// has outlasted its TimeoutSeconds budget, in which case the caller should
+// cascade-fail the task with a MissingDependency reason.
+//
+// The budget is measured from the DepWaitStarted condition's
+// LastTransitionTime -- the moment the reconciler FIRST observed the
+// dependency absent -- and NOT from the task's creation. Two reasons, and
+// the first is the load-bearing one:
+//
+//   - Semantics. The budget is for the wait, not for the task's lifetime. A
+//     task created well before its dependency is dispatched would already be
+//     past a creation-relative budget on its first reconcile and cascade-fail
+//     instantly, which is the create-ordering race this whole path exists to
+//     tolerate.
+//   - Testability. metadata.creationTimestamp is assigned by the API server
+//     and is immutable: an Update that backdates it returns success and
+//     silently stores the original value. A creation-relative budget is
+//     therefore unreachable from an envtest, so no test can prove the
+//     cascade-fail ever fires. status.conditions are ordinary status and can
+//     be written, so the condition clock is reachable.
+//
+// No condition means the wait has not been recorded yet, so nothing has
+// elapsed. An unset or zero TimeoutSeconds leaves the wait unbounded (the dep
+// is legal to wait for), which is the pre-1687 default and still correct.
+func depWaitExpired(task *foremanv1alpha1.AgenticTask) bool {
+	budget := time.Duration(task.Spec.TimeoutSeconds) * time.Second
+	if budget <= 0 {
+		return false
+	}
+	started := apimeta.FindStatusCondition(task.Status.Conditions, "DepWaitStarted")
+	if started == nil || started.LastTransitionTime.IsZero() {
+		return false
+	}
+	return time.Since(started.LastTransitionTime.Time) >= budget
 }
 
 // reserveFirstFitNode picks the alphabetically-first Ready FleetNode whose
