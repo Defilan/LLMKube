@@ -264,6 +264,120 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(failedCond).To(BeNil(), "a Skipped dependent must not carry a Failed condition")
 	})
 
+	// Regression for defilantech/LLMKube#1686. A Pending task whose
+	// dependency ended with a cross-stage contradiction (a non-empty
+	// extra.crossStageContradictions in its terminal result envelope, set by
+	// the detector in #1685) must be cascade-skipped so the contradiction stops
+	// the line instead of only being counted. The dependency is on-target
+	// (Phase=Succeeded + Verdict=GO) apart from the contradiction, so without
+	// the contradiction check the dependent would actually dispatch; the skip
+	// is what stops the line. The dependent is transitioned to
+	// Phase=Succeeded + Verdict=Skipped with a Skipped condition
+	// (Reason=UpstreamContradicted) so the Workload rollup excludes it from
+	// every bucket rather than cascade-failing it (which would pin the
+	// Workload to Failed). The contradicting dependency's own verdict and
+	// phase are left untouched — blocking is dependents-only.
+	It("cascade-skips a Pending task when its dependency ended with a contradiction (#1686)", func() {
+		dep := newTask("cascade-contra-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		// On-target (Phase=Succeeded + Verdict=GO) apart from the
+		// contradiction: the cascade path reads the contradiction via
+		// hasCrossStageContradiction / coderCrossStageContradictions. The dep's
+		// own verdict/phase are left unchanged — #1686 only blocks dependents,
+		// never demotes the contradicting task.
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		patch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictGo
+		dep.Status.Result = &runtime.RawExtension{
+			Raw: []byte(`{"summary":"staged","extra":{"crossStageContradictions":["gate: GATE-PASS on an empty branch (checks passed trivially)"]}}`),
+		}
+		Expect(k8sClient.Status().Patch(ctx, dep, patch)).To(Succeed())
+
+		target := newTask("cascade-contra-target")
+		target.Spec.DependsOn = []string{dep.Name}
+		Expect(k8sClient.Create(ctx, target)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, target) })
+		setPhase(target, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(target))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(target), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseSucceeded))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictSkipped))
+		Expect(fresh.Status.FinishedAt).NotTo(BeNil())
+		// A contradiction must dispatch nothing — the dependent is skipped, not
+		// assigned to a node.
+		Expect(fresh.Status.AssignedNode).To(BeEmpty())
+
+		skippedCond := findCondition(fresh.Status.Conditions, "Skipped")
+		Expect(skippedCond).NotTo(BeNil())
+		Expect(skippedCond.Reason).To(Equal("UpstreamContradicted"))
+		Expect(skippedCond.Message).To(ContainSubstring(dep.Name))
+		Expect(skippedCond.Message).To(ContainSubstring("GATE-PASS on an empty branch"))
+
+		// A Skipped dependent must not carry a Failed condition.
+		failedCond := findCondition(fresh.Status.Conditions, "Failed")
+		Expect(failedCond).To(BeNil(), "a Skipped dependent must not carry a Failed condition")
+
+		// The contradicting dependency's own verdict and phase are untouched:
+		// #1686 blocks dependents only, never demotes the contradicting task.
+		var depFresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(dep), &depFresh)).To(Succeed())
+		Expect(depFresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseSucceeded))
+		Expect(depFresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictGo))
+	})
+
+	// Regression for defilantech/LLMKube#1686. When a dependency is BOTH
+	// ALREADY-RESOLVED and contradicted, the already-resolved reason wins:
+	// an ALREADY-RESOLVED dependency is a terminal non-failure (the work is
+	// already on the branch), while a contradiction is a stop signal, so the
+	// contradiction check runs AFTER the already-resolved check and the
+	// benign signal wins. The dependent is skipped with Reason=
+	// UpstreamAlreadyResolved, not UpstreamContradicted.
+	It("an ALREADY-RESOLVED dependency that is also contradicted skips as already-resolved (#1686)", func() {
+		dep := newTask("cascade-both-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		// ALREADY-RESOLVED (Phase=Succeeded + Verdict=NO-GO +
+		// extra.outcome="ALREADY-RESOLVED") AND a contradiction in the same
+		// envelope. Both signals fire; the already-resolved check must win.
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		patch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictNoGo
+		dep.Status.Result = &runtime.RawExtension{
+			Raw: []byte(`{"summary":"already done","extra":{"outcome":"ALREADY-RESOLVED","resolvedBy":"sha-deadbeef","crossStageContradictions":["coder: claims edits but branch is empty"]}}`),
+		}
+		Expect(k8sClient.Status().Patch(ctx, dep, patch)).To(Succeed())
+
+		target := newTask("cascade-both-target")
+		target.Spec.DependsOn = []string{dep.Name}
+		Expect(k8sClient.Create(ctx, target)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, target) })
+		setPhase(target, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(target))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(target), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseSucceeded))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictSkipped))
+		Expect(fresh.Status.AssignedNode).To(BeEmpty())
+
+		skippedCond := findCondition(fresh.Status.Conditions, "Skipped")
+		Expect(skippedCond).NotTo(BeNil())
+		// The benign ALREADY-RESOLVED signal wins over the stop signal.
+		Expect(skippedCond.Reason).To(Equal("UpstreamAlreadyResolved"))
+		Expect(skippedCond.Message).To(ContainSubstring(dep.Name))
+		Expect(skippedCond.Message).NotTo(ContainSubstring("contradiction"))
+
+		failedCond := findCondition(fresh.Status.Conditions, "Failed")
+		Expect(failedCond).To(BeNil(), "a Skipped dependent must not carry a Failed condition")
+	})
+
 	It("waits with requeue when a dependency is still pre-terminal", func() {
 		dep := newTask("wait-dep") // status stays empty == pre-terminal
 		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
