@@ -554,8 +554,13 @@ func (r *AgenticTaskReconciler) recordMissingDepCondition(ctx context.Context, t
 	if hasCondition(task.Status.Conditions, depWait) {
 		return nil
 	}
+	// Capture the merge base BEFORE mutating, so the computed diff actually
+	// carries the newly added condition to the API server. Capturing after
+	// setCondition would make the base already contain it, so the merge
+	// patch would see no diff and the condition would never persist.
+	patch := client.MergeFrom(task.DeepCopy())
 	setCondition(&task.Status.Conditions, depWait)
-	return r.Status().Patch(ctx, task, client.MergeFrom(task.DeepCopy()))
+	return r.Status().Patch(ctx, task, patch)
 }
 
 // depWaitExpired reports whether the task's wait for an absent dependency
