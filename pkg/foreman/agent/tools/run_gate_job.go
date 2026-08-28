@@ -237,6 +237,12 @@ type runGateJobArgs struct {
 	Image       string   `json:"image,omitempty"`
 	Checks      []string `json:"checks,omitempty"`
 	BiteCheck   bool     `json:"biteCheck,omitempty"`
+	// HunkCheck runs the per-hunk mutation coverage pass for envtest packages
+	// (a per-hunk variant of the bite check: revert one production hunk at a
+	// time and require some test to fail). Reported as an advisory, never a
+	// block. Defaults to matching BiteCheck so it runs whenever the bite
+	// check does; the gate Job skips it safely when no envtest files changed.
+	HunkCheck bool `json:"hunkCheck,omitempty"`
 	// Generic switches the Job from the Go path (make-target Checks plus the
 	// bite check) to running Commands directly. Set for non-Go GateProfiles.
 	Generic bool `json:"generic,omitempty"`
@@ -276,7 +282,9 @@ func (RunGateJobTool) Schema() oai.ToolSchemaDef {
   "checks":    {"type": "array", "items": {"type": "string"},
     "description": "ordered list of make targets to run; defaults to the foreman gate suite"},
   "biteCheck": {"type": "boolean",
-    "description": "when true, run the bite check after standard checks"}
+    "description": "when true, run the bite check after standard checks"},
+  "hunkCheck": {"type": "boolean",
+    "description": "when true, run the per-hunk mutation coverage check for envtest packages after standard checks"}
 },
 "required": ["repo", "branch"]
 }`),
@@ -337,6 +345,7 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 		HelmVersion:             helmVersionFor(a.Checks),
 		HelmUnittestVersion:     HelmUnittestVersion,
 		BiteCheck:               a.BiteCheck,
+		HunkCheck:               a.HunkCheck,
 		Generic:                 a.Generic,
 		Commands:                a.Commands,
 		PVCName:                 cfg.PVCName,
@@ -502,6 +511,7 @@ type rendererInput struct {
 	HelmVersion             string
 	HelmUnittestVersion     string
 	BiteCheck               bool
+	HunkCheck               bool
 	Generic                 bool
 	Commands                []string
 	PVCName                 string
