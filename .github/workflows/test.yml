@@ -31,9 +31,17 @@ jobs:
         run: make validate-samples
 
       - name: Running Tests
+        # Two passes under two different fixed seeds (#1693). A single pinned
+        # seed would make the suite reproducible but permanently hide every
+        # ordering bug that seed happens to miss, so CI exercises two
+        # orderings. Each pass pins GINKGO_SEED so Ginkgo prints the seed it
+        # used, letting anyone replay a failure from the log alone.
         run: |
           go mod tidy
-          make test
+          GINKGO_SEED_1=$(node -e 'process.stdout.write(String(Math.floor(Math.random()*1e12)))') \
+          GINKGO_SEED_2=$(node -e 'process.stdout.write(String(Math.floor(Math.random()*1e12)))') \
+          GINKGO_SEED=$(GINKGO_SEED_1) make test \
+          && GINKGO_SEED=$(GINKGO_SEED_2) make test
 
       - name: Upload coverage to Codecov
         # make test writes cover.out via `go test -coverprofile`.

@@ -79,6 +79,15 @@ const MaxLogTailBytes = 32 * 1024
 // pull request and the test does not see it, and most of helm-chart.yml
 // drives helm and ct the same way. Widening the gate to such a check is
 // a manual decision; nothing here will prompt for it.
+//
+// The gate runs `make test` once; CI runs it twice, under two different
+// fixed Ginkgo seeds (#1693). The gate deliberately stays single-pass so
+// per-task gate latency is unchanged (the internal/controller suite alone
+// is ~270s, and doubling every gate run is not worth it for a class of
+// bug that only needs to be caught before merge). The gate therefore
+// offers a weaker guarantee than CI: a GATE-PASS proves the branch passes
+// one ordering, not every ordering. CI's second pass is where a
+// test-pollution bug is actually exercised.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds",

@@ -106,9 +106,16 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# GINKGO_SEED pins the Ginkgo seed for the envtest suites. Left empty the
+# run uses a seed derived from the current time, so `make test` still
+# randomizes ordering locally; CI passes an explicit seed (see
+# .github/workflows/test.yml) so a failure is reproducible from the log.
+# Whatever the value, Ginkgo prints it, so a pollution bug can be replayed.
+GINKGO_SEED ?=
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out -ginkgo.seed=$(GINKGO_SEED)
 
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
