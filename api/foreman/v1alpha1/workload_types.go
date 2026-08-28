@@ -404,6 +404,20 @@ type WorkloadStatus struct {
 	// +optional
 	IncompleteTasks int32 `json:"incompleteTasks,omitempty"`
 
+	// ContradictedTasks counts child tasks whose terminal result
+	// carried a cross-stage contradiction
+	// (extra.crossStageContradictions non-empty). A contradiction means a
+	// stage (coder / gate / reviewer) asserted something the
+	// ground-truth branch facts contradict (e.g. the coder claims it
+	// edited files on an empty branch). It is surfaced here so a
+	// contradiction is countable and visible instead of being written
+	// to the AgenticTask and read by nobody (#1685). Orthogonal to
+	// success: a task can Succeeded and still contradict itself, so it
+	// is counted in addition to whatever terminal bucket it already
+	// matched and does not move the Workload to Failed.
+	// +optional
+	ContradictedTasks int32 `json:"contradictedTasks,omitempty"`
+
 	// ReviewIterations counts the fix iterations the reconciler has
 	// emitted after reviewer NO-GO verdicts (#946), summed across
 	// issues. Zero (or absent) means no reviewer ever bounced a

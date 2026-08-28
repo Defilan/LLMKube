@@ -42,7 +42,8 @@ type coderResultEnvelope struct {
 		ModelExtra struct {
 			Outcome string `json:"outcome"`
 		} `json:"modelExtra"`
-		ResolvedBy string `json:"resolvedBy,omitempty"`
+		ResolvedBy               string   `json:"resolvedBy,omitempty"`
+		CrossStageContradictions []string `json:"crossStageContradictions,omitempty"`
 	} `json:"extra"`
 }
 
@@ -136,6 +137,45 @@ func isSkippedTask(task *foremanv1alpha1.AgenticTask) bool {
 	}
 	return task.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded &&
 		task.Status.Verdict == foremanv1alpha1.AgenticTaskVerdictSkipped
+}
+
+// hasCrossStageContradiction reports whether the task's terminal result
+// envelope carries a non-empty cross-stage contradiction list
+// (extra.crossStageContradictions, #1685). The detector writes these in
+// the coder / gate / reviewer wiring (pkg/foreman/agent/cross_stage_wiring.go)
+// when a stage's claim contradicts the ground-truth branch facts. A missing
+// or unparseable result returns false, matching coderTerminalOutcome's
+// convention. Counted into the rollup ContradictedTasks bucket so a
+// contradiction is visible on the Workload instead of being written to the
+// AgenticTask and read by nobody; orthogonal to success, so it does not
+// change terminal state.
+func hasCrossStageContradiction(task *foremanv1alpha1.AgenticTask) bool {
+	if task == nil {
+		return false
+	}
+	if task.Status.Result == nil || len(task.Status.Result.Raw) == 0 {
+		return false
+	}
+	var env coderResultEnvelope
+	if err := json.Unmarshal(task.Status.Result.Raw, &env); err != nil {
+		return false
+	}
+	return len(env.Extra.CrossStageContradictions) > 0
+}
+
+// coderCrossStageContradictions returns the contradiction strings from the
+// task's terminal result envelope (extra.crossStageContradictions). Empty
+// when Result is nil/unparseable or no contradictions are recorded. Used by
+// classifyChildren to carry the first contradiction string into the rollup.
+func coderCrossStageContradictions(task *foremanv1alpha1.AgenticTask) []string {
+	if task.Status.Result == nil || len(task.Status.Result.Raw) == 0 {
+		return nil
+	}
+	var env coderResultEnvelope
+	if err := json.Unmarshal(task.Status.Result.Raw, &env); err != nil {
+		return nil
+	}
+	return env.Extra.CrossStageContradictions
 }
 
 // shouldEscalateCoder is the escalation trigger: escalate only on

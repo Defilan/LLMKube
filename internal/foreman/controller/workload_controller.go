@@ -123,6 +123,14 @@ const conditionTypeCoderEscalationTriggered = "CoderEscalationTriggered"
 // (avoids a perpetual "0 issues" noise condition).
 const conditionTypeCoderAlreadyResolved = "CoderAlreadyResolved"
 
+// conditionTypeCrossStageContradiction marks a Workload whose child
+// tasks recorded a cross-stage contradiction in their terminal result
+// (extra.crossStageContradictions non-empty, #1685). Set when at least
+// one such child exists; the message names the count and the first
+// contradiction string. Not set when zero children contradict (avoids
+// a perpetual "0 contradictions" noise condition).
+const conditionTypeCrossStageContradiction = "CrossStageContradiction"
+
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=workloads,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=workloads/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=workloads/finalizers,verbs=update
@@ -584,9 +592,11 @@ func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Work
 	w.Status.SucceededTasks = cls.succeeded
 	w.Status.FailedTasks = cls.failed
 	w.Status.IncompleteTasks = cls.incomplete
+	w.Status.ContradictedTasks = cls.contradicted
 
 	computeTerminalState(w, cls, now)
 	r.emitAlreadyResolvedCondition(w, cls, now)
+	r.emitCrossStageContradictionCondition(w, cls, now)
 
 	if (w.Status.Phase == foremanv1alpha1.WorkloadPhaseCompleted ||
 		w.Status.Phase == foremanv1alpha1.WorkloadPhaseFailed) &&
@@ -610,6 +620,8 @@ func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Work
 type childCounts struct {
 	succeeded, incomplete, failed, inFlight int32
 	alreadyResolved                         int32
+	contradicted                            int32
+	contradictions                          []string
 	skipped                                 int32
 	resolvedIssues                          []int32
 	resolvedByList                          []string
@@ -627,6 +639,13 @@ type childCounts struct {
 //     skipped and not ALREADY-RESOLVED
 //   - failed: Phase=Failed
 //   - inFlight: everything else (Pending / Scheduled / Running)
+//
+// The `contradicted` bucket (#1685) is counted separately from these
+// terminal buckets: a child that carries a cross-stage contradiction is
+// counted in `contradicted` in addition to whatever terminal bucket it
+// matched, so a contradicting task that Succeeded still counts as
+// succeeded. It is orthogonal to success and never moves the Workload to
+// Failed.
 //
 // Classification is verdict-based, not kind-based: a sliced Workload's
 // integrate / reconcile steps (#1033) land here like any other kind, so a
@@ -648,6 +667,18 @@ type childCounts struct {
 func classifyChildren(children []foremanv1alpha1.AgenticTask) childCounts {
 	var c childCounts
 	for i := range children {
+		// Contradiction is orthogonal to success: it counts into the
+		// contradicted bucket in addition to whatever terminal bucket
+		// the task already matched (succeeded / incomplete / failed),
+		// so a contradicting task that Succeeded still counts as
+		// succeeded below. Counted in its own pass so it is not
+		// short-circuited by the switch below.
+		if hasCrossStageContradiction(&children[i]) {
+			c.contradicted++
+			if cs := coderCrossStageContradictions(&children[i]); len(cs) > 0 {
+				c.contradictions = append(c.contradictions, cs...)
+			}
+		}
 		switch {
 		case children[i].SucceededOnTarget():
 			c.succeeded++
@@ -822,6 +853,39 @@ func (r *WorkloadReconciler) emitAlreadyResolvedCondition(w *foremanv1alpha1.Wor
 				"Issue #%d resolved at run time; safe to close on GitHub", n)
 		}
 	}
+}
+
+// emitCrossStageContradictionCondition sets the CrossStageContradiction
+// condition (#1685) and surfaces the first contradiction string so the
+// reason is legible from `kubectl describe` without pulling the task's
+// result. When contradicted is zero, the condition is set to False (an
+// anti-stale guard). The count is orthogonal to success: it does not
+// change terminal state, so a contradicting task that Succeeded still
+// counts as succeeded.
+func (r *WorkloadReconciler) emitCrossStageContradictionCondition(w *foremanv1alpha1.Workload, c childCounts, now metav1.Time) {
+	if c.contradicted == 0 {
+		setCondition(&w.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeCrossStageContradiction,
+			Status:             metav1.ConditionFalse,
+			Reason:             "NoContradictions",
+			Message:            "no child tasks recorded a cross-stage contradiction",
+			LastTransitionTime: now,
+		})
+		return
+	}
+
+	msg := fmt.Sprintf("%d child task(s) recorded a cross-stage contradiction", c.contradicted)
+	if len(c.contradictions) > 0 {
+		msg += fmt.Sprintf("; first: %s", c.contradictions[0])
+	}
+	msg += ". Contradiction is orthogonal to success and does not change terminal state."
+	setCondition(&w.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeCrossStageContradiction,
+		Status:             metav1.ConditionTrue,
+		Reason:             "CrossStageContradiction",
+		Message:            msg,
+		LastTransitionTime: now,
+	})
 }
 
 // markPlanning patches phase=Planning the first time we touch the
