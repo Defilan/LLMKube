@@ -282,6 +282,42 @@ spec:
                   fi
               fi
               {{- end }}
+              {{- if .HunkCheck }}
+              # Per-hunk mutation coverage (advisory, never a gate failure). The
+              # bite check reverts the whole production diff at once, so a diff that
+              # is mostly covered can still ship one uncovered wiring line. This
+              # inverts that: for each added hunk in an envtest package it reverts
+              # only that hunk and runs the package's tests.
+              #
+              # The verdict, stated once so it cannot be read backwards: a revert
+              # that leaves the package GREEN means no test noticed the hunk was
+              # gone, so that hunk is UNCOVERED and gets reported. A revert that
+              # produces a test failure OR a compile break means the hunk is
+              # load-bearing for code some test exercises, so it is COVERED and
+              # nothing is reported.
+              #
+              # Scoped to envtest packages: Layer 2 covers non-envtest packages at
+              # function granularity, and per-hunk multiplies gate time by the hunk
+              # count, which is also why the pass is bounded (see maxPerHunkPackages).
+              #
+              # Implemented in Go (pkg/foreman/agent) and run here with `go run`
+              # so it reuses the same diff parsing as the in-agent gate. It diffs
+              # against the SAME merge-base the bite check resolved above ($MB),
+              # so both checks revert to one fork point; it reverts each hunk in
+              # place and restores it, so the tree is clean for CI's later runs.
+              if [ -n "$MB" ]; then
+                echo "=== per-hunk mutation coverage (base=$MB) ==="
+                # Run the Go core. It prints one advisory line per uncovered hunk
+                # (file + line range) and exits 0 unless --fail is set; the gate
+                # only reads its stdout for the advisory lines.
+                go run ./cmd/hunkcheck -base "$MB" --dir /work 2>/dev/null | while IFS= read -r line; do
+                  echo "$line"
+                done
+                echo "hunk check: done"
+              else
+                echo "hunk check: skipped, no usable base from change detection"
+              fi
+              {{- end }}
               {{- end }}
               [ "$rc" -eq 0 ] && echo "GATE PASS" || echo "GATE FAIL"
               exit "$rc"
