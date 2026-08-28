@@ -62,6 +62,17 @@ type fixedCapability struct {
 
 func (f *fixedCapability) Capability() foremanv1alpha1.FleetNodeCapability { return f.cap }
 
+// fixedSupervisionCapacity is a deterministic SupervisionCapacityProvider so
+// the heartbeat-publish assertions do not depend on any in-process state.
+type fixedSupervisionCapacity struct {
+	current int32
+	maximum *int32
+}
+
+func (f fixedSupervisionCapacity) SupervisionCapacity() (int32, *int32) {
+	return f.current, f.maximum
+}
+
 func TestSpecEqual(t *testing.T) {
 	cases := []struct {
 		name string
@@ -674,5 +685,151 @@ func TestRegistrar_PatchHeartbeat_KeepsExistingKubernetesNodeWhenUnset(t *testin
 	if got.Status.KubernetesNode != "ahazidgx1" {
 		t.Errorf("Status.KubernetesNode = %q, want %q (empty Registrar must not clear a stamped value)",
 			got.Status.KubernetesNode, "ahazidgx1")
+	}
+}
+
+// TestRegistrar_PatchHeartbeat_PublishesSupervisionCapacity verifies that the
+// Job-mode supervision budget the watcher holds in-process (#1639) lands on
+// FleetNode.status on the heartbeat patch, on the same patch as the phase and
+// heartbeat time -- not a second write path.
+func TestRegistrar_PatchHeartbeat_PublishesSupervisionCapacity(t *testing.T) {
+	existing := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "m5-max"},
+		Spec:       foremanv1alpha1.FleetNodeSpec{NodeName: "m5-max"},
+	}
+	kc := newFakeClient(t, existing)
+	max := int32(4)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "m5-max",
+		Provider: &fixedCapability{},
+		Watcher:  fixedSupervisionCapacity{current: 3, maximum: &max},
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "m5-max"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.SupervisionCapacity == nil {
+		t.Fatal("SupervisionCapacity is nil, want published budget")
+	}
+	if got.Status.SupervisionCapacity.Current != 3 {
+		t.Errorf("SupervisionCapacity.Current = %d, want 3", got.Status.SupervisionCapacity.Current)
+	}
+	if got.Status.SupervisionCapacity.Maximum == nil || *got.Status.SupervisionCapacity.Maximum != 4 {
+		t.Errorf("SupervisionCapacity.Maximum = %v, want 4", got.Status.SupervisionCapacity.Maximum)
+	}
+}
+
+// TestRegistrar_PatchHeartbeat_SupervisionCapacityZeroMaximum verifies the
+// "agent full" case: a node whose bound is 0 is at capacity and declines
+// further Job-mode tasks. A zero Maximum must be written verbatim -- it is
+// distinguishable from an absent capacity only because the Maximum is a
+// pointer on the API and the Registrar writes it whenever a bound is
+// reported.
+func TestRegistrar_PatchHeartbeat_SupervisionCapacityZeroMaximum(t *testing.T) {
+	existing := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "m5-full"},
+		Spec:       foremanv1alpha1.FleetNodeSpec{NodeName: "m5-full"},
+	}
+	kc := newFakeClient(t, existing)
+	zero := int32(0)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "m5-full",
+		Provider: &fixedCapability{},
+		Watcher:  fixedSupervisionCapacity{current: 0, maximum: &zero},
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "m5-full"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.SupervisionCapacity == nil {
+		t.Fatal("SupervisionCapacity is nil, want published zero-Maximum budget")
+	}
+	if got.Status.SupervisionCapacity.Maximum == nil {
+		t.Fatal("SupervisionCapacity.Maximum is nil, want 0 (agent full)")
+	}
+	if *got.Status.SupervisionCapacity.Maximum != 0 {
+		t.Errorf("SupervisionCapacity.Maximum = %d, want 0", *got.Status.SupervisionCapacity.Maximum)
+	}
+}
+
+// TestRegistrar_PatchHeartbeat_SupervisionCapacityAbsentWhenNoProvider
+// verifies the "older agent / no bound" case: with no Watcher wired the field
+// stays absent rather than being written as a zero Maximum, which would
+// otherwise read as "unbounded" -- a different state from "not reported".
+//
+// This is the mutation that must fail: stop writing the capacity fields on the
+// heartbeat patch and the first test fails. A test that only asserts the API
+// field exists passes with the feature entirely unwired, so this absent-case
+// guard is what pins the write path down.
+func TestRegistrar_PatchHeartbeat_SupervisionCapacityAbsentWhenNoProvider(t *testing.T) {
+	existing := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "studio-old"},
+		Spec:       foremanv1alpha1.FleetNodeSpec{NodeName: "studio-old"},
+	}
+	kc := newFakeClient(t, existing)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "studio-old",
+		Provider: &fixedCapability{},
+		// Watcher intentionally nil (older agent, no bound to report).
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "studio-old"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.SupervisionCapacity != nil {
+		t.Errorf("SupervisionCapacity = %+v, want absent (Watcher nil)", *got.Status.SupervisionCapacity)
+	}
+}
+
+// TestRegistrar_PatchHeartbeat_SupervisionCapacityAbsentPreservesExisting
+// verifies that a heartbeat from a node with no bound to report does not
+// clobber a value a newer agent already published: the MergeFrom patch must
+// leave the field where it was, not emit null.
+func TestRegistrar_PatchHeartbeat_SupervisionCapacityAbsentPreservesExisting(t *testing.T) {
+	max := int32(4)
+	existing := &foremanv1alpha1.FleetNode{
+		ObjectMeta: metav1.ObjectMeta{Name: "studio-upgrade"},
+		Spec:       foremanv1alpha1.FleetNodeSpec{NodeName: "studio-upgrade"},
+		Status: foremanv1alpha1.FleetNodeStatus{
+			SupervisionCapacity: &foremanv1alpha1.SupervisionCapacity{
+				Current: 2,
+				Maximum: &max,
+			},
+		},
+	}
+	kc := newFakeClient(t, existing)
+	r := &Registrar{
+		Client:   kc,
+		NodeName: "studio-upgrade",
+		Provider: &fixedCapability{},
+		// Watcher nil: the upgraded agent reports nothing, so the existing
+		// budget must survive.
+	}
+	if _, err := r.PatchHeartbeat(context.Background(), foremanv1alpha1.FleetNodePhaseReady); err != nil {
+		t.Fatalf("PatchHeartbeat: %v", err)
+	}
+	var got foremanv1alpha1.FleetNode
+	if err := kc.Get(context.Background(), types.NamespacedName{Name: "studio-upgrade"}, &got); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status.SupervisionCapacity == nil {
+		t.Fatal("SupervisionCapacity lost: a nil-Watcher heartbeat must not clobber an existing budget")
+	}
+	if got.Status.SupervisionCapacity.Current != 2 ||
+		got.Status.SupervisionCapacity.Maximum == nil ||
+		*got.Status.SupervisionCapacity.Maximum != 4 {
+		t.Errorf("SupervisionCapacity = %+v, want {Current:2, Maximum:4}", got.Status.SupervisionCapacity)
 	}
 }

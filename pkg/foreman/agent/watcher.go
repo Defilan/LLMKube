@@ -141,6 +141,30 @@ func (w *AgenticTaskWatcher) maxSupervised() int {
 	return w.MaxSupervisedTasks
 }
 
+// supervisionCapacity reports the node's Job-mode supervision budget as it
+// stands in this process: (current, maximum). current is the number of
+// Job-mode tasks currently in flight. This is the value published to
+// FleetNode.status on heartbeat (#1639): the cluster reads the same number
+// the watcher enforces in-process, not a second bound recomputed by the
+// controller. The watcher always has a bound to report (the default applies
+// when unset), so Maximum is always non-nil.
+func (w *AgenticTaskWatcher) supervisionCapacity() (current int32, maximum *int32) {
+	w.inflightMu.Lock()
+	current = int32(w.supervised) //nolint:gosec // bounded by the supervision budget the node advertises
+	w.inflightMu.Unlock()
+
+	max := int32(w.maxSupervised()) //nolint:gosec // the advertised bound, a small positive count
+	return current, &max
+}
+
+// SupervisionCapacity is the exported entry point satisfying
+// SupervisionCapacityProvider: the Registrar calls it on every heartbeat to
+// publish the watcher's in-process Job-mode supervision budget onto
+// FleetNode.status. See supervisionCapacity for the semantics.
+func (w *AgenticTaskWatcher) SupervisionCapacity() (current int32, maximum *int32) {
+	return w.supervisionCapacity()
+}
+
 // hasCapacityFor reports whether the slot a task of this execution mode
 // needs is free.
 func (w *AgenticTaskWatcher) hasCapacityFor(supervise bool) bool {
