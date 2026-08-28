@@ -155,7 +155,7 @@ func (r *recordingCodeHost) ResolveCloneURL(repoSlug string) string {
 }
 
 func (r *recordingCodeHost) EnsureChangeRequest(
-	context.Context, string, string, string, string, string,
+	context.Context, string, string, string, string, string, bool,
 ) (string, bool, error) {
 	return "", false, nil
 }

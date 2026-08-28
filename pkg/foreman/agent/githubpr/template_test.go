@@ -53,17 +53,20 @@ func TestPRBody_NoTemplateEmptySummary(t *testing.T) {
 	}
 }
 
-// TestPRBody_UsesTemplate pins the new behavior (#1541): when the target repo
-// ships a PR template it is used as the body (checkboxes left as authored),
-// the provenance is always appended, and the reviewer's summary is NOT
-// spliced into a template the repo wrote for its own shape.
+// TestPRBody_UsesTemplate pins the merge behavior (#1701): when the target
+// repo ships a PR template it is used as the body's scaffolding (checkboxes
+// left as authored — a wrongly-ticked box would be a false claim), the
+// reviewer's authored summary is spliced in rather than discarded, and the
+// provenance is always appended so an agent PR is never mistaken for a
+// hand-written one (#1541).
 func TestPRBody_UsesTemplate(t *testing.T) {
-	summary := "Reviewer summary that must not be spliced in."
+	summary := "Reviewer summary that must survive into the posted PR."
 	tmpl := "## What\n\nChanged X.\n\n## Checklist\n\n- [ ] tests\n- [ ] docs"
 	got := PRBody(tmpl, summary, 42, "wl-z")
 
-	if strings.Contains(got, summary) {
-		t.Errorf("reviewer summary must not be spliced into a repo template; got %q", got)
+	// The reviewer's prose must not be thrown away when a template exists.
+	if !strings.Contains(got, summary) {
+		t.Errorf("reviewer summary must survive into a PR that has a template; got %q", got)
 	}
 	// The template body must appear verbatim (checkboxes untouched).
 	if !strings.Contains(got, "- [ ] tests\n- [ ] docs") {
@@ -74,8 +77,10 @@ func TestPRBody_UsesTemplate(t *testing.T) {
 		!strings.Contains(got, "_Opened by foreman on review GO (workload wl-z)._") {
 		t.Errorf("provenance must always be appended; got %q", got)
 	}
-	// Template is the body, so it leads and the provenance trails.
+	// Template leads, the reviewer's prose is spliced between template and
+	// provenance, which trails.
 	want := tmpl + "\n\n" +
+		summary + "\n\n" +
 		"Fixes #42\n\n" +
 		"_Opened by foreman on review GO (workload wl-z)._"
 	if got != want {
@@ -107,6 +112,20 @@ func writeTree(t *testing.T, dir string, files map[string]string) {
 		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestPRBody_EmptySummaryWithTemplate: with a template and no reviewer prose
+// the body is just the template + provenance, exactly as the pre-#1701 code
+// emitted (an empty summary must not inject a blank line before provenance).
+func TestPRBody_EmptySummaryWithTemplate(t *testing.T) {
+	tmpl := "## What\n\nChanged X.\n\n## Checklist\n\n- [ ] tests"
+	got := PRBody(tmpl, "", 5, "w")
+	want := tmpl + "\n\n" +
+		"Fixes #5\n\n" +
+		"_Opened by foreman on review GO (workload w)._"
+	if got != want {
+		t.Errorf("template+empty-summary body mismatch:\n got %q\nwant %q", got, want)
 	}
 }
 

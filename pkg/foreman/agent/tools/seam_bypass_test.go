@@ -24,7 +24,7 @@ func (f *fakeCodeHost) ResolveCloneURL(repoSlug string) string {
 }
 
 func (f *fakeCodeHost) EnsureChangeRequest(
-	context.Context, string, string, string, string, string,
+	context.Context, string, string, string, string, string, bool,
 ) (string, bool, error) {
 	return "", false, nil
 }
