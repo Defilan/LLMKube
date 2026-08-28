@@ -89,10 +89,21 @@ var _ = Describe("AgenticTaskReconciler missing dependency (#1687)", func() {
 		Expect(k8sClient.Create(ctx, task)).To(Succeed())
 		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
 		setPhase(task, foremanv1alpha1.AgenticTaskPhasePending)
-		// Age the task past its TimeoutSeconds budget.
-		old := metav1.NewTime(time.Now().Add(-2 * time.Hour))
-		task.CreationTimestamp = old
-		Expect(k8sClient.Update(ctx, task)).To(Succeed())
+		// Age the WAIT past its TimeoutSeconds budget by backdating the
+		// DepWaitStarted condition, which is what depWaitExpired measures
+		// from. Do NOT try to backdate metadata.creationTimestamp: the API
+		// server assigns it and ignores any change, so the Update succeeds
+		// while the stored value stays put and the wait never appears
+		// expired. Conditions are ordinary status and are writable.
+		task.Status.Conditions = []metav1.Condition{{
+			Type:               "DepWaitStarted",
+			Status:             metav1.ConditionTrue,
+			Reason:             "DependencyAbsent",
+			Message:            `dependency "ghost-task" has not appeared yet`,
+			LastTransitionTime: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
+			ObservedGeneration: task.Generation,
+		}}
+		Expect(k8sClient.Status().Update(ctx, task)).To(Succeed())
 
 		_, err := reconciler.Reconcile(ctx, reqFor(task))
 		Expect(err).NotTo(HaveOccurred())
@@ -157,45 +168,55 @@ func TestDepWaitExpired(t *testing.T) {
 	now := time.Now()
 
 	cases := []struct {
-		name       string
-		timeoutSec int32
-		created    metav1.Time
-		want       bool
+		name        string
+		timeoutSec  int32
+		waitStarted metav1.Time // DepWaitStarted LastTransitionTime; zero means no condition
+		want        bool
 	}{
 		{
-			name:       "zero timeout never expires (unbounded wait)",
-			timeoutSec: 0,
-			created:    metav1.NewTime(now.Add(-100 * time.Hour)),
-			want:       false,
+			name:        "zero timeout never expires (unbounded wait)",
+			timeoutSec:  0,
+			waitStarted: metav1.NewTime(now.Add(-100 * time.Hour)),
+			want:        false,
 		},
 		{
-			name:       "within budget does not expire",
-			timeoutSec: 3600,
-			created:    metav1.NewTime(now.Add(-1 * time.Minute)),
-			want:       false,
+			name:        "within budget does not expire",
+			timeoutSec:  3600,
+			waitStarted: metav1.NewTime(now.Add(-1 * time.Minute)),
+			want:        false,
 		},
 		{
-			name:       "past budget expires",
-			timeoutSec: 3600,
-			created:    metav1.NewTime(now.Add(-2 * time.Hour)),
-			want:       true,
+			name:        "past budget expires",
+			timeoutSec:  3600,
+			waitStarted: metav1.NewTime(now.Add(-2 * time.Hour)),
+			want:        true,
 		},
 		{
-			name:       "no creation timestamp falls back to now (within budget)",
-			timeoutSec: 3600,
-			created:    metav1.Time{},
-			want:       false,
+			// No DepWaitStarted condition means the reconciler has not yet
+			// observed the dependency absent, so no wait has elapsed. This
+			// must stay false: treating "no condition" as expired would
+			// cascade-fail a task on the very first reconcile, killing the
+			// create-ordering race this path exists to tolerate.
+			name:        "no DepWaitStarted condition never expires",
+			timeoutSec:  3600,
+			waitStarted: metav1.Time{},
+			want:        false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			task := &foremanv1alpha1.AgenticTask{
-				ObjectMeta: metav1.ObjectMeta{
-					CreationTimestamp: tc.created,
-				},
 				Spec: foremanv1alpha1.AgenticTaskSpec{
 					TimeoutSeconds: tc.timeoutSec,
 				},
+			}
+			if !tc.waitStarted.IsZero() {
+				task.Status.Conditions = []metav1.Condition{{
+					Type:               "DepWaitStarted",
+					Status:             metav1.ConditionTrue,
+					Reason:             "DependencyAbsent",
+					LastTransitionTime: tc.waitStarted,
+				}}
 			}
 			if got := depWaitExpired(task); got != tc.want {
 				t.Fatalf("depWaitExpired() = %v, want %v", got, tc.want)

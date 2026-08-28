@@ -29,6 +29,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -565,24 +566,38 @@ func (r *AgenticTaskReconciler) recordMissingDepCondition(ctx context.Context, t
 
 // depWaitExpired reports whether the task's wait for an absent dependency
 // has outlasted its TimeoutSeconds budget, in which case the caller should
-// cascade-fail the task with a MissingDependency reason. The budget is
-// measured from the task's own creation so a task that has waited the
-// whole budget fails even if it was created far in the past (the first
-// reconcile after it is created). Fall back to "now" for a task with no
-// creation timestamp, so the wait still terminates.
+// cascade-fail the task with a MissingDependency reason.
 //
-// An unset or zero TimeoutSeconds leaves the wait unbounded (the dep is
-// legal to wait for), which is the pre-1687 default and still correct for
-// the create-ordering race.
+// The budget is measured from the DepWaitStarted condition's
+// LastTransitionTime -- the moment the reconciler FIRST observed the
+// dependency absent -- and NOT from the task's creation. Two reasons, and
+// the first is the load-bearing one:
+//
+//   - Semantics. The budget is for the wait, not for the task's lifetime. A
+//     task created well before its dependency is dispatched would already be
+//     past a creation-relative budget on its first reconcile and cascade-fail
+//     instantly, which is the create-ordering race this whole path exists to
+//     tolerate.
+//   - Testability. metadata.creationTimestamp is assigned by the API server
+//     and is immutable: an Update that backdates it returns success and
+//     silently stores the original value. A creation-relative budget is
+//     therefore unreachable from an envtest, so no test can prove the
+//     cascade-fail ever fires. status.conditions are ordinary status and can
+//     be written, so the condition clock is reachable.
+//
+// No condition means the wait has not been recorded yet, so nothing has
+// elapsed. An unset or zero TimeoutSeconds leaves the wait unbounded (the dep
+// is legal to wait for), which is the pre-1687 default and still correct.
 func depWaitExpired(task *foremanv1alpha1.AgenticTask) bool {
 	budget := time.Duration(task.Spec.TimeoutSeconds) * time.Second
 	if budget <= 0 {
 		return false
 	}
-	if task.CreationTimestamp.IsZero() {
-		return time.Since(time.Now()) >= budget
+	started := apimeta.FindStatusCondition(task.Status.Conditions, "DepWaitStarted")
+	if started == nil || started.LastTransitionTime.IsZero() {
+		return false
 	}
-	return time.Since(task.CreationTimestamp.Time) >= budget
+	return time.Since(started.LastTransitionTime.Time) >= budget
 }
 
 // reserveFirstFitNode picks the alphabetically-first Ready FleetNode whose
