@@ -706,7 +706,12 @@ func classifyChildren(children []foremanv1alpha1.AgenticTask) childCounts {
 //   - Otherwise (in-flight children) → Dispatched
 //
 // Skipped children never trigger Failed (the case arm requires
-// `failed > 0 || incomplete > 0` and Skipped is counted in neither).
+// `failed > 0 || incomplete > 0` and Skipped is counted in neither), so a
+// Workload whose only non-succeeded children are Skipped rolls to Completed
+// via the ALREADY-RESOLVED case: the transitive cascade-skip (#1688) makes
+// the downstream dependents Skipped, and the upstream ALREADY-RESOLVED coder
+// is counted in `alreadyResolved`, which the all-on-target case would
+// otherwise match and report "0/N on-target".
 func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1.Time) {
 	switch {
 	case c.inFlight == 0 && c.failed == 0 && c.incomplete == 0 && c.alreadyResolved == 0:

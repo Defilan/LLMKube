@@ -206,6 +206,64 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(failedCond).To(BeNil(), "a Skipped dependent must not carry a Failed condition")
 	})
 
+	// Regression for defilantech/LLMKube#1688. The ALREADY-RESOLVED
+	// cascade-skip propagates exactly one hop: a dependency that ended
+	// ALREADY-RESOLVED skips its direct dependent, but a dependent of
+	// that Skipped task fell through to cascade-fail (which treats
+	// verdict=Skipped as "terminal without success") and ended up
+	// cascade-failed. The skip must be transitive: a task whose
+	// dependency was itself Skipped is itself Skipped with the same
+	// reason chain, so the whole chain is skipped rather than the outer
+	// hop cascade-failing.
+	It("cascade-skips a task whose dependency was itself Skipped (#1688)", func() {
+		// code: ALREADY-RESOLVED.
+		code := newTask("transitive-code")
+		Expect(k8sClient.Create(ctx, code)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, code) })
+		setPhase(code, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		patch := client.MergeFrom(code.DeepCopy())
+		code.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictNoGo
+		code.Status.Result = &runtime.RawExtension{
+			Raw: []byte(`{"summary":"already done","extra":{"outcome":"ALREADY-RESOLVED","resolvedBy":"sha-deadbeef"}}`),
+		}
+		Expect(k8sClient.Status().Patch(ctx, code, patch)).To(Succeed())
+
+		// verify: cascade-skipped because code ended ALREADY-RESOLVED.
+		verify := newTask("transitive-verify")
+		verify.Spec.DependsOn = []string{code.Name}
+		Expect(k8sClient.Create(ctx, verify)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, verify) })
+		setPhase(verify, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		verifyPatch := client.MergeFrom(verify.DeepCopy())
+		verify.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictSkipped
+		Expect(k8sClient.Status().Patch(ctx, verify, verifyPatch)).To(Succeed())
+
+		// review: depends on verify, which is Skipped. Must be
+		// cascade-skipped too, not cascade-failed.
+		review := newTask("transitive-review")
+		review.Spec.DependsOn = []string{verify.Name}
+		Expect(k8sClient.Create(ctx, review)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, review) })
+		setPhase(review, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(review))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(review), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseSucceeded))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictSkipped))
+
+		skippedCond := findCondition(fresh.Status.Conditions, "Skipped")
+		Expect(skippedCond).NotTo(BeNil())
+		Expect(skippedCond.Reason).To(Equal("UpstreamAlreadyResolved"))
+		Expect(skippedCond.Message).To(ContainSubstring(verify.Name))
+
+		// A Skipped dependent must not carry a Failed condition.
+		failedCond := findCondition(fresh.Status.Conditions, "Failed")
+		Expect(failedCond).To(BeNil(), "a Skipped dependent must not carry a Failed condition")
+	})
+
 	It("waits with requeue when a dependency is still pre-terminal", func() {
 		dep := newTask("wait-dep") // status stays empty == pre-terminal
 		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
