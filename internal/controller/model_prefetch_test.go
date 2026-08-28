@@ -104,7 +104,7 @@ var _ = Describe("Model Prefetch", func() {
 				Effect:   corev1.TaintEffectNoSchedule,
 			}}
 			seedPrefetchCacheKey(m)
-			job, err := prefetchReconciler().buildPrefetchJob(m)
+			job, err := prefetchReconciler().buildPrefetchJob(m, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(job.Spec.Template.Spec.Tolerations).To(HaveLen(1))
 			Expect(job.Spec.Template.Spec.Tolerations[0].Key).To(Equal("nvidia.com/gpu"))
@@ -113,7 +113,7 @@ var _ = Describe("Model Prefetch", func() {
 		It("emits no tolerations when the Model declares none", func() {
 			m := newPrefetchModel("plain")
 			seedPrefetchCacheKey(m)
-			job, err := prefetchReconciler().buildPrefetchJob(m)
+			job, err := prefetchReconciler().buildPrefetchJob(m, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(job.Spec.Template.Spec.Tolerations).To(BeEmpty())
 		})
@@ -251,9 +251,136 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(updated.Status.Phase).To(Equal(PhaseDownloading))
 		})
 	})
+
+	Describe("#1676 per-service cache claim", func() {
+		// Prefetch must stage into the PVC the InferenceService will actually
+		// read, not always the shared cache.
+
+		newIsvc := func(modelName, name, claim string) *inferencev1alpha1.InferenceService {
+			return &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					ModelCache: &inferencev1alpha1.ModelCacheSpec{
+						ClaimName: claim,
+					},
+				},
+			}
+		}
+
+		// cleanupNamespacedObjects drains the InferenceServices and PVCs this
+		// block creates. It runs BOTH before each case (so a previous case
+		// cannot skew a resolution) and after the block (so these objects do
+		// not leak into the shared envtest cluster). The AfterEach is
+		// load-bearing: federation_edge_controller.go lists InferenceServices
+		// across ALL namespaces, and its spec asserts absolute counts, so a
+		// leaked service here fails an unrelated test.
+		cleanupNamespacedObjects := func() {
+			list := &inferencev1alpha1.InferenceServiceList{}
+			Expect(k8sClient.List(ctx, list, client.InNamespace(ns))).To(Succeed())
+			for i := range list.Items {
+				_ = k8sClient.Delete(ctx, &list.Items[i])
+			}
+			pvcList := &corev1.PersistentVolumeClaimList{}
+			Expect(k8sClient.List(ctx, pvcList, client.InNamespace(ns))).To(Succeed())
+			for i := range pvcList.Items {
+				_ = k8sClient.Delete(ctx, &pvcList.Items[i])
+			}
+		}
+
+		AfterEach(cleanupNamespacedObjects)
+
+		BeforeEach(func() {
+			// Clean any services left behind by a previous case.
+			list := &inferencev1alpha1.InferenceServiceList{}
+			Expect(k8sClient.List(ctx, list, client.InNamespace(ns))).To(Succeed())
+			for i := range list.Items {
+				_ = k8sClient.Delete(ctx, &list.Items[i])
+			}
+			// Drain PVCs created by prior cases in this namespace.
+			pvcList := &corev1.PersistentVolumeClaimList{}
+			Expect(k8sClient.List(ctx, pvcList, client.InNamespace(ns))).To(Succeed())
+			for i := range pvcList.Items {
+				_ = k8sClient.Delete(ctx, &pvcList.Items[i])
+			}
+		})
+
+		It("mounts the single referencing service's claimName PVC", func() {
+			m := newPrefetchModel("per-service-model")
+			seedPrefetchCacheKey(m)
+			Expect(k8sClient.Create(ctx, newIsvc("per-service-model", "svc-a", "llmkube-node-a-cache"))).To(Succeed())
+
+			// The bug: buildPrefetchJob hardcodes a nil isvc and the shared
+			// cache, so the per-service claim is never consulted.
+			job, err := prefetchReconciler().buildPrefetchJob(m, nil)
+			Expect(err).NotTo(HaveOccurred())
+			sharedClaim := sharedClaimName(job)
+			Expect(sharedClaim).To(Equal(ModelCachePVCName))
+
+			// The fix: pass the resolved target, and the Job mounts the
+			// service's PVC instead.
+			target := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "per-service-model", Namespace: ns},
+				Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "per-service-model", ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "llmkube-node-a-cache"}},
+			}
+			goodJob, err := prefetchReconciler().buildPrefetchJob(m, target)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sharedClaimName(goodJob)).To(Equal("llmkube-node-a-cache"))
+			Expect(sharedClaimName(goodJob)).NotTo(Equal(ModelCachePVCName))
+		})
+
+		It("resolves the single distinct claim among referencing services", func() {
+			r := prefetchReconciler()
+			m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "resolve-model", Namespace: ns}}
+
+			Expect(k8sClient.Create(ctx, newIsvc("resolve-model", "svc-a", "llmkube-cache-a"))).To(Succeed())
+			target, reason := r.resolvePrefetchTarget(ctx, m)
+			Expect(reason).To(BeEmpty())
+			Expect(target).NotTo(BeNil())
+			Expect(userModelCacheClaimName(target)).To(Equal("llmkube-cache-a"))
+			Expect(target.Spec.ModelRef).To(Equal("resolve-model"))
+		})
+
+		It("falls back to the shared cache when services disagree on claimName", func() {
+			r := prefetchReconciler()
+			m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "conflict-model", Namespace: ns}}
+
+			Expect(k8sClient.Create(ctx, newIsvc("conflict-model", "svc-a", "llmkube-cache-a"))).To(Succeed())
+			Expect(k8sClient.Create(ctx, newIsvc("conflict-model", "svc-b", "llmkube-cache-b"))).To(Succeed())
+
+			target, reason := r.resolvePrefetchTarget(ctx, m)
+			Expect(target).To(BeNil())
+			Expect(reason).NotTo(BeEmpty())
+		})
+
+		It("falls back to the shared cache when no service references the model", func() {
+			r := prefetchReconciler()
+			m := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "no-svc-model", Namespace: ns}}
+
+			// A service that references a different model must not match.
+			Expect(k8sClient.Create(ctx, newIsvc("other-model", "svc-other", "llmkube-cache-a"))).To(Succeed())
+
+			target, reason := r.resolvePrefetchTarget(ctx, m)
+			Expect(target).To(BeNil())
+			Expect(reason).NotTo(BeEmpty())
+		})
+	})
 })
 
 // #1621: a fleet whose GPU nodes are tainted needs the prefetch Job to
 // tolerate them. Inheriting from an InferenceService is ill-defined here,
 // because prefetch runs BEFORE the first InferenceService by design, so the
 // Model carries its own tolerations and the Job inherits those.
+
+// sharedClaimName returns the PersistentVolumeClaim name the prefetch Job's
+// model-cache volume mounts, by reading the Job's volumes. It is the
+// observable artefact of the #1676 fix: the bug mounts the shared cache PVC,
+// the fix mounts the per-service claim.
+func sharedClaimName(job *batchv1.Job) string {
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == "model-cache" && v.PersistentVolumeClaim != nil {
+			return v.PersistentVolumeClaim.ClaimName
+		}
+	}
+	return ""
+}

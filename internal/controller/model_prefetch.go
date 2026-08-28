@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -34,19 +35,20 @@ import (
 )
 
 // Model prefetch (#904): a Model with spec.prefetch=true and a remote source
-// gets its artifact pulled into the namespace's SHARED model cache PVC ahead
-// of any InferenceService, via an owner-ref'd Job whose pod reuses the exact
+// gets its artifact pulled into a model cache PVC ahead of any
+// InferenceService, via an owner-ref'd Job whose pod reuses the exact
 // init-container download stack the serving path uses
 // (buildModelStorageConfig with a nil InferenceService): same cache-prep
 // container, same downloader image and ETag handling, same multi-file
 // staging plan, same SourceSecretRef env. The first serving pod then starts
 // from a cache hit instead of a cold download.
 //
-// The prefetch deliberately targets the shared cache
-// (ModelCacheModeShared): perService cache PVCs are created per
-// InferenceService at serve time and cannot be pre-populated for a service
-// that does not exist yet. The field's GoDoc documents that limitation and
-// the pvc:// staging alternative.
+// The target PVC is chosen by the resolved policy (#1676): exactly one
+// distinct spec.modelCache.claimName among the InferenceServices referencing
+// this Model, so the download lands where the serving pod reads it, else the
+// shared cache (ModelCacheModeShared) when no service references the Model or
+// the services disagree. The field's GoDoc documents that limitation and the
+// pvc:// staging alternative.
 
 // defaultPrefetchImage mirrors the --init-container-image flag default for
 // the no-op completion container when the reconciler is constructed without
@@ -154,7 +156,7 @@ func (r *ModelReconciler) reconcilePrefetch(ctx context.Context, model *inferenc
 			model.Status.Phase = PhaseDownloading
 			seedPrefetchCacheKey(model)
 			if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue,
-				"PrefetchRunning", "Prefetch job downloading model into the shared cache"); err != nil {
+				"PrefetchRunning", "Prefetch job downloading model into the model cache"); err != nil {
 				return true, ctrl.Result{}, err
 			}
 		}
@@ -162,8 +164,68 @@ func (r *ModelReconciler) reconcilePrefetch(ctx context.Context, model *inferenc
 	}
 }
 
-// startPrefetch ensures the shared cache PVC exists and creates the
-// owner-ref'd prefetch Job.
+// resolvePrefetchTarget returns a synthetic InferenceService that carries the
+// cache claim prefetch should stage into, or nil for the shared cache, plus a
+// reason describing why the override was not honoured (empty when a per-service
+// target was resolved).
+//
+// A Model is 1:N with InferenceServices, so the target is not always
+// well-defined. The resolved policy (#1676):
+//   - exactly one distinct spec.modelCache.claimName among the referencing
+//     services: return a synthetic InferenceService naming that claim, so the
+//     download lands in the PVC the serving pod mounts;
+//   - no referencing service, or several disagreeing on claimName: return nil
+//     (the shared cache), so the behaviour is unchanged and the caller can
+//     surface that the override was not honoured.
+//
+// The nil isvc is a genuine InferenceService-shaped value only when a claim
+// was resolved; callers must not assume it is non-nil.
+func (r *ModelReconciler) resolvePrefetchTarget(ctx context.Context, model *inferencev1alpha1.Model) (target *inferencev1alpha1.InferenceService, reason string) {
+	list := &inferencev1alpha1.InferenceServiceList{}
+	if err := r.List(ctx, list, client.InNamespace(model.Namespace)); err != nil {
+		// A listing failure (RBAC denial, partitioned API server) must not
+		// wedge prefetch: fall back to the shared cache, which is the
+		// pre-#1676 behaviour, and let the caller surface the ignore.
+		return nil, "prefetch cache listing failed: " + err.Error()
+	}
+
+	var (
+		claim    string
+		seen     bool
+		conflict bool
+	)
+	for i := range list.Items {
+		svc := &list.Items[i]
+		if svc.Spec.ModelRef != model.Name {
+			continue
+		}
+		claimName := userModelCacheClaimName(svc)
+		if claimName == "" {
+			continue // references the model but no claim override to honour
+		}
+		if !seen {
+			seen = true
+			claim = claimName
+			continue
+		}
+		if claimName != claim {
+			conflict = true
+		}
+	}
+	if seen && !conflict {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: model.Name, Namespace: model.Namespace},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: model.Name, ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}},
+		}, ""
+	}
+	if !seen {
+		return nil, "no InferenceService references this Model with a modelCache.claimName override; prefetching into the shared cache"
+	}
+	return nil, "multiple InferenceServices referencing this Model disagree on their modelCache.claimName overrides; prefetching into the shared cache"
+}
+
+// startPrefetch ensures the shared cache PVC exists (unless prefetch has
+// resolved a per-service target) and creates the owner-ref'd prefetch Job.
 func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1alpha1.Model) (ctrl.Result, error) {
 	logger := logf.FromContext(ctx)
 
@@ -175,12 +237,27 @@ func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1a
 	// identical key and takes the cache-hit path.
 	seedPrefetchCacheKey(model)
 
-	if err := ensureSharedModelCachePVC(ctx, r.Client, model.Namespace,
-		r.ModelCacheSize, r.ModelCacheClass, r.ModelCacheAccessMode); err != nil {
-		return ctrl.Result{}, fmt.Errorf("ensuring shared model cache PVC: %w", err)
+	// Resolve the PVC the serving pod will read (#1676). A nil isvc means
+	// the shared cache; a resolved one means prefetch stages into that
+	// service's PVC, so the shared PVC must not be provisioned here.
+	target, ignoreReason := r.resolvePrefetchTarget(ctx, model)
+	if target == nil {
+		if err := ensureSharedModelCachePVC(ctx, r.Client, model.Namespace,
+			r.ModelCacheSize, r.ModelCacheClass, r.ModelCacheAccessMode); err != nil {
+			return ctrl.Result{}, fmt.Errorf("ensuring shared model cache PVC: %w", err)
+		}
+		// The override could not be honoured: keep today's shared-cache
+		// behaviour but surface the condition so the no-op is visible
+		// rather than silent (#1676).
+		if ignoreReason != "" {
+			if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue,
+				"PrefetchCacheIgnored", ignoreReason); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
-	job, err := r.buildPrefetchJob(model)
+	job, err := r.buildPrefetchJob(model, target)
 	if err != nil {
 		model.Status.Phase = PhaseFailed
 		return ctrl.Result{}, r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionFalse,
@@ -200,7 +277,7 @@ func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1a
 	logger.Info("Created prefetch job", "job", job.Name)
 	model.Status.Phase = PhaseDownloading
 	if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue,
-		"PrefetchStarted", "Started prefetch job downloading model into the shared cache"); err != nil {
+		"PrefetchStarted", prefetchStartedMessage(target)); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
@@ -215,7 +292,22 @@ func (r *ModelReconciler) completePrefetch(ctx context.Context, model *inference
 	now := metav1.Now()
 	model.Status.LastUpdated = &now
 	return r.updateStatus(ctx, model, "Available", metav1.ConditionTrue,
-		"ModelPrefetched", "Model prefetched into the shared cache")
+		"ModelPrefetched", "Model prefetched into the model cache")
+}
+
+// prefetchTargetName returns the PVC name prefetch will stage into, for status
+// messages: the resolved per-service claim, or the shared cache PVC.
+func prefetchTargetName(target *inferencev1alpha1.InferenceService) string {
+	if claim := userModelCacheClaimName(target); claim != "" {
+		return claim
+	}
+	return ModelCachePVCName
+}
+
+// prefetchStartedMessage renders the Job's target PVC into the started status
+// so operators can see where the download lands (#1676).
+func prefetchStartedMessage(target *inferencev1alpha1.InferenceService) string {
+	return fmt.Sprintf("Started prefetch job downloading model into %q", prefetchTargetName(target))
 }
 
 // buildPrefetchJob assembles the download Job. The pod reuses the serving
@@ -223,11 +315,15 @@ func (r *ModelReconciler) completePrefetch(ctx context.Context, model *inference
 // only isvc-derived input is an optional fsGroup override) and adds a no-op
 // completion container, since a Job pod must have at least one non-init
 // container.
-func (r *ModelReconciler) buildPrefetchJob(model *inferencev1alpha1.Model) (*batchv1.Job, error) {
+//
+// target is the resolved per-InferenceService cache claim (#1676), or nil for
+// the shared cache; buildModelStorageConfig reads userModelCacheClaimName off
+// it to pick the PVC, so the download lands where the serving pod reads.
+func (r *ModelReconciler) buildPrefetchJob(model *inferencev1alpha1.Model, target *inferencev1alpha1.InferenceService) (*batchv1.Job, error) {
 	if effectiveModelCacheKey(model) == "" {
 		return nil, fmt.Errorf("prefetch: model has no cache key; refusing to build a Job that would download into an emptyDir")
 	}
-	storage := buildModelStorageConfig(model, nil, model.Namespace, true, ModelCacheModeShared,
+	storage := buildModelStorageConfig(model, target, model.Namespace, true, ModelCacheModeShared,
 		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
 	if len(storage.initContainers) == 0 {
 		return nil, fmt.Errorf("prefetch: source %q produced no downloader containers", model.Spec.Source)
