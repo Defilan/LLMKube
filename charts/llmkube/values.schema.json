@@ -511,6 +511,11 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "watchNamespaces": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Namespaces the operator watches instead of the whole cluster. Empty (default) keeps the cluster-wide cache and ClusterRole; when set the operator's cache is scoped to these namespaces and a namespaced Role + RoleBinding per namespace is rendered."
+    },
     "gpuSharing": {
       "type": "object",
       "additionalProperties": false,

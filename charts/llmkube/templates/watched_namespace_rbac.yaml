@@ -1,0 +1,135 @@
+{{- /*
+  Per-namespace Role + RoleBinding for the namespaced resources the operator
+  manages. Rendered once per entry in watchNamespaces.
+
+  The operator's cache is scoped to these namespaces via --watch-namespaces, so
+  the operator only ever reads/writes objects in them. The four cluster-scoped
+  read types (nodes, persistentvolumes, priorityclasses, namespaces) stay
+  cluster-wide no matter how the watch is configured, so they remain in the
+  cluster-wide ClusterRole; the per-namespace Role here covers the rest of what
+  the operator's controllers touch.
+
+  This is NOT a superset of the ClusterRole's namespaced rules: the cluster-wide
+  grant also covers things the operator reads cluster-wide but that are never
+  namespaced-scoped (secrets, configmaps, serviceaccounts, pods/log,
+  endpointslices, pods/eviction, events, resourceclaims, ...). A namespaced
+  install still needs those, so they stay in the ClusterRole. The per-namespace
+  Role is the operator's OWN namespaced footprint: the resources it creates and
+  owns on behalf of Models/InferenceServices (deployments, services, HPAs,
+  PVCs, and the inference.llmkube.dev CRDs), plus the RBAC it needs to reconcile
+  its own CRDs' finalizers/status.
+*/ -}}
+{{- if and .Values.rbac.create .Values.watchNamespaces }}
+{{- $sa := include "llmkube.serviceAccountName" . -}}
+{{- $labels := include "llmkube.labels" . | nindent 2 -}}
+{{- $ns := include "llmkube.namespace" . -}}
+{{- range .Values.watchNamespaces }}
+{{- $watched := trim . -}}
+{{- if $watched }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "llmkube.fullname" $ }}-watched-namespace-role
+  namespace: {{ $watched }}
+  labels:
+    {{- $labels }}
+rules:
+# Managed workloads: the operator creates and owns Deployments, Services and
+# HPAs on behalf of InferenceServices/ModelRouters.
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# Model cache PVCs the operator provisions per InferenceService.
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+# The inference.llmkube.dev CRDs the operator reconciles (status + finalizers).
+- apiGroups:
+  - inference.llmkube.dev
+  resources:
+  - gpuquotas
+  - inferenceservices
+  - loraadapters
+  - modelpools
+  - modelrouters
+  - models
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - inference.llmkube.dev
+  resources:
+  - inferenceservices/finalizers
+  - loraadapters/finalizers
+  - modelpools/finalizers
+  - modelrouters/finalizers
+  - models/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - inference.llmkube.dev
+  resources:
+  - gpuquotas/status
+  - inferenceservices/status
+  - loraadapters/status
+  - modelpools/status
+  - modelrouters/status
+  - models/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "llmkube.fullname" $ }}-watched-namespace-rolebinding
+  namespace: {{ $watched }}
+  labels:
+    {{- $labels }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "llmkube.fullname" $ }}-watched-namespace-role
+subjects:
+- kind: ServiceAccount
+  name: {{ $sa }}
+  namespace: {{ $ns }}
+{{- end -}}
+{{- end -}}
+{{- end -}}

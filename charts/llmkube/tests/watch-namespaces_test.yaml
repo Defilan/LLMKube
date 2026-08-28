@@ -1,0 +1,97 @@
+suite: namespace-scoped watch
+templates:
+  - deployment.yaml
+  - watched_namespace_rbac.yaml
+
+tests:
+  # Default is cluster-wide: no flag, no per-namespace Role/RoleBinding.
+  - it: does not render --watch-namespaces by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-namespaces=
+
+  - it: renders no per-namespace Role by default
+    template: watched_namespace_rbac.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  # A single namespace scopes the cache and renders one Role + RoleBinding pair.
+  - it: renders --watch-namespaces when a namespace is set
+    set:
+      watchNamespaces:
+        - team-a
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-namespaces=team-a
+
+  - it: renders one Role + RoleBinding pair for a single watched namespace
+    template: watched_namespace_rbac.yaml
+    set:
+      watchNamespaces:
+        - team-a
+    asserts:
+      - hasDocuments:
+          count: 2
+
+  - it: scopes the per-namespace Role to the watched namespace
+    template: watched_namespace_rbac.yaml
+    set:
+      watchNamespaces:
+        - team-a
+    asserts:
+      - contains:
+          path: metadata.namespace
+          content: team-a
+
+  # A list of namespaces scopes the cache to all of them and renders one
+  # Role/RoleBinding pair per namespace.
+  - it: renders one pair per watched namespace
+    template: watched_namespace_rbac.yaml
+    set:
+      watchNamespaces:
+        - team-a
+        - team-b
+    asserts:
+      - hasDocuments:
+          count: 4
+
+  # The per-namespace Role is bound to the operator's ServiceAccount.
+  - it: binds the per-namespace Role to the operator ServiceAccount
+    template: watched_namespace_rbac.yaml
+    set:
+      watchNamespaces:
+        - team-a
+    asserts:
+      - contains:
+          path: subjects
+          content:
+            kind: ServiceAccount
+            name: RELEASE-NAME-llmkube-controller-manager
+            namespace: llmkube-system
+
+  # The per-namespace Role grants the namespaced resources the operator
+  # manages (deployments, services, HPAs, cache PVCs, the CRDs).
+  - it: grants the operator its namespaced footprint in the per-namespace Role
+    template: watched_namespace_rbac.yaml
+    set:
+      watchNamespaces:
+        - team-a
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+              - update
+              - watch

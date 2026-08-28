@@ -166,6 +166,18 @@ rbac:
   # Specifies whether RBAC resources should be created
   create: true
 
+# Namespaces the operator watches. When empty (default) the operator's cache
+# lists and watches at cluster scope and the chart installs the cluster-wide
+# ClusterRole. When set, the operator's cache is scoped to only these namespaces
+# (via --watch-namespaces), so a single-namespace install no longer needs a
+# cluster-wide cache. The four cluster-scoped read types (nodes,
+# persistentvolumes, priorityclasses, namespaces) stay cluster-wide no matter
+# what, so the ClusterRole keeps its cluster-scoped rules; the chart additionally
+# renders a namespaced Role + RoleBinding per watched namespace for the namespaced
+# resources the operator manages. This is unrelated to multitenancy (#416), which
+# gates the quota admission webhook and tenant ClusterRoles.
+watchNamespaces: []
+
 # Metrics service configuration
 metrics:
   # Enable metrics endpoint

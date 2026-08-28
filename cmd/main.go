@@ -45,6 +45,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -185,6 +186,7 @@ func main() {
 	var emitScrapeAnnotations bool
 	var routerProxyImage string
 	var defaultLiteLLMURL string
+	var watchNamespaces string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -263,6 +265,15 @@ func main() {
 			"endpoint so application teams can declare external backends "+
 			"without repeating the URL on every ModelRouter. Empty means "+
 			"users must specify url explicitly.")
+	flag.StringVar(&watchNamespaces, "watch-namespaces", "",
+		"Comma-separated set of namespaces the operator watches instead of the "+
+			"whole cluster. Empty (default) keeps the cluster-wide cache and "+
+			"ClusterRole. When set, the cache only lists and watches these "+
+			"namespaces; the four cluster-scoped read types (nodes, "+
+			"persistentvolumes, priorityclasses, namespaces) stay cluster-wide "+
+			"and the ClusterRole keeps its cluster-scoped rules. A startup log "+
+			"line lists the watched namespaces so a Model created in an "+
+			"unwatched namespace is silent rather than a missing-status surprise.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	var enablePyrraSLO bool
 	flag.BoolVar(&enablePyrraSLO, "enable-pyrra-slo", false,
@@ -327,6 +338,19 @@ func main() {
 	for _, host := range strings.Split(allowedRemoteHosts, ",") {
 		if host = strings.TrimSpace(host); host != "" {
 			allowedRemoteHostList = append(allowedRemoteHostList, host)
+		}
+	}
+
+	// Parse the watched-namespaces list the same way: split on comma, trim
+	// spaces, drop empties. Empty (the default) keeps the cluster-wide cache
+	// and ClusterRole. A malformed value is a startup error rather than a
+	// silent fall-back to cluster-wide, since an operator who asked for a
+	// scoped watch would otherwise get cluster-wide reach and no indication
+	// they configured it wrong.
+	var watchNamespaceList []string
+	for _, ns := range strings.Split(watchNamespaces, ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			watchNamespaceList = append(watchNamespaceList, ns)
 		}
 	}
 
@@ -466,7 +490,7 @@ func main() {
 	}
 
 	mgrCfg := ctrl.GetConfigOrDie()
-	mgr, err := ctrl.NewManager(mgrCfg, ctrl.Options{
+	cacheOptions := ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
@@ -484,7 +508,22 @@ func main() {
 		// if you are doing or is intended to do any operation such as perform cleanups
 		// after the manager stops then its usage might be unsafe.
 		// LeaderElectionReleaseOnCancel: true,
-	})
+	}
+	// When --watch-namespaces is set, scope the cache to those namespaces
+	// instead of the whole cluster. The four cluster-scoped read types
+	// (nodes, persistentvolumes, priorityclasses, namespaces) stay cluster-
+	// wide regardless, so the ClusterRole keeps its cluster-scoped rules and
+	// the chart renders a namespaced Role + RoleBinding per watched namespace.
+	if len(watchNamespaceList) > 0 {
+		namespaces := make(map[string]cache.Config, len(watchNamespaceList))
+		for _, ns := range watchNamespaceList {
+			namespaces[ns] = cache.Config{}
+		}
+		cacheOptions.Cache = cache.Options{
+			DefaultNamespaces: namespaces,
+		}
+	}
+	mgr, err := ctrl.NewManager(mgrCfg, cacheOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
@@ -702,6 +741,9 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
+	if len(watchNamespaceList) > 0 {
+		setupLog.Info("watching namespaces", "namespaces", watchNamespaceList)
+	}
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)

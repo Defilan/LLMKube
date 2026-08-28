@@ -120,6 +120,15 @@ spec:
         {{- if gt (int ($gs.vramPerDeviceGiB | default 0)) 0 }}
         - --gpu-sharing-vram-per-device-gib={{ $gs.vramPerDeviceGiB }}
         {{- end }}
+        {{- with .Values.watchNamespaces }}
+        # Scope the operator's cache to these namespaces instead of the whole
+        # cluster. cmd/main.go sets cache.Options.DefaultNamespaces from it; the
+        # four cluster-scoped read types (nodes, persistentvolumes,
+        # priorityclasses, namespaces) stay cluster-wide, so the ClusterRole
+        # keeps its cluster-scoped rules and a namespaced Role + RoleBinding per
+        # watched namespace are rendered (watched_namespace_role.yaml).
+        - --watch-namespaces={{ join "," . }}
+        {{- end }}
         {{- if .Values.webhook.enabled }}
         # Point the controller-runtime webhook server at the mounted serving
         # cert. cmd/main.go registers the ModelRouter validating webhook only
