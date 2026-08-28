@@ -103,12 +103,18 @@ func readDefaultTemplate(workspace string) (string, bool) {
 // PRBody composes the pull request body Foreman posts.
 //
 // When the target repository has a PR template (template non-blank), it is
-// used as the body's scaffolding — its checkboxes are left exactly as the
-// repo authored them (a wrongly-ticked box would be a false claim) — and the
-// reviewer's authored prose is spliced in rather than discarded. The
-// template's own structure decides where the prose goes; the authored body
-// must still survive into the posted PR. The issue link and provenance are
-// appended so an agent PR is never mistaken for a hand-written one (#1541).
+// used as the body's scaffolding and the reviewer's authored prose follows it,
+// rather than being discarded as it was before #1701.
+//
+// The prose is APPENDED after the template, not interpolated into its
+// sections: filling "## What" would mean parsing the repo's headings, which
+// is fragile and differs per repo. The checkboxes are deliberately left
+// exactly as the repo authored them — Foreman cannot verify the claims they
+// make, and a wrongly-ticked box would be a false one — so a human still
+// ticks them when promoting the draft.
+//
+// The issue link and provenance are appended last so an agent PR is never
+// mistaken for a hand-written one (#1541).
 //
 // When template is blank the body is Foreman's own fixed shape, byte-for-byte
 // identical to the pre-#1541 output: the reviewer's (diff-grounded, #1411)
