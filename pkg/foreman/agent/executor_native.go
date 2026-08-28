@@ -1748,6 +1748,12 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 		// The gate Job skips it safely when no test or no production files
 		// changed, so default-on costs nothing when there is nothing to check.
 		"biteCheck": true,
+		// Per-hunk mutation coverage (advisory, never a block): for each added
+		// hunk in an envtest package it reverts only that hunk and requires a
+		// test to fail, catching a single uncovered wiring line that the
+		// all-or-nothing bite check can still ship (#1694). The gate Job skips
+		// it safely when no envtest files changed, so default-on costs nothing.
+		"hunkCheck": true,
 		// baseBranch is the ref the bite check diffs the coder branch against
 		// and reverts production to. The clone is shallow + single-branch, so
 		// the bite check fetches this ref explicitly. Defaults to main, and

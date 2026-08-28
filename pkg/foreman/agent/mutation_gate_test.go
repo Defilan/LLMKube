@@ -513,3 +513,131 @@ func copyTree(t *testing.T, src, dst string) {
 		}
 	}
 }
+
+// TestCheckPerHunkCoverage_ReportsUncoveredWiringLine is the regression test
+// for #1694: a diff with two added hunks in an envtest package, where the
+// first hunk is covered (reverting it fails a test) and the second is a one
+// line wiring addition that no test exercises (reverting it passes). The
+// per-hunk pass must report exactly the second hunk, named by file and line
+// range, and nothing else.
+func TestCheckPerHunkCoverage_ReportsUncoveredWiringLine(t *testing.T) {
+	ws := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(ws, "internal/controller"), 0o755)
+	// The changed production file (HEAD content). The two hunks are the covered
+	// logic line and the uncovered wiring line appended to rollup.
+	_ = os.WriteFile(
+		filepath.Join(ws, "internal/controller/rollup.go"),
+		[]byte("package controller\n\nfunc rollup() {\n\t_ = compute()\n\temitContradiction()\n}\n"),
+		0o644)
+
+	// The diff against the base (merge-base) has two added hunks: the covered
+	// line at 3-4 and the uncovered wiring line at 5.
+	diffOut := "diff --git a/internal/controller/rollup.go b/internal/controller/rollup.go\n" +
+		"@@ -0,0 +1,4 @@\n+package controller\n+\n+func rollup() {\n+\t_ = compute()\n" +
+		"@@ -0,0 +5 @@\n+\temitContradiction()\n"
+	// testCalls counts go test invocations so the runner can fail the first
+	// revert (covered hunk) and pass the second (uncovered wiring line).
+	testCalls := 0
+	runner := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && len(args) > 1 && args[0] == "diff" && containsStr(args, "--name-only"):
+			// changedFilesFromDiff reads the name-only view.
+			return "internal/controller/rollup.go\n", nil
+		case name == "git" && len(args) > 1 && args[0] == "diff" && containsStr(args, "-U0"):
+			// splitProductionHunks reads the -U0 diff with line ranges.
+			return diffOut, nil
+		case name == "go" && len(args) > 0 && args[0] == "test":
+			testCalls++
+			if testCalls == 1 {
+				// First revert (covered hunk 1-4): a test fails -> covered.
+				return "FAIL", errors.New("boom")
+			}
+			// Second revert (uncovered wiring line 5): tests pass -> uncovered.
+			return "", nil
+		}
+		return "", nil
+	}
+
+	findings := CheckPerHunkCoverage(context.Background(), ws, "main", runner)
+	if len(findings) != 1 {
+		t.Fatalf("want exactly one uncovered hunk, got %d: %#v", len(findings), findings)
+	}
+	if findings[0].Dir != "internal/controller" || findings[0].File != "internal/controller/rollup.go" {
+		t.Errorf("unexpected finding: %#v", findings[0])
+	}
+	if findings[0].LineRange != "5-5" {
+		t.Errorf("LineRange = %q, want 5-5 (the uncovered wiring line)", findings[0].LineRange)
+	}
+}
+
+// TestCheckPerHunkCoverage_AllCoveredReportsClean is the companion fixture:
+// a diff whose every added hunk is covered (each revert fails a test). The
+// per-hunk pass must report nothing.
+func TestCheckPerHunkCoverage_AllCoveredReportsClean(t *testing.T) {
+	ws := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(ws, "internal/controller"), 0o755)
+	_ = os.WriteFile(
+		filepath.Join(ws, "internal/controller/rollup.go"),
+		[]byte("package controller\n\nfunc rollup() {\n\t_ = compute()\n\temitContradiction()\n}\n"),
+		0o644)
+	diffOut := "diff --git a/internal/controller/rollup.go b/internal/controller/rollup.go\n" +
+		"@@ -0,0 +1,4 @@\n+package controller\n+\n+func rollup() {\n+\t_ = compute()\n" +
+		"@@ -0,0 +5 @@\n+\temitContradiction()\n"
+	runner := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && len(args) > 1 && args[0] == "diff" && containsStr(args, "--name-only"):
+			return "internal/controller/rollup.go\n", nil
+		case name == "git" && len(args) > 1 && args[0] == "diff" && containsStr(args, "-U0"):
+			return diffOut, nil
+		case name == "go" && len(args) > 0 && args[0] == "test":
+			// Every reverted hunk fails a test -> every hunk is covered.
+			return "FAIL", errors.New("boom")
+		}
+		return "", nil
+	}
+
+	findings := CheckPerHunkCoverage(context.Background(), ws, "main", runner)
+	if len(findings) != 0 {
+		t.Fatalf("want no uncovered hunks, got %d: %#v", len(findings), findings)
+	}
+}
+
+// TestCheckPerHunkCoverage_CompileFailureCountsAsCovered verifies that a
+// compile failure on a reverted hunk counts as covered (not uncovered): the
+// hunk is load-bearing for code that is exercised. Only a clean green run
+// means uncovered.
+func TestCheckPerHunkCoverage_CompileFailureCountsAsCovered(t *testing.T) {
+	ws := t.TempDir()
+	_ = os.MkdirAll(filepath.Join(ws, "internal/controller"), 0o755)
+	_ = os.WriteFile(
+		filepath.Join(ws, "internal/controller/rollup.go"),
+		[]byte("package controller\n\nfunc rollup() {\n\temitContradiction()\n}\n"),
+		0o644)
+	diffOut := "diff --git a/internal/controller/rollup.go b/internal/controller/rollup.go\n" +
+		"@@ -0,0 +1,3 @@\n+package controller\n+\n+func rollup() {\n+\temitContradiction()\n}\n"
+	runner := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && len(args) > 1 && args[0] == "diff":
+			return diffOut, nil
+		case name == "go" && len(args) > 0 && args[0] == "test":
+			// A non-nil error (compile break) means the hunk is covered.
+			return "FAIL", errors.New("build failed")
+		}
+		return "", nil
+	}
+
+	findings := CheckPerHunkCoverage(context.Background(), ws, "main", runner)
+	if len(findings) != 0 {
+		t.Fatalf("compile failure must count as covered, got %d findings: %#v", len(findings), findings)
+	}
+}
+
+// containsStr reports whether args contains target.
+func containsStr(args []string, target string) bool {
+	for _, a := range args {
+		if a == target {
+			return true
+		}
+	}
+	return false
+}

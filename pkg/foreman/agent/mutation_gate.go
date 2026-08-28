@@ -878,3 +878,162 @@ func neuterAndTestPackage(
 	}
 	return allNeutered, nil
 }
+
+// revertHunk writes the file with exactly the given added lines removed,
+// returning the rewritten bytes. It reverts a single added hunk by operating
+// on the file's committed HEAD content (passed by the caller), so it is
+// independent of the uncommitted working tree that would defeat `git apply`.
+// A nil patch (no added lines) returns the input unchanged.
+func revertHunk(orig []byte, lines []string) []byte {
+	if len(lines) == 0 {
+		return orig
+	}
+	removed := map[string]bool{}
+	for _, l := range lines {
+		removed[l] = true
+	}
+	var out strings.Builder
+	for _, l := range strings.Split(string(orig), "\n") {
+		if removed[l] {
+			continue
+		}
+		out.WriteString(l + "\n")
+	}
+	return []byte(out.String())
+}
+
+// perHunkFinding names one added hunk that no test constrains.
+type perHunkFinding struct {
+	File string // workspace-relative path of the reverted file
+	Dir  string // package dir (e.g. internal/controller)
+	// LineRange is the 1-based inclusive new-file line range of the reverted
+	// hunk, e.g. "rollup.go:24-25", so the advisory names the exact wiring.
+	LineRange string
+}
+
+// changedFilesFromDiff returns the workspace-relative non-test Go files the
+// branch changed relative to base, per `git diff --name-only base HEAD`. It is
+// the committed-branch view the gate Job needs: the coder's work is committed
+// at HEAD, so `git status` is clean and `git diff --name-only` against the
+// fork point is the only way to see what changed. A git error yields nil.
+func changedFilesFromDiff(ctx context.Context, workspace, base string, run commandRunner) []string {
+	out, err := run(ctx, workspace, nil, "git", "diff", "--name-only", base, "HEAD")
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasSuffix(line, ".go") || strings.HasSuffix(line, "_test.go") {
+			continue
+		}
+		files = append(files, line)
+	}
+	return files
+}
+
+// productionHunk is one added block in a file's diff: the added new-file
+// lines (the "+" lines with the leading "+" stripped) and the 1-based
+// inclusive new-file line range they occupy.
+type productionHunk struct {
+	Lines     []string
+	LineRange string // e.g. "24-25"
+}
+
+// splitProductionHunks parses `git diff -U0 <base> -- <file>` and returns the
+// added hunks, each as the list of added new-file lines (the "+" lines with
+// the leading "+" stripped) in file order. A hunk is an added block: a
+// contiguous run of added lines, which is the unit the per-hunk pass reverts.
+// A git error yields nil (the caller skips the package rather than failing).
+//
+// The diff is taken against base (the fork point), not the plain working-tree
+// diff, so it is independent of whether an earlier gate staged the tree.
+func splitProductionHunks(ctx context.Context, workspace, base, file string, run commandRunner) []productionHunk {
+	out, err := run(ctx, workspace, nil, "git", "diff", "-U0", base, "HEAD", "--", file)
+	if err != nil {
+		return nil
+	}
+	var hunks []productionHunk
+	var cur []string
+	var start int
+	flush := func() {
+		if len(cur) > 0 {
+			end := start + len(cur) - 1
+			hunks = append(hunks, productionHunk{Lines: cur, LineRange: fmt.Sprintf("%d-%d", start, end)})
+			cur = nil
+		}
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if m := hunkHeaderRe.FindStringSubmatch(line); m != nil {
+			flush()
+			start, _ = strconv.Atoi(m[1])
+			continue
+		}
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			cur = append(cur, line[1:])
+			continue
+		}
+		// A context or removed line ends the current added block.
+		flush()
+	}
+	flush()
+	return hunks
+}
+
+// CheckPerHunkCoverage reports production hunks in envtest packages that no
+// test constrains, at hunk granularity. The all-or-nothing bite check reverts
+// the whole production diff at once, so a diff that is mostly covered can still
+// ship an uncovered wiring line (the #1694 shape: a one-line addition to a
+// pre-existing function). This inverts that: for each added hunk it reverts
+// only that hunk and runs the package's tests. A hunk whose revert produces a
+// green test run is uncovered; a clean pass or a compile failure (which proves
+// the hunk is load-bearing for exercised code) is covered.
+//
+// base is the ref the diff is taken against (the fork point / merge-base).
+// Scoped to envtest packages, the ones Layer 2 skips and where all three
+// observed misses (#1685, #1567) occurred. Reporting only: the caller surfaces
+// this as an advisory, never a block, until the false-positive rate on real
+// diffs is known.
+func CheckPerHunkCoverage(ctx context.Context, workspace, base string, run commandRunner) []perHunkFinding {
+	changed := changedFilesFromDiff(ctx, workspace, base, run)
+	if len(changed) == 0 {
+		return nil
+	}
+	// Only envtest packages: Layer 2 covers non-envtest packages at function
+	// granularity, and per-hunk multiplies gate time by the hunk count.
+	byDir := map[string][]string{}
+	for _, f := range changed {
+		if isEnvtestPackage("./" + filepath.Dir(f) + "/") {
+			byDir[filepath.Dir(f)] = append(byDir[filepath.Dir(f)], f)
+		}
+	}
+	if len(byDir) == 0 {
+		return nil
+	}
+
+	var findings []perHunkFinding
+	for dir, files := range byDir {
+		sort.Strings(files)
+		for _, f := range files {
+			orig, err := os.ReadFile(filepath.Join(workspace, f))
+			if err != nil {
+				continue
+			}
+			for _, hunk := range splitProductionHunks(ctx, workspace, base, f, run) {
+				if err := os.WriteFile(filepath.Join(workspace, f), revertHunk(orig, hunk.Lines), 0o644); err != nil {
+					continue
+				}
+				// A nil error means the package's tests PASSED with the hunk
+				// reverted -> the hunk is uncovered. A non-nil error (build
+				// break or failing test) means the hunk is load-bearing for
+				// something a test exercises -> covered.
+				_, terr := run(ctx, workspace, nil, "go", "test", "-count=1", "-timeout=180s", "./"+dir+"/")
+				_ = os.WriteFile(filepath.Join(workspace, f), orig, 0o644)
+				if terr == nil {
+					findings = append(findings, perHunkFinding{File: f, Dir: dir, LineRange: hunk.LineRange})
+				}
+			}
+		}
+	}
+	return findings
+}
