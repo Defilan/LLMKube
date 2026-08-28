@@ -2179,10 +2179,18 @@ func (e *NativeAgentLoopExecutor) maybeRefreshPRBody(
 		head = forkOwner + ":" + branch
 	}
 	prURL, err := ch.PullRequestUpdate(ctx, task.Spec.Payload.Repo, head, body)
-	// A missing PR for the head ("", nil) is not an update; only log
-	// success when a PR was actually PATCHed.
-	if err != nil || prURL == "" {
+	// Three outcomes, and only one of them is a failure. A real error is
+	// worth an error line. ("", nil) means there is simply no open PR for
+	// this head yet -- the ordinary case on a first GO, before any PR
+	// exists -- and logging that at error level with a nil error would put
+	// a spurious error in the record on nearly every run.
+	switch {
+	case err != nil:
 		log.Error(err, "PR body refresh failed after fix cycle",
+			"repo", task.Spec.Payload.Repo, "branch", branch)
+		return
+	case prURL == "":
+		log.V(1).Info("no open PR for head; nothing to refresh",
 			"repo", task.Spec.Payload.Repo, "branch", branch)
 		return
 	}

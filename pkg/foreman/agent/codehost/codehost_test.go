@@ -234,7 +234,8 @@ func TestEnsureChangeRequest(t *testing.T) {
 			baseBranch: "main",
 			title:      "Fix the thing",
 			body:       "Fixes #7",
-			ensurePR: func(ctx context.Context, owner, repo, head, base, title, body string, draft bool, token string) (*githubpr.Result, error) {
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title,
+				body string, draft bool, token string) (*githubpr.Result, error) {
 				return &githubpr.Result{URL: "https://github.com/defilantech/llmkube/pull/4", Created: false}, nil
 			},
 			updatePR: func(ctx context.Context, owner, repo, head, b, token string) (string, error) {
