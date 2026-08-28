@@ -25,14 +25,16 @@ import (
 
 // fakeEnsurer is a minimal githubpr.Ensurer implementation for tests.
 type fakeEnsurer struct {
-	ensurePRFunc func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error)
-	commitFunc   func(ctx context.Context, owner, repo, ref, token string) string
+	ensurePRFunc func(ctx context.Context, owner, repo, head, base, title,
+		body string, draft bool, token string) (*githubpr.Result, error)
+	commitFunc func(ctx context.Context, owner, repo, ref, token string) string
 }
 
 func (f *fakeEnsurer) EnsurePR(ctx context.Context, owner, repo, head,
-	base, title, body, token string) (*githubpr.Result, error) {
+	base, title,
+	body string, draft bool, token string) (*githubpr.Result, error) {
 	if f.ensurePRFunc != nil {
-		return f.ensurePRFunc(ctx, owner, repo, head, base, title, body, token)
+		return f.ensurePRFunc(ctx, owner, repo, head, base, title, body, draft, token)
 	}
 	return nil, nil
 }
@@ -147,13 +149,14 @@ func TestResolveCloneURL(t *testing.T) {
 
 func TestEnsureChangeRequest(t *testing.T) {
 	tests := []struct {
-		name        string
-		repoSlug    string
-		headBranch  string
-		baseBranch  string
-		title       string
-		body        string
-		ensurePR    func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error)
+		name       string
+		repoSlug   string
+		headBranch string
+		baseBranch string
+		title      string
+		body       string
+		ensurePR   func(ctx context.Context, owner, repo, head, base, title,
+			body string, draft bool, token string) (*githubpr.Result, error)
 		wantURL     string
 		wantCreated bool
 		wantErr     bool
@@ -165,7 +168,8 @@ func TestEnsureChangeRequest(t *testing.T) {
 			baseBranch: "main",
 			title:      "Fix the thing",
 			body:       "Fixes #7",
-			ensurePR: func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error) {
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title,
+				body string, draft bool, token string) (*githubpr.Result, error) {
 				return &githubpr.Result{URL: "https://github.com/defilantech/llmkube/pull/9", Created: true}, nil
 			},
 			wantURL:     "https://github.com/defilantech/llmkube/pull/9",
@@ -178,7 +182,8 @@ func TestEnsureChangeRequest(t *testing.T) {
 			baseBranch: "main",
 			title:      "Fix the thing",
 			body:       "Fixes #7",
-			ensurePR: func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error) {
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title,
+				body string, draft bool, token string) (*githubpr.Result, error) {
 				return &githubpr.Result{URL: "https://github.com/defilantech/llmkube/pull/4", Created: false}, nil
 			},
 			wantURL:     "https://github.com/defilantech/llmkube/pull/4",
@@ -202,7 +207,8 @@ func TestEnsureChangeRequest(t *testing.T) {
 			baseBranch: "main",
 			title:      "Fix the thing",
 			body:       "Fixes #7",
-			ensurePR: func(ctx context.Context, owner, repo, head, base, title, body, token string) (*githubpr.Result, error) {
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title,
+				body string, draft bool, token string) (*githubpr.Result, error) {
 				if owner != "group/subgroup" || repo != "project" {
 					t.Errorf("EnsurePR called with owner=%q repo=%q, want owner=%q repo=%q",
 						owner, repo, "group/subgroup", "project")
@@ -224,7 +230,7 @@ func TestEnsureChangeRequest(t *testing.T) {
 
 			url, created, err := g.EnsureChangeRequest(
 				context.Background(), tc.repoSlug, tc.headBranch,
-				tc.baseBranch, tc.title, tc.body)
+				tc.baseBranch, tc.title, tc.body, false)
 			if (err != nil) != tc.wantErr {
 				t.Errorf("EnsureChangeRequest() error = %v, wantErr %v", err, tc.wantErr)
 				return

@@ -19,6 +19,7 @@ package githubpr
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -58,7 +59,7 @@ func TestEnsurePR_CreatesWhenAbsent(t *testing.T) {
 	c, posts := prServer(t, nil, http.StatusCreated, `{"html_url":"https://github.com/o/r/pull/9"}`)
 
 	res, err := c.EnsurePR(context.Background(), "o", "r",
-		"foreman/wl-x/issue-7", "main", "Fix the thing", "Fixes #7", "tok")
+		"foreman/wl-x/issue-7", "main", "Fix the thing", "Fixes #7", true, "tok")
 	if err != nil {
 		t.Fatalf("EnsurePR: %v", err)
 	}
@@ -75,11 +76,65 @@ func TestEnsurePR_CreatesWhenAbsent(t *testing.T) {
 	}
 }
 
+// draftServer stands up the two-endpoint mock that EnsurePR touches,
+// capturing the raw create payload so a test can assert on the exact JSON
+// sent (not just the decoded fields). It returns the captured body and a
+// configured client wired to the mock.
+func draftServer(t *testing.T) (*string, *Client) {
+	t.Helper()
+	var raw string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("[]"))
+	})
+	mux.HandleFunc("POST /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		raw = string(b)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/pull/9"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &raw, &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+}
+
+// TestEnsurePR_PayloadDraftFlag pins the draft flag in the create payload
+// (#1701): a Foreman PR opens as a draft (draft=true) so it is reviewable
+// on arrival rather than inviting review before a human has looked at it,
+// while a non-draft caller threads false through. The payload is decoded
+// from the raw request body so we assert the exact JSON sent, not just the
+// re-marshalled fields.
+func TestEnsurePR_PayloadDraftFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		draft bool
+		want  bool
+	}{
+		{"draft default opens a draft", true, true},
+		{"non-draft opens ready for review", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, c := draftServer(t)
+			if _, err := c.EnsurePR(context.Background(), "o", "r",
+				"foreman/wl-x/issue-7", "main", "t", "b", tc.draft, "tok"); err != nil {
+				t.Fatalf("EnsurePR: %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(*raw), &payload); err != nil {
+				t.Fatalf("decode payload: %v (%q)", err, *raw)
+			}
+			if got, ok := payload["draft"]; !ok || got != tc.want {
+				t.Errorf("create payload draft = %v (%v); want %v", got, payload, tc.want)
+			}
+		})
+	}
+}
+
 func TestEnsurePR_ReusesExisting(t *testing.T) {
 	c, posts := prServer(t, []string{"https://github.com/o/r/pull/4"}, http.StatusCreated, `{}`)
 
 	res, err := c.EnsurePR(context.Background(), "o", "r",
-		"foreman/wl-x/issue-7", "main", "t", "b", "tok")
+		"foreman/wl-x/issue-7", "main", "t", "b", true, "tok")
 	if err != nil {
 		t.Fatalf("EnsurePR: %v", err)
 	}
@@ -119,7 +174,7 @@ func TestEnsurePR_ForkQualifiedHeadUsedVerbatim(t *testing.T) {
 	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 
 	res, err := c.EnsurePR(context.Background(), "o", "r",
-		"forker:foreman/wl-x/issue-7", "main", "t", "b", "tok")
+		"forker:foreman/wl-x/issue-7", "main", "t", "b", true, "tok")
 	if err != nil {
 		t.Fatalf("EnsurePR: %v", err)
 	}
@@ -192,7 +247,7 @@ func TestEnsurePR_FindByHeadStateLogic(t *testing.T) {
 			c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 
 			res, err := c.EnsurePR(context.Background(), "o", "r",
-				"foreman/wl-x/issue-7", "main", "t", "b", "tok")
+				"foreman/wl-x/issue-7", "main", "t", "b", true, "tok")
 			if err != nil {
 				t.Fatalf("EnsurePR: %v", err)
 			}
@@ -228,7 +283,7 @@ func TestEnsurePR_ResolvesCreateRace(t *testing.T) {
 	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 
 	res, err := c.EnsurePR(context.Background(), "o", "r",
-		"foreman/wl-x/issue-7", "main", "t", "b", "tok")
+		"foreman/wl-x/issue-7", "main", "t", "b", true, "tok")
 	if err != nil {
 		t.Fatalf("EnsurePR after race: %v", err)
 	}
@@ -247,7 +302,7 @@ func TestEnsurePR_SurfacesAuthFailure(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
 
-	_, err := c.EnsurePR(context.Background(), "o", "r", "h", "main", "t", "b", "tok")
+	_, err := c.EnsurePR(context.Background(), "o", "r", "h", "main", "t", "b", true, "tok")
 	if err == nil {
 		t.Fatal("want error on 403")
 	}
@@ -327,7 +382,7 @@ func TestEnsurePR_MergedPRUsesMergedAtNotMerged(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{BaseURL: srv.URL}
-	res, err := c.EnsurePR(context.Background(), "o", "r", "branch", "main", "t", "b", "tok")
+	res, err := c.EnsurePR(context.Background(), "o", "r", "branch", "main", "t", "b", true, "tok")
 	if err != nil {
 		t.Fatalf("EnsurePR: %v", err)
 	}

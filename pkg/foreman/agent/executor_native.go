@@ -2066,7 +2066,8 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	if prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra, cloneURL); prErr != nil {
+	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra, true, cloneURL)
+	if prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
 			"repo", task.Spec.Payload.Repo, "branch", task.Spec.Payload.Branch)
 		r.Extra["pullRequestError"] = prErr.Error()
@@ -2121,8 +2122,10 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 
 // openPullRequest ensures the PR for the task's branch exists: title
 // from the branch head's commit subject (fallback "Fix #<n>"), base
-// from payload.baseBranch (default main), body linking the issue. The
-// same token the coder pushed with authenticates the API calls.
+// from payload.baseBranch (default main), body linking the issue, and
+// draft opens it as a work-in-progress (a human reads it and marks it
+// ready) rather than straight for review. The same token the coder
+// pushed with authenticates the API calls.
 //
 // The coder pushed the branch to the configured git remote, which may be
 // a fork of payload.repo (--git-remote-url names the fork while
@@ -2135,7 +2138,7 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 func (e *NativeAgentLoopExecutor) openPullRequest(
 	ctx context.Context, task *foremanv1alpha1.AgenticTask,
 	auth *repo.Auth, workspace, summaryBody string, extra map[string]any,
-	cloneURL string,
+	draft bool, cloneURL string,
 ) (string, error) {
 	p := task.Spec.Payload
 	owner, _, ok := codehost.SplitRepoSlug(p.Repo)
@@ -2178,7 +2181,7 @@ func (e *NativeAgentLoopExecutor) openPullRequest(
 	body = githubpr.PRBody(githubpr.FindTemplate(workspace), body,
 		p.Issue, task.Labels["foreman.llmkube.dev/workload"])
 	prURL, _, err := ch.EnsureChangeRequest(ctx, p.Repo, head,
-		baseBranchOrDefault(p.BaseBranch), title, body)
+		baseBranchOrDefault(p.BaseBranch), title, body, draft)
 	if err != nil {
 		return "", err
 	}

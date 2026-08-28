@@ -49,7 +49,10 @@ type Ensurer interface {
 	// EnsurePR's head is a bare branch name for a same-repo PR, or a
 	// "forkOwner:branch" qualified head for a cross-fork PR (the coder
 	// pushed to a fork of owner/repo). owner/repo always name the base.
-	EnsurePR(ctx context.Context, owner, repo, head, base, title, body, token string) (*Result, error)
+	// draft opens the PR as a work-in-progress draft (a human reads it and
+	// marks it ready) rather than straight for review; the call path passes
+	// the flag so a future non-draft caller can opt out.
+	EnsurePR(ctx context.Context, owner, repo, head, base, title, body string, draft bool, token string) (*Result, error)
 	// HeadCommitSubject returns the branch head's commit subject for use
 	// as the PR title; "" on any failure (callers fall back).
 	HeadCommitSubject(ctx context.Context, owner, repo, ref, token string) string
@@ -73,7 +76,7 @@ func NewClient() *Client {
 // branch is returned rather than duplicated, and losing a create race
 // (GitHub 422 "already exists") resolves to the winner's PR.
 func (c *Client) EnsurePR(
-	ctx context.Context, owner, repo, head, base, title, body, token string,
+	ctx context.Context, owner, repo, head, base, title, body string, draft bool, token string,
 ) (*Result, error) {
 	if owner == "" || repo == "" || head == "" || base == "" {
 		return nil, fmt.Errorf("githubpr: owner, repo, head, and base are required")
@@ -88,7 +91,7 @@ func (c *Client) EnsurePR(
 		return &Result{URL: existing, Created: false}, nil
 	}
 
-	created, err := c.create(ctx, owner, repo, head, base, title, body, token)
+	created, err := c.create(ctx, owner, repo, head, base, title, body, draft, token)
 	if err == nil {
 		return &Result{URL: created, Created: true}, nil
 	}
@@ -170,15 +173,22 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 	return "", nil
 }
 
-func (c *Client) create(ctx context.Context, owner, repo, head, base, title, body, token string) (string, error) {
+func (c *Client) create(
+	ctx context.Context, owner, repo, head, base, title, body string, draft bool, token string,
+) (string, error) {
 	target := fmt.Sprintf("%s/repos/%s/%s/pulls", c.base(), owner, repo)
-	payload, err := json.Marshal(map[string]string{
+	// draft is a JSON boolean on GitHub's create-PR API; it must be a real
+	// field of the payload, not a hard-coded constant, so a future
+	// non-draft caller can thread a different value through.
+	payload := map[string]any{
 		"title": title, "head": head, "base": base, "body": body,
-	})
+		"draft": draft,
+	}
+	blob, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("githubpr: marshal: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(blob))
 	if err != nil {
 		return "", fmt.Errorf("githubpr: build request: %w", err)
 	}
