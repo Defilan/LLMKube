@@ -1551,7 +1551,7 @@ func TestIssueAskDemotionLandsUnderModelExtra(t *testing.T) {
 		Turns: 7,
 	}
 	e := &NativeAgentLoopExecutor{}
-	res := e.modelDecidedResult(time.Now(), corev1.ObjectReference{Name: "t"}, lr, verdict)
+	res := e.modelDecidedResult(context.Background(), time.Now(), corev1.ObjectReference{Name: "t"}, lr, verdict, "", "")
 	raw, err := json.Marshal(res)
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
@@ -2271,6 +2271,109 @@ func seededRemote(t *testing.T, dir string) (bare, mainSHA string) {
 	gitIn(t, seed, "commit", "-m", "seed")
 	gitIn(t, seed, "push", "origin", "main")
 	return bare, gitIn(t, seed, "rev-parse", "HEAD")
+}
+
+// TestPromoteTerminalOutcome_ResolvedByIsEvidence pins #1692: an
+// ALREADY-RESOLVED resolvedBy claim is treated as evidence, not narrative.
+// Before the outcome is allowed to skip the verify task, the claimed
+// commit must both resolve (`git cat-file -e <sha>^{commit}`) and be an
+// ancestor of the task's baseBranch (`git merge-base --is-ancestor
+// <sha> <baseBranch>`). The table drives the real promotion site with a
+// real git fixture repo and the real execCommandRunner so both checks
+// actually run. A claim that fails either check is downgraded to
+// NEEDS-VERIFICATION so the task stays gated; the claim is preserved on
+// the downgraded result. The two live strings from #1692 are two of the
+// cases: 88c85cce would pass both checks, and the branch-name-and-prose
+// claim fails the first. The mutation that must fail here is deleting the
+// ancestor check — with it gone, the "not an ancestor" case stops being
+// downgraded and the test fails; a test that only asserts the happy path
+// passes with the bug fully present.
+func TestPromoteTerminalOutcome_ResolvedByIsEvidence(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	// Upstream bare remote with one commit on main (the base).
+	remote := filepath.Join(dir, "origin.git")
+	seed := filepath.Join(dir, "seed")
+	gitIn(t, "", "init", "--bare", "-b", "main", remote)
+	gitIn(t, "", "clone", remote, seed)
+	if err := os.WriteFile(filepath.Join(seed, "README.md"), []byte("# seed\n"), 0o644); err != nil {
+		t.Fatalf("seed write: %v", err)
+	}
+	gitIn(t, seed, "add", "README.md")
+	gitIn(t, seed, "commit", "-m", "seed")
+	gitIn(t, seed, "push", "origin", "main")
+	mainSHA := gitIn(t, seed, "rev-parse", "HEAD")
+
+	// The agent's checked-out workspace: a clone of the remote on main.
+	workspace := filepath.Join(dir, "workspace")
+	gitIn(t, "", "clone", remote, workspace)
+
+	// A divergent commit: a real commit that is NOT an ancestor of main.
+	gitIn(t, workspace, "checkout", "-b", "issue-1676-prefetch-claimname")
+	if err := os.WriteFile(filepath.Join(workspace, "diverge.txt"), []byte("unmerged work\n"), 0o644); err != nil {
+		t.Fatalf("write diverge: %v", err)
+	}
+	gitIn(t, workspace, "add", "-A")
+	gitIn(t, workspace, "commit", "-m", "divergent work not on main")
+	divergedSHA := gitIn(t, workspace, "rev-parse", "HEAD")
+
+	// A well-formed 40-hex SHA that does not resolve to any object.
+	nonexistentSHA := "0000000000000000000000000000000000000000"
+
+	cases := []struct {
+		name       string
+		resolvedBy string
+		want       string
+	}{
+		{
+			name:       "valid ancestor SHA stays ALREADY-RESOLVED",
+			resolvedBy: mainSHA,
+			want:       alreadyResolvedOutcome,
+		},
+		{
+			name:       "well-formed SHA that is not an ancestor is downgraded",
+			resolvedBy: divergedSHA,
+			want:       needsVerificationOutcome,
+		},
+		{
+			name:       "SHA that does not resolve is downgraded",
+			resolvedBy: nonexistentSHA,
+			want:       needsVerificationOutcome,
+		},
+		{
+			// The #1692 false claim: a branch name (not a commit) that
+			// exists in the workspace but is not on the base. It resolves
+			// but fails the ancestor check, so it is downgraded.
+			name:       "branch name not on base is downgraded",
+			resolvedBy: "issue-1676-prefetch-claimname",
+			want:       needsVerificationOutcome,
+		},
+		{
+			name:       "free text is downgraded",
+			resolvedBy: "issue-1676-prefetch-claimname (working tree clean; full controller suite passes with envtest 1.31.0 and 1.32.x)",
+			want:       needsVerificationOutcome,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := map[string]any{}
+			terminalExtra := map[string]any{
+				"outcome":    alreadyResolvedOutcome,
+				"resolvedBy": tc.resolvedBy,
+			}
+			promoteTerminalOutcome(context.Background(), extra, terminalExtra, execCommandRunner, workspace, "main")
+			if got := extra["outcome"]; got != tc.want {
+				t.Errorf("outcome = %v, want %v (resolvedBy=%q)", got, tc.want, tc.resolvedBy)
+			}
+			// The claim is preserved on the downgraded result so the
+			// task stays gated with evidence rather than dropping it.
+			if got, ok := extra["resolvedBy"].(string); !ok || got != tc.resolvedBy {
+				t.Errorf("resolvedBy must be preserved, got %v", extra["resolvedBy"])
+			}
+		})
+	}
 }
 
 // TestReviewerDiffBase_ResolvesUpstreamNotStaleForkMain guards #1005: the

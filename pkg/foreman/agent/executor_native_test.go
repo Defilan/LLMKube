@@ -119,6 +119,20 @@ func initBareWithSeed(t *testing.T, root string) string {
 	return bare
 }
 
+// seedMainSHA returns the SHA of the single seed commit on main in the
+// bare repo at root. Used as a real, resolvable ancestor of the base
+// branch for the #1692 evidence check, which requires resolvedBy to name
+// a genuine commit on the base rather than a fake hash.
+func seedMainSHA(t *testing.T, root string) string {
+	t.Helper()
+	seed := filepath.Join(root, "seed")
+	out, err := exec.Command("git", "-C", seed, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD: %v: %s", err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // scriptedOAI returns canned chat-completions bodies in order. After
 // the script runs out, every subsequent request returns the final body
 // (lets the loop hit MaxTurns on stuck-tools tests). Fixtures stay in
@@ -988,15 +1002,25 @@ func TestNativeExecutor_PromotesNeedsVerificationOutcome(t *testing.T) {
 // the needs-verification promotion test: a model-emitted NO-GO with
 // outcome=ALREADY-RESOLVED and resolvedBy evidence must surface both at
 // the top level for isAlreadyResolvedCoder and the Workload rollup.
+//
+// The resolvedBy here is a real ancestor of the seed repo's main (the
+// task's baseBranch), so the #1692 evidence check passes and the outcome
+// stays ALREADY-RESOLVED. A claim that is not a real ancestor is
+// downgraded to NEEDS-VERIFICATION (see TestPromoteTerminalOutcome_ResolvedByIsEvidence).
 func TestNativeExecutor_PromotesAlreadyResolvedOutcome(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	initBareWithSeed(t, root)
+	mainSHA := seedMainSHA(t, root)
+
 	agent, task := taskAndAgent("already-resolved")
 	reg := &fakeRegistry{
 		results: map[string]*foremanagent.ToolResult{
 			"submit_result": {
-				Terminal: true, Verdict: "NO-GO", Summary: "already resolved by prior fix e97d0ca",
+				Terminal: true, Verdict: "NO-GO", Summary: "already resolved by prior fix on main",
 				Extra: map[string]any{
 					"outcome":    "ALREADY-RESOLVED",
-					"resolvedBy": "e97d0ca",
+					"resolvedBy": mainSHA,
 				},
 			},
 		},
@@ -1009,8 +1033,8 @@ func TestNativeExecutor_PromotesAlreadyResolvedOutcome(t *testing.T) {
 	if got := res.Extra["outcome"]; got != "ALREADY-RESOLVED" {
 		t.Errorf("top-level outcome: want ALREADY-RESOLVED got %v", got)
 	}
-	if got := res.Extra["resolvedBy"]; got != "e97d0ca" {
-		t.Errorf("top-level resolvedBy: want e97d0ca got %v", got)
+	if got := res.Extra["resolvedBy"]; got != mainSHA {
+		t.Errorf("top-level resolvedBy: want %s got %v", mainSHA, got)
 	}
 	me, ok := res.Extra["modelExtra"].(map[string]any)
 	if !ok || me["outcome"] != "ALREADY-RESOLVED" {
@@ -2343,6 +2367,7 @@ func TestNativeExecutor_ModelNoGoAlreadyResolved_PromotesOutcome(t *testing.T) {
 	gitOrSkip(t)
 	root := t.TempDir()
 	bare := initBareWithSeed(t, root)
+	mainSHA := seedMainSHA(t, root)
 	oaiSrv := scriptedOAI(t, []string{submitNoGoBody})
 
 	agent, task := taskAndAgent("nogo-resolved")
@@ -2352,10 +2377,10 @@ func TestNativeExecutor_ModelNoGoAlreadyResolved_PromotesOutcome(t *testing.T) {
 		results: map[string]*foremanagent.ToolResult{
 			"submit_result": {
 				Terminal: true, Verdict: "NO-GO",
-				Summary: "already fixed by abc1234",
+				Summary: "already fixed on main",
 				Extra: map[string]any{
 					"outcome":    "ALREADY-RESOLVED",
-					"resolvedBy": "abc1234",
+					"resolvedBy": mainSHA,
 				},
 			},
 		},
@@ -2385,8 +2410,8 @@ func TestNativeExecutor_ModelNoGoAlreadyResolved_PromotesOutcome(t *testing.T) {
 	if got := res.Extra["outcome"]; got != "ALREADY-RESOLVED" {
 		t.Errorf("top-level outcome: want ALREADY-RESOLVED got %v", got)
 	}
-	if got := res.Extra["resolvedBy"]; got != "abc1234" {
-		t.Errorf("top-level resolvedBy: want abc1234 got %v", got)
+	if got := res.Extra["resolvedBy"]; got != mainSHA {
+		t.Errorf("top-level resolvedBy: want %s got %v", mainSHA, got)
 	}
 	me, ok := res.Extra["modelExtra"].(map[string]any)
 	if !ok || me["outcome"] != "ALREADY-RESOLVED" {
