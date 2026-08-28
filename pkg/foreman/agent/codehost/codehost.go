@@ -22,6 +22,7 @@ package codehost
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -91,6 +92,12 @@ type CodeHost interface {
 	EnsureChangeRequest(ctx context.Context, repoSlug, headBranch,
 		baseBranch, title, body string) (url string, created bool, err error)
 
+	// PullRequestUpdate replaces the body of the existing pull request for
+	// head so a fix cycle can refresh the description to match what the
+	// amended branch now contains. Returns the PR URL, or "" on any
+	// failure (the caller keeps the stale body).
+	PullRequestUpdate(ctx context.Context, repoSlug, head, body string) (url string, err error)
+
 	// HeadCommitSubject returns the first line of the branch head's commit
 	// message — the natural PR title (the coder writes a conventional
 	// subject). Empty on any failure so callers can fall back.
@@ -139,7 +146,30 @@ func (g *GitHubCodeHost) EnsureChangeRequest(
 	if err != nil {
 		return "", false, err
 	}
+	// A PR that already existed (Created: false) is a fix cycle: refresh
+	// its body so the description matches what the amended head branch now
+	// contains (#1567). A freshly created PR already carries this body.
+	if !res.Created {
+		if _, updErr := g.Ensurer.UpdatePR(ctx, owner, name, headBranch, body, g.Token); updErr != nil {
+			return res.URL, false, updErr
+		}
+		return res.URL, false, nil
+	}
 	return res.URL, res.Created, nil
+}
+
+// PullRequestUpdate replaces the body of the existing pull request for
+// head so a fix cycle can refresh the description to match the amended
+// branch. Returns the PR URL, or "" on any failure (the caller keeps the
+// stale body).
+func (g *GitHubCodeHost) PullRequestUpdate(
+	ctx context.Context, repoSlug, head, body string,
+) (string, error) {
+	owner, name, ok := SplitRepoSlug(repoSlug)
+	if !ok {
+		return "", fmt.Errorf("PullRequestUpdate: repo slug %q is not a valid repo slug", repoSlug)
+	}
+	return g.Ensurer.UpdatePR(ctx, owner, name, head, body, g.Token)
 }
 
 // HeadCommitSubject returns the first line of the branch head's commit
