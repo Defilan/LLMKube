@@ -490,6 +490,11 @@ func main() {
 		Executor:           executor,
 		MaxSupervisedTasks: maxSupervised,
 	}
+	// Feed the watcher's in-process Job-mode supervision budget into the
+	// registrar so it publishes SupervisionCapacity on every heartbeat
+	// (#1639). The two goroutines share the watcher, so the registrar reads
+	// the same bound the watcher enforces -- never a recomputed one.
+	reg.Watcher = watcher
 
 	cap := provider.Capability()
 	setupLog.Info("foreman-agent started",

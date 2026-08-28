@@ -140,6 +140,33 @@ type FleetNodeUpdateRequest struct {
 	SHA256 string `json:"sha256"`
 }
 
+// SupervisionCapacity is the Job-mode supervision budget the agent holds in
+// process (#1639). It is published on heartbeat so the operator can tell
+// "the fleet is at capacity" apart from "something is broken": a node that is
+// heartbeating normally but declining further Job-mode tasks because its
+// supervision bound is full now reads as full from the cluster instead of
+// only in the agent's memory.
+//
+// Both fields are pointers so an absent capacity (an older agent that does
+// not report one, or a node that has never run a Job-mode task) renders as
+// absent rather than zero -- a zero Maximum would otherwise read as "full
+// and rejecting everything", which is a different state.
+type SupervisionCapacity struct {
+	// Current is the number of Job-mode tasks this node is currently
+	// supervising. Reported on heartbeat; resets to zero when none are in
+	// flight.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Current int32 `json:"current,omitempty"`
+
+	// Maximum is the node's Job-mode supervision bound (--max-supervised-tasks,
+	// defaulting to DefaultMaxSupervisedTasks). Zero means the bound is unset
+	// (unbounded); it is a pointer so an absent capacity renders as absent,
+	// not as "unbounded".
+	// +optional
+	Maximum *int32 `json:"maximum,omitempty"`
+}
+
 // FleetNodeStatus is the FleetAgent's live view of its host. Updated on
 // every heartbeat (every 30s); the FleetNodeReconciler marks the phase
 // NotReady when the heartbeat goes stale.
@@ -171,6 +198,22 @@ type FleetNodeStatus struct {
 	// be supervising coder Jobs; it is free for in-process work, not idle.
 	// +optional
 	CurrentTask string `json:"currentTask,omitempty"`
+
+	// SupervisionCapacity is the node's Job-mode supervision budget,
+	// published by the agent on heartbeat (#1639). It lets an operator
+	// tell "the fleet is at capacity" apart from "something is broken":
+	// a node that is heartbeating normally but declining further Job-mode
+	// tasks because its supervision bound is full now reads as full from
+	// the cluster instead of only in the agent's memory.
+	//
+	// This is NOT the scheduler's placement signal in v0.1 -- the
+	// scheduler keeps reading CurrentTask for that (see above), and this
+	// field is observability only until a later change makes it
+	// authoritative. A Maximum of zero means the bound is unset (unbounded);
+	// an absent value means the agent did not report one (older agent, or
+	// the node has never supervised a Job-mode task).
+	// +optional
+	SupervisionCapacity *SupervisionCapacity `json:"supervisionCapacity,omitempty"`
 
 	// AgentVersion is the observed running version of the agent, reported
 	// on heartbeat. Set by the foreman-agent using the binary's build-time
@@ -227,6 +270,8 @@ type FleetNodeStatus struct {
 // +kubebuilder:printcolumn:name="Accelerator",type=string,JSONPath=`.status.capability.accelerator`
 // +kubebuilder:printcolumn:name="RAM",type=integer,JSONPath=`.status.capability.availableRAMGB`
 // +kubebuilder:printcolumn:name="Current Task",type=string,JSONPath=`.status.currentTask`
+// +kubebuilder:printcolumn:name="Supervising",type=integer,JSONPath=`.status.supervisionCapacity.current`
+// +kubebuilder:printcolumn:name="Supervision",type=integer,JSONPath=`.status.supervisionCapacity.maximum`
 // +kubebuilder:printcolumn:name="K8s Node",type=string,JSONPath=`.status.kubernetesNode`
 // +kubebuilder:printcolumn:name="Heartbeat",type=date,JSONPath=`.status.lastHeartbeatTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

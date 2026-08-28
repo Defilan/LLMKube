@@ -115,6 +115,36 @@ type Registrar struct {
 	// is not running from the managed install root the caller should leave
 	// Updater nil so dev/test builds are unaffected.
 	Updater UpdateApplier
+
+	// Watcher, when non-nil, supplies the live in-process supervision
+	// budget to publish on FleetNode.status on every heartbeat so the
+	// cluster can see "the fleet is at capacity" instead of only the
+	// agent's process memory (#1639). It is the value the watcher holds
+	// in-process, not a second notion recomputed by the controller.
+	//
+	// A nil Watcher is intentional and distinct from a reporting one: when
+	// nil the field is left off the patch entirely, so an older agent that
+	// does not report a capacity does not clobber a newer one's value with a
+	// zero Maximum (which would read as "unbounded"). Leave it nil when the
+	// agent cannot report a bound.
+	Watcher SupervisionCapacityProvider
+}
+
+// SupervisionCapacityProvider is the seam the Registrar uses to read the
+// node's Job-mode supervision budget from the watcher (#1639). It is called
+// on every heartbeat and must be cheap and never block: the watcher holds
+// the only authoritative copy of the bound, and the Registrar must not
+// recompute it.
+//
+// A nil maximum is never returned by a wired provider -- the watcher always
+// has a bound to report (the default applies when unset) -- so the presence
+// of the returned *SupervisionCapacity is the value to publish. Absence is
+// signalled by the Registrar's Watcher being nil (an agent that predates
+// this field), which leaves the status field off the patch entirely.
+type SupervisionCapacityProvider interface {
+	// SupervisionCapacity returns (current, maximum): the number of Job-mode
+	// tasks in flight and the node's supervision bound.
+	SupervisionCapacity() (current int32, maximum *int32)
 }
 
 // Upsert creates the FleetNode if missing, otherwise updates its Spec and
@@ -203,7 +233,7 @@ func mergeManagedLabels(existing, managed map[string]string) (map[string]string,
 // reconcilers (M2+) do not conflict.
 //
 // Multiple writers own different fields on FleetNode.status:
-//   - Agent: phase, lastHeartbeatTime, capability, agentVersion, agentKind, os, arch.
+//   - Agent: phase, lastHeartbeatTime, capability, agentVersion, agentKind, os, arch, supervisionCapacity.
 //   - FleetNodeReconciler: staleness phase + Ready condition.
 //   - AgentReleaseReconciler: updateRequest.
 //
@@ -238,6 +268,19 @@ func (r *Registrar) PatchHeartbeat(ctx context.Context, phase foremanv1alpha1.Fl
 	node.Status.Phase = phase
 	node.Status.LastHeartbeatTime = &now
 	node.Status.Capability = r.Provider.Capability()
+	// Publish the in-process Job-mode supervision budget so the cluster can
+	// see "the fleet is at capacity" instead of only the agent's memory
+	// (#1639). A nil Watcher (an older agent, no bound to report) leaves the
+	// field absent rather than publishing a zero Maximum that would read as
+	// "unbounded".
+	if r.Watcher != nil {
+		if current, maximum := r.Watcher.SupervisionCapacity(); maximum != nil {
+			node.Status.SupervisionCapacity = &foremanv1alpha1.SupervisionCapacity{
+				Current: current,
+				Maximum: maximum,
+			}
+		}
+	}
 	if r.Version != "" {
 		node.Status.AgentVersion = r.Version
 	}
