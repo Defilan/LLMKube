@@ -268,6 +268,28 @@ var _ = Describe("Model Prefetch", func() {
 			}
 		}
 
+		// cleanupNamespacedObjects drains the InferenceServices and PVCs this
+		// block creates. It runs BOTH before each case (so a previous case
+		// cannot skew a resolution) and after the block (so these objects do
+		// not leak into the shared envtest cluster). The AfterEach is
+		// load-bearing: federation_edge_controller.go lists InferenceServices
+		// across ALL namespaces, and its spec asserts absolute counts, so a
+		// leaked service here fails an unrelated test.
+		cleanupNamespacedObjects := func() {
+			list := &inferencev1alpha1.InferenceServiceList{}
+			Expect(k8sClient.List(ctx, list, client.InNamespace(ns))).To(Succeed())
+			for i := range list.Items {
+				_ = k8sClient.Delete(ctx, &list.Items[i])
+			}
+			pvcList := &corev1.PersistentVolumeClaimList{}
+			Expect(k8sClient.List(ctx, pvcList, client.InNamespace(ns))).To(Succeed())
+			for i := range pvcList.Items {
+				_ = k8sClient.Delete(ctx, &pvcList.Items[i])
+			}
+		}
+
+		AfterEach(cleanupNamespacedObjects)
+
 		BeforeEach(func() {
 			// Clean any services left behind by a previous case.
 			list := &inferencev1alpha1.InferenceServiceList{}
