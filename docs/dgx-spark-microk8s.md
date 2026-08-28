@@ -79,7 +79,16 @@ driver:
 toolkit:
   env:
     - name: CONTAINERD_CONFIG
-      value: /var/snap/microk8s/current/args/containerd-template.toml
+      # The LIVE config, NOT containerd-template.toml. Pointing the toolkit at
+      # the template makes it rewrite a file MicroK8s regenerates, so the nvidia
+      # runtime never reaches the running config and the node stops scheduling
+      # GPU pods. This has bricked a node in this fleet twice.
+      #
+      # Confirm against a node that already works before changing it:
+      #   kubectl -n gpu-operator-resources get pod \
+      #     -l app=nvidia-container-toolkit-daemonset \
+      #     -o jsonpath='{.items[0].spec.containers[0].env}'
+      value: /var/snap/microk8s/current/args/containerd.toml
     - name: CONTAINERD_SOCKET
       value: /var/snap/microk8s/common/run/containerd.sock
     - name: CONTAINERD_SET_AS_DEFAULT
