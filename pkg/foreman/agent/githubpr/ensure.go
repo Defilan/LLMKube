@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -53,6 +54,12 @@ type Ensurer interface {
 	// marks it ready) rather than straight for review; the call path passes
 	// the flag so a future non-draft caller can opt out.
 	EnsurePR(ctx context.Context, owner, repo, head, base, title, body string, draft bool, token string) (*Result, error)
+	// UpdatePR replaces the body of the pull request for head. It is
+	// called only when a PR already exists (EnsurePR returned
+	// Created: false), so a fix cycle can refresh the description to
+	// match what the amended head branch now contains. Returns the PR
+	// URL, or "" on any failure (the caller keeps the stale body).
+	UpdatePR(ctx context.Context, owner, repo, head, body, token string) (string, error)
 	// HeadCommitSubject returns the branch head's commit subject for use
 	// as the PR title; "" on any failure (callers fall back).
 	HeadCommitSubject(ctx context.Context, owner, repo, ref, token string) string
@@ -170,6 +177,74 @@ func (c *Client) findByHead(ctx context.Context, owner, repo, head, token string
 	}
 	// Only closed-unmerged PRs exist; treat as absent so EnsurePR
 	// creates a fresh PR (the branch still exists, so GitHub allows it).
+	return "", nil
+}
+
+// UpdatePR PATCHes the body of the pull request for head, so a fix cycle
+// can refresh the description to match what the amended head branch now
+// contains. It returns the PR's html_url, or "" on any failure: the
+// caller (a fix pass) has nothing better to fall back to than the body
+// it already has, so a failed update simply leaves the stale body in place.
+func (c *Client) UpdatePR(ctx context.Context, owner, repo, head, body, token string) (string, error) {
+	prNum, err := prNumberForHead(ctx, c, owner, repo, head, token)
+	if err != nil || prNum == "" {
+		return "", err
+	}
+	target := fmt.Sprintf("%s/repos/%s/%s/pulls/%s", c.base(), owner, repo, prNum)
+	payload, err := json.Marshal(map[string]string{"body": body})
+	if err != nil {
+		return "", fmt.Errorf("githubpr: marshal: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, target, bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("githubpr: build request: %w", err)
+	}
+	c.headers(req, token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.client().Do(req)
+	if err != nil {
+		return "", fmt.Errorf("githubpr: http: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return "", fmt.Errorf("githubpr: read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", &HTTPError{StatusCode: resp.StatusCode, Body: string(raw)}
+	}
+	var pr struct {
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return "", fmt.Errorf("githubpr: decode updated PR: %w", err)
+	}
+	return pr.HTMLURL, nil
+}
+
+// prNumberForHead resolves the pull request number for head by listing
+// open PRs filtered on it. It is the same lookup EnsurePR's findByHead
+// performs; the fix cycle only needs the number to PATCH, not the full
+// object. Returns "" when no open PR exists for the head.
+func prNumberForHead(ctx context.Context, c *Client, owner, repo, head, token string) (string, error) {
+	filter := head
+	if !strings.Contains(head, ":") {
+		filter = owner + ":" + head
+	}
+	target := fmt.Sprintf("%s/repos/%s/%s/pulls?state=open&head=%s",
+		c.base(), owner, repo, url.QueryEscape(filter))
+	var prs []struct {
+		Number  int    `json:"number"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := c.getJSON(ctx, target, token, &prs); err != nil {
+		return "", fmt.Errorf("githubpr: list open PRs by head: %w", err)
+	}
+	for _, pr := range prs {
+		if pr.Number != 0 {
+			return strconv.Itoa(pr.Number), nil
+		}
+	}
 	return "", nil
 }
 

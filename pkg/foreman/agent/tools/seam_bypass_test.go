@@ -29,6 +29,10 @@ func (f *fakeCodeHost) EnsureChangeRequest(
 	return "", false, nil
 }
 
+func (f *fakeCodeHost) PullRequestUpdate(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
+
 func (f *fakeCodeHost) HeadCommitSubject(context.Context, string, string) (string, error) {
 	return "", nil
 }
