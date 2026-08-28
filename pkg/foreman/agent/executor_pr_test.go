@@ -40,15 +40,26 @@ type prSubjectCall struct {
 	owner, repo, ref string
 }
 
+// prUpdateCall records one UpdatePR invocation on the fake.
+type prUpdateCall struct {
+	owner, repo, head, body string
+}
+
 // fakePREnsurer is a recording githubpr.Ensurer for executor wiring
 // tests: it captures the arguments the executor derives (base owner,
 // qualified head, fork owner for the subject lookup) without any HTTP.
 type fakePREnsurer struct {
 	ensures  []prEnsureCall
 	subjects []prSubjectCall
+	updates  []prUpdateCall
 	subject  string
 	url      string
 	err      error
+	// noPR reports an open-PR lookup that finds nothing for the head, so
+	// UpdatePR returns ("", nil) exactly as the real client does when no
+	// PR exists — the "no PR to update" signal the executor must not log
+	// as a success.
+	noPR bool
 }
 
 func (f *fakePREnsurer) EnsurePR(
@@ -59,6 +70,16 @@ func (f *fakePREnsurer) EnsurePR(
 		return nil, f.err
 	}
 	return &githubpr.Result{URL: f.url, Created: true}, nil
+}
+
+func (f *fakePREnsurer) UpdatePR(
+	_ context.Context, owner, repo, head, body, _ string,
+) (string, error) {
+	if f.noPR {
+		return "", nil
+	}
+	f.updates = append(f.updates, prUpdateCall{owner, repo, head, body})
+	return f.url, f.err
 }
 
 func (f *fakePREnsurer) HeadCommitSubject(_ context.Context, owner, repo, ref, _ string) string {
@@ -477,4 +498,91 @@ func TestOpenPullRequest_PrBodyLongSurvivesIntact(t *testing.T) {
 		t.Errorf("long prBody must survive intact (not truncated at 280); len(body)=%d, wanted %d bytes",
 			len(body), len(want))
 	}
+}
+
+// TestMaybeRefreshPRBody_UpdatesExistingPRWithGroundedBody covers the #1567
+// fix at the seam: after a fix cycle GOs its amendment, the executor PATCHes
+// the existing PR's body with the grounded coder summary. This pins the
+// wiring that removes the feature without a failing test.
+func TestMaybeRefreshPRBody_UpdatesExistingPRWithGroundedBody(t *testing.T) {
+	orig := execCommandRunner
+	t.Cleanup(func() { execCommandRunner = orig })
+	execCommandRunner = func(_ context.Context, _ string, _ []string,
+		name string, args ...string) (string, error) {
+		if name != "git" || args[0] != "diff" {
+			t.Fatalf("unexpected command %s %v", name, args)
+		}
+		return "", nil
+	}
+
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
+	workspace := t.TempDir()
+
+	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
+		"foreman/wl-x/issue-7", "Revised summary of the amendment.",
+		workspace, "main", nil, "")
+
+	if len(fe.updates) != 1 {
+		t.Fatalf("want 1 UpdatePR call, got %+v", fe.updates)
+	}
+	got := fe.updates[0]
+	if got.owner != "defilantech" || got.repo != "LLMKube" ||
+		got.head != "foreman/wl-x/issue-7" || got.body != "Revised summary of the amendment." {
+		t.Errorf("UpdatePR args wrong: %+v", got)
+	}
+}
+
+// TestMaybeRefreshPRBody_NoPRIssuesNoUpdate asserts a GO with no existing PR
+// issues no update and logs no success: a missing PR for the head ("", nil)
+// is not an update, so the caller keeps the stale body.
+func TestMaybeRefreshPRBody_NoPRIssuesNoUpdate(t *testing.T) {
+	orig := execCommandRunner
+	t.Cleanup(func() { execCommandRunner = orig })
+	execCommandRunner = func(_ context.Context, _ string, _ []string,
+		name string, args ...string) (string, error) {
+		if name != "git" || args[0] != "diff" {
+			t.Fatalf("unexpected command %s %v", name, args)
+		}
+		return "", nil
+	}
+
+	// A fake that reports no open PR for the head: UpdatePR returns ("", nil).
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "", noPR: true}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
+	workspace := t.TempDir()
+
+	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
+		"foreman/wl-x/issue-7", "Revised summary of the amendment.",
+		workspace, "main", nil, "")
+
+	if len(fe.updates) != 0 {
+		t.Fatalf("no update should be issued when no PR exists; got %+v", fe.updates)
+	}
+}
+
+// TestMaybeRefreshPRBody_SkipsEmptySummary: an empty coder summary leaves the
+// PR untouched rather than blanking it.
+func TestMaybeRefreshPRBody_SkipsEmptySummary(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
+
+	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
+		"foreman/wl-x/issue-7", "   ", "", "", nil, "")
+
+	if len(fe.updates) != 0 {
+		t.Fatalf("empty summary must not PATCH the PR; got %+v", fe.updates)
+	}
+}
+
+// TestMaybeRefreshPRBody_DisabledWhenNoCodeHost: a nil CodeHost/PREnsurer is
+// a no-op, so a run that never configured PR access does not error.
+func TestMaybeRefreshPRBody_DisabledWhenNoCodeHost(t *testing.T) {
+	e := &NativeAgentLoopExecutor{}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
+	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
+		"foreman/wl-x/issue-7", "Revised summary.", "", "", nil, "")
 }

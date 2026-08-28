@@ -1162,6 +1162,20 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	r := e.goResult(start, transcriptRef, loopRes, branch, sha)
 	attachGateAdvisories(r.Extra, gateAdvisories)
 	r = e.applyWorkClassPolicyForTask(ctx, log, task, agent, workspace, evidenceBaseSHA, loopRes, r)
+	// #1567: refresh the PR body after a fix cycle. The PR was opened by a
+	// reviewer GO; a later issue-fix that GOed its amendment pushed a new
+	// head but has no reviewer to re-author the description, so the body
+	// stays frozen at the first attempt. Re-point it at what the amended
+	// branch now contains, grounded against that branch's diff (#1411) and
+	// using the coder's own summary rather than synthesizing a reviewer
+	// verdict. Best-effort: a missing PR, a git failure, or GitHub being
+	// down all leave the stale body in place and log. The amended
+	// branch's diff against baseBranch is what the summary is grounded
+	// against, so a fix cycle cannot write an ungrounded claim into the
+	// PR body (#1411).
+	amendedDiff, _ := repo.DiffNameOnly(ctx, workspace, baseBranch)
+	e.maybeRefreshPRBody(ctx, log, task, auth, branch, r.Summary,
+		workspace, baseBranch, amendedDiff, cloneURL)
 	return r, nil
 }
 
@@ -2118,6 +2132,70 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 	log.Info("PR body: summary claims not found in the branch diff; annotating",
 		"claims", unverified, "base", reviewBase)
 	return body
+}
+
+// maybeRefreshPRBody refreshes an existing PR's body after a fix cycle
+// (#1567). The PR was opened by a reviewer GO; a later issue-fix that GOed
+// its amendment pushed a new head but has no reviewer to re-author the
+// description, so the body stays frozen at the first attempt. Re-point it
+// at what the amended branch now contains, using the coder's own summary
+// as the description rather than synthesizing a second reviewer verdict.
+//
+// The summary is grounded against the amended branch's diff the same way
+// the opened body is (#1411): concrete claims the diff does not support
+// get a visible note appended, so a fix cycle cannot write an ungrounded
+// claim into a PR body. The workspace and review base/diff are threaded
+// through so this path shares groundPRSummary's exact grounding.
+//
+// Best-effort and idempotent: it PATCHes the PR only when one already
+// exists, and any failure (no PR for the head, GitHub down) logs and
+// leaves the stale body in place. Coder-role only in practice — the
+// mainline GO path is the only caller, and it fires for issue-fix /
+// freeform / integrate / reconcile GOs, none of which have a reviewer.
+func (e *NativeAgentLoopExecutor) maybeRefreshPRBody(
+	ctx context.Context, log logr.Logger,
+	task *foremanv1alpha1.AgenticTask, auth *repo.Auth,
+	branch, summary, workspace, reviewBase string, reviewDiff []string,
+	cloneURL string,
+) {
+	ch := e.codeHost(authToken(auth))
+	if ch == nil {
+		return
+	}
+	if strings.TrimSpace(summary) == "" || workspace == "" || reviewBase == "" {
+		return
+	}
+	// Ground the summary against the amended branch's diff before it
+	// becomes the PR body (#1411). The refreshed body must be grounded
+	// the same way the opened body is; passing the raw summary through
+	// would regress that fix.
+	body := e.groundPRSummary(ctx, log, &Result{Summary: summary},
+		workspace, reviewBase, reviewDiff)
+	// Same fork-qualification as openPullRequest: a cross-fork head must
+	// be qualified "forkOwner:branch" so the PATCH targets the PR in the
+	// fork where the head branch actually lives.
+	head := branch
+	if forkOwner, _ := gitRemoteOwnerRepo(cloneURL); forkOwner != "" {
+		head = forkOwner + ":" + branch
+	}
+	prURL, err := ch.PullRequestUpdate(ctx, task.Spec.Payload.Repo, head, body)
+	// Three outcomes, and only one of them is a failure. A real error is
+	// worth an error line. ("", nil) means there is simply no open PR for
+	// this head yet -- the ordinary case on a first GO, before any PR
+	// exists -- and logging that at error level with a nil error would put
+	// a spurious error in the record on nearly every run.
+	switch {
+	case err != nil:
+		log.Error(err, "PR body refresh failed after fix cycle",
+			"repo", task.Spec.Payload.Repo, "branch", branch)
+		return
+	case prURL == "":
+		log.V(1).Info("no open PR for head; nothing to refresh",
+			"repo", task.Spec.Payload.Repo, "branch", branch)
+		return
+	}
+	log.Info("PR body refreshed after fix cycle",
+		"repo", task.Spec.Payload.Repo, "branch", branch, "pr", prURL)
 }
 
 // openPullRequest ensures the PR for the task's branch exists: title

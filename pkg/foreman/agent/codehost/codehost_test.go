@@ -27,7 +27,8 @@ import (
 type fakeEnsurer struct {
 	ensurePRFunc func(ctx context.Context, owner, repo, head, base, title,
 		body string, draft bool, token string) (*githubpr.Result, error)
-	commitFunc func(ctx context.Context, owner, repo, ref, token string) string
+	commitFunc   func(ctx context.Context, owner, repo, ref, token string) string
+	updatePRFunc func(ctx context.Context, owner, repo, head, body, token string) (string, error)
 }
 
 func (f *fakeEnsurer) EnsurePR(ctx context.Context, owner, repo, head,
@@ -37,6 +38,13 @@ func (f *fakeEnsurer) EnsurePR(ctx context.Context, owner, repo, head,
 		return f.ensurePRFunc(ctx, owner, repo, head, base, title, body, draft, token)
 	}
 	return nil, nil
+}
+
+func (f *fakeEnsurer) UpdatePR(ctx context.Context, owner, repo, head, body, token string) (string, error) {
+	if f.updatePRFunc != nil {
+		return f.updatePRFunc(ctx, owner, repo, head, body, token)
+	}
+	return "", nil
 }
 
 func (f *fakeEnsurer) HeadCommitSubject(ctx context.Context, owner, repo, ref, token string) string {
@@ -157,6 +165,7 @@ func TestEnsureChangeRequest(t *testing.T) {
 		body       string
 		ensurePR   func(ctx context.Context, owner, repo, head, base, title,
 			body string, draft bool, token string) (*githubpr.Result, error)
+		updatePR    func(ctx context.Context, owner, repo, head, body, token string) (string, error)
 		wantURL     string
 		wantCreated bool
 		wantErr     bool
@@ -218,6 +227,26 @@ func TestEnsureChangeRequest(t *testing.T) {
 			wantURL:     "https://github.com/group/subgroup/project/pull/1",
 			wantCreated: true,
 		},
+		{
+			name:       "refreshes body when PR already exists",
+			repoSlug:   "defilantech/llmkube",
+			headBranch: "foreman/wl-x/issue-7",
+			baseBranch: "main",
+			title:      "Fix the thing",
+			body:       "Fixes #7",
+			ensurePR: func(ctx context.Context, owner, repo, head, base, title,
+				body string, draft bool, token string) (*githubpr.Result, error) {
+				return &githubpr.Result{URL: "https://github.com/defilantech/llmkube/pull/4", Created: false}, nil
+			},
+			updatePR: func(ctx context.Context, owner, repo, head, b, token string) (string, error) {
+				if b != "Fixes #7" {
+					t.Errorf("UpdatePR body = %q, want %q", b, "Fixes #7")
+				}
+				return "https://github.com/defilantech/llmkube/pull/4", nil
+			},
+			wantURL:     "https://github.com/defilantech/llmkube/pull/4",
+			wantCreated: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -225,6 +254,7 @@ func TestEnsureChangeRequest(t *testing.T) {
 			g := &GitHubCodeHost{
 				Ensurer: &fakeEnsurer{
 					ensurePRFunc: tc.ensurePR,
+					updatePRFunc: tc.updatePR,
 				},
 			}
 
@@ -242,6 +272,38 @@ func TestEnsureChangeRequest(t *testing.T) {
 				t.Errorf("EnsureChangeRequest() created = %v, want %v", created, tc.wantCreated)
 			}
 		})
+	}
+}
+
+// TestPullRequestUpdate_CallsUpdatePR pins the #1567 refresh seam: the
+// codehost forwards the body to the Ensurer's UpdatePR with the slug
+// split into owner/repo, and a malformed slug is refused before it
+// reaches the Ensurer.
+func TestPullRequestUpdate_CallsUpdatePR(t *testing.T) {
+	var gotOwner, gotRepo, gotHead, gotBody, gotToken string
+	g := &GitHubCodeHost{
+		Ensurer: &fakeEnsurer{
+			updatePRFunc: func(_ context.Context, owner, repo, head, body, token string) (string, error) {
+				gotOwner, gotRepo, gotHead, gotBody, gotToken = owner, repo, head, body, token
+				return "https://github.com/defilantech/llmkube/pull/4", nil
+			},
+		},
+		Token: "tok",
+	}
+
+	url, err := g.PullRequestUpdate(context.Background(),
+		"defilantech/llmkube", "foreman/wl-x/issue-7", "Fixes #7 (revised)")
+	if err != nil {
+		t.Fatalf("PullRequestUpdate() error = %v", err)
+	}
+	if url != "https://github.com/defilantech/llmkube/pull/4" {
+		t.Errorf("PullRequestUpdate() url = %q", url)
+	}
+	if gotOwner != "defilantech" || gotRepo != "llmkube" ||
+		gotHead != "foreman/wl-x/issue-7" ||
+		gotBody != "Fixes #7 (revised)" || gotToken != "tok" {
+		t.Errorf("UpdatePR args wrong: owner=%q repo=%q head=%q body=%q token=%q",
+			gotOwner, gotRepo, gotHead, gotBody, gotToken)
 	}
 }
 

@@ -191,6 +191,74 @@ func TestEnsurePR_ForkQualifiedHeadUsedVerbatim(t *testing.T) {
 	}
 }
 
+// TestUpdatePR_PatchesExistingPR covers the #1567 fix path: a fix cycle
+// refreshes an existing PR's body. UpdatePR lists open PRs filtered on
+// the head to resolve the number, then PATCHes that PR's body.
+func TestUpdatePR_PatchesExistingPR(t *testing.T) {
+	var patchBody string
+	var listHead string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		listHead = r.URL.Query().Get("head")
+		_, _ = w.Write([]byte(`[{"number":42,"html_url":"https://github.com/o/r/pull/42","state":"open"}]`))
+	})
+	mux.HandleFunc("PATCH /repos/o/r/pulls/42", func(w http.ResponseWriter, r *http.Request) {
+		var req map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		patchBody = req["body"]
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"html_url":"https://github.com/o/r/pull/42"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+
+	url, err := c.UpdatePR(context.Background(), "o", "r",
+		"foreman/wl-x/issue-7", "Fixes #7 (revised)", "tok")
+	if err != nil {
+		t.Fatalf("UpdatePR: %v", err)
+	}
+	if url != "https://github.com/o/r/pull/42" {
+		t.Fatalf("want PR 42, got %q", url)
+	}
+	if listHead != "o:foreman/wl-x/issue-7" {
+		t.Errorf("list head filter: got %q", listHead)
+	}
+	if patchBody != "Fixes #7 (revised)" {
+		t.Errorf("PATCH body: got %q", patchBody)
+	}
+}
+
+// TestUpdatePR_ReturnsEmptyWhenNoOpenPR: a head with no open PR leaves
+// nothing to PATCH, so UpdatePR returns an empty URL and no error — the
+// caller keeps whatever body it has.
+func TestUpdatePR_ReturnsEmptyWhenNoOpenPR(t *testing.T) {
+	var patchCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/o/r/pulls", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("[]"))
+	})
+	mux.HandleFunc("PATCH /repos/o/r/pulls/42", func(w http.ResponseWriter, r *http.Request) {
+		patchCalls++
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &Client{HTTPClient: srv.Client(), BaseURL: srv.URL}
+
+	url, err := c.UpdatePR(context.Background(), "o", "r",
+		"foreman/wl-x/issue-7", "Fixes #7 (revised)", "tok")
+	if err != nil {
+		t.Fatalf("UpdatePR: %v", err)
+	}
+	if url != "" {
+		t.Errorf("want empty URL when no open PR, got %q", url)
+	}
+	if patchCalls != 0 {
+		t.Errorf("no PATCH should be issued without an open PR; got %d", patchCalls)
+	}
+}
+
 // TestEnsurePR_FindByHeadStateLogic covers the three-way state logic:
 // open PR preferred, merged PR reused, closed-unmerged triggers a new PR.
 func TestEnsurePR_FindByHeadStateLogic(t *testing.T) {

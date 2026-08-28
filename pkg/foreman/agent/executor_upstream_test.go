@@ -160,6 +160,10 @@ func (r *recordingCodeHost) EnsureChangeRequest(
 	return "", false, nil
 }
 
+func (r *recordingCodeHost) PullRequestUpdate(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
+
 func (r *recordingCodeHost) HeadCommitSubject(context.Context, string, string) (string, error) {
 	return "", nil
 }
