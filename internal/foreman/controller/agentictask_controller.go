@@ -190,7 +190,24 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if depName, depState, err := r.cascadeSkipIfDepResolvedOrSkipped(ctx, &task); err != nil {
 		return ctrl.Result{}, err
 	} else if depName != "" {
-		return r.skipTask(ctx, &task, depName, depState)
+		return r.skipTask(ctx, &task, depName, depState, false)
+	}
+
+	// Cascade-skip if any dependency ended with a cross-stage contradiction.
+	// An ALREADY-RESOLVED dependency is a terminal non-failure (the work is
+	// already on the branch), while a contradicted dependency is an unresolved
+	// question: two independent witnesses disagreeing is the strongest evidence
+	// that something is wrong, so shipping work built on it is exactly the
+	// failure the detection was built to prevent. The contradiction check runs
+	// AFTER the already-resolved check so a dep that is both resolved and
+	// contradicted stays skipped as already-resolved (the benign signal wins
+	// over the stop signal), and a contradicted dep is skipped rather than
+	// cascade-failed so the rollup excludes it from every bucket instead of
+	// pinning the Workload to Failed.
+	if depName, contradiction, err := r.cascadeSkipIfDepContradicted(ctx, &task); err != nil {
+		return ctrl.Result{}, err
+	} else if depName != "" {
+		return r.skipTask(ctx, &task, depName, fmt.Sprintf("contradiction: %s", contradiction), true)
 	}
 
 	// Cascade-fail if any dependency has Failed.
@@ -818,26 +835,39 @@ func (r *AgenticTaskReconciler) failTask(ctx context.Context, task *foremanv1alp
 
 // skipTask transitions a Pending task to Phase=Succeeded + Verdict=Skipped
 // because its dependency ended ALREADY-RESOLVED or was itself Skipped
-// (#970, transitive #1688). The Workload rollup recognizes Skipped as a
-// terminal-non-failure shape that is excluded from every bucket; the
-// dependent's execution never happened, so no FailureReason is set (the
-// cause is upstream, recorded in the condition message). The Failed
-// condition is NOT set — this is the explicit non-failure path.
+// (#970, transitive #1688), or ended with a cross-stage contradiction
+// (#1686). The Workload rollup recognizes Skipped as a terminal-non-failure
+// shape that is excluded from every bucket; the dependent's execution never
+// happened, so no FailureReason is set (the cause is upstream, recorded in
+// the condition message). The Failed condition is NOT set — this is the
+// explicit non-failure path.
 //
 // depState is the dependency's own terminal state string ("ALREADY-RESOLVED"
 // or "Skipped"), threaded through so the condition message names the actual
 // reason rather than always saying ALREADY-RESOLVED for a transitive skip.
-func (r *AgenticTaskReconciler) skipTask(ctx context.Context, task *foremanv1alpha1.AgenticTask, depName, depState string) (ctrl.Result, error) {
+// When contradicted is true the dependency ended with a cross-stage
+// contradiction: skipTask stamps the distinct UpstreamContradicted reason and
+// names both the dependency and the contradiction text, so this stop signal
+// stays alertable separately from the benign UpstreamAlreadyResolved reason.
+func (r *AgenticTaskReconciler) skipTask(ctx context.Context, task *foremanv1alpha1.AgenticTask, depName, depState string, contradicted bool) (ctrl.Result, error) {
 	patch := client.MergeFrom(task.DeepCopy())
 	now := metav1.Now()
 	task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
 	task.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictSkipped
 	task.Status.FinishedAt = &now
+	reason := "UpstreamAlreadyResolved"
+	var message string
+	if contradicted {
+		reason = "UpstreamContradicted"
+		message = fmt.Sprintf("dependency %q ended with a contradiction; dependent skipped (%s)", depName, depState)
+	} else {
+		message = fmt.Sprintf("dependency %q ended %s; dependent skipped", depName, depState)
+	}
 	setCondition(&task.Status.Conditions, metav1.Condition{
 		Type:               "Skipped",
 		Status:             metav1.ConditionTrue,
-		Reason:             "UpstreamAlreadyResolved",
-		Message:            fmt.Sprintf("dependency %q ended %s; dependent skipped", depName, depState),
+		Reason:             reason,
+		Message:            message,
 		LastTransitionTime: now,
 	})
 	return ctrl.Result{}, r.Status().Patch(ctx, task, patch)
@@ -870,6 +900,46 @@ func (r *AgenticTaskReconciler) cascadeSkipIfDepResolvedOrSkipped(ctx context.Co
 		if isSkippedTask(&dep) {
 			return depName, "Skipped", nil
 		}
+	}
+	return "", "", nil
+}
+
+// cascadeSkipIfDepContradicted returns the first dependency that ended with a
+// cross-stage contradiction (a non-empty extra.crossStageContradictions in its
+// terminal result envelope, #1686), or "" if none. The second return value is
+// the contradiction text (the first contradiction string) the caller threads
+// into the skip condition message. The caller transitions the dependent to
+// Skipped; see skipTask. Runs AFTER cascadeSkipIfDepResolvedOrSkipped in
+// Reconcile so a dependency that is both ALREADY-RESOLVED and contradicted
+// stays skipped as already-resolved (the benign terminal non-failure wins over
+// the stop signal), and runs BEFORE cascadeFailIfDepFailed so the contradiction
+// skips the dependent rather than cascade-failing it (which would pin the
+// Workload to Failed).
+//
+// Uses hasCrossStageContradiction / coderCrossStageContradictions from the
+// predecessor issue (#1685) rather than re-deriving the signal: the detector
+// writes the contradiction list in the coder / gate / reviewer wiring, and the
+// controller only reads it. Blocking here is dependents-only: the contradicting
+// task's own verdict and phase are left untouched (demoting it was considered
+// and rejected — it would turn a records-only rail into a verdict-changing one).
+func (r *AgenticTaskReconciler) cascadeSkipIfDepContradicted(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, string, error) {
+	for _, depName := range task.Spec.DependsOn {
+		var dep foremanv1alpha1.AgenticTask
+		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: depName}, &dep); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return "", "", err
+		}
+		if !hasCrossStageContradiction(&dep) {
+			continue
+		}
+		cs := coderCrossStageContradictions(&dep)
+		contradiction := ""
+		if len(cs) > 0 {
+			contradiction = cs[0]
+		}
+		return depName, contradiction, nil
 	}
 	return "", "", nil
 }
