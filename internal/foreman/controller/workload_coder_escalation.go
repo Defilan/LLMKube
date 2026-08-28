@@ -122,12 +122,14 @@ func isAlreadyResolvedCoder(task *foremanv1alpha1.AgenticTask) bool {
 }
 
 // isSkippedTask reports whether the task was skipped because its
-// dependency ended ALREADY-RESOLVED (#970). The cascade path in
-// agentictask_controller.transitionToSkippedIfDepAlreadyResolved
-// stamps Phase=Succeeded + Verdict=Skipped on the dependent; the
-// rollup excludes Skipped tasks from every bucket (succeeded,
-// incomplete, failed, inFlight, alreadyResolved) so they don't pin
-// the Workload to Failed.
+// dependency ended ALREADY-RESOLVED or was itself Skipped (#970,
+// transitive #1688). The cascade path in
+// agentictask_controller.cascadeSkipIfDepResolvedOrSkipped stamps
+// Phase=Succeeded + Verdict=Skipped on the dependent; the rollup
+// excludes Skipped tasks from every bucket (succeeded, incomplete,
+// failed, inFlight, alreadyResolved) so they don't pin the Workload
+// to Failed. Reused by that cascade path so there is a single
+// predicate for the skip state rather than a second copy.
 func isSkippedTask(task *foremanv1alpha1.AgenticTask) bool {
 	if task == nil {
 		return false

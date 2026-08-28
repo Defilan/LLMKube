@@ -179,17 +179,18 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	// Cascade-skip if any dependency ended ALREADY-RESOLVED (#970). The
-	// dependent cannot meaningfully run (the work is already on the branch);
-	// mark it Skipped (Phase=Succeeded + Verdict=Skipped) so the rollup
-	// excludes it from every bucket instead of cascade-failing it (which
-	// would land at Phase=Failed and pin the Workload to Failed). The skip
-	// check runs before the cascade-fail check so an ALREADY-RESOLVED dep
-	// never trips the "terminal without success" branch.
-	if depName, err := r.cascadeSkipIfDepAlreadyResolved(ctx, &task); err != nil {
+	// Cascade-skip if any dependency ended ALREADY-RESOLVED or was itself
+	// Skipped (#970, transitive #1688). The dependent cannot meaningfully
+	// run (the work is already on the branch, or an upstream stage had
+	// nothing to do); mark it Skipped (Phase=Succeeded + Verdict=Skipped)
+	// so the rollup excludes it from every bucket instead of cascade-failing
+	// it (which would land at Phase=Failed and pin the Workload to Failed).
+	// The skip check runs before the cascade-fail check so a resolved/skipped
+	// dep never trips the "terminal without success" branch.
+	if depName, depState, err := r.cascadeSkipIfDepResolvedOrSkipped(ctx, &task); err != nil {
 		return ctrl.Result{}, err
 	} else if depName != "" {
-		return r.skipTask(ctx, &task, depName)
+		return r.skipTask(ctx, &task, depName, depState)
 	}
 
 	// Cascade-fail if any dependency has Failed.
@@ -816,13 +817,17 @@ func (r *AgenticTaskReconciler) failTask(ctx context.Context, task *foremanv1alp
 }
 
 // skipTask transitions a Pending task to Phase=Succeeded + Verdict=Skipped
-// because its dependency ended ALREADY-RESOLVED (#970). The Workload
-// rollup recognizes Skipped as a terminal-non-failure shape that is
-// excluded from every bucket; the dependent's execution never happened,
-// so no FailureReason is set (the cause is upstream, recorded in the
-// condition message). The Failed condition is NOT set — this is the
-// explicit non-failure path.
-func (r *AgenticTaskReconciler) skipTask(ctx context.Context, task *foremanv1alpha1.AgenticTask, depName string) (ctrl.Result, error) {
+// because its dependency ended ALREADY-RESOLVED or was itself Skipped
+// (#970, transitive #1688). The Workload rollup recognizes Skipped as a
+// terminal-non-failure shape that is excluded from every bucket; the
+// dependent's execution never happened, so no FailureReason is set (the
+// cause is upstream, recorded in the condition message). The Failed
+// condition is NOT set — this is the explicit non-failure path.
+//
+// depState is the dependency's own terminal state string ("ALREADY-RESOLVED"
+// or "Skipped"), threaded through so the condition message names the actual
+// reason rather than always saying ALREADY-RESOLVED for a transitive skip.
+func (r *AgenticTaskReconciler) skipTask(ctx context.Context, task *foremanv1alpha1.AgenticTask, depName, depState string) (ctrl.Result, error) {
 	patch := client.MergeFrom(task.DeepCopy())
 	now := metav1.Now()
 	task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
@@ -832,31 +837,41 @@ func (r *AgenticTaskReconciler) skipTask(ctx context.Context, task *foremanv1alp
 		Type:               "Skipped",
 		Status:             metav1.ConditionTrue,
 		Reason:             "UpstreamAlreadyResolved",
-		Message:            fmt.Sprintf("dependency %q ended ALREADY-RESOLVED; dependent skipped", depName),
+		Message:            fmt.Sprintf("dependency %q ended %s; dependent skipped", depName, depState),
 		LastTransitionTime: now,
 	})
 	return ctrl.Result{}, r.Status().Patch(ctx, task, patch)
 }
 
-// cascadeSkipIfDepAlreadyResolved returns the first dependency that ended
-// ALREADY-RESOLVED (#970), or "" if none. The caller transitions the
-// dependent to Skipped; see skipTask. Runs before cascadeFailIfDepFailed
-// in Reconcile so an ALREADY-RESOLVED dep never trips the
-// "terminal without success" branch.
-func (r *AgenticTaskReconciler) cascadeSkipIfDepAlreadyResolved(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, error) {
+// cascadeSkipIfDepResolvedOrSkipped returns the first dependency that ended
+// ALREADY-RESOLVED (#970) OR was itself Skipped, or "" if none. The caller
+// transitions the dependent to Skipped; see skipTask. Runs before
+// cascadeFailIfDepFailed in Reconcile so a resolved/skipped dep never trips
+// the "terminal without success" branch.
+//
+// Transitivity: a dependency that was itself cascade-skipped (because ITS
+// dependency ended ALREADY-RESOLVED) would otherwise fall through to
+// cascadeFailIfDepFailed, which treats verdict=Skipped as "terminal without
+// success" and cascade-fails the dependent. Checking isSkippedTask here makes
+// the skip walk the whole dependency chain rather than stopping after one
+// hop. Fixes defilantech/LLMKube#1688.
+func (r *AgenticTaskReconciler) cascadeSkipIfDepResolvedOrSkipped(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, string, error) {
 	for _, depName := range task.Spec.DependsOn {
 		var dep foremanv1alpha1.AgenticTask
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: depName}, &dep); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return "", err
+			return "", "", err
 		}
 		if isAlreadyResolvedCoder(&dep) {
-			return depName, nil
+			return depName, "ALREADY-RESOLVED", nil
+		}
+		if isSkippedTask(&dep) {
+			return depName, "Skipped", nil
 		}
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // checkClaimExpiry inspects the FleetNode named by task.status.assignedNode.

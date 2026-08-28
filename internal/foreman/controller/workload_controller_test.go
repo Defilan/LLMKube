@@ -1015,6 +1015,50 @@ var _ = Describe("WorkloadReconciler (M6 stub planner)", func() {
 		Expect(got["99"]).To(Equal("sha-99"))
 	})
 
+	It("rolls up a Workload whose verify child is cascade-Skipped to Completed (#1688)", func() {
+		// A three-task chain whose code child ends ALREADY-RESOLVED: the
+		// verify child is cascade-skipped (production path) and the
+		// Workload must roll to Completed, not Failed. The ALREADY-RESOLVED
+		// coder is counted in the alreadyResolved bucket, which the
+		// all-on-target case checks for before it would otherwise report
+		// "0/N on-target" for the Skipped verify child.
+		wl := newWorkload("rollup-skip-verify", foremanv1alpha1.WorkloadSpec{
+			Intent:           "verify cascade-skipped because code ALREADY-RESOLVED",
+			Repo:             "defilantech/LLMKube",
+			Issues:           []int32{152},
+			CoderAgentRef:    &corev1.LocalObjectReference{Name: "coder"},
+			VerifierAgentRef: &corev1.LocalObjectReference{Name: "gate"},
+		})
+		Expect(k8sClient.Create(ctx, wl)).To(Succeed())
+		DeferCleanup(func() {
+			cleanupChildren(wl)
+			_ = k8sClient.Delete(ctx, wl)
+		})
+
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var c foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "rollup-skip-verify-code-152"}, &c)).To(Succeed())
+		patch := client.MergeFrom(c.DeepCopy())
+		c.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+		c.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictNoGo
+		c.Status.Result = resultRaw("ALREADY-RESOLVED", "", "already done", "abc123def")
+		Expect(k8sClient.Status().Patch(ctx, &c, patch)).To(Succeed())
+		markVerifySkipped("rollup-skip-verify", 152)
+
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(wl)})
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.Workload
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wl), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.WorkloadPhaseCompleted))
+		Expect(fresh.Status.FailedTasks).To(Equal(int32(0)))
+		completed := findCondition(fresh.Status.Conditions, conditionTypeCompleted)
+		Expect(completed).NotTo(BeNil())
+		Expect(completed.Reason).To(Equal("AllAlreadyResolved"))
+	})
+
 	It("fails the Workload when gate passes but any reviewer emits NO-GO (#575)", func() {
 		// v0.4 regression test: this lock-in confirms the
 		// cascade-on-verdict behavior from #541 also catches the
