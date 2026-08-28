@@ -197,6 +197,61 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(failedCond.Message).To(ContainSubstring(dep.Name))
 	})
 
+	// Regression for defilantech/LLMKube#1644. Directly exercise
+	// cascadeFailIfDepFailed to pin the reason each dependency kind
+	// produces: UpstreamNeedsVerification for a NEEDS-VERIFICATION
+	// dependency, UpstreamFailed for a genuine failure, and "" when the
+	// dependency is on-target. The reason threads into the Failed
+	// condition in Reconcile, so this is the unit contract Reconcile
+	// relies on.
+	It("cascadeFailIfDepFailed reports UpstreamNeedsVerification for a NEEDS-VERIFICATION dep (#1644)", func() {
+		task := newTask("cfidf-task")
+		dep := newTask("cfidf-verify-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		patch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictNoGo
+		dep.Status.Result = &runtime.RawExtension{
+			Raw: []byte(`{"summary":"ungroundable","extra":{"outcome":"NEEDS-VERIFICATION"}}`),
+		}
+		Expect(k8sClient.Status().Patch(ctx, dep, patch)).To(Succeed())
+		task.Spec.DependsOn = []string{dep.Name}
+
+		reason, msg, err := reconciler.cascadeFailIfDepFailed(ctx, task)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reason).To(Equal("UpstreamNeedsVerification"))
+		Expect(msg).To(ContainSubstring(dep.Name))
+	})
+
+	It("cascadeFailIfDepFailed reports UpstreamFailed for a genuine failure (#1644)", func() {
+		task := newTask("cfidf-failed-task")
+		dep := newTask("cfidf-failed-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseFailed)
+		task.Spec.DependsOn = []string{dep.Name}
+
+		reason, msg, err := reconciler.cascadeFailIfDepFailed(ctx, task)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reason).To(Equal("UpstreamFailed"))
+		Expect(msg).To(ContainSubstring(dep.Name))
+	})
+
+	It("cascadeFailIfDepFailed returns empty for an on-target dependency (#1644)", func() {
+		task := newTask("cfidf-ok-task")
+		dep := newTask("cfidf-ok-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		task.Spec.DependsOn = []string{dep.Name}
+
+		reason, msg, err := reconciler.cascadeFailIfDepFailed(ctx, task)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(reason).To(BeEmpty())
+		Expect(msg).To(BeEmpty())
+	})
+
 	// Regression for defilantech/LLMKube#970. A Pending task whose
 	// dependency ended ALREADY-RESOLVED (Phase=Succeeded +
 	// Verdict=NO-GO + extra.outcome="ALREADY-RESOLVED") must NOT be

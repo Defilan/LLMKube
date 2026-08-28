@@ -223,11 +223,16 @@ func (r *AgenticTaskReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.failTask(ctx, &task, "MissingDependency", missingMsg)
 	}
 
-	// Cascade-fail if any dependency has Failed.
-	if cascadeMsg, err := r.cascadeFailIfDepFailed(ctx, &task); err != nil {
+	// Cascade-fail if any dependency is terminal-without-success
+	// (Failed, or Succeeded with a verdict that produced no usable
+	// output). The dependency's own reason (UpstreamFailed for a
+	// genuine failure, UpstreamNeedsVerification for a NEEDS-VERIFICATION
+	// dependency, #1644) threads into the Failed condition so it is
+	// alertable separately.
+	if cascadeReason, cascadeMsg, err := r.cascadeFailIfDepFailed(ctx, &task); err != nil {
 		return ctrl.Result{}, err
-	} else if cascadeMsg != "" {
-		return r.failTask(ctx, &task, "UpstreamFailed", cascadeMsg)
+	} else if cascadeReason != "" {
+		return r.failTask(ctx, &task, cascadeReason, cascadeMsg)
 	}
 
 	// Wait if any dependency is still pre-terminal.
@@ -439,33 +444,27 @@ func (r *AgenticTaskReconciler) setInitialPending(ctx context.Context, task *for
 	return ctrl.Result{}, nil
 }
 
-// cascadeFailIfDepFailed returns a non-empty message if any dependency
-// is terminal-without-success; the caller fails the task with that
-// message.
-//
-// "Terminal without success" means either:
-//   - Phase=Failed (executor errored out), OR
-//   - Phase=Succeeded but verdict in {INCOMPLETE, NO-GO, GATE-FAIL,
-//     GATE-ERROR}. The dep is done, but it did not produce a usable
-//     artifact. A downstream verify task should not run against a
-//     branch the coder never pushed; a downstream review task should
-//     not run against a coder verdict that already declined.
-//
-// Previously this gated on Phase=Failed only, which leaked INCOMPLETE
-// coder tasks through to their downstream verifiers and made the
-// downstream task fail GATE-FAIL on a clone-of-nonexistent-branch
-// (the wrong reason). Fixes defilantech/LLMKube#541.
-func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task *foremanv1alpha1.AgenticTask) (string, error) {
+// cascadeFailIfDepFailed returns the first dependency that is
+// terminal-without-success (Phase=Failed, or Phase=Succeeded with a
+// verdict that produced no usable artifact) and the reason + message the
+// caller threads into the Failed condition. The reason is "UpstreamFailed"
+// for a genuinely failed dependency, or "UpstreamNeedsVerification" for a
+// NEEDS-VERIFICATION dependency (#1644): a terminal non-failure the coder
+// could not finish because a load-bearing external fact was ungroundable
+// from the workspace (#1033). The work is not done and cannot be done
+// here, so the dependent must fail — not skip — but with a reason distinct
+// from a coder that gave up partway.
+func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task *foremanv1alpha1.AgenticTask) (reason, msg string, err error) {
 	for _, depName := range task.Spec.DependsOn {
 		var dep foremanv1alpha1.AgenticTask
 		if err := r.Get(ctx, types.NamespacedName{Namespace: task.Namespace, Name: depName}, &dep); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return "", err
+			return "", "", err
 		}
 		if dep.Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed {
-			return fmt.Sprintf("dependency %q failed; cascade-failing", depName), nil
+			return "UpstreamFailed", fmt.Sprintf("dependency %q failed; cascade-failing", depName), nil
 		}
 		// Phase=Succeeded but verdict not on-target = terminal without
 		// usable output. Cascade-fail so dependents don't run against
@@ -481,15 +480,15 @@ func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task
 			// NEEDS-VERIFICATION dependency must NOT unblock
 			// dependents (unverified work must not be shipped), so
 			// this is a fail, not a skip — skip means "there was
-			// nothing to do", which is false here.
+			// nothing to do", which is false here. See #1644.
 			if isNeedsVerificationCoder(&dep) {
-				return fmt.Sprintf("dependency %q ended NEEDS-VERIFICATION; dependent fails", depName), nil
+				return "UpstreamNeedsVerification", fmt.Sprintf("dependency %q ended NEEDS-VERIFICATION; dependent fails", depName), nil
 			}
-			return fmt.Sprintf("dependency %q ended with verdict=%s (not on-target); cascade-failing",
+			return "UpstreamFailed", fmt.Sprintf("dependency %q ended with verdict=%s (not on-target); cascade-failing",
 				depName, dep.Status.Verdict), nil
 		}
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // allDepsSucceeded returns true only when every dependency exists in
