@@ -338,3 +338,122 @@ func TestRollup_ContradictedTasksAndCondition(t *testing.T) {
 		t.Errorf("condition message does not name the first contradiction: %q", cond.Message)
 	}
 }
+
+// TestClassifyChildren_NeedsVerification locks in the rollup bucket for a
+// NEEDS-VERIFICATION coder result (#1644): a NO-GO + extra.outcome=
+// "NEEDS-VERIFICATION" is a terminal non-failure the coder could not finish
+// (a load-bearing external fact was ungroundable, #1033). It is NOT
+// incomplete — the model believes it is done and nothing confirmed it,
+// which is distinct from a coder that gave up partway. The bucket is
+// currently pinned by nothing, so this test asserts the observable shape
+// directly.
+//
+// This is the mutation that must fail: the NEEDS-VERIFICATION case sits
+// BEFORE the generic `case Status.Phase == Succeeded` arm. Moving it after
+// that arm (the bug this issue records) makes it fall through to
+// `c.incomplete++` and the needsVerification count goes to zero. A test
+// that only asserted the field existed would pass with the bug present.
+func TestClassifyChildren_NeedsVerification(t *testing.T) {
+	needsVerification := func(verdict foremanv1alpha1.AgenticTaskVerdict) foremanv1alpha1.AgenticTask {
+		return foremanv1alpha1.AgenticTask{
+			Status: foremanv1alpha1.AgenticTaskStatus{
+				Phase:   foremanv1alpha1.AgenticTaskPhaseSucceeded,
+				Verdict: verdict,
+				Result:  resultRaw("NEEDS-VERIFICATION", "", "could not ground external fact", ""),
+			},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		tasks           []foremanv1alpha1.AgenticTask
+		wantSucceeded   int32
+		wantIncomplete  int32
+		wantNeedsVerify int32
+	}{
+		{
+			name:            "genuine INCOMPLETE still counts as incomplete, not needs-verification",
+			tasks:           []foremanv1alpha1.AgenticTask{{Status: foremanv1alpha1.AgenticTaskStatus{Phase: foremanv1alpha1.AgenticTaskPhaseSucceeded, Verdict: foremanv1alpha1.AgenticTaskVerdictIncomplete, Result: resultRaw("MODEL-DECIDED", "", "gave up", "")}}},
+			wantIncomplete:  1,
+			wantNeedsVerify: 0,
+		},
+		{
+			name:            "a NEEDS-VERIFICATION child counts in needsVerification, not incomplete",
+			tasks:           []foremanv1alpha1.AgenticTask{needsVerification(foremanv1alpha1.AgenticTaskVerdictNoGo)},
+			wantIncomplete:  0,
+			wantNeedsVerify: 1,
+		},
+		{
+			name:            "both together count one each",
+			tasks:           []foremanv1alpha1.AgenticTask{{Status: foremanv1alpha1.AgenticTaskStatus{Phase: foremanv1alpha1.AgenticTaskPhaseSucceeded, Verdict: foremanv1alpha1.AgenticTaskVerdictIncomplete, Result: resultRaw("MODEL-DECIDED", "", "gave up", "")}}, needsVerification(foremanv1alpha1.AgenticTaskVerdictNoGo)},
+			wantIncomplete:  1,
+			wantNeedsVerify: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := classifyChildren(tc.tasks)
+			if c.needsVerification != tc.wantNeedsVerify {
+				t.Errorf("needsVerification = %d, want %d", c.needsVerification, tc.wantNeedsVerify)
+			}
+			// The crucial assertion: a NEEDS-VERIFICATION child must
+			// NOT be swept into `incomplete`. A test that only checked
+			// the field exists would pass with the bug present.
+			if c.incomplete != tc.wantIncomplete {
+				t.Errorf("incomplete = %d, want %d", c.incomplete, tc.wantIncomplete)
+			}
+		})
+	}
+}
+
+// TestEmitNeedsVerificationCondition verifies both arms of
+// emitNeedsVerificationCondition (#1644). Zero needs-verification leaves the
+// condition present with Status=False and Reason=NoNeedsVerification. One
+// or more sets Status=True, Reason=NeedsVerification, and the message names
+// the count.
+func TestEmitNeedsVerificationCondition(t *testing.T) {
+	r := &WorkloadReconciler{}
+	now := metav1.Now()
+
+	cond := func(w *foremanv1alpha1.Workload) *metav1.Condition {
+		for i := range w.Status.Conditions {
+			if w.Status.Conditions[i].Type == conditionTypeCoderNeedsVerification {
+				return &w.Status.Conditions[i]
+			}
+		}
+		return nil
+	}
+
+	// Zero needs-verification: condition present, Status=False,
+	// Reason=NoNeedsVerification (anti-stale guard).
+	w := &foremanv1alpha1.Workload{}
+	r.emitNeedsVerificationCondition(w, childCounts{}, now)
+	c := cond(w)
+	if c == nil {
+		t.Fatal("CoderNeedsVerification condition not present")
+	}
+	if c.Status != metav1.ConditionFalse {
+		t.Errorf("Status = %q, want %q", c.Status, metav1.ConditionFalse)
+	}
+	if c.Reason != "NoNeedsVerification" {
+		t.Errorf("Reason = %q, want %q", c.Reason, "NoNeedsVerification")
+	}
+
+	// One needs-verification: Status=True, Reason=NeedsVerification,
+	// message names the count.
+	w = &foremanv1alpha1.Workload{}
+	r.emitNeedsVerificationCondition(w, childCounts{needsVerification: 1}, now)
+	c = cond(w)
+	if c == nil {
+		t.Fatal("CoderNeedsVerification condition not present")
+	}
+	if c.Status != metav1.ConditionTrue {
+		t.Errorf("Status = %q, want %q", c.Status, metav1.ConditionTrue)
+	}
+	if c.Reason != "NeedsVerification" {
+		t.Errorf("Reason = %q, want %q", c.Reason, "NeedsVerification")
+	}
+	if !strings.Contains(c.Message, "1 child task(s) ended NEEDS-VERIFICATION") {
+		t.Errorf("message does not name the count: %q", c.Message)
+	}
+}

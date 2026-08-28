@@ -418,6 +418,19 @@ type WorkloadStatus struct {
 	// +optional
 	ContradictedTasks int32 `json:"contradictedTasks,omitempty"`
 
+	// NeedsVerificationTasks counts child tasks that ended with a
+	// NEEDS-VERIFICATION terminal result (verdict=NO-GO +
+	// extra.outcome="NEEDS-VERIFICATION", #1033): a load-bearing
+	// external fact was ungroundable from the workspace, so the coder
+	// could not finish here. Like ALREADY-RESOLVED it is a terminal
+	// non-failure the coder cannot make progress on, but unlike
+	// ALREADY-RESOLVED the work is NOT done and cannot be done here —
+	// the model believes it is done and nothing confirmed it. Counted
+	// in its own bucket so an operator can tell it apart from an
+	// IncompleteTasks coder that gave up partway.
+	// +optional
+	NeedsVerificationTasks int32 `json:"needsVerificationTasks,omitempty"`
+
 	// ReviewIterations counts the fix iterations the reconciler has
 	// emitted after reviewer NO-GO verdicts (#946), summed across
 	// issues. Zero (or absent) means no reviewer ever bounced a

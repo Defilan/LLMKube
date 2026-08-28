@@ -123,6 +123,15 @@ const conditionTypeCoderEscalationTriggered = "CoderEscalationTriggered"
 // (avoids a perpetual "0 issues" noise condition).
 const conditionTypeCoderAlreadyResolved = "CoderAlreadyResolved"
 
+// conditionTypeCoderNeedsVerification marks a Workload whose coder
+// children ended NEEDS-VERIFICATION (NO-GO + extra.outcome=
+// "NEEDS-VERIFICATION", #1033): a load-bearing external fact could not
+// be grounded from the workspace, so the work is not done and cannot be
+// done here. It is a terminal non-failure, distinct from ALREADY-RESOLVED
+// (where the work was already present) — here the work is simply
+// unverified. Set when at least one such child exists.
+const conditionTypeCoderNeedsVerification = "CoderNeedsVerification"
+
 // conditionTypeCrossStageContradiction marks a Workload whose child
 // tasks recorded a cross-stage contradiction in their terminal result
 // (extra.crossStageContradictions non-empty, #1685). Set when at least
@@ -593,10 +602,12 @@ func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Work
 	w.Status.FailedTasks = cls.failed
 	w.Status.IncompleteTasks = cls.incomplete
 	w.Status.ContradictedTasks = cls.contradicted
+	w.Status.NeedsVerificationTasks = cls.needsVerification
 
 	computeTerminalState(w, cls, now)
 	r.emitAlreadyResolvedCondition(w, cls, now)
 	r.emitCrossStageContradictionCondition(w, cls, now)
+	r.emitNeedsVerificationCondition(w, cls, now)
 
 	if (w.Status.Phase == foremanv1alpha1.WorkloadPhaseCompleted ||
 		w.Status.Phase == foremanv1alpha1.WorkloadPhaseFailed) &&
@@ -620,6 +631,7 @@ func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Work
 type childCounts struct {
 	succeeded, incomplete, failed, inFlight int32
 	alreadyResolved                         int32
+	needsVerification                       int32
 	contradicted                            int32
 	contradictions                          []string
 	skipped                                 int32
@@ -635,8 +647,11 @@ type childCounts struct {
 //   - skipped: Phase=Succeeded + Verdict=Skipped (cascade-skip from
 //     ALREADY-RESOLVED dep, #970)
 //   - alreadyResolved: NO-GO + extra.outcome="ALREADY-RESOLVED" (#970)
+//   - needsVerification: NO-GO + extra.outcome="NEEDS-VERIFICATION"
+//     (#1033) — a terminal non-failure the coder could not finish, kept
+//     out of `incomplete` because the model believes it is done
 //   - incomplete: Phase=Succeeded + verdict not on-target and not
-//     skipped and not ALREADY-RESOLVED
+//     skipped and not ALREADY-RESOLVED and not NEEDS-VERIFICATION
 //   - failed: Phase=Failed
 //   - inFlight: everything else (Pending / Scheduled / Running)
 //
@@ -694,6 +709,16 @@ func classifyChildren(children []foremanv1alpha1.AgenticTask) childCounts {
 			// (ad-hoc AgenticTasks); the per-issue condition + events
 			// can't name them, so they don't show up in either list.
 			// The counter is incremented either way.
+		case isNeedsVerificationCoder(&children[i]):
+			// NEEDS-VERIFICATION is a terminal non-failure NO-GO the
+			// coder could not finish because a load-bearing external
+			// fact was ungroundable from the workspace (#1033). It is
+			// not incomplete: the model believes it is done and nothing
+			// confirmed it, which is distinct from a coder that gave up
+			// partway. Counted here (before the generic Succeeded arm,
+			// which would otherwise sweep it into `incomplete`) so an
+			// operator can tell the two apart.
+			c.needsVerification++
 		case children[i].Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded:
 			c.incomplete++
 		case children[i].Status.Phase == foremanv1alpha1.AgenticTaskPhaseFailed:
@@ -883,6 +908,38 @@ func (r *WorkloadReconciler) emitCrossStageContradictionCondition(w *foremanv1al
 		Type:               conditionTypeCrossStageContradiction,
 		Status:             metav1.ConditionTrue,
 		Reason:             "CrossStageContradiction",
+		Message:            msg,
+		LastTransitionTime: now,
+	})
+}
+
+// emitNeedsVerificationCondition sets the CoderNeedsVerification condition
+// (#1644) so an operator can see when a coder ended NEEDS-VERIFICATION —
+// a terminal non-failure NO-GO where a load-bearing external fact was
+// ungroundable from the workspace (#1033), so the work is not done and
+// cannot be done here. Unlike ALREADY-RESOLVED the issue is NOT fixed:
+// counting it in its own bucket (rather than incomplete) lets an operator
+// tell "the model believes it is done and nothing confirmed it" apart
+// from a coder that gave up partway. When needsVerification is zero the
+// condition is set to False (an anti-stale guard — a stale True condition
+// would mislead operators reading later reconciles).
+func (r *WorkloadReconciler) emitNeedsVerificationCondition(w *foremanv1alpha1.Workload, c childCounts, now metav1.Time) {
+	if c.needsVerification == 0 {
+		setCondition(&w.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeCoderNeedsVerification,
+			Status:             metav1.ConditionFalse,
+			Reason:             "NoNeedsVerification",
+			Message:            "no coder children ended NEEDS-VERIFICATION",
+			LastTransitionTime: now,
+		})
+		return
+	}
+
+	msg := fmt.Sprintf("%d child task(s) ended NEEDS-VERIFICATION (unverifiable external fact; work not done and cannot be done here)", c.needsVerification)
+	setCondition(&w.Status.Conditions, metav1.Condition{
+		Type:               conditionTypeCoderNeedsVerification,
+		Status:             metav1.ConditionTrue,
+		Reason:             "NeedsVerification",
 		Message:            msg,
 		LastTransitionTime: now,
 	})

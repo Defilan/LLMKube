@@ -471,6 +471,20 @@ func (r *AgenticTaskReconciler) cascadeFailIfDepFailed(ctx context.Context, task
 		// usable output. Cascade-fail so dependents don't run against
 		// a nonexistent artifact.
 		if dep.Status.Phase == foremanv1alpha1.AgenticTaskPhaseSucceeded && !dep.SucceededOnTarget() {
+			// A NEEDS-VERIFICATION dep is a terminal non-failure the
+			// coder could not finish because a load-bearing external
+			// fact was ungroundable from the workspace (#1033): the
+			// work is not done and cannot be done here. It already
+			// cascade-fails (it is not SucceededOnTarget), but with a
+			// distinct reason so it is alertable separately from a
+			// genuine INCOMPLETE/NO-GO that gave up partway. A
+			// NEEDS-VERIFICATION dependency must NOT unblock
+			// dependents (unverified work must not be shipped), so
+			// this is a fail, not a skip — skip means "there was
+			// nothing to do", which is false here.
+			if isNeedsVerificationCoder(&dep) {
+				return fmt.Sprintf("dependency %q ended NEEDS-VERIFICATION; dependent fails", depName), nil
+			}
 			return fmt.Sprintf("dependency %q ended with verdict=%s (not on-target); cascade-failing",
 				depName, dep.Status.Verdict), nil
 		}

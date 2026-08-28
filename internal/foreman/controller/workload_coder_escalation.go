@@ -122,6 +122,20 @@ func isAlreadyResolvedCoder(task *foremanv1alpha1.AgenticTask) bool {
 	return verdict == foremanv1alpha1.AgenticTaskVerdictNoGo && topOutcome == alreadyResolvedOutcome
 }
 
+// isNeedsVerificationCoder reports whether the task ended in the machine
+// outcome for "could not finish here — a load-bearing external fact was
+// ungroundable" (#1033). Used by classifyChildren to keep the task out of
+// the incomplete bucket (the model believes it is done, which is distinct
+// from a coder that gave up partway). The signal lives at
+// extra.outcome == needsVerificationOutcome with verdict == NO-GO.
+func isNeedsVerificationCoder(task *foremanv1alpha1.AgenticTask) bool {
+	if task == nil {
+		return false
+	}
+	verdict, topOutcome, _ := coderTerminalOutcome(task)
+	return verdict == foremanv1alpha1.AgenticTaskVerdictNoGo && topOutcome == needsVerificationOutcome
+}
+
 // isSkippedTask reports whether the task was skipped because its
 // dependency ended ALREADY-RESOLVED or was itself Skipped (#970,
 // transitive #1688). The cascade path in

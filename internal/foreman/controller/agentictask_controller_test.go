@@ -155,6 +155,48 @@ var _ = Describe("AgenticTaskReconciler scheduler", func() {
 		Expect(failedCond.Reason).To(Equal("UpstreamFailed"))
 	})
 
+	// Regression for defilantech/LLMKube#1644. A Pending task whose
+	// dependency ended NEEDS-VERIFICATION (Phase=Succeeded +
+	// Verdict=NO-GO + extra.outcome="NEEDS-VERIFICATION") must
+	// cascade-FAIL with the distinct UpstreamNeedsVerification reason.
+	// It is a terminal non-failure the coder could not finish (a
+	// load-bearing external fact was ungroundable, #1033), so it is not
+	// on-target; the dependent must not run against nonexistent output.
+	// Unlike ALREADY-RESOLVED the work is NOT done and cannot be done
+	// here, so this is a fail, not a skip — unverified work must not
+	// unblock dependents.
+	It("cascade-fails a Pending task when its dependency ended NEEDS-VERIFICATION (#1644)", func() {
+		dep := newTask("cascade-verify-dep")
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, dep) })
+		setPhase(dep, foremanv1alpha1.AgenticTaskPhaseSucceeded)
+		patch := client.MergeFrom(dep.DeepCopy())
+		dep.Status.Verdict = foremanv1alpha1.AgenticTaskVerdictNoGo
+		dep.Status.Result = &runtime.RawExtension{
+			Raw: []byte(`{"summary":"ungroundable","extra":{"outcome":"NEEDS-VERIFICATION"}}`),
+		}
+		Expect(k8sClient.Status().Patch(ctx, dep, patch)).To(Succeed())
+
+		target := newTask("cascade-verify-target")
+		target.Spec.DependsOn = []string{dep.Name}
+		Expect(k8sClient.Create(ctx, target)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, target) })
+		setPhase(target, foremanv1alpha1.AgenticTaskPhasePending)
+
+		_, err := reconciler.Reconcile(ctx, reqFor(target))
+		Expect(err).NotTo(HaveOccurred())
+
+		var fresh foremanv1alpha1.AgenticTask
+		Expect(k8sClient.Get(ctx, nn(target), &fresh)).To(Succeed())
+		Expect(fresh.Status.Phase).To(Equal(foremanv1alpha1.AgenticTaskPhaseFailed))
+		Expect(fresh.Status.Verdict).To(Equal(foremanv1alpha1.AgenticTaskVerdictIncomplete))
+
+		failedCond := findCondition(fresh.Status.Conditions, "Failed")
+		Expect(failedCond).NotTo(BeNil())
+		Expect(failedCond.Reason).To(Equal("UpstreamNeedsVerification"))
+		Expect(failedCond.Message).To(ContainSubstring(dep.Name))
+	})
+
 	// Regression for defilantech/LLMKube#970. A Pending task whose
 	// dependency ended ALREADY-RESOLVED (Phase=Succeeded +
 	// Verdict=NO-GO + extra.outcome="ALREADY-RESOLVED") must NOT be
