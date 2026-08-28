@@ -82,6 +82,106 @@ spec:
         description: "No DCGM, amdgpu-sysfs, or drm-exporter utilization series for 15 minutes. Check that a GPU metrics exporter is running."
   {{- end }}
 
+  {{- if and .Values.prometheus.prometheusRule.rules.serving.enabled .Values.prometheus.inferencePodMonitor.enabled }}
+  - name: llmkube-serving
+    interval: 30s
+    rules:
+    # TGI, PersonaPlex and Generic export no queue metrics under these
+    # selectors, so they're left out. LlamaCppRouter is NOT excluded: it runs
+    # llama-server and runtime_llamacpp_router.go appends --metrics, so router
+    # pods emit llamacpp:* and are covered by the third arm.
+    #
+    # avg_over_time and a "<= 1" ceiling (not "== 0") catch a partial stall and
+    # survive a single scrape ticking above it.
+    #
+    # The llama.cpp arm gates on THROUGHPUT rather than a running-count ceiling,
+    # because that ceiling is meaningless there. executor.go omits --parallel
+    # when ParallelSlots <= 1 (one slot is llama-server's own default), so
+    # requests_processing is only ever 0 or 1 and the "<= 1" test is permanently
+    # true: a healthy single-slot engine at processing=1, deferred=3 would page
+    # at severity critical. A ceiling is also unstable around its own boundary --
+    # with running oscillating 0/1/2 the 10m average lands either side of 1 on
+    # consecutive evaluations, so `for: 10m` is never satisfied and a REAL stall
+    # hovering there never fires either. Zero predicted tokens while a queue
+    # persists is the honest definition of "not admitting work", and it holds
+    # for one slot and for many.
+    - alert: InferenceAdmissionStalled
+      expr: |
+        (avg_over_time(vllm:num_requests_waiting[10m]) > 0 and avg_over_time(vllm:num_requests_running[10m]) <= 1)
+        or
+        (avg_over_time(sglang:num_queue_reqs[10m]) > 0 and avg_over_time(sglang:num_running_reqs[10m]) <= 1)
+        or
+        (avg_over_time(llamacpp:requests_deferred[10m]) > 0 and rate(llamacpp:tokens_predicted_total[10m]) == 0)
+      for: 10m
+      labels:
+        severity: critical
+        component: inference
+      annotations:
+        summary: "Inference engine is queuing requests but running almost none"
+        description: "{{`{{ $labels.service }}`}} in {{`{{ $labels.namespace }}`}} has {{`{{ $value }}`}} requests queued while running almost none. The process is up; it is not admitting work."
+
+    # Same silent no-op class as GPUMetricsMissing/ControllerMetricsMissing: a
+    # dead selector reads as an idle-but-healthy engine, not a gap.
+    - alert: InferenceMetricsMissing
+      expr: absent(vllm:num_requests_running) and absent(sglang:num_running_reqs) and absent(llamacpp:requests_processing)
+      for: 15m
+      labels:
+        severity: warning
+        component: inference
+      annotations:
+        summary: "Inference serving metrics are not being scraped"
+        description: "No vLLM, SGLang, or llama.cpp request-count series for 15 minutes. Check the inference PodMonitor selector and pod labels."
+
+    # Reuses the per-pod p95 record below instead of re-deriving the ratio, so
+    # a third runtime is a one-line record edit. count>5 guards against a
+    # single slow request after a cold start reading as a sustained breach.
+    # `and on (...)` below is load-bearing, not stylistic. The p95 record stamps
+    # latency_kind="queue_wait" via its labels: block, while the min-sample guard
+    # is a bare sum by (service, namespace, runtime, pod) and carries no such
+    # label. A plain `and` matches on the FULL label set, so the two sides never
+    # join and the alert cannot fire on any input. Naming the join keys keeps it
+    # alive. KVOffloadLoadSlow uses the bare form safely because both of its
+    # sides are sum by (...) with identical labels, which is what makes this
+    # invisible on a read-through.
+    - alert: InferenceQueueTimeHigh
+      expr: |
+        (
+          llmkube:inference:queue_time_seconds:p95_5m
+          and on (service, namespace, runtime, pod) (
+            sum by (service, namespace, runtime, pod) (increase(vllm:request_queue_time_seconds_count[15m]))
+            or
+            sum by (service, namespace, runtime, pod) (increase(sglang:queue_time_seconds_count[15m]))
+          ) > 5
+        ) > {{ .Values.prometheus.prometheusRule.rules.serving.queueTimeSecondsThreshold }}
+      for: 15m
+      labels:
+        severity: warning
+        component: inference
+      annotations:
+        summary: "Inference requests are waiting a long time before starting"
+        description: "{{`{{ $labels.service }}`}} pod {{`{{ $labels.pod }}`}} in {{`{{ $labels.namespace }}`}} is queuing requests {{`{{ $value | printf \"%.0f\" }}`}}s before they start (threshold: {{ .Values.prometheus.prometheusRule.rules.serving.queueTimeSecondsThreshold }}s)."
+
+    {{- if .Values.prometheus.prometheusRule.rules.serving.kvOffload.enabled }}
+    # A slow async KV load holds its blocks for the whole transfer, gating
+    # admission; names the cause where InferenceQueueTimeHigh only sees the symptom.
+    - alert: KVOffloadLoadSlow
+      expr: |
+        (
+          sum by (service, namespace, runtime, pod) (increase(vllm:kv_offload_lookup_async_delay_seconds_sum[30m]))
+          /
+          sum by (service, namespace, runtime, pod) (increase(vllm:kv_offload_lookup_async_delay_seconds_count[30m]))
+          and sum by (service, namespace, runtime, pod) (increase(vllm:kv_offload_lookup_async_delay_seconds_count[30m])) > 5
+        ) > {{ .Values.prometheus.prometheusRule.rules.serving.kvOffload.loadSecondsThreshold }}
+      for: 15m
+      labels:
+        severity: warning
+        component: inference
+      annotations:
+        summary: "KV offload loads are slow enough to gate admission"
+        description: "{{`{{ $labels.service }}`}} pod {{`{{ $labels.pod }}`}} in {{`{{ $labels.namespace }}`}} is averaging {{`{{ $value | printf \"%.0f\" }}`}}s per async KV-offload load (threshold: {{ .Values.prometheus.prometheusRule.rules.serving.kvOffload.loadSecondsThreshold }}s)."
+    {{- end }}
+  {{- end }}
+
   {{- if .Values.prometheus.prometheusRule.rules.inference.enabled }}
   - name: llmkube-inference
     interval: 30s
@@ -177,14 +277,17 @@ spec:
       labels:
         latency_kind: ttft
 
-    # Queue wait over 5m. SGLang-only for now; no vllm equivalent metric.
+    # Queue wait over 5m, covers vLLM and SGLang. By pod, not just service (unlike
+    # the request_latency/ttft_seconds records above): a service-wide percentile
+    # would dilute one stalled replica out of it, and InferenceQueueTimeHigh
+    # alerts straight off this one.
     - record: llmkube:inference:queue_time_seconds:p95_5m
-      expr: histogram_quantile(0.95, sum by (service, namespace, runtime, le) (rate(sglang:queue_time_seconds_bucket[5m])))
+      expr: histogram_quantile(0.95, sum by (service, namespace, runtime, pod, le) (rate(vllm:request_queue_time_seconds_bucket[5m]) or rate(sglang:queue_time_seconds_bucket[5m])))
       labels:
         latency_kind: queue_wait
 
     - record: llmkube:inference:queue_time_seconds:p50_5m
-      expr: histogram_quantile(0.50, sum by (service, namespace, runtime, le) (rate(sglang:queue_time_seconds_bucket[5m])))
+      expr: histogram_quantile(0.50, sum by (service, namespace, runtime, pod, le) (rate(vllm:request_queue_time_seconds_bucket[5m]) or rate(sglang:queue_time_seconds_bucket[5m])))
       labels:
         latency_kind: queue_wait
   {{- end }}
