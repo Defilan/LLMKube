@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -640,4 +641,59 @@ func containsStr(args []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// TestCheckPerHunkCoverage_BoundedAndReportsTruncation verifies the pass is
+// bounded and says so. Every hunk costs a full `go test`, so an unbounded loop
+// lets a sprawling envtest diff overrun the gate deadline -- and a gate that
+// overruns reads as broken, not slow. Layer 2 bounds itself the same way.
+//
+// The truncation notice is the load-bearing half: a bounded pass that reported
+// nothing would be indistinguishable from a clean one, so "no findings" would
+// read as "fully covered" when most packages were never checked.
+func TestCheckPerHunkCoverage_BoundedAndReportsTruncation(t *testing.T) {
+	ws := t.TempDir()
+	// More envtest packages than the bound allows.
+	nPkgs := maxPerHunkPackages + 3
+	var names []string
+	for i := 0; i < nPkgs; i++ {
+		dir := filepath.Join("internal", "controller", "sub"+strconv.Itoa(i))
+		_ = os.MkdirAll(filepath.Join(ws, dir), 0o755)
+		_ = os.WriteFile(filepath.Join(ws, dir, "x.go"),
+			[]byte("package controller\n\nfunc f() {\n\tg()\n}\n"), 0o644)
+		names = append(names, filepath.Join(dir, "x.go"))
+	}
+	diffOut := "diff --git a/x b/x\n@@ -0,0 +4 @@\n+\tg()\n"
+
+	runner := func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		switch {
+		case name == "git" && len(args) > 1 && args[0] == "diff" && containsStr(args, "--name-only"):
+			return strings.Join(names, "\n") + "\n", nil
+		case name == "git" && len(args) > 1 && args[0] == "diff" && containsStr(args, "-U0"):
+			return diffOut, nil
+		case name == "go" && len(args) > 0 && args[0] == "test":
+			// Green: every hunk would be reported uncovered, so any package the
+			// bound skipped is visible as a missing finding.
+			return "ok", nil
+		}
+		return "", nil
+	}
+
+	findings := CheckPerHunkCoverage(context.Background(), ws, "main", runner)
+
+	var truncation string
+	pkgFindings := 0
+	for _, f := range findings {
+		if f.Dir == "" && f.LineRange == "" {
+			truncation = f.File
+			continue
+		}
+		pkgFindings++
+	}
+	if truncation == "" {
+		t.Fatalf("bounded run reported no truncation notice; %d findings would read as a complete pass", len(findings))
+	}
+	if pkgFindings > maxPerHunkPackages {
+		t.Fatalf("checked %d packages, bound is %d", pkgFindings, maxPerHunkPackages)
+	}
 }

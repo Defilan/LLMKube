@@ -503,6 +503,17 @@ func rangeIntersects(lines map[int]bool, start, end int) bool {
 
 // maxNeuterPackages bounds how many packages the neuter check will mutate in
 // one gate run, so a sprawling change cannot blow the loop's time budget.
+// maxPerHunkPackages and maxPerHunkHunks bound the per-hunk coverage pass
+// (#1694). Each hunk costs a full `go test` of its package, so without a bound
+// a sprawling envtest diff can add tens of minutes to a gate that already runs
+// for minutes. A gate that overruns its deadline is indistinguishable from a
+// broken one, which is the failure this avoids. Both limits report when they
+// truncate, so a bounded pass is never mistaken for a complete one.
+const (
+	maxPerHunkPackages = 5
+	maxPerHunkHunks    = 40
+)
+
 const maxNeuterPackages = 5
 
 // checkTwoSiteParity is a tierAdvisory gate check (#1418). For each changed
@@ -1011,8 +1022,35 @@ func CheckPerHunkCoverage(ctx context.Context, workspace, base string, run comma
 		return nil
 	}
 
+	// Bound the pass. Every hunk costs a full `go test` of its package, so an
+	// unbounded loop lets a sprawling envtest diff add tens of minutes to a
+	// gate that already takes minutes -- and a gate that overruns its deadline
+	// reads as a broken gate, not a slow one. Layer 2 bounds itself the same
+	// way for the same reason (maxNeuterPackages).
+	//
+	// Deterministic order so the same diff always yields the same subset, and
+	// truncation is REPORTED rather than silent: a bounded pass that looks like
+	// a complete one is worse than no pass, because "no findings" would read as
+	// "fully covered".
+	dirs := make([]string, 0, len(byDir))
+	for dir := range byDir {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	truncated := ""
+	if len(dirs) > maxPerHunkPackages {
+		truncated = fmt.Sprintf("%d of %d envtest packages checked (bounded by maxPerHunkPackages)",
+			maxPerHunkPackages, len(dirs))
+		dirs = dirs[:maxPerHunkPackages]
+	}
+
 	var findings []perHunkFinding
-	for dir, files := range byDir {
+	if truncated != "" {
+		findings = append(findings, perHunkFinding{File: truncated, Dir: "", LineRange: ""})
+	}
+	hunksChecked := 0
+	for _, dir := range dirs {
+		files := byDir[dir]
 		sort.Strings(files)
 		for _, f := range files {
 			orig, err := os.ReadFile(filepath.Join(workspace, f))
@@ -1020,6 +1058,15 @@ func CheckPerHunkCoverage(ctx context.Context, workspace, base string, run comma
 				continue
 			}
 			for _, hunk := range splitProductionHunks(ctx, workspace, base, f, run) {
+				if hunksChecked >= maxPerHunkHunks {
+					findings = append(findings, perHunkFinding{
+						File:      fmt.Sprintf("hunk budget reached after %d hunks; remaining hunks unchecked", maxPerHunkHunks),
+						Dir:       "",
+						LineRange: "",
+					})
+					return findings
+				}
+				hunksChecked++
 				if err := os.WriteFile(filepath.Join(workspace, f), revertHunk(orig, hunk.Lines), 0o644); err != nil {
 					continue
 				}
