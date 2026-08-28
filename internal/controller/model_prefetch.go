@@ -292,7 +292,7 @@ func (r *ModelReconciler) completePrefetch(ctx context.Context, model *inference
 	now := metav1.Now()
 	model.Status.LastUpdated = &now
 	return r.updateStatus(ctx, model, "Available", metav1.ConditionTrue,
-		"ModelPrefetched", "Model prefetched into the shared cache")
+		"ModelPrefetched", "Model prefetched into the model cache")
 }
 
 // prefetchTargetName returns the PVC name prefetch will stage into, for status
