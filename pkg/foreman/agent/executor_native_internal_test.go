@@ -3172,3 +3172,49 @@ func TestPushedRemoteMismatch(t *testing.T) {
 		t.Errorf("a fork of the task repo must not be flagged, got: %s", msg)
 	}
 }
+
+// TestOpenPRsAsDraft covers the #1706 resolution, including the two cases that
+// decide whether an upgrade is silent: a nil Agent and an unset field must both
+// stay true, so 0.9.22 behaviour is preserved for anyone who has not opted in.
+func TestOpenPRsAsDraft(t *testing.T) {
+	boolp := func(b bool) *bool { return &b }
+	cases := []struct {
+		name  string
+		agent *foremanv1alpha1.Agent
+		want  bool
+	}{
+		{
+			name:  "nil agent defaults to draft",
+			agent: nil,
+			want:  true,
+		},
+		{
+			name:  "unset field defaults to draft (preserves #1703)",
+			agent: &foremanv1alpha1.Agent{},
+			want:  true,
+		},
+		{
+			name: "explicit true opens a draft",
+			agent: &foremanv1alpha1.Agent{
+				Spec: foremanv1alpha1.AgentSpec{OpenPullRequestsAsDraft: boolp(true)},
+			},
+			want: true,
+		},
+		{
+			// The reported case: an unattended loop whose reviewer workflow
+			// skips drafts needs ready-for-review PRs.
+			name: "explicit false opens ready for review",
+			agent: &foremanv1alpha1.Agent{
+				Spec: foremanv1alpha1.AgentSpec{OpenPullRequestsAsDraft: boolp(false)},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := openPRsAsDraft(tc.agent); got != tc.want {
+				t.Fatalf("openPRsAsDraft() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
