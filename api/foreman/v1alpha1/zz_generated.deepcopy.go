@@ -299,6 +299,11 @@ func (in *AgentSpec) DeepCopyInto(out *AgentSpec) {
 		*out = new(StuckLoopDetectionSpec)
 		**out = **in
 	}
+	if in.OpenPullRequestsAsDraft != nil {
+		in, out := &in.OpenPullRequestsAsDraft, &out.OpenPullRequestsAsDraft
+		*out = new(bool)
+		**out = **in
+	}
 	if in.Tools != nil {
 		in, out := &in.Tools, &out.Tools
 		*out = make([]string, len(*in))

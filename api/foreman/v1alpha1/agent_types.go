@@ -399,6 +399,27 @@ type AgentSpec struct {
 	// +optional
 	BashTimeoutSeconds int32 `json:"bashTimeoutSeconds,omitempty"`
 
+	// OpenPullRequestsAsDraft controls whether a pull request this agent
+	// opens is created as a draft (#1706). Nil means true, preserving the
+	// behaviour introduced in #1703.
+	//
+	// This is an Agent field rather than a Workload one because whether a
+	// draft blocks the pipeline is a property of the DEPLOYMENT's review
+	// tooling, not of an individual run: a CI job that skips drafts skips
+	// every draft, so an operator needs one place to decide rather than a
+	// field to set on every generated Workload. Per-pool granularity comes
+	// free, so a fork-pinned agent can open drafts while an unattended loop
+	// does not.
+	//
+	// Distinct from Workload.spec.openPullRequest, which decides whether a
+	// PR is opened at all. This only decides what kind.
+	//
+	// Reported by a downstream operator whose reviewer workflow gates on
+	// `!github.event.pull_request.draft`: draft-by-default turned their
+	// unattended loop (#1653) into a supervised one.
+	// +optional
+	OpenPullRequestsAsDraft *bool `json:"openPullRequestsAsDraft,omitempty"`
+
 	// Tools is the tool whitelist surfaced to the model on every turn.
 	// Unknown names are rejected at agent startup so a typo in an Agent
 	// CR fails loud rather than silently disabling a tool.

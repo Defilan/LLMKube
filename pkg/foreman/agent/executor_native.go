@@ -1043,7 +1043,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// INCOMPLETE (this is NOT a GO); we only commit + push the branch and
 		// record it under r.Extra. Coder-role only (reviewers are read-only).
 		e.maybePreserveGateFailedBranch(ctx, log, agent, task, workspace, branch, auth, loopRes, r)
-		e.maybeOpenPullRequest(ctx, log, task, auth, verdict, r,
+		e.maybeOpenPullRequest(ctx, log, agent, task, auth, verdict, r,
 			workspace, reviewBase, reviewDiff, cloneURL)
 		// Attach the normalized failure reason from the model-to-CRD
 		// mapping (e.g. ERROR→INCOMPLETE + ModelReportedError for #649). Only
@@ -1395,7 +1395,7 @@ func (e *NativeAgentLoopExecutor) retryCoderTerminalResult(
 	// No reviewer rails ran on this path, so there is no resolved review base
 	// to ground the summary against; #1411's check degrades open on the empty
 	// base rather than grounding against a base it had to guess at.
-	e.maybeOpenPullRequest(ctx, log, task, auth, verdict, r, workspace, "", nil, cloneURL)
+	e.maybeOpenPullRequest(ctx, log, agent, task, auth, verdict, r, workspace, "", nil, cloneURL)
 	if normReason != "" && r.FailureReason == "" {
 		r.FailureReason = normReason
 	}
@@ -2067,6 +2067,21 @@ func (e *NativeAgentLoopExecutor) incompleteResult(
 	return r
 }
 
+// openPRsAsDraft resolves whether a PR this agent opens should be a draft
+// (#1706). Nil means true, preserving the behaviour #1703 introduced, so an
+// upgrade does not silently change what an existing install produces.
+//
+// A nil Agent also yields true rather than false: the caller has no
+// configuration to honour, and the safer reading of "unknown" is the
+// human-supervised one. A deployment that wants ready-for-review PRs is
+// making a deliberate choice and sets the field.
+func openPRsAsDraft(agent *foremanv1alpha1.Agent) bool {
+	if agent == nil || agent.Spec.OpenPullRequestsAsDraft == nil {
+		return true
+	}
+	return *agent.Spec.OpenPullRequestsAsDraft
+}
+
 // maybeOpenPullRequest opens the Workload's PR after a reviewer GO
 // (#937). A reviewer GO is APPROVE — the Workload's artifact is a pull
 // request. Best-effort: the approval stands even if GitHub is down; the
@@ -2075,6 +2090,7 @@ func (e *NativeAgentLoopExecutor) incompleteResult(
 // duplicate the PR.
 func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 	ctx context.Context, log logr.Logger,
+	agent *foremanv1alpha1.Agent,
 	task *foremanv1alpha1.AgenticTask, auth *repo.Auth,
 	verdict foremanv1alpha1.AgenticTaskVerdict, r *Result,
 	workspace, reviewBase string, reviewDiff []string, cloneURL string,
@@ -2086,7 +2102,8 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra, true, cloneURL)
+	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra,
+		openPRsAsDraft(agent), cloneURL)
 	if prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
 			"repo", task.Spec.Payload.Repo, "branch", task.Spec.Payload.Branch)

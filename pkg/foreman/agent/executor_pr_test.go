@@ -134,7 +134,7 @@ func TestMaybeOpenPullRequest_Gating(t *testing.T) {
 			task := reviewTaskForPR(tc.kind, tc.openPR)
 			r := &Result{Extra: map[string]any{}}
 
-			e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil, tc.verdict, r, "", "", nil, "")
+			e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil, tc.verdict, r, "", "", nil, "")
 
 			if called := len(fe.ensures) > 0; called != tc.wantCalled {
 				t.Fatalf("EnsurePR called=%v, want %v (calls=%+v)", called, tc.wantCalled, fe.ensures)
@@ -152,7 +152,7 @@ func TestMaybeOpenPullRequest_NilEnsurerIsDisabled(t *testing.T) {
 	e := &NativeAgentLoopExecutor{}
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
 	r := &Result{Extra: map[string]any{}}
-	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 	if len(r.Extra) != 0 {
 		t.Fatalf("nil ensurer must be a no-op; extra=%+v", r.Extra)
@@ -171,7 +171,7 @@ func TestMaybeOpenPullRequest_BodyCarriesReviewSummary(t *testing.T) {
 		Extra:   map[string]any{},
 	}
 
-	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 
 	if len(fe.ensures) != 1 {
@@ -203,7 +203,7 @@ func TestMaybeOpenPullRequest_ForkRemoteQualifiesHead(t *testing.T) {
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
 	r := &Result{Extra: map[string]any{}}
 
-	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 
 	if len(fe.ensures) != 1 {
@@ -246,7 +246,7 @@ func TestMaybeOpenPullRequest_SameRepoRemoteKeepsBareHead(t *testing.T) {
 		task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
 		r := &Result{Extra: map[string]any{}}
 
-		e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+		e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 			foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
 
 		if len(fe.ensures) != 1 {
@@ -314,7 +314,7 @@ func TestMaybeOpenPullRequest_BodyFlagsUngroundedClaim(t *testing.T) {
 	summary := "Replaces bare `print()` calls with `logger.info()` and adds a `/health` endpoint."
 	r := &Result{Summary: summary, Extra: map[string]any{}}
 
-	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 		foremanv1alpha1.AgenticTaskVerdictGo, r, t.TempDir(), "main", []string{"bridge/app.py"}, "")
 
 	if len(fe.ensures) != 1 {
@@ -356,7 +356,7 @@ func TestMaybeOpenPullRequest_GroundedSummaryUntouched(t *testing.T) {
 	summary := "Replaces bare `print()` calls in `bridge/app.py` with `logger.info()`."
 	r := &Result{Summary: summary, Extra: map[string]any{}}
 
-	e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 		foremanv1alpha1.AgenticTaskVerdictGo, r, t.TempDir(), "main", []string{"bridge/app.py"}, "")
 
 	body := fe.ensures[0].body
@@ -391,7 +391,7 @@ func TestMaybeOpenPullRequest_NoDiffSkipsGrounding(t *testing.T) {
 			summary := "Adds a `/health` endpoint."
 			r := &Result{Summary: summary, Extra: map[string]any{}}
 
-			e.maybeOpenPullRequest(context.Background(), logr.Discard(), task, nil,
+			e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
 				foremanv1alpha1.AgenticTaskVerdictGo, r, tc.workspace, tc.base, nil, "")
 
 			if body := fe.ensures[0].body; strings.Contains(body, "Unverified claims") {
@@ -585,4 +585,61 @@ func TestMaybeRefreshPRBody_DisabledWhenNoCodeHost(t *testing.T) {
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
 	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
 		"foreman/wl-x/issue-7", "Revised summary.", "", "", nil, "")
+}
+
+// TestMaybeOpenPullRequest_DraftFollowsAgent asserts the Agent's
+// openPullRequestsAsDraft actually reaches the EnsurePR call (#1706).
+//
+// The resolver has its own unit test, but that one passes even if nothing
+// calls it: reverting the call site to a hardcoded `true` left every other
+// test green. This is the test that fails when the wiring is removed, which
+// is the whole point of making the flag configurable.
+func TestMaybeOpenPullRequest_DraftFollowsAgent(t *testing.T) {
+	boolp := func(b bool) *bool { return &b }
+	cases := []struct {
+		name  string
+		agent *foremanv1alpha1.Agent
+		want  bool
+	}{
+		{name: "nil agent stays draft", agent: nil, want: true},
+		{
+			name:  "unset field stays draft",
+			agent: &foremanv1alpha1.Agent{},
+			want:  true,
+		},
+		{
+			// The reported case: an unattended loop whose reviewer workflow
+			// skips drafts needs the PR opened ready for review.
+			name: "false opens ready for review",
+			agent: &foremanv1alpha1.Agent{
+				Spec: foremanv1alpha1.AgentSpec{OpenPullRequestsAsDraft: boolp(false)},
+			},
+			want: false,
+		},
+		{
+			name: "true opens a draft",
+			agent: &foremanv1alpha1.Agent{
+				Spec: foremanv1alpha1.AgentSpec{OpenPullRequestsAsDraft: boolp(true)},
+			},
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1"}
+			e := &NativeAgentLoopExecutor{PREnsurer: fe}
+			task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+			r := &Result{Summary: "a change", Extra: map[string]any{}}
+
+			e.maybeOpenPullRequest(context.Background(), logr.Discard(), tc.agent, task, nil,
+				foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+			if len(fe.ensures) != 1 {
+				t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+			}
+			if got := fe.ensures[0].draft; got != tc.want {
+				t.Fatalf("EnsurePR draft = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
