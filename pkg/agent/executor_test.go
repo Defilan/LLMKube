@@ -140,6 +140,7 @@ func TestEnsureModel_AlreadyExists(t *testing.T) {
 		t.Context(),
 		"https://huggingface.co/org/repo/resolve/main/model.gguf",
 		"test-model",
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("ensureModel returned error: %v", err)
@@ -158,6 +159,7 @@ func TestEnsureModel_DownloadFails(t *testing.T) {
 		t.Context(),
 		"http://localhost:1/nonexistent-model.gguf",
 		"bad-model",
+		nil,
 	)
 	if err == nil {
 		t.Error("ensureModel with invalid URL should return error")
@@ -545,7 +547,7 @@ func TestEnsureModel_ZeroByteFileTriggersRedownload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := executor.ensureModel(t.Context(), srv.URL+"/model.gguf", "stub-model")
+	_, err := executor.ensureModel(t.Context(), srv.URL+"/model.gguf", "stub-model", nil)
 	if err != nil {
 		t.Fatalf("ensureModel should succeed when stub is zero bytes: %v", err)
 	}
