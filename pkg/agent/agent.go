@@ -330,6 +330,7 @@ func (a *MetalAgent) buildExecutors() {
 		a.config.LlamaServerBin,
 		a.config.ModelStorePath,
 		a.logger.With("subsystem", "executor"),
+		WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
 	)
 	if a.config.LlamaServerStartupTimeout > 0 {
 		metalExec.SetStartupTimeout(a.config.LlamaServerStartupTimeout)
@@ -604,6 +605,7 @@ func buildExecutorConfig(
 		Namespace:              isvc.Namespace,
 		ModelSource:            model.Spec.Source,
 		ModelName:              model.Name,
+		SourceSecretRef:        model.Spec.SourceSecretRef,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
 		RopeScalingType:        ropeType,
