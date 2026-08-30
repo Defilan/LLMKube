@@ -30,6 +30,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -39,9 +41,13 @@ type ExecutorConfig struct {
 	Namespace   string
 	ModelSource string
 	ModelName   string
-	GPULayers   int32
-	ContextSize int
-	Jinja       bool
+	// SourceSecretRef is the Model's spec.sourceSecretRef, used to resolve
+	// credentials for s3:// fetches on the metal path. May be nil for non-s3
+	// sources.
+	SourceSecretRef *corev1.LocalObjectReference
+	GPULayers       int32
+	ContextSize     int
+	Jinja           bool
 
 	// RopeScaling* map to llama.cpp's RoPE context-extension flags, resolved
 	// from InferenceService.spec.ropeScaling at the agent boundary. Empty
@@ -173,15 +179,45 @@ type MetalExecutor struct {
 	// instead of an ephemeral one. Set via SetPort. A fixed port gives native
 	// OpenAI-compatible clients a stable endpoint across process respawns.
 	fixedPort int
+
+	// namespace and k8sClient let the executor resolve a Model's
+	// sourceSecretRef for s3:// credentials (resolveS3Credentials). Both are
+	// optional: when nil, s3:// sources fail with a clear message rather than
+	// silently falling through to an anonymous GET. They are set via
+	// WithKubeClient.
+	namespace string
+	k8sClient client.Client
+	caCerts   [][]byte
 }
 
-func NewMetalExecutor(llamaServerBin, modelStorePath string, logger *zap.SugaredLogger) *MetalExecutor {
-	return &MetalExecutor{
+// Option configures a MetalExecutor. Used to wire the Kubernetes client and
+// namespace the s3 fetch path needs.
+type Option func(*MetalExecutor)
+
+// WithKubeClient attaches the agent's controller-runtime client and the
+// InferenceService/Model namespace so ensureModel can resolve sourceSecretRef
+// for s3:// sources. caCerts is the set of PEM CA bundles the operator trusts
+// (from the same caCertConfigMap the controller uses), so a private MinIO
+// behind a self-signed CA is reachable.
+func WithKubeClient(namespace string, c client.Client, caCerts [][]byte) Option {
+	return func(e *MetalExecutor) {
+		e.namespace = namespace
+		e.k8sClient = c
+		e.caCerts = caCerts
+	}
+}
+
+func NewMetalExecutor(llamaServerBin, modelStorePath string, logger *zap.SugaredLogger, opts ...Option) *MetalExecutor {
+	e := &MetalExecutor{
 		llamaServerBin: llamaServerBin,
 		modelStorePath: modelStorePath,
 		logger:         logger,
 		startupTimeout: DefaultLlamaServerStartupTimeout,
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // SetStartupTimeout overrides the default llama-server startup timeout.
@@ -205,7 +241,7 @@ func (e *MetalExecutor) SetPort(port int) {
 }
 
 func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig) (*ManagedProcess, error) {
-	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName)
+	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName, config.SourceSecretRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure model: %w", err)
 	}
@@ -279,7 +315,7 @@ func (e *MetalExecutor) StopProcess(pid int) error {
 	}
 }
 
-func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string) (string, error) {
+func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string, secretRef s3SecretRef) (string, error) {
 	filename := filepath.Base(source)
 	localPath := filepath.Join(e.modelStorePath, name, filename)
 
@@ -293,7 +329,7 @@ func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string) (s
 	}
 
 	e.logger.Infow("downloading model", "source", source, "destination", localPath)
-	if err := e.downloadFile(ctx, source, localPath); err != nil {
+	if err := e.fetchModel(ctx, source, localPath, secretRef); err != nil {
 		return "", fmt.Errorf("failed to download model: %w", err)
 	}
 
@@ -301,7 +337,87 @@ func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string) (s
 	return localPath, nil
 }
 
+// fetchModel downloads source to filePath. s3:// sources are routed through a
+// sigv4-signed client (the metal half of #1449, which #1450 fixed for the
+// controller path): the raw source never reaches a plain GET.
+func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string, secretRef s3SecretRef) error {
+	if isS3Source(source) {
+		return e.downloadS3(ctx, source, filePath, secretRef)
+	}
+	return e.downloadFile(ctx, source, filePath)
+}
+
+// downloadS3 fetches an s3:// source into filePath using AWS SigV4 signing and
+// the operator's trusted CA bundle, mirroring the controller's parseS3GGUFMetadata
+// (internal/controller/model_controller.go) and the init container's signed curl
+// (buildS3DownloadCommand, internal/controller/model_storage.go). secretRef is
+// the Model's spec.sourceSecretRef; when nil the fetch fails clearly rather than
+// falling back to an anonymous GET.
+func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string, secretRef s3SecretRef) error {
+	bucket, _, err := parseS3Source(source)
+	if err != nil {
+		return err
+	}
+
+	var secretName string
+	if secretRef != nil {
+		secretName = secretRef.Name
+	}
+	creds, err := e.resolveS3Credentials(ctx, source, secretName)
+	if err != nil {
+		return err
+	}
+
+	httpClient, objectURL, err := e.s3DownloadClient(source, creds)
+	if err != nil {
+		return err
+	}
+
+	e.logger.Infow("downloading model from S3", "bucket", bucket, "destination", filePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("s3 GET %s: %s", objectURL, resp.Status)
+	}
+
+	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
+}
+
 func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
+}
+
+// copyToFile streams r into filePath atomically: it writes to a ".partial"
+// file first and renames it into place only on success, so an interrupted
+// transfer (connection drop, mid-download error) never leaves a truncated
+// model that the stat check in ensureModel would treat as cached. When
+// contentLength > 0 it verifies the byte count matches, so a connection drop
+// mid-download doesn't leave a truncated model that passes the stat check.
+func (e *MetalExecutor) copyToFile(filePath string, r io.Reader, contentLength int64) error {
 	tmpPath := filePath + ".partial"
 
 	out, err := os.Create(tmpPath)
@@ -314,51 +430,19 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath string) 
 		}
 	}()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	written, err := io.Copy(out, r)
 	if err != nil {
-		if rmErr := os.Remove(tmpPath); rmErr != nil {
-			e.logger.Warnw("failed to clean up partial download", "path", tmpPath, "error", rmErr)
-		}
+		_ = os.Remove(tmpPath)
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		if rmErr := os.Remove(tmpPath); rmErr != nil {
-			e.logger.Warnw("failed to clean up partial download", "path", tmpPath, "error", rmErr)
-		}
-		return err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	if resp.StatusCode != http.StatusOK {
-		if rmErr := os.Remove(tmpPath); rmErr != nil {
-			e.logger.Warnw("failed to clean up partial download", "path", tmpPath, "error", rmErr)
-		}
-		return fmt.Errorf("bad status: %s", resp.Status)
-	}
-
-	written, err := io.Copy(out, resp.Body)
-	if err != nil {
-		if rmErr := os.Remove(tmpPath); rmErr != nil {
-			e.logger.Warnw("failed to clean up partial download", "path", tmpPath, "error", rmErr)
-		}
-		return err
-	}
-
-	// Verify Content-Length against bytes written so a connection drop
-	// mid-download doesn't leave a truncated model that passes the stat
-	// check.
-	if resp.ContentLength > 0 && written != resp.ContentLength {
-		if rmErr := os.Remove(tmpPath); rmErr != nil {
-			e.logger.Warnw("failed to clean up partial download", "path", tmpPath, "error", rmErr)
-		}
-		return fmt.Errorf("download truncated: expected %d bytes, got %d", resp.ContentLength, written)
+	if contentLength > 0 && written != contentLength {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("download truncated: expected %d bytes, got %d", contentLength, written)
 	}
 
 	if err := os.Rename(tmpPath, filePath); err != nil {
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("failed to rename downloaded model: %w", err)
 	}
 	return nil
