@@ -620,6 +620,22 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouterGateway")
 		os.Exit(1)
 	}
+	// ModelRouterAgentGateway compiles a ModelRouter in dataPlane: AgentGateway
+	// mode onto a pre-installed agentgateway data plane via the Gateway API
+	// Inference Extension (InferencePool / InferenceModel / HTTPRoute). Like the
+	// Envoy gateway controller it self-gates on the Inference Extension CRDs
+	// being present, so a cluster without the agentgateway stack still starts the
+	// operator cleanly and this controller no-ops. A failed reconcile is emitted
+	// as a Warning Event so the operator sees it at the request path even though
+	// the data plane keeps serving its last-good compilation.
+	if err := (&controller.ModelRouterAgentGatewayReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("modelrouter-agentgateway"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ModelRouterAgentGateway")
+		os.Exit(1)
+	}
 	// GPUQuota reconciles the status-only aggregation of GPU usage from
 	// InferenceServices in the quota's scope. It never rejects anything or
 	// owns external resources.

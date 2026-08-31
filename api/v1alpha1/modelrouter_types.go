@@ -32,6 +32,17 @@ const (
 	// ModelRouterDataPlaneGateway compiles the router policy onto a pre-installed
 	// Envoy AI Gateway instead of provisioning the router-proxy.
 	ModelRouterDataPlaneGateway ModelRouterDataPlane = "Gateway"
+
+	// ModelRouterDataPlaneAgentGateway compiles the router policy onto a
+	// pre-installed agentgateway data plane (AgentgatewayBackend + HTTPRoute)
+	// instead of provisioning the router-proxy. agentgateway is a conformant
+	// Gateway API Inference Extension implementation and applies model rewriting
+	// (spec.model) on its custom providers, so external-style model aliases are
+	// honored here where the Envoy AI Gateway path drops them. It also routes MCP
+	// and A2A natively in the same data plane. Requires the agentgateway.dev CRDs
+	// and a pre-installed agentgateway Gateway; when they are absent the resources
+	// are not generated and a condition explains why.
+	ModelRouterDataPlaneAgentGateway ModelRouterDataPlane = "AgentGateway"
 )
 
 // DefaultRouteStrategy selects what the router does when no rule matches a
@@ -70,7 +81,15 @@ type ModelRouterSpec struct {
 	// Gateway mode the router-proxy is NOT provisioned. Requires the aigw CRDs
 	// to be installed; when they are absent the gateway resources are not
 	// generated and a condition explains why.
-	// +kubebuilder:validation:Enum=Proxy;Gateway
+	//
+	// "AgentGateway" compiles the backends and rules onto a pre-installed
+	// agentgateway data plane: one AgentgatewayBackend (custom provider targeting
+	// an InferencePool) per InferenceServiceRef backend and a multi-rule HTTPRoute
+	// matching on the X-Gateway-Base-Model-Name header. In AgentGateway mode the
+	// router-proxy is NOT provisioned. Requires the agentgateway.dev CRDs and a
+	// pre-installed agentgateway Gateway; when they are absent the resources are
+	// not generated and a condition explains why.
+	// +kubebuilder:validation:Enum=Proxy;Gateway;AgentGateway
 	// +kubebuilder:default=Proxy
 	// +optional
 	DataPlane ModelRouterDataPlane `json:"dataPlane,omitempty"`
@@ -83,6 +102,16 @@ type ModelRouterSpec struct {
 	// allowedRoutes.namespaces to permit this ModelRouter's namespace.
 	// +optional
 	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
+
+	// AgentGatewayRef identifies the pre-installed agentgateway data plane the
+	// generated InferencePool/InferenceModel/HTTPRoute attach to when DataPlane
+	// is "AgentGateway". Required in AgentGateway mode; ignored otherwise. The
+	// Gateway, the Gateway API Inference Extension CRDs, and an Endpoint Picker
+	// (EPP) service are documented prerequisites; LLMKube does not install or own
+	// them. The EndpointPicker is referenced by every generated InferencePool so
+	// agentgateway can select a model-server endpoint per request.
+	// +optional
+	AgentGatewayRef *AgentGatewayReference `json:"agentGatewayRef,omitempty"`
 
 	// Backends are the candidate destinations the router can dispatch to.
 	// Order is not significant; selection is rule-driven. At least one
@@ -645,6 +674,37 @@ type MCPServerSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
 }
 
+// AgentGatewayReference identifies the pre-installed agentgateway data plane a
+// dataPlane: AgentGateway ModelRouter compiles onto. The Gateway is the
+// gateway.networking.k8s.io Gateway whose GatewayClass is agentgateway; the
+// EndpointPicker is the Endpoint Picker (EPP) Service that selects a model
+// server endpoint per request for each generated InferencePool. The Gateway,
+// the Gateway API Inference Extension CRDs, and a running EPP are documented
+// prerequisites that LLMKube does not install or own.
+type AgentGatewayReference struct {
+	// Name is the agentgateway Gateway's name.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
+
+	// Namespace is the Gateway's namespace. Empty means the ModelRouter's own
+	// namespace.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// EndpointPicker names the EPP Service agentgateway consults for endpoint
+	// selection. Required so each generated InferencePool can reference the
+	// picker; agentgateway cannot select endpoints without it.
+	// +kubebuilder:validation:Required
+	EndpointPicker string `json:"endpointPicker"`
+
+	// EndpointPickerPort is the port the EPP Service listens on. agentgateway
+	// dials the picker on this port.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	EndpointPickerPort int32 `json:"endpointPickerPort"`
+}
+
 // ModelRouterStatus reports the observed state of a ModelRouter.
 type ModelRouterStatus struct {
 	// Phase is a coarse summary of the router's state.
@@ -682,6 +742,14 @@ type ModelRouterStatus struct {
 	// in Proxy mode. Also surfaced via the GatewayReady condition.
 	// +optional
 	Gateway *GatewayStatus `json:"gateway,omitempty"`
+
+	// AgentGateway reports the observed state of dataPlane: AgentGateway
+	// exposure: whether the InferencePool / InferenceModel / HTTPRoute reconciled
+	// against the referenced agentgateway Gateway, and the resolved endpoint.
+	// nil in Proxy and Gateway modes. Also surfaced via the AgentGatewayReady
+	// condition.
+	// +optional
+	AgentGateway *AgentGatewayStatus `json:"agentGateway,omitempty"`
 
 	// conditions represent the current state of the ModelRouter resource.
 	//

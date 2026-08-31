@@ -1405,6 +1405,22 @@ type GatewayStatus struct {
 	AuthEnabled bool `json:"authEnabled,omitempty"`
 }
 
+// AgentGatewayStatus reports the observed state of dataPlane: AgentGateway
+// exposure for a ModelRouter. It mirrors GatewayStatus for the agentgateway
+// data plane: whether the InferencePool / InferenceModel / HTTPRoute reconciled
+// against the referenced agentgateway Gateway.
+type AgentGatewayStatus struct {
+	// PoolReady indicates the generated InferencePool(s) reconciled against the
+	// referenced agentgateway Gateway.
+	// +optional
+	PoolReady bool `json:"poolReady,omitempty"`
+
+	// Endpoint is the agentgateway address clients send OpenAI requests to,
+	// resolved from the referenced Gateway. Empty until the pool is ready.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+}
+
 // AccelerationStatus reports the offload result the serving engine produced
 // at load time. llama.cpp logs the device it assigned and how many layers it
 // offloaded onto that device; the operator reads that at readiness and stamps

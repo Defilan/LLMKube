@@ -114,6 +114,15 @@ func (v *ModelRouterValidator) validate(mr *inferencev1alpha1.ModelRouter) error
 		errs = append(errs, gatewayModeViolations(mr, specPath)...)
 	}
 
+	// AgentGateway-mode honest-boundary checks. These mirror the reconciler's
+	// fail-loud guards in ModelRouterAgentGatewayReconciler.Reconcile, calling
+	// the SAME agentgateway-flavored pure check functions. A Proxy- or
+	// Gateway-mode router is not subject to them (the agentgateway data plane's
+	// limits do not apply).
+	if mr.Spec.DataPlane == inferencev1alpha1.ModelRouterDataPlaneAgentGateway {
+		errs = append(errs, agentGatewayModeViolations(mr, specPath)...)
+	}
+
 	if len(errs) == 0 {
 		return nil
 	}
@@ -143,6 +152,34 @@ func gatewayModeViolations(mr *inferencev1alpha1.ModelRouter, specPath *field.Pa
 		errs = append(errs, field.Invalid(specPath.Child("policy", "auth", "allowlists"), nil, msg))
 	}
 	if msg := unsupportedAuditLogMessage(mr); msg != "" {
+		errs = append(errs, field.Invalid(specPath.Child("policy", "auditLog"), nil, msg))
+	}
+	if msg := unsafeSensitiveRouteMessage(mr); msg != "" {
+		errs = append(errs, field.Invalid(specPath.Child("rules"), nil, msg))
+	}
+
+	return errs
+}
+
+// agentGatewayModeViolations runs the agentgateway-mode honest-boundary checks
+// and returns a field.Error per non-empty violation. All checks are pure
+// (mr.Spec only) and already exist in this package; they are called directly so
+// the webhook and the agentgateway reconciler can never diverge. ALL violations
+// are collected (not just the first) so the user sees every problem in one
+// apply. A Proxy- or Gateway-mode router is not subject to these.
+func agentGatewayModeViolations(mr *inferencev1alpha1.ModelRouter, specPath *field.Path) field.ErrorList {
+	var errs field.ErrorList
+
+	if msg := agentGatewayUnsupportedMatchMessage(mr); msg != "" {
+		errs = append(errs, field.Invalid(specPath.Child("rules"), nil, msg))
+	}
+	if reason, msg := agentGatewayUnsupportedBudgetMessage(mr); reason != "" {
+		errs = append(errs, field.Invalid(specPath.Child("policy", "budgets"), nil, msg))
+	}
+	if msg := agentGatewayUnsupportedAuthMessage(mr); msg != "" {
+		errs = append(errs, field.Invalid(specPath.Child("policy", "auth"), nil, msg))
+	}
+	if msg := agentGatewayUnsupportedAuditLogMessage(mr); msg != "" {
 		errs = append(errs, field.Invalid(specPath.Child("policy", "auditLog"), nil, msg))
 	}
 	if msg := unsafeSensitiveRouteMessage(mr); msg != "" {
