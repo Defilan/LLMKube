@@ -260,6 +260,19 @@ rules:
   verbs:
   - update
 - apiGroups:
+  - inference.networking.k8s.io
+  resources:
+  - inferencemodels
+  - inferencepools
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - pyrra.dev
   resources:
   - servicelevelobjectives

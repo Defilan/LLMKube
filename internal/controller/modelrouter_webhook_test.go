@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -180,6 +181,69 @@ func TestModelRouterValidator_Create(t *testing.T) {
 				t.Fatalf("expected an Invalid error, got %T: %v", err, err)
 			}
 		})
+	}
+}
+
+// TestModelRouterValidator_AgentGatewayModeRejectsInexpressible proves the
+// agentgateway plane's honest-boundary checks are enforced at apply time, not
+// just at reconcile time: a config the agentgateway data plane cannot honor is
+// rejected with an Invalid error.
+func TestModelRouterValidator_AgentGatewayModeRejectsInexpressible(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	mr := validGatewayRouter()
+	mr.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneAgentGateway
+	mr.Spec.GatewayRef = nil
+	mr.Spec.AgentGatewayRef = &inferencev1alpha1.AgentGatewayReference{
+		Name:               "ai-gateway",
+		Namespace:          "ai-gateway",
+		EndpointPicker:     "llm-d-router-epp",
+		EndpointPickerPort: 9002,
+	}
+	// auth is not supported on the agentgateway Inference-Extension path.
+	mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{
+		Auth: &inferencev1alpha1.RouterAuthSpec{
+			JWT: &inferencev1alpha1.JWTAuthSpec{
+				Provider:  "keycloak",
+				Issuer:    "https://issuer.example.com",
+				JWKSURI:   "https://issuer.example.com/certs",
+				TeamClaim: "team",
+			},
+		},
+	}
+
+	_, err := v.ValidateCreate(ctx, mr)
+	if err == nil {
+		t.Fatal("expected AgentGateway-mode router with unsupported auth to be rejected at apply time")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("expected an Invalid error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "policy.auth is not supported in dataPlane: AgentGateway") {
+		t.Errorf("expected the unsupported-auth message, got %v", err)
+	}
+}
+
+// TestModelRouterValidator_AgentGatewayModeAcceptsExpressible proves a router
+// that uses only what the agentgateway plane supports (model/header matches,
+// primary-fallback, no auth/budget/audit) passes apply-time validation.
+func TestModelRouterValidator_AgentGatewayModeAcceptsExpressible(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	mr := validGatewayRouter()
+	mr.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneAgentGateway
+	mr.Spec.GatewayRef = nil
+	mr.Spec.AgentGatewayRef = &inferencev1alpha1.AgentGatewayReference{
+		Name:               "ai-gateway",
+		Namespace:          "ai-gateway",
+		EndpointPicker:     "llm-d-router-epp",
+		EndpointPickerPort: 9002,
+	}
+
+	if _, err := v.ValidateCreate(ctx, mr); err != nil {
+		t.Fatalf("expected a valid AgentGateway-mode router to pass, got %v", err)
 	}
 }
 
