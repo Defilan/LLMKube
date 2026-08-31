@@ -171,3 +171,73 @@ func TestMaybePreserveGateFailedBranch(t *testing.T) {
 		}
 	})
 }
+
+// A cancelled parent context must still preserve the branch.
+//
+// Regression for a silent no-op: every repo call runs git through
+// exec.CommandContext, so before the fix a cancelled ctx failed the commit
+// instantly and the work was dropped without a trace. mapLoopError routes
+// context.Canceled / DeadlineExceeded into this path by name, so it was the
+// documented case that did not work. The loop's own LoopBudget cannot land
+// here (it derives its own context and returns a terminal envelope before
+// mapLoopError), so a cancelled ctx here means the parent is genuinely gone.
+func TestPreserveUnsuccessfulLoopBranch_CancelledParentStillPreserves(t *testing.T) {
+	ident := repo.Identity{Name: "Foreman Bot", Email: "bot@example.com"}
+	e := &NativeAgentLoopExecutor{CommitAuthor: ident, CommitCommitter: ident}
+
+	const branch = "foreman/wl-cancel/issue-1715"
+	ws, origin := gpSetupWorkspace(t, branch, true)
+
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Payload: foremanv1alpha1.AgenticTaskPayload{Issue: 1715},
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the parent is already dead, as on a cancelled task
+
+	r := &Result{}
+	got := e.preserveUnsuccessfulLoopBranch(ctx, logr.Discard(),
+		gpAgent(foremanv1alpha1.AgentRoleCoder), task, ws, branch, nil, r)
+
+	if !gpOriginHasBranch(t, origin, branch) {
+		t.Error("branch not preserved under a cancelled parent context")
+	}
+	// Asserted rather than assumed: the function returns *Result, which is
+	// nil-able, and a nil here would mean the non-nil r was dropped.
+	if got == nil {
+		t.Fatal("non-nil Result must be returned, got nil")
+	}
+	if got.Extra["preservedBranch"] != branch {
+		t.Errorf("preservedBranch = %v, want %q", got.Extra["preservedBranch"], branch)
+	}
+}
+
+// r is nil whenever mapLoopError took its default branch (an infrastructure
+// error returns (nil, loopErr)). Preserving must still happen -- that is the
+// case where the agent died without warning -- and the nil Result must pass
+// straight through rather than be dereferenced or replaced.
+func TestPreserveUnsuccessfulLoopBranch_NilResultStillPreserves(t *testing.T) {
+	ident := repo.Identity{Name: "Foreman Bot", Email: "bot@example.com"}
+	e := &NativeAgentLoopExecutor{CommitAuthor: ident, CommitCommitter: ident}
+
+	const branch = "foreman/wl-nilres/issue-1715"
+	ws, origin := gpSetupWorkspace(t, branch, true)
+
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Payload: foremanv1alpha1.AgenticTaskPayload{Issue: 1715},
+		},
+	}
+
+	got := e.preserveUnsuccessfulLoopBranch(context.Background(), logr.Discard(),
+		gpAgent(foremanv1alpha1.AgentRoleCoder), task, ws, branch, nil, nil)
+
+	if got != nil {
+		t.Errorf("nil Result must pass through unchanged, got %+v", got)
+	}
+	if !gpOriginHasBranch(t, origin, branch) {
+		t.Error("branch not preserved when the loop failed with an infrastructure error")
+	}
+}

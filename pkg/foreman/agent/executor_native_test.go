@@ -2896,3 +2896,76 @@ func extraFindings(res *foremanagent.Result, key string) []string {
 	}
 	return out
 }
+
+// A transport failure mid-run must not take the agent process down.
+//
+// Regression for the nil-Result panic: mapLoopError returns (nil, loopErr)
+// from its default branch for any infrastructure / transport error, and both
+// preserve call sites enter on `r != nil || err != nil` -- a guard that reads
+// like a nil check but lets nil through. Before the fix this segfaulted in
+// preserveUnsuccessfulLoopBranch at the r.Extra write, crashing foreman-agent.
+//
+// Driven end to end through Execute rather than by calling the preserve
+// function directly: the defect was in what the call site passes, so a direct
+// call is the one shape that cannot prove the fix.
+func TestNativeExecutor_TransportErrorAfterWritesDoesNotPanic(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+
+	// Turn 1 serves a tool call; every later request 500s, as an inference
+	// server that drops mid-run does.
+	var n atomic.Int64
+	oaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n.Add(1) > 1 {
+			http.Error(w, "upstream gone", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(chatJSONBodyToSSE(t, readTurnBody)))
+	}))
+	defer oaiSrv.Close()
+
+	agent, task := taskAndAgent("transport-fail")
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	// The tool call writes real work into the workspace before the drop, so
+	// there is something to preserve.
+	reg := &fakeRegistry{results: map[string]*foremanagent.ToolResult{}}
+	reg.touch = func(_ string, ws string) {
+		_ = os.WriteFile(filepath.Join(ws, "half-done.go"), []byte("package coder\n"), 0o644)
+	}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		CommitCommitter:          repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		RegistryFactory: func(
+			_ context.Context, ws string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+
+	// A transport failure is an infrastructure error: it surfaces as an error
+	// return, not a verdict, and above all not a panic.
+	if _, err := execWithAgent(t, e, task); err == nil {
+		t.Fatal("want an error from a transport failure, got nil")
+	}
+
+	// The work must still be preserved, which is the whole point of #1715:
+	// this is the case where the agent died without warning.
+	out, gitErr := exec.Command("git", "-C", bare, "branch", "--list", "foreman/issue-9999").CombinedOutput()
+	if gitErr != nil {
+		t.Fatalf("branch list: %v: %s", gitErr, out)
+	}
+	if !strings.Contains(string(out), "foreman/issue-9999") {
+		t.Errorf("branch not preserved after a transport failure: %s", out)
+	}
+}

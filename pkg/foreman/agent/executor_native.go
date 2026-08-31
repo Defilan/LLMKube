@@ -2379,12 +2379,24 @@ func (e *NativeAgentLoopExecutor) maybePreserveGateFailedBranch(
 		"branch", branch, "sha", sha, "issue", task.Spec.Payload.Issue)
 }
 
+// preserveBranchTimeout bounds the detached commit + push in
+// preserveUnsuccessfulLoopBranch. Long enough for a clone-local commit and a
+// push over a slow link, short enough that a shutting-down agent is not held
+// open waiting on a remote that is not answering.
+const preserveBranchTimeout = 30 * time.Second
+
 // preserveUnsuccessfulLoopBranch commits and pushes whatever the model wrote
 // to the workspace when the loop ended unsuccessfully (max turns exhausted,
-// no tool call, truncation, context cancel). mapLoopError has already built
-// the unsuccessful result r; this does NOT change the verdict -- it only
-// makes that verdict land against a branch that exists, so a human can read
-// the diff, judge how far the run got, and finish or discard it (#1715).
+// no tool call, truncation, context cancel). This does NOT change the
+// verdict -- it only makes that verdict land against a branch that exists, so
+// a human can read the diff, judge how far the run got, and finish or discard
+// it (#1715).
+//
+// r MAY BE NIL. mapLoopError builds a Result for the model-behaviour
+// outcomes, but its default branch returns (nil, loopErr) for an
+// infrastructure / transport failure, and both call sites enter on
+// `r != nil || err != nil`. The branch is preserved either way; only the
+// r.Extra annotation is conditional. See the guard at the end.
 //
 // Nothing-to-commit is the EXPECTED case here (the model may have written
 // nothing before running out of turns), so ErrNothingToCommit is kept as the
@@ -2407,6 +2419,22 @@ func (e *NativeAgentLoopExecutor) preserveUnsuccessfulLoopBranch(
 	if agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer {
 		return r
 	}
+
+	// DETACH FROM THE INCOMING CONTEXT. mapLoopError reaches this function on
+	// context.Canceled / DeadlineExceeded, and every repo call below runs git
+	// through exec.CommandContext -- so on exactly that path a live ctx is
+	// already dead, every git command fails instantly, and the branch is
+	// silently not preserved. The loop's own LoopBudget cannot cause this (it
+	// derives its own context and returns a terminal envelope before
+	// mapLoopError), so arriving here cancelled means the PARENT is gone: a
+	// cancelled task, or the agent shutting down.
+	//
+	// Preserving the work is a few git commands and is worth finishing even
+	// then, so the deadline is short and best-effort: on SIGTERM the process
+	// may still die first, which loses nothing that was not already lost.
+	ctx, cancelPreserve := context.WithTimeout(
+		context.WithoutCancel(ctx), preserveBranchTimeout)
+	defer cancelPreserve()
 
 	hasChanges, err := repo.HasChanges(ctx, workspace)
 	if err != nil {
@@ -2462,11 +2490,25 @@ func (e *NativeAgentLoopExecutor) preserveUnsuccessfulLoopBranch(
 		return r
 	}
 
-	if r.Extra == nil {
-		r.Extra = map[string]any{}
+	// r IS NIL on the infrastructure-failure path, and that is the case this
+	// function matters most for. mapLoopError returns (nil, loopErr) from its
+	// default branch for any transport / system error, and BOTH call sites
+	// enter on `r != nil || err != nil` -- a guard that reads like a nil check
+	// but lets nil through. A transport drop mid-run is precisely when the
+	// agent dies without warning and the workspace is least recoverable, so
+	// the branch is still pushed above; only the annotation is skipped, since
+	// there is no Result to annotate.
+	//
+	// Do not "simplify" this into an early `if r == nil { return nil }` at the
+	// top of the function: that compiles, stops the panic, and silently throws
+	// away the work in the one scenario the issue was filed for.
+	if r != nil {
+		if r.Extra == nil {
+			r.Extra = map[string]any{}
+		}
+		r.Extra["preservedBranch"] = branch
+		r.Extra["commitSHA"] = sha
 	}
-	r.Extra["preservedBranch"] = branch
-	r.Extra["commitSHA"] = sha
 	log.Info("unsuccessful-loop preserve: pushed branch for human finish",
 		"branch", branch, "sha", sha, "issue", task.Spec.Payload.Issue)
 	return r
