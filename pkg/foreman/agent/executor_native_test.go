@@ -688,6 +688,169 @@ func TestNativeExecutor_NoStaticRemoteAndNoRepoIsHardError(t *testing.T) {
 	}
 }
 
+// --- #1715: an unsuccessful loop still commits and pushes the workspace --
+
+// readTurnBody is a non-terminal turn: the model calls a read-only tool
+// (read_file) and never submits. Each such turn is a "progress" turn (it has
+// a tool_call), so the loop keeps going until MaxTurns, at which point it
+// surfaces ErrMaxTurnsExhausted. The fakeRegistry's touch writes a file on
+// every dispatch, so the workspace carries real work when the loop becomes
+// unsuccessful.
+const readTurnBody = `{
+  "id": "read",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "tool_calls": [{
+        "id": "tc-1",
+        "type": "function",
+        "function": {"name": "read_file", "arguments": "{\"path\":\"main.go\"}"}
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}`
+
+// TestNativeExecutor_UnsuccessfulLoopPreservesWorkspace proves that when the
+// loop ends unsuccessfully (here: MaxTurns exhausted without a submit_result),
+// the executor still commits and pushes whatever is in the workspace before
+// returning the INCOMPLETE verdict, rather than discarding the workspace with
+// the pod.
+func TestNativeExecutor_UnsuccessfulLoopPreservesWorkspace(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+	oaiSrv := scriptedOAI(t, []string{readTurnBody})
+
+	agent, task := taskAndAgent("unsuccess")
+	// A small MaxTurns so the loop exhausts turns quickly. The model keeps
+	// reading (never submits), so it runs out of turns and surfaces
+	// ErrMaxTurnsExhausted.
+	agent.Spec.MaxTurns = 2
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(agent, task).
+		Build()
+
+	// fakeRegistry's touch writes a file to the workspace on every dispatch,
+	// simulating a coder that produced real work before the loop became
+	// unsuccessful.
+	reg := &fakeRegistry{results: map[string]*foremanagent.ToolResult{}}
+	reg.touch = func(name string, ws string) {
+		_ = os.WriteFile(filepath.Join(ws, "half-done.go"), []byte("package coder\n"), 0o644)
+	}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		CommitCommitter:          repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		RegistryFactory: func(
+			_ context.Context, ws string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+
+	res, err := execWithAgent(t, e, task)
+	if err != nil {
+		t.Fatalf("Execute returned a hard error; an unsuccessful loop must map to INCOMPLETE: %v", err)
+	}
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictIncomplete {
+		t.Fatalf("verdict: want INCOMPLETE got %s; result=%+v", res.Verdict, res)
+	}
+	// Must NOT be GO.
+	if res.Verdict == foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("verdict must not be GO on an unsuccessful loop")
+	}
+	// The branch must exist on the remote with the workspace's contents.
+	out, err := exec.Command("git", "-C", bare, "branch", "--list", "foreman/issue-9999").CombinedOutput()
+	if err != nil {
+		t.Fatalf("post-preserve branch list: %v: %s", err, out)
+	}
+	if !strings.Contains(string(out), "foreman/issue-9999") {
+		t.Errorf("branch not pushed to remote: %s", out)
+	}
+	// The preserved branch is recorded for observability, but must NOT be
+	// marked reviewable (no gateFailedBranch key).
+	if got := res.Extra["preservedBranch"]; got != "foreman/issue-9999" {
+		t.Errorf("preservedBranch = %v; want foreman/issue-9999", got)
+	}
+	if _, ok := res.Extra["gateFailedBranch"]; ok {
+		t.Errorf("unsuccessful-loop branch must not be marked reviewable (gateFailedBranch set)")
+	}
+	// The branch should carry the half-done work.
+	_, err = exec.Command("git", "-C", bare, "show", "foreman/issue-9999:half-done.go").CombinedOutput()
+	if err != nil {
+		t.Errorf("half-done.go not present on the pushed branch: %v", err)
+	}
+}
+
+// TestNativeExecutor_UnsuccessfulLoopCleanWorkspaceNoError proves the
+// nothing-to-commit case: a loop that becomes unsuccessful with an empty
+// workspace (the model wrote nothing) must return the INCOMPLETE verdict
+// WITHOUT erroring on ErrNothingToCommit and WITHOUT converting the verdict
+// to NO-CHANGES.
+func TestNativeExecutor_UnsuccessfulLoopCleanWorkspaceNoError(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+	oaiSrv := scriptedOAI(t, []string{readTurnBody})
+
+	agent, task := taskAndAgent("unsuccess-clean")
+	agent.Spec.MaxTurns = 2
+	c := fake.NewClientBuilder().
+		WithScheme(newScheme(t)).
+		WithObjects(agent, task).
+		Build()
+
+	// No touch: the workspace stays clean, so there is nothing to commit.
+	reg := &fakeRegistry{results: map[string]*foremanagent.ToolResult{}}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		CommitCommitter:          repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		RegistryFactory: func(
+			_ context.Context, ws string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+
+	res, err := execWithAgent(t, e, task)
+	if err != nil {
+		t.Fatalf("Execute returned an error on a clean unsuccessful loop; nothing-to-commit is expected: %v", err)
+	}
+	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictIncomplete {
+		t.Fatalf("verdict: want INCOMPLETE got %s; result=%+v", res.Verdict, res)
+	}
+	// Must not become NO-CHANGES.
+	if got := res.Extra["outcome"]; got == "NO-CHANGES" {
+		t.Errorf("nothing-to-commit on an unsuccessful loop must keep the loop-error verdict, not NO-CHANGES")
+	}
+	// Nothing to push: no branch should have landed.
+	out, err := exec.Command("git", "-C", bare, "branch", "--list", "foreman/issue-9999").CombinedOutput()
+	if err != nil {
+		t.Fatalf("branch list: %v: %s", err, out)
+	}
+	if strings.Contains(string(out), "foreman/issue-9999") {
+		t.Errorf("branch should not be pushed when the workspace is clean")
+	}
+}
+
 // --- Loop returns no-change GO -> reported as NO-GO/NO-CHANGES -----------
 
 func TestNativeExecutor_ModelEmitsGoButNoChanges(t *testing.T) {
@@ -2732,4 +2895,77 @@ func extraFindings(res *foremanagent.Result, key string) []string {
 		}
 	}
 	return out
+}
+
+// A transport failure mid-run must not take the agent process down.
+//
+// Regression for the nil-Result panic: mapLoopError returns (nil, loopErr)
+// from its default branch for any infrastructure / transport error, and both
+// preserve call sites enter on `r != nil || err != nil` -- a guard that reads
+// like a nil check but lets nil through. Before the fix this segfaulted in
+// preserveUnsuccessfulLoopBranch at the r.Extra write, crashing foreman-agent.
+//
+// Driven end to end through Execute rather than by calling the preserve
+// function directly: the defect was in what the call site passes, so a direct
+// call is the one shape that cannot prove the fix.
+func TestNativeExecutor_TransportErrorAfterWritesDoesNotPanic(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
+
+	// Turn 1 serves a tool call; every later request 500s, as an inference
+	// server that drops mid-run does.
+	var n atomic.Int64
+	oaiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n.Add(1) > 1 {
+			http.Error(w, "upstream gone", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(chatJSONBodyToSSE(t, readTurnBody)))
+	}))
+	defer oaiSrv.Close()
+
+	agent, task := taskAndAgent("transport-fail")
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
+
+	// The tool call writes real work into the workspace before the drop, so
+	// there is something to preserve.
+	reg := &fakeRegistry{results: map[string]*foremanagent.ToolResult{}}
+	reg.touch = func(_ string, ws string) {
+		_ = os.WriteFile(filepath.Join(ws, "half-done.go"), []byte("package coder\n"), 0o644)
+	}
+
+	e := &foremanagent.NativeAgentLoopExecutor{
+		Client:                   c,
+		WorkspaceRoot:            filepath.Join(root, "ws"),
+		GitRemoteURL:             bare,
+		UpstreamURLForRepo:       func(string) string { return bare },
+		InferenceBaseURLOverride: oaiSrv.URL + "/v1",
+		CommitAuthor:             repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		CommitCommitter:          repo.Identity{Name: "Foreman Bot", Email: "bot@foreman.test"},
+		RegistryFactory: func(
+			_ context.Context, ws string, _ *foremanv1alpha1.Agent, _ bool,
+		) (foremanagent.ToolRegistry, error) {
+			reg.workspace = ws
+			return reg, nil
+		},
+		AuthFactory: fakeAuth(t),
+	}
+
+	// A transport failure is an infrastructure error: it surfaces as an error
+	// return, not a verdict, and above all not a panic.
+	if _, err := execWithAgent(t, e, task); err == nil {
+		t.Fatal("want an error from a transport failure, got nil")
+	}
+
+	// The work must still be preserved, which is the whole point of #1715:
+	// this is the case where the agent died without warning.
+	out, gitErr := exec.Command("git", "-C", bare, "branch", "--list", "foreman/issue-9999").CombinedOutput()
+	if gitErr != nil {
+		t.Fatalf("branch list: %v: %s", gitErr, out)
+	}
+	if !strings.Contains(string(out), "foreman/issue-9999") {
+		t.Errorf("branch not preserved after a transport failure: %s", out)
+	}
 }
