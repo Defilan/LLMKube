@@ -139,3 +139,18 @@ func (s *TurnStream) SubscriberCount() int {
 	defer s.mu.Unlock()
 	return len(s.subs)
 }
+
+// turnHook returns the LoopConfig.OnTurn hook for this executor's stream, or
+// nil when no stream is attached.
+//
+// The nil case must stay NIL rather than a method value on a nil *TurnStream.
+// PublishTurn is safe to call on a nil receiver, but a method value is still a
+// non-nil func, so returning one unconditionally would make the loop's flusher
+// reslice the transcript on every turn of every run nobody is watching. The
+// loop checks this hook against nil precisely so an unwatched run pays nothing.
+func (e *NativeAgentLoopExecutor) turnHook() func(int, []oai.Message) {
+	if e.Stream == nil {
+		return nil
+	}
+	return e.Stream.PublishTurn
+}

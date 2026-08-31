@@ -114,3 +114,34 @@ func TestTurnStream_NilStreamPublishIsSafe(t *testing.T) {
 	var s *TurnStream
 	s.Publish(1, []oai.Message{{Role: oai.RoleAssistant, Content: "x"}})
 }
+
+// The nil case must return a nil hook, not a method value on a nil receiver.
+// Both are safe to call, but only nil lets the loop's flusher skip the work,
+// which is what keeps an unwatched run free. A method value would silently
+// pass a "does it panic" test while costing every run a reslice per turn.
+func TestTurnHook_NilStreamYieldsNilHook(t *testing.T) {
+	if hook := (&NativeAgentLoopExecutor{}).turnHook(); hook != nil {
+		t.Error("turnHook with no stream: want nil hook so the loop skips per-turn work, got non-nil")
+	}
+}
+
+func TestTurnHook_StreamYieldsWorkingHook(t *testing.T) {
+	s := NewTurnStream(4)
+	hook := (&NativeAgentLoopExecutor{Stream: s}).turnHook()
+	if hook == nil {
+		t.Fatal("turnHook with a stream: want a hook, got nil")
+	}
+
+	ch, cancel := s.Subscribe()
+	defer cancel()
+	hook(7, []oai.Message{{Role: oai.RoleAssistant, Content: "hi"}})
+
+	select {
+	case ev := <-ch:
+		if ev.Turn != 7 || len(ev.Messages) != 1 || ev.Messages[0].Content != "hi" {
+			t.Errorf("hook delivered %+v; want turn 7 carrying one assistant message", ev)
+		}
+	default:
+		t.Error("hook did not deliver the turn to a subscriber")
+	}
+}
