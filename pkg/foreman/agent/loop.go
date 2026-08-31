@@ -291,6 +291,14 @@ type LoopResult struct {
 	Terminal *ToolResult
 	// Turns is the count of completed chat-completions calls.
 	Turns int
+	// SubmissionsRejected counts the terminal submit_result calls the
+	// verification gate vetoed (applyTerminalGate returning "continue"),
+	// after which the loop kept running. It is the signal that lets a
+	// max-turns INCOMPLETE distinguish "the model never concluded" from
+	// "the model concluded but the gate refused it" — two different
+	// problems with different fixes. Zero when no terminal was ever
+	// reached, or when the gate is disabled.
+	SubmissionsRejected int
 }
 
 // ErrMaxTurnsExhausted is returned when the loop hits MaxTurns without
@@ -1093,6 +1101,13 @@ func (l *Loop) applyTerminalGate(
 	}
 	if *verifyRetries < cfg.MaxVerifyRetries {
 		*verifyRetries++
+		// Count this vetoed submission so a later max-turns INCOMPLETE
+		// can report that the model DID conclude (and was refused by the
+		// gate), rather than falsely claiming it never called
+		// submit_result. Only gate-vetoed continues reach here: a
+		// terminal the gate accepts returns false above and the loop
+		// exits, so this counter never over-counts.
+		res.SubmissionsRejected++
 		res.Transcript = append(res.Transcript, oai.Message{
 			Role:    oai.RoleUser,
 			Content: feedback,
