@@ -858,8 +858,16 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		log.Error(twErr, "transcript write failed; continuing")
 	}
 
-	if r, err := e.mapLoopError(start, transcriptRef, loopRes, loopErr); r != nil || err != nil {
-		return r, err
+	// #1715: an unsuccessful loop (max turns, no tool call, timeout) must not
+	// discard the workspace. Commit + push whatever the model wrote so the
+	// INCOMPLETE verdict lands against a branch a human can read, rather than
+	// dying with the pod. preserveLoopErrorBranch is best-effort and never
+	// changes the loop-error verdict; it only records the pushed branch under
+	// result extra (mirrors maybePreserveGateFailedBranch for #1109).
+	mapRes, mapErr := e.mapLoopError(start, transcriptRef, loopRes, loopErr)
+	e.preserveLoopErrorBranch(ctx, log, agent, task, workspace, branch, auth, loopRes, mapRes)
+	if mapRes != nil || mapErr != nil {
+		return mapRes, mapErr
 	}
 
 	if loopRes.Terminal == nil {
@@ -1115,8 +1123,13 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		if twErr != nil {
 			log.Error(twErr, "transcript write failed; continuing")
 		}
-		if r, err := e.mapLoopError(start, transcriptRef, loopRes, loopErr); r != nil || err != nil {
-			return r, err
+		// #1715: preserve the workspace on an unsuccessful retry loop too
+		// (see the initial loop call above). Best-effort; never changes the
+		// loop-error verdict.
+		mapRes, mapErr := e.mapLoopError(start, transcriptRef, loopRes, loopErr)
+		e.preserveLoopErrorBranch(ctx, log, agent, task, workspace, branch, auth, loopRes, mapRes)
+		if mapRes != nil || mapErr != nil {
+			return mapRes, mapErr
 		}
 		if loopRes.Terminal == nil {
 			return e.incompleteResult(start, transcriptRef, loopRes,
@@ -2363,6 +2376,84 @@ func (e *NativeAgentLoopExecutor) maybePreserveGateFailedBranch(
 	r.Extra["gateFailedBranch"] = branch
 	r.Extra["commitSHA"] = sha
 	log.Info("gate-failed preserve: pushed branch for human finish",
+		"branch", branch, "sha", sha, "issue", task.Spec.Payload.Issue)
+}
+
+// preserveLoopErrorBranch commits + pushes whatever the model wrote in the
+// workspace when the loop ended unsuccessfully (max turns, no tool call,
+// timeout), so an INCOMPLETE verdict lands against a branch a human can read
+// instead of the workspace being discarded with the pod (#1715). It mirrors
+// maybePreserveGateFailedBranch (#1109): coder-role only (reviewers are
+// read-only), best-effort, and never changes the loop-error verdict — it only
+// records the preserved branch under result extra.
+//
+// Nothing-to-commit is the expected case here, not a failure: the model may
+// genuinely have written nothing before the loop gave up, and the original
+// loop-error verdict stands. The branch is deliberately NOT marked
+// reviewable (no PR, no gate), so an unsuccessful run never enters the normal
+// review pipeline as though it were a GO candidate.
+func (e *NativeAgentLoopExecutor) preserveLoopErrorBranch(
+	ctx context.Context, log logr.Logger,
+	agent *foremanv1alpha1.Agent, task *foremanv1alpha1.AgenticTask,
+	workspace, branch string, auth *repo.Auth, lr *LoopResult, r *Result,
+) {
+	// Nothing to preserve (loop ended cleanly / not an error path).
+	if r == nil {
+		return
+	}
+	if agent.Spec.Role == foremanv1alpha1.AgentRoleReviewer {
+		return
+	}
+	if lr == nil {
+		return
+	}
+
+	hasChanges, err := repo.HasChanges(ctx, workspace)
+	if err != nil {
+		log.Error(err, "loop-error preserve: HasChanges failed; not preserving branch")
+		return
+	}
+	if !hasChanges {
+		// Nothing to preserve (the model left no uncommitted work); keep the
+		// plain loop-error result.
+		return
+	}
+
+	// The loop-error envelope carries no model commit message (the model
+	// never reached a GO), so synthesize a WIP subject that flags the branch
+	// as unfinished. Refs (not Fixes) the issue so merging this branch alone
+	// does not auto-close it.
+	msg := fmt.Sprintf(
+		"wip(incomplete): preserve coder attempt for issue #%d\n\n"+
+			"The loop ended without the model reaching submit_result (max turns, "+
+			"no tool call, or timeout), so this branch is preserved (verdict "+
+			"INCOMPLETE, not a GO) for a human to finish. Do not merge as-is.\n\n"+
+			"Refs #%d",
+		task.Spec.Payload.Issue, task.Spec.Payload.Issue)
+	sha, err := repo.Commit(ctx, repo.CommitOptions{
+		Workspace: workspace,
+		Message:   msg,
+		Author:    e.CommitAuthor,
+		Committer: e.CommitCommitter,
+	})
+	if err != nil {
+		log.Error(err, "loop-error preserve: commit failed; not preserving branch")
+		return
+	}
+	if err := repo.Push(ctx, repo.PushOptions{
+		Workspace:       workspace,
+		Branch:          branch,
+		Auth:            auth,
+		ReplaceOnReject: task.Spec.Payload.AllowOverwrite,
+	}); err != nil {
+		log.Error(err, "loop-error preserve: push failed; branch not preserved",
+			"branch", branch)
+		return
+	}
+
+	r.Extra["loopErrorBranch"] = branch
+	r.Extra["commitSHA"] = sha
+	log.Info("loop-error preserve: pushed branch for human finish",
 		"branch", branch, "sha", sha, "issue", task.Spec.Payload.Issue)
 }
 
