@@ -2494,9 +2494,24 @@ func (e *NativeAgentLoopExecutor) mapLoopError(
 	}
 	switch {
 	case errors.Is(loopErr, ErrMaxTurnsExhausted):
+		// The summary must describe the actual terminal state, not assume
+		// the model stayed silent. A max-turns exhaustion has two distinct
+		// causes: the model never reached submit_result (SubmissionsRejected
+		// == 0), or it did and the verification gate vetoed every attempt
+		// (SubmissionsRejected > 0) — the #1713 case, where the model called
+		// submit_result three times, was accepted each time, yet the loop
+		// kept running to MaxTurns. Both are INCOMPLETE outcomes, but the
+		// fixes differ: a bigger budget versus a gate that keeps rejecting.
+		var summary string
+		if lr.SubmissionsRejected > 0 {
+			summary = fmt.Sprintf(
+				"model submitted %d time(s), each rejected by the verification "+
+					"gate; turns exhausted", lr.SubmissionsRejected)
+		} else {
+			summary = "model did not call submit_result within max_turns"
+		}
 		return e.incompleteResult(start, tref, lr,
-			foremanv1alpha1.FailureMaxTurnsExhausted,
-			"model did not call submit_result within max_turns"), nil
+			foremanv1alpha1.FailureMaxTurnsExhausted, summary), nil
 	case errors.Is(loopErr, ErrAssistantNoToolCalls):
 		return e.incompleteResult(start, tref, lr,
 			foremanv1alpha1.FailureModelMisunderstood,

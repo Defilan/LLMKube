@@ -589,6 +589,42 @@ func TestIncompleteResult_EmitsStructuredFailureReason(t *testing.T) {
 	}
 }
 
+// TestMapLoopError_MaxTurns_SubmissionCount pins the #1713 fix: a max-turns
+// exhaustion reports the actual terminal state. When the model submitted
+// and the gate rejected it (SubmissionsRejected > 0), the summary says so
+// and says how many — it must NOT claim the model never called
+// submit_result. When no submission was rejected, the original "never
+// concluded" wording is kept.
+func TestMapLoopError_MaxTurns_SubmissionCount(t *testing.T) {
+	e := &NativeAgentLoopExecutor{}
+	tref := corev1.ObjectReference{Name: "transcript"}
+
+	// No rejection: the model never concluded.
+	r, err := e.mapLoopError(time.Time{}, tref, &LoopResult{Turns: 5}, ErrMaxTurnsExhausted)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if r.Summary != "model did not call submit_result within max_turns" {
+		t.Errorf("summary: want the never-concluded wording, got %q", r.Summary)
+	}
+
+	// Rejections: the model concluded repeatedly and was refused.
+	r, err = e.mapLoopError(time.Time{}, tref,
+		&LoopResult{Turns: 5, SubmissionsRejected: 3}, ErrMaxTurnsExhausted)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !strings.Contains(r.Summary, "3 time(s)") {
+		t.Errorf("summary: want it to report 3 rejected submissions, got %q", r.Summary)
+	}
+	if !strings.Contains(r.Summary, "verification gate") {
+		t.Errorf("summary: want it to name the gate, got %q", r.Summary)
+	}
+	if strings.Contains(r.Summary, "did not call submit_result") {
+		t.Errorf("summary: must not claim the model never submitted, got %q", r.Summary)
+	}
+}
+
 // TestResolveProviderEndpoint covers the v0.2 cloud-proxy resolution
 // path: providerConfig must carry baseURL + model, the optional
 // APIKeySecretRef must reference a real Secret, and missing fields

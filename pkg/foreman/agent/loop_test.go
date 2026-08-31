@@ -432,6 +432,47 @@ func TestLoop_MaxTurnsExhausted(t *testing.T) {
 	}
 }
 
+// TestLoop_MaxTurnsExhausted_AfterRejectedSubmissions is the #1713
+// regression. The model calls submit_result and is accepted by the harness
+// each time, but the verification gate vetoes the terminal and the loop
+// keeps running until MaxTurns. The resulting INCOMPLETE summary must not
+// claim the model never submitted: the loop threads a rejection count
+// through LoopResult so mapLoopError can report what actually happened.
+func TestLoop_MaxTurnsExhausted_AfterRejectedSubmissions(t *testing.T) {
+	// read_file, submit (vetoed), read_file, submit (vetoed), read_file.
+	// With MaxTurns=5 and a gate that always rejects, the two submit
+	// attempts are vetoed and the loop exhausts turns on the final read.
+	srv, _ := scriptedOAIServer(t, []string{
+		toolCallReadFile, toolCallSubmitGo, toolCallReadFile, toolCallSubmitGo, toolCallReadFile,
+	})
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"read_file":     {Output: map[string]any{"content": "# README\n"}},
+			"submit_result": {Terminal: true, Verdict: "GO", Summary: "done"},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	res, err := loop.Run(context.Background(), LoopConfig{
+		Model:    "test",
+		MaxTurns: 5,
+		// A gate that always vetoes the terminal with retries to spare,
+		// forcing the loop to continue after each submission.
+		VerifyTerminal: func(_ context.Context, _ *ToolResult, _ []oai.Message) (bool, string, error) {
+			return false, "gate: change does not compile", nil
+		},
+		MaxVerifyRetries: 10,
+	})
+	if !errors.Is(err, ErrMaxTurnsExhausted) {
+		t.Fatalf("expected ErrMaxTurnsExhausted, got %v", err)
+	}
+	if res.SubmissionsRejected != 2 {
+		t.Errorf("submissions rejected: want 2 got %d", res.SubmissionsRejected)
+	}
+	if res.Terminal != nil {
+		t.Errorf("did not expect a terminal: %+v", res.Terminal)
+	}
+}
+
 func TestLoop_UnknownToolBecomesToolErrorMessage(t *testing.T) {
 	srv, _ := scriptedOAIServer(t, []string{toolCallUnknownTool, toolCallSubmitGo})
 	reg := &fakeRegistry{
