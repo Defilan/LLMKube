@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -1411,6 +1412,61 @@ func TestInferPodSecurityContext_VulkanDRIRenderGID(t *testing.T) {
 			if g == renderGID {
 				t.Errorf("user override must not gain the operator render GID %d", renderGID)
 			}
+		}
+	})
+}
+
+// TestBuildContainerResources_MemoryLimit sets a memory LIMIT alongside the
+// request. Historically the builder set only Requests[memory], so a serving
+// container was unbounded: a model whose resident set exceeded available RAM
+// took the node down (kubelet stopped posting status, node went NotReady)
+// instead of being OOM-killed. See #1724.
+func TestBuildContainerResources_MemoryLimit(t *testing.T) {
+	build := func(isvc *inferencev1alpha1.InferenceService) corev1.ResourceRequirements {
+		return buildContainerResources(isvc, &inferencev1alpha1.Model{}, 0, "")
+	}
+
+	t.Run("memory sets equal request and limit", func(t *testing.T) {
+		res := build(&inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{Memory: "8Gi"},
+			},
+		})
+		want := resource.MustParse("8Gi")
+		if got := res.Requests[corev1.ResourceMemory]; !got.Equal(want) {
+			t.Errorf("Requests[memory] = %s, want %s", got.String(), want.String())
+		}
+		if got := res.Limits[corev1.ResourceMemory]; !got.Equal(want) {
+			t.Errorf("Limits[memory] = %s, want %s", got.String(), want.String())
+		}
+	})
+
+	t.Run("hostMemory wins and drives both request and limit", func(t *testing.T) {
+		res := build(&inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{Memory: "8Gi", HostMemory: "64Gi"},
+			},
+		})
+		want := resource.MustParse("64Gi")
+		if got := res.Requests[corev1.ResourceMemory]; !got.Equal(want) {
+			t.Errorf("Requests[memory] = %s, want %s", got.String(), want.String())
+		}
+		if got := res.Limits[corev1.ResourceMemory]; !got.Equal(want) {
+			t.Errorf("Limits[memory] = %s, want %s", got.String(), want.String())
+		}
+	})
+
+	t.Run("neither memory nor hostMemory sets no memory key", func(t *testing.T) {
+		res := build(&inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{CPU: "1"},
+			},
+		})
+		if v, ok := res.Requests[corev1.ResourceMemory]; ok {
+			t.Errorf("Requests has memory %s, want none", v.String())
+		}
+		if v, ok := res.Limits[corev1.ResourceMemory]; ok {
+			t.Errorf("Limits has memory %s, want none", v.String())
 		}
 	})
 }
