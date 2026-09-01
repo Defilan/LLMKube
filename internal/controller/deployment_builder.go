@@ -720,10 +720,10 @@ func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *in
 		// Request AND limit, driven by whichever of hostMemory/memory wins.
 		// The limit is what keeps an overrun charged to this pod: without one an
 		// unbounded container crosses MemoryPressure and stops the kubelet posting
-		// status (the node goes NotReady) instead of being OOM-killed. Equal request
-		// and limit also yields Guaranteed QoS. ParseQuantity, not MustParse, for the
-		// same reason as ephemeralStorage below: a panic here takes the controller
-		// down for every workload rather than failing the one object at fault.
+		// status (the node goes NotReady) instead of being OOM-killed. ParseQuantity,
+		// not MustParse, for the same reason as ephemeralStorage below: a panic here
+		// takes the controller down for every workload rather than failing the one
+		// object at fault.
 		var memoryQ *resource.Quantity
 		if isvc.Spec.Resources.HostMemory != "" {
 			if q, err := resource.ParseQuantity(isvc.Spec.Resources.HostMemory); err == nil {

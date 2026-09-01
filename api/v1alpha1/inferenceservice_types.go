@@ -901,6 +901,7 @@ type InferenceResourceRequirements struct {
 	CPU string `json:"cpu,omitempty"`
 
 	// Memory requests (e.g., "4Gi")
+	// +kubebuilder:validation:Pattern=`^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$`
 	// +optional
 	Memory string `json:"memory,omitempty"`
 
@@ -909,6 +910,7 @@ type InferenceResourceRequirements struct {
 	// Translated to pod resources.requests.memory, taking precedence over Memory when set.
 	// Without this, the K8s scheduler has no visibility into the pod's actual RAM consumption,
 	// which can lead to OOM kills after model load.
+	// +kubebuilder:validation:Pattern=`^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$`
 	// +optional
 	HostMemory string `json:"hostMemory,omitempty"`
 
@@ -932,10 +934,7 @@ type InferenceResourceRequirements struct {
 	// everywhere and none is applied.
 	//
 	// The pattern is the Kubernetes quantity format, so a malformed value is
-	// rejected at admission. The sibling quantity fields above predate this and
-	// carry no pattern; they reach resource.MustParse, which panics on
-	// malformed input and takes the controller down for every workload rather
-	// than failing the one object at fault.
+	// rejected at admission.
 	// +kubebuilder:validation:Pattern=`^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$`
 	// +optional
 	EphemeralStorage string `json:"ephemeralStorage,omitempty"`
