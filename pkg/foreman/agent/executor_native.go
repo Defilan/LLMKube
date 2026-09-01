@@ -1057,7 +1057,8 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			applyCrossStageContradictionsForTask(ctx, log, workspace, reviewBase,
 				reviewDiff, reviewDiffErr, loopRes, verdict)
 		}
-		r := e.modelDecidedResult(start, transcriptRef, loopRes, verdict)
+		r := e.modelDecidedResult(ctx, start, transcriptRef, loopRes, verdict,
+			workspace, baseBranchOrDefault(task.Spec.Payload.BaseBranch))
 		// #1109: preserve a coder's near-complete work when its in-loop
 		// verification gate never passed. A CODER-GATE-FAILED terminal builds
 		// and only trips the fast gate (fmt/vet/build/lint); without this the
@@ -1424,7 +1425,8 @@ func (e *NativeAgentLoopExecutor) retryCoderTerminalResult(
 	verdict foremanv1alpha1.AgenticTaskVerdict, normReason foremanv1alpha1.AgenticTaskFailureReason,
 	cloneURL string,
 ) *Result {
-	r := e.modelDecidedResult(start, tref, lr, verdict)
+	r := e.modelDecidedResult(ctx, start, tref, lr, verdict,
+		workspace, baseBranchOrDefault(task.Spec.Payload.BaseBranch))
 	e.maybePreserveGateFailedBranch(ctx, log, agent, task, workspace, branch, auth, lr, r)
 	// No reviewer rails ran on this path, so there is no resolved review base
 	// to ground the summary against; #1411's check degrades open on the empty
@@ -2536,8 +2538,8 @@ func (e *NativeAgentLoopExecutor) preserveUnsuccessfulLoopBranch(
 }
 
 func (e *NativeAgentLoopExecutor) modelDecidedResult(
-	start time.Time, tref corev1.ObjectReference, lr *LoopResult,
-	verdict foremanv1alpha1.AgenticTaskVerdict,
+	ctx context.Context, start time.Time, tref corev1.ObjectReference, lr *LoopResult,
+	verdict foremanv1alpha1.AgenticTaskVerdict, workspace, baseBranch string,
 ) *Result {
 	r := NewResult(e.Kind(), verdict, lr.Terminal.Summary, time.Since(start))
 	r.Extra = map[string]any{
@@ -2546,7 +2548,7 @@ func (e *NativeAgentLoopExecutor) modelDecidedResult(
 		"turnCount":     lr.Turns,
 		"modelExtra":    lr.Terminal.Extra,
 	}
-	promoteTerminalOutcome(r.Extra, lr.Terminal.Extra)
+	promoteTerminalOutcome(ctx, r.Extra, lr.Terminal.Extra, workspace, execCommandRunner, baseBranch)
 	return r
 }
 
@@ -2576,7 +2578,10 @@ func (e *NativeAgentLoopExecutor) modelDecidedResult(
 // "unverified" is promoted for parity and observability, and its readers
 // are all in this package (loop.go, verdict_policy.go). The full modelExtra nesting is left untouched for
 // observability (terminalExtra is the same map referenced there).
-func promoteTerminalOutcome(extra, terminalExtra map[string]any) {
+func promoteTerminalOutcome(
+	ctx context.Context, extra, terminalExtra map[string]any,
+	workspace string, run commandRunner, baseBranch string,
+) {
 	outcome, _ := terminalExtra["outcome"].(string)
 	switch outcome {
 	case needsVerificationOutcome:
@@ -2586,10 +2591,58 @@ func promoteTerminalOutcome(extra, terminalExtra map[string]any) {
 		}
 	case alreadyResolvedOutcome:
 		extra["outcome"] = alreadyResolvedOutcome
+		// resolvedBy is evidence, not narrative (#1692). ALREADY-RESOLVED
+		// is the one verdict that skips verification entirely (the controller
+		// cascade-skips the verify task, #970), so an unvalidated free-text
+		// claim would be the most consequential unverified assertion in the
+		// pipeline. Validate the claim here, at the promotion site, where the
+		// agent still has the repo checked out and git is available (the
+		// controller cannot run git and would have to trust the string
+		// regardless): the claimed commit must resolve AND be an ancestor of
+		// the task's base branch. Anything else -- a well-formed SHA that is
+		// not an ancestor, a SHA that does not resolve, or free text -- is
+		// downgraded to NEEDS-VERIFICATION so the work is still gated rather
+		// than skipped. The claim is not silently dropped and the task is not
+		// failed outright: a coder that is right but cites the commit badly
+		// still gets its work checked (the NEEDS-VERIFICATION outcome is
+		// itself a terminal non-failure NO-GO). The claim survives under
+		// extra["resolvedByClaimed"] for the audit record.
 		if v, ok := terminalExtra["resolvedBy"]; ok {
-			extra["resolvedBy"] = v
+			resolvedBy, _ := v.(string)
+			if resolvedBy != "" && resolvedByResolvesAndIsAncestor(
+				ctx, workspace, run, resolvedBy, baseBranch,
+			) {
+				extra["resolvedBy"] = v
+			} else {
+				extra["outcome"] = needsVerificationOutcome
+				if resolvedBy != "" {
+					extra["resolvedByClaimed"] = resolvedBy
+				}
+			}
 		}
 	}
+}
+
+// resolvedByResolvesAndIsAncestor reports whether claimed names a commit
+// that (1) resolves (`git cat-file -e <sha>^{commit}`) and (2) is an
+// ancestor of baseBranch (`git merge-base --is-ancestor <sha> <baseBranch>`).
+// These are the two checks #1692 requires before an ALREADY-RESOLVED
+// verdict is allowed to skip verification. Any git failure or empty input
+// fails closed (returns false) so an unverifiable claim is never honoured.
+func resolvedByResolvesAndIsAncestor(
+	ctx context.Context, workspace string, run commandRunner, claimed, baseBranch string,
+) bool {
+	claimed = strings.TrimSpace(claimed)
+	if claimed == "" || baseBranch == "" || workspace == "" {
+		return false
+	}
+	if _, err := run(ctx, workspace, nil, "git", "cat-file", "-e", claimed+"^{commit}"); err != nil {
+		return false
+	}
+	if _, err := run(ctx, workspace, nil, "git", "merge-base", "--is-ancestor", claimed, baseBranch); err != nil {
+		return false
+	}
+	return true
 }
 
 func (e *NativeAgentLoopExecutor) noChangesResult(
