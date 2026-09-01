@@ -1070,6 +1070,24 @@ func executeCoderTask(
 	gitOrSkip(t)
 	root := t.TempDir()
 	bare := initBareWithSeed(t, root)
+	return executeCoderTaskInRepo(t, agent, task, reg, oaiBody, noUpstream, bare)
+}
+
+// executeCoderTaskInRepo is executeCoderTask against a caller-provided bare
+// repo. Some tests need the seed commit SHA (an ancestor of main) before they
+// build their fake registry, e.g. to name a valid resolvedBy for #1692, so
+// they create the repo, resolve the SHA, and pass the bare path here.
+func executeCoderTaskInRepo(
+	t *testing.T,
+	agent *foremanv1alpha1.Agent,
+	task *foremanv1alpha1.AgenticTask,
+	reg *fakeRegistry,
+	oaiBody string,
+	noUpstream bool,
+	bare string,
+) *foremanagent.Result {
+	t.Helper()
+	root := filepath.Dir(bare)
 	oaiSrv := scriptedOAI(t, []string{oaiBody})
 	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
 
@@ -1151,20 +1169,29 @@ func TestNativeExecutor_PromotesNeedsVerificationOutcome(t *testing.T) {
 // the needs-verification promotion test: a model-emitted NO-GO with
 // outcome=ALREADY-RESOLVED and resolvedBy evidence must surface both at
 // the top level for isAlreadyResolvedCoder and the Workload rollup.
+//
+// Since #1692, resolvedBy is validated at the promotion site: it must name
+// a commit that resolves AND is an ancestor of the task's base branch. The
+// seed commit SHA (an ancestor of main in the fixture repo) satisfies both
+// checks, so the promotion still holds for a genuine claim.
 func TestNativeExecutor_PromotesAlreadyResolvedOutcome(t *testing.T) {
+	gitOrSkip(t)
+	root := t.TempDir()
+	bare := initBareWithSeed(t, root)
 	agent, task := taskAndAgent("already-resolved")
+	seedSHA := seedCommitSHA(t, bare)
 	reg := &fakeRegistry{
 		results: map[string]*foremanagent.ToolResult{
 			"submit_result": {
-				Terminal: true, Verdict: "NO-GO", Summary: "already resolved by prior fix e97d0ca",
+				Terminal: true, Verdict: "NO-GO", Summary: "already resolved by prior fix " + seedSHA,
 				Extra: map[string]any{
 					"outcome":    "ALREADY-RESOLVED",
-					"resolvedBy": "e97d0ca",
+					"resolvedBy": seedSHA,
 				},
 			},
 		},
 	}
-	res := executeCoderTask(t, agent, task, reg, submitNoGoBody, false)
+	res := executeCoderTaskInRepo(t, agent, task, reg, submitNoGoBody, false, bare)
 
 	if res.Verdict != foremanv1alpha1.AgenticTaskVerdictNoGo {
 		t.Fatalf("verdict: want NO-GO got %s", res.Verdict)
@@ -1172,8 +1199,8 @@ func TestNativeExecutor_PromotesAlreadyResolvedOutcome(t *testing.T) {
 	if got := res.Extra["outcome"]; got != "ALREADY-RESOLVED" {
 		t.Errorf("top-level outcome: want ALREADY-RESOLVED got %v", got)
 	}
-	if got := res.Extra["resolvedBy"]; got != "e97d0ca" {
-		t.Errorf("top-level resolvedBy: want e97d0ca got %v", got)
+	if got := res.Extra["resolvedBy"]; got != seedSHA {
+		t.Errorf("top-level resolvedBy: want %s got %v", seedSHA, got)
 	}
 	me, ok := res.Extra["modelExtra"].(map[string]any)
 	if !ok || me["outcome"] != "ALREADY-RESOLVED" {
@@ -2511,14 +2538,17 @@ func TestNativeExecutor_ModelNoGoAlreadyResolved_PromotesOutcome(t *testing.T) {
 	agent, task := taskAndAgent("nogo-resolved")
 	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(agent, task).Build()
 
+	// resolvedBy must name a real ancestor commit since #1692; the seed
+	// commit is the ancestor of main in this fixture.
+	seedSHA := seedCommitSHA(t, bare)
 	reg := &fakeRegistry{
 		results: map[string]*foremanagent.ToolResult{
 			"submit_result": {
 				Terminal: true, Verdict: "NO-GO",
-				Summary: "already fixed by abc1234",
+				Summary: "already fixed by " + seedSHA,
 				Extra: map[string]any{
 					"outcome":    "ALREADY-RESOLVED",
-					"resolvedBy": "abc1234",
+					"resolvedBy": seedSHA,
 				},
 			},
 		},
@@ -2548,13 +2578,26 @@ func TestNativeExecutor_ModelNoGoAlreadyResolved_PromotesOutcome(t *testing.T) {
 	if got := res.Extra["outcome"]; got != "ALREADY-RESOLVED" {
 		t.Errorf("top-level outcome: want ALREADY-RESOLVED got %v", got)
 	}
-	if got := res.Extra["resolvedBy"]; got != "abc1234" {
-		t.Errorf("top-level resolvedBy: want abc1234 got %v", got)
+	if got := res.Extra["resolvedBy"]; got != seedSHA {
+		t.Errorf("top-level resolvedBy: want %s got %v", seedSHA, got)
 	}
 	me, ok := res.Extra["modelExtra"].(map[string]any)
 	if !ok || me["outcome"] != "ALREADY-RESOLVED" {
 		t.Errorf("modelExtra should keep the nested outcome for observability, got %v", res.Extra["modelExtra"])
 	}
+}
+
+// seedCommitSHA returns the full SHA of the seed commit on a bare repo
+// created by initBareWithSeed. It is an ancestor of `main`, so a #1692
+// resolvedBy naming it passes both validation checks (resolves + ancestor).
+func seedCommitSHA(t *testing.T, bare string) string {
+	t.Helper()
+	gitOrSkip(t)
+	out, err := exec.Command("git", "--git-dir", bare, "rev-parse", "main").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse main: %v: %s", err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // Issue #1526: a submit_result carrying edits but an empty CommitMessage used

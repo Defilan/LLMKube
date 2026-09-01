@@ -1587,7 +1587,7 @@ func TestIssueAskDemotionLandsUnderModelExtra(t *testing.T) {
 		Turns: 7,
 	}
 	e := &NativeAgentLoopExecutor{}
-	res := e.modelDecidedResult(time.Now(), corev1.ObjectReference{Name: "t"}, lr, verdict)
+	res := e.modelDecidedResult(context.Background(), time.Now(), corev1.ObjectReference{Name: "t"}, lr, verdict, "", "")
 	raw, err := json.Marshal(res)
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
@@ -3250,6 +3250,169 @@ func TestOpenPRsAsDraft(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := openPRsAsDraft(tc.agent); got != tc.want {
 				t.Fatalf("openPRsAsDraft() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// ---- ALREADY-RESOLVED resolvedBy validation (#1692) ----
+
+// setupResolvedByFixtureRepo builds a real git repo used by
+// TestPromoteTerminalOutcome_AlreadyResolvedResolvedByValidation:
+//
+//	main:  baseSHA -> mainTipSHA (HEAD)
+//	side:  sideSHA (cut from baseSHA, not an ancestor of main)
+//
+// baseBranch is "main". mainTipSHA and baseSHA are ancestors of main;
+// sideSHA resolves but is not an ancestor; "deadbeef..." is a well-formed
+// SHA that does not resolve.
+func setupResolvedByFixtureRepo(t *testing.T) (ws string, baseSHA, mainTipSHA, sideSHA string) {
+	t.Helper()
+	ws = t.TempDir()
+	ctx := context.Background()
+	run := func(args ...string) string {
+		t.Helper()
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Dir = ws
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		full := filepath.Join(ws, rel)
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", rel, err)
+		}
+	}
+
+	run("init", "-b", "main")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	write("a.go", "package a\n")
+	run("add", ".")
+	run("commit", "-m", "base")
+	baseSHA = run("rev-parse", "HEAD")
+
+	write("b.go", "package b\n")
+	run("add", ".")
+	run("commit", "-m", "main tip")
+	mainTipSHA = run("rev-parse", "HEAD")
+
+	run("checkout", "-b", "side")
+	write("c.go", "package c\n")
+	run("add", ".")
+	run("commit", "-m", "side work")
+	sideSHA = run("rev-parse", "HEAD")
+	return ws, baseSHA, mainTipSHA, sideSHA
+}
+
+// TestPromoteTerminalOutcome_AlreadyResolvedResolvedByValidation pins the
+// #1692 guard: an ALREADY-RESOLVED terminal is only allowed to keep its
+// verdict when extra.resolvedBy names a commit that resolves AND is an
+// ancestor of the task's base branch. Everything else is downgraded to
+// NEEDS-VERIFICATION (the shared needsVerificationOutcome constant) so the
+// work is still gated rather than skipped. The claim is preserved under
+// resolvedByClaimed for the audit record; it is never silently dropped.
+//
+// Mutation this test kills: delete the ancestor check (or the whole
+// resolvedBy validation) and the free-text case below stops being
+// downgraded -- the exact failure #1692 describes.
+func TestPromoteTerminalOutcome_AlreadyResolvedResolvedByValidation(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	ws, baseSHA, mainTipSHA, sideSHA := setupResolvedByFixtureRepo(t)
+
+	// The two live strings from the #1692 report. The false claim's branch
+	// name + prose is used verbatim as the free-text case; the true one
+	// (88c85cce, a real ancestor commit) cannot be reproduced by SHA in a
+	// fresh fixture, so its semantic -- a valid ancestor -- is covered by
+	// the fixture's mainTipSHA / baseSHA cases instead.
+	const liveFalseClaim = "issue-1676-prefetch-claimname (working tree clean; full controller suite passes with envtest 1.31.0 and 1.32.x)"
+
+	wellFormedUnknownSHA := strings.Repeat("0", 40)
+
+	cases := []struct {
+		name          string
+		resolvedBy    string
+		wantOutcome   string
+		wantKeepClaim bool // whether resolvedBy is promoted verbatim
+		wantClaimed   string
+	}{
+		{
+			name:          "valid ancestor SHA stays ALREADY-RESOLVED",
+			resolvedBy:    mainTipSHA,
+			wantOutcome:   alreadyResolvedOutcome,
+			wantKeepClaim: true,
+		},
+		{
+			name:          "earlier ancestor SHA stays ALREADY-RESOLVED",
+			resolvedBy:    baseSHA,
+			wantOutcome:   alreadyResolvedOutcome,
+			wantKeepClaim: true,
+		},
+		{
+			name:        "well-formed SHA that is not an ancestor is downgraded",
+			resolvedBy:  sideSHA,
+			wantOutcome: needsVerificationOutcome,
+			wantClaimed: sideSHA,
+		},
+		{
+			name:        "SHA that does not resolve is downgraded",
+			resolvedBy:  wellFormedUnknownSHA,
+			wantOutcome: needsVerificationOutcome,
+			wantClaimed: wellFormedUnknownSHA,
+		},
+		{
+			name:        "free text (live false claim) is downgraded",
+			resolvedBy:  liveFalseClaim,
+			wantOutcome: needsVerificationOutcome,
+			wantClaimed: liveFalseClaim,
+		},
+		{
+			name:        "empty resolvedBy is downgraded and drops nothing",
+			resolvedBy:  "",
+			wantOutcome: needsVerificationOutcome,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			terminalExtra := map[string]any{
+				"outcome":    alreadyResolvedOutcome,
+				"resolvedBy": tc.resolvedBy,
+			}
+			extra := map[string]any{}
+			promoteTerminalOutcome(context.Background(), extra, terminalExtra,
+				ws, execCommandRunner, "main")
+
+			if got, _ := extra["outcome"].(string); got != tc.wantOutcome {
+				t.Fatalf("extra.outcome = %q, want %q", got, tc.wantOutcome)
+			}
+
+			gotResolvedBy, hasResolvedBy := extra["resolvedBy"].(string)
+			if tc.wantKeepClaim {
+				if !hasResolvedBy || gotResolvedBy != tc.resolvedBy {
+					t.Errorf("resolvedBy should be promoted verbatim; got %q (present=%v)",
+						gotResolvedBy, hasResolvedBy)
+				}
+				if _, claimed := extra["resolvedByClaimed"]; claimed {
+					t.Errorf("resolvedByClaimed should NOT be set on the happy path")
+				}
+			} else {
+				if hasResolvedBy {
+					t.Errorf("resolvedBy should not be promoted after downgrade; got %q", gotResolvedBy)
+				}
+				if gotClaimed, _ := extra["resolvedByClaimed"].(string); gotClaimed != tc.wantClaimed {
+					t.Errorf("resolvedByClaimed = %q, want %q", gotClaimed, tc.wantClaimed)
+				}
 			}
 		})
 	}
