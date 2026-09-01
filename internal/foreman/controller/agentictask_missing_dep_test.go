@@ -174,9 +174,31 @@ func TestDepWaitExpired(t *testing.T) {
 		want        bool
 	}{
 		{
-			name:        "zero timeout never expires (unbounded wait)",
+			// TimeoutSeconds unset with a wait older than the default one-hour
+			// fallback: the wait has outlasted the bounded budget, so the
+			// missing-dependency cascade-fail must fire (#1729).
+			name:        "unset timeout past fallback budget expires",
 			timeoutSec:  0,
-			waitStarted: metav1.NewTime(now.Add(-100 * time.Hour)),
+			waitStarted: metav1.NewTime(now.Add(-2 * time.Hour)),
+			want:        true,
+		},
+		{
+			// TimeoutSeconds unset with a recent wait: still inside the
+			// default one-hour fallback, so the create-ordering race is
+			// preserved and the wait must NOT expire.
+			name:        "unset timeout within fallback budget does not expire",
+			timeoutSec:  0,
+			waitStarted: metav1.NewTime(now.Add(-1 * time.Minute)),
+			want:        false,
+		},
+		{
+			// An explicitly set positive TimeoutSeconds must keep governing:
+			// a 2-hour budget with a 90-minute wait has not elapsed, even
+			// though the wait is already past the one-hour fallback. The
+			// fallback must never silently replace an explicit value.
+			name:        "explicit timeout governs over fallback",
+			timeoutSec:  7200,
+			waitStarted: metav1.NewTime(now.Add(-90 * time.Minute)),
 			want:        false,
 		},
 		{

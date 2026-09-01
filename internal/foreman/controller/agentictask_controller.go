@@ -89,6 +89,16 @@ const requeueNoFit = 10 * time.Second
 // still pre-terminal.
 const requeueWaitingForDeps = 10 * time.Second
 
+// defaultDepWaitBudget bounds the wait for an absent dependency when the task
+// does not set spec.TimeoutSeconds. One hour is deliberate, not arbitrary:
+// this guard measures a dependency that is ABSENT, not one that is slow. The
+// planner emits every task in a batch together, so a dependency that has not
+// appeared within an hour was deleted or never emitted -- waiting longer
+// cannot help it appear. Without this bound an unset TimeoutSeconds leaves the
+// wait unbounded and a task whose dependency vanished stays Pending forever
+// (#1729).
+const defaultDepWaitBudget = 1 * time.Hour
+
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=agentictasks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=agentictasks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=foreman.llmkube.dev,resources=agentictasks/finalizers,verbs=update
@@ -586,12 +596,14 @@ func (r *AgenticTaskReconciler) recordMissingDepCondition(ctx context.Context, t
 //     be written, so the condition clock is reachable.
 //
 // No condition means the wait has not been recorded yet, so nothing has
-// elapsed. An unset or zero TimeoutSeconds leaves the wait unbounded (the dep
-// is legal to wait for), which is the pre-1687 default and still correct.
+// elapsed. An unset or zero TimeoutSeconds falls back to the package-level
+// defaultDepWaitBudget so the wait is bounded even on paths (such as the
+// planner) that never stamp the field; an explicitly set positive
+// TimeoutSeconds always wins.
 func depWaitExpired(task *foremanv1alpha1.AgenticTask) bool {
 	budget := time.Duration(task.Spec.TimeoutSeconds) * time.Second
 	if budget <= 0 {
-		return false
+		budget = defaultDepWaitBudget
 	}
 	started := apimeta.FindStatusCondition(task.Status.Conditions, "DepWaitStarted")
 	if started == nil || started.LastTransitionTime.IsZero() {
