@@ -717,10 +717,26 @@ func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *in
 		if isvc.Spec.Resources.CPU != "" {
 			res.Requests[corev1.ResourceCPU] = resource.MustParse(isvc.Spec.Resources.CPU)
 		}
+		// Request AND limit, driven by whichever of hostMemory/memory wins.
+		// The limit is what keeps an overrun charged to this pod: without one an
+		// unbounded container crosses MemoryPressure and stops the kubelet posting
+		// status (the node goes NotReady) instead of being OOM-killed. ParseQuantity,
+		// not MustParse, for the same reason as ephemeralStorage below: a panic here
+		// takes the controller down for every workload rather than failing the one
+		// object at fault.
+		var memoryQ *resource.Quantity
 		if isvc.Spec.Resources.HostMemory != "" {
-			res.Requests[corev1.ResourceMemory] = resource.MustParse(isvc.Spec.Resources.HostMemory)
+			if q, err := resource.ParseQuantity(isvc.Spec.Resources.HostMemory); err == nil {
+				memoryQ = &q
+			}
 		} else if isvc.Spec.Resources.Memory != "" {
-			res.Requests[corev1.ResourceMemory] = resource.MustParse(isvc.Spec.Resources.Memory)
+			if q, err := resource.ParseQuantity(isvc.Spec.Resources.Memory); err == nil {
+				memoryQ = &q
+			}
+		}
+		if memoryQ != nil {
+			res.Requests[corev1.ResourceMemory] = *memoryQ
+			res.Limits[corev1.ResourceMemory] = *memoryQ
 		}
 		// Request AND limit. The request is what the scheduler reserves, so it
 		// stops placing further pods on a node this download is about to fill.

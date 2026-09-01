@@ -4465,10 +4465,7 @@ spec:
                       everywhere and none is applied.
 
                       The pattern is the Kubernetes quantity format, so a malformed value is
-                      rejected at admission. The sibling quantity fields above predate this and
-                      carry no pattern; they reach resource.MustParse, which panics on
-                      malformed input and takes the controller down for every workload rather
-                      than failing the one object at fault.
+                      rejected at admission.
                     pattern: ^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$
                     type: string
                   gpu:
@@ -4551,9 +4548,11 @@ spec:
                       Translated to pod resources.requests.memory, taking precedence over Memory when set.
                       Without this, the K8s scheduler has no visibility into the pod's actual RAM consumption,
                       which can lead to OOM kills after model load.
+                    pattern: ^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$
                     type: string
                   memory:
                     description: Memory requests (e.g., "4Gi")
+                    pattern: ^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$
                     type: string
                 type: object
               revisionHistoryLimit:
