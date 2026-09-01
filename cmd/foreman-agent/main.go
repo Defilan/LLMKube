@@ -169,6 +169,10 @@ func main() {
 		// PR4 self-update flags
 		selfUpdateEnabled bool
 		installRoot       string
+
+		// Live turn streaming
+		turnStreamAddr     string
+		turnStreamCapacity int
 	)
 
 	flag.StringVar(&fleetNodeName, "fleet-node-name", "",
@@ -210,6 +214,31 @@ func main() {
 		"Advertised decode throughput in tok/s (0 = unset).")
 	flag.IntVar(&staticTotalRAMGB, "total-ram-gb", 0,
 		"Advertised total RAM on platforms without live memory probing (non-darwin only).")
+
+	// Live turn streaming. Serves THIS agent's in-process run over SSE so a
+	// viewer can watch turns as they land instead of waiting for the terminal
+	// transcript ConfigMap. "0" (or empty) disables, matching the convention
+	// the operator's metrics flag uses.
+	//
+	// LOOPBACK BY DEFAULT, DELIBERATELY. The endpoint has NO authentication
+	// and the turns it serves are the coder's full transcript: prompts, file
+	// contents, and raw tool output, which is exactly where a leaked token or
+	// customer path would show up. Two of the places this binary runs make
+	// ":8082" the wrong default -- a metal agent runs as a plain process on a
+	// personal Mac on the house LAN, and an in-cluster pod is reachable by
+	// anything with pod-network access.
+	//
+	// 127.0.0.1 costs the viewer nothing in either place: `kubectl
+	// port-forward` attaches to the POD's network namespace, so it reaches a
+	// loopback listener, and an on-box viewer is already on the box. Widening
+	// this to :8082 or 0.0.0.0 is a deliberate operator decision to serve an
+	// unauthenticated transcript feed to the network, so it is opt-in.
+	flag.StringVar(&turnStreamAddr, "turn-stream-bind-address", "127.0.0.1:8082",
+		"Address the live turn stream serves SSE on (GET /stream). Loopback by "+
+			"default: the endpoint is unauthenticated and serves the full "+
+			"transcript. \"0\" disables it.")
+	flag.IntVar(&turnStreamCapacity, "turn-stream-replay-turns", 64,
+		"How many recent turns the stream replays to a viewer that attaches mid-run.")
 
 	// M3 Phase F: default flipped to native. The stub executor is
 	// kept around for development + tests, but production foreman-
@@ -426,6 +455,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Live turn stream. Built before the executor so the native executor can
+	// hold it; nil when disabled, which keeps the loop's OnTurn hook nil and
+	// costs a non-streaming agent nothing.
+	//
+	// This is the WATCHER's executor, which is where the loop actually runs
+	// for every agent whose spec.execution.mode is not Job (the default, and
+	// what the whole current fleet uses). A Job-mode agent runs its loop in a
+	// separate coder Job pod via `run-task`, whose executor is built in
+	// RunTask and has no stream: streaming that path needs per-Job discovery
+	// and is deliberately out of scope here.
+	var turnStream *foremanagent.TurnStream
+	if turnStreamAddr != "" && turnStreamAddr != "0" {
+		turnStream = foremanagent.NewTurnStream(turnStreamCapacity)
+	}
+
 	// Executor: M2 stub or M3 native. Selection via --agent-mode.
 	var executor foremanagent.Executor
 	switch agentMode {
@@ -433,6 +477,7 @@ func main() {
 		executor = &foremanagent.StubExecutor{SleepDuration: stubSleep}
 	case "native":
 		executor = &foremanagent.NativeAgentLoopExecutor{
+			Stream:                       turnStream,
 			Client:                       kc,
 			WorkspaceRoot:                workspaceDir,
 			GitRemoteURL:                 gitRemoteURL,
@@ -516,6 +561,18 @@ func main() {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return reg.Run(gctx) })
 	g.Go(func() error { return watcher.Run(gctx) })
+	// Serves the turn stream for as long as the agent runs. Start returns nil
+	// immediately-on-ctx when disabled, so this goroutine is harmless when the
+	// stream is off; it must NOT fail the group on a bind error taking the
+	// whole agent down, so a failure to listen is logged and swallowed --
+	// losing the view of a run is not a reason to stop doing the run.
+	g.Go(func() error {
+		srv := &foremanagent.TurnStreamServer{Addr: turnStreamAddr, Stream: turnStream}
+		if err := srv.Start(gctx); err != nil {
+			setupLog.Error(err, "turn stream server stopped", "addr", turnStreamAddr)
+		}
+		return nil
+	})
 
 	if err := g.Wait(); err != nil {
 		if errors.Is(err, foremanagent.ErrSelfUpdateRestart) {

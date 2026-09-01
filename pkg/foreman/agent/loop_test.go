@@ -1739,3 +1739,64 @@ func TestLoop_DoesNotRetryOnUnrelated400(t *testing.T) {
 		t.Errorf("an unrelated 400 must not be retried, saw %d requests", n)
 	}
 }
+
+// TestLoop_OnTurnCalledPerTurn covers the live-viewer seam: the loop must emit
+// each turn as it completes, because the transcript ConfigMap is written once
+// at the end and so cannot show a run in progress. Without this hook there is
+// no live surface at all: today watching a run means tailing llama.cpp server
+// logs and polling git status inside the workspace pod.
+func TestLoop_OnTurnCalledPerTurn(t *testing.T) {
+	srv, _ := scriptedOAIServer(t, []string{toolCallReadFile, toolCallReadFile, toolCallReadFile})
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"read_file": {Output: map[string]any{"content": "# README\n"}},
+		},
+	}
+
+	var turns []int
+	var msgCounts []int
+	loop := newTestLoop(srv, reg)
+	_, err := loop.Run(context.Background(), LoopConfig{
+		Model:    "test",
+		MaxTurns: 3,
+		OnTurn: func(turn int, msgs []oai.Message) {
+			turns = append(turns, turn)
+			msgCounts = append(msgCounts, len(msgs))
+		},
+	})
+	if !errors.Is(err, ErrMaxTurnsExhausted) {
+		t.Fatalf("expected ErrMaxTurnsExhausted, got %v", err)
+	}
+
+	if len(turns) == 0 {
+		t.Fatal("OnTurn was never called; a live viewer would show nothing")
+	}
+	for i, turn := range turns {
+		if turn != i+1 {
+			t.Fatalf("turn numbers must be sequential from 1, got %v", turns)
+		}
+	}
+	// Each turn must carry the messages appended during THAT turn, not an
+	// empty slice and not the whole transcript: a viewer renders the delta.
+	for i, n := range msgCounts {
+		if n == 0 {
+			t.Errorf("turn %d emitted 0 messages; nothing to render", turns[i])
+		}
+	}
+}
+
+// TestLoop_OnTurnNilIsSafe pins the hook as optional. Every existing caller
+// builds LoopConfig without it and must be unaffected.
+func TestLoop_OnTurnNilIsSafe(t *testing.T) {
+	srv, _ := scriptedOAIServer(t, []string{toolCallReadFile})
+	reg := &fakeRegistry{
+		results: map[string]*ToolResult{
+			"read_file": {Output: map[string]any{"content": "x"}},
+		},
+	}
+	loop := newTestLoop(srv, reg)
+	_, err := loop.Run(context.Background(), LoopConfig{Model: "test", MaxTurns: 1})
+	if !errors.Is(err, ErrMaxTurnsExhausted) {
+		t.Fatalf("a nil OnTurn must not change loop behaviour, got %v", err)
+	}
+}

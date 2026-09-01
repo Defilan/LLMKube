@@ -212,6 +212,20 @@ type LoopConfig struct {
 	// finish_reason=="stop" model that circled without acting. Resets after
 	// any tool-calling turn. <= 0 falls back to DefaultMaxTruncationRetries.
 	MaxTruncationRetries int
+
+	// OnTurn, when non-nil, is called once per completed turn with the
+	// 1-based turn number and the messages appended during that turn.
+	//
+	// It exists because the transcript ConfigMap is written once, at
+	// completion, so it cannot show a run in progress; and because a
+	// cancelled run writes no transcript at all. Without this hook the only
+	// way to watch a coder work is to tail the llama.cpp server log and poll
+	// git status inside the workspace pod.
+	//
+	// It MUST NOT block. It runs on the loop's own goroutine, so a slow
+	// consumer would stall the coder. Implementations send non-blocking and
+	// drop rather than wait.
+	OnTurn func(turn int, msgs []oai.Message)
 }
 
 // DefaultContextWindowTokens is the budget used when LoopConfig.ContextWindowTokens
@@ -784,7 +798,13 @@ func (l *Loop) Run(ctx context.Context, cfg LoopConfig) (*LoopResult, error) {
 	// verifyRetries counts coder-gate fix attempts spent so far (#749).
 	verifyRetries := 0
 
+	// Live turn emission. Kept in turnFlusher rather than a closure here so
+	// its branches do not count toward Run's cyclomatic budget.
+	flusher := &turnFlusher{onTurn: cfg.OnTurn, emitted: len(res.Transcript)}
+	defer flusher.flush(res)
+
 	for turn := 1; turn <= cfg.MaxTurns; turn++ {
+		flusher.flush(res)
 		res.Turns = turn
 
 		// During the forcing phase, advertise the restricted set (no grep,
@@ -1576,4 +1596,29 @@ func approxTokens(messages []oai.Message) int {
 		chars += 16
 	}
 	return chars / charsPerTokenApprox
+}
+
+// turnFlusher emits completed turns to LoopConfig.OnTurn as the loop runs.
+//
+// It flushes on transcript GROWTH rather than at a fixed point in the loop
+// body, because that body has nine exit paths (three continue, six return).
+// Emitting at the bottom would silently skip the retry-and-feedback turns,
+// which are exactly the ones worth watching live. Two call sites dominate all
+// nine: the top of each iteration flushes the turn that just ended however it
+// ended, and a deferred call flushes the final turn on any return.
+type turnFlusher struct {
+	onTurn func(turn int, msgs []oai.Message)
+	// emitted is the transcript length already sent. Seeded with the
+	// PRE-LOOP length, not zero: the system prompt and initial user message
+	// are in the transcript before turn 1 and are not a turn, so starting at
+	// zero emits them as a phantom turn 0.
+	emitted int
+}
+
+func (f *turnFlusher) flush(res *LoopResult) {
+	if f.onTurn == nil || len(res.Transcript) <= f.emitted {
+		return
+	}
+	f.onTurn(res.Turns, res.Transcript[f.emitted:])
+	f.emitted = len(res.Transcript)
 }

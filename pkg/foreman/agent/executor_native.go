@@ -204,6 +204,17 @@ type NativeAgentLoopExecutor struct {
 	// here. Nil skips the post-push envtest gate (e.g. the in-process
 	// run-task path, where the clean-room gate Job is the backstop).
 	EnvtestJobRunner EnvtestJobRunner
+
+	// Stream, when non-nil, receives each completed turn of the loop so a
+	// viewer can watch the run as it happens (see turnstream.go). Nil is the
+	// normal case and costs nothing: the loop's OnTurn hook stays nil, so no
+	// turn is ever copied.
+	//
+	// It is deliberately ONE stream per executor rather than one per task.
+	// An agent runs a single task at a time, so the executor's stream IS
+	// that run's stream; multiplexing by task would add a registry with a
+	// lifetime problem (when to evict a finished run) for no gain.
+	Stream *TurnStream
 }
 
 // codeHost returns the effective CodeHost seam: the injected CodeHost when
@@ -821,6 +832,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 		// template. Nil/empty omits the field on the wire so the request
 		// is byte-identical to today for agents that do not set it.
 		ChatTemplateKwargs: agent.Spec.ChatTemplateKwargs,
+		// Live turn streaming, opt-in. A method rather than an inline nil
+		// check because this function sits at the gocyclo ceiling; see
+		// turnHook for why the nil case must stay a nil hook.
+		OnTurn: e.turnHook(),
 	}
 
 	// Coder gate feedback loop (#749): coders verify their work through a
