@@ -1228,10 +1228,16 @@ func (e *NativeAgentLoopExecutor) postPushGateDecision(
 	start time.Time, transcriptRef corev1.ObjectReference, loopRes *LoopResult,
 	gateAdvisories *[]advisory, cloneURL string,
 ) (settled bool, done *Result, feedback string) {
+	// resolveUpstreamForRun, not the bare slug: the gate needs the CANONICAL
+	// repo URL to diff against merge-base rather than the fork's base tip
+	// (#1731). Threading it here rather than through the parameter list keeps
+	// the existing callers unchanged and reuses the same seam the self-commit
+	// recovery path already uses, so a test override still applies.
 	gate, fb := evaluatePostPushEnvtest(
 		ctx, envtestTouched, e.EnvtestJobRunner,
 		task.Namespace, task.Name,
 		task.Spec.Payload.Repo, branch, cloneURL,
+		e.resolveUpstreamForRun(task),
 	)
 	if gate == envtestGateOK || (gate == envtestGateUnverified && attempt == 0) {
 		return true, nil, ""

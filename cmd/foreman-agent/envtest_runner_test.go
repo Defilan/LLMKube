@@ -74,6 +74,7 @@ func TestEnvtestJobRunnerStampsTaskName(t *testing.T) {
 		ctx, taskNS, taskName,
 		"defilantech/LLMKube", "foreman/issue-893",
 		"https://github.com/Defilan/LLMKube.git",
+		"https://github.com/defilantech/LLMKube.git",
 	)
 
 	var job batchv1.Job
@@ -91,5 +92,72 @@ func TestEnvtestJobRunnerStampsTaskName(t *testing.T) {
 	// Pod template labels must match so a pod can also be traced back.
 	if got := job.Spec.Template.Labels["foreman.llmkube.dev/task-name"]; got != taskName {
 		t.Errorf("gate Job pod template task-name label = %q, want %q", got, taskName)
+	}
+}
+
+// TestEnvtestJobRunnerPassesUpstreamURL is the #1731 regression: the coder's
+// post-push envtest gate must submit its Job with UPSTREAM_URL set, so the
+// gate script diffs against merge-base(HEAD, canonical base) rather than
+// falling back to the FORK's base ref.
+//
+// The assertion is on the created Job's env, not on the args map, because the
+// env var is what the gate script actually reads. Observed in production on
+// 2026-09-01: the var reached the Job with no value key at all, the script took
+// its documented "no upstream URL" branch, and change detection plus non-Go
+// lint silently skipped while the Job still reported GATE PASS.
+func TestEnvtestJobRunnerPassesUpstreamURL(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := batchv1.AddToScheme(s); err != nil {
+		t.Fatalf("add batchv1 scheme: %v", err)
+	}
+	kc := fake.NewClientBuilder().WithScheme(s).Build()
+
+	const (
+		taskNS      = "foreman-system"
+		taskName    = "fix-issue-1731"
+		jobName     = "foreman-gate-fix-issue-1731-pinned"
+		upstreamURL = "https://github.com/defilantech/LLMKube.git"
+	)
+
+	runner := &envtestJobRunnerImpl{
+		tool: &foremantools.RunGateJobTool{
+			Client: kc,
+			Cfg: foremantools.RunGateJobToolConfig{
+				Namespace:    taskNS,
+				PollInterval: time.Millisecond,
+				PollTimeout:  5 * time.Millisecond,
+				NameFn:       func(string) string { return jobName },
+			},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, _ = runner.Run(
+		ctx, taskNS, taskName,
+		"defilantech/LLMKube", "foreman/issue-1731",
+		"https://github.com/Defilan/LLMKube.git",
+		upstreamURL,
+	)
+
+	var job batchv1.Job
+	key := types.NamespacedName{Namespace: taskNS, Name: jobName}
+	if err := kc.Get(context.Background(), key, &job); err != nil {
+		t.Fatalf("gate Job %s was not created: %v", key, err)
+	}
+
+	var got string
+	var found bool
+	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "UPSTREAM_URL" {
+			got, found = e.Value, true
+		}
+	}
+	if !found {
+		t.Fatalf("gate Job has no UPSTREAM_URL env var at all")
+	}
+	if got != upstreamURL {
+		t.Errorf("UPSTREAM_URL = %q, want %q (empty makes the gate resolve its "+
+			"base from the fork, which is the #1731 bug)", got, upstreamURL)
 	}
 }

@@ -97,7 +97,7 @@ type envtestGateResult struct {
 }
 
 func (f *scriptedEnvtestRunner) Run(
-	_ context.Context, _, _, _, _, _ string,
+	_ context.Context, _, _, _, _, _, _ string,
 ) (pass bool, ran bool, feedback string) {
 	i := f.calls
 	if i >= len(f.results) {
