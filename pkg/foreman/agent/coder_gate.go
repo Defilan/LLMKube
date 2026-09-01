@@ -309,6 +309,18 @@ func gateCheckRegistry(issueText, evidenceBaseSHA string, evidence []grounding.E
 			fn:   checkClaimEvidence(evidence, evidenceBaseSHA),
 		},
 		{
+			// Added lines that no test executes. Complements mutation-gate
+			// rather than duplicating it: that one asks whether a FUNCTION is
+			// referenced by a test, this one asks whether the BRANCHES the diff
+			// added actually run. Advisory until it has been quiet on real
+			// diffs; a new gate that blocks stalls the fleet on its first false
+			// positive.
+			name: "diff-coverage",
+			tier: tierAdvisory,
+			lang: foremanv1alpha1.GateLanguageGo,
+			fn:   checkDiffCoverage,
+		},
+		{
 			name: "grounding-breadth",
 			tier: tierAdvisory,
 			lang: foremanv1alpha1.GateLanguageGo,
