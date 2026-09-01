@@ -1046,13 +1046,21 @@ type envtestJobRunnerImpl struct {
 }
 
 func (e *envtestJobRunnerImpl) Run(
-	ctx context.Context, taskNamespace, taskName, repository, branch, cloneURL string,
+	ctx context.Context, taskNamespace, taskName, repository, branch, cloneURL, upstreamURL string,
 ) (pass bool, ran bool, feedback string) {
 	args, err := json.Marshal(map[string]any{
 		"repo":     repository,
 		"branch":   branch,
 		"checks":   []string{"test"},
 		"cloneURL": cloneURL,
+		// upstreamURL is what makes the gate diff against
+		// merge-base(HEAD, canonical base) instead of the FORK's base tip.
+		// Omitting it sends the gate script down its "no upstream URL"
+		// branch, where change detection and the non-Go lint silently skip
+		// while the Job still reports GATE PASS (#1731). run_gate_job
+		// validates the value against upstreamURLPattern and treats empty as
+		// "no upstream", so an unset repo slug degrades exactly as before.
+		"upstreamURL": upstreamURL,
 		// taskRef stamps the gate Job + pod with the originating AgenticTask
 		// identity (foreman.llmkube.dev/task-{namespace,name} labels) so a
 		// gate Job/pod can be traced back to its task (#893). Without it the

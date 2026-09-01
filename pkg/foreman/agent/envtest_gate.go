@@ -20,9 +20,17 @@ type EnvtestJobRunner interface {
 	// submitted gate Job carries the foreman.llmkube.dev/task-{namespace,name}
 	// labels and a Job/pod can be traced back to its task (#893). They mirror
 	// the coder Job path's TaskNamespace/TaskName.
+	//
+	// upstreamURL is the CANONICAL repo clone URL, and it is separate from
+	// cloneURL on purpose: cloneURL is where the branch lives (the fork),
+	// upstreamURL is what the branch was cut from. The gate diffs against
+	// merge-base(HEAD, upstreamURL base) so a stale fork base ref cannot
+	// manufacture failures (#1259). Empty makes the gate Job fall back to the
+	// fork's base tip, which silently skips change detection and the bite
+	// check while still reporting GATE PASS (#1731).
 	Run(
 		ctx context.Context,
-		taskNamespace, taskName, repository, branch, cloneURL string,
+		taskNamespace, taskName, repository, branch, cloneURL, upstreamURL string,
 	) (pass bool, ran bool, feedback string)
 }
 
@@ -55,12 +63,13 @@ func evaluatePostPushEnvtest(
 	ctx context.Context,
 	envtestTouched bool,
 	runner EnvtestJobRunner,
-	taskNamespace, taskName, repository, branch, cloneURL string,
+	taskNamespace, taskName, repository, branch, cloneURL, upstreamURL string,
 ) (envtestGateVerdict, string) {
 	if !envtestTouched || runner == nil {
 		return envtestGateOK, ""
 	}
-	pass, ran, fb := runner.Run(ctx, taskNamespace, taskName, repository, branch, cloneURL)
+	pass, ran, fb := runner.Run(
+		ctx, taskNamespace, taskName, repository, branch, cloneURL, upstreamURL)
 	if !ran {
 		return envtestGateUnverified, ""
 	}
