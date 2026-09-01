@@ -223,19 +223,37 @@ func TestReviewIterationSteps(t *testing.T) {
 			wantIterated: []int32{641},
 		},
 		{
-			// Rail-identity guard (#1641): enforceReviewerScopeOverlap also
-			// demotes a GO to NO-GO and also stamps verdictDemoted, but its
-			// verdict says the diff touches none of the files the issue
-			// names. That IS actionable, so it must iterate even with no
-			// structured findings. A predicate keyed off the bare
-			// verdictDemoted flag would swallow it.
-			name: "scope-overlap demotion of a GO with no findings still iterates",
+			// #1684: a scope-overlap demotion of a GO carrying NO findings
+			// is inert, exactly like the issueAsk case (#1636). An issue
+			// that names the file where a bug is OBSERVED while the fix
+			// belongs where the bug is CAUSED demotes the correct diff; the
+			// coder cannot act on the bare drift, so suppressing the
+			// iteration (instead of opening an unconvergeable revision
+			// cycle) is the right consequence. Detection still happens; only
+			// the consequence weakens.
+			name: "scope-overlap demotion of a GO with no findings is inert",
 			w:    iterationWorkload([]int32{641}, 1, nil),
 			children: []foremanv1alpha1.AgenticTask{
 				child("code-641", succeeded, goVerdict),
 				child("verify-641", succeeded, gatePass),
 				railDemotedNoGoChild(reviewer.RailScopeOverlap, string(goVerdict),
 					demotionReasonScopeDrift, "APPROVE: looks good to me", `[]`),
+			},
+			wantSuppressed: []string{reviewStep},
+		},
+		{
+			// #1684 safety boundary: a scope-overlap demotion is only inert
+			// when it carries nothing to fix. A demotion WITH findings names
+			// concrete work the coder can address, so it must still open an
+			// iteration even though the rail is scope-overlap.
+			name: "scope-overlap demotion carrying findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				railDemotedNoGoChild(reviewer.RailScopeOverlap, string(goVerdict),
+					demotionReasonScopeDrift, "scope drift plus a real defect",
+					`[{"severity":"major","area":"scope","message":"the fix must also touch the config loader"}]`),
 			},
 			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
 			wantIterated: []int32{641},
