@@ -96,6 +96,13 @@ const conditionTypeTruncated = "Truncated"
 // a terminal way.
 const conditionTypeCompleted = "Completed"
 
+// conditionTypeDispatched is True while children are still in flight, and
+// flips to False (with a reason naming the terminal outcome) when the
+// Workload reaches a terminal phase. Keeping it as a False condition (rather
+// than deleting it) keeps `kubectl wait --for=condition=Dispatched=false`
+// usable and records when dispatch actually ended via LastTransitionTime.
+const conditionTypeDispatched = "Dispatched"
+
 // conditionTypeCloudReviewersSuppressed is True when the sovereignty
 // gates (operator --allow-cloud-providers + Workload AllowCloudReviewers)
 // caused the reconciler to omit one or more reviewer Agents from the
@@ -755,6 +762,7 @@ func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1
 			Message:            fmt.Sprintf("%d/%d child tasks on-target Succeeded", c.succeeded, c.total),
 			LastTransitionTime: now,
 		})
+		setDispatchedTerminal(&w.Status.Conditions, "AllChildrenSucceeded", now)
 	case c.inFlight == 0 && c.failed == 0 && c.incomplete == 0 && c.succeeded == 0 && c.alreadyResolved > 0:
 		// Pure ALREADY-RESOLVED workload — nothing actually attempted.
 		w.Status.Phase = foremanv1alpha1.WorkloadPhaseCompleted
@@ -767,6 +775,7 @@ func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1
 			Message:            msg,
 			LastTransitionTime: now,
 		})
+		setDispatchedTerminal(&w.Status.Conditions, "AllAlreadyResolved", now)
 	case c.inFlight == 0 && c.failed == 0 && c.incomplete == 0:
 		// Mixed: at least one on-target succeeded AND at least one
 		// already-resolved. Still Completed; mention both.
@@ -780,6 +789,7 @@ func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1
 			Message:            msg,
 			LastTransitionTime: now,
 		})
+		setDispatchedTerminal(&w.Status.Conditions, "AllChildrenSucceeded", now)
 	case c.inFlight == 0 && (c.failed > 0 || c.incomplete > 0):
 		// Any incomplete OR failed child rolls the Workload to Failed
 		// terminal state. ALREADY-RESOLVED and Skipped children do not
@@ -797,10 +807,11 @@ func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1
 				c.succeeded, c.incomplete, c.failed, c.total, c.alreadyResolved),
 			LastTransitionTime: now,
 		})
+		setDispatchedTerminal(&w.Status.Conditions, reason, now)
 	default:
 		w.Status.Phase = foremanv1alpha1.WorkloadPhaseDispatched
 		setCondition(&w.Status.Conditions, metav1.Condition{
-			Type:   "Dispatched",
+			Type:   conditionTypeDispatched,
 			Status: metav1.ConditionTrue,
 			Reason: "ChildrenInFlight",
 			Message: fmt.Sprintf("%d in-flight, %d on-target, %d incomplete, %d failed, %d already-resolved",
@@ -808,6 +819,21 @@ func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1
 			LastTransitionTime: now,
 		})
 	}
+}
+
+// setDispatchedTerminal flips the Dispatched condition to False with a
+// Reason naming the terminal outcome once a Workload reaches a terminal
+// phase. The condition is kept (not deleted) so
+// `kubectl wait --for=condition=Dispatched=false` stays usable and
+// LastTransitionTime records when dispatch actually ended (#1739).
+func setDispatchedTerminal(conds *[]metav1.Condition, reason string, now metav1.Time) {
+	setCondition(conds, metav1.Condition{
+		Type:               conditionTypeDispatched,
+		Status:             metav1.ConditionFalse,
+		Reason:             reason,
+		Message:            "dispatch ended; workload reached a terminal phase",
+		LastTransitionTime: now,
+	})
 }
 
 // emitAlreadyResolvedCondition sets the CoderAlreadyResolved condition
