@@ -419,3 +419,99 @@ func TestRollup_ContradictedTasksAndCondition(t *testing.T) {
 		t.Errorf("condition message does not name the first contradiction: %q", cond.Message)
 	}
 }
+
+// TestRollup_ChildrenMissing drives rollup over planned-vs-observed
+// children and asserts the Dispatched condition reports planned children
+// the Workload can no longer see (#1738). The check MUST match by NAME,
+// never by count: escalation and iteration synthesize extra placeholder
+// children that are not in w.Status.Tasks, so a length comparison would
+// flap and cry wolf on every escalation.
+func TestRollup_ChildrenMissing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := foremanv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add foreman scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	taskRef := func(name string) corev1.ObjectReference {
+		return corev1.ObjectReference{Name: name}
+	}
+	child := func(name string) foremanv1alpha1.AgenticTask {
+		return foremanv1alpha1.AgenticTask{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: foremanv1alpha1.GroupVersion.String(),
+					Kind:       "Workload",
+					Name:       "missing-wl",
+				}},
+			},
+			Status: foremanv1alpha1.AgenticTaskStatus{
+				Phase: foremanv1alpha1.AgenticTaskPhasePending,
+			},
+		}
+	}
+
+	dispatched := func(w *foremanv1alpha1.Workload) *metav1.Condition {
+		return apimeta.FindStatusCondition(w.Status.Conditions, "Dispatched")
+	}
+
+	tests := []struct {
+		name        string
+		planned     []corev1.ObjectReference
+		children    []foremanv1alpha1.AgenticTask
+		wantReason  string
+		wantMissing string // substring the message must name; "" = none
+	}{
+		{
+			name:        "every planned ref observed",
+			planned:     []corev1.ObjectReference{taskRef("code-1"), taskRef("verify-1"), taskRef("review-1")},
+			children:    []foremanv1alpha1.AgenticTask{child("code-1"), child("verify-1"), child("review-1")},
+			wantReason:  "ChildrenInFlight",
+			wantMissing: "",
+		},
+		{
+			name:        "planned ref absent",
+			planned:     []corev1.ObjectReference{taskRef("code-1"), taskRef("verify-1"), taskRef("review-1")},
+			children:    []foremanv1alpha1.AgenticTask{child("code-1"), child("review-1")},
+			wantReason:  "ChildrenMissing",
+			wantMissing: "verify-1",
+		},
+		{
+			name:        "extra child not planned",
+			planned:     []corev1.ObjectReference{taskRef("code-1"), taskRef("review-1")},
+			children:    []foremanv1alpha1.AgenticTask{child("code-1"), child("review-1"), child("extra-escalation-1")},
+			wantReason:  "ChildrenInFlight",
+			wantMissing: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wl := &foremanv1alpha1.Workload{
+				ObjectMeta: metav1.ObjectMeta{Name: "missing-wl", Namespace: "default"},
+				Status:     foremanv1alpha1.WorkloadStatus{Tasks: tc.planned},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wl).WithStatusSubresource(wl).Build()
+			r := &WorkloadReconciler{Client: cl, Scheme: scheme}
+			if _, err := r.rollup(context.Background(), wl, tc.children); err != nil {
+				t.Fatalf("rollup: %v", err)
+			}
+			cond := dispatched(wl)
+			if cond == nil {
+				t.Fatal("Dispatched condition not emitted")
+			}
+			if cond.Reason != tc.wantReason {
+				t.Errorf("Reason = %q, want %q", cond.Reason, tc.wantReason)
+			}
+			if tc.wantMissing != "" && !strings.Contains(cond.Message, tc.wantMissing) {
+				t.Errorf("message does not name the missing child %q: %q", tc.wantMissing, cond.Message)
+			}
+			if wl.Status.Phase == foremanv1alpha1.WorkloadPhaseFailed {
+				t.Errorf("phase = %q, want not Failed", wl.Status.Phase)
+			}
+		})
+	}
+}

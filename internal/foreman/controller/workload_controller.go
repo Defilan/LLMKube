@@ -584,6 +584,12 @@ func (r *WorkloadReconciler) listChildren(ctx context.Context, w *foremanv1alpha
 // the wiring.
 func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Workload, children []foremanv1alpha1.AgenticTask) (ctrl.Result, error) {
 	cls := classifyChildren(children)
+	// Report planned children the Workload can no longer observe. This
+	// must match by NAME, never by count (#1738): escalation and
+	// iteration synthesize EXTRA placeholder children that are not in
+	// w.Status.Tasks, so len(children) can legitimately exceed the
+	// planned count and a length comparison would flap.
+	cls.missingTasks = missingPlannedTasks(w.Status.Tasks, children)
 
 	// Capture the patch BEFORE mutating w.Status — the patch's
 	// "original" snapshot must reflect the on-cluster state for the
@@ -633,6 +639,28 @@ type childCounts struct {
 	resolvedIssues                          []int32
 	resolvedByList                          []string
 	total                                   int32
+	missingTasks                            []string
+}
+
+// missingPlannedTasks returns the names of the Workload's planned task
+// references (w.Status.Tasks) that are absent from the observed children,
+// sorted for a stable message. It matches by name only and ignores any
+// observed child that is not a planned ref, so synthetic placeholder
+// children (escalation / iteration / informer-lag) never read as a
+// missing child (#1738).
+func missingPlannedTasks(planned []corev1.ObjectReference, children []foremanv1alpha1.AgenticTask) []string {
+	observed := make(map[string]struct{}, len(children))
+	for i := range children {
+		observed[children[i].Name] = struct{}{}
+	}
+	var missing []string
+	for _, ref := range planned {
+		if _, ok := observed[ref.Name]; !ok {
+			missing = append(missing, ref.Name)
+		}
+	}
+	sort.Strings(missing)
+	return missing
 }
 
 // classifyChildren walks the children slice and returns the bucket
@@ -810,12 +838,22 @@ func computeTerminalState(w *foremanv1alpha1.Workload, c childCounts, now metav1
 		setDispatchedTerminal(&w.Status.Conditions, reason, now)
 	default:
 		w.Status.Phase = foremanv1alpha1.WorkloadPhaseDispatched
+		reason := "ChildrenInFlight"
+		message := fmt.Sprintf("%d in-flight, %d on-target, %d incomplete, %d failed, %d already-resolved",
+			c.inFlight, c.succeeded, c.incomplete, c.failed, c.alreadyResolved)
+		if len(c.missingTasks) > 0 {
+			// A planned child is gone (deleted by hand or otherwise).
+			// This is diagnosability, not enforcement: the Workload
+			// stays Dispatched and its phase is unchanged (#1738).
+			reason = "ChildrenMissing"
+			message = fmt.Sprintf("%d planned child task(s) missing: %s; %s",
+				len(c.missingTasks), strings.Join(c.missingTasks, ", "), message)
+		}
 		setCondition(&w.Status.Conditions, metav1.Condition{
-			Type:   conditionTypeDispatched,
-			Status: metav1.ConditionTrue,
-			Reason: "ChildrenInFlight",
-			Message: fmt.Sprintf("%d in-flight, %d on-target, %d incomplete, %d failed, %d already-resolved",
-				c.inFlight, c.succeeded, c.incomplete, c.failed, c.alreadyResolved),
+			Type:               conditionTypeDispatched,
+			Status:             metav1.ConditionTrue,
+			Reason:             reason,
+			Message:            message,
 			LastTransitionTime: now,
 		})
 	}
