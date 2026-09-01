@@ -959,6 +959,22 @@ type productionHunk struct {
 //
 // The diff is taken against base (the fork point), not the plain working-tree
 // diff, so it is independent of whether an earlier gate staged the tree.
+//
+// A hunk is only a candidate when at least one of its lines is a plausible Go
+// statement: after strings.TrimSpace it is non-empty and does not start with
+// "//". A comment-only hunk is dropped here, in flush, not in the caller: the
+// per-hunk pass reverts each candidate and reports it uncovered when the
+// package's tests stay green, and reverting a comment can never turn a test
+// red, so an unfiltered comment-only hunk is reported as uncovered forever
+// (the #1735 false positive on a godoc that had to change). Filtering in flush
+// also keeps CheckPerHunkCoverage's maxPerHunkHunks budget honest: a hunk that
+// was never a candidate should not consume the budget.
+//
+// Gap accepted deliberately: a `/* */` block comment is not caught by a "//"
+// prefix test. Tracking block-comment state line by line is out of scope here;
+// the "//" case is the one actually being hit, and a block-comment-only hunk
+// is a far rarer shape that the same false positive would surface if it ever
+// matters.
 func splitProductionHunks(ctx context.Context, workspace, base, file string, run commandRunner) []productionHunk {
 	out, err := run(ctx, workspace, nil, "git", "diff", "-U0", base, "HEAD", "--", file)
 	if err != nil {
@@ -969,8 +985,22 @@ func splitProductionHunks(ctx context.Context, workspace, base, file string, run
 	var start int
 	flush := func() {
 		if len(cur) > 0 {
-			end := start + len(cur) - 1
-			hunks = append(hunks, productionHunk{Lines: cur, LineRange: fmt.Sprintf("%d-%d", start, end)})
+			// Drop hunks with no plausible statement (only comments and/or
+			// blank lines): reverting them can never turn a test red, so they
+			// would be reported uncovered forever, and they should not consume
+			// the caller's hunk budget.
+			plausible := false
+			for _, l := range cur {
+				trimmed := strings.TrimSpace(l)
+				if trimmed != "" && !strings.HasPrefix(trimmed, "//") {
+					plausible = true
+					break
+				}
+			}
+			if plausible {
+				end := start + len(cur) - 1
+				hunks = append(hunks, productionHunk{Lines: cur, LineRange: fmt.Sprintf("%d-%d", start, end)})
+			}
 			cur = nil
 		}
 	}

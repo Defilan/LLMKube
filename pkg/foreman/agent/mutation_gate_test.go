@@ -697,3 +697,54 @@ func TestCheckPerHunkCoverage_BoundedAndReportsTruncation(t *testing.T) {
 		t.Fatalf("checked %d packages, bound is %d", pkgFindings, maxPerHunkPackages)
 	}
 }
+
+// TestSplitProductionHunks_DropsCommentOnlyHunk is the regression test for
+// #1735: an added block that contains only "//" comment lines carries no Go
+// statement, so reverting it can never turn a test red and the per-hunk pass
+// would report it uncovered forever. splitProductionHunks must not emit it as
+// a candidate at all.
+func TestSplitProductionHunks_DropsCommentOnlyHunk(t *testing.T) {
+	diff := "diff --git a/x/x.go b/x/x.go\n" +
+		"@@ -0,0 +3,2 @@\n+// first comment\n+// second comment\n"
+	run := func(_ context.Context, _ string, _ []string, _ string, _ ...string) (string, error) {
+		return diff, nil
+	}
+	got := splitProductionHunks(context.Background(), "/ws", "main", "x/x.go", run)
+	if len(got) != 0 {
+		t.Fatalf("comment-only hunk must be dropped, got %d hunks: %#v", len(got), got)
+	}
+}
+
+// TestSplitProductionHunks_KeepsMixedHunk is the boundary test: a hunk that
+// mixes a comment line and a real statement still contains a plausible Go
+// statement, so it MUST be kept. Dropping it would silently stop checking real
+// code that happens to sit next to a comment.
+func TestSplitProductionHunks_KeepsMixedHunk(t *testing.T) {
+	diff := "diff --git a/x/x.go b/x/x.go\n" +
+		"@@ -0,0 +3,2 @@\n+// comment above the statement\n+\t_ = compute()\n"
+	run := func(_ context.Context, _ string, _ []string, _ string, _ ...string) (string, error) {
+		return diff, nil
+	}
+	got := splitProductionHunks(context.Background(), "/ws", "main", "x/x.go", run)
+	if len(got) != 1 {
+		t.Fatalf("mixed hunk must be kept, got %d hunks: %#v", len(got), got)
+	}
+	if got[0].LineRange != "3-4" {
+		t.Errorf("LineRange = %q, want 3-4", got[0].LineRange)
+	}
+}
+
+// TestSplitProductionHunks_DropsBlankOnlyHunk verifies a hunk of only blank
+// lines is also not a candidate: it carries no statement either, so it would
+// hit the same false positive.
+func TestSplitProductionHunks_DropsBlankOnlyHunk(t *testing.T) {
+	diff := "diff --git a/x/x.go b/x/x.go\n" +
+		"@@ -0,0 +3,2 @@\n+\n+\n"
+	run := func(_ context.Context, _ string, _ []string, _ string, _ ...string) (string, error) {
+		return diff, nil
+	}
+	got := splitProductionHunks(context.Background(), "/ws", "main", "x/x.go", run)
+	if len(got) != 0 {
+		t.Fatalf("blank-only hunk must be dropped, got %d hunks: %#v", len(got), got)
+	}
+}
