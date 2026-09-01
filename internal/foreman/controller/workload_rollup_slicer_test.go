@@ -67,6 +67,87 @@ func TestClassifyChildren_SlicerVerdicts(t *testing.T) {
 	}
 }
 
+// TestComputeTerminalState_DispatchedCondition locks in #1739: a terminal
+// Workload flips Dispatched to ConditionFalse (with a reason naming the
+// terminal outcome) instead of leaving it True, while an in-flight Workload
+// keeps Dispatched True. The condition is set (not deleted) on every
+// terminal branch so `kubectl wait --for=condition=Dispatched=false` stays
+// usable and LastTransitionTime records when dispatch ended.
+func TestComputeTerminalState_DispatchedCondition(t *testing.T) {
+	now := metav1.Now()
+
+	tests := []struct {
+		name            string
+		counts          childCounts
+		wantPhase       foremanv1alpha1.WorkloadPhase
+		wantDispatched  metav1.ConditionStatus
+		wantDispatchRsn string
+	}{
+		{
+			name:            "all children succeeded is terminal",
+			counts:          childCounts{succeeded: 3, total: 3},
+			wantPhase:       foremanv1alpha1.WorkloadPhaseCompleted,
+			wantDispatched:  metav1.ConditionFalse,
+			wantDispatchRsn: "AllChildrenSucceeded",
+		},
+		{
+			name:            "pure already-resolved is terminal",
+			counts:          childCounts{alreadyResolved: 1, resolvedIssues: []int32{42}, total: 1},
+			wantPhase:       foremanv1alpha1.WorkloadPhaseCompleted,
+			wantDispatched:  metav1.ConditionFalse,
+			wantDispatchRsn: "AllAlreadyResolved",
+		},
+		{
+			name:            "mixed on-target and already-resolved is terminal",
+			counts:          childCounts{succeeded: 2, alreadyResolved: 1, resolvedIssues: []int32{7}, total: 3},
+			wantPhase:       foremanv1alpha1.WorkloadPhaseCompleted,
+			wantDispatched:  metav1.ConditionFalse,
+			wantDispatchRsn: "AllChildrenSucceeded",
+		},
+		{
+			name:            "failed child rolls to Failed",
+			counts:          childCounts{failed: 1, succeeded: 2, total: 3},
+			wantPhase:       foremanv1alpha1.WorkloadPhaseFailed,
+			wantDispatched:  metav1.ConditionFalse,
+			wantDispatchRsn: "ChildrenFailed",
+		},
+		{
+			name:            "incomplete child rolls to Failed",
+			counts:          childCounts{incomplete: 1, total: 1},
+			wantPhase:       foremanv1alpha1.WorkloadPhaseFailed,
+			wantDispatched:  metav1.ConditionFalse,
+			wantDispatchRsn: "ChildrenIncomplete",
+		},
+		{
+			name:            "in-flight child stays Dispatched",
+			counts:          childCounts{inFlight: 1, total: 1},
+			wantPhase:       foremanv1alpha1.WorkloadPhaseDispatched,
+			wantDispatched:  metav1.ConditionTrue,
+			wantDispatchRsn: "ChildrenInFlight",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &foremanv1alpha1.Workload{}
+			computeTerminalState(w, tc.counts, now)
+
+			if w.Status.Phase != tc.wantPhase {
+				t.Errorf("Phase = %q, want %q", w.Status.Phase, tc.wantPhase)
+			}
+			cond := apimeta.FindStatusCondition(w.Status.Conditions, conditionTypeDispatched)
+			if cond == nil {
+				t.Fatalf("Dispatched condition not present")
+			}
+			if cond.Status != tc.wantDispatched {
+				t.Errorf("Dispatched status = %q, want %q", cond.Status, tc.wantDispatched)
+			}
+			if cond.Reason != tc.wantDispatchRsn {
+				t.Errorf("Dispatched reason = %q, want %q", cond.Reason, tc.wantDispatchRsn)
+			}
+		})
+	}
+}
+
 // withContradictionsEnvelope builds a complete result envelope that
 // carries the given cross-stage contradiction strings under
 // extra.crossStageContradictions (the shape the detector writes).
