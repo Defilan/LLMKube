@@ -202,29 +202,15 @@ func checkDiffCoverage(ctx context.Context, workspace string, run commandRunner)
 	}
 
 	var findings []string
+	// notEvaluated collects packages this check could not measure. Reporting
+	// them is the whole point of #1733: a silent skip renders identically to a
+	// clean result, so "we could not look" becomes indistinguishable from "we
+	// looked and found nothing" -- the exact failure class this gate exists to
+	// catch, occurring inside the gate.
+	var notEvaluated []string
 	for dir, dirFiles := range pkgs {
-		profile, err := os.CreateTemp("", "diffcov-*.out")
-		if err != nil {
-			continue
-		}
-		profilePath := profile.Name()
-		_ = profile.Close()
-
-		// A failing or absent test suite is NOT this gate's finding: the coder
-		// gate already runs build and test, and reporting here as well would
-		// double-report one problem under two names.
-		_, terr := run(ctx, workspace, nil, "go", "test", "-count=1", "-timeout=300s",
-			"-coverprofile="+profilePath, "./"+dir+"/")
-		if terr != nil {
-			_ = os.Remove(profilePath)
-			continue
-		}
-		raw, rerr := os.ReadFile(profilePath) //nolint:gosec // G304: path from os.CreateTemp
-		_ = os.Remove(profilePath)
-		if rerr != nil {
-			continue
-		}
-
+		// Added lines FIRST, before any coverage run. A package whose diff adds
+		// no statements cannot produce a finding, so testing it is pure cost.
 		added := map[string]map[int]bool{}
 		for _, f := range dirFiles {
 			if lines := changedNewLines(ctx, workspace, f, run); len(lines) > 0 {
@@ -235,20 +221,79 @@ func checkDiffCoverage(ctx context.Context, workspace string, run commandRunner)
 			continue
 		}
 
+		pkgPath := "./" + dir + "/"
+
+		// Envtest-backed packages are classified, not discovered by failing.
+		// envtestPackagePrefixes exists because the coder workspace has no
+		// KUBEBUILDER_ASSETS, and the fast unit-test tier already skips these
+		// for the same reason. Running them here would fail in BeforeSuite
+		// after burning the timeout.
+		//
+		// The post-push gate Job DOES run these with envtest assets, but it
+		// runs `make test`, not diff coverage. So for these packages this
+		// check happens nowhere, and saying so is the honest report.
+		if isEnvtestPackage(pkgPath) {
+			notEvaluated = append(notEvaluated,
+				dir+" (envtest package; not measurable in the coder workspace)")
+			continue
+		}
+
+		profile, err := os.CreateTemp("", "diffcov-*.out")
+		if err != nil {
+			notEvaluated = append(notEvaluated, dir+" (could not create a coverage profile)")
+			continue
+		}
+		profilePath := profile.Name()
+		_ = profile.Close()
+
+		// A failing or absent test suite is NOT this gate's finding: the coder
+		// gate already runs build and test, and reporting the failure here as
+		// well would double-report one problem under two names. What IS this
+		// gate's business is that coverage went unmeasured, so the package is
+		// recorded rather than dropped.
+		_, terr := run(ctx, workspace, nil, "go", "test", "-count=1", "-timeout=300s",
+			"-coverprofile="+profilePath, pkgPath)
+		if terr != nil {
+			_ = os.Remove(profilePath)
+			notEvaluated = append(notEvaluated, dir+" (its tests did not run here)")
+			continue
+		}
+		raw, rerr := os.ReadFile(profilePath) //nolint:gosec // G304: path from os.CreateTemp
+		_ = os.Remove(profilePath)
+		if rerr != nil {
+			notEvaluated = append(notEvaluated, dir+" (coverage profile unreadable)")
+			continue
+		}
+
 		for file, lines := range uncoveredAddedLines(parseCoverProfile(string(raw)), added) {
 			sort.Ints(lines)
 			findings = append(findings, fmt.Sprintf("%s: added lines never executed by any test: %s",
 				file, formatLineList(lines)))
 		}
 	}
-	if len(findings) == 0 {
+	if len(findings) == 0 && len(notEvaluated) == 0 {
 		return false, ""
 	}
 	sort.Strings(findings)
-	return true, "Added code that no test reaches:\n  " + strings.Join(findings, "\n  ") +
-		"\n\nThese lines were added by this change and ran zero times. An error path " +
-		"or guard that no test enters is not constrained by the suite: it can be " +
-		"wrong in either direction and every gate still passes."
+	sort.Strings(notEvaluated)
+
+	var b strings.Builder
+	if len(findings) > 0 {
+		b.WriteString("Added code that no test reaches:\n  " + strings.Join(findings, "\n  "))
+		b.WriteString("\n\nThese lines were added by this change and ran zero times. An error path " +
+			"or guard that no test enters is not constrained by the suite: it can be " +
+			"wrong in either direction and every gate still passes.")
+	}
+	if len(notEvaluated) > 0 {
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("Coverage NOT evaluated for:\n  " + strings.Join(notEvaluated, "\n  "))
+		b.WriteString("\n\nThis is not a finding about the code, it is the limit of this check. " +
+			"These packages were added to by this change and their diff coverage was " +
+			"never measured, so a silent pass here says nothing about them either way.")
+	}
+	return true, b.String()
 }
 
 // formatLineList renders line numbers compactly, collapsing runs into ranges so

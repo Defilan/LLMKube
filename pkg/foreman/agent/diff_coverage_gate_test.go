@@ -1,6 +1,11 @@
 package agent
 
-import "testing"
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+)
 
 // A Go coverprofile block is `importpath/file.go:sLine.sCol,eLine.eCol nStmt count`.
 // The paths are import paths; the diff gives repo-relative paths, so matching is
@@ -134,5 +139,112 @@ func TestFormatLineList_CollapsesRuns(t *testing.T) {
 		if got := formatLineList(tc.in); got != tc.want {
 			t.Errorf("formatLineList(%v) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// coverageFakeRunner answers the three command shapes checkDiffCoverage drives:
+// `git status -z` for the changed-file list, `git diff -U0 HEAD -- <file>` for a
+// file's added lines, and `go test` for the coverage run. goTestErr keys are
+// package dirs whose test run should fail. Every `go test` invocation is
+// recorded in *ran so a test can assert a package was NOT tested.
+func coverageFakeRunner(
+	status string, diffs map[string]string, goTestErr map[string]bool, ran *[]string,
+) commandRunner {
+	return func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "git" && len(args) >= 2 && args[0] == "status" {
+			return status, nil
+		}
+		if name == "git" && len(args) >= 1 && args[0] == "diff" {
+			file := args[len(args)-1]
+			return diffs[file], nil
+		}
+		if name == "go" && len(args) >= 1 && args[0] == "test" {
+			pkg := args[len(args)-1]
+			*ran = append(*ran, pkg)
+			if goTestErr[pkg] {
+				return "BeforeSuite failed: no such file or directory", errFakeGoTest
+			}
+			return "ok", nil
+		}
+		return "", nil
+	}
+}
+
+var errFakeGoTest = fmt.Errorf("exit status 1")
+
+// addedLineDiff builds the minimal `git diff -U0` shape parseAddedLines reads.
+func addedLineDiff(start int, n int) string {
+	d := fmt.Sprintf("@@ -%d,0 +%d,%d @@\n", start-1, start, n)
+	for i := 0; i < n; i++ {
+		d += "+\tsomeStatement()\n"
+	}
+	return d
+}
+
+// TestCheckDiffCoverage_ReportsEnvtestPackagesAsNotEvaluated is the #1733
+// regression. An envtest-backed package cannot be measured in the coder
+// workspace (no KUBEBUILDER_ASSETS), and the gate must SAY so. Emitting nothing
+// makes "could not look" render exactly like "looked and found nothing", which
+// is the failure class this gate exists to catch.
+func TestCheckDiffCoverage_ReportsEnvtestPackagesAsNotEvaluated(t *testing.T) {
+	file := "internal/foreman/controller/agentictask_controller.go"
+	var ran []string
+	run := coverageFakeRunner(
+		file,
+		map[string]string{file: addedLineDiff(591, 3)},
+		nil, &ran,
+	)
+
+	found, msg := checkDiffCoverage(context.Background(), t.TempDir(), run)
+	if !found {
+		t.Fatalf("envtest package went unreported; got found=false msg=%q", msg)
+	}
+	if !strings.Contains(msg, "internal/foreman/controller") {
+		t.Errorf("advisory does not name the unevaluated package: %q", msg)
+	}
+	// It must not even attempt the run: the fast tier skips these because
+	// running them in the coder workspace hangs or fails in BeforeSuite.
+	for _, p := range ran {
+		if strings.Contains(p, "internal/foreman/controller") {
+			t.Errorf("ran go test on an envtest package (%q); it should be "+
+				"classified via isEnvtestPackage, not discovered by failing", p)
+		}
+	}
+}
+
+// TestCheckDiffCoverage_ReportsAFailedTestRunAsNotEvaluated covers the other
+// way the check can be blind: a non-envtest package whose tests do not run.
+func TestCheckDiffCoverage_ReportsAFailedTestRunAsNotEvaluated(t *testing.T) {
+	file := "pkg/foreman/agent/thing.go"
+	var ran []string
+	run := coverageFakeRunner(
+		file,
+		map[string]string{file: addedLineDiff(10, 2)},
+		map[string]bool{"./pkg/foreman/agent/": true}, &ran,
+	)
+
+	found, msg := checkDiffCoverage(context.Background(), t.TempDir(), run)
+	if !found {
+		t.Fatalf("a package whose tests did not run went unreported: msg=%q", msg)
+	}
+	if !strings.Contains(msg, "pkg/foreman/agent") {
+		t.Errorf("advisory does not name the unevaluated package: %q", msg)
+	}
+}
+
+// TestCheckDiffCoverage_NoAddedLinesRunsNoTests asserts the ordering change:
+// added lines are computed BEFORE the coverage run, so a package whose diff
+// cannot produce a finding costs no `go test`.
+func TestCheckDiffCoverage_NoAddedLinesRunsNoTests(t *testing.T) {
+	file := "pkg/foreman/agent/thing.go"
+	var ran []string
+	run := coverageFakeRunner(file, map[string]string{file: ""}, nil, &ran)
+
+	found, msg := checkDiffCoverage(context.Background(), t.TempDir(), run)
+	if found {
+		t.Errorf("reported something for a diff with no added lines: %q", msg)
+	}
+	if len(ran) != 0 {
+		t.Errorf("ran %v; a package with no added lines needs no coverage run", ran)
 	}
 }
