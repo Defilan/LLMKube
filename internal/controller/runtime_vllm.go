@@ -118,6 +118,7 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 	gpuCount := resolveGPUCount(isvc, model)
 	if cfg != nil {
 		args = appendTensorParallelSize(args, cfg.TensorParallelSize)
+		args = appendPipelineParallelSize(args, cfg.PipelineParallelSize)
 		args = appendMaxModelLen(args, cfg.MaxModelLen)
 		args = appendQuantization(args, cfg.Quantization)
 		args = appendDtype(args, cfg.Dtype)
@@ -292,4 +293,58 @@ func (b *VLLMBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev
 		}}
 	}
 	return nil
+}
+
+// BuildMultiNodeArgs renders vLLM's native multi-node flags for one rank.
+// vLLM's own launcher: rank 0 runs the API server, every other rank runs
+// --headless and joins the torch.distributed rendezvous at master-addr.
+func (b *VLLMBackend) BuildMultiNodeArgs(isvc *inferencev1alpha1.InferenceService, rank int32) []string {
+	mn := isvc.Spec.MultiNode
+	if mn == nil || len(mn.Members) == 0 {
+		return nil
+	}
+	master := ""
+	if f := mn.Members[0].Fabric; f != nil {
+		master = f.Address
+	}
+	args := []string{
+		"--nnodes", fmt.Sprintf("%d", len(mn.Members)),
+		"--node-rank", fmt.Sprintf("%d", rank),
+		"--master-addr", master,
+		"--master-port", fmt.Sprintf("%d", mn.RendezvousPortOrDefault()),
+		"--distributed-executor-backend", "mp",
+	}
+	if rank > 0 {
+		args = append(args, "--headless")
+	}
+	return args
+}
+
+// BuildMultiNodeEnv renders the fabric env for one rank: which NIC carries the
+// bootstrap sockets, which HCA NCCL may use, and vLLM's own host IP. Names
+// differ per node for the same physical link, which is why they come from the
+// member and not the service.
+func (b *VLLMBackend) BuildMultiNodeEnv(isvc *inferencev1alpha1.InferenceService, rank int32) []corev1.EnvVar {
+	mn := isvc.Spec.MultiNode
+	if mn == nil || rank < 0 || int(rank) >= len(mn.Members) {
+		return nil
+	}
+	var env []corev1.EnvVar
+	if f := mn.Members[rank].Fabric; f != nil {
+		if f.Address != "" {
+			env = append(env, corev1.EnvVar{Name: "VLLM_HOST_IP", Value: f.Address})
+		}
+		if f.SocketInterface != "" {
+			for _, name := range []string{"NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "TP_SOCKET_IFNAME"} {
+				env = append(env, corev1.EnvVar{Name: name, Value: f.SocketInterface})
+			}
+		}
+		if f.IBHCA != "" {
+			env = append(env, corev1.EnvVar{Name: "NCCL_IB_HCA", Value: f.IBHCA})
+		}
+	}
+	if mn.IBGIDIndex != nil {
+		env = append(env, corev1.EnvVar{Name: "NCCL_IB_GID_INDEX", Value: fmt.Sprintf("%d", *mn.IBGIDIndex)})
+	}
+	return env
 }

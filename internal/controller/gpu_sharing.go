@@ -287,12 +287,39 @@ func gpuSharingParallelismConflict(isvc *inferencev1alpha1.InferenceService) err
 // (the reconcile backstop re-checks with the real Model) and DRA
 // resourceClaims, whose device count is unknowable here; silent beats wrong.
 //
-// vLLM's world size is TP alone today: VLLMConfig has no data/pipeline
-// parallel size fields, and EnableExpertParallel redistributes experts across
-// existing TP ranks. If DP/PP fields are ever added, this becomes the
-// product. SGLang differs: its in-process --dp launches dp engine replicas of
-// tp GPUs each inside one pod, so the per-pod need is tp*dp, and --ep cannot
-// exceed the world size either.
+// vLLM's world size is tensor x pipeline; EnableExpertParallel redistributes
+// experts across existing ranks and adds nothing. For a single pod the world
+// must fit the pod's GPUs. For a spec.multiNode group every GPU in the group
+// must be a rank, so the world must EQUAL members x GPUs per member (a
+// smaller world leaves a member idle and the rendezvous never completes).
+// SGLang differs: its in-process --dp launches dp engine replicas of tp GPUs
+// each inside one pod, so the per-pod need is tp*dp, and --ep cannot exceed
+// the world size either.
+// multiNodeParallelism resolves the vLLM topology a spec.multiNode group runs:
+// tensor and pipeline sizes (unset pipeline is 1; unset tensor is whatever
+// fills the group, expected / pp), the world size the group provides (members
+// x GPUs per member) and whether either size was explicit. The pod builder
+// pins the resolved sizes into the argv, because BuildArgs' own auto-derive
+// only knows one pod's GPU count and would leave a two-node group at TP 1.
+func multiNodeParallelism(cfg *inferencev1alpha1.VLLMConfig, members, gpuPerMember int32) (tp, pp, expected int32, explicit bool) {
+	expected = members * gpuPerMember
+	pp = 1
+	if cfg != nil && cfg.PipelineParallelSize != nil {
+		pp = *cfg.PipelineParallelSize
+		explicit = true
+	}
+	if pp > 0 && expected%pp == 0 {
+		tp = expected / pp
+	} else {
+		tp = expected
+	}
+	if cfg != nil && cfg.TensorParallelSize != nil {
+		tp = *cfg.TensorParallelSize
+		explicit = true
+	}
+	return tp, pp, expected, explicit
+}
+
 func parallelismExceedsGPUCount(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) error {
 	var count int32
 	if model != nil {
@@ -304,14 +331,47 @@ func parallelismExceedsGPUCount(isvc *inferencev1alpha1.InferenceService, model 
 		return nil
 	}
 
-	if cfg := isvc.Spec.VLLMConfig; cfg != nil && cfg.TensorParallelSize != nil &&
-		*cfg.TensorParallelSize > count {
-		return fmt.Errorf(
-			"vllmConfig.tensorParallelSize %d exceeds the %d GPU(s) this pod requests "+
-				"(model hardware.gpu.count / resources.gpu); multi-node inference is not "+
-				"supported, so the pod can never start. Lower tensorParallelSize, remove "+
-				"it to auto-match the GPU count, or request more GPUs",
-			*cfg.TensorParallelSize, count)
+	if mn := isvc.Spec.MultiNode; mn != nil {
+		members := int32(len(mn.Members)) //nolint:gosec // G115: bounded by the CRD's MaxItems=64
+		tp, pp, expected, explicit := multiNodeParallelism(isvc.Spec.VLLMConfig, members, count)
+		if explicit && tp*pp != expected {
+			return fmt.Errorf(
+				"vllmConfig tensorParallelSize x pipelineParallelSize = %d x %d = %d but the "+
+					"multiNode group provides %d GPUs (%d members x %d per member); every GPU "+
+					"in the group must be a rank, so set the sizes to multiply to %d or change "+
+					"the member count",
+				tp, pp, tp*pp, expected, members, count, expected)
+		}
+		return nil
+	}
+
+	if cfg := isvc.Spec.VLLMConfig; cfg != nil && (cfg.TensorParallelSize != nil || cfg.PipelineParallelSize != nil) {
+		// Mirror BuildArgs: an unset tensorParallelSize auto-derives to the
+		// pod's GPU count, an unset pipelineParallelSize is 1.
+		tp, pp := count, int32(1)
+		if cfg.TensorParallelSize != nil {
+			tp = *cfg.TensorParallelSize
+		}
+		if cfg.PipelineParallelSize != nil {
+			pp = *cfg.PipelineParallelSize
+		}
+		if cfg.PipelineParallelSize == nil && tp > count {
+			return fmt.Errorf(
+				"vllmConfig.tensorParallelSize %d exceeds the %d GPU(s) this pod requests "+
+					"(model hardware.gpu.count / resources.gpu), so the pod can never start. "+
+					"Lower tensorParallelSize, remove it to auto-match the GPU count, request "+
+					"more GPUs, or use spec.multiNode to span nodes",
+				tp, count)
+		}
+		if tp*pp > count {
+			return fmt.Errorf(
+				"vllmConfig tensorParallelSize x pipelineParallelSize = %d x %d = %d exceeds the "+
+					"%d GPU(s) this pod requests (model hardware.gpu.count / resources.gpu), so "+
+					"the pod can never start. Lower the sizes, set tensorParallelSize explicitly "+
+					"when using pipelineParallelSize, request more GPUs, or use spec.multiNode "+
+					"to span nodes",
+				tp, pp, tp*pp, count)
+		}
 	}
 
 	if cfg := isvc.Spec.SGLangConfig; cfg != nil {

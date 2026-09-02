@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -759,4 +760,129 @@ func TestNeedsCPUOffloadNoopWarning(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVLLMBuildArgsPipelineParallelSize covers vllmConfig.pipelineParallelSize:
+// emitted when above 1, silent at 1 (vLLM's default) and when unset.
+func TestVLLMBuildArgsPipelineParallelSize(t *testing.T) {
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "m"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "org/name"},
+	}
+	pp := int32(2)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime:    "vllm",
+			VLLMConfig: &inferencev1alpha1.VLLMConfig{PipelineParallelSize: &pp},
+		},
+	}
+	args := (&VLLMBackend{}).BuildArgs(isvc, model, "/models/m", "", 8000)
+	if got := argValue(args, "--pipeline-parallel-size"); got != "2" {
+		t.Fatalf("--pipeline-parallel-size = %q, want 2 in %v", got, args)
+	}
+
+	one := int32(1)
+	isvc.Spec.VLLMConfig.PipelineParallelSize = &one
+	args = (&VLLMBackend{}).BuildArgs(isvc, model, "/models/m", "", 8000)
+	for _, a := range args {
+		if a == "--pipeline-parallel-size" {
+			t.Fatalf("pipelineParallelSize 1 must not emit a flag: %v", args)
+		}
+	}
+}
+
+// multiNodeISVCForTest is the two-Spark ring pair: rank 0 on dgx3, rank 1 on
+// dgx1, each end of the same leg with its own NIC and HCA names.
+func multiNodeISVCForTest() *inferencev1alpha1.InferenceService {
+	tp := int32(2)
+	gid := int32(3)
+	return &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "ring", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime:    "vllm",
+			VLLMConfig: &inferencev1alpha1.VLLMConfig{TensorParallelSize: &tp},
+			MultiNode: &inferencev1alpha1.MultiNodeSpec{
+				IBGIDIndex: &gid,
+				Members: []inferencev1alpha1.MultiNodeMember{
+					{Node: "dgx3", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.10.4.1", SocketInterface: "enp1s0f0np0", IBHCA: "rocep1s0f0"}},
+					{Node: "dgx1", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.10.4.2", SocketInterface: "enp1s0f1np1", IBHCA: "rocep1s0f1"}},
+				},
+			},
+		},
+	}
+}
+
+func TestVLLMBuildMultiNodeArgs(t *testing.T) {
+	isvc := multiNodeISVCForTest()
+	b := &VLLMBackend{}
+
+	head := b.BuildMultiNodeArgs(isvc, 0)
+	for _, want := range [][2]string{
+		{"--nnodes", "2"}, {"--node-rank", "0"}, {"--master-addr", "10.10.4.1"},
+		{"--master-port", "29500"}, {"--distributed-executor-backend", "mp"},
+	} {
+		if !containsArg(head, want[0], want[1]) {
+			t.Errorf("rank 0 missing %s %s in %v", want[0], want[1], head)
+		}
+	}
+	if containsArg(head, "--headless", "") {
+		t.Errorf("rank 0 must not be headless: %v", head)
+	}
+
+	worker := b.BuildMultiNodeArgs(isvc, 1)
+	if !containsArg(worker, "--node-rank", "1") {
+		t.Errorf("rank 1 missing --node-rank 1 in %v", worker)
+	}
+	if !containsArg(worker, "--headless", "") {
+		t.Errorf("rank 1 must be --headless: %v", worker)
+	}
+
+	port := int32(31000)
+	isvc.Spec.MultiNode.RendezvousPort = &port
+	if got := argValue(b.BuildMultiNodeArgs(isvc, 1), "--master-port"); got != "31000" {
+		t.Errorf("--master-port = %q, want 31000", got)
+	}
+	if got := b.BuildMultiNodeArgs(&inferencev1alpha1.InferenceService{}, 0); got != nil {
+		t.Errorf("no multiNode block must yield nil args, got %v", got)
+	}
+}
+
+func TestVLLMBuildMultiNodeEnv(t *testing.T) {
+	isvc := multiNodeISVCForTest()
+	env := (&VLLMBackend{}).BuildMultiNodeEnv(isvc, 1)
+	want := map[string]string{
+		"VLLM_HOST_IP":       "10.10.4.2",
+		"NCCL_SOCKET_IFNAME": "enp1s0f1np1",
+		"GLOO_SOCKET_IFNAME": "enp1s0f1np1",
+		"TP_SOCKET_IFNAME":   "enp1s0f1np1",
+		"NCCL_IB_HCA":        "rocep1s0f1",
+		"NCCL_IB_GID_INDEX":  "3",
+	}
+	got := envMap(env)
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q (env %v)", k, got[k], v, env)
+		}
+	}
+	if len(env) != len(want) {
+		t.Errorf("unexpected extra env: %v", env)
+	}
+
+	// A member with no fabric block and no GID index yields nothing: NCCL
+	// enumerates, VLLM_HOST_IP is left to vLLM.
+	isvc.Spec.MultiNode.Members[1].Fabric = nil
+	isvc.Spec.MultiNode.IBGIDIndex = nil
+	if env := (&VLLMBackend{}).BuildMultiNodeEnv(isvc, 1); len(env) != 0 {
+		t.Errorf("expected no env for a member without fabric, got %v", env)
+	}
+}
+
+// envMap indexes a container env by name for assertions.
+func envMap(env []corev1.EnvVar) map[string]string {
+	m := map[string]string{}
+	for _, e := range env {
+		m[e.Name] = e.Value
+	}
+	return m
 }

@@ -55,6 +55,16 @@ type EnvBuilder interface {
 	BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar
 }
 
+// MultiNodeArgsBuilder is optionally implemented by backends that can run one
+// process per node as a single serving group (spec.multiNode). rank is the
+// member's index in spec.multiNode.members; rank 0 serves the endpoint. The
+// returned argv is appended to BuildArgs' output and the env is prepended to
+// the container's env (user env still wins on conflict).
+type MultiNodeArgsBuilder interface {
+	BuildMultiNodeArgs(isvc *inferencev1alpha1.InferenceService, rank int32) []string
+	BuildMultiNodeEnv(isvc *inferencev1alpha1.InferenceService, rank int32) []corev1.EnvVar
+}
+
 // HPAMetricProvider is optionally implemented by backends that have a default autoscaling metric.
 type HPAMetricProvider interface {
 	DefaultHPAMetric() string

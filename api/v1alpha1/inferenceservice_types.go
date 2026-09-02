@@ -212,6 +212,120 @@ type ModelCacheSpec struct {
 	ClaimName string `json:"claimName,omitempty"`
 }
 
+// DefaultMultiNodeRendezvousPort is the torch.distributed rendezvous port rank 0
+// listens on when spec.multiNode.rendezvousPort is unset. Matches vLLM's
+// --master-port default so a hand-written pod and an operator-generated one
+// interoperate.
+const DefaultMultiNodeRendezvousPort int32 = 29500
+
+// MultiNodeMemberFabric describes how one member reaches the group's
+// high-speed fabric. On a point-to-point ring every leg has its own subnet and
+// the same physical link has different NIC and HCA names on each end, so these
+// are per member rather than per service.
+type MultiNodeMemberFabric struct {
+	// Address is the member's IP on the fabric. Rank 0's address is the
+	// rendezvous address every other rank dials; for other ranks it seeds the
+	// runtime's own host IP (vLLM: VLLM_HOST_IP). Optional on ranks >= 1.
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// SocketInterface is the NIC that carries the bootstrap traffic
+	// (NCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME, TP_SOCKET_IFNAME).
+	// +optional
+	SocketInterface string `json:"socketInterface,omitempty"`
+
+	// IBHCA is the RDMA device NCCL may use (NCCL_IB_HCA). An exact device
+	// name (rocep1s0f0) or a prefix (mlx5). Unset lets NCCL enumerate.
+	// +optional
+	IBHCA string `json:"ibHCA,omitempty"`
+}
+
+// MultiNodeMemberCache overrides the model cache claim for one member. The
+// cluster may have no ReadWriteMany class, in which case every member needs
+// its own claim pinned to its node.
+type MultiNodeMemberCache struct {
+	// ClaimName is an existing PersistentVolumeClaim in the service namespace
+	// holding the model files for this member.
+	// +kubebuilder:validation:MinLength=1
+	ClaimName string `json:"claimName"`
+}
+
+// MultiNodeMember is one rank of a multi-node serving group.
+type MultiNodeMember struct {
+	// Node is the Kubernetes node this rank is pinned to.
+	// +kubebuilder:validation:MinLength=1
+	Node string `json:"node"`
+
+	// Fabric is this member's fabric configuration.
+	// +optional
+	Fabric *MultiNodeMemberFabric `json:"fabric,omitempty"`
+
+	// ModelCache overrides spec.modelCache for this member.
+	// +optional
+	ModelCache *MultiNodeMemberCache `json:"modelCache,omitempty"`
+}
+
+// MultiNodeSpec serves one model across several nodes. Members are ranked in
+// list order; rank 0 serves the endpoint. Supported runtimes: vllm.
+// +kubebuilder:validation:XValidation:rule="has(self.members[0].fabric) && has(self.members[0].fabric.address) && self.members[0].fabric.address.size() > 0",message="members[0].fabric.address is required: it is the rendezvous address every other rank dials"
+type MultiNodeSpec struct {
+	// Members lists the ranks in order. At least two.
+	// +kubebuilder:validation:MinItems=2
+	// +kubebuilder:validation:MaxItems=64
+	Members []MultiNodeMember `json:"members"`
+
+	// RDMAResource is an extended resource name advertised by an RDMA device
+	// plugin (e.g. rdma/rdma_shared_device_a). When set, every member requests
+	// one and gets CAP_IPC_LOCK, which NCCL needs to pin registered memory.
+	// +optional
+	RDMAResource string `json:"rdmaResource,omitempty"`
+
+	// IBGIDIndex sets NCCL_IB_GID_INDEX for every member (3 is RoCE v2 on the
+	// ConnectX-7 parts we run). Unset leaves NCCL's default.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	IBGIDIndex *int32 `json:"ibGIDIndex,omitempty"`
+
+	// RendezvousPort is the port rank 0 listens on for torch.distributed.
+	// Defaults to 29500.
+	// +optional
+	// +kubebuilder:validation:Minimum=1024
+	// +kubebuilder:validation:Maximum=65535
+	RendezvousPort *int32 `json:"rendezvousPort,omitempty"`
+}
+
+// RendezvousPortOrDefault returns the configured rendezvous port or the
+// default. Safe on a nil receiver.
+func (s *MultiNodeSpec) RendezvousPortOrDefault() int32 {
+	if s == nil || s.RendezvousPort == nil {
+		return DefaultMultiNodeRendezvousPort
+	}
+	return *s.RendezvousPort
+}
+
+// MultiNodeMemberStatus is the observed state of one rank.
+type MultiNodeMemberStatus struct {
+	Rank     int32  `json:"rank"`
+	Node     string `json:"node"`
+	Pod      string `json:"pod,omitempty"`
+	Phase    string `json:"phase,omitempty"`
+	Ready    bool   `json:"ready,omitempty"`
+	Restarts int32  `json:"restarts,omitempty"`
+}
+
+// MultiNodeStatus is the observed state of the serving group.
+type MultiNodeStatus struct {
+	// Size is the number of members in the spec.
+	Size int32 `json:"size"`
+	// ReadyMembers counts members that are Running (rank 0 must also be Ready).
+	ReadyMembers int32 `json:"readyMembers"`
+	// Members is per-rank detail in rank order.
+	// +optional
+	Members []MultiNodeMemberStatus `json:"members,omitempty"`
+}
+
+// +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || !has(self.replicas) || self.replicas <= 1",message="multiNode serves one group: replicas must be 1 or unset"
+// +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || (has(self.runtime) && self.runtime == 'vllm')",message="multiNode is supported for runtime vllm in this release"
 type InferenceServiceSpec struct {
 	// ModelRef references the Model CR that contains the model to serve
 	// +kubebuilder:validation:Required
@@ -604,6 +718,12 @@ type InferenceServiceSpec struct {
 	// operator-global cache mode applies unchanged.
 	// +optional
 	ModelCache *ModelCacheSpec `json:"modelCache,omitempty"`
+
+	// MultiNode serves this model across several nodes as one gang of pods.
+	// Rank 0 serves the endpoint; the Service selects it as usual. Replicas
+	// must be 1 or unset. See docs/multi-node-inference.md.
+	// +optional
+	MultiNode *MultiNodeSpec `json:"multiNode,omitempty"`
 
 	// PersonaPlexConfig holds configuration for the PersonaPlex (Moshi) runtime.
 	// Only used when Runtime is "personaplex".
@@ -1090,6 +1210,14 @@ type VLLMConfig struct {
 	// +optional
 	TensorParallelSize *int32 `json:"tensorParallelSize,omitempty"`
 
+	// PipelineParallelSize is the number of pipeline stages (vLLM
+	// --pipeline-parallel-size). Together with tensorParallelSize it defines the
+	// world size; for a multiNode service tensorParallelSize x
+	// pipelineParallelSize must equal members x resources.gpu.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	PipelineParallelSize *int32 `json:"pipelineParallelSize,omitempty"`
+
 	// MaxModelLen sets the maximum model context length.
 	// +optional
 	MaxModelLen *int32 `json:"maxModelLen,omitempty"`
@@ -1356,6 +1484,10 @@ type InferenceServiceStatus struct {
 	// surfaced via the GatewayReady condition).
 	// +optional
 	Gateway *GatewayStatus `json:"gateway,omitempty"`
+
+	// MultiNode is the observed state of a multi-node serving group.
+	// +optional
+	MultiNode *MultiNodeStatus `json:"multiNode,omitempty"`
 
 	// conditions represent the current state of the InferenceService resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.

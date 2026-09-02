@@ -561,3 +561,66 @@ func TestParallelismExceedsGPUCount(t *testing.T) {
 		})
 	}
 }
+
+// TestParallelismGuardMultiNode: for a spec.multiNode group the world size
+// (tensor x pipeline) is checked against members x GPUs per member, and every
+// GPU in the group must be a rank.
+func TestParallelismGuardMultiNode(t *testing.T) {
+	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}}
+	i32 := func(v int32) *int32 { return &v }
+	mk := func(tp, pp *int32, members int) *inferencev1alpha1.InferenceService {
+		ms := make([]inferencev1alpha1.MultiNodeMember, members)
+		for i := range ms {
+			ms[i] = inferencev1alpha1.MultiNodeMember{Node: "n" + string(rune('a'+i))}
+		}
+		return &inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				Resources:  &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{TensorParallelSize: tp, PipelineParallelSize: pp},
+				MultiNode:  &inferencev1alpha1.MultiNodeSpec{Members: ms},
+			},
+		}
+	}
+
+	if err := parallelismExceedsGPUCount(mk(i32(2), nil, 2), model); err != nil {
+		t.Errorf("TP2 over 2 members x 1 GPU must pass: %v", err)
+	}
+	if err := parallelismExceedsGPUCount(mk(nil, i32(2), 2), model); err != nil {
+		t.Errorf("PP2 with TP auto-derived to 1 over 2 members must pass: %v", err)
+	}
+	if err := parallelismExceedsGPUCount(mk(nil, nil, 2), model); err != nil {
+		t.Errorf("unset TP/PP auto-derives and must pass: %v", err)
+	}
+	if err := parallelismExceedsGPUCount(mk(i32(2), i32(2), 2), model); err == nil {
+		t.Errorf("TP2 x PP2 = 4 over 2 GPUs must fail")
+	}
+	if err := parallelismExceedsGPUCount(mk(i32(1), nil, 2), model); err == nil {
+		t.Errorf("TP1 over 2 members leaves a rank idle and must fail")
+	}
+}
+
+// TestParallelismGuardSinglePodPipeline: on a single pod the world size is the
+// product too, now that pipelineParallelSize exists.
+func TestParallelismGuardSinglePodPipeline(t *testing.T) {
+	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}}
+	i32 := func(v int32) *int32 { return &v }
+	mk := func(tp, pp *int32, gpus int32) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				Resources:  &inferencev1alpha1.InferenceResourceRequirements{GPU: gpus},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{TensorParallelSize: tp, PipelineParallelSize: pp},
+			},
+		}
+	}
+	if err := parallelismExceedsGPUCount(mk(i32(1), i32(2), 2), model); err != nil {
+		t.Errorf("TP1 x PP2 on 2 GPUs must pass: %v", err)
+	}
+	if err := parallelismExceedsGPUCount(mk(i32(2), i32(2), 2), model); err == nil {
+		t.Errorf("TP2 x PP2 = 4 on 2 GPUs must fail")
+	}
+	if err := parallelismExceedsGPUCount(mk(nil, i32(2), 1), model); err == nil {
+		t.Errorf("PP2 on 1 GPU must fail")
+	}
+}
