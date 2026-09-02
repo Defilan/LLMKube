@@ -79,6 +79,12 @@ const MaxLogTailBytes = 32 * 1024
 // pull request and the test does not see it, and most of helm-chart.yml
 // drives helm and ct the same way. Widening the gate to such a check is
 // a manual decision; nothing here will prompt for it.
+//
+// The `test` check runs `make test` WITHOUT a GINKGO_SEED, so the gate is
+// single-seed: per-run latency stays as cheap as local `make test`. The
+// second Ginkgo seed runs only in CI (test.yml runs `make test
+// GINKGO_SEED=22`), which is where an ordering-dependent suite failure is
+// caught before merge without taxing every gate run. Refs #1693.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds",

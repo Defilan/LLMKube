@@ -108,7 +108,16 @@ vet: ## Run go vet against code.
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	# Ginkgo only accepts -ginkgo.seed/-ginkgo.v on packages that run a
+	# suite, so split the package list. The Ginkgo packages get the seed
+	# (when GINKGO_SEED is set) and always -ginkgo.v so the "Random Seed:"
+	# line lands in the log; every other package runs unchanged. Coverage
+	# from the two invocations is merged back into the single cover.out.
+	GINKGO_TEST_PKGS=$$(go list $$(grep -rl 'RunSpecs(' --include='*_test.go' . | xargs -n1 dirname | sort -u | grep -v /e2e)); \
+	NON_GINKGO_TEST_PKGS=$$(go list ./... | grep -v /e2e | grep -vE "^($$(printf '%s\n' $$GINKGO_TEST_PKGS | sed 's/\./\\./g' | paste -sd'|' -))$$"); \
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$GINKGO_TEST_PKGS -ginkgo.v $(if $(GINKGO_SEED),-ginkgo.seed=$(GINKGO_SEED),) -coverprofile cover.out; \
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$NON_GINKGO_TEST_PKGS -coverprofile cover2.out; \
+	{ head -n1 cover.out; tail -n +2 cover.out; tail -n +2 cover2.out; } > cover.out.tmp; mv cover.out.tmp cover.out; rm -f cover2.out
 
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).

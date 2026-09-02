@@ -35,6 +35,15 @@ jobs:
           go mod tidy
           make test
 
+      - name: Running Tests (second seed)
+        # Ginkgo randomizes top-level container order per seed, so a test
+        # that leaks shared cluster state passes or fails on the draw.
+        # Running the envtest suites under a second fixed seed in CI catches
+        # ordering bugs the first seed happens to miss. Local `make test` and
+        # the Foreman gate stay single-pass (#1693).
+        run: |
+          make test GINKGO_SEED=22
+
       - name: Upload coverage to Codecov
         # make test writes cover.out via `go test -coverprofile`.
         # Do not fail CI if Codecov is unreachable.
