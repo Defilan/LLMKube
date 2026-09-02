@@ -1,5 +1,9 @@
 # Serving one model across two DGX Sparks (llama.cpp RPC)
 
+> The operator can now express a vLLM group directly through
+> `spec.multiNode`; see `docs/site/guides/multi-node-inference.md`. This
+> runbook remains the llama.cpp RPC pattern until that backend joins it.
+
 One model, two GB10s, their ConnectX-7 link between them. The memory is not
 pooled by hardware: the runtime splits the model, with `ggml-rpc-server`
 exposing the remote Spark's devices and the main `llama-server` offloading
