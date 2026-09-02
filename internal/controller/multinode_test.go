@@ -62,10 +62,12 @@ func pvcClaim(p *corev1.Pod) string {
 	return ""
 }
 
-func TestConstructMemberPods(t *testing.T) {
+// buildMemberPods runs the builder on the fixture and returns head, worker
+// and the group hash, failing the test on any error.
+func buildMemberPods(t *testing.T) (*corev1.Pod, *corev1.Pod, string) {
+	t.Helper()
 	isvc, model := multiNodeFixture()
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-
 	pods, hash, err := r.constructMemberPods(isvc, model, nil)
 	if err != nil {
 		t.Fatalf("constructMemberPods: %v", err)
@@ -73,15 +75,18 @@ func TestConstructMemberPods(t *testing.T) {
 	if len(pods) != 2 || hash == "" {
 		t.Fatalf("got %d pods, hash %q", len(pods), hash)
 	}
+	return pods[0], pods[1], hash
+}
 
-	head, worker := pods[0], pods[1]
+func TestConstructMemberPodsPlacementAndLabels(t *testing.T) {
+	head, worker, hash := buildMemberPods(t)
 	if head.Name != "ring-mn-0" || worker.Name != "ring-mn-1" {
 		t.Errorf("names = %s, %s", head.Name, worker.Name)
 	}
 	if head.Spec.NodeName != "dgx3" || worker.Spec.NodeName != "dgx1" {
 		t.Errorf("nodeName = %s, %s", head.Spec.NodeName, worker.Spec.NodeName)
 	}
-	for _, p := range pods {
+	for _, p := range []*corev1.Pod{head, worker} {
 		if !p.Spec.HostNetwork || !p.Spec.HostIPC || p.Spec.DNSPolicy != corev1.DNSClusterFirstWithHostNet {
 			t.Errorf("%s: hostNetwork=%v hostIPC=%v dns=%s", p.Name, p.Spec.HostNetwork, p.Spec.HostIPC, p.Spec.DNSPolicy)
 		}
@@ -107,7 +112,10 @@ func TestConstructMemberPods(t *testing.T) {
 	if head.Labels[LabelMultiNodeRank] != "0" || worker.Labels[LabelMultiNodeRank] != "1" {
 		t.Errorf("rank labels: %v / %v", head.Labels, worker.Labels)
 	}
+}
 
+func TestConstructMemberPodsProbesArgsEnv(t *testing.T) {
+	head, worker, _ := buildMemberPods(t)
 	hc, wc := head.Spec.Containers[0], worker.Spec.Containers[0]
 	if hc.ReadinessProbe == nil || hc.StartupProbe == nil {
 		t.Errorf("head keeps its probes")
@@ -121,12 +129,15 @@ func TestConstructMemberPods(t *testing.T) {
 	if !containsArg(hc.Args, "--tensor-parallel-size", "2") || !containsArg(wc.Args, "--tensor-parallel-size", "2") {
 		t.Errorf("both ranks carry --tensor-parallel-size 2: head %v worker %v", hc.Args, wc.Args)
 	}
-
 	env := envMap(wc.Env)
 	if env["VLLM_HOST_IP"] != "10.10.4.2" || env["NCCL_IB_HCA"] != "rocep1s0f1" || env["NCCL_IB_GID_INDEX"] != "3" || env["USER_VAR"] != "1" {
 		t.Errorf("worker env = %v", env)
 	}
+}
 
+func TestConstructMemberPodsResourcesAndClaims(t *testing.T) {
+	head, worker, _ := buildMemberPods(t)
+	wc := worker.Spec.Containers[0]
 	rdma := corev1.ResourceName("rdma/rdma_shared_device_a")
 	req, lim := wc.Resources.Requests[rdma], wc.Resources.Limits[rdma]
 	if req.Value() != 1 || lim.Value() != 1 {
@@ -143,7 +154,6 @@ func TestConstructMemberPods(t *testing.T) {
 	if !capOK {
 		t.Errorf("IPC_LOCK missing: %+v", wc.SecurityContext)
 	}
-
 	if pvcClaim(head) != "shared-claim" || pvcClaim(worker) != "dgx1-claim" {
 		t.Errorf("claims: head %q worker %q", pvcClaim(head), pvcClaim(worker))
 	}

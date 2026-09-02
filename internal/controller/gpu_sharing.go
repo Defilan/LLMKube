@@ -332,7 +332,7 @@ func parallelismExceedsGPUCount(isvc *inferencev1alpha1.InferenceService, model 
 	}
 
 	if mn := isvc.Spec.MultiNode; mn != nil {
-		members := int32(len(mn.Members))
+		members := int32(len(mn.Members)) //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 		tp, pp, expected, explicit := multiNodeParallelism(isvc.Spec.VLLMConfig, members, count)
 		if explicit && tp*pp != expected {
 			return fmt.Errorf(

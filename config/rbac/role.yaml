@@ -24,7 +24,6 @@ rules:
   - namespaces
   - nodes
   - persistentvolumes
-  - pods
   - secrets
   verbs:
   - get
@@ -40,6 +39,16 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
+  - get
+  - list
   - watch
 - apiGroups:
   - ""

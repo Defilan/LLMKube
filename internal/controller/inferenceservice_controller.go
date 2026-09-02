@@ -171,7 +171,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=core,resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
@@ -266,7 +266,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	r.emitSpecAdvisoryEvents(inferenceService, model)
 
-	deployment, readyReplicas, metalSnap, result, err := r.reconcileDeployment(ctx, inferenceService, model, draftModel, desiredReplicas, modelReady, isMetal)
+	deployment, readyReplicas, metalSnap, result, err := r.reconcileWorkload(ctx, inferenceService, model, draftModel, desiredReplicas, modelReady, isMetal)
 	if err != nil || result != nil {
 		if result != nil {
 			return *result, err
@@ -1005,10 +1005,33 @@ func (r *InferenceServiceReconciler) findInferenceServiceForEndpoints(ctx contex
 	}
 }
 
+// reconcileWorkload picks the serving shape. A spec.multiNode group replaces
+// the Deployment: one pinned pod per member, owned by the service, recreated
+// as a unit (#1423). Everything else is the Deployment (or, on Metal, the
+// agent-owned endpoint) path.
+func (r *InferenceServiceReconciler) reconcileWorkload(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	model, draftModel *inferencev1alpha1.Model,
+	desiredReplicas int32,
+	modelReady, isMetal bool,
+) (*appsv1.Deployment, int32, *metalSnapshot, *ctrl.Result, error) {
+	if isvc.Spec.MultiNode != nil {
+		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, model, draftModel, desiredReplicas, modelReady)
+		return nil, readyReplicas, nil, result, err
+	}
+	return r.reconcileDeployment(ctx, isvc, model, draftModel, desiredReplicas, modelReady, isMetal)
+}
+
 func (r *InferenceServiceReconciler) findInferenceServiceForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	pod := obj.(*corev1.Pod)
 
 	serviceName, ok := pod.Labels["inference.llmkube.dev/service"]
+	if !ok {
+		// Multi-node workers drop the service label so the Service never
+		// selects them; the group label still maps them to their owner.
+		serviceName, ok = pod.Labels[LabelMultiNodeGroup]
+	}
 	if !ok {
 		return nil
 	}

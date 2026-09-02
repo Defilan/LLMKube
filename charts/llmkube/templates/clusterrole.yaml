@@ -39,6 +39,15 @@ rules:
   - get
   - list
   - watch
+# Multi-node serving groups own their member pods directly (#1423); the
+# other core resources above stay read-only.
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - create
+  - delete
 - apiGroups:
   - discovery.k8s.io
   resources:

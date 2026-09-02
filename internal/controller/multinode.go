@@ -118,7 +118,8 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 	mnb := resolveBackend(isvc).(MultiNodeArgsBuilder) // validateMultiNode proved this
 
 	pinned := isvc.DeepCopy()
-	tp, pp, _, _ := multiNodeParallelism(pinned.Spec.VLLMConfig, int32(len(mn.Members)), resolveGPUCount(pinned, model))
+	members := int32(len(mn.Members)) //nolint:gosec // G115: bounded by the CRD's MaxItems=64
+	tp, pp, _, _ := multiNodeParallelism(pinned.Spec.VLLMConfig, members, resolveGPUCount(pinned, model))
 	if pinned.Spec.VLLMConfig == nil {
 		pinned.Spec.VLLMConfig = &inferencev1alpha1.VLLMConfig{}
 	}
@@ -129,7 +130,8 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 
 	pods := make([]*corev1.Pod, 0, len(mn.Members))
 	h := sha256.New()
-	for rank, member := range mn.Members {
+	for i, member := range mn.Members {
+		rank := int32(i) //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 		pod := memberPodFromTemplate(tmpl, pinned, member, rank, mnb)
 		// Hash the spec before the annotation is stamped, so stamping does
 		// not feed back into the hash.
@@ -151,7 +153,7 @@ func memberPodFromTemplate(
 	tmpl corev1.PodTemplateSpec,
 	isvc *inferencev1alpha1.InferenceService,
 	member inferencev1alpha1.MultiNodeMember,
-	rank int,
+	rank int32,
 	mnb MultiNodeArgsBuilder,
 ) *corev1.Pod {
 	spec := *tmpl.Spec.DeepCopy()
@@ -165,7 +167,7 @@ func memberPodFromTemplate(
 	}
 
 	labels[LabelMultiNodeGroup] = isvc.Name
-	labels[LabelMultiNodeRank] = strconv.Itoa(rank)
+	labels[LabelMultiNodeRank] = strconv.Itoa(int(rank))
 	if rank > 0 {
 		// Only rank 0 serves; the Service selector and the PodMonitor must
 		// never see a worker.
@@ -182,9 +184,9 @@ func memberPodFromTemplate(
 	spec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 
 	c := &spec.Containers[0]
-	c.Args = append(c.Args, mnb.BuildMultiNodeArgs(isvc, int32(rank))...)
+	c.Args = append(c.Args, mnb.BuildMultiNodeArgs(isvc, rank)...)
 	// Fabric env first, user env after, so a user override still wins.
-	c.Env = append(mnb.BuildMultiNodeEnv(isvc, int32(rank)), c.Env...)
+	c.Env = append(mnb.BuildMultiNodeEnv(isvc, rank), c.Env...)
 	if rank > 0 {
 		c.StartupProbe, c.LivenessProbe, c.ReadinessProbe = nil, nil, nil
 		c.Ports = nil
@@ -219,7 +221,7 @@ func memberPodFromTemplate(
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        memberPodName(isvc, rank),
+			Name:        memberPodName(isvc, int(rank)),
 			Namespace:   isvc.Namespace,
 			Labels:      labels,
 			Annotations: annotations,
@@ -321,6 +323,11 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 			fmt.Sprintf("Invalid parallelism: %v", err), nil)
 		return 0, &result, updateErr
 	}
+	if err := r.checkMemberClaims(ctx, isvc); err != nil {
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "",
+			fmt.Sprintf("Invalid multiNode: %v", err), nil)
+		return 0, &result, updateErr
+	}
 	desired, hash, err := r.constructMemberPods(isvc, model, draftModel)
 	if err != nil {
 		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "",
@@ -340,7 +347,9 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	// Suspended (desiredReplicas 0): the group must not exist.
 	if desiredReplicas == 0 {
 		if len(existing.Items) > 0 {
-			return 0, r.deleteMemberPods(ctx, isvc, existing.Items, "Suspended", "spec.suspend or replicas 0"), nil
+			setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, "Suspended", "spec.suspend or replicas 0")
+			r.deleteMemberPods(ctx, existing.Items)
+			return r.persistGroupTeardown(ctx, isvc, PhaseSuspended, modelReady, desiredReplicas)
 		}
 		setMultiNodeStatus(isvc, desired, nil, metav1.ConditionFalse, "Suspended", "group is scaled to zero")
 		return 0, nil, nil
@@ -353,7 +362,8 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	if reason, msg := groupNeedsRecreate(obs, hash, time.Now()); reason != "" {
 		log.Info("multiNode: recreating group", "reason", reason, "detail", msg)
 		setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, reason, msg)
-		return 0, r.deleteMemberPods(ctx, isvc, existing.Items, reason, msg), nil
+		r.deleteMemberPods(ctx, existing.Items)
+		return r.persistGroupTeardown(ctx, isvc, PhaseCreating, modelReady, desiredReplicas)
 	}
 
 	created := 0
@@ -383,19 +393,47 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	return 0, nil, nil
 }
 
-// deleteMemberPods removes every member (best effort) and records why on the
-// group condition. The caller's status write persists the condition.
-func (r *InferenceServiceReconciler) deleteMemberPods(ctx context.Context, isvc *inferencev1alpha1.InferenceService, pods []corev1.Pod, reason, msg string) *ctrl.Result {
+// checkMemberClaims mirrors ensureModelCachePVC for per-member claims: they
+// are user-owned and must exist before use, and a pod pinned to a node with
+// a missing claim would sit Pending forever with no diagnosis.
+func (r *InferenceServiceReconciler) checkMemberClaims(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	for i, m := range isvc.Spec.MultiNode.Members {
+		if m.ModelCache == nil || m.ModelCache.ClaimName == "" {
+			continue
+		}
+		var pvc corev1.PersistentVolumeClaim
+		err := r.Get(ctx, types.NamespacedName{Name: m.ModelCache.ClaimName, Namespace: isvc.Namespace}, &pvc)
+		if apierrors.IsNotFound(err) {
+			return fmt.Errorf("members[%d].modelCache.claimName %q not found in namespace %q: the claim is user-owned and must be created before use",
+				i, m.ModelCache.ClaimName, isvc.Namespace)
+		}
+		if err != nil {
+			return fmt.Errorf("members[%d].modelCache.claimName %q: %w", i, m.ModelCache.ClaimName, err)
+		}
+	}
+	return nil
+}
+
+// deleteMemberPods removes every member, best effort. Members keep their
+// normal grace period; the next reconcile sees them Terminating and waits.
+func (r *InferenceServiceReconciler) deleteMemberPods(ctx context.Context, pods []corev1.Pod) {
 	log := logf.FromContext(ctx)
 	for i := range pods {
 		if err := r.Delete(ctx, &pods[i]); err != nil && !apierrors.IsNotFound(err) {
 			log.Error(err, "multiNode: failed to delete member", "pod", pods[i].Name)
 		}
 	}
-	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
-		Type: ConditionMultiNodeGroupReady, Status: metav1.ConditionFalse, Reason: reason, Message: msg,
-	})
-	return &ctrl.Result{RequeueAfter: multiNodeRecreateRequeue}
+}
+
+// persistGroupTeardown writes the status (including the group condition the
+// caller just set) and asks for an early requeue so the group is recreated as
+// soon as its pods are gone. The caller returns this result to Reconcile,
+// which returns it as-is, so the status must be written here: Reconcile's own
+// status write only runs on the fall-through path.
+func (r *InferenceServiceReconciler) persistGroupTeardown(ctx context.Context, isvc *inferencev1alpha1.InferenceService, phase string, modelReady bool, desiredReplicas int32) (int32, *ctrl.Result, error) {
+	result, err := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady, 0, desiredReplicas, "", "", nil)
+	result.RequeueAfter = earliestPositive(result.RequeueAfter, multiNodeRecreateRequeue)
+	return 0, &result, err
 }
 
 // setMultiNodeStatus fills status.multiNode from the desired ranks and the
@@ -406,9 +444,9 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 	for i := range existing {
 		byName[existing[i].Name] = &existing[i]
 	}
-	st := &inferencev1alpha1.MultiNodeStatus{Size: int32(len(desired))}
+	st := &inferencev1alpha1.MultiNodeStatus{Size: int32(len(desired))} //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 	for rank, d := range desired {
-		m := inferencev1alpha1.MultiNodeMemberStatus{Rank: int32(rank), Node: d.Spec.NodeName, Pod: d.Name}
+		m := inferencev1alpha1.MultiNodeMemberStatus{Rank: int32(rank), Node: d.Spec.NodeName, Pod: d.Name} //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 		if p := byName[d.Name]; p != nil {
 			m.Phase = string(p.Status.Phase)
 			m.Ready = podReady(p)
