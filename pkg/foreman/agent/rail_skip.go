@@ -31,6 +31,9 @@ const (
 	railVerdictFromFindings = "verdict-from-findings"
 	railEmptyClaim          = "empty-claim"
 	railGroundedFinding     = "grounded-finding"
+	// railExecution names the review-execution rail (#1618). It can rewrite a
+	// verdict, so it lives here beside the other demoting rails.
+	railExecution = "review-execution"
 )
 
 // Reasons a rail could not run.
@@ -42,6 +45,9 @@ const (
 	// for any issue citing no extractable file paths, which hand-written
 	// issues routinely do not.
 	skipReasonNoPathRefs = "no-path-refs-in-issue"
+	// skipReasonNoTestRun marks the review-execution rail (#1618) short-
+	// circuiting: a GO on a .go diff whose transcript never ran `go test`.
+	skipReasonNoTestRun = "no-test-run"
 )
 
 // Reasons the scope rail detected drift and then declined to act on it. These

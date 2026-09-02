@@ -1038,6 +1038,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// those rails produced, and it is the last reviewer rail before the
 			// findings summary so its log line is the last rail signal recorded.
 			applyReviewerDiffGateForTask(log, loopRes, verdict)
+			// Review-execution rail (#1618): the rubric's Section K mandates
+			// running the diff's own new test (and an adversarial near-miss
+			// probe) whenever the diff touches `.go` files. A GO whose
+			// transcript never ran `go test` did not execute the change it
+			// approved, so demote it to NO-GO (it routes to escalation
+			// instead of opening a PR) and record the rail skipped. This is a
+			// demote rail like scope-overlap, and it runs after the diff gate
+			// so its verdict rewrite is what the findings summary reports.
+			verdict = enforceReviewerExecution(log, loopRes.Terminal.Extra, reviewDiff, verdict, loopRes.Transcript)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 			// Per-clause coverage rail (#1554): require the reviewer to have
 			// covered each behaviour clause the issue enumerated, or flag the
