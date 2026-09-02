@@ -118,6 +118,7 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 	gpuCount := resolveGPUCount(isvc, model)
 	if cfg != nil {
 		args = appendTensorParallelSize(args, cfg.TensorParallelSize)
+		args = appendPipelineParallelSize(args, cfg.PipelineParallelSize)
 		args = appendMaxModelLen(args, cfg.MaxModelLen)
 		args = appendQuantization(args, cfg.Quantization)
 		args = appendDtype(args, cfg.Dtype)

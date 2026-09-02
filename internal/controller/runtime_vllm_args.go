@@ -178,6 +178,15 @@ func appendTensorParallelSize(args []string, tensorParallelSize *int32) []string
 	return args
 }
 
+// appendPipelineParallelSize emits --pipeline-parallel-size when set above 1.
+// 1 is vLLM's default and emitting it would only add noise to the argv.
+func appendPipelineParallelSize(args []string, pipelineParallelSize *int32) []string {
+	if pipelineParallelSize == nil || *pipelineParallelSize <= 1 {
+		return args
+	}
+	return append(args, "--pipeline-parallel-size", fmt.Sprintf("%d", *pipelineParallelSize))
+}
+
 // needsCPUOffloadNoopWarning returns true when the vLLM runtime is selected
 // and spec.vllmConfig.cpuOffloadGB is set to a positive value. The flag is a
 // known silent no-op on current vLLM (vllm-project/vllm#48468), so the

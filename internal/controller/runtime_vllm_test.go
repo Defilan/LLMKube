@@ -760,3 +760,33 @@ func TestNeedsCPUOffloadNoopWarning(t *testing.T) {
 		})
 	}
 }
+
+// TestVLLMBuildArgsPipelineParallelSize covers vllmConfig.pipelineParallelSize:
+// emitted when above 1, silent at 1 (vLLM's default) and when unset.
+func TestVLLMBuildArgsPipelineParallelSize(t *testing.T) {
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "m"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "org/name"},
+	}
+	pp := int32(2)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime:    "vllm",
+			VLLMConfig: &inferencev1alpha1.VLLMConfig{PipelineParallelSize: &pp},
+		},
+	}
+	args := (&VLLMBackend{}).BuildArgs(isvc, model, "/models/m", "", 8000)
+	if got := argValue(args, "--pipeline-parallel-size"); got != "2" {
+		t.Fatalf("--pipeline-parallel-size = %q, want 2 in %v", got, args)
+	}
+
+	one := int32(1)
+	isvc.Spec.VLLMConfig.PipelineParallelSize = &one
+	args = (&VLLMBackend{}).BuildArgs(isvc, model, "/models/m", "", 8000)
+	for _, a := range args {
+		if a == "--pipeline-parallel-size" {
+			t.Fatalf("pipelineParallelSize 1 must not emit a flag: %v", args)
+		}
+	}
+}
