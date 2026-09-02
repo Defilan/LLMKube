@@ -100,6 +100,18 @@ replaces the service claim in that member's pod. All claims are user-owned
 and must exist before the service is created; a missing one fails the
 service with a message naming the member.
 
+The operator swaps only the claim name, never the path, so the Model's path
+inside the claim must be identical on every member. Two things bite here.
+Weights staged by the Hugging Face hub live under
+`models--<org>--<name>/snapshots/<hash>/`, where every file is a relative
+symlink into `../../blobs/`; a volume rooted at the snapshot directory
+mounts none of those targets and vLLM reports no configuration file. Root
+the volume at the `models--<org>--<name>` directory and use
+`pvc://<claim>/snapshots/<hash>` as the Model source. And a node that holds
+a plain directory needs the same relative path, which a relative symlink
+inside the volume root provides (`snapshots/<hash> -> ../<dir>`); a symlink
+to a path outside the volume root dangles the same way.
+
 ## Failure semantics
 
 The group is Ready only when every member is Running and rank 0 passes its
