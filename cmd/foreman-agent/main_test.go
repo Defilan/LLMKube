@@ -172,6 +172,31 @@ func TestClampInt32(t *testing.T) {
 	}
 }
 
+func TestGateActiveDeadlineSeconds(t *testing.T) {
+	ptr := func(n int64) *int64 { return &n }
+	max := int64(math.MaxInt32)
+	cases := []struct {
+		name string
+		in   *int64
+		want int32
+	}{
+		{"nil keeps zero (default 1800 later)", nil, 0},
+		{"zero keeps zero", ptr(0), 0},
+		{"negative keeps zero", ptr(-1), 0},
+		{"configured value passes through", ptr(7200), 7200},
+		{"exactly max int32 passes through", ptr(max), math.MaxInt32},
+		{"over max int32 saturates", ptr(max + 1), math.MaxInt32},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gateActiveDeadlineSeconds(tc.in)
+			if got != tc.want {
+				t.Errorf("gateActiveDeadlineSeconds(%v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSanitizeName(t *testing.T) {
 	cases := []struct {
 		name string

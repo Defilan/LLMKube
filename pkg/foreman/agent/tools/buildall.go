@@ -57,10 +57,11 @@ func BuildAll(deps ToolDeps) []Tool {
 		&RunGateJobTool{
 			Client: deps.Client,
 			Cfg: RunGateJobToolConfig{
-				Namespace: deps.ForemanNamespace,
-				PVCName:   deps.GateCachePVC,
-				LogTailFn: deps.LogTailFn,
-				CodeHost:  deps.CodeHost,
+				Namespace:             deps.ForemanNamespace,
+				PVCName:               deps.GateCachePVC,
+				LogTailFn:             deps.LogTailFn,
+				CodeHost:              deps.CodeHost,
+				ActiveDeadlineSeconds: deps.GateActiveDeadlineSeconds,
 			},
 		},
 		// fetch_issue: read-only GitHub issue surface for the reviewer. The
@@ -118,6 +119,13 @@ type ToolDeps struct {
 	// chart creates (foreman.gateCache.pvcName). Empty keeps the historical
 	// "no volume mount" behavior (#1538).
 	GateCachePVC string
+
+	// GateActiveDeadlineSeconds bounds the gate Job's wall-clock runtime,
+	// threaded from the verifying Agent's
+	// spec.execution.activeDeadlineSeconds so a heavy per-hunk mutation
+	// pass can be given more than the 1800 s default (#1748). Zero keeps
+	// the default via applyConfigDefaults.
+	GateActiveDeadlineSeconds int32
 
 	// LogTailFn reads a finished gate Job's pod logs back for the model.
 	LogTailFn func(ctx context.Context, namespace, jobName string) string
