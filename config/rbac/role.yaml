@@ -262,7 +262,6 @@ rules:
 - apiGroups:
   - inference.networking.k8s.io
   resources:
-  - inferencemodels
   - inferencepools
   verbs:
   - create

@@ -30,11 +30,9 @@ import (
 //   - one InferencePool per InferenceServiceRef backend (selecting that
 //     InferenceService's pods by label, referencing the operator's Endpoint
 //     Picker),
-//   - one InferenceModel per backend mapping the client-facing model name onto
-//     the pool,
 //   - one multi-rule HTTPRoute (a rule per spec.rules entry, matching on the
 //     OpenAI "model" field copied into the x-ai-eg-model header, plus header
-//     matches) whose backendRefs reference the generated InferenceModels.
+//     matches) whose backendRefs reference the backend's InferencePool.
 //
 // Shapes follow the Gateway API Inference Extension v1 API
 // (inference.networking.k8s.io/v1) and agentgateway's inference-routing docs.
@@ -46,7 +44,6 @@ const (
 	inferenceExtensionGroup   = "inference.networking.k8s.io"
 	inferenceExtensionVersion = "v1"
 	inferencePoolKind         = "InferencePool"
-	inferenceModelKind        = "InferenceModel"
 
 	// agentGatewayHTTPModelHeader is the header agentgateway matches the OpenAI
 	// "model" field on. Mirrors the Envoy plane's x-ai-eg-model: the gateway
@@ -55,21 +52,17 @@ const (
 	agentGatewayHTTPModelHeader = "x-ai-eg-model"
 )
 
-// inferencePoolGVK / inferenceModelGVK are the GVKs of the generated Inference
-// Extension resources. Exposed as functions so the reconciler and tests share a
-// single source of truth.
+// inferencePoolGVK is the GVK of the generated Inference Extension resource.
+// Exposed as a function so the reconciler and tests share a single source of
+// truth.
 func inferencePoolGVK() schema.GroupVersionKind {
 	return schema.GroupVersionKind{Group: inferenceExtensionGroup, Version: inferenceExtensionVersion, Kind: inferencePoolKind}
 }
 
-func inferenceModelGVK() schema.GroupVersionKind {
-	return schema.GroupVersionKind{Group: inferenceExtensionGroup, Version: inferenceExtensionVersion, Kind: inferenceModelKind}
-}
-
 // modelRouterAgentGatewayResourceName is the shared name for the HTTPRoute of a
-// ModelRouter. Per-backend InferencePool/InferenceModel resources are named
-// after the RouterBackend instead (so route backendRefs can reference them),
-// see newAgentGatewayInferenceModel.
+// ModelRouter. Per-backend InferencePools are named after the referenced
+// InferenceService instead (so route backendRefs can reference them), see
+// newAgentGatewayInferencePool.
 func modelRouterAgentGatewayResourceName(mr *inferencev1alpha1.ModelRouter) string {
 	return sanitizeDNSName(mr.Name)
 }
@@ -115,36 +108,16 @@ func newAgentGatewayInferencePool(mr *inferencev1alpha1.ModelRouter, b agentGate
 	return u
 }
 
-// newAgentGatewayInferenceModel builds the inference.networking.k8s.io
-// InferenceModel that maps one backend's client-facing model name onto its pool.
-// The modelName is the value clients send as the OpenAI "model" field; the
-// poolRef points at the backend's InferencePool. Lives in the ModelRouter
-// namespace.
-func newAgentGatewayInferenceModel(mr *inferencev1alpha1.ModelRouter, b agentGatewayBackendResource) *unstructured.Unstructured {
-	u := &unstructured.Unstructured{}
-	u.SetGroupVersionKind(inferenceModelGVK())
-	u.SetName(b.Name)
-	u.SetNamespace(mr.Namespace)
-	u.Object["spec"] = map[string]interface{}{
-		"modelName": b.Name,
-		"poolRef": map[string]interface{}{
-			"kind":            inferencePoolKind,
-			"group":           inferenceExtensionGroup,
-			metadataNameField: b.PoolName,
-		},
-	}
-	return u
-}
-
 // newAgentGatewayHTTPRoute builds the one-per-ModelRouter multi-rule HTTPRoute
 // attached to the referenced agentgateway Gateway. Each resolved rule becomes
 // one spec.rules entry whose matches OR over the rule's model names (each ANDed
-// with the rule's header matches) and whose backendRefs reference the generated
-// InferenceModels. Mirrors the Gateway plane's route shape.
+// with the rule's header matches) and whose backendRefs reference the backends'
+// InferencePools. Mirrors the Gateway plane's route shape.
 func newAgentGatewayHTTPRoute(
 	mr *inferencev1alpha1.ModelRouter,
 	ref *inferencev1alpha1.AgentGatewayReference,
 	rules []agentGatewayRuleResource,
+	backends []agentGatewayBackendResource,
 ) *unstructured.Unstructured {
 	parentRef := map[string]interface{}{
 		metadataNameField: ref.Name,
@@ -157,7 +130,7 @@ func newAgentGatewayHTTPRoute(
 
 	compiledRules := make([]interface{}, 0, len(rules))
 	for _, rule := range rules {
-		compiledRules = append(compiledRules, compileAgentGatewayRouteRule(rule))
+		compiledRules = append(compiledRules, compileAgentGatewayRouteRule(rule, backends))
 	}
 
 	u := &unstructured.Unstructured{}
@@ -174,10 +147,10 @@ func newAgentGatewayHTTPRoute(
 // compileAgentGatewayRouteRule builds one HTTPRoute rule: the matches block (a
 // match per model name, ANDed with header matches; a header-only match when the
 // rule declares no models, e.g. a catch-all) and the backendRefs block.
-func compileAgentGatewayRouteRule(rule agentGatewayRuleResource) map[string]interface{} {
+func compileAgentGatewayRouteRule(rule agentGatewayRuleResource, backends []agentGatewayBackendResource) map[string]interface{} {
 	return map[string]interface{}{
 		"matches":     compileAgentGatewayRuleMatches(rule),
-		"backendRefs": compileAgentGatewayRouteBackendRefs(rule.BackendRefs),
+		"backendRefs": compileAgentGatewayRouteBackendRefs(rule.BackendRefs, backends),
 	}
 }
 
@@ -208,15 +181,33 @@ func compileAgentGatewayRuleMatches(rule agentGatewayRuleResource) []interface{}
 	return matches
 }
 
-// compileAgentGatewayRouteBackendRefs turns the resolved backend refs into
-// HTTPRoute backendRefs, each referencing a generated InferenceModel.
-func compileAgentGatewayRouteBackendRefs(refs []agentGatewayBackendRef) []interface{} {
+// compileAgentGatewayRouteBackendRefs turns a rule's resolved backend refs into
+// HTTPRoute backendRefs, each referencing the backend's InferencePool directly:
+// name = the pool name, kind = InferencePool, group = the Inference Extension
+// group, and port = the pool's target port. This is the shape GIE v1 documents
+// and that agentgateway serves on the maintainer's cluster today. The refs are
+// the (possibly health-ejected) per-rule RouterBackend names; backends supplies
+// the pool name + port lookup for each.
+func compileAgentGatewayRouteBackendRefs(refs []agentGatewayBackendRef, backends []agentGatewayBackendResource) []interface{} {
+	poolByBackend := make(map[string]agentGatewayBackendResource, len(backends))
+	for _, b := range backends {
+		poolByBackend[b.Name] = b
+	}
+
 	out := make([]interface{}, 0, len(refs))
 	for _, ref := range refs {
+		b, ok := poolByBackend[ref.Name]
+		if !ok {
+			// A rule referencing a backend that is not in the resolved set should
+			// never happen (rules are compiled from the same backends), but skip
+			// it rather than emitting a pool ref with no backing pool.
+			continue
+		}
 		backendRef := map[string]interface{}{
-			metadataNameField: sanitizeDNSName(ref.Name),
-			"kind":            inferenceModelKind,
+			metadataNameField: b.PoolName,
+			"kind":            inferencePoolKind,
 			"group":           inferenceExtensionGroup,
+			"port":            b.Port,
 		}
 		out = append(out, backendRef)
 	}

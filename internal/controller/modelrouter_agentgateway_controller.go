@@ -48,10 +48,9 @@ const (
 
 	// ModelRouterAgentGatewayConditionReady is the ModelRouter status condition
 	// type the agentgateway reconciler owns. True once the InferencePool /
-	// InferenceModel / HTTPRoute reconciled against the referenced agentgateway
-	// Gateway; False (with a reason) when the Inference Extension CRDs are
-	// absent, when a rule uses an unsupported match, or when reconciliation
-	// fails.
+	// HTTPRoute reconciled against the referenced agentgateway Gateway; False
+	// (with a reason) when the Inference Extension CRDs are absent, when a rule
+	// uses an unsupported match, or when reconciliation fails.
 	ModelRouterAgentGatewayConditionReady = "AgentGatewayReady"
 
 	// ModelRouter agentgateway condition reasons.
@@ -79,9 +78,8 @@ const (
 // ModelRouterAgentGatewayReconciler compiles a ModelRouter in dataPlane:
 // AgentGateway mode onto an agentgateway data plane via the Gateway API
 // Inference Extension: one InferencePool per referenced InferenceService (with
-// the operator's Endpoint Picker), one InferenceModel per backend mapping the
-// client-facing model name onto the pool, and a multi-rule HTTPRoute that
-// matches on the OpenAI "model" field and routes to the pool. It is a sibling
+// the operator's Endpoint Picker), and a multi-rule HTTPRoute that matches on
+// the OpenAI "model" field and routes to the pools. It is a sibling
 // of ModelRouterGatewayReconciler (Envoy AI Gateway) and ModelRouterReconciler
 // (Proxy), selected by spec.dataPlane, so the agentgateway integration stays
 // cleanly optional and feature-flaggable, and a cluster without the Inference
@@ -91,7 +89,7 @@ type ModelRouterAgentGatewayReconciler struct {
 	Scheme *runtime.Scheme
 	// Recorder surfaces reconcile failures as Kubernetes Events. A failed
 	// reconcile does not retract the previously compiled InferencePool /
-	// InferenceModel / HTTPRoute, so the data plane keeps serving its last-good
+	// HTTPRoute, so the data plane keeps serving its last-good
 	// config: requests still succeed while silently using stale routing. A
 	// status condition alone is not enough, because nobody watches conditions
 	// during a routing change (#1395).
@@ -99,13 +97,12 @@ type ModelRouterAgentGatewayReconciler struct {
 
 	// detector is the shared CRD-presence gate, lazily initialized on first
 	// reconcile and reused thereafter. It requires the Inference Extension's
-	// InferencePool and InferenceModel kinds.
+	// InferencePool kind.
 	detectorOnce sync.Once
 	detector     *crdDetector
 }
 
 // +kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencemodels,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile compiles the agentgateway resources for a ModelRouter in dataPlane:
 // AgentGateway mode, or no-ops cleanly when the router is in Proxy or Gateway
@@ -153,7 +150,7 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// Fail-loud on matches the agentgateway data plane cannot express. We
 	// generate NOTHING for such a router rather than silently dropping a rule the
 	// user expects. The agentgateway plane matches on the OpenAI "model" field
-	// (via the InferenceModel's modelName) and on headers (via HTTPRoute header
+	// (via the x-ai-eg-model header) and on headers (via HTTPRoute header
 	// matches); everything the Gateway plane rejects is rejected here too.
 	if msg := agentGatewayUnsupportedMatchMessage(mr); msg != "" {
 		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonUnsupported, msg)
@@ -212,9 +209,9 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 }
 
 // reconcileAgentGatewayResources resolves the router's backends to their
-// InferenceService, compiles each into an InferencePool + InferenceModel, and
-// compiles the rules into a multi-rule HTTPRoute, creates-or-updating each one
-// owner-referenced to the ModelRouter.
+// InferenceService, compiles each into an InferencePool, and compiles the rules
+// into a multi-rule HTTPRoute, creates-or-updating each one owner-referenced to
+// the ModelRouter.
 func (r *ModelRouterAgentGatewayReconciler) reconcileAgentGatewayResources(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
@@ -229,22 +226,22 @@ func (r *ModelRouterAgentGatewayReconciler) reconcileAgentGatewayResources(
 		return nil, err
 	}
 
-	// InferencePool(s) and InferenceModel(s) for ALL backends (healthy or not) go
-	// up first, so the route that references them has its targets in place. An
-	// ejected backend still gets a pool + model so it can be re-added on
-	// recovery; only the route's backendRefs are filtered below.
-	desired := make([]*unstructured.Unstructured, 0, len(backends)*2)
+	// InferencePool(s) for ALL backends (healthy or not) go up first, so the
+	// route that references them has its targets in place. An ejected backend
+	// still gets a pool so it can be re-added on recovery; only the route's
+	// backendRefs are filtered below.
+	desired := make([]*unstructured.Unstructured, 0, len(backends)+1)
 	for _, b := range backends {
-		desired = append(desired, newAgentGatewayInferencePool(mr, b), newAgentGatewayInferenceModel(mr, b))
+		desired = append(desired, newAgentGatewayInferencePool(mr, b))
 	}
 
 	// Drop unhealthy backends from the route's backendRefs so agentgateway fails
 	// over to a healthy backend the instant the health signal changes. The
-	// InferencePool/InferenceModel objects above are generated for ALL backends;
-	// only the route is filtered, and a rule is never emptied (see
+	// InferencePool objects above are generated for ALL backends; only the route
+	// is filtered, and a rule is never emptied (see
 	// agentGatewayEjectUnhealthy).
 	rules, ejected := agentGatewayEjectUnhealthy(rules, backends)
-	desired = append(desired, newAgentGatewayHTTPRoute(mr, mr.Spec.AgentGatewayRef, rules))
+	desired = append(desired, newAgentGatewayHTTPRoute(mr, mr.Spec.AgentGatewayRef, rules, backends))
 
 	for _, obj := range desired {
 		if err := r.applyAgentGatewayResource(ctx, mr, obj); err != nil {
@@ -297,8 +294,8 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 			Port:     port,
 			// A backend is healthy iff its InferenceService has at least one ready
 			// replica. An unhealthy backend is ejected from the route's
-			// backendRefs while its InferencePool/InferenceModel stay in place for
-			// re-add on recovery.
+			// backendRefs while its InferencePool stays in place for re-add on
+			// recovery.
 			Healthy: isvc.Status.ReadyReplicas > 0,
 		})
 	}
@@ -458,18 +455,19 @@ func (r *ModelRouterAgentGatewayReconciler) modelRoutersForInferenceService(ctx 
 // InferencePool name (the referenced InferenceService), the cluster FQDN + port,
 // and health.
 type agentGatewayBackendResource struct {
-	// Name is the RouterBackend.Name; it names the generated InferenceModel and
-	// is what route backendRefs reference.
+	// Name is the RouterBackend.Name; it maps a rule backend ref to this
+	// backend's pool.
 	Name string
-	// PoolName is the InferencePool name (the sanitized InferenceService name).
+	// PoolName is the InferencePool name (the sanitized InferenceService name),
+	// which the HTTPRoute backendRefs reference.
 	PoolName string
 	// FQDN is the cluster-internal hostname the pool's selector resolves.
 	FQDN string
-	// Port is the Service port the pool targets.
+	// Port is the Service port the pool targets; the HTTPRoute backendRefs use it.
 	Port int64
 	// Healthy reports whether the referenced InferenceService currently has at
 	// least one ready replica. An unhealthy backend is dropped from the route's
-	// backendRefs while its InferencePool/InferenceModel stay in place.
+	// backendRefs while its InferencePool stays in place.
 	Healthy bool
 }
 
@@ -523,10 +521,10 @@ func compileAgentGatewayRules(mr *inferencev1alpha1.ModelRouter) ([]agentGateway
 }
 
 // compileAgentGatewayBackendRefs turns a rule's route.backends into ordered
-// backendRefs. The agentgateway data plane routes by InferenceModel; each ref
-// names a generated InferenceModel (the RouterBackend name). Priority/weight
-// are not expressed on the Inference Extension backendRef (agentgateway selects
-// the endpoint via the EPP), so a single ref per backend is emitted.
+// backendRefs. Each ref names a RouterBackend (matched by Name against the
+// resolved backends to find its pool). Priority/weight are not expressed on the
+// Inference Extension backendRef (agentgateway selects the endpoint via the
+// EPP), so a single ref per backend is emitted.
 func compileAgentGatewayBackendRefs(ruleName string, route inferencev1alpha1.RuleRoute) ([]agentGatewayBackendRef, error) {
 	refs := make([]agentGatewayBackendRef, 0, len(route.Backends))
 	if route.Strategy != "" && route.Strategy != "primary-fallback" {
@@ -547,22 +545,21 @@ type agentGatewayRuleResource struct {
 	// Headers are exact header matches (RuleMatch.Headers), ANDed into every
 	// model match.
 	Headers map[string]string
-	// BackendRefs are the ordered destinations, each naming a generated
-	// InferenceModel.
+	// BackendRefs are the ordered destinations, each naming a RouterBackend.
 	BackendRefs []agentGatewayBackendRef
 }
 
 // agentGatewayBackendRef is one backendRef in a compiled rule, naming a
-// generated InferenceModel.
+// RouterBackend.
 type agentGatewayBackendRef struct {
-	// Name references a generated InferenceModel (a RouterBackend.Name).
+	// Name references a RouterBackend (matched against the resolved backends to
+	// find its pool).
 	Name string
 }
 
 // agentGatewayEjectUnhealthy drops unhealthy backends from each rule's
-// backendRefs, returning the list of dropped names. The InferencePool/
-// InferenceModel objects are generated for ALL backends regardless; only the
-// route is filtered.
+// backendRefs, returning the list of dropped names. The InferencePool objects
+// are generated for ALL backends regardless; only the route is filtered.
 func agentGatewayEjectUnhealthy(rules []agentGatewayRuleResource, backends []agentGatewayBackendResource) ([]agentGatewayRuleResource, []string) {
 	healthy := make(map[string]bool, len(backends))
 	for _, b := range backends {
@@ -610,11 +607,12 @@ func agentGatewayEndpointAddress(ref *inferencev1alpha1.AgentGatewayReference) s
 
 // modelRouterAgentGatewayGVKs are the GVKs the ModelRouter agentgateway path
 // needs the cluster to have registered before it generates anything: the
-// Inference Extension's InferencePool and InferenceModel.
+// Inference Extension's InferencePool. GIE removed the InferenceModel kind (the
+// replacement, InferenceObjective, is optional for routing, so it must not gate
+// activation), so the gate requires only the pool.
 func modelRouterAgentGatewayGVKs() []schema.GroupVersionKind {
 	return []schema.GroupVersionKind{
 		inferencePoolGVK(),
-		inferenceModelGVK(),
 	}
 }
 

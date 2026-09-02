@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -160,8 +161,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	// An InferencePool + InferenceModel per backend, named after the
-	// RouterBackend.
+	// An InferencePool per backend, named after the referenced InferenceService.
 	for _, name := range []string{"qwen-cuda", "qwen-metal"} {
 		pool := getUnstructured(t, c, inferencePoolGVK(), name)
 		assertOwnedByRouter(t, pool, mr)
@@ -184,23 +184,12 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 			t.Errorf("pool %s endpointPickerRef.name = %v, want llm-d-router-epp", name, epRef["name"])
 		}
 
-		model := getUnstructured(t, c, inferenceModelGVK(), name)
-		assertOwnedByRouter(t, model, mr)
-		modelName, _, _ := unstructured.NestedString(model.Object, "spec", "modelName")
-		if modelName != name {
-			t.Errorf("model %s modelName = %q, want %s", name, modelName, name)
-		}
-		poolRef, _, _ := unstructured.NestedMap(model.Object, "spec", "poolRef")
-		if poolRef["name"] != name {
-			t.Errorf("model %s poolRef.name = %v, want %s", name, poolRef["name"], name)
-		}
-		if poolRef["kind"] != inferencePoolKind {
-			t.Errorf("model %s poolRef.kind = %v, want %s", name, poolRef["kind"], inferencePoolKind)
-		}
+		// No InferenceModel (or any model-kind) object is created for a backend.
+		assertNotExists(t, c, inferenceModelGVK(), name)
 	}
 
 	// One HTTPRoute named after the ModelRouter, attached to the Gateway, its
-	// single rule matching qwen35-27b and referencing both InferenceModels.
+	// single rule matching qwen35-27b and referencing both backends' pools.
 	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "agw-router")
 	assertOwnedByRouter(t, route, mr)
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
@@ -217,11 +206,18 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	}
 	for i, want := range []string{"qwen-cuda", "qwen-metal"} {
 		ref := refs[i].(map[string]interface{})
+		// backendRefs reference the backend's InferencePool directly.
 		if ref["name"] != want {
 			t.Errorf("backendRefs[%d].name = %v, want %s", i, ref["name"], want)
 		}
-		if ref["kind"] != inferenceModelKind {
-			t.Errorf("backendRefs[%d].kind = %v, want %s", i, ref["kind"], inferenceModelKind)
+		if ref["kind"] != inferencePoolKind {
+			t.Errorf("backendRefs[%d].kind = %v, want %s", i, ref["kind"], inferencePoolKind)
+		}
+		if ref["group"] != inferenceExtensionGroup {
+			t.Errorf("backendRefs[%d].group = %v, want %s", i, ref["group"], inferenceExtensionGroup)
+		}
+		if port, ok := ref["port"].(int64); !ok || port != 8080 {
+			t.Errorf("backendRefs[%d].port = %v, want 8080", i, ref["port"])
 		}
 	}
 
@@ -531,6 +527,30 @@ func agentGatewayRouteModelOfRule(t *testing.T, rule map[string]interface{}) str
 	}
 	v, _ := h["value"].(string)
 	return v
+}
+
+// inferenceModelGVK is a test-local GVK for the kind GIE used to ship but
+// renamed to InferenceObjective. The production code no longer generates or
+// gates on it, so the tests assert it is absent from the cluster after a
+// reconcile.
+func inferenceModelGVK() schema.GroupVersionKind {
+	return schema.GroupVersionKind{Group: inferenceExtensionGroup, Version: inferenceExtensionVersion, Kind: "InferenceModel"}
+}
+
+// TestModelRouterAgentGateway_GVKsRequireOnlyInferencePool covers the CRD gate:
+// against a current GIE install the only kind the agentgateway path must see is
+// the v1 InferencePool. InferenceModel no longer exists (GIE renamed it to
+// InferenceObjective, which is optional for routing), so it must not gate
+// activation.
+func TestModelRouterAgentGateway_GVKsRequireOnlyInferencePool(t *testing.T) {
+	gvks := modelRouterAgentGatewayGVKs()
+	if len(gvks) != 1 {
+		t.Fatalf("modelRouterAgentGatewayGVKs() has %d entries, want exactly 1", len(gvks))
+	}
+	want := schema.GroupVersionKind{Group: inferenceExtensionGroup, Version: inferenceExtensionVersion, Kind: inferencePoolKind}
+	if gvks[0] != want {
+		t.Errorf("modelRouterAgentGatewayGVKs()[0] = %+v, want %+v", gvks[0], want)
+	}
 }
 
 // ensure apierrors import is used (assertNotExists relies on it).
