@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -128,14 +129,23 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 
 	tmpl := r.constructDeployment(pinned, model, draftModel, 1).Spec.Template
 
+	// The group hash must describe intent, not observation. The template
+	// reads InferenceService status in places (the disruption-protection
+	// annotation is present only while the service is not Ready), so hashing
+	// the pods as rendered would change the hash the moment the group came
+	// up and tear it down again. Render the hash source from a copy with a
+	// blank status so only spec (service, model, image) feeds it.
+	statusless := pinned.DeepCopy()
+	statusless.Status = inferencev1alpha1.InferenceServiceStatus{}
+	hashTmpl := r.constructDeployment(statusless, model, draftModel, 1).Spec.Template
+
 	pods := make([]*corev1.Pod, 0, len(mn.Members))
 	h := sha256.New()
 	for i, member := range mn.Members {
 		rank := int32(i) //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 		pod := memberPodFromTemplate(tmpl, pinned, member, rank, mnb)
-		// Hash the spec before the annotation is stamped, so stamping does
-		// not feed back into the hash.
-		h.Write([]byte(desiredTemplateHash(corev1.PodTemplateSpec{ObjectMeta: pod.ObjectMeta, Spec: pod.Spec})))
+		hashPod := memberPodFromTemplate(hashTmpl, statusless, member, rank, mnb)
+		h.Write([]byte(desiredTemplateHash(corev1.PodTemplateSpec{ObjectMeta: hashPod.ObjectMeta, Spec: hashPod.Spec})))
 		pods = append(pods, pod)
 	}
 	hash := hex.EncodeToString(h.Sum(nil))[:16]
@@ -254,11 +264,15 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time) (re
 		}
 		switch p.Status.Phase {
 		case corev1.PodFailed, corev1.PodSucceeded, corev1.PodUnknown:
-			return "MemberFailed", fmt.Sprintf("%s is %s", p.Name, p.Status.Phase)
+			detail := ""
+			for _, cs := range p.Status.ContainerStatuses {
+				detail += lastTerminationDetail(cs)
+			}
+			return "MemberFailed", fmt.Sprintf("%s is %s%s", p.Name, p.Status.Phase, detail)
 		}
 		for _, cs := range p.Status.ContainerStatuses {
 			if cs.RestartCount > 0 {
-				return "MemberRestarted", fmt.Sprintf("%s restarted %d time(s)", p.Name, cs.RestartCount)
+				return "MemberRestarted", fmt.Sprintf("%s restarted %d time(s)%s", p.Name, cs.RestartCount, lastTerminationDetail(cs))
 			}
 		}
 		if o.rank == 0 && p.Status.Phase == corev1.PodRunning && !podReady(p) &&
@@ -267,6 +281,27 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time) (re
 		}
 	}
 	return "", ""
+}
+
+// lastTerminationDetail renders the exit code, reason and trailing message of
+// a container's last termination, so the recreate condition keeps the
+// evidence the pod deletion is about to erase. Empty when nothing terminated.
+func lastTerminationDetail(cs corev1.ContainerStatus) string {
+	t := cs.LastTerminationState.Terminated
+	if t == nil {
+		t = cs.State.Terminated
+	}
+	if t == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(t.Message)
+	if len(msg) > 200 {
+		msg = "..." + msg[len(msg)-200:]
+	}
+	if msg != "" {
+		msg = ": " + msg
+	}
+	return fmt.Sprintf(" (container %s exit %d %s%s)", cs.Name, t.ExitCode, t.Reason, msg)
 }
 
 // groupReadiness: the group serves when every member is Running and rank 0
@@ -360,7 +395,11 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		obs[i] = memberObservation{rank: i, desired: d, existing: byName[d.Name]}
 	}
 	if reason, msg := groupNeedsRecreate(obs, hash, time.Now()); reason != "" {
-		log.Info("multiNode: recreating group", "reason", reason, "detail", msg)
+		// A teardown takes several reconciles (every member event requeues);
+		// log the decision once per reason, not once per requeue.
+		if cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeGroupReady); cond == nil || cond.Reason != reason {
+			log.Info("multiNode: recreating group", "reason", reason, "detail", msg)
+		}
 		setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, reason, msg)
 		r.deleteMemberPods(ctx, existing.Items)
 		return r.persistGroupTeardown(ctx, isvc, PhaseCreating, modelReady, desiredReplicas)

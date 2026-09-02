@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -275,5 +276,54 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	}
 	if ok, _ := groupReadiness(obs); ok {
 		t.Errorf("head not Ready must not be ready")
+	}
+}
+
+// TestConstructMemberPodsHashIgnoresStatus: the template reads the service's
+// status phase (the disruption-protection annotation is only present while
+// not Ready), which must not move the group hash: a group that became Ready
+// would otherwise be torn down by its own success.
+func TestConstructMemberPodsHashIgnoresStatus(t *testing.T) {
+	isvc, model := multiNodeFixture()
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	isvc.Status.Phase = PhaseCreating
+	podsCreating, h1, err := r.constructMemberPods(isvc, model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isvc.Status.Phase = PhaseReady
+	podsReady, h2, err := r.constructMemberPods(isvc, model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 != h2 {
+		t.Fatalf("hash moved with status phase: %s (Creating) vs %s (Ready)", h1, h2)
+	}
+	// The rendered pods still follow the real status (the annotation is a
+	// startup protection), only the hash is status-blind.
+	_, creatingHas := podsCreating[0].Annotations["karpenter.sh/do-not-disrupt"]
+	_, readyHas := podsReady[0].Annotations["karpenter.sh/do-not-disrupt"]
+	if !creatingHas || readyHas {
+		t.Fatalf("expected the disruption annotation only while not Ready: creating=%v ready=%v", creatingHas, readyHas)
+	}
+}
+
+func TestLastTerminationDetail(t *testing.T) {
+	cs := corev1.ContainerStatus{Name: "vllm"}
+	if got := lastTerminationDetail(cs); got != "" {
+		t.Fatalf("no termination must render empty, got %q", got)
+	}
+	cs.LastTerminationState.Terminated = &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error", Message: "value_error: no config.json"}
+	got := lastTerminationDetail(cs)
+	for _, want := range []string{"vllm", "exit 1", "Error", "no config.json"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("detail %q lacks %q", got, want)
+		}
+	}
+	obs := []memberObservation{{rank: 0, existing: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "h", Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "vllm", RestartCount: 1, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"}}}}}}}}
+	reason, msg := groupNeedsRecreate(obs, "abc", time.Now())
+	if reason != "MemberRestarted" || !strings.Contains(msg, "OOMKilled") || !strings.Contains(msg, "137") {
+		t.Fatalf("restart detail missing: %s / %s", reason, msg)
 	}
 }
