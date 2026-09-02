@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -10,24 +9,84 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/agent/oai"
 )
 
+// assistantFunction returns an assistant message whose sole tool_call runs the
+// given non-bash tool with the given raw JSON arguments. It mirrors
+// assistantBash (in reviewer_diff_gate_test.go) but sets an arbitrary function
+// name so the review-execution rail can distinguish a bash call from a
+// read_file (or any other tool) that merely mentions `go test`.
+func assistantFunction(id, name, args string) oai.Message {
+	return oai.Message{
+		Role:    oai.RoleAssistant,
+		Content: "",
+		ToolCalls: []oai.ToolCall{
+			{
+				ID:   id,
+				Type: "function",
+				Function: oai.ToolCallFunction{
+					Name:      name,
+					Arguments: args,
+				},
+			},
+		},
+	}
+}
+
 func TestTranscriptRanGoTest_BashCommand(t *testing.T) {
 	tr := []oai.Message{
 		assistantBash("call-1", "go test ./pkg/foreman/agent/ -run TestReviewerSawDiff -count=1"),
-		toolResult("bash", "call-1", "ok  	pkg/foreman/agent\n"),
+		toolResult("bash", "call-1", "ok  \tpkg/foreman/agent\n"),
 	}
 	if !transcriptRanGoTest(tr) {
 		t.Fatalf("expected transcriptRanGoTest=true for a `go test` bash command, got false")
 	}
 }
 
-func TestTranscriptRanGoTest_ToolResultOnly(t *testing.T) {
-	// The bash tool echoes the command back in its JSON output; a transcript
-	// that records only the tool result (Name left empty) must still count.
+func TestTranscriptRanGoTest_ToolResultCorrelatedToBashCall(t *testing.T) {
+	// A bash tool result echoes the command back in its JSON output, so the
+	// rail must count it when the result is correlated (via ToolCallID) to a
+	// bash tool_call -- even though the assistant's own arguments mentioned
+	// no `go test`.
 	tr := []oai.Message{
-		toolResult("", "call-1", `{"command":"go test ./pkg/...","exit_code":0,"stdout":"ok"}`),
+		assistantBash("call-1", "make test-focus"),
+		toolResult("bash", "call-1", `{"command":"go test ./pkg/...","exit_code":0,"stdout":"ok"}`),
 	}
 	if !transcriptRanGoTest(tr) {
-		t.Fatalf("expected transcriptRanGoTest=true for a `go test` tool result, got false")
+		t.Fatalf("expected transcriptRanGoTest=true for a `go test` bash tool result, got false")
+	}
+}
+
+func TestTranscriptRanGoTest_ReadFileResultDoesNotCount(t *testing.T) {
+	// Reading a file whose text carries the literal `go test` is not executing
+	// `go test`. The reviewer must read every touched file (the
+	// review_execution_gate_test.go fixtures contain exactly such a literal),
+	// so a read_file result must not satisfy the rail.
+	tr := []oai.Message{
+		assistantFunction("call-1", "read_file", `{"path":"pkg/foreman/agent/review_execution_gate_test.go"}`),
+		toolResult("read_file", "call-1", "package agent\n\ngo test ./pkg/foreman/agent/ -run TestX -count=1\n"),
+	}
+	if transcriptRanGoTest(tr) {
+		t.Fatalf("expected transcriptRanGoTest=false for a read_file result that merely mentions `go test`, got true")
+	}
+}
+
+func TestTranscriptRanGoTest_GrepMentionDoesNotCount(t *testing.T) {
+	// A grep that only searches for the string `go test` is not a `go test`
+	// run; it must not satisfy the rail.
+	tr := []oai.Message{
+		assistantBash("call-1", `grep -rn "go test" Makefile`),
+		toolResult("bash", "call-1", `matches found`),
+	}
+	if transcriptRanGoTest(tr) {
+		t.Fatalf("expected transcriptRanGoTest=false for a grep that mentions `go test`, got true")
+	}
+
+	// But a `go test` run after a command separator IS executed and counts.
+	tr = []oai.Message{
+		assistantBash("call-1", "cd /tmp && go test ./..."),
+		toolResult("bash", "call-1", "ok\n"),
+	}
+	if !transcriptRanGoTest(tr) {
+		t.Fatalf("expected transcriptRanGoTest=true for a `go test` after `&&`, got false")
 	}
 }
 
@@ -61,11 +120,11 @@ func TestTranscriptRanGoTest_EmptyTranscript(t *testing.T) {
 }
 
 // TestEnforceReviewerExecution_GoDiffRanGoTest is case 1: a .go diff whose
-// transcript contains a `go test` call must not be demoted.
+// transcript contains a `go test` call must not be marked as skipped.
 func TestEnforceReviewerExecution_GoDiffRanGoTest(t *testing.T) {
 	tr := []oai.Message{
 		assistantBash("call-1", "go test ./pkg/foreman/agent/ -run TestReviewerSawDiff -count=1"),
-		toolResult("bash", "call-1", "ok  	pkg/foreman/agent\n"),
+		toolResult("bash", "call-1", "ok  \tpkg/foreman/agent\n"),
 	}
 	extra := map[string]any{}
 	got := enforceReviewerExecution(logr.Discard(), extra, []string{"pkg/foreman/agent/x.go"},
@@ -82,7 +141,8 @@ func TestEnforceReviewerExecution_GoDiffRanGoTest(t *testing.T) {
 }
 
 // TestEnforceReviewerExecution_GoDiffNoGoTest is case 2: a .go diff whose
-// transcript never ran `go test` must record the rail skipped and demote GO.
+// transcript never ran `go test` records the rail as skipped and the GO
+// stands (marking, not demotion).
 func TestEnforceReviewerExecution_GoDiffNoGoTest(t *testing.T) {
 	tr := []oai.Message{
 		assistantBash("call-1", "git diff main...HEAD"),
@@ -93,8 +153,8 @@ func TestEnforceReviewerExecution_GoDiffNoGoTest(t *testing.T) {
 	extra := map[string]any{}
 	got := enforceReviewerExecution(logr.Discard(), extra, []string{"pkg/foreman/agent/x.go"},
 		foremanv1alpha1.AgenticTaskVerdictGo, tr)
-	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
-		t.Fatalf("expected GO demoted to NO-GO when no `go test` ran, got %v", got)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Fatalf("expected GO to stand (marking, not demotion), got %v", got)
 	}
 	reason, ok := skippedFor(extra, railExecution)
 	if !ok {
@@ -103,15 +163,17 @@ func TestEnforceReviewerExecution_GoDiffNoGoTest(t *testing.T) {
 	if reason != skipReasonNoTestRun {
 		t.Fatalf("want reason %q, got %q", skipReasonNoTestRun, reason)
 	}
-	if extra["verdictDemotedBy"] != railExecution {
-		t.Fatalf("demotion must name this rail in verdictDemotedBy=%q; got %v",
-			railExecution, extra["verdictDemotedBy"])
+	if _, ok := extra["verdictDemoted"]; ok {
+		t.Fatalf("expected no verdictDemoted marker, extra=%v", extra)
 	}
-	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
-		t.Fatalf("verdictClaimed must archive the original GO, got %v", extra["verdictClaimed"])
+	if _, ok := extra["verdictDemotedBy"]; ok {
+		t.Fatalf("expected no verdictDemotedBy marker, extra=%v", extra)
 	}
-	if reason, _ := extra["demotionReason"].(string); strings.TrimSpace(reason) == "" {
-		t.Fatalf("expected a non-empty demotionReason, got %v", extra["demotionReason"])
+	if _, ok := extra["verdictClaimed"]; ok {
+		t.Fatalf("expected no verdictClaimed marker, extra=%v", extra)
+	}
+	if _, ok := extra["demotionReason"]; ok {
+		t.Fatalf("expected no demotionReason marker, extra=%v", extra)
 	}
 }
 

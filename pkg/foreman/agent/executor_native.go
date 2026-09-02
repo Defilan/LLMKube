@@ -1042,10 +1042,10 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// running the diff's own new test (and an adversarial near-miss
 			// probe) whenever the diff touches `.go` files. A GO whose
 			// transcript never ran `go test` did not execute the change it
-			// approved, so demote it to NO-GO (it routes to escalation
-			// instead of opening a PR) and record the rail skipped. This is a
-			// demote rail like scope-overlap, and it runs after the diff gate
-			// so its verdict rewrite is what the findings summary reports.
+			// approved, so record the rail as skipped and leave the verdict
+			// as the model returned it. This is a mark, not a demote rail: it
+			// runs after the diff gate, and demotion is a later flip once the
+			// fleet shows the runs fit the turn budget.
 			verdict = enforceReviewerExecution(log, loopRes.Terminal.Extra, reviewDiff, verdict, loopRes.Transcript)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 			// Per-clause coverage rail (#1554): require the reviewer to have

@@ -15,45 +15,55 @@ import (
 // the first live Section-K review the reviewer performed every read and skipped
 // both runs, disclosing the omission in onTrust instead. Numbered step
 // sequences are followed faithfully; checklist prose is treated as advisory.
-// This rail makes the execution mandate self-enforcing: when the diff touches a
-// `.go` file, a GO whose transcript never ran `go test` is demoted to NO-GO so
-// it routes to escalation instead of approving a branch the reviewer did not
-// execute.
+// This rail makes the execution mandate observable: when the diff touches a
+// `.go` file, a GO whose transcript never ran `go test` is marked in its
+// record (the skipped rail is recorded on the result's extra) so a later stage
+// can see the approval did not execute the change it covers. Marking, not
+// demotion: the verdict stands as returned, and flipping a GO to NO-GO is a
+// later decision for when the fleet shows the runs fit the turn budget.
 //
 // These functions are deterministic and model-free: they run over a stored
 // transcript ([]oai.Message) and the ground-truth diff files, making no git
 // calls. They mirror the shape of reviewer_diff_gate.go (walk a transcript,
 // correlate tool results to the assistant tool_call that produced them, return
-// a finding) and the demotion pattern of scope_overlap.go (stamp a GO->NO-GO
-// rewrite with verdictDemoted / verdictDemotedBy / verdictClaimed /
-// demotionReason).
+// a finding) and the mark-but-do-not-demote pattern of rail_skip.go (record the
+// rail as skipped on extra, leave the verdict alone).
 
-// reGoTestCommand matches a shell command that invokes `go test`. It is
-// applied to both the assistant tool_call arguments and the tool result
-// content (the bash tool echoes the command back in its JSON output), so a
-// `go test` run is caught whether the transcript records it as the request or
-// as the result. The leading word boundary keeps it from matching a path or a
-// comment; the space after `test` separates the subcommand from the package
-// pattern (`go test ./pkg/...`).
-var reGoTestCommand = regexp.MustCompile(`\bgo\s+test\b`)
+// reGoTestCommand matches a shell command that actually invokes `go test`. It
+// is anchored on a command position (start of a line, or right after a `;`,
+// `&`, or `|` command separator) so a mere mention — `grep "go test"
+// Makefile`, or a read_file of a test file whose text carries the literal `go
+// test` — does not satisfy the rail. The space after `test` separates the
+// subcommand from the package pattern (`go test ./pkg/...`).
+var reGoTestCommand = regexp.MustCompile(`(?m)(^|[;&|]\s*)go\s+test\b`)
 
-// transcriptRanGoTest reports whether any bash invocation in the transcript is
-// a `go test` run. It scans assistant tool_call arguments (via
+// transcriptRanGoTest reports whether any executed bash invocation in the
+// transcript is a `go test` run. It scans assistant tool_call arguments (via
 // commandFromToolCallArgs, the same correlation the diff gate uses) and
-// tool-role content (via toolContent, so a tool message whose Name is empty
-// still counts). An empty transcript yields false without panic.
+// tool-role content, but a tool-role message counts only when a bash tool call
+// produced it: a read_file of a file that merely contains the string `go test`
+// must not satisfy the rail. The tool-role correlation uses callNameByToolCallID
+// to recover the tool name from the assistant tool_call that produced the
+// message. An empty transcript yields false without panic.
 func transcriptRanGoTest(transcript []oai.Message) bool {
+	names := callNameByToolCallID(transcript)
 	for i := range transcript {
 		m := transcript[i]
 		switch m.Role {
 		case oai.RoleAssistant:
 			for _, tc := range m.ToolCalls {
+				if tc.Function.Name != "bash" {
+					continue
+				}
 				if reGoTestCommand.MatchString(commandFromToolCallArgs(tc.Function.Arguments)) {
 					return true
 				}
 			}
 		case oai.RoleTool:
-			if reGoTestCommand.MatchString(toolContent(m)) {
+			if names[m.ToolCallID] != "bash" {
+				continue
+			}
+			if reGoTestCommand.MatchString(commandFromToolCallArgs(toolContent(m))) {
 				return true
 			}
 		}
@@ -65,14 +75,12 @@ func transcriptRanGoTest(transcript []oai.Message) bool {
 // reviewer's verdict. It fires only for a GO on a diff that touches a `.go`
 // file: the Section-K execution runs are mandatory for Go diffs but are
 // exempt for docs/YAML-only changes. A GO whose transcript never ran `go test`
-// is demoted to NO-GO, and the skipped rail is recorded so the verdict is
-// distinguishable afterwards from one that earned the execution check. A
-// transcript that did run `go test` leaves the verdict untouched.
-//
-// The demotion is stamped exactly like the scope-overlap rail: verdictDemoted,
-// verdictDemotedBy (naming this rail), verdictClaimed (the archived original
-// verdict, first-writer-wins per #1678), and demotionReason. A non-GO verdict
-// is not this rail's business and returns untouched.
+// is marked — the skipped rail is recorded on extra so the verdict is
+// distinguishable afterwards from one that earned the execution check — and
+// the verdict stands as the model returned it. A transcript that did run `go
+// test` leaves the verdict untouched. Marking, not demotion: demotion is a
+// later flip once the fleet shows the runs fit the turn budget. A non-GO
+// verdict is not this rail's business and returns untouched.
 func enforceReviewerExecution(
 	log logr.Logger,
 	extra map[string]any,
@@ -81,6 +89,7 @@ func enforceReviewerExecution(
 	transcript []oai.Message,
 ) foremanv1alpha1.AgenticTaskVerdict {
 	if extra == nil {
+		log.Info("reviewer execution: extra is nil; cannot record the rail as skipped")
 		return verdict
 	}
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
@@ -96,19 +105,12 @@ func enforceReviewerExecution(
 		return verdict
 	}
 
-	// The GO on a Go diff never ran `go test`. Record the skipped rail and
-	// demote the verdict so the approval does not stand on an unexecuted
-	// branch.
+	// The GO on a Go diff never ran `go test`. Record the skipped rail so the
+	// approval is distinguishable afterwards from one that earned the execution
+	// check; the verdict stands as returned. Demotion is a later flip once the
+	// fleet shows the runs fit the turn budget.
 	recordRailSkipped(extra, railExecution, skipReasonNoTestRun)
-	extra["verdictDemoted"] = true
-	extra["verdictDemotedBy"] = railExecution
-	// First-writer-wins for the claimed verdict: another demoting rail may have
-	// already archived the reviewer's original GO (#1678).
-	if _, ok := extra["verdictClaimed"]; !ok {
-		extra["verdictClaimed"] = string(verdict)
-	}
-	extra["demotionReason"] = "reviewer returned GO on a .go diff without running `go test` in the transcript"
-	log.Info("reviewer execution: GO on a .go diff with no `go test` run in the transcript; demoting to NO-GO",
-		"verdictClaimed", verdict)
-	return foremanv1alpha1.AgenticTaskVerdictNoGo
+	log.Info("reviewer execution: GO on a .go diff with no `go test` run in the transcript; recorded the rail as skipped",
+		"verdict", verdict)
+	return verdict
 }
