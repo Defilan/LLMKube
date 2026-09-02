@@ -89,7 +89,9 @@ NCCL INFO NET/IB : Using [0]rocep1s0f0:1/RoCE
 
 `NET/Socket` instead means NCCL fell back to TCP. It works, but on the
 Spark ring prefill drops about 2.7x. Fix the resource, the capability, or
-the GID index before benchmarking anything.
+the GID index before benchmarking anything. NCCL prints that line only at
+`NCCL_DEBUG=INFO`; at `WARN` the log is silent about the transport, so set
+INFO for the first start and drop it afterwards.
 
 ## Storage
 
@@ -157,6 +159,24 @@ Two DGX Sparks (GB10, 121 GiB usable each) over one ConnectX-7 RoCE leg,
 | DeepSeek-V4-Flash-Vision-Exp, DSpark draft k=3 | vLLM TP2 + expert parallel | 2,047 | 39.1 |
 | Qwen3.8-Flash-Next (NVFP4), MTP k=3 | vLLM TP2 + expert parallel | 2,789 | 48.1 |
 | DeepSeek-V4-Flash (MXFP4) | llama.cpp RPC, two nodes | 357 | 19.4 |
+
+The same model as an operator-managed `multiNode` group, benchmarked from
+inside the cluster (median of three 3.7k-token prompts, then one 26k-token
+prompt):
+
+| Group configuration | Prefill tok/s (3.7k / 26k) | Decode tok/s (3.7k / 26k) | KV cache tokens |
+|---|---|---|---|
+| vLLM TP2 + expert parallel | 1,870 / 1,915 | 25.3 / 25.0 | 1,768,361 |
+| plus DSpark draft k=3 | 1,820 / 1,888 | 37.0 / 39.4 | 1,132,222 |
+| plus DSpark and `maxNumBatchedTokens: 8192` | 2,107 / 1,985 | 37.3 / 38.0 | 333,071 |
+
+Two things to take from that table. The draft is where the win is for a
+single agentic stream: decode rises by half for a third of the KV cache. And
+the prefill chunk size is a trade, not a free setting: 8192-token chunks
+match the hand-tuned prefill number but cost another 800k tokens of cache,
+which decides how many long-context requests can run at once. The group
+recreates in four to five minutes when a member dies, measured by deleting
+the worker pod by hand.
 
 Cross-node tensor parallel beat pipeline parallel on decode and tied it on
 prefill; both models refuse pipeline parallel anyway. Three nodes did not
