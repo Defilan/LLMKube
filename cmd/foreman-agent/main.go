@@ -801,6 +801,21 @@ func clampInt32(n int) int32 {
 	return int32(n) //nolint:gosec // bounded above
 }
 
+// gateActiveDeadlineSeconds converts the Agent's
+// spec.execution.activeDeadlineSeconds (*int64) into the int32 the gate
+// Job's RunGateJobToolConfig.ActiveDeadlineSeconds field carries. Zero or
+// unset keeps the 1800 s default via applyConfigDefaults; a value above
+// math.MaxInt32 saturates so the int32 field never wraps negative (#1748).
+func gateActiveDeadlineSeconds(n *int64) int32 {
+	if n == nil || *n <= 0 {
+		return 0
+	}
+	if *n > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	return int32(*n) //nolint:gosec // bounded above
+}
+
 // assembleAgentRegistry builds an agent's tool registry: native tools
 // filtered by the agent's spec.tools whitelist, then MCP tools appended.
 // MCP tools bypass the whitelist by design (they are already gated by their
@@ -869,14 +884,23 @@ func makeRegistryFactory(
 		// Constructed in pkg/foreman/agent/tools so there is exactly one list.
 		// Keeping it here made a third copy that drifted from the webhook
 		// allow-list, shipping three tools registered but unusable (#1482).
+		// GateActiveDeadlineSeconds threads the verifying Agent's
+		// spec.execution.activeDeadlineSeconds into the gate Job, so a
+		// heavy per-hunk mutation pass can raise the fixed 1800 s default
+		// (#1748). Unset keeps the default via applyConfigDefaults.
+		gateDeadline := gateActiveDeadlineSeconds(nil)
+		if ag.Spec.Execution != nil {
+			gateDeadline = gateActiveDeadlineSeconds(ag.Spec.Execution.ActiveDeadlineSeconds)
+		}
 		native := foremantools.BuildAll(foremantools.ToolDeps{
-			Workspace:        workspace,
-			BashTimeout:      bashTimeout,
-			Client:           kc,
-			ForemanNamespace: foremanNamespace,
-			GateCachePVC:     gateCachePVC,
-			LogTailFn:        logTail,
-			Token:            repo.TokenFromEnvOrFile,
+			Workspace:                 workspace,
+			BashTimeout:               bashTimeout,
+			Client:                    kc,
+			ForemanNamespace:          foremanNamespace,
+			GateCachePVC:              gateCachePVC,
+			LogTailFn:                 logTail,
+			Token:                     repo.TokenFromEnvOrFile,
+			GateActiveDeadlineSeconds: gateDeadline,
 		})
 
 		var mcpTools []foremantools.Tool

@@ -28,6 +28,40 @@ import (
 	"github.com/defilantech/llmkube/pkg/foreman/agent/tools/catalog"
 )
 
+// TestBuildAll_ThreadsGateActiveDeadlineSeconds is the regression test for
+// #1748: a configured GateActiveDeadlineSeconds on ToolDeps must reach the
+// RunGateJobTool's own config so the gate Job's activeDeadlineSeconds is
+// settable from the verifier Agent. Zero keeps the 1800 s default via
+// applyConfigDefaults (covered by TestApplyConfigDefaults_FillsEveryField).
+func TestBuildAll_ThreadsGateActiveDeadlineSeconds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		deps ToolDeps
+		want int32
+	}{
+		{"configured deadline reaches the tool", ToolDeps{GateActiveDeadlineSeconds: 7200}, 7200},
+		{"zero stays zero before defaults", ToolDeps{GateActiveDeadlineSeconds: 0}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tools := BuildAll(tc.deps)
+			var got *RunGateJobTool
+			for _, tool := range tools {
+				if gt, ok := tool.(*RunGateJobTool); ok {
+					got = gt
+					break
+				}
+			}
+			if got == nil {
+				t.Fatal("BuildAll did not construct a *RunGateJobTool")
+			}
+			if got.Cfg.ActiveDeadlineSeconds != tc.want {
+				t.Errorf("RunGateJobTool.Cfg.ActiveDeadlineSeconds: want %d got %d",
+					tc.want, got.Cfg.ActiveDeadlineSeconds)
+			}
+		})
+	}
+}
+
 // The webhook allow-list must match the tools that actually exist.
 //
 // A tool registered at runtime but missing from catalog is unusable in both

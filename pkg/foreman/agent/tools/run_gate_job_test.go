@@ -24,6 +24,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -77,6 +78,29 @@ func flipStatusOnce(ctx context.Context, c client.Client, key types.NamespacedNa
 		if err := c.Get(ctx, key, &job); err == nil {
 			job.Status.Succeeded = succeeded
 			job.Status.Failed = failed
+			_ = c.Status().Update(ctx, &job)
+			return
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+}
+
+// flipDeadlineOnce watches for the Job to appear, then marks it Failed
+// with a Failed condition whose Reason is DeadlineExceeded -- the shape
+// the Kubernetes controller sets when a Job outlives its
+// activeDeadlineSeconds (#1748). Mirrors flipStatusOnce's polling so a
+// test can drive the fake apiserver through the same terminal transition.
+func flipDeadlineOnce(ctx context.Context, c client.Client, key types.NamespacedName) {
+	for ctx.Err() == nil {
+		var job batchv1.Job
+		if err := c.Get(ctx, key, &job); err == nil {
+			job.Status.Failed = 1
+			job.Status.Conditions = []batchv1.JobCondition{{
+				Type:    batchv1.JobFailed,
+				Status:  corev1.ConditionTrue,
+				Reason:  batchv1.JobReasonDeadlineExceeded,
+				Message: "Job was active longer than specified deadline",
+			}}
 			_ = c.Status().Update(ctx, &job)
 			return
 		}
@@ -224,6 +248,51 @@ func TestRunGateJob_FailedProducesGATEFAIL(t *testing.T) {
 	}
 	if got, _ := res.Extra["logTail"].(string); !strings.Contains(got, "GATE FAIL") {
 		t.Errorf("logTail should carry failure marker; got %q", got)
+	}
+}
+
+// TestRunGateJob_DeadlineExceededProducesGATEERROR is the regression test
+// for #1748: a gate Job killed by its activeDeadlineSeconds must map to
+// GATE-ERROR (retryable gate infrastructure problem), not GATE-FAIL
+// (branch is bad). The summary names the deadline and, when the log tail
+// carries a phase header, the phase the Job was in when it died.
+func TestRunGateJob_DeadlineExceededProducesGATEERROR(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	c := fake.NewClientBuilder().WithScheme(gateScheme(t)).WithStatusSubresource(&batchv1.Job{}).Build()
+	jobName := "foreman-gate-fake-deadline"
+	key := types.NamespacedName{Namespace: "foreman-system", Name: jobName}
+
+	go flipDeadlineOnce(ctx, c, key)
+
+	tool := &RunGateJobTool{
+		Client: c,
+		Cfg: RunGateJobToolConfig{
+			NameFn:       pinName(jobName),
+			PollInterval: 5 * time.Millisecond,
+			PollTimeout:  2 * time.Second,
+			LogTailFn: func(_ context.Context, _, _ string) string {
+				return "=== bite check (base=main) ===\nok\n" +
+					"=== per-hunk mutation coverage (base=abc) ===\n"
+			},
+		},
+	}
+
+	res, err := tool.Execute(ctx, argsJSON(t, "x/y", "b"))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if res.Verdict != VerdictGateError {
+		t.Errorf("Verdict: want %s got %s", VerdictGateError, res.Verdict)
+	}
+	if !strings.Contains(res.Summary, "deadline") {
+		t.Errorf("Summary should name the deadline; got %q", res.Summary)
+	}
+	// The phase annotated onto the summary is the LAST "=== <phase> ==="
+	// header in the tail, which is where the Job stalled.
+	if !strings.Contains(res.Summary, "during per-hunk mutation coverage (base=abc)") {
+		t.Errorf("Summary should carry the active phase; got %q", res.Summary)
 	}
 }
 

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/yaml"
@@ -375,7 +376,7 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 	// Poll. Job.Status.Succeeded == 1 means GATE-PASS; .Failed >= 1
 	// means GATE-FAIL; neither set after PollTimeout means
 	// GATE-ERROR (apiserver lag or stuck Job).
-	verdict, summary, pollErr := t.pollForTerminal(ctx, cfg, jobName)
+	verdict, summary, pollErr, deadlineHit := t.pollForTerminal(ctx, cfg, jobName)
 
 	// Always try the log tail, even on poll error, so the operator
 	// has *something* to look at.
@@ -384,6 +385,16 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 		logTail = cfg.LogTailFn(ctx, cfg.Namespace, jobName)
 		if len(logTail) > MaxLogTailBytes {
 			logTail = logTail[len(logTail)-MaxLogTailBytes:]
+		}
+	}
+
+	// A DeadlineExceeded kill is a gate infrastructure problem, not a
+	// failing test. Name the phase the Job was in when it died so the
+	// operator can see whether it survived the standard checks and
+	// stalled in a long pass (e.g. per-hunk mutation coverage) (#1748).
+	if deadlineHit {
+		if phase := lastGatePhase(logTail); phase != "" {
+			summary += " during " + phase
 		}
 	}
 
@@ -410,11 +421,14 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 }
 
 // pollForTerminal blocks until Job.Status reports a terminal phase or
-// PollTimeout elapses. Returns (verdict, summary, pollError string).
-// pollError is the empty string on a clean Succeeded/Failed.
+// PollTimeout elapses. Returns (verdict, summary, pollError string,
+// deadlineHit bool).
+// pollError is the empty string on a clean Succeeded/Failed;
+// deadlineHit reports whether the terminal state was a DeadlineExceeded
+// kill (so Execute can annotate the summary with the active phase).
 func (t *RunGateJobTool) pollForTerminal(
 	ctx context.Context, cfg RunGateJobToolConfig, jobName string,
-) (string, string, string) {
+) (string, string, string, bool) {
 	deadline := time.Now().Add(cfg.PollTimeout)
 	key := types.NamespacedName{Namespace: cfg.Namespace, Name: jobName}
 
@@ -425,31 +439,74 @@ func (t *RunGateJobTool) pollForTerminal(
 				// Job vanished between Create and Get -- TTL fired or
 				// someone deleted it. Treat as GATE-ERROR.
 				return VerdictGateError, "Job disappeared before reaching a terminal phase",
-					"job not found during poll: " + err.Error()
+					"job not found during poll: " + err.Error(), false
 			}
-			return VerdictGateError, "apiserver poll failed", err.Error()
+			return VerdictGateError, "apiserver poll failed", err.Error(), false
 		}
 
 		switch {
 		case job.Status.Succeeded >= 1:
-			return VerdictGatePass, "all gate checks passed", ""
+			return VerdictGatePass, "all gate checks passed", "", false
 		case job.Status.Failed >= 1:
-			return VerdictGateFail, "one or more gate checks failed", ""
+			if gateJobDeadlineExceeded(&job) {
+				// A DeadlineExceeded kill is a gate infrastructure
+				// problem (the Job ran out of wall-clock), not a failing
+				// test. It maps to GATE-ERROR so the executor retries /
+				// escalates rather than marking the branch bad (#1748).
+				return VerdictGateError,
+					fmt.Sprintf("gate Job exceeded its %ds deadline", cfg.ActiveDeadlineSeconds), "", true
+			}
+			return VerdictGateFail, "one or more gate checks failed", "", false
 		}
 
 		if time.Now().After(deadline) {
 			return VerdictGateError,
 				fmt.Sprintf("Job did not reach a terminal phase within %s", cfg.PollTimeout),
-				"poll timeout"
+				"poll timeout", false
 		}
 
 		select {
 		case <-ctx.Done():
 			return VerdictGateError, "context cancelled while polling Job",
-				ctx.Err().Error()
+				ctx.Err().Error(), false
 		case <-time.After(cfg.PollInterval):
 		}
 	}
+}
+
+// gateJobDeadlineExceeded reports whether a terminated Job's failure
+// condition is the fixed ActiveDeadlineSeconds kill, rather than a
+// check that actually failed. The Kubernetes controller sets a
+// Failed condition with Reason DeadlineExceeded when a Job outlives
+// its activeDeadlineSeconds; every other failure reason means a gate
+// check ran to completion and failed (#1748).
+func gateJobDeadlineExceeded(job *batchv1.Job) bool {
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == batchv1.JobFailed &&
+			cond.Status == corev1.ConditionTrue &&
+			cond.Reason == batchv1.JobReasonDeadlineExceeded {
+			return true
+		}
+	}
+	return false
+}
+
+// gatePhaseHeaderPattern matches the "=== <phase> ===" banner the gate
+// script prints once per phase (clone, standard checks, bite check,
+// per-hunk mutation coverage). We keep the whole header text so the
+// operator sees the base ref carried inside it (e.g. "per-hunk mutation
+// coverage (base=abc123)").
+var gatePhaseHeaderPattern = regexp.MustCompile(`(?m)^=== (.+) ===$`)
+
+// lastGatePhase returns the LAST phase header in a log tail, or "" when
+// none matches. A DeadlineExceeded kill lands mid-phase, so the last
+// complete header tells the operator which pass the Job was in (#1748).
+func lastGatePhase(logTail string) string {
+	matches := gatePhaseHeaderPattern.FindAllStringSubmatch(logTail, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[len(matches)-1][1]
 }
 
 // errorResult is the Terminal=true result returned when something
