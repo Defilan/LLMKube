@@ -85,6 +85,14 @@ sections:
         slug: guides/karpenter-gpu-autoscaling
         file: guides/karpenter-gpu-autoscaling.md
 
+  - title: Lab builds
+    items:
+      - label: Overview
+        slug: labs
+        file: labs/index.md
+      - label: DeepSeek V4 Flash on two DGX Sparks
+        slug: labs/deepseek-v4-flash-two-sparks
+        file: labs/deepseek-v4-flash-two-sparks.md
   - title: Operations
     items:
       - label: Memory-pressure protection
