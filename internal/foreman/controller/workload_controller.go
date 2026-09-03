@@ -200,8 +200,10 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		// Downstream consumers judge each issue by its LATEST fix
 		// iteration: a superseded round's terminal NO-GO must neither
 		// re-fire escalation nor pin the rollup at Failed after a later
-		// round converged.
-		children = activeChildren(&workload, children)
+		// round converged. observeChildren also reports the planned refs
+		// that are genuinely gone, computed before that filtering (#1743).
+		var missingPlanned []string
+		children, missingPlanned = observeChildren(&workload, children)
 
 		// Second-pass emission (#546): escalation reviewers fire here,
 		// after base reviewer verdicts land, before status rollup.
@@ -210,7 +212,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, fmt.Errorf("emit escalations: %w", err)
 		}
 		// Roll up child phases into the Workload's status.
-		return r.rollup(ctx, &workload, children)
+		return r.rollup(ctx, &workload, children, missingPlanned)
 	}
 
 	// No children yet -> first reconcile. Decide which mode and render.
@@ -582,14 +584,19 @@ func (r *WorkloadReconciler) listChildren(ctx context.Context, w *foremanv1alpha
 // computeTerminalState, emitAlreadyResolvedCondition) to keep each
 // piece under the gocyclo threshold; the orchestrator here is just
 // the wiring.
-func (r *WorkloadReconciler) rollup(ctx context.Context, w *foremanv1alpha1.Workload, children []foremanv1alpha1.AgenticTask) (ctrl.Result, error) {
+func (r *WorkloadReconciler) rollup(
+	ctx context.Context,
+	w *foremanv1alpha1.Workload,
+	children []foremanv1alpha1.AgenticTask,
+	missingPlanned []string,
+) (ctrl.Result, error) {
 	cls := classifyChildren(children)
-	// Report planned children the Workload can no longer observe. This
-	// must match by NAME, never by count (#1738): escalation and
-	// iteration synthesize EXTRA placeholder children that are not in
-	// w.Status.Tasks, so len(children) can legitimately exceed the
-	// planned count and a length comparison would flap.
-	cls.missingTasks = missingPlannedTasks(w.Status.Tasks, children)
+	// Report planned children the Workload can no longer observe.
+	// missingPlanned is computed by observeChildren from the UNFILTERED
+	// observation, because `children` here has already had superseded
+	// rounds removed and those rounds are still alive in the cluster
+	// (#1743).
+	cls.missingTasks = missingPlanned
 
 	// Capture the patch BEFORE mutating w.Status — the patch's
 	// "original" snapshot must reflect the on-cluster state for the
@@ -661,6 +668,29 @@ func missingPlannedTasks(planned []corev1.ObjectReference, children []foremanv1a
 	}
 	sort.Strings(missing)
 	return missing
+}
+
+// observeChildren turns one observation of a Workload's children into the
+// two things rollup needs: the planned refs that are genuinely gone, and
+// the child set judged by each issue's latest attempt.
+//
+// The order is load-bearing (#1743). activeChildren drops rounds that a
+// later attempt superseded, and those rounds never leave w.Status.Tasks:
+// markPlanned assigns that list wholesale, appendNewTaskRefs only appends
+// to it, and nothing trims it. Computing the missing report from the
+// FILTERED set therefore reports every superseded round as missing for as
+// long as the retry round runs, which is precisely the cry-wolf the report
+// exists to avoid. Computing it first sees the superseded round alive.
+//
+// Emissions that both create children and record their refs (iteration,
+// coder escalation, reviewer escalation) are consistent either side of
+// this call: a ref and its child appear together, so neither a
+// just-planned nor a not-yet-planned task reads as missing here.
+func observeChildren(
+	w *foremanv1alpha1.Workload, children []foremanv1alpha1.AgenticTask,
+) ([]foremanv1alpha1.AgenticTask, []string) {
+	missing := missingPlannedTasks(w.Status.Tasks, children)
+	return activeChildren(w, children), missing
 }
 
 // classifyChildren walks the children slice and returns the bucket
