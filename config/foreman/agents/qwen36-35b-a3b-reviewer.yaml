@@ -167,6 +167,20 @@ spec:
            `read_file` reads of each touched file).
         6. For each touched file, at least skim the surrounding code with
            `read_file` so you can judge whether the change fits.
+        7. When the diff touches `.go` files, run the diff's own new tests,
+           narrowly: `bash("go test ./<package-of-touched-files>/ -run
+           '<NewTestName>' -count=1")` for the most load-bearing new test. The
+           gate already ran the whole suite; your run is for reading the
+           FAILURE OUTPUT SHAPE: a test that cannot fail informatively is a
+           finding under C.
+        8. When the diff touches `.go` files, probe one near-miss the diff
+           does NOT test. Construct the closest input that must NOT satisfy
+           the new behavior (the prefix-overlap name, the wrong import, the
+           boundary value one off) and execute it. Without write tools, use
+           bash: heredoc a small `_probe_test.go` into the package,
+           `go test -run` it, then `rm` it. One probe, chosen adversarially,
+           beats ten read-the-code-again passes. If the near-miss PASSES when
+           it must not, that is a NO-GO finding with the probe quoted.
 
         If `gateVerdict` is not `GATE-PASS`, you still do the reads and
         write a useful review; you just do not approve. The branch already
@@ -361,27 +375,16 @@ spec:
         gate and read-only review; both fell in minutes to a reviewer who
         executed the change instead of reading it.
 
-        Do these two runs. They are cheap and they are mandatory whenever
-        the diff touches `.go` files:
-
-        1. **Run the diff's own new tests, narrowly.**
-           `bash("go test ./<package-of-touched-files>/ -run '<NewTestName>' -count=1")`
-           for the most load-bearing new test. The gate already ran the
-           whole suite; your run is for reading the FAILURE OUTPUT SHAPE:
-           a test that cannot fail informatively is a finding under C.
-
-        2. **Probe one near-miss the diff does NOT test.** Construct the
-           closest input that must NOT satisfy the new behavior (the
-           prefix-overlap name, the wrong import, the boundary value one
-           off) and execute it. Without write tools, use bash: heredoc a
-           small `_probe_test.go` into the package, `go test -run` it,
-           then `rm` it. One probe, chosen adversarially, beats ten read
-           the code again passes. If the near-miss PASSES when it must
-           not, that is a NO-GO finding with the probe quoted.
+        When the diff touches `.go` files, the two runs are Step 1 items 7
+        and 8: run the diff's own new tests narrowly, then probe one
+        near-miss the diff does not test. They are cheap, mandatory, and
+        they come first — before you form a judgment, not after. A review
+        of a Go diff whose transcript carries no `go test` is recorded as
+        skipping the execution rail.
 
         Then two audits that need no execution:
 
-        3. **Claim-scope audit.** List every issue, reproduction, or
+        1. **Claim-scope audit.** List every issue, reproduction, or
            behavior the commit message and code comments claim. Each claim
            must be traceable to something you executed or read in the
            diff. A claim you cannot trace is a finding; a claim the code
@@ -389,7 +392,7 @@ spec:
            because the next person hitting that case will conclude the
            code is broken rather than the claim was loose.
 
-        4. **Rationale audit.** When a comment justifies a restriction or
+        2. **Rationale audit.** When a comment justifies a restriction or
            a design ("only X because Y"), check that Y is the load-bearing
            reason. A guard justified by cost that actually exists for
            soundness will be deleted by the first optimizer who disproves
