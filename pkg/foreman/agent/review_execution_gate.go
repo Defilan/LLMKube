@@ -31,11 +31,14 @@ import (
 
 // reGoTestCommand matches a shell command that actually invokes `go test`. It
 // is anchored on a command position (start of a line, or right after a `;`,
-// `&`, or `|` command separator) so a mere mention — `grep "go test"
-// Makefile`, or a read_file of a test file whose text carries the literal `go
-// test` — does not satisfy the rail. The space after `test` separates the
+// `&`, or `|` command separator) so a mere mention, such as `grep "go test"
+// Makefile` or a read_file of a test file whose text carries the literal `go
+// test`, does not satisfy the rail. The command position tolerates the
+// prefixes a reviewer naturally types in front of the binary: leading
+// indentation, `time`, `sudo`, and shell environment assignments such as
+// `GOFLAGS=-v` or `CGO_ENABLED=0`. The space after `test` separates the
 // subcommand from the package pattern (`go test ./pkg/...`).
-var reGoTestCommand = regexp.MustCompile(`(?m)(^|[;&|]\s*)go\s+test\b`)
+var reGoTestCommand = regexp.MustCompile(`(?m)(^|[;&|])\s*(?:(?:time|sudo|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*go\s+test\b`)
 
 // transcriptRanGoTest reports whether any executed bash invocation in the
 // transcript is a `go test` run. It scans assistant tool_call arguments (via
@@ -75,16 +78,24 @@ func transcriptRanGoTest(transcript []oai.Message) bool {
 // reviewer's verdict. It fires only for a GO on a diff that touches a `.go`
 // file: the Section-K execution runs are mandatory for Go diffs but are
 // exempt for docs/YAML-only changes. A GO whose transcript never ran `go test`
-// is marked — the skipped rail is recorded on extra so the verdict is
-// distinguishable afterwards from one that earned the execution check — and
+// is marked: the skipped rail is recorded on extra so the verdict is
+// distinguishable afterwards from one that earned the execution check, and
 // the verdict stands as the model returned it. A transcript that did run `go
 // test` leaves the verdict untouched. Marking, not demotion: demotion is a
 // later flip once the fleet shows the runs fit the turn budget. A non-GO
 // verdict is not this rail's business and returns untouched.
+//
+// diffErr is the error from the ground-truth diff fetch. When it is non-nil
+// the rail has no input: diffFiles is nil, which hasSourceFile reads as a
+// docs-only diff, so without this branch a GO issued with no diff at all would
+// look identical to a GO on a docs-only change. Like the scope-overlap rail
+// (#1605), the rail records itself as skipped with skipReasonNoDiff and leaves
+// the verdict alone.
 func enforceReviewerExecution(
 	log logr.Logger,
 	extra map[string]any,
 	diffFiles []string,
+	diffErr error,
 	verdict foremanv1alpha1.AgenticTaskVerdict,
 	transcript []oai.Message,
 ) foremanv1alpha1.AgenticTaskVerdict {
@@ -93,6 +104,16 @@ func enforceReviewerExecution(
 		return verdict
 	}
 	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		return verdict
+	}
+	if diffErr != nil {
+		// A log line is not a record (#1605). The diff never arrived, so the
+		// Go-only guard below cannot tell a docs-only change from no change
+		// at all; mark the skip so this GO is distinguishable afterwards from
+		// one the rail actually checked.
+		recordRailSkipped(extra, railExecution, skipReasonNoDiff)
+		log.Info("reviewer execution: ground-truth diff unavailable; skipping execution check",
+			"err", diffErr.Error())
 		return verdict
 	}
 	// Non-.go diffs are exempt: the mandatory execution runs only apply when

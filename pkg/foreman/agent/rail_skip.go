@@ -31,8 +31,10 @@ const (
 	railVerdictFromFindings = "verdict-from-findings"
 	railEmptyClaim          = "empty-claim"
 	railGroundedFinding     = "grounded-finding"
-	// railExecution names the review-execution rail (#1618). It can rewrite a
-	// verdict, so it lives here beside the other demoting rails.
+	// railExecution names the review-execution rail (#1618). It records a
+	// GO on a Go diff whose review never ran `go test`, and a GO whose diff
+	// could not be fetched at all; it never rewrites the verdict. Demotion is
+	// a later flip once the fleet shows the runs fit the turn budget.
 	railExecution = "review-execution"
 )
 

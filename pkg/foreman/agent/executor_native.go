@@ -1045,8 +1045,11 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// approved, so record the rail as skipped and leave the verdict
 			// as the model returned it. This is a mark, not a demote rail: it
 			// runs after the diff gate, and demotion is a later flip once the
-			// fleet shows the runs fit the turn budget.
-			verdict = enforceReviewerExecution(log, loopRes.Terminal.Extra, reviewDiff, verdict, loopRes.Transcript)
+			// fleet shows the runs fit the turn budget. It takes reviewDiffErr
+			// so a failed diff fetch is recorded as a skipped rail, like the
+			// scope rail above, instead of passing as a docs-only exemption.
+			verdict = enforceReviewerExecution(log, loopRes.Terminal.Extra, reviewDiff, reviewDiffErr,
+				verdict, loopRes.Transcript)
 			logReviewerFindings(log, loopRes.Terminal.Extra)
 			// Per-clause coverage rail (#1554): require the reviewer to have
 			// covered each behaviour clause the issue enumerated, or flag the
