@@ -100,6 +100,45 @@ func parseS3Source(source string) (bucket, key string, err error) {
 	return bucket, key, nil
 }
 
+// isHFAuthSource reports whether a bearer token should be attached to this
+// source. Mirrors the controller's isHFAuthSource
+// (internal/controller/source.go) so the metal path and the init container
+// agree on which hosts get the token: hf://, which the agent resolves to
+// huggingface.co, and a literal huggingface.co URL. Nothing else, so a Model
+// pointing elsewhere never receives the credential (#1750).
+func isHFAuthSource(source string) bool {
+	if strings.HasPrefix(strings.ToLower(source), "hf://") {
+		return true
+	}
+	rest := source
+	for _, scheme := range []string{"https://", "http://"} {
+		if len(rest) >= len(scheme) && strings.EqualFold(rest[:len(scheme)], scheme) {
+			rest = rest[len(scheme):]
+			rest = strings.TrimPrefix(rest, "www.")
+			return strings.HasPrefix(strings.ToLower(rest), "huggingface.co/")
+		}
+	}
+	return false
+}
+
+// resolveHFToken reads HF_TOKEN out of the Model's sourceSecretRef, the same
+// secret the AWS_* keys come from. Unlike the S3 credentials this is NOT a hard
+// error when absent: ungated repositories are the common case and must keep
+// working with no secret at all, so a missing secret or a missing key simply
+// yields an empty token and the request goes out unauthenticated.
+func (e *MetalExecutor) resolveHFToken(ctx context.Context, secretName string) string {
+	if e.k8sClient == nil || secretName == "" {
+		return ""
+	}
+	secret := &corev1.Secret{}
+	if err := e.k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: e.namespace}, secret); err != nil {
+		e.logger.Debugw("sourceSecretRef unreadable; continuing unauthenticated",
+			"secret", secretName, "namespace", e.namespace, "err", err)
+		return ""
+	}
+	return string(secret.Data["HF_TOKEN"])
+}
+
 // resolveS3Credentials reads the AWS_* keys out of the Model's sourceSecretRef.
 // The secret lives in the Model's namespace (the namespace the executor was
 // constructed with). This mirrors the controller's s3Credentials

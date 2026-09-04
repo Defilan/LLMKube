@@ -252,6 +252,19 @@ func isHuggingFaceURL(source string) bool {
 	return strings.HasPrefix(strings.ToLower(rest), "huggingface.co/")
 }
 
+// isHFAuthSource reports whether the operator's own downloads for this source
+// should carry a Hugging Face bearer token. True for both spellings the
+// downloader accepts: an hf:// source, which normalize_hf_source rewrites to
+// huggingface.co at run time, and a literal huggingface.co URL.
+//
+// This is the gate that keeps the token off every other host (#1750). The
+// header is emitted only when this returns true, so a Model pointing at a
+// mirror, a private registry, or an arbitrary https:// URL never sees it, even
+// if the referenced Secret happens to carry an HF_TOKEN key.
+func isHFAuthSource(source string) bool {
+	return hasSchemeFold(source, "hf://") || isHuggingFaceURL(source)
+}
+
 // hfURLPathSegments returns the non-empty path segments after the
 // "huggingface.co/" host for a huggingface.co URL, with any query string or
 // fragment stripped. ok is false when source is not a huggingface.co URL.
