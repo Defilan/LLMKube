@@ -391,7 +391,7 @@ func TestRollup_ContradictedTasksAndCondition(t *testing.T) {
 
 	ctx := context.Background()
 	children := []foremanv1alpha1.AgenticTask{contradicting}
-	if _, err := r.rollup(ctx, wl, children); err != nil {
+	if _, err := r.rollup(ctx, wl, children, nil); err != nil {
 		t.Fatalf("rollup: %v", err)
 	}
 
@@ -417,5 +417,177 @@ func TestRollup_ContradictedTasksAndCondition(t *testing.T) {
 	}
 	if !strings.Contains(cond.Message, "coder claims edits on empty branch") {
 		t.Errorf("condition message does not name the first contradiction: %q", cond.Message)
+	}
+}
+
+// TestRollup_ChildrenMissing drives rollup over planned-vs-observed
+// children and asserts the Dispatched condition reports planned children
+// the Workload can no longer see (#1738). The check MUST match by NAME,
+// never by count: escalation and iteration synthesize extra placeholder
+// children that are not in w.Status.Tasks, so a length comparison would
+// flap and cry wolf on every escalation.
+func TestRollup_ChildrenMissing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := foremanv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add foreman scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add core scheme: %v", err)
+	}
+
+	taskRef := func(name string) corev1.ObjectReference {
+		return corev1.ObjectReference{Name: name}
+	}
+	child := func(name string) foremanv1alpha1.AgenticTask {
+		return foremanv1alpha1.AgenticTask{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: foremanv1alpha1.GroupVersion.String(),
+					Kind:       "Workload",
+					Name:       "missing-wl",
+				}},
+			},
+			Status: foremanv1alpha1.AgenticTaskStatus{
+				Phase: foremanv1alpha1.AgenticTaskPhasePending,
+			},
+		}
+	}
+
+	// stepChild is child() plus the step label activeChildren reads and an
+	// explicit phase, so a case can build a superseded round.
+	stepChild := func(name string, phase foremanv1alpha1.AgenticTaskPhase) foremanv1alpha1.AgenticTask {
+		c := child(name)
+		c.Labels = map[string]string{labelWorkload: "missing-wl", labelStep: name}
+		c.Status.Phase = phase
+		return c
+	}
+
+	dispatched := func(w *foremanv1alpha1.Workload) *metav1.Condition {
+		return apimeta.FindStatusCondition(w.Status.Conditions, "Dispatched")
+	}
+
+	tests := []struct {
+		name        string
+		issues      []int32
+		planned     []corev1.ObjectReference
+		children    []foremanv1alpha1.AgenticTask
+		wantReason  string
+		wantMissing string // substring the message must name; "" = none
+		wantAbsent  string // substring the message must NOT name; "" = skip
+	}{
+		{
+			name:        "every planned ref observed",
+			planned:     []corev1.ObjectReference{taskRef("code-1"), taskRef("verify-1"), taskRef("review-1")},
+			children:    []foremanv1alpha1.AgenticTask{child("code-1"), child("verify-1"), child("review-1")},
+			wantReason:  "ChildrenInFlight",
+			wantMissing: "",
+		},
+		{
+			name:        "planned ref absent",
+			planned:     []corev1.ObjectReference{taskRef("code-1"), taskRef("verify-1"), taskRef("review-1")},
+			children:    []foremanv1alpha1.AgenticTask{child("code-1"), child("review-1")},
+			wantReason:  "ChildrenMissing",
+			wantMissing: "verify-1",
+		},
+		{
+			name:        "extra child not planned",
+			planned:     []corev1.ObjectReference{taskRef("code-1"), taskRef("review-1")},
+			children:    []foremanv1alpha1.AgenticTask{child("code-1"), child("review-1"), child("extra-escalation-1")},
+			wantReason:  "ChildrenInFlight",
+			wantMissing: "",
+		},
+		{
+			// #1743: activeChildren removes a round a fix iteration
+			// superseded, but its refs stay in Status.Tasks forever. The
+			// base round is alive in the cluster and must not be reported
+			// missing for the whole duration of the retry round.
+			name:   "superseded fix-iteration round is not missing",
+			issues: []int32{1},
+			planned: []corev1.ObjectReference{
+				taskRef("code-1"), taskRef("verify-1"), taskRef("review-1-0"),
+				taskRef("code-1-r1"), taskRef("verify-1-r1"), taskRef("review-1-0-r1"),
+			},
+			children: []foremanv1alpha1.AgenticTask{
+				stepChild("code-1", foremanv1alpha1.AgenticTaskPhaseSucceeded),
+				stepChild("verify-1", foremanv1alpha1.AgenticTaskPhaseSucceeded),
+				stepChild("review-1-0", foremanv1alpha1.AgenticTaskPhaseSucceeded),
+				stepChild("code-1-r1", foremanv1alpha1.AgenticTaskPhaseRunning),
+				stepChild("verify-1-r1", foremanv1alpha1.AgenticTaskPhasePending),
+				stepChild("review-1-0-r1", foremanv1alpha1.AgenticTaskPhasePending),
+			},
+			wantReason: "ChildrenInFlight",
+			wantAbsent: "code-1",
+		},
+		{
+			// The other supersession rule (#963): once a coder escalation
+			// exists the WHOLE base attempt is filtered out, and all three
+			// of its refs remain planned.
+			name:   "escalated base attempt is not missing",
+			issues: []int32{1},
+			planned: []corev1.ObjectReference{
+				taskRef("code-1"), taskRef("verify-1"), taskRef("review-1-0"), taskRef("code-1-esc"),
+			},
+			children: []foremanv1alpha1.AgenticTask{
+				stepChild("code-1", foremanv1alpha1.AgenticTaskPhaseFailed),
+				stepChild("verify-1", foremanv1alpha1.AgenticTaskPhaseFailed),
+				stepChild("review-1-0", foremanv1alpha1.AgenticTaskPhaseFailed),
+				stepChild("code-1-esc", foremanv1alpha1.AgenticTaskPhaseRunning),
+			},
+			wantReason: "ChildrenInFlight",
+			wantAbsent: "code-1",
+		},
+		{
+			// The fix must not blunt the feature: a genuinely deleted child
+			// of the LIVE round is still reported, and the superseded round
+			// beside it is still not.
+			name:   "deleted child of the live round is still reported",
+			issues: []int32{1},
+			planned: []corev1.ObjectReference{
+				taskRef("code-1"), taskRef("code-1-r1"), taskRef("verify-1-r1"),
+			},
+			children: []foremanv1alpha1.AgenticTask{
+				stepChild("code-1", foremanv1alpha1.AgenticTaskPhaseSucceeded),
+				stepChild("code-1-r1", foremanv1alpha1.AgenticTaskPhaseRunning),
+			},
+			wantReason:  "ChildrenMissing",
+			wantMissing: "verify-1-r1",
+			wantAbsent:  "code-1,",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wl := &foremanv1alpha1.Workload{
+				ObjectMeta: metav1.ObjectMeta{Name: "missing-wl", Namespace: "default"},
+				Spec:       foremanv1alpha1.WorkloadSpec{Issues: tc.issues},
+				Status:     foremanv1alpha1.WorkloadStatus{Tasks: tc.planned},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(wl).WithStatusSubresource(wl).Build()
+			r := &WorkloadReconciler{Client: cl, Scheme: scheme}
+			// Reconcile's real order: observe (report + filter), then roll
+			// up the filtered set. Calling observeChildren here rather than
+			// re-deriving it keeps the test from drifting off the caller.
+			active, missing := observeChildren(wl, tc.children)
+			if _, err := r.rollup(context.Background(), wl, active, missing); err != nil {
+				t.Fatalf("rollup: %v", err)
+			}
+			cond := dispatched(wl)
+			if cond == nil {
+				t.Fatal("Dispatched condition not emitted")
+			}
+			if cond.Reason != tc.wantReason {
+				t.Errorf("Reason = %q, want %q", cond.Reason, tc.wantReason)
+			}
+			if tc.wantMissing != "" && !strings.Contains(cond.Message, tc.wantMissing) {
+				t.Errorf("message does not name the missing child %q: %q", tc.wantMissing, cond.Message)
+			}
+			if tc.wantAbsent != "" && strings.Contains(cond.Message, tc.wantAbsent) {
+				t.Errorf("message names %q, which is alive in the cluster: %q", tc.wantAbsent, cond.Message)
+			}
+			if wl.Status.Phase == foremanv1alpha1.WorkloadPhaseFailed {
+				t.Errorf("phase = %q, want not Failed", wl.Status.Phase)
+			}
+		})
 	}
 }
