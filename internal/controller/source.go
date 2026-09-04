@@ -284,10 +284,22 @@ func hfURLPathSegments(source string) (segments []string, ok bool) {
 	} else {
 		return nil, false
 	}
+	// Fold ONLY the host, up to the first slash: the host is case-insensitive
+	// per RFC 3986 but the repo path is not, so Qwen/Qwen3-8B must keep its
+	// capital Q. Folding has to happen before the www. trim, or an uppercase
+	// label survives and the match below fails.
+	//
+	// This has to agree with isHuggingFaceURL. When it did not, an uppercase
+	// host classified as a Hugging Face URL there and as nothing here, leaving
+	// a source that was neither an HF repo nor a plain remote HTTP file, which
+	// no branch in the Model controller's classifier handles.
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest = strings.ToLower(rest[:i]) + rest[i:]
+	}
 	rest = strings.TrimPrefix(rest, "www.")
-	// "huggingface.co/" is 15 bytes in any case, so slicing by the literal
-	// length is safe after a case-insensitive prefix check.
-	if !strings.HasPrefix(strings.ToLower(rest), "huggingface.co/") {
+	// "huggingface.co/" is 15 bytes in any case, and the host is folded above,
+	// so slicing by the literal length is safe.
+	if !strings.HasPrefix(rest, "huggingface.co/") {
 		return nil, false
 	}
 	rest = rest[len("huggingface.co/"):]

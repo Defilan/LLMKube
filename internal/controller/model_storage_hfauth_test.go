@@ -45,6 +45,45 @@ func TestIsHFAuthSource(t *testing.T) {
 	}
 }
 
+// The host predicates must agree on every input, because each HF branch gates
+// on isHuggingFaceURL and then calls through to hfURLPathSegments. When they
+// disagreed, an uppercase host was a Hugging Face URL to the first and not a
+// Hugging Face URL to the second, producing a source that is neither an HF repo
+// nor a plain remote HTTP file, a combination the Model controller's classifier
+// has no case for. Nothing failed when they drifted, which is why this exists.
+func TestHFHostPredicatesAgree(t *testing.T) {
+	sources := []string{
+		"https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model.gguf",
+		"https://www.huggingface.co/Qwen/Qwen3-8B/resolve/main/model.gguf",
+		"https://WWW.HuggingFace.co/Qwen/Qwen3-8B/resolve/main/model.gguf",
+		"https://HUGGINGFACE.CO/Qwen/Qwen3-8B/resolve/main/model.gguf",
+		"http://huggingface.co/Qwen/Qwen3-8B/resolve/main/model.gguf",
+		"https://huggingface.co.evil.example/Qwen/Qwen3-8B/model.gguf",
+		"https://cdn.example.com/model.gguf",
+		"s3://models/Qwen/model.gguf",
+		"",
+	}
+	for _, src := range sources {
+		_, segOK := hfURLPathSegments(src)
+		if got := isHuggingFaceURL(src); got != segOK {
+			t.Errorf("%q: isHuggingFaceURL=%v but hfURLPathSegments ok=%v; the two must agree",
+				src, got, segOK)
+		}
+	}
+}
+
+// The repo path is case-sensitive even though the host is not, so folding the
+// host must not reach the path.
+func TestHFPathSegmentsPreserveCase(t *testing.T) {
+	segs, ok := hfURLPathSegments("https://WWW.HuggingFace.co/Qwen/Qwen3-8B/resolve/main/model.gguf")
+	if !ok {
+		t.Fatal("uppercase host rejected")
+	}
+	if len(segs) < 2 || segs[0] != "Qwen" || segs[1] != "Qwen3-8B" {
+		t.Errorf("repo case not preserved: %v", segs)
+	}
+}
+
 // authHeader is the exact text a gated fetch must carry. Asserting the whole
 // string rather than a substring keeps a malformed header (a missing space
 // after "Bearer", say) from passing.
