@@ -23,6 +23,9 @@ func TestIsHFAuthSource(t *testing.T) {
 		{"resolved https url", "https://huggingface.co/org/repo/resolve/main/model.gguf", true},
 		{"host case folded", "https://HuggingFace.CO/org/repo/resolve/main/model.gguf", true},
 		{"www prefix", "https://www.huggingface.co/org/repo/resolve/main/model.gguf", true},
+		// The host is case-insensitive per RFC 3986, including the www. label.
+		// Folding after the trim left this false and downloaded unauthenticated.
+		{"www prefix upper", "https://WWW.HuggingFace.co/org/repo/resolve/main/model.gguf", true},
 		// The gate exists to keep the token off other hosts. A lookalike host is
 		// the case that matters: a prefix match on "huggingface.co" without the
 		// trailing slash would leak the token to an attacker-controlled domain.

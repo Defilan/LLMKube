@@ -100,22 +100,34 @@ func parseS3Source(source string) (bucket, key string, err error) {
 	return bucket, key, nil
 }
 
-// isHFAuthSource reports whether a bearer token should be attached to this
-// source. Mirrors the controller's isHFAuthSource
-// (internal/controller/source.go) so the metal path and the init container
-// agree on which hosts get the token: hf://, which the agent resolves to
-// huggingface.co, and a literal huggingface.co URL. Nothing else, so a Model
-// pointing elsewhere never receives the credential (#1750).
-func isHFAuthSource(source string) bool {
-	if strings.HasPrefix(strings.ToLower(source), "hf://") {
-		return true
-	}
+// isHFAuthHost reports whether a bearer token should be attached to this
+// source on the metal path.
+//
+// Deliberately narrower than the controller's isHFAuthSource
+// (internal/controller/source.go), which also accepts hf://. The metal
+// downloader hands the source straight to http.NewRequestWithContext, and
+// nothing here rewrites hf:// the way the init container's
+// normalize_hf_source does in the shell, so an hf:// Model on a Metal agent
+// fails with `unsupported protocol scheme "hf"` before any credential is
+// consulted. Claiming to authenticate a scheme this path cannot fetch would
+// describe a step that does not exist. That gap predates this change and is
+// tracked as #1759; TestDownloadFile_HFSchemeUnsupported pins the current
+// behaviour so a future fix has to update this comment too.
+//
+// The two predicates are therefore intentionally different rather than a
+// copy that might drift: this one answers "can the metal downloader reach
+// this host", the controller's answers "will the init container".
+func isHFAuthHost(source string) bool {
 	rest := source
 	for _, scheme := range []string{"https://", "http://"} {
 		if len(rest) >= len(scheme) && strings.EqualFold(rest[:len(scheme)], scheme) {
 			rest = rest[len(scheme):]
+			// Host is case-insensitive per RFC 3986, so fold BEFORE trimming
+			// the www. label: trimming first leaves "WWW.huggingface.co"
+			// intact and the match fails, downloading unauthenticated.
+			rest = strings.ToLower(rest)
 			rest = strings.TrimPrefix(rest, "www.")
-			return strings.HasPrefix(strings.ToLower(rest), "huggingface.co/")
+			return strings.HasPrefix(rest, "huggingface.co/")
 		}
 	}
 	return false

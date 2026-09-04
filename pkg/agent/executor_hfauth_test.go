@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
@@ -100,24 +101,46 @@ func TestDownloadFile_TokenNotForwardedAcrossHosts(t *testing.T) {
 	}
 }
 
-func TestIsHFAuthSource_Agent(t *testing.T) {
+// hf:// is NOT in this table. The metal downloader cannot fetch that scheme at
+// all, so a predicate that accepted it would be authenticating a request that
+// never gets made; TestDownloadFile_HFSchemeUnsupported pins that instead.
+func TestIsHFAuthHost(t *testing.T) {
 	tests := []struct {
 		source string
 		want   bool
 	}{
-		{"hf://meta-llama/Llama-Guard-4-12B", true},
-		{"HF://meta-llama/Llama-Guard-4-12B", true},
 		{"https://huggingface.co/org/repo/resolve/main/m.gguf", true},
 		{"https://HuggingFace.CO/org/repo/resolve/main/m.gguf", true},
 		{"https://www.huggingface.co/org/repo/resolve/main/m.gguf", true},
+		{"https://WWW.HuggingFace.co/org/repo/resolve/main/m.gguf", true},
+		{"http://huggingface.co/org/repo/resolve/main/m.gguf", true},
 		{"https://huggingface.co.evil.example/org/repo/m.gguf", false},
+		{"https://nothuggingface.co/org/repo/m.gguf", false},
 		{"https://cdn.example.com/m.gguf", false},
+		{"hf://meta-llama/Llama-Guard-4-12B", false},
 		{"s3://models/org/repo/m.gguf", false},
 		{"", false},
 	}
 	for _, tc := range tests {
-		if got := isHFAuthSource(tc.source); got != tc.want {
-			t.Errorf("isHFAuthSource(%q) = %v, want %v", tc.source, got, tc.want)
+		if got := isHFAuthHost(tc.source); got != tc.want {
+			t.Errorf("isHFAuthHost(%q) = %v, want %v", tc.source, got, tc.want)
 		}
+	}
+}
+
+// The metal path cannot fetch hf:// today: nothing here rewrites it to a
+// resolve URL the way the init container's normalize_hf_source does, so the
+// request fails on the scheme long before a token would matter. Pinned so the
+// gap is visible and a future fix has to come through this test.
+func TestDownloadFile_HFSchemeUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	err := hfTestExecutor(t, dir).downloadFile(
+		t.Context(), "hf://meta-llama/Llama-Guard-4-12B", filepath.Join(dir, "m.gguf"), "tok")
+	if err == nil {
+		t.Fatal("hf:// unexpectedly succeeded; if the metal path learned to resolve it, " +
+			"isHFAuthHost should accept hf:// too and this test should change")
+	}
+	if !strings.Contains(err.Error(), "unsupported protocol scheme") {
+		t.Errorf("want an unsupported-scheme error, got: %v", err)
 	}
 }

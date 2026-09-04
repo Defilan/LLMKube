@@ -246,10 +246,15 @@ func isHuggingFaceURL(source string) bool {
 	} else {
 		rest = rest[len("http://"):]
 	}
-	rest = strings.TrimPrefix(rest, "www.")
 	// Host is case-insensitive per RFC 3986; the repo path is not (Qwen/... must
-	// keep its case), so only lower-case for the host comparison.
-	return strings.HasPrefix(strings.ToLower(rest), "huggingface.co/")
+	// keep its case), so only lower-case for the host comparison. Fold BEFORE
+	// trimming the www. label: trimming first leaves "WWW.huggingface.co"
+	// untouched and the match fails, which for the auth gate means downloading
+	// unauthenticated rather than sending the token. It fails safe, but the code
+	// disagreed with this comment.
+	rest = strings.ToLower(rest)
+	rest = strings.TrimPrefix(rest, "www.")
+	return strings.HasPrefix(rest, "huggingface.co/")
 }
 
 // isHFAuthSource reports whether the operator's own downloads for this source

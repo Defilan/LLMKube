@@ -349,7 +349,7 @@ func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string,
 	// Read from the same sourceSecretRef the S3 path uses, and attached only for
 	// huggingface.co so a Model pointing at another host never sees it.
 	var token string
-	if isHFAuthSource(source) && secretRef != nil {
+	if isHFAuthHost(source) && secretRef != nil {
 		token = e.resolveHFToken(ctx, secretRef.Name)
 	}
 	return e.downloadFile(ctx, source, filePath, token)
