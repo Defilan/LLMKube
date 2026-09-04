@@ -23,7 +23,7 @@ written down anywhere you can copy.
 
 | Build | Hardware | Model | Shape |
 | --- | --- | --- | --- |
-| [DeepSeek V4 Flash Vision on two DGX Sparks](deepseek-v4-flash-two-sparks) | 2x GB10, 200 Gb RoCE | DeepSeek-V4-Flash-Vision-Exp | vLLM, TP2 + expert parallel, speculative decoding |
+| [DeepSeek V4 Flash Vision on two DGX Sparks](/docs/labs/deepseek-v4-flash-two-sparks) | 2x GB10, 200 Gb RoCE | DeepSeek-V4-Flash-Vision-Exp | vLLM, TP2 + expert parallel, speculative decoding |
 
 ## What a build page contains
 
