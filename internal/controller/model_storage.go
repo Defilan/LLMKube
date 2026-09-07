@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -306,24 +308,30 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // --location-trusted must NOT be added here.
 const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authorization: Bearer ${HF_TOKEN}" "$@"; else curl "$@"; fi; }` + " && "
 
-// All transfers write to "$MODEL_PATH.tmp" and mv onto "$MODEL_PATH" on
+// All transfers publish via a partial file and mv onto "$MODEL_PATH" on
 // success: the guard is a bare existence check, so publishing the file
 // non-atomically would let an interrupted transfer (OOM-kill, eviction,
 // node reboot) leave a truncated artifact that every subsequent restart
-// treats as cached. See remoteRevalidateScript for the same pattern.
+// treats as cached. The non-S3 HTTP transfers write into "$MODEL_PARTIAL", a
+// source-keyed partial that survives the keep-one sweep so an interrupted
+// download can resume into it with curl -C - (#1765); the S3 and local-copy
+// branches still write to "$MODEL_PATH.tmp". See remoteRevalidateScript for
+// the same pattern.
 func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy string) string {
 	if useCache {
 		if isLocal {
-			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model copied successfully'; else echo 'Model already cached, skipping copy'; fi`
+			return `mkdir -p "$CACHE_DIR" && ` + partialSweep() +
+				`if [ ! -f "$MODEL_PATH" ]; then echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model copied successfully'; else echo 'Model already cached, skipping copy'; fi`
 		}
 		if isS3 {
-			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+			return `mkdir -p "$CACHE_DIR" && ` + partialSweep() +
+				`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
-			return "mkdir -p \"$CACHE_DIR\" && rm -f \"$MODEL_PATH.tmp\" && " + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
+			return "mkdir -p \"$CACHE_DIR\" && " + partialSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 		}
-		return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + hfAuthPrefix(isHFAuth) +
-			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+		return `mkdir -p "$CACHE_DIR" && ` + partialSweep() + hfAuthPrefix(isHFAuth) +
+			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 	}
 
 	if isLocal {
@@ -336,7 +344,7 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 		return hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 	}
 	return hfAuthPrefix(isHFAuth) +
-		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -380,7 +388,7 @@ func remoteRevalidateScript(isHFAuth bool) string {
 		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 		`echo 'Model revalidated (unchanged, skipped download)'; ` +
 		`else ` +
-		`if ` + c + ` -fsSL -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"; then ` +
+		`if ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH"; then ` +
 		`echo 'Model revalidated (downloaded)'; ` +
 		`elif [ -f "$MODEL_PATH" ]; then echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
 		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
@@ -404,11 +412,32 @@ func hfAuthPrefix(isHFAuth bool) string {
 	return ""
 }
 
+// partialSweep is the shell fragment that removes every orphaned download
+// partial in the cache dir except the one for the transfer about to be
+// retried. It replaces the historical unconditional `rm -f "$MODEL_PATH.tmp"`:
+// a source-keyed partial named after the current transfer survives so an
+// interrupted download can resume into it (#1765), while every other *.tmp is
+// still swept on each attempt, preserving the #1435 guarantee that debris does
+// not accumulate on the shared cache PVC.
+func partialSweep() string {
+	return `find "$CACHE_DIR" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete && `
+}
+
+// modelPartialPath names the source-keyed download partial for a transfer:
+// "<modelPath>.<first 12 hex of sha256(normalizeHFSource(source))>.tmp". It is
+// deterministic for a given source, so a retry of the same transfer finds its
+// own partial and a different source can never resume into it (#1765).
+func modelPartialPath(source, modelPath string) string {
+	sum := sha256.Sum256([]byte(normalizeHFSource(source)))
+	return modelPath + "." + hex.EncodeToString(sum[:])[:12] + ".tmp"
+}
+
 func modelInitEnvVars(source, cacheDir, modelPath string) []corev1.EnvVar {
 	envs := []corev1.EnvVar{
 		{Name: "MODEL_SOURCE", Value: source},
 		{Name: "CACHE_DIR", Value: cacheDir},
 		{Name: "MODEL_PATH", Value: modelPath},
+		{Name: "MODEL_PARTIAL", Value: modelPartialPath(source, modelPath)},
 	}
 	if isS3Source(source) {
 		bucket, key, err := parseS3Source(source)

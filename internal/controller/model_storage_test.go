@@ -52,7 +52,7 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 	It("should NOT emit --aws-sigv4 for non-s3 source", func() {
 		cmd := buildModelInitCommand(false, false, true, false, "")
 		Expect(cmd).ToNot(ContainSubstring("aws-sigv4"))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"`))
+		Expect(cmd).To(ContainSubstring(`curl -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
 	})
 
 	// A truncated transfer must never be published at $MODEL_PATH: the guard
@@ -81,45 +81,125 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 
 // Issue #1435: interrupted transfers leave orphaned .tmp files that nothing
 // cleans up. The init command must remove stale .tmp files before starting a
-// new download so they do not accumulate on the shared cache PVC.
+// new download so they do not accumulate on the shared cache PVC. The sweep is
+// keep-one (#1765): every .tmp except the current transfer's source-keyed
+// partial is removed, so resumable progress survives while debris is still
+// swept.
 var _ = Describe("buildModelInitCommand (orphan .tmp cleanup, #1435)", func() {
-	It("should remove stale .tmp before downloading in cached remote path", func() {
+	It("should sweep stale .tmp but keep the current partial in cached remote path", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached S3 path", func() {
+	It("should sweep stale .tmp but keep the current partial in cached S3 path", func() {
 		cmd := buildModelInitCommand(false, true, true, false, RefreshPolicyIfNotPresent)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached local path", func() {
+	It("should sweep stale .tmp but keep the current partial in cached local path", func() {
 		cmd := buildModelInitCommand(true, false, true, false, RefreshPolicyIfNotPresent)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached OnChange path", func() {
+	It("should sweep stale .tmp but keep the current partial in cached OnChange path", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete`))
+	})
+})
+
+// Issue #1765: an interrupted single-file download must resume from where it
+// stopped. The non-S3 HTTP transfers write into "$MODEL_PARTIAL" (a
+// source-keyed partial that survives the sweep) with `-C -`, and mv onto
+// "$MODEL_PATH" on success. S3 and the local cp branch keep their current
+// behaviour.
+var _ = Describe("buildModelInitCommand (resume into source-keyed partial, #1765)", func() {
+	It("cached HTTP download resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("uncached HTTP download resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("cached OnChange revalidate transfer resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("uncached OnChange revalidate transfer resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("s3 branches carry no -C - and still write to MODEL_PATH.tmp", func() {
+		for _, useCache := range []bool{true, false} {
+			cmd := buildModelInitCommand(false, true, useCache, false, RefreshPolicyIfNotPresent)
+			Expect(cmd).ToNot(ContainSubstring("-C -"))
+			Expect(cmd).To(ContainSubstring(`-o "$MODEL_PATH.tmp"`))
+			Expect(cmd).To(ContainSubstring(`mv "$MODEL_PATH.tmp" "$MODEL_PATH"`))
+		}
+	})
+
+	It("local cp branch carries no -C -", func() {
+		cmd := buildModelInitCommand(true, false, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).ToNot(ContainSubstring("-C -"))
+		Expect(cmd).To(ContainSubstring(`cp /host-model/model.gguf "$MODEL_PATH.tmp"`))
 	})
 })
 
 var _ = Describe("modelInitEnvVars (s3)", func() {
 	It("should include S3_BUCKET and S3_KEY for s3 source", func() {
 		envs := modelInitEnvVars("s3://my-bucket/models/model.gguf", "/models/cache", "/models/cache/model.gguf")
-		Expect(envs).To(HaveLen(5))
+		Expect(envs).To(HaveLen(6))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "S3_BUCKET", Value: "my-bucket"}))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "S3_KEY", Value: "models/model.gguf"}))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MODEL_SOURCE", Value: "s3://my-bucket/models/model.gguf"}))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "CACHE_DIR", Value: "/models/cache"}))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MODEL_PATH", Value: "/models/cache/model.gguf"}))
+		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MODEL_PARTIAL", Value: modelPartialPath("s3://my-bucket/models/model.gguf", "/models/cache/model.gguf")}))
 	})
 
 	It("should NOT include S3_BUCKET and S3_KEY for non-s3 source", func() {
 		envs := modelInitEnvVars("https://example.com/model.gguf", "/models/cache", "/models/cache/model.gguf")
-		Expect(envs).To(HaveLen(3))
+		Expect(envs).To(HaveLen(4))
 		Expect(envs).ToNot(ContainElement(corev1.EnvVar{Name: "S3_BUCKET"}))
 		Expect(envs).ToNot(ContainElement(corev1.EnvVar{Name: "S3_KEY"}))
+	})
+})
+
+// Issue #1765: MODEL_PARTIAL keys the resumable partial to the resolved
+// source. It must be deterministic for a given source so a retry resumes into
+// its own partial, and must differ for a different source so a re-pointed
+// source can never resume into a stale one.
+var _ = Describe("modelPartialPath (source-keyed partial, #1765)", func() {
+	It("is stable for the same source and differs for a different source", func() {
+		modelPath := "/models/cache/model.gguf"
+		a := modelPartialPath("https://huggingface.co/org/repo/resolve/main/model.gguf", modelPath)
+		b := modelPartialPath("https://huggingface.co/org/repo/resolve/main/model.gguf", modelPath)
+		Expect(a).To(Equal(b))
+		Expect(a).To(HaveSuffix(".tmp"))
+		Expect(a).To(HavePrefix(modelPath + "."))
+		Expect(a).To(HaveLen(len(modelPath) + 1 + 12 + len(".tmp")))
+
+		different := modelPartialPath("https://example.com/other.gguf", modelPath)
+		Expect(different).ToNot(Equal(a))
+	})
+
+	It("normalizes hf:// and https resolve URLs to the same digest", func() {
+		modelPath := "/models/cache/model.gguf"
+		fromScheme := modelPartialPath("hf://org/repo", modelPath)
+		fromURL := modelPartialPath("https://huggingface.co/org/repo/resolve/main/", modelPath)
+		Expect(fromScheme).To(Equal(fromURL))
 	})
 })
 

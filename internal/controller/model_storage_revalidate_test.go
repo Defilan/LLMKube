@@ -85,6 +85,7 @@ func TestRemoteRevalidateScript_Behavioral(t *testing.T) {
 		cmd.Env = append(os.Environ(),
 			"MODEL_SOURCE="+srv.URL+"/model.gguf",
 			"MODEL_PATH="+modelPath,
+			"MODEL_PARTIAL="+modelPath+".deadbeef.tmp",
 		)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
