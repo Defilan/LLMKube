@@ -26,6 +26,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -382,22 +383,79 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 	}
 
 	e.logger.Infow("downloading model from S3", "bucket", bucket, "destination", filePath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
+	// Resume (#1762): a .partial left by an interrupted attempt continues with
+	// a Range request. S3 and S3-compatible stores honor single-range GETs with
+	// 206, so this works out of the box; the sigv4 signature covers the added
+	// header because it is set before signing. The resume HEAD is sent unsigned
+	// for simplicity (S3 rejects it without creds, which resumeGuard treats as
+	// "unknown size", under-resuming to a clean restart at worst).
+	have := resumeGuard(ctx, httpClient, objectURL, filePath)
+	newReq := func(rangeStart int64) (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if rangeStart > 0 {
+			r.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeStart))
+		}
+		return r, nil
+	}
+
+	req, err := newReq(have)
 	if err != nil {
 		return err
 	}
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
+	// A beyond-end range (416, e.g. the object was re-pointed to something
+	// smaller) restarts clean: drop the partial and re-request without Range.
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && have > 0 {
+		_ = resp.Body.Close()
+		have = 0
+		_ = os.Remove(filePath + ".partial")
+		req, err = newReq(0)
+		if err != nil {
+			return err
+		}
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("s3 GET %s: %s", objectURL, resp.Status)
+	if resp.StatusCode == http.StatusOK {
+		if have > 0 {
+			// The range was ignored. The body restarts from byte zero, but its
+			// Content-Length may or may not reveal it: a lying gateway can
+			// serve a truncated 200. Decide by size: if the 200 is the full
+			// object the partial is redundant and the fresh path republishes;
+			// if it is short of the partial the response is not trustworthy
+			// and nothing may be published (#1309's invariant).
+			switch {
+			case resp.ContentLength >= 0 && resp.ContentLength <= have:
+				_ = os.Remove(filePath + ".partial")
+				return fmt.Errorf("s3 GET %s: range ignored, %d-byte 200 shorter than the %d bytes already downloaded",
+					objectURL, resp.ContentLength, have)
+			case resp.ContentLength > have:
+				_ = os.Remove(filePath + ".partial")
+			default: // size unknown: cannot trust an append onto the partial
+				_ = os.Remove(filePath + ".partial")
+			}
+		}
+		return e.copyToFile(filePath, resp.Body, resp.ContentLength)
 	}
-
-	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
+	if resp.StatusCode == http.StatusPartialContent {
+		ok, total := rangeResponseOK(resp, have)
+		if !ok {
+			return fmt.Errorf("s3 GET %s: unusable 206 continuation (Content-Range %q)",
+				objectURL, resp.Header.Get("Content-Range"))
+		}
+		return e.copyToFileFrom(filePath, resp.Body, have, total)
+	}
+	return fmt.Errorf("s3 GET %s: %s", objectURL, resp.Status)
 }
 
 // downloadFile fetches url into filePath. token, when non-empty, is sent as a
@@ -413,27 +471,88 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 // which is also why huggingface_hub does not send it there. hfRedirectStripper
 // therefore drops the header on ANY change of host.
 func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
+	// Resume (#1762): a .partial left by an interrupted attempt continues with
+	// a Range request. The bearer token rides on the ranged request (and on the
+	// resume HEAD) to the first hop only, exactly as on a fresh transfer;
+	// hfRedirectStripper keeps stripping it across the CDN host change, so the
+	// range request that gets redirected to a fresh signed CDN URL carries no
+	// credential onward. A server that ignores the range (a 200 for a
+	// conditional GET) restarts the body from zero, so the partial is discarded
+	// rather than appended.
 	httpClient := http.DefaultClient
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
 		httpClient = hfRedirectStripper()
 	}
 
+	have := resumeGuard(ctx, httpClient, url, filePath)
+	newReq := func(rangeStart int64) (*http.Request, error) {
+		r, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if rangeStart > 0 {
+			r.Header.Set("Range", fmt.Sprintf("bytes=%d-", rangeStart))
+		}
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		return r, nil
+	}
+
+	req, err := newReq(have)
+	if err != nil {
+		return err
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
+	// A beyond-end range (416, e.g. the source was re-pointed to a smaller
+	// file) restarts clean.
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && have > 0 {
+		_ = resp.Body.Close()
+		have = 0
+		_ = os.Remove(filePath + ".partial")
+		req, err = newReq(0)
+		if err != nil {
+			return err
+		}
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
+	if resp.StatusCode == http.StatusOK {
+		if have > 0 {
+			// The range was ignored. The body restarts from byte zero, but its
+			// Content-Length may or may not reveal it: a lying gateway can
+			// serve a truncated 200. Decide by size: if the 200 is the full
+			// object the partial is redundant and the fresh path republishes;
+			// if it is short of the partial the response is not trustworthy
+			// and nothing may be published (#1309's invariant).
+			switch {
+			case resp.ContentLength >= 0 && resp.ContentLength <= have:
+				_ = os.Remove(filePath + ".partial")
+				return fmt.Errorf("GET %s: range ignored, %d-byte 200 shorter than the %d bytes already downloaded",
+					url, resp.ContentLength, have)
+			case resp.ContentLength > have:
+				_ = os.Remove(filePath + ".partial")
+			default: // size unknown: cannot trust an append onto the partial
+				_ = os.Remove(filePath + ".partial")
+			}
+		}
+		return e.copyToFile(filePath, resp.Body, resp.ContentLength)
 	}
-
-	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
+	if resp.StatusCode == http.StatusPartialContent {
+		ok, total := rangeResponseOK(resp, have)
+		if !ok {
+			return fmt.Errorf("bad continuation: %s (Content-Range %q)", resp.Status, resp.Header.Get("Content-Range"))
+		}
+		return e.copyToFileFrom(filePath, resp.Body, have, total)
+	}
+	return fmt.Errorf("bad status: %s", resp.Status)
 }
 
 // hfRedirectStripper returns a client that removes the Authorization header
@@ -454,12 +573,181 @@ func hfRedirectStripper() *http.Client {
 	return &c
 }
 
+// resumeGuard inspects an existing .partial for filePath and decides whether
+// the next attempt can continue it (#1762). It mirrors the controller-side
+// resumeSetup guard (internal/controller/model_storage.go): a change to either
+// side's resume semantics should be reflected in the other.
+//
+// Returns the number of bytes the next attempt may resume from, or 0 to mean
+// "start clean" (the .partial is dropped in that case). Two cases must not be
+// resumed, both because a bad resume can publish a corrupt artifact:
+//   - a zero-byte partial, which would ask for "Range: bytes=0-" for no gain;
+//   - a partial already at or past the current remote size: appending a body
+//     that is really the full object from byte zero would publish a doubled
+//     file with a perfectly consistent total check, and no post-write byte
+//     count can detect it. A partial larger than the remote (the source was
+//     re-pointed to something smaller mid-transfer) cannot be resumed either.
+//
+// The remote size is discovered by a HEAD (same client, so an HF bearer token
+// is offered exactly where a fresh transfer would offer it). Go's http client
+// has no curl-style resume, so unlike the controller side (where curl itself
+// rejects a mismatched resume), the agent must know the size BEFORE sending a
+// conditional GET. The probe's failure modes are all fail-safe: any error or
+// missing size means "unknown", which keeps the partial (a fresh interrupted
+// transfer can only be shorter than the object, so a resumed append is
+// verified by the total check on the 206; a re-pointed larger object can only
+// under-resume). The one case this cannot protect is a byte-exhausted partial
+// against a source re-pointed to a larger same-size-prefix object; the
+// controller's OnChange revalidation is the line of defense there.
+func resumeGuard(ctx context.Context, hc *http.Client, url, filePath string) int64 {
+	tmpPath := filePath + ".partial"
+	info, err := os.Stat(tmpPath)
+	if err != nil {
+		return 0
+	}
+	if info.Size() == 0 {
+		_ = os.Remove(tmpPath)
+		return 0
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return 0
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = resp.Body.Close() }()
+	// A redirect answers 200 only after following; a bare 3xx or any error
+	// status is "unknown".
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return 0
+	}
+	if resp.ContentLength > 0 && info.Size() >= resp.ContentLength {
+		_ = os.Remove(tmpPath)
+		return 0
+	}
+	return info.Size()
+}
+
+// copyToFileFrom streams r into filePath as a continuation of an existing
+// haveBytes of the .partial, completing copyToFile's atomic-publish contract
+// for resumed transfers. total is the object's full size (206 Content-Range
+// total, or 200 Content-Length), or <0 / absent when unknown.
+//
+// The final integrity check is total-based: it requires the .partial to be
+// exactly haveBytes + received == total. This is strictly stronger than the
+// written-vs-Content-Length check on a fresh transfer, and it is load-bearing
+// for resume: a broken gateway can answer a ranged GET with a 200 carrying a
+// truncated body and an internally-consistent (wrong) Content-Length, which
+// the weaker check would accept and publish corrupt. With the total in hand
+// the shortfall is caught and the .partial deleted, so the next attempt
+// retries and no corrupt file is ever cached (the #1309/#1432 invariant). When
+// total is unknown (chunked/absent), the check degrades to the fresh-transfer
+// behavior: any bytes already in the .partial are trusted, matching what curl
+// -C - can do against such a server.
+func (e *MetalExecutor) copyToFileFrom(filePath string, r io.Reader, haveBytes, total int64) error {
+	tmpPath := filePath + ".partial"
+
+	out, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	errCopy := func() error {
+		written, cerr := io.Copy(out, r)
+		if cerr != nil {
+			_ = out.Close()
+			_ = os.Remove(tmpPath)
+			return cerr
+		}
+		if total >= 0 && haveBytes+written != total {
+			_ = out.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("download truncated: expected %d bytes, got %d", total, haveBytes+written)
+		}
+		if cerr := out.Close(); cerr != nil {
+			_ = os.Remove(tmpPath)
+			return cerr
+		}
+		return nil
+	}()
+	if errCopy != nil {
+		return errCopy
+	}
+
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename downloaded model: %w", err)
+	}
+	return nil
+}
+
+// rangeResponseOK validates that resp is a usable continuation of a
+// Range: bytes=have- request. The second return value is the authoritative
+// full size to feed copyToFileFrom.
+//
+//	206: the range was honored. Content-Range's total is taken as authoritative
+//	   and must be >= have, and the range start must equal have; a mismatch
+//	   means the server is not a reliable continuation source.
+//	200: the server ignored the range and is sending the whole object from byte
+//	   zero. Continuing would double the bytes, so this is rejected and the
+//	   caller restarts clean.
+func rangeResponseOK(resp *http.Response, have int64) (bool, int64) {
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		start, end, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if !ok || start != have || end != total-1 || total < have {
+			return false, 0
+		}
+		return true, total
+	case http.StatusOK:
+		// Server ignored the range: it is restarting the body from zero, which
+		// must not be appended. Restart clean.
+		return false, 0
+	default:
+		return false, 0
+	}
+}
+
+// parseContentRange parses the "bytes start-end/total" form of a Content-Range
+// header. A "*" total (unknown) is not usable for the integrity check and is
+// reported as not ok.
+func parseContentRange(v string) (start, end, total int64, ok bool) {
+	// "bytes 0-499/1234"
+	if !strings.HasPrefix(v, "bytes ") {
+		return 0, 0, 0, false
+	}
+	rest := strings.TrimPrefix(v, "bytes ")
+	slash := strings.IndexByte(rest, '/')
+	if slash < 0 {
+		return 0, 0, 0, false
+	}
+	pair, totalStr := rest[:slash], rest[slash+1:]
+	if totalStr == "*" {
+		return 0, 0, 0, false
+	}
+	dash := strings.IndexByte(pair, '-')
+	if dash < 0 {
+		return 0, 0, 0, false
+	}
+	s, err1 := strconv.ParseInt(pair[:dash], 10, 64)
+	en, err2 := strconv.ParseInt(pair[dash+1:], 10, 64)
+	t, err3 := strconv.ParseInt(totalStr, 10, 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return 0, 0, 0, false
+	}
+	return s, en, t, true
+}
+
 // copyToFile streams r into filePath atomically: it writes to a ".partial"
 // file first and renames it into place only on success, so an interrupted
 // transfer (connection drop, mid-download error) never leaves a truncated
 // model that the stat check in ensureModel would treat as cached. When
 // contentLength > 0 it verifies the byte count matches, so a connection drop
 // mid-download doesn't leave a truncated model that passes the stat check.
+//
+// This is the fresh-transfer (no resume) path: it always starts the .partial
+// from zero. Resumed transfers go through copyToFileFrom.
 func (e *MetalExecutor) copyToFile(filePath string, r io.Reader, contentLength int64) error {
 	tmpPath := filePath + ".partial"
 
