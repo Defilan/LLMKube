@@ -224,3 +224,106 @@ func TestFindTemplate_MultiTemplateDir(t *testing.T) {
 		}
 	})
 }
+
+// TestDescriptionBody is the #1768 renderer contract: a description an agent
+// authored is posted as-is, without the repository template prepended, with
+// the issue link added only when the author did not write one, and always
+// with the provenance line.
+func TestDescriptionBody(t *testing.T) {
+	const provenance = "_Opened by foreman on review GO (workload wl-x)._"
+	cases := []struct {
+		name    string
+		desc    string
+		issue   int32
+		wantIn  []string
+		wantOut []string
+	}{
+		{
+			// A multi-slice issue must survive its first slice: the
+			// coder wrote Refs deliberately, so no Fixes may be added.
+			name:    "desc already referencing the issue gets no Fixes line",
+			desc:    "## What\n\nResumes the local slice.\n\nRefs #7",
+			wantIn:  []string{"## What", "Refs #7"},
+			wantOut: []string{"Fixes #7"},
+		},
+		{
+			name:   "desc without the issue reference gets Fixes appended",
+			desc:   "## What\n\nFixes the SSO error path.",
+			wantIn: []string{"## What", "Fixes #7"},
+		},
+		{
+			name:    "surrounding whitespace is trimmed",
+			desc:    "\n\n  Trimmed description.  \n\n",
+			wantIn:  []string{"Trimmed description.", "Fixes #7"},
+			wantOut: []string{"\n\n\n"},
+		},
+		{
+			name:   "empty description still links the issue",
+			desc:   "",
+			wantIn: []string{"Fixes #7"},
+		},
+		{
+			// The reference match is digit-bounded: a body citing a
+			// sibling issue must not suppress this issue's Fixes line,
+			// or this PR would never auto-close its own issue (#1768
+			// revision).
+			name:    "a longer sibling reference does not suppress the Fixes line",
+			desc:    "## What\n\nFollows up on #1768.",
+			issue:   176,
+			wantIn:  []string{"Fixes #176"},
+			wantOut: nil,
+		},
+		{
+			name:    "a shorter prefix-like reference does not suppress the Fixes line",
+			desc:    "## What\n\nSee #17680 for context.",
+			issue:   1768,
+			wantIn:  []string{"Fixes #1768"},
+			wantOut: nil,
+		},
+		{
+			name:    "an exact reference still suppresses the Fixes line",
+			desc:    "## What\n\nRefs #1768.",
+			issue:   1768,
+			wantIn:  []string{"Refs #1768."},
+			wantOut: []string{"Fixes #1768"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			issue := tc.issue
+			if issue == 0 {
+				issue = 7
+			}
+			got := DescriptionBody(tc.desc, issue, "wl-x")
+			for _, s := range tc.wantIn {
+				if !strings.Contains(got, s) {
+					t.Errorf("body must contain %q; got %q", s, got)
+				}
+			}
+			for _, s := range tc.wantOut {
+				if strings.Contains(got, s) {
+					t.Errorf("body must NOT contain %q; got %q", s, got)
+				}
+			}
+			if !strings.HasSuffix(got, provenance) {
+				t.Errorf("body must end with the provenance line %q; got %q", provenance, got)
+			}
+		})
+	}
+}
+
+// TestDescriptionBody_NeverCarriesTemplateText pins the difference from
+// PRBody that #1768 exists to create: the rendered description stands alone,
+// so the target repo's template scaffolding never reaches the PR.
+func TestDescriptionBody_NeverCarriesTemplateText(t *testing.T) {
+	const template = "## What this PR does\n<!-- Describe your change -->\n- [ ] AI assistance disclosed"
+	got := DescriptionBody("## What\n\nResumes a truncated download.\n", 7, "wl-x")
+	if strings.Contains(got, "Describe your change") ||
+		strings.Contains(got, "AI assistance disclosed") {
+		t.Errorf("DescriptionBody must not prepend template text; got %q", got)
+	}
+	withTemplate := PRBody(template, "Resumes a truncated download.", 7, "wl-x")
+	if !strings.Contains(withTemplate, "Describe your change") {
+		t.Errorf("PRBody must keep honouring the template; got %q", withTemplate)
+	}
+}

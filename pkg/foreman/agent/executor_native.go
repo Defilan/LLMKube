@@ -2150,7 +2150,27 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra,
+	// The coder is the stage that knows what the change does and is the
+	// stage prompted to write a PR description, so its own body wins when
+	// it authored one (#1768). Fall back to the reviewer's prBody, then to
+	// the grounded summary (today's path). The winner is carried in the
+	// summaryBody argument and a copy of the reviewer's extra, never in
+	// r.Extra itself: r.Extra is persisted as the *review* task's result,
+	// so writing the coder's body there would both claim the reviewer
+	// authored it and leave a stale body behind after a fix cycle.
+	extra := r.Extra
+	bodySource := "summary"
+	if coderBody := e.coderPRBody(ctx, task); coderBody != "" {
+		body = coderBody
+		extra = copyExtraWithPRBody(r.Extra, coderBody)
+		bodySource = "coder"
+		log.Info("PR body: using the coder's authored description",
+			"task", task.Name, "branch", task.Spec.Payload.Branch)
+	} else if pb, ok := r.Extra["prBody"].(string); ok && strings.TrimSpace(pb) != "" {
+		bodySource = "reviewer"
+	}
+	r.Extra["prBodySource"] = bodySource
+	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, extra,
 		openPRsAsDraft(agent), cloneURL)
 	if prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
@@ -2161,6 +2181,80 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 			"repo", task.Spec.Payload.Repo, "pr", prURL)
 		r.Extra["pullRequestURL"] = prURL
 	}
+}
+
+// copyExtraWithPRBody returns a shallow copy of extra carrying the coder's
+// PR description under "prBody" (#1768). openPullRequest renders a body that
+// arrives as a prBody without prepending the repository template, so the
+// coder's description has to travel in that slot — and a copy is what lets
+// it travel there without rewriting the reviewer's own result extra, which
+// is persisted as the review task's record.
+func copyExtraWithPRBody(extra map[string]any, prBody string) map[string]any {
+	out := make(map[string]any, len(extra)+1)
+	for k, v := range extra {
+		out[k] = v
+	}
+	out["prBody"] = prBody
+	return out
+}
+
+// coderPRBody returns the coder's authored PR description for the branch the
+// review task is on (#1768). When a Workload's PR opens on a reviewer GO the
+// body was composed from the *reviewer's* result, so the coder's complete
+// description — sitting in the code task's
+// extra.modelExtra.prBody, which submit_result passes through uncapped —
+// never reached GitHub and the PR shipped the repo's raw template (#1768).
+//
+// The lookup is best-effort and deliberately silent: a nil client (unit
+// tests, harnesses without an API reader), a list error, no matching code
+// task, a nil Result or malformed JSON all yield "" so the caller keeps
+// today's grounded-summary behaviour. Status.Result.Raw is decoded through
+// the same extra.modelExtra envelope the controller's inertDemotion reads.
+func (e *NativeAgentLoopExecutor) coderPRBody(
+	ctx context.Context, task *foremanv1alpha1.AgenticTask,
+) string {
+	if e.Client == nil {
+		return ""
+	}
+	workload := task.Labels["foreman.llmkube.dev/workload"]
+	if workload == "" || task.Spec.Payload.Branch == "" {
+		return ""
+	}
+	var tasks foremanv1alpha1.AgenticTaskList
+	if err := e.Client.List(ctx, &tasks,
+		client.InNamespace(task.Namespace),
+		client.MatchingLabels{"foreman.llmkube.dev/workload": workload},
+	); err != nil {
+		return ""
+	}
+	var newest *foremanv1alpha1.AgenticTask
+	for i := range tasks.Items {
+		c := &tasks.Items[i]
+		if c.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix ||
+			c.Spec.Payload.Branch != task.Spec.Payload.Branch {
+			continue
+		}
+		if newest == nil || c.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = c
+		}
+	}
+	if newest == nil || newest.Status.Result == nil ||
+		len(newest.Status.Result.Raw) == 0 {
+		return ""
+	}
+	var envelope struct {
+		Extra struct {
+			ModelExtra map[string]any `json:"modelExtra"`
+		} `json:"extra"`
+	}
+	if err := json.Unmarshal(newest.Status.Result.Raw, &envelope); err != nil {
+		return ""
+	}
+	if body, ok := envelope.Extra.ModelExtra["prBody"].(string); ok &&
+		strings.TrimSpace(body) != "" {
+		return body
+	}
+	return ""
 }
 
 // groundPRSummary cross-checks the summary that is about to become the PR
@@ -2320,15 +2414,27 @@ func (e *NativeAgentLoopExecutor) openPullRequest(
 	// the reviewer authors the full body in extra["prBody"], which passes
 	// through submit_result uncapped. Prefer it when present and non-empty,
 	// else fall back to summaryBody so existing agents that only set a
-	// summary keep working. The chosen body still flows through PRBody so
-	// the target repo's PR template is honoured (#1541); PRBody keeps the
-	// no-template path byte-for-byte identical to the pre-#1541 output.
+	// summary keep working.
+	//
+	// The renderer then depends on which of the two it is. A prBody — from
+	// the coder (#1768) or the reviewer (#1568) — is already the complete,
+	// repo-shaped description, so DescriptionBody renders it alone and only
+	// adds the issue link when the author did not write one. The summary
+	// fallback still goes through PRBody, which scaffolds it on the target
+	// repo's template (#1541) and stays byte-for-byte identical without one.
 	body := summaryBody
+	fromDescription := false
 	if pb, ok := extra["prBody"].(string); ok && strings.TrimSpace(pb) != "" {
 		body = pb
+		fromDescription = true
 	}
-	body = githubpr.PRBody(githubpr.FindTemplate(workspace), body,
-		p.Issue, task.Labels["foreman.llmkube.dev/workload"])
+	if fromDescription {
+		body = githubpr.DescriptionBody(body, p.Issue,
+			task.Labels["foreman.llmkube.dev/workload"])
+	} else {
+		body = githubpr.PRBody(githubpr.FindTemplate(workspace), body,
+			p.Issue, task.Labels["foreman.llmkube.dev/workload"])
+	}
 	prURL, _, err := ch.EnsureChangeRequest(ctx, p.Repo, head,
 		baseBranchOrDefault(p.BaseBranch), title, body, draft)
 	if err != nil {

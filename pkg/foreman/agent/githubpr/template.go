@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -136,5 +137,40 @@ func PRBody(template, summary string, issue int32, workload string) string {
 	// Provenance always appended, template or not (#1541 step 4).
 	fmt.Fprintf(&bodyB, "Fixes #%d\n\n_Opened by foreman on review GO (workload %s)._",
 		issue, workload)
+	return bodyB.String()
+}
+
+// DescriptionBody composes the pull request body when an agent authored the
+// complete description (#1768) — the coder's prBody on the review-GO open
+// path, or the reviewer's on the pre-#1568 shape.
+//
+// Unlike PRBody it does NOT prepend the repository template. The description
+// is already a finished, repo-shaped document (the coder is prompted with the
+// target repo's template and fills it in); prepending the template on top of
+// it is what shipped PRs whose body was the raw unfilled template with every
+// HTML comment intact and every checklist box empty (#1768).
+//
+// The issue link is appended only when the description does not already
+// mention the issue. The match is digit-bounded, so a body citing #1768
+// does not satisfy the reference for issue 176 — without the boundary the
+// sibling reference would suppress the Fixes line and the issue would
+// never auto-close. An agent that wrote `Refs #<N>` deliberately chose not
+// to close the issue on merge — a multi-slice issue must survive its first
+// slice — and an unconditional `Fixes #<N>` would silently close it.
+//
+// The provenance line is always appended, so an agent PR is never mistaken
+// for a hand-written one.
+func DescriptionBody(desc string, issue int32, workload string) string {
+	var bodyB strings.Builder
+	if d := strings.TrimSpace(desc); d != "" {
+		bodyB.WriteString(d)
+		bodyB.WriteString("\n\n")
+	}
+	issueRef := fmt.Sprintf("#%d", issue)
+	ref := regexp.MustCompile(fmt.Sprintf(`#%d(\D|$)`, issue))
+	if !ref.MatchString(desc) {
+		fmt.Fprintf(&bodyB, "Fixes %s\n\n", issueRef)
+	}
+	fmt.Fprintf(&bodyB, "_Opened by foreman on review GO (workload %s)._", workload)
 	return bodyB.String()
 }
