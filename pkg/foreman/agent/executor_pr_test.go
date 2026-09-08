@@ -247,9 +247,11 @@ func codeTaskForPR(name, branch, created, prBody string) *foremanv1alpha1.Agenti
 	}
 }
 
-// codeTaskOnBranch is the single-branch convenience wrapper.
-func codeTaskOnBranch(name, prBody string) *foremanv1alpha1.AgenticTask {
-	return codeTaskForPR(name, "foreman/wl-x/issue-7", "2026-09-07T10:00:00Z", prBody)
+// codeTaskOnBranch is the single-branch convenience wrapper: the code task
+// wl-x-code-1 on the review branch. Tests that need a second task on the
+// same branch call codeTaskForPR directly with their own name and time.
+func codeTaskOnBranch(prBody string) *foremanv1alpha1.AgenticTask {
+	return codeTaskForPR("wl-x-code-1", "foreman/wl-x/issue-7", "2026-09-07T10:00:00Z", prBody)
 }
 
 const coderPRDescription = "## What\n\nResume a truncated model download from the " +
@@ -267,7 +269,7 @@ const coderPRDescription = "## What\n\nResume a truncated model download from th
 // the coder's Refs #N cannot be silently upgraded to an auto-closing Fixes.
 func TestMaybeOpenPullRequest_CoderPRBodyPreferred(t *testing.T) {
 	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
-	codeTask := codeTaskOnBranch("wl-x-code-1", coderPRDescription)
+	codeTask := codeTaskOnBranch(coderPRDescription)
 	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
 		WithObjects(codeTask).Build()
 	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
@@ -397,7 +399,7 @@ func TestMaybeOpenPullRequest_ReviewerPRBodyPreferredWhenNoCoderTask(t *testing.
 // the newest, which is the one whose head actually got reviewed.
 func TestMaybeOpenPullRequest_NewestCoderTaskWinsWhenBranchRerun(t *testing.T) {
 	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
-	stale := codeTaskOnBranch("wl-x-code-1", "## What\n\nStale first-attempt description.")
+	stale := codeTaskOnBranch("## What\n\nStale first-attempt description.")
 	fresh := codeTaskForPR("wl-x-code-2", "foreman/wl-x/issue-7",
 		"2026-09-07T12:00:00Z", coderPRDescription)
 	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
@@ -430,7 +432,7 @@ func TestMaybeOpenPullRequest_NewestCoderTaskWinsWhenBranchRerun(t *testing.T) {
 // records where the body came from.
 func TestMaybeOpenPullRequest_CoderTaskWithoutPRBodyFallsBack(t *testing.T) {
 	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
-	codeTask := codeTaskOnBranch("wl-x-code-1", "")
+	codeTask := codeTaskOnBranch("")
 	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
 		WithObjects(codeTask).Build()
 	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
@@ -456,7 +458,7 @@ func TestMaybeOpenPullRequest_CoderTaskWithoutPRBodyFallsBack(t *testing.T) {
 // JSON yields "" without panicking and the summary body stands.
 func TestMaybeOpenPullRequest_CoderTaskMalformedResultFallsBack(t *testing.T) {
 	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
-	codeTask := codeTaskOnBranch("wl-x-code-1", coderPRDescription)
+	codeTask := codeTaskOnBranch(coderPRDescription)
 	codeTask.Status.Result = &runtime.RawExtension{Raw: []byte("{not json")}
 	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
 		WithObjects(codeTask).Build()
