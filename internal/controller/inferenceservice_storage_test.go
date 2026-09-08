@@ -399,7 +399,7 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
 		Expect(cmd).To(ContainSubstring("printf '%s\\n' \"$MODEL_FILES\""))
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$(dirname "$dest")"`))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"`))
+		Expect(cmd).To(ContainSubstring(`curl -f -L --create-dirs -C - -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"`))
 		Expect(cmd).ToNot(ContainSubstring(`-o "$dest" `))
 		Expect(cmd).To(ContainSubstring("already cached, skipping download"))
 	})
@@ -1265,7 +1265,11 @@ var _ = Describe("buildModelInitCommand", func() {
 		Expect(cmd).To(ContainSubstring("curl -f -L"))
 		Expect(cmd).To(ContainSubstring(`"$MODEL_SOURCE"`))
 		Expect(cmd).To(ContainSubstring(`"$MODEL_PATH"`))
-		Expect(cmd).NotTo(ContainSubstring("mkdir -p"))
+		// #1762: the uncached branch now sweeps stale .tmp debris in the
+		// target dir (it previously left debris with no cleanup at all), but
+		// it must not touch $CACHE_DIR, which is empty in this mode.
+		Expect(cmd).NotTo(ContainSubstring(`"$CACHE_DIR"`))
+		Expect(cmd).To(ContainSubstring(`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' -mtime +1 -delete`))
 	})
 
 	It("should not contain user-controlled values in the command string", func() {
@@ -1301,7 +1305,11 @@ var _ = Describe("buildModelInitCommand", func() {
 			cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyOnChange)
 			Expect(cmd).To(ContainSubstring("remote_size"))
 			Expect(cmd).To(ContainSubstring(`"$MODEL_SOURCE"`))
-			Expect(cmd).NotTo(ContainSubstring("mkdir -p"))
+			// #1762: the sweep prelude now runs here too; what this test
+			// guards is that the uncached branch never provisions a cache
+			// dir, so check for that specifically instead of for mkdir.
+			Expect(cmd).NotTo(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
+			Expect(cmd).NotTo(ContainSubstring(`"$CACHE_DIR"`))
 			Expect(cmd).NotTo(ContainSubstring("skipping download"))
 		})
 

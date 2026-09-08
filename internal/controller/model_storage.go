@@ -306,37 +306,149 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // --location-trusted must NOT be added here.
 const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authorization: Bearer ${HF_TOKEN}" "$@"; else curl "$@"; fi; }` + " && "
 
+// staleSweep is the opening clause of every cached download branch: create the
+// cache dir and delete abandoned .tmp debris (#1435), but only debris:
+// anything under a day old is treated as resumable progress for the transfer
+// about to run, and curl -C - continues it (#1762).
+//
+// This cannot regress #1435 while still resuming because a .tmp is always
+// either resumable progress or disposable debris, never ambiguous:
+//   - The cache directory is keyed by hash-of-source (pkg/cachekey) and the
+//     .tmp sits next to its exact dest, so a .tmp can only ever be a partial
+//     for one source version.
+//   - Publishes are atomic (mv after a complete transfer), so a .tmp is never
+//     debris from a published file.
+//   - A re-pointed or re-uploaded source yields a bad resume at worst: the
+//     server answers the range request with a 416 or a fresh full body, curl
+//     restarts from zero, and OnChange's size guard catches it. A corrupt
+//     cache is not possible.
+//
+// The one cost versus the old unconditional rm -f: an abandoned partial is
+// held for the threshold before reclamation. The age is generous by design
+// (#1435 suggests "older than some threshold"); a day of abandoned bytes on a
+// cache PVC is cheap next to discarding an in-flight pull of a 100+ GB
+// checkpoint on every init-container restart.
+//
+// It mirrors MetalExecutor.copyToFile (pkg/agent/executor.go) on the metal
+// side, which keeps its .partial across attempts for the same reason.
+const staleSweep = `mkdir -p "$CACHE_DIR" && find "$CACHE_DIR" -name '*.tmp' -mtime +1 -delete && `
+
+// staleSweepDir is the staleSweep for the non-cached (emptyDir) single-file
+// branches, whose partial lives in the parent directory of $MODEL_PATH rather
+// than a $CACHE_DIR.
+const staleSweepDir = `mkdir -p "$(dirname "$MODEL_PATH")" && find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' -mtime +1 -delete && `
+
+// resumeFlag is the flag pair every resumed curl download passes instead of a
+// bare "-C -".
+//
+// It carries one flag, -C -. curl's resume logic (libcurl's range resp
+// parsing, verified against curl 8.7.1): with a non-empty -o file it sends
+// "Range: bytes=N-"; a 206 continues the file; a 416 restarts from zero; a 200
+// whose Content-Length matches the resumed size is accepted silently, and a
+// 200 whose Content-Length differs is treated as "server ignored the range"
+// and refused with exit 33 (CURLE_RANGE_ERROR).
+//
+// That exit-33 is a feature here, not an obstacle, and --ignore-content-length
+// is deliberately NOT part of this pair even though it would convert the 33
+// into a content-verified restart. curl's content-verification path can only
+// tell "the body replayed from byte zero" from "the server ignored my range":
+// a 200 body that starts at the requested offset is indistinguishable from
+// the correct 206 continuation, so the verified body appends. A broken
+// gateway that answers a ranged GET with a 200 carrying a *truncated* body
+// and a lying Content-Length (observed against a hand-built repro) is then
+// appended and published corrupt, exactly the artifact class #1309/#1432 were
+// fixed to make uncacheable. Failing loudly and letting the init container
+// retry keeps every failure path fail-safe; the age sweep still reclaims the
+// abandoned .tmp if the gateway never recovers.
+//
+// The byte-exhausted .tmp case (a transfer that completed but died before its
+// mv) cannot take the 416 path: a 416 makes curl restart the output file from
+// zero, which on a byte-exhausted file means replaying the body onto the
+// existing bytes and publishing a doubled file. That is why resumeSetup
+// deletes an at-or-past-remote .tmp before the -C - runs.
+//
+// The const carries its own leading space because every call site glues it
+// onto a backtick string ending in a flag (typically "--create-dirs"); the
+// next fragment must start at "-o" with no space to keep the rendering a
+// single space.
+const resumeFlag = ` -C -`
+
+// resumeSetup guards curl -C - at the download site itself, covering the
+// windows the startup sweep cannot: a second attempt within the age threshold
+// after the source was re-pointed mid-transfer, or debris a sweep could not
+// reach (e.g. an OnChange retry landing on a different node). Two cases get
+// the .tmp dropped before the resume: a zero-byte .tmp, because
+// "Range: bytes=0-" can draw a 416 from a strict server (which would then
+// make curl restart, so it is only fatal once, but the drop is free); and a
+// .tmp already at or past the current remote size, because curl's 416 resume
+// restarts the output file from zero, which on a byte-exhausted file replays
+// the body onto the existing bytes and publishes a doubled, corrupt file.
+// Size-equality with the remote means a completed transfer that died before
+// its mv: the size guard cannot distinguish it from a re-pointed source, so
+// the fetch restarts and the mv republishes. A re-pointed source whose remote
+// is merely larger is not detectable here; OnChange's HEAD comparison
+// re-validates on the next cycle, and a mismatched-size resume draws the
+// exit-33 loud failure (see resumeFlag). The probe is a HEAD via the same
+// curl wrapper as the transfer, so gated sources authenticate; -L follows the
+// HuggingFace 302 to read the final Content-Length. http(s) sources only:
+// the S3 branches use emptyTmpGuard instead, because the signed S3 download
+// reads bucket/key from separate env vars and $MODEL_SOURCE is an s3:// URL
+// a plain curl HEAD cannot fetch. There the size-equality case is rarer (no
+// revalidation retry loop) and an exit-33 attempt fails loudly, with the
+// age-based sweep reclaiming the .tmp on a later attempt.
+func resumeSetup(isHFAuth bool) string {
+	return `if [ -f "$MODEL_PATH.tmp" ] && { [ ! -s "$MODEL_PATH.tmp" ] || [ "$(stat -c %s "$MODEL_PATH.tmp" 2>/dev/null || echo 0)" -ge "$(` + curlCmd(isHFAuth) + ` -fsIL "$MODEL_SOURCE" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0)" ]; }; then rm -f "$MODEL_PATH.tmp"; fi; `
+}
+
+// emptyTmpGuard is the zero-byte half of resumeSetup, for branches where the
+// size probe is not available (see resumeSetup). curl -C - over an empty .tmp
+// asks for "Range: bytes=0-", which a strict server can reject with a 416, so
+// an empty .tmp is dropped before the resume.
+const emptyTmpGuard = `if [ -f "$MODEL_PATH.tmp" ] && [ ! -s "$MODEL_PATH.tmp" ]; then rm -f "$MODEL_PATH.tmp"; fi; `
+
 // All transfers write to "$MODEL_PATH.tmp" and mv onto "$MODEL_PATH" on
 // success: the guard is a bare existence check, so publishing the file
 // non-atomically would let an interrupted transfer (OOM-kill, eviction,
 // node reboot) leave a truncated artifact that every subsequent restart
 // treats as cached. See remoteRevalidateScript for the same pattern.
+//
+// Interrupted transfers resume (#1762): curl gets -C - (and --create-dirs, so
+// the sweep below can assume the output dir exists, which also lets curl
+// create per-file subdirs under $CACHE_DIR), and a remote branch's opening
+// `rm -f "$MODEL_PATH.tmp"` becomes the age-based staleSweep so the next
+// attempt continues the transfer instead of restarting from byte zero. Only
+// the local cp branch keeps the unconditional rm: the copy is a local-disk
+// operation, and there is no transfer worth resuming.
+//
+// The mirror of this on the metal agent side is MetalExecutor.copyToFile
+// (pkg/agent/executor.go), which keeps its .partial across attempts; a change
+// to either side's resume semantics should be reflected in the other.
 func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy string) string {
 	if useCache {
 		if isLocal {
 			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model copied successfully'; else echo 'Model already cached, skipping copy'; fi`
 		}
 		if isS3 {
-			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+			return staleSweep + `if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; ` + emptyTmpGuard + `curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L --create-dirs` + resumeFlag + ` -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
-			return "mkdir -p \"$CACHE_DIR\" && rm -f \"$MODEL_PATH.tmp\" && " + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
+			return staleSweep + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 		}
-		return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + hfAuthPrefix(isHFAuth) +
-			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+		return staleSweep + hfAuthPrefix(isHFAuth) +
+			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumeSetup(isHFAuth) + curlCmd(isHFAuth) + ` -f -L --create-dirs` + resumeFlag + ` -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 	}
 
 	if isLocal {
 		return `echo 'ERROR: Local model source requires model cache to be configured.'; exit 1`
 	}
 	if isS3 {
-		return `if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+		return staleSweepDir + `if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; ` + emptyTmpGuard + `curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L --create-dirs` + resumeFlag + ` -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 	}
 	if refreshPolicy == RefreshPolicyOnChange {
-		return hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
+		return staleSweepDir + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 	}
-	return hfAuthPrefix(isHFAuth) +
-		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+	return staleSweepDir + hfAuthPrefix(isHFAuth) +
+		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumeSetup(isHFAuth) + curlCmd(isHFAuth) + ` -f -L --create-dirs` + resumeFlag + ` -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -365,7 +477,11 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 //     is current: log "revalidated" and skip the transfer.
 //  3. Otherwise download to "$dest.tmp" and `mv` it onto "$dest" on success,
 //     so a redundant or failed transfer can never truncate a good cache. The
-//     rename also makes the artifact publish atomically.
+//     rename also makes the artifact publish atomically. The download uses
+//     -C - so an interrupted attempt resumes into the existing .tmp (#1762)
+//     rather than restarting from byte zero: on resume the size-equality skip
+//     in step 2 cannot fire (the .tmp is smaller than remote_size), so the
+//     ranged GET streams only the remainder and the mv publishes.
 //
 // Robustness: the init container gates pod startup, so a transient network
 // failure (air-gapped, upstream 5xx, DNS) must not take down an
@@ -380,7 +496,8 @@ func remoteRevalidateScript(isHFAuth bool) string {
 		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 		`echo 'Model revalidated (unchanged, skipped download)'; ` +
 		`else ` +
-		`if ` + c + ` -fsSL -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"; then ` +
+		resumeSetup(isHFAuth) +
+		`if ` + c + ` -fsSL --create-dirs` + resumeFlag + ` -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"; then ` +
 		`echo 'Model revalidated (downloaded)'; ` +
 		`elif [ -f "$MODEL_PATH" ]; then echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
 		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
@@ -570,6 +687,20 @@ func multiFileInitEnvVars(source, cacheDir string, files []string) []corev1.EnvV
 	return envs
 }
 
+// remoteResumeGuard is the multi-file download site's equivalent of
+// resumeSetup: an empty .tmp would ask for "Range: bytes=0-" (a strict server
+// can reject that with 416), and a .tmp already at or past the remote size
+// would replay the body onto the existing bytes and publish a doubled file
+// (#1762; see resumeSetup for the curl semantics). The probe reuses the
+// per-file URL through the same curl wrapper as the transfer (gated sources
+// authenticate; the #1750 auth test rejects any plain-curl call site in an
+// HF-auth script), every failure mode falls through to the plain restart via
+// "|| echo 0", and for S3 branches the probe simply fails to fetch (the URL
+// there needs sigv4), which lands on the safe restart.
+func remoteResumeGuard(isHFAuth bool) string {
+	return `if [ -f "$dest.tmp" ] && { [ ! -s "$dest.tmp" ] || [ "$(stat -c %s "$dest.tmp" 2>/dev/null || echo 0)" -ge "$(` + curlCmd(isHFAuth) + ` -fsIL "$url" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0)" ]; }; then rm -f "$dest.tmp"; fi; `
+}
+
 // buildMultiFileInitCommand returns a shell command that downloads each file
 // listed in $MODEL_FILES from the normalized $MODEL_SOURCE. For cached storage
 // (useCache=true), it creates $CACHE_DIR first. For emptyDir (useCache=false),
@@ -577,10 +708,14 @@ func multiFileInitEnvVars(source, cacheDir string, files []string) []corev1.EnvV
 // values directly in the script. When isS3 is true, the curl command is signed
 // with --aws-sigv4 and uses ${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_PREFIX}/$rel
 // as the per-file URL (S3_PREFIX may be empty for bare-bucket sources).
+//
+// Per-file transfers resume (#1762): the prefix sweep deletes only .tmp debris
+// older than a day (see staleSweep), and curl -C - continues a fresh partial,
+// so an init-container restart no longer discards every in-flight file.
 func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy string) string {
-	prefix := `mkdir -p "$CACHE_DIR" && find "$CACHE_DIR" -name '*.tmp' -delete && `
+	prefix := staleSweep
 	if !useCache {
-		prefix = `mkdir -p /models && find /models -name '*.tmp' -delete && `
+		prefix = `mkdir -p /models && find /models -name '*.tmp' -mtime +1 -delete && `
 	}
 
 	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) src="${1#hf://}"; rev="${src#*@}"; if [ "$rev" != "$src" ]; then echo "https://huggingface.co/${src%%@*}/resolve/$rev/"; else echo "https://huggingface.co/$src/resolve/main/"; fi ;; *) echo "$1" ;; esac; }` + " && "
@@ -599,7 +734,8 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 				`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 				`else ` +
-				`if curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
+				remoteResumeGuard(isHFAuth) +
+				`if curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L --create-dirs` + resumeFlag + ` -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
 				`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 				`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
@@ -618,7 +754,8 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 			`url="${AWS_ENDPOINT_URL}/${S3_BUCKET}/${key}"; ` +
 			`if [ ! -f "$dest" ]; then ` +
 			`echo "Downloading model artifact $rel..."; ` +
-			`curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
+			remoteResumeGuard(isHFAuth) +
+			`curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L --create-dirs` + resumeFlag + ` -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
 			`else echo "Model artifact $rel already cached, skipping download"; fi; ` +
 			`done`
 		return prefix + body
@@ -636,7 +773,8 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
-			`if ` + curlCmd(isHFAuth) + ` -fsSL -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
+			remoteResumeGuard(isHFAuth) +
+			`if ` + curlCmd(isHFAuth) + ` -fsSL --create-dirs` + resumeFlag + ` -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
@@ -654,7 +792,8 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 		`url="${SOURCE%/}/$rel"; ` +
 		`if [ ! -f "$dest" ]; then ` +
 		`echo "Downloading model artifact $rel..."; ` +
-		curlCmd(isHFAuth) + ` -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
+		remoteResumeGuard(isHFAuth) +
+		curlCmd(isHFAuth) + ` -f -L --create-dirs` + resumeFlag + ` -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
 		`else echo "Model artifact $rel already cached, skipping download"; fi; ` +
 		`done`
 	return prefix + body

@@ -52,7 +52,7 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 	It("should NOT emit --aws-sigv4 for non-s3 source", func() {
 		cmd := buildModelInitCommand(false, false, true, false, "")
 		Expect(cmd).ToNot(ContainSubstring("aws-sigv4"))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"`))
+		Expect(cmd).To(ContainSubstring(`curl -f -L --create-dirs -C - -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"`))
 	})
 
 	// A truncated transfer must never be published at $MODEL_PATH: the guard
@@ -80,27 +80,94 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 })
 
 // Issue #1435: interrupted transfers leave orphaned .tmp files that nothing
-// cleans up. The init command must remove stale .tmp files before starting a
-// new download so they do not accumulate on the shared cache PVC.
+// cleans up. The init command must still remove stale .tmp files before
+// starting a new download so they do not accumulate on the shared cache PVC.
+// Issue #1762 narrowed the sweep to age-based deletion (-mtime +1) so a fresh
+// .tmp survives as resumable progress: #1435's invariant is that DEBRIS is
+// eventually reclaimed, not that every .tmp dies at container start.
 var _ = Describe("buildModelInitCommand (orphan .tmp cleanup, #1435)", func() {
-	It("should remove stale .tmp before downloading in cached remote path", func() {
+	It("should sweep stale .tmp before downloading in cached remote path", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -name '*.tmp' -mtime +1 -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached S3 path", func() {
+	It("should sweep stale .tmp before downloading in cached S3 path", func() {
 		cmd := buildModelInitCommand(false, true, true, false, RefreshPolicyIfNotPresent)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -name '*.tmp' -mtime +1 -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached local path", func() {
+	It("should still remove the .tmp unconditionally in cached local path", func() {
+		// The local cp is a local-disk copy: there is no transfer worth
+		// resuming, so the branch keeps the unconditional rm -f.
 		cmd := buildModelInitCommand(true, false, true, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
 	})
 
-	It("should remove stale .tmp before downloading in cached OnChange path", func() {
+	It("should sweep stale .tmp before downloading in cached OnChange path", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -name '*.tmp' -mtime +1 -delete`))
+	})
+
+	It("should sweep stale .tmp in the uncached branches' target dir (#1762 closes the pre-#1762 gap)", func() {
+		// The uncached (emptyDir) branches previously left .tmp debris with
+		// no cleanup at all; the sweep now covers them too.
+		cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' -mtime +1 -delete`))
+	})
+
+	It("should sweep the multi-file cache dir age-based, not unconditionally (#1435 kept, #1762 narrows it)", func() {
+		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`find "$CACHE_DIR" -name '*.tmp' -mtime +1 -delete`))
+		Expect(cmd).ToNot(ContainSubstring(`find "$CACHE_DIR" -name '*.tmp' -delete`))
+	})
+})
+
+// Issue #1762: an interrupted transfer used to restart from byte zero because
+// every branch deleted its own .tmp at start. Remote branches now resume with
+// curl -C -, guarded so a zero-byte or byte-exhausted .tmp restarts clean
+// (see resumeSetup in model_storage.go).
+var _ = Describe("buildModelInitCommand (download resume, #1762)", func() {
+	It("should resume cached remote downloads with -C -", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring("--create-dirs -C - -o \"$MODEL_PATH.tmp\""))
+		Expect(cmd).To(ContainSubstring(`if [ -f "$MODEL_PATH.tmp" ] && { [ ! -s "$MODEL_PATH.tmp" ] ||`))
+	})
+
+	It("should resume cached S3 downloads with -C - and the zero-byte guard", func() {
+		cmd := buildModelInitCommand(false, true, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring("--create-dirs -C - -o \"$MODEL_PATH.tmp\""))
+		Expect(cmd).To(ContainSubstring(`if [ -f "$MODEL_PATH.tmp" ] && [ ! -s "$MODEL_PATH.tmp" ]; then rm -f "$MODEL_PATH.tmp"; fi;`))
+	})
+
+	It("should resume uncached remote downloads with -C -", func() {
+		cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring("--create-dirs -C - -o \"$MODEL_PATH.tmp\""))
+	})
+
+	It("should resume the OnChange revalidation download with -C -", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring("--create-dirs -C - -o \"$MODEL_PATH.tmp\""))
+	})
+
+	It("should route the resume probe through hf_curl for HF-auth sources", func() {
+		cmd := buildModelInitCommand(false, false, true, true, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`hf_curl -fsIL "$MODEL_SOURCE"`))
+	})
+
+	It("should NOT resume the local cp branch", func() {
+		cmd := buildModelInitCommand(true, false, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).ToNot(ContainSubstring("-C -"))
+	})
+
+	It("should resume multi-file per-file downloads with -C -", func() {
+		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring("--create-dirs -C - -o \"$dest.tmp\""))
+		Expect(cmd).To(ContainSubstring(`if [ -f "$dest.tmp" ] && { [ ! -s "$dest.tmp" ] ||`))
+	})
+
+	It("should resume multi-file S3 per-file downloads with -C -", func() {
+		cmd := buildMultiFileInitCommand(true, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring("--create-dirs -C - -o \"$dest.tmp\""))
 	})
 })
 
@@ -153,14 +220,14 @@ var _ = Describe("buildMultiFileInitCommand (s3)", func() {
 	It("should NOT emit --aws-sigv4 for non-s3 source (HTTP regression)", func() {
 		cmd := buildMultiFileInitCommand(true, false, false, "")
 		Expect(cmd).ToNot(ContainSubstring("aws-sigv4"))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$dest.tmp" "$url"`))
+		Expect(cmd).To(ContainSubstring(`curl -f -L --create-dirs -C - -o "$dest.tmp" "$url"`))
 		Expect(cmd).To(ContainSubstring("${SOURCE%/}/$rel"))
 	})
 
 	It("should NOT emit --aws-sigv4 for non-s3 source with OnChange (HTTP regression)", func() {
 		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyOnChange)
 		Expect(cmd).ToNot(ContainSubstring("aws-sigv4"))
-		Expect(cmd).To(ContainSubstring(`curl -fsSL -o "$dest.tmp" "$url"`))
+		Expect(cmd).To(ContainSubstring(`curl -fsSL --create-dirs -C - -o "$dest.tmp" "$url"`))
 		Expect(cmd).To(ContainSubstring("${SOURCE%/}/$rel"))
 	})
 })
