@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -121,8 +122,27 @@ func TestConstructMemberPodsProbesArgsEnv(t *testing.T) {
 	if hc.ReadinessProbe == nil || hc.StartupProbe == nil {
 		t.Errorf("head keeps its probes")
 	}
-	if wc.ReadinessProbe != nil || wc.StartupProbe != nil || wc.LivenessProbe != nil || len(wc.Ports) != 0 {
-		t.Errorf("worker must have no probes or ports: %+v", wc)
+	if wc.ReadinessProbe != nil || wc.StartupProbe == nil || wc.LivenessProbe == nil || len(wc.Ports) != 0 {
+		t.Errorf("worker must keep no HTTP probes or ports, but carry startup+liveness: %+v", wc)
+	}
+	for name, probe := range map[string]*corev1.Probe{"startup": wc.StartupProbe, "liveness": wc.LivenessProbe} {
+		if probe == nil || probe.Exec == nil || probe.HTTPGet != nil {
+			t.Errorf("worker %s probe must dial the rendezvous via exec, got %+v", name, probe)
+			continue
+		}
+		want := "exec 3<>/dev/tcp/10.10.4.1/29500"
+		if len(probe.Exec.Command) != 3 || probe.Exec.Command[0] != "/bin/bash" || probe.Exec.Command[2] != want {
+			t.Errorf("worker %s probe must dial %q, got %v", name, want, probe.Exec)
+		}
+	}
+	if wc.StartupProbe != nil && (wc.StartupProbe.PeriodSeconds != 10 || wc.StartupProbe.FailureThreshold != 180) {
+		t.Errorf("worker startup budget must match the head's HTTP startup probe: %+v", wc.StartupProbe)
+	}
+	if wc.LivenessProbe != nil && (wc.LivenessProbe.PeriodSeconds != 30 || wc.LivenessProbe.FailureThreshold != 10) {
+		t.Errorf("worker liveness budget: %+v", wc.LivenessProbe)
+	}
+	if wc.ReadinessProbe != nil {
+		t.Errorf("worker has nothing to serve, so it must have no readiness probe: %+v", wc.ReadinessProbe)
 	}
 	if !containsArg(hc.Args, "--node-rank", "0") || !containsArg(wc.Args, "--node-rank", "1") || !containsArg(wc.Args, "--master-addr", "10.10.4.1") {
 		t.Errorf("rank args missing: head %v worker %v", hc.Args, wc.Args)
@@ -133,6 +153,34 @@ func TestConstructMemberPodsProbesArgsEnv(t *testing.T) {
 	env := envMap(wc.Env)
 	if env["VLLM_HOST_IP"] != "10.10.4.2" || env["NCCL_IB_HCA"] != "rocep1s0f1" || env["NCCL_IB_GID_INDEX"] != "3" || env["USER_VAR"] != "1" {
 		t.Errorf("worker env = %v", env)
+	}
+}
+
+// TestRendezvousEndpoint: the worker probe dials whatever rendezvous the
+// runtime's argv carries, and stays unset when the argv names none.
+func TestRendezvousEndpoint(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		host string
+		port string
+		ok   bool
+	}{
+		{name: "vllm argv", args: []string{"vllm", "serve", "m", "--nnodes", "2", "--node-rank", "1", "--master-addr", "10.10.4.1", "--master-port", "29500"}, host: "10.10.4.1", port: "29500", ok: true},
+		{name: "ipv6 host", args: []string{"--master-addr", "[fd00::1]", "--master-port", "29500"}, host: "[fd00::1]", port: "29500", ok: true},
+		{name: "shell metachars are refused", args: []string{"--master-addr", "10.0.0.1;reboot", "--master-port", "29500"}, host: "10.0.0.1;reboot", port: "29500", ok: false},
+		{name: "hostname is refused", args: []string{"--master-addr", "dgx3", "--master-port", "29500"}, host: "dgx3", port: "29500", ok: false},
+		{name: "trailing flag with no value", args: []string{"--master-addr", "10.0.0.1", "--master-port"}, host: "10.0.0.1", port: "", ok: false},
+		{name: "no rendezvous flags", args: []string{"vllm", "serve", "m"}, ok: false},
+		{name: "empty argv", args: nil, ok: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			host, port, ok := rendezvousEndpoint(tt.args)
+			if host != tt.host || port != tt.port || ok != tt.ok {
+				t.Errorf("rendezvousEndpoint(%v) = (%q, %q, %v), want (%q, %q, %v)", tt.args, host, port, ok, tt.host, tt.port, tt.ok)
+			}
+		})
 	}
 }
 
@@ -279,6 +327,40 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	}
 }
 
+// TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate pins the path the
+// #1781 worker liveness probe feeds: once the probe kills the wedged
+// headless container, the restart alone recreates the group. Rank must not
+// gate this: a restarted worker is as fatal to the group as a restarted head
+// (#1781 kept a dead rank-1 process alive because health was rank-0-only).
+func TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate(t *testing.T) {
+	mk := func(name string, restarts int32) *corev1.Pod {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}}}
+		p.Status.Phase = corev1.PodRunning
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{RestartCount: restarts}}
+		return p
+	}
+	tests := []struct {
+		name   string
+		worker *corev1.Pod
+		want   string
+	}{
+		{name: "probe-killed worker restarts, group recreates", worker: mk("w", 1), want: "MemberRestarted"},
+		{name: "healthy worker with no restart stays up", worker: mk("w", 0), want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			obs := []memberObservation{
+				{rank: 0, existing: mk("h", 0)},
+				{rank: 1, existing: tt.worker},
+			}
+			reason, _ := groupNeedsRecreate(obs, "abc", time.Now())
+			if reason != tt.want {
+				t.Errorf("worker restart: got reason %q, want %q", reason, tt.want)
+			}
+		})
+	}
+}
+
 // TestConstructMemberPodsHashIgnoresStatus: the template reads the service's
 // status phase (the disruption-protection annotation is only present while
 // not Ready), which must not move the group hash: a group that became Ready
@@ -325,5 +407,58 @@ func TestLastTerminationDetail(t *testing.T) {
 	reason, msg := groupNeedsRecreate(obs, "abc", time.Now())
 	if reason != "MemberRestarted" || !strings.Contains(msg, "OOMKilled") || !strings.Contains(msg, "137") {
 		t.Fatalf("restart detail missing: %s / %s", reason, msg)
+	}
+}
+
+// makeDesired builds the desired-pod stubs setMultiNodeStatus matches against.
+func makeDesired(n int) []*corev1.Pod {
+	desired := make([]*corev1.Pod, n)
+	for i := range desired {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ring-mn-" + strconv.Itoa(i)}}
+		p.Spec.NodeName = "node"
+		desired[i] = p
+	}
+	return desired
+}
+
+// TestSetMultiNodeStatusReadyMembers is the #1781 miscount: the aggregate
+// counts Ready pods, matching the per-member m.Ready field it renders
+// alongside, so status can no longer claim 2/2 while a member is 0/1.
+func TestSetMultiNodeStatusReadyMembers(t *testing.T) {
+	isvc, _ := multiNodeFixture()
+	mk := func(name string, phase corev1.PodPhase, ready bool) corev1.Pod {
+		p := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		p.Status.Phase = phase
+		if ready {
+			p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		}
+		return p
+	}
+	tests := []struct {
+		name  string
+		pods  []corev1.Pod
+		wantR int32
+	}{
+		{name: "all members Ready", pods: []corev1.Pod{mk("ring-mn-0", corev1.PodRunning, true), mk("ring-mn-1", corev1.PodRunning, true)}, wantR: 2},
+		{name: "running worker without Ready does not count", pods: []corev1.Pod{mk("ring-mn-0", corev1.PodRunning, true), mk("ring-mn-1", corev1.PodRunning, false)}, wantR: 1},
+		{name: "pending member does not count", pods: []corev1.Pod{mk("ring-mn-0", corev1.PodPending, false), mk("ring-mn-1", corev1.PodPending, false)}, wantR: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			isvc := isvc.DeepCopy()
+			setMultiNodeStatus(isvc, makeDesired(len(tt.pods)), tt.pods, metav1.ConditionFalse, "Starting", "test")
+			if isvc.Status.MultiNode == nil {
+				t.Fatal("status.multiNode must be set")
+			}
+			if got := isvc.Status.MultiNode.ReadyMembers; got != tt.wantR {
+				t.Errorf("readyMembers = %d, want %d", got, tt.wantR)
+			}
+			for _, m := range isvc.Status.MultiNode.Members {
+				p := tt.pods[m.Rank]
+				if m.Ready != (p.Status.Phase == corev1.PodRunning && len(p.Status.Conditions) > 0) {
+					t.Errorf("member %d ready flag %v disagrees with its pod", m.Rank, m.Ready)
+				}
+			}
+		})
 	}
 }

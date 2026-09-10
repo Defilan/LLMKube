@@ -317,7 +317,8 @@ type MultiNodeMemberStatus struct {
 type MultiNodeStatus struct {
 	// Size is the number of members in the spec.
 	Size int32 `json:"size"`
-	// ReadyMembers counts members that are Running (rank 0 must also be Ready).
+	// ReadyMembers counts members whose pod is Ready. The group condition
+	// additionally requires every member Running before the group serves.
 	ReadyMembers int32 `json:"readyMembers"`
 	// Members is per-rank detail in rank order.
 	// +optional

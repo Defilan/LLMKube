@@ -6173,8 +6173,9 @@ spec:
                       type: object
                     type: array
                   readyMembers:
-                    description: ReadyMembers counts members that are Running (rank
-                      0 must also be Ready).
+                    description: |-
+                      ReadyMembers counts members whose pod is Ready. The group condition
+                      additionally requires every member Running before the group serves.
                     format: int32
                     type: integer
                   size:

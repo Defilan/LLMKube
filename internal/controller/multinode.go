@@ -198,8 +198,18 @@ func memberPodFromTemplate(
 	// Fabric env first, user env after, so a user override still wins.
 	c.Env = append(mnb.BuildMultiNodeEnv(isvc, rank), c.Env...)
 	if rank > 0 {
+		// A headless worker serves no HTTP, so the runtime's HTTP probes
+		// would never pass. Its health signal is the rendezvous dial instead.
 		c.StartupProbe, c.LivenessProbe, c.ReadinessProbe = nil, nil, nil
 		c.Ports = nil
+		if host, port, ok := rendezvousEndpoint(c.Args); ok {
+			// Startup gets the head's own budget (10s x 180 = 30m) to form the
+			// rendezvous; after that, 30s x 10 = five minutes of unreachable
+			// rendezvous restarts the container, and MemberRestarted then
+			// recreates the group.
+			c.StartupProbe = rendezvousProbe(host, port, 10, 180)
+			c.LivenessProbe = rendezvousProbe(host, port, 30, 10)
+		}
 	}
 
 	if res := isvc.Spec.MultiNode.RDMAResource; res != "" {
@@ -237,6 +247,62 @@ func memberPodFromTemplate(
 			Annotations: annotations,
 		},
 		Spec: spec,
+	}
+}
+
+// rendezvousEndpoint extracts the rendezvous the rank dials from the backend's
+// argv. Members of a group are pinned to their own nodes on hostNetwork, so
+// the endpoint is only meaningful for the workers, which dial rank 0. ok is
+// false unless both values are safe to interpolate into a probe command.
+func rendezvousEndpoint(args []string) (host, port string, ok bool) {
+	for i, a := range args {
+		if a != "--master-addr" && a != "--master-port" {
+			continue
+		}
+		if i+1 >= len(args) {
+			continue
+		}
+		if a == "--master-addr" {
+			host = args[i+1]
+		} else {
+			port = args[i+1]
+		}
+	}
+	return host, port, rendezvousEndpointSafe(host) && rendezvousEndpointSafe(port)
+}
+
+// rendezvousEndpointSafe accepts IP literals (v4 and bracketed v6) and digits:
+// exactly what BuildMultiNodeArgs emits, and nothing a shell would read as
+// syntax. Anything else renders the worker probeless, as before this probe.
+func rendezvousEndpointSafe(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '[' {
+		return s[len(s)-1] == ']' && !strings.ContainsAny(s[1:len(s)-1], "[].")
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && r != '.' && r != ':' {
+			return false
+		}
+	}
+	return true
+}
+
+// rendezvousProbe builds the worker's health signal for a headless vLLM
+// worker: a shell dial of the rank-0 rendezvous endpoint. The invariant is
+// narrow: if the worker cannot open a TCP connection to the master address,
+// it cannot serve in the group, so it must restart and re-rendezvous.
+func rendezvousProbe(host, port string, period, failureThreshold int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"/bin/bash", "-c", "exec 3<>/dev/tcp/" + host + "/" + port},
+			},
+		},
+		PeriodSeconds:    period,
+		TimeoutSeconds:   5,
+		FailureThreshold: failureThreshold,
 	}
 }
 
@@ -492,7 +558,7 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 			for _, cs := range p.Status.ContainerStatuses {
 				m.Restarts += cs.RestartCount
 			}
-			if p.Status.Phase == corev1.PodRunning {
+			if m.Ready {
 				st.ReadyMembers++
 			}
 		}
