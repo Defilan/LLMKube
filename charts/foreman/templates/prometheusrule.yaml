@@ -53,8 +53,8 @@ spec:
         severity: critical
         component: foreman
       annotations:
-        summary: "FleetNode {{`{{ $labels.node }}`}} heartbeat stale"
-        description: "FleetNode {{`{{ $labels.node }}`}} has not heartbeated in more than {{ .Values.foreman.crs.alerts.staleHeartbeatDuration }}. The foreman-agent on this node may be crashed or the network partitioned."
+        summary: "FleetNode {{`{{ $labels.name }}`}} heartbeat stale"
+        description: "FleetNode {{`{{ $labels.name }}`}} has not heartbeated in more than {{ .Values.foreman.crs.alerts.staleHeartbeatDuration }}. The foreman-agent on this node may be crashed or the network partitioned."
 
   - name: foreman-agentictask
     interval: 30s

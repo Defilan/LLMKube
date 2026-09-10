@@ -453,6 +453,22 @@ tests:
           path: spec.groups[1].rules[0].alert
           pattern: "ForemanFleetNodeHeartbeatStale"
 
+  # The heartbeat metric carries `name` (labelsFromPath [metadata, name])
+  # and no `node` label (#1779), so the annotations must interpolate
+  # $labels.name to say which FleetNode is stale.
+  - it: stale-heartbeat annotations name the FleetNode with $labels.name
+    template: prometheusrule.yaml
+    set:
+      foreman.crs.enabled: true
+      foreman.crs.alerts.enabled: true
+    asserts:
+      - matchRegex:
+          path: spec.groups[1].rules[0].annotations.summary
+          pattern: 'FleetNode \{\{ \$labels\.name \}\} heartbeat stale'
+      - matchRegex:
+          path: spec.groups[1].rules[0].annotations.description
+          pattern: 'FleetNode \{\{ \$labels\.name \}\} has not heartbeated'
+
   # ---- Grafana dashboard: disabled by default ----
 
   - it: Grafana dashboard ConfigMap is omitted when foreman.crs.enabled is false
