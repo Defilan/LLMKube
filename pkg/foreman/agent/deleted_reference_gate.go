@@ -60,6 +60,20 @@ func deletedReferenceDisabled() bool {
 	return os.Getenv("FOREMAN_DELETED_REFERENCE") == "0"
 }
 
+// looksLikeUnifiedDiff reports whether s has the shape of a unified diff
+// (hunk headers are mandatory in every real diff). The rail must scan only
+// genuine diffs: any other string reaching the scan — an error message, a
+// branch or ref listing, a log — has its "-..." lines mistaken for removed
+// lines and produces references the change never removed.
+func looksLikeUnifiedDiff(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, "@@") {
+			return true
+		}
+	}
+	return false
+}
+
 // deletedIssueReferences returns the issue/PR references found on the REMOVED
 // lines of a unified diff, deduplicated and sorted so the output is
 // deterministic and testable.
@@ -68,8 +82,12 @@ func deletedReferenceDisabled() bool {
 // (the latter is the "a/..." file header, not a removed line). Added and
 // context lines are ignored entirely. Both the bare "#N" and the full
 // "owner/repo#N" forms are matched. Taking a diff string rather than a repo
-// path keeps the function pure, so it is testable without git.
+// path keeps the function pure, so it is testable without git. A string with
+// no hunk header is not a diff and yields no references.
 func deletedIssueReferences(unifiedDiff string) []string {
+	if !looksLikeUnifiedDiff(unifiedDiff) {
+		return nil
+	}
 	seen := make(map[string]struct{})
 	for _, line := range strings.Split(unifiedDiff, "\n") {
 		if !strings.HasPrefix(line, "-") || strings.HasPrefix(line, "---") {
