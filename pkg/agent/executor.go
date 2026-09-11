@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/hfsource"
 )
 
 type ExecutorConfig struct {
@@ -346,8 +347,11 @@ func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string,
 		return e.downloadS3(ctx, source, filePath, secretRef)
 	}
 	// Gated and private Hugging Face repositories need a bearer token (#1750).
-	// Read from the same sourceSecretRef the S3 path uses, and attached only for
-	// huggingface.co so a Model pointing at another host never sees it.
+	// Read from the same sourceSecretRef the S3 path uses, and attach it only
+	// for Hugging Face sources (hf:// or huggingface.co) so a Model pointing
+	// at another host never sees it. The hf:// source downloadFile receives is
+	// resolved to its huggingface.co form before the request is built, so the
+	// scheme works the same as the init-container path.
 	var token string
 	if isHFAuthHost(source) && secretRef != nil {
 		token = e.resolveHFToken(ctx, secretRef.Name)
@@ -400,6 +404,12 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
 }
 
+// hfNormalize is the source resolver the download path applies before the
+// request is built: hf:// sources become their huggingface.co HTTPS resolve
+// URLs, everything else passes through. A variable so tests can pin the
+// resolved host to a reachable server.
+var hfNormalize = hfsource.NormalizeHFSource
+
 // downloadFile fetches url into filePath. token, when non-empty, is sent as a
 // bearer credential on the FIRST hop only.
 //
@@ -413,6 +423,7 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 // which is also why huggingface_hub does not send it there. hfRedirectStripper
 // therefore drops the header on ANY change of host.
 func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token string) error {
+	url = hfNormalize(url)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err
