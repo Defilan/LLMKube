@@ -3,6 +3,8 @@ package controller
 import (
 	"strings"
 	"testing"
+
+	"github.com/defilantech/llmkube/pkg/hfsource"
 )
 
 // The operator's own downloads had no way to authenticate: only s3:// sources
@@ -64,7 +66,7 @@ func TestHFHostPredicatesAgree(t *testing.T) {
 		"",
 	}
 	for _, src := range sources {
-		_, segOK := hfURLPathSegments(src)
+		_, segOK := hfsource.HFURLPathSegments(src)
 		if got := isHuggingFaceURL(src); got != segOK {
 			t.Errorf("%q: isHuggingFaceURL=%v but hfURLPathSegments ok=%v; the two must agree",
 				src, got, segOK)
@@ -75,7 +77,7 @@ func TestHFHostPredicatesAgree(t *testing.T) {
 // The repo path is case-sensitive even though the host is not, so folding the
 // host must not reach the path.
 func TestHFPathSegmentsPreserveCase(t *testing.T) {
-	segs, ok := hfURLPathSegments("https://WWW.HuggingFace.co/Qwen/Qwen3-8B/resolve/main/model.gguf")
+	segs, ok := hfsource.HFURLPathSegments("https://WWW.HuggingFace.co/Qwen/Qwen3-8B/resolve/main/model.gguf")
 	if !ok {
 		t.Fatal("uppercase host rejected")
 	}

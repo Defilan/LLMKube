@@ -47,24 +47,6 @@ func TestHFSourceShimsDelegate(t *testing.T) {
 			t.Errorf(`isHFAuthSource("https://cdn.example.com/model.gguf") = true, want false`)
 		}
 	})
-	t.Run("hfURLPathSegments", func(t *testing.T) {
-		segs, ok := hfURLPathSegments("https://WWW.HuggingFace.co/Qwen/Qwen3-8B/resolve/main/model.gguf")
-		if !ok {
-			t.Fatal("hfURLPathSegments ok = false, want true")
-		}
-		want := []string{"Qwen", "Qwen3-8B", "resolve", "main", "model.gguf"}
-		if len(segs) != len(want) {
-			t.Fatalf("hfURLPathSegments segments = %v, want %v", segs, want)
-		}
-		for i := range want {
-			if segs[i] != want[i] {
-				t.Fatalf("hfURLPathSegments segments = %v, want %v", segs, want)
-			}
-		}
-		if _, ok := hfURLPathSegments("https://example.com/model.gguf"); ok {
-			t.Error(`hfURLPathSegments("https://example.com/model.gguf") ok = true, want false`)
-		}
-	})
 	t.Run("isHuggingFaceFileURL", func(t *testing.T) {
 		if !isHuggingFaceFileURL("https://huggingface.co/org/repo/blob/v1.0/config.json") {
 			t.Errorf(`isHuggingFaceFileURL(".../blob/v1.0/config.json") = false, want true`)
