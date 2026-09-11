@@ -107,8 +107,15 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
+# One seed per run, printed and exported so any failure is replayable from the
+# log; override with GINKGO_SEED=<n> to replay a run.
+ifeq ($(origin GINKGO_SEED),undefined)
+GINKGO_SEED := $(shell od -An -N4 -tu4 /dev/urandom | tr -d ' \n')
+endif
+
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	@echo "ginkgo seed: $(GINKGO_SEED)"
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED="$(GINKGO_SEED)" go test $$(go list ./... | grep -v /e2e) -count=1 -coverprofile cover.out
 
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
