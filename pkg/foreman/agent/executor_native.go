@@ -1198,7 +1198,8 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// committed base...HEAD diff. That is its own `git diff` call, not a
 	// reused result. Records-and-logs onto loopRes.Terminal.Extra; never
 	// changes the verdict.
-	applyDeletedReferenceRailForTask(ctx, task, workspace, loopRes)
+	applyDeletedReferenceRailForTask(ctx, task, workspace, loopRes,
+		func(slug string) string { return e.resolveUpstreamForRun(task) })
 
 	r := e.goResult(start, transcriptRef, loopRes, branch, sha)
 	attachGateAdvisories(r.Extra, gateAdvisories)
