@@ -290,23 +290,23 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	if ok, n := groupReadiness(obs); !ok || n != 2 {
 		t.Errorf("head Ready + worker Running must be ready (got %v, %d)", ok, n)
 	}
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "" {
 		t.Errorf("healthy group must not recreate: %s", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodRunning, false, 1, "abc")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "MemberRestarted" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "MemberRestarted" {
 		t.Errorf("restarted worker: got %q", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodRunning, false, 0, "old")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "SpecChanged" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "SpecChanged" {
 		t.Errorf("stale hash: got %q", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodFailed, false, 0, "abc")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "MemberFailed" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "MemberFailed" {
 		t.Errorf("failed worker: got %q", reason)
 	}
 	obs[1].existing = nil
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "" {
 		t.Errorf("a missing member is created, not a recreate trigger: got %q", reason)
 	}
 	if ok, n := groupReadiness(obs); ok || n != 1 {
@@ -315,11 +315,11 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	obs[1].existing = mk("w", corev1.PodRunning, false, 0, "abc")
 	obs[0].existing = mk("h", corev1.PodRunning, false, 0, "abc")
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-multiNodeStartupBudget - time.Minute))
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "HeadNotReady" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "HeadNotReady" {
 		t.Errorf("head past budget: got %q", reason)
 	}
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
-	if reason, _ := groupNeedsRecreate(obs, "abc", now); reason != "" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "" {
 		t.Errorf("head inside budget must wait: got %q", reason)
 	}
 	if ok, _ := groupReadiness(obs); ok {
@@ -353,9 +353,112 @@ func TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate(t *testing.T) {
 				{rank: 0, existing: mk("h", 0)},
 				{rank: 1, existing: tt.worker},
 			}
-			reason, _ := groupNeedsRecreate(obs, "abc", time.Now())
+			reason, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Now())
 			if reason != tt.want {
 				t.Errorf("worker restart: got reason %q, want %q", reason, tt.want)
+			}
+		})
+	}
+}
+
+// TestGroupNeedsRecreateFormation pins the #1757 formation rules: while a
+// member is still staging its weights, the members that did start wait for the
+// rendezvous and exit on their own, and kubelet restarts them; recreating the
+// group on those exits kills the downloader and loses its progress, so they
+// are formation noise. The noise ends at the group's formation timestamp, and
+// a staging member whose init containers keep dying is bounded by
+// MemberInitLoop so masking cannot hide a permanently broken download.
+func TestGroupNeedsRecreateFormation(t *testing.T) {
+	now := time.Now()
+	// mkWaiting is a member whose runtime has been up, exited and been
+	// restarted by the kubelet.
+	mkWaiting := func(name string, restarts int32, finishedAt time.Time) *corev1.Pod {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}}}
+		p.Status.Phase = corev1.PodRunning
+		cs := corev1.ContainerStatus{RestartCount: restarts}
+		if !finishedAt.IsZero() {
+			cs.LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1, Reason: "Error", FinishedAt: metav1.NewTime(finishedAt),
+			}}
+		}
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{cs}
+		return p
+	}
+	// mkStaging is a member still in its model-downloader init container.
+	mkStaging := func(name string, initRestarts int32) *corev1.Pod {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}}}
+		p.Status.Phase = corev1.PodPending
+		started := metav1.NewTime(now.Add(-10 * time.Minute))
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+			Name:         "model-downloader",
+			State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: started}},
+			RestartCount: initRestarts,
+		}}
+		return p
+	}
+
+	tests := []struct {
+		name     string
+		obs      []memberObservation
+		formedAt time.Time
+		want     string
+	}{
+		{
+			name: "restarts while a member stages are formation noise",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 2, now.Add(-time.Minute))},
+				{rank: 1, existing: mkStaging("w", 0)},
+			},
+			formedAt: time.Time{},
+			want:     "",
+		},
+		{
+			name: "a termination after formation is still fatal",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 1, now.Add(-time.Minute))},
+				{rank: 1, existing: mkStaging("w", 0)},
+			},
+			formedAt: now.Add(-5 * time.Minute),
+			want:     "MemberRestarted",
+		},
+		{
+			name: "an init container that keeps dying is bounded by MemberInitLoop",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 0, now.Add(-time.Minute))},
+				{rank: 1, existing: mkStaging("w", 4)},
+			},
+			formedAt: time.Time{},
+			want:     "MemberInitLoop",
+		},
+		{
+			name: "init restarts within the bound keep waiting for staging",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 0, now.Add(-time.Minute))},
+				{rank: 1, existing: mkStaging("w", 3)},
+			},
+			formedAt: time.Time{},
+			want:     "",
+		},
+		{
+			name: "a staging member gates the head startup budget",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 0, time.Time{})},
+				{rank: 1, existing: mkStaging("w", 0)},
+			},
+			formedAt: time.Time{},
+			want:     "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "a staging member gates the head startup budget" {
+				// Age the head past the budget so the gating is what is under
+				// test, not the budget itself.
+				tt.obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-multiNodeStartupBudget - time.Minute))
+			}
+			reason, _ := groupNeedsRecreate(tt.obs, "abc", now, tt.formedAt)
+			if reason != tt.want {
+				t.Errorf("got reason %q, want %q", reason, tt.want)
 			}
 		})
 	}
@@ -402,9 +505,12 @@ func TestLastTerminationDetail(t *testing.T) {
 			t.Errorf("detail %q lacks %q", got, want)
 		}
 	}
+	// The formation-aware recreate rule (#1757) judges a termination against
+	// the group's formation timestamp, so the fixture terminates after the
+	// group formed: formedAt an hour ago, FinishedAt now.
 	obs := []memberObservation{{rank: 0, existing: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "h", Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "vllm", RestartCount: 1, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled"}}}}}}}}
-	reason, msg := groupNeedsRecreate(obs, "abc", time.Now())
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "vllm", RestartCount: 1, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled", FinishedAt: metav1.NewTime(time.Now())}}}}}}}}
+	reason, msg := groupNeedsRecreate(obs, "abc", time.Now(), time.Now().Add(-time.Hour))
 	if reason != "MemberRestarted" || !strings.Contains(msg, "OOMKilled") || !strings.Contains(msg, "137") {
 		t.Fatalf("restart detail missing: %s / %s", reason, msg)
 	}
