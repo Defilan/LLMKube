@@ -282,6 +282,36 @@ outruns `swapBudget`, so a client that retries after the incumbent drains is
 served. It is deliberately not a `502`: nothing is broken upstream, the slot is
 just occupied.
 
+### Precise drain for a custom-image member: the metric idle probe
+
+The `llamacpp`, `vllm` and `sglang` runtimes know how to ask their server whether
+it is idle (llama.cpp's `/slots`, vLLM's `vllm:num_requests_running` gauge), so a
+swap waits for in-flight work to finish before freeing the slot. The `generic`
+runtime, used for a custom image whose entrypoint the built-in runtimes cannot
+drive, has no such knowledge. By default it can only be told a health path via
+`inference.llmkube.dev/idle-endpoint`, and a plain health check returns 2xx even
+while the server is busy, so the pool treats such a member as always idle and can
+preempt it mid-request.
+
+If the custom image exposes Prometheus metrics with an in-flight-work gauge (most
+vLLM- and SGLang-derived images do), point the generic idle probe at it instead:
+
+```yaml
+metadata:
+  annotations:
+    inference.llmkube.dev/idle-metric: "vllm:num_requests_running"
+    # optional, default 0
+    inference.llmkube.dev/idle-metric-threshold: "0"
+    # optional, default /metrics
+    inference.llmkube.dev/idle-metric-path: "/metrics"
+```
+
+The probe scrapes the metrics path, sums the named gauge, and reports the member
+idle only when the sum is at or below the threshold, the same precise drain the
+native runtimes get. It fails closed: a non-200 scrape or an absent gauge counts
+as busy, so a member whose idleness cannot be established is never preempted.
+`idle-metric` takes precedence over `idle-endpoint` when both are set.
+
 ### swapBudget, and why it is separate from the request timeout
 
 `swapBudget` (default `300s`) bounds how long the router holds a cross-model

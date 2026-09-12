@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -82,6 +84,49 @@ func (b *GenericBackend) BuildProbes(port int32) (startup, liveness, readiness *
 // returns (false, errIdleUnsupported). If present, GETs the annotated path and
 // returns true on 2xx (idle), false on non-2xx (busy).
 func (b *GenericBackend) IdleProbe(isvc *inferencev1alpha1.InferenceService, client *http.Client) func(ctx context.Context, baseURL string) (bool, error) {
+	// Metric-gated mode takes precedence: scrape a Prometheus endpoint and gate
+	// idleness on the sum of a named gauge. This gives a custom-image server
+	// (e.g. a patched vLLM) the same precise drain the native runtimes get,
+	// rather than a 2xx health check that always reads as idle.
+	if metric := isvc.Annotations[inferencev1alpha1.AnnotationIdleMetric]; metric != "" {
+		metricsPath := isvc.Annotations[inferencev1alpha1.AnnotationIdleMetricPath]
+		if metricsPath == "" {
+			metricsPath = "/metrics"
+		}
+		var threshold float64
+		if raw := isvc.Annotations[inferencev1alpha1.AnnotationIdleMetricThreshold]; raw != "" {
+			if t, err := strconv.ParseFloat(raw, 64); err == nil {
+				threshold = t
+			}
+		}
+		return func(ctx context.Context, baseURL string) (bool, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+metricsPath, nil)
+			if err != nil {
+				return false, fmt.Errorf("failed to create request: %w", err)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return false, fmt.Errorf("idle metric probe failed: %w", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				return false, fmt.Errorf("idle metric endpoint returned status %d", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return false, fmt.Errorf("failed to read idle metric response: %w", err)
+			}
+			sum, found := parsePrometheusGaugeSum(string(body), metric)
+			if !found {
+				// The gauge is absent. Fail closed (report busy) rather than
+				// drain a member whose idleness we cannot establish; this mirrors
+				// the native vLLM/SGLang probes.
+				return false, nil
+			}
+			return sum <= threshold, nil
+		}
+	}
+
 	path, ok := isvc.Annotations[inferencev1alpha1.AnnotationIdleEndpoint]
 	if !ok {
 		return func(ctx context.Context, baseURL string) (bool, error) {

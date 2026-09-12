@@ -38,6 +38,25 @@ const (
 	// in to drain-before-roll. Set on InferenceService metadata.annotations.
 	AnnotationIdleEndpoint = "inference.llmkube.dev/idle-endpoint"
 
+	// AnnotationIdleMetric names a Prometheus gauge exposed on the generic
+	// runtime's metrics endpoint whose sum reports in-flight work (for example
+	// vLLM's vllm:num_requests_running or SGLang's sglang:num_running_reqs).
+	// When set, the generic idle probe scrapes the metrics path and reports the
+	// member idle when the gauge sum is at or below AnnotationIdleMetricThreshold,
+	// giving a custom-image server the same precise drain the native runtimes
+	// get instead of a 2xx health check that is always "idle". Takes precedence
+	// over AnnotationIdleEndpoint. Set on InferenceService metadata.annotations.
+	AnnotationIdleMetric = "inference.llmkube.dev/idle-metric"
+
+	// AnnotationIdleMetricThreshold is the gauge sum at or below which the
+	// member counts as idle for AnnotationIdleMetric. Parsed as a float;
+	// defaults to 0 when unset or unparseable.
+	AnnotationIdleMetricThreshold = "inference.llmkube.dev/idle-metric-threshold"
+
+	// AnnotationIdleMetricPath overrides the HTTP path scraped for
+	// AnnotationIdleMetric. Defaults to /metrics.
+	AnnotationIdleMetricPath = "inference.llmkube.dev/idle-metric-path"
+
 	// DefaultAgentHeartbeatInterval is how often the metal-agent re-asserts
 	// its registrations (which also self-heals any missed update, #657).
 	DefaultAgentHeartbeatInterval = 30 * time.Second
