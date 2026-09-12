@@ -52,7 +52,7 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 	It("should NOT emit --aws-sigv4 for non-s3 source", func() {
 		cmd := buildModelInitCommand(false, false, true, false, "")
 		Expect(cmd).ToNot(ContainSubstring("aws-sigv4"))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"`))
+		Expect(cmd).To(ContainSubstring(`curl -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
 	})
 
 	// A truncated transfer must never be published at $MODEL_PATH: the guard
@@ -81,26 +81,94 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 
 // Issue #1435: interrupted transfers leave orphaned .tmp files that nothing
 // cleans up. The init command must remove stale .tmp files before starting a
-// new download so they do not accumulate on the shared cache PVC.
+// new download so they do not accumulate on the shared cache PVC. The HTTP
+// branches keep-one sweep (#1765) rather than the unconditional rm: it removes
+// every .tmp except the current transfer's content-keyed partial, so resumable
+// progress survives while debris is still swept. The S3 and local branches,
+// which do not resume, keep the original `rm -f "$MODEL_PATH.tmp"`.
 var _ = Describe("buildModelInitCommand (orphan .tmp cleanup, #1435)", func() {
-	It("should remove stale .tmp before downloading in cached remote path", func() {
+	It("should sweep stale .tmp but keep the current partial in the cached remote HTTP path", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached S3 path", func() {
+	It("should keep the unconditional rm in the cached S3 path (S3 does not resume)", func() {
 		cmd := buildModelInitCommand(false, true, true, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`! -name "$(basename "$MODEL_PARTIAL")" -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached local path", func() {
+	It("should keep the unconditional rm in the cached local path (local copy does not resume)", func() {
 		cmd := buildModelInitCommand(true, false, true, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`! -name "$(basename "$MODEL_PARTIAL")" -delete`))
 	})
 
-	It("should remove stale .tmp before downloading in cached OnChange path", func() {
+	It("should sweep stale .tmp but keep the current partial in the cached OnChange path", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
-		Expect(cmd).To(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).ToNot(ContainSubstring(`rm -f "$MODEL_PATH.tmp"`))
+		Expect(cmd).To(ContainSubstring(`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete`))
+	})
+})
+
+// Issue #1765: an interrupted single-file HTTP download must resume from where it
+// stopped. The non-S3 HTTP transfers write into "$MODEL_PARTIAL" (a validator-
+// keyed partial that survives the keep-one sweep) with `-C -`, and mv onto
+// "$MODEL_PATH" on success. S3 and the local cp branch keep their pre-resume
+// behaviour: no `-C -`, transfer into "$MODEL_PATH.tmp".
+var _ = Describe("buildModelInitCommand (resume into content-keyed partial, #1765)", func() {
+	It("cached HTTP download resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("uncached HTTP download resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("cached OnChange revalidate transfer resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("uncached OnChange revalidate transfer resumes into MODEL_PARTIAL and mv's onto MODEL_PATH", func() {
+		cmd := buildModelInitCommand(false, false, false, false, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"`))
+		Expect(cmd).To(ContainSubstring(`mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+	})
+
+	It("the partial key is derived from the upstream validator, not a Go-computed env var", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent)
+		// The validator is only knowable at run time, so the name is computed in
+		// the shell from sha256($remote_validator). Dropping the validator from
+		// the key is what makes a same-length content change splice.
+		Expect(cmd).To(ContainSubstring(`key=$(printf '%s' "$remote_validator" | sha256sum | cut -c1-12)`))
+		Expect(cmd).To(ContainSubstring(`MODEL_PARTIAL="$MODEL_PATH.$key.tmp"`))
+	})
+
+	It("OnChange reads the ETag in the same single HEAD as Content-Length", func() {
+		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
+		Expect(cmd).To(ContainSubstring(`-w 'CL%header{content-length}ET%header{etag}'`))
+	})
+
+	It("s3 branches carry no -C - and still write to MODEL_PATH.tmp", func() {
+		for _, useCache := range []bool{true, false} {
+			cmd := buildModelInitCommand(false, true, useCache, false, RefreshPolicyIfNotPresent)
+			Expect(cmd).ToNot(ContainSubstring("-C -"))
+			Expect(cmd).To(ContainSubstring(`-o "$MODEL_PATH.tmp"`))
+			Expect(cmd).To(ContainSubstring(`mv "$MODEL_PATH.tmp" "$MODEL_PATH"`))
+		}
+	})
+
+	It("local cp branch carries no -C -", func() {
+		cmd := buildModelInitCommand(true, false, true, false, RefreshPolicyIfNotPresent)
+		Expect(cmd).ToNot(ContainSubstring("-C -"))
+		Expect(cmd).To(ContainSubstring(`cp /host-model/model.gguf "$MODEL_PATH.tmp"`))
 	})
 })
 
@@ -113,6 +181,9 @@ var _ = Describe("modelInitEnvVars (s3)", func() {
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MODEL_SOURCE", Value: "s3://my-bucket/models/model.gguf"}))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "CACHE_DIR", Value: "/models/cache"}))
 		Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MODEL_PATH", Value: "/models/cache/model.gguf"}))
+		// The partial name is computed in the shell at run time from the upstream
+		// validator, so no MODEL_PARTIAL env var is emitted (#1765).
+		Expect(envs).ToNot(ContainElement(corev1.EnvVar{Name: "MODEL_PARTIAL"}))
 	})
 
 	It("should NOT include S3_BUCKET and S3_KEY for non-s3 source", func() {

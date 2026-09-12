@@ -306,11 +306,31 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // --location-trusted must NOT be added here.
 const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authorization: Bearer ${HF_TOKEN}" "$@"; else curl "$@"; fi; }` + " && "
 
-// All transfers write to "$MODEL_PATH.tmp" and mv onto "$MODEL_PATH" on
-// success: the guard is a bare existence check, so publishing the file
-// non-atomically would let an interrupted transfer (OOM-kill, eviction,
-// node reboot) leave a truncated artifact that every subsequent restart
-// treats as cached. See remoteRevalidateScript for the same pattern.
+// The HTTP transfers fill a content-keyed partial and mv onto "$MODEL_PATH"
+// on success; the S3 and local-copy branches still fill "$MODEL_PATH.tmp".
+// Two invariants the shape of the command exists to hold:
+//
+//   - Atomic publish. The cache guard is a bare existence check, so publishing
+//     non-atomically would let an interrupted transfer (OOM-kill, eviction,
+//     node reboot) leave a truncated artifact every later restart treats as
+//     cached. Every branch therefore writes a partial and `mv`s it onto the
+//     destination, never `-o` the live path (#1309, #1432). See
+//     remoteRevalidateScript for the same pattern.
+//   - Resume without splicing. The non-S3 HTTP transfers fetch a validator from
+//     upstream (HEAD etag|content-length), key the partial on it
+//     ("$MODEL_PATH.<sha256(validator)[:12]>.tmp"), and `curl -C -` into it, so
+//     an interrupted download resumes where it stopped (#1765). The keep-one
+//     sweep deletes every *.tmp in the destination dir except that partial: it
+//     replaces both jobs the old unconditional `rm -f` did. It keeps the #1435
+//     guarantee that debris does not accumulate on the shared cache PVC, and,
+//     because a content change yields a different key and so an evicted partial,
+//     it makes cross-version splicing impossible (a `curl -C -` / `Range` resume
+//     sends no If-Range, so an abandoned partial from different bytes would
+//     otherwise splice onto the new content).
+//
+// The s3:// and local `cp` branches still open with the plain
+// `rm -f "$MODEL_PATH.tmp"`: sigv4 range signing is unverified and a local copy
+// has nothing to resume, so they stay byte-for-byte as they were pre-resume.
 func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy string) string {
 	if useCache {
 		if isLocal {
@@ -320,10 +340,10 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
-			return "mkdir -p \"$CACHE_DIR\" && rm -f \"$MODEL_PATH.tmp\" && " + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
+			return "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 		}
-		return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + hfAuthPrefix(isHFAuth) +
-			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+		return `mkdir -p "$CACHE_DIR" && ` + hfAuthPrefix(isHFAuth) + resumePrologue(isHFAuth) +
+			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 	}
 
 	if isLocal {
@@ -335,8 +355,8 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 	if refreshPolicy == RefreshPolicyOnChange {
 		return hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 	}
-	return hfAuthPrefix(isHFAuth) +
-		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+	return hfAuthPrefix(isHFAuth) + resumePrologue(isHFAuth) +
+		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -353,19 +373,27 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 // good cache before any decision is made.
 //
 // Strategy (works for both origin and CDN-served files):
-//  1. HEAD the artifact and read Content-Length. This MUST use curl's
-//     -w '%header{content-length}' (curl 7.84+, satisfied by curlimages/curl):
-//     a HEAD has no response body, so -w '%{size_download}' would always report
-//     0 and the skip branch below could never fire. -L makes %header report the
-//     final CDN response's Content-Length across HuggingFace's 302 redirect.
-//     If the header is absent or the HEAD is rejected, remote_size is empty/0
-//     and the script downloads (size-equality is a truncation guard, not an
-//     integrity check).
+//  1. HEAD the artifact once and read both Content-Length and ETag in that same
+//     request. This MUST use curl's -w '%header{...}' (curl 7.84+, satisfied by
+//     curlimages/curl): a HEAD has no response body, so -w '%{size_download}'
+//     would always report 0 and the skip branch below could never fire. -L makes
+//     %header report the final CDN response's headers across HuggingFace's 302
+//     redirect. Content-Length drives the skip decision (size-equality is a
+//     truncation guard, not an integrity check); the whole probe string is the
+//     validator that keys the resumable partial (validatorDeriveAndSweep), so a
+//     change to either the length or the ETag changes the key. The two values
+//     are read with a delimiter-free -w format ('CL...ET...') precisely so a "|"
+//     inside a quoted ETag cannot corrupt the size/validator split. If the HEAD
+//     is rejected the probe yields its fallback and the script downloads into a
+//     fresh partial.
 //  2. If the local file exists and its size matches Content-Length, the cache
 //     is current: log "revalidated" and skip the transfer.
-//  3. Otherwise download to "$dest.tmp" and `mv` it onto "$dest" on success,
-//     so a redundant or failed transfer can never truncate a good cache. The
-//     rename also makes the artifact publish atomically.
+//  3. Otherwise key a partial on the validator (validatorDeriveAndSweep), sweep
+//     every other *.tmp in the destination dir, `curl -C -` into the partial so
+//     an interrupted transfer resumes, and `mv` it onto "$dest" on success. The
+//     resume never splices: a content change yields a different validator, so
+//     the stale partial is swept instead of appended onto. The rename publishes
+//     atomically.
 //
 // Robustness: the init container gates pod startup, so a transient network
 // failure (air-gapped, upstream 5xx, DNS) must not take down an
@@ -376,11 +404,14 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 func remoteRevalidateScript(isHFAuth bool) string {
 	c := curlCmd(isHFAuth)
 	return `echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
-		`remote_size=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0); ` +
+		`probe=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w 'CL%header{content-length}ET%header{etag}' 2>/dev/null || echo 'CL0ET'); ` +
+		`remote_size=${probe#CL}; remote_size=${remote_size%%ET*}; ` +
+		`remote_validator=${probe}; ` +
 		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 		`echo 'Model revalidated (unchanged, skipped download)'; ` +
 		`else ` +
-		`if ` + c + ` -fsSL -o "$MODEL_PATH.tmp" "$MODEL_SOURCE" && mv "$MODEL_PATH.tmp" "$MODEL_PATH"; then ` +
+		validatorDeriveAndSweep() +
+		`if ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH"; then ` +
 		`echo 'Model revalidated (downloaded)'; ` +
 		`elif [ -f "$MODEL_PATH" ]; then echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
 		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
@@ -402,6 +433,59 @@ func hfAuthPrefix(isHFAuth bool) string {
 		return hfAuthFn
 	}
 	return ""
+}
+
+// validatorDeriveAndSweep is the shell fragment that turns $remote_validator (an
+// upstream validator string: an ETag, or Content-Length when the origin sends no
+// ETag) into a content-keyed $MODEL_PARTIAL, then removes every other *.tmp in
+// the destination directory.
+//
+// The partial name is computed at run time, not in Go, because the validator is
+// only knowable after the upstream probe. Keying on the validator (not the
+// source URL) is what makes the resume splice-safe: a content change yields a
+// different validator, hence a different partial name, so the keep-one predicate
+// below evicts the abandoned partial instead of `curl -C -` appending new bytes
+// onto it.
+//
+// The sweep targets $(dirname "$MODEL_PATH"), never $CACHE_DIR: the emptyDir
+// branches have CACHE_DIR="" and `find ""` fails with "No such file or
+// directory", which would hard-fail the whole init script through the && chain.
+// dirname is correct on both the cached and the uncached path. The sweep keeps
+// the #1435 guarantee (debris is still removed every attempt) while preserving
+// the resumable partial (#1765).
+func validatorDeriveAndSweep() string {
+	return `key=$(printf '%s' "$remote_validator" | sha256sum | cut -c1-12); ` +
+		`MODEL_PARTIAL="$MODEL_PATH.$key.tmp"; ` +
+		`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete; `
+}
+
+// debrisSweep is the unconditional #1435 sweep of every *.tmp in the destination
+// directory (targeted at $(dirname "$MODEL_PATH") so the emptyDir branches, whose
+// CACHE_DIR is empty, do not fail `find ""`). The OnChange path runs it before
+// the revalidation probe: when the cached file is already current the script
+// short-circuits without ever computing a partial name, and the sweep still has
+// to run to keep debris from accumulating. The derive-and-sweep inside the
+// download branch then re-sweeps with a keep-one predicate once the partial is
+// known.
+func debrisSweep() string {
+	return `find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' -delete && `
+}
+
+// resumePrologue is the cached and uncached IfNotPresent resume sequence: a
+// validator probe (HEAD reading ETag + Content-Length) that sets
+// $remote_validator, then the derive-and-sweep that names $MODEL_PARTIAL. The
+// caller follows it with `curl -C -` into $MODEL_PARTIAL and an mv onto
+// $MODEL_PATH.
+//
+// The probe runs through the same auth wrapper as the body transfer: on an
+// huggingface.co source a gated repo 401s on an anonymous HEAD, and the probe
+// must never issue an unauthenticated request to an HF host. A probe that fails
+// (an offline or rejecting origin, a gated repo with no token) yields an empty
+// validator: the key is fixed and the transfer downloads into a fresh partial
+// instead of resuming blindly.
+func resumePrologue(isHFAuth bool) string {
+	return `remote_validator=$(` + curlCmd(isHFAuth) + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w 'CL%header{content-length}ET%header{etag}' 2>/dev/null || echo ''); ` +
+		validatorDeriveAndSweep()
 }
 
 func modelInitEnvVars(source, cacheDir, modelPath string) []corev1.EnvVar {
