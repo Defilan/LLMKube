@@ -170,7 +170,7 @@ func TestApplyCoderGroundingRailForTask_GatesOnIssueFixKind(t *testing.T) {
 		Spec: foremanv1alpha1.AgenticTaskSpec{Kind: foremanv1alpha1.AgenticTaskKindReview},
 	}
 	lr := newLoopRes()
-	applyCoderGroundingRailForTask(context.Background(), logr.Discard(), reviewTask, "/ws", lr)
+	applyCoderGroundingRailForTask(context.Background(), logr.Discard(), reviewTask, "/ws", "main", lr)
 	if _, present := lr.Terminal.Extra["coderGroundingViolations"]; present {
 		t.Fatal("kind != issue-fix -> rail must be a no-op")
 	}
@@ -179,7 +179,7 @@ func TestApplyCoderGroundingRailForTask_GatesOnIssueFixKind(t *testing.T) {
 		Spec: foremanv1alpha1.AgenticTaskSpec{Kind: foremanv1alpha1.AgenticTaskKindIssueFix},
 	}
 	lr = newLoopRes()
-	applyCoderGroundingRailForTask(context.Background(), logr.Discard(), issueFixTask, "/ws", lr)
+	applyCoderGroundingRailForTask(context.Background(), logr.Discard(), issueFixTask, "/ws", "main", lr)
 	recs, ok := lr.Terminal.Extra["coderGroundingViolations"].([]map[string]any)
 	if !ok || len(recs) != 1 || recs[0]["written"] != "vllm:request_failure_total" {
 		t.Fatalf("issue-fix kind should apply the rail; got %v", lr.Terminal.Extra["coderGroundingViolations"])

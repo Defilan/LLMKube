@@ -1182,23 +1182,26 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// working tree), so a pre-commit base...HEAD is empty and the rail sees
 	// nothing. Records-and-logs onto loopRes.Terminal.Extra (which goResult
 	// serializes into status extra.modelExtra); never changes the verdict.
-	applyCoderGroundingRailForTask(ctx, log, task, workspace, loopRes)
+	applyCoderGroundingRailForTask(ctx, log, task, workspace, evidenceBaseSHA, loopRes)
 
 	// No-functional-change advisory (non-blocking): flag a GO whose committed
 	// diff is docs/comments/tests only, so a "fix" that changes no production
 	// code (and whose prose may claim unimplemented behavior, #850/#1022) does
 	// not read as a clean functional GATE-PASS. Same after-commit requirement
 	// as the grounding rail; records-and-logs, never changes the verdict.
-	applyNoFunctionalChangeForTask(ctx, log, task, workspace, loopRes)
+	applyNoFunctionalChangeForTask(ctx, log, task, workspace, evidenceBaseSHA, loopRes)
 
 	// Deleted-reference rail (#1553, non-blocking): flag a GO whose committed
 	// diff removes code citing an issue/PR number (a "this exists because of
 	// #N" comment), so the removal of tracked work is stated, not silent.
-	// Same after-commit requirement as the two rails above -- it reads the
-	// committed base...HEAD diff. That is its own `git diff` call, not a
-	// reused result. Records-and-logs onto loopRes.Terminal.Extra; never
-	// changes the verdict.
-	applyDeletedReferenceRailForTask(ctx, task, workspace, loopRes)
+	// Same after-commit requirement as the two rails above. Each rail runs
+	// its own `git diff <anchor>...HEAD` (no result is reused), anchored to
+	// evidenceBaseSHA, the literal upstream base tip resolved before the
+	// loop (#1769): the workspace's local base ref belongs to the fork and
+	// lags upstream, so a stale anchor sweeps the whole intervening upstream
+	// delta into the scanned diff. Records-and-logs onto
+	// loopRes.Terminal.Extra; never changes the verdict.
+	applyDeletedReferenceRailForTask(ctx, task, workspace, evidenceBaseSHA, loopRes)
 
 	r := e.goResult(start, transcriptRef, loopRes, branch, sha)
 	attachGateAdvisories(r.Extra, gateAdvisories)

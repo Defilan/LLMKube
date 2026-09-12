@@ -103,13 +103,22 @@ func applyNoFunctionalChange(ctx context.Context, log logr.Logger, base, workspa
 }
 
 // applyNoFunctionalChangeForTask gates the advisory to issue-fix runs and
-// resolves the base branch, mirroring applyCoderGroundingRailForTask. Must run
-// after repo.Commit so base...HEAD reflects the committed diff.
+// takes the diff anchor from the caller, mirroring applyCoderGroundingRailForTask.
+// base must be the literal upstream base SHA the task branch was cut from
+// (evidenceBaseSHA in runLLMPath); the workspace's local base ref belongs to
+// the fork, which lags upstream, so diffing against it sweeps the whole
+// intervening upstream delta into the scanned diff and a docs-only GO can read
+// as functional (#1769, the coder-side half of #1005). No resolved SHA degrades
+// to the payload base branch name, the pre-#1769 posture. Must run after
+// repo.Commit so the diff reflects the committed work.
 func applyNoFunctionalChangeForTask(
-	ctx context.Context, log logr.Logger, task *foremanv1alpha1.AgenticTask, workspace string, loopRes *LoopResult,
+	ctx context.Context, log logr.Logger, task *foremanv1alpha1.AgenticTask, workspace, base string, loopRes *LoopResult,
 ) {
 	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
 		return
 	}
-	applyNoFunctionalChange(ctx, log, baseBranchOrDefault(task.Spec.Payload.BaseBranch), workspace, loopRes)
+	if base == "" {
+		base = baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+	}
+	applyNoFunctionalChange(ctx, log, base, workspace, loopRes)
 }
