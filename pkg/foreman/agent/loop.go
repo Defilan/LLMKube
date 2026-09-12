@@ -674,18 +674,29 @@ func appendCorrectiveIfBudget(res *LoopResult, streak *int, maxRetries int, msg 
 	return true
 }
 
-// Loop runs the native agent loop against a single OAI endpoint. It is
-// safe to reuse a Loop across many Run calls; each call starts a fresh
-// transcript and is self-contained.
+// ChatCompleter is the client seam the loop drives: one turn = one
+// request. Both the oai.Client (OpenAI-compatible: local llama.cpp
+// serve, cloud-proxy gateway) and the anthropic.Client (Anthropic
+// native /v1/messages) satisfy it, so the loop's reasoning / tool /
+// transcript logic is provider-agnostic (#1627).
+type ChatCompleter interface {
+	Chat(ctx context.Context, req oai.ChatRequest) (*oai.ChatResponse, error)
+}
+
+// Loop runs the native agent loop against a single chat endpoint. It
+// is safe to reuse a Loop across many Run calls; each call starts a
+// fresh transcript and is self-contained.
 type Loop struct {
-	client   *oai.Client
+	client   ChatCompleter
 	registry ToolRegistry
 	tracer   trace.Tracer
 }
 
-// NewLoop builds a Loop. Pass tracer=nil to use the global tracer
+// NewLoop builds a Loop. client may be either *oai.Client
+// (OpenAI-compatible) or *anthropic.Client (Anthropic native); both
+// satisfy ChatCompleter. Pass tracer=nil to use the global tracer
 // provider's "foreman.agent.loop" tracer.
-func NewLoop(client *oai.Client, registry ToolRegistry, tracer trace.Tracer) *Loop {
+func NewLoop(client ChatCompleter, registry ToolRegistry, tracer trace.Tracer) *Loop {
 	if tracer == nil {
 		tracer = otel.Tracer("foreman.agent.loop")
 	}

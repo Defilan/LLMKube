@@ -167,12 +167,13 @@ func validateAgentPromptShape(agent *foremanv1alpha1.Agent, specPath *field.Path
 	}
 
 	// LLM-driven Agent. Name whichever field actually made it LLM-driven: a
-	// cloud-proxy Agent has no inferenceServiceRef, so citing that field sends
-	// the operator looking at something they never set.
+	// non-local Agent (cloud-proxy or anthropic) has no inferenceServiceRef,
+	// so citing that field sends the operator looking at something they never
+	// set.
 	if strings.TrimSpace(agent.Spec.SystemPrompt) == "" {
 		because := "inferenceServiceRef is set"
-		if agent.Spec.Provider == foremanv1alpha1.AgentProviderCloudProxy {
-			because = "provider is cloud-proxy"
+		if p := agent.Spec.Provider; p != "" && p != foremanv1alpha1.AgentProviderLocal {
+			because = "provider is " + string(p)
 		}
 		errs = append(errs, field.Required(
 			specPath.Child("systemPrompt"),

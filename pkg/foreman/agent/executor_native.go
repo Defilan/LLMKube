@@ -40,6 +40,7 @@ import (
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/anthropic"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/changepolicy"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/codehost"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
@@ -127,10 +128,13 @@ type NativeAgentLoopExecutor struct {
 	// reads $GITHUB_TOKEN or ~/.config/foreman/github-token.
 	AuthFactory func() (*repo.Auth, error)
 
-	// LoopFactory builds the Loop given the resolved OAI client and
+	// LoopFactory builds the Loop given the resolved chat client and
 	// tool registry. Mostly to support tests with a fake loop; nil
-	// uses the real NewLoop.
-	LoopFactory func(client *oai.Client, registry ToolRegistry) *Loop
+	// uses the real NewLoop. The client is provider-shaped at the call
+	// site (oai.Client for local + cloud-proxy, anthropic.Client for
+	// anthropic) but arrives as a ChatCompleter so a fake loop can be
+	// injected without caring which wire it speaks (#1627).
+	LoopFactory func(client ChatCompleter, registry ToolRegistry) *Loop
 
 	// RegistryFactory builds the tool registry for a given workspace +
 	// agent. Required; the executor refuses to start without one
@@ -724,27 +728,14 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 ) (*Result, error) {
 	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
 
-	// 6. Build OAI client + loop. The auth header is empty for local
-	// providers and "Bearer <token>" for cloud-proxy Agents whose
-	// providerConfig carries an APIKeySecretRef.
-	oaiOpts := []oai.Option{}
-	if endpoint.authHeader != "" {
-		oaiOpts = append(oaiOpts, oai.WithAuthHeader(endpoint.authHeader))
-	}
-	oaiClient := oai.New(
-		endpoint.baseURL,
-		// Per-request header timeout (#532): how long one turn waits for
-		// the first token before retrying. The loop-wide budget is
-		// applied separately via LoopConfig.LoopBudget below.
-		durationFromSeconds(agent.Spec.RequestTurnTimeoutSeconds, 120),
-		int(agent.Spec.MaxRetries),
-		oaiOpts...,
-	)
+	// 6. Build the chat client + loop. The client follows the provider
+	// (#1627); see newChatCompleter for the provider-to-client map.
+	chat := newChatCompleter(agent, endpoint)
 	loopFactory := e.LoopFactory
 	if loopFactory == nil {
-		loopFactory = func(c *oai.Client, r ToolRegistry) *Loop { return NewLoop(c, r, nil) }
+		loopFactory = func(c ChatCompleter, r ToolRegistry) *Loop { return NewLoop(c, r, nil) }
 	}
-	loop := loopFactory(oaiClient, registry)
+	loop := loopFactory(chat, registry)
 
 	// 7. Build the user prompt from the task payload. The composition,
 	// outermost-first:
@@ -1871,16 +1862,18 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 	return out
 }
 
-// providerEndpoint is the resolved triple the LLM path needs to dial
-// any provider: where to POST, which model to name in the request body,
-// and the optional Authorization header value. The cloud-proxy branch
-// populates all three from Agent.spec.providerConfig + a referenced
-// Secret; the local branch leaves authHeader empty and pulls modelName
-// from Agent.spec.Model.
+// providerEndpoint is the resolved descriptor the LLM path needs to
+// dial any provider: where to POST, which model to name in the request
+// body, and the provider-shaped auth material. The auth is
+// provider-shaped: cloud-proxy carries an Authorization header value
+// ("Bearer <token>"); anthropic carries the raw key for the x-api-key
+// header; local leaves both empty and pulls modelName from
+// Agent.spec.Model.
 type providerEndpoint struct {
 	baseURL    string
 	modelName  string
 	authHeader string
+	apiKey     string
 }
 
 // isDeterministicAgent reports whether the Agent runs the model-free
@@ -1906,7 +1899,8 @@ func mcpEnabledForTask(task *foremanv1alpha1.AgenticTask) bool {
 // resolveProviderEndpoint dispatches to the right resolver based on
 // Agent.spec.Provider. Empty / "local" -> existing InferenceService
 // resolution; "cloud-proxy" -> providerConfig.BaseURL + Secret lookup
-// for the auth header.
+// for the Authorization header; "anthropic" -> providerConfig.BaseURL +
+// Secret lookup for the x-api-key header.
 func (e *NativeAgentLoopExecutor) resolveProviderEndpoint(
 	ctx context.Context, namespace string, agent *foremanv1alpha1.Agent,
 ) (providerEndpoint, error) {
@@ -1921,9 +1915,34 @@ func (e *NativeAgentLoopExecutor) resolveProviderEndpoint(
 	case foremanv1alpha1.AgentProviderCloudProxy:
 		return e.resolveCloudProxyEndpoint(ctx, namespace, agent)
 
+	case foremanv1alpha1.AgentProviderAnthropic:
+		return e.resolveAnthropicEndpoint(ctx, namespace, agent)
+
 	default:
 		return providerEndpoint{}, fmt.Errorf("unknown agent.spec.provider %q", agent.Spec.Provider)
 	}
+}
+
+// newChatCompleter maps a resolved providerEndpoint to the wire client
+// for its provider (#1627). local + cloud-proxy dial an
+// OpenAI-compatible endpoint via oai.Client (Authorization header for
+// cloud-proxy); anthropic dials the native /v1/messages endpoint via
+// anthropic.Client (x-api-key header). Both satisfy ChatCompleter, so
+// the loop never sees the provider difference.
+func newChatCompleter(agent *foremanv1alpha1.Agent, endpoint providerEndpoint) ChatCompleter {
+	// Per-request header timeout (#532): how long one turn waits for
+	// the first byte of the SSE stream before retrying. The loop-wide
+	// budget is applied separately via LoopConfig.LoopBudget.
+	timeout := durationFromSeconds(agent.Spec.RequestTurnTimeoutSeconds, 120)
+	if agent.Spec.Provider == foremanv1alpha1.AgentProviderAnthropic {
+		return anthropic.New(endpoint.baseURL, timeout, int(agent.Spec.MaxRetries),
+			anthropic.WithAPIKey(endpoint.apiKey))
+	}
+	var oaiOpts []oai.Option
+	if endpoint.authHeader != "" {
+		oaiOpts = append(oaiOpts, oai.WithAuthHeader(endpoint.authHeader))
+	}
+	return oai.New(endpoint.baseURL, timeout, int(agent.Spec.MaxRetries), oaiOpts...)
 }
 
 // resolveCloudProxyEndpoint reads providerConfig + the optional
@@ -1953,6 +1972,40 @@ func (e *NativeAgentLoopExecutor) resolveCloudProxyEndpoint(
 			return providerEndpoint{}, err
 		}
 		ep.authHeader = "Bearer " + token
+	}
+	return ep, nil
+}
+
+// resolveAnthropicEndpoint reads providerConfig + the optional
+// APIKeySecretRef to build the endpoint for an Anthropic-native
+// /v1/messages server (#1627). baseURL and model are required; the
+// Secret is optional (a local Anthropic-compatible server can run
+// without auth). Mirrors resolveCloudProxyEndpoint except the secret
+// value is stored RAW in apiKey: the Messages API sends it as the
+// x-api-key header, never as Authorization: Bearer.
+func (e *NativeAgentLoopExecutor) resolveAnthropicEndpoint(
+	ctx context.Context, namespace string, agent *foremanv1alpha1.Agent,
+) (providerEndpoint, error) {
+	cfg := agent.Spec.ProviderConfig
+	if cfg == nil {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig is required for provider=anthropic")
+	}
+	if cfg.BaseURL == "" {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig.baseURL is required for provider=anthropic")
+	}
+	if cfg.Model == "" {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig.model is required for provider=anthropic")
+	}
+	ep := providerEndpoint{
+		baseURL:   strings.TrimRight(cfg.BaseURL, "/"),
+		modelName: cfg.Model,
+	}
+	if cfg.APIKeySecretRef != nil {
+		key, err := e.resolveAuthToken(ctx, namespace, cfg.APIKeySecretRef)
+		if err != nil {
+			return providerEndpoint{}, err
+		}
+		ep.apiKey = key
 	}
 	return ep, nil
 }

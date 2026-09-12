@@ -773,6 +773,139 @@ func TestResolveProviderEndpoint(t *testing.T) {
 	}
 }
 
+// TestResolveAnthropicEndpoint covers the v0.3 anthropic resolution
+// path (#1627): providerConfig must carry baseURL + model, and the
+// optional APIKeySecretRef value lands RAW in the endpoint (the
+// Messages API sends it as x-api-key, never Authorization: Bearer) —
+// the inverse of the cloud-proxy contract, which is the whole point of
+// having a separate resolver.
+func TestResolveAnthropicEndpoint(t *testing.T) {
+	mkAgent := func(name string, cfg *foremanv1alpha1.ProviderConfig) *foremanv1alpha1.Agent {
+		return &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:           foremanv1alpha1.AgentRoleReviewer,
+				Provider:       foremanv1alpha1.AgentProviderAnthropic,
+				ProviderConfig: cfg,
+				Model:          "human-readable-name",
+			},
+		}
+	}
+	mkSecret := func(name, key, value string) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Data:       map[string][]byte{key: []byte(value)},
+		}
+	}
+
+	cases := []struct {
+		name        string
+		agent       *foremanv1alpha1.Agent
+		seedObjects []runtime.Object
+		wantBase    string
+		wantModel   string
+		wantAuth    string
+		wantKey     string
+		wantErrFrag string
+	}{
+		{
+			name: "anthropic without auth: baseURL + model resolve, both auth fields empty",
+			agent: mkAgent("anth-no-auth", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1/",
+				Model:   "claude-sonnet-4-6",
+			}),
+			wantBase:  "https://api.anthropic.com/v1",
+			wantModel: "claude-sonnet-4-6",
+		},
+		{
+			name: "anthropic with Secret: apiKey is the raw value, authHeader stays empty",
+			agent: mkAgent("anth-auth", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1",
+				Model:   "claude-sonnet-4-6",
+				APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
+					Key:                  "key",
+				},
+			}),
+			seedObjects: []runtime.Object{mkSecret("anthropic-api-key", "key", "sk-ant-test\n")},
+			wantBase:    "https://api.anthropic.com/v1",
+			wantModel:   "claude-sonnet-4-6",
+			wantAuth:    "",            // no Bearer header on the Messages wire
+			wantKey:     "sk-ant-test", // raw, TrimSpace'd
+		},
+		{
+			name:        "anthropic missing providerConfig",
+			agent:       mkAgent("anth-no-cfg", nil),
+			wantErrFrag: "providerConfig is required for provider=anthropic",
+		},
+		{
+			name: "anthropic missing baseURL",
+			agent: mkAgent("anth-no-base", &foremanv1alpha1.ProviderConfig{
+				Model: "claude-sonnet-4-6",
+			}),
+			wantErrFrag: "baseURL is required for provider=anthropic",
+		},
+		{
+			name: "anthropic missing model",
+			agent: mkAgent("anth-no-model", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1",
+			}),
+			wantErrFrag: "model is required for provider=anthropic",
+		},
+		{
+			name: "anthropic: APIKeySecretRef points at nonexistent Secret",
+			agent: mkAgent("anth-missing-secret", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1",
+				Model:   "claude-sonnet-4-6",
+				APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "nope"},
+					Key:                  "key",
+				},
+			}),
+			wantErrFrag: "get Secret",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := fake.NewClientBuilder().WithScheme(resolveSchemeForTests(t))
+			b = b.WithObjects(tc.agent)
+			for _, obj := range tc.seedObjects {
+				if co, ok := obj.(client.Object); ok {
+					b = b.WithObjects(co)
+				}
+			}
+			e := &NativeAgentLoopExecutor{Client: b.Build()}
+
+			ep, err := e.resolveAnthropicEndpoint(context.Background(), "default", tc.agent)
+			if tc.wantErrFrag != "" {
+				if err == nil {
+					t.Fatalf("want error containing %q, got nil (endpoint=%+v)", tc.wantErrFrag, ep)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrFrag) {
+					t.Errorf("error fragment: want %q, got %v", tc.wantErrFrag, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveAnthropicEndpoint: %v", err)
+			}
+			if ep.baseURL != tc.wantBase {
+				t.Errorf("baseURL: want %q got %q", tc.wantBase, ep.baseURL)
+			}
+			if ep.modelName != tc.wantModel {
+				t.Errorf("modelName: want %q got %q", tc.wantModel, ep.modelName)
+			}
+			if ep.authHeader != tc.wantAuth {
+				t.Errorf("authHeader: want %q got %q (anthropic never sends Bearer)", tc.wantAuth, ep.authHeader)
+			}
+			if ep.apiKey != tc.wantKey {
+				t.Errorf("apiKey: want %q got %q", tc.wantKey, ep.apiKey)
+			}
+		})
+	}
+}
+
 // TestIsDeterministicAgent pins the rules for the model-free branch:
 // only local + empty InferenceServiceRef qualifies. A cloud-proxy
 // Agent always runs the LLM loop, even with an empty
