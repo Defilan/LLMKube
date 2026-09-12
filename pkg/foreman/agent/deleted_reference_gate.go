@@ -46,6 +46,7 @@ import (
 	"strings"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/repo"
 )
 
 // deletedIssueRefRe matches a full owner/repo#N reference first (so the full
@@ -109,6 +110,11 @@ func recordDeletedIssueReferences(extra map[string]any, unifiedDiff string) {
 		strings.Join(refs, ", "))
 }
 
+// deletedRefUpstreamResolver resolves the upstream URL for a repo slug.
+// It is passed in from the executor so that tests can inject a local bare
+// remote.
+type deletedRefUpstreamResolver func(string) string
+
 // applyDeletedReferenceRailForTask is the production entry point that wires the
 // deleted-reference rail (#1553) into the coder GO-settle path. It gates the
 // rail to issue-fix coder tasks and resolves the base branch, mirroring the
@@ -128,6 +134,7 @@ func recordDeletedIssueReferences(extra map[string]any, unifiedDiff string) {
 // when the model's submit_result carried no extra.
 func applyDeletedReferenceRailForTask(
 	ctx context.Context, task *foremanv1alpha1.AgenticTask, workspace string, loopRes *LoopResult,
+	upstreamResolver deletedRefUpstreamResolver,
 ) {
 	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
 		return
@@ -138,6 +145,24 @@ func applyDeletedReferenceRailForTask(
 	if loopRes.Terminal.Extra == nil {
 		loopRes.Terminal.Extra = map[string]any{}
 	}
+	// The diff must be computed against the reviewer's base, which is the
+	// current upstream tip. We resolve the upstream URL and then the SHA of
+	// that tip, and diff against the literal SHA rather than the branch name
+	// so that a possibly-stale local ref (e.g. origin/main pointing at a
+	// commit between the reviewer's base and HEAD) cannot drag extra history
+	// into the diff (#1769).
+	baseBranch := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+	upstreamURL := upstreamResolver(task.Spec.Payload.Repo)
+	if upstreamURL != "" {
+		if sha, err := repo.BaseBranchSHA(ctx, workspace, upstreamURL, baseBranch); err == nil {
+			recordDeletedIssueReferences(loopRes.Terminal.Extra,
+				branchDiffText(ctx, workspace, sha, execCommandRunner))
+			return
+		}
+	}
+	// Degrade to the branch-name diff when there is no upstream to resolve
+	// against or the fetch fails. The deleted-reference rail prefers to err
+	// toward recording something rather than silently dropping the advisory.
 	recordDeletedIssueReferences(loopRes.Terminal.Extra,
-		branchDiffText(ctx, workspace, baseBranchOrDefault(task.Spec.Payload.BaseBranch), execCommandRunner))
+		branchDiffText(ctx, workspace, baseBranch, execCommandRunner))
 }
