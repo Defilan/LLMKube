@@ -225,7 +225,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// Early exit: if status is Ready and the cached file is current, skip the
 	// rest of the reconcile (a drift check may schedule a requeue). Otherwise we
 	// fall through to (re-)download or migrate the cached file.
-	if skip, result, err := r.handleReadyCachedModel(ctx, model); skip || err != nil {
+	if skip, result, err := r.handleReadyCachedModel(ctx, model, cacheKey); skip || err != nil {
 		return result, err
 	}
 
@@ -476,13 +476,25 @@ func (r *ModelReconciler) failInvalidFileSet(ctx context.Context, model *inferen
 // is current); the returned result may carry a RequeueAfter scheduling the next
 // drift revalidation. It returns skip=false to let Reconcile fall through and
 // (re-)download or migrate the file: either because the file is missing, needs
-// a filename migration, or drifted under RefreshPolicy=OnChange.
+// a filename migration, drifted under RefreshPolicy=OnChange, or the status was
+// written by an older spec.source and is stale (#1767).
 func (r *ModelReconciler) handleReadyCachedModel(
-	ctx context.Context, model *inferencev1alpha1.Model,
+	ctx context.Context, model *inferencev1alpha1.Model, cacheKey string,
 ) (skip bool, result ctrl.Result, err error) {
 	logger := log.FromContext(ctx)
 
 	if model.Status.Phase != PhaseReady || model.Status.Path == "" {
+		return false, ctrl.Result{}, nil
+	}
+	// Status.CacheKey is derived from spec.source; a mismatch means the spec
+	// changed after the status was written, so the status is stale and must be
+	// re-resolved, not skipped (#1767). The re-resolve rewrites CacheKey, Path,
+	// GGUF and the fingerprint baseline for the new source; the old cache
+	// directory is deliberately left in place, since other dependents or a
+	// spec revert may still reference it.
+	if model.Status.CacheKey != cacheKey {
+		logger.Info("Model spec.source changed since the status was written; re-resolving",
+			"statusCacheKey", model.Status.CacheKey, "specCacheKey", cacheKey)
 		return false, ctrl.Result{}, nil
 	}
 	if _, statErr := os.Stat(model.Status.Path); statErr != nil {
@@ -521,11 +533,22 @@ func (r *ModelReconciler) handleReadyCachedModel(
 func (r *ModelReconciler) reconcilePVCSource(ctx context.Context, model *inferencev1alpha1.Model) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Early exit if already Ready
+	// Early exit if already Ready, unless the status was written by an older
+	// spec: Status.CacheKey is derived from spec.source, so a mismatch means
+	// the source moved and the resolve below must re-derive Path and CacheKey
+	// (#1767). GGUF metadata describes the previous source, so it is cleared
+	// and left for the next source that populates it.
+	wantCacheKey := computeCacheKey(model.Spec.Source)
 	if model.Status.Phase == PhaseReady {
-		logger.Info("PVC model already Ready, skipping reconcile")
-		llmkubemetrics.ReconcileTotal.WithLabelValues("model", "success").Inc()
-		return ctrl.Result{}, nil
+		if model.Status.CacheKey != wantCacheKey {
+			logger.Info("Model spec.source changed since the status was written; re-resolving",
+				"statusCacheKey", model.Status.CacheKey, "specCacheKey", wantCacheKey)
+			model.Status.GGUF = nil
+		} else {
+			logger.Info("PVC model already Ready, skipping reconcile")
+			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "success").Inc()
+			return ctrl.Result{}, nil
+		}
 	}
 
 	claimName, modelFilePath, err := parsePVCSource(model.Spec.Source)
@@ -660,6 +683,22 @@ func (r *ModelReconciler) reconcileBySourceType(
 
 func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, model *inferencev1alpha1.Model, cacheKey string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Status.CacheKey is derived from spec.source; a mismatch means the spec
+	// changed after the status was written, so the status is stale and must be
+	// re-resolved, not skipped (#1767). GGUF metadata and the fingerprint
+	// baseline describe the previous source: clear both so the resolve below
+	// re-derives the metadata and the next revalidation re-baselines instead of
+	// reading old-source drift as upstream drift.
+	if model.Status.Phase == PhaseReady && cacheKey != model.Status.CacheKey {
+		logger.Info("Model spec.source changed since the status was written; re-resolving",
+			"statusCacheKey", model.Status.CacheKey, "specCacheKey", cacheKey)
+		model.Status.Phase = ""
+		model.Status.GGUF = nil
+		model.Status.SourceETag = ""
+		model.Status.SourceContentLength = 0
+		model.Status.LastRevalidated = nil
+	}
 
 	// Early exit if already Ready. For sources with a controller-observable
 	// fingerprint (http/https) run a cadence-gated drift check so the
