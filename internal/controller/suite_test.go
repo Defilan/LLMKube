@@ -18,11 +18,15 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2/types"
 	. "github.com/onsi/gomega"
 
 	"k8s.io/client-go/kubernetes/scheme"
@@ -51,7 +55,9 @@ var (
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	RunSpecs(t, "Controller Suite")
+	suiteConfig := types.NewDefaultSuiteConfig()
+	suiteConfig.RandomSeed = ginkgoSeed()
+	RunSpecs(t, "Controller Suite", suiteConfig)
 }
 
 var _ = BeforeSuite(func() {
@@ -95,6 +101,26 @@ var _ = AfterSuite(func() {
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
 })
+
+// ginkgoSeed resolves the suite's random seed. Ginkgo randomizes top-level
+// containers per run, so a test that leaks shared cluster state passes or
+// fails on the draw (#1693). The seed is reported on every run so a failure
+// can be replayed from the log alone, and GINKGO_SEED pins it for the replay:
+// the Makefile picks one per run, exports it, and echoes it into the log
+// (`make test GINKGO_SEED=<n>` to replay).
+func ginkgoSeed() int64 {
+	if v := os.Getenv("GINKGO_SEED"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err == nil && n > 0 {
+			fmt.Printf("ginkgo seed: %d (pinned by GINKGO_SEED)\n", n)
+			return n
+		}
+		fmt.Printf("ginkgo seed: ignoring invalid GINKGO_SEED %q, using a fresh one\n", v)
+	}
+	seed := time.Now().Unix()
+	fmt.Printf("ginkgo seed: %d\n", seed)
+	return seed
+}
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by
