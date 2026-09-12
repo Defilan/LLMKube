@@ -1711,6 +1711,183 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoNoRefsNoVouchDemotes(t *testing.T) 
 	}
 }
 
+// TestEnforceReviewerUnverifiedSummary covers #1454: a reviewer GO whose
+// terminal summary states in plain language that verification could not be
+// performed must demote to NO-GO, and a normal GO must stand untouched. The
+// first row is verbatim from the windowstead#321 incident that motivated
+// the rail; the variant rows pin the full phrase set the enforcer's
+// docstring promises, including both apostrophe forms of the contractions.
+func TestEnforceReviewerUnverifiedSummary(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary string
+		verdict foremanv1alpha1.AgenticTaskVerdict
+		want    foremanv1alpha1.AgenticTaskVerdict
+	}{
+		{
+			name:    "windowstead reproduction: cannot verify",
+			summary: "Tests fail due to missing godot runtime in environment; cannot verify goal reward or progression logic.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "could not verify",
+			summary: "The change looks correct but I could not verify it without the service running.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "unable to verify",
+			summary: "Reviewed statically; unable to verify runtime behavior in this environment.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction can't, straight apostrophe",
+			summary: "Reviewed statically; can't verify the migration path without a database.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction can't, curly apostrophe",
+			summary: "Reviewed statically; can’t verify the migration path without a database.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction couldn't, straight apostrophe",
+			summary: "The harness is missing, so we couldn't verify the fix in this environment.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction couldn't, curly apostrophe",
+			summary: "The harness is missing, so we couldn’t verify the fix in this environment.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "spaced can not",
+			summary: "No runtime is available here, so I can not verify the behavior.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "was not able to",
+			summary: "I was not able to verify the fix before approving; the harness was unavailable.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "case-insensitive",
+			summary: "APPROVE. Could NOT VERIFY the migration path; no database available.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "whitespace-tolerant across wrapped lines",
+			summary: "The harness is missing, so we cannot\nverify the fix here.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "normal GO stays GO",
+			summary: "APPROVE: ran go test ./... and all specs pass; the change is minimal and well covered.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictGo,
+		},
+		{
+			name:    "affirmative verification language is not a match",
+			summary: "The new guard verifies the token before use; tests confirm it rejects expired tokens.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictGo,
+		},
+		{
+			// The tradeoff the enforcer's docstring documents: phrase
+			// anchoring matches whatever subject the phrase carries, so an
+			// honest GO describing what a third party cannot do is
+			// demoted. The false positive is accepted, because the
+			// subjectless incident summaries this rail exists for (#1454)
+			// are the common case.
+			name:    "object-subject honest GO is the accepted false positive",
+			summary: "The new signature check is correct: a client without the key cannot verify a forged signature, and the tests prove it.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "non-GO with the phrase passes through unmarked",
+			summary: "REJECT: cannot verify anything in this broken environment and the diff is wrong.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictNoGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := map[string]any{}
+			got := enforceReviewerUnverifiedSummary(logr.Discard(), extra, tc.summary, tc.verdict)
+			if got != tc.want {
+				t.Fatalf("verdict = %v, want %v", got, tc.want)
+			}
+			demoted := tc.verdict == foremanv1alpha1.AgenticTaskVerdictGo &&
+				tc.want == foremanv1alpha1.AgenticTaskVerdictNoGo
+			v, marked := extra["verdictDemoted"].(bool)
+			if !demoted {
+				if marked {
+					t.Errorf("non-demoting path must not annotate extra; got verdictDemoted=%v", v)
+				}
+				return
+			}
+			if !v {
+				t.Errorf("demotion must set verdictDemoted=true; got %v", v)
+			}
+			if extra["verdictDemotedBy"] != railUnverifiedSummary {
+				t.Errorf("verdictDemotedBy = %v, want %q", extra["verdictDemotedBy"], railUnverifiedSummary)
+			}
+			if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+				t.Errorf("verdictClaimed should archive the original GO; got %v", extra["verdictClaimed"])
+			}
+			if reason, _ := extra["demotionReason"].(string); reason == "" {
+				t.Error("demotionReason must explain the demotion")
+			}
+			if phrase, _ := extra["unverifiedSummaryPhrase"].(string); phrase == "" {
+				t.Error("unverifiedSummaryPhrase must record the matched admission")
+			}
+		})
+	}
+}
+
+func TestEnforceReviewerUnverifiedSummary_NilExtraIsNoOp(t *testing.T) {
+	// Without an extra map the demotion cannot be recorded or grounded in
+	// the audit trail, so the rails pass the verdict through with only a
+	// log line — the enforceReviewerIssueAsk convention.
+	got := enforceReviewerUnverifiedSummary(logr.Discard(), nil,
+		"cannot verify anything", foremanv1alpha1.AgenticTaskVerdictGo)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Errorf("nil extra must pass the verdict through; got %v", got)
+	}
+}
+
+func TestEnforceReviewerUnverifiedSummary_PreservesFirstWriterVerdictClaimed(t *testing.T) {
+	// The issueAsk scope-vouch path marks a still-GO verdict with
+	// verdictClaimed; this rail must not overwrite it (#1678 first-writer-
+	// wins), while its own rail name still records who made the rewrite.
+	extra := map[string]any{
+		"verdictClaimed": string(foremanv1alpha1.AgenticTaskVerdictGo),
+	}
+	got := enforceReviewerUnverifiedSummary(logr.Discard(), extra,
+		"Tests could not verify the fix; no runtime available.",
+		foremanv1alpha1.AgenticTaskVerdictGo)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("matching GO must demote to NO-GO; got %v", got)
+	}
+	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+		t.Errorf("verdictClaimed must keep the first writer's archive; got %v", extra["verdictClaimed"])
+	}
+	if extra["verdictDemotedBy"] != railUnverifiedSummary {
+		t.Errorf("verdictDemotedBy = %v, want %q", extra["verdictDemotedBy"], railUnverifiedSummary)
+	}
+}
+
 // TestNormalizeModelVerdict_ErrorMapsToIncompleteWithModelReportedError pins
 // the #649 fix: the submit_result tool contract allows verdict="ERROR" (model
 // reports it cannot complete the task: a reviewer's could-not-review, a

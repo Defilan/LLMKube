@@ -183,14 +183,17 @@ func taskStepLabel(t *foremanv1alpha1.AgenticTask) string {
 // Three conditions are required, and each one excludes a NO-GO the coder
 // CAN act on:
 //
-//   - verdictDemotedBy is the issueAsk or scope-overlap rail. A rail that
-//     rewrites a GO without findings manufactures a rejection the coder
-//     cannot act on: re-running cannot make an unverifiable issueAsk verify,
-//     and an issue that names the symptom file rather than the fix site is
-//     scope drift the coder already answered by fixing the cause (#1684).
-//     Keying off the bare verdictDemoted flag alone would not distinguish
-//     these two rails from each other, but both are inert when they carry
-//     no findings, so the single condition below accepts either name.
+//   - verdictDemotedBy is the issueAsk, scope-overlap, or unverified-summary
+//     rail. A rail that rewrites a GO without findings manufactures a
+//     rejection the coder cannot act on: re-running cannot make an
+//     unverifiable issueAsk verify, an issue that names the symptom file
+//     rather than the fix site is scope drift the coder already answered by
+//     fixing the cause (#1684), and a GO whose own summary admits
+//     verification could not be performed (#1454) is a statement about the
+//     review environment, which no re-run changes either. Keying off the
+//     bare verdictDemoted flag alone would not distinguish these rails from
+//     each other, but all are inert when they carry no findings, so the
+//     single condition below accepts any of their names.
 //   - verdictClaimed is GO, i.e. the rail really did rewrite the verdict.
 //     enforceReviewerIssueAsk stamps the demotion fields on a path where
 //     it does NOT: an unverified non-GO review is marked untrusted and the
@@ -217,7 +220,8 @@ func inertDemotion(t *foremanv1alpha1.AgenticTask) (reason string, inert bool) {
 		return "", false
 	}
 	modelExtra := envelope.Extra.ModelExtra
-	if by, _ := modelExtra["verdictDemotedBy"].(string); by != reviewer.RailIssueAsk && by != reviewer.RailScopeOverlap {
+	if by, _ := modelExtra["verdictDemotedBy"].(string); by != reviewer.RailIssueAsk &&
+		by != reviewer.RailScopeOverlap && by != reviewer.RailUnverifiedSummary {
 		return "", false
 	}
 	if claimed, _ := modelExtra["verdictClaimed"].(string); claimed != string(foremanv1alpha1.AgenticTaskVerdictGo) {

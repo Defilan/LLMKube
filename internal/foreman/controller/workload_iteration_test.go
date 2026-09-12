@@ -55,17 +55,22 @@ func iterationWorkload(issues []int32, reviewers int, maxIter *int32) *foremanv1
 // rather than being threaded through every call site.
 const reviewStep = "review-641-0"
 
-// demotionReasonIssueAsk / demotionReasonScopeDrift are the two rails'
-// demotionReason strings, copied from enforceReviewerIssueAsk
-// (pkg/foreman/agent/executor_native.go) and enforceReviewerScopeOverlap
-// (pkg/foreman/agent/scope_overlap.go). Only the prose is copied; the
-// verdictDemotedBy values that actually drive the predicate come from the
-// shared reviewer constants both sides compile against.
+// demotionReasonIssueAsk / demotionReasonScopeDrift /
+// demotionReasonUnverifiedSummary are the demotion rails' demotionReason
+// strings, copied from enforceReviewerIssueAsk and
+// enforceReviewerUnverifiedSummary (pkg/foreman/agent/executor_native.go)
+// and enforceReviewerScopeOverlap (pkg/foreman/agent/scope_overlap.go).
+// Only the prose is copied; the verdictDemotedBy values that actually drive
+// the predicate come from the shared reviewer constants both sides compile
+// against.
 const (
 	demotionReasonIssueAsk = "issueAsk could not be verified as covering the " +
 		"fetched issue body; review verdict is untrusted"
 	demotionReasonScopeDrift = "scope drift: the issue names 1 file(s) " +
 		"(internal/foreman/controller/workload_iteration.go) and the diff touches none of them"
+	demotionReasonUnverifiedSummary = "reviewer summary states \"cannot verify goal reward or " +
+		"progression logic\"; a GO whose own summary reports verification could " +
+		"not be performed is not a verified approval"
 )
 
 // reviewResultRaw renders the status.result a reviewer task really carries,
@@ -105,9 +110,10 @@ func reviewResultRaw(
 // stamped verdictDemoted plus verdictDemotedBy naming itself, and
 // verdictClaimed archiving the verdict it rewrote (#1636).
 //
-// rail and claimed are parameters because the predicate turns on both: only
-// the issueAsk rail rewriting a GO is inert. findingsJSON decides whether the
-// demotion carries anything the coder could act on.
+// rail, claimed, and findingsJSON are parameters because the predicate turns
+// on all three: any of the demoting rails (issueAsk, scope-overlap,
+// unverified-summary) rewriting a GO is inert, and only while the demotion
+// carries nothing the coder could act on.
 func railDemotedNoGoChild(
 	rail, claimed, reason, summary, findingsJSON string,
 ) foremanv1alpha1.AgenticTask {
@@ -254,6 +260,45 @@ func TestReviewIterationSteps(t *testing.T) {
 				railDemotedNoGoChild(reviewer.RailScopeOverlap, string(goVerdict),
 					demotionReasonScopeDrift, "scope drift plus a real defect",
 					`[{"severity":"major","area":"scope","message":"the fix must also touch the config loader"}]`),
+			},
+			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
+			wantIterated: []int32{641},
+		},
+		{
+			// #1454: the unverified-summary rail rewrites a GO to NO-GO when
+			// the reviewer's own terminal summary admits verification could
+			// not be performed. That is a statement about the review
+			// environment, not the change: with no findings the coder is
+			// handed a rejection it cannot act on, and re-running cannot
+			// make an unverifiable environment verifiable, so the iteration
+			// is suppressed (#1636). Before this rail's name reached the
+			// inertDemotion predicate, this exact envelope drove a futile
+			// fix iteration.
+			name: "unverified-summary demotion of a GO with no findings is inert",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				railDemotedNoGoChild(reviewer.RailUnverifiedSummary, string(goVerdict),
+					demotionReasonUnverifiedSummary,
+					"cannot verify goal reward or progression logic", `[]`),
+			},
+			wantSuppressed: []string{reviewStep},
+		},
+		{
+			// Narrowness guard, mirroring the issueAsk and scope-overlap
+			// pairs: a demotion that carries findings names concrete work
+			// the coder can address, so it must still open an iteration
+			// even though the rail is unverified-summary.
+			name: "unverified-summary demotion carrying findings still iterates",
+			w:    iterationWorkload([]int32{641}, 1, nil),
+			children: []foremanv1alpha1.AgenticTask{
+				child("code-641", succeeded, goVerdict),
+				child("verify-641", succeeded, gatePass),
+				railDemotedNoGoChild(reviewer.RailUnverifiedSummary, string(goVerdict),
+					demotionReasonUnverifiedSummary,
+					"verification could not be performed, but the diff has a real defect",
+					`[{"severity":"major","area":"correctness","message":"the retry loop drops the last batch"}]`),
 			},
 			wantSteps:    []string{"code-641-r1", "verify-641-r1", "review-641-0-r1"},
 			wantIterated: []int32{641},

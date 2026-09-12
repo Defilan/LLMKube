@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1028,6 +1029,13 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the model paraphrased the issue ask (#744).
 			verdict = enforceReviewerIssueAsk(log, loopRes.Terminal.Extra, verdict,
 				scopeDriftDetected, scopeMatched)
+			// Unverified-summary rail (#1454): a GO whose own terminal
+			// summary says verification could not be performed demotes to
+			// NO-GO. Runs with the other demote rails and before the
+			// flag-only diff gate, so the diff gate reports on the verdict
+			// the demote rails produced.
+			verdict = enforceReviewerUnverifiedSummary(log, loopRes.Terminal.Extra,
+				loopRes.Terminal.Summary, verdict)
 			// Ungrounded-review rail (#1570): a GO whose transcript carries no
 			// evidence the reviewer ever obtained the branch diff is uncorrelated
 			// with the code it approves. This is a FLAG, not a block: it records
@@ -1036,7 +1044,9 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the demote rails (empty-claim, grounded-finding, verdict-from-
 			// findings, scope-overlap, issueAsk) so it reports on the verdict
 			// those rails produced, and it is the last reviewer rail before the
-			// findings summary so its log line is the last rail signal recorded.
+			// findings summary so its log line is the last rail signal
+			// recorded. (The unverified-summary rail #1454 joins this list as
+			// the last demote rail.)
 			applyReviewerDiffGateForTask(log, loopRes, verdict)
 			// Review-execution rail (#1618): the rubric's Section K mandates
 			// running the diff's own new test (and an adversarial near-miss
@@ -3762,6 +3772,92 @@ func enforceReviewerIssueAsk(
 		"fetched issue body; review verdict is untrusted"
 	log.Info("reviewer integrity: unverified issueAsk on GO verdict; demoting to NO-GO",
 		"verdictClaimed", verdict)
+	return foremanv1alpha1.AgenticTaskVerdictNoGo
+}
+
+// reUnverifiedReviewerSummary matches a reviewer's own plain-language
+// admission of non-verification in its terminal summary (#1454). The
+// phrases are the model saying, in its own words, that the change was not
+// checked; anything phrased that way is unambiguous enough to act on. The
+// match is case-insensitive and whitespace-tolerant (summaries wrap), and
+// the trailing \b keeps it off nouns like "verifies"/"verifier" — a summary
+// describing what the change DOES verify is not this rail's business. The
+// set spans the registers the models actually use: "cannot" and "could not"
+// (formal), "can not" (spaced), the contractions "can't" / "couldn't" in
+// both straight and curly apostrophes, "unable to", and "was not able to".
+var reUnverifiedReviewerSummary = regexp.MustCompile(`(?i)\b(?:cannot|can\s+not|can(?:’|')t|` +
+	`could\s+not|couldn(?:’|')t|unable\s+to|was\s+not\s+able\s+to)\s+verify\b`)
+
+// enforceReviewerUnverifiedSummary demotes a GO whose terminal summary says
+// verification could not be performed (#1454). A GO means "this change was
+// verified"; a summary admitting as much — "cannot verify", "can't verify",
+// "couldn't verify", "unable to verify", or any of the rail's other
+// phrases — contradicts the verdict in the field that becomes the PR body,
+// so the resulting PR advertises its own lack of validation and still
+// opens. The live case (misospace/windowstead#321): a reviewer GO whose
+// summary read "cannot verify goal reward or progression logic" — the
+// self-gate had deferred to a verify Job the fleet runs disabled, and GitHub
+// CI failed two checks the reviewer waved off.
+//
+// Policy: fire only on GO; a matching summary demotes to NO-GO so the
+// branch routes to escalation instead of a PR. The demotion is grounded in
+// the model's own sentence — the matched phrase is quoted in the
+// demotionReason and recorded under unverifiedSummaryPhrase, so the audit
+// record shows the exact words that made the call, the way the other rails
+// archive what they acted on. Non-GO verdicts need nothing (the branch is
+// already not landing) and pass through untouched, marked nowhere. A nil
+// extra cannot carry the demotion record, so like the other rails the
+// verdict passes through with only a log line.
+//
+// The rail is deliberately phrase-anchored to these admissions rather than
+// any mention of tests or verification: reviewers legitimately write
+// "verified via go test" or "tests cover X", and a guard that fired on the
+// general topic would manufacture NO-GOs on honest approvals.
+//
+// Known tradeoff, kept on purpose: the phrases match whatever subject they
+// carry. A summary like "a client without the key cannot verify a forged
+// signature" describes the fixed system, not the reviewer's own
+// non-verification, yet it demotes — the honest GO is the false positive.
+// Requiring a first-person subject ("I could not verify") would close that
+// hole, but it would also miss the incident this rail exists for: the
+// windowstead#321 summary "cannot verify goal reward or progression logic"
+// names no subject at all, and subjectless admissions are the common shape
+// of these summaries. Phrase anchoring trades that rare object-subject
+// false positive for catching them.
+func enforceReviewerUnverifiedSummary(
+	log logr.Logger,
+	extra map[string]any,
+	summary string,
+	verdict foremanv1alpha1.AgenticTaskVerdict,
+) foremanv1alpha1.AgenticTaskVerdict {
+	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		return verdict
+	}
+	match := reUnverifiedReviewerSummary.FindString(summary)
+	if match == "" {
+		return verdict
+	}
+	if extra == nil {
+		log.Info("reviewer integrity: unverified-summary GO but extra is nil; cannot record the demotion",
+			"phrase", match)
+		return verdict
+	}
+
+	// Established demotion markers (#1636): the flag travels with the rail
+	// name, and verdictClaimed is first-writer-wins so an earlier rail that
+	// merely re-annotated this verdict (the issueAsk scope-vouch path) keeps
+	// its archive of the original.
+	extra["verdictDemoted"] = true
+	extra["verdictDemotedBy"] = railUnverifiedSummary
+	if _, ok := extra["verdictClaimed"]; !ok {
+		extra["verdictClaimed"] = string(verdict)
+	}
+	extra["unverifiedSummaryPhrase"] = match
+	extra["demotionReason"] = fmt.Sprintf(
+		"reviewer summary states %q; a GO whose own summary reports verification "+
+			"could not be performed is not a verified approval", match)
+	log.Info("reviewer integrity: GO with a verification-failure summary; demoting to NO-GO",
+		"phrase", match)
 	return foremanv1alpha1.AgenticTaskVerdictNoGo
 }
 
