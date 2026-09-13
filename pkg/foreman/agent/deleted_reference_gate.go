@@ -111,11 +111,17 @@ func recordDeletedIssueReferences(extra map[string]any, unifiedDiff string) {
 
 // applyDeletedReferenceRailForTask is the production entry point that wires the
 // deleted-reference rail (#1553) into the coder GO-settle path. It gates the
-// rail to issue-fix coder tasks and resolves the base branch, mirroring the
-// sibling rails applyCoderGroundingRailForTask and applyNoFunctionalChangeForTask,
-// so the call site in runLLMPath is a single statement and that function's
-// cyclomatic-complexity budget stays untouched (the stated reason the siblings
-// are wrapped rather than inlined).
+// rail to issue-fix coder tasks and takes the diff anchor from the caller,
+// mirroring the sibling rails applyCoderGroundingRailForTask and
+// applyNoFunctionalChangeForTask, so the call site in runLLMPath is a single
+// statement and that function's cyclomatic-complexity budget stays untouched
+// (the stated reason the siblings are wrapped rather than inlined).
+//
+// base must be the literal upstream base SHA the task branch was cut from
+// (evidenceBaseSHA in runLLMPath). The workspace's local base ref belongs to
+// the fork, which lags upstream, so diffing against it sweeps the whole
+// intervening upstream delta into the scanned diff and reports refs the coder
+// never touched (#1769, the coder-side half of #1005).
 //
 // It must run after repo.Commit, reading the committed base...HEAD diff via
 // branchDiffText, the same helper the grounding rail uses. Note that this is a
@@ -125,9 +131,11 @@ func recordDeletedIssueReferences(extra map[string]any, unifiedDiff string) {
 // not a block: it records the removed-line issue references onto the task's
 // extra map and never changes the verdict. The extra map is ensured non-nil
 // (the sibling rails do the same before writing) so the flag is recorded even
-// when the model's submit_result carried no extra.
+// when the model's submit_result carried no extra. When no SHA was resolved
+// (non-coder-role agent, or the upstream fetch failed) it degrades to the
+// payload base branch name, the pre-#1769 posture.
 func applyDeletedReferenceRailForTask(
-	ctx context.Context, task *foremanv1alpha1.AgenticTask, workspace string, loopRes *LoopResult,
+	ctx context.Context, task *foremanv1alpha1.AgenticTask, workspace, base string, loopRes *LoopResult,
 ) {
 	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
 		return
@@ -138,6 +146,9 @@ func applyDeletedReferenceRailForTask(
 	if loopRes.Terminal.Extra == nil {
 		loopRes.Terminal.Extra = map[string]any{}
 	}
+	if base == "" {
+		base = baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+	}
 	recordDeletedIssueReferences(loopRes.Terminal.Extra,
-		branchDiffText(ctx, workspace, baseBranchOrDefault(task.Spec.Payload.BaseBranch), execCommandRunner))
+		branchDiffText(ctx, workspace, base, execCommandRunner))
 }

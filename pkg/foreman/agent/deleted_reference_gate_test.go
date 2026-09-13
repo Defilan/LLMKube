@@ -17,9 +17,13 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
+
+	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 )
 
 func TestDeletedIssueReferences_RemovedBareRef(t *testing.T) {
@@ -187,5 +191,35 @@ func TestDeletedReferenceDisabled_DefaultEnabled(t *testing.T) {
 	t.Setenv("FOREMAN_DELETED_REFERENCE", "1")
 	if deletedReferenceDisabled() {
 		t.Fatal("only \"0\" disables the rail")
+	}
+}
+
+// applyDeletedReferenceRailForTask degrades to the payload base branch name
+// when the executor resolved no literal base SHA (non-coder-role agent, or the
+// upstream fetch failed): the flag must still be computed from that branch's
+// diff, the pre-#1769 posture.
+func TestApplyDeletedReferenceRailForTask_FallsBackToBranchNameWhenNoResolvedBase(t *testing.T) {
+	orig := execCommandRunner
+	t.Cleanup(func() { execCommandRunner = orig })
+	execCommandRunner = func(_ context.Context, _ string, _ []string, name string, args ...string) (string, error) {
+		if name == "git" && strings.Join(args, " ") == "diff main...HEAD" {
+			return "@@ -1,3 +1,2 @@\n-// removed, cites #1234\n", nil
+		}
+		return "", context.Canceled
+	}
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind:    foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{BaseBranch: "main"},
+		},
+	}
+	loopRes := &LoopResult{Terminal: &ToolResult{Extra: map[string]any{}}}
+
+	applyDeletedReferenceRailForTask(context.Background(), task, "/ws", "", loopRes)
+
+	refs, ok := loopRes.Terminal.Extra["deletedIssueReferences"].([]string)
+	if !ok || len(refs) != 1 || refs[0] != "#1234" {
+		t.Fatalf("fallback base branch must still be scanned; deletedIssueReferences = %v",
+			loopRes.Terminal.Extra["deletedIssueReferences"])
 	}
 }

@@ -185,14 +185,24 @@ func applyCoderGroundingRail(ctx context.Context, log logr.Logger, base, workspa
 }
 
 // applyCoderGroundingRailForTask gates applyCoderGroundingRail to issue-fix
-// tasks and resolves the base branch. Extracted out of runLLMPath so the
-// call site there is a single statement rather than a branch, keeping
+// tasks and takes the diff anchor from the caller. Extracted out of runLLMPath
+// so the call site there is a single statement rather than a branch, keeping
 // runLLMPath's cyclomatic complexity budget untouched.
+//
+// base must be the literal upstream base SHA the task branch was cut from
+// (evidenceBaseSHA in runLLMPath); the workspace's local base ref belongs to
+// the fork, which lags upstream, so diffing against it sweeps the whole
+// intervening upstream delta into the scanned diff (#1769, the coder-side half
+// of #1005). No resolved SHA degrades to the payload base branch name, the
+// pre-#1769 posture.
 func applyCoderGroundingRailForTask(
-	ctx context.Context, log logr.Logger, task *foremanv1alpha1.AgenticTask, workspace string, loopRes *LoopResult,
+	ctx context.Context, log logr.Logger, task *foremanv1alpha1.AgenticTask, workspace, base string, loopRes *LoopResult,
 ) {
 	if task.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix {
 		return
 	}
-	applyCoderGroundingRail(ctx, log, baseBranchOrDefault(task.Spec.Payload.BaseBranch), workspace, loopRes)
+	if base == "" {
+		base = baseBranchOrDefault(task.Spec.Payload.BaseBranch)
+	}
+	applyCoderGroundingRail(ctx, log, base, workspace, loopRes)
 }
