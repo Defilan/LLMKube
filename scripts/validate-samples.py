@@ -72,7 +72,7 @@ def extract_schemas(crd_dir: str) -> dict:
 # Standard K8s kinds that should be skipped (not LLMKube CRDs)
 STANDARD_KINDS = {
     "Secret", "Service", "ConfigMap", "Deployment", "StatefulSet", "DaemonSet",
-    "Pod", "Namespace", "ServiceAccount", "Role", "RoleBinding", "ClusterRole",
+    "Pod", "Job", "Namespace", "ServiceAccount", "Role", "RoleBinding", "ClusterRole",
     "ClusterRoleBinding", "PersistentVolumeClaim", "Ingress", "HorizontalPodAutoscaler",
     "NetworkPolicy", "PodDisruptionBudget", "PriorityClass", "StorageClass",
     "CustomResourceDefinition", "APIService", "ValidatingWebhookConfiguration",

@@ -1,0 +1,143 @@
+# DeepSeek-V4.1-Flash EXL3 3.5bpw across THREE DGX Sparks cabled in a ring (P0->P1, three /30 legs, no
+# switch), tensor-parallel 3. Measured 2026-09-13 on the Shadowstack ring: three-rank NCCL all-reduce
+# 23.2 GB/s bus bandwidth; model numbers in docs/site/guides/multi-node-inference.md ("Three-Spark ring").
+#
+# Two things about the fabric block that the field docs do not say loudly enough:
+#   - fabric.address is the BOOTSTRAP plane and must be reachable from every member. On a ring no
+#     fabric /30 is, so it is the management IP; socketInterface is the management NIC.
+#   - ibHCA is the DATA plane and takes a comma list; list all four ConnectX ports and set
+#     NCCL_IB_SUBNET_AWARE_ROUTING=1 (NCCL >= 2.30) so NCCL picks, per peer, the port on that peer's
+#     subnet. Without it NCCL pairs NICs by channel index on both ends, which a P0->P1 ring never satisfies.
+#
+# Before creating this: stage all 54 checkpoint files on every member (config/samples/model_dsv41_flash_exl3.yaml),
+# apply config/samples/jobs/dsv41-tp3-config.yaml (72 heads / 9 o_groups), and run
+# config/samples/jobs/drop-page-cache.yaml on each member; vLLM's worker refuses to start when CUDA-free at
+# init is below gpuMemoryUtilization x total, and a fresh 460 GB stage leaves that memory as page cache.
+#
+# Turn swap off on every member before the first boot (sudo swapoff -a): a memory overrun then OOM-kills the worker,
+# which the operator restarts, instead of paging kubelet out and wedging the node. The image pre-warms FlashInfer's
+# JIT modules; MAX_JOBS=1 below bounds any remaining first-serve compile to one nvcc at a time (~6 GB of host RAM).
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: dsv41-exl3-ring
+  namespace: default
+spec:
+  modelRef: dsv41-flash-exl3
+  runtime: vllm
+  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3:stable  # pin by digest in production
+  replicas: 1
+  containerPort: 8080
+  resources:
+    gpu: 1
+    memory: 110Gi
+    cpu: "8"
+  # Pinned to a member claim so the operator does not also create a dynamic <isvc>-model-cache.
+  modelCache:
+    claimName: dsv41-dgx1
+  vllmConfig:
+    tensorParallelSize: 3
+    pipelineParallelSize: 1
+    maxModelLen: 65536
+    gpuMemoryUtilization: 0.78
+    # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
+    # expert parallelism is off and every expert stays local to its rank.
+  extraArgs:
+    - --served-model-name
+    - DeepSeek-V4.1-Flash-EXL3
+    - --reasoning-parser
+    - deepseek_v41
+    - --tool-call-parser
+    - deepseek_v41
+    - --enable-auto-tool-choice
+    - --block-size
+    - "128"
+    - --max-num-seqs
+    - "4"
+    - --max-num-batched-tokens
+    - "8192"
+    # Text-only for the measure boot (skips the vision tower); vision is a second step on the same group.
+    - --language-model-only
+    # The patched engram.py reads the two n-gram tables from the safetensors shards on disk
+    # (DSV41_ENGRAM_DISK=1 below); never resident.
+    - --engram-config
+    - '{"cpu_offload": false}'
+    # Thinking off for the measure boot; the deepseek_v41 reasoning parser stays wired.
+    - --default-chat-template-kwargs
+    - '{"thinking": false}'
+    # CUDA graphs as tonyd2wild's TP3 ran them (FULL_AND_PIECEWISE, decode sizes 1..max-num-seqs);
+    # first request checks logprobs for the NaN failure LibertAI's TP2 lane hit with graphs on.
+    - --compilation-config
+    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,3,4]}'
+    # TP3: 64 heads / 8 o_groups do not divide by 3. virtual_heads.py pads to 72 / 9 at load time
+    # against the declaration that 47-tp3-config.yaml writes into the staged config.json (what
+    # tonyd2wild's reddie_prep_tp3.sh does). NOT --hf-overrides: on this build text_config is
+    # dict-typed, and the dict form replaces the whole sub-config (measured: "text_config ... does
+    # not have num_attention_heads").
+    # No --quantization: bot-lab-21's config.json carries quant_method exl3, which cuda-exl3's
+    # Exl3Config reads via the vllm.general_plugins entry point found on PYTHONPATH.
+  env:
+    - {name: NCCL_NET, value: IB}
+    - {name: NCCL_IB_DISABLE, value: "0"}
+    - {name: NCCL_IB_ROCE_VERSION_NUM, value: "2"}
+    - {name: NCCL_IB_ADDR_FAMILY, value: AF_INET}
+    - {name: NCCL_IB_TC, value: "106"}
+    - {name: NCCL_IB_TIMEOUT, value: "22"}
+    - {name: NCCL_IB_SUBNET_AWARE_ROUTING, value: "1"}
+    - {name: NCCL_IB_MERGE_NICS, value: "0"}
+    - {name: NCCL_NET_PLUGIN, value: none}
+    - {name: NCCL_NVLS_ENABLE, value: "0"}
+    - {name: NCCL_CUMEM_ENABLE, value: "0"}
+    - {name: NCCL_IGNORE_CPU_AFFINITY, value: "1"}
+    - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}
+    - {name: NCCL_DEBUG, value: INFO}
+    - {name: NCCL_DEBUG_SUBSYS, value: "INIT,NET"}
+    - {name: MN_IF_NAME, value: enP7s7}
+    - {name: TORCH_CUDA_ARCH_LIST, value: 12.1a}
+    - {name: FLASHINFER_CUDA_ARCH_LIST, value: 12.1a}
+    - {name: FLASHINFER_DISABLE_VERSION_CHECK, value: "1"}
+    # Match the build Job's prewarm env exactly (a JIT with different nvcc flags is a different cache
+    # entry) and bound any first-serve JIT so it cannot exhaust unified memory.
+    - {name: MAX_JOBS, value: "1"}
+    - {name: FLASHINFER_NVCC_THREADS, value: "1"}
+    - {name: VLLM_HAS_FLASHINFER_CUBIN, value: "1"}
+    - {name: VLLM_ENGINE_READY_TIMEOUT_S, value: "3600"}
+    - {name: PYTORCH_CUDA_ALLOC_CONF, value: "expandable_segments:True,garbage_collection_threshold:0.6"}
+    - {name: VLLM_USE_BREAKABLE_CUDAGRAPH, value: "1"}
+    - {name: VLLM_USE_FLASHINFER_SAMPLER, value: "0"}
+    # Engram-on-disk (tonyd2wild engram.py): rows are read from model-00047/48 in the model dir per forward.
+    - {name: DSV41_ENGRAM_DISK, value: "1"}
+    - {name: DSV41_ENGRAM_DISK_THREADS, value: "8"}
+    - {name: DSV41_ENGRAM_DISK_CHUNK, value: "8"}
+    # cuda-exl3 reads quantization_config.json next to the weights; the operator serves the cached
+    # multi-file model from /models/<cacheKey>.
+    - {name: CUDA_EXL3_MODEL_PATH, value: /models/22fa141368a3262a}
+    - {name: HF_HUB_OFFLINE, value: "1"}
+    - {name: TRANSFORMERS_OFFLINE, value: "1"}
+    - {name: HF_HOME, value: /cache/huggingface}
+    - {name: VLLM_CACHE_ROOT, value: /cache/vllm}
+    - {name: TRITON_CACHE_DIR, value: /cache/triton}
+    - {name: TILELANG_CACHE_DIR, value: /cache/tilelang}
+    - {name: TORCHINDUCTOR_CACHE_DIR, value: /cache/torchinductor}
+    - {name: CUDA_CACHE_PATH, value: /cache/jit}
+  extraVolumes:
+    - name: cache
+      hostPath: {path: /var/lib/vllm-cache/dsv41, type: DirectoryOrCreate}
+    - name: shm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+  extraVolumeMounts:
+    - {name: cache, mountPath: /cache}
+    - {name: shm, mountPath: /dev/shm}
+  multiNode:
+    rdmaResource: rdma/rdma_shared_device_a
+    ibGIDIndex: 3
+    members:
+      - node: ahazidgx1
+        fabric: {address: 192.168.1.28,  socketInterface: enP7s7, ibHCA: "rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1"}
+        modelCache: {claimName: dsv41-dgx1}
+      - node: ahazidgx2
+        fabric: {address: 192.168.1.86,  socketInterface: enP7s7, ibHCA: "rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1"}
+        modelCache: {claimName: dsv41-dgx2}
+      - node: ahazidgx3
+        fabric: {address: 192.168.1.220, socketInterface: enP7s7, ibHCA: "rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0f1"}
+        modelCache: {claimName: dsv41-dgx3}
