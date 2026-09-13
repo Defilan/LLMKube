@@ -16,72 +16,57 @@ spec:
     accelerator: cuda
     gpu: {enabled: true, count: 1, vendor: nvidia}
   files:
-    - model-00001-of-00048.safetensors
+    - config.json
+    - quantization_config.json
+    - model.safetensors.index.json
+    - tokenizer.json
     - tokenizer_config.json
     - MD5SUMS.body
-    - config.json
-    - tokenizer.json
-    - model.safetensors.index.json
-    - quantization_config.json
-    - model-00043-of-00048.safetensors
+    - model-00001-of-00048.safetensors
     - model-00002-of-00048.safetensors
-    - model-00045-of-00048.safetensors
-    - model-00044-of-00048.safetensors
-    - model-00046-of-00048.safetensors
-    - model-00018-of-00048.safetensors
-    - model-00022-of-00048.safetensors
-    - model-00026-of-00048.safetensors
-    - model-00028-of-00048.safetensors
-    - model-00029-of-00048.safetensors
-    - model-00030-of-00048.safetensors
-    - model-00032-of-00048.safetensors
-    - model-00033-of-00048.safetensors
-    - model-00034-of-00048.safetensors
-    - model-00036-of-00048.safetensors
-    - model-00037-of-00048.safetensors
-    - model-00038-of-00048.safetensors
-    - model-00040-of-00048.safetensors
-    - model-00041-of-00048.safetensors
-    - model-00042-of-00048.safetensors
-    - model-00031-of-00048.safetensors
-    - model-00035-of-00048.safetensors
-    - model-00039-of-00048.safetensors
-    - model-00025-of-00048.safetensors
-    - model-00027-of-00048.safetensors
-    - model-00023-of-00048.safetensors
     - model-00003-of-00048.safetensors
     - model-00004-of-00048.safetensors
+    - model-00005-of-00048.safetensors
     - model-00006-of-00048.safetensors
     - model-00007-of-00048.safetensors
     - model-00008-of-00048.safetensors
     - model-00009-of-00048.safetensors
     - model-00010-of-00048.safetensors
+    - model-00011-of-00048.safetensors
     - model-00012-of-00048.safetensors
     - model-00013-of-00048.safetensors
     - model-00014-of-00048.safetensors
     - model-00015-of-00048.safetensors
     - model-00016-of-00048.safetensors
+    - model-00017-of-00048.safetensors
+    - model-00018-of-00048.safetensors
     - model-00019-of-00048.safetensors
     - model-00020-of-00048.safetensors
     - model-00021-of-00048.safetensors
+    - model-00022-of-00048.safetensors
+    - model-00023-of-00048.safetensors
     - model-00024-of-00048.safetensors
-    - model-00005-of-00048.safetensors
-    - model-00011-of-00048.safetensors
-    - model-00017-of-00048.safetensors
+    - model-00025-of-00048.safetensors
+    - model-00026-of-00048.safetensors
+    - model-00027-of-00048.safetensors
+    - model-00028-of-00048.safetensors
+    - model-00029-of-00048.safetensors
+    - model-00030-of-00048.safetensors
+    - model-00031-of-00048.safetensors
+    - model-00032-of-00048.safetensors
+    - model-00033-of-00048.safetensors
+    - model-00034-of-00048.safetensors
+    - model-00035-of-00048.safetensors
+    - model-00036-of-00048.safetensors
+    - model-00037-of-00048.safetensors
+    - model-00038-of-00048.safetensors
+    - model-00039-of-00048.safetensors
+    - model-00040-of-00048.safetensors
+    - model-00041-of-00048.safetensors
+    - model-00042-of-00048.safetensors
+    - model-00043-of-00048.safetensors
+    - model-00044-of-00048.safetensors
+    - model-00045-of-00048.safetensors
+    - model-00046-of-00048.safetensors
     - model-00047-of-00048.safetensors
     - model-00048-of-00048.safetensors
----
-# The same model straight from Hugging Face, for clusters without a lab object store. Same 54 files;
-# the operator fetches them into the cache claim at first start.
-apiVersion: inference.llmkube.dev/v1alpha1
-kind: Model
-metadata:
-  name: dsv41-flash-exl3-hf
-spec:
-  source: hf://bot-lab-21/DeepSeek-V4.1-Flash-EXL3-3.5bpw-Pollard
-  format: safetensors
-  quantization: exl3
-  refreshPolicy: IfNotPresent
-  hardware:
-    accelerator: cuda
-    gpu: {enabled: true, count: 1, vendor: nvidia}

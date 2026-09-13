@@ -1,7 +1,7 @@
 # Drop the page cache on NODE right before the group boots. After a 460 GB prestage most of the
 # Spark's unified memory is page cache, and vLLM's worker refuses to start when CUDA-free at its
 # init snapshot is below gpu-memory-utilization x total (bot-lab-21's launcher gates on exactly
-# this and drops caches first; sp7 died at 96.08 < 97.35 GiB). CUDA-free on GB10 tracks MemFree.
+# this and drops caches first; a member with 96.08 GiB free failed the 97.35 GiB gate). CUDA-free on GB10 tracks MemFree.
 # Privileged hostPath write of "3" to drop_caches; prints MemFree before and after. One Job per node.
 # Usage: for n in <member nodes>; do sed "s/NODE/$n/g" drop-page-cache.yaml | kubectl apply -f -; done
 apiVersion: batch/v1

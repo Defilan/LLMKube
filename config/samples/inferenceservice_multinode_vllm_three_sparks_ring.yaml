@@ -56,28 +56,29 @@ spec:
     - "4"
     - --max-num-batched-tokens
     - "8192"
-    # Text-only for the measure boot (skips the vision tower); vision is a second step on the same group.
+    # Text-only for the first boot (skips the vision tower); vision is a second step on the same group.
     - --language-model-only
     # The patched engram.py reads the two n-gram tables from the safetensors shards on disk
     # (DSV41_ENGRAM_DISK=1 below); never resident.
     - --engram-config
     - '{"cpu_offload": false}'
-    # Thinking off for the measure boot; the deepseek_v41 reasoning parser stays wired.
+    # Thinking off for the first boot; the deepseek_v41 reasoning parser stays wired.
     - --default-chat-template-kwargs
     - '{"thinking": false}'
-    # CUDA graphs as tonyd2wild's TP3 ran them (FULL_AND_PIECEWISE, decode sizes 1..max-num-seqs);
-    # first request checks logprobs for the NaN failure LibertAI's TP2 lane hit with graphs on.
+    # CUDA graphs (FULL_AND_PIECEWISE). With speculative decoding the decode batch is k or k+1 tokens per sequence, so the
+    # capture sizes are the multiples of k up to k x max-num-seqs plus the multiples of k+1: for k=5 and 4 sequences,
+    # [5,6,10,12,15,18,20,24]. The first request should check logprobs for NaN (a GB10 TP2 build emitted NaN with graphs on).
     - --compilation-config
     - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,6,10,12,15,18,20,24]}'
     # DSpark k=5 speculative decoding: the drafter lives in the checkpoint; block verification with probabilistic draft
     # sampling is lossless (same distribution as the target). Measured 2026-09-13 on the ring: code 2.4x, arithmetic 2x,
-    # prose 1.0 to 1.3x, 1.5x across a mixed set. Capture sizes = {k..k*seqs} U {k+1..(k+1)*seqs} for k=5, seqs=4.
+    # prose 1.2 to 1.3x, 1.5x across a mixed set. Capture sizes follow the rule above.
     # Adaptive verification is unsupported on GB10 (SM12x sparse indexer); leave it false.
     - --speculative-config
     - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
     # TP3: 64 heads / 8 o_groups do not divide by 3. virtual_heads.py pads to 72 / 9 at load time
-    # against the declaration that 47-tp3-config.yaml writes into the staged config.json (what
-    # tonyd2wild's reddie_prep_tp3.sh does). NOT --hf-overrides: on this build text_config is
+    # against the declaration that config/samples/jobs/dsv41-tp3-config.yaml writes into the staged config.json (what
+    # tonyd2wild's reddie_prep_tp3.sh (https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark) does). NOT --hf-overrides: on this build text_config is
     # dict-typed, and the dict form replaces the whole sub-config (measured: "text_config ... does
     # not have num_attention_heads").
     # No --quantization: bot-lab-21's config.json carries quant_method exl3, which cuda-exl3's
@@ -96,13 +97,14 @@ spec:
     - {name: NCCL_CUMEM_ENABLE, value: "0"}
     - {name: NCCL_IGNORE_CPU_AFFINITY, value: "1"}
     - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}
+    # INFO plus INIT,NET prints the per-peer port choice during bring-up; drop both once the ring is proven.
     - {name: NCCL_DEBUG, value: INFO}
     - {name: NCCL_DEBUG_SUBSYS, value: "INIT,NET"}
-    - {name: MN_IF_NAME, value: enP7s7}
+    - {name: MN_IF_NAME, value: enP7s7}  # bootstrap NIC name vLLM's multi-node launcher reads
     - {name: TORCH_CUDA_ARCH_LIST, value: 12.1a}
     - {name: FLASHINFER_CUDA_ARCH_LIST, value: 12.1a}
     - {name: FLASHINFER_DISABLE_VERSION_CHECK, value: "1"}
-    # Match the build Job's prewarm env exactly (a JIT with different nvcc flags is a different cache
+    # Match the image's prewarm env exactly (a JIT with different nvcc flags is a different cache
     # entry) and bound any first-serve JIT so it cannot exhaust unified memory.
     - {name: MAX_JOBS, value: "1"}
     - {name: FLASHINFER_NVCC_THREADS, value: "1"}
