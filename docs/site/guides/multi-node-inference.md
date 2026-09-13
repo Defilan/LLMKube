@@ -213,7 +213,9 @@ the fallback if RDMA is unavailable). The full serving example, DeepSeek-V4.1-Fl
 is `config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml`, with its Model and the two
 checkpoint-side Jobs (the TP3 `config.json` edit, and a page-cache drop before the group boots) next to
 it. Text-only, single stream, on that ring: prefill 1,137 tok/s at 49.7k prompt tokens (1,123 at
-3.4k), decode 26.5 tok/s without speculative decoding; the sample runs a 65,536-token context.
+3.4k), decode 26.5 tok/s without speculative decoding and 31 to 35 tok/s with DSpark k=5 (65 tok/s on code, 1.5x across a mixed
+set; block verification is lossless). The sample runs DSpark k=5 with a 131,072-token context and four sequences,
+which leaves a KV pool of about 356,000 tokens at `gpuMemoryUtilization: 0.78`.
 
 Four operational notes from bringing it up: every member needs all 54 checkpoint files locally,
 including the two 101 GB Engram tables the runtime reads from NVMe; a claim the operator must stage into
