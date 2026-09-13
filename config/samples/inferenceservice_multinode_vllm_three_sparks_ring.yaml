@@ -38,7 +38,7 @@ spec:
   vllmConfig:
     tensorParallelSize: 3
     pipelineParallelSize: 1
-    maxModelLen: 65536
+    maxModelLen: 131072
     gpuMemoryUtilization: 0.78
     # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
     # expert parallelism is off and every expert stays local to its rank.
@@ -68,7 +68,13 @@ spec:
     # CUDA graphs as tonyd2wild's TP3 ran them (FULL_AND_PIECEWISE, decode sizes 1..max-num-seqs);
     # first request checks logprobs for the NaN failure LibertAI's TP2 lane hit with graphs on.
     - --compilation-config
-    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,3,4]}'
+    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,6,10,12,15,18,20,24]}'
+    # DSpark k=5 speculative decoding: the drafter lives in the checkpoint; block verification with probabilistic draft
+    # sampling is lossless (same distribution as the target). Measured 2026-09-13 on the ring: code 2.4x, arithmetic 2x,
+    # prose 1.0 to 1.3x, 1.5x across a mixed set. Capture sizes = {k..k*seqs} U {k+1..(k+1)*seqs} for k=5, seqs=4.
+    # Adaptive verification is unsupported on GB10 (SM12x sparse indexer); leave it false.
+    - --speculative-config
+    - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
     # TP3: 64 heads / 8 o_groups do not divide by 3. virtual_heads.py pads to 72 / 9 at load time
     # against the declaration that 47-tp3-config.yaml writes into the staged config.json (what
     # tonyd2wild's reddie_prep_tp3.sh does). NOT --hf-overrides: on this build text_config is
