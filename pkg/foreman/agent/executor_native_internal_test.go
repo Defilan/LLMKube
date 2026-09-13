@@ -2462,6 +2462,57 @@ func TestBuildUserPrompt_ReviewerOmitsAdvisoryBlockWhenNone(t *testing.T) {
 	}
 }
 
+// TestBuildUserPrompt_ReviewerZeroIssueOmitsIssue verifies that a review task
+// whose payload carries no issue key (int32 zero value) does not anchor the
+// reviewer on a non-existent "issue #0": the branch under review is the anchor
+// instead (#1761), matching the #1530 guards on the two sibling call sites.
+func TestBuildUserPrompt_ReviewerZeroIssueOmitsIssue(t *testing.T) {
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindReview,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Branch: "foreman/wl/no-issue-review",
+			},
+		},
+	}
+	got := buildUserPrompt(task)
+	if strings.Contains(got, "issue #0") {
+		t.Errorf("reviewer prompt with no issue in the payload must not reference issue #0; got:\n%s", got)
+	}
+	if strings.Contains(got, "- issue:") {
+		t.Errorf("zero-issue reviewer prompt must omit the issue line entirely; got:\n%s", got)
+	}
+	if !strings.Contains(got, "reviewing the branch foreman/wl/no-issue-review of defilantech/LLMKube") {
+		t.Errorf("zero-issue reviewer prompt must name the branch under review; got:\n%s", got)
+	}
+}
+
+// TestBuildUserPrompt_ReviewerPositiveIssueKeepsReferences verifies the guard
+// leaves the issue-anchored form untouched when the payload carries an issue.
+func TestBuildUserPrompt_ReviewerPositiveIssueKeepsReferences(t *testing.T) {
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindReview,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  510,
+				Branch: "foreman/wl/issue-510",
+			},
+		},
+	}
+	got := buildUserPrompt(task)
+	for _, want := range []string{
+		"reviewing the branch the coder produced for issue #510 of defilantech/LLMKube",
+		"- issue: 510",
+		"- branch: foreman/wl/issue-510",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt with an issue missing %q in:\n%s", want, got)
+		}
+	}
+}
+
 // stubIssueFetcher is a minimal whitebox Fetcher: it returns the
 // canned issue and counts calls. The blackbox fakeIssueFetcher in
 // executor_native_test.go drives the end-to-end path; this one pins

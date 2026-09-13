@@ -3383,10 +3383,22 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		// it, but parity across the local reviewer fleet matters.
 		// Empirical: rerun-7 review-510-1 (devstral) failed turn 1
 		// with that exact 400 before this case existed.
-		fmt.Fprintf(&b, "You are reviewing the branch the coder produced for issue #%d of %s.\n\n",
-			p.Issue, p.Repo)
+		// Payload.Issue is int32 omitempty, so a dispatch payload without
+		// the key reads as 0; repoMapQuery and synthesizedCommitMessage
+		// already guard their rendering for that (#1530) and this case was
+		// the missed third place (#1761). Anchoring the reviewer on a
+		// non-existent issue grounds it on nothing, so with no issue the
+		// branch under review is the anchor.
+		if p.Issue > 0 {
+			fmt.Fprintf(&b, "You are reviewing the branch the coder produced for issue #%d of %s.\n\n",
+				p.Issue, p.Repo)
+		} else {
+			fmt.Fprintf(&b, "You are reviewing the branch %s of %s.\n\n", p.Branch, p.Repo)
+		}
 		fmt.Fprintf(&b, "- repo: %s\n", p.Repo)
-		fmt.Fprintf(&b, "- issue: %d\n", p.Issue)
+		if p.Issue > 0 {
+			fmt.Fprintf(&b, "- issue: %d\n", p.Issue)
+		}
 		fmt.Fprintf(&b, "- branch: %s\n", p.Branch)
 		b.WriteString("\nFollow Step 1 of your system prompt to navigate to ")
 		b.WriteString("the branch under review before forming any judgment, ")
