@@ -290,23 +290,23 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	if ok, n := groupReadiness(obs); !ok || n != 2 {
 		t.Errorf("head Ready + worker Running must be ready (got %v, %d)", ok, n)
 	}
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("healthy group must not recreate: %s", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodRunning, false, 1, "abc")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "MemberRestarted" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "MemberRestarted" {
 		t.Errorf("restarted worker: got %q", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodRunning, false, 0, "old")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "SpecChanged" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "SpecChanged" {
 		t.Errorf("stale hash: got %q", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodFailed, false, 0, "abc")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "MemberFailed" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "MemberFailed" {
 		t.Errorf("failed worker: got %q", reason)
 	}
 	obs[1].existing = nil
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("a missing member is created, not a recreate trigger: got %q", reason)
 	}
 	if ok, n := groupReadiness(obs); ok || n != 1 {
@@ -315,11 +315,11 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	obs[1].existing = mk("w", corev1.PodRunning, false, 0, "abc")
 	obs[0].existing = mk("h", corev1.PodRunning, false, 0, "abc")
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-multiNodeStartupBudget - time.Minute))
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "HeadNotReady" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "HeadNotReady" {
 		t.Errorf("head past budget: got %q", reason)
 	}
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now); reason != "" {
+	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("head inside budget must wait: got %q", reason)
 	}
 	if ok, _ := groupReadiness(obs); ok {
@@ -353,7 +353,7 @@ func TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate(t *testing.T) {
 				{rank: 0, existing: mk("h", 0)},
 				{rank: 1, existing: tt.worker},
 			}
-			reason, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Now())
+			reason, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Now(), time.Time{})
 			if reason != tt.want {
 				t.Errorf("worker restart: got reason %q, want %q", reason, tt.want)
 			}
@@ -367,7 +367,9 @@ func TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate(t *testing.T) {
 // group on those exits kills the downloader and loses its progress, so they
 // are formation noise. The noise ends at the group's formation timestamp, and
 // a staging member whose init containers keep dying is bounded by
-// MemberInitLoop so masking cannot hide a permanently broken download.
+// MemberInitLoop so masking cannot hide a permanently broken download. When
+// the group never forms, the noise ends at stagedAt + multiNodePostStagingBudget
+// instead, so a runtime crashloop after staging is recreated rather than masked.
 func TestGroupNeedsRecreateFormation(t *testing.T) {
 	now := time.Now()
 	// mkWaiting is a member whose runtime has been up, exited and been
@@ -401,6 +403,7 @@ func TestGroupNeedsRecreateFormation(t *testing.T) {
 		name     string
 		obs      []memberObservation
 		formedAt time.Time
+		stagedAt time.Time
 		want     string
 	}{
 		{
@@ -448,6 +451,26 @@ func TestGroupNeedsRecreateFormation(t *testing.T) {
 			formedAt: time.Time{},
 			want:     "",
 		},
+		{
+			name: "a runtime still rendezvousing inside the post-staging window is noise",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 2, now.Add(-time.Minute))},
+				{rank: 1, existing: mkWaiting("w", 0, time.Time{})},
+			},
+			formedAt: time.Time{},
+			stagedAt: now.Add(-2 * time.Minute),
+			want:     "",
+		},
+		{
+			name: "a runtime that keeps dying after staging is fatal",
+			obs: []memberObservation{
+				{rank: 0, existing: mkWaiting("h", 4, now.Add(-time.Minute))},
+				{rank: 1, existing: mkWaiting("w", 0, time.Time{})},
+			},
+			formedAt: time.Time{},
+			stagedAt: now.Add(-multiNodePostStagingBudget - time.Minute),
+			want:     "MemberRestarted",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -456,7 +479,7 @@ func TestGroupNeedsRecreateFormation(t *testing.T) {
 				// test, not the budget itself.
 				tt.obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-multiNodeStartupBudget - time.Minute))
 			}
-			reason, _ := groupNeedsRecreate(tt.obs, "abc", now, tt.formedAt)
+			reason, _ := groupNeedsRecreate(tt.obs, "abc", now, tt.formedAt, tt.stagedAt)
 			if reason != tt.want {
 				t.Errorf("got reason %q, want %q", reason, tt.want)
 			}
@@ -510,7 +533,7 @@ func TestLastTerminationDetail(t *testing.T) {
 	// group formed: formedAt an hour ago, FinishedAt now.
 	obs := []memberObservation{{rank: 0, existing: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "h", Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "vllm", RestartCount: 1, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled", FinishedAt: metav1.NewTime(time.Now())}}}}}}}}
-	reason, msg := groupNeedsRecreate(obs, "abc", time.Now(), time.Now().Add(-time.Hour))
+	reason, msg := groupNeedsRecreate(obs, "abc", time.Now(), time.Now().Add(-time.Hour), time.Time{})
 	if reason != "MemberRestarted" || !strings.Contains(msg, "OOMKilled") || !strings.Contains(msg, "137") {
 		t.Fatalf("restart detail missing: %s / %s", reason, msg)
 	}

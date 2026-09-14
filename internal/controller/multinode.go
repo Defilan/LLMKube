@@ -58,11 +58,23 @@ const (
 	// member's runtime container was up at once. Its LastTransitionTime is the
 	// formation timestamp groupNeedsRecreate judges restarts against (#1757).
 	ConditionMultiNodeFormed = "MultiNodeFormed"
+	// ConditionMultiNodeStaged is True from the first reconcile on which every
+	// desired member exists and every member has finished staging. Its
+	// LastTransitionTime is when staging ended for the group: the deadline the
+	// unformed mask in memberRestartFatal is measured from.
+	ConditionMultiNodeStaged = "MultiNodeStaged"
 
 	// multiNodeStartupBudget bounds how long rank 0 may stay Running but not
 	// Ready before the group is recreated. It matches the vLLM startup probe's
 	// budget (180 x 10s) so a slow but honest weight load is not punished.
 	multiNodeStartupBudget = 30 * time.Minute
+
+	// multiNodePostStagingBudget bounds how long a group that never formed may
+	// keep collecting runtime restarts after its members have finished staging.
+	// The runtimes still have to rendezvous once the runtimes come up, but that
+	// window has an end: past this the restarts are a crashloop, not rendezvous
+	// noise, and the group is recreated. It matches the rank 0 startup budget.
+	multiNodePostStagingBudget = multiNodeStartupBudget
 
 	// multiNodeMaxInitRestarts bounds how many times a member's init containers
 	// may restart while the group waits for staging. Formation masking must not
@@ -351,31 +363,50 @@ func initRestartCount(p *corev1.Pod) int32 {
 	return n
 }
 
+// memberStaged reports whether the member has genuinely finished staging: it
+// is not staging and every init container in the pod spec has reported a
+// status. A pod the kubelet has not started yet reports no statuses, so it is
+// not staged: the post-staging deadline must not be anchored before the
+// downloader runs.
+func memberStaged(p *corev1.Pod) bool {
+	if memberStaging(p) {
+		return false
+	}
+	return len(p.Status.InitContainerStatuses) >= len(p.Spec.InitContainers)
+}
+
 // memberRestartFatal reports whether a member's restart counts as group-fatal.
 //
-// While the group is forming (formedAt zero: there has never been a reconcile
-// with every member's runtime container up at once), a waiting runtime that
-// cannot rendezvous yet exits on its own and kubelet restarts it, and that
-// repeats until the last member finishes staging. Recreating the group on
-// those restarts would kill the member still downloading and discard its
-// progress, which never converges (#1757), so a termination is formation
-// noise when it finished at or before formedAt.
+// While the group is forming, a waiting runtime that cannot rendezvous yet
+// exits on its own and kubelet restarts it, and that repeats until every
+// member has staged and the runtimes come up. Recreating the group on those
+// restarts would kill the member still staging and discard its progress, which
+// never converges (#1757), so they are masked.
+//
+// The mask ends at stagedAt + multiNodePostStagingBudget, not at formation
+// alone: a member's weights load can outlast its downloader by minutes while
+// the runtimes still find each other, but past the budget an unformed group
+// whose members have stopped staging is a crashloop and the group is recreated
+// rather than masked forever.
 //
 // After formation the old strictness holds: a termination that finished after
 // formedAt is a real crash. A restart with no readable termination is also
 // fatal, so an untraceable restart cannot hide behind the masking.
-func memberRestartFatal(cs corev1.ContainerStatus, formedAt time.Time) bool {
-	if formedAt.IsZero() {
-		return false
-	}
+func memberRestartFatal(cs corev1.ContainerStatus, formedAt, stagedAt, now time.Time) bool {
 	t := cs.LastTerminationState.Terminated
 	if t == nil {
 		t = cs.State.Terminated
 	}
-	if t == nil {
-		return true
+	if !formedAt.IsZero() {
+		if t == nil {
+			return true
+		}
+		return t.FinishedAt.Time.IsZero() || t.FinishedAt.Time.After(formedAt)
 	}
-	return t.FinishedAt.Time.After(formedAt)
+	if stagedAt.IsZero() || now.Sub(stagedAt) <= multiNodePostStagingBudget {
+		return false
+	}
+	return true
 }
 
 // multiNodeFormedAt reads the formation timestamp off the InferenceService's
@@ -383,6 +414,17 @@ func memberRestartFatal(cs corev1.ContainerStatus, formedAt time.Time) bool {
 // the group has never been fully up.
 func multiNodeFormedAt(isvc *inferencev1alpha1.InferenceService) time.Time {
 	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeFormed)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		return time.Time{}
+	}
+	return cond.LastTransitionTime.Time
+}
+
+// multiNodeStagedAt reads staging-end off the InferenceService's
+// MultiNodeStaged condition. Zero when the condition is absent or not True:
+// some member is still staging, or not every member has been seen yet.
+func multiNodeStagedAt(isvc *inferencev1alpha1.InferenceService) time.Time {
+	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeStaged)
 	if cond == nil || cond.Status != metav1.ConditionTrue {
 		return time.Time{}
 	}
@@ -398,7 +440,13 @@ func multiNodeFormedAt(isvc *inferencev1alpha1.InferenceService) time.Time {
 // staging, rank 0 cannot become Ready either (the ring is incomplete), so the
 // startup budget is gated the same way; MemberInitLoop is the bound on a group
 // whose staging never finishes.
-func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, formedAt time.Time) (reason, msg string) {
+//
+// stagedAt (the MultiNodeStaged timestamp) is the unformed mask's deadline:
+// past stagedAt + multiNodePostStagingBudget a restart is finally fatal, so a
+// group that never forms cannot be masked forever. A staging member that hangs
+// without restarting (Running, RestartCount 0) is deliberately not bounded
+// here: a 184 GiB download legitimately exceeds any fixed budget.
+func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, formedAt, stagedAt time.Time) (reason, msg string) {
 	stagingAny := false
 	for _, o := range obs {
 		p := o.existing
@@ -432,7 +480,7 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 			continue
 		}
 		for _, cs := range p.Status.ContainerStatuses {
-			if cs.RestartCount > 0 && memberRestartFatal(cs, formedAt) {
+			if cs.RestartCount > 0 && memberRestartFatal(cs, formedAt, stagedAt, now) {
 				return "MemberRestarted", fmt.Sprintf("%s restarted %d time(s)%s", p.Name, cs.RestartCount, lastTerminationDetail(cs))
 			}
 		}
@@ -553,11 +601,13 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		if len(existing.Items) > 0 {
 			setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, "Suspended", "spec.suspend or replicas 0")
 			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
+			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
 			r.deleteMemberPods(ctx, existing.Items)
 			return r.persistGroupTeardown(ctx, isvc, PhaseSuspended, modelReady, desiredReplicas)
 		}
 		setMultiNodeStatus(isvc, desired, nil, metav1.ConditionFalse, "Suspended", "group is scaled to zero")
 		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
 		return 0, nil, nil
 	}
 
@@ -565,7 +615,7 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	for i, d := range desired {
 		obs[i] = memberObservation{rank: i, desired: d, existing: byName[d.Name]}
 	}
-	if reason, msg := groupNeedsRecreate(obs, hash, time.Now(), multiNodeFormedAt(isvc)); reason != "" {
+	if reason, msg := groupNeedsRecreate(obs, hash, time.Now(), multiNodeFormedAt(isvc), multiNodeStagedAt(isvc)); reason != "" {
 		// A teardown takes several reconciles (every member event requeues);
 		// log the decision once per reason, not once per requeue.
 		if cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeGroupReady); cond == nil || cond.Reason != reason {
@@ -576,6 +626,7 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		// timestamp, or the new pods' kubelet restarts would be judged against
 		// the old group's formation (#1757).
 		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
 		r.deleteMemberPods(ctx, existing.Items)
 		return r.persistGroupTeardown(ctx, isvc, PhaseCreating, modelReady, desiredReplicas)
 	}
@@ -660,6 +711,11 @@ func (r *InferenceServiceReconciler) persistGroupTeardown(ctx context.Context, i
 // preserves it across later True writes, so the timestamp is the group's
 // first formation, not the most recent. Teardown paths clear the condition so
 // a recreated group forms afresh.
+//
+// MultiNodeStaged mirrors it one step earlier: True from the first reconcile
+// on which every desired member exists and every member has finished staging.
+// Its LastTransitionTime is the deadline memberRestartFatal measures the
+// unformed mask from, so a group that never forms is not masked forever.
 func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*corev1.Pod, existing []corev1.Pod, status metav1.ConditionStatus, reason, msg string) {
 	byName := map[string]*corev1.Pod{}
 	for i := range existing {
@@ -667,6 +723,7 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 	}
 	st := &inferencev1alpha1.MultiNodeStatus{Size: int32(len(desired))} //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 	formed := len(desired) > 0
+	staged := len(desired) > 0
 	for rank, d := range desired {
 		m := inferencev1alpha1.MultiNodeMemberStatus{Rank: int32(rank), Node: d.Spec.NodeName, Pod: d.Name} //nolint:gosec // G115: bounded by the CRD's MaxItems=64
 		if p := byName[d.Name]; p != nil {
@@ -680,6 +737,9 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 			}
 			if memberStaging(p) {
 				formed = false
+			}
+			if !memberStaged(p) {
+				staged = false
 			}
 			started := false
 			for _, cs := range p.Status.ContainerStatuses {
@@ -696,6 +756,7 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 			}
 		} else {
 			formed = false
+			staged = false
 		}
 		st.Members = append(st.Members, m)
 	}
@@ -704,6 +765,12 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 		meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
 			Type: ConditionMultiNodeFormed, Status: metav1.ConditionTrue,
 			Reason: "AllMembersStarted", Message: "every member's runtime container has started",
+		})
+	}
+	if staged {
+		meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
+			Type: ConditionMultiNodeStaged, Status: metav1.ConditionTrue,
+			Reason: "AllMembersStaged", Message: "every member has finished staging",
 		})
 	}
 	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
