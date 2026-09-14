@@ -111,9 +111,20 @@ def marker_triples(src_dir):
 
 
 def chart_triples(path):
+    """(group, resource, verb) the chart's ClusterRoles grant.
+
+    ClusterRole only, deliberately. A namespaced Role is a grant in one
+    namespace, so it cannot cover a marker for a cluster-wide watch: a
+    ControllerManager whose cache cannot list a type cluster-wide is the
+    failure this check exists to catch (#376, #1593). The llmkube chart's
+    leader-election Role grants configmaps, events and coordination leases in
+    the release namespace. Accepting it here let a lease marker read as covered
+    while the operator's ClusterRole had none, so every pooled ModelRouter got
+    a 403 on its Lease (found on the #1477 branch, never on main).
+    """
     out = set()
     for doc in yaml.safe_load_all(Path(path).read_text()):
-        if not doc or doc.get("kind") not in ("ClusterRole", "Role"):
+        if not doc or doc.get("kind") != "ClusterRole":
             continue
         for rule in (doc.get("rules") or []):
             for g in (rule.get("apiGroups") or []):
