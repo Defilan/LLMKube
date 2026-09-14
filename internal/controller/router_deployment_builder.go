@@ -113,13 +113,9 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		imagePullSecrets = mr.Spec.Proxy.ImagePullSecrets
 		nodeSelector = mr.Spec.Proxy.NodeSelector
 	}
-	// A pooled router must run exactly one proxy replica: ModelPool activation
-	// serializes swaps through a single in-process lock, so a second replica
-	// would race it and thrash the shared GPU slot. Pin to 1 regardless of
-	// spec.proxy.replicas until cross-replica swap coordination lands.
-	if hasPools {
-		replicas = 1
-	}
+	// spec.proxy.replicas is honored whether or not the router has pooled
+	// backends: cross-replica swap coordination is a per-pool Lease, so a
+	// second replica no longer races the shared GPU slot (#1477).
 	if resources.Requests == nil && resources.Limits == nil {
 		resources = defaultRouterProxyResources()
 	}
@@ -139,9 +135,20 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	// namespace default SA and no API access.
 	serviceAccountName := ""
 	env := []corev1.EnvVar{}
+	// A pooled router runs one or more proxy replicas; ModelPool swaps are
+	// serialized across replicas by a per-pool Lease, so pod churn does not
+	// require pinning spec.proxy.replicas to 1 (#1477).
 	if hasPools {
 		serviceAccountName = routerProxyResourceName(mr.Name)
 		env = append(env, corev1.EnvVar{Name: "ROUTER_NAME", Value: mr.Name})
+		// POD_NAMESPACE is the lease namespace: the proxy's own namespace is
+		// the ModelRouter (and ModelPool) namespace.
+		env = append(env, corev1.EnvVar{
+			Name: "POD_NAMESPACE",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+			},
+		})
 	}
 
 	return &appsv1.Deployment{

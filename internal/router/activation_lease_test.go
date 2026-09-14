@@ -1,0 +1,193 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package router
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	coordinationv1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+)
+
+func leaseScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := coordinationv1.AddToScheme(s); err != nil {
+		t.Fatalf("add coordination scheme: %v", err)
+	}
+	if err := inferencev1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("add inference scheme: %v", err)
+	}
+	return s
+}
+
+// TestLeaseCoordinatorSerializesHolders verifies the cross-replica single-writer
+// invariant (#1477): while one replica holds a pool's swap lease, another
+// replica's Acquire reports not-owned, and once the holder releases the next
+// replica takes it.
+func TestLeaseCoordinatorSerializesHolders(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(leaseScheme(t)).Build()
+	ctx := context.Background()
+
+	a := NewLeaseCoordinator(c, "lab")
+	a.identity = "proxy-a"
+	b := NewLeaseCoordinator(c, "lab")
+	b.identity = "proxy-b"
+
+	okA, err := a.Acquire(ctx, "lab/heavy-slot")
+	if err != nil {
+		t.Fatalf("a.Acquire: %v", err)
+	}
+	if !okA {
+		t.Fatal("first Acquire = not owned, want owned on an unheld pool")
+	}
+
+	okB, err := b.Acquire(ctx, "lab/heavy-slot")
+	if err != nil {
+		t.Fatalf("b.Acquire: %v", err)
+	}
+	if okB {
+		t.Fatal("second replica acquired a lease the first still holds; swaps are not single-writer")
+	}
+
+	a.Release(ctx, "lab/heavy-slot")
+	okB, err = b.Acquire(ctx, "lab/heavy-slot")
+	if err != nil {
+		t.Fatalf("b.Acquire after release: %v", err)
+	}
+	if !okB {
+		t.Fatal("a released lease must be acquirable by the next replica")
+	}
+}
+
+// TestLeaseCoordinatorTakesOverExpired verifies a lease whose holder stopped
+// renewing is taken over, so a crashed proxy replica does not wedge the pool.
+func TestLeaseCoordinatorTakesOverExpired(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(leaseScheme(t)).Build()
+	ctx := context.Background()
+
+	l := NewLeaseCoordinator(c, "lab")
+	l.identity = "live"
+	l.duration = time.Minute
+	stale := metav1.NewMicroTime(time.Now().Add(-2 * time.Minute))
+	dead := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{Name: leaseNamePrefix + sanitizeLeaseName("lab/heavy-slot"), Namespace: "lab"},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       ptr.To("dead-proxy"),
+			LeaseDurationSeconds: ptr.To(int32(time.Minute.Seconds())),
+			RenewTime:            &stale,
+		},
+	}
+	if err := c.Create(ctx, dead); err != nil {
+		t.Fatalf("seed lease: %v", err)
+	}
+
+	ok, err := l.Acquire(ctx, "lab/heavy-slot")
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if !ok {
+		t.Fatal("Acquire = not owned, want takeover of an expired lease")
+	}
+}
+
+// fakeCoordinator is an injectable SwapCoordinator for Activator tests.
+type fakeCoordinator struct {
+	mu       sync.Mutex
+	owner    bool
+	released bool
+}
+
+func (f *fakeCoordinator) Acquire(context.Context, string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.owner, nil
+}
+
+func (f *fakeCoordinator) Release(context.Context, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released = true
+}
+
+func (f *fakeCoordinator) wasReleased() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.released
+}
+
+// TestActivatorDefersSwapToLeaseOwner verifies a replica that does not own the
+// swap lease does not scale the member: it waits for the owner to bring the
+// member up and, when its caller gives up, leaves the member alone rather than
+// undoing the owner's activation (#1477).
+func TestActivatorDefersSwapToLeaseOwner(t *testing.T) {
+	memberCtrl := newFakeMemberController()
+	coord := &fakeCoordinator{owner: false}
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	a := NewActivator(baseCtx, memberCtrl, "r", nil)
+	a.SetSwapCoordinator(coord)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := a.Acquire(ctx, testPool("coder")); !errors.Is(err, ErrHoldBudgetExceeded) {
+		t.Fatalf("Acquire = %v, want ErrHoldBudgetExceeded while deferring", err)
+	}
+
+	if got := memberCtrl.activateCount("coder"); got != 0 {
+		t.Errorf("deferring replica scaled the member %d times, want 0 (only the lease owner writes)", got)
+	}
+	if got := memberCtrl.deactivateCount("coder"); got != 0 {
+		t.Errorf("deferring replica deactivated the member %d times, want 0", got)
+	}
+	// The cancel-on-timeout path cancels the deferred wait asynchronously, so
+	// the lease is released shortly after Acquire returns.
+	deadline := time.Now().Add(2 * time.Second)
+	for !coord.wasReleased() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !coord.wasReleased() {
+		t.Error("the swap lease was not released when the swap ended")
+	}
+}
+
+// TestActivatorOwnerDrivesSwap is the positive control for the deferral test:
+// the replica that owns the lease scales the member.
+func TestActivatorOwnerDrivesSwap(t *testing.T) {
+	memberCtrl := newFakeMemberController()
+	a := NewActivator(context.Background(), memberCtrl, "r", nil)
+	a.SetSwapCoordinator(&fakeCoordinator{owner: true})
+
+	rel, err := a.Acquire(context.Background(), testPool("coder"))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	rel()
+
+	if got := memberCtrl.activateCount("coder"); got != 1 {
+		t.Errorf("lease owner activate count = %d, want 1", got)
+	}
+}

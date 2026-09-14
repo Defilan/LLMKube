@@ -1089,6 +1089,19 @@ func TestReconcileRouterActivationRBAC(t *testing.T) {
 		t.Error("Role over-grants: proxy should not be able to delete inferenceservices")
 	}
 
+	// The per-pool swap Lease that serializes ModelPool activation across
+	// proxy replicas (#1477).
+	var leaseRule bool
+	for _, rule := range role.Rules {
+		if strSliceHas(rule.APIGroups, "coordination.k8s.io") && strSliceHas(rule.Resources, "leases") &&
+			strSliceHas(rule.Verbs, "create") && strSliceHas(rule.Verbs, "update") {
+			leaseRule = true
+		}
+	}
+	if !leaseRule {
+		t.Errorf("Role missing create/update on coordination.k8s.io leases: %+v", role.Rules)
+	}
+
 	binding := &rbacv1.RoleBinding{}
 	if err := c.Get(context.Background(), nn, binding); err != nil {
 		t.Fatalf("RoleBinding not created: %v", err)
@@ -1177,19 +1190,33 @@ func TestNewRouterDeploymentActivationWiring(t *testing.T) {
 	}
 }
 
-// TestNewRouterDeploymentPinsReplicasWhenPooled verifies the single-writer
-// constraint (#1393 review): a pooled router is pinned to one proxy replica
-// even when spec.proxy.replicas asks for more, so ModelPool swaps stay
-// serialized; an unpooled router honors the requested replica count.
-func TestNewRouterDeploymentPinsReplicasWhenPooled(t *testing.T) {
+// TestNewRouterDeploymentHonorsReplicasWhenPooled verifies that a pooled router
+// honors spec.proxy.replicas: cross-replica swap coordination is a per-pool
+// Lease, so a second replica no longer races the shared GPU slot (#1477). The
+// pooled deployment must still carry the activation ServiceAccount and
+// POD_NAMESPACE the lease needs.
+func TestNewRouterDeploymentHonorsReplicasWhenPooled(t *testing.T) {
 	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
 	mr := canonicalModelRouter()
 	three := int32(3)
 	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{Replicas: &three}
 
 	pooled := r.newRouterDeployment(mr, "hash", true)
-	if pooled.Spec.Replicas == nil || *pooled.Spec.Replicas != 1 {
-		t.Errorf("pooled replicas = %v, want 1 (pinned)", pooled.Spec.Replicas)
+	if pooled.Spec.Replicas == nil || *pooled.Spec.Replicas != 3 {
+		t.Errorf("pooled replicas = %v, want 3 (spec.proxy.replicas honored)", pooled.Spec.Replicas)
+	}
+	if got := envValue(pooled.Spec.Template.Spec.Containers[0].Env, "POD_NAMESPACE"); got != "" {
+		t.Errorf("POD_NAMESPACE env value = %q, want a fieldRef (value is injected at runtime)", got)
+	}
+	var hasNamespaceRef bool
+	for _, e := range pooled.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "POD_NAMESPACE" && e.ValueFrom != nil && e.ValueFrom.FieldRef != nil &&
+			e.ValueFrom.FieldRef.FieldPath == "metadata.namespace" {
+			hasNamespaceRef = true
+		}
+	}
+	if !hasNamespaceRef {
+		t.Error("pooled deployment must inject POD_NAMESPACE for the swap lease namespace")
 	}
 
 	unpooled := r.newRouterDeployment(mr, "hash", false)
