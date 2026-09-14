@@ -18,6 +18,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -401,7 +404,10 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 		return fmt.Errorf("s3 GET %s: %s", objectURL, resp.Status)
 	}
 
-	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
+	// S3 does not resume: it writes the plain ".partial" path and starts from
+	// zero every attempt (sigv4 range signing is unverified). This is the same
+	// behaviour it had before resume existed (#1765).
+	return e.copyToFileNoResume(filePath, resp.Body, resp.ContentLength)
 }
 
 // hfNormalize is the source resolver the download path applies before the
@@ -410,8 +416,23 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 // resolved host to a reachable server.
 var hfNormalize = hfsource.NormalizeHFSource
 
-// downloadFile fetches url into filePath. token, when non-empty, is sent as a
+// downloadFile fetches url into filePath, resuming from a validator-keyed
+// partial left by an interrupted attempt. token, when non-empty, is sent as a
 // bearer credential on the FIRST hop only.
+//
+// Resume works by asking upstream for a validator (a HEAD reading ETag plus
+// Content-Length), deriving the partial name from it, and, when a matching
+// partial survives, sending "Range: bytes=N-" for the remainder. Like curl -C -,
+// the Range request sends no If-Range, so the content key is what makes the
+// resume safe: a content change yields a different validator, hence a different
+// partial name, so the abandoned bytes are never appended onto. An origin that
+// ignores the Range and answers 200 is handled by discarding the partial and
+// rewriting from zero.
+//
+// Every transfer, the from-zero one included, writes the probed validator's
+// partial, so an interruption at any offset leaves progress the next attempt
+// resumes. Only the probe-failure path (downloadFull with an empty validator)
+// has no key to write under and uses the fixed empty-validator name.
 //
 // The redirect handling is deliberate and stricter than net/http's default.
 // Go strips Authorization only when a redirect leaves the registrable domain
@@ -424,14 +445,60 @@ var hfNormalize = hfsource.NormalizeHFSource
 // therefore drops the header on ANY change of host.
 func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token string) error {
 	url = hfNormalize(url)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+
+	httpClient := http.DefaultClient
+	if token != "" {
+		httpClient = hfRedirectStripper()
+	}
+
+	validator, size, err := probeValidator(ctx, httpClient, url, token)
+	if err != nil {
+		// A failed probe is not fatal to the download: treat the content as
+		// unknown, start from zero, and let the GET below surface any real error.
+		e.logger.Debugw("validator probe failed; downloading without resume", "url", url, "error", err)
+		return e.downloadFull(ctx, httpClient, url, filePath, token, "")
+	}
+
+	partPath := validatorPartialPath(filePath, validator)
+
+	// Sweep partials left by a different validator before starting. Content
+	// keying already guarantees those stale bytes can never be resumed into (the
+	// key differs), but leaving them lets them accumulate across content
+	// changes: an unpinned repo whose bytes rotate keeps a fresh key on every
+	// change and drops the old partial each time this runs, which bounds the
+	// debris. The current key is exempt so an interrupted transfer keeps its own
+	// resumable partial.
+	sweepStalePartials(filePath, partPath)
+
+	var resumeFrom int64
+	if fi, statErr := os.Stat(partPath); statErr == nil && fi.Mode().IsRegular() {
+		// The partial is keyed on the validator, so its very name proves it
+		// belongs to the current content: a change in length or ETag yields a
+		// different key and this stat would miss it.
+		switch {
+		case size > 0 && fi.Size() < size:
+			resumeFrom = fi.Size()
+		case size > 0 && fi.Size() == size:
+			// Already complete: a ranged request would 416 and the full-body
+			// path would rewrite identical bytes anyway, so publish the partial
+			// as-is. Renaming the content-keyed partial onto the final path also
+			// clears the key, so a later content change re-downloads cleanly
+			// instead of splicing onto these bytes.
+			return os.Rename(partPath, filePath)
+		default:
+			_ = os.Remove(partPath)
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	httpClient := http.DefaultClient
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
-		httpClient = hfRedirectStripper()
+	}
+	if resumeFrom > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", resumeFrom))
 	}
 
 	resp, err := httpClient.Do(req)
@@ -440,11 +507,168 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	// A 206 response is verified against the full object size (probeFullSize), so
+	// the total after the append is expected; a 200 is verified against the
+	// response's own Content-Length.
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// A 200 in response to a Range request means the server ignored the
+		// range and is sending the whole object; the partial must not be
+		// appended to (that would splice). resumeFrom is 0 here, so os.Create
+		// truncates the probed validator's partial and the transfer starts from
+		// zero, keeping that partial resumable if this attempt is interrupted.
+		return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0)
+	case http.StatusPartialContent:
+		if resumeFrom == 0 {
+			// A 206 with no partial to append to cannot be trusted; restart.
+			return e.downloadFull(ctx, httpClient, url, filePath, token, validator)
+		}
+		// ContentLength is the remaining bytes; total on disk is resumeFrom +
+		// written, which must equal the full size the probe saw.
+		expected := resumeFrom + resp.ContentLength
+		if full := probeFullSize(validator, resp); full > 0 && expected != full {
+			_ = os.Remove(partPath)
+			return e.downloadFull(ctx, httpClient, url, filePath, token, validator)
+		}
+		return e.copyToFileResume(partPath, filePath, resp.Body, expected, resumeFrom)
+	default:
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+}
+
+// downloadFull performs a non-resuming GET of url and publishes the body at
+// filePath via the partial keyed on partValidator. It is the from-zero path
+// taken when there is nothing to resume or a resume was invalidated; the caller
+// passes the probed validator so an interrupted restart stays resumable, or the
+// empty validator when the probe failed and no key is known.
+func (e *MetalExecutor) downloadFull(
+	ctx context.Context,
+	httpClient *http.Client,
+	url, filePath, token, partValidator string,
+) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
+	partPath := validatorPartialPath(filePath, partValidator)
+	return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0)
+}
 
-	return e.copyToFile(filePath, resp.Body, resp.ContentLength)
+// probeValidator HEADs url on the given client and returns the raw validator
+// ("CL<len>ET<etag>") plus the parsed size, mirroring the init-container probes so
+// the same bytes produce the same partial key in-cluster and on the metal path.
+func probeValidator(
+	ctx context.Context,
+	httpClient *http.Client,
+	url, token string,
+) (validator string, size int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 400 {
+		return "", 0, fmt.Errorf("HEAD %s: %s", url, resp.Status)
+	}
+	etag := resp.Header.Get("ETag")
+	sizeStr := resp.Header.Get("Content-Length")
+	if sizeStr == "" {
+		sizeStr = fmt.Sprintf("%d", resp.ContentLength)
+	}
+	size, _ = strconv.ParseInt(sizeStr, 10, 64)
+	return "CL" + sizeStr + "ET" + etag, size, nil
+}
+
+// validatorSize parses the length out of a "CL<len>ET..." validator string, or -1
+// when it is unparseable (an empty/absent probe result).
+func validatorSize(validator string) int64 {
+	if !strings.HasPrefix(validator, "CL") {
+		return -1
+	}
+	rest := strings.TrimPrefix(validator, "CL")
+	et := strings.Index(rest, "ET")
+	if et < 0 {
+		et = len(rest)
+	}
+	n, err := strconv.ParseInt(rest[:et], 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// probeFullSize returns the total size the ranged response implies, used to
+// verify the appended bytes complete the object. It prefers the size the probe
+// already read (the validator) and falls back to the instance-length in the
+// response's Content-Range header, returning 0 when neither is known (nothing to
+// check against).
+func probeFullSize(validator string, resp *http.Response) int64 {
+	if n := validatorSize(validator); n > 0 {
+		return n
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		if slash := strings.LastIndexByte(cr, '/'); slash >= 0 {
+			if total, err := strconv.ParseInt(cr[slash+1:], 10, 64); err == nil {
+				return total
+			}
+		}
+	}
+	return 0
+}
+
+// validatorPartialPath names the partial that holds resume progress for a
+// download, or the scratch file a from-zero transfer writes. The name embeds the
+// first 12 hex of sha256(validator) so the bytes a transfer holds are always the
+// bytes the current validator implies. A caller that has a validator always
+// passes it, from-zero transfers included, so the partial a fresh attempt leaves
+// behind is the one a later attempt looks for; only the probe-failure path, which
+// has no validator, collapses to the fixed empty-validator name.
+func validatorPartialPath(filePath, validator string) string {
+	sum := sha256.Sum256([]byte(validator))
+	key := hex.EncodeToString(sum[:])[:12]
+	return filepath.Join(filepath.Dir(filePath), "."+filepath.Base(filePath)+"."+key+".partial")
+}
+
+// sweepStalePartials deletes every content-keyed partial for filePath in its
+// directory except keep. A partial whose key does not match the current
+// validator belongs to different content and cannot be resumed, so removing it
+// here keeps such partials from accumulating across content changes; the resume
+// key itself is always kept so an interrupted transfer retains its progress.
+func sweepStalePartials(filePath, keep string) {
+	dir := filepath.Dir(filePath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	prefix := "." + filepath.Base(filePath) + "."
+	for _, ent := range entries {
+		name := ent.Name()
+		if !ent.Type().IsRegular() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".partial") {
+			continue
+		}
+		if filepath.Join(dir, name) == keep {
+			continue
+		}
+		_ = os.Remove(filepath.Join(dir, name))
+	}
 }
 
 // hfRedirectStripper returns a client that removes the Authorization header
@@ -465,38 +689,60 @@ func hfRedirectStripper() *http.Client {
 	return &c
 }
 
-// copyToFile streams r into filePath atomically: it writes to a ".partial"
-// file first and renames it into place only on success, so an interrupted
-// transfer (connection drop, mid-download error) never leaves a truncated
+// copyToFileNoResume streams r into filePath atomically through the plain
+// ".partial" sibling: it writes to filePath+".partial" first and renames into
+// place only on success, so an interrupted transfer never leaves a truncated
 // model that the stat check in ensureModel would treat as cached. When
-// contentLength > 0 it verifies the byte count matches, so a connection drop
-// mid-download doesn't leave a truncated model that passes the stat check.
-func (e *MetalExecutor) copyToFile(filePath string, r io.Reader, contentLength int64) error {
-	tmpPath := filePath + ".partial"
+// contentLength > 0 it verifies the byte count matches, so a mid-stream
+// connection drop does not leave a truncated model. This is the non-resuming
+// path (S3), byte-for-byte the behaviour it had before resume was added.
+func (e *MetalExecutor) copyToFileNoResume(filePath string, r io.Reader, contentLength int64) error {
+	return e.copyToFileResume(filePath+".partial", filePath, r, contentLength, 0)
+}
 
-	out, err := os.Create(tmpPath)
+// copyToFileResume streams r into partPath (opened for append at resumeFrom, or
+// created/truncated at 0), then renames it onto filePath on success. It reports
+// an error, without publishing, if the total size does not match contentLength
+// (when known) so a truncated transfer is never mistaken for a complete one.
+//
+// The partial is deliberately kept on a mid-stream failure and only removed on a
+// size mismatch or a rename failure: a resumable error leaves the partial in
+// place so a later attempt resumes, while a size mismatch means the partial is
+// untrustworthy.
+func (e *MetalExecutor) copyToFileResume(
+	partPath, filePath string,
+	r io.Reader,
+	contentLength, resumeFrom int64,
+) error {
+	var out *os.File
+	var err error
+	if resumeFrom > 0 {
+		// The file is published (renamed) to the same path a full download
+		// writes; 0600 matches the umask-collapsed result and gosec's default.
+		out, err = os.OpenFile(partPath, os.O_WRONLY|os.O_APPEND, 0o600)
+	} else {
+		out, err = os.Create(partPath)
+	}
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if cerr := out.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	written, err := io.Copy(out, r)
-	if err != nil {
-		_ = os.Remove(tmpPath)
+	written, cerr := io.Copy(out, r)
+	if cerr != nil {
+		_ = out.Close()
+		return cerr
+	}
+	if err := out.Close(); err != nil {
 		return err
 	}
 
-	if contentLength > 0 && written != contentLength {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("download truncated: expected %d bytes, got %d", contentLength, written)
+	total := resumeFrom + written
+	if contentLength > 0 && total != contentLength {
+		_ = os.Remove(partPath)
+		return fmt.Errorf("download truncated: expected %d bytes, got %d", contentLength, total)
 	}
 
-	if err := os.Rename(tmpPath, filePath); err != nil {
-		_ = os.Remove(tmpPath)
+	if err := os.Rename(partPath, filePath); err != nil {
+		_ = os.Remove(partPath)
 		return fmt.Errorf("failed to rename downloaded model: %w", err)
 	}
 	return nil

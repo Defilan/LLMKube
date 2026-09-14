@@ -120,4 +120,44 @@ func TestRemoteRevalidateScript_Behavioral(t *testing.T) {
 			t.Errorf("expected exactly 1 download when nothing is cached, got %d\n%s", downloads, out)
 		}
 	})
+
+	// #1765: a stale resumable partial (left by a prior transfer of different
+	// content) must not splice into the published file. The revalidate script
+	// keys its partial on the upstream validator and sweeps every other *.tmp
+	// before transferring, so an abandoned partial from a prior version is
+	// deleted rather than resumed into. Asserting the served bytes are pure
+	// version B proves the old bytes never survived into the artifact.
+	t.Run("stale partial from another version is swept, published bytes are pure", func(t *testing.T) {
+		atomic.StoreInt32(&gets, 0)
+		dir := t.TempDir()
+		modelPath := filepath.Join(dir, "model.gguf")
+
+		// Seed a partial keyed on a DIFFERENT validator, holding bytes no version
+		// of the served content contains. Its name will not match the key the
+		// script derives for the current content, so the keep-one sweep removes it.
+		stale := filepath.Join(dir, "model.gguf."+strings.Repeat("f", 12)+".tmp")
+		if err := os.WriteFile(stale, []byte("STALE-STALE-STALE"), 0o644); err != nil {
+			t.Fatalf("seed stale partial: %v", err)
+		}
+
+		cmd := exec.Command("sh", "-c", remoteRevalidateScript(false))
+		cmd.Env = append(os.Environ(),
+			"MODEL_SOURCE="+srv.URL+"/model.gguf",
+			"MODEL_PATH="+modelPath,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("revalidation script failed: %v\n%s", err, out)
+		}
+		got, err := os.ReadFile(modelPath)
+		if err != nil {
+			t.Fatalf("published file missing: %v", err)
+		}
+		if string(got) != string(body) {
+			t.Errorf("published bytes differ from the served version (splice?):\n%s", out)
+		}
+		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+			t.Errorf("the stale partial survived the keep-one sweep")
+		}
+	})
 }
