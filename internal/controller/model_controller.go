@@ -36,7 +36,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -687,8 +686,10 @@ func (r *ModelReconciler) reconcileBySourceType(
 // condition means this controller never wrote a Ready status for the object (a
 // hand-set or pre-upgrade status), so there is no evidence the status is stale.
 func availableObservedGeneration(model *inferencev1alpha1.Model) (int64, bool) {
-	if cond := meta.FindStatusCondition(model.Status.Conditions, ConditionAvailable); cond != nil {
-		return cond.ObservedGeneration, true
+	for i := range model.Status.Conditions {
+		if model.Status.Conditions[i].Type == ConditionAvailable {
+			return model.Status.Conditions[i].ObservedGeneration, true
+		}
 	}
 	return 0, false
 }
