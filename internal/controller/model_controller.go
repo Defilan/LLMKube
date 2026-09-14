@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -681,18 +682,35 @@ func (r *ModelReconciler) reconcileBySourceType(
 	return false, ctrl.Result{}, nil
 }
 
+// availableObservedGeneration returns the generation the Available condition
+// was written for, and whether the condition is present at all. An absent
+// condition means this controller never wrote a Ready status for the object (a
+// hand-set or pre-upgrade status), so there is no evidence the status is stale.
+func availableObservedGeneration(model *inferencev1alpha1.Model) (int64, bool) {
+	if cond := meta.FindStatusCondition(model.Status.Conditions, ConditionAvailable); cond != nil {
+		return cond.ObservedGeneration, true
+	}
+	return 0, false
+}
+
 func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, model *inferencev1alpha1.Model, cacheKey string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Status.CacheKey is derived from spec.source; a mismatch means the spec
-	// changed after the status was written, so the status is stale and must be
-	// re-resolved, not skipped (#1767). GGUF metadata and the fingerprint
-	// baseline describe the previous source: clear both so the resolve below
-	// re-derives the metadata and the next revalidation re-baselines instead of
-	// reading old-source drift as upstream drift.
-	if model.Status.Phase == PhaseReady && cacheKey != model.Status.CacheKey {
-		logger.Info("Model spec.source changed since the status was written; re-resolving",
-			"statusCacheKey", model.Status.CacheKey, "specCacheKey", cacheKey)
+	// A Ready Model whose Available observedGeneration trails
+	// metadata.generation holds a status derived from an earlier spec, so
+	// re-resolve rather than skip it (#1767, #1813). CacheKey cannot carry this
+	// signal: a HuggingFace repo ID and a Metal local path both resolve with an
+	// empty cache key, so a spec change between two of them leaves the key
+	// unchanged and the old guard never fired. An absent condition is not
+	// evidence of staleness, so a hand-set or pre-upgrade Ready status is left
+	// to the revalidation path. GGUF metadata and the fingerprint baseline
+	// describe the previous source: clear both so the resolve below re-derives
+	// the metadata and the next revalidation re-baselines instead of reading
+	// old-source drift as upstream drift.
+	observedGen, statusWritten := availableObservedGeneration(model)
+	if model.Status.Phase == PhaseReady && statusWritten && observedGen != model.Generation {
+		logger.Info("Model spec changed since the status was written; re-resolving",
+			"observedGeneration", observedGen, "generation", model.Generation)
 		model.Status.Phase = ""
 		model.Status.GGUF = nil
 		model.Status.SourceETag = ""

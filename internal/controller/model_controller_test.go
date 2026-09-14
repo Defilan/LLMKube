@@ -34,6 +34,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -2472,6 +2473,84 @@ var _ = Describe("Model spec.source re-resolve", func() {
 		Expect(updated.Status.Phase).To(Equal(PhaseReady))
 		Expect(updated.Status.CacheKey).To(BeEmpty(), "a runtime-resolved repo ID must not keep the previous source's cache key")
 		Expect(updated.Status.Path).To(BeEmpty())
+	})
+
+	// A HuggingFace repo ID and a Metal local path both resolve with an empty
+	// Status.CacheKey, so a spec change between two of them leaves the
+	// cache-key guard unchanged and pins the status to the previous source
+	// (#1813). The generation signal must drive the re-resolve instead.
+	It("re-resolves a Model when spec.source changes between two HuggingFace repo IDs", func() {
+		modelName := "model-srcdrift-hf-to-hf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"}}
+
+		_, err := reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		changeSource(modelName, "mistralai/Mistral-7B-v0.1")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Generation).To(BeNumerically(">", int64(1)))
+		cond := meta.FindStatusCondition(updated.Status.Conditions, ConditionAvailable)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.ObservedGeneration).To(Equal(updated.Generation),
+			"the Available condition must describe the new source, not the one the status was first written for")
+	})
+
+	It("re-resolves a Metal local-path Model when spec.source changes between two local paths", func() {
+		modelName := "model-srcdrift-metal-local"
+		tempDir, err := os.MkdirTemp("", "llmkube-srcdrift-metal-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "/models/on/the/metal/node/Qwen3.6-35B-A3B-8bit",
+				Format:   "safetensors",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"}}
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		changeSource(modelName, "/models/on/the/metal/node/Qwen3.6-30B-A3B-8bit")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		Expect(updated.Generation).To(BeNumerically(">", int64(1)))
+		cond := meta.FindStatusCondition(updated.Status.Conditions, ConditionAvailable)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.ObservedGeneration).To(Equal(updated.Generation),
+			"the Available condition must describe the new Metal local path, not the previous one")
 	})
 
 	It("re-resolves a PVC source when the path within the claim changes", func() {
