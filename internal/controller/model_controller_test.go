@@ -2215,3 +2215,310 @@ var _ = Describe("Model Controller remote GGUF metadata (#728, Task 2)", func() 
 		Expect(hits).To(Equal(0), "the SSRF guard must block the connection at dial time")
 	})
 })
+
+// Changing spec.source must re-resolve the Model: every early exit that skips
+// an already-Ready reconcile used to compare nothing against the spec, so the
+// status kept the old cacheKey and dependents kept serving the previous model
+// file. Regression for the silent-wrong-model bug (#1767).
+var _ = Describe("Model spec.source re-resolve", func() {
+	ctx := context.Background()
+
+	// serveGGUF stands in for an origin whose bytes and ETag differ per path,
+	// so a spec.source change is observable without leaving the process.
+	serveGGUF := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/a.gguf":
+				w.Header().Set("ETag", `"etag-a"`)
+				_, _ = w.Write(buildMinimalGGUF("Source-A-Model"))
+			case "/b.gguf":
+				w.Header().Set("ETag", `"etag-b"`)
+				_, _ = w.Write([]byte("this is not a gguf file at all"))
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+
+	changeSource := func(name, source string) {
+		GinkgoHelper()
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, updated)).To(Succeed())
+		updated.Spec.Source = source
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+	}
+
+	It("re-resolves a remote HTTP source when spec.source changes", func() {
+		srv := serveGGUF()
+		defer srv.Close()
+
+		modelName := "model-srcdrift-http"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: srv.URL + "/a.gguf"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-srcdrift-http-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			AllowedRemoteHosts:   testRemoteHosts,
+		}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"}}
+
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		ready := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, ready)).To(Succeed())
+		Expect(ready.Status.Phase).To(Equal(PhaseReady))
+		firstKey := computeCacheKey(srv.URL + "/a.gguf")
+		Expect(ready.Status.CacheKey).To(Equal(firstKey))
+		Expect(ready.Status.GGUF).NotTo(BeNil(), "the metadata read must populate GGUF for the first source")
+
+		// A second unchanged reconcile runs the cadence-gated revalidation,
+		// which records the old source's fingerprint baseline. Without a
+		// baseline the reset below would not be observable.
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		baselined := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, baselined)).To(Succeed())
+		Expect(baselined.Status.SourceETag).To(Equal(`"etag-a"`))
+
+		changeSource(modelName, srv.URL+"/b.gguf")
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+
+		secondKey := computeCacheKey(srv.URL + "/b.gguf")
+		Expect(secondKey).NotTo(Equal(firstKey))
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.CacheKey).To(Equal(secondKey), "the status must describe the new source, not the old one")
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		// GGUF was populated for the old source and /b.gguf is not a GGUF
+		// file, so the only way to observe the invalidation is the nil that
+		// a stale resolve would have left as the old file's metadata.
+		Expect(updated.Status.GGUF).To(BeNil(), "GGUF metadata from the previous source must not survive a spec change")
+		Expect(updated.Status.Size).To(Equal("0"))
+		Expect(updated.Status.SourceETag).To(BeEmpty(), "the fingerprint baseline must be reset so the next revalidation re-baselines")
+
+		// The Available condition must reflect the generation that re-resolved,
+		// not the generation that first resolved the old source.
+		for _, cond := range updated.Status.Conditions {
+			if cond.Type == ConditionAvailable {
+				Expect(cond.ObservedGeneration).To(Equal(updated.Generation))
+			}
+		}
+
+		// A later revalidation probes the NEW source and re-baselines without
+		// reading old-source drift as upstream drift.
+		_, err = reconciler.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		rebaselined := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, rebaselined)).To(Succeed())
+		Expect(rebaselined.Status.SourceETag).To(Equal(`"etag-b"`))
+		for _, cond := range rebaselined.Status.Conditions {
+			if cond.Type == ConditionSourceDrifted {
+				Expect(cond.Reason).To(Equal("InSync"), "a spec change must not be reported as upstream drift")
+			}
+		}
+	})
+
+	It("keeps a stable status when the spec is unchanged", func() {
+		srv := serveGGUF()
+		defer srv.Close()
+
+		modelName := "model-srcdrift-stable"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: srv.URL + "/a.gguf"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-srcdrift-stable-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			AllowedRemoteHosts:   testRemoteHosts,
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		ready := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, ready)).To(Succeed())
+		Expect(ready.Status.Phase).To(Equal(PhaseReady))
+		lastUpdated := ready.Status.LastUpdated.DeepCopy()
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		after := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, after)).To(Succeed())
+		Expect(after.Status.CacheKey).To(Equal(ready.Status.CacheKey))
+		Expect(after.Status.LastUpdated.Equal(lastUpdated)).To(BeTrue(), "an unchanged spec must not re-resolve the model")
+	})
+
+	It("re-downloads a controller-cached local source under the new cache key when spec.source changes", func() {
+		srcDir, err := os.MkdirTemp("", "llmkube-srcdrift-src-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(srcDir) }()
+		fileA := filepath.Join(srcDir, "model-a.gguf")
+		fileB := filepath.Join(srcDir, "model-b.gguf")
+		Expect(os.WriteFile(fileA, []byte("fake-model-data-a"), 0644)).To(Succeed())
+		Expect(os.WriteFile(fileB, []byte("fake-model-data-b"), 0644)).To(Succeed())
+
+		modelName := "model-srcdrift-local"
+		sourceA := fmt.Sprintf("file://%s", fileA)
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: sourceA},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-srcdrift-cache-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		ready := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, ready)).To(Succeed())
+		firstKey := computeCacheKey(sourceA)
+		Expect(ready.Status.CacheKey).To(Equal(firstKey))
+
+		sourceB := fmt.Sprintf("file://%s", fileB)
+		changeSource(modelName, sourceB)
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.CacheKey).To(Equal(computeCacheKey(sourceB)), "the cached copy of the old source must not be served for the new source")
+		_, statErr := os.Stat(updated.Status.Path)
+		Expect(statErr).NotTo(HaveOccurred(), "the new source's file must be cached at the new key's path")
+
+		// The previous cache directory is deliberately left in place: other
+		// dependents or a spec revert may still reference it.
+		_, statErr = os.Stat(filepath.Join(tempDir, firstKey))
+		Expect(statErr).NotTo(HaveOccurred(), "the old cache directory must not be garbage-collected by a spec change")
+	})
+
+	It("clears CacheKey when spec.source changes to a HuggingFace repo ID", func() {
+		srv := serveGGUF()
+		defer srv.Close()
+
+		modelName := "model-srcdrift-hf"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: srv.URL + "/a.gguf"},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		tempDir, err := os.MkdirTemp("", "llmkube-srcdrift-hf-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+			AllowedRemoteHosts:   testRemoteHosts,
+		}
+
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		changeSource(modelName, "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		Expect(updated.Status.CacheKey).To(BeEmpty(), "a runtime-resolved repo ID must not keep the previous source's cache key")
+		Expect(updated.Status.Path).To(BeEmpty())
+	})
+
+	It("re-resolves a PVC source when the path within the claim changes", func() {
+		pvcName := "srcdrift-pvc"
+		pvc := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: "default"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceStorage: resource.MustParse("10Gi"),
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, pvc) }()
+		pvc.Status.Phase = corev1.ClaimBound
+		Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
+
+		modelName := "model-srcdrift-pvc"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: fmt.Sprintf("pvc://%s/models/a.gguf", pvcName)},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		reconciler := &ModelReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		changeSource(modelName, fmt.Sprintf("pvc://%s/models/b.gguf", pvcName))
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		Expect(updated.Status.Path).To(Equal("/model-source/models/b.gguf"), "the mount path must follow the new source, not the old one")
+		Expect(updated.Status.CacheKey).To(Equal(computeCacheKey(fmt.Sprintf("pvc://%s/models/b.gguf", pvcName))))
+	})
+})
