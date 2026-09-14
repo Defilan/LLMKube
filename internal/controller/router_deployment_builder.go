@@ -113,9 +113,16 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		imagePullSecrets = mr.Spec.Proxy.ImagePullSecrets
 		nodeSelector = mr.Spec.Proxy.NodeSelector
 	}
-	// spec.proxy.replicas is honored whether or not the router has pooled
-	// backends: cross-replica swap coordination is a per-pool Lease, so a
-	// second replica no longer races the shared GPU slot (#1477).
+	// A pooled router runs exactly one proxy replica. The per-pool Lease makes
+	// the member *write* single-writer across replicas, but the activator's
+	// residency and in-flight accounting is per-replica state, so a second
+	// replica could dispatch on a stale belief until its next member-phase
+	// re-read. Sharing that state is the prerequisite for lifting this pin;
+	// until then spec.proxy.replicas is overridden for pooled routers. The
+	// Lease still matters here: a rollout overlaps the old and new pod.
+	if hasPools {
+		replicas = 1
+	}
 	if resources.Requests == nil && resources.Limits == nil {
 		resources = defaultRouterProxyResources()
 	}

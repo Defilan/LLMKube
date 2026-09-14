@@ -618,9 +618,13 @@ type RouterProxySpec struct {
 	// counters live in memory and reset on pod restart until the
 	// persistence feature lands.
 	//
-	// Pooled routers may scale past one replica: ModelPool activation is
-	// serialized across replicas by an owner-referenced Lease, so replicas do
-	// not race the shared GPU slot.
+	// When any backend resolves to a ModelPool member, the operator pins this
+	// to 1 regardless of the value set here. A per-pool Lease makes the member
+	// write single-writer across replicas, but swap residency and in-flight
+	// accounting are per-replica, so a second proxy could dispatch on a stale
+	// belief until its next member-phase re-read. Shared residency state is the
+	// prerequisite for lifting the pin; the Lease and the optimistic-locked
+	// member writes stay, because a rollout overlaps the old and new pod.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=10
 	// +optional

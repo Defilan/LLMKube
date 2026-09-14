@@ -1193,23 +1193,21 @@ func TestNewRouterDeploymentActivationWiring(t *testing.T) {
 	}
 }
 
-// TestNewRouterDeploymentHonorsReplicasWhenPooled verifies that a pooled router
-// honors spec.proxy.replicas: cross-replica swap coordination is a per-pool
-// Lease, so a second replica no longer races the shared GPU slot (#1477). The
-// pooled deployment must still carry the activation ServiceAccount and
-// POD_NAMESPACE the lease needs.
-func TestNewRouterDeploymentHonorsReplicasWhenPooled(t *testing.T) {
+// TestNewRouterDeploymentPinsReplicasWhenPooled verifies the pooled
+// single-replica invariant (#1477): a pooled router is pinned to one proxy
+// replica even when spec.proxy.replicas asks for more, because swap residency
+// and in-flight accounting are per-replica, while an unpooled router honors the
+// requested count. The pinned deployment must still carry the activation
+// ServiceAccount and POD_NAMESPACE the swap lease needs.
+func TestNewRouterDeploymentPinsReplicasWhenPooled(t *testing.T) {
 	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
 	mr := canonicalModelRouter()
 	three := int32(3)
 	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{Replicas: &three}
 
 	pooled := r.newRouterDeployment(mr, "hash", true)
-	if pooled.Spec.Replicas == nil || *pooled.Spec.Replicas != 3 {
-		t.Errorf("pooled replicas = %v, want 3 (spec.proxy.replicas honored)", pooled.Spec.Replicas)
-	}
-	if got := envValue(pooled.Spec.Template.Spec.Containers[0].Env, "POD_NAMESPACE"); got != "" {
-		t.Errorf("POD_NAMESPACE env value = %q, want a fieldRef (value is injected at runtime)", got)
+	if pooled.Spec.Replicas == nil || *pooled.Spec.Replicas != 1 {
+		t.Errorf("pooled replicas = %v, want 1 (pinned)", pooled.Spec.Replicas)
 	}
 	var hasNamespaceRef bool
 	for _, e := range pooled.Spec.Template.Spec.Containers[0].Env {
