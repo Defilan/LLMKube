@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -32,29 +33,29 @@ import (
 )
 
 // SwapCoordinator decides which router-proxy replica drives a ModelPool swap.
-// With spec.proxy.replicas > 1 the in-process Activator mutex only serializes
-// swaps inside one replica, so a per-pool lease makes activation a real
-// single-writer: the owner scales the member, every other replica defers and
-// waits for it (#1477).
+// With spec.proxy.replicas > 1 (or two pods overlapping in a rollout) the
+// in-process Activator mutex only serializes swaps inside one replica, so a
+// per-pool lease makes activation a real single-writer: the owner scales the
+// member, every other replica defers and waits for it (#1477).
 //
 // It is an interface so the swap policy stays unit-testable without a live API
 // server; production injects LeaseCoordinator.
 type SwapCoordinator interface {
-	// Acquire reports whether this replica owns swap decisions for poolKey. A
-	// non-owner must not write the member. Ownership is per call: the caller
-	// releases when its swap completes.
-	Acquire(ctx context.Context, poolKey string) (bool, error)
-
-	// Release gives up ownership of poolKey if this replica holds it. Safe to
-	// call when ownership was never acquired, or was lost to a takeover.
-	Release(ctx context.Context, poolKey string)
+	// Acquire claims the pool's swap lease and keeps it renewed for as long as
+	// the returned release is outstanding. owned reports whether this replica
+	// may write the member; a non-owner must not, and receives a nil release.
+	// The release is idempotent and clears the hold outright, so the next swap
+	// need not wait out the lease duration.
+	Acquire(ctx context.Context, poolKey string) (release func(), owned bool, err error)
 }
 
 const (
-	// defaultLeaseDuration is how long a swap lease survives without renewal.
-	// Long enough to cover a slow cold load, short enough that a crashed owner
-	// frees the pool quickly.
-	defaultLeaseDuration = 60 * time.Second
+	// defaultLeaseDuration bounds how quickly a dead owner frees the pool: a
+	// hold older than this without a renewal is taken over. It does NOT bound
+	// the hold itself; a cold load routinely outlives any fixed TTL
+	// (ModelPool.spec.swapBudget defaults to 300s), which is why the lease is
+	// renewed for the life of the hold rather than granted a long TTL.
+	defaultLeaseDuration = 120 * time.Second
 	leaseNamePrefix      = "llmkube-pool-"
 )
 
@@ -87,13 +88,82 @@ func NewLeaseCoordinator(cl client.Client, namespace string) *LeaseCoordinator {
 	}
 }
 
-// Acquire claims the pool's swap lease for this replica, or reports that
-// another live replica holds it. A lease whose RenewTime plus duration has
-// lapsed is taken over, so a crashed owner does not wedge the pool forever. A
-// write that loses the resourceVersion race reports not-owned rather than
-// retrying: the winner owns the swap.
-func (c *LeaseCoordinator) Acquire(ctx context.Context, poolKey string) (bool, error) {
+// renewInterval is how often a held lease refreshes its RenewTime. A third of
+// the duration means two consecutive failed renewals still cannot let a second
+// replica take over a live hold.
+func (c *LeaseCoordinator) renewInterval() time.Duration {
+	if c.duration <= 0 {
+		return defaultLeaseDuration / 3
+	}
+	return c.duration / 3
+}
+
+// Acquire claims the pool's swap lease for this replica and starts renewing it,
+// or reports that another live replica holds it. A lease whose RenewTime plus
+// duration has lapsed is taken over, so a crashed owner does not wedge the pool
+// forever. A write that loses the resourceVersion race reports not-owned rather
+// than retrying: the winner owns the swap.
+func (c *LeaseCoordinator) Acquire(ctx context.Context, poolKey string) (func(), bool, error) {
 	name := leaseNamePrefix + sanitizeLeaseName(poolKey)
+	owned, err := c.claim(ctx, name)
+	if err != nil || !owned {
+		return nil, false, err
+	}
+
+	// The release must still run when the caller's context is done (the swap
+	// goroutine's context is cancelled when the last waiter gives up), so
+	// detach from its cancellation while keeping its values.
+	releaseCtx := context.WithoutCancel(ctx)
+	renewCtx, cancelRenew := context.WithCancel(releaseCtx)
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			cancelRenew()
+			c.release(releaseCtx, name)
+		})
+	}
+	go c.renewLoop(renewCtx, name)
+	return release, true, nil
+}
+
+// renewLoop refreshes RenewTime until the hold is released. Without it a second
+// replica takes over mid-swap once the TTL lapses, and both replicas drive an
+// activation: the double-write #1477 exists to close, reached by the ordinary
+// slow-load path.
+func (c *LeaseCoordinator) renewLoop(ctx context.Context, name string) {
+	ticker := time.NewTicker(c.renewInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// A failed renewal is not fatal: the lease ages toward expiry and
+			// the next tick retries, so a single API blip cannot hand the pool
+			// to another replica.
+			_ = c.renew(ctx, name)
+		}
+	}
+}
+
+// renew refreshes the lease's RenewTime while this replica still holds it. A
+// lease taken over by another replica is left alone. The plain Update carries
+// resourceVersion, so a concurrent write conflicts rather than clobbering.
+func (c *LeaseCoordinator) renew(ctx context.Context, name string) error {
+	lease := &coordinationv1.Lease{}
+	if err := c.client.Get(ctx, types.NamespacedName{Namespace: c.namespace, Name: name}, lease); err != nil {
+		return err
+	}
+	if ptr.Deref(lease.Spec.HolderIdentity, "") != c.identity {
+		return nil
+	}
+	lease.Spec.RenewTime = &metav1.MicroTime{Time: c.nowFn()}
+	lease.Spec.LeaseDurationSeconds = ptr.To(int32(c.duration.Seconds()))
+	return c.client.Update(ctx, lease)
+}
+
+// claim performs the one-shot takeover-or-create decision behind Acquire.
+func (c *LeaseCoordinator) claim(ctx context.Context, name string) (bool, error) {
 	lease := &coordinationv1.Lease{}
 	err := c.client.Get(ctx, types.NamespacedName{Namespace: c.namespace, Name: name}, lease)
 	if apierrors.IsNotFound(err) {
@@ -135,10 +205,9 @@ func (c *LeaseCoordinator) Acquire(ctx context.Context, poolKey string) (bool, e
 	return true, nil
 }
 
-// Release clears this replica's hold so the next swap can be driven without
+// release clears this replica's hold so the next swap can be driven without
 // waiting out the duration. A lease now held by another replica is left alone.
-func (c *LeaseCoordinator) Release(ctx context.Context, poolKey string) {
-	name := leaseNamePrefix + sanitizeLeaseName(poolKey)
+func (c *LeaseCoordinator) release(ctx context.Context, name string) {
 	lease := &coordinationv1.Lease{}
 	if err := c.client.Get(ctx, types.NamespacedName{Namespace: c.namespace, Name: name}, lease); err != nil {
 		return

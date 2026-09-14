@@ -26,6 +26,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -57,7 +58,7 @@ func TestLeaseCoordinatorSerializesHolders(t *testing.T) {
 	b := NewLeaseCoordinator(c, "lab")
 	b.identity = "proxy-b"
 
-	okA, err := a.Acquire(ctx, "lab/heavy-slot")
+	releaseA, okA, err := a.Acquire(ctx, "lab/heavy-slot")
 	if err != nil {
 		t.Fatalf("a.Acquire: %v", err)
 	}
@@ -65,7 +66,7 @@ func TestLeaseCoordinatorSerializesHolders(t *testing.T) {
 		t.Fatal("first Acquire = not owned, want owned on an unheld pool")
 	}
 
-	okB, err := b.Acquire(ctx, "lab/heavy-slot")
+	_, okB, err := b.Acquire(ctx, "lab/heavy-slot")
 	if err != nil {
 		t.Fatalf("b.Acquire: %v", err)
 	}
@@ -73,13 +74,98 @@ func TestLeaseCoordinatorSerializesHolders(t *testing.T) {
 		t.Fatal("second replica acquired a lease the first still holds; swaps are not single-writer")
 	}
 
-	a.Release(ctx, "lab/heavy-slot")
-	okB, err = b.Acquire(ctx, "lab/heavy-slot")
+	releaseA()
+	_, okB, err = b.Acquire(ctx, "lab/heavy-slot")
 	if err != nil {
 		t.Fatalf("b.Acquire after release: %v", err)
 	}
 	if !okB {
 		t.Fatal("a released lease must be acquirable by the next replica")
+	}
+}
+
+// TestLeaseCoordinatorRenewsHold verifies the hold is renewed for its whole
+// life, so a cold load that outlives the lease TTL (ModelPool.spec.swapBudget
+// defaults to 300s) does not let a second replica take over mid-swap (#1477).
+func TestLeaseCoordinatorRenewsHold(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(leaseScheme(t)).Build()
+	ctx := context.Background()
+
+	a := NewLeaseCoordinator(c, "lab")
+	a.identity = "proxy-a"
+	// Short duration so the renew loop ticks quickly; renewInterval is
+	// duration/3.
+	a.duration = 600 * time.Millisecond
+
+	release, owned, err := a.Acquire(ctx, "lab/heavy-slot")
+	if err != nil || !owned {
+		t.Fatalf("Acquire = (owned=%v, err=%v), want owned", owned, err)
+	}
+	defer release()
+
+	name := leaseNamePrefix + sanitizeLeaseName("lab/heavy-slot")
+	readRenew := func() time.Time {
+		lease := &coordinationv1.Lease{}
+		if err := c.Get(ctx, types.NamespacedName{Namespace: "lab", Name: name}, lease); err != nil {
+			t.Fatalf("get lease: %v", err)
+		}
+		if lease.Spec.RenewTime == nil {
+			t.Fatal("lease has no RenewTime")
+		}
+		return lease.Spec.RenewTime.Time
+	}
+	initial := readRenew()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !readRenew().After(initial) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !readRenew().After(initial) {
+		t.Fatal("the lease RenewTime must advance while the hold is outstanding")
+	}
+
+	// A competing replica must still see the hold as live.
+	b := NewLeaseCoordinator(c, "lab")
+	b.identity = "proxy-b"
+	if _, ownedB, err := b.Acquire(ctx, "lab/heavy-slot"); err != nil {
+		t.Fatalf("b.Acquire: %v", err)
+	} else if ownedB {
+		t.Fatal("a renewed hold must not be takeover-eligible")
+	}
+}
+
+// TestLeaseCoordinatorReleaseFreesTheLease verifies the release closure clears
+// the hold outright, so the next swap need not wait out the lease duration.
+func TestLeaseCoordinatorReleaseFreesTheLease(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(leaseScheme(t)).Build()
+	ctx := context.Background()
+
+	a := NewLeaseCoordinator(c, "lab")
+	a.identity = "proxy-a"
+	release, owned, err := a.Acquire(ctx, "lab/heavy-slot")
+	if err != nil || !owned {
+		t.Fatalf("Acquire = (owned=%v, err=%v), want owned", owned, err)
+	}
+
+	// Idempotent: a second call must not panic or double-clear.
+	release()
+	release()
+
+	name := leaseNamePrefix + sanitizeLeaseName("lab/heavy-slot")
+	lease := &coordinationv1.Lease{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "lab", Name: name}, lease); err != nil {
+		t.Fatalf("get lease: %v", err)
+	}
+	if holder := ptr.Deref(lease.Spec.HolderIdentity, ""); holder != "" {
+		t.Errorf("holder after release = %q, want empty", holder)
+	}
+
+	b := NewLeaseCoordinator(c, "lab")
+	b.identity = "proxy-b"
+	if _, ownedB, err := b.Acquire(ctx, "lab/heavy-slot"); err != nil {
+		t.Fatalf("b.Acquire after release: %v", err)
+	} else if !ownedB {
+		t.Fatal("a released lease must be immediately acquirable")
 	}
 }
 
@@ -105,13 +191,14 @@ func TestLeaseCoordinatorTakesOverExpired(t *testing.T) {
 		t.Fatalf("seed lease: %v", err)
 	}
 
-	ok, err := l.Acquire(ctx, "lab/heavy-slot")
+	release, ok, err := l.Acquire(ctx, "lab/heavy-slot")
 	if err != nil {
 		t.Fatalf("Acquire: %v", err)
 	}
 	if !ok {
 		t.Fatal("Acquire = not owned, want takeover of an expired lease")
 	}
+	release()
 }
 
 // fakeCoordinator is an injectable SwapCoordinator for Activator tests.
@@ -121,16 +208,25 @@ type fakeCoordinator struct {
 	released bool
 }
 
-func (f *fakeCoordinator) Acquire(context.Context, string) (bool, error) {
+func (f *fakeCoordinator) Acquire(context.Context, string) (func(), bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.owner, nil
+	if !f.owner {
+		return nil, false, nil
+	}
+	return f.releaseFunc(), true, nil
 }
 
-func (f *fakeCoordinator) Release(context.Context, string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.released = true
+// releaseFunc returns a closure that records the release exactly once.
+func (f *fakeCoordinator) releaseFunc() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.released = true
+		})
+	}
 }
 
 func (f *fakeCoordinator) wasReleased() bool {
@@ -163,14 +259,9 @@ func TestActivatorDefersSwapToLeaseOwner(t *testing.T) {
 	if got := memberCtrl.deactivateCount("coder"); got != 0 {
 		t.Errorf("deferring replica deactivated the member %d times, want 0", got)
 	}
-	// The cancel-on-timeout path cancels the deferred wait asynchronously, so
-	// the lease is released shortly after Acquire returns.
-	deadline := time.Now().Add(2 * time.Second)
-	for !coord.wasReleased() && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !coord.wasReleased() {
-		t.Error("the swap lease was not released when the swap ended")
+	// A non-owner never acquired a hold, so there is nothing for it to release.
+	if coord.wasReleased() {
+		t.Error("a deferring replica released a lease it never acquired")
 	}
 }
 
@@ -178,8 +269,9 @@ func TestActivatorDefersSwapToLeaseOwner(t *testing.T) {
 // the replica that owns the lease scales the member.
 func TestActivatorOwnerDrivesSwap(t *testing.T) {
 	memberCtrl := newFakeMemberController()
+	coord := &fakeCoordinator{owner: true}
 	a := NewActivator(context.Background(), memberCtrl, "r", nil)
-	a.SetSwapCoordinator(&fakeCoordinator{owner: true})
+	a.SetSwapCoordinator(coord)
 
 	rel, err := a.Acquire(context.Background(), testPool("coder"))
 	if err != nil {
@@ -189,5 +281,14 @@ func TestActivatorOwnerDrivesSwap(t *testing.T) {
 
 	if got := memberCtrl.activateCount("coder"); got != 1 {
 		t.Errorf("lease owner activate count = %d, want 1", got)
+	}
+	// The swap goroutine releases the hold when the swap ends, so a later swap
+	// need not wait out the duration.
+	deadline := time.Now().Add(2 * time.Second)
+	for !coord.wasReleased() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !coord.wasReleased() {
+		t.Error("the owner did not release the swap lease when the swap ended")
 	}
 }

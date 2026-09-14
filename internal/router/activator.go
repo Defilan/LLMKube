@@ -331,9 +331,10 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 		swapStart := time.Now()
 		key := pr.namespace + "/" + pr.pool
 		owned := true
+		var release func()
 		var err error
 		if a.coord != nil {
-			owned, err = a.coord.Acquire(swapCtx, key)
+			release, owned, err = a.coord.Acquire(swapCtx, key)
 			a.mu.Lock()
 			pr.leaseHeld = err == nil && owned
 			a.mu.Unlock()
@@ -354,7 +355,7 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 
 		// Release the lease before publishing the result so a waiter that starts
 		// the next swap can acquire it without waiting out the duration.
-		a.releaseSwapLease(key)
+		a.releaseSwapLease(key, release)
 
 		a.mu.Lock()
 		pr.swapping = false
@@ -366,9 +367,15 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 			// The swap just made target Ready, so the belief is fresh: record the
 			// check so reconcileResident does not immediately re-read its phase.
 			pr.residentCheckedAt = time.Now()
-			prommetrics.ModelPoolSwapsTotal.WithLabelValues(a.router, pr.pool, incumbent, target).Inc()
-			prommetrics.ModelPoolSwapDuration.WithLabelValues(a.router, pr.pool).Observe(time.Since(swapStart).Seconds())
-			prommetrics.ModelPoolHoldDuration.WithLabelValues(a.router, pr.pool, target).Observe(time.Since(holdStart).Seconds())
+			// Only the replica that drove the write counts a swap. A deferring
+			// replica reaches the same resident state but drove nothing, so
+			// counting it there would double the swap rate that operators watch
+			// to confirm the thrash is gone.
+			if owned {
+				prommetrics.ModelPoolSwapsTotal.WithLabelValues(a.router, pr.pool, incumbent, target).Inc()
+				prommetrics.ModelPoolSwapDuration.WithLabelValues(a.router, pr.pool).Observe(time.Since(swapStart).Seconds())
+				prommetrics.ModelPoolHoldDuration.WithLabelValues(a.router, pr.pool, target).Observe(time.Since(holdStart).Seconds())
+			}
 			a.observeResident(pr)
 		case swapCtx.Err() != nil:
 			// A cancelled swap (last caller gave up) is not a failure: the
@@ -387,14 +394,14 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 // releaseSwapLease clears this replica's swap lease and its ownership flag for
 // a pool. Called when a swap completes, fails, or is cancelled, so the next
 // swap can be driven without waiting out the lease duration.
-func (a *Activator) releaseSwapLease(key string) {
+func (a *Activator) releaseSwapLease(key string, release func()) {
 	a.mu.Lock()
 	if pr, ok := a.pools[key]; ok {
 		pr.leaseHeld = false
 	}
 	a.mu.Unlock()
-	if a.coord != nil {
-		a.coord.Release(a.baseCtx, key)
+	if release != nil {
+		release()
 	}
 }
 
