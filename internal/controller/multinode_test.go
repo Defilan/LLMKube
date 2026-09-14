@@ -591,3 +591,86 @@ func TestSetMultiNodeStatusReadyMembers(t *testing.T) {
 		})
 	}
 }
+
+// TestSetMultiNodeStatusStagedClearedOnRestage pins the stale-stamp bug in the
+// post-staging deadline. MultiNodeStaged was only ever written True, and only
+// the teardown paths removed it, but a member replaced in place (node reboot,
+// eviction, a deleted pod) is recreated without a teardown. Its replacement
+// re-downloads while the condition still carries the PREVIOUS staging
+// episode's timestamp, so once that stamp ages past multiNodePostStagingBudget
+// the next waiting-runtime restart is judged fatal and the group is recreated
+// out from under the download: the #1757 loop, restored.
+func TestSetMultiNodeStatusStagedClearedOnRestage(t *testing.T) {
+	isvc, _ := multiNodeFixture()
+	mk := func(name string, staging bool) corev1.Pod {
+		p := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		p.Spec.InitContainers = []corev1.Container{{Name: "model-downloader"}}
+		if staging {
+			p.Status.Phase = corev1.PodPending
+			p.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+				Name:  "model-downloader",
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}}
+			return p
+		}
+		p.Status.Phase = corev1.PodRunning
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "model-downloader",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+		}}
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "vllm",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}}
+		return p
+	}
+	desired := makeDesired(2)
+
+	// Every member has staged: the deadline is anchored.
+	setMultiNodeStatus(isvc, desired,
+		[]corev1.Pod{mk("ring-mn-0", false), mk("ring-mn-1", false)},
+		metav1.ConditionFalse, "Starting", "test")
+	if multiNodeStagedAt(isvc).IsZero() {
+		t.Fatal("MultiNodeStaged must be stamped once every member has staged")
+	}
+
+	// Age the stamp past the budget, the way a long-lived group would.
+	for i := range isvc.Status.Conditions {
+		if isvc.Status.Conditions[i].Type == ConditionMultiNodeStaged {
+			isvc.Status.Conditions[i].LastTransitionTime =
+				metav1.NewTime(time.Now().Add(-2 * multiNodePostStagingBudget))
+		}
+	}
+
+	// Member 1 was replaced in place and is staging again.
+	setMultiNodeStatus(isvc, desired,
+		[]corev1.Pod{mk("ring-mn-0", false), mk("ring-mn-1", true)},
+		metav1.ConditionFalse, "Starting", "test")
+
+	if got := multiNodeStagedAt(isvc); !got.IsZero() {
+		t.Errorf("a member is staging again, so the post-staging deadline must not be anchored; "+
+			"multiNodeStagedAt = %s (%s old)", got, time.Since(got).Round(time.Minute))
+	}
+
+	// The mask must hold while that member stages, rather than judging the
+	// peer's waiting-runtime restart against the stale stamp.
+	waiting := mk("ring-mn-0", false)
+	waiting.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "vllm", RestartCount: 2,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 1, Reason: "Error", FinishedAt: metav1.Now(),
+		}},
+	}}
+	restaging := mk("ring-mn-1", true)
+	obs := []memberObservation{
+		{rank: 0, existing: &waiting},
+		{rank: 1, existing: &restaging},
+	}
+	for i := range obs {
+		obs[i].existing.Annotations = map[string]string{AnnotationMultiNodeGroupHash: "abc"}
+	}
+	if reason, msg := groupNeedsRecreate(obs, "abc", time.Now(), time.Time{}, multiNodeStagedAt(isvc)); reason != "" {
+		t.Errorf("the group must be held while a member re-stages; got %s: %s", reason, msg)
+	}
+}

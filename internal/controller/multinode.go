@@ -772,6 +772,16 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 			Type: ConditionMultiNodeStaged, Status: metav1.ConditionTrue,
 			Reason: "AllMembersStaged", Message: "every member has finished staging",
 		})
+	} else {
+		// Staging is under way again: a member was replaced in place (node
+		// reboot, eviction, a deleted pod) and its replacement re-downloads.
+		// That path creates the missing member without a teardown, so nothing
+		// else clears this condition, and leaving it True would measure the
+		// post-staging deadline from a staging episode that already ended.
+		// A stale stamp older than multiNodePostStagingBudget makes the next
+		// waiting-runtime restart fatal and recreates the group out from under
+		// the download, which is the #1757 loop this file exists to prevent.
+		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
 	}
 	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
 		Type: ConditionMultiNodeGroupReady, Status: status, Reason: reason, Message: msg,
