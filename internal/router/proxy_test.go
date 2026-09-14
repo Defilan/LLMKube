@@ -236,6 +236,7 @@ func TestProxyMountsEmbeddings(t *testing.T) {
 		"model": "qwen3-coder",
 		"input": "hello",
 	})
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/v1/embeddings = %d, want 200", resp.StatusCode)
 	}
@@ -253,6 +254,7 @@ func TestProxyMountsRerank(t *testing.T) {
 		"query":     "hello",
 		"documents": []string{"a"},
 	})
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/v1/rerank = %d, want 200", resp.StatusCode)
 	}
