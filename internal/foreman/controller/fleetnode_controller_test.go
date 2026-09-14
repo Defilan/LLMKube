@@ -343,6 +343,122 @@ var _ = Describe("FleetNodeReconciler heartbeat staleness", func() {
 	})
 })
 
+// The FleetNodeReconciler clears a stale Status.CurrentTask: a task deleted
+// outright is gone before its own reconcile can release the reservation, so
+// the node must re-derive liveness itself with the same predicate the
+// scheduler uses. Regression for defilantech/LLMKube#1791.
+var _ = Describe("FleetNodeReconciler reservation hygiene", func() {
+	var reconciler *FleetNodeReconciler
+
+	BeforeEach(func() {
+		reconciler = &FleetNodeReconciler{
+			Client: k8sClient,
+			Scheme: k8sClient.Scheme(),
+		}
+	})
+
+	freshHeartbeat := func() *metav1.Time {
+		t := metav1.NewTime(time.Now().Add(-1 * time.Second))
+		return &t
+	}
+
+	It("clears currentTask when its AgenticTask was deleted outright", func() {
+		fn := newFleetNode("hygiene-phantom")
+		Expect(k8sClient.Create(ctx, fn)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, fn) })
+
+		fn.Status.Phase = foremanv1alpha1.FleetNodePhaseReady
+		fn.Status.CurrentTask = "default/ghost-task-deleted"
+		fn.Status.LastHeartbeatTime = freshHeartbeat()
+		Expect(k8sClient.Status().Update(ctx, fn)).To(Succeed())
+
+		res, err := reconciler.Reconcile(ctx, reqFor(fn))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(BeNumerically(">", time.Duration(0)))
+
+		var got foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, nn(fn), &got)).To(Succeed())
+		Expect(got.Status.CurrentTask).To(BeEmpty(), "a reservation whose task no longer exists must be cleared from status")
+		Expect(got.Status.Phase).To(Equal(foremanv1alpha1.FleetNodePhaseReady))
+	})
+
+	It("keeps currentTask while its AgenticTask is live", func() {
+		fn := newFleetNode("hygiene-live")
+		Expect(k8sClient.Create(ctx, fn)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, fn) })
+
+		task := newTask("hygiene-live-task")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+		task.Status.AssignedNode = "hygiene-live"
+		Expect(k8sClient.Status().Update(ctx, task)).To(Succeed())
+
+		fn.Status.Phase = foremanv1alpha1.FleetNodePhaseReady
+		fn.Status.CurrentTask = "default/hygiene-live-task"
+		fn.Status.LastHeartbeatTime = freshHeartbeat()
+		Expect(k8sClient.Status().Update(ctx, fn)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reqFor(fn))
+		Expect(err).NotTo(HaveOccurred())
+
+		var got foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, nn(fn), &got)).To(Succeed())
+		Expect(got.Status.CurrentTask).To(Equal("default/hygiene-live-task"))
+		Expect(got.Status.Phase).To(Equal(foremanv1alpha1.FleetNodePhaseReady))
+	})
+
+	It("clears currentTask when its AgenticTask reached a terminal phase", func() {
+		fn := newFleetNode("hygiene-terminal")
+		Expect(k8sClient.Create(ctx, fn)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, fn) })
+
+		task := newTask("hygiene-terminal-task")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseSucceeded
+		task.Status.AssignedNode = "hygiene-terminal"
+		Expect(k8sClient.Status().Update(ctx, task)).To(Succeed())
+
+		fn.Status.Phase = foremanv1alpha1.FleetNodePhaseReady
+		fn.Status.CurrentTask = "default/hygiene-terminal-task"
+		fn.Status.LastHeartbeatTime = freshHeartbeat()
+		Expect(k8sClient.Status().Update(ctx, fn)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reqFor(fn))
+		Expect(err).NotTo(HaveOccurred())
+
+		var got foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, nn(fn), &got)).To(Succeed())
+		Expect(got.Status.CurrentTask).To(BeEmpty(), "a reservation held by a terminal task must be cleared from status")
+	})
+
+	It("clears currentTask when its AgenticTask was reassigned to another node", func() {
+		fn := newFleetNode("hygiene-reassigned")
+		Expect(k8sClient.Create(ctx, fn)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, fn) })
+
+		task := newTask("hygiene-reassigned-task")
+		Expect(k8sClient.Create(ctx, task)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, task) })
+		task.Status.Phase = foremanv1alpha1.AgenticTaskPhaseRunning
+		task.Status.AssignedNode = "hygiene-elsewhere"
+		Expect(k8sClient.Status().Update(ctx, task)).To(Succeed())
+
+		fn.Status.Phase = foremanv1alpha1.FleetNodePhaseReady
+		fn.Status.CurrentTask = "default/hygiene-reassigned-task"
+		fn.Status.LastHeartbeatTime = freshHeartbeat()
+		Expect(k8sClient.Status().Update(ctx, fn)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reqFor(fn))
+		Expect(err).NotTo(HaveOccurred())
+
+		var got foremanv1alpha1.FleetNode
+		Expect(k8sClient.Get(ctx, nn(fn), &got)).To(Succeed())
+		Expect(got.Status.CurrentTask).To(BeEmpty(), "a reservation held by a task scheduled elsewhere must be cleared from status")
+	})
+})
+
 // meta finds a condition by type, or nil.
 func meta(conds []metav1.Condition, condType string) *metav1.Condition {
 	for i := range conds {

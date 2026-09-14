@@ -763,7 +763,7 @@ func (r *AgenticTaskReconciler) jobModeLoadByNode(ctx context.Context, task *for
 // clear cannot wedge a node busy forever.
 func (r *AgenticTaskReconciler) reserveNode(ctx context.Context, node *foremanv1alpha1.FleetNode, taskKey string) (bool, error) {
 	if cur := node.Status.CurrentTask; cur != "" && cur != taskKey {
-		live, err := r.taskIsLive(ctx, cur, node.Name)
+		live, err := taskIsLive(ctx, r.Client, cur, node.Name)
 		if err != nil {
 			return false, err
 		}
@@ -791,14 +791,16 @@ func (r *AgenticTaskReconciler) reserveNode(ctx context.Context, node *foremanv1
 // to a different node. A missing, terminal, or reassigned task is not live, so
 // a node whose CurrentTask points at it may be reclaimed. An empty AssignedNode
 // counts as live — that is the legitimate window between reserveNode and
-// scheduleToNode, which must not be stolen.
-func (r *AgenticTaskReconciler) taskIsLive(ctx context.Context, key, nodeName string) (bool, error) {
+// scheduleToNode, which must not be stolen. Shared with the FleetNode
+// reconciler's reservation hygiene, which runs the same predicate against a
+// task deleted outright (#1791).
+func taskIsLive(ctx context.Context, c client.Client, key, nodeName string) (bool, error) {
 	ns, name, ok := splitNamespacedName(key)
 	if !ok {
 		return false, nil // unparseable key: treat as not live so the node frees
 	}
 	var t foremanv1alpha1.AgenticTask
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &t); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &t); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}

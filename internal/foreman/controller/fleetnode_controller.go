@@ -75,6 +75,34 @@ func (r *FleetNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	now := time.Now()
+
+	// Reservation hygiene (#1791): a CurrentTask whose AgenticTask was deleted
+	// outright is never released by the task's own terminal reconcile, so the
+	// node advertises phantom work indefinitely. Re-derive liveness with the
+	// same predicate reserveNode uses to self-heal scheduling; this repairs
+	// status only. Hygiene runs on the heartbeat requeue, so a reservation
+	// whose task died is cleared within one heartbeat interval; no AgenticTask
+	// watch is needed for that bound.
+	if node.Status.CurrentTask != "" {
+		live, err := taskIsLive(ctx, r.Client, node.Status.CurrentTask, node.Name)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !live {
+			patch := client.MergeFromWithOptions(node.DeepCopy(), client.MergeFromWithOptimisticLock{})
+			node.Status.CurrentTask = ""
+			if err := r.Status().Patch(ctx, &node, patch); err != nil {
+				// Lost the node to a concurrent writer (a scheduler reserve
+				// won the optimistic lock, the node was deleted between the
+				// Get and here): leave the decision to the next requeue.
+				if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+					return ctrl.Result{RequeueAfter: foremanv1alpha1.FleetNodeHeartbeatTimeout}, nil
+				}
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
 	stale := node.HeartbeatStale(now)
 
 	// An in-cluster agent pod that terminates abruptly (node reboot, rollout,
