@@ -23,10 +23,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
-	"time"
 
 	. "github.com/onsi/ginkgo/v2"
-	"github.com/onsi/ginkgo/v2/types"
 	. "github.com/onsi/gomega"
 
 	"k8s.io/client-go/kubernetes/scheme"
@@ -55,8 +53,12 @@ var (
 func TestControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
 
-	suiteConfig := types.NewDefaultSuiteConfig()
-	suiteConfig.RandomSeed = ginkgoSeed()
+	// GinkgoConfiguration carries the config Ginkgo derived from its
+	// command-line flags; types.NewDefaultSuiteConfig would replace that
+	// wholesale and drop -ginkgo.focus / -ginkgo.label-filter /
+	// -ginkgo.skip / -ginkgo.seed (#1693).
+	suiteConfig, _ := GinkgoConfiguration()
+	suiteConfig.RandomSeed = ginkgoSeed(suiteConfig.RandomSeed)
 	RunSpecs(t, "Controller Suite", suiteConfig)
 }
 
@@ -107,19 +109,21 @@ var _ = AfterSuite(func() {
 // fails on the draw (#1693). The seed is reported on every run so a failure
 // can be replayed from the log alone, and GINKGO_SEED pins it for the replay:
 // the Makefile picks one per run, exports it, and echoes it into the log
-// (`make test GINKGO_SEED=<n>` to replay).
-func ginkgoSeed() int64 {
+// (`make test GINKGO_SEED=<n>` to replay). When GINKGO_SEED is unset the
+// suite keeps the seed it already has (a -ginkgo.seed flag, or Ginkgo's
+// per-run default) and reports that, so a direct `go test` still honours its
+// own flag.
+func ginkgoSeed(current int64) int64 {
 	if v := os.Getenv("GINKGO_SEED"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err == nil && n > 0 {
 			fmt.Printf("ginkgo seed: %d (pinned by GINKGO_SEED)\n", n)
 			return n
 		}
-		fmt.Printf("ginkgo seed: ignoring invalid GINKGO_SEED %q, using a fresh one\n", v)
+		fmt.Printf("ginkgo seed: ignoring invalid GINKGO_SEED %q, using %d\n", v, current)
 	}
-	seed := time.Now().Unix()
-	fmt.Printf("ginkgo seed: %d\n", seed)
-	return seed
+	fmt.Printf("ginkgo seed: %d\n", current)
+	return current
 }
 
 // getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.

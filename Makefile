@@ -116,6 +116,14 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test GINKGO_SEED=$(GINKGO_SEED))"
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
+# The envtest suites only, so CI can run a second fixed seed over just the
+# specs whose ordering matters (#1693). Not part of the Foreman gate: the
+# gate stays single-pass, and `make test` above is what it runs.
+.PHONY: test-envtest
+test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites only (CI second seed pass, #1693).
+	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test-envtest GINKGO_SEED=$(GINKGO_SEED))"
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test ./internal/controller/ ./internal/foreman/controller/ -count=1
+
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
 	helm lint charts/llmkube charts/foreman
