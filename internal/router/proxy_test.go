@@ -41,6 +41,16 @@ type fakeBackend struct {
 	body      atomic.Pointer[string]
 	stream    atomic.Bool
 	lastModel atomic.Pointer[string] // "model" field of the last received body
+	lastPath  atomic.Pointer[string] // request path of the last received request
+}
+
+// LastPath returns the request path of the most recent request this backend
+// received, or "" if it has not been called.
+func (fb *fakeBackend) LastPath() string {
+	if p := fb.lastPath.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // LastModel returns the OpenAI "model" field of the most recent request
@@ -61,6 +71,7 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 
 	fb.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fb.calls.Add(1)
+		fb.lastPath.Store(&r.URL.Path)
 		if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
 			var m struct {
 				Model string `json:"model"`
@@ -172,6 +183,21 @@ func (h *proxyHarness) post(t *testing.T, payload map[string]any, headers map[st
 	return rec.Result()
 }
 
+// postPath posts an OpenAI-compatible body to an arbitrary mounted path so
+// tests can cover endpoints beyond chat completions.
+func (h *proxyHarness) postPath(t *testing.T, path string, payload map[string]any) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
 // streamingPost uses a real httptest.Server so we exercise streaming via
 // a chunked response (httptest.ResponseRecorder doesn't implement
 // Flusher).
@@ -199,6 +225,41 @@ func TestProxyHealth(t *testing.T) {
 	h.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("/health = %d, want 200", rec.Code)
+	}
+}
+
+// TestProxyMountsEmbeddings verifies the proxy fronts POST /v1/embeddings and
+// forwards it to the chosen backend at that path, not the chat path (#1812).
+func TestProxyMountsEmbeddings(t *testing.T) {
+	h := newProxyHarness(t)
+	resp := h.postPath(t, "/v1/embeddings", map[string]any{
+		"model": "qwen3-coder",
+		"input": "hello",
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/v1/embeddings = %d, want 200", resp.StatusCode)
+	}
+	if got := h.localBack.LastPath(); got != "/v1/embeddings" {
+		t.Errorf("upstream path = %q, want /v1/embeddings", got)
+	}
+}
+
+// TestProxyMountsRerank verifies the proxy fronts POST /v1/rerank and forwards
+// it to the chosen backend at that path, not the chat path (#1812).
+func TestProxyMountsRerank(t *testing.T) {
+	h := newProxyHarness(t)
+	resp := h.postPath(t, "/v1/rerank", map[string]any{
+		"model":     "qwen3-coder",
+		"query":     "hello",
+		"documents": []string{"a"},
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/v1/rerank = %d, want 200", resp.StatusCode)
+	}
+	if got := h.localBack.LastPath(); got != "/v1/rerank" {
+		t.Errorf("upstream path = %q, want /v1/rerank", got)
 	}
 }
 
