@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -61,6 +62,29 @@ var _ = Describe("multiNode group reconcile", func() {
 			names = append(names, p.Name)
 		}
 		return names
+	}
+	// stagedNoRuntime plays a member whose weights are on disk but whose
+	// runtime has not started: every init container exited 0, the main
+	// container is still waiting. The group is staged, not formed.
+	stagedNoRuntime := func(name string) {
+		var p corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &p)).To(Succeed())
+		p.Status.Phase = corev1.PodRunning
+		ics := make([]corev1.ContainerStatus, 0, len(p.Spec.InitContainers))
+		for _, c := range p.Spec.InitContainers {
+			ics = append(ics, corev1.ContainerStatus{
+				Name: c.Name,
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 0, FinishedAt: metav1.Now(),
+				}},
+			})
+		}
+		p.Status.InitContainerStatuses = ics
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "vllm",
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, &p)).To(Succeed())
 	}
 
 	BeforeEach(func() {
@@ -243,5 +267,180 @@ var _ = Describe("multiNode group reconcile", func() {
 		degraded := meta.FindStatusCondition(got.Status.Conditions, ConditionDegraded)
 		Expect(degraded).NotTo(BeNil())
 		Expect(degraded.Message).To(ContainSubstring("multiNode group provides 2 GPUs"))
+	})
+
+	It("holds the group while a member stages, then polices post-formation restarts", func() {
+		// #1757: one member's claim starts empty, so its init container is
+		// still downloading while the other member's runtime waits for the
+		// rendezvous, exits, and is restarted by the kubelet. Recreating the
+		// group on that exit kills the downloader and loses its progress,
+		// which never converges: 62 recreates in 20 minutes in the field.
+		reconcileOnce()
+		Expect(memberPods()).To(HaveLen(2))
+
+		// mn-1 is staging: init container running, runtime never started.
+		var staging corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mn-ring-mn-1", Namespace: ns}, &staging)).To(Succeed())
+		staging.Status.Phase = corev1.PodPending
+		staging.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "model-downloader",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, &staging)).To(Succeed())
+
+		// mn-0 started, could not rendezvous, exited, was restarted.
+		var waiting corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mn-ring-mn-0", Namespace: ns}, &waiting)).To(Succeed())
+		waiting.Status.Phase = corev1.PodRunning
+		waiting.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "vllm", RestartCount: 2,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 1, Reason: "Error", FinishedAt: metav1.Now(),
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, &waiting)).To(Succeed())
+
+		reconcileOnce()
+		Expect(memberPods()).To(HaveLen(2), "formation noise must not tear the group down while a member is staging")
+		var held inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &held)).To(Succeed())
+		Expect(meta.FindStatusCondition(held.Status.Conditions, ConditionMultiNodeFormed)).To(BeNil(),
+			"a group with a staging member is not formed")
+		Expect(meta.FindStatusCondition(held.Status.Conditions, ConditionMultiNodeStaged)).To(BeNil(),
+			"a staging member does not anchor the post-staging deadline")
+
+		// Staging completes: the downloader's init container exits 0 and the
+		// runtime starts. The group forms, stamping a fresh timestamp.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mn-ring-mn-1", Namespace: ns}, &staging)).To(Succeed())
+		staging.Status.Phase = corev1.PodRunning
+		staging.Status.InitContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "model-downloader",
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0, FinishedAt: metav1.Now()}},
+		}}
+		staging.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  "vllm",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, &staging)).To(Succeed())
+
+		reconcileOnce()
+		var formed inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &formed)).To(Succeed())
+		formCond := meta.FindStatusCondition(formed.Status.Conditions, ConditionMultiNodeFormed)
+		Expect(formCond).NotTo(BeNil())
+		Expect(formCond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(memberPods()).To(HaveLen(2), "the pre-formation exits finished at or before the formation timestamp")
+
+		// A termination strictly after formation is a real crash and must
+		// recreate, proving the masking is not permanent. The timestamp is
+		// nudged into the future so the ordering against the stamp cannot race
+		// the test clock.
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mn-ring-mn-0", Namespace: ns}, &waiting)).To(Succeed())
+		waiting.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "vllm", RestartCount: 3,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 137, Reason: "OOMKilled", FinishedAt: metav1.NewTime(time.Now().Add(time.Second)),
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, &waiting)).To(Succeed())
+
+		reconcileOnce() // observes the post-formation crash, deletes the group
+		finishTerminating()
+		Eventually(memberPods).Should(BeEmpty())
+		var torn inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &torn)).To(Succeed())
+		cond := meta.FindStatusCondition(torn.Status.Conditions, ConditionMultiNodeGroupReady)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("MemberRestarted"))
+		Expect(meta.FindStatusCondition(torn.Status.Conditions, ConditionMultiNodeFormed)).To(BeNil(),
+			"teardown clears the formation timestamp so the next group forms afresh")
+		Expect(meta.FindStatusCondition(torn.Status.Conditions, ConditionMultiNodeStaged)).To(BeNil(),
+			"teardown clears the staging deadline too")
+	})
+
+	It("recreates a group that never forms after staging ends", func() {
+		// The formation mask must not hide a runtime crashloop forever. Once
+		// every member has finished staging, the group has a bounded window to
+		// form; past it a restart is fatal, not rendezvous noise.
+		reconcileOnce()
+		Expect(memberPods()).To(HaveLen(2))
+
+		// Both members have finished staging but their runtimes have not
+		// started, so the group is staged but not formed.
+		stagedNoRuntime("mn-ring-mn-0")
+		stagedNoRuntime("mn-ring-mn-1")
+
+		reconcileOnce()
+		var staged inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &staged)).To(Succeed())
+		stagedCond := meta.FindStatusCondition(staged.Status.Conditions, ConditionMultiNodeStaged)
+		Expect(stagedCond).NotTo(BeNil(), "every member finished staging")
+		Expect(stagedCond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(meta.FindStatusCondition(staged.Status.Conditions, ConditionMultiNodeFormed)).To(BeNil(),
+			"a runtime that has not started does not form the group")
+
+		// mn-0's runtime keeps dying while the group never forms.
+		var crashing corev1.Pod
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mn-ring-mn-0", Namespace: ns}, &crashing)).To(Succeed())
+		crashing.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name: "vllm", RestartCount: 2,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: 137, Reason: "OOMKilled", FinishedAt: metav1.NewTime(time.Now().Add(-time.Minute)),
+			}},
+		}}
+		Expect(k8sClient.Status().Update(ctx, &crashing)).To(Succeed())
+
+		// Inside the post-staging window the restart is still masked; the
+		// deadline is aged past the budget so the bound is what is under test.
+		reconcileOnce()
+		Expect(memberPods()).To(HaveLen(2), "inside the post-staging window the restart is noise")
+
+		var aging inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &aging)).To(Succeed())
+		ageCond := meta.FindStatusCondition(aging.Status.Conditions, ConditionMultiNodeStaged)
+		Expect(ageCond).NotTo(BeNil())
+		ageCond.LastTransitionTime = metav1.NewTime(time.Now().Add(-multiNodePostStagingBudget - time.Minute))
+		Expect(k8sClient.Status().Update(ctx, &aging)).To(Succeed())
+
+		reconcileOnce() // past the deadline the crashloop recreates the group
+		finishTerminating()
+		Eventually(memberPods).Should(BeEmpty())
+		var torn inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &torn)).To(Succeed())
+		cond := meta.FindStatusCondition(torn.Status.Conditions, ConditionMultiNodeGroupReady)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("MemberRestarted"))
+		Expect(meta.FindStatusCondition(torn.Status.Conditions, ConditionMultiNodeStaged)).To(BeNil(),
+			"teardown clears the staging deadline")
+	})
+
+	It("clears the staging deadline when the group is scaled to zero", func() {
+		// The suspended path deletes the group too: a later recreate must not
+		// inherit the old group's staging deadline.
+		reconcileOnce()
+		Expect(memberPods()).To(HaveLen(2))
+		stagedNoRuntime("mn-ring-mn-0")
+		stagedNoRuntime("mn-ring-mn-1")
+
+		reconcileOnce()
+		var before inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &before)).To(Succeed())
+		Expect(meta.FindStatusCondition(before.Status.Conditions, ConditionMultiNodeStaged)).NotTo(BeNil())
+
+		zero := int32(0)
+		before.Spec.Replicas = &zero
+		Expect(k8sClient.Update(ctx, &before)).To(Succeed())
+
+		reconcileOnce()
+		finishTerminating()
+		Eventually(memberPods).Should(BeEmpty())
+		var after inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &after)).To(Succeed())
+		Expect(meta.FindStatusCondition(after.Status.Conditions, ConditionMultiNodeFormed)).To(BeNil())
+		Expect(meta.FindStatusCondition(after.Status.Conditions, ConditionMultiNodeStaged)).To(BeNil(),
+			"scale to zero clears the staging deadline")
 	})
 })

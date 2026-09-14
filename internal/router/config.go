@@ -88,6 +88,12 @@ type Backend struct {
 	// providers it is the provider base URL.
 	Address string `json:"address"`
 
+	// Endpoints are the per-pod base URLs the proxy balances requests
+	// across when a backend declares endpoint resolution. When non-empty
+	// they supersede Address for dispatch; Address remains the fallback
+	// (the Service DNS) for a backend whose endpoint set is empty.
+	Endpoints []string `json:"endpoints,omitempty"`
+
 	// Provider identifies the upstream API surface for external backends
 	// ("anthropic", "openai", "litellm", etc.). Empty for local backends.
 	Provider string `json:"provider,omitempty"`
@@ -280,7 +286,7 @@ func (c *Config) Validate() error {
 		if b.Tier != "local" && b.Tier != "cloud" {
 			return fmt.Errorf("backends[%d] %s: tier must be local or cloud, got %q", i, b.Name, b.Tier)
 		}
-		if b.Address == "" {
+		if b.Address == "" && len(b.Endpoints) == 0 {
 			return fmt.Errorf("backends[%d] %s: address is required", i, b.Name)
 		}
 	}
