@@ -18,6 +18,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -58,6 +59,13 @@ const (
 	defaultLeaseDuration = 120 * time.Second
 	leaseNamePrefix      = "llmkube-pool-"
 )
+
+// ErrActivationLeaseUnavailable signals that the swap lease could not be read
+// or written, so this replica cannot know whether it owns the swap. The request
+// fails closed rather than risking a double activation, but the error is kept
+// distinct from a backend failure: an unavailable lease is a transient control
+// plane condition the caller may retry, not a serving outage.
+var ErrActivationLeaseUnavailable = errors.New("activation lease unavailable")
 
 // LeaseCoordinator implements SwapCoordinator over coordination.k8s.io Leases.
 // A lease held by another live replica means a swap is already being driven, so
@@ -179,12 +187,12 @@ func (c *LeaseCoordinator) claim(ctx context.Context, name string) (bool, error)
 			if apierrors.IsAlreadyExists(cerr) {
 				return false, nil
 			}
-			return false, fmt.Errorf("create activation lease %s: %w", name, cerr)
+			return false, fmt.Errorf("%w: create lease %s: %w", ErrActivationLeaseUnavailable, name, cerr)
 		}
 		return true, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("get activation lease %s: %w", name, err)
+		return false, fmt.Errorf("%w: get lease %s: %w", ErrActivationLeaseUnavailable, name, err)
 	}
 	if holder := ptr.Deref(lease.Spec.HolderIdentity, ""); holder != "" && holder != c.identity {
 		if !c.expired(lease) {
@@ -200,7 +208,7 @@ func (c *LeaseCoordinator) claim(ctx context.Context, name string) (bool, error)
 		if apierrors.IsConflict(uerr) {
 			return false, nil
 		}
-		return false, fmt.Errorf("renew activation lease %s: %w", name, uerr)
+		return false, fmt.Errorf("%w: renew lease %s: %w", ErrActivationLeaseUnavailable, name, uerr)
 	}
 	return true, nil
 }

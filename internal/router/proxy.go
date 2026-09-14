@@ -206,6 +206,18 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				"pool_incumbent_busy", elapsed)
 			return
 		}
+		// The swap lease could not be read or written, so this replica cannot
+		// know whether it owns the swap. Fail closed, but as a transient
+		// control-plane condition the client may retry, not a 502 that reads as
+		// an upstream outage.
+		if errors.Is(err, ErrActivationLeaseUnavailable) {
+			w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
+			writeError(w, http.StatusServiceUnavailable,
+				"model pool activation lease unavailable; retry")
+			p.audit(features, decision, nil, http.StatusServiceUnavailable,
+				"pool_lease_unavailable", elapsed)
+			return
+		}
 		// Runtime fail-closed: when every backend in a fail-closed
 		// rule's pool is unreachable, return 503 with a clear reason
 		// rather than 502. This is the runtime counterpart to the

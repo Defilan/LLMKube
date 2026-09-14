@@ -13,6 +13,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -384,7 +385,14 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 		default:
 			a.logger.Error("model pool swap failed", "pool", pr.pool,
 				"from", incumbent, "to", target, "error", err)
-			pr.swapErr[target] = errors.New("model pool swap failed for member " + target + ": " + err.Error())
+			// An unavailable swap lease is a transient control-plane condition,
+			// not a serving failure: keep the sentinel so the proxy surfaces it
+			// as retryable rather than folding it into a generic upstream error.
+			if errors.Is(err, ErrActivationLeaseUnavailable) {
+				pr.swapErr[target] = fmt.Errorf("activation lease unavailable for member %s: %w", target, err)
+			} else {
+				pr.swapErr[target] = errors.New("model pool swap failed for member " + target + ": " + err.Error())
+			}
 		}
 		pr.notify()
 		a.mu.Unlock()

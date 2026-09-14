@@ -208,12 +208,16 @@ func TestLeaseCoordinatorTakesOverExpired(t *testing.T) {
 type fakeCoordinator struct {
 	mu       sync.Mutex
 	owner    bool
+	err      error
 	released bool
 }
 
 func (f *fakeCoordinator) Acquire(context.Context, string) (func(), bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.err != nil {
+		return nil, false, f.err
+	}
 	if !f.owner {
 		return nil, false, nil
 	}
@@ -340,5 +344,24 @@ func TestDeferringReplicaDoesNotCountSwap(t *testing.T) {
 	if got := testutil.ToFloat64(prommetrics.ModelPoolSwapsTotal.WithLabelValues(
 		"owner-test", "heavy-slot", "", "coder")); got != 1 {
 		t.Errorf("ModelPoolSwapsTotal = %v for the owning replica, want 1", got)
+	}
+}
+
+// TestActivatorSurfacesLeaseUnavailable verifies a lease API failure is kept
+// distinct from a backend swap failure, so an operator can tell a control-plane
+// blip from a serving outage (#1477).
+func TestActivatorSurfacesLeaseUnavailable(t *testing.T) {
+	memberCtrl := newFakeMemberController()
+	a := NewActivator(context.Background(), memberCtrl, "r", nil)
+	a.SetSwapCoordinator(&fakeCoordinator{err: ErrActivationLeaseUnavailable})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := a.Acquire(ctx, testPool("coder"))
+	if !errors.Is(err, ErrActivationLeaseUnavailable) {
+		t.Fatalf("Acquire = %v, want it to wrap ErrActivationLeaseUnavailable", err)
+	}
+	if got := memberCtrl.activateCount("coder"); got != 0 {
+		t.Errorf("activate count = %d, want 0 (an unavailable lease must not drive a swap)", got)
 	}
 }

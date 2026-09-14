@@ -251,6 +251,13 @@ func newActivator(baseCtx context.Context, logger *slog.Logger) (*router.Activat
 	// proxy without it keeps the in-process-only guarantee.
 	if ns := os.Getenv("POD_NAMESPACE"); ns != "" {
 		act.SetSwapCoordinator(router.NewLeaseCoordinator(cl, ns))
+	} else {
+		// The Deployment injects POD_NAMESPACE; an empty value means an older
+		// Deployment that has not rolled yet, or a hand-run proxy. Say so,
+		// because pooled swap coordination silently degrades to in-process
+		// serialization without it.
+		logger.Warn("activation is enabled without POD_NAMESPACE; " +
+			"pool swap coordination is in-process only")
 	}
 	return act, nil
 }
