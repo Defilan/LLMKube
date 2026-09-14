@@ -17,6 +17,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -380,8 +381,53 @@ func (r *ModelRouterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&inferencev1alpha1.ModelPool{},
 			handler.EnqueueRequestsFromMapFunc(r.findModelRoutersForModelPool),
 		).
+		Watches(
+			&discoveryv1.EndpointSlice{},
+			handler.EnqueueRequestsFromMapFunc(r.findModelRoutersForEndpointSlice),
+		).
 		Named(modelRouterControllerName).
 		Complete(r)
+}
+
+// findModelRoutersForEndpointSlice re-reconciles every ModelRouter in a changed
+// EndpointSlice's namespace that has at least one endpoint-resolution backend.
+// The endpoint list is part of the compiled config and therefore of its hash,
+// so pod churn must rebuild the config and re-roll the proxy. The mapping is
+// namespace-wide rather than joined back to the owning InferenceService: a
+// slice carries only the Service name, and a router with endpoint backends is
+// cheap to recompile.
+func (r *ModelRouterReconciler) findModelRoutersForEndpointSlice(ctx context.Context, obj client.Object) []reconcile.Request {
+	slice, ok := obj.(*discoveryv1.EndpointSlice)
+	if !ok {
+		return nil
+	}
+	routerList := &inferencev1alpha1.ModelRouterList{}
+	if err := r.List(ctx, routerList, client.InNamespace(slice.Namespace)); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range routerList.Items {
+		mr := &routerList.Items[i]
+		if !routerHasEndpointBackend(mr) {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: mr.Namespace},
+		})
+	}
+	return requests
+}
+
+// routerHasEndpointBackend reports whether any of the router's local backends
+// resolves to pod endpoints rather than the Service DNS name.
+func routerHasEndpointBackend(mr *inferencev1alpha1.ModelRouter) bool {
+	for i := range mr.Spec.Backends {
+		b := &mr.Spec.Backends[i]
+		if b.InferenceServiceRef != nil && b.Resolution == inferencev1alpha1.RouterBackendResolutionEndpoint {
+			return true
+		}
+	}
+	return false
 }
 
 // findModelRoutersForModelPool re-reconciles every ModelRouter in a changed

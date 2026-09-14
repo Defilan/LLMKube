@@ -20,6 +20,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +50,9 @@ func builderTestScheme(t *testing.T) *runtime.Scheme {
 	}
 	if err := rbacv1.AddToScheme(s); err != nil {
 		t.Fatalf("add rbacv1: %v", err)
+	}
+	if err := discoveryv1.AddToScheme(s); err != nil {
+		t.Fatalf("add discoveryv1: %v", err)
 	}
 	return s
 }
@@ -153,6 +157,129 @@ func TestCompileRouterConfigResolvesLocalBackend(t *testing.T) {
 		if !b.Healthy {
 			t.Errorf("backend %s should be healthy after resolution, Message=%q", b.Name, b.Message)
 		}
+	}
+}
+
+// TestCompileRouterConfigEndpointResolution verifies opt-in endpoint resolution
+// (#1812): with resolution=endpoint the backend compiles one address per ready
+// pod and keeps the Service DNS name as the fallback.
+func TestCompileRouterConfigEndpointResolution(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "qwen3-coder",
+			Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1", "10.0.0.2"))
+
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	var cfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+		t.Fatalf("unmarshal compiled JSON: %v", err)
+	}
+	want := []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"}
+	if len(cfg.Backends[0].Endpoints) != len(want) {
+		t.Fatalf("endpoints = %v, want %v", cfg.Backends[0].Endpoints, want)
+	}
+	for i := range want {
+		if cfg.Backends[0].Endpoints[i] != want[i] {
+			t.Errorf("endpoints[%d] = %q, want %q", i, cfg.Backends[0].Endpoints[i], want[i])
+		}
+	}
+	if !strings.Contains(cfg.Backends[0].Address, "qwen3-coder."+testBuilderNs+".svc.cluster.local") {
+		t.Errorf("fallback address = %q, want the Service DNS name", cfg.Backends[0].Address)
+	}
+}
+
+// TestCompileRouterConfigEndpointResolutionFallback covers the two negative
+// cases: the default service resolution compiles no endpoints even when
+// EndpointSlices exist, and an endpoint backend with no ready pods falls back
+// to the Service DNS name with a status message.
+func TestCompileRouterConfigEndpointResolutionFallback(t *testing.T) {
+	mr := canonicalModelRouter() // default resolution is service
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "qwen3-coder",
+			Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	slices := endpointSliceFor("qwen3-coder", testBuilderNs, false, "10.0.0.9")
+
+	service := newRouterReconcilerForTest(t, mr, isvc, secret, slices)
+	compiled, err := service.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig (service): %v", err)
+	}
+	var serviceCfg router.Config
+	if err := json.Unmarshal(compiled.JSON, &serviceCfg); err != nil {
+		t.Fatalf("unmarshal service JSON: %v", err)
+	}
+	if len(serviceCfg.Backends[0].Endpoints) != 0 {
+		t.Errorf("service resolution compiled endpoints %v, want none", serviceCfg.Backends[0].Endpoints)
+	}
+
+	mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+	endpoint := newRouterReconcilerForTest(t, mr, isvc, secret, slices)
+	compiledEP, err := endpoint.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig (endpoint): %v", err)
+	}
+	var endpointCfg router.Config
+	if err := json.Unmarshal(compiledEP.JSON, &endpointCfg); err != nil {
+		t.Fatalf("unmarshal endpoint JSON: %v", err)
+	}
+	if len(endpointCfg.Backends[0].Endpoints) != 0 {
+		t.Errorf("no ready pods compiled endpoints %v, want none", endpointCfg.Backends[0].Endpoints)
+	}
+	if !strings.Contains(endpointCfg.Backends[0].Address, "qwen3-coder."+testBuilderNs+".svc.cluster.local") {
+		t.Errorf("fallback address = %q, want the Service DNS name", endpointCfg.Backends[0].Address)
+	}
+	for _, b := range compiledEP.Backends {
+		if b.Name != "local-qwen" {
+			continue
+		}
+		if b.Healthy {
+			t.Error("backend with no ready endpoints should report unhealthy")
+		}
+		if !strings.Contains(b.Message, "no ready endpoints") {
+			t.Errorf("status message = %q, want it to mention the missing endpoints", b.Message)
+		}
+	}
+}
+
+// endpointSliceFor builds an EndpointSlice labelled for the named Service, so
+// the router config builder's service-name selector finds it.
+func endpointSliceFor(service, namespace string, ready bool, addrs ...string) *discoveryv1.EndpointSlice {
+	eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+	for _, a := range addrs {
+		eps = append(eps, discoveryv1.Endpoint{
+			Addresses:  []string{a},
+			Conditions: discoveryv1.EndpointConditions{Ready: &ready},
+		})
+	}
+	return &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      service + "-slices",
+			Namespace: namespace,
+			Labels:    map[string]string{"kubernetes.io/service-name": sanitizeDNSName(service)},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   eps,
 	}
 }
 
@@ -1232,5 +1359,30 @@ func TestFindModelRoutersForModelPool(t *testing.T) {
 	}
 	if reqs[0].Name != mr.Name || reqs[0].Namespace != mr.Namespace {
 		t.Errorf("enqueued %s/%s, want %s/%s", reqs[0].Namespace, reqs[0].Name, mr.Namespace, mr.Name)
+	}
+}
+
+// TestFindModelRoutersForEndpointSlice verifies the EndpointSlice watch mapping:
+// every ModelRouter in the slice's namespace with an endpoint-resolution backend
+// is enqueued so pod churn rebuilds the compiled config, and a router whose
+// backends stay service-level is not.
+func TestFindModelRoutersForEndpointSlice(t *testing.T) {
+	withEndpoints := canonicalModelRouter()
+	withEndpoints.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+	serviceLevel := canonicalModelRouter()
+	serviceLevel.Name = "service-router"
+
+	scheme := builderTestScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(withEndpoints, serviceLevel).Build()
+	r := &ModelRouterReconciler{Client: c, Scheme: scheme}
+
+	reqs := r.findModelRoutersForEndpointSlice(context.Background(),
+		endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1"))
+
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests, want 1 (only the endpoint-resolution router)", len(reqs))
+	}
+	if reqs[0].Name != withEndpoints.Name {
+		t.Errorf("enqueued %q, want %q", reqs[0].Name, withEndpoints.Name)
 	}
 }

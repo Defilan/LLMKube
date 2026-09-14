@@ -45,6 +45,18 @@ const (
 	ModelRouterDataPlaneAgentGateway ModelRouterDataPlane = "AgentGateway"
 )
 
+// Backend resolution modes for RouterBackend.Resolution. See the CRD field
+// documentation for the semantics of each.
+const (
+	// RouterBackendResolutionService dispatches to the InferenceService's
+	// ClusterIP Service DNS name. This is the default.
+	RouterBackendResolutionService = "service"
+
+	// RouterBackendResolutionEndpoint compiles one address per ready pod and
+	// lets the router-proxy balance requests across them.
+	RouterBackendResolutionEndpoint = "endpoint"
+)
+
 // DefaultRouteStrategy selects what the router does when no rule matches a
 // request, before falling back to DefaultRoute.
 type DefaultRouteStrategy string
@@ -199,6 +211,17 @@ type RouterBackend struct {
 	// +kubebuilder:default=local
 	// +optional
 	Tier string `json:"tier,omitempty"`
+
+	// Resolution selects how a local (inferenceServiceRef) backend's upstream
+	// address is resolved. "service" (the default) dispatches to the
+	// InferenceService's ClusterIP Service DNS name, so a keep-alive client
+	// can pin to one pod through conntrack. "endpoint" compiles one address
+	// per ready pod and the router-proxy balances requests across them.
+	// External backends ignore this field.
+	// +kubebuilder:validation:Enum=service;endpoint
+	// +kubebuilder:default=service
+	// +optional
+	Resolution string `json:"resolution,omitempty"`
 
 	// Capabilities advertised by this backend. Rules can require
 	// capabilities (e.g. ["tools", "vision", "long-context"]) to filter

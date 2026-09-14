@@ -240,6 +240,19 @@ spec:
                         Must be lowercase alphanumeric or '-'.
                       pattern: ^[a-z0-9][a-z0-9-]{0,62}$
                       type: string
+                    resolution:
+                      default: service
+                      description: |-
+                        Resolution selects how a local (inferenceServiceRef) backend's upstream
+                        address is resolved. "service" (the default) dispatches to the
+                        InferenceService's ClusterIP Service DNS name, so a keep-alive client
+                        can pin to one pod through conntrack. "endpoint" compiles one address
+                        per ready pod and the router-proxy balances requests across them.
+                        External backends ignore this field.
+                      enum:
+                      - service
+                      - endpoint
+                      type: string
                     tier:
                       default: local
                       description: |-
