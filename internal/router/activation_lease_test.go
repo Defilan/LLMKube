@@ -30,7 +30,10 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 func leaseScheme(t *testing.T) *runtime.Scheme {
@@ -290,5 +293,52 @@ func TestActivatorOwnerDrivesSwap(t *testing.T) {
 	}
 	if !coord.wasReleased() {
 		t.Error("the owner did not release the swap lease when the swap ended")
+	}
+}
+
+// TestDeferringReplicaDoesNotCountSwap verifies the swap counters move only on
+// the replica that drove the member write. A deferring replica reaches the same
+// resident state but drove nothing, so counting it there would double the swap
+// rate operators watch to confirm the thrash is gone (#1477).
+func TestDeferringReplicaDoesNotCountSwap(t *testing.T) {
+	// Deferring replica: another replica owns the swap, so this one only waits.
+	deferCtrl := newFakeMemberController()
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	deferring := NewActivator(baseCtx, deferCtrl, "defer-test", nil)
+	deferring.SetSwapCoordinator(&fakeCoordinator{owner: false})
+
+	// Stand in for the owning replica bringing the member up.
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		deferCtrl.setPhase("coder", modelReadyPhase)
+	}()
+
+	rel, err := deferring.Acquire(context.Background(), testPool("coder"))
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	rel()
+
+	if got := testutil.ToFloat64(prommetrics.ModelPoolSwapsTotal.WithLabelValues(
+		"defer-test", "heavy-slot", "", "coder")); got != 0 {
+		t.Errorf("ModelPoolSwapsTotal = %v for a deferring replica, want 0 "+
+			"(only the replica that drove the write counts a swap)", got)
+	}
+
+	// Control: the owning replica's swap is counted, so the assertion above is
+	// not passing merely because the counter never moves.
+	ownerCtrl := newFakeMemberController()
+	owner := NewActivator(context.Background(), ownerCtrl, "owner-test", nil)
+	owner.SetSwapCoordinator(&fakeCoordinator{owner: true})
+	relOwner, err := owner.Acquire(context.Background(), testPool("coder"))
+	if err != nil {
+		t.Fatalf("owner Acquire: %v", err)
+	}
+	relOwner()
+
+	if got := testutil.ToFloat64(prommetrics.ModelPoolSwapsTotal.WithLabelValues(
+		"owner-test", "heavy-slot", "", "coder")); got != 1 {
+		t.Errorf("ModelPoolSwapsTotal = %v for the owning replica, want 1", got)
 	}
 }
