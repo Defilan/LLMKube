@@ -142,9 +142,6 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	// namespace default SA and no API access.
 	serviceAccountName := ""
 	env := []corev1.EnvVar{}
-	// A pooled router runs one or more proxy replicas; ModelPool swaps are
-	// serialized across replicas by a per-pool Lease, so pod churn does not
-	// require pinning spec.proxy.replicas to 1 (#1477).
 	if hasPools {
 		serviceAccountName = routerProxyResourceName(mr.Name)
 		env = append(env, corev1.EnvVar{Name: "ROUTER_NAME", Value: mr.Name})
