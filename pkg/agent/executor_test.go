@@ -623,10 +623,17 @@ func TestDownloadFile_SuccessRenamesTempFile(t *testing.T) {
 		t.Errorf("model file size = %d, want %d", info.Size(), len(payload))
 	}
 
-	// No .partial stub should remain.
-	partialPath := localPath + ".partial"
-	if _, err := os.Stat(partialPath); !os.IsNotExist(err) {
-		t.Errorf("partial file still exists at %q: %v", partialPath, err)
+	// No partial should remain, under any name: the HTTP path writes
+	// ".<base>.<validator>.partial", not "<base>.partial", so scanning the
+	// directory catches a leftover the old exact-path check would miss.
+	entries, err := os.ReadDir(filepath.Dir(localPath))
+	if err != nil {
+		t.Fatalf("read model dir: %v", err)
+	}
+	for _, ent := range entries {
+		if strings.HasSuffix(ent.Name(), ".partial") {
+			t.Errorf("partial file still exists: %q", ent.Name())
+		}
 	}
 }
 

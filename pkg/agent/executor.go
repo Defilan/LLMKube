@@ -429,6 +429,11 @@ var hfNormalize = hfsource.NormalizeHFSource
 // ignores the Range and answers 200 is handled by discarding the partial and
 // rewriting from zero.
 //
+// Every transfer, the from-zero one included, writes the probed validator's
+// partial, so an interruption at any offset leaves progress the next attempt
+// resumes. Only the probe-failure path (downloadFull with an empty validator)
+// has no key to write under and uses the fixed empty-validator name.
+//
 // The redirect handling is deliberate and stricter than net/http's default.
 // Go strips Authorization only when a redirect leaves the registrable domain
 // (shouldCopyHeaderOnRedirect uses isDomainOrSubdomain), so it keeps the header
@@ -451,7 +456,7 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 		// A failed probe is not fatal to the download: treat the content as
 		// unknown, start from zero, and let the GET below surface any real error.
 		e.logger.Debugw("validator probe failed; downloading without resume", "url", url, "error", err)
-		return e.downloadFull(ctx, httpClient, url, filePath, token)
+		return e.downloadFull(ctx, httpClient, url, filePath, token, "")
 	}
 
 	partPath := validatorPartialPath(filePath, validator)
@@ -466,7 +471,6 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 	sweepStalePartials(filePath, partPath)
 
 	var resumeFrom int64
-	var resumeValidator string
 	if fi, statErr := os.Stat(partPath); statErr == nil && fi.Mode().IsRegular() {
 		// The partial is keyed on the validator, so its very name proves it
 		// belongs to the current content: a change in length or ETag yields a
@@ -474,7 +478,6 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 		switch {
 		case size > 0 && fi.Size() < size:
 			resumeFrom = fi.Size()
-			resumeValidator = validator
 		case size > 0 && fi.Size() == size:
 			// Already complete: a ranged request would 416 and the full-body
 			// path would rewrite identical bytes anyway, so publish the partial
@@ -504,9 +507,6 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	partValidator := resumeValidator
-	partPath = validatorPartialPath(filePath, partValidator)
-
 	// A 206 response is verified against the full object size (probeFullSize), so
 	// the total after the append is expected; a 200 is verified against the
 	// response's own Content-Length.
@@ -514,20 +514,21 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 	case http.StatusOK:
 		// A 200 in response to a Range request means the server ignored the
 		// range and is sending the whole object; the partial must not be
-		// appended to (that would splice). partValidator is the empty key here, so
-		// os.Create truncates it and the transfer starts from zero.
+		// appended to (that would splice). resumeFrom is 0 here, so os.Create
+		// truncates the probed validator's partial and the transfer starts from
+		// zero, keeping that partial resumable if this attempt is interrupted.
 		return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0)
 	case http.StatusPartialContent:
 		if resumeFrom == 0 {
 			// A 206 with no partial to append to cannot be trusted; restart.
-			return e.downloadFull(ctx, httpClient, url, filePath, token)
+			return e.downloadFull(ctx, httpClient, url, filePath, token, validator)
 		}
 		// ContentLength is the remaining bytes; total on disk is resumeFrom +
 		// written, which must equal the full size the probe saw.
 		expected := resumeFrom + resp.ContentLength
 		if full := probeFullSize(validator, resp); full > 0 && expected != full {
 			_ = os.Remove(partPath)
-			return e.downloadFull(ctx, httpClient, url, filePath, token)
+			return e.downloadFull(ctx, httpClient, url, filePath, token, validator)
 		}
 		return e.copyToFileResume(partPath, filePath, resp.Body, expected, resumeFrom)
 	default:
@@ -536,9 +537,15 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 }
 
 // downloadFull performs a non-resuming GET of url and publishes the body at
-// filePath via the validator-keyed partial. It is the from-zero path taken when
-// there is nothing to resume or a resume was invalidated.
-func (e *MetalExecutor) downloadFull(ctx context.Context, httpClient *http.Client, url, filePath, token string) error {
+// filePath via the partial keyed on partValidator. It is the from-zero path
+// taken when there is nothing to resume or a resume was invalidated; the caller
+// passes the probed validator so an interrupted restart stays resumable, or the
+// empty validator when the probe failed and no key is known.
+func (e *MetalExecutor) downloadFull(
+	ctx context.Context,
+	httpClient *http.Client,
+	url, filePath, token, partValidator string,
+) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -554,7 +561,7 @@ func (e *MetalExecutor) downloadFull(ctx context.Context, httpClient *http.Clien
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
-	partPath := validatorPartialPath(filePath, "")
+	partPath := validatorPartialPath(filePath, partValidator)
 	return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0)
 }
 
@@ -630,9 +637,10 @@ func probeFullSize(validator string, resp *http.Response) int64 {
 // validatorPartialPath names the partial that holds resume progress for a
 // download, or the scratch file a from-zero transfer writes. The name embeds the
 // first 12 hex of sha256(validator) so the bytes a transfer holds are always the
-// bytes the current validator implies: with an empty validator it collapses to a
-// fixed name (no resume progress to preserve), which is why the caller recomputes
-// it from the resume decision rather than reading the file it probed.
+// bytes the current validator implies. A caller that has a validator always
+// passes it, from-zero transfers included, so the partial a fresh attempt leaves
+// behind is the one a later attempt looks for; only the probe-failure path, which
+// has no validator, collapses to the fixed empty-validator name.
 func validatorPartialPath(filePath, validator string) string {
 	sum := sha256.Sum256([]byte(validator))
 	key := hex.EncodeToString(sum[:])[:12]

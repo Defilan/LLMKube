@@ -33,7 +33,10 @@ import (
 // range-serving origin and assert the bytes that land on disk, mirroring the
 // in-container init script tests: the splice case is the load-bearing one, since
 // the Range request (like curl -C -) carries no If-Range and is only kept honest
-// by keying the partial on the upstream validator.
+// by keying the partial on the upstream validator. A from-zero transfer writes
+// the probed validator's partial too, so an interrupted fresh download is the
+// same resumable artifact a seeded partial is; TestDownloadFile_
+// InterruptedTransferThenResume drives that end to end rather than seeding.
 
 const (
 	dlSizeA = 80000
@@ -300,5 +303,121 @@ func TestDownloadFile_NoETagKeysOnContentLength(t *testing.T) {
 	}
 	if o.rangeRequests.Load() == 0 {
 		t.Errorf("expected the content-length-keyed partial to resume with a Range request")
+	}
+}
+
+// TestDownloadFile_InterruptedTransferThenResume drives the real interruption
+// rather than seeding a partial: the first attempt is cut off mid-body, and the
+// retry must resume it with a Range request. Seeding a validator-keyed partial
+// directly would pass even when a from-zero transfer writes a differently keyed
+// file, which is the failure this pins.
+func TestDownloadFile_InterruptedTransferThenResume(t *testing.T) {
+	dir := t.TempDir()
+	ex := executorFor(dir)
+	md := modelDirPath(t, dir, "interrupt-model")
+	localPath := filepath.Join(md, "model.gguf")
+
+	body := []byte(strings.Repeat("A", dlSizeA))
+	var fullFromZero, rangeRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"vA"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if start := parseBytesStart(r.Header.Get("Range")); start >= 0 {
+			rangeRequests.Add(1)
+			out := body[start:]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(body)-1, len(body)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(out)
+			return
+		}
+		// Advertise the full length but send half, so io.Copy in the downloader
+		// sees an unexpected EOF and the partial survives the failed attempt.
+		fullFromZero.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write(body[:len(body)/2])
+	}))
+	defer srv.Close()
+
+	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, ""); err == nil {
+		t.Fatal("the interrupted first attempt should return an error, else this test proves nothing")
+	}
+
+	fullFromZero.Store(0)
+	rangeRequests.Store(0)
+	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, ""); err != nil {
+		t.Fatalf("resuming retry failed: %v", err)
+	}
+
+	if rangeRequests.Load() == 0 {
+		t.Errorf("retry did not resume; fullGETs=%d rangeGETs=%d", fullFromZero.Load(), rangeRequests.Load())
+	}
+	if fullFromZero.Load() != 0 {
+		t.Errorf("retry re-fetched from zero instead of resuming; fullGETs=%d rangeGETs=%d",
+			fullFromZero.Load(), rangeRequests.Load())
+	}
+	got, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("published file missing: %v", err)
+	}
+	if string(got) != string(body) {
+		t.Errorf("resumed bytes are wrong (len %d, want %d)", len(got), len(body))
+	}
+}
+
+// TestDownloadFile_InvalidatedResumeKeepsValidatorKey pins that the from-zero
+// fallback taken when a resume is invalidated carries the probed validator
+// through downloadFull. If it collapses to the empty key, the fallback's own
+// interrupted bytes land under a name the next attempt never looks for, which is
+// the same defect the fresh path had.
+func TestDownloadFile_InvalidatedResumeKeepsValidatorKey(t *testing.T) {
+	dir := t.TempDir()
+	ex := executorFor(dir)
+	md := modelDirPath(t, dir, "invalidated-model")
+	localPath := filepath.Join(md, "model.gguf")
+
+	validator := "CL" + strconv.Itoa(dlSizeA) + `ET"vA"`
+	seed := validatorPartialPath(localPath, validator)
+	if err := os.WriteFile(seed, []byte(strings.Repeat("A", 40000)), 0o644); err != nil {
+		t.Fatalf("seed resumable partial: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"vA"`)
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(dlSizeA))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if parseBytesStart(r.Header.Get("Range")) >= 0 {
+			// A 206 whose implied total contradicts the probed size, so the
+			// downloader invalidates the resume and restarts from zero.
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 40000-%d/60000", dlSizeA-1))
+			w.Header().Set("Content-Length", "10000")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte(strings.Repeat("A", 10000)))
+			return
+		}
+		// The from-zero fallback is cut off mid-body so its partial survives; the
+		// test then reads which name it was written under.
+		w.Header().Set("Content-Length", strconv.Itoa(dlSizeA))
+		_, _ = w.Write([]byte(strings.Repeat("A", dlSizeA/2)))
+	}))
+	defer srv.Close()
+
+	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, ""); err == nil {
+		t.Fatal("the interrupted from-zero fallback should return an error")
+	}
+
+	if _, err := os.Stat(validatorPartialPath(localPath, validator)); err != nil {
+		t.Errorf("from-zero fallback did not write the probed validator's partial: %v", err)
+	}
+	if _, err := os.Stat(validatorPartialPath(localPath, "")); !os.IsNotExist(err) {
+		t.Errorf("from-zero fallback wrote the empty-validator partial, which no retry looks for")
 	}
 }
