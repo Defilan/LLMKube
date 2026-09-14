@@ -389,3 +389,40 @@ func testResumeVariant(t *testing.T, v resumeVariant) {
 		}
 	})
 }
+
+// TestWarmCacheIfNotPresentMakesNoNetworkRequest pins #1765 requirement 4: the
+// IfNotPresent validator probe belongs inside the model-absent branch, so a warm
+// cache starts the pod with no request at all. An unconditional probe would add
+// a HEAD (and, with no --max-time on the curl, a possible stall on an air-gapped
+// node) to a start that previously made none.
+func TestWarmCacheIfNotPresentMakesNoNetworkRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("ETag", `"vA"`)
+		w.Header().Set("Content-Length", "5")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("seed warm cache: %v", err)
+	}
+
+	cmd := exec.Command("sh", "-c", buildModelInitCommand(false, false, true, false, RefreshPolicyIfNotPresent))
+	cmd.Env = append(os.Environ(),
+		"MODEL_SOURCE="+srv.URL+"/model.gguf",
+		"MODEL_PATH="+modelPath,
+		"CACHE_DIR="+dir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("init script failed: %v\n%s", err, out)
+	}
+	if requests.Load() != 0 {
+		t.Errorf("warm cache issued %d network request(s) before the cache check\n%s", requests.Load(), out)
+	}
+}

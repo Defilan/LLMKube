@@ -326,7 +326,10 @@ const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authoriza
 //     because a content change yields a different key and so an evicted partial,
 //     it makes cross-version splicing impossible (a `curl -C -` / `Range` resume
 //     sends no If-Range, so an abandoned partial from different bytes would
-//     otherwise splice onto the new content).
+//     otherwise splice onto the new content). The IfNotPresent probe runs only
+//     inside the `[ ! -f "$MODEL_PATH" ]` branch, so a warm cache starts the pod
+//     with no network request (#1765); the OnChange path probes unconditionally
+//     by design, because the probe is what decides whether the cache is current.
 //
 // The s3:// and local `cp` branches still open with the plain
 // `rm -f "$MODEL_PATH.tmp"`: sigv4 range signing is unverified and a local copy
@@ -342,8 +345,8 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 		if refreshPolicy == RefreshPolicyOnChange {
 			return "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 		}
-		return `mkdir -p "$CACHE_DIR" && ` + hfAuthPrefix(isHFAuth) + resumePrologue(isHFAuth) +
-			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+		return `mkdir -p "$CACHE_DIR" && ` + hfAuthPrefix(isHFAuth) +
+			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 	}
 
 	if isLocal {
@@ -355,8 +358,8 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 	if refreshPolicy == RefreshPolicyOnChange {
 		return hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 	}
-	return hfAuthPrefix(isHFAuth) + resumePrologue(isHFAuth) +
-		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+	return hfAuthPrefix(isHFAuth) +
+		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -472,10 +475,14 @@ func debrisSweep() string {
 }
 
 // resumePrologue is the cached and uncached IfNotPresent resume sequence: a
-// validator probe (HEAD reading ETag + Content-Length) that sets
+// validator probe (HEAD reading Etag + Content-Length) that sets
 // $remote_validator, then the derive-and-sweep that names $MODEL_PARTIAL. The
 // caller follows it with `curl -C -` into $MODEL_PARTIAL and an mv onto
 // $MODEL_PATH.
+//
+// The caller places it inside the `[ ! -f "$MODEL_PATH" ]` branch, so a warm
+// cache makes no request: the cache check short-circuits before the probe, and
+// nothing has to be swept because nothing is downloading.
 //
 // The probe runs through the same auth wrapper as the body transfer: on an
 // huggingface.co source a gated repo 401s on an anonymous HEAD, and the probe
