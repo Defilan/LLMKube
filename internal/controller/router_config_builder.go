@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -150,11 +151,25 @@ func (r *ModelRouterReconciler) resolveBackend(
 			wire.Tier = backendTierLocal
 			status.Tier = backendTierLocal
 		}
-		addr, msg := r.resolveInferenceServiceAddress(ctx, mr.Namespace, b.InferenceServiceRef.Name)
-		wire.Address = addr
-		status.Address = addr
-		status.Healthy = addr != ""
-		status.Message = msg
+		if b.Resolution == inferencev1alpha1.RouterBackendResolutionEndpoint {
+			endpoints, svcAddr, msg := r.resolveInferenceServiceEndpoints(ctx, mr.Namespace, b.InferenceServiceRef.Name)
+			wire.Address = svcAddr
+			wire.Endpoints = endpoints
+			status.Address = svcAddr
+			if len(endpoints) == 0 {
+				status.Healthy = false
+				status.Message = appendMsg(msg, "no ready endpoints; dispatch falls back to the Service DNS name")
+			} else {
+				status.Healthy = true
+				status.Message = msg
+			}
+		} else {
+			addr, msg := r.resolveInferenceServiceAddress(ctx, mr.Namespace, b.InferenceServiceRef.Name)
+			wire.Address = addr
+			status.Address = addr
+			status.Healthy = addr != ""
+			status.Message = msg
+		}
 		if pool, perr := r.resolveBackendPool(ctx, mr.Namespace, b.InferenceServiceRef.Name); perr != nil {
 			// A pool lookup failure must not fail the whole compile; the
 			// backend just dispatches without activation (as if unpooled).
@@ -253,6 +268,40 @@ func (r *ModelRouterReconciler) resolveInferenceServiceAddress(
 	}
 	svcName := sanitizeDNSName(isvc.Name)
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, isvc.Namespace, port), ""
+}
+
+// resolveInferenceServiceEndpoints returns one "http://<podIP>:<port>" URL per
+// ready pod behind the InferenceService's Service, plus the Service DNS URL to
+// fall back to when the endpoint set is empty. Endpoint resolution is opt-in
+// (spec.backends[].resolution = "endpoint") because it only helps an
+// in-cluster backend whose pod churn the controller can watch; the external
+// path stays service-level, and a metal member is out-of-cluster and has no
+// EndpointSlices at all.
+func (r *ModelRouterReconciler) resolveInferenceServiceEndpoints(
+	ctx context.Context,
+	namespace, name string,
+) (endpoints []string, serviceAddr, msg string) {
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, isvc); err != nil {
+		if errors.IsNotFound(err) {
+			return nil, "", fmt.Sprintf("InferenceService %q not found in namespace %q", name, namespace)
+		}
+		return nil, "", fmt.Sprintf("InferenceService %q lookup failed: %v", name, err)
+	}
+	port := int32(8080)
+	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Port > 0 {
+		port = isvc.Spec.Endpoint.Port
+	}
+	svcName := sanitizeDNSName(isvc.Name)
+	serviceAddr = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, isvc.Namespace, port)
+
+	slices := &discoveryv1.EndpointSliceList{}
+	if err := r.List(ctx, slices,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"kubernetes.io/service-name": svcName}); err != nil {
+		return nil, serviceAddr, fmt.Sprintf("list EndpointSlices for %q: %v", svcName, err)
+	}
+	return collectReadyReplicaURLs(slices, port), serviceAddr, ""
 }
 
 // resolveBackendPool finds the ModelPool a member InferenceService belongs to
