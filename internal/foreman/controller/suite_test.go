@@ -22,8 +22,10 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -52,7 +54,13 @@ var (
 
 func TestForemanControllers(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Foreman Controller Suite")
+	// GinkgoConfiguration carries the config Ginkgo derived from its
+	// command-line flags; types.NewDefaultSuiteConfig would replace that
+	// wholesale and drop -ginkgo.focus / -ginkgo.label-filter /
+	// -ginkgo.skip / -ginkgo.seed (#1693).
+	suiteConfig, _ := GinkgoConfiguration()
+	suiteConfig.RandomSeed = ginkgoSeed(suiteConfig.RandomSeed)
+	RunSpecs(t, "Foreman Controller Suite", suiteConfig)
 }
 
 var _ = BeforeSuite(func() {
@@ -90,6 +98,29 @@ var _ = AfterSuite(func() {
 	err := testEnv.Stop()
 	Expect(err).NotTo(HaveOccurred())
 })
+
+// ginkgoSeed resolves the suite's random seed. Ginkgo randomizes top-level
+// containers per run, so a test that leaks shared cluster state passes or
+// fails on the draw (#1693). The seed is reported on every run so a failure
+// can be replayed from the log alone, and GINKGO_SEED pins it for the replay:
+// the Makefile picks one per run, exports it, and echoes it into the log
+// (`make test GINKGO_SEED=<n>` to replay). When GINKGO_SEED is unset the
+// suite keeps the seed it already has (a -ginkgo.seed flag, or Ginkgo's
+// per-run default) and reports that, so a direct `go test` still honours its
+// own flag. Mirrors the helper in internal/controller/suite_test.go, as the
+// suite files mirror each other.
+func ginkgoSeed(current int64) int64 {
+	if v := os.Getenv("GINKGO_SEED"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err == nil && n > 0 {
+			fmt.Printf("ginkgo seed: %d (pinned by GINKGO_SEED)\n", n)
+			return n
+		}
+		fmt.Printf("ginkgo seed: ignoring invalid GINKGO_SEED %q, using %d\n", v, current)
+	}
+	fmt.Printf("ginkgo seed: %d\n", current)
+	return current
+}
 
 // getFirstFoundEnvTestBinaryDir mirrors the helper in
 // internal/controller/suite_test.go: when running tests from an IDE

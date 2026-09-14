@@ -80,6 +80,12 @@ const MaxLogTailBytes = 32 * 1024
 // pull request and the test does not see it, and most of helm-chart.yml
 // drives helm and ct the same way. Widening the gate to such a check is
 // a manual decision; nothing here will prompt for it.
+//
+// The gate's `test` is single-pass by #1693's decided approach: CI runs
+// the envtest suites a second time under a second seed (test-envtest,
+// exempted in gateExemptCIChecks), while the gate pays for one ordering
+// only. A GATE-PASS therefore does not claim the second-seed ordering
+// was exercised.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds",
