@@ -14,6 +14,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/router"
@@ -1259,5 +1262,36 @@ func TestFindModelRoutersForModelPool(t *testing.T) {
 	}
 	if reqs[0].Name != mr.Name || reqs[0].Namespace != mr.Namespace {
 		t.Errorf("enqueued %s/%s, want %s/%s", reqs[0].Namespace, reqs[0].Name, mr.Namespace, mr.Name)
+	}
+}
+
+// TestClusterRoleGrantsActivationLease verifies the operator's generated
+// ClusterRole holds the lease verbs the runtime activation Role grants. RBAC
+// escalation prevention rejects a Role that grants a permission its creator
+// does not hold, so without this grant every pooled ModelRouter fails to
+// provision its activation RBAC and is reported Failed (#1477).
+func TestClusterRoleGrantsActivationLease(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
+	if err != nil {
+		t.Fatalf("read generated ClusterRole: %v", err)
+	}
+	var role rbacv1.ClusterRole
+	if err := yaml.Unmarshal(data, &role); err != nil {
+		t.Fatalf("parse generated ClusterRole: %v", err)
+	}
+	got := map[string]bool{}
+	for _, rule := range role.Rules {
+		if !strSliceHas(rule.APIGroups, "coordination.k8s.io") || !strSliceHas(rule.Resources, "leases") {
+			continue
+		}
+		for _, v := range rule.Verbs {
+			got[v] = true
+		}
+	}
+	for _, want := range []string{"get", "list", "watch", "create", "update", "patch"} {
+		if !got[want] {
+			t.Errorf("generated ClusterRole is missing %q on coordination.k8s.io/leases; "+
+				"a pooled ModelRouter's activation Role cannot be created without it", want)
+		}
 	}
 }
