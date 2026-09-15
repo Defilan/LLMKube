@@ -25,6 +25,7 @@ written down anywhere you can copy.
 | --- | --- | --- | --- |
 | [DeepSeek V4 Flash Vision on two DGX Sparks](/docs/labs/deepseek-v4-flash-two-sparks) | 2x GB10, 200 Gb RoCE | DeepSeek-V4-Flash-Vision-Exp | vLLM, TP2 + expert parallel, speculative decoding |
 | [GLM-5.3-Flash EXL3 on two DGX Sparks](/docs/labs/glm-5-3-flash-exl3-two-sparks) | 2x GB10, CX7 RoCE | GLM-5.3-Flash EXL3/TR3 4bpw | vLLM, TP2, DFlash2 speculative decoding, self-built runtime |
+| [Qwen3.8-Flash-Next with MTP on one Strix Halo](/docs/labs/qwen38-flash-next-mtp-on-strix-halo) | 1x Ryzen AI Max+ 395, gfx1151 | Qwen3.8-Flash-Next UD-Q3_K_XL | llama.cpp Vulkan, MTP speculative decoding, upstream pin plus one vendored PR |
 
 ## What a build page contains
 

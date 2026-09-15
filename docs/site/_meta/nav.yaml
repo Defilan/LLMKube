@@ -96,6 +96,9 @@ sections:
       - label: GLM-5.3-Flash EXL3 on two DGX Sparks
         slug: labs/glm-5-3-flash-exl3-two-sparks
         file: labs/glm-5-3-flash-exl3-two-sparks.md
+      - label: Qwen3.8-Flash-Next with MTP on one Strix Halo
+        slug: labs/qwen38-flash-next-mtp-on-strix-halo
+        file: labs/qwen38-flash-next-mtp-on-strix-halo.md
   - title: Operations
     items:
       - label: Memory-pressure protection
