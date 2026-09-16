@@ -97,7 +97,7 @@ const (
 // v0.3 #559 introduces the enum + emission; per-reason retry policy
 // on AgenticTaskSpec and retry-with-correction in the loop are
 // follow-up work that consumes this signal.
-// +kubebuilder:validation:Enum=AgentNotFound;InferenceServiceUnavailable;AuthUnavailable;GitRemoteNotConfigured;CloneFailed;ModelMisunderstood;ToolFailed;MaxTurnsExhausted;LoopSpinning;ConstraintViolated;Timeout;InfrastructureError;GateFailed;GateError;ModelReportedError
+// +kubebuilder:validation:Enum=AgentNotFound;InferenceServiceUnavailable;AuthUnavailable;GitRemoteNotConfigured;CloneFailed;RebaseConflictUnresolved;ModelMisunderstood;ToolFailed;MaxTurnsExhausted;LoopSpinning;ConstraintViolated;Timeout;InfrastructureError;GateFailed;GateError;ModelReportedError
 type AgenticTaskFailureReason string
 
 const (
@@ -129,6 +129,13 @@ const (
 	// network or auth; sometimes a missing branch. Retryable for
 	// transient cases.
 	FailureCloneFailed AgenticTaskFailureReason = "CloneFailed"
+
+	// FailureRebaseConflictUnresolved: the task started mid-rebase (the
+	// executor left a rebase conflict for the coder to resolve, #1839) and
+	// the coder reported GO while the workspace was still mid-rebase or
+	// carried unmerged files. The GO is downgraded rather than committed, so
+	// a half-applied or merged-work-reverting tree never lands. Retryable.
+	FailureRebaseConflictUnresolved AgenticTaskFailureReason = "RebaseConflictUnresolved"
 
 	// In-loop failures (the model loop ran but did not reach
 	// submit_result with a successful verdict):
