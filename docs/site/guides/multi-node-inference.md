@@ -222,7 +222,11 @@ unavailable). The full serving example, DeepSeek-V4.1-Flash EXL3 3.5bpw at
 TP3, is
 `config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml`, with
 its Model and the two checkpoint-side Jobs (the TP3 `config.json` edit, and a
-page-cache drop before the group boots) next to it. Text-only, single stream,
+page-cache drop before the group boots) next to it. The build write-up for it,
+with the hardware table, the Engram-on-disk step and the failures in order, is
+[DeepSeek-V4.1-Flash EXL3 on three DGX Sparks in a ring](../labs/deepseek-v41-flash-exl3-three-sparks-ring);
+this guide stays the API reference, that page is the recipe.
+Text-only, single stream,
 on that ring: prefill 1,094 to 1,334 tok/s from 3.4k to 49.8k prompt tokens,
 decode 26.5 tok/s without speculative decoding and 31 to 35 tok/s with DSpark
 k=5 (65 tok/s on code, 1.5x across a mixed set; block verification is
