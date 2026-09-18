@@ -11,12 +11,13 @@ counterpart to the vLLM ring: the same checkpoint geometry, a different memory
 strategy, and a different runtime.
 
 > **Status.** Stands up on hardware and serves. The pack loads, `/ready` reports
-> the model loaded, and completions return text. Measured single-stream warm,
-> with the checkpoint's own MTP drafter on: **0.44 to 0.59 s to first token and
-> 12.9 to 14.4 tok/s** on a chat request, and 12.9 tok/s over 64 raw completion
-> tokens. With the drafter off the same runs gave 3.7 tok/s and 1.2 tok/s, so
-> speculative decoding is worth roughly 4 to 10x here. Two image defects were
-> found and fixed on the way; see "What a first boot settled".
+> the model loaded, and completions return text. Warm decode with the checkpoint's
+> own MTP drafter: **13.2 tok/s median measured in process** over 256-token
+> generations, and 8 to 14 tok/s early in a process while the Triton kernels are
+> still compiling. Through llmkube-bench, chat pattern, concurrency 1: **12.2
+> tok/s aggregate** at 1.45 s median time to first token, whose 45 ms median
+> inter-token gap is ~22 tok/s once the first token is excluded. Two image
+> defects were found and fixed on the way; see "What a first boot settled".
 
 The manifest is
 [`config/samples/inferenceservice_dsv41_exl3_exllamav3_tp1.yaml`](https://github.com/defilantech/LLMKube/blob/main/config/samples/inferenceservice_dsv41_exl3_exllamav3_tp1.yaml).
@@ -82,21 +83,59 @@ onto a grid and inserts filler.
 
 ## The configuration that fits
 
-Weights are aliased out of page cache rather than pinned, and `EXL3_ATS_COPY` is
-a regex over tensor names where only the MATCHES are copied into CUDA memory, so
-the pattern has to name the drafter alone. Names that do not match stay aliased,
-which is what keeps the box inside 128 GB.
+`EXL3_ATS_COPY` is a regex over tensor names: the MATCHES are copied into CUDA
+memory and everything else is aliased out of page cache. The main model is copied
+and only the drafter is left aliased, because ~107 GiB of model plus the drafter
+cannot both be resident in 128 GB. A pattern that names the drafter instead of
+excluding it inverts that and pins the whole pack.
 
 ```yaml
 env:
   - {name: EXL3_ATS_MMAP, value: "1"}
-  - {name: EXL3_ATS_COPY, value: '^mtp\.'}   # pin the drafter only; all else is aliased
-  - {name: EXL3_DSPARK_CONF, value: "0.7"}   # DSpark confidence gate
-  - {name: CHUNK, value: "2048"}             # prefill chunk
+  - {name: EXL3_ATS_COPY, value: '^(?!mtp\.)'}  # copy the model, alias the drafter
+  - {name: EXL3_DSPARK_CONF, value: "0.7"}      # drafter confidence threshold
+  - {name: CHUNK, value: "2048"}                # prefill chunk
   - {name: CTX, value: "6144"}
 ```
 
-## Serving it through LLMKube
+Both placements were measured on the target Spark, and they cost about the same
+decode rate: copying the model loads in 36 s and leaves the box with ~4 GiB free,
+aliasing it loads in 8 s and leaves page cache holding the weights. The copy is
+the configuration the upstream recipe publishes, so it is the one the sample ships.
+
+The upstream recipe also measured that the 64-byte re-lay makes no difference to
+throughput (17.29 against 17.67 median tok/s) and is not needed. It is done here
+because it is harmless, not because the numbers require it.
+
+## Where our numbers sit against the upstream recipe
+
+Every figure below comes from the same instrument: an in-process decode loop, one
+sequence, greedy, `CTX=6144`, chunk 2048, drafter at `EXL3_DSPARK_CONF=0.7`. The
+upstream column is the recipe author's published measurement; local is ours on the
+target Spark.
+
+| Configuration | Upstream | Local |
+|---|---|---|
+| Copy the model, drafter on, 256-token generation | 17.53 median / 19.82 mean, acceptance 0.889 | 13.20 median, acceptance 0.796 |
+| Copy the model, drafter on, 64-token generation | not published | 12.14 to 12.81 median, acceptance 0.667 to 0.765 |
+| Copy the model, no drafter | 15.13 to 15.22 | not measured in process |
+| Alias the model, drafter on | not published | 12.52 median, acceptance 0.684 |
+| Copy the model, prewarm on | the recipe's launcher default | 7.66 median, acceptance 0.667 |
+| Copy the model, persistent kernel cache | the recipe's launcher default | 12.14 then 12.17 median; no effect |
+
+The honest gap is about 25% on decode, not the order of magnitude that comparing
+llmkube-bench's aggregate against a decode-rate headline suggests. Three of the
+four differences account for the apparent distance:
+
+1. An aggregate amortizes prompt processing over varied prompts; a decode rate does
+   not, and the two are not comparable.
+2. Short generations carry the Triton compilation transient. The 1 to 4 tok/s from
+   the first requests of a fresh process are that transient, not a steady state.
+3. Prewarm and a persistent kernel cache were both measured here and move nothing.
+
+The fourth is unexplained: **acceptance is 0.80 against the recipe's 0.889**, a
+real difference in drafting quality that accounts for part of the remaining gap
+and has not been run down.
 
 The operator has no native ExLlamaV3 runtime, and this POC does not add one. It
 uses the existing **`generic`** runtime, which is a bring-your-own-container
@@ -167,9 +206,10 @@ is silence.
 **Staging is done and the numbers are real.** The pack downloaded byte-identical
 to the repo's own manifest (318.3 GiB over 17 shards plus the 10.61 GiB overlay),
 the overlay parts were copied into the pack root, and the re-lay rewrote 15 shards
-and byte-verified every one. Then it served: warm, 0.44 to 0.59 s to first token
-and 12.9 to 14.4 tok/s with the checkpoint's own MTP drafter on, against 1 to 4
-tok/s with it off.
+and byte-verified every one. Then it served: 13.2 tok/s median decode in process
+with the checkpoint's own MTP drafter, and 12.2 tok/s aggregate through
+llmkube-bench at concurrency 1. The comparison table above says where those sit
+against the upstream recipe and what is still unexplained.
 
 **Two defects in our own runtime image blocked generation.** Both are build-stage
 gaps, not model or operator problems. The runtime stage shipped no C compiler and
