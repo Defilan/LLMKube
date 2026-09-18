@@ -1,0 +1,130 @@
+# DeepSeek-V4.1-Flash EXL3 (SAGE 1.59bpw) on ONE DGX Spark, native ExLlamaV3 +
+# TabbyAPI, TP1. This is the single-Spark sibling of the vLLM ring
+# (inferenceservice_multinode_vllm_three_sparks_ring.yaml), and two invariants
+# make it a different animal rather than a smaller one.
+#
+# 1. The pack stays WARM IN PAGE CACHE. Native ExLlamaV3 on GB10 aliases the
+#    1.59bpw safetensors straight out of an mmap (ATS addressing mode) instead of
+#    copying them into CUDA memory, and that alias is what lets ~107 GiB fit a
+#    128 GB box. Do NOT run config/samples/jobs/drop-page-cache.yaml here, however
+#    tempting the vLLM ring's advice looks: dropping the cache evicts exactly the
+#    pages this loader needs to alias.
+#
+# 2. `generic` mounts NO model volume. GenericBackend.NeedsModelInit() is false,
+#    so the operator injects no init container and no /models mount; the pack
+#    arrives only through spec.extraVolumes below. The Model CR is therefore
+#    declarative on this path: nothing downloads or stages it.
+#
+# PREREQUISITE, not yet published: ghcr.io/defilantech/llmkube-exllamav3-cuda-gb10-dsv41-exl3
+# does not exist in llmkube-runtimes today. Building it (the recipe's native
+# ExLlamaV3 fork pin, aarch64/sm_121, CUDA 13) is the work this sample assumes.
+# Pin the tag by digest before serving anything that matters.
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: dsv41-flash-sage-exl3
+  namespace: default
+spec:
+  # The re-laid pack plus the EXL3 attention / MTP overlay, staged on the target
+  # Spark's node-local claim. `generic` never fetches it, so the claim contents
+  # are the source of truth; pvc:// makes the Model controller validate the
+  # claim and mark it Ready without copying anything (model_controller.go,
+  # reconcilePVCSource).
+  source: pvc://dsv41-sage-exl3/dsv41-flash-sage-exl3-1.59bpw-a64
+  format: safetensors
+  quantization: exl3
+  refreshPolicy: IfNotPresent
+  hardware:
+    accelerator: cuda
+    gpu: {enabled: true, count: 1, vendor: nvidia}
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: dsv41-flash-sage-exl3-one-spark
+  namespace: default
+spec:
+  modelRef: dsv41-flash-sage-exl3
+  runtime: generic
+  image: ghcr.io/defilantech/llmkube-exllamav3-cuda-gb10-dsv41-exl3:REPLACE_WITH_PINNED_TAG
+  replicas: 1
+  containerPort: 5000
+  endpoint:
+    port: 5000
+    path: /v1/chat/completions
+    type: ClusterIP
+  # One Spark holds exactly one copy of this pack and the recipe refuses a second
+  # model process alongside it, so this service must not share the node. Replace
+  # with the target Spark's hostname label.
+  nodeSelector:
+    kubernetes.io/hostname: REPLACE_WITH_SPARK_NODE
+  # The GB10 nodes carry a NoSchedule taint on nvidia.com/gpu, so a GPU pod must
+  # tolerate it. Without this the pod never schedules and the symptom is silence.
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  resources:
+    gpu: 1
+    cpu: "8"
+    ephemeralStorage: 40Gi
+    # No memory request or limit: the operator sets limits.memory == requests.memory
+    # from spec.resources.memory, and a cgroup memory ceiling is charged against
+    # the aliased page cache the ATS loader depends on. First boot runs uncapped.
+  env:
+    # ATS zero-copy loader. EXL3_ATS_COPY names the tensors that are pinned into
+    # CUDA memory; every other tensor at or above EXL3_ATS_MMAP_MIN bytes is
+    # aliased out of page cache instead. Only the drafter is pinned here, so the
+    # quoting must survive YAML intact.
+    - {name: EXL3_ATS_MMAP, value: "1"}
+    - {name: EXL3_ATS_COPY, value: '^mtp\.'}
+    # The checkpoint carries its own MTP / DSPARK drafter as a second component
+    # ("mtp"), so speculative decoding runs off the pack itself with no second
+    # model directory. EXL3_DSPARK_CONF is the drafter's confidence gate. Measured
+    # about 13 tok/s warm with it on, against 1 to 4 tok/s with it off.
+    - {name: EXL3_MTP, value: "1"}
+    - {name: EXL3_DSPARK_CONF, value: "0.7"}
+    - {name: CHUNK, value: "2048"}
+    - {name: CTX, value: "6144"}
+    - {name: TORCH_CUDA_ARCH_LIST, value: "12.1a"}
+    - {name: HF_HUB_OFFLINE, value: "1"}
+    - {name: TRANSFORMERS_OFFLINE, value: "1"}
+    # The server defaults match, but naming the mount point here keeps the sample
+    # self-describing. EXL3_REQUIRE_MODEL makes a failed load fatal, so a pod with
+    # an empty or wrong pack crash-loops loudly instead of serving 503s.
+    - {name: EXL3_MODEL_DIR, value: /models}
+    - {name: EXL3_REQUIRE_MODEL, value: "1"}
+  probeOverrides:
+    # The image's own health surfaces, so Ready means "a model is loaded" rather
+    # than "a port is open". generic's default probes are TCP, which would mark
+    # this pod Ready the moment uvicorn binds, long before the ~107 GiB load.
+    startup:
+      httpGet: {path: /health, port: 5000}
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 180
+    readiness:
+      httpGet: {path: /ready, port: 5000}
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+  extraVolumes:
+    # The staged pack, mounted read-only. Its root must contain both the base
+    # shards and the copied exllamav3/ overlay parts (the loader globs the pack
+    # root, non-recursively).
+    - name: pack
+      persistentVolumeClaim:
+        claimName: dsv41-sage-exl3
+        readOnly: true
+    # ExLlamaV3 attention kernels want real shared memory, not the 64 MB default.
+    - name: shm
+      emptyDir: {medium: Memory, sizeLimit: 8Gi}
+  extraVolumeMounts:
+    # The re-lay step symlinks the shards it does not rewrite by absolute
+    # realpath into the source directory, so the mount path has to be the path the
+    # pack was staged at on the node. A different mount path leaves those links
+    # dangling and the loader sees a short pack. Replace both this and the
+    # Model's source subpath with the staging path on the target Spark.
+    - {name: pack, mountPath: /models, readOnly: true}
+    - {name: shm, mountPath: /dev/shm}
