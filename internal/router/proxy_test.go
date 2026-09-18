@@ -41,6 +41,16 @@ type fakeBackend struct {
 	body      atomic.Pointer[string]
 	stream    atomic.Bool
 	lastModel atomic.Pointer[string] // "model" field of the last received body
+	lastPath  atomic.Pointer[string] // request path of the last received request
+}
+
+// LastPath returns the request path of the most recent request this backend
+// received, or "" if it has not been called.
+func (fb *fakeBackend) LastPath() string {
+	if p := fb.lastPath.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // LastModel returns the OpenAI "model" field of the most recent request
@@ -61,6 +71,7 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 
 	fb.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fb.calls.Add(1)
+		fb.lastPath.Store(&r.URL.Path)
 		if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
 			var m struct {
 				Model string `json:"model"`
@@ -172,6 +183,21 @@ func (h *proxyHarness) post(t *testing.T, payload map[string]any, headers map[st
 	return rec.Result()
 }
 
+// postPath posts an OpenAI-compatible body to an arbitrary mounted path so
+// tests can cover endpoints beyond chat completions.
+func (h *proxyHarness) postPath(t *testing.T, path string, payload map[string]any) *http.Response {
+	t.Helper()
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
 // streamingPost uses a real httptest.Server so we exercise streaming via
 // a chunked response (httptest.ResponseRecorder doesn't implement
 // Flusher).
@@ -199,6 +225,41 @@ func TestProxyHealth(t *testing.T) {
 	h.handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("/health = %d, want 200", rec.Code)
+	}
+}
+
+// TestProxyMountsEmbeddings verifies the proxy fronts POST /v1/embeddings and
+// forwards it to the chosen backend at that path, not the chat path (#1812).
+func TestProxyMountsEmbeddings(t *testing.T) {
+	h := newProxyHarness(t)
+	resp := h.postPath(t, "/v1/embeddings", map[string]any{
+		"model": "qwen3-coder",
+		"input": "hello",
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/v1/embeddings = %d, want 200", resp.StatusCode)
+	}
+	if got := h.localBack.LastPath(); got != "/v1/embeddings" {
+		t.Errorf("upstream path = %q, want /v1/embeddings", got)
+	}
+}
+
+// TestProxyMountsRerank verifies the proxy fronts POST /v1/rerank and forwards
+// it to the chosen backend at that path, not the chat path (#1812).
+func TestProxyMountsRerank(t *testing.T) {
+	h := newProxyHarness(t)
+	resp := h.postPath(t, "/v1/rerank", map[string]any{
+		"model":     "qwen3-coder",
+		"query":     "hello",
+		"documents": []string{"a"},
+	})
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/v1/rerank = %d, want 200", resp.StatusCode)
+	}
+	if got := h.localBack.LastPath(); got != "/v1/rerank" {
+		t.Errorf("upstream path = %q, want /v1/rerank", got)
 	}
 }
 
@@ -549,6 +610,171 @@ func TestProxyPoolSwapBudgetDecoupledFromDispatchTimeout(t *testing.T) {
 	}
 	if fb.calls.Load() != 1 {
 		t.Errorf("backend calls = %d, want 1 (request dispatched after the swap completed)", fb.calls.Load())
+	}
+}
+
+// TestProxyPoolIfIdleFallsBackToResident is the end-to-end IfIdle contract: a
+// rule routes [coder, judge] with poolActivation IfIdle while judge is resident
+// and busy. The request must be served by judge immediately, with coder never
+// activated and nothing held. Under the default Wait mode the same request would
+// sit in the hold until judge drained.
+func TestProxyPoolIfIdleFallsBackToResident(t *testing.T) {
+	coderBackend := newFakeBackend(t)
+	judgeBackend := newFakeBackend(t)
+
+	fake := newFakeMemberController()
+	fake.setPhase("judge", modelReadyPhase)
+	pool := func(member string) *BackendPool {
+		return &BackendPool{
+			Name:       "heavy-slot",
+			Namespace:  "lab",
+			Member:     member,
+			Members:    []string{"coder", "judge"},
+			SwapBudget: 5 * time.Second,
+		}
+	}
+	cfg := &Config{
+		Backends: []Backend{
+			{Name: "coder", Tier: "local", Address: coderBackend.URL(),
+				InferenceService: "coder", Pool: pool("coder")},
+			{Name: "judge", Tier: "local", Address: judgeBackend.URL(),
+				InferenceService: "judge", Pool: pool("judge")},
+		},
+		Rules: []Rule{{
+			Name:  "prefer-coder",
+			Match: RuleMatch{Models: []string{"work"}},
+			Route: RuleRoute{Backends: []string{"coder", "judge"}, PoolActivation: PoolActivationIfIdle},
+		}},
+		DefaultRoute: "judge",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	act := NewActivator(context.Background(), fake, "r", slog.Default())
+	// judge is resident with one request in flight for the whole test.
+	judgeRel, err := act.Acquire(context.Background(), pool("judge"))
+	if err != nil {
+		t.Fatalf("seed busy judge: %v", err)
+	}
+	defer judgeRel()
+
+	proxy := NewProxy(cfg, slog.Default(), WithActivator(act))
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "work",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (busy incumbent must serve the request)", rec.Code)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("request took %v; IfIdle must not hold behind the busy incumbent", elapsed)
+	}
+	if judgeBackend.calls.Load() != 1 {
+		t.Errorf("judge calls = %d, want 1", judgeBackend.calls.Load())
+	}
+	if coderBackend.calls.Load() != 0 {
+		t.Errorf("coder calls = %d, want 0", coderBackend.calls.Load())
+	}
+	if got := fake.activateCount("coder"); got != 0 {
+		t.Errorf("coder activate count = %d, want 0 (no swap while judge is busy)", got)
+	}
+	// The fall-through backend must receive its own served model name. Left as
+	// the client alias, a name-validating runtime (vLLM / SGLang / TGI) answers
+	// 404 "The model work does not exist" and the proxy reports it as a
+	// successful dispatch.
+	if got := judgeBackend.LastModel(); got != "judge" {
+		t.Errorf("judge received model %q, want judge (its served name, not the client alias)", got)
+	}
+}
+
+// TestProxyPoolIfIdleAllBusyReturns503 verifies that when every backend in an
+// IfIdle rule skips because the pool incumbent is busy (no preferred member is
+// warm), the proxy returns 503 + Retry-After (the same retryable class as a
+// hold-budget timeout), not a 502 that reads as an upstream outage. A third
+// member, gemma, holds the slot busy; the rule only routes to coder and judge,
+// so both skip.
+func TestProxyPoolIfIdleAllBusyReturns503(t *testing.T) {
+	coderBackend := newFakeBackend(t)
+	judgeBackend := newFakeBackend(t)
+
+	fake := newFakeMemberController()
+	fake.setPhase("gemma", modelReadyPhase)
+	pool := func(member string) *BackendPool {
+		return &BackendPool{
+			Name:       "heavy-slot",
+			Namespace:  "lab",
+			Member:     member,
+			Members:    []string{"coder", "judge", "gemma"},
+			SwapBudget: 5 * time.Second,
+		}
+	}
+	cfg := &Config{
+		Backends: []Backend{
+			{Name: "coder", Tier: "local", Address: coderBackend.URL(), Pool: pool("coder")},
+			{Name: "judge", Tier: "local", Address: judgeBackend.URL(), Pool: pool("judge")},
+		},
+		Rules: []Rule{{
+			Name:  "prefer-coder",
+			Match: RuleMatch{Models: []string{"work"}},
+			Route: RuleRoute{Backends: []string{"coder", "judge"}, PoolActivation: PoolActivationIfIdle},
+		}},
+		DefaultRoute: "coder",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	act := NewActivator(context.Background(), fake, "r", slog.Default())
+	// gemma owns the slot with a request in flight for the whole test, so
+	// neither coder nor judge (the rule's backends) can swap in under IfIdle.
+	gemmaRel, err := act.Acquire(context.Background(), pool("gemma"))
+	if err != nil {
+		t.Fatalf("seed busy gemma: %v", err)
+	}
+	defer gemmaRel()
+
+	proxy := NewProxy(cfg, slog.Default(), WithActivator(act))
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+
+	body, _ := json.Marshal(map[string]any{
+		"model":    "work",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	mux.ServeHTTP(rec, req)
+
+	resp := rec.Result()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (all IfIdle backends busy is retryable, not 502)", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Error("missing Retry-After header on all-incumbent-busy 503")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("request took %v; IfIdle must skip immediately, not hold", elapsed)
+	}
+	if coderBackend.calls.Load() != 0 || judgeBackend.calls.Load() != 0 {
+		t.Errorf("backend calls coder=%d judge=%d, want 0/0 (nothing warm to serve)",
+			coderBackend.calls.Load(), judgeBackend.calls.Load())
+	}
+	if got := fake.activateCount("coder") + fake.activateCount("judge"); got != 0 {
+		t.Errorf("activate count = %d, want 0 (no swap while gemma is busy)", got)
 	}
 }
 

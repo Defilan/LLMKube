@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= ghcr.io/defilantech/llmkube-controller:0.9.25 # x-release-please-version
+IMG ?= ghcr.io/defilantech/llmkube-controller:0.9.29 # x-release-please-version
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -106,9 +106,23 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# A fresh seed per run keeps spec-order randomization (it catches test
+# pollution); echoing it into the log makes any failure replayable
+# (#1693): `make test GINKGO_SEED=<n>` reruns the exact order.
+GINKGO_SEED ?= $(shell date +%s)
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test GINKGO_SEED=$(GINKGO_SEED))"
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+
+# The envtest suites only, so CI can run a second fixed seed over just the
+# specs whose ordering matters (#1693). Not part of the Foreman gate: the
+# gate stays single-pass, and `make test` above is what it runs.
+.PHONY: test-envtest
+test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites only (CI second seed pass, #1693).
+	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test-envtest GINKGO_SEED=$(GINKGO_SEED))"
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test ./internal/controller/ ./internal/foreman/controller/ -count=1
 
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).

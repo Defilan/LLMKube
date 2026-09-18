@@ -374,6 +374,93 @@ func TestGenericIdleProbe(t *testing.T) {
 	}
 }
 
+func TestGenericMetricIdleProbe(t *testing.T) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	metricAnno := func(extra map[string]string) *inferencev1alpha1.InferenceService {
+		anno := map[string]string{inferencev1alpha1.AnnotationIdleMetric: "vllm:num_requests_running"}
+		for k, v := range extra {
+			anno[k] = v
+		}
+		return &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Annotations: anno}}
+	}
+	cases := []struct {
+		name     string
+		isvc     *inferencev1alpha1.InferenceService
+		body     string
+		status   int
+		wantErr  bool
+		wantIdle bool
+	}{
+		{"idle when gauge sum is 0", metricAnno(nil), "vllm:num_requests_running{m=\"a\"} 0\n", 200, false, true},
+		{"busy when gauge sum > 0", metricAnno(nil), "vllm:num_requests_running 2\n", 200, false, false},
+		{"idle at threshold", metricAnno(map[string]string{inferencev1alpha1.AnnotationIdleMetricThreshold: "1"}), "vllm:num_requests_running 1\n", 200, false, true},
+		{"busy above threshold", metricAnno(map[string]string{inferencev1alpha1.AnnotationIdleMetricThreshold: "1"}), "vllm:num_requests_running 2\n", 200, false, false},
+		{"busy when gauge absent (fail closed)", metricAnno(nil), "other_metric 0\n", 200, false, false},
+		{"error on non-200", metricAnno(nil), "", 503, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			probe := (&GenericBackend{}).IdleProbe(tc.isvc, client)
+			idle, err := probe(context.Background(), server.URL)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+			} else if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if idle != tc.wantIdle {
+				t.Errorf("idle = %v, want %v", idle, tc.wantIdle)
+			}
+			if gotPath != "/metrics" {
+				t.Errorf("scraped path = %q, want /metrics", gotPath)
+			}
+		})
+	}
+
+	t.Run("custom metrics path", func(t *testing.T) {
+		var gotPath string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("vllm:num_requests_running 0\n"))
+		}))
+		defer server.Close()
+		isvc := metricAnno(map[string]string{inferencev1alpha1.AnnotationIdleMetricPath: "/proxy/metrics"})
+		idle, err := (&GenericBackend{}).IdleProbe(isvc, client)(context.Background(), server.URL)
+		if err != nil || !idle {
+			t.Errorf("idle=%v err=%v, want idle with no error", idle, err)
+		}
+		if gotPath != "/proxy/metrics" {
+			t.Errorf("scraped path = %q, want /proxy/metrics", gotPath)
+		}
+	})
+
+	t.Run("metric annotation takes precedence over idle-endpoint", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/metrics" {
+				t.Errorf("expected /metrics scrape, got %q", r.URL.Path)
+			}
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte("vllm:num_requests_running 0\n"))
+		}))
+		defer server.Close()
+		isvc := metricAnno(map[string]string{inferencev1alpha1.AnnotationIdleEndpoint: "/health"})
+		idle, err := (&GenericBackend{}).IdleProbe(isvc, client)(context.Background(), server.URL)
+		if err != nil || !idle {
+			t.Errorf("idle=%v err=%v, want metric mode to win", idle, err)
+		}
+	})
+}
+
 func TestIdleDetectorConformance(t *testing.T) {
 	backends := []struct {
 		name    string

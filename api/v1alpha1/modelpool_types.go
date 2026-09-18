@@ -23,15 +23,24 @@ import (
 
 // ModelPoolSwapPolicy selects how a ModelPool decides which member owns the
 // shared GPU slot when demand crosses model boundaries.
-// +kubebuilder:validation:Enum=sticky
+// +kubebuilder:validation:Enum=sticky;reclaim
 type ModelPoolSwapPolicy string
 
 const (
 	// ModelPoolSwapPolicySticky keeps whichever member is resident resident
 	// until a different member is requested. There is no automatic restore of
-	// a default member. This is the default and, in v1, the only policy. A
-	// priority-based reclaim policy is tracked as a follow-up (PR2).
+	// a default member. This is the default policy.
 	ModelPoolSwapPolicySticky ModelPoolSwapPolicy = "sticky"
+
+	// ModelPoolSwapPolicyReclaim behaves like sticky for cross-model demand but
+	// additionally returns the slot to spec.default once the resident
+	// non-default member has been continuously idle for spec.reclaimAfter. It
+	// lets a background default model share one GPU with an on-demand member:
+	// the on-demand member's requests swap it in, an interactive workload rides
+	// whichever member is warm (with router poolActivation IfIdle), and the slot
+	// returns to the default on its own once the burst subsides, without any
+	// workload forcing a disruptive swap.
+	ModelPoolSwapPolicyReclaim ModelPoolSwapPolicy = "reclaim"
 )
 
 // ModelPool status phases.
@@ -111,8 +120,9 @@ type ModelPoolSpec struct {
 
 	// SwapPolicy selects how the slot owner is chosen when demand crosses model
 	// boundaries. "sticky" (default) keeps the incumbent until a different
-	// member is requested. It is the only policy in v1; a priority-based reclaim
-	// policy is a planned follow-up.
+	// member is requested. "reclaim" additionally returns the slot to
+	// spec.default after the resident non-default member has been idle for
+	// spec.reclaimAfter.
 	// +kubebuilder:default=sticky
 	// +optional
 	SwapPolicy ModelPoolSwapPolicy `json:"swapPolicy,omitempty"`
@@ -142,6 +152,17 @@ type ModelPoolSpec struct {
 	// +kubebuilder:default="300s"
 	// +optional
 	SwapBudget *metav1.Duration `json:"swapBudget,omitempty"`
+
+	// ReclaimAfter is how long the resident non-default member must be
+	// continuously idle before the slot is reclaimed for spec.default. Only
+	// consulted when SwapPolicy is "reclaim" and Default is set. It MUST be set
+	// comfortably longer than the on-demand member's typical inter-request gap:
+	// a value shorter than that gap trades cross-model request coalescing for
+	// load-side thrash, reclaiming the default only to swap it straight back
+	// out on the next on-demand request. Defaults to 300s.
+	// +kubebuilder:default="300s"
+	// +optional
+	ReclaimAfter *metav1.Duration `json:"reclaimAfter,omitempty"`
 }
 
 // ModelPoolMemberStatus reports the observed state of one pool member.
@@ -174,6 +195,13 @@ type ModelPoolStatus struct {
 	// pool is not mid-swap.
 	// +optional
 	PendingMember string `json:"pendingMember,omitempty"`
+
+	// ResidentIdleSince is when the resident non-default member was first
+	// observed idle under the "reclaim" swap policy. It is cleared when the
+	// member serves a request again or when spec.default becomes resident, and
+	// is used to time the reclaim of the slot back to spec.default.
+	// +optional
+	ResidentIdleSince *metav1.Time `json:"residentIdleSince,omitempty"`
 
 	// Members reports the observed state of each pool member.
 	// +listType=map

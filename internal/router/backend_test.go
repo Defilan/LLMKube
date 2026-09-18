@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -459,6 +460,82 @@ func TestApplyModelOverride(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("already-matching model is byte-identical", func(t *testing.T) {
+		in := `{"model":"large","messages":[],"temperature":0.5}`
+		if out := applyModelOverride([]byte(in), "large"); string(out) != in {
+			t.Errorf("body re-marshalled to %q; want the original bytes", out)
+		}
+	})
+}
+
+// TestBackendOutboundModel pins which identifier each backend shape sends
+// upstream: an external backend's declared Model, a local backend's
+// InferenceService name (the name its runtime serves), and pass-through when
+// neither is known.
+func TestBackendOutboundModel(t *testing.T) {
+	cases := []struct {
+		name    string
+		backend Backend
+		want    string
+	}{
+		{"external declares model", Backend{Tier: "cloud", Model: "provider-large"}, "provider-large"},
+		{"local serves its InferenceService name", Backend{Tier: "local", InferenceService: "large"}, "large"},
+		{"model wins over InferenceService", Backend{Model: "provider-large", InferenceService: "large"}, "provider-large"},
+		{"neither set passes through", Backend{Tier: "local"}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.backend.outboundModel(); got != tc.want {
+				t.Errorf("outboundModel() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDispatchRewritesModelForLocalBackend is the regression test for the
+// IfIdle fall-through 404: a request that reaches a local backend under a
+// different client alias must arrive carrying the InferenceService's own
+// served name, because a name-validating runtime (vLLM / SGLang / TGI) 404s
+// on the alias. A request that already names the served model is untouched.
+func TestDispatchRewritesModelForLocalBackend(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		gotModel = m.Model
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "large", Tier: "local", Address: srv.URL, InferenceService: "large",
+	}}}
+	disp := NewDispatcher(cfg)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"client alias is rewritten", `{"model":"small","messages":[]}`},
+		{"served name is left alone", `{"model":"large","messages":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotModel = ""
+			resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
+				http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(tc.body))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			_ = resp.Body.Close()
+			if gotModel != "large" {
+				t.Errorf("upstream received model %q, want large (the InferenceService served name)", gotModel)
+			}
+		})
+	}
 }
 
 // TestDispatchRewritesModelForExternalBackend proves the override reaches
@@ -551,5 +628,96 @@ func TestDispatchUpstream5xxStillQuarantines(t *testing.T) {
 
 	if disp.IsHealthy("broken") {
 		t.Error("backend should be marked unhealthy after a 5xx response")
+	}
+}
+
+// TestDispatcherBalancesAcrossEndpoints verifies that a backend that compiles
+// per-pod endpoints spreads consecutive dispatches across them instead of
+// pinning to the first. A keep-alive client would otherwise reach only one pod
+// through conntrack (#1812).
+func TestDispatcherBalancesAcrossEndpoints(t *testing.T) {
+	var aHits, bHits atomic.Int64
+	newEndpoint := func(hits *atomic.Int64) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	a := newEndpoint(&aHits)
+	defer a.Close()
+	b := newEndpoint(&bHits)
+	defer b.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "sharded", Tier: "local",
+		Address:   "http://sharded.ns.svc.cluster.local:8080",
+		Endpoints: []string{a.URL, b.URL},
+	}}}
+	disp := NewDispatcher(cfg)
+
+	for i := 0; i < 4; i++ {
+		resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
+			http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("dispatch %d: %v", i, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+
+	if aHits.Load() == 0 || bHits.Load() == 0 {
+		t.Errorf("endpoint hits = a:%d b:%d, want both > 0 (requests must rotate across pods)",
+			aHits.Load(), bHits.Load())
+	}
+}
+
+// TestDispatcherQuarantinesOneEndpoint verifies that a 5xx from one pod
+// quarantines only that endpoint: the next dispatch goes to a healthy sibling
+// and the backend stays healthy, rather than the whole backend being skipped.
+func TestDispatcherQuarantinesOneEndpoint(t *testing.T) {
+	var badHits, goodHits atomic.Int64
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badHits.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer good.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name: "sharded", Tier: "local",
+		Address:   "http://sharded.ns.svc.cluster.local:8080",
+		Endpoints: []string{bad.URL, good.URL},
+	}}}
+	disp := NewDispatcher(cfg, WithQuarantineDuration(time.Minute))
+
+	// First dispatch rotates to the bad endpoint and quarantines it.
+	resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
+		http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(`{"model":"m"}`))
+	if err != nil {
+		t.Fatalf("first dispatch: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if !disp.IsHealthy("sharded") {
+		t.Fatal("one bad endpoint must not mark the whole backend unhealthy")
+	}
+
+	// Two more dispatches: rotation would return to the bad endpoint on the
+	// third, so honouring the endpoint quarantine is observable as bad=1, good=2.
+	for i := 0; i < 2; i++ {
+		resp, err = disp.Dispatch(context.Background(), &cfg.Backends[0],
+			http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(`{"model":"m"}`))
+		if err != nil {
+			t.Fatalf("dispatch %d: %v", i, err)
+		}
+		_ = resp.Body.Close()
+	}
+	if badHits.Load() != 1 || goodHits.Load() != 2 {
+		t.Errorf("after 3 dispatches hits = bad:%d good:%d, want bad:1 good:2 (the 5xx pod must be quarantined, not retried)",
+			badHits.Load(), goodHits.Load())
 	}
 }

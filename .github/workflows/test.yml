@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Run on Ubuntu
@@ -30,10 +33,16 @@ jobs:
       - name: Validate samples against CRD schemas
         run: make validate-samples
 
-      - name: Running Tests
+      - name: Running Tests (seed 11)
         run: |
           go mod tidy
-          make test
+          make test GINKGO_SEED=11
+
+      # Spec-order pollution only shows under some seeds, so CI runs the
+      # envtest suites a second time under a second fixed seed (#1693).
+      # `make test` and the Foreman gate stay single-pass.
+      - name: Envtest suites (seed 22)
+        run: make test-envtest GINKGO_SEED=22
 
       - name: Upload coverage to Codecov
         # make test writes cover.out via `go test -coverprofile`.

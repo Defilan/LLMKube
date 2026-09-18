@@ -93,7 +93,9 @@ func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 // Mount wires up the OpenAI-compatible endpoints plus /health on the
 // given mux. Callers attach the mux to an http.Server.
 func (p *Proxy) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/chat/completions", p.handleChatCompletions)
+	mux.HandleFunc("POST /v1/chat/completions", p.handleCompletion("/v1/chat/completions"))
+	mux.HandleFunc("POST /v1/embeddings", p.handleCompletion("/v1/embeddings"))
+	mux.HandleFunc("POST /v1/rerank", p.handleCompletion("/v1/rerank"))
 	mux.HandleFunc("GET /v1/models", p.handleModels)
 	mux.HandleFunc("GET /health", p.handleHealth)
 	mux.HandleFunc("GET /healthz", p.handleHealth)
@@ -138,118 +140,140 @@ func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// handleChatCompletions is the primary routing endpoint. It buffers the
-// inbound request body (needs the "model" field for matching), evaluates
-// the rule set, dispatches to the chosen backend, and streams the
-// response back. SSE / chunked passthrough is automatic.
-func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "request body: "+err.Error())
-		return
-	}
-
-	features, isStream := extractFeatures(body, r, p.cfg.ClassificationHeader())
-
-	decision := p.matcher.Match(&features)
-	if len(decision.Backends) == 0 {
-		writeError(w, http.StatusServiceUnavailable, "no rule matched and no defaultRoute configured")
-		p.audit(features, decision, nil, http.StatusServiceUnavailable, "no_route", 0)
-		return
-	}
-
-	if err := p.enforceFailClosed(&features, &decision); err != nil {
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		p.audit(features, decision, nil, http.StatusServiceUnavailable, "fail_closed", 0)
-		p.observeFailClosed(&features, &decision)
-		return
-	}
-
-	tracer := otel.Tracer("model_router.dispatch")
-	attrs := []otelattribute.KeyValue{
-		otelattribute.String("routing.classification", features.Classification),
-	}
-	if decision.Rule != nil {
-		attrs = append(attrs, otelattribute.String("routing.rule.matched", decision.Rule.Name))
-		attrs = append(attrs, otelattribute.String("routing.strategy", decision.Rule.Route.Strategy))
-	}
-	ctx, span := tracer.Start(r.Context(), "model_router.dispatch", oteltrace.WithAttributes(attrs...))
-	defer span.End()
-
-	start := time.Now()
-	chosen, resp, err := p.dispatchWithFallback(ctx, &decision, r.Header, body, "/v1/chat/completions")
-	elapsed := time.Since(start)
-	if err != nil {
-		// ModelPool cold-start hold exceeded its budget: the client's request
-		// outlived the swap window. 503 + Retry-After is the standards-correct
-		// "temporarily unavailable" signal so well-behaved clients back off
-		// deterministically; 429 would wrongly imply rate limiting.
-		if errors.Is(err, ErrHoldBudgetExceeded) {
-			w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
-			writeError(w, http.StatusServiceUnavailable,
-				"model pool activation did not complete within the request budget; retry")
-			p.audit(features, decision, nil, http.StatusServiceUnavailable,
-				"pool_activation_timeout", elapsed)
+// handleCompletion is the shared handler for the OpenAI-compatible inference
+// endpoints the proxy fronts (/v1/chat/completions, /v1/embeddings,
+// /v1/rerank). It buffers the inbound request body (needs the "model" field for
+// matching), evaluates the rule set, dispatches to the chosen backend, and
+// streams the response back. SSE / chunked passthrough is automatic.
+//
+// upstreamPath is forwarded verbatim to the chosen backend, so each mounted
+// endpoint must pass its own path: the surface the proxy fronts is not just
+// chat completions, and a hardcoded path silently turns an embeddings request
+// into a chat request at the upstream.
+func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "request body: "+err.Error())
 			return
 		}
-		// Runtime fail-closed: when every backend in a fail-closed
-		// rule's pool is unreachable, return 503 with a clear reason
-		// rather than 502. This is the runtime counterpart to the
-		// controller's static fail-closed validation: we refuse the
-		// request instead of letting it spill onto an unmatched
-		// backend (which dispatchWithFallback never does anyway, but
-		// the status code communicates intent — sensitive data did
-		// not egress because policy said so, not because of a generic
-		// upstream outage).
-		if decision.FailClosed {
-			writeError(w, http.StatusServiceUnavailable,
-				"fail-closed: all rule backends unhealthy: "+err.Error())
-			p.audit(features, decision, nil, http.StatusServiceUnavailable,
-				"fail_closed_runtime", elapsed)
+
+		features, isStream := extractFeatures(body, r, p.cfg.ClassificationHeader())
+
+		decision := p.matcher.Match(&features)
+		if len(decision.Backends) == 0 {
+			writeError(w, http.StatusServiceUnavailable, "no rule matched and no defaultRoute configured")
+			p.audit(features, decision, nil, http.StatusServiceUnavailable, "no_route", 0)
+			return
+		}
+
+		if err := p.enforceFailClosed(&features, &decision); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			p.audit(features, decision, nil, http.StatusServiceUnavailable, "fail_closed", 0)
 			p.observeFailClosed(&features, &decision)
 			return
 		}
-		writeError(w, http.StatusBadGateway, "all backends failed: "+err.Error())
-		p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	span.SetAttributes(
-		otelattribute.String("routing.backend.selected", chosen.Name),
-		otelattribute.String("routing.backend.tier", chosen.Tier),
-	)
+		tracer := otel.Tracer("model_router.dispatch")
+		attrs := []otelattribute.KeyValue{
+			otelattribute.String("routing.classification", features.Classification),
+		}
+		if decision.Rule != nil {
+			attrs = append(attrs, otelattribute.String("routing.rule.matched", decision.Rule.Name))
+			attrs = append(attrs, otelattribute.String("routing.strategy", decision.Rule.Route.Strategy))
+		}
+		ctx, span := tracer.Start(r.Context(), "model_router.dispatch", oteltrace.WithAttributes(attrs...))
+		defer span.End()
 
-	streamed := streamResponse(w, resp, isStream)
-	outcome := streamedReason(streamed)
-	p.audit(features, decision, chosen, resp.StatusCode, outcome, elapsed)
-	p.observeRequest(&features, &decision, chosen, outcome, elapsed)
-
-	// Record TTFT for streaming responses. We approximate first-byte
-	// time as the time the response body began flowing: the proxy
-	// writes the status line immediately on streamResponse entry, so
-	// the elapsed window from dispatch start to the first flush is a
-	// close proxy of TTFT. Non-streaming responses skip this gauge —
-	// their TTFT equals their total duration and is already captured
-	// by RouterRequestDuration.
-	if isStream && chosen != nil {
-		prommetrics.RouterFirstTokenSeconds.WithLabelValues(p.routerName, chosen.Name).Observe(elapsed.Seconds())
-	}
-
-	// Record budget utilization against the resolved per-request
-	// deadline. scope=rule when a rule's timeout drove the cap, else
-	// scope=proxy. Values above 1.0 mean the request consumed more
-	// time than the cap allowed (shouldn't happen for successful
-	// dispatches, but the gauge is float so it's safe).
-	if chosen != nil {
-		resolved := resolveDispatchTimeout(&decision, chosen, p.disp.ResponseHeaderTimeout())
-		if resolved > 0 {
-			util := elapsed.Seconds() / resolved.Seconds()
-			scope := "proxy"
-			if decision.Rule != nil && decision.Rule.Timeout > 0 {
-				scope = "rule"
+		start := time.Now()
+		chosen, resp, err := p.dispatchWithFallback(ctx, &decision, r.Header, body, upstreamPath)
+		elapsed := time.Since(start)
+		if err != nil {
+			// ModelPool cold-start hold exceeded its budget: the client's request
+			// outlived the swap window. 503 + Retry-After is the standards-correct
+			// "temporarily unavailable" signal so well-behaved clients back off
+			// deterministically; 429 would wrongly imply rate limiting.
+			if errors.Is(err, ErrHoldBudgetExceeded) {
+				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
+				writeError(w, http.StatusServiceUnavailable,
+					"model pool activation did not complete within the request budget; retry")
+				p.audit(features, decision, nil, http.StatusServiceUnavailable,
+					"pool_activation_timeout", elapsed)
+				return
 			}
-			prommetrics.RouterBudgetUtilization.WithLabelValues(p.routerName, scope).Set(util)
+			// Every backend in an IfIdle rule skipped because its ModelPool incumbent
+			// was busy: no preferred member is warm right now. This is the same
+			// transient, retryable class as the hold-budget timeout above (the
+			// incumbent will drain and a retry will serve), so give it the same 503 +
+			// Retry-After treatment and its own audit reason rather than a generic
+			// 502 that reads as an upstream outage.
+			if errors.Is(err, ErrIncumbentBusy) {
+				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
+				writeError(w, http.StatusServiceUnavailable,
+					"model pool incumbent busy; no preferred member is warm, retry")
+				p.audit(features, decision, nil, http.StatusServiceUnavailable,
+					"pool_incumbent_busy", elapsed)
+				return
+			}
+			// Runtime fail-closed: when every backend in a fail-closed
+			// rule's pool is unreachable, return 503 with a clear reason
+			// rather than 502. This is the runtime counterpart to the
+			// controller's static fail-closed validation: we refuse the
+			// request instead of letting it spill onto an unmatched
+			// backend (which dispatchWithFallback never does anyway, but
+			// the status code communicates intent — sensitive data did
+			// not egress because policy said so, not because of a generic
+			// upstream outage).
+			if decision.FailClosed {
+				writeError(w, http.StatusServiceUnavailable,
+					"fail-closed: all rule backends unhealthy: "+err.Error())
+				p.audit(features, decision, nil, http.StatusServiceUnavailable,
+					"fail_closed_runtime", elapsed)
+				p.observeFailClosed(&features, &decision)
+				return
+			}
+			writeError(w, http.StatusBadGateway, "all backends failed: "+err.Error())
+			p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		span.SetAttributes(
+			otelattribute.String("routing.backend.selected", chosen.Name),
+			otelattribute.String("routing.backend.tier", chosen.Tier),
+		)
+
+		streamed := streamResponse(w, resp, isStream)
+		outcome := streamedReason(streamed)
+		p.audit(features, decision, chosen, resp.StatusCode, outcome, elapsed)
+		p.observeRequest(&features, &decision, chosen, outcome, elapsed)
+
+		// Record TTFT for streaming responses. We approximate first-byte
+		// time as the time the response body began flowing: the proxy
+		// writes the status line immediately on streamResponse entry, so
+		// the elapsed window from dispatch start to the first flush is a
+		// close proxy of TTFT. Non-streaming responses skip this gauge —
+		// their TTFT equals their total duration and is already captured
+		// by RouterRequestDuration.
+		if isStream && chosen != nil {
+			prommetrics.RouterFirstTokenSeconds.WithLabelValues(p.routerName, chosen.Name).Observe(elapsed.Seconds())
+		}
+
+		// Record budget utilization against the resolved per-request
+		// deadline. scope=rule when a rule's timeout drove the cap, else
+		// scope=proxy. Values above 1.0 mean the request consumed more
+		// time than the cap allowed (shouldn't happen for successful
+		// dispatches, but the gauge is float so it's safe).
+		if chosen != nil {
+			resolved := resolveDispatchTimeout(&decision, chosen, p.disp.ResponseHeaderTimeout())
+			if resolved > 0 {
+				util := elapsed.Seconds() / resolved.Seconds()
+				scope := "proxy"
+				if decision.Rule != nil && decision.Rule.Timeout > 0 {
+					scope = "rule"
+				}
+				prommetrics.RouterBudgetUtilization.WithLabelValues(p.routerName, scope).Set(util)
+			}
 		}
 	}
 }
@@ -321,7 +345,7 @@ func (p *Proxy) enforceFailClosed(f *RequestFeatures, dec *MatchResult) error {
 // returns the first successful (non-5xx, non-error) response. On
 // fail-closed routes with all backends unhealthy, the last error
 // propagates back to the handler as HTTP 502 or 503 (the caller in
-// handleChatCompletions decides the surface based on dec.FailClosed).
+// handleCompletion decides the surface based on dec.FailClosed).
 //
 // Per-attempt deadline: resolveDispatchTimeout produces the cap for
 // each backend attempt, with resolution order rule -> backend ->
@@ -336,15 +360,24 @@ func (p *Proxy) dispatchWithFallback(
 	path string,
 ) (*Backend, *http.Response, error) {
 	var lastErr error
+	// allIncumbentBusy stays true only if every backend that was tried failed
+	// specifically because its ModelPool incumbent was busy under IfIdle (no
+	// swap started). Any other failure (unconfigured, unhealthy, dispatch error,
+	// 5xx) makes it false. When it holds, the aggregate is a transient,
+	// retryable condition (503 + Retry-After) rather than a generic upstream
+	// outage (502).
+	allIncumbentBusy := true
 	tracer := otel.Tracer("model_router.dispatch")
 	for i, name := range dec.Backends {
 		b := p.matcher.BackendByName(name)
 		if b == nil {
 			lastErr = fmt.Errorf("backend %q not configured", name)
+			allIncumbentBusy = false
 			continue
 		}
 		if !p.disp.IsHealthy(name) {
 			lastErr = fmt.Errorf("backend %q marked unhealthy", name)
+			allIncumbentBusy = false
 			continue
 		}
 
@@ -361,10 +394,13 @@ func (p *Proxy) dispatchWithFallback(
 		if b.Pool != nil && p.activator != nil {
 			holdCtx, holdCancel := context.WithTimeout(ctx,
 				resolveSwapBudget(b.Pool, p.disp.ResponseHeaderTimeout()))
-			rel, aerr := p.activator.Acquire(holdCtx, b.Pool)
+			rel, aerr := p.activator.AcquireWithMode(holdCtx, b.Pool, dec.PoolActivation)
 			holdCancel()
 			if aerr != nil {
 				lastErr = aerr
+				if !errors.Is(aerr, ErrIncumbentBusy) {
+					allIncumbentBusy = false
+				}
 				continue
 			}
 			poolRelease = rel
@@ -396,6 +432,7 @@ func (p *Proxy) dispatchWithFallback(
 			span.End()
 			cancel()
 			lastErr = err
+			allIncumbentBusy = false
 			continue
 		}
 		if resp.StatusCode >= 500 {
@@ -408,6 +445,7 @@ func (p *Proxy) dispatchWithFallback(
 			span.End()
 			cancel()
 			lastErr = fmt.Errorf("%s returned %d", name, resp.StatusCode)
+			allIncumbentBusy = false
 			continue
 		}
 		// Successful response: wrap the body so its Close also
@@ -427,6 +465,11 @@ func (p *Proxy) dispatchWithFallback(
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no backends attempted")
+	} else if allIncumbentBusy {
+		// Every backend skipped under IfIdle because its incumbent was busy.
+		// Return the sentinel unwrapped so the handler maps it to 503 +
+		// Retry-After like the sibling hold-budget timeout, not a 502.
+		return nil, nil, ErrIncumbentBusy
 	}
 	return nil, nil, lastErr
 }

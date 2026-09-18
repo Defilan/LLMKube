@@ -3,9 +3,9 @@ templates:
   - agent-deployment.yaml
 
 tests:
-  # ---- Defaults reproduce the previous hardcoded output exactly ----
+  # ---- Defaults render the 300s drain window (#1438) ----
 
-  - it: default agent renders Recreate and a 30s grace period (no change on upgrade)
+  - it: default agent renders Recreate and a 300s grace period (the drain window)
     template: agent-deployment.yaml
     set:
       agent.enabled: true
@@ -18,9 +18,9 @@ tests:
           path: spec.strategy.rollingUpdate
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
-          value: 30
+          value: 300
 
-  - it: default multi-pool install renders Recreate and 30s for the default pool
+  - it: default multi-pool install renders Recreate and 300s for the default pool
     template: agent-deployment.yaml
     values:
       - ./values-multi.yaml
@@ -36,9 +36,9 @@ tests:
           path: spec.strategy.rollingUpdate
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
-          value: 30
+          value: 300
 
-  - it: default multi-pool install renders Recreate and 30s for the fork pool
+  - it: default multi-pool install renders Recreate and 300s for the fork pool
     template: agent-deployment.yaml
     values:
       - ./values-multi.yaml
@@ -54,7 +54,7 @@ tests:
           path: spec.strategy.rollingUpdate
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
-          value: 30
+          value: 300
 
   # ---- Opting into RollingUpdate ----
 
@@ -135,7 +135,7 @@ tests:
           path: spec.strategy.rollingUpdate
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
-          value: 30
+          value: 300
 
   - it: the opting-in pool still carries its raised grace period when a sibling opts in
     template: agent-deployment.yaml

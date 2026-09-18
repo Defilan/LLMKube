@@ -187,6 +187,62 @@ For a pair of DGX B200 chassis the same spec reads `tensorParallelSize: 8`,
 `pipelineParallelSize: 2`, two members with `ibHCA: mlx5` and `resources:
 {gpu: 8}`.
 
+## Three-Spark ring
+
+Three DGX Sparks cabled directly (Port0 of each to Port1 of the next, NVIDIA's
+`connect-three-sparks` playbook) form three point-to-point legs and no switch.
+Its default leg addresses sit in 192.168.0.0/24 to 192.168.5.0/24; if the
+management LAN is 192.168.1.0/24, as in the sample, move the legs elsewhere
+(this lab uses 10.10.0.0/30 to 10.10.5.0/30) before the bootstrap can even
+start. That changes two things about `spec.multiNode` that the field comments
+state too gently.
+
+**`fabric.address` is the bootstrap plane, and on a ring no fabric address
+will do.** Rank 0's address is what every other rank dials for the torch
+rendezvous, and each rank's address becomes its `VLLM_HOST_IP`. On a ring each
+/30 is reachable from one neighbour only, so use the management IP and name
+the management NIC in `socketInterface`. Bandwidth is irrelevant here; the
+bootstrap is a handful of small messages.
+
+**`ibHCA` is the data plane and takes a comma list.** List every ConnectX port
+on the member (a Spark has four, named rocep1s0f0, rocep1s0f1, roceP2p1s0f0
+and roceP2p1s0f1: two ConnectX controllers with two ports each) and set
+`NCCL_IB_SUBNET_AWARE_ROUTING=1` in `spec.env`. NCCL >= 2.30 then picks, per
+peer, the local port whose subnet matches that peer's. Without it NCCL assigns
+the NIC by channel index on both ends of every link, and a P0->P1 ring is an
+odd cycle that no index assignment can satisfy: every channel is wrong on one
+end and the group dies with `ncclSystemError` during channel setup.
+`NCCL_IB_MERGE_NICS=0` and `NCCL_NET_PLUGIN=none` complete NVIDIA's ring
+environment; do not set `NCCL_IB_ADDR_RANGE` or `NCCL_CROSS_NIC`.
+
+Measured 2026-09-13 with a 256 MB all-reduce over three ranks: 23.2 GB/s bus
+bandwidth on the ring (11.3 GB/s for two ranks on one leg; 7.9 GB/s with
+NCCL's Socket transport routed over the same legs, the fallback if RDMA is
+unavailable). The full serving example, DeepSeek-V4.1-Flash EXL3 3.5bpw at
+TP3, is
+`config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml`, with
+its Model and the two checkpoint-side Jobs (the TP3 `config.json` edit, and a
+page-cache drop before the group boots) next to it. Text-only, single stream,
+on that ring: prefill 1,094 to 1,334 tok/s from 3.4k to 49.8k prompt tokens,
+decode 26.5 tok/s without speculative decoding and 31 to 35 tok/s with DSpark
+k=5 (65 tok/s on code, 1.5x across a mixed set; block verification is
+lossless). The sample runs DSpark k=5 with a 131,072-token context and four
+sequences, which leaves a KV pool of about 356,000 tokens at
+`gpuMemoryUtilization: 0.78`.
+
+Five operational notes from bringing it up: every member needs all 54
+checkpoint files locally, including the two 101 GB Engram tables the runtime
+reads from NVMe; a claim the operator must stage into has to be a pre-bound
+static `local` PV (the members are placed with `nodeName`, so a
+WaitForFirstConsumer class never binds); and after a large stage, drop the
+page cache on each member before creating the InferenceService, or the worker
+refuses to start with CUDA-free below `gpuMemoryUtilization` x total. Turn
+swap off on every member first (`sudo swapoff -a`): an overrun then OOM-kills
+the worker, which the operator restarts, where a swapping node pages kubelet
+out and needs a power cycle; and use an image that pre-warms its JIT kernels,
+because compiling a cutlass GEMM on the serving node costs about 6 GB of host
+RAM per nvcc process on top of 79.5 GiB of pinned weights.
+
 ## Limits in this release
 
 - vLLM only. llama.cpp RPC members are the next runtime; the manual pattern

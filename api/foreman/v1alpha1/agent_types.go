@@ -49,15 +49,19 @@ const (
 // AgentProvider names the model-serving backend the executor dispatches
 // to. v0.2 introduces this enum so reviewer Agents can route to an
 // OpenAI-compatible cloud proxy (typically a LiteLLM gateway hitting
-// Anthropic / OpenAI / Bedrock) without changing the agent loop. The
-// default "local" preserves the v0.1 behavior of resolving an
+// Anthropic / OpenAI / Bedrock) without changing the agent loop.
+// "anthropic" dials an Anthropic-native /v1/messages endpoint directly
+// (#1627): the Messages wire carries first-class thinking blocks and
+// structured tool input, which a translation proxy degrades or drops.
+// The default "local" preserves the v0.1 behavior of resolving an
 // in-cluster InferenceService.
 //
-// Air-gapped orgs MUST keep cloud-proxy Agents out of dispatch; both
-// the operator-level kill switch (--allow-cloud-providers flag, chart
-// value foreman.allowCloudProviders) and the per-Workload opt-in
-// (Workload.spec.allowCloudReviewers) gate this.
-// +kubebuilder:validation:Enum=local;cloud-proxy
+// Air-gapped orgs MUST keep non-local Agents out of dispatch; both the
+// operator-level kill switch (--allow-cloud-providers flag, chart value
+// foreman.allowCloudProviders) and the per-Workload opt-in
+// (Workload.spec.allowCloudReviewers) gate every non-local provider,
+// including anthropic.
+// +kubebuilder:validation:Enum=local;cloud-proxy;anthropic
 type AgentProvider string
 
 const (
@@ -70,34 +74,46 @@ const (
 	// Anthropic / OpenAI / Bedrock. Data leaves the cluster on every
 	// call; subject to the operator + workload sovereignty toggles.
 	AgentProviderCloudProxy AgentProvider = "cloud-proxy"
+	// AgentProviderAnthropic dispatches via providerConfig.baseURL to
+	// an Anthropic-native /v1/messages endpoint (e.g.
+	// "https://api.anthropic.com/v1"), the official API or a compatible
+	// server. The executor uses the Messages wire directly instead of an
+	// OpenAI-compatible translation proxy (#1627). Data leaves the
+	// cluster on every call; subject to the operator + workload
+	// sovereignty toggles.
+	AgentProviderAnthropic AgentProvider = "anthropic"
 )
 
 // ProviderConfig configures a non-local AgentProvider. Required when
-// AgentSpec.Provider is "cloud-proxy"; ignored when Provider is "local"
-// or unset.
+// AgentSpec.Provider is "cloud-proxy" or "anthropic"; ignored when
+// Provider is "local" or unset.
 type ProviderConfig struct {
-	// BaseURL is the OpenAI-compatible HTTP endpoint the executor
-	// dispatches chat-completions requests to. The /chat/completions
-	// path is appended; supply the /v1 prefix (e.g.
-	// "http://foundation-router.lan:4000/v1"). Required for
-	// cloud-proxy.
+	// BaseURL is the HTTP endpoint the executor dispatches to. The path
+	// appended depends on the provider: cloud-proxy posts to
+	// /chat/completions (supply the /v1 prefix, e.g.
+	// "http://foundation-router.lan:4000/v1"); anthropic posts to
+	// /messages (supply the /v1 prefix, e.g.
+	// "https://api.anthropic.com/v1"). Required for non-local providers.
 	// +kubebuilder:validation:MinLength=1
 	// +optional
 	BaseURL string `json:"baseURL,omitempty"`
 
-	// Model is the identifier the proxy expects in the request body
+	// Model is the identifier the upstream expects in the request body
 	// (e.g. "claude-sonnet-4-6", "gpt-4o", "anthropic/claude-sonnet-4-6"
-	// when LiteLLM is in front). Required for cloud-proxy; overrides
-	// AgentSpec.Model on the wire while AgentSpec.Model remains the
-	// human-readable handle.
+	// when LiteLLM is in front). Required for non-local providers;
+	// overrides AgentSpec.Model on the wire while AgentSpec.Model
+	// remains the human-readable handle.
 	// +kubebuilder:validation:MinLength=1
 	// +optional
 	Model string `json:"model,omitempty"`
 
-	// APIKeySecretRef references a Secret carrying the bearer token
-	// the executor sends as the Authorization header. Optional: when
-	// nil, the proxy is dialed without auth (LAN-only LiteLLM behind
-	// a network policy is a common case).
+	// APIKeySecretRef references a Secret carrying the credential the
+	// executor sends with every request. The header is provider-shaped:
+	// cloud-proxy sends it as Authorization: Bearer <value> (the
+	// LiteLLM gateway contract); anthropic sends it verbatim as the
+	// x-api-key header (the Messages API contract). Optional: when nil,
+	// the endpoint is dialed without auth (LAN-only proxies behind a
+	// network policy are a common case).
 	// +optional
 	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 }

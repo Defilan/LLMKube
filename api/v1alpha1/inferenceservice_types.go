@@ -317,7 +317,8 @@ type MultiNodeMemberStatus struct {
 type MultiNodeStatus struct {
 	// Size is the number of members in the spec.
 	Size int32 `json:"size"`
-	// ReadyMembers counts members that are Running (rank 0 must also be Ready).
+	// ReadyMembers counts members whose pod is Ready. The group condition
+	// additionally requires every member Running before the group serves.
 	ReadyMembers int32 `json:"readyMembers"`
 	// Members is per-rank detail in rank order.
 	// +optional
@@ -614,7 +615,8 @@ type InferenceServiceSpec struct {
 	// Arguments are appended after all other configured flags.
 	// Supported by the "llamacpp", "llamacpp-router", "sglang", "tgi" and
 	// "vllm" runtimes. Ignored by "generic" (which takes spec.args instead)
-	// and "personaplex".
+	// and "personaplex" — except that whenever spec.command is set, extraArgs
+	// are appended after spec.args regardless of runtime.
 	// Example: ["--seed", "42", "--log-disable"]
 	// +optional
 	ExtraArgs []string `json:"extraArgs,omitempty"`
@@ -655,13 +657,24 @@ type InferenceServiceSpec struct {
 	// +optional
 	PagedSSDCacheMaxSize *string `json:"pagedSSDCacheMaxSize,omitempty"`
 
-	// Command overrides the container entrypoint.
-	// Only used when Runtime is "generic" or for advanced customization.
+	// Command overrides the container entrypoint. Its effect on the container's
+	// arguments depends on whether the runtime injects its own CLI:
+	// for runtimes that build a command (vllm, sglang, personaplex), setting
+	// Command declares a bring-your-own launcher, so the runtime's generated args
+	// are dropped and the container receives Args followed by ExtraArgs verbatim;
+	// for runtimes that serve via the image entrypoint (llamacpp, tgi,
+	// llamacpp-router, generic), Command overrides the entrypoint only and
+	// whatever args that runtime generates still apply -- llamacpp's model path,
+	// context size and host/port, tgi's --model-id, llamacpp-router's
+	// --models-dir. generic generates none of its own and passes Args through.
 	// +optional
 	Command []string `json:"command,omitempty"`
 
-	// Args overrides the container arguments entirely.
-	// Only used when Runtime is "generic". For llamacpp, use ExtraArgs instead.
+	// Args overrides the container arguments entirely. Used when Runtime is
+	// "generic", and — whenever spec.command is set — under any runtime: a
+	// custom entrypoint receives spec.args verbatim (with spec.extraArgs
+	// appended) instead of the runtime's built args. Without a command override,
+	// non-generic runtimes build their own args; use ExtraArgs there instead.
 	// +optional
 	Args []string `json:"args,omitempty"`
 

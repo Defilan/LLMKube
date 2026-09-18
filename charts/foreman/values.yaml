@@ -357,16 +357,18 @@ agent:
   # How long the kubelet waits after sending SIGTERM before force-killing
   # the agent pod.
   #
-  # Raising this does NOT currently lengthen anything. On SIGTERM the
-  # watcher's poll loop returns straight away on ctx.Done()
-  # (pkg/foreman/agent/watcher.go), an in-process task's executor runs in
-  # a goroutine that nothing waits on, and the FleetNode registrar's drain
-  # patch is capped at its own 5s timeout (pkg/foreman/agent/fleetnode.go),
-  # so the process is gone within a few seconds whatever this is set to.
-  # There is no drain hook yet. Treat the knob as forward-wiring for the
-  # drain work tracked in #1438, plus a way to LOWER the value on a pool
-  # that should die fast. It does not buy a slow local-model turn a longer
-  # window to finish or to be interrupted cleanly.
+  # This is the drain window. On SIGTERM the agent DRAINS instead of
+  # dropping its work (#1438): the watcher's poll loop stops claiming new
+  # tasks, but the turns it already launched keep running and write their
+  # terminal status before the process exits, so a rollout no longer kills a
+  # local-model turn mid-patch (pkg/foreman/agent/watcher.go). The FleetNode
+  # registrar keeps its existing Draining heartbeat throughout
+  # (pkg/foreman/agent/fleetnode.go).
+  #
+  # The default of 300s (5 min) is generous for a bounded turn to land its
+  # final patch without a forced kill. A turn that runs past the window is
+  # force-killed by the kubelet, and the work is recovered by the operator,
+  # not the agent.
   #
   # What recovers the killed task is the operator, not the agent. It is
   # NOT recoverOrphanedTasks: that matches only tasks whose
@@ -383,9 +385,9 @@ agent:
   # Must be a non-negative whole number of seconds. The chart fails the
   # render on a negative, non-numeric or fractional value, rather than
   # shipping a manifest the API server rejects or silently truncating a
-  # 30.5 to 30. The default of 30 reproduces the previous hardcoded value
-  # so an existing install is unchanged until it opts in.
-  terminationGracePeriodSeconds: 30
+  # 30.5 to 30. Lower the value on a pool that should die fast; the default
+  # 300 is what buys a slow turn a clean finish.
+  terminationGracePeriodSeconds: 300
 
   # Pod rollout strategy for this agent Deployment.
   #

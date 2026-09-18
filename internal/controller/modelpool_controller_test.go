@@ -19,9 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // modelPoolMemberFixture builds a minimal member InferenceService. Members are
@@ -390,6 +393,66 @@ var _ = Describe("ModelPool Controller", func() {
 		reconcile()
 		Expect(replicasOfMember(ctx, "coder")).To(Equal(int32(1)))
 		Expect(replicasOfMember(ctx, "judge")).To(Equal(int32(0)))
+	})
+
+	It("reclaims the slot to the default after the resident is idle for reclaimAfter (#1795)", func() {
+		Expect(k8sClient.Create(ctx, modelPoolMemberFixture("judge", 0))).To(Succeed())
+		Expect(k8sClient.Create(ctx, modelPoolMemberFixture("coder", 1))).To(Succeed())
+
+		// Reclaim pool defaulting to judge with a short idle window. createPool
+		// does not set ReclaimAfter, so build it inline.
+		pool := &inferencev1alpha1.ModelPool{
+			ObjectMeta: metav1.ObjectMeta{Name: poolName, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelPoolSpec{
+				GPU:          1,
+				SwapPolicy:   inferencev1alpha1.ModelPoolSwapPolicyReclaim,
+				ReclaimAfter: &metav1.Duration{Duration: 20 * time.Millisecond},
+				Members: []inferencev1alpha1.ModelPoolMember{
+					{InferenceServiceRef: corev1.LocalObjectReference{Name: "judge"}},
+					{InferenceServiceRef: corev1.LocalObjectReference{Name: "coder"}},
+				},
+				Default: "judge",
+			},
+		}
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+
+		// coder is the active (non-default) resident; judge is drained.
+		reconcile()
+		setMemberPhase(ctx, "coder", PhaseReady, 1)
+		reconcile()
+		Expect(k8sClient.Get(ctx, poolKey, pool)).To(Succeed())
+		Expect(pool.Status.ResidentMember).To(Equal("coder"))
+
+		before := testutil.ToFloat64(llmkubemetrics.ModelPoolReclaimsTotal.WithLabelValues("default", poolName, "coder", "judge"))
+
+		// coder reports idle (idleReport default). The first reconcile starts the
+		// idle clock, and it MUST persist across reconciles: the bug this exercises
+		// diffed the clock out of the status patch, so it reset every reconcile and
+		// the reclaim never fired.
+		reconcile()
+		Expect(k8sClient.Get(ctx, poolKey, pool)).To(Succeed())
+		Expect(pool.Status.ResidentIdleSince).NotTo(BeNil(), "the idle clock must persist across reconciles")
+
+		// Past the window the reclaim fires: the idle resident drains and the
+		// desired owner flips back to the default.
+		time.Sleep(40 * time.Millisecond)
+		reconcile()
+		Expect(replicasOfMember(ctx, "coder")).To(Equal(int32(0)), "the idle resident must be drained on reclaim")
+		Expect(testutil.ToFloat64(llmkubemetrics.ModelPoolReclaimsTotal.WithLabelValues("default", poolName, "coder", "judge"))).
+			To(Equal(before+1), "the reclaim must increment llmkube_modelpool_reclaims_total")
+
+		// coder finishes unloading; judge reloads and becomes resident again.
+		setMemberPhase(ctx, "coder", PhaseStopped, 0)
+		setMemberPhase(ctx, "judge", PhaseReady, 1)
+		reconcile()
+		Expect(k8sClient.Get(ctx, poolKey, pool)).To(Succeed())
+		Expect(pool.Status.ResidentMember).To(Equal("judge"), "the slot must return to the default")
+
+		// Further reconciles stay put and the clock self-clears.
+		reconcile()
+		Expect(k8sClient.Get(ctx, poolKey, pool)).To(Succeed())
+		Expect(pool.Status.ResidentMember).To(Equal("judge"))
+		Expect(pool.Status.ResidentIdleSince).To(BeNil(), "the clock self-clears once the default is resident")
 	})
 
 	It("marks the pool Degraded when a member reference is missing", func() {

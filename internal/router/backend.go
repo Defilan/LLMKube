@@ -77,7 +77,16 @@ type backendHealth struct {
 type Dispatcher struct {
 	cfg    *Config
 	client *http.Client
-	health sync.Map // backendName -> *backendHealth
+	health sync.Map // healthKey -> *backendHealth
+
+	// endpoints holds the per-pod addresses for backends that balance across
+	// them, keyed by backend name, so IsHealthy can decide from the endpoint
+	// set without the caller passing the Backend.
+	endpoints sync.Map // backendName -> []string
+
+	// cursors is the round-robin position per endpoint backend. Consecutive
+	// requests advance it so a keep-alive client spreads across pods.
+	cursors sync.Map // backendName -> *atomic.Uint64
 
 	// quarantineDuration controls how long a backend stays in the
 	// "skip" state after MarkUnhealthy. Defaults to
@@ -160,8 +169,97 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 		h := &backendHealth{}
 		h.healthy.Store(true)
 		d.health.Store(b.Name, h)
+		if len(b.Endpoints) > 0 {
+			d.endpoints.Store(b.Name, b.Endpoints)
+			for _, ep := range b.Endpoints {
+				eh := &backendHealth{}
+				eh.healthy.Store(true)
+				d.health.Store(healthKey(b.Name, ep), eh)
+			}
+		}
 	}
 	return d
+}
+
+// healthKey is the dispatcher's health-map key for a backend. An endpoint
+// backend keys per endpoint so one bad pod is quarantined on its own; a backend
+// with no endpoints keys on its name, preserving the per-backend quarantine.
+func healthKey(backendName, endpoint string) string {
+	if endpoint == "" {
+		return backendName
+	}
+	return backendName + "|" + endpoint
+}
+
+// healthFor returns the health state for key, creating a healthy entry on first
+// use so an endpoint is quarantinable before it has ever been dispatched to.
+func (d *Dispatcher) healthFor(key string) *backendHealth {
+	if v, ok := d.health.Load(key); ok {
+		return v.(*backendHealth)
+	}
+	h := &backendHealth{}
+	h.healthy.Store(true)
+	actual, _ := d.health.LoadOrStore(key, h)
+	return actual.(*backendHealth)
+}
+
+// endpointCursor returns the round-robin position for an endpoint backend.
+func (d *Dispatcher) endpointCursor(name string) *atomic.Uint64 {
+	if v, ok := d.cursors.Load(name); ok {
+		return v.(*atomic.Uint64)
+	}
+	c := &atomic.Uint64{}
+	actual, _ := d.cursors.LoadOrStore(name, c)
+	return actual.(*atomic.Uint64)
+}
+
+// dispatchable reports whether the single health entry key may be tried now:
+// healthy outright, or quarantined with the window expired (half-open probe).
+// An unknown key is not dispatchable, so an unknown backend name stays
+// unhealthy.
+func (d *Dispatcher) dispatchable(key string) bool {
+	v, ok := d.health.Load(key)
+	if !ok {
+		return false
+	}
+	h := v.(*backendHealth)
+	if h.healthy.Load() {
+		return true
+	}
+	until := h.quarantineUntil.Load()
+	return until > 0 && d.nowFn().UnixNano() >= until
+}
+
+// pickEndpoint chooses the pod to dispatch to for a backend that balances
+// across its endpoints. Consecutive calls rotate so a keep-alive client spreads
+// across pods rather than pinning to one through conntrack. Quarantined
+// endpoints are skipped; when every endpoint is quarantined the rotation
+// returns one anyway so the half-open probe still happens.
+func (d *Dispatcher) pickEndpoint(backend *Backend) string {
+	n := len(backend.Endpoints)
+	if n == 0 {
+		return ""
+	}
+	if n == 1 {
+		return backend.Endpoints[0]
+	}
+	start := int(d.endpointCursor(backend.Name).Add(1)-1) % n //nolint:gosec // modulo bounds the value below n, an int
+	for i := 0; i < n; i++ {
+		ep := backend.Endpoints[(start+i)%n]
+		if d.dispatchable(healthKey(backend.Name, ep)) {
+			return ep
+		}
+	}
+	return backend.Endpoints[start]
+}
+
+// dispatchTarget resolves the base URL a dispatch to backend should use: the
+// chosen pod endpoint when the backend balances, else the Service DNS Address.
+func dispatchTarget(backend *Backend, endpoint string) string {
+	if endpoint != "" {
+		return endpoint
+	}
+	return backend.Address
 }
 
 // IsHealthy reports whether the dispatcher will *consider* the backend
@@ -173,18 +271,23 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 //     either re-marks healthy (on success) or extends quarantine
 //     (on failure).
 //
+// An endpoint backend is considered healthy while any one of its pods is
+// dispatchable, so a single quarantined pod does not skip the backend.
+//
 // Unknown backend names report unhealthy.
 func (d *Dispatcher) IsHealthy(name string) bool {
-	v, ok := d.health.Load(name)
-	if !ok {
-		return false
+	if eps, ok := d.endpoints.Load(name); ok {
+		list := eps.([]string)
+		if len(list) > 0 {
+			for _, ep := range list {
+				if d.dispatchable(healthKey(name, ep)) {
+					return true
+				}
+			}
+			return false
+		}
 	}
-	h := v.(*backendHealth)
-	if h.healthy.Load() {
-		return true
-	}
-	until := h.quarantineUntil.Load()
-	return until > 0 && d.nowFn().UnixNano() >= until
+	return d.dispatchable(name)
 }
 
 // MarkHealthy flips the backend to healthy and clears any pending
@@ -209,6 +312,23 @@ func (d *Dispatcher) MarkUnhealthy(name string) {
 	}
 }
 
+// markUnhealthy quarantines one endpoint of a backend, or the whole backend
+// when endpoint is empty. Dispatch calls this because it knows the pod it
+// actually talked to, so one bad pod does not skip the backend's siblings.
+func (d *Dispatcher) markUnhealthy(name, endpoint string) {
+	h := d.healthFor(healthKey(name, endpoint))
+	h.healthy.Store(false)
+	h.quarantineUntil.Store(d.nowFn().Add(d.quarantineDuration).UnixNano())
+}
+
+// markHealthy clears quarantine on one endpoint (or the whole backend when
+// endpoint is empty).
+func (d *Dispatcher) markHealthy(name, endpoint string) {
+	h := d.healthFor(healthKey(name, endpoint))
+	h.healthy.Store(true)
+	h.quarantineUntil.Store(0)
+}
+
 // Dispatch forwards the request to the named backend and returns the
 // upstream response. Caller is responsible for streaming the body to
 // the inbound client and closing it. On error the response is nil.
@@ -226,11 +346,12 @@ func (d *Dispatcher) Dispatch(
 	if backend == nil {
 		return nil, fmt.Errorf("dispatch: backend is nil")
 	}
-	url := joinURL(backend.Address, path)
+	endpoint := d.pickEndpoint(backend)
+	url := joinURL(dispatchTarget(backend, endpoint), path)
 
-	// Send the backend's configured model, not the client-facing alias the
-	// router matched on.
-	outboundBody := applyModelOverride(requestBody, backend.Model)
+	// Send the model name this backend actually serves, not the
+	// client-facing alias the router matched on.
+	outboundBody := applyModelOverride(requestBody, backend.outboundModel())
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(outboundBody))
 	if err != nil {
@@ -273,16 +394,16 @@ func (d *Dispatcher) Dispatch(
 		// backend. Closes #462.
 		if !errors.Is(err, context.DeadlineExceeded) &&
 			!errors.Is(err, context.Canceled) {
-			d.MarkUnhealthy(backend.Name)
+			d.markUnhealthy(backend.Name, endpoint)
 		}
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	if resp.StatusCode >= 500 {
 		// Don't flip on 4xx: those are client errors, not backend
 		// problems. 5xx however means the backend itself misbehaved.
-		d.MarkUnhealthy(backend.Name)
+		d.markUnhealthy(backend.Name, endpoint)
 	} else {
-		d.MarkHealthy(backend.Name)
+		d.markHealthy(backend.Name, endpoint)
 	}
 	return resp, nil
 }
@@ -328,11 +449,28 @@ func (d *Dispatcher) applyCredentials(b *Backend, req *http.Request) error {
 	return nil
 }
 
+// outboundModel returns the model identifier this backend expects to see in
+// the request body. External backends declare it explicitly as Model. Local
+// backends serve whatever their InferenceService is named, which is also the
+// alias the controller registers upstream, so a request that reached this
+// backend under a different alias (a rule fall-through, an IfIdle skip past a
+// busy pool member) must be rewritten to it: llama.cpp ignores the field, but
+// vLLM / SGLang / TGI answer an unknown name with 404 "The model X does not
+// exist". A backend with neither set (a hand-written config, a backend whose
+// InferenceService did not resolve) keeps the historical pass-through.
+func (b *Backend) outboundModel() string {
+	if b.Model != "" {
+		return b.Model
+	}
+	return b.InferenceService
+}
+
 // applyModelOverride returns a copy of body with the OpenAI "model" field
-// set to the backend's configured Model, so external providers receive an
-// identifier they recognize and a fallback chain degrades across models
-// instead of re-sending the client alias. Empty Model (all local backends)
-// and non-JSON-object bodies are returned unchanged.
+// set to model, so the upstream receives an identifier it recognizes and a
+// fallback chain degrades across models instead of re-sending the client
+// alias. An empty model, a body whose model field already equals model, and
+// non-JSON-object bodies are returned unchanged; the equality case keeps the
+// common request byte-identical instead of re-marshalling it.
 func applyModelOverride(body []byte, model string) []byte {
 	if model == "" {
 		return body
@@ -343,6 +481,9 @@ func applyModelOverride(body []byte, model string) []byte {
 	}
 	enc, err := json.Marshal(model)
 	if err != nil {
+		return body
+	}
+	if cur, ok := obj["model"]; ok && bytes.Equal(cur, enc) {
 		return body
 	}
 	obj["model"] = enc

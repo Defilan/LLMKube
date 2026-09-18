@@ -88,6 +88,12 @@ type Backend struct {
 	// providers it is the provider base URL.
 	Address string `json:"address"`
 
+	// Endpoints are the per-pod base URLs the proxy balances requests
+	// across when a backend declares endpoint resolution. When non-empty
+	// they supersede Address for dispatch; Address remains the fallback
+	// (the Service DNS) for a backend whose endpoint set is empty.
+	Endpoints []string `json:"endpoints,omitempty"`
+
 	// Provider identifies the upstream API surface for external backends
 	// ("anthropic", "openai", "litellm", etc.). Empty for local backends.
 	Provider string `json:"provider,omitempty"`
@@ -95,6 +101,15 @@ type Backend struct {
 	// Model is the upstream model identifier passed to the provider.
 	// Empty for local backends (the request body carries the model name).
 	Model string `json:"model,omitempty"`
+
+	// InferenceService is the name of the InferenceService this backend
+	// resolves to, and therefore the model name the runtime behind it
+	// serves. Empty for external backends, which carry Model instead.
+	// The proxy uses it to rewrite the outbound "model" field when a
+	// request reaches this backend under a different client-facing alias
+	// (a rule fall-through, an IfIdle skip): llama.cpp ignores the field
+	// but vLLM / SGLang / TGI reject an unknown name with a 404.
+	InferenceService string `json:"inferenceService,omitempty"`
 
 	// Capabilities advertised by this backend (e.g. ["tools", "vision"]).
 	// Rules can require capabilities to filter candidates.
@@ -202,7 +217,20 @@ type RuleRoute struct {
 	// Only primary-fallback is implemented in the MVP; the other two land
 	// in #432.
 	Strategy string `json:"strategy,omitempty"`
+
+	// PoolActivation is "Wait" (default) or "IfIdle". Under IfIdle a pooled
+	// backend whose incumbent is busy is skipped rather than held, so the
+	// dispatch loop falls through to the next backend in Backends. Compiled
+	// from ModelRouter.spec.rules[].route.poolActivation.
+	PoolActivation string `json:"poolActivation,omitempty"`
 }
+
+// Pool activation modes for RuleRoute.PoolActivation. See the CRD field
+// documentation for the semantics of each.
+const (
+	PoolActivationWait   = "Wait"
+	PoolActivationIfIdle = "IfIdle"
+)
 
 // Policy holds cross-cutting controls.
 type Policy struct {
@@ -267,7 +295,7 @@ func (c *Config) Validate() error {
 		if b.Tier != "local" && b.Tier != "cloud" {
 			return fmt.Errorf("backends[%d] %s: tier must be local or cloud, got %q", i, b.Name, b.Tier)
 		}
-		if b.Address == "" {
+		if b.Address == "" && len(b.Endpoints) == 0 {
 			return fmt.Errorf("backends[%d] %s: address is required", i, b.Name)
 		}
 	}
@@ -292,6 +320,12 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("rules[%d] %s: route.backends[%d] %q does not name an existing backend",
 					i, r.Name, j, name)
 			}
+		}
+		switch r.Route.PoolActivation {
+		case "", PoolActivationWait, PoolActivationIfIdle:
+		default:
+			return fmt.Errorf("rules[%d] %s: route.poolActivation %q must be %q or %q",
+				i, r.Name, r.Route.PoolActivation, PoolActivationWait, PoolActivationIfIdle)
 		}
 	}
 	return nil

@@ -130,6 +130,16 @@ type AgenticTaskWatcher struct {
 	// they run, so they get their own budget instead of the single
 	// in-process slot (#1559).
 	supervised int
+
+	// execs counts every execution goroutine launchExecutor has started that
+	// has not yet finished and released its slot. Run takes one final Wait()
+	// on it when its ctx is cancelled so a SIGTERM DRAINS the node -- stops
+	// claiming new work but lets the turns already in flight finish and write
+	// their terminal status inside the pod's termination grace window --
+	// instead of orphaning them when the process exits (#1438). It is only
+	// Add()ed from the poll loop and Wait()ed once that loop has exited, so
+	// the two never race (a positive-delta Add after Wait has begun panics).
+	execs sync.WaitGroup
 }
 
 // maxSupervised is MaxSupervisedTasks with its default applied. See the
@@ -260,6 +270,15 @@ func (w *AgenticTaskWatcher) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Drain, don't kill (#1438): the node is going away (SIGTERM), so
+			// stop claiming new work but let the executions we already
+			// launched finish and terminally patch. Their contexts are
+			// detached from this one (launchExecutor), so ctx.Done does not
+			// cancel them -- we simply stop starting new work and wait for the
+			// ones in flight to complete. The pod's termination grace window
+			// bounds the wait: a turn that runs past it is force-killed by the
+			// kubelet and re-queued by claim expiry, exactly as before.
+			w.execs.Wait()
 			log.Info("stopping")
 			return nil
 		case <-ticker.C:
@@ -417,6 +436,16 @@ func (w *AgenticTaskWatcher) pollOnce(ctx context.Context, namespace string) err
 	resolved := make(map[string]agentResolution, 2)
 
 	for _, t := range candidates {
+		// Stop at the first candidate if the node is draining (#1438): Run
+		// cancels its ctx on SIGTERM to stop claiming new work, but this pass
+		// is already looping over the candidates it listed before the cancel.
+		// A per-candidate check, placed before any resolve/claim/launch for
+		// this task, makes the pass fall out so no candidate beyond the one
+		// already claimed is started; that run finishes under its detached
+		// context while the rest stay Scheduled for the next node to pick up.
+		if ctx.Err() != nil {
+			return nil
+		}
 		// Capacity is checked per candidate because the two execution modes
 		// draw on different slots: with the in-process slot busy, a Job-mode
 		// task can still start (and vice versa). Only this goroutine reserves
@@ -443,6 +472,16 @@ func (w *AgenticTaskWatcher) pollOnce(ctx context.Context, namespace string) err
 		}
 		if !w.hasCapacityFor(res.supervise) {
 			continue
+		}
+		// Re-check the drain immediately before the claim. A SIGTERM can land
+		// after the top-of-loop check above but before the status patch here —
+		// the resolve above is an uncached apiserver GET, so that window is
+		// real. A claim issued on a draining node can still land server-side
+		// even though the client is going away, stranding the task in Running
+		// until claim expiry; checking here closes the gap to a few
+		// instructions.
+		if ctx.Err() != nil {
+			return nil
 		}
 		if err := w.claim(ctx, t); err != nil {
 			// Patch race or transient apiserver error; let the next
@@ -516,7 +555,15 @@ func (w *AgenticTaskWatcher) launchExecutor(
 		WithValues("task", t.Name, "kind", t.Spec.Kind, "supervised", supervise)
 	log.Info("dispatching to executor")
 
+	// Count this execution before its goroutine starts so a drain that
+	// lands in between still blocks on it (Run's execs.Wait). Add must
+	// happen before the goroutine that will Done it.
+	w.execs.Add(1)
 	go func() {
+		// Registered first, so it runs LAST: the slot below is released and
+		// the run's context cancelled before the drain in Run observes this
+		// execution as complete.
+		defer w.execs.Done()
 		defer func() {
 			w.inflightMu.Lock()
 			if supervise {
@@ -527,9 +574,13 @@ func (w *AgenticTaskWatcher) launchExecutor(
 			w.inflightMu.Unlock()
 		}()
 
-		// Use a fresh context so the executor's lifetime is decoupled from
-		// the poll tick. Cancellation still propagates from the parent.
-		execCtx, cancel := context.WithCancel(ctx)
+		// Detach the run from the drain so a SIGTERM lets the turn finish
+		// instead of killing it mid-patch (#1438). WithoutCancel keeps the
+		// parent's log values but stops inheriting its cancellation, so the
+		// run is now cancelled ONLY by its liveness watchdog (the task
+		// deleted out from under us, #1136) or its own completion -- never
+		// by the watcher's ctx.
+		execCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 		defer cancel()
 
 		// Abort the run if its AgenticTask is deleted out from under us
@@ -539,7 +590,12 @@ func (w *AgenticTaskWatcher) launchExecutor(
 		go w.watchTaskLiveness(execCtx, cancel, t)
 
 		res, execErr := w.Executor.Execute(execCtx, t, agent)
-		if patchErr := w.patchTerminal(ctx, t, res, execErr); patchErr != nil {
+		// Patch the terminal status on a context that outlives BOTH the
+		// drain (SIGTERM) and the liveness cancellation: WithoutCancel keeps
+		// the run's log values but detaches cancellation, so the patch can
+		// still re-fetch and write the final status while draining (#1438),
+		// and still detect a deleted task gracefully (#1136).
+		if patchErr := w.patchTerminal(context.WithoutCancel(ctx), t, res, execErr); patchErr != nil {
 			log.Error(patchErr, "patching terminal status failed")
 		}
 	}()

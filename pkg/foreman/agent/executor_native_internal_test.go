@@ -625,6 +625,84 @@ func TestMapLoopError_MaxTurns_SubmissionCount(t *testing.T) {
 	}
 }
 
+// TestMapLoopError_MaxTurns_SpinGuard pins the #1628 spin
+// classification: a max-turns run whose per-turn average is strictly below
+// spinGuardMaxAvgTurn ran faster than a model can generate, so the
+// failure reason is LoopSpinning and the summary reports the rate. Real
+// exhaustion (1662s of work), runs below the min-turns floor, and runs at
+// exactly the threshold (strict less-than fails) all stay on the
+// ordinary MaxTurnsExhausted reason.
+func TestMapLoopError_MaxTurns_SpinGuard(t *testing.T) {
+	e := &NativeAgentLoopExecutor{}
+	tref := corev1.ObjectReference{Name: "transcript"}
+
+	cases := []struct {
+		name       string
+		lr         *LoopResult
+		wantReason foremanv1alpha1.AgenticTaskFailureReason
+		wantFrags  []string
+	}{
+		{
+			// #1628's observed spin: 160 turns in 65s (0.41s/turn),
+			// far faster than any model can produce a turn.
+			name:       "spin",
+			lr:         &LoopResult{Turns: 160, TurnDuration: 65 * time.Second, TurnsWithCompletion: 160, TurnsWithToolCall: 150},
+			wantReason: foremanv1alpha1.FailureLoopSpinning,
+			wantFrags:  []string{"0.41s/turn", "spinning backend or shim"},
+		},
+		{
+			// A spin that also had gate-rejected submissions keeps the
+			// #1713 rejection detail in the summary.
+			name:       "spin with rejected submissions",
+			lr:         &LoopResult{Turns: 160, TurnDuration: 65 * time.Second, TurnsWithCompletion: 160, TurnsWithToolCall: 150, SubmissionsRejected: 2},
+			wantReason: foremanv1alpha1.FailureLoopSpinning,
+			wantFrags:  []string{"0.41s/turn", "2 time(s)", "verification gate"},
+		},
+		{
+			// 1662s over 160 turns is slow real work, not a spin.
+			name:       "real exhaustion",
+			lr:         &LoopResult{Turns: 160, TurnDuration: 1662 * time.Second, TurnsWithCompletion: 160, TurnsWithToolCall: 150},
+			wantReason: foremanv1alpha1.FailureMaxTurnsExhausted,
+		},
+		{
+			// Below the min-turns floor: a fast tiny run keeps the
+			// ordinary reason even at ~0.2ms/turn.
+			name:       "below min-turns floor",
+			lr:         &LoopResult{Turns: 5, TurnDuration: time.Millisecond},
+			wantReason: foremanv1alpha1.FailureMaxTurnsExhausted,
+		},
+		{
+			// Average exactly at the threshold: the strict less-than
+			// fails, so 10 turns in 10s is not a spin.
+			name:       "boundary exactly one second per turn",
+			lr:         &LoopResult{Turns: 10, TurnDuration: 10 * time.Second},
+			wantReason: foremanv1alpha1.FailureMaxTurnsExhausted,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := e.mapLoopError(time.Time{}, tref, tc.lr, ErrMaxTurnsExhausted)
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if r.FailureReason != tc.wantReason {
+				t.Errorf("FailureReason: want %q got %q", tc.wantReason, r.FailureReason)
+			}
+			for _, frag := range tc.wantFrags {
+				if !strings.Contains(r.Summary, frag) {
+					t.Errorf("summary: want it to contain %q, got %q", frag, r.Summary)
+				}
+			}
+			if got := r.Extra["turnsWithCompletion"]; got != tc.lr.TurnsWithCompletion {
+				t.Errorf("Extra[turnsWithCompletion]: want %d got %v", tc.lr.TurnsWithCompletion, got)
+			}
+			if got := r.Extra["turnsWithToolCall"]; got != tc.lr.TurnsWithToolCall {
+				t.Errorf("Extra[turnsWithToolCall]: want %d got %v", tc.lr.TurnsWithToolCall, got)
+			}
+		})
+	}
+}
+
 // TestResolveProviderEndpoint covers the v0.2 cloud-proxy resolution
 // path: providerConfig must carry baseURL + model, the optional
 // APIKeySecretRef must reference a real Secret, and missing fields
@@ -768,6 +846,139 @@ func TestResolveProviderEndpoint(t *testing.T) {
 			}
 			if ep.authHeader != tc.wantAuth {
 				t.Errorf("authHeader: want %q got %q", tc.wantAuth, ep.authHeader)
+			}
+		})
+	}
+}
+
+// TestResolveAnthropicEndpoint covers the v0.3 anthropic resolution
+// path (#1627): providerConfig must carry baseURL + model, and the
+// optional APIKeySecretRef value lands RAW in the endpoint (the
+// Messages API sends it as x-api-key, never Authorization: Bearer) —
+// the inverse of the cloud-proxy contract, which is the whole point of
+// having a separate resolver.
+func TestResolveAnthropicEndpoint(t *testing.T) {
+	mkAgent := func(name string, cfg *foremanv1alpha1.ProviderConfig) *foremanv1alpha1.Agent {
+		return &foremanv1alpha1.Agent{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: foremanv1alpha1.AgentSpec{
+				Role:           foremanv1alpha1.AgentRoleReviewer,
+				Provider:       foremanv1alpha1.AgentProviderAnthropic,
+				ProviderConfig: cfg,
+				Model:          "human-readable-name",
+			},
+		}
+	}
+	mkSecret := func(name, key, value string) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Data:       map[string][]byte{key: []byte(value)},
+		}
+	}
+
+	cases := []struct {
+		name        string
+		agent       *foremanv1alpha1.Agent
+		seedObjects []runtime.Object
+		wantBase    string
+		wantModel   string
+		wantAuth    string
+		wantKey     string
+		wantErrFrag string
+	}{
+		{
+			name: "anthropic without auth: baseURL + model resolve, both auth fields empty",
+			agent: mkAgent("anth-no-auth", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1/",
+				Model:   "claude-sonnet-4-6",
+			}),
+			wantBase:  "https://api.anthropic.com/v1",
+			wantModel: "claude-sonnet-4-6",
+		},
+		{
+			name: "anthropic with Secret: apiKey is the raw value, authHeader stays empty",
+			agent: mkAgent("anth-auth", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1",
+				Model:   "claude-sonnet-4-6",
+				APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "anthropic-api-key"},
+					Key:                  "key",
+				},
+			}),
+			seedObjects: []runtime.Object{mkSecret("anthropic-api-key", "key", "sk-ant-test\n")},
+			wantBase:    "https://api.anthropic.com/v1",
+			wantModel:   "claude-sonnet-4-6",
+			wantAuth:    "",            // no Bearer header on the Messages wire
+			wantKey:     "sk-ant-test", // raw, TrimSpace'd
+		},
+		{
+			name:        "anthropic missing providerConfig",
+			agent:       mkAgent("anth-no-cfg", nil),
+			wantErrFrag: "providerConfig is required for provider=anthropic",
+		},
+		{
+			name: "anthropic missing baseURL",
+			agent: mkAgent("anth-no-base", &foremanv1alpha1.ProviderConfig{
+				Model: "claude-sonnet-4-6",
+			}),
+			wantErrFrag: "baseURL is required for provider=anthropic",
+		},
+		{
+			name: "anthropic missing model",
+			agent: mkAgent("anth-no-model", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1",
+			}),
+			wantErrFrag: "model is required for provider=anthropic",
+		},
+		{
+			name: "anthropic: APIKeySecretRef points at nonexistent Secret",
+			agent: mkAgent("anth-missing-secret", &foremanv1alpha1.ProviderConfig{
+				BaseURL: "https://api.anthropic.com/v1",
+				Model:   "claude-sonnet-4-6",
+				APIKeySecretRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "nope"},
+					Key:                  "key",
+				},
+			}),
+			wantErrFrag: "get Secret",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := fake.NewClientBuilder().WithScheme(resolveSchemeForTests(t))
+			b = b.WithObjects(tc.agent)
+			for _, obj := range tc.seedObjects {
+				if co, ok := obj.(client.Object); ok {
+					b = b.WithObjects(co)
+				}
+			}
+			e := &NativeAgentLoopExecutor{Client: b.Build()}
+
+			ep, err := e.resolveAnthropicEndpoint(context.Background(), "default", tc.agent)
+			if tc.wantErrFrag != "" {
+				if err == nil {
+					t.Fatalf("want error containing %q, got nil (endpoint=%+v)", tc.wantErrFrag, ep)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrFrag) {
+					t.Errorf("error fragment: want %q, got %v", tc.wantErrFrag, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveAnthropicEndpoint: %v", err)
+			}
+			if ep.baseURL != tc.wantBase {
+				t.Errorf("baseURL: want %q got %q", tc.wantBase, ep.baseURL)
+			}
+			if ep.modelName != tc.wantModel {
+				t.Errorf("modelName: want %q got %q", tc.wantModel, ep.modelName)
+			}
+			if ep.authHeader != tc.wantAuth {
+				t.Errorf("authHeader: want %q got %q (anthropic never sends Bearer)", tc.wantAuth, ep.authHeader)
+			}
+			if ep.apiKey != tc.wantKey {
+				t.Errorf("apiKey: want %q got %q", tc.wantKey, ep.apiKey)
 			}
 		})
 	}
@@ -1711,6 +1922,183 @@ func TestEnforceReviewerIssueAsk_UnverifiedGoNoRefsNoVouchDemotes(t *testing.T) 
 	}
 }
 
+// TestEnforceReviewerUnverifiedSummary covers #1454: a reviewer GO whose
+// terminal summary states in plain language that verification could not be
+// performed must demote to NO-GO, and a normal GO must stand untouched. The
+// first row is verbatim from the windowstead#321 incident that motivated
+// the rail; the variant rows pin the full phrase set the enforcer's
+// docstring promises, including both apostrophe forms of the contractions.
+func TestEnforceReviewerUnverifiedSummary(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary string
+		verdict foremanv1alpha1.AgenticTaskVerdict
+		want    foremanv1alpha1.AgenticTaskVerdict
+	}{
+		{
+			name:    "windowstead reproduction: cannot verify",
+			summary: "Tests fail due to missing godot runtime in environment; cannot verify goal reward or progression logic.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "could not verify",
+			summary: "The change looks correct but I could not verify it without the service running.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "unable to verify",
+			summary: "Reviewed statically; unable to verify runtime behavior in this environment.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction can't, straight apostrophe",
+			summary: "Reviewed statically; can't verify the migration path without a database.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction can't, curly apostrophe",
+			summary: "Reviewed statically; can’t verify the migration path without a database.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction couldn't, straight apostrophe",
+			summary: "The harness is missing, so we couldn't verify the fix in this environment.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "contraction couldn't, curly apostrophe",
+			summary: "The harness is missing, so we couldn’t verify the fix in this environment.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "spaced can not",
+			summary: "No runtime is available here, so I can not verify the behavior.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "was not able to",
+			summary: "I was not able to verify the fix before approving; the harness was unavailable.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "case-insensitive",
+			summary: "APPROVE. Could NOT VERIFY the migration path; no database available.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "whitespace-tolerant across wrapped lines",
+			summary: "The harness is missing, so we cannot\nverify the fix here.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "normal GO stays GO",
+			summary: "APPROVE: ran go test ./... and all specs pass; the change is minimal and well covered.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictGo,
+		},
+		{
+			name:    "affirmative verification language is not a match",
+			summary: "The new guard verifies the token before use; tests confirm it rejects expired tokens.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictGo,
+		},
+		{
+			// The tradeoff the enforcer's docstring documents: phrase
+			// anchoring matches whatever subject the phrase carries, so an
+			// honest GO describing what a third party cannot do is
+			// demoted. The false positive is accepted, because the
+			// subjectless incident summaries this rail exists for (#1454)
+			// are the common case.
+			name:    "object-subject honest GO is the accepted false positive",
+			summary: "The new signature check is correct: a client without the key cannot verify a forged signature, and the tests prove it.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+		{
+			name:    "non-GO with the phrase passes through unmarked",
+			summary: "REJECT: cannot verify anything in this broken environment and the diff is wrong.",
+			verdict: foremanv1alpha1.AgenticTaskVerdictNoGo,
+			want:    foremanv1alpha1.AgenticTaskVerdictNoGo,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			extra := map[string]any{}
+			got := enforceReviewerUnverifiedSummary(logr.Discard(), extra, tc.summary, tc.verdict)
+			if got != tc.want {
+				t.Fatalf("verdict = %v, want %v", got, tc.want)
+			}
+			demoted := tc.verdict == foremanv1alpha1.AgenticTaskVerdictGo &&
+				tc.want == foremanv1alpha1.AgenticTaskVerdictNoGo
+			v, marked := extra["verdictDemoted"].(bool)
+			if !demoted {
+				if marked {
+					t.Errorf("non-demoting path must not annotate extra; got verdictDemoted=%v", v)
+				}
+				return
+			}
+			if !v {
+				t.Errorf("demotion must set verdictDemoted=true; got %v", v)
+			}
+			if extra["verdictDemotedBy"] != railUnverifiedSummary {
+				t.Errorf("verdictDemotedBy = %v, want %q", extra["verdictDemotedBy"], railUnverifiedSummary)
+			}
+			if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+				t.Errorf("verdictClaimed should archive the original GO; got %v", extra["verdictClaimed"])
+			}
+			if reason, _ := extra["demotionReason"].(string); reason == "" {
+				t.Error("demotionReason must explain the demotion")
+			}
+			if phrase, _ := extra["unverifiedSummaryPhrase"].(string); phrase == "" {
+				t.Error("unverifiedSummaryPhrase must record the matched admission")
+			}
+		})
+	}
+}
+
+func TestEnforceReviewerUnverifiedSummary_NilExtraIsNoOp(t *testing.T) {
+	// Without an extra map the demotion cannot be recorded or grounded in
+	// the audit trail, so the rails pass the verdict through with only a
+	// log line — the enforceReviewerIssueAsk convention.
+	got := enforceReviewerUnverifiedSummary(logr.Discard(), nil,
+		"cannot verify anything", foremanv1alpha1.AgenticTaskVerdictGo)
+	if got != foremanv1alpha1.AgenticTaskVerdictGo {
+		t.Errorf("nil extra must pass the verdict through; got %v", got)
+	}
+}
+
+func TestEnforceReviewerUnverifiedSummary_PreservesFirstWriterVerdictClaimed(t *testing.T) {
+	// The issueAsk scope-vouch path marks a still-GO verdict with
+	// verdictClaimed; this rail must not overwrite it (#1678 first-writer-
+	// wins), while its own rail name still records who made the rewrite.
+	extra := map[string]any{
+		"verdictClaimed": string(foremanv1alpha1.AgenticTaskVerdictGo),
+	}
+	got := enforceReviewerUnverifiedSummary(logr.Discard(), extra,
+		"Tests could not verify the fix; no runtime available.",
+		foremanv1alpha1.AgenticTaskVerdictGo)
+	if got != foremanv1alpha1.AgenticTaskVerdictNoGo {
+		t.Fatalf("matching GO must demote to NO-GO; got %v", got)
+	}
+	if extra["verdictClaimed"] != string(foremanv1alpha1.AgenticTaskVerdictGo) {
+		t.Errorf("verdictClaimed must keep the first writer's archive; got %v", extra["verdictClaimed"])
+	}
+	if extra["verdictDemotedBy"] != railUnverifiedSummary {
+		t.Errorf("verdictDemotedBy = %v, want %q", extra["verdictDemotedBy"], railUnverifiedSummary)
+	}
+}
+
 // TestNormalizeModelVerdict_ErrorMapsToIncompleteWithModelReportedError pins
 // the #649 fix: the submit_result tool contract allows verdict="ERROR" (model
 // reports it cannot complete the task: a reviewer's could-not-review, a
@@ -2149,6 +2537,57 @@ func TestBuildUserPrompt_ReviewerOmitsAdvisoryBlockWhenNone(t *testing.T) {
 	// Must still produce a non-empty, useful prompt.
 	if !strings.Contains(got, "reviewing the branch") {
 		t.Errorf("reviewer prompt missing base content; got:\n%s", got)
+	}
+}
+
+// TestBuildUserPrompt_ReviewerZeroIssueOmitsIssue verifies that a review task
+// whose payload carries no issue key (int32 zero value) does not anchor the
+// reviewer on a non-existent "issue #0": the branch under review is the anchor
+// instead (#1761), matching the #1530 guards on the two sibling call sites.
+func TestBuildUserPrompt_ReviewerZeroIssueOmitsIssue(t *testing.T) {
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindReview,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Branch: "foreman/wl/no-issue-review",
+			},
+		},
+	}
+	got := buildUserPrompt(task)
+	if strings.Contains(got, "issue #0") {
+		t.Errorf("reviewer prompt with no issue in the payload must not reference issue #0; got:\n%s", got)
+	}
+	if strings.Contains(got, "- issue:") {
+		t.Errorf("zero-issue reviewer prompt must omit the issue line entirely; got:\n%s", got)
+	}
+	if !strings.Contains(got, "reviewing the branch foreman/wl/no-issue-review of defilantech/LLMKube") {
+		t.Errorf("zero-issue reviewer prompt must name the branch under review; got:\n%s", got)
+	}
+}
+
+// TestBuildUserPrompt_ReviewerPositiveIssueKeepsReferences verifies the guard
+// leaves the issue-anchored form untouched when the payload carries an issue.
+func TestBuildUserPrompt_ReviewerPositiveIssueKeepsReferences(t *testing.T) {
+	task := &foremanv1alpha1.AgenticTask{
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindReview,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  510,
+				Branch: "foreman/wl/issue-510",
+			},
+		},
+	}
+	got := buildUserPrompt(task)
+	for _, want := range []string{
+		"reviewing the branch the coder produced for issue #510 of defilantech/LLMKube",
+		"- issue: 510",
+		"- branch: foreman/wl/issue-510",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("reviewer prompt with an issue missing %q in:\n%s", want, got)
+		}
 	}
 }
 

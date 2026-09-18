@@ -254,3 +254,26 @@ const canonicalJSON = `{
     "auditLog": {"sink": "stdout"}
   }
 }`
+
+// TestConfigValidateRejectsUnknownPoolActivation keeps the wire enum closed so a
+// typo in poolActivation fails at compile time instead of silently meaning Wait.
+func TestConfigValidateRejectsUnknownPoolActivation(t *testing.T) {
+	cfg := &Config{
+		Backends:     []Backend{{Name: "a", Tier: "local", Address: "http://a"}},
+		DefaultRoute: "a",
+		Rules: []Rule{{
+			Name:  "r",
+			Route: RuleRoute{Backends: []string{"a"}, PoolActivation: "Sometimes"},
+		}},
+		Policy: Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate accepted poolActivation \"Sometimes\"; want an error")
+	}
+	for _, ok := range []string{"", PoolActivationWait, PoolActivationIfIdle} {
+		cfg.Rules[0].Route.PoolActivation = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate rejected poolActivation %q: %v", ok, err)
+		}
+	}
+}

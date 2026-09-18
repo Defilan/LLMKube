@@ -20,14 +20,23 @@ import "github.com/defilantech/llmkube/pkg/foreman/agent/reviewer"
 // this verdict?" and answering it should not require knowing every rail's name.
 const railsSkippedKey = "railsSkipped"
 
-// Rail names. Used in railsSkipped entries and, for the two rails that can
+// Rail names. Used in railsSkipped entries and, for the rails that can
 // rewrite a verdict, in the verdictDemotedBy marker those rails stamp. The
 // demoting rails take their names from pkg/foreman/agent/reviewer so the
 // controller, which reads verdictDemotedBy back out of the result envelope
 // and cannot import this package, compares against the same strings (#1636).
 const (
-	railIssueAsk            = reviewer.RailIssueAsk
-	railScopeOverlap        = reviewer.RailScopeOverlap
+	railIssueAsk     = reviewer.RailIssueAsk
+	railScopeOverlap = reviewer.RailScopeOverlap
+	// railUnverifiedSummary aliases the shared rail name so the rail's
+	// verdictDemotedBy marker and the controller's inertDemotion predicate
+	// compile against the same string (#1454, #1636). The rail rewrites a
+	// GO to NO-GO when the reviewer's own terminal summary states in plain
+	// language that verification could not be performed. Like the issueAsk
+	// rail's demotion, this is a statement about verification confidence,
+	// not about the change: re-running the coder cannot make an unverifiable
+	// environment verifiable.
+	railUnverifiedSummary   = reviewer.RailUnverifiedSummary
 	railVerdictFromFindings = "verdict-from-findings"
 	railEmptyClaim          = "empty-claim"
 	railGroundedFinding     = "grounded-finding"

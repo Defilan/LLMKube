@@ -239,6 +239,29 @@ var (
 		[]string{"router", "pool", "from", "to"},
 	)
 
+	// ModelPoolSwapFailuresTotal counts swaps that never made their target
+	// resident, by reason: "deadline" when the swap outran its bound and was
+	// abandoned so the pool could recover, "error" when the controller refused
+	// the activation or the readiness wait failed outright.
+	ModelPoolSwapFailuresTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_modelpool_swap_failures_total",
+			Help: "ModelPool slot swaps that failed or were abandoned before the target became resident.",
+		},
+		[]string{"router", "pool", "member", "reason"},
+	)
+
+	// ModelPoolReclaimsTotal counts slot reclaims: the controller returned the
+	// shared slot to spec.default after the resident non-default member went
+	// idle for the pool's reclaimAfter under the "reclaim" swap policy.
+	ModelPoolReclaimsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_modelpool_reclaims_total",
+			Help: "Total number of ModelPool slot reclaims to spec.default after the resident member went idle.",
+		},
+		[]string{"namespace", "pool", "from", "to"},
+	)
+
 	// ModelPoolSwapDuration measures how long a swap takes from the router's
 	// commit (incumbent drain start) to the target reporting Ready.
 	ModelPoolSwapDuration = prometheus.NewHistogramVec(
@@ -267,6 +290,17 @@ var (
 		prometheus.CounterOpts{
 			Name: "llmkube_modelpool_coalesced_total",
 			Help: "Requests coalesced onto the resident member instead of triggering a swap.",
+		},
+		[]string{"router", "pool", "member"},
+	)
+
+	// ModelPoolBusySkipsTotal counts cross-model requests that skipped a pooled
+	// backend under poolActivation=IfIdle because the incumbent was busy, and
+	// fell through to the next backend instead of being held.
+	ModelPoolBusySkipsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_modelpool_busy_skips_total",
+			Help: "Pooled backends skipped under IfIdle activation because the resident member was busy.",
 		},
 		[]string{"router", "pool", "member"},
 	)
@@ -374,9 +408,12 @@ var AllCollectors = []prometheus.Collector{
 	RouterBudgetUtilization,
 	ModelPoolResident,
 	ModelPoolSwapsTotal,
+	ModelPoolSwapFailuresTotal,
+	ModelPoolReclaimsTotal,
 	ModelPoolSwapDuration,
 	ModelPoolHoldDuration,
 	ModelPoolCoalescedTotal,
+	ModelPoolBusySkipsTotal,
 	ModelPoolHeldRequests,
 	ForemanTaskCompletedTotal,
 	ForemanTaskDurationSeconds,

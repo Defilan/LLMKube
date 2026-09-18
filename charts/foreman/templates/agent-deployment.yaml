@@ -62,7 +62,7 @@ spec:
   {{- if and (ne $st "Recreate") (ne $st "RollingUpdate") }}
   {{- fail (printf "agents.%s.strategy.type: %q is not a valid Deployment strategy; use \"Recreate\" or \"RollingUpdate\" (the API server rejects anything else, including case variants like \"rollingUpdate\")" $name $st) }}
   {{- end }}
-  {{- $tgps := $agent.terminationGracePeriodSeconds | default 30 }}
+  {{- $tgps := $agent.terminationGracePeriodSeconds | default 300 }}
   {{- /* Kind, not a single kind: the same value reaches this line as
          different Go types depending on how it was supplied. Everything
          routed through `include "foreman.agents" | fromYaml` is float64,

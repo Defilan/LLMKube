@@ -47,6 +47,9 @@ var gateExemptCIChecks = map[string]string{
 		"succeeds; the gate image is a plain golang image that ships python3 but neither PyYAML " +
 		"nor pip3, so adding this target would fail every gate run. CI clears it only because " +
 		"helm-chart.yml installs PyYAML in a step of its own beforehand",
+	"test-envtest": "the CI-only second-seed envtest pass (#1693); the gate deliberately runs " +
+		"`make test` single-pass, so gating this target would double the ordering coverage the " +
+		"gate was decided not to pay for (see the DefaultGateChecks comment)",
 	"setup-test-e2e":                "provisions an e2e cluster; lifecycle, not a branch check",
 	"cleanup-test-e2e":              "tears down an e2e cluster; lifecycle, not a branch check",
 	"test-e2e":                      "needs a live cluster the gate Job does not own",

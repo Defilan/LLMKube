@@ -33,6 +33,9 @@ on:
       - 'Dockerfile.foreman-agent'
       - '.github/workflows/foreman-e2e.yml'
 
+permissions:
+  contents: read
+
 jobs:
   foreman-e2e:
     name: Stub task flows Pending -> Succeeded on kind
@@ -60,7 +63,7 @@ jobs:
           version: v3.13.0
 
       - name: Create kind cluster
-        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
         with:
           cluster_name: foreman-e2e
 

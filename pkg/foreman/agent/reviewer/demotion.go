@@ -29,13 +29,20 @@ package reviewer
 // that is a statement about verification confidence, and re-running the
 // coder cannot change it. The scope-overlap rail demotes when the diff
 // touches none of the files the issue names: that is a statement about the
-// diff, and the coder CAN act on it. A consumer keying off verdictDemoted
-// alone conflates the two.
+// diff, and the coder CAN act on it. The unverified-summary rail demotes a
+// GO whose own summary admits verification could not be performed (#1454):
+// a statement about the review environment, not the change, and re-running
+// the coder cannot change it either. A consumer keying off verdictDemoted
+// alone conflates the three.
 //
 // The names live here, in the leaf package that already defines the
 // reviewer's submit_result.extra contract, because the producer
 // (pkg/foreman/agent's rails) and the consumer (internal/foreman/controller)
-// both need the same strings and neither imports the other.
+// both need the same strings and neither imports the other. A rail name
+// that exists only inside pkg/foreman/agent is one the controller's
+// inertDemotion predicate can never match, which is how unverified-summary
+// demotions silently drove futile fix iterations before this constant
+// existed.
 const (
 	// RailIssueAsk names enforceReviewerIssueAsk in
 	// pkg/foreman/agent/executor_native.go.
@@ -43,4 +50,7 @@ const (
 	// RailScopeOverlap names enforceReviewerScopeOverlap in
 	// pkg/foreman/agent/scope_overlap.go.
 	RailScopeOverlap = "scope-overlap"
+	// RailUnverifiedSummary names enforceReviewerUnverifiedSummary in
+	// pkg/foreman/agent/executor_native.go.
+	RailUnverifiedSummary = "unverified-summary"
 )

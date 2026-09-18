@@ -48,6 +48,18 @@ import (
 // member reaches Stopped, so this is a backstop, not the primary signal.
 const modelPoolSwapRequeue = 3 * time.Second
 
+// modelPoolReclaimPoll bounds how often the reclaim policy re-probes the
+// resident member's idle state. A request completing does not change the member
+// InferenceService or its Pods, so neither watch fires when a busy resident goes
+// idle; the reconciler must poll to notice it. Capped low enough that reclaim
+// fires promptly after reclaimAfter elapses, high enough not to hammer /slots.
+const modelPoolReclaimPoll = 30 * time.Second
+
+// defaultReclaimAfter is used when SwapPolicy is "reclaim" but spec.reclaimAfter
+// is unset (the CRD default also supplies 300s; this guards direct API writes
+// and unit construction).
+const defaultReclaimAfter = 300 * time.Second
+
 // ModelPoolReconciler enforces the exclusive-slot invariant for a ModelPool:
 // at most one member InferenceService is resident (Ready) at a time, and the
 // incumbent is fully drained and unloaded (VRAM freed) before the next member
@@ -116,6 +128,20 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	owner := resolveSlotOwner(pool, members)
+
+	// Capture the status baseline before applyReclaimOwner mutates
+	// status.ResidentIdleSince. updateStatus patches with MergeFrom against this
+	// baseline; taken after the mutation it would diff the idle clock away, so
+	// the clock would never persist and the reclaim would never fire.
+	statusBefore := pool.DeepCopy()
+
+	// Reclaim policy: once the resident non-default member has been idle for
+	// spec.reclaimAfter, return the slot to spec.default. This overrides the
+	// desired owner and then rides the ordinary drain-and-swap machinery below
+	// (the idle resident is drained like any displaced incumbent). reclaimRequeue
+	// keeps the reconciler polling idle state, which no InferenceService or Pod
+	// event would otherwise surface.
+	owner, reclaimRequeue := r.applyReclaimOwner(ctx, pool, members, owner)
 
 	// Drain every non-owner. A non-owner that is currently serving (Ready) is
 	// the incumbent being displaced: idle-gate it through the shared /slots
@@ -199,7 +225,12 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if swapping || (owner != "" && !memberReady(members[owner])) {
 		result.RequeueAfter = modelPoolSwapRequeue
 	}
-	if err := r.updateStatus(ctx, pool, members, owner, swapping, deferReason); err != nil {
+	// The reclaim poll is a low-frequency heartbeat; the swap requeue (when a
+	// swap is in flight) is shorter and wins.
+	if reclaimRequeue > 0 && (result.RequeueAfter == 0 || reclaimRequeue < result.RequeueAfter) {
+		result.RequeueAfter = reclaimRequeue
+	}
+	if err := r.updateStatus(ctx, pool, statusBefore, members, owner, swapping, deferReason); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
@@ -314,6 +345,101 @@ func resolveSlotOwner(pool *inferencev1alpha1.ModelPool, members map[string]*inf
 		}
 	}
 	return resident
+}
+
+// applyReclaimOwner implements the "reclaim" swap policy. When a non-default
+// member has held the slot and been continuously idle for spec.reclaimAfter, it
+// overrides owner with spec.default so the ordinary drain-and-swap machinery
+// returns the slot to the background model. It returns the (possibly overridden)
+// owner and a requeue interval that keeps the reconciler polling idle state
+// while a non-default member is resident (no watch fires on a busy->idle
+// transition). Idle-probe failure is fail-closed: the clock resets and the slot
+// is not reclaimed. The idle clock lives in status.ResidentIdleSince, which
+// updateStatus persists untouched; it self-clears once the default is resident.
+func (r *ModelPoolReconciler) applyReclaimOwner(
+	ctx context.Context,
+	pool *inferencev1alpha1.ModelPool,
+	members map[string]*inferencev1alpha1.InferenceService,
+	owner string,
+) (string, time.Duration) {
+	log := logf.FromContext(ctx)
+
+	def := pool.Spec.Default
+	if pool.Spec.SwapPolicy != inferencev1alpha1.ModelPoolSwapPolicyReclaim || def == "" {
+		pool.Status.ResidentIdleSince = nil
+		return owner, 0
+	}
+
+	// Reclaim only applies to a pool that is settled on a non-default resident:
+	// resolveSlotOwner returned that same resident (no cross-model activation is
+	// already redirecting the slot), the resident is Ready, and spec.default is
+	// still a member to reclaim to. Any other shape means a real swap is already
+	// in motion or there is nothing to reclaim.
+	resident := pool.Status.ResidentMember
+	if owner == "" || owner != resident || resident == def {
+		pool.Status.ResidentIdleSince = nil
+		return owner, 0
+	}
+	residentISVC, ok := members[resident]
+	if !ok || !memberReady(residentISVC) {
+		pool.Status.ResidentIdleSince = nil
+		return owner, 0
+	}
+	if _, ok := members[def]; !ok {
+		pool.Status.ResidentIdleSince = nil
+		return owner, 0
+	}
+
+	idle, err := r.memberIdle(ctx, residentISVC)
+	if err != nil {
+		// Fail closed: an unestablished idle state never reclaims. Reset the
+		// clock and poll again shortly.
+		log.Info("reclaim idle check failed; resetting idle clock", "member", resident, "error", err)
+		pool.Status.ResidentIdleSince = nil
+		return owner, modelPoolReclaimPoll
+	}
+	if !idle {
+		// Busy: a request is in flight. Reset the clock and keep polling so the
+		// next busy->idle transition is noticed (no watch fires for it).
+		pool.Status.ResidentIdleSince = nil
+		return owner, modelPoolReclaimPoll
+	}
+
+	reclaimAfter := reclaimAfterDuration(pool)
+	now := time.Now()
+	if pool.Status.ResidentIdleSince == nil {
+		t := metav1.NewTime(now)
+		pool.Status.ResidentIdleSince = &t
+		return owner, pollWithin(reclaimAfter)
+	}
+	if elapsed := now.Sub(pool.Status.ResidentIdleSince.Time); elapsed >= reclaimAfter {
+		log.Info("reclaiming pool slot to default after idle",
+			"pool", pool.Name, "from", resident, "to", def, "idleFor", elapsed.String())
+		llmkubemetrics.ModelPoolReclaimsTotal.WithLabelValues(pool.Namespace, pool.Name, resident, def).Inc()
+		// Leave ResidentIdleSince set; it clears on the next reconcile once the
+		// default is resident (owner == resident == def branch above).
+		return def, 0
+	}
+	return owner, pollWithin(reclaimAfter)
+}
+
+// pollWithin returns how long to wait before re-checking a running idle clock:
+// the shorter of the reclaim window and the poll cap, so a small reclaimAfter
+// still fires promptly while a large one polls at a steady cadence.
+func pollWithin(reclaimAfter time.Duration) time.Duration {
+	if reclaimAfter < modelPoolReclaimPoll {
+		return reclaimAfter
+	}
+	return modelPoolReclaimPoll
+}
+
+// reclaimAfterDuration is spec.reclaimAfter, or defaultReclaimAfter when unset
+// or non-positive.
+func reclaimAfterDuration(pool *inferencev1alpha1.ModelPool) time.Duration {
+	if pool.Spec.ReclaimAfter != nil && pool.Spec.ReclaimAfter.Duration > 0 {
+		return pool.Spec.ReclaimAfter.Duration
+	}
+	return defaultReclaimAfter
 }
 
 // ensureReplicas patches the member InferenceService's spec.replicas when it
@@ -447,9 +573,12 @@ func (r *ModelPoolReconciler) markMetalUnsupported(ctx context.Context, pool *in
 	return ctrl.Result{}, nil
 }
 
-func (r *ModelPoolReconciler) updateStatus(ctx context.Context, pool *inferencev1alpha1.ModelPool, members map[string]*inferencev1alpha1.InferenceService, owner string, swapping bool, deferReason string) error {
-	before := pool.DeepCopy()
-
+// updateStatus patches the pool's status with MergeFrom(before). The caller
+// must capture before BEFORE applyReclaimOwner runs: applyReclaimOwner mutates
+// status.ResidentIdleSince, and a baseline taken after that mutation diffs the
+// idle clock out of the patch, so it never persists and the reclaim never fires
+// (the clock resets every reconcile). See the Reconcile call site.
+func (r *ModelPoolReconciler) updateStatus(ctx context.Context, pool, before *inferencev1alpha1.ModelPool, members map[string]*inferencev1alpha1.InferenceService, owner string, swapping bool, deferReason string) error {
 	memberStatuses := make([]inferencev1alpha1.ModelPoolMemberStatus, 0, len(pool.Spec.Members))
 	for _, m := range pool.Spec.Members {
 		name := m.InferenceServiceRef.Name

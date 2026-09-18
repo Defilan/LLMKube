@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,7 @@ import (
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/foreman/agent/anthropic"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/changepolicy"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/codehost"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubissue"
@@ -126,10 +128,13 @@ type NativeAgentLoopExecutor struct {
 	// reads $GITHUB_TOKEN or ~/.config/foreman/github-token.
 	AuthFactory func() (*repo.Auth, error)
 
-	// LoopFactory builds the Loop given the resolved OAI client and
+	// LoopFactory builds the Loop given the resolved chat client and
 	// tool registry. Mostly to support tests with a fake loop; nil
-	// uses the real NewLoop.
-	LoopFactory func(client *oai.Client, registry ToolRegistry) *Loop
+	// uses the real NewLoop. The client is provider-shaped at the call
+	// site (oai.Client for local + cloud-proxy, anthropic.Client for
+	// anthropic) but arrives as a ChatCompleter so a fake loop can be
+	// injected without caring which wire it speaks (#1627).
+	LoopFactory func(client ChatCompleter, registry ToolRegistry) *Loop
 
 	// RegistryFactory builds the tool registry for a given workspace +
 	// agent. Required; the executor refuses to start without one
@@ -454,6 +459,9 @@ func (e *NativeAgentLoopExecutor) Execute(
 	// when it is a fork of payload.repo (same repo name, different owner): the
 	// fork deployment pushes to the fork, not upstream (#915).
 	cloneURL := ""
+	// rebaseConflict is set when setupTaskBranch left the workspace mid-rebase
+	// for the coder loop to resolve (#1839); nil in the common case.
+	var rebaseConflict *repo.RebaseConflictError
 	if needsRepo {
 		cloneURL = resolveUpstream(task.Spec.Payload.Repo)
 		if cloneURL == "" || isForkOf(e.GitRemoteURL, task.Spec.Payload.Repo) {
@@ -476,8 +484,14 @@ func (e *NativeAgentLoopExecutor) Execute(
 		// clone-HEAD fallback). Failures bucket with CloneFailed for the
 		// retry policy.
 		baseBranch := baseBranchOrDefault(task.Spec.Payload.BaseBranch)
-		if err := setupTaskBranch(ctx, task, workspace, branch, baseBranch, resolveUpstream, auth, log); err != nil {
-			return e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error()), nil
+		// A rebase conflict is not a hard failure: setupTaskBranch leaves the
+		// workspace mid-rebase and the coder loop resolves it (#1839). Any
+		// other error buckets as CloneFailed for the retry policy.
+		var failR *Result
+		rebaseConflict, failR = e.setupBranchClassified(
+			ctx, task, workspace, branch, baseBranch, resolveUpstream, auth, log, start)
+		if failR != nil {
+			return failR, nil
 		}
 	}
 
@@ -516,7 +530,8 @@ func (e *NativeAgentLoopExecutor) Execute(
 	// 6+. LLM-driven path: extracted to keep Execute below the
 	// cyclomatic-complexity threshold. runLLMPath owns OAI + loop +
 	// transcript + commit/push.
-	return e.runLLMPath(ctx, task, agent, endpoint, workspace, branch, registry, auth, needsRepo, cloneURL, start)
+	return e.runLLMPath(
+		ctx, task, agent, endpoint, workspace, branch, registry, auth, needsRepo, cloneURL, rebaseConflict, start)
 }
 
 // setupTaskBranch cuts the task's working branch in the freshly cloned
@@ -542,6 +557,34 @@ func (e *NativeAgentLoopExecutor) Execute(
 //     unsafe for these kinds — it bases on a fork tip that drifts from
 //     upstream — so the missing slug is refused, not papered over.
 //  4. Clone-HEAD checkout for freeform tasks without a repo slug.
+//
+// setupBranchClassified runs setupTaskBranch and classifies its outcome for
+// Execute: a *repo.RebaseConflictError is a soft signal (the workspace is left
+// mid-rebase for the coder loop to resolve, #1839), returned as the first
+// value; any other error yields a fail Result as the second value. Both nil on
+// success.
+func (e *NativeAgentLoopExecutor) setupBranchClassified(
+	ctx context.Context,
+	task *foremanv1alpha1.AgenticTask,
+	workspace, branch, baseBranch string,
+	resolveUpstream func(string) string,
+	auth *repo.Auth,
+	log logr.Logger,
+	start time.Time,
+) (*repo.RebaseConflictError, *Result) {
+	err := setupTaskBranch(ctx, task, workspace, branch, baseBranch, resolveUpstream, auth, log)
+	if err == nil {
+		return nil, nil
+	}
+	var rce *repo.RebaseConflictError
+	if errors.As(err, &rce) {
+		log.Info("rebase onto base conflicted; handing the mid-rebase workspace to the coder to resolve",
+			"branch", branch, "files", rce.Files)
+		return rce, nil
+	}
+	return nil, e.failResult(start, foremanv1alpha1.FailureCloneFailed, err.Error())
+}
+
 func setupTaskBranch(
 	ctx context.Context,
 	task *foremanv1alpha1.AgenticTask,
@@ -588,12 +631,16 @@ func setupTaskBranch(
 		}
 		if found {
 			// Replay the restored prior attempt onto the current base. A
-			// conflict fails the task loud rather than reverting merged work.
+			// conflict is LEFT in the workspace (LeaveConflicts) and returned
+			// as a *repo.RebaseConflictError so Execute can hand the mid-rebase
+			// tree to the coder loop to resolve (#1839), rather than failing
+			// loud with no path forward. Any other error still fails loud.
 			if err := repo.RebaseOntoBase(ctx, repo.RebaseOntoBaseOptions{
-				Workspace:   workspace,
-				BaseBranch:  baseBranch,
-				UpstreamURL: resolveUpstream(task.Spec.Payload.Repo),
-				Auth:        auth,
+				Workspace:      workspace,
+				BaseBranch:     baseBranch,
+				UpstreamURL:    resolveUpstream(task.Spec.Payload.Repo),
+				Auth:           auth,
+				LeaveConflicts: true,
 			}); err != nil {
 				return err
 			}
@@ -709,6 +756,56 @@ func setupTaskBranch(
 // local or cloud-proxy). The split from Execute is purely about
 // cyclomatic complexity, not separation of concerns: nothing here
 // should be reachable from the deterministic branch.
+// rebaseConflictInstruction is the opening the coder reads when its task
+// started mid-rebase (#1839). It names the conflicted files and spells out the
+// resolve-then-continue contract, emphasizing that merged work must be kept —
+// the invariant the post-loop guard and reviewer independently enforce.
+func rebaseConflictInstruction(rc *repo.RebaseConflictError) string {
+	files := "the conflicted files"
+	if len(rc.Files) > 0 {
+		files = strings.Join(rc.Files, ", ")
+	}
+	return fmt.Sprintf(
+		"IMPORTANT — resolve a rebase conflict first. Your branch is mid-rebase onto %s "+
+			"with conflicts in: %s. Before the task below, open each conflicted file and "+
+			"resolve every marker keeping BOTH the base's already-merged work and this "+
+			"branch's intent — never delete or revert work merged into %s. Then `git add` "+
+			"the resolved files and run `git rebase --continue` (repeat if more conflicts "+
+			"surface). Confirm `git status` shows no rebase in progress and no unmerged "+
+			"paths, and that the project still builds and its tests pass, before you submit GO.",
+		rc.Base, files, rc.Base)
+}
+
+// maybePrependRebaseInstruction leads the prompt with the rebase-conflict
+// instruction when the task started mid-rebase (#1839); a nil conflict returns
+// the prompt unchanged (the common case).
+func maybePrependRebaseInstruction(prompt string, rc *repo.RebaseConflictError) string {
+	if rc == nil {
+		return prompt
+	}
+	return rebaseConflictInstruction(rc) + "\n\n" + prompt
+}
+
+// applyRepoMapPrefix prepends a repo-map summary to a coder Agent's prompt
+// (#560). Non-coder agents, and a failed or empty build, return the prompt
+// unchanged.
+func (e *NativeAgentLoopExecutor) applyRepoMapPrefix(
+	ctx context.Context, agent *foremanv1alpha1.Agent,
+	workspace, issueText, userPrompt string, log logr.Logger,
+) string {
+	if agent.Spec.Role != foremanv1alpha1.AgentRoleCoder {
+		return userPrompt
+	}
+	summary, mapErr := repomap.Build(ctx, workspace, issueText, repomap.Options{})
+	switch {
+	case mapErr != nil:
+		log.Info("repomap build failed; continuing without summary", "err", mapErr.Error())
+	case summary != "":
+		return summary + "\n" + userPrompt
+	}
+	return userPrompt
+}
+
 func (e *NativeAgentLoopExecutor) runLLMPath(
 	ctx context.Context,
 	task *foremanv1alpha1.AgenticTask,
@@ -719,31 +816,19 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	auth *repo.Auth,
 	needsRepo bool,
 	cloneURL string,
+	rebaseConflict *repo.RebaseConflictError,
 	start time.Time,
 ) (*Result, error) {
 	log := logf.FromContext(ctx).WithName("native-agent-loop").WithValues("task", task.Name, "ns", task.Namespace)
 
-	// 6. Build OAI client + loop. The auth header is empty for local
-	// providers and "Bearer <token>" for cloud-proxy Agents whose
-	// providerConfig carries an APIKeySecretRef.
-	oaiOpts := []oai.Option{}
-	if endpoint.authHeader != "" {
-		oaiOpts = append(oaiOpts, oai.WithAuthHeader(endpoint.authHeader))
-	}
-	oaiClient := oai.New(
-		endpoint.baseURL,
-		// Per-request header timeout (#532): how long one turn waits for
-		// the first token before retrying. The loop-wide budget is
-		// applied separately via LoopConfig.LoopBudget below.
-		durationFromSeconds(agent.Spec.RequestTurnTimeoutSeconds, 120),
-		int(agent.Spec.MaxRetries),
-		oaiOpts...,
-	)
+	// 6. Build the chat client + loop. The client follows the provider
+	// (#1627); see newChatCompleter for the provider-to-client map.
+	chat := newChatCompleter(agent, endpoint)
 	loopFactory := e.LoopFactory
 	if loopFactory == nil {
-		loopFactory = func(c *oai.Client, r ToolRegistry) *Loop { return NewLoop(c, r, nil) }
+		loopFactory = func(c ChatCompleter, r ToolRegistry) *Loop { return NewLoop(c, r, nil) }
 	}
-	loop := loopFactory(oaiClient, registry)
+	loop := loopFactory(chat, registry)
 
 	// 7. Build the user prompt from the task payload. The composition,
 	// outermost-first:
@@ -777,18 +862,15 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// a git/grep error logs and skips, never blocking the task.
 	applyStalenessCheckForTask(ctx, log, task, workspace)
 	userPrompt := buildUserPrompt(task)
+	// #1839: when setupTaskBranch left the workspace mid-rebase for the coder
+	// to resolve, lead with the conflict so it is the first thing the model
+	// acts on. A GO that leaves the tree mid-rebase or still conflicted is
+	// caught by the post-loop guard below and downgraded to INCOMPLETE.
+	userPrompt = maybePrependRebaseInstruction(userPrompt, rebaseConflict)
 	// issueText ranks files for both the repo-map prefix (coder Agents) and the
 	// scope-overlap guard in the coder gate verifier (#782).
 	issueText := repoMapQuery(task)
-	if agent.Spec.Role == foremanv1alpha1.AgentRoleCoder {
-		summary, mapErr := repomap.Build(ctx, workspace, issueText, repomap.Options{})
-		switch {
-		case mapErr != nil:
-			log.Info("repomap build failed; continuing without summary", "err", mapErr.Error())
-		case summary != "":
-			userPrompt = summary + "\n" + userPrompt
-		}
-	}
+	userPrompt = e.applyRepoMapPrefix(ctx, agent, workspace, issueText, userPrompt, log)
 	userPrompt = workspaceOrientationBlock(workspace) + "\n" + userPrompt
 
 	// Resolve an optional ModelProfile and layer it onto the loop config
@@ -897,6 +979,23 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	stampAgentConfigWarnings(loopRes.Terminal, &agent.Spec)
 
 	verdict, normalizedReason := normalizeModelVerdict(loopRes.Terminal.Verdict)
+
+	// #1839 rebase-conflict guard: this task started mid-rebase (the executor
+	// left an unfinished rebase for the coder to resolve). A GO must not land
+	// unless the rebase actually completed cleanly — a still-mid-rebase or
+	// still-conflicted tree is proof the coder did not finish, and committing
+	// it would push a half-applied or merged-work-reverting branch. Downgrade
+	// to INCOMPLETE, preserving the #1042/#1364 invariant. Only GO is gated;
+	// a non-GO terminal already routes without committing.
+	if rebaseConflict != nil && verdict == foremanv1alpha1.AgenticTaskVerdictGo {
+		if unresolved, why := repo.RebaseUnresolved(ctx, workspace, rebaseConflict.BaseSHA); unresolved {
+			log.Info("rebase conflict left unresolved on GO; downgrading to INCOMPLETE",
+				"reason", why, "files", rebaseConflict.Files)
+			return e.incompleteResult(start, transcriptRef, loopRes,
+				foremanv1alpha1.FailureRebaseConflictUnresolved,
+				"rebase conflict unresolved: "+why), nil
+		}
+	}
 
 	// 9. Non-GO verdicts: no commit, no push, just record the model's
 	// stated outcome and return.
@@ -1028,6 +1127,13 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the model paraphrased the issue ask (#744).
 			verdict = enforceReviewerIssueAsk(log, loopRes.Terminal.Extra, verdict,
 				scopeDriftDetected, scopeMatched)
+			// Unverified-summary rail (#1454): a GO whose own terminal
+			// summary says verification could not be performed demotes to
+			// NO-GO. Runs with the other demote rails and before the
+			// flag-only diff gate, so the diff gate reports on the verdict
+			// the demote rails produced.
+			verdict = enforceReviewerUnverifiedSummary(log, loopRes.Terminal.Extra,
+				loopRes.Terminal.Summary, verdict)
 			// Ungrounded-review rail (#1570): a GO whose transcript carries no
 			// evidence the reviewer ever obtained the branch diff is uncorrelated
 			// with the code it approves. This is a FLAG, not a block: it records
@@ -1036,7 +1142,9 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 			// the demote rails (empty-claim, grounded-finding, verdict-from-
 			// findings, scope-overlap, issueAsk) so it reports on the verdict
 			// those rails produced, and it is the last reviewer rail before the
-			// findings summary so its log line is the last rail signal recorded.
+			// findings summary so its log line is the last rail signal
+			// recorded. (The unverified-summary rail #1454 joins this list as
+			// the last demote rail.)
 			applyReviewerDiffGateForTask(log, loopRes, verdict)
 			// Review-execution rail (#1618): the rubric's Section K mandates
 			// running the diff's own new test (and an adversarial near-miss
@@ -1182,23 +1290,26 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// working tree), so a pre-commit base...HEAD is empty and the rail sees
 	// nothing. Records-and-logs onto loopRes.Terminal.Extra (which goResult
 	// serializes into status extra.modelExtra); never changes the verdict.
-	applyCoderGroundingRailForTask(ctx, log, task, workspace, loopRes)
+	applyCoderGroundingRailForTask(ctx, log, task, workspace, evidenceBaseSHA, loopRes)
 
 	// No-functional-change advisory (non-blocking): flag a GO whose committed
 	// diff is docs/comments/tests only, so a "fix" that changes no production
 	// code (and whose prose may claim unimplemented behavior, #850/#1022) does
 	// not read as a clean functional GATE-PASS. Same after-commit requirement
 	// as the grounding rail; records-and-logs, never changes the verdict.
-	applyNoFunctionalChangeForTask(ctx, log, task, workspace, loopRes)
+	applyNoFunctionalChangeForTask(ctx, log, task, workspace, evidenceBaseSHA, loopRes)
 
 	// Deleted-reference rail (#1553, non-blocking): flag a GO whose committed
 	// diff removes code citing an issue/PR number (a "this exists because of
 	// #N" comment), so the removal of tracked work is stated, not silent.
-	// Same after-commit requirement as the two rails above -- it reads the
-	// committed base...HEAD diff. That is its own `git diff` call, not a
-	// reused result. Records-and-logs onto loopRes.Terminal.Extra; never
-	// changes the verdict.
-	applyDeletedReferenceRailForTask(ctx, task, workspace, loopRes)
+	// Same after-commit requirement as the two rails above. Each rail runs
+	// its own `git diff <anchor>...HEAD` (no result is reused), anchored to
+	// evidenceBaseSHA, the literal upstream base tip resolved before the
+	// loop (#1769): the workspace's local base ref belongs to the fork and
+	// lags upstream, so a stale anchor sweeps the whole intervening upstream
+	// delta into the scanned diff. Records-and-logs onto
+	// loopRes.Terminal.Extra; never changes the verdict.
+	applyDeletedReferenceRailForTask(ctx, task, workspace, evidenceBaseSHA, loopRes)
 
 	r := e.goResult(start, transcriptRef, loopRes, branch, sha)
 	attachGateAdvisories(r.Extra, gateAdvisories)
@@ -1861,16 +1972,18 @@ func buildDeterministicArgs(task *foremanv1alpha1.AgenticTask, branch, cloneURL 
 	return out
 }
 
-// providerEndpoint is the resolved triple the LLM path needs to dial
-// any provider: where to POST, which model to name in the request body,
-// and the optional Authorization header value. The cloud-proxy branch
-// populates all three from Agent.spec.providerConfig + a referenced
-// Secret; the local branch leaves authHeader empty and pulls modelName
-// from Agent.spec.Model.
+// providerEndpoint is the resolved descriptor the LLM path needs to
+// dial any provider: where to POST, which model to name in the request
+// body, and the provider-shaped auth material. The auth is
+// provider-shaped: cloud-proxy carries an Authorization header value
+// ("Bearer <token>"); anthropic carries the raw key for the x-api-key
+// header; local leaves both empty and pulls modelName from
+// Agent.spec.Model.
 type providerEndpoint struct {
 	baseURL    string
 	modelName  string
 	authHeader string
+	apiKey     string
 }
 
 // isDeterministicAgent reports whether the Agent runs the model-free
@@ -1896,7 +2009,8 @@ func mcpEnabledForTask(task *foremanv1alpha1.AgenticTask) bool {
 // resolveProviderEndpoint dispatches to the right resolver based on
 // Agent.spec.Provider. Empty / "local" -> existing InferenceService
 // resolution; "cloud-proxy" -> providerConfig.BaseURL + Secret lookup
-// for the auth header.
+// for the Authorization header; "anthropic" -> providerConfig.BaseURL +
+// Secret lookup for the x-api-key header.
 func (e *NativeAgentLoopExecutor) resolveProviderEndpoint(
 	ctx context.Context, namespace string, agent *foremanv1alpha1.Agent,
 ) (providerEndpoint, error) {
@@ -1911,9 +2025,34 @@ func (e *NativeAgentLoopExecutor) resolveProviderEndpoint(
 	case foremanv1alpha1.AgentProviderCloudProxy:
 		return e.resolveCloudProxyEndpoint(ctx, namespace, agent)
 
+	case foremanv1alpha1.AgentProviderAnthropic:
+		return e.resolveAnthropicEndpoint(ctx, namespace, agent)
+
 	default:
 		return providerEndpoint{}, fmt.Errorf("unknown agent.spec.provider %q", agent.Spec.Provider)
 	}
+}
+
+// newChatCompleter maps a resolved providerEndpoint to the wire client
+// for its provider (#1627). local + cloud-proxy dial an
+// OpenAI-compatible endpoint via oai.Client (Authorization header for
+// cloud-proxy); anthropic dials the native /v1/messages endpoint via
+// anthropic.Client (x-api-key header). Both satisfy ChatCompleter, so
+// the loop never sees the provider difference.
+func newChatCompleter(agent *foremanv1alpha1.Agent, endpoint providerEndpoint) ChatCompleter {
+	// Per-request header timeout (#532): how long one turn waits for
+	// the first byte of the SSE stream before retrying. The loop-wide
+	// budget is applied separately via LoopConfig.LoopBudget.
+	timeout := durationFromSeconds(agent.Spec.RequestTurnTimeoutSeconds, 120)
+	if agent.Spec.Provider == foremanv1alpha1.AgentProviderAnthropic {
+		return anthropic.New(endpoint.baseURL, timeout, int(agent.Spec.MaxRetries),
+			anthropic.WithAPIKey(endpoint.apiKey))
+	}
+	var oaiOpts []oai.Option
+	if endpoint.authHeader != "" {
+		oaiOpts = append(oaiOpts, oai.WithAuthHeader(endpoint.authHeader))
+	}
+	return oai.New(endpoint.baseURL, timeout, int(agent.Spec.MaxRetries), oaiOpts...)
 }
 
 // resolveCloudProxyEndpoint reads providerConfig + the optional
@@ -1943,6 +2082,40 @@ func (e *NativeAgentLoopExecutor) resolveCloudProxyEndpoint(
 			return providerEndpoint{}, err
 		}
 		ep.authHeader = "Bearer " + token
+	}
+	return ep, nil
+}
+
+// resolveAnthropicEndpoint reads providerConfig + the optional
+// APIKeySecretRef to build the endpoint for an Anthropic-native
+// /v1/messages server (#1627). baseURL and model are required; the
+// Secret is optional (a local Anthropic-compatible server can run
+// without auth). Mirrors resolveCloudProxyEndpoint except the secret
+// value is stored RAW in apiKey: the Messages API sends it as the
+// x-api-key header, never as Authorization: Bearer.
+func (e *NativeAgentLoopExecutor) resolveAnthropicEndpoint(
+	ctx context.Context, namespace string, agent *foremanv1alpha1.Agent,
+) (providerEndpoint, error) {
+	cfg := agent.Spec.ProviderConfig
+	if cfg == nil {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig is required for provider=anthropic")
+	}
+	if cfg.BaseURL == "" {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig.baseURL is required for provider=anthropic")
+	}
+	if cfg.Model == "" {
+		return providerEndpoint{}, fmt.Errorf("agent.spec.providerConfig.model is required for provider=anthropic")
+	}
+	ep := providerEndpoint{
+		baseURL:   strings.TrimRight(cfg.BaseURL, "/"),
+		modelName: cfg.Model,
+	}
+	if cfg.APIKeySecretRef != nil {
+		key, err := e.resolveAuthToken(ctx, namespace, cfg.APIKeySecretRef)
+		if err != nil {
+			return providerEndpoint{}, err
+		}
+		ep.apiKey = key
 	}
 	return ep, nil
 }
@@ -2107,10 +2280,12 @@ func (e *NativeAgentLoopExecutor) incompleteResult(
 	r := NewResult(e.Kind(), foremanv1alpha1.AgenticTaskVerdictIncomplete, msg, time.Since(start))
 	r.FailureReason = reason
 	r.Extra = map[string]any{
-		"reason":        string(reason),
-		"outcome":       "LOOP-INCOMPLETE",
-		"transcriptRef": objRefAsMap(tref),
-		"turnCount":     lr.Turns,
+		"reason":              string(reason),
+		"outcome":             "LOOP-INCOMPLETE",
+		"transcriptRef":       objRefAsMap(tref),
+		"turnCount":           lr.Turns,
+		"turnsWithCompletion": lr.TurnsWithCompletion,
+		"turnsWithToolCall":   lr.TurnsWithToolCall,
 	}
 	return r
 }
@@ -2150,7 +2325,27 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 		return
 	}
 	body := e.groundPRSummary(ctx, log, r, workspace, reviewBase, reviewDiff)
-	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, r.Extra,
+	// The coder is the stage that knows what the change does and is the
+	// stage prompted to write a PR description, so its own body wins when
+	// it authored one (#1768). Fall back to the reviewer's prBody, then to
+	// the grounded summary (today's path). The winner is carried in the
+	// summaryBody argument and a copy of the reviewer's extra, never in
+	// r.Extra itself: r.Extra is persisted as the *review* task's result,
+	// so writing the coder's body there would both claim the reviewer
+	// authored it and leave a stale body behind after a fix cycle.
+	extra := r.Extra
+	bodySource := "summary"
+	if coderBody := e.coderPRBody(ctx, task); coderBody != "" {
+		body = coderBody
+		extra = copyExtraWithPRBody(r.Extra, coderBody)
+		bodySource = "coder"
+		log.Info("PR body: using the coder's authored description",
+			"task", task.Name, "branch", task.Spec.Payload.Branch)
+	} else if pb, ok := r.Extra["prBody"].(string); ok && strings.TrimSpace(pb) != "" {
+		bodySource = "reviewer"
+	}
+	r.Extra["prBodySource"] = bodySource
+	prURL, prErr := e.openPullRequest(ctx, task, auth, workspace, body, extra,
 		openPRsAsDraft(agent), cloneURL)
 	if prErr != nil {
 		log.Error(prErr, "review GO: opening pull request failed",
@@ -2161,6 +2356,80 @@ func (e *NativeAgentLoopExecutor) maybeOpenPullRequest(
 			"repo", task.Spec.Payload.Repo, "pr", prURL)
 		r.Extra["pullRequestURL"] = prURL
 	}
+}
+
+// copyExtraWithPRBody returns a shallow copy of extra carrying the coder's
+// PR description under "prBody" (#1768). openPullRequest renders a body that
+// arrives as a prBody without prepending the repository template, so the
+// coder's description has to travel in that slot — and a copy is what lets
+// it travel there without rewriting the reviewer's own result extra, which
+// is persisted as the review task's record.
+func copyExtraWithPRBody(extra map[string]any, prBody string) map[string]any {
+	out := make(map[string]any, len(extra)+1)
+	for k, v := range extra {
+		out[k] = v
+	}
+	out["prBody"] = prBody
+	return out
+}
+
+// coderPRBody returns the coder's authored PR description for the branch the
+// review task is on (#1768). When a Workload's PR opens on a reviewer GO the
+// body was composed from the *reviewer's* result, so the coder's complete
+// description — sitting in the code task's
+// extra.modelExtra.prBody, which submit_result passes through uncapped —
+// never reached GitHub and the PR shipped the repo's raw template (#1768).
+//
+// The lookup is best-effort and deliberately silent: a nil client (unit
+// tests, harnesses without an API reader), a list error, no matching code
+// task, a nil Result or malformed JSON all yield "" so the caller keeps
+// today's grounded-summary behaviour. Status.Result.Raw is decoded through
+// the same extra.modelExtra envelope the controller's inertDemotion reads.
+func (e *NativeAgentLoopExecutor) coderPRBody(
+	ctx context.Context, task *foremanv1alpha1.AgenticTask,
+) string {
+	if e.Client == nil {
+		return ""
+	}
+	workload := task.Labels["foreman.llmkube.dev/workload"]
+	if workload == "" || task.Spec.Payload.Branch == "" {
+		return ""
+	}
+	var tasks foremanv1alpha1.AgenticTaskList
+	if err := e.Client.List(ctx, &tasks,
+		client.InNamespace(task.Namespace),
+		client.MatchingLabels{"foreman.llmkube.dev/workload": workload},
+	); err != nil {
+		return ""
+	}
+	var newest *foremanv1alpha1.AgenticTask
+	for i := range tasks.Items {
+		c := &tasks.Items[i]
+		if c.Spec.Kind != foremanv1alpha1.AgenticTaskKindIssueFix ||
+			c.Spec.Payload.Branch != task.Spec.Payload.Branch {
+			continue
+		}
+		if newest == nil || c.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = c
+		}
+	}
+	if newest == nil || newest.Status.Result == nil ||
+		len(newest.Status.Result.Raw) == 0 {
+		return ""
+	}
+	var envelope struct {
+		Extra struct {
+			ModelExtra map[string]any `json:"modelExtra"`
+		} `json:"extra"`
+	}
+	if err := json.Unmarshal(newest.Status.Result.Raw, &envelope); err != nil {
+		return ""
+	}
+	if body, ok := envelope.Extra.ModelExtra["prBody"].(string); ok &&
+		strings.TrimSpace(body) != "" {
+		return body
+	}
+	return ""
 }
 
 // groundPRSummary cross-checks the summary that is about to become the PR
@@ -2320,15 +2589,27 @@ func (e *NativeAgentLoopExecutor) openPullRequest(
 	// the reviewer authors the full body in extra["prBody"], which passes
 	// through submit_result uncapped. Prefer it when present and non-empty,
 	// else fall back to summaryBody so existing agents that only set a
-	// summary keep working. The chosen body still flows through PRBody so
-	// the target repo's PR template is honoured (#1541); PRBody keeps the
-	// no-template path byte-for-byte identical to the pre-#1541 output.
+	// summary keep working.
+	//
+	// The renderer then depends on which of the two it is. A prBody — from
+	// the coder (#1768) or the reviewer (#1568) — is already the complete,
+	// repo-shaped description, so DescriptionBody renders it alone and only
+	// adds the issue link when the author did not write one. The summary
+	// fallback still goes through PRBody, which scaffolds it on the target
+	// repo's template (#1541) and stays byte-for-byte identical without one.
 	body := summaryBody
+	fromDescription := false
 	if pb, ok := extra["prBody"].(string); ok && strings.TrimSpace(pb) != "" {
 		body = pb
+		fromDescription = true
 	}
-	body = githubpr.PRBody(githubpr.FindTemplate(workspace), body,
-		p.Issue, task.Labels["foreman.llmkube.dev/workload"])
+	if fromDescription {
+		body = githubpr.DescriptionBody(body, p.Issue,
+			task.Labels["foreman.llmkube.dev/workload"])
+	} else {
+		body = githubpr.PRBody(githubpr.FindTemplate(workspace), body,
+			p.Issue, task.Labels["foreman.llmkube.dev/workload"])
+	}
 	prURL, _, err := ch.EnsureChangeRequest(ctx, p.Repo, head,
 		baseBranchOrDefault(p.BaseBranch), title, body, draft)
 	if err != nil {
@@ -2714,6 +2995,19 @@ func (e *NativeAgentLoopExecutor) envtestGateFailedResult(
 	return r
 }
 
+// Spin-guard thresholds (#1628). The observed spins burned their max-turns
+// budget in 65 s / 160 turns and 105 s / 160 turns — 0.4-0.66 s/turn, faster
+// than any model can generate tokens, while healthy runs average ~1.7 s+/turn
+// (seconds to tens of seconds per real turn). A run that exhausted MaxTurns
+// with a strict per-turn average below spinGuardMaxAvgTurn therefore cannot
+// be real model work. spinGuardMinTurns keeps tiny, fast runs — and the
+// small-budget fakes in unit tests — on the ordinary MaxTurnsExhausted
+// reason.
+const (
+	spinGuardMinTurns   = 10
+	spinGuardMaxAvgTurn = time.Second
+)
+
 // mapLoopError converts a loop.Run error into the Result the initial and
 // retry paths both return. It returns (nil, nil) when loopErr is nil (the
 // caller proceeds to inspect the terminal); (result, nil) for a
@@ -2743,6 +3037,28 @@ func (e *NativeAgentLoopExecutor) mapLoopError(
 					"gate; turns exhausted", lr.SubmissionsRejected)
 		} else {
 			summary = "model did not call submit_result within max_turns"
+		}
+		// Spin guard (#1628): a max-turns run whose average turn is
+		// strictly under spinGuardMaxAvgTurn ran faster than a model can
+		// generate, so the budget died of a spinning backend/shim, not of
+		// a model that gave up. The min-turns floor keeps tiny runs on the
+		// ordinary reason. The #1713 rejected-submissions detail is kept in
+		// the summary when present so that signal is not lost.
+		spinning := lr.Turns >= spinGuardMinTurns &&
+			lr.TurnDuration < spinGuardMaxAvgTurn*time.Duration(lr.Turns)
+		if spinning {
+			spun := fmt.Sprintf(
+				"loop exhausted %d turns in %.1fs (avg %.2fs/turn; "+
+					"%d turns with a tool call) — too fast to be real "+
+					"model work, suspect a spinning backend or shim",
+				lr.Turns, lr.TurnDuration.Seconds(),
+				lr.TurnDuration.Seconds()/float64(lr.Turns),
+				lr.TurnsWithToolCall)
+			if lr.SubmissionsRejected > 0 {
+				spun += "; " + summary
+			}
+			return e.incompleteResult(start, tref, lr,
+				foremanv1alpha1.FailureLoopSpinning, spun), nil
 		}
 		return e.incompleteResult(start, tref, lr,
 			foremanv1alpha1.FailureMaxTurnsExhausted, summary), nil
@@ -3214,10 +3530,22 @@ func buildUserPrompt(task *foremanv1alpha1.AgenticTask) string {
 		// it, but parity across the local reviewer fleet matters.
 		// Empirical: rerun-7 review-510-1 (devstral) failed turn 1
 		// with that exact 400 before this case existed.
-		fmt.Fprintf(&b, "You are reviewing the branch the coder produced for issue #%d of %s.\n\n",
-			p.Issue, p.Repo)
+		// Payload.Issue is int32 omitempty, so a dispatch payload without
+		// the key reads as 0; repoMapQuery and synthesizedCommitMessage
+		// already guard their rendering for that (#1530) and this case was
+		// the missed third place (#1761). Anchoring the reviewer on a
+		// non-existent issue grounds it on nothing, so with no issue the
+		// branch under review is the anchor.
+		if p.Issue > 0 {
+			fmt.Fprintf(&b, "You are reviewing the branch the coder produced for issue #%d of %s.\n\n",
+				p.Issue, p.Repo)
+		} else {
+			fmt.Fprintf(&b, "You are reviewing the branch %s of %s.\n\n", p.Branch, p.Repo)
+		}
 		fmt.Fprintf(&b, "- repo: %s\n", p.Repo)
-		fmt.Fprintf(&b, "- issue: %d\n", p.Issue)
+		if p.Issue > 0 {
+			fmt.Fprintf(&b, "- issue: %d\n", p.Issue)
+		}
 		fmt.Fprintf(&b, "- branch: %s\n", p.Branch)
 		b.WriteString("\nFollow Step 1 of your system prompt to navigate to ")
 		b.WriteString("the branch under review before forming any judgment, ")
@@ -3656,6 +3984,92 @@ func enforceReviewerIssueAsk(
 		"fetched issue body; review verdict is untrusted"
 	log.Info("reviewer integrity: unverified issueAsk on GO verdict; demoting to NO-GO",
 		"verdictClaimed", verdict)
+	return foremanv1alpha1.AgenticTaskVerdictNoGo
+}
+
+// reUnverifiedReviewerSummary matches a reviewer's own plain-language
+// admission of non-verification in its terminal summary (#1454). The
+// phrases are the model saying, in its own words, that the change was not
+// checked; anything phrased that way is unambiguous enough to act on. The
+// match is case-insensitive and whitespace-tolerant (summaries wrap), and
+// the trailing \b keeps it off nouns like "verifies"/"verifier" — a summary
+// describing what the change DOES verify is not this rail's business. The
+// set spans the registers the models actually use: "cannot" and "could not"
+// (formal), "can not" (spaced), the contractions "can't" / "couldn't" in
+// both straight and curly apostrophes, "unable to", and "was not able to".
+var reUnverifiedReviewerSummary = regexp.MustCompile(`(?i)\b(?:cannot|can\s+not|can(?:’|')t|` +
+	`could\s+not|couldn(?:’|')t|unable\s+to|was\s+not\s+able\s+to)\s+verify\b`)
+
+// enforceReviewerUnverifiedSummary demotes a GO whose terminal summary says
+// verification could not be performed (#1454). A GO means "this change was
+// verified"; a summary admitting as much — "cannot verify", "can't verify",
+// "couldn't verify", "unable to verify", or any of the rail's other
+// phrases — contradicts the verdict in the field that becomes the PR body,
+// so the resulting PR advertises its own lack of validation and still
+// opens. The live case (misospace/windowstead#321): a reviewer GO whose
+// summary read "cannot verify goal reward or progression logic" — the
+// self-gate had deferred to a verify Job the fleet runs disabled, and GitHub
+// CI failed two checks the reviewer waved off.
+//
+// Policy: fire only on GO; a matching summary demotes to NO-GO so the
+// branch routes to escalation instead of a PR. The demotion is grounded in
+// the model's own sentence — the matched phrase is quoted in the
+// demotionReason and recorded under unverifiedSummaryPhrase, so the audit
+// record shows the exact words that made the call, the way the other rails
+// archive what they acted on. Non-GO verdicts need nothing (the branch is
+// already not landing) and pass through untouched, marked nowhere. A nil
+// extra cannot carry the demotion record, so like the other rails the
+// verdict passes through with only a log line.
+//
+// The rail is deliberately phrase-anchored to these admissions rather than
+// any mention of tests or verification: reviewers legitimately write
+// "verified via go test" or "tests cover X", and a guard that fired on the
+// general topic would manufacture NO-GOs on honest approvals.
+//
+// Known tradeoff, kept on purpose: the phrases match whatever subject they
+// carry. A summary like "a client without the key cannot verify a forged
+// signature" describes the fixed system, not the reviewer's own
+// non-verification, yet it demotes — the honest GO is the false positive.
+// Requiring a first-person subject ("I could not verify") would close that
+// hole, but it would also miss the incident this rail exists for: the
+// windowstead#321 summary "cannot verify goal reward or progression logic"
+// names no subject at all, and subjectless admissions are the common shape
+// of these summaries. Phrase anchoring trades that rare object-subject
+// false positive for catching them.
+func enforceReviewerUnverifiedSummary(
+	log logr.Logger,
+	extra map[string]any,
+	summary string,
+	verdict foremanv1alpha1.AgenticTaskVerdict,
+) foremanv1alpha1.AgenticTaskVerdict {
+	if verdict != foremanv1alpha1.AgenticTaskVerdictGo {
+		return verdict
+	}
+	match := reUnverifiedReviewerSummary.FindString(summary)
+	if match == "" {
+		return verdict
+	}
+	if extra == nil {
+		log.Info("reviewer integrity: unverified-summary GO but extra is nil; cannot record the demotion",
+			"phrase", match)
+		return verdict
+	}
+
+	// Established demotion markers (#1636): the flag travels with the rail
+	// name, and verdictClaimed is first-writer-wins so an earlier rail that
+	// merely re-annotated this verdict (the issueAsk scope-vouch path) keeps
+	// its archive of the original.
+	extra["verdictDemoted"] = true
+	extra["verdictDemotedBy"] = railUnverifiedSummary
+	if _, ok := extra["verdictClaimed"]; !ok {
+		extra["verdictClaimed"] = string(verdict)
+	}
+	extra["unverifiedSummaryPhrase"] = match
+	extra["demotionReason"] = fmt.Sprintf(
+		"reviewer summary states %q; a GO whose own summary reports verification "+
+			"could not be performed is not a verified approval", match)
+	log.Info("reviewer integrity: GO with a verification-failure summary; demoting to NO-GO",
+		"phrase", match)
 	return foremanv1alpha1.AgenticTaskVerdictNoGo
 }
 

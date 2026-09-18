@@ -178,18 +178,143 @@ Four conditions report the pool's health:
 | `SwapDeferred` | a swap is being held off rather than performed |
 | `MetalSupported` | whether the members are Kubernetes GPU-gated or Apple-metal backed |
 
-### Sticky is the only policy, and it means what it says
+### Sticky is the default policy, and it means what it says
 
-`swapPolicy: sticky` (the default and the only value in v1) keeps the incumbent
-until a *different* member is requested. A priority-based reclaim policy is a
-planned follow-up.
+`swapPolicy: sticky` (the default) keeps the incumbent until a *different* member
+is requested.
 
 One consequence surprises operators, so it is worth stating plainly: **editing
-`spec.default` on a warm pool does not move the slot.** `default` names the
+`spec.default` on a warm sticky pool does not move the slot.** `default` names the
 member to warm on a *cold* pool, before anything has picked an owner. Once a
 member is resident, sticky keeps it there and the `default` edit is inert until
 the pool next goes cold. Verified on-cluster: after repointing `default` at the
 other member, the incumbent still owned the slot two minutes later.
+
+### Returning the slot to a background default: `swapPolicy: reclaim`
+
+Sticky never brings the pool back to a preferred model on its own. That is fine
+when both members are peers, but not when one is a *background default* you want
+resident at rest and the other is an *on-demand* model a batch job bursts
+against. With sticky, the first on-demand burst takes the slot and keeps it: the
+on-demand member stays resident and idle, and (with `poolActivation: IfIdle`,
+below) an interactive workload rides that idle on-demand model forever. Nothing
+returns the slot to the default.
+
+`swapPolicy: reclaim` adds that missing half. It behaves like sticky for
+cross-model demand, and additionally returns the slot to `spec.default` once the
+resident *non-default* member has been continuously idle for `spec.reclaimAfter`:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelPool
+spec:
+  swapPolicy: reclaim
+  default: glimmer          # the background model, resident at rest
+  reclaimAfter: 10m         # idle grace before the slot returns to glimmer
+  members:
+    - inferenceServiceRef: { name: glimmer }   # background default
+    - inferenceServiceRef: { name: coder }     # on-demand burst tenant
+```
+
+The reclaim reuses the ordinary drain contract: the idle resident is drained
+like any displaced incumbent, then the default loads. A busy resident is never
+reclaimed. Reclaims are counted in `llmkube_modelpool_reclaims_total`.
+
+**`reclaimAfter` must be longer than the on-demand member's inter-burst gap.**
+This is the one way to misconfigure reclaim. If the grace is shorter than the gap
+between the on-demand model's requests, the pool reclaims the default the moment
+the burst pauses, the next request immediately swaps it back out, and you have
+traded request coalescing for load thrash — two cold loads where sticky would
+have done none. Size `reclaimAfter` to comfortably outlast a typical lull in the
+on-demand traffic, not the gap between two adjacent requests. The idle clock
+resets only when one of the idle polls catches the resident serving. Idleness is
+sampled on a fixed interval (capped at ~30s, because no event fires on a
+busy-to-idle transition), so a request that starts and finishes between two
+polls is never observed and does not reset the clock: a stream of on-demand work
+that keeps the member busy across polls holds the slot, but a sparse trickle of
+short, sub-poll requests can slip between samples and let the slot reclaim during
+a lull. Size the grace to outlast a genuine quiet period, and expect the guard to
+keep the on-demand model resident only while its traffic keeps at least one poll
+busy.
+
+### Serving on the warm member instead of waiting: `poolActivation: IfIdle`
+
+By default a request for the non-resident member is held until the incumbent
+drains, however long that takes (up to `swapBudget`). That is the right call
+when the caller only accepts that one model. It is the wrong call for a caller
+that *prefers* one member but would rather run on the other than queue behind
+someone else's work: an interactive assistant that likes the small model, on a
+slot a batch coder keeps busy for an hour at a time.
+
+A `ModelRouter` rule can express that preference. List the members in
+preference order and set `route.poolActivation: IfIdle`:
+
+```yaml
+rules:
+  - name: assistant
+    match:
+      models: ["assistant"]
+    route:
+      backends: ["coder-small", "coder-large"]
+      poolActivation: IfIdle
+```
+
+Under `IfIdle` the proxy only starts a swap when the incumbent is idle. If
+`coder-small` is not resident and `coder-large` has requests in flight, the
+proxy skips `coder-small` at once and dispatches to `coder-large`, the member
+that is already warm. Nothing is held and no swap is queued. When the slot is
+idle the rule behaves exactly like the default (`Wait`): the swap runs under
+`swapBudget` and the request is served by `coder-small` afterwards. A swap that
+is already in flight is waited on in both modes, because the incumbent is
+unloading and cannot serve anyway. The fall-through backend receives its own
+served model name in the outbound request (the InferenceService name) rather
+than the alias the client asked for, so a runtime that validates the field
+(vLLM, SGLang, TGI) accepts it instead of answering `404 The model ... does not
+exist`.
+
+"Busy" means requests the proxy itself is tracking. Traffic that reaches a
+member's Service directly, bypassing the router, is invisible to this check
+(the controller's `/slots` drain still protects it at swap time). Route all
+pool traffic through the router if you rely on `IfIdle`. Skips are counted in
+`llmkube_modelpool_busy_skips_total{router,pool,member}`.
+
+If *every* backend in an `IfIdle` rule skips because no preferred member is warm
+(the slot is held busy by a member outside the rule), the request cannot be
+served right now. The proxy returns `503` with a `Retry-After` header and the
+audit reason `pool_incumbent_busy`, the same retryable signal as a swap that
+outruns `swapBudget`, so a client that retries after the incumbent drains is
+served. It is deliberately not a `502`: nothing is broken upstream, the slot is
+just occupied.
+
+### Precise drain for a custom-image member: the metric idle probe
+
+The `llamacpp`, `vllm` and `sglang` runtimes know how to ask their server whether
+it is idle (llama.cpp's `/slots`, vLLM's `vllm:num_requests_running` gauge), so a
+swap waits for in-flight work to finish before freeing the slot. The `generic`
+runtime, used for a custom image whose entrypoint the built-in runtimes cannot
+drive, has no such knowledge. By default it can only be told a health path via
+`inference.llmkube.dev/idle-endpoint`, and a plain health check returns 2xx even
+while the server is busy, so the pool treats such a member as always idle and can
+preempt it mid-request.
+
+If the custom image exposes Prometheus metrics with an in-flight-work gauge (most
+vLLM- and SGLang-derived images do), point the generic idle probe at it instead:
+
+```yaml
+metadata:
+  annotations:
+    inference.llmkube.dev/idle-metric: "vllm:num_requests_running"
+    # optional, default 0
+    inference.llmkube.dev/idle-metric-threshold: "0"
+    # optional, default /metrics
+    inference.llmkube.dev/idle-metric-path: "/metrics"
+```
+
+The probe scrapes the metrics path, sums the named gauge, and reports the member
+idle only when the sum is at or below the threshold, the same precise drain the
+native runtimes get. It fails closed: a non-200 scrape or an absent gauge counts
+as busy, so a member whose idleness cannot be established is never preempted.
+`idle-metric` takes precedence over `idle-endpoint` when both are set.
 
 ### swapBudget, and why it is separate from the request timeout
 
@@ -200,6 +325,21 @@ model can take minutes to load without loosening the per-request generation cap
 for every request on the fleet. If the budget elapses before the target is
 resident, the held request fails with `503` and a `Retry-After`; the caller can
 retry, and the now-warm member serves the next one.
+
+`swapBudget` also bounds the swap itself, not just the request holding on it. If
+the target has not reported `Ready` within the budget, the router abandons the
+swap: it scales the target back to zero, logs `model pool swap abandoned` at
+`ERROR` with the pool, the two members and the elapsed time, counts it in
+`llmkube_modelpool_swap_failures_total{router,pool,member,reason}` (with
+`reason="deadline"`; an activation the controller rejected outright is counted
+with `reason="error"`), and fails the waiting requests with a swap error. This
+matters because the pool is otherwise unusable while a swap is in flight: the
+resident member's fast path is closed for the duration, so an unbounded swap
+whose target can never become `Ready` would 503 every request on the pool -
+including requests for the member that is still loaded - until the proxy was
+restarted. Abandoning the swap reopens the resident's fast path, and the next
+request for the target starts a fresh swap. A pool with no explicit
+`swapBudget` uses twice the router's response-header timeout as the bound.
 
 ### A pooled router runs one replica
 

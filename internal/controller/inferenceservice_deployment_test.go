@@ -4311,6 +4311,101 @@ var _ = Describe("Generic Runtime Deployment Construction", func() {
 		Expect(container.ReadinessProbe.TCPSocket).NotTo(BeNil())
 	})
 
+	It("honors spec.args verbatim under a native runtime when spec.command is set", func() {
+		// A custom-image vLLM server whose entrypoint dispatches serving modes
+		// can run under the vllm runtime purely to inherit its
+		// num_requests_running idle probe. It must NOT receive the runtime's
+		// built `serve <model> --host …` args, which would break its launcher.
+		customPort := int32(18020)
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "vllm-custom-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "org/custom-27b",
+				Format: "safetensors",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cuda",
+					GPU:         &inferencev1alpha1.GPUSpec{Enabled: true, Count: 1, Vendor: "nvidia"},
+				},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready"},
+		}
+
+		skipInit := true
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "vllm-custom-svc", Namespace: "llm"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:      "vllm-custom-model",
+				Runtime:       "vllm",
+				Image:         "ghcr.io/example/tuned-vllm:latest",
+				Command:       []string{"bash", "docker/entrypoint.sh"},
+				Args:          []string{"batch"},
+				ExtraArgs:     []string{"--seed", "42"},
+				ContainerPort: &customPort,
+				SkipModelInit: &skipInit,
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{
+					GPU:    1,
+					CPU:    "2",
+					Memory: "16Gi",
+				},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+
+		By("using the custom entrypoint, not vllm serve")
+		Expect(container.Command).To(Equal([]string{"bash", "docker/entrypoint.sh"}))
+
+		By("passing spec.args verbatim then spec.extraArgs, not the built vllm serve flags")
+		Expect(container.Args).To(Equal([]string{"batch", "--seed", "42"}))
+		Expect(container.Args).NotTo(ContainElement("serve"))
+		Expect(container.Args).NotTo(ContainElement("org/custom-27b"))
+	})
+
+	It("keeps the generated args when spec.command is set on a runtime that builds no command", func() {
+		// llamacpp implements no CommandBuilder: it serves via the image
+		// entrypoint plus generated args, so spec.command is an entrypoint
+		// override only. Dropping the generated args here started llama-server
+		// with no --model — it answered /health, so the pod went Ready while
+		// /v1/models stayed empty (#1842).
+		contextSize := int32(4096)
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "llamacpp-entrypoint-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Format:   "gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+			Status: inferencev1alpha1.ModelStatus{Phase: "Ready", Path: "/models/model.gguf"},
+		}
+
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "llamacpp-entrypoint-svc", Namespace: "llm"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:    "llamacpp-entrypoint-model",
+				Runtime:     "llamacpp",
+				Command:     []string{"/app/llama-server"},
+				ContextSize: &contextSize,
+				ExtraArgs:   []string{"--alias", "my-model"},
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1)
+		container := deployment.Spec.Template.Spec.Containers[0]
+
+		By("using the overridden entrypoint")
+		Expect(container.Command).To(Equal([]string{"/app/llama-server"}))
+
+		By("still passing the runtime's generated args")
+		Expect(container.Args).To(ContainElement("--model"))
+		Expect(argValue(container.Args, "--model")).To(HaveSuffix(".gguf"))
+		Expect(argValue(container.Args, "--ctx-size")).To(Equal("4096"))
+		Expect(container.Args).To(ContainElements("--host", "--port"))
+
+		By("still appending spec.extraArgs")
+		Expect(container.Args).To(ContainElements("--alias", "my-model"))
+	})
+
 	It("should support probe overrides", func() {
 		containerPort := int32(8000)
 		model := &inferencev1alpha1.Model{

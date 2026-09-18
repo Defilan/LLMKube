@@ -18,12 +18,17 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	foremanv1alpha1 "github.com/defilantech/llmkube/api/foreman/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/foreman/agent/githubpr"
@@ -183,6 +188,339 @@ func TestMaybeOpenPullRequest_BodyCarriesReviewSummary(t *testing.T) {
 	}
 	if !strings.Contains(body, "Fixes #") {
 		t.Errorf("body must still link the issue; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "summary" {
+		t.Errorf("prBodySource = %v, want %q when no prBody exists (nil client path)", src, "summary")
+	}
+}
+
+// prTestScheme builds the scheme the fake client needs to read AgenticTasks
+// for the #1768 coder-prBody lookup. executor_native_test.go's newScheme
+// lives in the external agent_test package, so the internal tests get their
+// own minimal one.
+func prTestScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := foremanv1alpha1.AddToScheme(s); err != nil {
+		t.Fatalf("foreman: %v", err)
+	}
+	return s
+}
+
+// codeTaskForPR builds the coder task a Workload creates for the same
+// branch the reviewer reads: same workload label, kind issue-fix, and the
+// coder's own result carrying extra.modelExtra.prBody — the shape
+// submit_result persists and the controller's inertDemotion decodes.
+// When prBody is "" the result carries no prBody key at all, so callers can
+// also stand in for a coder that only set a summary.
+func codeTaskForPR(name, branch, created, prBody string) *foremanv1alpha1.AgenticTask {
+	extra := map[string]any{"summary": "Implemented the change."}
+	if prBody != "" {
+		extra["prBody"] = prBody
+	}
+	raw, err := json.Marshal(map[string]any{"extra": map[string]any{"modelExtra": extra}})
+	if err != nil {
+		panic(err)
+	}
+	ts := &metav1.Time{}
+	if err := ts.UnmarshalQueryParameter(created); err != nil {
+		panic(err)
+	}
+	return &foremanv1alpha1.AgenticTask{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              name,
+			Namespace:         "default",
+			CreationTimestamp: *ts,
+			Labels:            map[string]string{"foreman.llmkube.dev/workload": "wl-x"},
+		},
+		Spec: foremanv1alpha1.AgenticTaskSpec{
+			Kind: foremanv1alpha1.AgenticTaskKindIssueFix,
+			Payload: foremanv1alpha1.AgenticTaskPayload{
+				Repo:   "defilantech/LLMKube",
+				Issue:  7,
+				Branch: branch,
+			},
+		},
+		Status: foremanv1alpha1.AgenticTaskStatus{
+			Result: &runtime.RawExtension{Raw: raw},
+		},
+	}
+}
+
+// codeTaskOnBranch is the single-branch convenience wrapper: the code task
+// wl-x-code-1 on the review branch. Tests that need a second task on the
+// same branch call codeTaskForPR directly with their own name and time.
+func codeTaskOnBranch(prBody string) *foremanv1alpha1.AgenticTask {
+	return codeTaskForPR("wl-x-code-1", "foreman/wl-x/issue-7", "2026-09-07T10:00:00Z", prBody)
+}
+
+const coderPRDescription = "## What\n\nResume a truncated model download from the " +
+	"byte offset the partial file already reached.\n\n## Why\n\nRefs #7 tracks the " +
+	"whole resume feature; this PR is only the local-disk slice.\n\n## How\n\n" +
+	"Seek the partial file to its existing length and stream the remainder.\n\n" +
+	"## Checklist\n\n- [x] Tests added"
+
+// TestMaybeOpenPullRequest_CoderPRBodyPreferred is the #1768 fix. The PR
+// opens on a reviewer GO, but the coder is the stage that knows what the
+// change does and is the stage prompted to write a PR description, so the
+// coder's extra.modelExtra.prBody must become the body — not the raw
+// template with the reviewer's summary bolted on. The body is always
+// rendered from one author's prose and carries exactly one issue link, so
+// the coder's Refs #N cannot be silently upgraded to an auto-closing Fixes.
+func TestMaybeOpenPullRequest_CoderPRBodyPreferred(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	codeTask := codeTaskOnBranch(coderPRDescription)
+	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
+		WithObjects(codeTask).Build()
+	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{
+		Summary: "APPROVE: the resume logic is minimal and well covered.",
+		Extra:   map[string]any{},
+	}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	body := fe.ensures[0].body
+	if !strings.Contains(body, coderPRDescription) {
+		t.Errorf("body must be the coder's description; got %q", body)
+	}
+	if strings.Contains(body, r.Summary) {
+		t.Errorf("body must NOT carry the reviewer summary when the coder authored one; got %q", body)
+	}
+	// The coder wrote "Refs #7" on purpose (issue #7 is the tracking
+	// umbrella) and the rendered body still carries exactly one issue
+	// link: a second, auto-closing one would close it on merge (#1768).
+	if n := strings.Count(body, "#7"); n != 1 {
+		t.Errorf("the coder's single Refs #7 must be the only issue link, saw %d; body=%q", n, body)
+	}
+	if !strings.Contains(body, "_Opened by foreman on review GO") {
+		t.Errorf("body must keep the provenance line; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "coder" {
+		t.Errorf("prBodySource = %v, want %q", src, "coder")
+	}
+	// r.Extra is persisted as the REVIEW task's result. The coder's body
+	// is handed to the renderer by value, never written into the
+	// reviewer's map, so the record cannot later be read as if the
+	// reviewer had authored it.
+	if got, ok := r.Extra["prBody"]; ok {
+		t.Errorf("r.Extra must not gain the coder's prBody; got %v", got)
+	}
+}
+
+// TestMaybeOpenPullRequest_CoderPRBodyBranchMismatch: a coder task on a
+// different branch describes a different change, so its prBody must not be
+// borrowed for this PR — the grounded summary path stands.
+func TestMaybeOpenPullRequest_CoderPRBodyBranchMismatch(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	other := codeTaskForPR("wl-x-code-1", "foreman/wl-x/issue-9",
+		"2026-09-07T10:00:00Z", coderPRDescription)
+	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).WithObjects(other).Build()
+	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{Summary: "APPROVE: reviewed the branch diff.", Extra: map[string]any{}}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	if body := fe.ensures[0].body; !strings.Contains(body, r.Summary) {
+		t.Errorf("a sibling branch's prBody must not be reused; body=%q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "summary" {
+		t.Errorf("prBodySource = %v, want %q", src, "summary")
+	}
+}
+
+// TestMaybeOpenPullRequest_NilClientKeepsSummaryPath: e.Client is nil in
+// unit tests and harnesses without an API reader, so the coder lookup must
+// degrade to today's behaviour instead of panicking.
+func TestMaybeOpenPullRequest_NilClientKeepsSummaryPath(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{Summary: "APPROVE: no API reader here.", Extra: map[string]any{}}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	if body := fe.ensures[0].body; !strings.Contains(body, r.Summary) {
+		t.Errorf("nil client must fall back to the summary body; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "summary" {
+		t.Errorf("prBodySource = %v, want %q", src, "summary")
+	}
+}
+
+// TestMaybeOpenPullRequest_ReviewerPRBodyPreferredWhenNoCoderTask: a reviewer
+// that authored a full description still wins over its own summary (#1568)
+// when no coder task carries one, and the audit records who wrote it.
+func TestMaybeOpenPullRequest_ReviewerPRBodyPreferredWhenNoCoderTask(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	reviewerBody := "## What\n\nThe reviewer's own structured description of the branch."
+	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).Build()
+	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{
+		Summary: "APPROVE: summary line.",
+		Extra:   map[string]any{"prBody": reviewerBody},
+	}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	body := fe.ensures[0].body
+	if !strings.Contains(body, reviewerBody) {
+		t.Errorf("body must be the reviewer's prBody; got %q", body)
+	}
+	if strings.Contains(body, r.Summary) {
+		t.Errorf("summary must not appear when the reviewer authored a body; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "reviewer" {
+		t.Errorf("prBodySource = %v, want %q", src, "reviewer")
+	}
+}
+
+// TestMaybeOpenPullRequest_NewestCoderTaskWinsWhenBranchRerun: a fix cycle
+// leaves two coder tasks on the same branch; the description must come from
+// the newest, which is the one whose head actually got reviewed.
+func TestMaybeOpenPullRequest_NewestCoderTaskWinsWhenBranchRerun(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	stale := codeTaskOnBranch("## What\n\nStale first-attempt description.")
+	fresh := codeTaskForPR("wl-x-code-2", "foreman/wl-x/issue-7",
+		"2026-09-07T12:00:00Z", coderPRDescription)
+	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
+		WithObjects(stale, fresh).Build()
+	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{Summary: "APPROVE: reviewed the amended branch.", Extra: map[string]any{}}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	body := fe.ensures[0].body
+	if !strings.Contains(body, coderPRDescription) {
+		t.Errorf("body must come from the newest coder task; got %q", body)
+	}
+	if strings.Contains(body, "Stale first-attempt") {
+		t.Errorf("the superseded coder task's description must not be used; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "coder" {
+		t.Errorf("prBodySource = %v, want %q", src, "coder")
+	}
+}
+
+// TestMaybeOpenPullRequest_CoderTaskWithoutPRBodyFallsBack: a coder task on
+// the review branch whose result carries no prBody key at all must not stop
+// the PR from opening — the grounded summary path stands and the audit
+// records where the body came from.
+func TestMaybeOpenPullRequest_CoderTaskWithoutPRBodyFallsBack(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	codeTask := codeTaskOnBranch("")
+	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
+		WithObjects(codeTask).Build()
+	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{Summary: "APPROVE: reviewed the branch diff.", Extra: map[string]any{}}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	if body := fe.ensures[0].body; !strings.Contains(body, r.Summary) {
+		t.Errorf("a coder task with no prBody must fall back to the summary body; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "summary" {
+		t.Errorf("prBodySource = %v, want %q", src, "summary")
+	}
+}
+
+// TestMaybeOpenPullRequest_CoderTaskMalformedResultFallsBack: the coder
+// lookup is best-effort, so a code task whose Status.Result is not valid
+// JSON yields "" without panicking and the summary body stands.
+func TestMaybeOpenPullRequest_CoderTaskMalformedResultFallsBack(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	codeTask := codeTaskOnBranch(coderPRDescription)
+	codeTask.Status.Result = &runtime.RawExtension{Raw: []byte("{not json")}
+	c := fake.NewClientBuilder().WithScheme(prTestScheme(t)).
+		WithObjects(codeTask).Build()
+	e := &NativeAgentLoopExecutor{PREnsurer: fe, Client: c}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	r := &Result{Summary: "APPROVE: reviewed the branch diff.", Extra: map[string]any{}}
+
+	e.maybeOpenPullRequest(context.Background(), logr.Discard(), nil, task, nil,
+		foremanv1alpha1.AgenticTaskVerdictGo, r, "", "", nil, "")
+
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	if body := fe.ensures[0].body; !strings.Contains(body, r.Summary) {
+		t.Errorf("a malformed coder result must fall back to the summary body; got %q", body)
+	}
+	if src := r.Extra["prBodySource"]; src != "summary" {
+		t.Errorf("prBodySource = %v, want %q", src, "summary")
+	}
+}
+
+// TestOpenPullRequest_PrBodySkipsRepoTemplate is the second half of #1768:
+// a prBody is already the complete description the author wrote against the
+// repo's template, so rendering it through PRBody on top of that template is
+// what shipped a body with the raw unfilled template above the prose. The
+// ensured body must carry the description and none of the template.
+func TestOpenPullRequest_PrBodySkipsRepoTemplate(t *testing.T) {
+	workspace := t.TempDir()
+	tmplDir := filepath.Join(workspace, ".github")
+	if err := os.MkdirAll(tmplDir, 0o755); err != nil {
+		t.Fatalf("mkdir .github: %v", err)
+	}
+	const templateText = "## What this PR does\n<!-- Describe your change -->\n" +
+		"## Which issue it fixes\n<!-- Fixes # -->\n- [ ] AI assistance disclosed"
+	if err := os.WriteFile(filepath.Join(tmplDir, "pull_request_template.md"),
+		[]byte(templateText), 0o644); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1768"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindReview, true)
+	if _, err := e.openPullRequest(context.Background(), task, nil, workspace,
+		"APPROVE: reviewer summary.", map[string]any{"prBody": coderPRDescription},
+		true, ""); err != nil {
+		t.Fatalf("openPullRequest() error = %v", err)
+	}
+	if len(fe.ensures) != 1 {
+		t.Fatalf("want 1 EnsurePR call, got %+v", fe.ensures)
+	}
+	body := fe.ensures[0].body
+	if !strings.Contains(body, coderPRDescription) {
+		t.Errorf("body must be the authored description; got %q", body)
+	}
+	if strings.Contains(body, "Describe your change") ||
+		strings.Contains(body, "AI assistance disclosed") {
+		t.Errorf("body must NOT contain the repo template when a prBody was authored; got %q", body)
+	}
+	// Exactly one issue link survives: the coder's Refs is not overridden
+	// by an appended, auto-closing Fixes.
+	if n := strings.Count(body, "#7"); n != 1 {
+		t.Errorf("the coder's Refs #7 must be the only issue link, saw %d; body=%q", n, body)
 	}
 }
 

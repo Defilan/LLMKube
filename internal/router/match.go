@@ -56,6 +56,11 @@ type MatchResult struct {
 	// FailClosed is true when a matched fail-closed rule rejects the
 	// request rather than falling through if no backend is healthy.
 	FailClosed bool
+
+	// PoolActivation is the matched rule's Route.PoolActivation, or empty
+	// (Wait) when no rule matched. It tells the dispatch loop whether a
+	// pooled backend with a busy incumbent is held or skipped.
+	PoolActivation string
 }
 
 // Matcher pre-computes lookups over a Config so the per-request hot path
@@ -99,10 +104,11 @@ func (m *Matcher) Match(features *RequestFeatures) MatchResult {
 			continue
 		}
 		return MatchResult{
-			Rule:       rule,
-			Backends:   rule.Route.Backends,
-			Strategy:   strategyOrDefault(rule.Route.Strategy),
-			FailClosed: rule.FailClosed,
+			Rule:           rule,
+			Backends:       rule.Route.Backends,
+			Strategy:       strategyOrDefault(rule.Route.Strategy),
+			FailClosed:     rule.FailClosed,
+			PoolActivation: rule.Route.PoolActivation,
 		}
 	}
 
