@@ -189,6 +189,17 @@ over the ConnectX-7 link via llama.cpp RPC. Full runbook, including the
 worker pod, the InferenceService shape, and the wire verification:
 [dgx-spark-two-node-rpc.md](dgx-spark-two-node-rpc.md).
 
+## 5c. One Spark, native ExLlamaV3
+
+The two-Spark path above runs llama.cpp over RPC. A single Spark can also serve
+an EXL3 checkpoint on **native ExLlamaV3** behind an OpenAI-compatible server of
+our own, using the operator's `generic` runtime. That path aliases the weights
+out of an `mmap` instead of copying them, so it wants the node's page cache
+**warm**, which is the opposite of what the vLLM multi-Spark builds do. The
+configuration, the operator integration, and what the first boot on hardware
+settled:
+[DeepSeek-V4.1-Flash EXL3 on one DGX Spark, native ExLlamaV3](site/labs/deepseek-v41-flash-exl3-one-spark-native-exllamav3.md).
+
 ## 6. Test the endpoint
 
 ```bash
