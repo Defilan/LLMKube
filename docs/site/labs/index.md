@@ -24,6 +24,7 @@ written down anywhere you can copy.
 | Build | Hardware | Model | Shape |
 | --- | --- | --- | --- |
 | [DeepSeek V4 Flash Vision on two DGX Sparks](/docs/labs/deepseek-v4-flash-two-sparks) | 2x GB10, 200 Gb RoCE | DeepSeek-V4-Flash-Vision-Exp | vLLM, TP2 + expert parallel, speculative decoding |
+| [DeepSeek-V4.1-Flash EXL3 on one DGX Spark, native ExLlamaV3](/docs/labs/deepseek-v41-flash-exl3-one-spark-native-exllamav3) | 1x GB10 | DeepSeek-V4.1-Flash EXL3 SAGE 1.59bpw + attention/MTP overlay | native ExLlamaV3, TP1, ATS zero-copy alias, checkpoint MTP drafter; measured 12.9 to 14.4 tok/s single stream |
 
 ## What a build page contains
 

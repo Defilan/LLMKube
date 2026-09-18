@@ -93,6 +93,9 @@ sections:
       - label: DeepSeek V4 Flash on two DGX Sparks
         slug: labs/deepseek-v4-flash-two-sparks
         file: labs/deepseek-v4-flash-two-sparks.md
+      - label: DeepSeek-V4.1-Flash EXL3 on one DGX Spark (native ExLlamaV3)
+        slug: labs/deepseek-v41-flash-exl3-one-spark-native-exllamav3
+        file: labs/deepseek-v41-flash-exl3-one-spark-native-exllamav3.md
   - title: Operations
     items:
       - label: Memory-pressure protection
