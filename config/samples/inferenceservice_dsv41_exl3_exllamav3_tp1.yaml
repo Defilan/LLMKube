@@ -73,16 +73,17 @@ spec:
     # from spec.resources.memory, and a cgroup memory ceiling is charged against
     # the aliased page cache the ATS loader depends on. First boot runs uncapped.
   env:
-    # ATS zero-copy loader. EXL3_ATS_COPY names the tensors that are pinned into
-    # CUDA memory; every other tensor at or above EXL3_ATS_MMAP_MIN bytes is
-    # aliased out of page cache instead. Only the drafter is pinned here, so the
+    # ATS zero-copy loader. EXL3_ATS_COPY is a regex over tensor names: matching
+    # tensors are copied into CUDA memory, everything else is aliased out of page
+    # cache. The main model is copied and only the drafter is left aliased, because
+    # ~107 GiB of model plus the drafter cannot both be resident in 128 GB. The
     # quoting must survive YAML intact.
     - {name: EXL3_ATS_MMAP, value: "1"}
-    - {name: EXL3_ATS_COPY, value: '^mtp\.'}
+    - {name: EXL3_ATS_COPY, value: '^(?!mtp\.)'}
     # The checkpoint carries its own MTP / DSPARK drafter as a second component
     # ("mtp"), so speculative decoding runs off the pack itself with no second
-    # model directory. EXL3_DSPARK_CONF is the drafter's confidence gate. Measured
-    # about 13 tok/s warm with it on, against 1 to 4 tok/s with it off.
+    # model directory. EXL3_DSPARK_CONF is the drafter's own confidence threshold,
+    # read by the MTP module rather than by the generator.
     - {name: EXL3_MTP, value: "1"}
     - {name: EXL3_DSPARK_CONF, value: "0.7"}
     - {name: CHUNK, value: "2048"}
