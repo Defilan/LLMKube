@@ -27,6 +27,7 @@ written down anywhere you can copy.
 | [GLM-5.3-Flash EXL3 on two DGX Sparks](/docs/labs/glm-5-3-flash-exl3-two-sparks) | 2x GB10, CX7 RoCE | GLM-5.3-Flash EXL3/TR3 4bpw | vLLM, TP2, DFlash2 speculative decoding, self-built runtime |
 | [Qwen3.8-Flash-Next with MTP on one Strix Halo](/docs/labs/qwen38-flash-next-mtp-on-strix-halo) | 1x Ryzen AI Max+ 395, gfx1151 | Qwen3.8-Flash-Next UD-Q3_K_XL | llama.cpp Vulkan, MTP speculative decoding, upstream pin plus one vendored PR |
 | [DeepSeek-V4.1-Flash EXL3 on one DGX Spark, native ExLlamaV3](/docs/labs/deepseek-v41-flash-exl3-one-spark-native-exllamav3) | 1x GB10 | DeepSeek-V4.1-Flash EXL3 SAGE 1.59bpw + attention/MTP overlay | native ExLlamaV3, TP1, ATS zero-copy alias, checkpoint MTP drafter; measured 12.9 to 14.4 tok/s single stream |
+| [DeepSeek-V4.1-Flash EXL3 on three DGX Sparks in a ring](/docs/labs/deepseek-v41-flash-exl3-three-sparks-ring) | 3x GB10, P0 to P1 ring, no switch | DeepSeek-V4.1-Flash EXL3 3.5bpw | vLLM, TP3, DSpark k=5, Engram on NVMe; measured 31 to 35 tok/s decode, 1,094 to 1,334 tok/s prefill |
 
 ## What a build page contains
 
