@@ -25,7 +25,7 @@ metadata:
 spec:
   modelRef: dsv41-flash-exl3
   runtime: vllm
-  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3:stable  # pin by digest in production
+  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3@sha256:8dab469dd37e28c26612648079eb075eb3152dc2dacd8347c55a6f2aba037b54
   replicas: 1
   containerPort: 8080
   resources:
@@ -38,8 +38,8 @@ spec:
   vllmConfig:
     tensorParallelSize: 3
     pipelineParallelSize: 1
-    maxModelLen: 131072
-    gpuMemoryUtilization: 0.78
+    maxModelLen: 524288
+    gpuMemoryUtilization: 0.80
     # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
     # expert parallelism is off and every expert stays local to its rank.
   extraArgs:
@@ -53,7 +53,7 @@ spec:
     - --block-size
     - "128"
     - --max-num-seqs
-    - "4"
+    - "2"
     - --max-num-batched-tokens
     - "8192"
     # Text-only for the first boot (skips the vision tower); vision is a second step on the same group.
@@ -66,10 +66,10 @@ spec:
     - --default-chat-template-kwargs
     - '{"thinking": false}'
     # CUDA graphs (FULL_AND_PIECEWISE). With speculative decoding the decode batch is k or k+1 tokens per sequence, so the
-    # capture sizes are the multiples of k up to k x max-num-seqs plus the multiples of k+1: for k=5 and 4 sequences,
-    # [5,6,10,12,15,18,20,24]. The first request should check logprobs for NaN (a GB10 TP2 build emitted NaN with graphs on).
+    # capture sizes are the multiples of k up to k x max-num-seqs plus the multiples of k+1: for k=5 and 2 sequences,
+    # [5,6,10,12]. The first request should check logprobs for NaN (a GB10 TP2 build emitted NaN with graphs on).
     - --compilation-config
-    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,6,10,12,15,18,20,24]}'
+    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,6,10,12]}'
     # DSpark k=5 speculative decoding: the drafter lives in the checkpoint; block verification with probabilistic draft
     # sampling is lossless (same distribution as the target). Measured 2026-09-13 on the ring: code 2.4x, arithmetic 2x,
     # prose 1.2 to 1.3x, 1.5x across a mixed set. Capture sizes follow the rule above.
