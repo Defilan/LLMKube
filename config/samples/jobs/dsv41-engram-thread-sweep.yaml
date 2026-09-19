@@ -1,0 +1,64 @@
+# Bench one serving config of the three-Spark ring so an Engram read-thread sweep can be compared. This Job
+# only calls the OpenAI endpoint (no API access, no ServiceAccount). The sweep's loop is operator-driven,
+# because changing DSV41_ENGRAM_DISK_THREADS respawns the ring and this Job must not own that:
+#
+#   1. set DSV41_ENGRAM_DISK_THREADS in the InferenceService to the value under test
+#   2. kubectl apply the InferenceService, wait for the ring to answer
+#   3. THREADS=<value>; sed "s/LABEL/$THREADS/g" dsv41-engram-thread-sweep.yaml | kubectl create -f -
+#   4. kubectl logs job/dsv41-thread-sweep-LABEL   -> THREADS=<value> DECODE=<x> PREFILL=<y>
+#   5. kubectl delete job dsv41-thread-sweep-LABEL, repeat for the next value
+#
+# Adopt a value only if it clears the accept rule (>= +3 percent on decode, or a prefill gain with decode
+# flat). bot-lab-21 rejected 64 read threads on their four-Spark line, and tonyd2wild's speedrun used 128, so
+# the two references disagree and this is worth measuring here rather than copying either.
+apiVersion: batch/v1
+kind: Job
+metadata: {name: dsv41-thread-sweep-LABEL, namespace: default}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      containers:
+        - name: bench
+          image: python:3.12-slim
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import json, os, time, urllib.request
+
+              BASE = "http://dsv41-exl3-ring.default.svc.cluster.local:8080/v1/chat/completions"
+              MODEL = "DeepSeek-V4.1-Flash-EXL3"
+              LABEL = os.environ.get("THREADS_LABEL", "unset")
+
+              def post(payload, timeout=1800):
+                  data = json.dumps(payload).encode()
+                  req = urllib.request.Request(BASE, data=data, headers={"Content-Type": "application/json"})
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      return json.loads(r.read().decode())
+
+              def decode_rate(prompt, ntok):
+                  t0 = time.time()
+                  r = post({"model": MODEL, "max_tokens": ntok, "temperature": 0,
+                            "messages": [{"role": "user", "content": prompt}]})
+                  dt = time.time() - t0
+                  n = r.get("usage", {}).get("completion_tokens", 0)
+                  return n / dt if dt > 0 and n > 0 else 0.0
+
+              # Warm, then measure. Decode is a short code-shaped prompt; prefill is a long repeated passage
+              # with a one-token reply, so TTFT is the prefill.
+              decode_rate("Write a small Python function that reverses a string.", 4)
+              dec = decode_rate("Write a small Python function that reverses a string.", 256)
+
+              passage = "The quick brown fox jumps over the lazy dog. " * 6000  # about 47k tokens
+              t0 = time.time()
+              post({"model": MODEL, "max_tokens": 1, "temperature": 0,
+                    "messages": [{"role": "user", "content": passage}]})
+              prefill_tokens = 6000 * 10  # 10 tokens per repetition, order of magnitude
+              pre = prefill_tokens / (time.time() - t0)
+
+              print("THREADS=%s DECODE=%.1f PREFILL=%.0f" % (LABEL, dec, pre))
+          env: [{name: THREADS_LABEL, value: "LABEL"}]
+          resources: {requests: {cpu: 500m, memory: 256Mi}, limits: {memory: 512Mi}}

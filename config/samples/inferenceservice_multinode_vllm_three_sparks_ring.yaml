@@ -55,9 +55,14 @@ spec:
     - --max-num-seqs
     - "2"
     - --max-num-batched-tokens
-    - "8192"
-    # Text-only for the first boot (skips the vision tower); vision is a second step on the same group.
-    - --language-model-only
+    - "16384"
+    # Vision on. The tower loads only when --language-model-only is absent; the checkpoint's vision_config
+    # is 32 layers and its weights ride in shards 1, 2, 43-48, byte-identical to the release.
+    - --limit-mm-per-prompt
+    - '{"image":4}'
+    - --mm-processor-cache-gb
+    - "1"
+    # Async scheduling is default-on for dspark in this build (config/vllm.py resolver), so no flag is passed.
     # The patched engram.py reads the two n-gram tables from the safetensors shards on disk
     # (DSV41_ENGRAM_DISK=1 below); never resident.
     - --engram-config
@@ -94,6 +99,9 @@ spec:
     - {name: NCCL_IB_MERGE_NICS, value: "0"}
     - {name: NCCL_NET_PLUGIN, value: none}
     - {name: NCCL_NVLS_ENABLE, value: "0"}
+    # bot-lab-21's NCCL_CH=8 lever, folded into the vision respawn; 6-stream aggregate attribution is
+    # not separable from the vision change.
+    - {name: NCCL_MAX_NCHANNELS, value: "8"}
     - {name: NCCL_CUMEM_ENABLE, value: "0"}
     - {name: NCCL_IGNORE_CPU_AFFINITY, value: "1"}
     - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}

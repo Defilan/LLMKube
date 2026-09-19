@@ -16,9 +16,9 @@ runtime.
 > runs of the kind I would otherwise hand to a hosted coding assistant,
 > research against my MCP servers, and system design. I drive it through
 > `opencode`, and Foreman's coding fleet runs its work against the same
-> endpoint. Text-only, single stream, four sequences, 131,072-token context;
-> decode **31 to 35 tok/s** with DSpark k=5 and **26.5 tok/s** without it, at a
-> KV pool of about 356,000 tokens.
+> endpoint. Vision and tools are on, single stream, two sequences, 524,288-token
+> context; decode **31 to 35 tok/s** with DSpark k=5 and **26.5 tok/s** without
+> it, at a KV pool measured 2026-09-13 at about 356,000 tokens.
 
 The manifests are
 [`config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml`](https://github.com/defilantech/LLMKube/blob/main/config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml),
@@ -208,22 +208,55 @@ The serving arguments that are load-bearing:
 - `--served-model-name DeepSeek-V4.1-Flash-EXL3`, with the `deepseek_v41`
   reasoning and tool parsers and `--enable-auto-tool-choice`. The endpoint
   speaks OpenAI function calling, which is what Foreman's agent loop requires.
-- `--language-model-only`. Text-only for this boot; the vision tower is a
-  second step on the same group.
+- Vision on: no `--language-model-only`, with `--limit-mm-per-prompt
+  '{"image":4}'` and `--mm-processor-cache-gb 1`. See "Turning vision on" below.
 - `--default-chat-template-kwargs '{"thinking": false}'`. Thinking off, with the
   reasoning parser still wired.
-- `--max-num-seqs 4`, `--block-size 128`, `--max-num-batched-tokens 8192`. Sized
-  for a handful of long single streams, not for throughput under load.
+- `--max-num-seqs 2`, `--block-size 128`, `--max-num-batched-tokens 16384`.
+  Sized for a handful of long single streams, not for throughput under load.
+  The 16384 batched-token budget is bot-lab-21's `MAXB16K` lever, accepted on
+  their line as +11 percent cold prefill with no decode cost; it is also a
+  clean 128 x block-size multiple.
 - `--speculative-config` with the `dspark` method, five speculative tokens, and
   **block** verification with probabilistic draft sampling. Block verification
   is lossless: it produces the same distribution as the target model. Adaptive
   verification is unsupported on GB10 (the SM12x sparse indexer), so it stays
-  `false`.
+  `false`. Async scheduling is default-on for `dspark` in this build (the
+  `config/vllm.py` resolver enables it when nothing disables it), so no
+  `--async-scheduling` flag is passed.
 - `--compilation-config` with `cudagraph_mode: FULL_AND_PIECEWISE` and capture
-  sizes `[5, 6, 10, 12, 15, 18, 20, 24]`. With speculative decoding the decode
-  batch is k or k+1 tokens per sequence, so the sizes are the multiples of k up
-  to k x `max-num-seqs` plus the multiples of k+1. Check the first request's
-  logprobs for NaN: a GB10 TP2 build emitted NaN with graphs on.
+  sizes `[5, 6, 10, 12]`. With speculative decoding the decode batch is k or k+1
+  tokens per sequence, so the sizes are the multiples of k up to k x
+  `max-num-seqs` plus the multiples of k+1. Check the first request's logprobs
+  for NaN: a GB10 TP2 build emitted NaN with graphs on.
+
+### Turning vision on
+
+Vision needs three things, all of them already on disk or in the runtime:
+
+- The checkpoint carries the tower. `config.json` has a `vision_config` of 32
+  layers, and shards 1, 2 and 43 to 48 are byte-identical to the release, so the
+  vision weights are present (the EXL3 quantization touched only the routed
+  experts).
+- The runtime speaks multimodal. `models/deepseek_v4_1/attention.py` reads
+  `vision_max_n_token` and `vision_n_layers`, and `EngineArgs` exposes
+  `--limit-mm-per-prompt` and `--mm-processor-cache-gb`.
+- The one flag that suppresses it is ours. `--language-model-only` sets the
+  per-modality limit to zero, so the image is ignored. Drop it, add the two
+  multimodal flags above, and the tower loads for about 0.22 GiB per rank plus
+  the 1 GiB processor cache. Against a ring that sits at 11 to 12 percent KV
+  usage on a long single request, that is headroom already paid for.
+
+`config/samples/jobs/dsv41-apply-and-verify.yaml` is the end-to-end check. It
+is a Job rather than a script because applying the changed `InferenceService`
+terminates the ring, which is the endpoint the applying session runs on; the Job
+waits for the ring and asserts that the model names a known red / green / blue
+stripes image left to right. It carries no API access, so its readiness gate is
+the vision request itself, not a Kubernetes signal.
+
+Vision on SM120 (GB10) is lightly proven upstream: three light image tests
+passed on a sibling build, with heavier image traffic and large photos
+untested, and this first-party image is not that build. The Job is the gate.
 
 ### The NCCL environment that makes the ring work
 
@@ -252,7 +285,7 @@ correctly. A 256 MB all-reduce over three ranks, measured 2026-09-13:
 | One leg, two ranks, RDMA | 11.3 GB/s |
 | Three ranks, NCCL Socket transport | 7.9 GB/s |
 
-Serving numbers, single stream, text-only, from an in-cluster client. Prefill is
+Serving numbers, single stream, from an in-cluster client. Prefill is
 tokens per second at prompt lengths from 3.4k to 49.8k; decode is tokens per
 second on the new tokens:
 
@@ -263,9 +296,17 @@ second on the new tokens:
 | DSpark k=5, code prompts | same | 65 |
 
 DSpark is worth about 1.5x across a mixed set (roughly 2x on arithmetic, 2.4x
-on code, 1.2 to 1.3x on prose), and it costs KV cache rather than adding it: the
-group runs four sequences and a 131,072-token context at a KV pool of about
-356,000 tokens with `gpuMemoryUtilization: 0.78`.
+on code, 1.2 to 1.3x on prose), and it costs KV cache rather than adding it. That
+run used four sequences and a 131,072-token context at a KV pool of about
+356,000 tokens with `gpuMemoryUtilization: 0.78`; the serving config has since
+been retuned to two sequences, a 524,288-token context and 0.80, and the KV pool
+is re-measured on the next boot.
+
+The current config carries two levers from bot-lab-21's EXL3 tuning ladder:
+`NCCL_MAX_NCHANNELS=8` and `--max-num-batched-tokens 16384`. Both were accepted
+on a four-Spark line (6-stream aggregate and cold prefill, respectively); here
+they ride the same respawn as the vision flip, so a regression cannot be
+attributed to either without a bisect.
 
 The provenance of these numbers, stated because a throughput figure without it
 is not reproducible: they come from the same 2026-09-13 run the
