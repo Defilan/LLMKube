@@ -250,9 +250,10 @@ Vision needs three things, all of them already on disk or in the runtime:
 `config/samples/jobs/dsv41-apply-and-verify.yaml` is the end-to-end check. It
 is a Job rather than a script because applying the changed `InferenceService`
 terminates the ring, which is the endpoint the applying session runs on; the Job
-waits for the ring and asserts that the model names a known red / green / blue
-stripes image left to right. It carries no API access, so its readiness gate is
-the vision request itself, not a Kubernetes signal.
+waits for the ring to drop and come back, then asserts that the model names a
+known red / green / blue stripes image left to right. It carries no API access,
+so its gate is the endpoint itself: the observed restart window makes the
+assertion meaningful, and the vision request is the readiness signal.
 
 Vision on SM120 (GB10) is lightly proven upstream: three light image tests
 passed on a sibling build, with heavier image traffic and large photos
