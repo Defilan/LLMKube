@@ -11,8 +11,10 @@
 #
 # Before creating this: stage all 54 checkpoint files on every member (config/samples/model_dsv41_flash_exl3.yaml),
 # apply config/samples/jobs/dsv41-tp3-config.yaml (72 heads / 9 o_groups), and run
-# config/samples/jobs/drop-page-cache.yaml on each member; vLLM's worker refuses to start when CUDA-free at
-# init is below gpuMemoryUtilization x total, and a fresh 460 GB stage leaves that memory as page cache.
+# config/samples/jobs/drop-page-cache.yaml on each member, and run it again on every member before EVERY boot:
+# with the KV pin below, vLLM skips memory profiling, so nothing catches a dirty page cache (a fresh 460 GB stage
+# leaves ~10 GiB of it resident even with the group down; measured 2026-09-20). While serving, keep a flusher
+# that drops caches on any member whose MemFree falls under 4 GiB (Engram row reads regrow the cache).
 #
 # Turn swap off on every member before the first boot (sudo swapoff -a): a memory overrun then OOM-kills the worker,
 # which the operator restarts, instead of paging kubelet out and wedging the node. The image pre-warms FlashInfer's
@@ -38,13 +40,17 @@ spec:
   vllmConfig:
     tensorParallelSize: 3
     pipelineParallelSize: 1
-    # 300,000, tonyd2wild's TP3 serving config, not 524288. The KV pool is what is left after weights, and the
-    # indexer prefill buffer scales with max context (about 5.2 GiB at 1M per his RECIPE.md): at 524288 the
-    # tightest rank offered 1.49-1.59 GiB of KV against a 2.08 GiB requirement and the group could not boot;
-    # at 300000 the same rank offers 2.78-2.86 GiB against 1.19 (measured 2026-09-19, pool 594-611K tokens,
-    # 2.0x at 300K). Every coder Agent in the fleet asks for 220K or less. YaRN is already factor 16 in the
-    # checkpoint (1,048,576 positions), so position range was never the limit; memory is.
-    maxModelLen: 300000
+    # 524288 works on three Sparks only together with the KV pin in extraArgs. Without it vLLM's profiler sizes
+    # the pool from what it measures after load, and on a GB10 that count includes reclaimable page cache: at
+    # 524288 it reported 1.49-1.59 GiB against a 2.08 GiB requirement and the group could not boot, while the
+    # true CUDA-free at init on a clean cache is ~111 GiB. The indexer prefill buffer also scales with this
+    # value (about 5.2 GiB at 1M per tonyd2wild's RECIPE.md), which is why 300000, his TP3 serving config, is
+    # the largest context the profiler allows here and the fallback if the pin is ever removed. opencode's
+    # provider limit.context must be this minus its limit.output (524288 - 65536 = 458752) or turns in that band
+    # get HTTP 400 instead of compacting. YaRN is already factor 16 in the checkpoint (1,048,576 positions).
+    maxModelLen: 524288
+    # Ignored while --kv-cache-memory-bytes is set (vLLM: "skipped memory profiling. This does not respect the
+    # gpu_memory_utilization config"). Kept at tonyd2wild's 0.80 for the un-pinned fallback.
     gpuMemoryUtilization: 0.80
     # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
     # expert parallelism is off and every expert stays local to its rank.
@@ -93,6 +99,16 @@ spec:
     # Adaptive verification is unsupported on GB10 (SM12x sparse indexer); leave it false.
     - --speculative-config
     - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+    # KV pin: 4.2 GiB per rank = 1,057,457 tokens, 2.02x at 512K (measured 2026-09-20, generation 43, vision
+    # on, DSpark k=5: stripe PASS, prefill 2,000 / 2,120 tok/s at 10K / 40K, a 450,979-token request at
+    # 1,472 tok/s, decode 84-86). vLLM then skips memory profiling and ignores gpuMemoryUtilization; the pin
+    # is the whole budget, which is what lets 512K + vision fit (see maxModelLen). Two things become
+    # mandatory: drop caches on every member before every boot (jobs/drop-page-cache.yaml; no profiler
+    # catches a dirty cache), and a serving-phase flusher under 4 GiB MemFree (rank 2 dipped to 2.7 GiB under
+    # the 450K prefill even with one). Do not raise the pin past ~4.2 GiB on three Sparks: MemAvailable while
+    # serving is ~10 GiB. 2.3 GiB (1.10x) also boots and serves if headroom matters more than concurrency.
+    - --kv-cache-memory-bytes
+    - "4509715660"
     # TP3: 64 heads / 8 o_groups do not divide by 3. virtual_heads.py pads to 72 / 9 at load time
     # against the declaration that config/samples/jobs/dsv41-tp3-config.yaml writes into the staged config.json (what
     # tonyd2wild's reddie_prep_tp3.sh (https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark) does). NOT --hf-overrides: on this build text_config is
