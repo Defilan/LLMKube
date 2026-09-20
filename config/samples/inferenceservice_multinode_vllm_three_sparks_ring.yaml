@@ -11,10 +11,10 @@
 #
 # Before creating this: stage all 54 checkpoint files on every member (config/samples/model_dsv41_flash_exl3.yaml),
 # apply config/samples/jobs/dsv41-tp3-config.yaml (72 heads / 9 o_groups), and run
-# config/samples/jobs/drop-page-cache.yaml on each member, and run it again on every member before EVERY boot:
-# with the KV pin below, vLLM skips memory profiling, so nothing catches a dirty page cache (a fresh 460 GB stage
-# leaves ~10 GiB of it resident even with the group down; measured 2026-09-20). While serving, keep a flusher
-# that drops caches on any member whose MemFree falls under 4 GiB (Engram row reads regrow the cache).
+# config/samples/jobs/drop-page-cache.yaml on each member, and apply config/samples/gb10-memory-guard.yaml once:
+# with the KV pin below, vLLM skips memory profiling, so nothing else catches a dirty page cache (a fresh 460 GB
+# stage leaves ~10 GiB of it resident even with the group down; measured 2026-09-20). The guard DaemonSet does the
+# drop on every boot, keeps MemFree above 4 GiB while serving, and suspends the group before the allocator stalls.
 #
 # Turn swap off on every member before the first boot (sudo swapoff -a): a memory overrun then OOM-kills the worker,
 # which the operator restarts, instead of paging kubelet out and wedging the node. The image pre-warms FlashInfer's
