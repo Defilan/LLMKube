@@ -111,9 +111,12 @@ spec:
     - {name: NCCL_IB_MERGE_NICS, value: "0"}
     - {name: NCCL_NET_PLUGIN, value: none}
     - {name: NCCL_NVLS_ENABLE, value: "0"}
-    # bot-lab-21's NCCL_CH=8 lever, folded into the vision respawn; 6-stream aggregate attribution is
-    # not separable from the vision change.
-    - {name: NCCL_MAX_NCHANNELS, value: "8"}
+    # 4, not 8. NCCL_MAX_NCHANNELS=8 came from bot-lab-21's ladder, which is a switched fabric (+10.7% C6 there).
+    # This ring is a switchless cycle, and on that topology koldfrontier (tonyd2wild issue #9) measured 8 as
+    # neutral and reverted to 4. Same here: 8 -> 4 moved prefill and decode inside the run-to-run spread (10K
+    # +6%, 40K -2%, decode -1%) and cut NCCL's pinned host Shmem from 0.77 to 0.47 GiB on every rank, which on
+    # a unified-memory GB10 is KV. Measured 2026-09-20, generation 37.
+    - {name: NCCL_MAX_NCHANNELS, value: "4"}
     - {name: NCCL_CUMEM_ENABLE, value: "0"}
     - {name: NCCL_IGNORE_CPU_AFFINITY, value: "1"}
     - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}
