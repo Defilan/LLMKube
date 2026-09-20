@@ -38,7 +38,13 @@ spec:
   vllmConfig:
     tensorParallelSize: 3
     pipelineParallelSize: 1
-    maxModelLen: 524288
+    # 300,000, tonyd2wild's TP3 serving config, not 524288. The KV pool is what is left after weights, and the
+    # indexer prefill buffer scales with max context (about 5.2 GiB at 1M per his RECIPE.md): at 524288 the
+    # tightest rank offered 1.49-1.59 GiB of KV against a 2.08 GiB requirement and the group could not boot;
+    # at 300000 the same rank offers 2.78-2.86 GiB against 1.19 (measured 2026-09-19, pool 594-611K tokens,
+    # 2.0x at 300K). Every coder Agent in the fleet asks for 220K or less. YaRN is already factor 16 in the
+    # checkpoint (1,048,576 positions), so position range was never the limit; memory is.
+    maxModelLen: 300000
     gpuMemoryUtilization: 0.80
     # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
     # expert parallelism is off and every expert stays local to its rank.
@@ -54,14 +60,20 @@ spec:
     - "128"
     - --max-num-seqs
     - "2"
+    # 8192, not 16384: the encoder cache is budgeted off this value and profiled with limit-mm x max-num-seqs
+    # max-size images, so 16384 cost 2.77 GiB of KV on rank 0 (measured -1.13 -> +1.64 GiB) and tonyd2wild's
+    # b1-mb16k row lost 35.8% of its pool for it. 8192 = 64 x 128 stays block-aligned.
     - --max-num-batched-tokens
-    - "16384"
+    - "8192"
     # Vision on. The tower loads only when --language-model-only is absent; the checkpoint's vision_config
     # is 32 layers and its weights ride in shards 1, 2, 43-48, byte-identical to the release.
     - --limit-mm-per-prompt
     - '{"image":4}'
+    # 0, not 1: the processor cache lives in the API server on rank 0 only (measured +1.16 GiB on rank 0,
+    # nothing on ranks 1 and 2). vLLM sizes the pool from the tightest rank, which is rank 2 here, so a
+    # gigabyte spent on rank 0 would make rank 0 the floor and shrink the pool for everyone.
     - --mm-processor-cache-gb
-    - "1"
+    - "0"
     # Async scheduling is default-on for dspark in this build (config/vllm.py resolver), so no flag is passed.
     # The patched engram.py reads the two n-gram tables from the safetensors shards on disk
     # (DSV41_ENGRAM_DISK=1 below); never resident.
@@ -123,7 +135,10 @@ spec:
     - {name: VLLM_USE_FLASHINFER_SAMPLER, value: "0"}
     # Engram-on-disk (tonyd2wild engram.py): rows are read from model-00047/48 in the model dir per forward.
     - {name: DSV41_ENGRAM_DISK, value: "1"}
-    - {name: DSV41_ENGRAM_DISK_THREADS, value: "8"}
+    # 32 is tonyd2wild's default. Measured neutral on a warm page cache (10K prefill 0%, 40K +4% inside the
+    # run-to-run spread, decode -1%): the rows are already resident, so reads are not the bottleneck. It costs
+    # nothing and only pays on a cold cache; his fast-staging gain is GPU dequant, a separate patch.
+    - {name: DSV41_ENGRAM_DISK_THREADS, value: "32"}
     - {name: DSV41_ENGRAM_DISK_CHUNK, value: "8"}
     # cuda-exl3 reads quantization_config.json next to the weights; the operator serves the cached
     # multi-file model from /models/<cacheKey>.

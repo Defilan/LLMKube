@@ -1,0 +1,35 @@
+# Keep the three-Spark DeepSeek-V4.1-Flash ring in the GB10 fast state. tonyd2wild issue #1: the first request
+# after ~13 minutes idle runs its whole length in a hidden slow state (94 vs 63 ms per decode step, 62 vs 92
+# tok/s); 45 s of idle does not trigger it. A 2-token completion every 90 s keeps the window closed. Two tokens,
+# not sixteen: his own liveness probe at 16 tokens / 60 s produced PIECEWISE steps that showed up in the profile.
+# One Deployment, not a CronJob: a CronJob at this cadence would churn ~1000 pods a day.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: dsv41-keepwarm, namespace: default}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: dsv41-keepwarm}}
+  template:
+    metadata: {labels: {app: dsv41-keepwarm}}
+    spec:
+      containers:
+        - name: warm
+          image: python:3.12-slim
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import json, time, urllib.request
+              BASE = "http://dsv41-exl3-ring.default.svc.cluster.local:8080/v1/chat/completions"
+              body = json.dumps({"model": "DeepSeek-V4.1-Flash-EXL3", "max_tokens": 2,
+                                 "messages": [{"role": "user", "content": "ok"}]}).encode()
+              while True:
+                  t = time.time()
+                  try:
+                      req = urllib.request.Request(BASE, data=body, headers={"Content-Type": "application/json"})
+                      with urllib.request.urlopen(req, timeout=60) as r:
+                          r.read()
+                      print(f"{time.strftime('%H:%M:%S')} warm ok {time.time() - t:.2f}s", flush=True)
+                  except Exception as e:
+                      print(f"{time.strftime('%H:%M:%S')} warm fail {type(e).__name__}", flush=True)
+                  time.sleep(90)
+          resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 64Mi}}
