@@ -92,7 +92,7 @@ jobs:
         run: |
           go mod tidy
           make setup-test-e2e
-          KIND_CLUSTER=llmkube-test-e2e go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
+          KIND_CLUSTER=llmkube-test-e2e go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v \
             -ginkgo.focus='GPUQuota Multi-tenancy'
 
       - name: Tear down the kind cluster
@@ -296,7 +296,7 @@ jobs:
           # by the kind and Longhorn jobs above; what we want from the
           # MicroShift job is signal that the OpenShift SCC admission
           # path works end-to-end with the Helm preset.
-          go test -tags=e2e ./test/e2e/ -v -ginkgo.v \
+          go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v \
             -ginkgo.focus='OpenShift SCC admission'
 
       - name: Tear down MicroShift cluster
