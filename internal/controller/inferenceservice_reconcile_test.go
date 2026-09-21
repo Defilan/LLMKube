@@ -291,6 +291,22 @@ var _ = Describe("Multi-GPU End-to-End Reconciliation", func() {
 			Expect(deployment.Spec.Template.Spec.Containers).NotTo(BeEmpty())
 			gpuLimit := deployment.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
 			Expect(gpuLimit.String()).To(Equal("2"))
+
+			// The builder's intentional multi-GPU choices must survive the
+			// reconcile path, not only the constructor snapshot: a GPU
+			// workload replaces rather than surging and pins to the device
+			// taint. Asserting them here is what catches a builder regression
+			// that the shape test would restate (#378 finding 14).
+			By("verifying the Deployment carries the multi-GPU scheduling choices")
+			Expect(deployment.Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
+
+			var gpuToleration bool
+			for _, t := range deployment.Spec.Template.Spec.Tolerations {
+				if t.Key == "nvidia.com/gpu" {
+					gpuToleration = t.Value == "present" && t.Effect == corev1.TaintEffectNoSchedule
+				}
+			}
+			Expect(gpuToleration).To(BeTrue(), "a multi-GPU workload must tolerate the nvidia.com/gpu:present NoSchedule taint")
 		})
 	})
 })
