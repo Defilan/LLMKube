@@ -33,6 +33,11 @@ const (
 	certmanagerVersion = "v1.18.2"
 	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
 
+	// certManagerApplyAttempts and certManagerApplyBackoff bound the retry
+	// of the cert-manager manifest fetch.
+	certManagerApplyAttempts = 3
+	certManagerApplyBackoff  = 2 * time.Second
+
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
 
@@ -55,6 +60,25 @@ const (
 
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
+}
+
+// retryN runs fn until it succeeds or attempts are exhausted, sleeping a
+// multiple of backoff between attempts. It returns the last error seen, or
+// nil when an attempt succeeded before the budget ran out.
+func retryN(attempts int, backoff time.Duration, fn func() error) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if attempt < attempts {
+			time.Sleep(time.Duration(attempt) * backoff)
+		}
+	}
+	return err
 }
 
 // Run executes the provided command within this context
@@ -99,16 +123,20 @@ func UninstallCertManager() {
 	}
 }
 
-// InstallCertManager installs the cert manager bundle.
+// InstallCertManager installs the cert manager bundle. The manifest is
+// fetched from GitHub at test time, so the apply is retried: a transient 5xx
+// there would otherwise fail BeforeSuite and skip every spec in the suite.
 func InstallCertManager() error {
 	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
-	if _, err := Run(cmd); err != nil {
+	if err := retryN(certManagerApplyAttempts, certManagerApplyBackoff, func() error {
+		_, err := Run(exec.Command("kubectl", "apply", "-f", url))
+		return err
+	}); err != nil {
 		return err
 	}
 	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
 	// was re-installed after uninstalling on a cluster.
-	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
+	cmd := exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
 		"--for", "condition=Available",
 		"--namespace", "cert-manager",
 		"--timeout", "5m",

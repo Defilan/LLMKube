@@ -17,6 +17,10 @@ limitations under the License.
 package utils
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -85,5 +89,78 @@ func TestRunCurlInClusterSurfacesUnfinishedPod(t *testing.T) {
 	}
 	if status != 503 {
 		t.Fatalf("parsed status = %d, want 503", status)
+	}
+}
+
+func TestRetryNRetriesTransientFailures(t *testing.T) {
+	var calls int
+	err := retryN(3, 0, func() error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("504 Gateway Timeout")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("retryN() = %v, want nil once a later attempt succeeds", err)
+	}
+	if calls != 3 {
+		t.Fatalf("fn invoked %d time(s), want 3", calls)
+	}
+}
+
+func TestRetryNReturnsLastErrorWhenExhausted(t *testing.T) {
+	var calls int
+	want := fmt.Errorf("504 Gateway Timeout")
+	err := retryN(2, 0, func() error {
+		calls++
+		return want
+	})
+	if err == nil {
+		t.Fatalf("retryN() = nil, want the last error after exhausting the budget")
+	}
+	if calls != 2 {
+		t.Fatalf("fn invoked %d time(s), want 2", calls)
+	}
+}
+
+// fakeKubectl is a kubectl stand-in that fails its first invocation with a
+// 504-like error and succeeds afterwards, counting every call so a test can
+// tell a retried apply from a single-shot one.
+const fakeKubectl = `#!/bin/sh
+n=$(cat "$FAKE_KUBECTL_COUNTER" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$FAKE_KUBECTL_COUNTER"
+if [ "$n" -eq 1 ]; then
+  echo 'error: unable to read URL "cert-manager.yaml", server reported 504 Gateway Timeout' >&2
+  exit 1
+fi
+exit 0
+`
+
+func TestInstallCertManagerRetriesTransientApply(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "calls")
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"),
+		[]byte(fakeKubectl), 0o755); err != nil {
+		t.Fatalf("write fake kubectl: %v", err)
+	}
+	t.Setenv("FAKE_KUBECTL_COUNTER", counter)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := InstallCertManager(); err != nil {
+		t.Fatalf("InstallCertManager() = %v, want nil after one transient failure", err)
+	}
+
+	raw, err := os.ReadFile(counter)
+	if err != nil {
+		t.Fatalf("read invocation counter: %v", err)
+	}
+	calls, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("parse invocation counter %q: %v", string(raw), err)
+	}
+	if calls < 2 {
+		t.Fatalf("kubectl invoked %d time(s), want the failed apply retried", calls)
 	}
 }
