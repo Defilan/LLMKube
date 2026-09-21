@@ -1359,6 +1359,43 @@ var _ = Describe("spec advisory warning events (#378)", func() {
 
 		Expect(drainEvents()).To(ContainElement(ContainSubstring("MissingSkipModelInit")))
 	})
+
+	It("warns MissingMemoryRequest when hybrid offload is set without a memory budget", func() {
+		// Same contract as the init-container warning: the operator only
+		// learns its pods may be OOM-killed if Reconcile emits the event, so
+		// assert the emission, not the helper's boolean (#378 finding 15).
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		moe := true
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:      modelName,
+				Replicas:      &replicas,
+				Image:         "ghcr.io/ggml-org/llama.cpp:server",
+				MoeCPUOffload: &moe,
+				// resources.memory / hostMemory deliberately unset.
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), isvc)).To(Succeed())
+
+		_, err := newReconciler().Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: namespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("MissingMemoryRequest")))
+	})
 })
 
 var _ = Describe("resolveCacheMode", func() {
