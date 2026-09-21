@@ -507,7 +507,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Regenerate all codegen
-        run: make generate manifests chart-crds foreman-chart-crds
+        run: make generate manifests chart-crds foreman-chart-crds federation-chart-crds
 
       - name: Verify committed codegen is in sync
         run: |

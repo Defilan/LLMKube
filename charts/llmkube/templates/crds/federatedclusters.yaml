@@ -74,8 +74,10 @@ spec:
                 description: |-
                   HeartbeatIntervalSeconds is how often the edge is expected to push status.
                   The datacenter derives staleness thresholds from it (3x Stale, 10x Unreachable).
+                  The floor is the edge's fixed 30s push cadence: a lower value is never
+                  delivered, so it only makes the hub read a healthy site as Stale.
                 format: int32
-                minimum: 5
+                minimum: 30
                 type: integer
             type: object
           status:

@@ -19,6 +19,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -460,5 +461,64 @@ func TestFleetStatusRendersPerSiteAndFleetWideTable(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("footer missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestFleetRegisterRejectsSubCadenceHeartbeatInterval pins the CLI floor against
+// the CRD minimum: a value below the edge's delivered cadence is rejected
+// locally with an error naming the floor, 0 still means "default", and the
+// floor itself is accepted.
+func TestFleetRegisterRejectsSubCadenceHeartbeatInterval(t *testing.T) {
+	accepted := []struct {
+		name       string
+		in         int32
+		wantStored int32
+	}{
+		{"floor exactly", minHeartbeatIntervalSeconds, minHeartbeatIntervalSeconds},
+		{"above the floor", 45, 45},
+		{"zero means the default", 0, defaultHeartbeatIntervalSeconds},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			stubToken(t, "test-token-123")
+			c := fake.NewClientBuilder().WithScheme(fleetTestScheme(t)).Build()
+			ctx := context.Background()
+
+			if _, err := fleetRegister(ctx, c, nil, fleetRegisterInput{
+				Name:                     "edge-floor",
+				HeartbeatIntervalSeconds: tc.in,
+			}); err != nil {
+				t.Fatalf("fleetRegister(interval=%d): %v", tc.in, err)
+			}
+
+			fc := &federationv1alpha1.FederatedCluster{}
+			if err := c.Get(ctx, types.NamespacedName{Name: "edge-floor"}, fc); err != nil {
+				t.Fatalf("get FederatedCluster: %v", err)
+			}
+			if fc.Spec.HeartbeatIntervalSeconds != tc.wantStored {
+				t.Errorf("HeartbeatIntervalSeconds = %d, want %d",
+					fc.Spec.HeartbeatIntervalSeconds, tc.wantStored)
+			}
+		})
+	}
+
+	for _, in := range []int32{1, 5, 29} {
+		t.Run(fmt.Sprintf("rejects %d", in), func(t *testing.T) {
+			// Stub the token so a regressed guard runs the whole happy path and
+			// fails on the nil error, rather than tripping over a real mint.
+			stubToken(t, "test-token-123")
+			c := fake.NewClientBuilder().WithScheme(fleetTestScheme(t)).Build()
+
+			_, err := fleetRegister(context.Background(), c, nil, fleetRegisterInput{
+				Name:                     "edge-low",
+				HeartbeatIntervalSeconds: in,
+			})
+			if err == nil {
+				t.Fatalf("fleetRegister(interval=%d) = nil error, want a rejection", in)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("%d", minHeartbeatIntervalSeconds)) {
+				t.Errorf("error %q does not name the %ds floor", err, minHeartbeatIntervalSeconds)
+			}
+		})
 	}
 }

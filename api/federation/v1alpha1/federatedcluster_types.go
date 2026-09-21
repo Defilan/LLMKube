@@ -51,8 +51,10 @@ type FederatedClusterSpec struct {
 
 	// HeartbeatIntervalSeconds is how often the edge is expected to push status.
 	// The datacenter derives staleness thresholds from it (3x Stale, 10x Unreachable).
+	// The floor is the edge's fixed 30s push cadence: a lower value is never
+	// delivered, so it only makes the hub read a healthy site as Stale.
 	// +kubebuilder:default=30
-	// +kubebuilder:validation:Minimum=5
+	// +kubebuilder:validation:Minimum=30
 	HeartbeatIntervalSeconds int32 `json:"heartbeatIntervalSeconds,omitempty"`
 }
 
