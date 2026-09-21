@@ -25,9 +25,11 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
@@ -260,6 +262,16 @@ var _ = Describe("Multi-GPU End-to-End Reconciliation", func() {
 		})
 
 		It("should create deployment with correct multi-GPU configuration", func() {
+			// The Model must be Ready for reconcile to reach the Deployment
+			// builder; a not-Ready Model stops at Pending and creates nothing.
+			// This It asserts the created Deployment carries the requested GPU
+			// count, not just that the spec holds what the test itself wrote
+			// (#378 finding 2).
+			model := &inferencev1alpha1.Model{}
+			Expect(k8sClient.Get(ctx, modelNamespacedName, model)).To(Succeed())
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
 			By("reconciling the InferenceService")
 			reconciler := &InferenceServiceReconciler{
 				Client:             k8sClient,
@@ -267,20 +279,17 @@ var _ = Describe("Multi-GPU End-to-End Reconciliation", func() {
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
 			}
 
-			// First reconcile may not create deployment if model isn't ready
-			// We're testing that the controller doesn't error
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: serviceNamespacedName,
 			})
-			// May return error since model download will fail (test URL)
-			// but should not panic
-			_ = err
+			Expect(err).NotTo(HaveOccurred(), "a multi-GPU reconcile must not error (#378 finding 2)")
 
-			By("verifying the InferenceService was created")
-			isvc := &inferencev1alpha1.InferenceService{}
-			err = k8sClient.Get(ctx, serviceNamespacedName, isvc)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(isvc.Spec.Resources.GPU).To(Equal(int32(2)))
+			By("verifying the Deployment carries the requested GPU count")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, serviceNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.Containers).NotTo(BeEmpty())
+			gpuLimit := deployment.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceName("nvidia.com/gpu")]
+			Expect(gpuLimit.String()).To(Equal("2"))
 		})
 	})
 })
@@ -421,6 +430,18 @@ var _ = Describe("Reconcile lifecycle", func() {
 			updated := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
 			Expect(updated.Status.Phase).To(Equal(PhaseFailed))
+
+			By("verifying no workload resources were created for the missing Model")
+			depErr := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, &appsv1.Deployment{})
+			Expect(errors.IsNotFound(depErr)).To(BeTrue(), "a missing Model must not create a Deployment")
+			svcErr := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, &corev1.Service{})
+			Expect(errors.IsNotFound(svcErr)).To(BeTrue(), "a missing Model must not create a Service")
+
+			By("verifying the Failed condition carries the missing-Model cause")
+			degraded := meta.FindStatusCondition(updated.Status.Conditions, ConditionDegraded)
+			Expect(degraded).NotTo(BeNil(), "a missing Model must surface a Degraded condition")
+			Expect(degraded.Status).To(Equal(metav1.ConditionTrue))
+			Expect(degraded.Message).To(ContainSubstring("Model not found"))
 		})
 
 		It("should set Pending status when Model is not Ready", func() {
@@ -465,6 +486,17 @@ var _ = Describe("Reconcile lifecycle", func() {
 			updated := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
 			Expect(updated.Status.Phase).To(Equal("Pending"))
+
+			// Ready means a request to this endpoint will succeed. A not-Ready
+			// Model must therefore leave no Deployment, Service, or HPA behind,
+			// not merely report a Pending phase (#378 finding 11).
+			By("verifying no workload resources were created while the Model is not Ready")
+			depErr := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, &appsv1.Deployment{})
+			Expect(errors.IsNotFound(depErr)).To(BeTrue(), "a not-Ready Model must not create a Deployment")
+			svcErr := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, &corev1.Service{})
+			Expect(errors.IsNotFound(svcErr)).To(BeTrue(), "a not-Ready Model must not create a Service")
+			hpaErr := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, &autoscalingv2.HorizontalPodAutoscaler{})
+			Expect(errors.IsNotFound(hpaErr)).To(BeTrue(), "a not-Ready Model must not create an HPA")
 		})
 
 		It("should create Deployment and Service when Model is Ready", func() {
@@ -528,6 +560,15 @@ var _ = Describe("Reconcile lifecycle", func() {
 			svc := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc)).To(Succeed())
 			Expect(svc.OwnerReferences).To(HaveLen(1))
+
+			// The Service selector must select the Deployment's pods. An endpoint
+			// string with no selector backing it is the #374 shape: correct in
+			// the report, unreachable in practice (#378 finding 1).
+			By("verifying the Service selector selects the Deployment pods")
+			Expect(svc.Spec.Selector).NotTo(BeEmpty())
+			for k, v := range svc.Spec.Selector {
+				Expect(dep.Spec.Template.Labels).To(HaveKeyWithValue(k, v))
+			}
 
 			By("verifying status was updated")
 			updated := &inferencev1alpha1.InferenceService{}
@@ -686,6 +727,14 @@ var _ = Describe("Reconcile lifecycle", func() {
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
 			}
+			// The URL is only meaningful if the metal-agent actually backs it:
+			// register the EndpointSlice before reconciling, then assert both
+			// the Ready phase and the URL, so a fabricated URL cannot pass
+			// (#378 finding 4).
+			slice := metalEndpointSliceFixture(isvcName, "192.0.2.10")
+			Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, slice) }()
+
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
 			})
@@ -693,6 +742,7 @@ var _ = Describe("Reconcile lifecycle", func() {
 
 			updated := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Ready"))
 			Expect(updated.Status.Endpoint).To(Equal(
 				"http://isvc-metal-endpoint.default.svc.cluster.local:8080/v1/chat/completions",
 			))
@@ -735,6 +785,14 @@ var _ = Describe("Reconcile lifecycle", func() {
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
 			}
+			// Back the URL with a real EndpointSlice before reconciling (#378
+			// finding 4): Ready and the URL are asserted together. The
+			// controller matches the slice by the sanitized service name, so
+			// the fixture must carry it too.
+			slice := metalEndpointSliceFixture(sanitizeDNSName(isvcName), "192.0.2.10")
+			Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, slice) }()
+
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
 			})
@@ -742,6 +800,7 @@ var _ = Describe("Reconcile lifecycle", func() {
 
 			updated := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Ready"))
 			Expect(updated.Status.Endpoint).To(Equal(
 				"http://isvc-metal-v1-0.default.svc.cluster.local:8080/v1/chat/completions",
 			))
@@ -788,6 +847,13 @@ var _ = Describe("Reconcile lifecycle", func() {
 				Scheme:             k8sClient.Scheme(),
 				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
 			}
+			// Back the URL with a real EndpointSlice before reconciling (#378
+			// finding 4): Ready and the URL (custom port and path) are
+			// asserted together.
+			slice := metalEndpointSliceFixture(isvcName, "192.0.2.10")
+			Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, slice) }()
+
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
 			})
@@ -795,6 +861,7 @@ var _ = Describe("Reconcile lifecycle", func() {
 
 			updated := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal("Ready"))
 			Expect(updated.Status.Endpoint).To(Equal(
 				"http://isvc-metal-custom-ep.default.svc.cluster.local:9090/api/generate",
 			))
