@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -1171,6 +1172,55 @@ var _ = Describe("ModelCacheClaimIgnored warning events (#928)", func() {
 		)))
 	})
 
+	It("provisions no cache PVC for an oci:// source even with a cache key", func() {
+		createModel("oci://registry.defilan.net/models/qwen3-32b@sha256:"+strings.Repeat("a", 64), "abc123def456")
+		replicas := int32(1)
+		// No spec.modelCache block: this is the case that used to create a cache
+		// PVC for an oci:// source, a volume the pod never mounts. Per-service
+		// mode names the claim after this ISVC, so the assertion is independent
+		// of any shared cache PVC another spec left in the namespace.
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: modelName,
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), isvc)).To(Succeed())
+		perServicePVC := isvcName + "-model-cache"
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: perServicePVC, Namespace: namespace}})
+		})
+
+		reconciler := newReconciler("/models")
+		reconciler.ModelCacheMode = ModelCacheModePerService
+		reconcileOnce(reconciler)
+
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := k8sClient.Get(context.Background(),
+			types.NamespacedName{Name: perServicePVC, Namespace: namespace}, pvc)
+		Expect(errors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("warns and does not fail the reconcile when claimName targets an oci:// source with a missing claim", func() {
+		// The user claim is deliberately absent. Provisioning a cache PVC for
+		// this source would make ensureModelCachePVC enforce the claim and fail
+		// the reconcile over a cache the source never uses.
+		createModel("oci://registry.defilan.net/models/qwen3-32b@sha256:"+strings.Repeat("a", 64), "abc123def456")
+		createISVC()
+
+		reconcileOnce(newReconciler("/models"))
+
+		drained := drainEvents()
+		Expect(drained).To(ContainElement(SatisfyAll(
+			ContainSubstring("ModelCacheClaimIgnored"),
+			ContainSubstring("pre-staged oci:// ImageVolume"),
+		)))
+		Expect(drained).NotTo(ContainElement(ContainSubstring("ModelCachePVCNotFound")))
+	})
+
 	It("warns when claimName is set but caching is disabled on the operator", func() {
 		createModel("https://example.com/model.gguf", "abc123def456")
 		createISVC()
@@ -1536,3 +1586,55 @@ func getEnvVar(env []corev1.EnvVar, name string) string {
 	}
 	return ""
 }
+
+var _ = Describe("buildOCIStorageConfig (#1379)", func() {
+	ociModel := func(source string) *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "qwen3-oci"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: source},
+		}
+	}
+
+	It("mounts the artifact as a read-only ImageVolume with no downloader and no cache PVC", func() {
+		ref := "oci://registry.defilan.net/models/qwen3-32b@sha256:" + strings.Repeat("a", 64)
+		config := buildModelStorageConfig(ociModel(ref), nil, "default", true, "", "", "curl:8.18.0", 102, nil)
+
+		Expect(config.initContainers).To(BeEmpty())
+		Expect(config.volumes).To(HaveLen(1))
+		Expect(config.volumes[0].Name).To(Equal("model-source"))
+		Expect(config.volumes[0].PersistentVolumeClaim).To(BeNil())
+		Expect(config.volumes[0].Image).NotTo(BeNil())
+		Expect(config.volumes[0].Image.Reference).To(Equal("registry.defilan.net/models/qwen3-32b@sha256:" + strings.Repeat("a", 64)))
+		Expect(config.volumes[0].Image.PullPolicy).To(Equal(corev1.PullIfNotPresent))
+		Expect(config.volumeMounts).To(HaveLen(1))
+		Expect(config.volumeMounts[0].MountPath).To(Equal("/model-source"))
+		Expect(config.volumeMounts[0].ReadOnly).To(BeTrue())
+		Expect(config.modelPath).To(Equal("/model-source/qwen3-oci.gguf"))
+	})
+
+	It("ignores the cache flag: an oci:// source never gets a cache PVC or a downloader even with useCache=true", func() {
+		config := buildModelStorageConfig(
+			ociModel("oci://registry.example.com/models/llama-3.1-8b:latest"),
+			nil, "default", true, ModelCacheModePerService, "", "curl:8.18.0", 102, nil)
+		Expect(config.initContainers).To(BeEmpty())
+		Expect(config.volumes[0].Image).NotTo(BeNil())
+	})
+
+	It("fails loudly with an init container when the reference is malformed", func() {
+		// No repository segment: parseOCISource rejects it.
+		config := buildModelStorageConfig(ociModel("oci://busybox:1.36"), nil, "default", true, "", "", "curl:8.18.0", 102, nil)
+		Expect(config.volumes[0].Image).To(BeNil())
+		Expect(config.initContainers).To(HaveLen(1))
+		Expect(config.initContainers[0].Command).To(HaveLen(3))
+		Expect(config.initContainers[0].Command[2]).To(ContainSubstring("InvalidOCISource"))
+	})
+
+	It("uses the primary file of a multi-file spec as the model path, with no per-file fetch", func() {
+		m := ociModel("oci://registry.example.com/models/sharded-gguf")
+		m.Spec.Files = []string{"weights/model-00001-of-00002.gguf", "weights/model-00002-of-00002.gguf"}
+		config := buildModelStorageConfig(m, nil, "default", true, "", "", "curl:8.18.0", 102, nil)
+
+		Expect(config.initContainers).To(BeEmpty())
+		Expect(config.modelPath).To(Equal("/model-source/weights/model-00001-of-00002.gguf"))
+	})
+})

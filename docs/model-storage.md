@@ -57,6 +57,70 @@ Strict-taint users can use `spec.modelCache.claimName` with a pre-provisioned, n
 | Multi-node with an RWX storage class | `shared` + `accessMode: ReadWriteMany` + `storageClass: <rwx-class>` |
 | Multi-node without RWX | `perService` |
 
+## OCI image sources (`oci://`)
+
+A model can be delivered as an OCI **container image** and mounted directly by
+the Kubernetes **ImageVolume**:
+
+```yaml
+source: oci://registry.defilan.net/models/qwen3-32b@sha256:<digest>
+```
+
+The image is mounted read-only at `/model-source`, the same contract the
+`pvc://` path uses. Because the kubelet and the node runtime pull and mount
+it, an `oci://` model has **no downloader init container and no cache PVC**:
+`spec.modelCache` is ignored for this source type, and the cache bug class
+around PVC provisioning does not apply. Pull credentials come from
+`InferenceService.spec.imagePullSecrets`, the same as any container image,
+so private registries and air-gapped mirrors work with no extra configuration.
+
+Pin by **digest** (`@sha256:...`) so a served model is immutable and
+reproducible. A tag works but re-resolves when the pod restarts.
+
+### What the image must contain
+
+The reference must be a **container image** whose filesystem holds the weights, as
+a `tar` / `tar+gzip` / `tar+zstd` layer. A raw OCI artifact (ModelPack, Docker
+Model Artifact, an `oras push` with a model media type) is not a substitute: under
+containerd the kubelet unpacks only tar image layers and mounts the volume
+**empty** for any other layer media type (containerd issues #11381 / #11907).
+CRI-O is more permissive; do not rely on that for a portable manifest.
+
+The image's filesystem is mounted at `/model-source` and the served file is
+`/model-source/<primary>`, where `<primary>` is
+
+- `spec.files[0]` (or `spec.mmproj`), read as a path **relative to the image
+  root**, when the file list is explicit; or
+- `<Model.metadata.name>.gguf` (or the resolved `Status.GGUF.ModelName`) when
+  `spec.files` is empty.
+
+So put the weights at the **image root**, under the name LLMKube serves. The
+KServe / Red Hat modelcar convention (`COPY weights /models/`) does not match: it
+mounts at `/model-source/models/...`.
+
+A minimal, correct image:
+
+```dockerfile
+FROM scratch
+COPY ./qwen3-32b.gguf /
+```
+
+### Cluster requirement
+
+`oci://` needs **Kubernetes >= 1.36** on the serving node (ImageVolume reached
+GA there) and a supporting container runtime: **containerd >= 2.1.0** or
+**CRI-O >= 1.31**. The capability lives on the node, not the API server, so a
+node whose runtime cannot serve the volume fails the pod.
+
+The operator refuses an `oci://` Model on a control plane below 1.36 with an
+`UnsupportedCluster` condition naming the floor, rather than rendering a pod
+that cannot start. Below the floor, use `pvc://`, `s3://`, or `hf://`, which
+all work on older clusters and are the paths for edge, K3s, ARM, and Jetson
+deployments.
+
+See `docs/proposals/1379-oci-imagevolume-model-source.md` for the evaluation
+behind this source type.
+
 ## Metadata
 
 In `perService` mode the operator reads GGUF metadata (architecture, layer count, context length, etc.) for `Model.Status` by reading **only the file header** over HTTP range requests — it never downloads the whole model itself. The full model bytes are fetched only by the init container, on the serving node. `pvc://` and HuggingFace-repo sources are resolved at pod runtime and are unaffected.
@@ -74,3 +138,9 @@ mmproj: mmproj-model-f16.gguf
 ```
 
 When `spec.files` is empty, `spec.source` must name a single object directly.
+
+An `oci://` source carries every file in the image already, so
+`spec.files` selects the primary file within that tree and nothing is fetched
+per file. Use **explicit paths**: a glob cannot be expanded against an OCI
+image, which provides no file listing, and the Model fails loudly rather
+than serving a wrong path.
