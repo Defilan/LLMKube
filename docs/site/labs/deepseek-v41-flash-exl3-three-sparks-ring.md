@@ -16,9 +16,12 @@ runtime.
 > runs of the kind I would otherwise hand to a hosted coding assistant,
 > research against my MCP servers, and system design. I drive it through
 > `opencode`, and Foreman's coding fleet runs its work against the same
-> endpoint. Text-only, single stream, four sequences, 131,072-token context;
-> decode **31 to 35 tok/s** with DSpark k=5 and **26.5 tok/s** without it, at a
-> KV pool of about 356,000 tokens.
+> endpoint. Vision and tools are on, two sequences, a 524,288-token context with
+> the KV cache pinned at 4.2 GiB per rank, a pool of **1,057,457 tokens** (2.02
+> full-length requests). Measured 2026-09-20 on runtime candidate `24b44f42`:
+> cold prefill **2,209 / 2,262 / 1,740 tok/s** at 10K / 40K / 450K prompt tokens
+> and decode **80 to 90 tok/s** on a counting prompt, DSpark k=5, Engram fast
+> staging and the indexer TP-split on.
 
 The manifests are
 [`config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml`](https://github.com/defilantech/LLMKube/blob/main/config/samples/inferenceservice_multinode_vllm_three_sparks_ring.yaml),
@@ -32,7 +35,10 @@ memory between them. So two boxes would spend everything they have on the
 weights and leave nothing for a KV pool, which for a coding agent is the thing
 you cannot give up: the workloads are long-context and decode-bound. Three
 boxes give about 365 GiB, and the serving configuration below lands at a KV
-pool of about 356,000 tokens.
+pool of 1,057,457 tokens with the KV cache pinned (see "The InferenceService":
+without the pin, vLLM's profiler counts reclaimable page cache as memory in use
+and lands the same ring at about 600,000 tokens at 300K context, or refuses
+512K altogether).
 
 Tensor parallel rather than pipeline parallel is not a preference here. On the
 two-Spark measurements cross-node tensor parallel beat pipeline parallel on
@@ -174,13 +180,13 @@ The complete deployed spec is in the sample. What matters in it:
 ```yaml
 spec:
   runtime: vllm
-  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3:stable
+  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3@sha256:24b44f42...   # pinned by digest
   resources: {gpu: 1, memory: 110Gi, cpu: "8"}
   vllmConfig:
     tensorParallelSize: 3
     pipelineParallelSize: 1
-    maxModelLen: 131072
-    gpuMemoryUtilization: 0.78
+    maxModelLen: 524288
+    gpuMemoryUtilization: 0.80          # ignored while the KV cache is pinned (see extraArgs below)
   multiNode:
     rdmaResource: rdma/rdma_shared_device_a
     ibGIDIndex: 3
@@ -195,11 +201,12 @@ Expert parallelism stays **off**: the TP3 DSpark patch relaxes the 128-expert
 divisibility check only when every expert stays local to its rank, so enabling
 EP would defeat the patch that makes TP3 load at all.
 
-The image is pinned by tag here and should be pinned by digest in production.
-The runtime is
+The image is pinned by digest. The runtime is
 `ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3`, built in
-`llmkube-runtimes` (tag `cuda-gb10-vllm-dsv41-exl3-v0.1.0-rc4`, merge commit
-`9a2dafd`). It is a first-party build for this model, not a stock vLLM image,
+`llmkube-runtimes`; the serving digest is candidate `24b44f42`, built from the
+merge of llmkube-runtimes#47, which added tonyd2wild's cuda-exl3 `limit` kernel
+and two env-gated levers (Engram fast staging, the indexer TP-split) on top of
+the `v0.1.0-rc4` lineage. It is a first-party build for this model, not a stock vLLM image,
 and it pre-warms its JIT kernels so a cutlass GEMM is not compiled on the
 serving node.
 
@@ -208,22 +215,87 @@ The serving arguments that are load-bearing:
 - `--served-model-name DeepSeek-V4.1-Flash-EXL3`, with the `deepseek_v41`
   reasoning and tool parsers and `--enable-auto-tool-choice`. The endpoint
   speaks OpenAI function calling, which is what Foreman's agent loop requires.
-- `--language-model-only`. Text-only for this boot; the vision tower is a
-  second step on the same group.
+- Vision on: no `--language-model-only`, with `--limit-mm-per-prompt
+  '{"image":4}'` and `--mm-processor-cache-gb 0`. The processor cache lives in
+  the API server on rank 0 only (measured 1.16 GiB there, nothing on ranks 1
+  and 2); with rank 2 the tightest rank, a gigabyte on rank 0 would only make
+  rank 0 the floor. See "Turning vision on" below.
+- `--kv-cache-memory-bytes 4509715660` (4.2 GiB per rank). This is the lever
+  that makes 512K with vision fit on three Sparks. vLLM's memory profiler counts
+  reclaimable page cache as memory in use, so at 512K with vision it reported
+  1.49 to 1.59 GiB of KV against a 2.08 GiB requirement and the group could not
+  boot, while CUDA-free at init on a clean cache is about 111 GiB per rank. With
+  the pin, vLLM skips profiling entirely and ignores `gpuMemoryUtilization`
+  (its own log says so), which removes the safety net: caches must be dropped on
+  every member before every boot and kept in check while serving, which is what
+  `config/samples/gb10-memory-guard.yaml` does (a DaemonSet on the ring nodes:
+  pre-boot drop, load-time and serving flushers, and a one-shot suspend at a
+  MemFree floor; it also sets `vm.min_free_kbytes` and `watermark_scale_factor`).
+  Do not raise the pin past about 4.2 GiB on three Sparks.
 - `--default-chat-template-kwargs '{"thinking": false}'`. Thinking off, with the
   reasoning parser still wired.
-- `--max-num-seqs 4`, `--block-size 128`, `--max-num-batched-tokens 8192`. Sized
-  for a handful of long single streams, not for throughput under load.
+- `--max-num-seqs 2`, `--block-size 128`, `--max-num-batched-tokens 8192`.
+  Sized for a handful of long single streams, not for throughput under load.
+  bot-lab-21's `MAXB16K` lever (16384) was tried and reverted: the encoder cache
+  is budgeted off this value and profiled with `limit-mm` x `max-num-seqs`
+  max-size images, and 16384 cost 2.77 GiB of KV on rank 0 here; tonyd2wild's
+  own `b1-mb16k` row lost 35.8 percent of its pool to it.
 - `--speculative-config` with the `dspark` method, five speculative tokens, and
   **block** verification with probabilistic draft sampling. Block verification
   is lossless: it produces the same distribution as the target model. Adaptive
   verification is unsupported on GB10 (the SM12x sparse indexer), so it stays
-  `false`.
+  `false`. Async scheduling is default-on for `dspark` in this build (the
+  `config/vllm.py` resolver enables it when nothing disables it), so no
+  `--async-scheduling` flag is passed.
+- `NCCL_MAX_NCHANNELS=4`, `DSV41_ENGRAM_DISK_THREADS=32`, `DSV41_ENGRAM_FAST=1`
+  and `DSV41_INDEXER_TP_SPLIT=1` in the environment. Channels 8 (bot-lab-21's
+  switched-fabric lever) measured neutral on this switchless ring and cost 0.3
+  GiB of pinned NCCL memory per rank, the same finding as the only other ring
+  fleet that measured it. The last two are the runtime's env-gated levers from
+  llmkube-runtimes#47; each proved bit-exact on the candidate before it was
+  measured, and each logs its activation at boot (`Engram FAST staging on`,
+  `DSV41_INDEXER_TP_SPLIT on`). Either reverts with `"0"` and no rebuild.
 - `--compilation-config` with `cudagraph_mode: FULL_AND_PIECEWISE` and capture
-  sizes `[5, 6, 10, 12, 15, 18, 20, 24]`. With speculative decoding the decode
-  batch is k or k+1 tokens per sequence, so the sizes are the multiples of k up
-  to k x `max-num-seqs` plus the multiples of k+1. Check the first request's
-  logprobs for NaN: a GB10 TP2 build emitted NaN with graphs on.
+  sizes `[5, 6, 10, 12]`. With speculative decoding the decode batch is k or k+1
+  tokens per sequence, so the sizes are the multiples of k up to k x
+  `max-num-seqs` plus the multiples of k+1. Check the first request's logprobs
+  for NaN: a GB10 TP2 build emitted NaN with graphs on.
+
+### Turning vision on
+
+Vision needs three things, all of them already on disk or in the runtime:
+
+- The checkpoint carries the tower. `config.json` has a `vision_config` of 32
+  layers, and shards 1, 2 and 43 to 48 are byte-identical to the release, so the
+  vision weights are present (the EXL3 quantization touched only the routed
+  experts).
+- The runtime speaks multimodal. `models/deepseek_v4_1/attention.py` reads
+  `vision_max_n_token` and `vision_n_layers`, and `EngineArgs` exposes
+  `--limit-mm-per-prompt` and `--mm-processor-cache-gb`.
+- The one flag that suppresses it is ours. `--language-model-only` sets the
+  per-modality limit to zero, so the image is ignored. Drop it, add the two
+  multimodal flags above, and the tower loads for about 0.36 GiB per rank. The
+  cost that matters is elsewhere: the vision encoder's attention heads do not
+  divide by three, so vLLM replicates the encoder on every rank instead of
+  sharding it, and the encoder cache is profiled with `limit-mm` x
+  `max-num-seqs` max-size images off the batched-token budget. That is why the
+  vision flip on 2026-09-19 could not boot at 512K until the KV cache was pinned,
+  and why `--max-num-batched-tokens` went back to 8192.
+
+`config/samples/jobs/dsv41-apply-and-verify.yaml` is the end-to-end check. It
+is a Job rather than a script because applying the changed `InferenceService`
+terminates the ring, which is the endpoint the applying session runs on; the Job
+waits for the ring to drop and come back, then asserts that the model names a
+known red / green / blue stripes image left to right. It carries no API access,
+so its gate is the endpoint itself: the observed restart window makes the
+assertion meaningful, and the vision request is the readiness signal.
+`config/samples/jobs/dsv41-vision-smoke.yaml` is the same assertion against a
+ring that is already serving, for boot-by-boot ladders where the restart gate
+cannot run. Every configuration on this page passed it.
+
+Vision on SM120 (GB10) is lightly proven upstream: three light image tests
+passed on a sibling build, with heavier image traffic and large photos
+untested, and this first-party image is not that build. The Job is the gate.
 
 ### The NCCL environment that makes the ring work
 
@@ -252,25 +324,51 @@ correctly. A 256 MB all-reduce over three ranks, measured 2026-09-13:
 | One leg, two ranks, RDMA | 11.3 GB/s |
 | Three ranks, NCCL Socket transport | 7.9 GB/s |
 
-Serving numbers, single stream, text-only, from an in-cluster client. Prefill is
+Serving numbers, single stream, from an in-cluster client. Prefill is
 tokens per second at prompt lengths from 3.4k to 49.8k; decode is tokens per
 second on the new tokens:
 
-| Variant | Prefill tok/s | Decode tok/s |
+| Variant (2026-09-13, 131K context, no vision) | Prefill tok/s | Decode tok/s |
 | --- | --- | --- |
 | No speculative decoding | 1,094 to 1,334 | 26.5 |
 | DSpark k=5 | same | 31 to 35 |
 | DSpark k=5, code prompts | same | 65 |
 
 DSpark is worth about 1.5x across a mixed set (roughly 2x on arithmetic, 2.4x
-on code, 1.2 to 1.3x on prose), and it costs KV cache rather than adding it: the
-group runs four sequences and a 131,072-token context at a KV pool of about
+on code, 1.2 to 1.3x on prose), and it costs KV cache rather than adding it. That
+run used four sequences and a 131,072-token context at a KV pool of about
 356,000 tokens with `gpuMemoryUtilization: 0.78`.
 
+The 2026-09-20 ladder, on the serving configuration above (512K context, vision,
+KV pin 4.2 GiB, one change per boot, each row gated by the stripe test), with a
+cold-prefill probe (unique prefix so nothing hits the prefix cache, `max_tokens`
+1, tokens per second from `usage`) and a count-to-100 decode measured from
+`usage.completion_tokens` on a non-streaming request:
+
+| Row, runtime candidate `24b44f42` | Prefill 10K / 40K / 450K tok/s | Decode tok/s |
+| --- | --- | --- |
+| Previous candidate `8dab469d`, for reference | 2,000 / 2,120 / 1,447 | 84 to 86 |
+| Both gates off (the cuda-exl3 `limit` kernel alone) | 2,127 / 2,142 / 1,559 | 84 to 85 |
+| `DSV41_ENGRAM_FAST=1` | 2,216 / 2,249 / 1,655 | 86 to 89 |
+| Plus `DSV41_INDEXER_TP_SPLIT=1` (serving) | 2,209 / 2,262 / 1,740 | 80 to 90 |
+
+The single 450K-token request is +20 percent against the previous candidate.
+The memory guard logged no page-cache drops on any row, and MemFree on every
+rank stayed above 8 GiB through the 450K prefill (it reached 1.0 GiB with no
+guard before `vm.min_free_kbytes` was raised from 44 MiB to 1 GiB).
+
+The two levers that rode the vision respawn were bisected one boot at a time:
+`--max-num-batched-tokens 16384` cost 2.77 GiB of KV on rank 0 and went back to
+8192; `NCCL_MAX_NCHANNELS=8` measured within the run-to-run spread and went to
+4, which freed 0.3 GiB of pinned NCCL memory per rank. Neither was a throughput
+lever on this fabric.
+
 The provenance of these numbers, stated because a throughput figure without it
-is not reproducible: they come from the same 2026-09-13 run the
+is not reproducible: the 2026-09-13 table comes from the same run the
 [multi-node guide's Three-Spark ring section](../guides/multi-node-inference)
-cites, on the runtime build named above. There is no `llmkube-bench` artifact
+cites, on runtime `v0.1.0-rc4`; the 2026-09-20 table comes from the ladder in
+llmkube-runtimes#45, on candidate `24b44f42`, with the bit-identity tests for
+both gates run on the candidate first. There is no `llmkube-bench` artifact
 behind them yet; when there is, it will be linked here.
 
 ## What went wrong
@@ -294,7 +392,10 @@ stage, CUDA-free memory at init sat below `gpuMemoryUtilization x total`,
 because the freshly written weights were counted as page cache. The worker
 exits with a message that reads like a memory-sizing problem. Drop the page
 cache on each member before creating the `InferenceService`
-(`config/samples/jobs/drop-page-cache.yaml`). Note this is the exact opposite of
+(`config/samples/jobs/drop-page-cache.yaml`). With the KV cache pinned there is
+no profiler left to catch a dirty cache, so the drop is mandatory before every
+boot; `config/samples/gb10-memory-guard.yaml` performs it whenever the group
+enters `Creating`. Note this is the exact opposite of
 what the one-Spark ExLlamaV3 build needs, which aliases that same page cache;
 do not copy a cleanup step between the two.
 
@@ -324,9 +425,14 @@ build the dict form replaces `text_config` wholesale.
 5. Stage all 54 files to every member, keeping the relative layout identical.
 6. Apply `config/samples/jobs/dsv41-tp3-config.yaml` on each member, then
    `config/samples/jobs/drop-page-cache.yaml`, with swap already off.
-7. Apply the `Model`, then the `InferenceService`.
-8. Watch for the `NET/IB` line and the 23.2 GB/s all-reduce before trusting any
-   number you measure.
+7. Apply `config/samples/gb10-memory-guard.yaml` once; it drops caches on every
+   later boot and keeps MemFree above 4 GiB while serving.
+8. Apply the `Model`, then the `InferenceService`, then `dsv41-keepwarm.yaml`
+   (the first request after a long idle otherwise runs in a hidden GB10 slow
+   state, about 1.5x slower for its whole length).
+9. Watch for the `NET/IB` line and the 23.2 GB/s all-reduce before trusting any
+   number you measure, and run tonyd2wild's `gpuflip.py` probe on each node
+   first: a GB10 can sit in a hidden slow state that `nvidia-smi` does not show.
 
 ## Related
 

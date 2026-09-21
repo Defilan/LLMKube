@@ -1,0 +1,144 @@
+# GB10 memory guard for the three-Spark DeepSeek-V4.1-Flash ring: the page-cache flusher and MemFree guard that the
+# KV pin in inferenceservice_multinode_vllm_three_sparks_ring.yaml makes mandatory. On a DGX Spark host RAM is GPU
+# memory, and vLLM's --kv-cache-memory-bytes skips memory profiling, so nothing else protects the group from a
+# dirty page cache at boot or from Engram row reads regrowing the cache while serving.
+#
+# One DaemonSet on the ring nodes (nvidia.com/gpu.product=NVIDIA-GB10 AND llmkube.dev/rdma-fabric=true; the single-Spark
+# box carries no fabric label and is left alone), privileged for /proc/sys/vm, one Python loop every 2 s:
+#   - on start: vm.min_free_kbytes=1048576, vm.watermark_scale_factor=200 (bot-lab-21 / tonyd2wild host hardening; the
+#     nodes shipped at 44 MiB / 10, so background reclaim had no room). APPLY_SYSCTLS=0 turns this off.
+#   - ring not Ready (suspended, creating, loading): one unconditional drop when the phase enters Creating, that is the
+#     pre-boot drop the ring sample requires, then a drop whenever Cached > 40 GiB (bot-lab-21's load-time flusher).
+#   - ring Ready: a drop when MemFree < 4 GiB and there is at least 512 MiB of cache to drop, at most one per 5 s
+#     (tonyd2wild's memfree_flusher). Measured 2026-09-20: a 450K-token prefill took a rank to 1.0 GiB MemFree with no
+#     flusher and to 2.7 GiB with a 15 s one. With this guard and the sysctls in place the same probe needed 0 drops:
+#     kswapd reclaims early enough on its own, MemFree stayed ~10 GiB after a 450,977-token prefill at 1,447 tok/s.
+#   - guard: if MemFree stays under 1.5 GiB for 10 s while Ready, even after a drop, patch spec.suspend=true ONCE on the
+#     InferenceService (the operator then deletes the members cleanly) and say so in the log. That is the K8s form of his
+#     servguard. SUSPEND_ON_FLOOR=0 disarms it. The Role is scoped to that one object by resourceNames.
+# Audit: kubectl logs ds/gb10-memory-guard --all-containers --prefix. Every action is one line with before/after MiB.
+# Usage: kubectl apply -f gb10-memory-guard.yaml   (once; it survives ring restarts)
+apiVersion: v1
+kind: ServiceAccount
+metadata: {name: gb10-memory-guard, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: {name: gb10-memory-guard, namespace: default}
+rules:
+  - apiGroups: [inference.llmkube.dev]
+    resources: [inferenceservices]
+    resourceNames: [dsv41-exl3-ring]
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: {name: gb10-memory-guard, namespace: default}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: gb10-memory-guard}
+subjects: [{kind: ServiceAccount, name: gb10-memory-guard, namespace: default}]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: gb10-memory-guard, namespace: default}
+spec:
+  selector: {matchLabels: {app: gb10-memory-guard}}
+  template:
+    metadata: {labels: {app: gb10-memory-guard}}
+    spec:
+      serviceAccountName: gb10-memory-guard
+      tolerations: [{key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}]
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - {key: nvidia.com/gpu.product, operator: In, values: [NVIDIA-GB10]}
+                  - {key: llmkube.dev/rdma-fabric, operator: In, values: ["true"]}
+      containers:
+        - name: guard
+          image: python:3.12-slim
+          securityContext: {privileged: true}
+          env:
+            - {name: NODE_NAME, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}
+            - {name: ISVC_NAMESPACE, value: default}
+            - {name: ISVC_NAME, value: dsv41-exl3-ring}
+            - {name: APPLY_SYSCTLS, value: "1"}
+            - {name: SUSPEND_ON_FLOOR, value: "1"}
+            - {name: FLUSH_FLOOR_MIB, value: "4096"}
+            - {name: LOAD_CACHED_MIB, value: "40960"}
+            - {name: SUSPEND_FLOOR_MIB, value: "1536"}
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import json, os, ssl, time, urllib.request
+              NODE = os.environ.get("NODE_NAME", "?"); NS = os.environ["ISVC_NAMESPACE"]; ISVC = os.environ["ISVC_NAME"]
+              FLUSH_FLOOR = int(os.environ["FLUSH_FLOOR_MIB"]); LOAD_CACHED = int(os.environ["LOAD_CACHED_MIB"])
+              SUSPEND_FLOOR = int(os.environ["SUSPEND_FLOOR_MIB"]); MIN_CACHED = 512
+              SUSPEND_AFTER_S = 10; DROP_INTERVAL_S = 5.0; POLL_S = 2.0; PHASE_POLL_S = 10.0
+              APPLY_SYSCTLS = os.environ.get("APPLY_SYSCTLS", "1") == "1"; ARMED = os.environ.get("SUSPEND_ON_FLOOR", "1") == "1"
+              VM = "/host/proc/sys/vm"
+              def log(m): print(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), NODE, m, flush=True)
+              def meminfo():
+                  d = {}
+                  for line in open("/proc/meminfo"):
+                      k, v = line.split(":", 1); d[k] = int(v.split()[0]) // 1024
+                  return d["MemFree"], d["MemAvailable"], d["Cached"]
+              def drop(reason):
+                  f0, _, c0 = meminfo(); os.sync()
+                  with open(VM + "/drop_caches", "w") as f: f.write("3\n")
+                  f1, _, c1 = meminfo(); log(f"{reason}: MemFree {f0} -> {f1} MiB, Cached {c0} -> {c1} MiB"); return f1
+              def sysctl(name, val):
+                  p = f"{VM}/{name}"; before = open(p).read().strip()
+                  with open(p, "w") as f: f.write(f"{val}\n")
+                  log(f"sysctl vm.{name}: {before} -> {open(p).read().strip()}")
+              API = f"https://{os.environ['KUBERNETES_SERVICE_HOST']}:{os.environ['KUBERNETES_SERVICE_PORT']}"
+              CTX = ssl.create_default_context(cafile="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
+              PATH = f"/apis/inference.llmkube.dev/v1alpha1/namespaces/{NS}/inferenceservices/{ISVC}"
+              def api(method, body=None, ctype="application/json"):
+                  tok = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+                  req = urllib.request.Request(API + PATH, data=body, method=method, headers={"Authorization": f"Bearer {tok}", "Content-Type": ctype, "Accept": "application/json"})
+                  with urllib.request.urlopen(req, context=CTX, timeout=10) as r: return json.load(r)
+              def ring():
+                  try:
+                      o = api("GET"); return o.get("status", {}).get("phase", "?"), bool(o.get("spec", {}).get("suspend", False))
+                  except Exception as e:
+                      log(f"ring read failed: {type(e).__name__}: {e}"); return "?", None
+              if APPLY_SYSCTLS:
+                  sysctl("min_free_kbytes", 1048576); sysctl("watermark_scale_factor", 200)
+              f, a, c = meminfo(); log(f"start: MemFree {f} MemAvailable {a} Cached {c} MiB; flush<{FLUSH_FLOOR} load-cached>{LOAD_CACHED} guard<{SUSPEND_FLOOR} armed={ARMED}")
+              phase, susp = ring(); log(f"ring phase {phase} suspend={susp}")
+              last_phase_t = time.time(); last_drop = 0.0; low_since = None; we_suspended = False
+              while True:
+                  now = time.time()
+                  if now - last_phase_t >= PHASE_POLL_S:
+                      p2, susp = ring(); last_phase_t = now
+                      if p2 != phase:
+                          log(f"ring phase {phase} -> {p2}")
+                          if p2 == "Creating": drop("pre-boot drop"); last_drop = time.time()
+                          phase = p2
+                      if we_suspended and susp is False: we_suspended = False; log("ring was unsuspended; guard re-armed")
+                  free, avail, cached = meminfo()
+                  if phase == "Ready":
+                      if free < FLUSH_FLOOR and cached > MIN_CACHED and now - last_drop >= DROP_INTERVAL_S:
+                          free = drop(f"serving drop (MemFree < {FLUSH_FLOOR})"); last_drop = time.time()
+                      if ARMED and not we_suspended:
+                          if free < SUSPEND_FLOOR:
+                              low_since = low_since or now
+                              if now - low_since >= SUSPEND_AFTER_S:
+                                  free = drop("guard: last drop before suspend")
+                                  if free < SUSPEND_FLOOR:
+                                      try:
+                                          api("PATCH", json.dumps({"spec": {"suspend": True}}).encode(), "application/merge-patch+json")
+                                          we_suspended = True; log(f"GUARD: MemFree {free} MiB < {SUSPEND_FLOOR} for {SUSPEND_AFTER_S}s after drops; SUSPENDED {NS}/{ISVC}")
+                                      except Exception as e:
+                                          log(f"GUARD: suspend failed: {type(e).__name__}: {e}")
+                                  low_since = None
+                          else:
+                              low_since = None
+                  else:
+                      if cached > LOAD_CACHED and now - last_drop >= DROP_INTERVAL_S:
+                          drop(f"load-time drop (Cached > {LOAD_CACHED})"); last_drop = time.time()
+                  time.sleep(POLL_S)
+          volumeMounts: [{name: vm, mountPath: /host/proc/sys/vm}]
+          resources: {requests: {cpu: 50m, memory: 64Mi}, limits: {memory: 128Mi}}
+      volumes: [{name: vm, hostPath: {path: /proc/sys/vm, type: Directory}}]

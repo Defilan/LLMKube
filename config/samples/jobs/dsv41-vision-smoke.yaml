@@ -1,0 +1,38 @@
+# Vision smoke against the LIVE three-Spark DeepSeek-V4.1-Flash EXL3 ring, for the boot-by-boot ladder.
+# dsv41-apply-and-verify.yaml is the right gate for a config change: its phase 1 insists on seeing the ring go
+# down first, so it cannot run against a ring that is already serving. This Job sends the same 90x30 PNG
+# (three vertical stripes, red / green / blue) once and asserts the three colour words appear in that order.
+# No ServiceAccount, no RBAC: it only talks to the OpenAI endpoint, like the other Jobs in this directory.
+# Usage: kubectl create -f dsv41-vision-smoke.yaml && kubectl wait --for=condition=complete job/dsv41-vision-smoke
+#        kubectl logs job/dsv41-vision-smoke      # expect: vision reply: 'Red Green Blue' / VISION PASS
+apiVersion: batch/v1
+kind: Job
+metadata: {name: dsv41-vision-smoke, namespace: default}
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: smoke
+          image: python:3.12-slim
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import json, sys, urllib.request
+              BASE = "http://dsv41-exl3-ring.default.svc.cluster.local:8080/v1/chat/completions"
+              IMG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFoAAAAeCAIAAAAjA54vAAAAQ0lEQVR42u3QsQkAMAzAMP//dHpFCAWBZw9qaql+XOPAgQMHDhw4cODAgQMHDhw4cODAgQMHDhw4cODAgQMHDhw36wd5i4ILfk+OkgAAAABJRU5ErkJggg=="
+              payload = {"model": "DeepSeek-V4.1-Flash-EXL3", "max_tokens": 24, "temperature": 0, "messages": [
+                  {"role": "user", "content": [
+                      {"type": "image_url", "image_url": {"url": IMG}},
+                      {"type": "text", "text": "Name the colours of the three vertical stripes, left to right, as three words."}]}]}
+              req = urllib.request.Request(BASE, data=json.dumps(payload).encode(),
+                                           headers={"Content-Type": "application/json"})
+              text = json.load(urllib.request.urlopen(req, timeout=180))["choices"][0]["message"]["content"].strip()
+              low = text.lower()
+              ok = all(c in low for c in ("red", "green", "blue")) and low.index("red") < low.index("green") < low.index("blue")
+              print("vision reply:", repr(text))
+              print("VISION PASS" if ok else "VISION FAIL")
+              sys.exit(0 if ok else 1)
+          resources: {requests: {cpu: 50m, memory: 32Mi}, limits: {memory: 128Mi}}

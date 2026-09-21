@@ -11,8 +11,10 @@
 #
 # Before creating this: stage all 54 checkpoint files on every member (config/samples/model_dsv41_flash_exl3.yaml),
 # apply config/samples/jobs/dsv41-tp3-config.yaml (72 heads / 9 o_groups), and run
-# config/samples/jobs/drop-page-cache.yaml on each member; vLLM's worker refuses to start when CUDA-free at
-# init is below gpuMemoryUtilization x total, and a fresh 460 GB stage leaves that memory as page cache.
+# config/samples/jobs/drop-page-cache.yaml on each member, and apply config/samples/gb10-memory-guard.yaml once:
+# with the KV pin below, vLLM skips memory profiling, so nothing else catches a dirty page cache (a fresh 460 GB
+# stage leaves ~10 GiB of it resident even with the group down; measured 2026-09-20). The guard DaemonSet does the
+# drop on every boot, keeps MemFree above 4 GiB while serving, and suspends the group before the allocator stalls.
 #
 # Turn swap off on every member before the first boot (sudo swapoff -a): a memory overrun then OOM-kills the worker,
 # which the operator restarts, instead of paging kubelet out and wedging the node. The image pre-warms FlashInfer's
@@ -25,7 +27,7 @@ metadata:
 spec:
   modelRef: dsv41-flash-exl3
   runtime: vllm
-  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3:stable  # pin by digest in production
+  image: ghcr.io/defilantech/llmkube-vllm-cuda-gb10-dsv41-exl3@sha256:24b44f422363117990b4d2edfbdea1399ff89a4a74a075cd773f52704ef5b98c
   replicas: 1
   containerPort: 8080
   resources:
@@ -38,8 +40,18 @@ spec:
   vllmConfig:
     tensorParallelSize: 3
     pipelineParallelSize: 1
-    maxModelLen: 131072
-    gpuMemoryUtilization: 0.78
+    # 524288 works on three Sparks only together with the KV pin in extraArgs. Without it vLLM's profiler sizes
+    # the pool from what it measures after load, and on a GB10 that count includes reclaimable page cache: at
+    # 524288 it reported 1.49-1.59 GiB against a 2.08 GiB requirement and the group could not boot, while the
+    # true CUDA-free at init on a clean cache is ~111 GiB. The indexer prefill buffer also scales with this
+    # value (about 5.2 GiB at 1M per tonyd2wild's RECIPE.md), which is why 300000, his TP3 serving config, is
+    # the largest context the profiler allows here and the fallback if the pin is ever removed. opencode's
+    # provider limit.context must be this minus its limit.output (524288 - 65536 = 458752) or turns in that band
+    # get HTTP 400 instead of compacting. YaRN is already factor 16 in the checkpoint (1,048,576 positions).
+    maxModelLen: 524288
+    # Ignored while --kv-cache-memory-bytes is set (vLLM: "skipped memory profiling. This does not respect the
+    # gpu_memory_utilization config"). Kept at tonyd2wild's 0.80 for the un-pinned fallback.
+    gpuMemoryUtilization: 0.80
     # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
     # expert parallelism is off and every expert stays local to its rank.
   extraArgs:
@@ -53,11 +65,22 @@ spec:
     - --block-size
     - "128"
     - --max-num-seqs
-    - "4"
+    - "2"
+    # 8192, not 16384: the encoder cache is budgeted off this value and profiled with limit-mm x max-num-seqs
+    # max-size images, so 16384 cost 2.77 GiB of KV on rank 0 (measured -1.13 -> +1.64 GiB) and tonyd2wild's
+    # b1-mb16k row lost 35.8% of its pool for it. 8192 = 64 x 128 stays block-aligned.
     - --max-num-batched-tokens
     - "8192"
-    # Text-only for the first boot (skips the vision tower); vision is a second step on the same group.
-    - --language-model-only
+    # Vision on. The tower loads only when --language-model-only is absent; the checkpoint's vision_config
+    # is 32 layers and its weights ride in shards 1, 2, 43-48, byte-identical to the release.
+    - --limit-mm-per-prompt
+    - '{"image":4}'
+    # 0, not 1: the processor cache lives in the API server on rank 0 only (measured +1.16 GiB on rank 0,
+    # nothing on ranks 1 and 2). vLLM sizes the pool from the tightest rank, which is rank 2 here, so a
+    # gigabyte spent on rank 0 would make rank 0 the floor and shrink the pool for everyone.
+    - --mm-processor-cache-gb
+    - "0"
+    # Async scheduling is default-on for dspark in this build (config/vllm.py resolver), so no flag is passed.
     # The patched engram.py reads the two n-gram tables from the safetensors shards on disk
     # (DSV41_ENGRAM_DISK=1 below); never resident.
     - --engram-config
@@ -66,16 +89,26 @@ spec:
     - --default-chat-template-kwargs
     - '{"thinking": false}'
     # CUDA graphs (FULL_AND_PIECEWISE). With speculative decoding the decode batch is k or k+1 tokens per sequence, so the
-    # capture sizes are the multiples of k up to k x max-num-seqs plus the multiples of k+1: for k=5 and 4 sequences,
-    # [5,6,10,12,15,18,20,24]. The first request should check logprobs for NaN (a GB10 TP2 build emitted NaN with graphs on).
+    # capture sizes are the multiples of k up to k x max-num-seqs plus the multiples of k+1: for k=5 and 2 sequences,
+    # [5,6,10,12]. The first request should check logprobs for NaN (a GB10 TP2 build emitted NaN with graphs on).
     - --compilation-config
-    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,6,10,12,15,18,20,24]}'
+    - '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,6,10,12]}'
     # DSpark k=5 speculative decoding: the drafter lives in the checkpoint; block verification with probabilistic draft
     # sampling is lossless (same distribution as the target). Measured 2026-09-13 on the ring: code 2.4x, arithmetic 2x,
     # prose 1.2 to 1.3x, 1.5x across a mixed set. Capture sizes follow the rule above.
     # Adaptive verification is unsupported on GB10 (SM12x sparse indexer); leave it false.
     - --speculative-config
     - '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}'
+    # KV pin: 4.2 GiB per rank = 1,057,457 tokens, 2.02x at 512K (measured 2026-09-20, generation 43, vision
+    # on, DSpark k=5: stripe PASS, prefill 2,000 / 2,120 tok/s at 10K / 40K, a 450,979-token request at
+    # 1,472 tok/s, decode 84-86). vLLM then skips memory profiling and ignores gpuMemoryUtilization; the pin
+    # is the whole budget, which is what lets 512K + vision fit (see maxModelLen). Two things become
+    # mandatory: drop caches on every member before every boot (jobs/drop-page-cache.yaml; no profiler
+    # catches a dirty cache), and a serving-phase flusher under 4 GiB MemFree (rank 2 dipped to 2.7 GiB under
+    # the 450K prefill even with one). Do not raise the pin past ~4.2 GiB on three Sparks: MemAvailable while
+    # serving is ~10 GiB. 2.3 GiB (1.10x) also boots and serves if headroom matters more than concurrency.
+    - --kv-cache-memory-bytes
+    - "4509715660"
     # TP3: 64 heads / 8 o_groups do not divide by 3. virtual_heads.py pads to 72 / 9 at load time
     # against the declaration that config/samples/jobs/dsv41-tp3-config.yaml writes into the staged config.json (what
     # tonyd2wild's reddie_prep_tp3.sh (https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark) does). NOT --hf-overrides: on this build text_config is
@@ -94,6 +127,12 @@ spec:
     - {name: NCCL_IB_MERGE_NICS, value: "0"}
     - {name: NCCL_NET_PLUGIN, value: none}
     - {name: NCCL_NVLS_ENABLE, value: "0"}
+    # 4, not 8. NCCL_MAX_NCHANNELS=8 came from bot-lab-21's ladder, which is a switched fabric (+10.7% C6 there).
+    # This ring is a switchless cycle, and on that topology koldfrontier (tonyd2wild issue #9) measured 8 as
+    # neutral and reverted to 4. Same here: 8 -> 4 moved prefill and decode inside the run-to-run spread (10K
+    # +6%, 40K -2%, decode -1%) and cut NCCL's pinned host Shmem from 0.77 to 0.47 GiB on every rank, which on
+    # a unified-memory GB10 is KV. Measured 2026-09-20, generation 37.
+    - {name: NCCL_MAX_NCHANNELS, value: "4"}
     - {name: NCCL_CUMEM_ENABLE, value: "0"}
     - {name: NCCL_IGNORE_CPU_AFFINITY, value: "1"}
     - {name: TORCH_NCCL_ASYNC_ERROR_HANDLING, value: "1"}
@@ -115,8 +154,27 @@ spec:
     - {name: VLLM_USE_FLASHINFER_SAMPLER, value: "0"}
     # Engram-on-disk (tonyd2wild engram.py): rows are read from model-00047/48 in the model dir per forward.
     - {name: DSV41_ENGRAM_DISK, value: "1"}
-    - {name: DSV41_ENGRAM_DISK_THREADS, value: "8"}
+    # 32 is tonyd2wild's default. Measured neutral on a warm page cache (10K prefill 0%, 40K +4% inside the
+    # run-to-run spread, decode -1%): the rows are already resident, so reads are not the bottleneck. It costs
+    # nothing and only pays on a cold cache; his fast-staging gain is GPU dequant, a separate patch.
+    - {name: DSV41_ENGRAM_DISK_THREADS, value: "32"}
     - {name: DSV41_ENGRAM_DISK_CHUNK, value: "8"}
+    # The two env-gated levers llmkube-runtimes#47 added to the image (candidate 24b44f42, tonyd2wild's speed-run
+    # patches, MIT), each accepted on this ring by a one-change boot against the row before it (2026-09-20, same
+    # 10K/40K/450K cold-prefill probe, vision stripe test and count decode on every row, 0 guard drops on any):
+    #   row 0, gates off (the cuda-exl3 limit kernel alone): prefill 2,127 / 2,142 / 1,559, decode 84-85; the
+    #          "has no 'limit' argument" warning is gone from the boot log.
+    #   row 1, DSV41_ENGRAM_FAST=1: 2,216 / 2,249 / 1,655, decode 86-89. Engram rows gathered through a numpy
+    #          memmap and dequantized on the GPU; bit-identical to the preadv path (tools/test_stage_fast.py, 288
+    #          and 98,304 rows). Boot log line: "Engram FAST staging on (DSV41_ENGRAM_FAST=1)".
+    #   row 2, + DSV41_INDEXER_TP_SPLIT=1: 2,209 / 2,262 / 1,740, decode 80-90. Each rank computes the lightning
+    #          indexer's top-k for a slice of the prefill rows, then one all-gather; byte-equal to the unsplit
+    #          reference at tp=3 (test_idxsplit.py sim). The value MUST be identical on every member. Boot log
+    #          line: "DSV41_INDEXER_TP_SPLIT on: indexer prefill rows split across 3 TP ranks".
+    # Against the previous image (gen 43: 1,447 tok/s at 450K) the long prefill is +20%. Set either to "0" to
+    # fall back to the previous behaviour without a rebuild.
+    - {name: DSV41_ENGRAM_FAST, value: "1"}
+    - {name: DSV41_INDEXER_TP_SPLIT, value: "1"}
     # cuda-exl3 reads quantization_config.json next to the weights; the operator serves the cached
     # multi-file model from /models/<cacheKey>.
     - {name: CUDA_EXL3_MODEL_PATH, value: /models/22fa141368a3262a}
