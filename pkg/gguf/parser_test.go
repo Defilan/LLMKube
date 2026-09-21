@@ -25,6 +25,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -818,4 +819,109 @@ func (c *countingResponseWriter) Write(p []byte) (int, error) {
 	n, err := c.ResponseWriter.Write(p)
 	c.n.Add(int64(n))
 	return n, err
+}
+
+// TestReadValueScalarTypes pins each scalar decode branch of readValueData:
+// both the wire width and the concrete decoded value. A wrong-width read or a
+// wrong *Val return type fails its row, not merely the "no error" check.
+func TestReadValueScalarTypes(t *testing.T) {
+	cases := []struct {
+		name   string
+		encode func(*bytes.Buffer)
+		want   GGUFValue
+	}{
+		{"uint8", func(b *bytes.Buffer) { writeLE(b, valueTypeUint8); writeLE(b, uint8(200)) }, Uint8Val{Value: 200}},
+		{"int8", func(b *bytes.Buffer) { writeLE(b, valueTypeInt8); writeLE(b, int8(-100)) }, Int8Val{Value: -100}},
+		{"uint16", func(b *bytes.Buffer) { writeLE(b, valueTypeUint16); writeLE(b, uint16(50000)) }, Uint16Val{Value: 50000}},
+		{"int16", func(b *bytes.Buffer) { writeLE(b, valueTypeInt16); writeLE(b, int16(-30000)) }, Int16Val{Value: -30000}},
+		{"uint32", func(b *bytes.Buffer) { writeLE(b, valueTypeUint32); writeLE(b, uint32(4096)) }, Uint32Val{Value: 4096}},
+		{"int32", func(b *bytes.Buffer) { writeLE(b, valueTypeInt32); writeLE(b, int32(-123456)) }, Int32Val{Value: -123456}},
+		{"float32", func(b *bytes.Buffer) { writeLE(b, valueTypeFloat32); writeLE(b, float32(1.5)) }, Float32Val{Value: 1.5}},
+		{"bool true", func(b *bytes.Buffer) { writeLE(b, valueTypeBool); writeLE(b, uint8(1)) }, BoolVal{Value: true}},
+		{"bool false on a non-1 byte", func(b *bytes.Buffer) {
+			writeLE(b, valueTypeBool)
+			writeLE(b, uint8(2))
+		}, BoolVal{Value: true}},
+		{"string", func(b *bytes.Buffer) {
+			writeLE(b, valueTypeString)
+			writeLE(b, uint64(5))
+			b.WriteString("llama")
+		}, StringVal{Value: "llama"}},
+		{"uint64", func(b *bytes.Buffer) {
+			writeLE(b, valueTypeUint64)
+			writeLE(b, uint64(1)<<40)
+		}, Uint64Val{Value: 1 << 40}},
+		{"int64", func(b *bytes.Buffer) {
+			writeLE(b, valueTypeInt64)
+			writeLE(b, -(int64(1) << 40))
+		}, Int64Val{Value: -(int64(1) << 40)}},
+		{"float64", func(b *bytes.Buffer) { writeLE(b, valueTypeFloat64); writeLE(b, float64(2.5)) }, Float64Val{Value: 2.5}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			tc.encode(buf)
+
+			got, err := readValue(buf)
+			if err != nil {
+				t.Fatalf("readValue(%s): unexpected error: %v", tc.name, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("readValue(%s) = %#v, want %#v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadValueUnknownType pins the default branch: an unrecognised type tag
+// must surface ErrUnknownValueType rather than decode garbage or return nil.
+func TestReadValueUnknownType(t *testing.T) {
+	buf := &bytes.Buffer{}
+	writeLE(buf, uint32(99))
+
+	_, err := readValue(buf)
+	if !errors.Is(err, ErrUnknownValueType) {
+		t.Fatalf("readValue(unknown type) error = %v, want ErrUnknownValueType", err)
+	}
+}
+
+// TestUnsignedAccessors pins the accessor switch arms: the unsigned widths
+// convert, and the mis-typed inputs are rejected rather than silently zeroed.
+func TestUnsignedAccessors(t *testing.T) {
+	unsigned := []struct {
+		name string
+		in   GGUFValue
+		want uint64
+	}{
+		{"uint8", Uint8Val{Value: 7}, 7},
+		{"uint16", Uint16Val{Value: 700}, 700},
+		{"uint32", Uint32Val{Value: 70000}, 70000},
+		{"uint64", Uint64Val{Value: 1 << 40}, 1 << 40},
+	}
+	for _, tc := range unsigned {
+		got, ok := AsU64(tc.in)
+		if !ok {
+			t.Errorf("AsU64(%s) reported not-ok, want a value", tc.name)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("AsU64(%s) = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+
+	rejected := []struct {
+		name string
+		call func() bool
+	}{
+		{"AsU64 rejects a string", func() bool { _, ok := AsU64(StringVal{Value: "x"}); return ok }},
+		{"AsU32 rejects a uint64", func() bool { _, ok := AsU32(Uint64Val{Value: 1}); return ok }},
+		{"AsStr rejects a uint32", func() bool { _, ok := AsStr(Uint32Val{Value: 1}); return ok }},
+		{"AsBool rejects a uint8", func() bool { _, ok := AsBool(Uint8Val{Value: 1}); return ok }},
+	}
+	for _, tc := range rejected {
+		if tc.call() {
+			t.Errorf("%s: accepted, want rejected", tc.name)
+		}
+	}
 }
