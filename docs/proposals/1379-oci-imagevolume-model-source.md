@@ -226,6 +226,18 @@ If (1) fails for your fleet, this is a no-go on the floor, not on the mechanism.
   release with no pinned 1.36 node image. Covering it in CI would need a pinned
   node image at 1.36 with containerd >= 2.1.
 - **Non-containerd runtimes.** Only containerd was tested.
+- **Image vs artifact form.** The probe mounted a container image
+  (`busybox:1.36`), not a model artifact. Under containerd the kubelet unpacks
+  only `application/vnd.oci.image.layer.v1.tar{+gzip|zstd}` layers; any other
+  layer media type is **silently skipped** and the volume mounts **empty**
+  (containerd issues #11381 / #11907). So an `oci://` source is a *container
+  image* source: a raw OCI artifact (ModelPack, Docker Model Artifact, an
+  `oras push` with a model media type) is not a substitute. CRI-O is more
+  permissive, which is exactly why the floor must not be read as portable
+  across runtimes. Related: nothing records the interior layout the image must
+  satisfy for `ociPrimaryFile` to resolve (weights at the image root, named to
+  match the Model or listed in `spec.files`), so `COPY weights /models/` does
+  not match.
 
 ## Phase B scope (separate PR, only if the decision is go)
 
@@ -244,7 +256,9 @@ If (1) fails for your fleet, this is a no-go on the floor, not on the mechanism.
   chooses a mechanism (a documented prerequisite plus a clear status condition on
   pod-start failure, or a probe) and states it. It must not assume support.
 - `docs/model-storage.md` and `docs/air-gapped-quickstart.md`: document the source
-  type, the node floor, digest pinning, and mirroring.
+  type, the node floor, digest pinning, and mirroring, plus the image-vs-artifact
+  constraint (container image with tar layers; a raw OCI artifact mounts empty
+  under containerd) and the required interior layout.
 - Tests: an envtest render test that `oci://` yields an image-volume volume and
   **zero** model-downloader init containers (fails if the dispatch is removed),
   and a gate test that an unsupported cluster is refused with a clear condition
