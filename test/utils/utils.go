@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
@@ -33,6 +35,22 @@ const (
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
+
+	// curlPodImage is the pinned image the one-shot request pods run.
+	curlPodImage = "docker.io/curlimages/curl:8.18.0"
+
+	// curlConnectTimeout and curlMaxTime bound the request itself so a
+	// blackholed upstream aborts curl instead of hanging the pod. curlMaxTime
+	// sits below curlPodWaitTimeout so curl's own abort, not the poll
+	// deadline, is normally what ends the pod.
+	curlConnectTimeout = "5"
+	curlMaxTime        = "45"
+
+	// curlPodWaitTimeout bounds how long RunCurlInCluster waits for the
+	// request pod to reach a terminal phase.
+	curlPodWaitTimeout = 60 * time.Second
+
+	curlPhasePollInterval = 500 * time.Millisecond
 )
 
 func warnError(err error) {
@@ -147,6 +165,150 @@ func LoadImageToKindClusterWithName(name string) error {
 	cmd := exec.Command(kindBinary, kindOptions...)
 	_, err := Run(cmd)
 	return err
+}
+
+// CurlArgs builds the curl argument vector for a one-shot in-cluster
+// request. The connect and max-time bounds are what stop a blackholed
+// upstream from hanging the request pod.
+func CurlArgs(method string, headers map[string]string, body, url string) []string {
+	args := []string{
+		"curl", "-sS", "-o", "/tmp/body", "-w", "HTTP_STATUS=%{http_code}\n",
+		"--connect-timeout", curlConnectTimeout,
+		"--max-time", curlMaxTime,
+		"-X", method,
+	}
+	for k, v := range headers {
+		args = append(args, "-H", fmt.Sprintf("%s: %s", k, v))
+	}
+	if body != "" {
+		args = append(args, "-H", "content-type: application/json",
+			"--data-binary", body)
+	}
+	return append(args, url)
+}
+
+// WaitForPodTerminal polls getPhase until it reports a terminal phase or the
+// deadline passes, returning the last phase observed and whether that phase
+// was terminal. A pod that never leaves a non-terminal phase is an
+// orchestration failure, so callers must not read the false result as an
+// empty HTTP response.
+func WaitForPodTerminal(deadline time.Time, getPhase func() (string, error)) (string, bool) {
+	var last string
+	for time.Now().Before(deadline) {
+		phase, err := getPhase()
+		if err == nil {
+			if phase == "Succeeded" || phase == "Failed" {
+				return phase, true
+			}
+			last = phase
+		}
+		time.Sleep(curlPhasePollInterval)
+	}
+	return last, false
+}
+
+// RunCurlInCluster runs a one-shot curl against an in-cluster URL using
+// kubectl run + delete. Returns (stdout, status code, error). The body of the
+// HTTP response is followed by an `HTTP_STATUS=<code>` line that the parser
+// strips out. Errors are reserved for orchestration failures (pod scheduling,
+// log fetch, or a pod that never reached a terminal phase); an HTTP 5xx still
+// returns (logs, code, nil) so callers can assert on the status.
+func RunCurlInCluster(ns, url, method string, headers map[string]string, body string) (string, int, error) {
+	// The pod runs `curl ... > status_line; cat /tmp/body; status_line` so
+	// the pod logs end with the parseable HTTP_STATUS= sentinel.
+	shellCmd := strings.Join(quoteShell(CurlArgs(method, headers, body, url)), " ") +
+		" > /tmp/status; cat /tmp/body; echo; cat /tmp/status"
+
+	// Match the curl-metrics pattern used elsewhere in this suite:
+	// kubectl run with --overrides supplying the full container spec
+	// (command/args + securityContext). The pod's logs are then
+	// fetched to retrieve the response body and the parseable
+	// HTTP_STATUS= sentinel.
+	overrides := fmt.Sprintf(`{
+		"spec": {
+			"restartPolicy": "Never",
+			"containers": [{
+				"name": "curl",
+				"image": %q,
+				"command": ["/bin/sh", "-c"],
+				"args": [%q],
+				"securityContext": {
+					"allowPrivilegeEscalation": false,
+					"capabilities": {"drop": ["ALL"]},
+					"runAsNonRoot": true,
+					"runAsUser": 1000,
+					"seccompProfile": {"type": "RuntimeDefault"}
+				}
+			}]
+		}
+	}`, curlPodImage, shellCmd)
+
+	podName := fmt.Sprintf("e2e-curl-%d", time.Now().UnixNano())
+	runCmd := exec.Command("kubectl", "run", podName,
+		"--restart=Never", "--namespace", ns,
+		"--image="+curlPodImage,
+		"--overrides", overrides)
+	if _, err := Run(runCmd); err != nil {
+		return "", 0, fmt.Errorf("kubectl run: %w", err)
+	}
+	defer func() {
+		_, _ = Run(exec.Command("kubectl", "delete", "pod", podName,
+			"-n", ns, "--ignore-not-found", "--wait=false"))
+	}()
+
+	// Poll for terminal phase (Succeeded or Failed); kubectl wait can't
+	// express "either" cleanly so we look at .status.phase directly.
+	lastPhase, terminal := WaitForPodTerminal(
+		time.Now().Add(curlPodWaitTimeout),
+		func() (string, error) {
+			return Run(exec.Command("kubectl", "get", "pod", podName,
+				"-n", ns, "-o", "jsonpath={.status.phase}"))
+		})
+	if !terminal {
+		return curlResult(podName, "", lastPhase, false)
+	}
+
+	logs, err := Run(exec.Command("kubectl", "logs", podName, "-n", ns))
+	if err != nil {
+		return "", 0, fmt.Errorf("kubectl logs: %w", err)
+	}
+	return curlResult(podName, logs, lastPhase, true)
+}
+
+// curlResult maps a request pod's terminal state and logs into
+// RunCurlInCluster's return shape. A pod that never reached a terminal phase
+// is an orchestration failure, not an empty HTTP response, so it returns an
+// error rather than status 0.
+func curlResult(podName, logs, lastPhase string, terminal bool) (string, int, error) {
+	if !terminal {
+		return "", 0, fmt.Errorf(
+			"curl pod %s did not reach a terminal phase within %s (last phase %q)",
+			podName, curlPodWaitTimeout, lastPhase)
+	}
+	return logs, parseHTTPStatus(logs), nil
+}
+
+// parseHTTPStatus extracts the HTTP_STATUS= sentinel from a request pod's
+// logs, returning 0 when the sentinel is absent.
+func parseHTTPStatus(logs string) int {
+	status := 0
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.HasPrefix(line, "HTTP_STATUS=") {
+			status, _ = strconv.Atoi(strings.TrimPrefix(line, "HTTP_STATUS="))
+		}
+	}
+	return status
+}
+
+// quoteShell shell-quotes each arg so the rendered command is safe to
+// run via sh -c. POSIX single quotes block expansion; the only escaping
+// needed is for embedded single quotes.
+func quoteShell(args []string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	return out
 }
 
 // GetNonEmptyLines converts given command output string into individual objects
