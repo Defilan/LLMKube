@@ -577,6 +577,79 @@ var _ = Describe("Reconcile lifecycle", func() {
 			Expect(updated.Status.Endpoint).NotTo(BeEmpty())
 		})
 
+		It("should report Ready once the Deployment reports its ready replicas", func() {
+			// Ready means a request to the endpoint will succeed. The generic
+			// path reaches Ready only when the Deployment reports the desired
+			// ready replicas, so this drives determinePhase through Reconcile
+			// rather than calling the helper with synthetic tuples: a caller
+			// passing the wrong readyReplicas (the literal #374 bug) fails
+			// here (#378 finding 3).
+			modelName := "model-ready-replicas"
+			isvcName := "isvc-ready-replicas"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// A queued workload is not serving yet. Mark the Deployment as
+			// reporting its desired ready replicas, the only gate between
+			// Creating and Ready on the generic path.
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			dep.Status.Replicas = replicas
+			dep.Status.ReadyReplicas = replicas
+			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(PhaseReady))
+			Expect(updated.Status.Endpoint).NotTo(BeEmpty())
+		})
+
 		It("should skip Deployment for Metal accelerator", func() {
 			modelName := "metal-model"
 			isvcName := "isvc-metal"
