@@ -6,12 +6,13 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
-// TestModelNeedsCachePVC guards the fix for the unused cache PVC on pvc://
-// sources: a pre-staged pvc:// model is mounted read-only (no download), so the
-// operator must not provision a per-ISVC cache PVC for it. Each model below
-// sets Status.CacheKey so effectiveModelCacheKey is non-empty -- the pvc:// case
-// is therefore false ONLY because of the isPVCSource guard. Remove that guard
-// and the pvc:// case flips to true, failing this test.
+// TestModelNeedsCachePVC guards the fix for the unused cache PVC on pre-staged
+// sources: a pvc:// model or an oci:// ImageVolume is mounted read-only (no
+// download), so the operator must not provision a cache PVC for either. Each
+// model below sets Status.CacheKey so effectiveModelCacheKey is non-empty -- the
+// pvc:// and oci:// cases are therefore false ONLY because of the isPVCSource /
+// isOCISource guards. Remove either guard and its row flips to true, failing
+// this test.
 func TestModelNeedsCachePVC(t *testing.T) {
 	withKey := func(source string) *inferencev1alpha1.Model {
 		return &inferencev1alpha1.Model{
@@ -31,6 +32,7 @@ func TestModelNeedsCachePVC(t *testing.T) {
 		{"http source is downloaded -> needs a cache", withKey("http://example.com/model.gguf"), cachePath, true},
 		{"s3 source is downloaded -> needs a cache", withKey("s3://bucket/model.gguf"), cachePath, true},
 		{"pvc:// source is pre-staged/read-only -> no cache PVC", withKey("pvc://my-models/model.gguf"), cachePath, false},
+		{"oci:// source is pre-staged/read-only -> no cache PVC", withKey("oci://registry.defilan.net/models/qwen3-32b@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), cachePath, false},
 		{"caching disabled (empty cache path) -> no cache PVC", withKey("https://example.com/model.gguf"), "", false},
 		{"no cache key -> no cache PVC", &inferencev1alpha1.Model{Spec: inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"}}, cachePath, false},
 	}

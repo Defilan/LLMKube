@@ -88,6 +88,8 @@ func userModelCacheClaimName(isvc *inferencev1alpha1.InferenceService) string {
 // download-into-cache path, so it is meaningless whenever that path is
 // inactive; warn in each such case instead of silently dropping the field:
 //   - pvc:// sources are pre-staged (mounted read-only, no download);
+//   - oci:// sources are pre-staged too (mounted read-only through a Kubernetes
+//     ImageVolume, no download);
 //   - with caching disabled on the operator, or a model without an effective
 //     cache key (local file:// source, or a remote model whose fingerprint has
 //     not landed in Status.CacheKey yet), the pod falls back to an ephemeral
@@ -104,6 +106,10 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheClaim(
 	case isPVCSource(model.Spec.Source):
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "ModelCacheClaimIgnored", "Reconcile",
 			"spec.modelCache.claimName is ignored: model source %q is a pre-staged pvc:// volume (read-only, no download)",
+			model.Spec.Source)
+	case isOCISource(model.Spec.Source):
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "ModelCacheClaimIgnored", "Reconcile",
+			"spec.modelCache.claimName is ignored: model source %q is a pre-staged oci:// ImageVolume (read-only, no download)",
 			model.Spec.Source)
 	case r.ModelCachePath == "":
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "ModelCacheClaimIgnored", "Reconcile",
@@ -147,18 +153,20 @@ func (r *InferenceServiceReconciler) warnUnboundedEphemeralCache(
 // modelNeedsCachePVC reports whether the operator should provision a model
 // cache PVC for this reconcile. Caching must be enabled on the operator
 // (modelCachePath set) and the model must have a cache key. It must NOT be a
-// pvc:// source: those are pre-staged and mounted read-only
-// (buildModelStorageConfig dispatches to buildPVCStorageConfig, never the
-// cache), so provisioning a cache PVC for them only leaves an unused,
-// ISVC-owned claim. Kept as its own predicate so the mount side (isPVCSource
-// in buildModelStorageConfig) and the provisioning side agree on pvc://.
+// pvc:// or oci:// source: both are pre-staged and mounted read-only
+// (buildModelStorageConfig dispatches them to buildPVCStorageConfig /
+// buildOCIStorageConfig, never the cache), so provisioning a cache PVC for
+// them only leaves an unused, ISVC-owned claim. Kept as its own predicate so
+// the mount side (isPVCSource / isOCISource in buildModelStorageConfig) and
+// the provisioning side agree on both pre-staged schemes.
 func modelNeedsCachePVC(
 	model *inferencev1alpha1.Model,
 	isvc *inferencev1alpha1.InferenceService,
 	modelCachePath string,
 ) bool {
 	return modelWantsCacheVolume(model, isvc, modelCachePath) &&
-		!isPVCSource(model.Spec.Source)
+		!isPVCSource(model.Spec.Source) &&
+		!isOCISource(model.Spec.Source)
 }
 
 // modelWantsCacheVolume reports whether this workload should download into the
@@ -168,8 +176,9 @@ func modelNeedsCachePVC(
 // on a volume nobody creates, and a claim without a mount leaves an orphaned,
 // ISVC-owned PVC behind.
 //
-// The pvc:// exclusion lives only on the provisioning side because those
-// sources are dispatched to buildPVCStorageConfig, which never consults this.
+// The pvc:// and oci:// exclusions live only on the provisioning side because
+// those sources are dispatched to buildPVCStorageConfig / buildOCIStorageConfig,
+// which never consult this.
 func modelWantsCacheVolume(
 	model *inferencev1alpha1.Model,
 	isvc *inferencev1alpha1.InferenceService,
