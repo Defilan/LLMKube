@@ -25,7 +25,9 @@ import (
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	federationv1alpha1 "github.com/defilantech/llmkube/api/federation/v1alpha1"
@@ -135,3 +137,93 @@ var _ = Describe("FederatedClusterReconciler phase transitions", func() {
 		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 	})
 })
+
+// TestEffectiveHeartbeatIntervalSeconds pins the clamp: anything below the
+// delivered cadence (unset, negative, or a sub-cadence value) resolves to the
+// cadence, and a larger spec is honoured as written.
+func TestEffectiveHeartbeatIntervalSeconds(t *testing.T) {
+	for _, c := range []struct {
+		spec int32
+		want int32
+	}{
+		{0, 30},
+		{-3, 30},
+		{5, 30},
+		{29, 30},
+		{30, 30},
+		{31, 31},
+		{45, 45},
+	} {
+		if got := effectiveHeartbeatIntervalSeconds(c.spec); got != c.want {
+			t.Errorf("effectiveHeartbeatIntervalSeconds(%d) = %d, want %d", c.spec, got, c.want)
+		}
+	}
+}
+
+// TestPhaseForHeartbeatSubCadenceInterval is the false-Stale guard: a spec
+// interval below the edge's delivered cadence must not shorten the staleness
+// thresholds, or a healthy site reads Stale between pushes.
+func TestPhaseForHeartbeatSubCadenceInterval(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	for _, c := range []struct {
+		name string
+		age  time.Duration
+		want string
+	}{
+		{"fresh by the delivered cadence", 20 * time.Second, federationv1alpha1.FederatedClusterConnected},
+		{"stale by the delivered cadence", 4 * time.Minute, federationv1alpha1.FederatedClusterStale},
+		{"unreachable by the delivered cadence", 6 * time.Minute, federationv1alpha1.FederatedClusterUnreachable},
+	} {
+		last := metav1.NewTime(now.Add(-c.age))
+		if got := phaseForHeartbeat(&last, 5, now); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestReconcileRequeuesAtDeliveredCadence pins the requeue site to the same
+// clamp as the phase derivation, so the hub does not wake faster than heartbeats
+// arrive. A spec below the cadence cannot be created through admission since
+// the CRD floor landed, so a fake client stands in for an object created before
+// it (the real upgrade case).
+func TestReconcileRequeuesAtDeliveredCadence(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		spec int32
+		want time.Duration
+	}{
+		{"sub-cadence spec clamps up", 5, 30 * time.Second},
+		{"unset spec clamps up", 0, 30 * time.Second},
+		{"above the cadence is honoured", 45, 45 * time.Second},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := runtime.NewScheme()
+			if err := federationv1alpha1.AddToScheme(s); err != nil {
+				t.Fatalf("add federation scheme: %v", err)
+			}
+
+			fc := &federationv1alpha1.FederatedCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "fc-requeue"},
+				Spec: federationv1alpha1.FederatedClusterSpec{
+					HeartbeatIntervalSeconds: c.spec,
+				},
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(s).
+				WithStatusSubresource(&federationv1alpha1.FederatedCluster{}).
+				WithObjects(fc).
+				Build()
+			r := &FederatedClusterReconciler{Client: cl, Scheme: s}
+
+			result, err := r.Reconcile(context.Background(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: "fc-requeue"},
+			})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if result.RequeueAfter != c.want {
+				t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, c.want)
+			}
+		})
+	}
+}
