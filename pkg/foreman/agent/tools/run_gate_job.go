@@ -88,7 +88,7 @@ const MaxLogTailBytes = 32 * 1024
 // was exercised.
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
-	"generate", "manifests", "chart-crds", "foreman-chart-crds",
+	"generate", "manifests", "chart-crds", "foreman-chart-crds", "federation-chart-crds",
 	"check-reviewer-prompts", ChartCheck,
 }
 

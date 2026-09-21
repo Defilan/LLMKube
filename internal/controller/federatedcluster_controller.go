@@ -35,6 +35,22 @@ type FederatedClusterReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+// deliveredHeartbeatIntervalSeconds is the cadence the edge actually pushes on
+// (defaultFederationEdgeInterval), so the hub's staleness thresholds and requeue
+// cannot outrun it. Deriving them from a spec value the edge cannot honor is how
+// a sub-cadence site reads Stale between pushes.
+const deliveredHeartbeatIntervalSeconds = int32(defaultFederationEdgeInterval / time.Second)
+
+// effectiveHeartbeatIntervalSeconds clamps a spec interval up to the cadence the
+// edge delivers, so a sub-cadence value cannot make a healthy site read Stale or
+// make the hub requeue faster than heartbeats arrive.
+func effectiveHeartbeatIntervalSeconds(spec int32) int32 {
+	if spec < deliveredHeartbeatIntervalSeconds {
+		return deliveredHeartbeatIntervalSeconds
+	}
+	return spec
+}
+
 // phaseForHeartbeat derives status.phase from staleness of the last edge
 // heartbeat relative to a multiple of the expected interval. A nil heartbeat
 // (never reported) is Unreachable.
@@ -42,9 +58,7 @@ func phaseForHeartbeat(last *metav1.Time, intervalSeconds int32, now time.Time) 
 	if last == nil {
 		return federationv1alpha1.FederatedClusterUnreachable
 	}
-	if intervalSeconds <= 0 {
-		intervalSeconds = 30
-	}
+	intervalSeconds = effectiveHeartbeatIntervalSeconds(intervalSeconds)
 	age := now.Sub(last.Time)
 	iv := time.Duration(intervalSeconds) * time.Second
 	switch {
@@ -76,10 +90,7 @@ func (r *FederatedClusterReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Requeue so phase decays even without an edge write. Requeue at the
 	// interval so a missed heartbeat is reflected within one interval.
-	iv := fc.Spec.HeartbeatIntervalSeconds
-	if iv <= 0 {
-		iv = 30
-	}
+	iv := effectiveHeartbeatIntervalSeconds(fc.Spec.HeartbeatIntervalSeconds)
 	return ctrl.Result{RequeueAfter: time.Duration(iv) * time.Second}, nil
 }
 

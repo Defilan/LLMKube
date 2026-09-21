@@ -53,6 +53,11 @@ const (
 	// +kubebuilder:default=30 on HeartbeatIntervalSeconds.
 	defaultHeartbeatIntervalSeconds = int32(30)
 
+	// minHeartbeatIntervalSeconds mirrors the CRD's
+	// +kubebuilder:validation:Minimum=30, so the CLI rejects a sub-cadence
+	// interval locally rather than bouncing off admission.
+	minHeartbeatIntervalSeconds = int32(30)
+
 	// fleetTokenExpirationSeconds is long-lived (10 years): this token is a
 	// bootstrap credential embedded in a kubeconfig file carried to a remote
 	// edge site, not a short-lived pod-projected token, so it must keep
@@ -267,6 +272,11 @@ func fleetRegister(
 	interval := in.HeartbeatIntervalSeconds
 	if interval <= 0 {
 		interval = defaultHeartbeatIntervalSeconds
+	}
+	if interval < minHeartbeatIntervalSeconds {
+		return "", fmt.Errorf(
+			"fleet register: heartbeat-interval must be at least %ds (the edge pushes on a fixed %ds cadence); got %ds",
+			minHeartbeatIntervalSeconds, minHeartbeatIntervalSeconds, interval)
 	}
 	saName := fleetServiceAccountPrefix + in.Name
 
