@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -577,6 +578,79 @@ var _ = Describe("Reconcile lifecycle", func() {
 			Expect(updated.Status.Endpoint).NotTo(BeEmpty())
 		})
 
+		It("should report Ready once the Deployment reports its ready replicas", func() {
+			// Ready means a request to the endpoint will succeed. The generic
+			// path reaches Ready only when the Deployment reports the desired
+			// ready replicas, so this drives determinePhase through Reconcile
+			// rather than calling the helper with synthetic tuples: a caller
+			// passing the wrong readyReplicas (the literal #374 bug) fails
+			// here (#378 finding 3).
+			modelName := "model-ready-replicas"
+			isvcName := "isvc-ready-replicas"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// A queued workload is not serving yet. Mark the Deployment as
+			// reporting its desired ready replicas, the only gate between
+			// Creating and Ready on the generic path.
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			dep.Status.Replicas = replicas
+			dep.Status.ReadyReplicas = replicas
+			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(PhaseReady))
+			Expect(updated.Status.Endpoint).NotTo(BeEmpty())
+		})
+
 		It("should skip Deployment for Metal accelerator", func() {
 			modelName := "metal-model"
 			isvcName := "isvc-metal"
@@ -1060,6 +1134,7 @@ var _ = Describe("Reconcile lifecycle", func() {
 
 			model.Status.Phase = PhaseReady
 			model.Status.CacheKey = "abc123def456"
+			model.Status.Path = "/models/abc123def456/model.gguf"
 			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
 			replicas := int32(1)
@@ -1103,6 +1178,38 @@ var _ = Describe("Reconcile lifecycle", func() {
 			pvc := &corev1.PersistentVolumeClaim{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: "default"}, pvc)).To(Succeed())
 			Expect(pvc.OwnerReferences).To(BeEmpty())
+
+			// The PVC the operator provisions must be the one the workload
+			// actually mounts, and the cache directory it reads must be the one
+			// the Model controller wrote. A PVC nobody mounts, or a directory
+			// the two sides disagree on, is the #363 class (#378 finding 18,
+			// finding 9).
+			By("verifying the Deployment mounts the PVC the operator created")
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+
+			var mounted bool
+			for _, v := range dep.Spec.Template.Spec.Volumes {
+				if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == ModelCachePVCName {
+					mounted = true
+				}
+			}
+			Expect(mounted).To(BeTrue(), "the workload must mount the %s PVC the operator created", ModelCachePVCName)
+
+			By("verifying the workload cache directory agrees with the Model controller path")
+			var downloader *corev1.Container
+			for i := range dep.Spec.Template.Spec.InitContainers {
+				if dep.Spec.Template.Spec.InitContainers[i].Name == "model-downloader" {
+					downloader = &dep.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(downloader).NotTo(BeNil())
+			cacheDir := getEnvVar(downloader.Env, "CACHE_DIR")
+			modelPath := getEnvVar(downloader.Env, "MODEL_PATH")
+			Expect(cacheDir).NotTo(BeEmpty())
+			Expect(filepath.Dir(modelPath)).To(Equal(cacheDir))
+			Expect(filepath.Base(cacheDir)).To(Equal(filepath.Base(filepath.Dir(model.Status.Path))),
+				"the workload cache directory must be the one the Model controller persisted (#363 round-trip)")
 		})
 
 		It("should preserve agent-written schedulingStatus on status update", func() {

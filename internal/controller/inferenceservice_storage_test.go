@@ -22,6 +22,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -1268,6 +1269,132 @@ var _ = Describe("ModelCacheClaimIgnored warning events (#928)", func() {
 		reconcileOnce(newReconciler("/models"))
 
 		Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("ModelCacheClaimIgnored")))
+	})
+})
+
+var _ = Describe("spec advisory warning events (#378)", func() {
+	const namespace = "default"
+
+	var recorder *events.FakeRecorder
+	var modelName, isvcName string
+
+	// drainEvents empties the FakeRecorder channel into a slice.
+	drainEvents := func() []string {
+		var out []string
+		for {
+			select {
+			case e := <-recorder.Events:
+				out = append(out, e)
+			default:
+				return out
+			}
+		}
+	}
+
+	newReconciler := func() *InferenceServiceReconciler {
+		return &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			Recorder:           recorder,
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+	}
+
+	BeforeEach(func() {
+		recorder = events.NewFakeRecorder(20)
+		suffix := rand.String(5)
+		modelName = "advisory-model-" + suffix
+		isvcName = "advisory-isvc-" + suffix
+	})
+
+	AfterEach(func() {
+		for _, obj := range []client.Object{
+			&inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace}},
+			&inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace}},
+		} {
+			if err := k8sClient.Delete(context.Background(), obj); err != nil {
+				Expect(errors.IsNotFound(err)).To(BeTrue())
+			}
+		}
+		dep := &appsv1.Deployment{}
+		if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: isvcName, Namespace: namespace}, dep); err == nil {
+			_ = k8sClient.Delete(context.Background(), dep)
+		}
+		svc := &corev1.Service{}
+		if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: isvcName, Namespace: namespace}, svc); err == nil {
+			_ = k8sClient.Delete(context.Background(), svc)
+		}
+	})
+
+	It("warns MissingSkipModelInit when an HF repo-ID source keeps the init container enabled", func() {
+		// The warning is the operator's only signal before the Pod fails to
+		// start, so it must be emitted by Reconcile, not merely computed by
+		// the helper (#378 finding 16).
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "Qwen/Qwen3.6-35B-A3B",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: modelName,
+				Replicas: &replicas,
+				Image:    "ghcr.io/ggml-org/llama.cpp:server",
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), isvc)).To(Succeed())
+
+		_, err := newReconciler().Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: namespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("MissingSkipModelInit")))
+	})
+
+	It("warns MissingMemoryRequest when hybrid offload is set without a memory budget", func() {
+		// Same contract as the init-container warning: the operator only
+		// learns its pods may be OOM-killed if Reconcile emits the event, so
+		// assert the emission, not the helper's boolean (#378 finding 15).
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/model.gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), model)).To(Succeed())
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(context.Background(), model)).To(Succeed())
+
+		moe := true
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:      modelName,
+				Replicas:      &replicas,
+				Image:         "ghcr.io/ggml-org/llama.cpp:server",
+				MoeCPUOffload: &moe,
+				// resources.memory / hostMemory deliberately unset.
+			},
+		}
+		Expect(k8sClient.Create(context.Background(), isvc)).To(Succeed())
+
+		_, err := newReconciler().Reconcile(context.Background(), reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: isvcName, Namespace: namespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("MissingMemoryRequest")))
 	})
 })
 
