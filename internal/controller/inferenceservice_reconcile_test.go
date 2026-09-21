@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -1133,6 +1134,7 @@ var _ = Describe("Reconcile lifecycle", func() {
 
 			model.Status.Phase = PhaseReady
 			model.Status.CacheKey = "abc123def456"
+			model.Status.Path = "/models/abc123def456/model.gguf"
 			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
 
 			replicas := int32(1)
@@ -1176,6 +1178,38 @@ var _ = Describe("Reconcile lifecycle", func() {
 			pvc := &corev1.PersistentVolumeClaim{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: ModelCachePVCName, Namespace: "default"}, pvc)).To(Succeed())
 			Expect(pvc.OwnerReferences).To(BeEmpty())
+
+			// The PVC the operator provisions must be the one the workload
+			// actually mounts, and the cache directory it reads must be the one
+			// the Model controller wrote. A PVC nobody mounts, or a directory
+			// the two sides disagree on, is the #363 class (#378 finding 18,
+			// finding 9).
+			By("verifying the Deployment mounts the PVC the operator created")
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+
+			var mounted bool
+			for _, v := range dep.Spec.Template.Spec.Volumes {
+				if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == ModelCachePVCName {
+					mounted = true
+				}
+			}
+			Expect(mounted).To(BeTrue(), "the workload must mount the %s PVC the operator created", ModelCachePVCName)
+
+			By("verifying the workload cache directory agrees with the Model controller path")
+			var downloader *corev1.Container
+			for i := range dep.Spec.Template.Spec.InitContainers {
+				if dep.Spec.Template.Spec.InitContainers[i].Name == "model-downloader" {
+					downloader = &dep.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(downloader).NotTo(BeNil())
+			cacheDir := getEnvVar(downloader.Env, "CACHE_DIR")
+			modelPath := getEnvVar(downloader.Env, "MODEL_PATH")
+			Expect(cacheDir).NotTo(BeEmpty())
+			Expect(filepath.Dir(modelPath)).To(Equal(cacheDir))
+			Expect(filepath.Base(cacheDir)).To(Equal(filepath.Base(filepath.Dir(model.Status.Path))),
+				"the workload cache directory must be the one the Model controller persisted (#363 round-trip)")
 		})
 
 		It("should preserve agent-written schedulingStatus on status update", func() {
