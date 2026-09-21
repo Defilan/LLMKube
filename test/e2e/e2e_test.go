@@ -1171,8 +1171,12 @@ spec:
   # 3s quarantine keeps the recovery e2e fast. Default in production
   # is 15s; the test's "scale back up + verify dispatch works again"
   # spec waits one window plus headroom for the next probe to land.
+  # A blackholed local-stub has no dial timeout of its own, so the
+  # fail-closed 503 has to be produced well inside the request pod's
+  # window rather than the 120s proxy default.
   proxy:
     quarantineDuration: 3s
+    responseHeaderTimeout: 10s
   backends:
     - name: local-stub
       external:
@@ -1511,12 +1515,12 @@ spec:
 
 			By("POSTing through the timeout router with the tight header (in-cluster, no port-forward)")
 			// Hit the new router via cluster DNS so we don't have to
-			// stand up a second port-forward. runCurlInCluster spins
+			// stand up a second port-forward. utils.RunCurlInCluster spins
 			// up a one-shot curl pod and reports HTTP_STATUS.
 			timeoutURL := fmt.Sprintf(
 				"http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
 				timeoutRouterName, mrcTestNs)
-			_, status, err := runCurlInCluster(mrcTestNs, timeoutURL, "POST",
+			_, status, err := utils.RunCurlInCluster(mrcTestNs, timeoutURL, "POST",
 				map[string]string{"x-llmkube-task": "tight"},
 				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 			Expect(err).NotTo(HaveOccurred())
@@ -1548,7 +1552,7 @@ spec:
 			// with `backend "slow-local" marked unhealthy`. After
 			// the fix the backend stays healthy and dispatch
 			// succeeds.
-			_, status, err = runCurlInCluster(mrcTestNs, timeoutURL, "POST",
+			_, status, err = utils.RunCurlInCluster(mrcTestNs, timeoutURL, "POST",
 				nil, // no x-llmkube-task header -> defaultRoute path
 				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
 			Expect(err).NotTo(HaveOccurred())
@@ -2149,12 +2153,19 @@ spec:
 				_, _ = utils.Run(cmd)
 			}()
 
-			cmd = exec.Command("kubectl", "get", "ns", sccTestNs,
-				"-o", `jsonpath={.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}`)
-			rangeAnnotation, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(rangeAnnotation).NotTo(BeEmpty(),
-				"namespace must carry openshift.io/sa.scc.supplemental-groups; SCC admission cannot inject fsGroup otherwise")
+			// The supplemental-groups annotation is applied by the OpenShift
+			// namespace controller once the namespace exists, not at create
+			// time, so poll for it rather than reading once.
+			var rangeAnnotation string
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "ns", sccTestNs,
+					"-o", `jsonpath={.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}`)
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(BeEmpty(),
+					"namespace must carry openshift.io/sa.scc.supplemental-groups; SCC admission cannot inject fsGroup otherwise")
+				rangeAnnotation = output
+			}, 60*time.Second, time.Second).Should(Succeed())
 
 			// Parse "1000680000/10000" → (min=1000680000, count=10000).
 			parts := strings.SplitN(rangeAnnotation, "/", 2)
@@ -2485,105 +2496,6 @@ type stubIntrospectResponse struct {
 	} `json:"requests"`
 }
 
-// runCurlInCluster runs a one-shot curl against an in-cluster URL using
-// kubectl run + delete. Returns (stdout, status code, error). The body
-// of the HTTP response is followed by an `HTTP_STATUS=<code>` line that
-// the parser strips out. Errors here are reserved for orchestration
-// failures (pod scheduling, log fetch) – an HTTP 5xx still returns
-// (logs, code, nil) so callers can assert on the status.
-func runCurlInCluster(ns, url, method string, headers map[string]string, body string) (string, int, error) {
-	curlArgs := []string{
-		"curl", "-sS", "-o", "/tmp/body", "-w", "HTTP_STATUS=%{http_code}\n",
-		"-X", method,
-	}
-	for k, v := range headers {
-		curlArgs = append(curlArgs, "-H", fmt.Sprintf("%s: %s", k, v))
-	}
-	if body != "" {
-		curlArgs = append(curlArgs, "-H", "content-type: application/json",
-			"--data-binary", body)
-	}
-	curlArgs = append(curlArgs, url)
-
-	// The pod runs `curl ... > status_line; cat /tmp/body; status_line` so
-	// the pod logs end with the parseable HTTP_STATUS= sentinel.
-	shellCmd := strings.Join(quoteShell(curlArgs), " ") +
-		" > /tmp/status; cat /tmp/body; echo; cat /tmp/status"
-
-	// Match the curl-metrics pattern used elsewhere in this suite:
-	// kubectl run with --overrides supplying the full container spec
-	// (command/args + securityContext). The pod's logs are then
-	// fetched to retrieve the response body and the parseable
-	// HTTP_STATUS= sentinel.
-	overrides := fmt.Sprintf(`{
-		"spec": {
-			"restartPolicy": "Never",
-			"containers": [{
-				"name": "curl",
-				"image": "docker.io/curlimages/curl:8.18.0",
-				"command": ["/bin/sh", "-c"],
-				"args": [%q],
-				"securityContext": {
-					"allowPrivilegeEscalation": false,
-					"capabilities": {"drop": ["ALL"]},
-					"runAsNonRoot": true,
-					"runAsUser": 1000,
-					"seccompProfile": {"type": "RuntimeDefault"}
-				}
-			}]
-		}
-	}`, shellCmd)
-
-	podName := fmt.Sprintf("e2e-curl-%d", time.Now().UnixNano())
-	runCmd := exec.Command("kubectl", "run", podName,
-		"--restart=Never", "--namespace", ns,
-		"--image=docker.io/curlimages/curl:8.18.0",
-		"--overrides", overrides)
-	if _, err := utils.Run(runCmd); err != nil {
-		return "", 0, fmt.Errorf("kubectl run: %w", err)
-	}
-	defer func() {
-		_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", podName,
-			"-n", ns, "--ignore-not-found", "--wait=false"))
-	}()
-
-	// Poll for terminal phase (Succeeded or Failed); kubectl wait can't
-	// express "either" cleanly so we look at .status.phase directly.
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		phaseCmd := exec.Command("kubectl", "get", "pod", podName,
-			"-n", ns, "-o", "jsonpath={.status.phase}")
-		phase, _ := utils.Run(phaseCmd)
-		if phase == "Succeeded" || phase == "Failed" {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	logs, err := utils.Run(exec.Command("kubectl", "logs", podName, "-n", ns))
-	if err != nil {
-		return "", 0, fmt.Errorf("kubectl logs: %w", err)
-	}
-	status := 0
-	for _, line := range strings.Split(logs, "\n") {
-		if strings.HasPrefix(line, "HTTP_STATUS=") {
-			status, _ = strconv.Atoi(strings.TrimPrefix(line, "HTTP_STATUS="))
-		}
-	}
-	return logs, status, nil
-}
-
-// quoteShell shell-quotes each arg so the rendered command is safe to
-// run via sh -c. POSIX single quotes block expansion; the only escaping
-// needed is for embedded single quotes.
-func quoteShell(args []string) []string {
-	out := make([]string, len(args))
-	for i, a := range args {
-		out[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
-	}
-	return out
-}
-
 // chatCompletion runs a curl pod that POSTs to the router-proxy Service
 // for the given router. Returns the body of the response (best-effort,
 // shape may vary on error). Fails the test if the request couldn't be
@@ -2591,7 +2503,7 @@ func quoteShell(args []string) []string {
 func chatCompletion(ns, router string, headers map[string]string, body string) string {
 	url := fmt.Sprintf("http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
 		router, ns)
-	out, _, err := runCurlInCluster(ns, url, "POST", headers, body)
+	out, _, err := utils.RunCurlInCluster(ns, url, "POST", headers, body)
 	Expect(err).NotTo(HaveOccurred(), "curl dispatch failed: %s", out)
 	return out
 }
@@ -2602,7 +2514,7 @@ func chatCompletion(ns, router string, headers map[string]string, body string) s
 func chatCompletionStatus(ns, router string, headers map[string]string, body string) int {
 	url := fmt.Sprintf("http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
 		router, ns)
-	_, status, err := runCurlInCluster(ns, url, "POST", headers, body)
+	_, status, err := utils.RunCurlInCluster(ns, url, "POST", headers, body)
 	Expect(err).NotTo(HaveOccurred(), "curl dispatch failed")
 	return status
 }
@@ -2613,10 +2525,10 @@ func chatCompletionStatus(ns, router string, headers map[string]string, body str
 // what.
 func stubSnapshot(g Gomega, ns, svc string) stubIntrospectResponse {
 	url := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080/__introspect__", svc, ns)
-	out, _, err := runCurlInCluster(ns, url, "GET", nil, "")
+	out, _, err := utils.RunCurlInCluster(ns, url, "GET", nil, "")
 	g.Expect(err).NotTo(HaveOccurred(), "introspect curl failed: %s", out)
 
-	// runCurlInCluster's logs include a trailing HTTP_STATUS= line; strip
+	// utils.RunCurlInCluster's logs include a trailing HTTP_STATUS= line; strip
 	// it and any leading non-JSON noise.
 	idx := strings.Index(out, "{")
 	if idx == -1 {
@@ -2642,6 +2554,6 @@ func stubRequestCount(g Gomega, ns, svc string) int {
 func resetStubs(ns string, svcs ...string) {
 	for _, svc := range svcs {
 		url := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080/__introspect__/reset", svc, ns)
-		_, _, _ = runCurlInCluster(ns, url, "POST", nil, "")
+		_, _, _ = utils.RunCurlInCluster(ns, url, "POST", nil, "")
 	}
 }
