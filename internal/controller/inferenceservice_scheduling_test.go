@@ -438,6 +438,74 @@ var _ = Describe("HPA Autoscaling", func() {
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
 
+		It("should NOT create HPA when the Model is not Ready", func() {
+			// A not-Ready Model gates the whole workload, so autoscaling must
+			// not race ahead of the model download. Every sibling It in this
+			// Context bypasses that gate by pre-setting Phase=Ready; this one
+			// exercises it (#378 finding 5).
+			modelName := "hpa-not-ready-model"
+			isvcName := "hpa-not-ready-isvc"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: modelName, Namespace: "default",
+				},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						Accelerator: "cpu",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: isvcName, Namespace: "default",
+				},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{
+						MinReplicas: int32Ptr(2),
+						MaxReplicas: 8,
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{
+					Name: isvcName, Namespace: "default",
+				}, hpa); err == nil {
+					_ = k8sClient.Delete(ctx, hpa)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name: isvcName, Namespace: "default",
+				},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying no HPA was created while the Model is not Ready")
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+			err = k8sClient.Get(ctx, types.NamespacedName{
+				Name: isvcName, Namespace: "default",
+			}, hpa)
+			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+
 		It("should delete HPA when autoscaling is removed", func() {
 			modelName := "hpa-delete-model"
 			isvcName := "hpa-delete-isvc"

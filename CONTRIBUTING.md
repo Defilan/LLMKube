@@ -249,6 +249,15 @@ git diff --exit-code  # Should be no changes
 - Test CRD validation and defaulting
 - Add GPU-specific tests for GPU features
 - Verify metrics are properly exported
+- **Assert on side effects, not return values.** A controller test must
+  check the world changed the way the spec requires (an object exists, a file
+  is on disk, a condition carries the cause), not merely that the code
+  returned the string it returns. A test that asserts implementation output
+  stays green through any regression that keeps the same arithmetic. Issue
+  #374 is the canonical case: a Metal InferenceService reported `Ready` while
+  no endpoint was backed by anything, and the test asserted only
+  `Phase == "Ready"`. Before adding an assertion, name the production edit
+  that would make it fail; if you cannot, the assertion does not bite.
 
 ### Adding entry to model catalog
 
