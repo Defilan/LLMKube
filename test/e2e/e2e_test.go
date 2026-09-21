@@ -1171,8 +1171,12 @@ spec:
   # 3s quarantine keeps the recovery e2e fast. Default in production
   # is 15s; the test's "scale back up + verify dispatch works again"
   # spec waits one window plus headroom for the next probe to land.
+  # A blackholed local-stub has no dial timeout of its own, so the
+  # fail-closed 503 has to be produced well inside the request pod's
+  # window rather than the 120s proxy default.
   proxy:
     quarantineDuration: 3s
+    responseHeaderTimeout: 10s
   backends:
     - name: local-stub
       external:
