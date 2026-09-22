@@ -175,11 +175,11 @@ var _ = Describe("Operator state metrics lifecycle", func() {
 			// the status is written; calling it here drives the same two-phase
 			// publish without standing up a full reconcile.
 			_, err := reconciler.updateStatusWithSchedulingInfo(
-				ctx, isvc, PhaseCreating, false, 0, 1, "", "", nil)
+				ctx, isvc, PhaseCreating, false, 0, 0, 1, "", "", nil)
 			Expect(err).NotTo(HaveOccurred())
 			publishInferenceServiceState(isvc, nil)
 			_, err = reconciler.updateStatusWithSchedulingInfo(
-				ctx, isvc, PhaseReady, true, 1, 1, "http://example", "", nil)
+				ctx, isvc, PhaseReady, true, 1, 1, 1, "http://example", "", nil)
 			Expect(err).NotTo(HaveOccurred())
 			publishInferenceServiceState(isvc, nil)
 
@@ -317,7 +317,7 @@ var _ = Describe("Operator state metrics lifecycle", func() {
 
 			for _, isvc := range []*inferencev1alpha1.InferenceService{gamma, beta, alpha} {
 				_, err := reconciler.updateStatusWithSchedulingInfo(
-					ctx, isvc, PhaseWaitingForGPU, true, 0, 1, "", "", nil)
+					ctx, isvc, PhaseWaitingForGPU, true, 0, 0, 1, "", "", nil)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(depth()).To(Equal(3.0),
 					"three services are queued whichever one reconciled")
@@ -332,7 +332,7 @@ var _ = Describe("Operator state metrics lifecycle", func() {
 
 			for i, isvc := range []*inferencev1alpha1.InferenceService{alpha, beta, gamma} {
 				_, err := reconciler.updateStatusWithSchedulingInfo(
-					ctx, isvc, PhaseReady, true, 1, 1, "http://example", "", nil)
+					ctx, isvc, PhaseReady, true, 1, 1, 1, "http://example", "", nil)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(depth()).To(Equal(float64(2-i)),
 					"the depth must drop as each service is scheduled")
@@ -348,7 +348,7 @@ var _ = Describe("Operator state metrics lifecycle", func() {
 			reconciler := reconcilerFor(delta, alpha, beta)
 
 			_, err := reconciler.updateStatusWithSchedulingInfo(
-				ctx, delta, PhaseWaitingForGPU, true, 0, 1, "", "", nil)
+				ctx, delta, PhaseWaitingForGPU, true, 0, 0, 1, "", "", nil)
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(depth()).To(Equal(3.0), "the entering service must count itself")

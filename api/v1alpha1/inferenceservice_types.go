@@ -358,7 +358,7 @@ type InferenceServiceSpec struct {
 
 	// Replicas is the desired number of inference pods
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:validation:Maximum=10
+	// +kubebuilder:validation:Maximum=100
 	// +kubebuilder:default=1
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -1483,6 +1483,12 @@ type InferenceServiceStatus struct {
 	// +optional
 	Replicas int32 `json:"replicas,omitempty"`
 
+	// Selector is the label selector for the pods this service owns. It backs
+	// the /scale subresource's selectorpath; an HPA or KEDA target rejects an
+	// empty selector.
+	// +optional
+	Selector string `json:"selector,omitempty"`
+
 	// Endpoint is the service URL where inference requests can be sent
 	// +optional
 	Endpoint string `json:"endpoint,omitempty"`
@@ -1618,7 +1624,7 @@ type AccelerationStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:resource:shortName=isvc
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.spec.modelRef`

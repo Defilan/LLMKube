@@ -68,10 +68,11 @@ spec:
         targetAverageValue: "4"
 ```
 
-Valid metric `type` values are `Pods` and `Resource`. The managed HPA
-targets the inference Deployment directly (`apps/v1`, not the
-`InferenceService` CRD), so the HPA controller reads the Deployment's
-pod metrics.
+Valid metric `type` values are `Pods` and `Resource`. The controller
+owns this HPA and points it at the inference Deployment it created; that
+is an implementation detail. When you author or manage an autoscaler
+yourself, always target the `InferenceService` (see below), never the
+Deployment.
 
 ### Expose the metrics to the HPA
 
@@ -109,10 +110,10 @@ the inference pods.
 ### Hand-authored HPAs (advanced / custom metrics)
 
 If you need a metric the controller does not support, or you want to
-use a custom trigger (e.g. KEDA), you can author your own HPA and
-point it at the inference Deployment by name. The Deployment is
-named `<inferenceservice-name>` and carries the label
-`inference.llmkube.dev/service=<inferenceservice-name>`.
+use a custom trigger (e.g. KEDA), you can author your own HPA and point
+it at the `InferenceService` by name. The `InferenceService` implements
+the `/scale` subresource, and the operator remains the single writer of
+the backing Deployment's replica count.
 
 ```yaml
 apiVersion: autoscaling/v2
@@ -120,8 +121,8 @@ kind: HorizontalPodAutoscaler
 metadata: { name: llama-3-8b-hpa }
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: inference.llmkube.dev/v1alpha1
+    kind: InferenceService
     name: llama-3-8b
   minReplicas: 1
   maxReplicas: 5
@@ -135,10 +136,15 @@ spec:
           averageValue: "4"
 ```
 
-> **Warning:** do not configure both `spec.autoscaling` and a hand-authored
-> HPA on the same `InferenceService`. Two controllers would fight over
-> `spec.replicas` and you would get unpredictable scaling behavior.
-> Pick one path and stick with it.
+> **Warning:** do not point your HPA or KEDA `ScaledObject` at the inference
+> Deployment. The operator owns the Deployment's replica count and rewrites
+> `spec.replicas` on every reconcile, so an external write to the Deployment
+> is reverted. Scale the `InferenceService` instead.
+>
+> Also do not configure both `spec.autoscaling` and a hand-authored HPA on
+> the same `InferenceService`. Two controllers would fight over
+> `spec.replicas` and you would get unpredictable scaling behavior. Pick one
+> path and stick with it.
 
 ## Step 2: Pick your scaling signal
 
@@ -184,8 +190,8 @@ metadata:
   name: llama-3-8b-hpa
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: inference.llmkube.dev/v1alpha1
+    kind: InferenceService
     name: llama-3-8b
   minReplicas: 1
   maxReplicas: 5
@@ -217,8 +223,8 @@ metadata:
   name: llama-3-8b-hpa
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: inference.llmkube.dev/v1alpha1
+    kind: InferenceService
     name: llama-3-8b
   minReplicas: 1
   maxReplicas: 10
@@ -248,8 +254,8 @@ metadata:
   name: llama-3-8b-hpa
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: inference.llmkube.dev/v1alpha1
+    kind: InferenceService
     name: llama-3-8b
   minReplicas: 1
   maxReplicas: 10
@@ -282,8 +288,8 @@ metadata:
   name: llama-3-8b-keda
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: inference.llmkube.dev/v1alpha1
+    kind: InferenceService
     name: llama-3-8b
   minReplicaCount: 0
   maxReplicaCount: 10
@@ -299,14 +305,17 @@ spec:
         threshold: "4"
 ```
 
-KEDA manages the HPA underneath. Use this when you need scale-to-zero
-or complex trigger logic.
+KEDA manages the HPA underneath. The `scaleTargetRef` points at the
+`InferenceService`, which implements the `/scale` subresource KEDA
+requires: KEDA reads it for 0 to 1 activation, then delegates 1 to N to
+the HPA it generates. Use this when you need scale-to-zero or complex
+trigger logic.
 
-## Step 3: Wire the HPA to the InferenceService
+## Step 3: Wire the scaler to the InferenceService
 
-Apply the HPA from Step 2. The HPA controller will read the
-inference Deployment's scale subresource and patch `spec.replicas` as
-needed:
+Apply the HPA from Step 2 (or the KEDA `ScaledObject` from Option D).
+The HPA controller reads the `InferenceService`'s `/scale` subresource
+and patches `spec.replicas` as needed:
 
 ```bash
 kubectl apply -f hpa.yaml
@@ -319,7 +328,24 @@ kubectl get hpa llama-3-8b-hpa -w
 ```
 
 You should see `Current` and `Desired` replicas change as load
-changes. The HPA reconciles every 15 seconds by default.
+changes. `Current` reflects the observed inference pods the operator
+reports, not the desired count. The HPA reconciles every 15 seconds by
+default.
+
+### Manual scaling
+
+The same `/scale` subresource backs manual scaling. Scale the
+`InferenceService`, never the Deployment:
+
+```bash
+kubectl scale inferenceservice/llama-3-8b --replicas 3
+# or, with the CLI:
+llmkube scale llama-3-8b --replicas 3
+```
+
+Writing `deployment.spec.replicas` directly does not work: the operator
+is the single writer of the Deployment and reverts the count on its next
+reconcile.
 
 ### Tuning the HPA
 
@@ -489,8 +515,8 @@ kind: HorizontalPodAutoscaler
 metadata: { name: llama-3-8b-hpa }
 spec:
   scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
+    apiVersion: inference.llmkube.dev/v1alpha1
+    kind: InferenceService
     name: llama-3-8b
   minReplicas: 1
   maxReplicas: 5
@@ -583,6 +609,15 @@ kubectl apply -f nodepool.yaml
    ```
 
 ## Common pitfalls
+
+### The scaler targets the Deployment
+
+If the HPA shows `ScalingActive False` with reason `InvalidSelector`
+("the HPA target's scale is missing a selector"), or replicas climb and
+then snap back, the scaler is pointed at the inference Deployment
+instead of the `InferenceService`. Repoint `scaleTargetRef` at
+`inference.llmkube.dev/v1alpha1 InferenceService <name>`; the operator
+reverts direct writes to the Deployment's replica count by design.
 
 ### HPA cannot read the metric
 

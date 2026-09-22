@@ -4679,7 +4679,7 @@ spec:
                 default: 1
                 description: Replicas is the desired number of inference pods
                 format: int32
-                maximum: 10
+                maximum: 100
                 minimum: 0
                 type: integer
               resources:
@@ -6386,6 +6386,12 @@ spec:
                 description: SchedulingStatus indicates why pods cannot be scheduled
                   (e.g., "InsufficientGPU")
                 type: string
+              selector:
+                description: |-
+                  Selector is the label selector for the pods this service owns. It backs
+                  the /scale subresource's selectorpath; an HPA or KEDA target rejects an
+                  empty selector.
+                type: string
               waitingFor:
                 description: 'WaitingFor describes the resource constraint (e.g.,
                   "nvidia.com/gpu: 1")'
@@ -6398,6 +6404,7 @@ spec:
     storage: true
     subresources:
       scale:
+        labelSelectorPath: .status.selector
         specReplicasPath: .spec.replicas
         statusReplicasPath: .status.replicas
       status: {}

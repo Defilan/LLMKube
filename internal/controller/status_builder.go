@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -181,6 +182,7 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 	phase string,
 	modelReady bool,
 	readyReplicas int32,
+	observedReplicas int32,
 	desiredReplicas int32,
 	endpoint string,
 	errorMsg string,
@@ -194,8 +196,11 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 	isvc.Status.Mode = resolveServingMode(isvc)
 	isvc.Status.ModelReady = modelReady
 	isvc.Status.ReadyReplicas = readyReplicas
-	isvc.Status.Replicas = desiredReplicas
+	// Status.Replicas is the observed count the /scale subresource exposes;
+	// Status.DesiredReplicas carries intent.
+	isvc.Status.Replicas = observedReplicas
 	isvc.Status.DesiredReplicas = desiredReplicas
+	isvc.Status.Selector = labels.SelectorFromSet(deploymentSelectorLabels(isvc)).String()
 	isvc.Status.Endpoint = endpoint
 	isvc.Status.LastUpdated = &now
 
