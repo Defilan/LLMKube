@@ -75,7 +75,8 @@ mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 
 export B200_LIB="$here/lib"
-export B200_REPO="$(b200_repo_root)"
+B200_REPO="$(b200_repo_root)"
+export B200_REPO
 export B200_OUT="$out_dir"
 export B200_NS="$ns"
 export B200_DRY_RUN="$dry_run"

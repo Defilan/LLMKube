@@ -58,8 +58,8 @@ gate. It is never treated as a pass.
 
 ## Row contract
 
-Each row is `apply manifest -> wait Ready -> llmkube benchmark -o json ->
-assert -> capture`. Rows 1-4 use the shared `b200_standard_row` driver in
+Each asserting row is `apply manifest -> wait Ready -> llmkube benchmark -o
+json -> assert -> capture`. Rows 1-3 use the shared `b200_standard_row` driver in
 `lib/common.sh` and assert a decode-throughput floor:
 
 | Row | Model | Decode floor |
@@ -67,7 +67,6 @@ assert -> capture`. Rows 1-4 use the shared `b200_standard_row` driver in
 | 1 | TinyLlama-1.1B FP16 | 5 tok/s |
 | 2 | Llama-3.1-8B-Instruct FP8 | 5 tok/s |
 | 3 | Llama-3.1-70B-Instruct FP8 | 2 tok/s |
-| 4 | Llama-3.1-70B-Instruct FP8, 8x shard | 2 tok/s |
 
 The floors are conservative sanity gates, not performance targets. They exist
 to catch a silent CPU fallback, where the server is healthy but decodes at a
@@ -77,12 +76,23 @@ Row 1 is vLLM on purpose. llama.cpp has no `sm_100` codegen, so a llama.cpp
 baseline would measure the PTX-JIT Hopper path and misreport it as a Blackwell
 baseline (matrix row 1 correction, #1375).
 
+Rows 4-10 (NVLink5 single-chassis sharding, DCGM Blackwell counters, recording
+rules under load, MIG profiles, NVFP4, MXFP4, operational runbooks) carry the
+marker `# ASSERTIONS-DEFERRED: #1377` and call `b200_deferred_row`. Their
+load-bearing assertions are properties of the B200 itself and are owned by the
+matrix-execution pass, so the harness carries their structure and dry-run
+wiring only and never asserts a floor for them. A deferred row records a
+`deferred` result and publishes no status, so an off-hardware run can never read
+as a pass. The marker is enforced by the self-test: a row that neither asserts a
+floor nor declares its deferral fails `make test-b200-harness`.
+
 ## Scope
 
-Rows 1-4 are implemented here. Rows 5-10 (DCGM Blackwell counters, recording
-rules under load, MIG profiles, NVFP4, MXFP4, operational runbooks) are a
-follow-up pass and stay `blocked-by-hardware` until then. The preflight gate and
-capture path they will reuse are already in place.
+Rows 1-3 assert a real floor in CI-verifiable form. Rows 4-10 are structured and
+dry-run-verifiable here, with their hardware-gated assertions deferred to the
+matrix-execution pass [#1377](https://github.com/defilantech/LLMKube/issues/1377).
+The preflight gate and capture path they reuse are already in place, and each
+deferred row names its own assertion in the marker comment.
 
 ## Self-test
 
@@ -92,4 +102,5 @@ make test-b200-harness
 
 Runs `selftest.sh`, which needs no cluster and no GPU. It covers the preflight
 gate (compliant, below-floor, Fabric Manager mismatch), the capture round-trip,
-the matrix-doc rewrite, and the dry-run resume guard.
+the matrix-doc rewrite, the row coverage and deferral markers, the dry-run
+resume guard, and the deferred-row path.

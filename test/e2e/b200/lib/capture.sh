@@ -56,7 +56,28 @@ cap_normalize_dry_run() {
   mv "$tmp" "$out"
 }
 
-# cap_write_row <doc> <row> <status> rewrites the status cell of one matrix
+# cap_normalize_deferred <out.json> <row> records a row whose hardware-gated
+# assertions are owned by #1377. The result marks the run resumable without
+# claiming an outcome, so a deferred row can never be read as a pass.
+cap_normalize_deferred() {
+  local out="$1" row="$2" tmp
+  b200_require_cmd jq
+  tmp="$(mktemp)"
+  jq -n --arg row "$row" \
+    '{
+       row: $row,
+       status: "deferred",
+       service_name: null,
+       iterations: 0,
+       successful_runs: 0,
+       generation_toks_per_sec_mean: null,
+       prompt_toks_per_sec_mean: null,
+       latency_p50_ms: null,
+       latency_p95_ms: null,
+       timestamp: null
+     }' > "$tmp"
+  mv "$tmp" "$out"
+}
 # row. status is one of pass / fail / blocked / inprogress / deferred.
 cap_write_row() {
   local doc="$1" row="$2" status="$3"

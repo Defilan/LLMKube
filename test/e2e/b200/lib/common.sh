@@ -79,3 +79,23 @@ b200_standard_row() {
   cap_normalize "$out-benchmark.json" "$out.json" "$row" pass
   cap_publish "$row" pass
 }
+
+# b200_deferred_row drives a row whose hardware-gated assertions are owned by
+# the matrix-execution issue (#1377): NVLink5 topology, DCGM counters, MIG
+# profiles, FP4 serve paths, and the operational runbooks all need the B200
+# itself, so the harness carries the row's structure and dry-run wiring only
+# and never asserts a floor here. A run therefore cannot publish a pass it did
+# not earn.
+#
+# Args: <row> <description>
+b200_deferred_row() {
+  local row="$1" desc="$2"
+  local out="$B200_OUT/$row"
+
+  b200_log "row $row: assertions deferred to #1377 ($desc)"
+  if [ "${B200_DRY_RUN:-0}" = "1" ]; then
+    b200_log "row $row: dry-run: harness wiring present; no floor asserted"
+  fi
+  cap_normalize_deferred "$out.json" "$row"
+  return 0
+}

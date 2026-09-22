@@ -130,6 +130,23 @@ spec:
                 helm plugin list >/dev/null 2>&1 || { echo "GATE FAIL: helm-unittest unusable"; exit 1; }
               fi
               {{- end }}
+              {{- if .JQVersion }}
+              # jq for the B200 validation harness self-test (#1833). The gate
+              # image is a plain golang image whose whole buildpack-deps chain
+              # installs no jq, while test/e2e/b200/lib/capture.sh normalizes
+              # `llmkube benchmark` JSON with it, so the self-test would fail
+              # with "required command not found: jq" without this. Same shape
+              # as the helm install above: pinned, and under the gate cache PVC
+              # (/cache/bin) so a warm cache makes it a no-op.
+              export PATH="/cache/bin:$PATH"
+              mkdir -p /cache/bin
+              if ! command -v jq >/dev/null 2>&1; then
+                echo "=== install jq {{ .JQVersion }} ==="
+                curl -sSfL "https://github.com/jqlang/jq/releases/download/jq-{{ .JQVersion }}/jq-linux-amd64" -o /cache/bin/jq \
+                  && chmod +x /cache/bin/jq \
+                  || { echo "GATE FAIL: jq install"; exit 1; }
+              fi
+              {{- end }}
               {{- range .Checks }}
               echo "=== make {{ . }} ==="; make {{ . }} || rc=1
               {{- end }}

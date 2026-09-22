@@ -209,5 +209,12 @@ pf_preflight_selfcheck() {
     b200_log "preflight self-check: a fabric-manager mismatch is rejected"
   fi
 
+  if pf_assert_floors "$fx/floors.yaml" "$fx/measured-absent.kv" >/dev/null 2>&1; then
+    b200_log "preflight self-check FAILED: an unread floor was accepted as a pass"
+    rc=1
+  else
+    b200_log "preflight self-check: an unread floor fails as unverified"
+  fi
+
   return $rc
 }

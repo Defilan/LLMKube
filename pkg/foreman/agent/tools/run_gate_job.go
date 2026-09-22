@@ -89,7 +89,7 @@ const MaxLogTailBytes = 32 * 1024
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds", "federation-chart-crds",
-	"check-reviewer-prompts", ChartCheck,
+	"check-reviewer-prompts", ChartCheck, B200HarnessCheck,
 }
 
 // ChartCheck is the make target that lints and unit-tests the Helm charts.
@@ -97,12 +97,22 @@ var DefaultGateChecks = []string{
 // the checks: the gate image is a plain golang image with no helm in it.
 const ChartCheck = "test-chart"
 
+// B200HarnessCheck is the make target that runs the B200 validation harness
+// self-test (#1376). Named because the Job has to know whether to install jq
+// before running the checks: the gate image is a plain golang image, and the
+// self-test normalizes benchmark JSON with jq (#1833).
+const B200HarnessCheck = "test-b200-harness"
+
 // Pinned so a helm or plugin release cannot silently change gate behavior.
 // HelmUnittestVersion matches .github/workflows/helm-chart.yml so the gate
 // and CI validate charts with the same tool.
 const (
 	HelmVersion         = "v3.13.0"
 	HelmUnittestVersion = "1.1.1"
+	// JQVersion is the jq release the gate installs for the B200 harness
+	// self-test (#1833). The tag and the asset name both carry the version,
+	// so they are composed in the template rather than pinned separately.
+	JQVersion = "1.7.1"
 )
 
 // helmVersionFor returns the pinned helm version when the checks need it, and
@@ -118,6 +128,26 @@ func helmVersionFor(checks []string) string {
 func needsHelm(checks []string) bool {
 	for _, c := range checks {
 		if c == ChartCheck {
+			return true
+		}
+	}
+	return false
+}
+
+// jqVersionFor returns the pinned jq version when the checks need it, and ""
+// otherwise so the template skips the install entirely on runs that do not
+// touch the B200 harness.
+func jqVersionFor(checks []string) string {
+	if needsJQ(checks) {
+		return JQVersion
+	}
+	return ""
+}
+
+// needsJQ reports whether any requested check requires jq on PATH.
+func needsJQ(checks []string) bool {
+	for _, c := range checks {
+		if c == B200HarnessCheck {
 			return true
 		}
 	}
@@ -351,6 +381,7 @@ func (t *RunGateJobTool) Execute(ctx context.Context, args json.RawMessage) (*ag
 		Checks:                  a.Checks,
 		HelmVersion:             helmVersionFor(a.Checks),
 		HelmUnittestVersion:     HelmUnittestVersion,
+		JQVersion:               jqVersionFor(a.Checks),
 		BiteCheck:               a.BiteCheck,
 		HunkCheck:               a.HunkCheck,
 		Generic:                 a.Generic,
@@ -571,8 +602,11 @@ type rendererInput struct {
 	Checks     []string
 	// HelmVersion is non-empty only when a chart check was requested; the
 	// template installs helm and the unittest plugin when it is set.
-	HelmVersion             string
-	HelmUnittestVersion     string
+	HelmVersion         string
+	HelmUnittestVersion string
+	// JQVersion is non-empty only when a check that needs jq was requested;
+	// the template installs a pinned jq when it is set.
+	JQVersion               string
 	BiteCheck               bool
 	HunkCheck               bool
 	Generic                 bool

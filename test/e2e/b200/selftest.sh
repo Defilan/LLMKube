@@ -78,6 +78,15 @@ rc=$?
 assert_ne_zero "$rc" "preflight rejects a Fabric Manager mismatch"
 assert_contains "$out" "fabricManager 580.150.00 does not match driver 580.173.02" "preflight names the Fabric Manager mismatch"
 
+# Preflight: a floor the probe could not read fails as unverified, never as a
+# pass. This is the branch that keeps an absent toolkit probe from silently
+# green-lighting a row. The fixture makes the unread floor the ONLY failure, so
+# a gate that dropped it would accept the node.
+out="$(pf_assert_floors "$B200_FIXTURES/floors.yaml" "$B200_FIXTURES/measured-absent.kv" 2>&1)"
+rc=$?
+assert_ne_zero "$rc" "preflight rejects an unread floor"
+assert_contains "$out" "PREFLIGHT UNVERIFIED: cudaToolkit could not be read" "preflight names the unread floor"
+
 # Capture: a benchmark result round-trips into the harness row schema.
 cap_normalize "$B200_FIXTURES/benchmark-sample.json" "$tmp/01.json" 1 pass
 assert_eq "$(jq -r '.row' "$tmp/01.json")" "1" "capture records the row"
@@ -97,6 +106,53 @@ else
 fi
 assert_contains "$row10" "blocked-by-hardware" "unrelated rows are untouched"
 
+# Row coverage: all ten rows are present, and a row that does not assert a
+# floor must say so. The deferral marker is the contract that keeps "deferred
+# to #1377" from silently reading as "covered": drop it and this fails.
+rows_dir="$here/rows"
+for n in 1 2 3 4 5 6 7 8 9 10; do
+  padded="$(printf '%02d' "$n")"
+  f=$(printf '%s' "$rows_dir/$padded-"*.sh)
+  if [ -e "$f" ]; then
+    ok "row $n script present"
+  else
+    bad "row $n script missing"
+    continue
+  fi
+  if bash -n "$f" 2>/dev/null; then
+    ok "row $n parses"
+  else
+    bad "row $n has a syntax error"
+  fi
+  if [ -x "$f" ]; then
+    ok "row $n is executable"
+  else
+    bad "row $n is not executable"
+  fi
+done
+
+for n in 1 2 3; do
+  padded="$(printf '%02d' "$n")"
+  f=$(printf '%s' "$rows_dir/$padded-"*.sh)
+  if grep -qF 'ASSERTIONS-DEFERRED' "$f"; then
+    bad "row $n is deferred but rows 1-3 must assert a floor"
+  elif grep -qF 'b200_standard_row' "$f"; then
+    ok "row $n asserts a decode floor"
+  else
+    bad "row $n has neither an assertion nor a deferral marker"
+  fi
+done
+
+for n in 4 5 6 7 8 9 10; do
+  padded="$(printf '%02d' "$n")"
+  f=$(printf '%s' "$rows_dir/$padded-"*.sh)
+  if grep -qF 'ASSERTIONS-DEFERRED: #1377' "$f"; then
+    ok "row $n marks its assertions deferred to #1377"
+  else
+    bad "row $n has no assertions and no deferral marker"
+  fi
+done
+
 # Resume: a captured row is skipped on re-run, so an interrupted session
 # resumes instead of restarting.
 run1="$( "$here/run-matrix.sh" --rows 1 --dry-run --out "$tmp/results" 2>&1 )"
@@ -107,6 +163,14 @@ run2="$( "$here/run-matrix.sh" --rows 1 --dry-run --out "$tmp/results" 2>&1 )"
 rc=$?
 assert_eq "$rc" "0" "re-run of a captured row succeeds"
 assert_contains "$run2" "skip row 1 (already captured" "a captured row is skipped on re-run"
+
+# Deferred rows: a row whose assertions are owned by #1377 runs in dry-run and
+# records a deferred result, so an off-hardware run never reads as a pass.
+run3="$( "$here/run-matrix.sh" --rows 7 --dry-run --out "$tmp/results-deferred" 2>&1 )"
+rc=$?
+assert_eq "$rc" "0" "dry-run of a deferred row succeeds"
+assert_contains "$run3" "assertions deferred to #1377" "a deferred row announces its deferral"
+assert_eq "$(jq -r '.status' "$tmp/results-deferred/7.json")" "deferred" "a deferred row records the deferred status"
 
 b200_log "self-test: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]
