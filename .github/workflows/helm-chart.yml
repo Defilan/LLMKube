@@ -541,6 +541,24 @@ jobs:
       - name: Verify Helm RBAC Covers kubebuilder Rules
         run: make check-helm-rbac
 
+  webhook-cert-check:
+    name: Webhook Cert Identity
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Verify Webhook Serving Cert Names the Capped Service (#1885)
+        run: make check-helm-webhook-cert
+
   package-test:
     name: Package and Install Test
     runs-on: ubuntu-latest

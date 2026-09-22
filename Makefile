@@ -86,6 +86,10 @@ federation-chart-crds: manifests ## Sync federation.llmkube.dev CRDs into the ma
 check-helm-rbac: manifests ## Verify the Helm charts' RBAC covers every kubebuilder-generated rule (#379).
 	@./scripts/check-helm-rbac.sh
 
+.PHONY: check-helm-webhook-cert
+check-helm-webhook-cert: ## Verify the webhook serving cert names the capped Service (#1885).
+	@./scripts/check-helm-webhook-cert.sh
+
 .PHONY: sync-reviewer-prompts
 sync-reviewer-prompts: ## Sync reviewer.md into spec.systemPrompt of every reviewer Agent manifest (#804).
 	@go run ./cmd/sync-reviewer-prompts

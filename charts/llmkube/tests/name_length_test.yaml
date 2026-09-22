@@ -1,0 +1,63 @@
+suite: resource name length
+# Service.metadata.name is an RFC 1035 label (63 char hard cap), while most
+# other kinds accept DNS-1123 subdomains (253). llmkube.fullname truncates only
+# the base, so a suffix appended after it (-controller-manager-metrics-service,
+# 35 chars) pushed a 30 char release name's metrics Service to 65 chars and the
+# API server rejected it. These tests pin the cap, the suffix it must keep
+# whole, and the cert SANs that must name the Service the cap produces.
+templates:
+  - metrics-service.yaml
+  - webhook.yaml
+  - webhook-certmanager.yaml
+
+tests:
+  - it: caps the metrics Service name to 63 chars
+    template: metrics-service.yaml
+    release:
+      name: llmkube-example-release-region
+    asserts:
+      - equal:
+          path: metadata.name
+          value: llmkube-example-release-regi-controller-manager-metrics-service
+
+  # Anything that renders today must keep its exact name: the cap may only bite
+  # the overflow case, or an upgrade would rename resources out from under a
+  # running release.
+  - it: leaves a name that already fits unchanged
+    template: metrics-service.yaml
+    asserts:
+      - equal:
+          path: metadata.name
+          value: RELEASE-NAME-llmkube-controller-manager-metrics-service
+
+  # fullnameOverride, not a long release.name: Helm caps release names at 53
+  # chars, so only fullnameOverride can push the fullname past 55.
+  - it: caps the webhook Service name to 63 chars
+    template: webhook.yaml
+    set:
+      fullnameOverride: llmkube-example-release-region-primary-cluster-production
+    documentSelector:
+      path: kind
+      value: Service
+    asserts:
+      - equal:
+          path: metadata.name
+          value: llmkube-example-release-region-primary-cluster-producti-webhook
+
+  # The API server validates the serving cert against the Service DNS name. If
+  # the Service caps but the SAN does not, every admission call fails.
+  - it: the webhook cert SAN names the same capped Service
+    template: webhook-certmanager.yaml
+    capabilities:
+      apiVersions:
+        - cert-manager.io/v1
+    set:
+      fullnameOverride: llmkube-example-release-region-primary-cluster-production
+      webhook.certManager.enabled: true
+    documentSelector:
+      path: kind
+      value: Certificate
+    asserts:
+      - equal:
+          path: spec.dnsNames[0]
+          value: llmkube-example-release-region-primary-cluster-producti-webhook.NAMESPACE.svc

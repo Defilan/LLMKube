@@ -22,6 +22,21 @@ Create a default fully qualified app name.
 {{- end }}
 
 {{/*
+Compose a resource name from the chart fullname and a role suffix, capped to
+Kubernetes' 63 char RFC 1035 limit (Service.metadata.name). The cap is spent on
+the base, never the suffix: the suffix is what identifies the object, and trunc
+is a no-op when the base already fits. Suffixes are short by contract; at 63+
+chars the budget goes negative and sprig's trunc slices from the end, a wrong
+answer rather than an error.
+
+Usage: {{ include "llmkube.resourceName" (dict "root" $ "suffix" "-webhook") }}
+*/}}
+{{- define "llmkube.resourceName" -}}
+{{- $suffix := .suffix -}}
+{{- printf "%s%s" (trunc (int (sub 63 (len $suffix))) (include "llmkube.fullname" .root) | trimSuffix "-") $suffix -}}
+{{- end }}
+
+{{/*
 Create chart name and version as used by the chart label.
 */}}
 {{- define "llmkube.chart" -}}
@@ -156,10 +171,12 @@ power: DCGM_FI_DEV_POWER_USAGE or node_hwmon_power_watt * on(chip, instance) gro
 
 {{/*
 Webhook Service name. The validating webhook's clientConfig targets this
-Service; the controller-manager pod labels are the Service selector.
+Service; the controller-manager pod labels are the Service selector. The
+Service, the webhook clients, and the serving cert SANs all derive from this
+name, so the length cap here keeps the cert identity matched to the Service.
 */}}
 {{- define "llmkube.webhook.serviceName" -}}
-{{- printf "%s-webhook" (include "llmkube.fullname" .) -}}
+{{- include "llmkube.resourceName" (dict "root" . "suffix" "-webhook") -}}
 {{- end }}
 
 {{/*
@@ -223,7 +240,7 @@ is found and reused.
 {{- if and $existing $existing.data (index $existing.data "tls.crt") (index $existing.data "tls.key") (index $existing.data "ca.crt") -}}
 {{- dict "ca" (index $existing.data "ca.crt") "cert" (index $existing.data "tls.crt") "key" (index $existing.data "tls.key") | toYaml -}}
 {{- else -}}
-{{- $ca := genCA (printf "%s-webhook-ca" (include "llmkube.fullname" .)) (int .Values.webhook.certValidityDays) -}}
+{{- $ca := genCA (include "llmkube.resourceName" (dict "root" . "suffix" "-webhook-ca")) (int .Values.webhook.certValidityDays) -}}
 {{- $cert := genSignedCert $svc nil $altNames (int .Values.webhook.certValidityDays) $ca -}}
 {{- dict "ca" ($ca.Cert | b64enc) "cert" ($cert.Cert | b64enc) "key" ($cert.Key | b64enc) | toYaml -}}
 {{- end -}}

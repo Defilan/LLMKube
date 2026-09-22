@@ -56,7 +56,7 @@ GETTING STARTED:
 
 5. Prometheus metrics are enabled!
    ServiceMonitor deployed to namespace: {{ include "llmkube.prometheus.serviceMonitor.namespace" . }}
-   Metrics endpoint: https://{{ include "llmkube.fullname" . }}-controller-manager-metrics-service.{{ include "llmkube.namespace" . }}.svc:{{ .Values.metrics.service.port }}/metrics
+   Metrics endpoint: https://{{ include "llmkube.resourceName" (dict "root" $ "suffix" "-controller-manager-metrics-service") }}.{{ include "llmkube.namespace" . }}.svc:{{ .Values.metrics.service.port }}/metrics
 {{- end }}
 
 {{- if .Values.prometheus.prometheusRule.enabled }}
