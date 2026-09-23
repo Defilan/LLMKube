@@ -66,3 +66,9 @@ CLAUDE.md
 .superpowers/
 /docs/superpowers/plans/
 /docs/superpowers/specs/
+
+# B200 validation harness results (#1376): captured evidence packs are large
+# and machine-specific, so they are never committed. The dir is kept by a
+# .gitkeep.
+/test/e2e/b200/results/*
+!/test/e2e/b200/results/.gitkeep

@@ -1,0 +1,12 @@
+# Measured platform versions: the probe could not read the CUDA toolkit, as
+# happens when the toolkit probe has no CUDA docker tag to inspect. Exactly one
+# floor is unread and every other floor passes, so an unread floor must be the
+# only thing failing the gate. A gate that treated it as a pass would accept
+# this node.
+nvidiaDriver=580.173.02
+cudaToolkit=unknown
+nccl=2.30.4
+gpuOperator=v26.3.3
+k8sDevicePlugin=v0.19.3
+dcgmExporter=4.6.0-4.8.3
+fabricManager=580.173.02

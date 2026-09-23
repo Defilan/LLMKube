@@ -1297,6 +1297,56 @@ func TestNeedsHelm(t *testing.T) {
 	}
 }
 
+// TestGateJobInstallsJQOnlyForB200Harness pins the #1833 fix. The gate image
+// is a plain golang image whose buildpack-deps chain installs no jq, while the
+// B200 harness self-test normalizes benchmark JSON with it, so rendering the
+// self-test check without installing jq turns every gate run into "required
+// command not found: jq". The install must appear when the harness check is
+// requested and must NOT appear otherwise.
+func TestGateJobInstallsJQOnlyForB200Harness(t *testing.T) {
+	render := func(checks []string) string {
+		job, err := renderGateJob(rendererInput{
+			Name: "g", Namespace: "foreman-system", Image: "golang:1.26",
+			Repo: "o/r", Branch: "b", BaseBranch: "main", Checks: checks,
+			PVCName: "foreman-gate-cache", CloneURLBase: "https://github.com",
+			ActiveDeadlineSeconds: 1800, TTLSecondsAfterFinished: 86400,
+			CPURequest: "1", CPULimit: "2", MemRequest: "1Gi", MemLimit: "2Gi",
+			HelmVersion: helmVersionFor(checks), HelmUnittestVersion: HelmUnittestVersion,
+			JQVersion: jqVersionFor(checks),
+		})
+		if err != nil {
+			t.Fatalf("renderGateJob: %v", err)
+		}
+		return strings.Join(job.Spec.Template.Spec.Containers[0].Args, "\n")
+	}
+
+	withHarness := render([]string{"fmt", "vet", B200HarnessCheck})
+	if !strings.Contains(withHarness, "install jq "+JQVersion) {
+		t.Error("harness check requested but the jq install is missing; the gate image has no jq")
+	}
+	if !strings.Contains(withHarness, "jq-linux-amd64") {
+		t.Error("jq install must fetch the pinned static binary")
+	}
+
+	goOnly := render([]string{"fmt", "vet", "test"})
+	if strings.Contains(goOnly, "install jq") {
+		t.Error("jq installed for a Go-only run; the install must be conditional")
+	}
+}
+
+// TestNeedsJQ covers the predicate directly.
+func TestNeedsJQ(t *testing.T) {
+	if !needsJQ([]string{"fmt", B200HarnessCheck}) {
+		t.Error("needsJQ should be true when the harness check is present")
+	}
+	if needsJQ([]string{"fmt", "vet", "lint", "test"}) {
+		t.Error("needsJQ should be false without the harness check")
+	}
+	if !needsJQ(DefaultGateChecks) {
+		t.Error("DefaultGateChecks must include the B200 harness check (#1833)")
+	}
+}
+
 // TestGateJobCacheVolumeOmittedWhenPVCNameEmpty asserts that an empty PVCName
 // renders NO cache volume and NO /cache volumeMount.
 //
