@@ -95,6 +95,10 @@ The following table lists the configurable parameters of the LLMKube chart and t
 | `nameOverride` | Override the chart name | `""` |
 | `fullnameOverride` | Override the full chart name | `""` |
 
+Resource names are capped at 63 characters (the Kubernetes RFC 1035 label limit
+for a Service name). A long release name or `fullnameOverride` is truncated to
+fit, keeping the role suffix that identifies the object.
+
 ### Controller Manager Parameters
 
 | Parameter | Description | Default |
