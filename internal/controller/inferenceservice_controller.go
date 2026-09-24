@@ -233,7 +233,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// from before the allowlist was introduced (or tightened).
 	if valErr := validateLocalSourceAllowed(model.Spec.Source, r.AllowedHostPathRoots); valErr != nil {
 		log.Error(valErr, "rejected local model source by host-path allowlist", "model", model.Name, "source", model.Spec.Source)
-		blockResult, updateErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, 0, 0, "",
+		blockResult, updateErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, inferenceService.Status.Replicas, 0, "",
 			valErr.Error(), nil)
 		return blockResult, updateErr
 	}
@@ -254,7 +254,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if modelNeedsCachePVC(model, inferenceService, r.ModelCachePath) {
 		if err := r.ensureModelCachePVC(ctx, inferenceService); err != nil {
 			log.Error(err, "Failed to ensure model cache PVC exists", "namespace", inferenceService.Namespace)
-			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, 0, desiredReplicas, "",
+			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, inferenceService.Status.Replicas, desiredReplicas, "",
 				fmt.Sprintf("Failed to ensure model cache PVC: %v", err), nil)
 		}
 	}
@@ -376,7 +376,7 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	if err := r.Get(ctx, modelName, model); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("Referenced Model not found", "model", isvc.Spec.ModelRef)
-			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, false, 0, 0, 0, "", "Model not found", nil)
+			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, false, 0, isvc.Status.Replicas, 0, "", "Model not found", nil)
 			return nil, false, &result, updateErr
 		}
 		log.Error(err, "Failed to get Model")
@@ -386,7 +386,7 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	modelReady := model.Status.Phase == PhaseReady
 	if !modelReady {
 		log.Info("Model not ready yet", "model", model.Name, "phase", model.Status.Phase)
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, "Pending", false, 0, 0, 0, "", "Waiting for Model to be Ready", nil)
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, "Pending", false, 0, isvc.Status.Replicas, 0, "", "Waiting for Model to be Ready", nil)
 		return nil, false, &result, updateErr
 	}
 
@@ -437,7 +437,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 		if apierrors.IsNotFound(err) {
 			log.Info("Referenced draft Model not found", "draftModel", ref)
 			result, updateErr := r.updateStatusWithSchedulingInfo(
-				ctx, isvc, PhaseFailed, false, 0, 0, 0, "",
+				ctx, isvc, PhaseFailed, false, 0, isvc.Status.Replicas, 0, "",
 				fmt.Sprintf("Draft model %q not found", ref), nil)
 			return nil, false, &result, updateErr
 		}
@@ -448,7 +448,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 	if draft.Status.Phase != PhaseReady {
 		log.Info("Draft Model not ready yet", "draftModel", draft.Name, "phase", draft.Status.Phase)
 		result, updateErr := r.updateStatusWithSchedulingInfo(
-			ctx, isvc, "Pending", false, 0, 0, 0, "",
+			ctx, isvc, "Pending", false, 0, isvc.Status.Replicas, 0, "",
 			fmt.Sprintf("Waiting for draft model %q to be Ready", draft.Name), nil)
 		return nil, false, &result, updateErr
 	}
@@ -499,7 +499,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// message; admission-time rejection is the follow-up (#1196 story 5).
 	if _, err := resolveGPUSharing(isvc, model, r.GPUSharingSharedPool); err != nil {
 		log.Info("Rejecting InferenceService with invalid gpuSharing spec", "reason", err.Error())
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, 0, desiredReplicas, "", fmt.Sprintf("Invalid gpuSharing: %v", err), nil)
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", fmt.Sprintf("Invalid gpuSharing: %v", err), nil)
 		return nil, replicaCounts{}, nil, &result, updateErr
 	}
 
@@ -509,7 +509,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// enabled; this backstop covers default installs.
 	if err := parallelismExceedsGPUCount(isvc, model); err != nil {
 		log.Info("Rejecting InferenceService with unsatisfiable parallelism", "reason", err.Error())
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, 0, desiredReplicas, "", fmt.Sprintf("Invalid parallelism: %v", err), nil)
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", fmt.Sprintf("Invalid parallelism: %v", err), nil)
 		return nil, replicaCounts{}, nil, &result, updateErr
 	}
 
@@ -531,7 +531,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		deployment.Annotations[AnnotationDesiredTemplateHash] = tmplHash
 		if err := r.Create(ctx, deployment); err != nil {
 			log.Error(err, "Failed to create Deployment")
-			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, 0, desiredReplicas, "", "Failed to create Deployment", nil)
+			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Deployment", nil)
 			return nil, replicaCounts{}, nil, &result, updateErr
 		}
 		return deployment, replicaCounts{}, nil, nil, nil
@@ -735,7 +735,7 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 		log.Info("Creating new Service", "name", service.Name)
 		if err := r.Create(ctx, service); err != nil {
 			log.Error(err, "Failed to create Service")
-			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, 0, desiredReplicas, "", "Failed to create Service", nil)
+			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Service", nil)
 			return nil, &result, updateErr
 		}
 	} else if err != nil {

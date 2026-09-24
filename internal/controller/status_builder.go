@@ -197,9 +197,16 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 	isvc.Status.ModelReady = modelReady
 	isvc.Status.ReadyReplicas = readyReplicas
 	// Status.Replicas is the observed count the /scale subresource exposes;
-	// Status.DesiredReplicas carries intent.
+	// Status.DesiredReplicas carries intent. A caller that did not inspect
+	// the workload passes the last persisted value (isvc.Status.Replicas),
+	// not 0, so a transient failure does not zero the count an HPA reads as
+	// currentReplicas. A real observation, including a genuine 0, only comes
+	// from a caller that read the workload.
 	isvc.Status.Replicas = observedReplicas
 	isvc.Status.DesiredReplicas = desiredReplicas
+	// The selector is nominal on the metal and multiNode paths: it names the
+	// labels a Deployment would carry, and no Deployment (or a member set
+	// whose labels differ) backs it. An HPA only parses it.
 	isvc.Status.Selector = labels.SelectorFromSet(deploymentSelectorLabels(isvc)).String()
 	isvc.Status.Endpoint = endpoint
 	isvc.Status.LastUpdated = &now
