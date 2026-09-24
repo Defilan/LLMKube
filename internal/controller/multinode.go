@@ -571,18 +571,18 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	}
 
 	if err := parallelismExceedsGPUCount(isvc, model); err != nil {
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "",
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "",
 			fmt.Sprintf("Invalid parallelism: %v", err), nil)
 		return 0, &result, updateErr
 	}
 	if err := r.checkMemberClaims(ctx, isvc); err != nil {
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "",
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "",
 			fmt.Sprintf("Invalid multiNode: %v", err), nil)
 		return 0, &result, updateErr
 	}
 	desired, hash, err := r.constructMemberPods(isvc, model, draftModel)
 	if err != nil {
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "",
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "",
 			fmt.Sprintf("Invalid multiNode: %v", err), nil)
 		return 0, &result, updateErr
 	}
@@ -696,7 +696,9 @@ func (r *InferenceServiceReconciler) deleteMemberPods(ctx context.Context, pods 
 // which returns it as-is, so the status must be written here: Reconcile's own
 // status write only runs on the fall-through path.
 func (r *InferenceServiceReconciler) persistGroupTeardown(ctx context.Context, isvc *inferencev1alpha1.InferenceService, phase string, modelReady bool, desiredReplicas int32) (int32, *ctrl.Result, error) {
-	result, err := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady, 0, desiredReplicas, "", "", nil)
+	// observed is 0 here deliberately: teardown is removing the member pods,
+	// so there is no count left to carry (unlike the failure paths above).
+	result, err := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady, 0, 0, desiredReplicas, "", "", nil)
 	result.RequeueAfter = earliestPositive(result.RequeueAfter, multiNodeRecreateRequeue)
 	return 0, &result, err
 }

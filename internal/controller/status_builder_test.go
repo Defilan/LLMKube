@@ -88,7 +88,7 @@ func TestUpdateStatusStoppedClearsStaleAvailable(t *testing.T) {
 	r := newStatusBuilderReconciler(t, isvc)
 	seedReadyAvailable(t, ctx, r.Client, isvc)
 
-	if _, err := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseStopped, false, 0, 0, "", "", nil); err != nil {
+	if _, err := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseStopped, false, 0, 0, 0, "", "", nil); err != nil {
 		t.Fatalf("updateStatusWithSchedulingInfo: %v", err)
 	}
 
@@ -131,7 +131,7 @@ func TestUpdateStatusSuspendedClearsStaleAvailable(t *testing.T) {
 	r := newStatusBuilderReconciler(t, isvc)
 	seedReadyAvailable(t, ctx, r.Client, isvc)
 
-	if _, err := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseSuspended, false, 0, 0, "", "", nil); err != nil {
+	if _, err := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseSuspended, false, 0, 0, 0, "", "", nil); err != nil {
 		t.Fatalf("updateStatusWithSchedulingInfo: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestUpdateStatusStoppedAndSuspendedReasonsDiffer(t *testing.T) {
 	}
 	rStopped := newStatusBuilderReconciler(t, stopped)
 	seedReadyAvailable(t, ctx, rStopped.Client, stopped)
-	if _, err := rStopped.updateStatusWithSchedulingInfo(ctx, stopped, PhaseStopped, false, 0, 0, "", "", nil); err != nil {
+	if _, err := rStopped.updateStatusWithSchedulingInfo(ctx, stopped, PhaseStopped, false, 0, 0, 0, "", "", nil); err != nil {
 		t.Fatalf("stopped updateStatusWithSchedulingInfo: %v", err)
 	}
 
@@ -185,7 +185,7 @@ func TestUpdateStatusStoppedAndSuspendedReasonsDiffer(t *testing.T) {
 	}
 	rSuspended := newStatusBuilderReconciler(t, suspended)
 	seedReadyAvailable(t, ctx, rSuspended.Client, suspended)
-	if _, err := rSuspended.updateStatusWithSchedulingInfo(ctx, suspended, PhaseSuspended, false, 0, 0, "", "", nil); err != nil {
+	if _, err := rSuspended.updateStatusWithSchedulingInfo(ctx, suspended, PhaseSuspended, false, 0, 0, 0, "", "", nil); err != nil {
 		t.Fatalf("suspended updateStatusWithSchedulingInfo: %v", err)
 	}
 
@@ -242,7 +242,7 @@ func TestUpdateStatusAvailableFalseWhenNoReadyReplicas(t *testing.T) {
 			seedReadyAvailable(t, ctx, r.Client, isvc)
 
 			if _, err := r.updateStatusWithSchedulingInfo(
-				ctx, isvc, tc.phase, true, 0, 1, "", "", nil); err != nil {
+				ctx, isvc, tc.phase, true, 0, 0, 1, "", "", nil); err != nil {
 				t.Fatalf("updateStatusWithSchedulingInfo: %v", err)
 			}
 
@@ -289,7 +289,7 @@ func TestUpdateStatusAvailableStaysTrueWithReadyReplicas(t *testing.T) {
 
 	// 1 of 3 ready: still serving, so Available must remain True.
 	if _, err := r.updateStatusWithSchedulingInfo(
-		ctx, isvc, "Progressing", true, 1, 3, "", "", nil); err != nil {
+		ctx, isvc, "Progressing", true, 1, 1, 3, "", "", nil); err != nil {
 		t.Fatalf("updateStatusWithSchedulingInfo: %v", err)
 	}
 

@@ -233,7 +233,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// from before the allowlist was introduced (or tightened).
 	if valErr := validateLocalSourceAllowed(model.Spec.Source, r.AllowedHostPathRoots); valErr != nil {
 		log.Error(valErr, "rejected local model source by host-path allowlist", "model", model.Name, "source", model.Spec.Source)
-		blockResult, updateErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, 0, "",
+		blockResult, updateErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, inferenceService.Status.Replicas, 0, "",
 			valErr.Error(), nil)
 		return blockResult, updateErr
 	}
@@ -254,7 +254,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	if modelNeedsCachePVC(model, inferenceService, r.ModelCachePath) {
 		if err := r.ensureModelCachePVC(ctx, inferenceService); err != nil {
 			log.Error(err, "Failed to ensure model cache PVC exists", "namespace", inferenceService.Namespace)
-			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, desiredReplicas, "",
+			return r.updateStatusWithSchedulingInfo(ctx, inferenceService, PhaseFailed, modelReady, 0, inferenceService.Status.Replicas, desiredReplicas, "",
 				fmt.Sprintf("Failed to ensure model cache PVC: %v", err), nil)
 		}
 	}
@@ -266,7 +266,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	r.emitSpecAdvisoryEvents(inferenceService, model)
 
-	deployment, readyReplicas, metalSnap, result, err := r.reconcileWorkload(ctx, inferenceService, model, draftModel, desiredReplicas, modelReady, isMetal)
+	deployment, counts, metalSnap, result, err := r.reconcileWorkload(ctx, inferenceService, model, draftModel, desiredReplicas, modelReady, isMetal)
 	if err != nil || result != nil {
 		if result != nil {
 			return *result, err
@@ -298,7 +298,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	endpoint := r.constructEndpoint(inferenceService, service)
-	phase, schedulingInfo := r.determinePhase(ctx, inferenceService, readyReplicas, desiredReplicas, isMetal, deployment, metalSnap)
+	phase, schedulingInfo := r.determinePhase(ctx, inferenceService, counts.Ready, desiredReplicas, isMetal, deployment, metalSnap)
 
 	// Surface the engine's offload result before the status write persists it
 	// with the phase. Deployment path only: the metal path runs the engine
@@ -322,7 +322,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		inferenceService.Status.WaitingFor = ""
 	}
 
-	finalResult, statusErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, phase, modelReady, readyReplicas, desiredReplicas, endpoint, "", schedulingInfo)
+	finalResult, statusErr := r.updateStatusWithSchedulingInfo(ctx, inferenceService, phase, modelReady, counts.Ready, counts.Observed, desiredReplicas, endpoint, "", schedulingInfo)
 	if statusErr != nil {
 		return finalResult, statusErr
 	}
@@ -376,7 +376,7 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	if err := r.Get(ctx, modelName, model); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("Referenced Model not found", "model", isvc.Spec.ModelRef)
-			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, false, 0, 0, "", "Model not found", nil)
+			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, false, 0, isvc.Status.Replicas, 0, "", "Model not found", nil)
 			return nil, false, &result, updateErr
 		}
 		log.Error(err, "Failed to get Model")
@@ -386,7 +386,7 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	modelReady := model.Status.Phase == PhaseReady
 	if !modelReady {
 		log.Info("Model not ready yet", "model", model.Name, "phase", model.Status.Phase)
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, "Pending", false, 0, 0, "", "Waiting for Model to be Ready", nil)
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, "Pending", false, 0, isvc.Status.Replicas, 0, "", "Waiting for Model to be Ready", nil)
 		return nil, false, &result, updateErr
 	}
 
@@ -437,7 +437,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 		if apierrors.IsNotFound(err) {
 			log.Info("Referenced draft Model not found", "draftModel", ref)
 			result, updateErr := r.updateStatusWithSchedulingInfo(
-				ctx, isvc, PhaseFailed, false, 0, 0, "",
+				ctx, isvc, PhaseFailed, false, 0, isvc.Status.Replicas, 0, "",
 				fmt.Sprintf("Draft model %q not found", ref), nil)
 			return nil, false, &result, updateErr
 		}
@@ -448,12 +448,20 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 	if draft.Status.Phase != PhaseReady {
 		log.Info("Draft Model not ready yet", "draftModel", draft.Name, "phase", draft.Status.Phase)
 		result, updateErr := r.updateStatusWithSchedulingInfo(
-			ctx, isvc, "Pending", false, 0, 0, "",
+			ctx, isvc, "Pending", false, 0, isvc.Status.Replicas, 0, "",
 			fmt.Sprintf("Waiting for draft model %q to be Ready", draft.Name), nil)
 		return nil, false, &result, updateErr
 	}
 
 	return draft, true, nil, nil
+}
+
+// replicaCounts carries the two replica observations a reconcile feeds the
+// status writer: Ready gates the phase, Observed is what /scale must expose so
+// an HPA reads a truthful current count.
+type replicaCounts struct {
+	Ready    int32
+	Observed int32
 }
 
 // reconcileDeployment coordinates several independent concerns (metal snapshot,
@@ -462,7 +470,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 // threshold; splitting it further would fragment one linear reconcile step.
 //
 //nolint:gocyclo
-func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, int32, *metalSnapshot, *ctrl.Result, error) {
+func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if isMetal {
@@ -474,7 +482,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		snap := r.metalEndpointSnapshot(ctx, isvc)
 		log.Info("Metal accelerator detected, skipping Deployment creation",
 			"readyEndpoints", snap.ReadyReplicas, "desiredReplicas", desiredReplicas)
-		return nil, snap.ReadyReplicas, snap, nil, nil
+		return nil, replicaCounts{Ready: snap.ReadyReplicas, Observed: snap.ReadyReplicas}, snap, nil, nil
 	}
 
 	// Surface non-fatal runtime spec problems as a status condition before we
@@ -491,8 +499,8 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// message; admission-time rejection is the follow-up (#1196 story 5).
 	if _, err := resolveGPUSharing(isvc, model, r.GPUSharingSharedPool); err != nil {
 		log.Info("Rejecting InferenceService with invalid gpuSharing spec", "reason", err.Error())
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "", fmt.Sprintf("Invalid gpuSharing: %v", err), nil)
-		return nil, 0, nil, &result, updateErr
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", fmt.Sprintf("Invalid gpuSharing: %v", err), nil)
+		return nil, replicaCounts{}, nil, &result, updateErr
 	}
 
 	// Explicit parallelism that cannot fit the pod's GPUs is equally fatal:
@@ -501,14 +509,14 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// enabled; this backstop covers default installs.
 	if err := parallelismExceedsGPUCount(isvc, model); err != nil {
 		log.Info("Rejecting InferenceService with unsatisfiable parallelism", "reason", err.Error())
-		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "", fmt.Sprintf("Invalid parallelism: %v", err), nil)
-		return nil, 0, nil, &result, updateErr
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", fmt.Sprintf("Invalid parallelism: %v", err), nil)
+		return nil, replicaCounts{}, nil, &result, updateErr
 	}
 
 	deployment := r.constructDeployment(isvc, model, draftModel, desiredReplicas)
 	if err := setControllerReferenceUnblocked(isvc, deployment, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for Deployment")
-		return nil, 0, nil, nil, err
+		return nil, replicaCounts{}, nil, nil, err
 	}
 
 	existingDeployment := &appsv1.Deployment{}
@@ -523,13 +531,13 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		deployment.Annotations[AnnotationDesiredTemplateHash] = tmplHash
 		if err := r.Create(ctx, deployment); err != nil {
 			log.Error(err, "Failed to create Deployment")
-			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "", "Failed to create Deployment", nil)
-			return nil, 0, nil, &result, updateErr
+			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Deployment", nil)
+			return nil, replicaCounts{}, nil, &result, updateErr
 		}
-		return deployment, 0, nil, nil, nil
+		return deployment, replicaCounts{}, nil, nil, nil
 	} else if err != nil {
 		log.Error(err, "Failed to get Deployment")
-		return nil, 0, nil, nil, err
+		return nil, replicaCounts{}, nil, nil, err
 	}
 
 	// Deployment.spec.selector is immutable. A Deployment created by an older
@@ -546,18 +554,18 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			"newSelector", deployment.Spec.Selector)
 		if err := r.Delete(ctx, existingDeployment); err != nil && !apierrors.IsNotFound(err) {
 			log.Error(err, "Failed to delete stale Deployment for selector migration")
-			return nil, 0, nil, nil, err
+			return nil, replicaCounts{}, nil, nil, err
 		}
 		if err := r.Create(ctx, deployment); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				// The old Deployment is still terminating; recreate on the
 				// next reconcile once its deletion has propagated.
-				return nil, 0, nil, &ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+				return nil, replicaCounts{}, nil, &ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 			log.Error(err, "Failed to recreate Deployment after selector change")
-			return nil, 0, nil, nil, err
+			return nil, replicaCounts{}, nil, nil, err
 		}
-		return deployment, 0, nil, nil, nil
+		return deployment, replicaCounts{}, nil, nil, nil
 	}
 
 	// Snapshot externally-set template metadata before the wholesale
@@ -618,7 +626,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		rollResult, err := r.reconcileRolloutPolicy(ctx, isvc, svc)
 		if err != nil {
 			log.Error(err, "Failed to reconcile rollout policy")
-			return nil, 0, nil, nil, err
+			return nil, replicaCounts{}, nil, nil, err
 		}
 		if rollResult.RequeueAfter > 0 {
 			// Rollout deferred until idle: hold the pod-template Update so the
@@ -626,7 +634,10 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			// to Service/HPA/status by returning without a result. The
 			// RolloutDeferred=True condition (set by reconcileRolloutPolicy)
 			// drives a requeue in Reconcile.
-			return existingDeployment, existingDeployment.Status.ReadyReplicas, nil, nil, nil
+			return existingDeployment, replicaCounts{
+				Ready:    existingDeployment.Status.ReadyReplicas,
+				Observed: existingDeployment.Status.Replicas,
+			}, nil, nil, nil
 		}
 	} else if !isMetal && !templateChanged {
 		// Template no longer differs — clear any stale RolloutDeferred condition.
@@ -634,7 +645,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionRolloutDeferred)
 			if updateErr := r.Status().Update(ctx, isvc); updateErr != nil {
 				log.Error(updateErr, "Failed to clear stale RolloutDeferred condition")
-				return nil, 0, nil, nil, updateErr
+				return nil, replicaCounts{}, nil, nil, updateErr
 			}
 		}
 	}
@@ -648,6 +659,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// re-derives the preserved external template metadata and the HPA-owned
 	// replica count from the current object so the retry stays self-consistent.
 	readyReplicas := existingDeployment.Status.ReadyReplicas
+	observedReplicas := existingDeployment.Status.Replicas
 	updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		liveTemplateLabels := existingDeployment.Spec.Template.Labels
 		liveTemplateAnnotations := existingDeployment.Spec.Template.Annotations
@@ -685,14 +697,15 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			return err
 		}
 		readyReplicas = existingDeployment.Status.ReadyReplicas
+		observedReplicas = existingDeployment.Status.Replicas
 		return nil
 	})
 	if updateErr != nil {
 		log.Error(updateErr, "Failed to update Deployment")
-		return nil, 0, nil, nil, updateErr
+		return nil, replicaCounts{}, nil, nil, updateErr
 	}
 
-	return deployment, readyReplicas, nil, nil, nil
+	return deployment, replicaCounts{Ready: readyReplicas, Observed: observedReplicas}, nil, nil, nil
 }
 
 func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc *inferencev1alpha1.InferenceService, modelReady bool, desiredReplicas int32, isMetal bool) (*corev1.Service, *ctrl.Result, error) {
@@ -722,7 +735,7 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 		log.Info("Creating new Service", "name", service.Name)
 		if err := r.Create(ctx, service); err != nil {
 			log.Error(err, "Failed to create Service")
-			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, desiredReplicas, "", "Failed to create Service", nil)
+			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Service", nil)
 			return nil, &result, updateErr
 		}
 	} else if err != nil {
@@ -1015,10 +1028,12 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 	model, draftModel *inferencev1alpha1.Model,
 	desiredReplicas int32,
 	modelReady, isMetal bool,
-) (*appsv1.Deployment, int32, *metalSnapshot, *ctrl.Result, error) {
+) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
 	if isvc.Spec.MultiNode != nil {
 		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, model, draftModel, desiredReplicas, modelReady)
-		return nil, readyReplicas, nil, result, err
+		// A multiNode group has no Deployment to read an observed total from,
+		// so the ready member count stands in for both.
+		return nil, replicaCounts{Ready: readyReplicas, Observed: readyReplicas}, nil, result, err
 	}
 	return r.reconcileDeployment(ctx, isvc, model, draftModel, desiredReplicas, modelReady, isMetal)
 }

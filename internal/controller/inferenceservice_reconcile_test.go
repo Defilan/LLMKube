@@ -31,6 +31,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
@@ -1053,11 +1054,18 @@ var _ = Describe("Reconcile lifecycle", func() {
 			})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("reading status.replicas via the /scale subresource after reconcile")
+			By("reading status.replicas and status.selector via the /scale subresource after reconcile")
 			scale := &autoscalingv1.Scale{}
 			Expect(k8sClient.SubResource("scale").Get(ctx, isvc, scale)).To(Succeed())
 			Expect(scale.Spec.Replicas).To(Equal(int32(2)))
 			Expect(scale.Status.Replicas).To(Equal(int32(2)))
+			// An HPA rejects a scale target whose selector is missing or
+			// unparseable (validateAndParseSelector), so a blank selector here
+			// reproduces the #1881 InvalidSelector failure.
+			Expect(scale.Status.Selector).To(Equal(
+				"app=" + isvcName + ",inference.llmkube.dev/service=" + isvcName))
+			_, selectorErr := labels.Parse(scale.Status.Selector)
+			Expect(selectorErr).NotTo(HaveOccurred())
 
 			By("writing a new replica count via the /scale subresource")
 			scale.Spec.Replicas = 3
@@ -1130,6 +1138,444 @@ var _ = Describe("Reconcile lifecycle", func() {
 
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
 			Expect(updated.Status.Replicas).To(Equal(int32(0)))
+
+			By("verifying the /scale subresource reports 0 current replicas too")
+			scaleAfter := &autoscalingv1.Scale{}
+			Expect(k8sClient.SubResource("scale").Get(ctx, isvc, scaleAfter)).To(Succeed())
+			Expect(scaleAfter.Status.Replicas).To(Equal(int32(0)))
+		})
+
+		It("should expose a parseable pod selector via the /scale subresource", func() {
+			modelName := "model-scale-selector"
+			isvcName := "isvc-scale-selector"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+
+			scale := &autoscalingv1.Scale{}
+			Expect(k8sClient.SubResource("scale").Get(ctx, isvc, scale)).To(Succeed())
+			// The reported selector must match the pods the Deployment owns, so
+			// the HPA resolves a real target rather than the #1881
+			// SelectorRequired failure.
+			Expect(scale.Status.Selector).To(Equal(
+				labels.SelectorFromSet(dep.Spec.Selector.MatchLabels).String()))
+			Expect(scale.Status.Selector).NotTo(BeEmpty())
+			_, selectorErr := labels.Parse(scale.Status.Selector)
+			Expect(selectorErr).NotTo(HaveOccurred())
+		})
+
+		It("should report observed replicas via /scale, not the desired count", func() {
+			modelName := "model-scale-observed"
+			isvcName := "isvc-scale-observed"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(3)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Observed total is 2 while only 1 pod is ready and 3 are desired:
+			// /scale must expose the observed total, and status.desiredReplicas
+			// must still carry the intent.
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			dep.Status.Replicas = 2
+			dep.Status.ReadyReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			scale := &autoscalingv1.Scale{}
+			Expect(k8sClient.SubResource("scale").Get(ctx, isvc, scale)).To(Succeed())
+			Expect(scale.Spec.Replicas).To(Equal(int32(3)))
+			Expect(scale.Status.Replicas).To(Equal(int32(2)))
+
+			updated := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+			Expect(updated.Status.Replicas).To(Equal(int32(2)))
+			Expect(updated.Status.ReadyReplicas).To(Equal(int32(1)))
+			Expect(updated.Status.DesiredReplicas).To(Equal(int32(3)))
+		})
+
+		Context("observed replicas on paths that do not inspect the workload", func() {
+			// A path that cannot observe the live workload (a fatal spec error, a
+			// Model that is not Ready) must carry the last observed replica
+			// count rather than zeroing status.replicas. An HPA reads that field
+			// as currentReplicas through the /scale subresource, so a transient
+			// failure must not make it look like nothing is running.
+			DescribeTable("carries the last observed count",
+				func(suffix, wantPhase string, trip func(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService)) {
+					modelName := "model-observed-" + suffix
+					isvcName := "isvc-observed-" + suffix
+
+					model := &inferencev1alpha1.Model{
+						ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+						Spec: inferencev1alpha1.ModelSpec{
+							Source:   "https://example.com/model.gguf",
+							Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+						},
+					}
+					Expect(k8sClient.Create(ctx, model)).To(Succeed())
+					defer func() { _ = k8sClient.Delete(ctx, model) }()
+					model.Status.Phase = PhaseReady
+					Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+					replicas := int32(3)
+					isvc := &inferencev1alpha1.InferenceService{
+						ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+						Spec: inferencev1alpha1.InferenceServiceSpec{
+							ModelRef: modelName,
+							Replicas: &replicas,
+						},
+					}
+					Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+					defer func() {
+						_ = k8sClient.Delete(ctx, isvc)
+						dep := &appsv1.Deployment{}
+						if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+							_ = k8sClient.Delete(ctx, dep)
+						}
+						svc := &corev1.Service{}
+						if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+							_ = k8sClient.Delete(ctx, svc)
+						}
+					}()
+
+					reconciler := &InferenceServiceReconciler{
+						Client:             k8sClient,
+						Scheme:             k8sClient.Scheme(),
+						InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+					}
+					req := reconcile.Request{
+						NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+					}
+					_, err := reconciler.Reconcile(ctx, req)
+					Expect(err).NotTo(HaveOccurred())
+
+					// Establish a nonzero observed count the way a Deployment
+					// controller would: 2 observed with 1 ready of 3 desired.
+					dep := &appsv1.Deployment{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+					dep.Status.Replicas = 2
+					dep.Status.ReadyReplicas = 1
+					Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+					_, err = reconciler.Reconcile(ctx, req)
+					Expect(err).NotTo(HaveOccurred())
+
+					updated := &inferencev1alpha1.InferenceService{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+					Expect(updated.Status.Replicas).To(Equal(int32(2)),
+						"the observed count must be established before the path is tripped")
+
+					// Re-read before the trip: the reconcile above bumped the
+					// object's resourceVersion with its status write.
+					live := &inferencev1alpha1.InferenceService{}
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, live)).To(Succeed())
+					trip(model, live)
+					Expect(k8sClient.Update(ctx, live)).To(Succeed())
+					_, err = reconciler.Reconcile(ctx, req)
+					Expect(err).NotTo(HaveOccurred())
+
+					Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, updated)).To(Succeed())
+					Expect(updated.Status.Phase).To(Equal(wantPhase))
+					Expect(updated.Status.Replicas).To(Equal(int32(2)),
+						"a path that cannot observe the workload must carry the last observed count, not zero it")
+
+					scale := &autoscalingv1.Scale{}
+					Expect(k8sClient.SubResource("scale").Get(ctx, isvc, scale)).To(Succeed())
+					Expect(scale.Status.Replicas).To(Equal(int32(2)),
+						"/scale must expose the carried count an HPA reads as currentReplicas")
+				},
+				Entry("invalid parallelism", "parallelism", PhaseFailed,
+					func(_ *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService) {
+						isvc.Spec.Resources = &inferencev1alpha1.InferenceResourceRequirements{GPU: 1}
+						isvc.Spec.VLLMConfig = &inferencev1alpha1.VLLMConfig{
+							TensorParallelSize: ptr.To(int32(2)),
+						}
+					}),
+				Entry("invalid gpuSharing", "gpushing", PhaseFailed,
+					func(_ *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService) {
+						isvc.Spec.Resources = &inferencev1alpha1.InferenceResourceRequirements{
+							GPU:        2,
+							GPUSharing: &inferencev1alpha1.GPUSharingSpec{Mode: inferencev1alpha1.GPUSharingModeShared},
+						}
+					}),
+				Entry("model not found", "notfound", PhaseFailed,
+					func(_ *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService) {
+						isvc.Spec.ModelRef = "missing-model"
+					}),
+				Entry("model not ready", "notready", "Pending",
+					func(model *inferencev1alpha1.Model, _ *inferencev1alpha1.InferenceService) {
+						model.Status.Phase = ""
+						Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+					}),
+			)
+		})
+
+		It("should accept manual scaling above 10 replicas", func() {
+			modelName := "model-scale-cap"
+			isvcName := "isvc-scale-cap"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(11)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+				},
+			}
+			// The old Maximum=10 rejected this at admission with
+			// "spec.replicas ... should be less than or equal to 10".
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			Expect(*dep.Spec.Replicas).To(Equal(int32(11)))
+		})
+
+		// Guards pre-existing single-writer behavior (an external write to the
+		// Deployment is reverted), not the #1881 selector/observed change.
+		It("should revert an external Deployment replica write without spec.autoscaling", func() {
+			modelName := "model-scale-revert"
+			isvcName := "isvc-scale-revert"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			// An external scaler pointed at the Deployment writes replicas
+			// directly; the operator is the single writer and puts its own
+			// desired count back on the next reconcile.
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			scaled := int32(5)
+			dep.Spec.Replicas = &scaled
+			Expect(k8sClient.Update(ctx, dep)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			Expect(*dep.Spec.Replicas).To(Equal(int32(1)))
+		})
+
+		// Guards the pre-existing /scale spec-path propagation, not the #1881
+		// selector/observed change.
+		It("should propagate a /scale write through to the Deployment", func() {
+			modelName := "model-scale-propagate"
+			isvcName := "isvc-scale-propagate"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			req := reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: "default"},
+			}
+			_, err := reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("writing 3 replicas through the InferenceService /scale subresource")
+			scale := &autoscalingv1.Scale{}
+			Expect(k8sClient.SubResource("scale").Get(ctx, isvc, scale)).To(Succeed())
+			scale.Spec.Replicas = 3
+			Expect(k8sClient.SubResource("scale").Update(ctx, isvc, client.WithSubResourceBody(scale))).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, req)
+			Expect(err).NotTo(HaveOccurred())
+
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep)).To(Succeed())
+			Expect(*dep.Spec.Replicas).To(Equal(int32(3)))
 		})
 
 		It("should create PVC when model has CacheKey and ModelCachePath is set", func() {

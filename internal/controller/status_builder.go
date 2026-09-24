@@ -25,6 +25,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -181,6 +182,7 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 	phase string,
 	modelReady bool,
 	readyReplicas int32,
+	observedReplicas int32,
 	desiredReplicas int32,
 	endpoint string,
 	errorMsg string,
@@ -194,8 +196,18 @@ func (r *InferenceServiceReconciler) updateStatusWithSchedulingInfo(
 	isvc.Status.Mode = resolveServingMode(isvc)
 	isvc.Status.ModelReady = modelReady
 	isvc.Status.ReadyReplicas = readyReplicas
-	isvc.Status.Replicas = desiredReplicas
+	// Status.Replicas is the observed count the /scale subresource exposes;
+	// Status.DesiredReplicas carries intent. A caller that did not inspect
+	// the workload passes the last persisted value (isvc.Status.Replicas),
+	// not 0, so a transient failure does not zero the count an HPA reads as
+	// currentReplicas. A real observation, including a genuine 0, only comes
+	// from a caller that read the workload.
+	isvc.Status.Replicas = observedReplicas
 	isvc.Status.DesiredReplicas = desiredReplicas
+	// The selector is nominal on the metal and multiNode paths: it names the
+	// labels a Deployment would carry, and no Deployment (or a member set
+	// whose labels differ) backs it. An HPA only parses it.
+	isvc.Status.Selector = labels.SelectorFromSet(deploymentSelectorLabels(isvc)).String()
 	isvc.Status.Endpoint = endpoint
 	isvc.Status.LastUpdated = &now
 
