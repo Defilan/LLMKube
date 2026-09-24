@@ -1209,6 +1209,33 @@ func TestProxyTeamBudgetIsPerValue(t *testing.T) {
 	}
 }
 
+// TestProxyTeamBudgetValueWithColon covers the end-to-end path for a team
+// value containing a colon: it resolves to its header's rule, so the cap
+// applies exactly as it does for a colon-free value.
+func TestProxyTeamBudgetValueWithColon(t *testing.T) {
+	_, mux, back := budgetTestProxy(t, []Budget{
+		{Name: "team-cap", Scope: BudgetScopeTeam, HeaderKey: DefaultTeamHeaderKey, Window: time.Hour, MaxTokens: 100},
+	})
+
+	colon := map[string]string{DefaultTeamHeaderKey: "research:evil"}
+
+	r1 := budgetPost(t, mux, colon)
+	_ = r1.Body.Close()
+	if r1.StatusCode != http.StatusOK {
+		t.Fatalf("first status = %d, want 200", r1.StatusCode)
+	}
+
+	r2 := budgetPost(t, mux, colon)
+	_ = r2.Body.Close()
+	if r2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want 429 (a colon in the team value must not bypass the cap)", r2.StatusCode)
+	}
+
+	if got := back.calls.Load(); got != 1 {
+		t.Errorf("backend calls = %d, want 1 (the exhausted request must not dispatch)", got)
+	}
+}
+
 // TestProxyBudgetUncharged asserts the guard's failure path is visible: a
 // streaming response that reports no token usage is charged zero and counted
 // in RouterBudgetUnchargedTotal, never estimated.

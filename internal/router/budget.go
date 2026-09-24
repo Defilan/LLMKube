@@ -142,15 +142,20 @@ func (s *BudgetStore) ruleFor(sk string) (BudgetRule, bool) {
 }
 
 // teamHeaderKey extracts the header name from a concrete team scope key
-// "team:<headerKey>:<value>". It returns false for any other shape,
-// including the two-segment "team:<x>" form, which only ever matches a rule
-// exactly. Team header values must not contain ":".
+// "team:<headerKey>:<value>". It returns false for the two-segment
+// "team:<x>" form, which only ever matches a rule exactly. A header name
+// cannot contain a colon, so the first colon after the "team:" prefix
+// delimits the name; the value is opaque and may contain colons.
 func teamHeaderKey(sk string) (string, bool) {
-	parts := strings.Split(sk, ":")
-	if len(parts) != 3 || parts[0] != "team" || parts[1] == "" || parts[2] == "" {
+	rest, ok := strings.CutPrefix(sk, "team:")
+	if !ok {
 		return "", false
 	}
-	return parts[1], true
+	hk, value, ok := strings.Cut(rest, ":")
+	if !ok || hk == "" || value == "" {
+		return "", false
+	}
+	return hk, true
 }
 
 // Allowed reports whether all matching budgets have headroom. If any is

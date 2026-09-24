@@ -623,3 +623,23 @@ func TestTeamPrefixSnapshot(t *testing.T) {
 		t.Error("expected the configured team rule to appear at zero usage")
 	}
 }
+
+// TestTeamPrefixValueWithColon pins that a team value containing a colon
+// resolves to its header's rule and is capped like any other value. The key
+// is "team:<headerKey>:<value>" and a header name cannot contain a colon, so
+// the value is opaque.
+func TestTeamPrefixValueWithColon(t *testing.T) {
+	t0 := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	nowFn, _ := nowFn(t0)
+
+	store := NewBudgetStore([]BudgetRule{
+		{Name: "team-cap", ScopeKey: "team:x-llmkube-team", MaxTokens: 200, Window: 1 * time.Hour},
+	}, nowFn)
+
+	colon := "team:x-llmkube-team:research:evil"
+	store.Charge([]string{colon}, 200, 0)
+
+	if ok, _, exhausted := store.Allowed([]string{colon}); ok {
+		t.Fatalf("expected research:evil exhausted, got ok=true (exhausted=%s)", exhausted)
+	}
+}
