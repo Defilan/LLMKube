@@ -121,6 +121,54 @@ func CostUSD(prompt, completion int64, cost *TokenCost) float64 {
 	return float64(prompt)/1e6*cost.PromptUSD + float64(completion)/1e6*cost.CompletionUSD
 }
 
+// InjectStreamUsage rewrites a buffered OpenAI-compatible request body to ask
+// the upstream for a token-usage object on a streamed response. The proxy
+// charges from the provider's own count, so a budgeted stream must request one
+// or it is charged zero. A body that is not a stream is returned unchanged; a
+// body that already asks for usage is unchanged; otherwise stream_options is
+// set to include_usage true, merged into any existing stream_options so
+// sibling fields survive. It reports whether the body changed.
+func InjectStreamUsage(body []byte) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+	var stream bool
+	if err := json.Unmarshal(req["stream"], &stream); err != nil || !stream {
+		return body, false
+	}
+
+	// A stream_options that is not a JSON object (or is null) carries no flag
+	// to preserve, so it is replaced wholesale.
+	opts := map[string]json.RawMessage{}
+	if raw, ok := req["stream_options"]; ok {
+		if err := json.Unmarshal(raw, &opts); err != nil || opts == nil {
+			opts = map[string]json.RawMessage{}
+		}
+	}
+	var alreadyAsking bool
+	if inc, ok := opts["include_usage"]; ok {
+		_ = json.Unmarshal(inc, &alreadyAsking)
+	}
+	if alreadyAsking {
+		return body, false
+	}
+	opts["include_usage"] = json.RawMessage(`true`)
+	mergedOpts, err := json.Marshal(opts)
+	if err != nil {
+		return body, false
+	}
+	req["stream_options"] = json.RawMessage(mergedOpts)
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // looksLikeSSE reports whether a captured response body is an SSE stream
 // rather than a single JSON object. Used to pick the right usage parser. An
 // SSE body carries at least one line beginning with "data:"; a single JSON

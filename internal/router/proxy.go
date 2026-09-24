@@ -245,6 +245,16 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			}
 		}
 
+		// A budgeted stream must ask the upstream for usage, since the charge
+		// is taken from the provider's own count and a stream that reports none
+		// is charged zero. The rewrite is gated on a budget applying to this
+		// request; unbudgeted traffic dispatches untouched.
+		if isStream && len(scopeKeys) > 0 {
+			if injected, changed := InjectStreamUsage(body); changed {
+				body = injected
+			}
+		}
+
 		tracer := otel.Tracer("model_router.dispatch")
 		attrs := []otelattribute.KeyValue{
 			otelattribute.String("routing.classification", features.Classification),

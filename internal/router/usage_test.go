@@ -16,7 +16,10 @@ limitations under the License.
 
 package router
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestUsageTokens(t *testing.T) {
 	tests := []struct {
@@ -160,6 +163,86 @@ func TestLooksLikeSSE(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := looksLikeSSE([]byte(tt.body)); got != tt.want {
 				t.Errorf("looksLikeSSE(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInjectStreamUsage(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantChanged bool
+		// wantContains is asserted present in the rewritten body when changed.
+		wantContains string
+		// wantAbsent is asserted absent whenever non-empty.
+		wantAbsent string
+	}{
+		{
+			name:         "stream without options gets the flag",
+			body:         `{"model":"any","stream":true}`,
+			wantChanged:  true,
+			wantContains: `"include_usage":true`,
+		},
+		{
+			name:        "non-stream is untouched",
+			body:        `{"model":"any"}`,
+			wantChanged: false,
+			wantAbsent:  "include_usage",
+		},
+		{
+			name:        "stream false is untouched",
+			body:        `{"model":"any","stream":false}`,
+			wantChanged: false,
+			wantAbsent:  "include_usage",
+		},
+		{
+			name:         "client stream_options asking false is forced to true",
+			body:         `{"model":"any","stream":true,"stream_options":{"include_usage":false}}`,
+			wantChanged:  true,
+			wantContains: `"include_usage":true`,
+			wantAbsent:   `"include_usage":false`,
+		},
+		{
+			name:         "existing stream_options siblings are preserved",
+			body:         `{"model":"any","stream":true,"stream_options":{"include_usage":false,"foo":"bar"}}`,
+			wantChanged:  true,
+			wantContains: `"foo":"bar"`,
+		},
+		{
+			name:         "existing include_usage true is left unchanged",
+			body:         `{"model":"any","stream":true,"stream_options":{"include_usage":true}}`,
+			wantChanged:  false,
+			wantContains: `"include_usage":true`,
+		},
+		{
+			name:         "non-object stream_options is replaced",
+			body:         `{"model":"any","stream":true,"stream_options":"none"}`,
+			wantChanged:  true,
+			wantContains: `"include_usage":true`,
+		},
+		{
+			name:        "empty body is untouched",
+			body:        "",
+			wantChanged: false,
+		},
+		{
+			name:        "non-json is untouched",
+			body:        `not json`,
+			wantChanged: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, changed := InjectStreamUsage([]byte(tt.body))
+			if changed != tt.wantChanged {
+				t.Fatalf("changed = %v, want %v", changed, tt.wantChanged)
+			}
+			if tt.wantContains != "" && !strings.Contains(string(out), tt.wantContains) {
+				t.Errorf("rewritten body = %q, want it to contain %q", out, tt.wantContains)
+			}
+			if tt.wantAbsent != "" && strings.Contains(string(out), tt.wantAbsent) {
+				t.Errorf("rewritten body = %q, want it to not contain %q", out, tt.wantAbsent)
 			}
 		})
 	}
