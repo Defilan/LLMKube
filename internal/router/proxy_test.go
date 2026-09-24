@@ -1270,3 +1270,26 @@ func TestProxyBudgetUncharged(t *testing.T) {
 		t.Error("RouterBudgetUnchargedTotal not found in registry after a usage-less streaming request")
 	}
 }
+
+// TestProxyBudgetJSONContentMentionsData pins that a non-streaming JSON
+// response is charged even when its content mentions the substring "data:".
+// The SSE-vs-JSON choice keys off a line beginning with "data:", not a
+// substring anywhere in the body.
+func TestProxyBudgetJSONContentMentionsData(t *testing.T) {
+	proxy, mux, back := budgetTestProxy(t, []Budget{
+		{Name: "router-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 1000000},
+	})
+	body := `{"choices":[{"message":{"content":"send data: to the server"}}],"usage":{"prompt_tokens":60,"completion_tokens":40}}`
+	back.body.Store(&body)
+
+	r := budgetPost(t, mux, nil)
+	_ = r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+
+	snap := proxy.budgets.Snapshot()
+	if len(snap) != 1 || snap[0].UsedTokens != 100 {
+		t.Fatalf("snapshot = %+v, want one entry with UsedTokens 100", snap)
+	}
+}

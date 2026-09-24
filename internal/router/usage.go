@@ -31,7 +31,6 @@ than estimated, so a silently under-enforcing budget is visible.
 import (
 	"bytes"
 	"encoding/json"
-	"strings"
 )
 
 // usageEnvelope is the minimal OpenAI-compatible shape we read. Every field
@@ -123,7 +122,14 @@ func CostUSD(prompt, completion int64, cost *TokenCost) float64 {
 }
 
 // looksLikeSSE reports whether a captured response body is an SSE stream
-// rather than a single JSON object. Used to pick the right usage parser.
+// rather than a single JSON object. Used to pick the right usage parser. An
+// SSE body carries at least one line beginning with "data:"; a single JSON
+// object does not, however often its content mentions "data:".
 func looksLikeSSE(body []byte) bool {
-	return strings.Contains(string(body), "data:")
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		if bytes.HasPrefix(bytes.TrimSpace(line), []byte("data:")) {
+			return true
+		}
+	}
+	return false
 }
