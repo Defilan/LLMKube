@@ -89,7 +89,7 @@ const MaxLogTailBytes = 32 * 1024
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds", "federation-chart-crds",
-	"check-reviewer-prompts", ChartCheck, B200HarnessCheck,
+	"check-reviewer-prompts", "check-agents-md", ChartCheck, B200HarnessCheck,
 }
 
 // ChartCheck is the make target that lints and unit-tests the Helm charts.

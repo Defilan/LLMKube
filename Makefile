@@ -98,6 +98,10 @@ sync-reviewer-prompts: ## Sync reviewer.md into spec.systemPrompt of every revie
 check-reviewer-prompts: ## Drift-check: fail if any reviewer Agent's systemPrompt diverges from reviewer.md (#804).
 	@go run ./cmd/sync-reviewer-prompts --check
 
+.PHONY: check-agents-md
+check-agents-md: ## Drift-check: fail if any make target, repo path, or Go version AGENTS.md references no longer resolves.
+	@go run ./cmd/check-agents-md --check
+
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
