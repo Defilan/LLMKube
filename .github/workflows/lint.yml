@@ -38,3 +38,8 @@ jobs:
 
       - name: Check reviewer prompt sync
         run: make check-reviewer-prompts
+
+      - name: Check AGENTS.md references
+        # AGENTS.md is the file agents read first; a make target, path, or Go
+        # version it names that no longer resolves sends them down a dead end.
+        run: make check-agents-md
