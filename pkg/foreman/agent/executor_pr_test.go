@@ -859,7 +859,7 @@ func TestMaybeRefreshPRBody_UpdatesExistingPRWithGroundedBody(t *testing.T) {
 	workspace := t.TempDir()
 
 	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
-		"foreman/wl-x/issue-7", "Revised summary of the amendment.",
+		"foreman/wl-x/issue-7", &Result{Summary: "Revised summary of the amendment."},
 		workspace, "main", nil, "")
 
 	if len(fe.updates) != 1 {
@@ -869,6 +869,55 @@ func TestMaybeRefreshPRBody_UpdatesExistingPRWithGroundedBody(t *testing.T) {
 	if got.owner != "defilantech" || got.repo != "LLMKube" ||
 		got.head != "foreman/wl-x/issue-7" || got.body != "Revised summary of the amendment." {
 		t.Errorf("UpdatePR args wrong: %+v", got)
+	}
+}
+
+// TestMaybeRefreshPRBody_PrefersCoderPRBody is the #1777 fix. A fix cycle
+// that GOes its amendment holds the coder's authored description in its own
+// result, and that description must survive the refresh — not be replaced by
+// the reviewer's one-line summary, which is today's behaviour.
+func TestMaybeRefreshPRBody_PrefersCoderPRBody(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
+	r := &Result{
+		Summary: "APPROVE: the resume logic is minimal and well covered.",
+		Extra:   map[string]any{"modelExtra": map[string]any{"prBody": coderPRDescription}},
+	}
+
+	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
+		"foreman/wl-x/issue-7", r, t.TempDir(), "main", nil, "")
+
+	if len(fe.updates) != 1 {
+		t.Fatalf("want 1 UpdatePR call, got %+v", fe.updates)
+	}
+	body := fe.updates[0].body
+	if !strings.Contains(body, coderPRDescription) {
+		t.Errorf("body must carry the coder's description; got %q", body)
+	}
+	if strings.Contains(body, r.Summary) {
+		t.Errorf("body must NOT carry the reviewer summary when the coder authored one; got %q", body)
+	}
+}
+
+// TestMaybeRefreshPRBody_RefreshesOnCoderBodyWithEmptySummary: a coder body
+// with no reviewer summary must still refresh. The pre-#1777 guard returned
+// early on an empty summary, so this pins the branch that keeps the refresh
+// from being skipped on the iterations that carry a description.
+func TestMaybeRefreshPRBody_RefreshesOnCoderBodyWithEmptySummary(t *testing.T) {
+	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1"}
+	e := &NativeAgentLoopExecutor{PREnsurer: fe}
+	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
+	r := &Result{Extra: map[string]any{"modelExtra": map[string]any{"prBody": coderPRDescription}}}
+
+	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
+		"foreman/wl-x/issue-7", r, t.TempDir(), "main", nil, "")
+
+	if len(fe.updates) != 1 {
+		t.Fatalf("a coder body must refresh even when the summary is empty; got %+v", fe.updates)
+	}
+	if body := fe.updates[0].body; !strings.Contains(body, coderPRDescription) {
+		t.Errorf("body must carry the coder's description; got %q", body)
 	}
 }
 
@@ -893,7 +942,7 @@ func TestMaybeRefreshPRBody_NoPRIssuesNoUpdate(t *testing.T) {
 	workspace := t.TempDir()
 
 	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
-		"foreman/wl-x/issue-7", "Revised summary of the amendment.",
+		"foreman/wl-x/issue-7", &Result{Summary: "Revised summary of the amendment."},
 		workspace, "main", nil, "")
 
 	if len(fe.updates) != 0 {
@@ -901,15 +950,15 @@ func TestMaybeRefreshPRBody_NoPRIssuesNoUpdate(t *testing.T) {
 	}
 }
 
-// TestMaybeRefreshPRBody_SkipsEmptySummary: an empty coder summary leaves the
-// PR untouched rather than blanking it.
+// TestMaybeRefreshPRBody_SkipsEmptySummary: an empty coder summary, with no
+// coder-authored body, leaves the PR untouched rather than blanking it.
 func TestMaybeRefreshPRBody_SkipsEmptySummary(t *testing.T) {
 	fe := &fakePREnsurer{subject: "fix: the thing", url: "https://example/pr/1"}
 	e := &NativeAgentLoopExecutor{PREnsurer: fe}
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
 
 	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
-		"foreman/wl-x/issue-7", "   ", "", "", nil, "")
+		"foreman/wl-x/issue-7", &Result{Summary: "   "}, t.TempDir(), "main", nil, "")
 
 	if len(fe.updates) != 0 {
 		t.Fatalf("empty summary must not PATCH the PR; got %+v", fe.updates)
@@ -922,7 +971,7 @@ func TestMaybeRefreshPRBody_DisabledWhenNoCodeHost(t *testing.T) {
 	e := &NativeAgentLoopExecutor{}
 	task := reviewTaskForPR(foremanv1alpha1.AgenticTaskKindIssueFix, false)
 	e.maybeRefreshPRBody(context.Background(), logr.Discard(), task, nil,
-		"foreman/wl-x/issue-7", "Revised summary.", "", "", nil, "")
+		"foreman/wl-x/issue-7", &Result{Summary: "Revised summary."}, "", "", nil, "")
 }
 
 // TestMaybeOpenPullRequest_DraftFollowsAgent asserts the Agent's
