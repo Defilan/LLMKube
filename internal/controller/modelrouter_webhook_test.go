@@ -257,7 +257,11 @@ func TestModelRouterValidator_ProxyModeSkipsGatewayChecks(t *testing.T) {
 
 	mr := validGatewayRouter()
 	// Proxy mode (the default). The router-proxy honors dollar budgets and
-	// auditLog, so neither is a violation here.
+	// auditLog, so neither is a violation here. A dollar budget needs backend
+	// pricing, which is a Proxy-mode concern, not a gateway check.
+	for i := range mr.Spec.Backends {
+		mr.Spec.Backends[i].CostPerMillionTokens = &inferencev1alpha1.TokenCost{PromptUSD: "0.50"}
+	}
 	mr.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
 	mr.Spec.GatewayRef = nil
 	mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{

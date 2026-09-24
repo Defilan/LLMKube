@@ -12,6 +12,7 @@ package controller
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,7 +55,8 @@ func (e ModelRouterValidationError) String() string {
 //     have failClosed=true AND route only to local-tier backends. This is
 //     the regulated-data gate that prevents sensitive data from egressing.
 //   - Budget specs are well-formed (rule scope references a real rule;
-//     at least one of maxTokens or maxUSD is set).
+//     at least one of maxTokens or maxUSD is set; a maxUSD budget requires
+//     every backend to declare pricing).
 //
 // The function is pure: no K8s API access. The caller transforms the
 // returned errors into a Validated condition on the ModelRouter status.
@@ -299,8 +301,11 @@ func validateRuleSensitiveData(
 }
 
 // validateBudgets covers the BudgetSpec invariants: rule-scoped budgets
-// must reference a real rule, and every budget must set at least one of
-// maxTokens / maxUSD.
+// must reference a real rule, every budget must set at least one of
+// maxTokens / maxUSD, and a maxUSD budget requires every backend to declare
+// pricing. A maxUSD budget is unenforceable unless every backend it can route
+// to declares pricing, so fail loud here rather than admit a budget that
+// charges 0 USD forever.
 func validateBudgets(
 	spec *inferencev1alpha1.ModelRouterSpec,
 	ruleNames map[string]bool,
@@ -309,6 +314,7 @@ func validateBudgets(
 		return nil
 	}
 	var errs []ModelRouterValidationError
+	needsPricing := false
 	for i, b := range spec.Policy.Budgets {
 		path := fmt.Sprintf("spec.policy.budgets[%d]", i)
 		if b.Scope == "rule" {
@@ -331,8 +337,40 @@ func validateBudgets(
 				Message: "must set at least one of maxTokens or maxUSD",
 			})
 		}
+		if strings.TrimSpace(b.MaxUSD) != "" {
+			needsPricing = true
+		}
+	}
+	if needsPricing {
+		for i, b := range spec.Backends {
+			if !pricesTokens(b.CostPerMillionTokens) {
+				errs = append(errs, ModelRouterValidationError{
+					Field: fmt.Sprintf("spec.backends[%d].costPerMillionTokens", i),
+					Message: "required when any budget sets maxUSD; without it that budget " +
+						"charges 0 USD and never blocks",
+				})
+			}
+		}
 	}
 	return errs
+}
+
+// pricesTokens reports whether a backend's declared pricing can charge a
+// nonzero USD amount. A nil cost, or one whose prompt and completion rates
+// both parse to zero, prices every request at zero and cannot feed a maxUSD
+// budget.
+func pricesTokens(c *inferencev1alpha1.TokenCost) bool {
+	if c == nil {
+		return false
+	}
+	return positiveUSD(c.PromptUSD) || positiveUSD(c.CompletionUSD)
+}
+
+// positiveUSD reports whether a validated decimal string parses to a value
+// greater than zero.
+func positiveUSD(s string) bool {
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	return err == nil && f > 0
 }
 
 // sensitiveClassificationSet returns the set of classification values that

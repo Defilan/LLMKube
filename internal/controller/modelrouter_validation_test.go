@@ -305,6 +305,53 @@ func TestValidateModelRouterBudget(t *testing.T) {
 	}
 }
 
+// TestValidateModelRouterBudgetPricing pins that a maxUSD budget requires
+// every backend to declare usable pricing. Without it the budget charges 0
+// USD and never blocks, so the spec must fail loud instead.
+func TestValidateModelRouterBudgetPricing(t *testing.T) {
+	t.Run("unpriced backend rejected", func(t *testing.T) {
+		mr := validRouter()
+		mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{
+			Budgets: []inferencev1alpha1.BudgetSpec{
+				{Name: "usd-cap", Scope: "router", MaxUSD: "1.50"},
+			},
+		}
+		errs := validateModelRouter(mr)
+		if !errsContain(errs, "required when any budget sets maxUSD") {
+			t.Errorf("expected a pricing error, got: %s", formatValidationErrors(errs))
+		}
+	})
+
+	t.Run("all backends priced accepted", func(t *testing.T) {
+		mr := validRouter()
+		for i := range mr.Spec.Backends {
+			mr.Spec.Backends[i].CostPerMillionTokens = &inferencev1alpha1.TokenCost{PromptUSD: "0.50"}
+		}
+		mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{
+			Budgets: []inferencev1alpha1.BudgetSpec{
+				{Name: "usd-cap", Scope: "router", MaxUSD: "1.50"},
+			},
+		}
+		errs := validateModelRouter(mr)
+		if errsContain(errs, "required when any budget sets maxUSD") {
+			t.Errorf("did not expect a pricing error; got: %s", formatValidationErrors(errs))
+		}
+	})
+
+	t.Run("token budget needs no pricing", func(t *testing.T) {
+		mr := validRouter()
+		mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{
+			Budgets: []inferencev1alpha1.BudgetSpec{
+				{Name: "tok-cap", Scope: "router", MaxTokens: ptrInt64Local(1000)},
+			},
+		}
+		errs := validateModelRouter(mr)
+		if errsContain(errs, "required when any budget sets maxUSD") {
+			t.Errorf("did not expect a pricing error for a token-only budget; got: %s", formatValidationErrors(errs))
+		}
+	})
+}
+
 // errsContain reports whether any validation error's serialized form
 // contains the given substring. Helper to keep the tests above readable.
 func errsContain(errs []ModelRouterValidationError, substr string) bool {

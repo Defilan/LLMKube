@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // validConfig is the canonical "everything is fine" fixture used as the
@@ -275,5 +276,50 @@ func TestConfigValidateRejectsUnknownPoolActivation(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Errorf("Validate rejected poolActivation %q: %v", ok, err)
 		}
+	}
+}
+
+// TestConfigValidateBudgets covers the fail-loud validation of compiled
+// budgets, so a hand-edited ConfigMap cannot silently under-enforce.
+func TestConfigValidateBudgets(t *testing.T) {
+	tests := []struct {
+		name string
+		// priced marks the fixture backends as carrying pricing, which a
+		// maxUSD budget requires.
+		priced  bool
+		budget  Budget
+		wantErr string
+	}{
+		{"router ok", false, Budget{Name: "router-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 100}, ""},
+		{"team ok usd priced", true, Budget{Name: "team-cap", Scope: BudgetScopeTeam, Window: time.Hour, MaxUSD: 1.5}, ""},
+		{"rule known ok", false, Budget{Name: "rule-cap", Scope: BudgetScopeRule, RuleName: "pii-stays-local", Window: time.Hour, MaxTokens: 100}, ""},
+		{"missing name", false, Budget{Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 100}, "name is required"},
+		{"bad scope", false, Budget{Name: "b", Scope: "tenant", Window: time.Hour, MaxTokens: 100}, "scope must be"},
+		{"rule without ruleName", false, Budget{Name: "b", Scope: BudgetScopeRule, Window: time.Hour, MaxTokens: 100}, "ruleName is required"},
+		{"rule unknown", false, Budget{Name: "b", Scope: BudgetScopeRule, RuleName: "nope", Window: time.Hour, MaxTokens: 100}, "does not name an existing rule"},
+		{"no cap", false, Budget{Name: "b", Scope: BudgetScopeRouter, Window: time.Hour}, "at least one of"},
+		{"zero window", false, Budget{Name: "b", Scope: BudgetScopeRouter, MaxTokens: 100}, "window must be positive"},
+		{"usd budget unpriced backend", false, Budget{Name: "b", Scope: BudgetScopeRouter, Window: time.Hour, MaxUSD: 1.5}, "costPerMillionTokens is required"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			if tt.priced {
+				for i := range cfg.Backends {
+					cfg.Backends[i].CostPerMillionTokens = &TokenCost{PromptUSD: 0.5}
+				}
+			}
+			cfg.Policy.Budgets = []Budget{tt.budget}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
