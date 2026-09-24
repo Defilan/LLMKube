@@ -148,6 +148,10 @@ func main() {
 	if addr := *metricsListen; !metricsDisabled(addr) {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("GET /metrics", newMetricsHandler())
+		// The budget admin endpoint rides this listener: the operator polls it
+		// to publish ModelRouter.status.budgetUtilization, and the inference
+		// listener stays free of admin surface (#1851).
+		proxy.MountAdmin(metricsMux)
 		metricsSrv = &http.Server{
 			Addr:              addr,
 			Handler:           metricsMux,

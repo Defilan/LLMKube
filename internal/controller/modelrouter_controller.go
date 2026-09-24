@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 
@@ -42,8 +43,9 @@ const (
 	ModelRouterPhaseProvisioning = "Provisioning"
 	ModelRouterPhaseDegraded     = "Degraded"
 
-	ModelRouterConditionValidated     = "Validated"
-	ModelRouterConditionBackendsReady = "BackendsReady"
+	ModelRouterConditionValidated       = "Validated"
+	ModelRouterConditionBackendsReady   = "BackendsReady"
+	ModelRouterConditionBudgetReporting = "BudgetReporting"
 
 	ModelRouterReasonSpecValid          = "SpecValid"
 	ModelRouterReasonSpecInvalid        = "SpecInvalid"
@@ -54,6 +56,8 @@ const (
 	ModelRouterReasonDeploymentReady    = "DeploymentReady"
 	ModelRouterReasonDeploymentNotReady = "DeploymentNotReady"
 	ModelRouterReasonDeploymentDegraded = "DeploymentDegraded"
+	ModelRouterReasonBudgetReported     = "BudgetReported"
+	ModelRouterReasonBudgetUnreachable  = "BudgetUnreachable"
 
 	modelRouterControllerName = "modelrouter"
 )
@@ -78,6 +82,11 @@ type ModelRouterReconciler struct {
 	// the LiteLLM Service URL on every ModelRouter. Empty string
 	// means "no default — the user must specify URL explicitly".
 	DefaultLiteLLMURL string
+
+	// BudgetStatusURL overrides how the reconciler derives the proxy's budget
+	// admin URL from a ModelRouter. Nil means routerProxyBudgetEndpoint, the
+	// in-cluster Service address. Tests inject it to point at a stub proxy.
+	BudgetStatusURL func(*inferencev1alpha1.ModelRouter) string
 }
 
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=modelrouters,verbs=get;list;watch;create;update;patch;delete
@@ -147,7 +156,16 @@ func (r *ModelRouterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, r.recordReconcileFailure(ctx, mr, compiled, "DeploymentReadiness", err)
 	}
 
-	return ctrl.Result{}, r.recordSuccess(ctx, mr, compiled, deployReady, deployMessage)
+	if err := r.recordSuccess(ctx, mr, compiled, deployReady, deployMessage); err != nil {
+		return ctrl.Result{}, err
+	}
+	// The proxy holds the only copy of the rolling-window budget counters, so
+	// a router that declares budgets needs a timer to refresh its status even
+	// when no watched object changes.
+	if routerHasBudgets(mr) {
+		return ctrl.Result{RequeueAfter: modelRouterBudgetPollInterval}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 // recordValidationFailure writes the validated=false branch of the
@@ -245,6 +263,33 @@ func (r *ModelRouterReconciler) recordSuccess(
 	desired.Status.Endpoint = routerProxyEndpoint(mr)
 	desired.Status.ActiveRules = safeInt32(len(mr.Spec.Rules))
 	desired.Status.Backends = compiled.Backends
+
+	// Budget utilization is per-budget state the proxy process holds, so it is
+	// polled rather than derived. A proxy that cannot answer leaves the
+	// previous snapshot in place (desired is a deep copy of the observed
+	// object) and reports why: a status that quietly reads zero is worse than
+	// a stale one.
+	if routerHasBudgets(mr) {
+		pollCtx, cancel := context.WithTimeout(ctx, budgetProbeTimeout)
+		usage, pollErr := probeBudgetUtilization(pollCtx, r.budgetStatusURL(mr))
+		cancel()
+		if pollErr != nil {
+			apimeta.SetStatusCondition(&desired.Status.Conditions, metav1.Condition{
+				Type:    ModelRouterConditionBudgetReporting,
+				Status:  metav1.ConditionFalse,
+				Reason:  ModelRouterReasonBudgetUnreachable,
+				Message: pollErr.Error(),
+			})
+		} else {
+			desired.Status.BudgetUtilization = budgetStatusFromUsage(usage)
+			apimeta.SetStatusCondition(&desired.Status.Conditions, metav1.Condition{
+				Type:    ModelRouterConditionBudgetReporting,
+				Status:  metav1.ConditionTrue,
+				Reason:  ModelRouterReasonBudgetReported,
+				Message: fmt.Sprintf("%d budgets reported", len(desired.Status.BudgetUtilization)),
+			})
+		}
+	}
 
 	apimeta.SetStatusCondition(&desired.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterConditionValidated,
