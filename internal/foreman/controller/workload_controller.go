@@ -63,6 +63,15 @@ type WorkloadReconciler struct {
 	// (as in most tests) disables event emission.
 	Recorder events.EventRecorder
 
+	// APIReader is an uncached reader the reconciler consults to confirm an
+	// apparently-missing planned child before the Dispatched condition
+	// reports it (#1744). A cache-backed List can lag the API right after a
+	// child is created, so a planned ref the cache has not observed yet
+	// would otherwise read as missing. Optional: nil (as in tests that
+	// construct the reconciler directly) skips the confirmation and keeps
+	// the cached behaviour.
+	APIReader client.Reader
+
 	// AllowCloudProviders is the operator-level sovereignty kill
 	// switch. True (default) lets reviewer Agents with
 	// spec.provider="cloud-proxy" dispatch (subject to per-Workload
@@ -204,6 +213,10 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		// that are genuinely gone, computed before that filtering (#1743).
 		var missingPlanned []string
 		children, missingPlanned = observeChildren(&workload, children)
+		// observeChildren flags a planned ref the cache has not observed
+		// yet; confirm genuine absence against the API before reporting it
+		// (#1744). No-op without an APIReader.
+		missingPlanned = r.confirmMissing(ctx, &workload, missingPlanned)
 
 		// Second-pass emission (#546): escalation reviewers fire here,
 		// after base reviewer verdicts land, before status rollup.
@@ -682,6 +695,36 @@ func missingPlannedTasks(planned []corev1.ObjectReference, children []foremanv1a
 	}
 	sort.Strings(missing)
 	return missing
+}
+
+// confirmMissing drops planned-child refs that the cache has not observed
+// yet but that still exist in the API (#1744). observeChildren flags a
+// planned ref absent from the cache-backed List, which is wrong during
+// informer lag right after a child is created, so the reconciler would
+// report ChildrenMissing for a child that is healthy.
+//
+// The confirmation runs only on the shortfall path, so it costs one Get per
+// suspected-absent child and nothing in steady state. A nil APIReader skips
+// it and returns the suspects unchanged. A ref is kept only on NotFound:
+// any other error means the reader could not prove absence, and a
+// diagnostic condition that fires because the API hiccuped is exactly the
+// cry-wolf this report exists to avoid.
+func (r *WorkloadReconciler) confirmMissing(
+	ctx context.Context, w *foremanv1alpha1.Workload, suspects []string,
+) []string {
+	if len(suspects) == 0 || r.APIReader == nil {
+		return suspects
+	}
+	confirmed := make([]string, 0, len(suspects))
+	for _, name := range suspects {
+		var task foremanv1alpha1.AgenticTask
+		err := r.APIReader.Get(ctx,
+			types.NamespacedName{Namespace: w.Namespace, Name: name}, &task)
+		if apierrors.IsNotFound(err) {
+			confirmed = append(confirmed, name)
+		}
+	}
+	return confirmed
 }
 
 // observeChildren turns one observation of a Workload's children into the

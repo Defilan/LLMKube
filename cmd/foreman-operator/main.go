@@ -148,6 +148,7 @@ func main() {
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		Recorder:            mgr.GetEventRecorder("workload-controller"),
+		APIReader:           mgr.GetAPIReader(),
 		AllowCloudProviders: allowCloudProviders,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Workload")
