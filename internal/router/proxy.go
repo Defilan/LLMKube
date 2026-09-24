@@ -40,6 +40,10 @@ type Proxy struct {
 	routerName string
 	activator  *Activator
 	budgets    *BudgetStore
+	// hasUSDBudget is set when any configured budget carries a dollar cap.
+	// It gates the residual no_pricing counter for a request served by an
+	// unpriced backend, a config that bypassed validation.
+	hasUSDBudget bool
 }
 
 // ProxyOption customizes a Proxy at construction time. The proxy
@@ -87,6 +91,12 @@ func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 		logger:     logger,
 		routerName: "default",
 		budgets:    NewBudgetStore(compileBudgetRules(cfg.Policy.Budgets), time.Now),
+	}
+	for _, b := range cfg.Policy.Budgets {
+		if b.MaxUSD > 0 {
+			p.hasUSDBudget = true
+			break
+		}
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -319,6 +329,12 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		// would silently diverge from the provider's own count.
 		ba := budgetAudit{}
 		if len(scopeKeys) > 0 {
+			// An unpriced backend can never charge USD, so a dollar budget it
+			// serves is a no-op. Validation rejects that pairing; counting it
+			// here keeps a config that bypassed validation visible.
+			if p.hasUSDBudget && !chosen.pricesTokens() {
+				prommetrics.RouterBudgetUnchargedTotal.WithLabelValues(p.routerName, "no_pricing").Inc()
+			}
 			prompt, completion, usageOK := parseUsage(captured.Bytes(), streamed)
 			if usageOK {
 				usd := CostUSD(prompt, completion, chosen.CostPerMillionTokens)

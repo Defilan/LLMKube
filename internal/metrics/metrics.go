@@ -190,12 +190,14 @@ var (
 	)
 
 	// RouterBudgetUnchargedTotal counts requests that could not be charged
-	// against a budget because the upstream reported no token usage. A
-	// non-zero rate means budgets are under-enforcing for that traffic class.
+	// against a budget: reason no_usage when the upstream reported no token
+	// usage, reason no_pricing when a dollar budget was in scope but the
+	// serving backend declared no pricing. A non-zero rate means budgets are
+	// under-enforcing for that traffic class.
 	RouterBudgetUnchargedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "llmkube_router_budget_uncharged_total",
-			Help: "Requests not charged against a budget because usage was unavailable.",
+			Help: "Requests not charged against a budget because usage was unavailable or the backend was unpriced.",
 		},
 		[]string{labelRouter, "reason"},
 	)

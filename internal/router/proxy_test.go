@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
@@ -1291,5 +1292,43 @@ func TestProxyBudgetJSONContentMentionsData(t *testing.T) {
 	snap := proxy.budgets.Snapshot()
 	if len(snap) != 1 || snap[0].UsedTokens != 100 {
 		t.Fatalf("snapshot = %+v, want one entry with UsedTokens 100", snap)
+	}
+}
+
+// TestProxyBudgetUnpricedBackendCounted pins the residual visibility for a
+// config that reached the proxy without validation: a dollar budget served by
+// an unpriced backend ties no USD to it and is counted under
+// RouterBudgetUnchargedTotal{reason="no_pricing"}.
+func TestProxyBudgetUnpricedBackendCounted(t *testing.T) {
+	back := newFakeBackend(t)
+	usageBody := `{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":60,"completion_tokens":40}}`
+	back.body.Store(&usageBody)
+
+	// Constructed directly, bypassing Config.Validate, which rejects a maxUSD
+	// budget over an unpriced backend.
+	cfg := &Config{
+		Backends:     []Backend{{Name: "local-qwen", Tier: "local", Address: back.URL()}},
+		Rules:        []Rule{{Name: "all", Route: RuleRoute{Backends: []string{"local-qwen"}}}},
+		DefaultRoute: "local-qwen",
+		Policy: Policy{
+			Classification: ClassificationPolicy{Mode: "header-only"},
+			Budgets:        []Budget{{Name: "usd-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxUSD: 1.5}},
+		},
+	}
+	proxy := NewProxy(cfg, slog.Default())
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+
+	before := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_pricing"))
+
+	r := budgetPost(t, mux, nil)
+	_ = r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+
+	after := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_pricing"))
+	if after != before+1 {
+		t.Errorf("no_pricing counter = %v, want %v", after, before+1)
 	}
 }

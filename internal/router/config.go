@@ -396,9 +396,14 @@ func (c *Config) Validate() error {
 				i, r.Name, r.Route.PoolActivation, PoolActivationWait, PoolActivationIfIdle)
 		}
 	}
-	// Budget validation mirrors the controller's validateBudgets so a
-	// hand-edited ConfigMap fails loudly here rather than silently
-	// under-enforcing at request time.
+	return c.validateBudgets(ruleNames)
+}
+
+// validateBudgets mirrors the controller's validateBudgets so a hand-edited
+// ConfigMap fails loudly here rather than silently under-enforcing at request
+// time. A maxUSD budget also requires every backend to declare usable pricing,
+// because an unpriced backend charges 0 USD and would never trip the cap.
+func (c *Config) validateBudgets(ruleNames map[string]bool) error {
 	budgetNames := make(map[string]bool, len(c.Policy.Budgets))
 	for i, b := range c.Policy.Budgets {
 		if b.Name == "" {
@@ -428,8 +433,25 @@ func (c *Config) Validate() error {
 		if b.MaxTokens <= 0 && b.MaxUSD <= 0 {
 			return fmt.Errorf("policy.budgets[%d] %s: must set at least one of maxTokens or maxUSD", i, b.Name)
 		}
+		if b.MaxUSD > 0 {
+			for j := range c.Backends {
+				if !c.Backends[j].pricesTokens() {
+					return fmt.Errorf("backends[%d] %s: costPerMillionTokens is required when any budget sets maxUSD",
+						j, c.Backends[j].Name)
+				}
+			}
+		}
 	}
 	return nil
+}
+
+// pricesTokens reports whether this backend's declared pricing can charge a
+// nonzero USD amount. A nil cost, or one whose prompt and completion rates
+// are both zero, prices every request at zero and cannot feed a maxUSD
+// budget.
+func (b *Backend) pricesTokens() bool {
+	return b.CostPerMillionTokens != nil &&
+		(b.CostPerMillionTokens.PromptUSD > 0 || b.CostPerMillionTokens.CompletionUSD > 0)
 }
 
 // BackendByName returns the backend with the given name, or nil. The

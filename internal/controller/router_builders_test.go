@@ -779,9 +779,13 @@ func TestCompileRouterConfigCopiesBudgetsAndCost(t *testing.T) {
 		{Name: "team-cap", Scope: "team", HeaderKey: "x-llmkube-team", WindowSeconds: 600, MaxUSD: "1.50"},
 		{Name: "rule-cap", Scope: "rule", RuleName: "pii-stays-local", WindowSeconds: 3600, MaxTokens: &maxTokens},
 	}
-	mr.Spec.Backends[0].CostPerMillionTokens = &inferencev1alpha1.TokenCost{
-		PromptUSD:     "0.50",
-		CompletionUSD: "1.50",
+	// Every backend needs pricing: the team-cap budget sets maxUSD, and a
+	// dollar budget requires pricing on every backend.
+	for i := range mr.Spec.Backends {
+		mr.Spec.Backends[i].CostPerMillionTokens = &inferencev1alpha1.TokenCost{
+			PromptUSD:     "0.50",
+			CompletionUSD: "1.50",
+		}
 	}
 
 	isvc := &inferencev1alpha1.InferenceService{
