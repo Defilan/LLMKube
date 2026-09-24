@@ -43,6 +43,11 @@ type fakeBackend struct {
 	stream    atomic.Bool
 	lastModel atomic.Pointer[string] // "model" field of the last received body
 	lastPath  atomic.Pointer[string] // request path of the last received request
+	lastBody  atomic.Pointer[string] // raw body of the last received request
+	// honorUsage makes the SSE response emit a usage chunk when the request
+	// asks for one via stream_options.include_usage. Off by default, so the
+	// streaming backend models an older server that ignores the option.
+	honorUsage atomic.Bool
 }
 
 // LastPath returns the request path of the most recent request this backend
@@ -63,6 +68,15 @@ func (fb *fakeBackend) LastModel() string {
 	return ""
 }
 
+// LastBody returns the raw body of the most recent request this backend
+// received, or "" if it has not been called.
+func (fb *fakeBackend) LastBody() string {
+	if p := fb.lastBody.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 func newFakeBackend(t *testing.T) *fakeBackend {
 	t.Helper()
 	fb := &fakeBackend{}
@@ -73,7 +87,10 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 	fb.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fb.calls.Add(1)
 		fb.lastPath.Store(&r.URL.Path)
-		if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
+		raw, _ := io.ReadAll(r.Body)
+		if len(raw) > 0 {
+			body := string(raw)
+			fb.lastBody.Store(&body)
 			var m struct {
 				Model string `json:"model"`
 			}
@@ -94,6 +111,9 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 					flusher.Flush()
 				}
 				time.Sleep(2 * time.Millisecond)
+			}
+			if fb.honorUsage.Load() && strings.Contains(string(raw), `"include_usage":true`) {
+				_, _ = fmt.Fprintln(w, `data: {"usage":{"prompt_tokens":60,"completion_tokens":40}}`)
 			}
 			_, _ = fmt.Fprintln(w, "data: [DONE]")
 			if flusher != nil {
@@ -1117,6 +1137,23 @@ func budgetPost(t *testing.T, mux http.Handler, headers map[string]string) *http
 	return rec.Result()
 }
 
+// budgetStreamPost posts a streamed completion request through a real server,
+// so the response is chunked and the proxy's captured-tail usage path is
+// exercised rather than a ResponseRecorder's.
+func budgetStreamPost(t *testing.T, mux http.Handler) *http.Response {
+	t.Helper()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"any","stream":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("streaming request: %v", err)
+	}
+	return resp
+}
+
 // registryHas reports whether the controller-runtime registry currently
 // holds a metric family whose descriptor contains name.
 func registryHas(name string) bool {
@@ -1269,6 +1306,73 @@ func TestProxyBudgetUncharged(t *testing.T) {
 	}
 	if !registryHas("llmkube_router_budget_uncharged_total") {
 		t.Error("RouterBudgetUnchargedTotal not found in registry after a usage-less streaming request")
+	}
+}
+
+// TestProxyStreamingBudgetInjectsIncludeUsage pins that a budgeted stream
+// reaches the upstream asking for a usage object, and that unbudgeted traffic
+// dispatches untouched. The injection is the whole point of #1852: the proxy
+// cannot charge a stream the provider reports no usage for.
+func TestProxyStreamingBudgetInjectsIncludeUsage(t *testing.T) {
+	_, mux, back := budgetTestProxy(t, []Budget{
+		{Name: "router-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 1000000},
+	})
+	back.stream.Store(true)
+
+	resp := budgetStreamPost(t, mux)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := back.LastBody(); !strings.Contains(got, `"include_usage":true`) {
+		t.Errorf("upstream body = %q, want it to carry stream_options.include_usage", got)
+	}
+}
+
+// TestProxyStreamingUnbudgetedDoesNotInject is the guard on the gate: with no
+// budget applying, the request body must reach the upstream unmodified.
+func TestProxyStreamingUnbudgetedDoesNotInject(t *testing.T) {
+	_, mux, back := budgetTestProxy(t, nil)
+	back.stream.Store(true)
+
+	resp := budgetStreamPost(t, mux)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := back.LastBody(); strings.Contains(got, "include_usage") {
+		t.Errorf("upstream body = %q, want no stream_options injection for unbudgeted traffic", got)
+	}
+}
+
+// TestProxyStreamingBudgetChargedWhenUpstreamHonorsUsage is the positive case
+// for #1852: once the proxy asks, a compliant upstream reports usage and the
+// request is charged a non-zero amount, with the uncharged counter left alone.
+func TestProxyStreamingBudgetChargedWhenUpstreamHonorsUsage(t *testing.T) {
+	proxy, mux, back := budgetTestProxy(t, []Budget{
+		{Name: "router-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 1000000},
+	})
+	back.stream.Store(true)
+	back.honorUsage.Store(true)
+
+	before := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_usage"))
+
+	resp := budgetStreamPost(t, mux)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	snap := proxy.budgets.Snapshot()
+	if len(snap) != 1 || snap[0].UsedTokens != 100 {
+		t.Fatalf("snapshot = %+v, want one entry with UsedTokens 100 (a budgeted stream the upstream reports usage for must be charged)", snap)
+	}
+	after := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_usage"))
+	if after != before {
+		t.Errorf("no_usage counter = %v, want unchanged at %v", after, before)
 	}
 }
 

@@ -121,6 +121,34 @@ func CostUSD(prompt, completion int64, cost *TokenCost) float64 {
 	return float64(prompt)/1e6*cost.PromptUSD + float64(completion)/1e6*cost.CompletionUSD
 }
 
+// InjectStreamUsage rewrites a buffered OpenAI-compatible request body to ask
+// the upstream for a token-usage object on a streamed response. The proxy
+// charges from the provider's own count, so a budgeted stream must request one
+// or it is charged zero; a body that is not a stream, or that already carries
+// stream_options, is returned unchanged. It reports whether the body changed.
+func InjectStreamUsage(body []byte) ([]byte, bool) {
+	if len(body) == 0 {
+		return body, false
+	}
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+	var stream bool
+	if err := json.Unmarshal(req["stream"], &stream); err != nil || !stream {
+		return body, false
+	}
+	if _, ok := req["stream_options"]; ok {
+		return body, false
+	}
+	req["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // looksLikeSSE reports whether a captured response body is an SSE stream
 // rather than a single JSON object. Used to pick the right usage parser. An
 // SSE body carries at least one line beginning with "data:"; a single JSON
