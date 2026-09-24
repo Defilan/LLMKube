@@ -1,56 +1,80 @@
 # AGENTS.md
 
 LLMKube is a Kubernetes operator that deploys and manages local LLM inference
-workloads. Go 1.25, built with controller-runtime / Kubebuilder. This file tells
-coding agents how to work in this repo. Humans: see `CONTRIBUTING.md`.
+workloads. Go 1.26, built with controller-runtime / Kubebuilder.
+
+This file is the source of truth for the engineering conventions that agents and
+contributors share. The human onboarding narrative lives in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Contents
+
+- [Setup](#setup)
+- [Commands](#commands)
+- [Definition of done](#definition-of-done)
+- [Code style](#code-style)
+- [Testing](#testing)
+- [Commits](#commits)
+- [Branches and pull requests](#branches-and-pull-requests)
+- [Project layout](#project-layout)
+- [Runtime-arg parity](#runtime-arg-parity)
+- [Security-sensitive invariants](#security-sensitive-invariants)
+- [Do not](#do-not)
 
 ## Setup
 
-- Go 1.25+ (pinned in `go.mod`).
-- `make test` downloads envtest binaries on first run; no cluster needed for unit tests.
+- Go 1.26+ (pinned in `go.mod`).
+- `make test` downloads envtest binaries on first run; no cluster needed for
+  unit tests.
+- `make test-chart` needs `helm` and the `helm-unittest` plugin.
 - `make test-e2e` requires Docker and Kind.
 
 ## Commands
 
-| Task                              | Command          |
-|-----------------------------------|------------------|
-| Build the controller              | `make build`     |
-| Build the `llmkube` CLI           | `make build-cli` |
-| Unit tests (envtest)              | `make test`      |
-| E2E tests (needs Kind)            | `make test-e2e`  |
-| Format                            | `make fmt`       |
-| Vet                               | `make vet`       |
-| Lint (golangci-lint)              | `make lint`      |
-| Regenerate CRDs / RBAC / webhooks | `make manifests` |
-| Regenerate DeepCopy methods       | `make generate`  |
+| Task                                | Command                 |
+|-------------------------------------|-------------------------|
+| Build the controller                | `make build`            |
+| Build the `llmkube` CLI             | `make build-cli`        |
+| Build the router-proxy              | `make build-router-proxy` |
+| Build the metal-agent               | `make build-metal-agent`  |
+| Unit tests (envtest, all packages)  | `make test`             |
+| envtest suites only (fixed seed)    | `make test-envtest`     |
+| Helm chart lint + unit tests        | `make test-chart`       |
+| E2E tests (needs Kind)              | `make test-e2e`         |
+| Format                              | `make fmt`              |
+| Vet                                 | `make vet`              |
+| Lint (golangci-lint)                | `make lint`             |
+| Lint under every `GOOS`             | `make lint-all`         |
+| Dead-production-code guard          | `make lint-deadcode`    |
+| Validate samples against CRD schema | `make validate-samples` |
+| Regenerate CRDs / RBAC / webhooks   | `make manifests`        |
+| Regenerate DeepCopy methods         | `make generate`         |
+| Regenerate CRDs into the Helm chart | `make chart-crds`       |
+| Check AGENTS.md references resolve  | `make check-agents-md`  |
 
-## Before you commit
+## Definition of done
 
-A change is not done until all of these pass:
+A change is not done until all of these hold.
 
-1. `make fmt`
-2. `make vet`
-3. `make lint`
-4. `make test`
-
-## Before pushing a PR
-
-Run the cross-arch lint pass:
-
-```sh
-make lint-all
-```
-
-This catches `//go:build`-tagged files that the host's default `GOOS` would
-silently skip. About 2× slower than `make lint`; intentional opt-in so the
-inner loop stays fast.
-
-If you edited CRD types in `api/v1alpha1/`, also run:
-
-5. `make generate` — DeepCopy methods
-6. `make chart-crds` — regenerates CRDs and syncs them into the Helm chart
-7. `git status` must be clean afterward. Uncommitted generated files mean a
-   step was skipped, and the CI CRD sync check will fail.
+1. The pre-commit gate passes: `make fmt`, `make vet`, `make lint`, `make test`.
+2. The pre-push gate passes: `make lint-all`. If `charts/` changed, run
+   `make test-chart`. If CRD types in `api/v1alpha1/` changed, run
+   `make generate` and `make chart-crds`, then `git status` must be clean.
+   Uncommitted generated files mean a step was skipped, and the CI CRD sync
+   check will fail.
+3. Every behavior change has a test that fails without it. Before adding an
+   assertion, name the production edit that would make it fail. If you cannot,
+   the assertion does not bite. Paste the failure you saw, not a paraphrase.
+4. The tests assert on side effects, not return values. A controller test must
+   check the world changed the way the spec requires (an object exists, a file
+   is on disk, a condition carries the cause), not merely that the code
+   returned what it returns. Issue #374 is the canonical case.
+5. You can name every consumer of anything you touched (a resource, an
+   endpoint, a port, a wire payload, a command-line contract) and what must stay
+   true for it. A change that fixes one path while silently breaking a consumer
+   is not done.
+6. The PR description matches the code. No claim in it that a test or the diff
+   does not back.
 
 ## Code style
 
@@ -68,10 +92,15 @@ If you edited CRD types in `api/v1alpha1/`, also run:
 - Every behavior change needs a test. A bug fix gets a regression test that
   fails before the fix and passes after.
 - Unit tests use `envtest` (controller-runtime); they run with `make test` and
-  need no live cluster.
+  need no live cluster. For the blessed envtest patterns and the common traps,
+  see `docs/contributing/envtest-guide.md`.
 - Assert observable behavior, not internal implementation detail.
 - Do not weaken or delete a test to make a change pass. If a test is genuinely
   wrong, fix it and say why.
+- Do not test a contract against a double built from the consumer's own type. A
+  stub that constructs its payload with the same type the code decodes pins
+  nothing: a rename of a wire field leaves it green. Feed the real producer's
+  bytes, or assert both sides of the contract.
 
 ## Commits
 
@@ -96,49 +125,63 @@ Use `feat!:` / `fix!:` for breaking changes.
 - Subject says *what* changed; body says *why*. No implementation play-by-play.
 - Keep commit messages free of attribution trailers (`Co-Authored-By`,
   `AI-Agent`, `Assisted-by`, etc.). Disclose AI assistance in the PR
-  description instead, per [CONTRIBUTING.md](CONTRIBUTING.md) ("AI-Assisted and
-  Agent Contributions").
+  description instead, per `CONTRIBUTING.md` ("AI-Assisted and Agent
+  Contributions").
 - One logical change per commit.
 
 ## Branches and pull requests
 
 - Contributions go through fork-based PRs. Branch from an up-to-date `main`.
-- Branch names: `feat/<slug>`, `fix/<slug>`, `chore/<slug>`.
+- Branch names: `feat/<slug>`, `fix/<slug>`, `docs/<slug>`, `refactor/<slug>`,
+  `chore/<slug>`.
 - PRs follow `.github/PULL_REQUEST_TEMPLATE.md` (What / Why / How / Checklist)
   and reference the issue with `Fixes #N`.
 - Do not push to `main`. Do not force-push shared branches.
 
 ## Project layout
 
-| Path                   | Contents                                        |
-|------------------------|-------------------------------------------------|
-| `cmd/`                 | Entry points (controller, metal-agent)          |
-| `internal/controller/` | Model + InferenceService reconcilers            |
-| `internal/metrics/`    | Prometheus metrics                              |
-| `pkg/cli/`             | Cobra CLI commands                              |
-| `api/v1alpha1/`        | CRD type definitions (regenerate after editing) |
-| `charts/llmkube/`      | Helm chart (CRDs synced via `make chart-crds`)  |
-| `config/`              | Kustomize bases                                 |
+| Path                    | Contents                                          |
+|-------------------------|---------------------------------------------------|
+| `cmd/`                  | Entry points (controller, router-proxy, metal-agent, foreman, CLI) |
+| `internal/controller/`  | Model, InferenceService, ModelPool, ModelRouter reconcilers |
+| `internal/metrics/`     | Prometheus metrics                                |
+| `internal/foreman/`     | Foreman controllers                               |
+| `pkg/agent/`            | Metal-agent process executor and arg builders     |
+| `pkg/foreman/`          | Foreman agent core (gates, tools, review)         |
+| `pkg/cli/`              | Cobra CLI commands                                |
+| `api/v1alpha1/`         | Core CRD types (regenerate after editing)         |
+| `api/foreman/`          | Foreman CRD types                                 |
+| `api/federation/`       | Federation CRD types                              |
+| `charts/llmkube/`       | Helm chart (CRDs synced via `make chart-crds`)    |
+| `charts/foreman/`       | Foreman Helm chart                                |
+| `config/`               | Kustomize bases                                   |
+| `catalog/`              | Model catalog definitions                         |
+| `deployment/`           | Deployment manifests and Ansible                 |
+| `terraform/`            | Terraform modules                                 |
+| `examples/`             | Sample manifests                                  |
+| `hack/`                | Boilerplate and helper scripts                    |
+| `scripts/`              | CI helper and validation scripts                  |
 
-The two CRDs are **Model** (a model spec) and **InferenceService** (a
-deployment config).
+The core API group (`api/v1alpha1/`) holds the inference CRDs (Model,
+InferenceService, ModelPool, ModelRouter, and the rest). Foreman and federation
+are separate API groups under their own directories.
 
 ## Runtime-arg parity
 
 Any new `InferenceServiceSpec` field that changes the llama-server command
 line must be wired into **all three** of these places, with a test for each:
 
-1. `LlamaCppBackend.BuildArgs` —
+1. `LlamaCppBackend.BuildArgs`:
    `internal/controller/runtime_llamacpp.go` (and the helper in
    `runtime_llamacpp_args.go`). This is the controller-side arg builder that
    renders the args for the in-cluster container.
 2. The metal-agent path:
-   `MetalAgent.ensureProcess` → `buildExecutorConfig` (in
-   `pkg/agent/agent.go`) → `MetalExecutor.StartProcess` /
+   `MetalAgent.ensureProcess` -> `buildExecutorConfig` (in
+   `pkg/agent/agent.go`) -> `MetalExecutor.StartProcess` /
    `buildLlamaServerArgs` (in `pkg/agent/executor.go`). The metal-agent is
    the out-of-cluster sibling that runs llama-server natively on Apple
    Silicon hosts; its flags must match the controller's.
-3. `computeSpecHash` (in `pkg/agent/agent.go`) — any field that changes the
+3. `computeSpecHash` (in `pkg/agent/agent.go`): any field that changes the
    command line must also be folded into the spec hash so a change triggers
    a respawn instead of a no-op.
 
@@ -148,30 +191,47 @@ explaining that it mirrors the other side, and add a single table-driven
 Go test that feeds one representative `InferenceService` spec (with the
 runtime-affecting fields set) through **both** `LlamaCppBackend.BuildArgs`
 and the metal-agent's `buildLlamaServerArgs`, asserting the same flags
-appear on both sides for each field. This is the parity guard — it
-catches drift the moment someone wires a field into one side and forgets
-the other.
+appear on both sides for each field. This is the parity guard; it catches
+drift the moment someone wires a field into one side and forgets the other.
 
 Do **not** refactor the two arg builders into one shared function; they
 serve different runtimes and have different defaults. The parity test is
 the contract, not shared code.
 
+## Security-sensitive invariants
+
+- **Enforcement code is adversarial.** Anything between a client request and a
+  decision (a charge, an allow, a route) is driven by input the client
+  controls. For every guard, fallback, default, or early return, name the input
+  that reaches it and whether a client controls it. A guard whose fallback a
+  client can trigger needs a test at the request path, not only a unit case for
+  the helper.
+- **Contracts that cross a process boundary are duplicated.** The router
+  proxy's budget wire tags and the operator's decoder are one pair; the three
+  runtime-arg sites above are another. Test them with the real producer's
+  bytes or type, never with a double built from the consumer side.
+- **A ClusterIP is not a network boundary.** Any new Service port, endpoint, or
+  admin surface is reachable by every pod in the cluster once it exists. State
+  the default posture in the change, and scope it (NetworkPolicy, an internal
+  Service, auth) or say why not.
+- **A privileged syscall in a container needs runtime reasoning, not just a
+  rendered-spec test.** Do not run an init/main container that performs a
+  privileged syscall (`chown`, `chmod` of an unowned file, `mount`, etc.)
+  non-root with `capabilities.add` when the syscall runs in an exec'd child
+  (`command: ["sh", "-c", "chown ..."]`). A non-root process loses its
+  capabilities across `execve` unless the runtime sets ambient capabilities,
+  which is runtime-dependent (it works on kind but not on every cluster, so
+  envtest and CI will pass while real users hit `EPERM`). Either run the
+  container as root (uid 0, still `Drop: [ALL]` + the minimal caps + no
+  privilege escalation), or do the syscall directly in the container's
+  entrypoint (a small helper binary) so the caps are not cleared. This caused
+  the 0.8.20 `model-cache-prep` regression (#887).
+
 ## Do not
 
 - Do not hand-edit generated files (`zz_generated.*`, CRD YAML under `config/`
   and `charts/`). Change the source and regenerate.
+- Do not edit `.claude/worktrees/` or `bin/`; they are local checkout and build
+  artifacts, not source.
 - Do not commit secrets, kubeconfigs, or `.env` files.
 - Do not skip the pre-commit checks or the CRD sync step.
-- Do not run an init/main container that performs a privileged syscall (`chown`,
-  `chmod` of an unowned file, `mount`, etc.) non-root with `capabilities.add`
-  when the syscall runs in an exec'd child (`command: ["sh", "-c", "chown ..."]`).
-  A non-root process loses its capabilities across `execve` unless the runtime
-  sets ambient capabilities, which is runtime-dependent (it works on kind but
-  not on every cluster, so envtest and CI will pass while real users hit
-  `EPERM`). Either run the container as root (uid 0, still `Drop: [ALL]` + the
-  minimal caps + no privilege escalation), or do the syscall directly in the
-  container's entrypoint (a small helper binary) so the caps are not cleared.
-  This caused the 0.8.20 `model-cache-prep` regression (#887). Any change to an
-  init/main container `securityContext`, `command`, `image`, or user that affects
-  a privileged syscall must be reasoned about at the runtime level, not just by
-  the rendered-spec envtest.
