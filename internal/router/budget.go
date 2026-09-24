@@ -49,27 +49,29 @@ type BudgetRule struct {
 }
 
 // BudgetUsage reports per-budget used/utilization for status/metrics surfaces.
+// The json tags are the wire contract the router-proxy admin endpoint serves
+// and the operator's status poller reads.
 type BudgetUsage struct {
 	// Name is the budget identifier.
-	Name string
+	Name string `json:"name"`
 
 	// ScopeKey is the scope this budget applies to.
-	ScopeKey string
+	ScopeKey string `json:"scopeKey"`
 
 	// UsedTokens is the total tokens consumed in the current window.
-	UsedTokens int64
+	UsedTokens int64 `json:"usedTokens"`
 
 	// UsedUSD is the total cost consumed in the current window.
-	UsedUSD float64
+	UsedUSD float64 `json:"usedUSD"`
 
 	// MaxTokens is the token cap (0 if no token cap).
-	MaxTokens int64
+	MaxTokens int64 `json:"maxTokens"`
 
 	// MaxUSD is the USD cap (0 if no USD cap).
-	MaxUSD float64
+	MaxUSD float64 `json:"maxUSD"`
 
 	// Window is the rolling window duration.
-	Window time.Duration
+	Window time.Duration `json:"windowNanos"`
 }
 
 // BudgetStore is an in-memory rolling-window budget accounting engine.

@@ -927,8 +927,20 @@ func TestRouterServiceBuilder(t *testing.T) {
 	if svc.Spec.Type != corev1.ServiceTypeClusterIP {
 		t.Errorf("default type = %v, want ClusterIP", svc.Spec.Type)
 	}
-	if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 8080 {
-		t.Errorf("ports = %+v", svc.Spec.Ports)
+	// Two ports: the inference listener (http, 8080) plus the admin listener
+	// (admin, 9090) the reconciler polls for budget utilization (#1851).
+	if len(svc.Spec.Ports) != 2 {
+		t.Fatalf("ports = %+v, want http and admin", svc.Spec.Ports)
+	}
+	gotPorts := map[string]int32{}
+	for _, p := range svc.Spec.Ports {
+		gotPorts[p.Name] = p.Port
+	}
+	if gotPorts["http"] != routerProxyPort {
+		t.Errorf("http port = %d, want %d", gotPorts["http"], routerProxyPort)
+	}
+	if gotPorts["admin"] != routerProxyMetricsPort {
+		t.Errorf("admin port = %d, want %d", gotPorts["admin"], routerProxyMetricsPort)
 	}
 	if got := svc.Spec.Selector["inference.llmkube.dev/model-router"]; got != mr.Name {
 		t.Errorf("selector label = %q, want %q", got, mr.Name)
@@ -953,6 +965,17 @@ func TestRouterProxyEndpointURL(t *testing.T) {
 	mr.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: 9090, Path: "/v1/completions"}
 	if got := routerProxyEndpoint(mr); !strings.HasSuffix(got, ":9090/v1/completions") {
 		t.Errorf("override endpoint = %q", got)
+	}
+}
+
+// TestRouterProxyBudgetEndpointURL pins the admin URL the reconciler polls for
+// status.budgetUtilization: the metrics port, not the inference port, and off
+// the cluster Service DNS name.
+func TestRouterProxyBudgetEndpointURL(t *testing.T) {
+	mr := canonicalModelRouter()
+	want := "http://coding-router-router-proxy." + testBuilderNs + ".svc.cluster.local:9090/admin/budgets"
+	if got := routerProxyBudgetEndpoint(mr); got != want {
+		t.Errorf("budget endpoint = %q, want %q", got, want)
 	}
 }
 

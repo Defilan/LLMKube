@@ -91,6 +91,17 @@ func newRouterService(mr *inferencev1alpha1.ModelRouter) *corev1.Service {
 					TargetPort: intstr.FromInt(int(port)),
 					Protocol:   corev1.ProtocolTCP,
 				},
+				{
+					// The proxy's metrics listener also serves the budget
+					// admin endpoint the reconciler polls for status. The
+					// port is exposed on the Service so a separate-process
+					// operator can reach it; NetworkPolicies decide who may
+					// scrape it.
+					Name:       "admin",
+					Port:       routerProxyMetricsPort,
+					TargetPort: intstr.FromInt(int(routerProxyMetricsPort)),
+					Protocol:   corev1.ProtocolTCP,
+				},
 			},
 		},
 	}
@@ -112,4 +123,12 @@ func routerProxyEndpoint(mr *inferencev1alpha1.ModelRouter) string {
 	}
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d%s",
 		routerProxyResourceName(mr.Name), mr.Namespace, port, path)
+}
+
+// routerProxyBudgetEndpoint is the admin URL the reconciler polls for budget
+// utilization. It rides the proxy's metrics listener, exposed on the Service
+// as the "admin" port.
+func routerProxyBudgetEndpoint(mr *inferencev1alpha1.ModelRouter) string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d/admin/budgets",
+		routerProxyResourceName(mr.Name), mr.Namespace, routerProxyMetricsPort)
 }
