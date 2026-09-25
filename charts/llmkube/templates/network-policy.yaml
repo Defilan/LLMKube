@@ -34,6 +34,17 @@ spec:
   - ports:
     - protocol: TCP
       port: 80
+  # The router-proxy admin/budget listener (9090). Scoped to router-proxy pods
+  # rather than a general 9090 egress: the operator reads the budget snapshot to
+  # publish ModelRouter.status.budgetUtilization.
+  - to:
+    - podSelector:
+        matchExpressions:
+        - key: inference.llmkube.dev/model-router
+          operator: Exists
+    ports:
+    - protocol: TCP
+      port: 9090
   {{- with .Values.networkPolicies.additionalEgressCIDRs }}
   - to:
     {{- range . }}

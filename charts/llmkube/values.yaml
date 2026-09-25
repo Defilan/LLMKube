@@ -564,6 +564,13 @@ multitenancy:
 networkPolicies:
   enabled: false
   additionalEgressCIDRs: []
+  # Namespaces allowed through the router-proxy ingress policy on the metrics
+  # listener (9090): the Prometheus scrape source. The PodMonitor is scraped by
+  # whatever Prometheus runs here, which is not the controller-manager, so
+  # without an entry the router metrics scrape is denied. Matches the default
+  # prometheus.prometheusRule.namespace.
+  metricsScrapeNamespaces:
+    - monitoring
 
 # GPU sharing configuration for the operator's gpuSharing feature (#1196).
 # These values are rendered as operator flags; they do not change any CRD.

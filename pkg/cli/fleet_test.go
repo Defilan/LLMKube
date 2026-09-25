@@ -464,60 +464,49 @@ func TestFleetStatusRendersPerSiteAndFleetWideTable(t *testing.T) {
 	}
 }
 
-// TestFleetRegisterRejectsSubCadenceHeartbeatInterval pins the CLI floor against
-// the CRD minimum: a value below the edge's delivered cadence is rejected
-// locally with an error naming the floor, 0 still means "default", and the
-// floor itself is accepted.
-func TestFleetRegisterRejectsSubCadenceHeartbeatInterval(t *testing.T) {
-	accepted := []struct {
+// TestFleetRegisterAcceptsSubCadenceHeartbeatInterval pins the CLI's handling of
+// an interval below the edge's delivered cadence: the value is stored as
+// declared and register warns in its output rather than rejecting it, 0 still
+// means "default", and an interval at or above the cadence carries no warning.
+func TestFleetRegisterAcceptsSubCadenceHeartbeatInterval(t *testing.T) {
+	tests := []struct {
 		name       string
 		in         int32
 		wantStored int32
+		wantWarn   bool
 	}{
-		{"floor exactly", minHeartbeatIntervalSeconds, minHeartbeatIntervalSeconds},
-		{"above the floor", 45, 45},
-		{"zero means the default", 0, defaultHeartbeatIntervalSeconds},
+		{"sub-cadence", 5, 5, true},
+		{"sub-cadence lower bound", 1, 1, true},
+		{"just below the cadence", 29, 29, true},
+		{"cadence exactly", subCadenceWarnThreshold, subCadenceWarnThreshold, false},
+		{"above the cadence", 45, 45, false},
+		{"zero means the default", 0, defaultHeartbeatIntervalSeconds, false},
 	}
-	for _, tc := range accepted {
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			stubToken(t, "test-token-123")
 			c := fake.NewClientBuilder().WithScheme(fleetTestScheme(t)).Build()
 			ctx := context.Background()
 
-			if _, err := fleetRegister(ctx, c, nil, fleetRegisterInput{
-				Name:                     "edge-floor",
+			out, err := fleetRegister(ctx, c, nil, fleetRegisterInput{
+				Name:                     "edge-cadence",
 				HeartbeatIntervalSeconds: tc.in,
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatalf("fleetRegister(interval=%d): %v", tc.in, err)
 			}
 
 			fc := &federationv1alpha1.FederatedCluster{}
-			if err := c.Get(ctx, types.NamespacedName{Name: "edge-floor"}, fc); err != nil {
+			if err := c.Get(ctx, types.NamespacedName{Name: "edge-cadence"}, fc); err != nil {
 				t.Fatalf("get FederatedCluster: %v", err)
 			}
 			if fc.Spec.HeartbeatIntervalSeconds != tc.wantStored {
 				t.Errorf("HeartbeatIntervalSeconds = %d, want %d",
 					fc.Spec.HeartbeatIntervalSeconds, tc.wantStored)
 			}
-		})
-	}
-
-	for _, in := range []int32{1, 5, 29} {
-		t.Run(fmt.Sprintf("rejects %d", in), func(t *testing.T) {
-			// Stub the token so a regressed guard runs the whole happy path and
-			// fails on the nil error, rather than tripping over a real mint.
-			stubToken(t, "test-token-123")
-			c := fake.NewClientBuilder().WithScheme(fleetTestScheme(t)).Build()
-
-			_, err := fleetRegister(context.Background(), c, nil, fleetRegisterInput{
-				Name:                     "edge-low",
-				HeartbeatIntervalSeconds: in,
-			})
-			if err == nil {
-				t.Fatalf("fleetRegister(interval=%d) = nil error, want a rejection", in)
-			}
-			if !strings.Contains(err.Error(), fmt.Sprintf("%d", minHeartbeatIntervalSeconds)) {
-				t.Errorf("error %q does not name the %ds floor", err, minHeartbeatIntervalSeconds)
+			gotWarn := strings.Contains(out, fmt.Sprintf("heartbeat-interval %ds", tc.wantStored))
+			if gotWarn != tc.wantWarn {
+				t.Errorf("warning present = %v, want %v; output:\n%s", gotWarn, tc.wantWarn, out)
 			}
 		})
 	}

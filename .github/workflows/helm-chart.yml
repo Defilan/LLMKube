@@ -390,6 +390,21 @@ jobs:
             echo "❌ DNS egress port 53 not found"
             exit 1
           fi
+
+          # Verify the router metrics listener (9090) admits its scrape source
+          # and the controller. Three rules carry 9090: the controller-manager
+          # ingress, the Prometheus scrape namespace, and the controller egress
+          # to the router admin listener. Fewer means one of those paths is
+          # missing and either the scrape or the budget poll is denied.
+          n9090=$(grep -c "port: 9090" /tmp/with-netpol.yaml)
+          if [ "$n9090" -lt 3 ]; then
+            echo "❌ expected at least 3 rules on port 9090, found $n9090"
+            exit 1
+          fi
+          if ! grep -q "monitoring" /tmp/with-netpol.yaml; then
+            echo "❌ Prometheus scrape namespace not allowed on the router listener"
+            exit 1
+          fi
           echo "✅ NetworkPolicy renders correctly when enabled"
 
       - name: Test Metrics Port Conditional on metrics.enabled

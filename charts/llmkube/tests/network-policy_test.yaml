@@ -31,7 +31,8 @@ tests:
           content:
             protocol: TCP
             port: 8080
-      # The metrics/admin listener is reachable only from the controller-manager.
+      # The metrics/admin listener is reachable from the controller-manager and
+      # from the Prometheus scrape source (the rule below).
       - contains:
           path: spec.ingress[1].from
           content:
@@ -46,3 +47,35 @@ tests:
           content:
             protocol: TCP
             port: 9090
+
+  - it: allows the Prometheus scrape namespace on the metrics listener
+    set:
+      networkPolicies.enabled: true
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      # The PodMonitor scrapes 9090 from Prometheus, which is not the
+      # controller-manager; without this rule the scrape is denied.
+      - contains:
+          path: spec.ingress[2].from
+          content:
+            namespaceSelector:
+              matchExpressions:
+                - key: kubernetes.io/metadata.name
+                  operator: In
+                  values:
+                    - monitoring
+      - contains:
+          path: spec.ingress[2].ports
+          content:
+            protocol: TCP
+            port: 9090
+
+  - it: omits the scrape-namespace rule when the list is empty
+    set:
+      networkPolicies.enabled: true
+      networkPolicies.metricsScrapeNamespaces: []
+    asserts:
+      - lengthEqual:
+          path: spec.ingress
+          count: 2
