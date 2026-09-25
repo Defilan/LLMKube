@@ -1333,7 +1333,7 @@ func (e *NativeAgentLoopExecutor) runLLMPath(
 	// against, so a fix cycle cannot write an ungrounded claim into the
 	// PR body (#1411).
 	amendedDiff, _ := repo.DiffNameOnly(ctx, workspace, baseBranch)
-	e.maybeRefreshPRBody(ctx, log, task, auth, branch, r.Summary,
+	e.maybeRefreshPRBody(ctx, log, task, auth, branch, r,
 		workspace, baseBranch, amendedDiff, cloneURL)
 	return r, nil
 }
@@ -2621,6 +2621,23 @@ func copyExtraWithPRBody(extra map[string]any, prBody string) map[string]any {
 	return out
 }
 
+// coderPRBodyFromResult returns the coder's authored PR description from a
+// Result's extra.modelExtra.prBody, the slot submit_result persists (#1777).
+// Empty when the coder authored none, when the result carries no modelExtra
+// envelope, or on a nil result, so the caller falls back to the grounded
+// summary.
+func coderPRBodyFromResult(r *Result) string {
+	if r == nil || r.Extra == nil {
+		return ""
+	}
+	modelExtra, ok := r.Extra["modelExtra"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	body, _ := modelExtra["prBody"].(string)
+	return body
+}
+
 // coderPRBody returns the coder's authored PR description for the branch the
 // review task is on (#1768). When a Workload's PR opens on a reviewer GO the
 // body was composed from the *reviewer's* result, so the coder's complete
@@ -2726,14 +2743,21 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 // (#1567). The PR was opened by a reviewer GO; a later issue-fix that GOed
 // its amendment pushed a new head but has no reviewer to re-author the
 // description, so the body stays frozen at the first attempt. Re-point it
-// at what the amended branch now contains, using the coder's own summary
-// as the description rather than synthesizing a second reviewer verdict.
+// at what the amended branch now contains.
 //
-// The summary is grounded against the amended branch's diff the same way
-// the opened body is (#1411): concrete claims the diff does not support
-// get a visible note appended, so a fix cycle cannot write an ungrounded
-// claim into a PR body. The workspace and review base/diff are threaded
-// through so this path shares groundPRSummary's exact grounding.
+// The coder is the stage that authored the change and is prompted to write
+// a description, so its own extra.modelExtra.prBody is the body when it
+// wrote one (#1777), rendered the same way the open path renders it. The
+// refresh runs on the executing coder, whose result is in hand, so the body
+// comes from r rather than a sibling lookup — a List at this moment selects
+// this task, whose status.result is not yet persisted, and would find
+// nothing. An empty coder body falls back to the grounded reviewer summary.
+//
+// The summary fallback is grounded against the amended branch's diff the
+// same way the opened body is (#1411): concrete claims the diff does not
+// support get a visible note appended, so a fix cycle cannot write an
+// ungrounded claim into a PR body. The workspace and review base/diff are
+// threaded through so this path shares groundPRSummary's exact grounding.
 //
 // Best-effort and idempotent: it PATCHes the PR only when one already
 // exists, and any failure (no PR for the head, GitHub down) logs and
@@ -2743,22 +2767,39 @@ func (e *NativeAgentLoopExecutor) groundPRSummary(
 func (e *NativeAgentLoopExecutor) maybeRefreshPRBody(
 	ctx context.Context, log logr.Logger,
 	task *foremanv1alpha1.AgenticTask, auth *repo.Auth,
-	branch, summary, workspace, reviewBase string, reviewDiff []string,
+	branch string, r *Result, workspace, reviewBase string, reviewDiff []string,
 	cloneURL string,
 ) {
 	ch := e.codeHost(authToken(auth))
 	if ch == nil {
 		return
 	}
-	if strings.TrimSpace(summary) == "" || workspace == "" || reviewBase == "" {
+	if workspace == "" || reviewBase == "" {
 		return
 	}
-	// Ground the summary against the amended branch's diff before it
-	// becomes the PR body (#1411). The refreshed body must be grounded
-	// the same way the opened body is; passing the raw summary through
-	// would regress that fix.
-	body := e.groundPRSummary(ctx, log, &Result{Summary: summary},
-		workspace, reviewBase, reviewDiff)
+	// Body: the coder's authored description wins when present (#1777),
+	// exactly as on the open path. Only the grounded reviewer summary,
+	// which is what the refresh replaced with a one-line verdict before,
+	// falls back to needing a non-empty summary.
+	body := coderPRBodyFromResult(r)
+	if strings.TrimSpace(body) != "" {
+		body = githubpr.DescriptionBody(body, task.Spec.Payload.Issue,
+			task.Labels["foreman.llmkube.dev/workload"])
+	} else {
+		summary := ""
+		if r != nil {
+			summary = r.Summary
+		}
+		if strings.TrimSpace(summary) == "" {
+			return
+		}
+		// Ground the summary against the amended branch's diff before it
+		// becomes the PR body (#1411). The refreshed body must be grounded
+		// the same way the opened body is; passing the raw summary through
+		// would regress that fix.
+		body = e.groundPRSummary(ctx, log, &Result{Summary: summary},
+			workspace, reviewBase, reviewDiff)
+	}
 	// Same fork-qualification as openPullRequest: a cross-fork head must
 	// be qualified "forkOwner:branch" so the PATCH targets the PR in the
 	// fork where the head branch actually lives.
