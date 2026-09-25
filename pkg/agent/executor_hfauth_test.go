@@ -109,8 +109,9 @@ func TestDownloadFile_TokenNotForwardedAcrossHosts(t *testing.T) {
 
 // Accepts both spellings the fetch path can actually download: a
 // huggingface.co URL, and hf:// which downloadFile resolves to one before
-// building the request (#1759).
-func TestIsHFAuthHost(t *testing.T) {
+// building the request (#1759). An empty HF_ENDPOINT names no mirror, so these
+// rows are the pre-#1900 behaviour.
+func TestIsHFAuthHostForEndpoint(t *testing.T) {
 	tests := []struct {
 		source string
 		want   bool
@@ -129,8 +130,30 @@ func TestIsHFAuthHost(t *testing.T) {
 		{"", false},
 	}
 	for _, tc := range tests {
-		if got := isHFAuthHost(tc.source); got != tc.want {
-			t.Errorf("isHFAuthHost(%q) = %v, want %v", tc.source, got, tc.want)
+		if got := isHFAuthHostForEndpoint(tc.source, ""); got != tc.want {
+			t.Errorf("isHFAuthHostForEndpoint(%q, \"\") = %v, want %v", tc.source, got, tc.want)
+		}
+	}
+}
+
+// The metal half of the mirror gate. The host comparison itself is pinned in
+// pkg/hfsource; this asserts the agent reaches it, including the lookalike host
+// that must never see the token.
+func TestIsHFAuthHostForEndpointMirror(t *testing.T) {
+	const mirror = "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo"
+	tests := []struct {
+		source     string
+		hfEndpoint string
+		want       bool
+	}{
+		{"https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/org/repo/resolve/main/m.gguf", mirror, true},
+		{"https://artifactory.corp.example.evil.example/repo/m.gguf", mirror, false},
+		{"https://cdn.example.com/m.gguf", mirror, false},
+		{"https://artifactory.corp.example/repo/m.gguf", "", false},
+	}
+	for _, tc := range tests {
+		if got := isHFAuthHostForEndpoint(tc.source, tc.hfEndpoint); got != tc.want {
+			t.Errorf("isHFAuthHostForEndpoint(%q, %q) = %v, want %v", tc.source, tc.hfEndpoint, got, tc.want)
 		}
 	}
 }
@@ -237,5 +260,96 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 				t.Errorf("body = %q, want the resolved download", string(b))
 			}
 		})
+	}
+}
+
+// End to end through ensureModel: a Model whose source is on the host named by
+// HF_ENDPOINT in its sourceSecretRef must send the bearer token. Before #1900
+// the gate was huggingface.co only, so a mirror download went out anonymous
+// and the mirror answered 401.
+func TestEnsureModel_MirrorHostSendsToken(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("weights-from-mirror"))
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add inference scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+
+	// The mirror endpoint is the test server, and the source is a file under it,
+	// so the two share a host and only the path differs, exactly as Artifactory.
+	source := srv.URL + "/artifactory/api/huggingfaceml/repo/org/repo/resolve/main/m.gguf"
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		Data: map[string][]byte{
+			"HF_TOKEN":    []byte("hf_secret"),
+			"HF_ENDPOINT": []byte(srv.URL),
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
+		WithKubeClient("default", k8sClient, nil))
+
+	dst, err := executor.ensureModel(t.Context(), source, "mirror-model", &corev1.LocalObjectReference{Name: "hf-token"})
+	if err != nil {
+		t.Fatalf("ensureModel(%q): %v", source, err)
+	}
+	if gotAuth != "Bearer hf_secret" {
+		t.Errorf("Authorization = %q, want the token on the mirror host", gotAuth)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "weights-from-mirror" {
+		t.Errorf("body = %q, want the mirror download", string(b))
+	}
+}
+
+// The same source with a Secret that names a different HF_ENDPOINT host must
+// go out anonymous: the token is bound to the host the Secret names, not to any
+// non-Hugging-Face URL the Model happens to carry.
+func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
+	var present bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.Header["Authorization"]
+		_, _ = w.Write([]byte("weights"))
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add inference scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		Data: map[string][]byte{
+			"HF_TOKEN":    []byte("hf_secret"),
+			"HF_ENDPOINT": []byte("https://other-mirror.corp.example/repo"),
+		},
+	}
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
+		WithKubeClient("default", k8sClient, nil))
+
+	dst, err := executor.ensureModel(t.Context(), srv.URL+"/m.gguf", "other-model",
+		&corev1.LocalObjectReference{Name: "hf-token"})
+	if err != nil {
+		t.Fatalf("ensureModel: %v", err)
+	}
+	if present {
+		t.Error("Authorization header sent to a host HF_ENDPOINT does not name")
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "weights" {
+		t.Errorf("body = %q", string(b))
 	}
 }

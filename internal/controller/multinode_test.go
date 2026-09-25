@@ -70,7 +70,7 @@ func buildMemberPods(t *testing.T) (*corev1.Pod, *corev1.Pod, string) {
 	t.Helper()
 	isvc, model := multiNodeFixture()
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-	pods, hash, err := r.constructMemberPods(isvc, model, nil)
+	pods, hash, err := r.constructMemberPods(isvc, model, nil, "", "")
 	if err != nil {
 		t.Fatalf("constructMemberPods: %v", err)
 	}
@@ -215,7 +215,7 @@ func TestConstructMemberPodsAutoTP(t *testing.T) {
 	isvc, model := multiNodeFixture()
 	isvc.Spec.VLLMConfig = nil
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-	pods, _, err := r.constructMemberPods(isvc, model, nil)
+	pods, _, err := r.constructMemberPods(isvc, model, nil, "", "")
 	if err != nil {
 		t.Fatalf("constructMemberPods: %v", err)
 	}
@@ -232,13 +232,13 @@ func TestConstructMemberPodsAutoTP(t *testing.T) {
 func TestConstructMemberPodsHashStableAndSpecSensitive(t *testing.T) {
 	isvc, model := multiNodeFixture()
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-	_, h1, _ := r.constructMemberPods(isvc, model, nil)
-	_, h2, _ := r.constructMemberPods(isvc, model, nil)
+	_, h1, _ := r.constructMemberPods(isvc, model, nil, "", "")
+	_, h2, _ := r.constructMemberPods(isvc, model, nil, "", "")
 	if h1 != h2 {
 		t.Fatalf("hash not stable: %s vs %s", h1, h2)
 	}
 	isvc.Spec.MultiNode.Members[1].Fabric.IBHCA = "rocep1s0f0"
-	_, h3, _ := r.constructMemberPods(isvc, model, nil)
+	_, h3, _ := r.constructMemberPods(isvc, model, nil, "", "")
 	if h3 == h1 {
 		t.Fatalf("hash must change when a member's fabric changes")
 	}
@@ -495,12 +495,12 @@ func TestConstructMemberPodsHashIgnoresStatus(t *testing.T) {
 	isvc, model := multiNodeFixture()
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
 	isvc.Status.Phase = PhaseCreating
-	podsCreating, h1, err := r.constructMemberPods(isvc, model, nil)
+	podsCreating, h1, err := r.constructMemberPods(isvc, model, nil, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	isvc.Status.Phase = PhaseReady
-	podsReady, h2, err := r.constructMemberPods(isvc, model, nil)
+	podsReady, h2, err := r.constructMemberPods(isvc, model, nil, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

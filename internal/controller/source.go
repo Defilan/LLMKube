@@ -229,8 +229,8 @@ func parsePVCSource(source string) (claimName, path string, err error) {
 }
 
 // The HF source-resolution family (hasSchemeFold, isHuggingFaceURL,
-// isHFAuthSource, isHuggingFaceFileURL, extractHFRepoFromURL, parseHFSource,
-// normalizeHFSource) moved to
+// isHFAuthSourceForEndpoint, isHuggingFaceFileURL, extractHFRepoFromURL,
+// parseHFSource, normalizeHFSource) moved to
 // pkg/hfsource in #1759 so the Metal agent could resolve hf:// the same way;
 // these wrappers keep the call sites and tests unchanged.
 
@@ -242,8 +242,8 @@ func isHuggingFaceURL(source string) bool {
 	return hfsource.IsHuggingFaceURL(source)
 }
 
-func isHFAuthSource(source string) bool {
-	return hfsource.IsHFAuthSource(source)
+func isHFAuthSourceForEndpoint(source, hfEndpoint string) bool {
+	return hfsource.IsHFAuthSourceForEndpoint(source, hfEndpoint)
 }
 
 func isHuggingFaceFileURL(source string) bool {

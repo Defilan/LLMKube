@@ -133,6 +133,8 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 	isvc *inferencev1alpha1.InferenceService,
 	model *inferencev1alpha1.Model,
 	draftModel *inferencev1alpha1.Model,
+	hfEndpoint string,
+	draftHFEndpoint string,
 ) ([]*corev1.Pod, string, error) {
 	if err := validateMultiNode(isvc); err != nil {
 		return nil, "", err
@@ -149,7 +151,7 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 	pinned.Spec.VLLMConfig.TensorParallelSize = &tp
 	pinned.Spec.VLLMConfig.PipelineParallelSize = &pp
 
-	tmpl := r.constructDeployment(pinned, model, draftModel, 1).Spec.Template
+	tmpl := r.constructDeployment(pinned, model, draftModel, 1, hfEndpoint, draftHFEndpoint).Spec.Template
 
 	// The group hash must describe intent, not observation. The template
 	// reads InferenceService status in places (the disruption-protection
@@ -159,7 +161,7 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 	// blank status so only spec (service, model, image) feeds it.
 	statusless := pinned.DeepCopy()
 	statusless.Status = inferencev1alpha1.InferenceServiceStatus{}
-	hashTmpl := r.constructDeployment(statusless, model, draftModel, 1).Spec.Template
+	hashTmpl := r.constructDeployment(statusless, model, draftModel, 1, hfEndpoint, draftHFEndpoint).Spec.Template
 
 	pods := make([]*corev1.Pod, 0, len(mn.Members))
 	h := sha256.New()
@@ -580,7 +582,8 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 			fmt.Sprintf("Invalid multiNode: %v", err), nil)
 		return 0, &result, updateErr
 	}
-	desired, hash, err := r.constructMemberPods(isvc, model, draftModel)
+	desired, hash, err := r.constructMemberPods(isvc, model, draftModel,
+		hfEndpointFromSecret(ctx, r.Client, model), hfEndpointFromSecret(ctx, r.Client, draftModel))
 	if err != nil {
 		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "",
 			fmt.Sprintf("Invalid multiNode: %v", err), nil)

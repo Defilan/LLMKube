@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -28,7 +29,7 @@ func TestPrefetchJob_CarriesHFAuth(t *testing.T) {
 		Status: inferencev1alpha1.ModelStatus{CacheKey: "testcachekey"},
 	}
 
-	job, err := r.buildPrefetchJob(model, nil)
+	job, err := r.buildPrefetchJob(context.Background(), model, nil)
 	if err != nil {
 		t.Fatalf("buildPrefetchJob: %v", err)
 	}
@@ -62,7 +63,9 @@ func TestPrefetchJob_CarriesHFAuth(t *testing.T) {
 
 // The same Job for a non-Hugging-Face source must not carry the header, so a
 // secret shared between an S3 Model and an HF Model cannot leak the token to
-// the object store.
+// the object store. A source on the host named by HF_ENDPOINT IS authenticated
+// (the mirror case, #1900); this Model names no such Secret, so the mirror
+// branch cannot fire.
 func TestPrefetchJob_NoHFAuthForOtherHosts(t *testing.T) {
 	r := &ModelReconciler{InitContainerImage: defaultPrefetchImage}
 	model := &inferencev1alpha1.Model{
@@ -75,7 +78,7 @@ func TestPrefetchJob_NoHFAuthForOtherHosts(t *testing.T) {
 		Status: inferencev1alpha1.ModelStatus{CacheKey: "testcachekey"},
 	}
 
-	job, err := r.buildPrefetchJob(model, nil)
+	job, err := r.buildPrefetchJob(context.Background(), model, nil)
 	if err != nil {
 		t.Fatalf("buildPrefetchJob: %v", err)
 	}
@@ -83,5 +86,58 @@ func TestPrefetchJob_NoHFAuthForOtherHosts(t *testing.T) {
 		if strings.Contains(strings.Join(c.Command, " "), "HF_TOKEN") {
 			t.Errorf("non-HF source leaks the token into %s:\n%s", c.Name, strings.Join(c.Command, " "))
 		}
+	}
+}
+
+// The prefetch Job inherits the mirror gate from buildModelStorageConfig, so a
+// Model whose source is on the host named by HF_ENDPOINT in its sourceSecretRef
+// must carry the bearer header. Before #1900 the gate was huggingface.co only,
+// so a prefetch from a mirror went out anonymous and the mirror answered 401.
+func TestPrefetchJob_CarriesHFAuthForMirror(t *testing.T) {
+	const endpoint = "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo"
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		Data: map[string][]byte{
+			"HF_TOKEN":    []byte("hf_secret"),
+			"HF_ENDPOINT": []byte(endpoint),
+		},
+	}
+	r := newHFSecretClient(t, secret)
+	r.InitContainerImage = defaultPrefetchImage
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "mirrored", Namespace: "default"},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source:          endpoint + "/unsloth/Qwen3-GGUF/resolve/main/m.gguf",
+			Format:          "gguf",
+			SourceSecretRef: &corev1.LocalObjectReference{Name: "hf-token"},
+		},
+		Status: inferencev1alpha1.ModelStatus{CacheKey: "testcachekey"},
+	}
+
+	job, err := r.buildPrefetchJob(context.Background(), model, nil)
+	if err != nil {
+		t.Fatalf("buildPrefetchJob: %v", err)
+	}
+	script := ""
+	for _, c := range job.Spec.Template.Spec.InitContainers {
+		script += strings.Join(c.Command, " ")
+	}
+	if !strings.Contains(script, `-H "Authorization: Bearer ${HF_TOKEN}"`) {
+		t.Errorf("mirror prefetch downloader sends no bearer header:\n%s", script)
+	}
+
+	// The lookalike host must not authenticate even with the same Secret.
+	lookalike := model.DeepCopy()
+	lookalike.Spec.Source = "https://artifactory.corp.example.evil.example/repo/m.gguf"
+	job, err = r.buildPrefetchJob(context.Background(), lookalike, nil)
+	if err != nil {
+		t.Fatalf("buildPrefetchJob(lookalike): %v", err)
+	}
+	script = ""
+	for _, c := range job.Spec.Template.Spec.InitContainers {
+		script += strings.Join(c.Command, " ")
+	}
+	if strings.Contains(script, "HF_TOKEN") {
+		t.Errorf("lookalike host leaked the token:\n%s", script)
 	}
 }

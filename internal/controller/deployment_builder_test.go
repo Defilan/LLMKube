@@ -778,7 +778,7 @@ func TestBuildDeployment_MountsDraftModelAndEmitsMd(t *testing.T) {
 	}
 
 	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-	dep := r.constructDeployment(isvc, target, draft, 1)
+	dep := r.constructDeployment(isvc, target, draft, 1, "", "")
 
 	pod := dep.Spec.Template.Spec
 	var cacheVolumes int
@@ -934,7 +934,7 @@ func TestConstructDeployment_DraftPodIsWellFormed(t *testing.T) {
 				},
 			}
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-			pod := r.constructDeployment(isvc, tc.target, tc.draft, 1).Spec.Template.Spec
+			pod := r.constructDeployment(isvc, tc.target, tc.draft, 1, "", "").Spec.Template.Spec
 
 			// Container names are unique across initContainers AND containers:
 			// Kubernetes rejects the whole Deployment otherwise.
@@ -1043,7 +1043,7 @@ func TestConstructDeployment_DraftStorageHonoursTheInitGate(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-			pod := r.constructDeployment(tc.isvc, target, draft, 1).Spec.Template.Spec
+			pod := r.constructDeployment(tc.isvc, target, draft, 1, "", "").Spec.Template.Spec
 
 			if len(pod.InitContainers) != 0 {
 				t.Errorf("initContainers = %v, want none", containerNames(pod.InitContainers))
@@ -1133,7 +1133,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
 		defer func() { resolveBackend = orig }()
 
-		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 		got := archAffinityTerms(pod)
 		if !equalStrings(got, []string{"amd64"}) {
 			t.Errorf("arch affinity values = %v, want [amd64]", got)
@@ -1154,7 +1154,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
 		defer func() { resolveBackend = orig }()
 
-		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 		if got := archAffinityTerms(pod); got != nil {
 			t.Errorf("arch affinity values = %v, want none for user-supplied image", got)
 		}
@@ -1171,7 +1171,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &LlamaCppBackend{} }
 		defer func() { resolveBackend = orig }()
 
-		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 		if got := archAffinityTerms(pod); got != nil {
 			t.Errorf("arch affinity values = %v, want none for multi-arch backend", got)
 		}
@@ -1206,7 +1206,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
 		defer func() { resolveBackend = orig }()
 
-		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 		terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 		if len(terms) != 1 {
 			t.Fatalf("nodeSelectorTerms = %d, want 1; extra terms are ORed and make the "+
@@ -1242,7 +1242,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
 		defer func() { resolveBackend = orig }()
 
-		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 		terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 		if len(terms) != 1 || len(terms[0].MatchExpressions) != 1 ||
 			terms[0].MatchExpressions[0].Key != corev1.LabelArchStable {
@@ -1278,7 +1278,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		resolveBackend = func(*inferencev1alpha1.InferenceService) RuntimeBackend { return &archAwareBackend{} }
 		defer func() { resolveBackend = orig }()
 
-		pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+		pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 		terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 		if len(terms) != 2 {
 			t.Fatalf("nodeSelectorTerms = %d, want the user's 2 alternatives preserved: %+v", len(terms), terms)
@@ -1327,7 +1327,7 @@ func TestConstructDeployment_ArchAffinity(t *testing.T) {
 		defer func() { resolveBackend = orig }()
 
 		for i := range 3 {
-			pod := r.constructDeployment(isvc, model, nil, 1).Spec.Template.Spec
+			pod := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
 			terms := pod.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 			if len(terms) != 1 || len(terms[0].MatchExpressions) != 2 {
 				t.Fatalf("build %d: want 1 term of 2 expressions, got %+v", i+1, terms)

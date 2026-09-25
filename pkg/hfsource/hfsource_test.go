@@ -78,6 +78,76 @@ func TestIsHFAuthSource(t *testing.T) {
 	}
 }
 
+// SourceHost is the whole match key for the mirror gate, so it must drop
+// everything that is not the host: an Artifactory HF_ENDPOINT carries a long
+// /artifactory/api/... path and often a port.
+func TestSourceHost(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		want   string
+	}{
+		{"plain", "https://mirror.corp.example/org/repo/model.gguf", "mirror.corp.example"},
+		{"host case folded", "https://Mirror.Corp.Example/org/repo", "mirror.corp.example"},
+		{"artifactory path", "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo",
+			"artifactory.corp.example"},
+		{"explicit port", "https://mirror.corp.example:8443/org/repo", "mirror.corp.example"},
+		{"userinfo ignored", "https://user:pass@mirror.corp.example/org/repo", "mirror.corp.example"},
+		{"http scheme", "http://mirror.corp.example/org/repo", "mirror.corp.example"},
+		{"no scheme names no host", "mirror.corp.example/org/repo", ""},
+		{"local path", "/host-model/model.gguf", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SourceHost(tc.source); got != tc.want {
+				t.Errorf("SourceHost(%q) = %q, want %q", tc.source, got, tc.want)
+			}
+		})
+	}
+}
+
+// The mirror gate. A source on the host the Secret named gets the token; a
+// lookalike host must not, because that is the leak this gate exists to stop,
+// and an empty HF_ENDPOINT names no mirror at all.
+func TestIsHFAuthSourceForEndpoint(t *testing.T) {
+	const mirror = "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo"
+	tests := []struct {
+		name       string
+		source     string
+		hfEndpoint string
+		want       bool
+	}{
+		{"mirror source",
+			"https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/unsloth/Qwen3-GGUF/resolve/main/m.gguf",
+			mirror, true},
+		{"mirror source other path", "https://artifactory.corp.example/other/repo/m.gguf", mirror, true},
+		{"mirror host case folded", "https://ARTIFACTORY.Corp.Example/.../resolve/main/m.gguf", mirror, true},
+		{"mirror host with port", "https://artifactory.corp.example:8443/.../resolve/main/m.gguf", mirror, true},
+		// The one that matters. A prefix or substring match would send the token
+		// to an attacker-controlled domain that merely contains the mirror host.
+		{"lookalike host", "https://artifactory.corp.example.evil.example/repo/m.gguf", mirror, false},
+		{"substring host", "https://notartifactory.corp.example/repo/m.gguf", mirror, false},
+		{"different host", "https://cdn.example.com/m.gguf", mirror, false},
+		// An empty HF_ENDPOINT is no mirror: only IsHFAuthSource's own hosts qualify.
+		{"empty endpoint other host", "https://artifactory.corp.example/repo/m.gguf", "", false},
+		{"scheme-less endpoint names no host", "https://artifactory.corp.example/repo/m.gguf",
+			"artifactory.corp.example", false},
+		// huggingface.co and hf:// still qualify on their own.
+		{"huggingface source, empty endpoint", "https://huggingface.co/org/repo/resolve/main/m.gguf", "", true},
+		{"hf scheme, empty endpoint", "hf://org/repo", "", true},
+		{"hf scheme, unrelated endpoint", "hf://org/repo", mirror, true},
+		{"empty source", "", mirror, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsHFAuthSourceForEndpoint(tc.source, tc.hfEndpoint); got != tc.want {
+				t.Errorf("IsHFAuthSourceForEndpoint(%q, %q) = %v, want %v", tc.source, tc.hfEndpoint, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsHuggingFaceURL(t *testing.T) {
 	tests := []struct {
 		name   string

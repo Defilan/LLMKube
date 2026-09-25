@@ -155,6 +155,40 @@ spec:
 Public repositories need none of this. Omit the key, or the Secret entirely,
 and downloads go out unauthenticated as before.
 
+### Pulling from an authenticated Hugging Face mirror
+
+A network that allows `huggingface.co` but blocks the CDN hosts that `resolve/`
+redirects to can serve models from its own Hugging Face mirror instead
+(Artifactory's `huggingfaceml` remotes are one). Point `spec.source` at the
+mirror and add `HF_ENDPOINT` to the same Secret. A source whose host matches
+`HF_ENDPOINT` is authenticated like a Hugging Face source, so the mirror's
+bearer token is sent:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: huggingface
+stringData:
+  HF_ENDPOINT: https://artifactory.corp.example/artifactory/api/huggingfaceml/repo
+  HF_TOKEN: <token>
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-6-35b-a3b
+spec:
+  format: gguf
+  source: https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-IQ4_NL.gguf
+  sourceSecretRef:
+    name: huggingface
+```
+
+Only the host is compared, so the `/artifactory/api/huggingfaceml/...` path and
+any port are ignored, and `HF_ENDPOINT` must be a full URL with a scheme. Leave
+`HF_ENDPOINT` out to keep the previous behaviour (only `huggingface.co` is
+authenticated).
+
 This covers every path the operator downloads on: single-file GGUF, multi-file
 `spec.files` staging, `RefreshPolicy: OnChange` revalidation, the prefetch Job,
 and the macOS Metal agent. It is separate from the runtime token settings
@@ -162,18 +196,24 @@ and the macOS Metal agent. It is separate from the runtime token settings
 serving container for the different case where the runtime downloads its own
 weights from a bare repo ID.
 
-Two properties worth knowing:
+Three properties worth knowing:
 
-- **The token is only ever sent to huggingface.co.** A Model pointing at a
-  mirror, a private registry or any other host gets no header, even if the
-  Secret it names carries an `HF_TOKEN` key. One Secret can safely hold both
-  `HF_TOKEN` and the `AWS_*` keys.
+- **The token is only ever sent to `huggingface.co`, or to the host named by
+  `HF_ENDPOINT` in the same Secret.** A Model pointing at any other host gets
+  no header, even if the Secret it names carries an `HF_TOKEN` key, and the
+  `HF_ENDPOINT` match is exact host equality, so a lookalike host cannot
+  receive it. One Secret can safely hold both `HF_TOKEN` and the `AWS_*` keys.
+- **A Model can name one mirror host**, because `spec.sourceSecretRef` is a
+  single Secret with a single `HF_ENDPOINT`. A fleet with two mirrors needs two
+  Secrets.
 - **It is dropped on a redirect that changes host.** Hugging Face answers a
   weights request with a redirect to a content host, and the token does not
   follow it.
 
 Rotating the token is a Secret edit; the new value is picked up the next time a
-pod starts, the same as the S3 credentials.
+pod starts, the same as the S3 credentials. An `HF_ENDPOINT` change is also
+picked up on the next reconcile or pod restart, not the moment the Secret is
+edited.
 
 ## Troubleshooting
 

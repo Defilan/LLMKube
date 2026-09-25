@@ -308,8 +308,8 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // four arguments and sends a malformed header, and quoting it sends one empty
 // argument when the token is unset.
 //
-// The caller decides whether this is used at all, gating on isHFAuthSource, so
-// the token cannot leak to another host. Redirects are safe to follow with -L:
+// The caller decides whether this is used at all, gating on
+// isHFAuthSourceForEndpoint, so the token cannot leak to another host. Redirects are safe to follow with -L:
 // curl drops a caller-supplied Authorization header when a redirect crosses to
 // a different host, which is exactly what the LFS handoff to the CDN needs, so
 // --location-trusted must NOT be added here.
@@ -560,6 +560,27 @@ func modelEnvFrom(model *inferencev1alpha1.Model) []corev1.EnvFromSource {
 			},
 		},
 	}
+}
+
+// hfEndpointFromSecret returns the HF_ENDPOINT host named by the Model's
+// sourceSecretRef, or "" when there is none. It decides whether a non-Hugging
+// Face source is treated as a mirror for the bearer-token gate
+// (isHFAuthSourceForEndpoint), so it must never fail a reconcile: an absent
+// Secret, a missing key, a nil client (unit tests), and a refused Get all mean
+// "no mirror", which is exactly the ungated download that worked before #1900.
+//
+// This mirrors s3Credentials (model_controller.go), the controller's other
+// sourceSecretRef read, except that the S3 keys are mandatory and this one is
+// optional: an ungated repository is the common case and carries no Secret.
+func hfEndpointFromSecret(ctx context.Context, c client.Client, model *inferencev1alpha1.Model) string {
+	if c == nil || model == nil || model.Spec.SourceSecretRef == nil || model.Spec.SourceSecretRef.Name == "" {
+		return ""
+	}
+	secret := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: model.Spec.SourceSecretRef.Name, Namespace: model.Namespace}, secret); err != nil {
+		return ""
+	}
+	return string(secret.Data["HF_ENDPOINT"])
 }
 
 // resolveHFSourceURL converts hf://repo-id sources to their huggingface.co
@@ -816,7 +837,7 @@ func applyInitContainerDiagnostics(containers []corev1.Container) {
 	}
 }
 
-func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, allowedHostPathRoots []string) (cfg modelStorageConfig) {
+func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, useCache bool, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, allowedHostPathRoots []string, hfEndpoint string) (cfg modelStorageConfig) {
 	// Stamp crash diagnostics on whatever the branches below return. Done
 	// once here rather than at each construction site so a future storage
 	// path cannot be added without it (#1437).
@@ -840,9 +861,9 @@ func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1al
 		return buildOCIStorageConfig(model, initContainerImage)
 	}
 	if useCache {
-		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup)
+		return buildCachedStorageConfig(model, isvc, cacheMode, caCertConfigMap, initContainerImage, defaultFSGroup, hfEndpoint)
 	}
-	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage)
+	return buildEmptyDirStorageConfig(model, isvc, namespace, caCertConfigMap, initContainerImage, hfEndpoint)
 }
 
 // disallowedLocalSourceStorageConfig returns a storage config whose init
@@ -1015,7 +1036,7 @@ func invalidFileSetStorageConfig(initImage string) modelStorageConfig {
 	}
 }
 
-func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64) modelStorageConfig {
+func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, caCertConfigMap string, initContainerImage string, defaultFSGroup int64, hfEndpoint string) modelStorageConfig {
 	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
 
 	// Resolve the fsGroup that the CSI will actually apply to the volume.
@@ -1054,7 +1075,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	}
 	if plan != nil {
 		modelPath := stagedCachePath(cacheDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSource(model.Spec.Source), model.Spec.RefreshPolicy)
+		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
 		env := multiFileInitEnvVars(model.Spec.Source, cacheDir, plan.Files)
 
 		initVolumeMounts := []corev1.VolumeMount{
@@ -1142,7 +1163,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		})
 	}
 
-	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), true, isHFAuthSource(model.Spec.Source), model.Spec.RefreshPolicy)
+	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), true, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
 	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath)
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
@@ -1167,7 +1188,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	}
 }
 
-func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string) modelStorageConfig {
+func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, namespace string, caCertConfigMap string, initContainerImage string, hfEndpoint string) modelStorageConfig {
 	// Multi-file staging branch for emptyDir storage.
 	plan, err := modelStagingPlan(model)
 	if err != nil {
@@ -1185,7 +1206,7 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	if plan != nil {
 		stagedDir := fmt.Sprintf("/models/%s-%s", namespace, model.Name)
 		modelPath := fmt.Sprintf("%s/%s", stagedDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSource(model.Spec.Source), model.Spec.RefreshPolicy)
+		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
 		env := multiFileInitEnvVars(model.Spec.Source, stagedDir, plan.Files)
 
 		initVolumeMounts := []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}}
@@ -1230,7 +1251,7 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		},
 	}
 
-	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), false, isHFAuthSource(model.Spec.Source), model.Spec.RefreshPolicy)
+	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), false, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
 	env := modelInitEnvVars(model.Spec.Source, "", modelPath)
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 

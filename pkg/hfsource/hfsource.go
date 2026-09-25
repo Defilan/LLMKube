@@ -23,6 +23,7 @@ package hfsource
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 )
 
@@ -71,6 +72,47 @@ func IsHuggingFaceURL(source string) bool {
 // if the referenced Secret happens to carry an HF_TOKEN key.
 func IsHFAuthSource(source string) bool {
 	return HasSchemeFold(source, "hf://") || IsHuggingFaceURL(source)
+}
+
+// IsHFAuthSourceForEndpoint reports whether the operator's own downloads for
+// source should carry a Hugging Face bearer token, given the HF_ENDPOINT host
+// named by the same spec.sourceSecretRef that holds the token. It is
+// IsHFAuthSource plus the mirror case: a source on the host the user named.
+//
+// The token stays bound to a host the user named in the Secret that holds it,
+// so a Model author who controls only spec.source cannot redirect it. The match
+// is exact host equality, never a prefix: HF_ENDPOINT=https://mirror.corp.example
+// must NOT send the token to mirror.corp.example.evil.com, which is the lookalike
+// host this gate exists to stop, exactly as for huggingface.co.
+//
+// An empty HF_ENDPOINT names no mirror, so only IsHFAuthSource's hosts qualify.
+func IsHFAuthSourceForEndpoint(source, hfEndpoint string) bool {
+	if IsHFAuthSource(source) {
+		return true
+	}
+	srcHost := SourceHost(source)
+	epHost := SourceHost(hfEndpoint)
+	return srcHost != "" && epHost != "" && strings.EqualFold(srcHost, epHost)
+}
+
+// SourceHost returns the lowercased host of an absolute URL, or "" when source
+// is empty or does not parse as one. The path, port, and userinfo are ignored:
+// a Hugging Face remote in Artifactory names its endpoint with a long
+// /artifactory/api/... path, and its resolve URLs share the host with it.
+//
+// A value without a scheme ("mirror.corp.example") parses as a path, so it
+// names no host and matches nothing. That fails safe: the download goes out
+// unauthenticated rather than the token reaching a host the user did not
+// spell out in full, matching how huggingface_hub writes HF_ENDPOINT.
+func SourceHost(source string) string {
+	if source == "" {
+		return ""
+	}
+	u, err := url.Parse(source)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
 }
 
 // HFURLPathSegments returns the non-empty path segments after the

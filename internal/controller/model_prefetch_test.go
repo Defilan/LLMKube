@@ -104,7 +104,7 @@ var _ = Describe("Model Prefetch", func() {
 				Effect:   corev1.TaintEffectNoSchedule,
 			}}
 			seedPrefetchCacheKey(m)
-			job, err := prefetchReconciler().buildPrefetchJob(m, nil)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(job.Spec.Template.Spec.Tolerations).To(HaveLen(1))
 			Expect(job.Spec.Template.Spec.Tolerations[0].Key).To(Equal("nvidia.com/gpu"))
@@ -113,7 +113,7 @@ var _ = Describe("Model Prefetch", func() {
 		It("emits no tolerations when the Model declares none", func() {
 			m := newPrefetchModel("plain")
 			seedPrefetchCacheKey(m)
-			job, err := prefetchReconciler().buildPrefetchJob(m, nil)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, nil)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(job.Spec.Template.Spec.Tolerations).To(BeEmpty())
 		})
@@ -312,7 +312,7 @@ var _ = Describe("Model Prefetch", func() {
 
 			// The bug: buildPrefetchJob hardcodes a nil isvc and the shared
 			// cache, so the per-service claim is never consulted.
-			job, err := prefetchReconciler().buildPrefetchJob(m, nil)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, nil)
 			Expect(err).NotTo(HaveOccurred())
 			sharedClaim := sharedClaimName(job)
 			Expect(sharedClaim).To(Equal(ModelCachePVCName))
@@ -323,7 +323,7 @@ var _ = Describe("Model Prefetch", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "per-service-model", Namespace: ns},
 				Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "per-service-model", ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: "llmkube-node-a-cache"}},
 			}
-			goodJob, err := prefetchReconciler().buildPrefetchJob(m, target)
+			goodJob, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, target)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(sharedClaimName(goodJob)).To(Equal("llmkube-node-a-cache"))
 			Expect(sharedClaimName(goodJob)).NotTo(Equal(ModelCachePVCName))

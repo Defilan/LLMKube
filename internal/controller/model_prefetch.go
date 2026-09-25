@@ -257,7 +257,7 @@ func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1a
 		}
 	}
 
-	job, err := r.buildPrefetchJob(model, target)
+	job, err := r.buildPrefetchJob(ctx, model, target)
 	if err != nil {
 		model.Status.Phase = PhaseFailed
 		return ctrl.Result{}, r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionFalse,
@@ -319,12 +319,16 @@ func prefetchStartedMessage(target *inferencev1alpha1.InferenceService) string {
 // target is the resolved per-InferenceService cache claim (#1676), or nil for
 // the shared cache; buildModelStorageConfig reads userModelCacheClaimName off
 // it to pick the PVC, so the download lands where the serving pod reads.
-func (r *ModelReconciler) buildPrefetchJob(model *inferencev1alpha1.Model, target *inferencev1alpha1.InferenceService) (*batchv1.Job, error) {
+//
+// ctx is needed only to read HF_ENDPOINT from the Model's sourceSecretRef, so
+// a prefetch from a mirror carries the bearer token as the serving pod does
+// (#1900).
+func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inferencev1alpha1.Model, target *inferencev1alpha1.InferenceService) (*batchv1.Job, error) {
 	if effectiveModelCacheKey(model) == "" {
 		return nil, fmt.Errorf("prefetch: model has no cache key; refusing to build a Job that would download into an emptyDir")
 	}
 	storage := buildModelStorageConfig(model, target, model.Namespace, true, ModelCacheModeShared,
-		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
+		r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpointFromSecret(ctx, r.Client, model))
 	if len(storage.initContainers) == 0 {
 		return nil, fmt.Errorf("prefetch: source %q produced no downloader containers", model.Spec.Source)
 	}

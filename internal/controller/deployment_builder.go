@@ -379,6 +379,8 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	model *inferencev1alpha1.Model,
 	draftModel *inferencev1alpha1.Model,
 	replicas int32,
+	hfEndpoint string,
+	draftHFEndpoint string,
 ) *appsv1.Deployment {
 	backend := resolveBackend(isvc)
 
@@ -411,7 +413,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		// service that declined the cache mounts an emptyDir instead of a claim
 		// nobody created (#1451).
 		useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
-		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
+		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpoint)
 		modelPath = servedModelPath(isvc, model, storageConfig)
 
 		// The draft's weights ride in the same pod, under the SAME gate as the
@@ -422,7 +424,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		if draftModel != nil {
 			draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
 			draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
-				r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots)
+				r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, draftHFEndpoint)
 			// The path comes from the merge's rewritten draft config, not from
 			// draftStorage: the merge may have remounted the draft's volume to
 			// clear a collision with the target's, and -md must follow it.
