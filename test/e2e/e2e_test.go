@@ -1515,15 +1515,19 @@ spec:
 
 			By("POSTing through the timeout router with the tight header (in-cluster, no port-forward)")
 			// Hit the new router via cluster DNS so we don't have to
-			// stand up a second port-forward. utils.RunCurlInCluster spins
-			// up a one-shot curl pod and reports HTTP_STATUS.
+			// stand up a second port-forward. utils.CurlInClusterEventually
+			// spins up one-shot curl pods and reports HTTP_STATUS, retrying
+			// until the router answers: its Service is brand new and its
+			// DNS/Endpoints can lag the Deployment's readiness for a moment,
+			// so a no-response is reachability, not the timeout under test.
 			timeoutURL := fmt.Sprintf(
 				"http://%s-router-proxy.%s.svc.cluster.local:8080/v1/chat/completions",
 				timeoutRouterName, mrcTestNs)
-			_, status, err := utils.RunCurlInCluster(mrcTestNs, timeoutURL, "POST",
+			_, status, err := utils.CurlInClusterEventually(mrcTestNs, timeoutURL, "POST",
 				map[string]string{"x-llmkube-task": "tight"},
-				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
-			Expect(err).NotTo(HaveOccurred())
+				`{"model":"stub","stream":false,"messages":[{"role":"user","content":"hi"}]}`,
+				3*time.Minute)
+			Expect(err).NotTo(HaveOccurred(), "timeout router never answered")
 			Expect(status).To(SatisfyAny(Equal(502), Equal(503)),
 				"tight-timeout dispatch should surface 502 or 503; got %d", status)
 

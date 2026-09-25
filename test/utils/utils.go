@@ -56,6 +56,14 @@ const (
 	curlPodWaitTimeout = 60 * time.Second
 
 	curlPhasePollInterval = 500 * time.Millisecond
+
+	// curlEventuallyRetryDelay paces CurlInClusterEventually's retries of a
+	// router that has not answered yet.
+	curlEventuallyRetryDelay = 2 * time.Second
+
+	// curlEventuallyDefaultDeadline bounds CurlInClusterEventually when a
+	// caller passes a non-positive window.
+	curlEventuallyDefaultDeadline = 3 * time.Minute
 )
 
 func warnError(err error) {
@@ -238,9 +246,11 @@ func WaitForPodTerminal(deadline time.Time, getPhase func() (string, error)) (st
 // RunCurlInCluster runs a one-shot curl against an in-cluster URL using
 // kubectl run + delete. Returns (stdout, status code, error). The body of the
 // HTTP response is followed by an `HTTP_STATUS=<code>` line that the parser
-// strips out. Errors are reserved for orchestration failures (pod scheduling,
-// log fetch, or a pod that never reached a terminal phase); an HTTP 5xx still
-// returns (logs, code, nil) so callers can assert on the status.
+// strips out. Errors are reserved for the request never producing an HTTP
+// response: an orchestration failure (pod scheduling, log fetch, or a pod that
+// never reached a terminal phase) or a completed curl that got no response at
+// all (000, a failed dial). A real HTTP status, including 5xx, still returns
+// (logs, code, nil) so callers can assert on it.
 func RunCurlInCluster(ns, url, method string, headers map[string]string, body string) (string, int, error) {
 	// The pod runs `curl ... > status_line; cat /tmp/body; status_line` so
 	// the pod logs end with the parseable HTTP_STATUS= sentinel.
@@ -304,16 +314,25 @@ func RunCurlInCluster(ns, url, method string, headers map[string]string, body st
 }
 
 // curlResult maps a request pod's terminal state and logs into
-// RunCurlInCluster's return shape. A pod that never reached a terminal phase
-// is an orchestration failure, not an empty HTTP response, so it returns an
-// error rather than status 0.
+// RunCurlInCluster's return shape. Two states are not an HTTP response and so
+// are errors rather than status 0: a pod that never reached a terminal phase
+// (an orchestration failure), and a completed curl that got no HTTP response
+// at all (000, a failed dial: DNS, connection refused, or --max-time). Only a
+// real status, including a 5xx, returns (logs, code, nil) for the caller to
+// assert on.
 func curlResult(podName, logs, lastPhase string, terminal bool) (string, int, error) {
 	if !terminal {
 		return "", 0, fmt.Errorf(
 			"curl pod %s did not reach a terminal phase within %s (last phase %q)",
 			podName, curlPodWaitTimeout, lastPhase)
 	}
-	return logs, parseHTTPStatus(logs), nil
+	status := parseHTTPStatus(logs)
+	if status == 0 {
+		return logs, 0, fmt.Errorf(
+			"curl pod %s got no HTTP response (HTTP_STATUS 000, a failed dial); logs:\n%s",
+			podName, logs)
+	}
+	return logs, status, nil
 }
 
 // parseHTTPStatus extracts the HTTP_STATUS= sentinel from a request pod's
@@ -326,6 +345,42 @@ func parseHTTPStatus(logs string) int {
 		}
 	}
 	return status
+}
+
+// runCurlInCluster is the request primitive CurlInClusterEventually retries. It
+// is a package variable so a unit test can substitute a stub runner without a
+// live cluster.
+var runCurlInCluster = RunCurlInCluster
+
+// CurlInClusterEventually posts the same request until it gets an HTTP
+// response, bounded by deadline, and returns the last result. A router's
+// Service can lag its Deployment for a moment after creation, so a request
+// that got no HTTP response is retried; any real response, including a 5xx, is
+// returned immediately for the caller to assert on.
+func CurlInClusterEventually(
+	ns, url, method string, headers map[string]string, body string, deadline time.Duration,
+) (string, int, error) {
+	if deadline <= 0 {
+		deadline = curlEventuallyDefaultDeadline
+	}
+	var (
+		lastOut    string
+		lastStatus int
+		lastErr    error
+	)
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		out, status, err := runCurlInCluster(ns, url, method, headers, body)
+		if err == nil {
+			return out, status, nil
+		}
+		lastOut, lastStatus, lastErr = out, status, err
+		time.Sleep(curlEventuallyRetryDelay)
+	}
+	if lastErr == nil {
+		return "", 0, fmt.Errorf("no HTTP response within %s", deadline)
+	}
+	return lastOut, lastStatus, fmt.Errorf("no HTTP response within %s: %w", deadline, lastErr)
 }
 
 // quoteShell shell-quotes each arg so the rendered command is safe to
