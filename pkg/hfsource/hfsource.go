@@ -75,44 +75,77 @@ func IsHFAuthSource(source string) bool {
 }
 
 // IsHFAuthSourceForEndpoint reports whether the operator's own downloads for
-// source should carry a Hugging Face bearer token, given the HF_ENDPOINT host
+// source should carry a Hugging Face bearer token, given the HF_ENDPOINT URL
 // named by the same spec.sourceSecretRef that holds the token. It is
-// IsHFAuthSource plus the mirror case: a source on the host the user named.
+// IsHFAuthSource plus the mirror case: a source on the origin the user named.
 //
-// The token stays bound to a host the user named in the Secret that holds it,
-// so a Model author who controls only spec.source cannot redirect it. The match
-// is exact host equality, never a prefix: HF_ENDPOINT=https://mirror.corp.example
-// must NOT send the token to mirror.corp.example.evil.com, which is the lookalike
-// host this gate exists to stop, exactly as for huggingface.co.
+// What the Secret authorizes is an ORIGIN: scheme, host and effective port.
+// A Model author who controls only spec.source can therefore not redirect the
+// token to a different service on that host, nor downgrade it to cleartext: an
+// http:// source does not match an https:// endpoint, and :8080 does not match
+// the scheme default. The path is not compared, so an Artifactory endpoint with
+// a long /artifactory/api/... path still matches its own resolve URLs, and the
+// match is exact, so mirror.corp.example.evil.com never sees the token.
 //
 // An empty HF_ENDPOINT names no mirror, so only IsHFAuthSource's hosts qualify.
 func IsHFAuthSourceForEndpoint(source, hfEndpoint string) bool {
 	if IsHFAuthSource(source) {
 		return true
 	}
-	srcHost := SourceHost(source)
-	epHost := SourceHost(hfEndpoint)
-	return srcHost != "" && epHost != "" && strings.EqualFold(srcHost, epHost)
+	return sameOrigin(source, hfEndpoint)
 }
 
-// SourceHost returns the lowercased host of an absolute URL, or "" when source
-// is empty or does not parse as one. The path, port, and userinfo are ignored:
-// a Hugging Face remote in Artifactory names its endpoint with a long
-// /artifactory/api/... path, and its resolve URLs share the host with it.
+// sameOrigin reports whether two absolute URLs name the same origin: equal
+// scheme (case-insensitive), equal host (case-insensitive), and equal effective
+// port. The port is the URL's own, or the scheme default when it is omitted, so
+// https://h and https://h:443 are the same origin while https://h:8080 is not.
 //
 // A value without a scheme ("mirror.corp.example") parses as a path, so it
-// names no host and matches nothing. That fails safe: the download goes out
-// unauthenticated rather than the token reaching a host the user did not
+// names no origin and matches nothing. That fails safe: the download goes out
+// unauthenticated rather than the token reaching an origin the user did not
 // spell out in full, matching how huggingface_hub writes HF_ENDPOINT.
-func SourceHost(source string) string {
-	if source == "" {
-		return ""
+func sameOrigin(a, b string) bool {
+	aScheme, aHost, aPort, aOK := sourceOrigin(a)
+	bScheme, bHost, bPort, bOK := sourceOrigin(b)
+	if !aOK || !bOK {
+		return false
 	}
-	u, err := url.Parse(source)
+	return aScheme == bScheme && aHost == bHost && aPort == bPort
+}
+
+// sourceOrigin splits an absolute URL into the origin triple the mirror gate
+// compares. ok is false when raw is empty or does not parse as a URL with a
+// host. The path, query, fragment and userinfo are deliberately ignored: a
+// Hugging Face remote in Artifactory names its endpoint with a long
+// /artifactory/api/... path, and its resolve URLs share the origin with it.
+func sourceOrigin(raw string) (scheme, host, port string, ok bool) {
+	if raw == "" {
+		return "", "", "", false
+	}
+	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		return ""
+		return "", "", "", false
 	}
-	return strings.ToLower(u.Hostname())
+	h := strings.ToLower(u.Hostname())
+	if h == "" {
+		return "", "", "", false
+	}
+	return strings.ToLower(u.Scheme), h, effectivePort(u), true
+}
+
+// effectivePort returns the URL's port, or the scheme's default when the URL
+// omits it, so an explicit :443 and a bare https:// compare equal.
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	}
+	return ""
 }
 
 // HFURLPathSegments returns the non-empty path segments after the

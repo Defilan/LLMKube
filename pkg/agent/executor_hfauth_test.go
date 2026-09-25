@@ -136,9 +136,9 @@ func TestIsHFAuthHostForEndpoint(t *testing.T) {
 	}
 }
 
-// The metal half of the mirror gate. The host comparison itself is pinned in
+// The metal half of the mirror gate. The origin comparison itself is pinned in
 // pkg/hfsource; this asserts the agent reaches it, including the lookalike host
-// that must never see the token.
+// and the scheme/port variants that must never see the token.
 func TestIsHFAuthHostForEndpointMirror(t *testing.T) {
 	const mirror = "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo"
 	tests := []struct {
@@ -148,6 +148,8 @@ func TestIsHFAuthHostForEndpointMirror(t *testing.T) {
 	}{
 		{"https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/org/repo/resolve/main/m.gguf", mirror, true},
 		{"https://artifactory.corp.example.evil.example/repo/m.gguf", mirror, false},
+		{"http://artifactory.corp.example/repo/m.gguf", mirror, false},
+		{"https://artifactory.corp.example:8443/repo/m.gguf", mirror, false},
 		{"https://cdn.example.com/m.gguf", mirror, false},
 		{"https://artifactory.corp.example/repo/m.gguf", "", false},
 	}
@@ -352,4 +354,49 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 	if b, _ := os.ReadFile(dst); string(b) != "weights" {
 		t.Errorf("body = %q", string(b))
 	}
+}
+
+// resolveHFAuth is the one read both gate keys come from, so its unavailable
+// cases must resolve to empty values (the ungated request that worked before
+// #1900) rather than failing, and its values must be trimmed: an env-projected
+// Secret routinely carries a trailing newline, which would send a malformed
+// token or close the mirror gate silently.
+func TestResolveHFAuth(t *testing.T) {
+	if got, ep := (&MetalExecutor{}).resolveHFAuth(t.Context(), "hf-token"); got != "" || ep != "" {
+		t.Errorf("nil client resolved (%q, %q), want empty values", got, ep)
+	}
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-token", Namespace: "default"},
+		Data: map[string][]byte{
+			"HF_TOKEN":    []byte("hf_secret\n"),
+			"HF_ENDPOINT": []byte("https://mirror.corp.example/repo\n"),
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
+		WithKubeClient("default", client, nil))
+
+	t.Run("both keys are trimmed", func(t *testing.T) {
+		got, ep := executor.resolveHFAuth(t.Context(), "hf-token")
+		if got != "hf_secret" || ep != "https://mirror.corp.example/repo" {
+			t.Errorf("resolveHFAuth() = (%q, %q), want trimmed values", got, ep)
+		}
+	})
+	t.Run("empty secret name reads nothing", func(t *testing.T) {
+		got, ep := executor.resolveHFAuth(t.Context(), "")
+		if got != "" || ep != "" {
+			t.Errorf("resolveHFAuth(empty) = (%q, %q), want empty values", got, ep)
+		}
+	})
+	t.Run("absent secret continues unauthenticated", func(t *testing.T) {
+		got, ep := executor.resolveHFAuth(t.Context(), "missing")
+		if got != "" || ep != "" {
+			t.Errorf("resolveHFAuth(missing) = (%q, %q), want empty values", got, ep)
+		}
+	})
 }

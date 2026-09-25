@@ -580,7 +580,11 @@ func hfEndpointFromSecret(ctx context.Context, c client.Client, model *inference
 	if err := c.Get(ctx, types.NamespacedName{Name: model.Spec.SourceSecretRef.Name, Namespace: model.Namespace}, secret); err != nil {
 		return ""
 	}
-	return string(secret.Data["HF_ENDPOINT"])
+	// Trimmed because an env-projected Secret routinely carries a trailing
+	// newline (kubectl --from-file, a base64 taken from echo output), and a
+	// value with a control character parses as no URL at all: the gate would
+	// then close silently and the mirror would answer 401.
+	return strings.TrimSpace(string(secret.Data["HF_ENDPOINT"]))
 }
 
 // resolveHFSourceURL converts hf://repo-id sources to their huggingface.co

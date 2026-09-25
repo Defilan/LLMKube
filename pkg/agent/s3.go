@@ -116,10 +116,12 @@ func isHFAuthHostForEndpoint(source, hfEndpoint string) bool {
 // resolveHFAuth reads HF_TOKEN and HF_ENDPOINT out of the Model's
 // sourceSecretRef, the same secret the AWS_* keys come from. One read serves
 // both keys so the gate cannot see a token without the endpoint it was paired
-// with. Unlike the S3 credentials neither is a hard error when absent: ungated
-// repositories are the common case and must keep working with no secret at
-// all, so a missing secret or a missing key simply yields an empty value and
-// the request goes out unauthenticated.
+// with. Both are trimmed: an env-projected Secret routinely carries a trailing
+// newline, which would send a malformed token or close the mirror gate
+// silently. Unlike the S3 credentials neither is a hard error when absent:
+// ungated repositories are the common case and must keep working with no
+// secret at all, so a missing secret or a missing key simply yields an empty
+// value and the request goes out unauthenticated.
 func (e *MetalExecutor) resolveHFAuth(ctx context.Context, secretName string) (token, endpoint string) {
 	if e.k8sClient == nil || secretName == "" {
 		return "", ""
@@ -130,7 +132,7 @@ func (e *MetalExecutor) resolveHFAuth(ctx context.Context, secretName string) (t
 			"secret", secretName, "namespace", e.namespace, "err", err)
 		return "", ""
 	}
-	return string(secret.Data["HF_TOKEN"]), string(secret.Data["HF_ENDPOINT"])
+	return strings.TrimSpace(string(secret.Data["HF_TOKEN"])), strings.TrimSpace(string(secret.Data["HF_ENDPOINT"]))
 }
 
 // resolveS3Credentials reads the AWS_* keys out of the Model's sourceSecretRef.

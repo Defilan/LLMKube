@@ -221,6 +221,14 @@ func TestHFEndpointFromSecret(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "aws-only", Namespace: "default"},
 		Data:       map[string][]byte{"AWS_ENDPOINT_URL": []byte("https://s3.example")},
 	}
+	// An env-projected Secret value routinely carries a trailing newline
+	// (kubectl --from-file, a base64 from echo). A control character makes the
+	// value parse as no URL at all, so the gate would close silently and the
+	// mirror would answer 401 with nothing pointing at the cause.
+	withNewline := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-nl", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte("https://mirror.corp.example/repo\n")},
+	}
 
 	tests := []struct {
 		name  string
@@ -235,6 +243,7 @@ func TestHFEndpointFromSecret(t *testing.T) {
 		{"secret absent", newHFSecretClient(t, withKey), model(&corev1.LocalObjectReference{Name: "missing"}), ""},
 		{"key absent", newHFSecretClient(t, withoutKey), model(&corev1.LocalObjectReference{Name: "aws-only"}), ""},
 		{"key present", newHFSecretClient(t, withKey), model(&corev1.LocalObjectReference{Name: "hf"}), "https://mirror.corp.example/repo"},
+		{"value with trailing newline", newHFSecretClient(t, withNewline), model(&corev1.LocalObjectReference{Name: "hf-nl"}), "https://mirror.corp.example/repo"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
