@@ -59,6 +59,38 @@ func TestLlamaCppBuildArgs(t *testing.T) {
 			notContains: []string{"--ctx-size", "--parallel", "--flash-attn", "--jinja", "--cache-type-k", "--cpu-moe", "--n-cpu-moe", "--no-kv-offload", "--override-tensor", "--override-kv", "--batch-size", "--ubatch-size", "--no-warmup", "--reasoning-budget", "--reasoning-budget-message", "--mmproj"},
 		},
 		{
+			// #1894: llama.cpp reports the on-disk path as the /v1/models ID
+			// unless --alias is set, so Open WebUI and other OpenAI clients show
+			// a namespaced filename. Default it to modelRef, matching SGLang's
+			// --served-model-name.
+			model: model,
+			name:  "alias defaults to ModelRef",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:  "llama",
+				ModelRef: "test-model",
+			},
+			contains: []FlagCheck{{"--alias", "test-model"}},
+		},
+		{
+			model: &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "fallback-name"}},
+			name:  "alias falls back to model.Name when ModelRef empty",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime: "llama",
+			},
+			contains: []FlagCheck{{"--alias", "fallback-name"}},
+		},
+		{
+			model: model,
+			name:  "alias not emitted when extraArgs already has it",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:   "llama",
+				ModelRef:  "should-not-appear",
+				ExtraArgs: []string{"--alias", "custom"},
+			},
+			contains:    []FlagCheck{{"--alias", "custom"}},
+			notContains: []string{"should-not-appear"},
+		},
+		{
 			// #972: bind the dual-stack wildcard (::), not 0.0.0.0, so pods are
 			// reachable on IPv6-only clusters. :: still accepts IPv4 (default
 			// bindv6only=0), so IPv4-only clusters are unaffected.

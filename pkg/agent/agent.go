@@ -605,6 +605,7 @@ func buildExecutorConfig(
 		Namespace:              isvc.Namespace,
 		ModelSource:            model.Spec.Source,
 		ModelName:              model.Name,
+		ServedModelName:        servedModelName(isvc, model),
 		SourceSecretRef:        model.Spec.SourceSecretRef,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
@@ -634,6 +635,20 @@ func buildExecutorConfig(
 		HotCacheMaxSize:        derefString(isvc.Spec.HotCacheMaxSize),
 		PagedSSDCacheMaxSize:   derefString(isvc.Spec.PagedSSDCacheMaxSize),
 	}
+}
+
+// servedModelName derives the llama-server --alias from spec.modelRef, falling
+// back to the Model's name, and returns "" when neither is set. It mirrors the
+// controller-side LlamaCppBackend.BuildArgs block so the in-cluster and metal
+// runtimes report the same model ID; the parity test is the contract.
+func servedModelName(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) string {
+	if isvc.Spec.ModelRef != "" {
+		return isvc.Spec.ModelRef
+	}
+	if model != nil {
+		return model.Name
+	}
+	return ""
 }
 
 func derefBool(p *bool) bool {
@@ -1766,6 +1781,10 @@ func computeSpecHash(isvc *inferencev1alpha1.InferenceService) string {
 	// Fields included MUST match what the executor actually consumes (or what
 	// it will consume once #349 closes the ExecutorConfig gap). When adding a
 	// new spec field that affects llama-server args, add it here too.
+	//
+	// ModelRef is hashed because it also derives the --alias served model name
+	// (servedModelName); that derivation needs no separate entry, and a renamed
+	// Model is a new object rather than a spec change.
 	relevant := struct {
 		ModelRef               string
 		ContextSize            *int32

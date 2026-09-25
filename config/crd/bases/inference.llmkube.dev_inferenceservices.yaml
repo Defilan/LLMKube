@@ -1436,7 +1436,9 @@ spec:
                 description: |-
                   ExtraArgs provides additional command-line arguments passed directly to the
                   runtime process. Use for flags not yet supported as typed CRD fields.
-                  Arguments are appended after all other configured flags.
+                  They are added alongside the operator's own flags, but the operator may
+                  still append arguments of its own afterward (for example llama.cpp's
+                  --metrics), so do not rely on extraArgs overriding a flag by position.
                   Supported by the "llamacpp", "llamacpp-router", "sglang", "tgi" and
                   "vllm" runtimes. Ignored by "generic" (which takes spec.args instead)
                   and "personaplex" — except that whenever spec.command is set, extraArgs
