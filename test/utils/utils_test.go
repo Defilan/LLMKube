@@ -92,6 +92,71 @@ func TestRunCurlInClusterSurfacesUnfinishedPod(t *testing.T) {
 	}
 }
 
+// TestCurlResultRejectsNoResponse pins that a completed curl with no HTTP
+// response (HTTP_STATUS 000) is an error, not a status of 0 a caller would
+// read as a response.
+func TestCurlResultRejectsNoResponse(t *testing.T) {
+	logs := "curl: (7) Failed to connect\nHTTP_STATUS=000\n"
+	_, status, err := curlResult("e2e-curl-test", logs, "Succeeded", true)
+	if err == nil {
+		t.Fatalf("curlResult() = nil error for a request that got no HTTP response (status %d)", status)
+	}
+	if !strings.Contains(err.Error(), "no HTTP response") {
+		t.Fatalf("error = %q, want it to name the missing HTTP response", err)
+	}
+}
+
+// TestCurlInClusterEventuallyRetriesUntilResponse covers the retry seam: a
+// router that answers on a later attempt is returned, not failed, because a
+// freshly created Service can lag its Deployment.
+func TestCurlInClusterEventuallyRetriesUntilResponse(t *testing.T) {
+	orig := runCurlInCluster
+	t.Cleanup(func() { runCurlInCluster = orig })
+
+	var calls int
+	runCurlInCluster = func(_, _, _ string, _ map[string]string, _ string) (string, int, error) {
+		calls++
+		if calls < 2 {
+			return "", 0, fmt.Errorf("got no HTTP response")
+		}
+		return "body", 503, nil
+	}
+
+	out, status, err := CurlInClusterEventually("ns", "http://router", "POST", nil, "{}", time.Minute)
+	if err != nil {
+		t.Fatalf("CurlInClusterEventually() = %v, want nil once a later attempt answers", err)
+	}
+	if status != 503 {
+		t.Fatalf("status = %d, want 503", status)
+	}
+	if out != "body" {
+		t.Fatalf("body = %q, want %q", out, "body")
+	}
+	if calls != 2 {
+		t.Fatalf("attempts = %d, want 2 (one retry)", calls)
+	}
+}
+
+// TestCurlInClusterEventuallyGivesUpAtDeadline pins the bound: a router that
+// never answers must surface an error that names the missing response, so the
+// spec fails on the real cause rather than on a status of 0.
+func TestCurlInClusterEventuallyGivesUpAtDeadline(t *testing.T) {
+	orig := runCurlInCluster
+	t.Cleanup(func() { runCurlInCluster = orig })
+
+	runCurlInCluster = func(_, _, _ string, _ map[string]string, _ string) (string, int, error) {
+		return "", 0, fmt.Errorf("got no HTTP response")
+	}
+
+	_, _, err := CurlInClusterEventually("ns", "http://router", "POST", nil, "{}", 300*time.Millisecond)
+	if err == nil {
+		t.Fatalf("CurlInClusterEventually() = nil, want an error once the deadline passes")
+	}
+	if !strings.Contains(err.Error(), "no HTTP response") {
+		t.Fatalf("error = %q, want it to name the missing response", err)
+	}
+}
+
 func TestRetryNRetriesTransientFailures(t *testing.T) {
 	var calls int
 	err := retryN(3, 0, func() error {
