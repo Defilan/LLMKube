@@ -1,8 +1,9 @@
 {{/*
 Router-proxy pods. The inference data plane stays reachable from all callers;
-the metrics listener (9090), which also serves the budget snapshot the operator
-reads to publish ModelRouter.status.budgetUtilization, is scoped to the
-controller-manager. Without this the admin Service is reachable by every pod in
+the metrics listener (9090), which serves both the budget snapshot the operator
+reads to publish ModelRouter.status.budgetUtilization and the metrics the
+PodMonitor scrapes, is scoped to the controller-manager and the Prometheus
+scrape namespaces. Without this the admin Service is reachable by every pod in
 the cluster, since a ClusterIP is not a boundary.
 
 Scope note: a NetworkPolicy is namespace-scoped, so this covers router-proxy
@@ -32,7 +33,8 @@ spec:
   - ports:
     - protocol: TCP
       port: 8080
-  # The metrics/admin listener, read only by the controller-manager.
+  # The metrics/admin listener, read by the controller-manager and by the
+  # Prometheus scrape source.
   - from:
     - namespaceSelector:
         matchLabels:
@@ -43,4 +45,20 @@ spec:
     ports:
     - protocol: TCP
       port: 9090
+  {{- /* The PodMonitor scrapes 9090 from Prometheus, which is not the
+         controller-manager; without this the metrics scrape is denied. */}}
+  {{- with .Values.networkPolicies.metricsScrapeNamespaces }}
+  - from:
+    - namespaceSelector:
+        matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+          {{- range . }}
+          - {{ . }}
+          {{- end }}
+    ports:
+    - protocol: TCP
+      port: 9090
+  {{- end }}
 {{- end }}

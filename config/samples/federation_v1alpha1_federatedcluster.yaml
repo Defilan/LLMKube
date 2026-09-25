@@ -14,8 +14,8 @@ spec:
   # HeartbeatIntervalSeconds is how often the edge operator is expected to push
   # status updates to the datacenter. The datacenter controller derives staleness
   # thresholds from this: 3x the interval marks the site as Stale, 10x marks it as
-  # Unreachable. The floor is 30 seconds, the cadence the edge pushes on, which
-  # is also the default.
+  # Unreachable. The delivered cadence is 30 seconds, which is also the default;
+  # a value below it is accepted and clamped up to 30 for those thresholds.
   heartbeatIntervalSeconds: 30
 
 # Status is edge-written by the federation-edge controller and datacenter-written

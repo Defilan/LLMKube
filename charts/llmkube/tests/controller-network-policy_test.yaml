@@ -1,0 +1,30 @@
+suite: controller-manager network policy
+templates:
+  - network-policy.yaml
+
+tests:
+  - it: renders no controller policy when networkPolicies is disabled
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: allows the controller to reach the router-proxy budget listener
+    set:
+      networkPolicies.enabled: true
+    asserts:
+      - isKind:
+          of: NetworkPolicy
+      # The operator polls the router admin endpoint (9090) to publish
+      # ModelRouter.status.budgetUtilization; without this egress the poll is
+      # denied by the port allowlist above.
+      - contains:
+          path: spec.egress
+          content:
+            to:
+              - podSelector:
+                  matchExpressions:
+                    - key: inference.llmkube.dev/model-router
+                      operator: Exists
+            ports:
+              - protocol: TCP
+                port: 9090

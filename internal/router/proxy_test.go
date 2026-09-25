@@ -1469,3 +1469,26 @@ func TestProxyBudgetUnpricedBackendCounted(t *testing.T) {
 		t.Errorf("no_pricing counter = %v, want %v", after, before+1)
 	}
 }
+
+// TestCaptureForBudgetOnlyWhenBudgeted pins the allocation gate: the response
+// tail buffer exists for token accounting, so an unbudgeted request must not
+// have its body wrapped, while a budgeted one must.
+func TestCaptureForBudgetOnlyWhenBudgeted(t *testing.T) {
+	orig := io.NopCloser(strings.NewReader("body"))
+	resp := &http.Response{Body: orig}
+
+	if got := captureForBudget(resp, nil); got != nil {
+		t.Errorf("captureForBudget(nil scope) = %v, want nil", got)
+	}
+	if resp.Body != orig {
+		t.Error("captureForBudget(nil scope) replaced resp.Body")
+	}
+
+	captured := captureForBudget(resp, []string{"router"})
+	if captured == nil {
+		t.Fatal("captureForBudget(router scope) = nil, want a capture")
+	}
+	if resp.Body != captured {
+		t.Error("captureForBudget(router scope) did not install the capture on resp.Body")
+	}
+}

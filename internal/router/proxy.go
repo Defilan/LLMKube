@@ -327,8 +327,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		// Capture the response body as it streams so the proxy can read the
 		// upstream's token usage after the client has been served. The buffer
 		// keeps the tail, where an SSE usage chunk lives.
-		captured := &capturedBody{rc: resp.Body, limit: maxUsageCaptureBytes}
-		resp.Body = captured
+		captured := captureForBudget(resp, scopeKeys)
 
 		streamed := streamResponse(w, resp, isStream)
 		outcome := streamedReason(streamed)
@@ -500,6 +499,20 @@ func (c *capturedBody) Close() error { return c.rc.Close() }
 
 // Bytes returns the captured tail of the response body.
 func (c *capturedBody) Bytes() []byte { return c.buf }
+
+// captureForBudget wraps resp.Body in the bounded tail buffer only when a
+// budget applies to the request, and returns nil otherwise. The buffer exists
+// for token accounting, so an unbudgeted response must not pay its allocation:
+// it installs the wrapper on resp.Body and hands it back, or leaves resp.Body
+// untouched.
+func captureForBudget(resp *http.Response, scopeKeys []string) *capturedBody {
+	if len(scopeKeys) == 0 {
+		return nil
+	}
+	captured := &capturedBody{rc: resp.Body, limit: maxUsageCaptureBytes}
+	resp.Body = captured
+	return captured
+}
 
 // modelPoolRetryAfterSeconds is the Retry-After value sent with a 503 when a
 // ModelPool activation hold exceeds the request budget. A few seconds is enough

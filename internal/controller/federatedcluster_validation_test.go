@@ -21,7 +21,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -29,8 +28,10 @@ import (
 )
 
 // There is no admission webhook for FederatedCluster, so the CRD schema is the
-// only guard on the heartbeat cadence. These Its pin that bound at the API
-// server, which is what an operator actually hits.
+// only gate at the API server. A heartbeat interval below the edge's delivered
+// cadence is accepted and stored as declared; the hub clamps it before deriving
+// staleness thresholds (TestEffectiveHeartbeatIntervalSeconds), so rejecting it
+// at admission is not required and would invalidate existing objects.
 var _ = Describe("FederatedCluster admission validation", func() {
 	var (
 		ctx  context.Context
@@ -49,7 +50,7 @@ var _ = Describe("FederatedCluster admission validation", func() {
 		}
 	})
 
-	It("rejects a heartbeat interval below the edge push cadence", func() {
+	It("accepts a heartbeat interval below the edge push cadence", func() {
 		fc := &federationv1alpha1.FederatedCluster{
 			ObjectMeta: metav1.ObjectMeta{Name: name},
 			Spec: federationv1alpha1.FederatedClusterSpec{
@@ -57,12 +58,13 @@ var _ = Describe("FederatedCluster admission validation", func() {
 			},
 		}
 
-		err := k8sClient.Create(ctx, fc)
-		Expect(err).To(HaveOccurred())
-		// A CRD schema violation is Invalid (422), not merely any error: a bare
-		// non-nil check would pass on an unrelated failure.
-		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "err = %v", err)
-		Expect(err.Error()).To(ContainSubstring("30"))
+		Expect(k8sClient.Create(ctx, fc)).To(Succeed())
+
+		// The declared value is stored unchanged; the hub, not admission, is
+		// what makes a sub-cadence value behave as the delivered cadence.
+		stored := &federationv1alpha1.FederatedCluster{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name}, stored)).To(Succeed())
+		Expect(stored.Spec.HeartbeatIntervalSeconds).To(Equal(int32(5)))
 	})
 
 	It("accepts the cadence floor exactly", func() {

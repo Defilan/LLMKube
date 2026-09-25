@@ -53,10 +53,11 @@ const (
 	// +kubebuilder:default=30 on HeartbeatIntervalSeconds.
 	defaultHeartbeatIntervalSeconds = int32(30)
 
-	// minHeartbeatIntervalSeconds mirrors the CRD's
-	// +kubebuilder:validation:Minimum=30, so the CLI rejects a sub-cadence
-	// interval locally rather than bouncing off admission.
-	minHeartbeatIntervalSeconds = int32(30)
+	// subCadenceWarnThreshold is the edge's fixed 30s push cadence. An interval
+	// below it is stored as declared and the hub clamps it before deriving
+	// staleness thresholds, so register warns rather than rejecting: a caller
+	// that set a low interval keeps working, and the clamping is visible.
+	subCadenceWarnThreshold = int32(30)
 
 	// fleetTokenExpirationSeconds is long-lived (10 years): this token is a
 	// bootstrap credential embedded in a kubeconfig file carried to a remote
@@ -273,11 +274,6 @@ func fleetRegister(
 	if interval <= 0 {
 		interval = defaultHeartbeatIntervalSeconds
 	}
-	if interval < minHeartbeatIntervalSeconds {
-		return "", fmt.Errorf(
-			"fleet register: heartbeat-interval must be at least %ds (the edge pushes on a fixed %ds cadence); got %ds",
-			minHeartbeatIntervalSeconds, minHeartbeatIntervalSeconds, interval)
-	}
 	saName := fleetServiceAccountPrefix + in.Name
 
 	fc := &federationv1alpha1.FederatedCluster{
@@ -343,8 +339,13 @@ func fleetRegister(
 	if err != nil {
 		return "", err
 	}
-
-	return buildEdgeConfigSnippet(in.Name, in.DatacenterEndpoint, in.CACertData, saName, namespace, token, expiresAt), nil
+	out := buildEdgeConfigSnippet(in.Name, in.DatacenterEndpoint, in.CACertData, saName, namespace, token, expiresAt)
+	if interval < subCadenceWarnThreshold {
+		out += fmt.Sprintf("# WARNING: heartbeat-interval %ds is below the edge's fixed %ds push\n"+
+			"# cadence; the datacenter clamps a sub-cadence value up to %ds for staleness\n"+
+			"# and requeue.\n", interval, subCadenceWarnThreshold, subCadenceWarnThreshold)
+	}
+	return out, nil
 }
 
 // buildEdgeConfigSnippet formats the kubeconfig + operator flags a site

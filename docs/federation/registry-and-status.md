@@ -37,7 +37,7 @@ Flag meanings:
 
 - `--name` (required): Unique identifier for this edge site's FederatedCluster object. Used as the token's resource scope.
 - `--residency`: Free-form data residency tier label (e.g., "eu", "us-west", "floor-3"). Recorded now; enforced later by the federation router (issue #1237).
-- `--heartbeat-interval`: Expected edge heartbeat interval in seconds. Staleness thresholds are derived from this (3x=Stale, 10x=Unreachable). Defaults to 30 seconds. The floor is also 30 seconds: that is the cadence the edge pushes on, so a lower value is never delivered and the command rejects it.
+- `--heartbeat-interval`: Expected edge heartbeat interval in seconds. Staleness thresholds are derived from this (3x=Stale, 10x=Unreachable). Defaults to 30 seconds. Values below 30 are accepted, and the datacenter clamps them up to the 30 second cadence the edge actually pushes on before deriving those thresholds.
 - `--datacenter-endpoint`: Datacenter API server URL to embed in the edge kubeconfig. If omitted, falls back to the current kubeconfig context's server.
 - `--namespace`: Kubernetes namespace on the datacenter to create the per-site ServiceAccount. Defaults to llmkube-system.
 
