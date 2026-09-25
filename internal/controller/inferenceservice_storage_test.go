@@ -401,7 +401,7 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
 		Expect(cmd).To(ContainSubstring("printf '%s\\n' \"$MODEL_FILES\""))
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$(dirname "$dest")"`))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"`))
+		Expect(cmd).To(ContainSubstring(`curl -f -L -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest"`))
 		Expect(cmd).ToNot(ContainSubstring(`-o "$dest" `))
 		Expect(cmd).To(ContainSubstring("already cached, skipping download"))
 	})
@@ -1532,7 +1532,11 @@ var _ = Describe("buildCachedStorageConfig RefreshPolicy plumbing", func() {
 		}
 		config := buildCachedStorageConfig(model, nil, "", "", "curl:8.18.0", 102)
 		cmd := config.initContainers[1].Command[2]
-		Expect(cmd).NotTo(ContainSubstring("remote_size"))
+		// Existence-only, not revalidation: the OnChange marker never appears.
+		// remote_size no longer discriminates the two paths, because the
+		// IfNotPresent resume prologue sets it for the progress heartbeat too.
+		Expect(cmd).NotTo(ContainSubstring("kept cached copy"))
+		Expect(cmd).To(ContainSubstring(`if [ ! -f "$MODEL_PATH" ]`))
 		Expect(cmd).To(ContainSubstring("skipping download"))
 	})
 })

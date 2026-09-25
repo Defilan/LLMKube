@@ -52,7 +52,8 @@ var _ = Describe("buildModelInitCommand (s3)", func() {
 	It("should NOT emit --aws-sigv4 for non-s3 source", func() {
 		cmd := buildModelInitCommand(false, false, true, false, "")
 		Expect(cmd).ToNot(ContainSubstring("aws-sigv4"))
-		Expect(cmd).To(ContainSubstring(`curl -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
+		Expect(cmd).To(ContainSubstring(`download_with_progress "$MODEL_PARTIAL" "$remote_size" curl -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter`))
+		Expect(cmd).To(ContainSubstring(`&& mv "$MODEL_PARTIAL" "$MODEL_PATH"`))
 	})
 
 	// A truncated transfer must never be published at $MODEL_PATH: the guard

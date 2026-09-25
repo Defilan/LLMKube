@@ -315,6 +315,24 @@ func addCACertVolume(volumes *[]corev1.Volume, mounts *[]corev1.VolumeMount, cmd
 // --location-trusted must NOT be added here.
 const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authorization: Bearer ${HF_TOKEN}" "$@"; else curl "$@"; fi; }` + " && "
 
+// downloadProgressFn defines download_with_progress, the shell helper every
+// transfer runs under so kubectl logs -c model-downloader shows newline-
+// terminated progress. A live curl meter redraws over itself with carriage
+// returns, and Kubernetes records a log line only at a newline, so without this
+// a multi-gigabyte download is indistinguishable from a stalled one until it
+// finishes (#1895).
+//
+// It backgrounds the transfer and polls the partial's size every second,
+// printing a line on each ${PROGRESS_INTERVAL:-10} tick. Interval is a positive
+// integer of seconds, overridable through the init container's environment.
+// `wait` returns the transfer's own exit status so a failed download still
+// fails the init container.
+//
+// Every variable is _llmkube_-prefixed because download_with_progress is called
+// inside buildMultiFileInitCommand's `while read` loop, whose dest, url, and
+// remote_size must survive the call.
+const downloadProgressFn = `download_with_progress() { _llmkube_dest="$1"; _llmkube_total="${2:-}"; shift 2; "$@" & _llmkube_pid=$!; _llmkube_elapsed=0; while kill -0 "$_llmkube_pid" 2>/dev/null; do sleep 1; kill -0 "$_llmkube_pid" 2>/dev/null || break; _llmkube_elapsed=$((_llmkube_elapsed + 1)); [ $((_llmkube_elapsed % ${PROGRESS_INTERVAL:-10})) -eq 0 ] || continue; _llmkube_have=$(stat -c %s "$_llmkube_dest" 2>/dev/null || echo 0); if [ -n "$_llmkube_total" ] && [ "$_llmkube_total" -gt 0 ] 2>/dev/null; then echo "Downloaded $((_llmkube_have / 1048576)) MiB of $((_llmkube_total / 1048576)) MiB ($((_llmkube_have * 100 / _llmkube_total))%)"; else echo "Downloaded $((_llmkube_have / 1048576)) MiB"; fi; done; wait "$_llmkube_pid"; }` + " && "
+
 // The HTTP transfers fill a content-keyed partial and mv onto "$MODEL_PATH"
 // on success; the S3 and local-copy branches still fill "$MODEL_PATH.tmp".
 // Two invariants the shape of the command exists to hold:
@@ -343,32 +361,36 @@ const hfAuthFn = `hf_curl() { if [ -n "${HF_TOKEN:-}" ]; then curl -H "Authoriza
 // The s3:// and local `cp` branches still open with the plain
 // `rm -f "$MODEL_PATH.tmp"`: sigv4 range signing is unverified and a local copy
 // has nothing to resume, so they stay byte-for-byte as they were pre-resume.
+//
+// Every curl transfer is wrapped in download_with_progress, and the transfer's
+// --no-progress-meter is placed at the END of its arguments so the existing
+// `-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"` shape stays contiguous.
 func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy string) string {
 	if useCache {
 		if isLocal {
 			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model copied successfully'; else echo 'Model already cached, skipping copy'; fi`
 		}
 		if isS3 {
-			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; ` + downloadProgressFn + `download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
 			return "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 		}
-		return `mkdir -p "$CACHE_DIR" && ` + hfAuthPrefix(isHFAuth) +
-			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+		return `mkdir -p "$CACHE_DIR" && ` + downloadProgressFn + hfAuthPrefix(isHFAuth) +
+			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + `download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
 	}
 
 	if isLocal {
 		return `echo 'ERROR: Local model source requires model cache to be configured.'; exit 1`
 	}
 	if isS3 {
-		return `if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+		return `if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; ` + downloadProgressFn + `download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 	}
 	if refreshPolicy == RefreshPolicyOnChange {
 		return hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
 	}
-	return hfAuthPrefix(isHFAuth) +
-		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+	return downloadProgressFn + hfAuthPrefix(isHFAuth) +
+		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + `download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -415,7 +437,8 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 // container.
 func remoteRevalidateScript(isHFAuth bool) string {
 	c := curlCmd(isHFAuth)
-	return `echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
+	return downloadProgressFn +
+		`echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
 		`probe=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w 'CL%header{content-length}ET%header{etag}' 2>/dev/null || echo 'CL0ET'); ` +
 		`remote_size=${probe#CL}; remote_size=${remote_size%%ET*}; ` +
 		`remote_validator=${probe}; ` +
@@ -423,7 +446,7 @@ func remoteRevalidateScript(isHFAuth bool) string {
 		`echo 'Model revalidated (unchanged, skipped download)'; ` +
 		`else ` +
 		validatorDeriveAndSweep() +
-		`if ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" && mv "$MODEL_PARTIAL" "$MODEL_PATH"; then ` +
+		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && mv "$MODEL_PARTIAL" "$MODEL_PATH"; then ` +
 		`echo 'Model revalidated (downloaded)'; ` +
 		`elif [ -f "$MODEL_PATH" ]; then echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
 		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
@@ -501,6 +524,9 @@ func debrisSweep() string {
 // instead of resuming blindly.
 func resumePrologue(isHFAuth bool) string {
 	return `remote_validator=$(` + curlCmd(isHFAuth) + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w 'CL%header{content-length}ET%header{etag}' 2>/dev/null || echo ''); ` +
+		// remote_size feeds download_with_progress the total for a percent line;
+		// it is empty when the probe failed, and the heartbeat then prints bytes.
+		`remote_size=${remote_validator#CL}; remote_size=${remote_size%%ET*}; ` +
 		validatorDeriveAndSweep()
 }
 
@@ -682,6 +708,9 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 	if !useCache {
 		prefix = `mkdir -p /models && find /models -name '*.tmp' -delete && `
 	}
+	// Every branch transfers per file, so the heartbeat helper rides the prefix
+	// once rather than being concatenated at each call site.
+	prefix = downloadProgressFn + prefix
 
 	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) src="${1#hf://}"; rev="${src#*@}"; if [ "$rev" != "$src" ]; then echo "https://huggingface.co/${src%%@*}/resolve/$rev/"; else echo "https://huggingface.co/$src/resolve/main/"; fi ;; *) echo "$1" ;; esac; }` + " && "
 
@@ -699,7 +728,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 				`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 				`else ` +
-				`if curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
+				`if download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest"; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
 				`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 				`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
@@ -718,7 +747,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 			`url="${AWS_ENDPOINT_URL}/${S3_BUCKET}/${key}"; ` +
 			`if [ ! -f "$dest" ]; then ` +
 			`echo "Downloading model artifact $rel..."; ` +
-			`curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
+			`download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
 			`else echo "Model artifact $rel already cached, skipping download"; fi; ` +
 			`done`
 		return prefix + body
@@ -736,7 +765,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
-			`if ` + curlCmd(isHFAuth) + ` -fsSL -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest"; then ` +
+			`if download_with_progress "$dest.tmp" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest"; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
@@ -754,7 +783,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 		`url="${SOURCE%/}/$rel"; ` +
 		`if [ ! -f "$dest" ]; then ` +
 		`echo "Downloading model artifact $rel..."; ` +
-		curlCmd(isHFAuth) + ` -f -L -o "$dest.tmp" "$url" && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
+		`download_with_progress "$dest.tmp" "" ` + curlCmd(isHFAuth) + ` -f -L -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
 		`else echo "Model artifact $rel already cached, skipping download"; fi; ` +
 		`done`
 	return prefix + body
