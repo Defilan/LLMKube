@@ -39,12 +39,15 @@ func TestHFSourceShimsDelegate(t *testing.T) {
 			t.Errorf(`isHuggingFaceURL("https://example.com/model.gguf") = true, want false`)
 		}
 	})
-	t.Run("isHFAuthSource", func(t *testing.T) {
-		if !isHFAuthSource("hf://meta-llama/Llama-Guard-4-12B") {
-			t.Errorf(`isHFAuthSource("hf://meta-llama/Llama-Guard-4-12B") = false, want true`)
+	t.Run("isHFAuthSourceForEndpoint", func(t *testing.T) {
+		if !isHFAuthSourceForEndpoint("hf://meta-llama/Llama-Guard-4-12B", "") {
+			t.Errorf(`isHFAuthSourceForEndpoint("hf://meta-llama/Llama-Guard-4-12B", "") = false, want true`)
 		}
-		if isHFAuthSource("https://cdn.example.com/model.gguf") {
-			t.Errorf(`isHFAuthSource("https://cdn.example.com/model.gguf") = true, want false`)
+		if isHFAuthSourceForEndpoint("https://cdn.example.com/model.gguf", "") {
+			t.Errorf(`isHFAuthSourceForEndpoint("https://cdn.example.com/model.gguf", "") = true, want false`)
+		}
+		if !isHFAuthSourceForEndpoint("https://mirror.corp.example/repo/m.gguf", "https://mirror.corp.example/repo") {
+			t.Errorf("the controller shim dropped the mirror host match")
 		}
 	})
 	t.Run("isHuggingFaceFileURL", func(t *testing.T) {

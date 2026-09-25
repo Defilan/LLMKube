@@ -1,9 +1,16 @@
 package controller
 
 import (
+	"context"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/hfsource"
 )
 
@@ -11,7 +18,9 @@ import (
 // got credentials, so every gated or private Hugging Face repository failed
 // with 401 for GGUF models, for spec.files staging, and for prefetch (#1750).
 // These pin the two halves of the fix: the header is emitted for huggingface.co
-// sources, and for nothing else.
+// sources, and for nothing else. An empty HF_ENDPOINT names no mirror, so these
+// rows are the behaviour that predates #1900; the mirror rows live in
+// pkg/hfsource and in the prefetch mirror test.
 
 func TestIsHFAuthSource(t *testing.T) {
 	tests := []struct {
@@ -40,8 +49,8 @@ func TestIsHFAuthSource(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isHFAuthSource(tc.source); got != tc.want {
-				t.Errorf("isHFAuthSource(%q) = %v, want %v", tc.source, got, tc.want)
+			if got := isHFAuthSourceForEndpoint(tc.source, ""); got != tc.want {
+				t.Errorf("isHFAuthSourceForEndpoint(%q, \"\") = %v, want %v", tc.source, got, tc.want)
 			}
 		})
 	}
@@ -174,4 +183,73 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+func newHFSecretClient(t *testing.T, objs ...*corev1.Secret) *ModelReconciler {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add inference scheme: %v", err)
+	}
+	builder := fake.NewClientBuilder().WithScheme(scheme)
+	for _, o := range objs {
+		builder = builder.WithObjects(o)
+	}
+	return &ModelReconciler{Client: builder.Build()}
+}
+
+// hfEndpointFromSecret decides whether a non-Hugging-Face source is a mirror
+// (#1900), so every unavailable case must resolve to "no mirror" rather than
+// failing the reconcile: an absent Secret, a missing key, an empty ref, a nil
+// model and a nil client (unit tests build the reconciler bare) each mean the
+// ungated download that worked before this change.
+func TestHFEndpointFromSecret(t *testing.T) {
+	model := func(ref *corev1.LocalObjectReference) *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://mirror.corp.example/m.gguf", SourceSecretRef: ref},
+		}
+	}
+	withKey := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte("https://mirror.corp.example/repo")},
+	}
+	withoutKey := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "aws-only", Namespace: "default"},
+		Data:       map[string][]byte{"AWS_ENDPOINT_URL": []byte("https://s3.example")},
+	}
+	// An env-projected Secret value routinely carries a trailing newline
+	// (kubectl --from-file, a base64 from echo). A control character makes the
+	// value parse as no URL at all, so the gate would close silently and the
+	// mirror would answer 401 with nothing pointing at the cause.
+	withNewline := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "hf-nl", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte("https://mirror.corp.example/repo\n")},
+	}
+
+	tests := []struct {
+		name  string
+		r     *ModelReconciler
+		model *inferencev1alpha1.Model
+		want  string
+	}{
+		{"nil client", &ModelReconciler{}, model(&corev1.LocalObjectReference{Name: "hf"}), ""},
+		{"nil model", newHFSecretClient(t, withKey), nil, ""},
+		{"no secret ref", newHFSecretClient(t, withKey), model(nil), ""},
+		{"empty secret name", newHFSecretClient(t, withKey), model(&corev1.LocalObjectReference{}), ""},
+		{"secret absent", newHFSecretClient(t, withKey), model(&corev1.LocalObjectReference{Name: "missing"}), ""},
+		{"key absent", newHFSecretClient(t, withoutKey), model(&corev1.LocalObjectReference{Name: "aws-only"}), ""},
+		{"key present", newHFSecretClient(t, withKey), model(&corev1.LocalObjectReference{Name: "hf"}), "https://mirror.corp.example/repo"},
+		{"value with trailing newline", newHFSecretClient(t, withNewline), model(&corev1.LocalObjectReference{Name: "hf-nl"}), "https://mirror.corp.example/repo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hfEndpointFromSecret(context.Background(), tc.r.Client, tc.model); got != tc.want {
+				t.Errorf("hfEndpointFromSecret() = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

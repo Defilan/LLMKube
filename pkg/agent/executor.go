@@ -354,15 +354,19 @@ func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string,
 	if isS3Source(source) {
 		return e.downloadS3(ctx, source, filePath, secretRef)
 	}
-	// Gated and private Hugging Face repositories need a bearer token (#1750).
-	// Read from the same sourceSecretRef the S3 path uses, and attach it only
-	// for Hugging Face sources (hf:// or huggingface.co) so a Model pointing
-	// at another host never sees it. The hf:// source downloadFile receives is
-	// resolved to its huggingface.co form before the request is built, so the
-	// scheme works the same as the init-container path.
+	// Gated and private Hugging Face repositories need a bearer token (#1750),
+	// and so does a Hugging Face mirror named by HF_ENDPOINT (#1900). Both come
+	// from the same sourceSecretRef the S3 path uses, and the token is attached
+	// only for Hugging Face sources or a source on the HF_ENDPOINT host, so a
+	// Model pointing at another host never sees it. The hf:// source
+	// downloadFile receives is resolved to its huggingface.co form before the
+	// request is built, so the scheme works the same as the init-container path.
 	var token string
-	if isHFAuthHost(source) && secretRef != nil {
-		token = e.resolveHFToken(ctx, secretRef.Name)
+	if secretRef != nil {
+		secretToken, hfEndpoint := e.resolveHFAuth(ctx, secretRef.Name)
+		if isHFAuthHostForEndpoint(source, hfEndpoint) {
+			token = secretToken
+		}
 	}
 	return e.downloadFile(ctx, source, filePath, token)
 }

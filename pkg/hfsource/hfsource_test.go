@@ -78,6 +78,102 @@ func TestIsHFAuthSource(t *testing.T) {
 	}
 }
 
+// sourceOrigin is the whole match key for the mirror gate, so it must drop
+// everything that is not part of the origin: an Artifactory HF_ENDPOINT carries
+// a long /artifactory/api/... path, and the port must be normalised so an
+// explicit :443 and a bare https:// compare equal.
+func TestSourceOrigin(t *testing.T) {
+	tests := []struct {
+		name       string
+		source     string
+		wantScheme string
+		wantHost   string
+		wantPort   string
+		wantOK     bool
+	}{
+		{"plain", "https://mirror.corp.example/org/repo/model.gguf", "https", "mirror.corp.example", "443", true},
+		{"host case folded", "https://Mirror.Corp.Example/org/repo", "https", "mirror.corp.example", "443", true},
+		{"artifactory path", "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo",
+			"https", "artifactory.corp.example", "443", true},
+		{"explicit default port", "https://mirror.corp.example:443/org/repo", "https", "mirror.corp.example", "443", true},
+		{"explicit port", "https://mirror.corp.example:8443/org/repo", "https", "mirror.corp.example", "8443", true},
+		{"http default port", "http://mirror.corp.example/org/repo", "http", "mirror.corp.example", "80", true},
+		{"http explicit port", "http://mirror.corp.example:8080/org/repo", "http", "mirror.corp.example", "8080", true},
+		{"userinfo ignored", "https://user:pass@mirror.corp.example/org/repo", "https", "mirror.corp.example", "443", true},
+		{"no scheme names no origin", "mirror.corp.example/org/repo", "", "", "", false},
+		{"local path", "/host-model/model.gguf", "", "", "", false},
+		{"empty", "", "", "", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme, host, port, ok := sourceOrigin(tc.source)
+			if ok != tc.wantOK {
+				t.Fatalf("sourceOrigin(%q) ok = %v, want %v", tc.source, ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if scheme != tc.wantScheme || host != tc.wantHost || port != tc.wantPort {
+				t.Errorf("sourceOrigin(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					tc.source, scheme, host, port, tc.wantScheme, tc.wantHost, tc.wantPort)
+			}
+		})
+	}
+}
+
+// The mirror gate. A source on the origin the Secret named gets the token; a
+// lookalike host, a scheme downgrade or a different port must not, because
+// each is a different origin than the Secret authorized, and an empty
+// HF_ENDPOINT names no mirror at all.
+func TestIsHFAuthSourceForEndpoint(t *testing.T) {
+	const mirror = "https://artifactory.corp.example/artifactory/api/huggingfaceml/repo"
+	tests := []struct {
+		name       string
+		source     string
+		hfEndpoint string
+		want       bool
+	}{
+		{"mirror source",
+			"https://artifactory.corp.example/artifactory/api/huggingfaceml/repo/unsloth/Qwen3-GGUF/resolve/main/m.gguf",
+			mirror, true},
+		{"mirror source other path", "https://artifactory.corp.example/other/repo/m.gguf", mirror, true},
+		{"mirror host case folded", "https://ARTIFACTORY.Corp.Example/.../resolve/main/m.gguf", mirror, true},
+		{"mirror explicit default port", "https://artifactory.corp.example:443/.../resolve/main/m.gguf", mirror, true},
+		// The token is bound to an ORIGIN, not a host: a downgrade or another
+		// port is a different service than the Secret named.
+		{"mirror host other port", "https://artifactory.corp.example:8443/.../resolve/main/m.gguf", mirror, false},
+		{"scheme downgrade", "http://artifactory.corp.example/repo/m.gguf", mirror, false},
+		// A scheme change with the SAME explicit port isolates the scheme check:
+		// http-vs-https on default ports also changes the effective port, so the
+		// port check alone would catch that spelling and this guard would look
+		// stronger than it is.
+		{"scheme differs, same explicit port",
+			"http://artifactory.corp.example:8080/repo/m.gguf",
+			"https://artifactory.corp.example:8080/artifactory/api/huggingfaceml/repo", false},
+		// The one that matters. A prefix or substring match would send the token
+		// to an attacker-controlled domain that merely contains the mirror host.
+		{"lookalike host", "https://artifactory.corp.example.evil.example/repo/m.gguf", mirror, false},
+		{"substring host", "https://notartifactory.corp.example/repo/m.gguf", mirror, false},
+		{"different host", "https://cdn.example.com/m.gguf", mirror, false},
+		// An empty HF_ENDPOINT is no mirror: only IsHFAuthSource's own hosts qualify.
+		{"empty endpoint other host", "https://artifactory.corp.example/repo/m.gguf", "", false},
+		{"scheme-less endpoint names no origin", "https://artifactory.corp.example/repo/m.gguf",
+			"artifactory.corp.example", false},
+		// huggingface.co and hf:// still qualify on their own.
+		{"huggingface source, empty endpoint", "https://huggingface.co/org/repo/resolve/main/m.gguf", "", true},
+		{"hf scheme, empty endpoint", "hf://org/repo", "", true},
+		{"hf scheme, unrelated endpoint", "hf://org/repo", mirror, true},
+		{"empty source", "", mirror, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsHFAuthSourceForEndpoint(tc.source, tc.hfEndpoint); got != tc.want {
+				t.Errorf("IsHFAuthSourceForEndpoint(%q, %q) = %v, want %v", tc.source, tc.hfEndpoint, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsHuggingFaceURL(t *testing.T) {
 	tests := []struct {
 		name   string

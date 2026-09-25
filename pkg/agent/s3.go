@@ -102,31 +102,37 @@ func parseS3Source(source string) (bucket, key string, err error) {
 	return bucket, key, nil
 }
 
-// isHFAuthHost reports whether a bearer token should be attached to this
-// source on the metal path. It is the controller's IsHFAuthSource: since
-// #1759 the metal fetch path resolves hf:// to huggingface.co itself
-// (downloadFile), so the two hosts' gates agree on every input rather than
-// intentionally diverging.
-func isHFAuthHost(source string) bool {
-	return hfsource.IsHFAuthSource(source)
+// isHFAuthHostForEndpoint reports whether a bearer token should be attached to
+// this source on the metal path: the Hugging Face hosts (hf:// or
+// huggingface.co, since #1759 the metal fetch path resolves hf:// to
+// huggingface.co itself), or a source on the host named by HF_ENDPOINT in the
+// same sourceSecretRef that holds the token (#1900). It delegates to the same
+// predicate the controller-side builder uses, so the in-cluster downloader and
+// the metal agent cannot disagree about which hosts see the token.
+func isHFAuthHostForEndpoint(source, hfEndpoint string) bool {
+	return hfsource.IsHFAuthSourceForEndpoint(source, hfEndpoint)
 }
 
-// resolveHFToken reads HF_TOKEN out of the Model's sourceSecretRef, the same
-// secret the AWS_* keys come from. Unlike the S3 credentials this is NOT a hard
-// error when absent: ungated repositories are the common case and must keep
-// working with no secret at all, so a missing secret or a missing key simply
-// yields an empty token and the request goes out unauthenticated.
-func (e *MetalExecutor) resolveHFToken(ctx context.Context, secretName string) string {
+// resolveHFAuth reads HF_TOKEN and HF_ENDPOINT out of the Model's
+// sourceSecretRef, the same secret the AWS_* keys come from. One read serves
+// both keys so the gate cannot see a token without the endpoint it was paired
+// with. Both are trimmed: an env-projected Secret routinely carries a trailing
+// newline, which would send a malformed token or close the mirror gate
+// silently. Unlike the S3 credentials neither is a hard error when absent:
+// ungated repositories are the common case and must keep working with no
+// secret at all, so a missing secret or a missing key simply yields an empty
+// value and the request goes out unauthenticated.
+func (e *MetalExecutor) resolveHFAuth(ctx context.Context, secretName string) (token, endpoint string) {
 	if e.k8sClient == nil || secretName == "" {
-		return ""
+		return "", ""
 	}
 	secret := &corev1.Secret{}
 	if err := e.k8sClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: e.namespace}, secret); err != nil {
 		e.logger.Debugw("sourceSecretRef unreadable; continuing unauthenticated",
 			"secret", secretName, "namespace", e.namespace, "err", err)
-		return ""
+		return "", ""
 	}
-	return string(secret.Data["HF_TOKEN"])
+	return strings.TrimSpace(string(secret.Data["HF_TOKEN"])), strings.TrimSpace(string(secret.Data["HF_ENDPOINT"]))
 }
 
 // resolveS3Credentials reads the AWS_* keys out of the Model's sourceSecretRef.

@@ -151,6 +151,15 @@ After code changes:
   with `skipModelInit: true`), which left every GGUF Model, every `spec.files`
   staging and the prefetch Job unable to reach a gated repository at all. See
   the gated-repositories section of the model cache guide.
+- ~~Auth to a Hugging Face mirror~~ **Shipped in #1900.** The gate is now
+  `pkg/hfsource.IsHFAuthSourceForEndpoint`: the Hugging Face hosts, or a source
+  on the host named by `HF_ENDPOINT` in the same `spec.sourceSecretRef`. The
+  controller resolves `HF_ENDPOINT` from the Secret (`hfEndpointFromSecret`) and
+  threads it into `buildModelStorageConfig`; the Metal agent resolves it in
+  `MetalExecutor.resolveHFAuth`. Both call the one predicate, so the two gates
+  cannot drift, and the match is exact scheme, host and port so a lookalike host,
+  a downgrade or another port never sees the token. The Secret values are
+  trimmed, because an env-projected value routinely carries a trailing newline.
 - Format validation against HF model type (leave to the runtime)
 - Supporting HF revisions/branches (user can put `owner/repo@revision` syntax in source if HF supports it via vLLM; don't special-case here)
 

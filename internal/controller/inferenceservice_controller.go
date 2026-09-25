@@ -513,7 +513,11 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		return nil, replicaCounts{}, nil, &result, updateErr
 	}
 
-	deployment := r.constructDeployment(isvc, model, draftModel, desiredReplicas)
+	// The HF mirror host, resolved per reconcile from each Model's
+	// sourceSecretRef (#1900). A Model on the host named by HF_ENDPOINT gets
+	// the bearer token; a nil draftModel (the helper is nil-safe) names none.
+	deployment := r.constructDeployment(isvc, model, draftModel, desiredReplicas,
+		hfEndpointFromSecret(ctx, r.Client, model), hfEndpointFromSecret(ctx, r.Client, draftModel))
 	if err := setControllerReferenceUnblocked(isvc, deployment, r.Scheme); err != nil {
 		log.Error(err, "Failed to set controller reference for Deployment")
 		return nil, replicaCounts{}, nil, nil, err
