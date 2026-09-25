@@ -46,6 +46,11 @@ type ExecutorConfig struct {
 	Namespace   string
 	ModelSource string
 	ModelName   string
+	// ServedModelName is the model ID llama-server reports from /v1/models,
+	// emitted as --alias. Derived from spec.modelRef (fallback Model name) at
+	// the agent boundary, mirroring LlamaCppBackend.BuildArgs. Empty omits the
+	// flag, so llama.cpp falls back to the model path.
+	ServedModelName string
 	// SourceSecretRef is the Model's spec.sourceSecretRef, used to resolve
 	// credentials for s3:// fetches on the metal path. May be nil for non-s3
 	// sources.
@@ -842,6 +847,13 @@ func buildLlamaServerArgs(modelPath string, port int, config ExecutorConfig) []s
 		"--port", fmt.Sprintf("%d", port),
 		"--n-gpu-layers", fmt.Sprintf("%d", gpuLayers),
 		"--ctx-size", fmt.Sprintf("%d", config.ContextSize),
+	}
+
+	// --alias: report a clean model ID from /v1/models instead of the on-disk
+	// path. Mirrors LlamaCppBackend.BuildArgs (see the parity test); skip if the
+	// user already set --alias in ExtraArgs.
+	if config.ServedModelName != "" && !hasMatchingExtraArg(config.ExtraArgs, "alias") {
+		args = append(args, "--alias", config.ServedModelName)
 	}
 
 	// Prometheus metrics, unless the user already asked for it in ExtraArgs

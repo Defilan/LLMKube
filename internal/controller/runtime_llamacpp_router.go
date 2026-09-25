@@ -98,6 +98,10 @@ func (b *LlamaCppRouterBackend) BuildArgs(isvc *inferencev1alpha1.InferenceServi
 		"--port", fmt.Sprintf("%d", port),
 	}
 
+	// No --alias here, unlike the single-model llama.cpp runtime (#1894): router
+	// mode serves many models from --models-dir and their IDs come from the INI
+	// presets, so there is no single model name to alias.
+
 	// BindAddress: default "::" (dual-stack wildcard, #972/#973). Skip if
 	// user already set --host in extraArgs (extraArgs wins).
 	if !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "host") {

@@ -722,6 +722,7 @@ func TestBuildLlamaServerArgsRuntimeArgParity(t *testing.T) {
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "parity-test", Namespace: "default"},
 		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:               "parity-model",
 			ContextSize:            ptrInt32(8192),
 			ParallelSlots:          ptrInt32(4),
 			FlashAttention:         ptrBool(true),
@@ -768,6 +769,7 @@ func TestBuildLlamaServerArgsRuntimeArgParity(t *testing.T) {
 		"--model",
 		"--host",
 		"--port",
+		"--alias",
 		"--n-gpu-layers",
 		"--ctx-size",
 		"--rope-scaling",
@@ -805,6 +807,48 @@ func TestBuildLlamaServerArgsRuntimeArgParity(t *testing.T) {
 	}
 }
 
+// TestBuildLlamaServerArgsAlias pins the metal-agent half of #1894: --alias is
+// emitted from ExecutorConfig.ServedModelName, guarded by ExtraArgs (the
+// operator must not add a second one when the user set it), and omitted when
+// the name is empty.
+func TestBuildLlamaServerArgsAlias(t *testing.T) {
+	tests := []struct {
+		name      string
+		served    string
+		extraArgs []string
+		// wantAlias is the effective --alias value; wantCount is how many
+		// --alias flags the args must carry (1 ordinarily, and only the user's
+		// when extraArgs already set it).
+		wantAlias string
+		wantCount int
+	}{
+		{"emits the served name", "qwen2.5-0.5b-instruct", nil, "qwen2.5-0.5b-instruct", 1},
+		{"does not add a second --alias when extraArgs has one", "auto", []string{"--alias", "custom"}, "custom", 1},
+		{"omits when the name is empty", "", nil, "", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := buildLlamaServerArgs("/models/m.gguf", 8080, ExecutorConfig{
+				ContextSize:     4096,
+				ServedModelName: tc.served,
+				ExtraArgs:       tc.extraArgs,
+			})
+			count := 0
+			for _, a := range args {
+				if a == "--alias" {
+					count++
+				}
+			}
+			if count != tc.wantCount {
+				t.Errorf("--alias count = %d, want %d; args: %v", count, tc.wantCount, args)
+			}
+			if got := flagValue(args, "--alias"); got != tc.wantAlias {
+				t.Errorf("--alias = %q, want %q; args: %v", got, tc.wantAlias, args)
+			}
+		})
+	}
+}
+
 // buildExecutorConfigForTest mirrors buildExecutorConfig for the parity test.
 // It lives in the test file so the parity test does not reach into unexported
 // agent internals; the production path goes through the real
@@ -823,6 +867,7 @@ func buildExecutorConfigForTest(isvc *inferencev1alpha1.InferenceService) Execut
 	return ExecutorConfig{
 		Name:                   isvc.Name,
 		Namespace:              isvc.Namespace,
+		ServedModelName:        isvc.Spec.ModelRef,
 		GPULayers:              99,
 		ContextSize:            derefInt32(isvc.Spec.ContextSize),
 		RopeScalingType:        ropeType,

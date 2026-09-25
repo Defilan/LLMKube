@@ -417,6 +417,61 @@ func (f *fakeApplePowerRunner) Run(ctx context.Context) {
 	}
 }
 
+func TestServedModelName(t *testing.T) {
+	tests := []struct {
+		name      string
+		modelRef  string
+		modelName string
+		want      string
+	}{
+		{"modelRef wins", "qwen2.5-0.5b-instruct", "model-cr", "qwen2.5-0.5b-instruct"},
+		{"falls back to the Model name", "", "qwen2-5-0-5b", "qwen2-5-0-5b"},
+		{"empty when neither is set", "", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: tc.modelRef},
+			}
+			var model *inferencev1alpha1.Model
+			if tc.modelName != "" {
+				model = &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: tc.modelName}}
+			}
+			if got := servedModelName(isvc, model); got != tc.want {
+				t.Errorf("servedModelName = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServedModelName covers the derivation in isolation; this pins that the
+// production buildExecutorConfig actually feeds it into ExecutorConfig. The
+// parity test builds its ExecutorConfig from a test-local mirror
+// (buildExecutorConfigForTest), so reverting this wiring would otherwise pass
+// every test in the package.
+func TestBuildExecutorConfigServedModelName(t *testing.T) {
+	model := &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "model-cr"}}
+	tests := []struct {
+		name     string
+		modelRef string
+		want     string
+	}{
+		{"from modelRef", "qwen2-5-0-5b", "qwen2-5-0-5b"},
+		{"falls back to the Model name", "", "model-cr"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{ModelRef: tc.modelRef},
+			}
+			cfg := buildExecutorConfig(isvc, model, executorBaseConfig{})
+			if cfg.ServedModelName != tc.want {
+				t.Errorf("buildExecutorConfig ServedModelName = %q, want %q", cfg.ServedModelName, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunWatcherLoop_StalledPushesFatal(t *testing.T) {
 	// Build a watcher whose Watch will return ErrWatchStalled on the first
 	// poll cycle. The scriptedListClient pattern from watcher_test.go is

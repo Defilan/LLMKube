@@ -89,6 +89,19 @@ func (b *LlamaCppBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mo
 		args = append(args, "--host", bindAddr)
 	}
 
+	// --alias: report a clean model ID from /v1/models instead of the on-disk
+	// path, matching the SGLang backend's --served-model-name (#1894). Without
+	// it llama.cpp reports the namespaced file path, which Open WebUI and other
+	// OpenAI clients show verbatim, and which changes when a service moves
+	// namespace. Skip if the user already set --alias in extraArgs.
+	servedName := isvc.Spec.ModelRef
+	if servedName == "" && model != nil {
+		servedName = model.Name
+	}
+	if servedName != "" && !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "alias") {
+		args = append(args, "--alias", servedName)
+	}
+
 	gpuCount := resolveGPUCount(isvc, model)
 
 	if hasGPUPresent(isvc, model) {
