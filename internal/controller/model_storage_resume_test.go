@@ -62,6 +62,7 @@ type rangeOrigin struct {
 	srv           *httptest.Server
 	version       atomic.Value // string: "A" or "B"
 	sendETag      bool
+	ignoreRange   bool         // answer Range with 200 + full body, advertise no Accept-Ranges
 	fullFromZero  atomic.Int32 // GETs with no Range header
 	rangeRequests atomic.Int32 // GETs with a Range header
 }
@@ -92,9 +93,11 @@ func (o *rangeOrigin) handle(w http.ResponseWriter, r *http.Request) {
 	if o.sendETag {
 		w.Header().Set("ETag", o.validator())
 	}
-	w.Header().Set("Accept-Ranges", "bytes")
+	if !o.ignoreRange {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
 
-	if rng := r.Header.Get("Range"); rng != "" {
+	if rng := r.Header.Get("Range"); rng != "" && !o.ignoreRange {
 		start := parseRangeStart(rng)
 		if start < 0 || start >= full {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", full))
@@ -109,7 +112,10 @@ func (o *rangeOrigin) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A HEAD or a plain GET is treated as a from-zero transfer.
+	// A HEAD or a plain GET is treated as a from-zero transfer. An origin that
+	// ignores Range (o.ignoreRange) lands here for a Range request too, with a
+	// 200 and the whole body and no Accept-Ranges, which is what JFrog's
+	// huggingfaceml endpoint does.
 	if r.Method != http.MethodHead {
 		o.fullFromZero.Add(1)
 	}
@@ -336,6 +342,17 @@ func testResumeVariant(t *testing.T, v resumeVariant) {
 		}
 	})
 
+	// The escape hatch for an upstream that ignores Range (JFrog's
+	// huggingfaceml endpoint answers every range request with the whole file and
+	// advertises no Accept-Ranges). A seeded partial cannot be resumed there, so
+	// it must be dropped and the transfer restarted from zero: `curl -C -` against
+	// such a server exits 33, which would fail the init container on every restart
+	// and leave the pod CrashLooping until someone deleted the partial by hand.
+	// This is the case the mirror auth change routes traffic into.
+	t.Run("origin that ignores Range drops the partial and restarts", func(t *testing.T) {
+		assertIgnoringOriginRestarts(t, v)
+	})
+
 	t.Run("origin with no ETag keys on content-length alone", func(t *testing.T) {
 		o := newRangeOrigin(t, false)
 		dir := t.TempDir()
@@ -388,6 +405,46 @@ func testResumeVariant(t *testing.T, v resumeVariant) {
 			t.Errorf("unrelated .tmp debris survived the sweep (#1435)")
 		}
 	})
+}
+
+// assertIgnoringOriginRestarts drives one generated script against an origin
+// that ignores Range and asserts the bytes that land on disk. Split out of
+// testResumeVariant to keep that function's branch count in bounds.
+func assertIgnoringOriginRestarts(t *testing.T, v resumeVariant) {
+	t.Helper()
+	o := newRangeOrigin(t, true)
+	o.ignoreRange = true
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+
+	key := partialKey(shellValidator(strconv.Itoa(contentALen), `"vA"`))
+	partial := fmt.Sprintf("%s.%s.tmp", modelPath, key)
+	if err := os.WriteFile(partial, []byte(strings.Repeat("A", 4000)), 0o644); err != nil {
+		t.Fatalf("seed partial: %v", err)
+	}
+
+	o.rangeRequests.Store(0)
+	o.fullFromZero.Store(0)
+	runInitScript(t, v.script(), o.srv.URL+"/model.gguf", modelPath, dir)
+
+	got, err := os.ReadFile(modelPath)
+	if err != nil {
+		t.Fatalf("published file missing: %v", err)
+	}
+	if string(got) != string(o.content()) {
+		t.Errorf("from-zero download bytes are wrong (len %d, want %d)", len(got), len(o.content()))
+	}
+	if o.fullFromZero.Load() == 0 {
+		t.Errorf("expected a from-zero transfer after the partial was dropped")
+	}
+	if o.rangeRequests.Load() != 0 {
+		t.Errorf("the partial was resumed against an origin that cannot serve ranges")
+	}
+	// A successful transfer mv's the partial onto MODEL_PATH, so nothing may be
+	// left behind under the seeded name.
+	if _, err := os.Stat(partial); !os.IsNotExist(err) {
+		t.Errorf("the seeded partial survived the transfer")
+	}
 }
 
 // TestWarmCacheIfNotPresentMakesNoNetworkRequest pins #1765 requirement 4: the

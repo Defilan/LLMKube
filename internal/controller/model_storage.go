@@ -407,7 +407,8 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 // good cache before any decision is made.
 //
 // Strategy (works for both origin and CDN-served files):
-//  1. HEAD the artifact once and read both Content-Length and ETag in that same
+//  1. HEAD the artifact once and read Content-Length, ETag and
+//     Accept-Ranges in that same
 //     request. This MUST use curl's -w '%header{...}' (curl 7.84+, satisfied by
 //     curlimages/curl): a HEAD has no response body, so -w '%{size_download}'
 //     would always report 0 and the skip branch below could never fire. -L makes
@@ -417,7 +418,9 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 //     validator that keys the resumable partial (validatorDeriveAndSweep), so a
 //     change to either the length or the ETag changes the key. The two values
 //     are read with a delimiter-free -w format ('CL...ET...') precisely so a "|"
-//     inside a quoted ETag cannot corrupt the size/validator split. If the HEAD
+//     inside a quoted ETag cannot corrupt the size/validator split. Accept-Ranges
+//     is the third value: an upstream that does not advertise bytes cannot
+//     resume, so the partial is dropped (see validatorDeriveAndSweep). If the HEAD
 //     is rejected the probe yields its fallback and the script downloads into a
 //     fresh partial.
 //  2. If the local file exists and its size matches Content-Length, the cache
@@ -439,9 +442,9 @@ func remoteRevalidateScript(isHFAuth bool) string {
 	c := curlCmd(isHFAuth)
 	return downloadProgressFn +
 		`echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
-		`probe=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w 'CL%header{content-length}ET%header{etag}' 2>/dev/null || echo 'CL0ET'); ` +
-		`remote_size=${probe#CL}; remote_size=${remote_size%%ET*}; ` +
-		`remote_validator=${probe}; ` +
+		`remote_head=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w ` + headProbeFormat + ` 2>/dev/null || echo 'CL0ET'); ` +
+		splitHeadProbe +
+		`remote_size=${remote_validator#CL}; remote_size=${remote_size%%ET*}; ` +
 		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
 		`echo 'Model revalidated (unchanged, skipped download)'; ` +
 		`else ` +
@@ -475,6 +478,19 @@ func hfAuthPrefix(isHFAuth bool) string {
 // ETag) into a content-keyed $MODEL_PARTIAL, then removes every other *.tmp in
 // the destination directory.
 //
+// It also drops $MODEL_PARTIAL when the upstream did not advertise
+// Accept-Ranges: bytes. Such a server cannot honour `curl -C -` (it answers 200
+// to a Range request and curl exits 33, "HTTP server doesn't seem to support
+// byte ranges"), so a pre-existing partial would fail every restart and leave
+// the pod in CrashLoop until someone deleted the file by hand. With the partial
+// gone the same `curl -C -` is an ordinary transfer from byte 0. This is exactly
+// the case a Hugging Face mirror can present: JFrog's huggingfaceml endpoint
+// answers every range request with the whole file and advertises no
+// Accept-Ranges, so the mirror path this gate now authenticates would otherwise
+// be unusable after one interruption. $accept_ranges is set by splitHeadProbe at
+// every probe site; an empty value (a failed probe, a server that advertises
+// something else) also drops the partial, which is the safe direction.
+//
 // The partial name is computed at run time, not in Go, because the validator is
 // only knowable after the upstream probe. Keying on the validator (not the
 // source URL) is what makes the resume splice-safe: a content change yields a
@@ -491,8 +507,23 @@ func hfAuthPrefix(isHFAuth bool) string {
 func validatorDeriveAndSweep() string {
 	return `key=$(printf '%s' "$remote_validator" | sha256sum | cut -c1-12); ` +
 		`MODEL_PARTIAL="$MODEL_PATH.$key.tmp"; ` +
-		`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete; `
+		`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete; ` +
+		`[ "$accept_ranges" = bytes ] || rm -f "$MODEL_PARTIAL"; `
 }
+
+// headProbeFormat is the curl -w write-out both resume probes emit. Line 1 is
+// the validator the partial is keyed on, line 2 is the server's Accept-Ranges,
+// which validatorDeriveAndSweep reads to decide whether a resume is possible.
+// Line 1 is delimiter-free ('CL...ET...') precisely so a "|" inside a quoted
+// ETag cannot corrupt the size/validator split; the newline is what separates
+// the two values.
+const headProbeFormat = `'CL%header{content-length}ET%header{etag}\n%header{accept-ranges}'`
+
+// splitHeadProbe reads the two lines headProbeFormat emits into
+// $remote_validator and $accept_ranges. It must be emitted after the probe and
+// before validatorDeriveAndSweep at every probe site.
+const splitHeadProbe = `remote_validator=$(printf '%s\n' "$remote_head" | sed -n 1p); ` +
+	`accept_ranges=$(printf '%s\n' "$remote_head" | sed -n 2p); `
 
 // debrisSweep is the unconditional #1435 sweep of every *.tmp in the destination
 // directory (targeted at $(dirname "$MODEL_PATH") so the emptyDir branches, whose
@@ -507,10 +538,10 @@ func debrisSweep() string {
 }
 
 // resumePrologue is the cached and uncached IfNotPresent resume sequence: a
-// validator probe (HEAD reading Etag + Content-Length) that sets
-// $remote_validator, then the derive-and-sweep that names $MODEL_PARTIAL. The
-// caller follows it with `curl -C -` into $MODEL_PARTIAL and an mv onto
-// $MODEL_PATH.
+// validator probe (HEAD reading Etag + Content-Length + Accept-Ranges) that
+// sets $remote_validator and $accept_ranges, then the derive-and-sweep that
+// names $MODEL_PARTIAL. The caller follows it with `curl -C -` into
+// $MODEL_PARTIAL and an mv onto $MODEL_PATH.
 //
 // The caller places it inside the `[ ! -f "$MODEL_PATH" ]` branch, so a warm
 // cache makes no request: the cache check short-circuits before the probe, and
@@ -520,10 +551,11 @@ func debrisSweep() string {
 // huggingface.co source a gated repo 401s on an anonymous HEAD, and the probe
 // must never issue an unauthenticated request to an HF host. A probe that fails
 // (an offline or rejecting origin, a gated repo with no token) yields an empty
-// validator: the key is fixed and the transfer downloads into a fresh partial
-// instead of resuming blindly.
+// validator and an empty $accept_ranges: the key is fixed and the transfer
+// downloads into a fresh partial instead of resuming blindly.
 func resumePrologue(isHFAuth bool) string {
-	return `remote_validator=$(` + curlCmd(isHFAuth) + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w 'CL%header{content-length}ET%header{etag}' 2>/dev/null || echo ''); ` +
+	return `remote_head=$(` + curlCmd(isHFAuth) + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w ` + headProbeFormat + ` 2>/dev/null || echo ''); ` +
+		splitHeadProbe +
 		// remote_size feeds download_with_progress the total for a percent line;
 		// it is empty when the probe failed, and the heartbeat then prints bytes.
 		`remote_size=${remote_validator#CL}; remote_size=${remote_size%%ET*}; ` +

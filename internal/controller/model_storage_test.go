@@ -152,9 +152,12 @@ var _ = Describe("buildModelInitCommand (resume into content-keyed partial, #176
 		Expect(cmd).To(ContainSubstring(`MODEL_PARTIAL="$MODEL_PATH.$key.tmp"`))
 	})
 
-	It("OnChange reads the ETag in the same single HEAD as Content-Length", func() {
+	It("OnChange reads the ETag, Content-Length and Accept-Ranges in the same single HEAD", func() {
 		cmd := buildModelInitCommand(false, false, true, false, RefreshPolicyOnChange)
-		Expect(cmd).To(ContainSubstring(`-w 'CL%header{content-length}ET%header{etag}'`))
+		Expect(cmd).To(ContainSubstring(`-w 'CL%header{content-length}ET%header{etag}\n%header{accept-ranges}'`))
+		// A server that does not advertise bytes cannot resume, so the partial
+		// is dropped and `curl -C -` restarts from zero instead of exiting 33.
+		Expect(cmd).To(ContainSubstring(`[ "$accept_ranges" = bytes ] || rm -f "$MODEL_PARTIAL"`))
 	})
 
 	It("s3 branches carry no -C - and still write to MODEL_PATH.tmp", func() {

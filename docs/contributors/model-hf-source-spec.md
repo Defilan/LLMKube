@@ -157,8 +157,9 @@ After code changes:
   controller resolves `HF_ENDPOINT` from the Secret (`hfEndpointFromSecret`) and
   threads it into `buildModelStorageConfig`; the Metal agent resolves it in
   `MetalExecutor.resolveHFAuth`. Both call the one predicate, so the two gates
-  cannot drift, and the host match is exact equality so a lookalike host never
-  sees the token.
+  cannot drift, and the match is exact scheme, host and port so a lookalike host,
+  a downgrade or another port never sees the token. The Secret values are
+  trimmed, because an env-projected value routinely carries a trailing newline.
 - Format validation against HF model type (leave to the runtime)
 - Supporting HF revisions/branches (user can put `owner/repo@revision` syntax in source if HF supports it via vLLM; don't special-case here)
 

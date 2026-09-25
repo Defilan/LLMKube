@@ -184,10 +184,14 @@ spec:
     name: huggingface
 ```
 
-Only the host is compared, so the `/artifactory/api/huggingfaceml/...` path and
-any port are ignored, and `HF_ENDPOINT` must be a full URL with a scheme. Leave
-`HF_ENDPOINT` out to keep the previous behaviour (only `huggingface.co` is
-authenticated).
+The scheme, host and port must match, so the `/artifactory/api/huggingfaceml/...`
+path is ignored but an `http://` source or a different port is not treated as the
+same mirror (both would send the token somewhere the Secret did not name).
+`HF_ENDPOINT` must be a full URL with a scheme. Leave `HF_ENDPOINT` out to keep
+the previous behaviour (only `huggingface.co` is authenticated).
+
+The value is trimmed, so a trailing newline from `kubectl create secret
+--from-file` does not close the gate.
 
 This covers every path the operator downloads on: single-file GGUF, multi-file
 `spec.files` staging, `RefreshPolicy: OnChange` revalidation, the prefetch Job,
@@ -198,17 +202,23 @@ weights from a bare repo ID.
 
 Three properties worth knowing:
 
-- **The token is only ever sent to `huggingface.co`, or to the host named by
-  `HF_ENDPOINT` in the same Secret.** A Model pointing at any other host gets
+- **The token is only ever sent to `huggingface.co`, or to the origin named by
+  `HF_ENDPOINT` in the same Secret.** A Model pointing at any other origin gets
   no header, even if the Secret it names carries an `HF_TOKEN` key, and the
-  `HF_ENDPOINT` match is exact host equality, so a lookalike host cannot
-  receive it. One Secret can safely hold both `HF_TOKEN` and the `AWS_*` keys.
-- **A Model can name one mirror host**, because `spec.sourceSecretRef` is a
+  `HF_ENDPOINT` match is exact scheme, host and port, so a lookalike host, a
+  downgrade to `http://` or another port cannot receive it. One Secret can safely
+  hold both `HF_TOKEN` and the `AWS_*` keys.
+- **A Model can name one mirror origin**, because `spec.sourceSecretRef` is a
   single Secret with a single `HF_ENDPOINT`. A fleet with two mirrors needs two
   Secrets.
 - **It is dropped on a redirect that changes host.** Hugging Face answers a
   weights request with a redirect to a content host, and the token does not
   follow it.
+- **An interrupted download behind a mirror that ignores `Range` restarts from
+  zero.** Some remotes (Artifactory's `huggingfaceml` among them) answer a range
+  request with the whole file and advertise no `Accept-Ranges`. The downloader
+  then discards its partial rather than failing to resume it, so a restart is a
+  full re-download instead of a pod that will not start.
 
 Rotating the token is a Secret edit; the new value is picked up the next time a
 pod starts, the same as the S3 credentials. An `HF_ENDPOINT` change is also
