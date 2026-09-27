@@ -77,6 +77,8 @@ func TestValidateRuntimePlacement(t *testing.T) {
 		{name: "mlx-server on cuda", runtime: "mlx-server", model: placementModel("m", "cuda"), wantErrPart: `accelerator "cuda"`},
 		{name: "ollama on cpu", runtime: "ollama", model: placementModel("m", "cpu"), wantErrPart: "metal-agent"},
 		{name: "vllm-swift with no hardware block", runtime: "vllm-swift", model: placementModel("m", ""), wantErrPart: "accelerator unset"},
+		{name: "tensorfold on metal", runtime: "tensorfold", model: placementModel("m", "metal")},
+		{name: "tensorfold on cuda", runtime: "tensorfold", model: placementModel("m", "cuda"), wantErrPart: `accelerator "cuda"`},
 		{name: "llamacpp on cuda", runtime: "llamacpp", model: placementModel("m", "cuda")},
 		{name: "empty on cuda", runtime: "", model: placementModel("m", "cuda")},
 		{name: "empty on metal", runtime: "", model: placementModel("m", "metal")},

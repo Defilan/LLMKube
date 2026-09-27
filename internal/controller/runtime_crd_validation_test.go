@@ -46,7 +46,7 @@ var _ = Describe("InferenceService spec.runtime CRD validation", func() {
 		}
 	}
 
-	for _, rt := range []string{"mlx-server", "omlx", "vllm-swift", "ollama"} {
+	for _, rt := range []string{"mlx-server", "omlx", "vllm-swift", "ollama", "tensorfold"} {
 		It("admits the metal-agent runtime "+rt, func() {
 			isvc := newISvc("rt-metal-"+rt, rt)
 			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())

@@ -343,11 +343,12 @@ type InferenceServiceSpec struct {
 	// "tgi": HuggingFace Text Generation Inference server.
 	// "sglang": SGLang OpenAI-compatible server with RadixAttention prefix caching.
 	// Metal-agent only (the Model must set hardware.accelerator: metal):
-	// "mlx-server", "omlx", "vllm-swift", "ollama". The agent must have the
-	// matching binary configured.
+	// "mlx-server", "omlx", "vllm-swift", "ollama", "tensorfold" (TensorFold,
+	// exact speculative decoding on MLX; serves an MLX model directory). The
+	// agent must have the matching binary configured.
 	// No schema default: an unset value must reach the metal-agent as empty so
 	// its --runtime flag applies (#525).
-	// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic;mlx-server;omlx;vllm-swift;ollama
+	// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic;mlx-server;omlx;vllm-swift;ollama;tensorfold
 	// +optional
 	Runtime string `json:"runtime,omitempty"`
 

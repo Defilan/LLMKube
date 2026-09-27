@@ -463,13 +463,13 @@ Everything on one machine — simpler but minikube consumes resources:
 The agent picks the runtime for each InferenceService in this order:
 
 1. `spec.runtime` on the InferenceService, if set. The metal-agent runtimes are
-   `llamacpp`, `mlx-server`, `omlx`, `vllm-swift`, and `ollama`.
+   `llamacpp`, `mlx-server`, `omlx`, `vllm-swift`, `ollama`, and `tensorfold`.
 2. The agent's `--runtime` flag, when `spec.runtime` is unset.
 3. `llama-server` (llama.cpp), when neither is set.
 
 One agent can serve several runtimes at once, as long as each binary is
-configured (`--mlx-server-bin`, `--omlx-bin`, `--vllm-swift-bin`, or
-`--ollama-port`) or selected with `--runtime`:
+configured (`--mlx-server-bin`, `--omlx-bin`, `--vllm-swift-bin`,
+`--tensorfold-bin`, or `--ollama-port`) or selected with `--runtime`:
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -481,7 +481,7 @@ spec:
   runtime: mlx-server
 ```
 
-`mlx-server`, `omlx`, `vllm-swift`, and `ollama` only work on the metal-agent.
+`mlx-server`, `omlx`, `vllm-swift`, `ollama`, and `tensorfold` only work on the metal-agent.
 The operator rejects them on an InferenceService whose Model does not set
 `hardware.accelerator: metal`.
 
@@ -493,6 +493,73 @@ agent's flag, remove the field:
 ```bash
 kubectl patch inferenceservice <name> --type=json -p '[{"op":"remove","path":"/spec/runtime"}]'
 ```
+
+### TensorFold
+
+[TensorFold](https://github.com/ashhart/TensorFold) (MIT) serves an
+OpenAI-compatible endpoint on MLX with exact speculative decoding: a draft
+model proposes tokens and the target model verifies them, so the output is the
+same as decoding without drafts, only faster.
+
+The operator installs and pins the engine; LLMKube only launches it. Install a
+pinned release with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install --python 3.12 --with "mlx==0.31.2" \
+  "git+https://github.com/ashhart/TensorFold.git@v0.3.4.1"
+```
+
+Pin MLX to 0.31.2. On M5 hardware, MLX 0.32.2 fails the load-time exactness
+self-check for Nemotron, and TensorFold then keeps serving without drafts, so
+the only symptom is lost speed. Confirm the version inside the tool's
+environment after installing:
+
+```bash
+~/.local/share/uv/tools/tensorfold/bin/python -c "import mlx.core as mx; print(mx.__version__)"
+```
+
+Drafts come from the Hugging Face cache. `--drafter auto` (TensorFold's
+default) uses the model family's draft model only if it is already there, so
+pull it once as the user the agent runs as:
+
+```bash
+tensorfold pull z-lab/Qwen3.8-27B-DFlash2
+```
+
+Start the agent with the binary. Without `--tensorfold-bin`, the agent looks in
+`~/.local/bin/tensorfold` (where `uv tool install` puts it),
+`/opt/homebrew/bin/tensorfold`, and `/usr/local/bin/tensorfold` when
+`--runtime tensorfold` is set:
+
+```bash
+llmkube-metal-agent --tensorfold-bin ~/.local/bin/tensorfold
+```
+
+How the agent runs it:
+
+- The Model must have `format: mlx` and `hardware.accelerator: metal`. The
+  agent does not download MLX directories; stage the directory first. An
+  absolute `spec.source` is used as-is (the operator must allow its root with
+  `--allowed-host-path-roots`). A Hugging Face style `owner/repo` source is
+  read from `<model-store>/owner/repo`.
+- Each InferenceService gets its own `tensorfold serve` process on an
+  ephemeral port, bound to `0.0.0.0`, with `--name` set to `spec.modelRef` (the
+  model ID clients send) and `--no-update-check`.
+- `spec.contextSize` becomes `--context`. Set it: when it is unset the agent
+  uses 2048, as for the other metal runtimes, rather than the model's full
+  window.
+- TensorFold's own flags (`--no-thinking`, `--drafter`, `--alias`,
+  `--max-tokens`) go in `spec.extraArgs`. A flag set there replaces the one the
+  agent would add.
+- Output goes to `<model-store>/tensorfold-<namespace>-<name>.log`. When
+  TensorFold refuses a checkpoint and exits, the InferenceService error carries
+  the exit status and the last lines of that log. `--tensorfold-startup-timeout`
+  (default 10m) bounds only a child that stays up without answering `/health`;
+  a first run compiles kernels and runs the exactness check, so it is slower
+  than later ones.
+
+See `config/samples/inferenceservice_qwen38_27b_tensorfold.yaml` for a full
+Model and InferenceService.
 
 ## oMLX Runtime (MLX Backend)
 

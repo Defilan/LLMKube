@@ -17,12 +17,17 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
 
 // processLogTailLines is how many trailing lines of a child's log a startup
@@ -97,4 +102,126 @@ func withLogTail(err error, logPath string) error {
 		return fmt.Errorf("%w (log: %s)", err, logPath)
 	}
 	return fmt.Errorf("%w; last lines of %s:\n%s", err, logPath, tail)
+}
+
+// childTracker maps the PID of every child an executor spawned to its reaper,
+// so StopProcess can learn the child is gone without a second wait. PIDs
+// absent here (a process adopted after an agent restart) fall back to
+// signalling and waiting on the PID directly. The zero value is ready to use.
+type childTracker struct {
+	childMu  sync.Mutex
+	children map[int]*childExit
+}
+
+func (t *childTracker) trackChild(cmd *exec.Cmd) *childExit {
+	exit := watchChild(cmd)
+	t.childMu.Lock()
+	if t.children == nil {
+		t.children = map[int]*childExit{}
+	}
+	t.children[cmd.Process.Pid] = exit
+	t.childMu.Unlock()
+	return exit
+}
+
+func (t *childTracker) trackedChild(pid int) *childExit {
+	t.childMu.Lock()
+	defer t.childMu.Unlock()
+	return t.children[pid]
+}
+
+func (t *childTracker) untrackChild(pid int) {
+	t.childMu.Lock()
+	delete(t.children, pid)
+	t.childMu.Unlock()
+}
+
+// stopChild sends SIGTERM with a 10s grace period before SIGKILL. A tracked
+// child is stopped through its reaper; an untracked PID is signalled and
+// waited on directly.
+func (t *childTracker) stopChild(pid int) error {
+	if exit := t.trackedChild(pid); exit != nil {
+		return t.stopTrackedChild(pid, exit)
+	}
+
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("failed to find process %d: %w", pid, err)
+	}
+
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := process.Wait()
+		done <- err
+	}()
+
+	select {
+	case <-time.After(10 * time.Second):
+		_ = process.Kill()
+		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
+	case err := <-done:
+		return err
+	}
+}
+
+// stopTrackedChild stops a child this executor spawned. Its reaper owns the
+// wait, so this only signals and watches done.
+func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
+	defer t.untrackChild(pid)
+
+	select {
+	case <-exit.done:
+		// Exited and reaped already; signalling now could hit a reused PID.
+		return nil
+	default:
+	}
+
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
+	}
+
+	select {
+	case <-time.After(10 * time.Second):
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
+	case <-exit.done:
+		return nil
+	}
+}
+
+// waitForChildHealthy polls http://localhost:<port>/health until it returns
+// 200, the timeout fires, or exited closes. The last returns errChildExited at
+// once: a child that died on startup will never answer, and polling it for the
+// full timeout would stall every other InferenceService the agent is waiting
+// to reconcile.
+func waitForChildHealthy(port int, timeout time.Duration, exited <-chan struct{}) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timeout waiting for health check")
+		case <-exited:
+			return errChildExited
+		case <-ticker.C:
+			resp, err := http.Get(healthURL)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				_ = resp.Body.Close()
+				return nil
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
 }

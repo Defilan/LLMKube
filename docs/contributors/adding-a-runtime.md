@@ -64,7 +64,7 @@ case "yourengine":
 In `api/v1alpha1/inferenceservice_types.go`, update the runtime validation:
 
 ```go
-// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic;yourengine;mlx-server;omlx;vllm-swift;ollama
+// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic;yourengine;mlx-server;omlx;vllm-swift;ollama;tensorfold
 ```
 
 Do not add a `+kubebuilder:default` to this field. An unset runtime must stay
@@ -115,6 +115,13 @@ Add `--runtime yourengine` handling in `pkg/cli/deploy.go`.
 | `sglang` | SGLang | 30000 | HTTP /health_generate | Yes (curl) | sglang:num_running_reqs |
 | `generic` | Any container | 8080 | TCP socket | No | — |
 
-The metal-agent runtimes `mlx-server`, `omlx`, `vllm-swift`, and `ollama` run as
-native processes on Apple Silicon hosts, not as pods. They need a Model with
-`hardware.accelerator: metal`. See `deployment/macos/README.md`.
+The metal-agent runtimes `mlx-server`, `omlx`, `vllm-swift`, `ollama`, and
+`tensorfold` run as native processes on Apple Silicon hosts, not as pods. They
+need a Model with `hardware.accelerator: metal`. See `deployment/macos/README.md`.
+
+A new metal-agent runtime has no `RuntimeBackend`. Instead it needs a
+`ProcessExecutor` in `pkg/agent/` (`executor_tensorfold.go` is a compact
+template: per-process log, reaper-tracked child, health wait that ends when the
+child exits), a registration in `MetalAgent.buildExecutors`, a case in
+`validateRuntimeFormat`, a binary flag in `cmd/metal-agent/main.go`, and its
+name in the runtime list of `TestCRDRuntimeContract`.

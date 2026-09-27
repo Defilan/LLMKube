@@ -73,10 +73,11 @@ const (
 // strings and pkg/agent cannot import internal/controller. The values are
 // CRD-visible (spec.runtime enum) and must not change without an API bump.
 const (
-	RuntimeMLXServer = "mlx-server"
-	RuntimeOMLX      = "omlx"
-	RuntimeOllama    = "ollama"
-	RuntimeVLLMSwift = "vllm-swift"
+	RuntimeMLXServer  = "mlx-server"
+	RuntimeOMLX       = "omlx"
+	RuntimeOllama     = "ollama"
+	RuntimeVLLMSwift  = "vllm-swift"
+	RuntimeTensorFold = "tensorfold"
 )
 
 // IsMetalOnlyRuntime reports whether runtime is served only by the
@@ -84,7 +85,7 @@ const (
 // agent's --runtime flag on a Mac.
 func IsMetalOnlyRuntime(runtime string) bool {
 	switch runtime {
-	case RuntimeMLXServer, RuntimeOMLX, RuntimeOllama, RuntimeVLLMSwift:
+	case RuntimeMLXServer, RuntimeOMLX, RuntimeOllama, RuntimeVLLMSwift, RuntimeTensorFold:
 		return true
 	default:
 		return false

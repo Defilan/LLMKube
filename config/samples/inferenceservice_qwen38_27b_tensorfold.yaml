@@ -1,0 +1,41 @@
+# Qwen3.8-27B served by TensorFold on the metal-agent path. TensorFold is an
+# OpenAI-compatible MLX server with exact speculative decoding: a draft model
+# proposes tokens and the target verifies them, so output matches plain decoding.
+#
+# spec.runtime selects tensorfold for this service only. The metal-agent
+# registers the executor when started with `--tensorfold-bin <path>` or
+# `--runtime tensorfold`. The operator installs and pins TensorFold; LLMKube only
+# launches it. See deployment/macos/README.md ("TensorFold") for the pinned
+# install, the MLX pin, and pulling the draft model:
+#   tensorfold pull z-lab/Qwen3.8-27B-DFlash2
+#
+# The agent does not download MLX directories. This relative owner/repo source
+# is read from <model-store>/lmstudio-community/Qwen3.8-27B-MLX-4bit, so stage it
+# there first, for example:
+#   hf download lmstudio-community/Qwen3.8-27B-MLX-4bit \
+#     --local-dir <model-store>/lmstudio-community/Qwen3.8-27B-MLX-4bit
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen38-27b-mlx
+spec:
+  source: lmstudio-community/Qwen3.8-27B-MLX-4bit
+  format: mlx
+  hardware:
+    accelerator: metal
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen38-27b-tensorfold
+spec:
+  # Also the model ID clients send (tensorfold --name).
+  modelRef: qwen38-27b-mlx
+  runtime: tensorfold
+  replicas: 1
+  # Becomes --context (prompt plus reply). Leave it unset and the agent passes
+  # 2048, not the model's full window.
+  contextSize: 65536
+  # TensorFold flags ride through extraArgs, appended last.
+  extraArgs:
+    - --no-thinking

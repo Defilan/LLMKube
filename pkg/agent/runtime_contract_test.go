@@ -121,7 +121,7 @@ func TestCRDRuntimeContract(t *testing.T) {
 	// The literals are the agent's executor keys (buildExecutors) and the
 	// values an operator types into a CR; they are deliberately not the Go
 	// constants, so a constant drifting away from the CRD fails here.
-	for _, rt := range []string{"llamacpp", "mlx-server", "omlx", "vllm-swift", "ollama"} {
+	for _, rt := range []string{"llamacpp", "mlx-server", "omlx", "vllm-swift", "ollama", "tensorfold"} {
 		if !enum[rt] {
 			t.Errorf("metal-agent runtime %q is not in the CRD spec.runtime enum %v; "+
 				"the API server rejects any CR that selects it", rt, enumNames)
