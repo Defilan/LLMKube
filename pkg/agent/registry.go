@@ -113,6 +113,130 @@ func (r *ServiceRegistry) WithdrawEndpoint(
 	return r.upsertEndpoint(ctx, isvc, port, false)
 }
 
+// WithdrawEndpointIfPresent flips an existing agent-managed EndpointSlice for
+// isvc to Ready=false without knowing the serving port. It is the withdrawal
+// path for an InferenceService this agent owns but is not serving: a start
+// that failed (format mismatch, missing executor, memory admission, spawn
+// error) or a slice inherited from a previous agent process. Neither has a
+// live child whose port could be passed to WithdrawEndpoint, so the port
+// already recorded on the slice is reused and the write goes through the same
+// upsertEndpoint path. The object is kept, so a later successful start flips
+// it back to Ready (#1918).
+//
+// It never creates anything: with no slice there is nothing for kube-proxy to
+// route to. A slice without this agent's managed-by label is left alone.
+// Returns whether a withdrawal was written.
+func (r *ServiceRegistry) WithdrawEndpointIfPresent(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+) (bool, error) {
+	slice := &discoveryv1.EndpointSlice{}
+	err := r.client.Get(ctx, types.NamespacedName{
+		Namespace: isvc.Namespace,
+		Name:      sanitizeServiceName(isvc.Name),
+	}, slice)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to get endpointslice: %w", err)
+	}
+	if slice.Labels["llmkube.ai/managed-by"] != "metal-agent" {
+		return false, nil
+	}
+	port := 0
+	if len(slice.Ports) > 0 && slice.Ports[0].Port != nil {
+		port = int(*slice.Ports[0].Port)
+	}
+	if port <= 0 {
+		// An agent-written slice always carries a port; one without it cannot
+		// be routed by kube-proxy, so there is nothing to withdraw.
+		return false, nil
+	}
+	if sliceWithdrawnRecently(slice, r.now()) {
+		// A failing start is retried on every watch event; skip the rewrite
+		// while the slice is already unready and its heartbeat is younger than
+		// one heartbeat interval, so retries do not become a write loop.
+		return false, nil
+	}
+	if err := r.upsertEndpoint(ctx, isvc, port, false); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// sliceWithdrawnRecently reports whether every endpoint on slice is already
+// unready and its heartbeat annotation is younger than one heartbeat interval.
+func sliceWithdrawnRecently(slice *discoveryv1.EndpointSlice, now time.Time) bool {
+	for _, ep := range slice.Endpoints {
+		if ep.Conditions.Ready == nil || *ep.Conditions.Ready {
+			return false
+		}
+	}
+	ts, err := time.Parse(time.RFC3339, slice.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat])
+	if err != nil {
+		return false
+	}
+	return now.Sub(ts) < inferencev1alpha1.DefaultAgentHeartbeatInterval
+}
+
+// WithdrawOwnedEndpoints withdraws (Ready=false) the agent-managed
+// EndpointSlice of every InferenceService for which owns reports true. It runs
+// once at agent startup: a fresh agent process serves nothing yet, so a slice
+// a previous process left Ready points at a child that no longer exists. The
+// next successful ensureProcess re-registers it Ready (#1918).
+//
+// owns is the agent's ownership predicate (the watcher's allowlist + metal
+// check, #524), so a multi-Mac partition never touches a sibling agent's
+// slices. Services whose InferenceService is gone are left to
+// ReconcileOrphanEndpoints. Per-object errors are logged and skipped.
+func (r *ServiceRegistry) WithdrawOwnedEndpoints(
+	ctx context.Context,
+	namespace string,
+	owns func(context.Context, *inferencev1alpha1.InferenceService) bool,
+) (int, error) {
+	services := &corev1.ServiceList{}
+	opts := []client.ListOption{
+		client.MatchingLabels{"llmkube.ai/managed-by": "metal-agent"},
+	}
+	if namespace != "" {
+		opts = append(opts, client.InNamespace(namespace))
+	}
+	if err := r.client.List(ctx, services, opts...); err != nil {
+		return 0, fmt.Errorf("list managed services: %w", err)
+	}
+
+	withdrawn := 0
+	for i := range services.Items {
+		svc := &services.Items[i]
+		isvcName := svc.Labels["llmkube.ai/inference-service"]
+		if isvcName == "" {
+			continue
+		}
+		isvc := &inferencev1alpha1.InferenceService{}
+		if err := r.client.Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: isvcName}, isvc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				r.logger.Warnw("failed to look up InferenceService for startup withdrawal",
+					"namespace", svc.Namespace, "isvc", isvcName, "error", err)
+			}
+			continue
+		}
+		if !owns(ctx, isvc) {
+			continue
+		}
+		ok, err := r.WithdrawEndpointIfPresent(ctx, isvc)
+		if err != nil {
+			r.logger.Warnw("failed to withdraw inherited endpoint at startup",
+				"namespace", svc.Namespace, "isvc", isvcName, "error", err)
+			continue
+		}
+		if ok {
+			withdrawn++
+		}
+	}
+	return withdrawn, nil
+}
+
 // upsertEndpoint is the shared Service+EndpointSlice writer behind
 // RegisterEndpoint (ready=true) and WithdrawEndpoint (ready=false). The only
 // difference between the two is the endpoint's Conditions.Ready value; the

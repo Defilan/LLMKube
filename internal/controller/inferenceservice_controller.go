@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -170,7 +171,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=models,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=core,resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get
@@ -480,6 +481,9 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		// than blindly returning desiredReplicas, otherwise Phase reports Ready
 		// before the agent has done anything (issue #374).
 		snap := r.metalEndpointSnapshot(ctx, isvc)
+		if snap.Kind == metalHBStale {
+			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+		}
 		log.Info("Metal accelerator detected, skipping Deployment creation",
 			"readyEndpoints", snap.ReadyReplicas, "desiredReplicas", desiredReplicas)
 		return nil, replicaCounts{Ready: snap.ReadyReplicas, Observed: snap.ReadyReplicas}, snap, nil, nil
@@ -801,6 +805,9 @@ type metalSnapshot struct {
 	RawHeartbeat string
 	// ParseErr is set when Kind == metalHBUnparseable.
 	ParseErr error
+	// staleSlices holds the listed slices when Kind == metalHBStale so the
+	// reconciler can withdraw their endpoints without a second List.
+	staleSlices []discoveryv1.EndpointSlice
 }
 
 // metalEndpointSnapshot lists the EndpointSlices for isvc and returns a
@@ -872,7 +879,7 @@ func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, 
 		if age > inferencev1alpha1.DefaultAgentHeartbeatTimeout {
 			log.Info("Metal endpoint heartbeat stale; treating as not ready",
 				"name", name, "heartbeat", rawHeartbeat, "age", age.Round(time.Second), "timeout", inferencev1alpha1.DefaultAgentHeartbeatTimeout)
-			return &metalSnapshot{Kind: metalHBStale, RawHeartbeat: rawHeartbeat}
+			return &metalSnapshot{Kind: metalHBStale, RawHeartbeat: rawHeartbeat, staleSlices: slices.Items}
 		}
 	case hasAnnotation:
 		// Every heartbeat annotation present was unparseable.
@@ -900,6 +907,69 @@ func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, 
 		kind = metalHBFresh
 	}
 	return &metalSnapshot{ReadyReplicas: ready, Kind: kind, RawHeartbeat: rawHeartbeat}
+}
+
+// withdrawStaleMetalEndpoints marks the endpoints of metal-agent slices whose
+// heartbeat has expired as not ready and not serving, so kube-proxy stops
+// routing Service traffic to a host that stopped re-asserting them (agent dead,
+// Mac asleep or offline). Status already treats a stale heartbeat as zero
+// ready replicas; without this the slice itself kept Ready=true and direct
+// Service clients were sent to a closed port indefinitely (#1918).
+//
+// Only a slice that carries the metal-agent managed-by label and its own
+// expired heartbeat is touched; mirrored or foreign slices are left alone.
+// The patch carries an optimistic lock: the agent re-registers with a full
+// Update that refreshes the heartbeat, so if it came back between our List and
+// this Patch the write fails with a conflict instead of clobbering its
+// Ready=true, and the next reconcile sees a fresh heartbeat. Once withdrawn,
+// the slice is skipped, so the EndpointSlice watch this write triggers does
+// not loop. Failures are logged, not returned: status is already correct and
+// the stale-heartbeat requeue retries.
+func (r *InferenceServiceReconciler) withdrawStaleMetalEndpoints(ctx context.Context, slices []discoveryv1.EndpointSlice) {
+	log := logf.FromContext(ctx)
+	for i := range slices {
+		slice := &slices[i]
+		if !metalSliceNeedsWithdrawal(slice, time.Now()) {
+			continue
+		}
+		patch := client.MergeFromWithOptions(slice.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		for j := range slice.Endpoints {
+			slice.Endpoints[j].Conditions.Ready = ptr.To(false)
+			slice.Endpoints[j].Conditions.Serving = ptr.To(false)
+		}
+		if err := r.Patch(ctx, slice, patch); err != nil {
+			if apierrors.IsConflict(err) || apierrors.IsNotFound(err) {
+				log.V(1).Info("Metal EndpointSlice changed before stale withdrawal; re-evaluating next reconcile",
+					"endpointSlice", slice.Name, "reason", err.Error())
+				continue
+			}
+			log.Error(err, "Failed to withdraw stale metal EndpointSlice", "endpointSlice", slice.Name)
+			continue
+		}
+		log.Info("Withdrew stale metal EndpointSlice endpoints so kube-proxy stops routing to the host",
+			"endpointSlice", slice.Name)
+	}
+}
+
+// metalSliceNeedsWithdrawal reports whether slice is an agent-managed metal
+// slice whose own heartbeat has expired while some endpoint still advertises
+// ready or serving (a nil condition counts as true, per EndpointSlice
+// convention).
+func metalSliceNeedsWithdrawal(slice *discoveryv1.EndpointSlice, now time.Time) bool {
+	if slice.Labels["llmkube.ai/managed-by"] != "metal-agent" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, slice.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat])
+	if err != nil || now.Sub(ts) <= inferencev1alpha1.DefaultAgentHeartbeatTimeout {
+		return false
+	}
+	for _, ep := range slice.Endpoints {
+		c := ep.Conditions
+		if c.Ready == nil || *c.Ready || c.Serving == nil || *c.Serving {
+			return true
+		}
+	}
+	return false
 }
 
 // metalHeartbeatRequeueDuration returns the RequeueAfter duration to use after
