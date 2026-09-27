@@ -458,6 +458,11 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		a.logger.Infow("cleaned up orphaned endpoints from prior sessions", "count", cleaned)
 	}
 
+	// This process serves nothing yet, so any slice a previous agent process
+	// left Ready points at a child that is gone. Withdraw them before the
+	// watcher starts; each successful ensureProcess re-registers Ready (#1918).
+	a.withdrawInheritedEndpoints(ctx)
+
 	// Start health server. An unexpected exit here (port binding lost,
 	// listener crashed) is fatal — the management plane is how operators
 	// observe and recover the agent, so running blind is worse than
@@ -782,6 +787,54 @@ func isvcStopped(isvc *inferencev1alpha1.InferenceService) bool {
 }
 
 func (a *MetalAgent) ensureProcess(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	err := a.reconcileProcess(ctx, isvc)
+	if err != nil {
+		a.withdrawAfterStartFailure(ctx, isvc)
+	}
+	return err
+}
+
+// withdrawAfterStartFailure withdraws the endpoint of an InferenceService this
+// agent failed to start, so kube-proxy stops routing to a port nothing listens
+// on. Without it a slice left Ready by an earlier start (in this process or a
+// previous one) keeps attracting traffic until the controller's heartbeat
+// expiry, and forever for direct Service clients (#1918). Stopped or deleting
+// services are skipped: those paths tear the endpoint down themselves, and a
+// withdrawal would recreate a Service they just removed.
+func (a *MetalAgent) withdrawAfterStartFailure(ctx context.Context, isvc *inferencev1alpha1.InferenceService) {
+	if isvc.DeletionTimestamp != nil || isvcStopped(isvc) {
+		return
+	}
+	key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String()
+	a.mu.RLock()
+	p := a.processes[key]
+	a.mu.RUnlock()
+	if p != nil && p.Healthy {
+		return
+	}
+	a.withdrawEndpointFor(ctx, isvc)
+}
+
+// withdrawInheritedEndpoints runs WithdrawOwnedEndpoints with the watcher's
+// ownership predicate, so the allowlist partition (#524) bounds which slices a
+// restarted agent may touch.
+func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
+	if a.watcher == nil {
+		return
+	}
+	n, err := a.registry.WithdrawOwnedEndpoints(ctx, a.config.Namespace, a.watcher.shouldWatch)
+	if err != nil {
+		a.logger.Warnw("startup endpoint withdrawal failed", "error", err)
+		return
+	}
+	if n > 0 {
+		a.logger.Infow("withdrew endpoints inherited from a previous agent process", "count", n)
+	}
+}
+
+// reconcileProcess is the body of ensureProcess; see ensureProcess for the
+// start-failure withdrawal wrapped around it.
+func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
 	key := types.NamespacedName{
 		Namespace: isvc.Namespace,
 		Name:      isvc.Name,
@@ -1315,15 +1368,30 @@ func (a *MetalAgent) withdrawEndpoint(ctx context.Context, name, namespace strin
 			"name", name, "namespace", namespace, "error", err)
 		return
 	}
+	a.withdrawEndpointFor(ctx, isvc)
+}
 
-	// Read the port from the managed process snapshot.
+// withdrawEndpointFor flips isvc's endpoint to Ready=false. With a managed
+// process it withdraws at that process's port; without one (a start that
+// failed before a child existed) it withdraws only a slice that already
+// exists, at the port recorded on it, and never creates one.
+func (a *MetalAgent) withdrawEndpointFor(ctx context.Context, isvc *inferencev1alpha1.InferenceService) {
+	port := 0
 	a.mu.RLock()
-	port := a.processes[types.NamespacedName{Namespace: namespace, Name: name}.String()].Port
+	if p := a.processes[types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String()]; p != nil {
+		port = p.Port
+	}
 	a.mu.RUnlock()
 
-	if err := a.registry.WithdrawEndpoint(ctx, isvc, port); err != nil {
+	var err error
+	if port > 0 {
+		err = a.registry.WithdrawEndpoint(ctx, isvc, port)
+	} else {
+		_, err = a.registry.WithdrawEndpointIfPresent(ctx, isvc)
+	}
+	if err != nil {
 		a.logger.Warnw("failed to withdraw endpoint",
-			"name", name, "namespace", namespace, "error", err)
+			"name", isvc.Name, "namespace", isvc.Namespace, "error", err)
 	}
 }
 
