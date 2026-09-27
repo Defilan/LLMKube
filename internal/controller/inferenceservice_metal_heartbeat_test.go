@@ -226,6 +226,24 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 				"expected a non-zero RequeueAfter for a metal service with heartbeat Endpoints")
 			Expect(result.RequeueAfter).To(Equal(inferencev1alpha1.DefaultAgentHeartbeatTimeout / 2))
 		})
+
+		It("should leave a fresh-heartbeat EndpointSlice endpoint ready", func() {
+			fresh := time.Now().UTC().Format(time.RFC3339)
+			ep := metalEndpoints(isvcName, fresh)
+			Expect(k8sClient.Create(ctx, ep)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &discoveryv1.EndpointSlice{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: namespace}, got)).To(Succeed())
+			Expect(got.Endpoints).To(HaveLen(1))
+			Expect(got.Endpoints[0].Conditions.Ready).To(HaveValue(BeTrue()),
+				"a live agent's endpoint must not be withdrawn by the controller")
+			Expect(got.Endpoints[0].Conditions.Serving).To(BeNil())
+		})
 	})
 
 	Context("Reconcile with a stale metal-agent heartbeat", func() {
@@ -307,6 +325,47 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 				"stale heartbeat must report AgentHeartbeatStale, not WaitingForMetalAgent")
 			Expect(isvc.Status.SchedulingMessage).To(ContainSubstring("last seen"),
 				"stale heartbeat message must include the last-seen timestamp")
+		})
+
+		It("should mark the stale EndpointSlice endpoints not ready and not serving (#1918)", func() {
+			stale := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+			ep := metalEndpoints(isvcName, stale)
+			Expect(k8sClient.Create(ctx, ep)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			// kube-proxy routes on the slice, not on InferenceService status:
+			// a Ready endpoint here keeps sending Service traffic to a host
+			// that stopped heartbeating.
+			got := &discoveryv1.EndpointSlice{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: namespace}, got)).To(Succeed())
+			Expect(got.Endpoints).To(HaveLen(1))
+			Expect(got.Endpoints[0].Conditions.Ready).To(HaveValue(BeFalse()),
+				"stale heartbeat must withdraw the endpoint so kube-proxy stops routing to it")
+			Expect(got.Endpoints[0].Conditions.Serving).To(HaveValue(BeFalse()))
+			// The address and heartbeat stay: the agent's next re-register
+			// flips the same object back to Ready.
+			Expect(got.Endpoints[0].Addresses).To(Equal([]string{"192.0.2.10"}))
+			Expect(got.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat]).To(Equal(stale))
+		})
+
+		It("should not touch a stale slice that the metal-agent does not manage", func() {
+			stale := time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339)
+			ep := metalEndpoints(isvcName, stale)
+			delete(ep.Labels, "llmkube.ai/managed-by")
+			Expect(k8sClient.Create(ctx, ep)).To(Succeed())
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvcName, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &discoveryv1.EndpointSlice{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: namespace}, got)).To(Succeed())
+			Expect(got.Endpoints[0].Conditions.Ready).To(HaveValue(BeTrue()))
 		})
 	})
 })

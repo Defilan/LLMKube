@@ -124,6 +124,7 @@ rules:
   verbs:
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - federation.llmkube.dev
