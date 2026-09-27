@@ -129,9 +129,9 @@ func directoryOrientedRuntime(runtime string) bool {
 }
 
 // validateRuntimePlacement rejects a metal-agent-only runtime (mlx-server,
-// omlx, vllm-swift, ollama) on a Model the metal-agent will not pick up. Those
-// runtimes have no in-cluster backend: resolveBackend would fall through to
-// llama.cpp and serve something other than what the CR asked for. Placement is
+// omlx, vllm-swift, ollama, tensorfold) on a Model the metal-agent will not
+// pick up. Those runtimes have no in-cluster backend: resolveBackend would fall
+// through to llama.cpp and serve something other than what the CR asked for. Placement is
 // decided by the referenced Model's accelerator (the same test the agent's
 // watcher applies), which CEL on the InferenceService cannot see, so this runs
 // in the validating webhook and again at reconcile. A nil Model (not created

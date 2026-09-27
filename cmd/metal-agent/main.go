@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -60,6 +61,7 @@ type AgentConfig struct {
 	VLLMSwiftBin              string
 	MLXServerBin              string
 	MLXServerPort             int
+	TensorFoldBin             string
 	Port                      int
 	ClientPort                int
 	LogLevel                  string
@@ -76,6 +78,7 @@ type AgentConfig struct {
 	OMLXStartupTimeout        time.Duration
 	VLLMSwiftStartupTimeout   time.Duration
 	MLXServerStartupTimeout   time.Duration
+	TensorFoldStartupTimeout  time.Duration
 	ApplePowerEnabled         bool
 	ApplePowerInterval        time.Duration
 	PowermetricsBin           string
@@ -209,6 +212,46 @@ func resolveMLXServerBin(override string) (string, error) {
 		defaultMLXServerPaths)
 }
 
+// defaultTensorFoldPaths is the list of paths to search for the tensorfold
+// binary. TensorFold is a Python CLI; `uv tool install` (the documented,
+// pinned install) puts its shim in ~/.local/bin. A leading "~/" is expanded
+// against the agent user's home directory.
+var defaultTensorFoldPaths = []string{
+	"~/.local/bin/tensorfold",
+	"/opt/homebrew/bin/tensorfold",
+	"/usr/local/bin/tensorfold",
+}
+
+// userHomeDir is os.UserHomeDir, overridden in tests.
+var userHomeDir = os.UserHomeDir
+
+// resolveTensorFoldBin returns the tensorfold binary path. If override is
+// non-empty it is returned as-is. Otherwise the function searches
+// defaultTensorFoldPaths.
+func resolveTensorFoldBin(override string) (string, error) {
+	if override != "" {
+		return override, nil
+	}
+	home, homeErr := userHomeDir()
+	for _, p := range defaultTensorFoldPaths {
+		if rest, ok := strings.CutPrefix(p, "~/"); ok {
+			if homeErr != nil {
+				continue
+			}
+			p = filepath.Join(home, rest)
+		}
+		if _, err := statFunc(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"tensorfold binary not found in default paths (%v); "+
+			"install with: uv tool install --python 3.12 "+
+			"\"git+https://github.com/ashhart/TensorFold.git@v0.3.4.1\", "+
+			"or pass --tensorfold-bin=/path/to/tensorfold",
+		defaultTensorFoldPaths)
+}
+
 // resolveOMLXBin returns the omlx binary path. If override is non-empty it is
 // returned as-is. Otherwise the function searches defaultOMLXPaths.
 func resolveOMLXBin(override string) (string, error) {
@@ -226,6 +269,69 @@ func resolveOMLXBin(override string) (string, error) {
 		defaultOMLXPaths)
 }
 
+// resolveOptionalRuntimeBins resolves the binaries of the non-default
+// runtimes. Each one is resolved when its binary flag is set or --runtime
+// selects it, so one agent can host several runtimes (#525). A runtime that
+// was asked for but cannot be found is fatal.
+func resolveOptionalRuntimeBins(cfg *AgentConfig, logger *zap.SugaredLogger) {
+	if cfg.Runtime == "omlx" || cfg.OMLXBin != "" {
+		resolvedBin, err := resolveOMLXBin(cfg.OMLXBin)
+		if err != nil {
+			logger.Errorw("omlx binary not found",
+				"searchPaths", defaultOMLXPaths,
+				"installHint", "brew install jundot/omlx/omlx",
+				"error", err,
+			)
+			os.Exit(1)
+		}
+		cfg.OMLXBin = resolvedBin
+	}
+	if cfg.Runtime == "ollama" {
+		// Ollama manages itself — no binary resolution needed.
+		// The agent will check if Ollama is running at startup via health check.
+		logger.Infow("using Ollama runtime", "port", cfg.OllamaPort)
+	}
+	if cfg.Runtime == "vllm-swift" || cfg.VLLMSwiftBin != "" {
+		resolvedBin, err := resolveVLLMSwiftBin(cfg.VLLMSwiftBin)
+		if err != nil {
+			logger.Errorw("vllm-swift binary not found",
+				"searchPaths", defaultVLLMSwiftPaths,
+				"installHint", "brew tap TheTom/tap && brew install vllm-swift",
+				"error", err,
+			)
+			os.Exit(1)
+		}
+		cfg.VLLMSwiftBin = resolvedBin
+	}
+	if cfg.Runtime == "mlx-server" || cfg.MLXServerBin != "" {
+		resolvedBin, err := resolveMLXServerBin(cfg.MLXServerBin)
+		if err != nil {
+			logger.Errorw("mlx-server binary not found",
+				"searchPaths", defaultMLXServerPaths,
+				"installHint", "brew install defilantech/tap/mlx-server, "+
+					"or pass --mlx-server-bin=/path/to/mlx-server",
+				"error", err,
+			)
+			os.Exit(1)
+		}
+		cfg.MLXServerBin = resolvedBin
+	}
+	if cfg.Runtime == "tensorfold" || cfg.TensorFoldBin != "" {
+		resolvedBin, err := resolveTensorFoldBin(cfg.TensorFoldBin)
+		if err != nil {
+			logger.Errorw("tensorfold binary not found",
+				"searchPaths", defaultTensorFoldPaths,
+				"installHint", "uv tool install --python 3.12 "+
+					"\"git+https://github.com/ashhart/TensorFold.git@v0.3.4.1\", "+
+					"or pass --tensorfold-bin=/path/to/tensorfold",
+				"error", err,
+			)
+			os.Exit(1)
+		}
+		cfg.TensorFoldBin = resolvedBin
+	}
+}
+
 func main() {
 	cfg := &AgentConfig{}
 
@@ -239,13 +345,15 @@ func main() {
 			"ephemeral port per process; set a fixed port for stable native "+
 			"clients (e.g. an OpenAI-compatible tool pointed at localhost).")
 	flag.StringVar(&cfg.Runtime, "runtime", "llama-server",
-		"Inference runtime: llama-server, omlx, ollama, vllm-swift, or mlx-server")
+		"Inference runtime: llama-server, omlx, ollama, vllm-swift, mlx-server, or tensorfold")
 	flag.StringVar(&cfg.OMLXBin, "omlx-bin", "", "Path to omlx binary (auto-detected if not set)")
 	flag.IntVar(&cfg.OMLXPort, "omlx-port", 8000, "Port for oMLX server")
 	flag.IntVar(&cfg.OllamaPort, "ollama-port", 11434, "Port for Ollama server")
 	flag.StringVar(&cfg.VLLMSwiftBin, "vllm-swift-bin", "", "Path to vllm-swift binary (auto-detected if not set)")
 	flag.StringVar(&cfg.MLXServerBin, "mlx-server-bin", "", "Path to mlx-server binary (auto-detected if not set)")
 	flag.IntVar(&cfg.MLXServerPort, "mlx-server-port", 8080, "Fixed port for the mlx-server runtime")
+	flag.StringVar(&cfg.TensorFoldBin, "tensorfold-bin", "",
+		"Path to tensorfold binary (auto-detected if not set; searched when --runtime tensorfold)")
 	flag.IntVar(&cfg.Port, "port", 9090, "Agent metrics/health port")
 	flag.IntVar(&cfg.ClientPort, "client-port", 9999,
 		"Stable host-side listener (127.0.0.1:<port>) that forwards /v1/* to the current inference child; 0 disables")
@@ -289,6 +397,11 @@ func main() {
 		agent.DefaultMLXServerStartupTimeout,
 		"How long to wait for mlx-server to respond on /health. MLX weight load "+
 			"grows with model size; default 120s works for ~35B models on M5 Max.")
+	flag.DurationVar(&cfg.TensorFoldStartupTimeout, "tensorfold-startup-timeout",
+		agent.DefaultTensorFoldStartupTimeout,
+		"How long to wait for tensorfold to respond on /health. A warm load is "+
+			"seconds, but a first run compiles kernels and runs an exactness "+
+			"self-check; a child that exits ends the wait early.")
 	flag.BoolVar(&cfg.ApplePowerEnabled, "apple-power-enabled", false,
 		"Enable the macOS powermetrics sampler that publishes apple_power_*_watts gauges "+
 			"for InferCost. Requires a NOPASSWD sudoers entry for /usr/bin/powermetrics; "+
@@ -338,48 +451,7 @@ func main() {
 		}
 		cfg.LlamaServerBin = resolvedBin
 	}
-	if cfg.Runtime == "omlx" || cfg.OMLXBin != "" {
-		resolvedBin, err := resolveOMLXBin(cfg.OMLXBin)
-		if err != nil {
-			logger.Errorw("omlx binary not found",
-				"searchPaths", defaultOMLXPaths,
-				"installHint", "brew install jundot/omlx/omlx",
-				"error", err,
-			)
-			os.Exit(1)
-		}
-		cfg.OMLXBin = resolvedBin
-	}
-	if cfg.Runtime == "ollama" {
-		// Ollama manages itself — no binary resolution needed.
-		// The agent will check if Ollama is running at startup via health check.
-		logger.Infow("using Ollama runtime", "port", cfg.OllamaPort)
-	}
-	if cfg.Runtime == "vllm-swift" || cfg.VLLMSwiftBin != "" {
-		resolvedBin, err := resolveVLLMSwiftBin(cfg.VLLMSwiftBin)
-		if err != nil {
-			logger.Errorw("vllm-swift binary not found",
-				"searchPaths", defaultVLLMSwiftPaths,
-				"installHint", "brew tap TheTom/tap && brew install vllm-swift",
-				"error", err,
-			)
-			os.Exit(1)
-		}
-		cfg.VLLMSwiftBin = resolvedBin
-	}
-	if cfg.Runtime == "mlx-server" || cfg.MLXServerBin != "" {
-		resolvedBin, err := resolveMLXServerBin(cfg.MLXServerBin)
-		if err != nil {
-			logger.Errorw("mlx-server binary not found",
-				"searchPaths", defaultMLXServerPaths,
-				"installHint", "brew install defilantech/tap/mlx-server, "+
-					"or pass --mlx-server-bin=/path/to/mlx-server",
-				"error", err,
-			)
-			os.Exit(1)
-		}
-		cfg.MLXServerBin = resolvedBin
-	}
+	resolveOptionalRuntimeBins(cfg, logger)
 
 	hostIP := cfg.HostIP
 	if hostIP == "" {
@@ -433,6 +505,9 @@ func main() {
 	}
 	if cfg.MLXServerBin != "" {
 		logger.Infow("mlx-server binary found", "path", cfg.MLXServerBin)
+	}
+	if cfg.TensorFoldBin != "" {
+		logger.Infow("tensorfold binary found", "path", cfg.TensorFoldBin)
 	}
 
 	// Get Kubernetes client
@@ -491,6 +566,7 @@ func main() {
 		VLLMSwiftBin:              cfg.VLLMSwiftBin,
 		MLXServerBin:              cfg.MLXServerBin,
 		MLXServerPort:             cfg.MLXServerPort,
+		TensorFoldBin:             cfg.TensorFoldBin,
 		Port:                      cfg.Port,
 		ClientPort:                cfg.ClientPort,
 		HostIP:                    cfg.HostIP,
@@ -503,6 +579,7 @@ func main() {
 		OMLXStartupTimeout:        cfg.OMLXStartupTimeout,
 		VLLMSwiftStartupTimeout:   cfg.VLLMSwiftStartupTimeout,
 		MLXServerStartupTimeout:   cfg.MLXServerStartupTimeout,
+		TensorFoldStartupTimeout:  cfg.TensorFoldStartupTimeout,
 		ApplePowerEnabled:         cfg.ApplePowerEnabled,
 		ApplePowerInterval:        cfg.ApplePowerInterval,
 		PowermetricsBin:           cfg.PowermetricsBin,

@@ -247,7 +247,7 @@ func TestInferenceServiceMinimalSpec(t *testing.T) {
 // are accepted by the type.
 func TestInferenceServiceRuntimeEnum(t *testing.T) {
 	runtimes := []string{"llamacpp", "personaplex", "vllm", "tgi", "generic",
-		RuntimeMLXServer, RuntimeOMLX, RuntimeVLLMSwift, RuntimeOllama}
+		RuntimeMLXServer, RuntimeOMLX, RuntimeVLLMSwift, RuntimeOllama, RuntimeTensorFold}
 	for _, rt := range runtimes {
 		t.Run(rt, func(t *testing.T) {
 			isvc := &InferenceService{
@@ -274,7 +274,7 @@ func TestInferenceServiceRuntimeEnum(t *testing.T) {
 // TestIsMetalOnlyRuntime: the empty runtime and every in-cluster runtime must
 // report false, or the controller would refuse ordinary GPU services.
 func TestIsMetalOnlyRuntime(t *testing.T) {
-	for _, rt := range []string{"mlx-server", "omlx", "vllm-swift", "ollama"} {
+	for _, rt := range []string{"mlx-server", "omlx", "vllm-swift", "ollama", "tensorfold"} {
 		if !IsMetalOnlyRuntime(rt) {
 			t.Errorf("IsMetalOnlyRuntime(%q) = false, want true", rt)
 		}

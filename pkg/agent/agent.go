@@ -58,6 +58,7 @@ const (
 	runtimeOllama      = inferencev1alpha1.RuntimeOllama
 	runtimeVLLMSwift   = inferencev1alpha1.RuntimeVLLMSwift
 	runtimeMLXServer   = inferencev1alpha1.RuntimeMLXServer
+	runtimeTensorFold  = inferencev1alpha1.RuntimeTensorFold
 )
 
 // Model format identifiers (Model.Spec.Format) the agent recognizes for
@@ -94,8 +95,9 @@ type MetalAgentConfig struct {
 
 	// Runtime is the agent-wide default inference backend, used for any
 	// InferenceService that leaves spec.runtime empty (#525): "llama-server"
-	// (default), "omlx", "ollama", "vllm-swift", or "mlx-server". A CR that
-	// sets spec.runtime overrides it (see resolveRuntime).
+	// (default), "omlx", "ollama", "vllm-swift", "mlx-server", or
+	// "tensorfold". A CR that sets spec.runtime overrides it (see
+	// resolveRuntime).
 	Runtime string
 	// OMLXBin is the path to the omlx binary. Only used when Runtime is "omlx".
 	OMLXBin string
@@ -112,6 +114,10 @@ type MetalAgentConfig struct {
 	// MLXServerPort is the fixed port the mlx-server process binds.
 	// Only used when Runtime is "mlx-server"; zero defaults to 8080.
 	MLXServerPort int
+	// TensorFoldBin is the path to the tensorfold binary. The executor is
+	// registered when this is set or Runtime is "tensorfold"; empty then
+	// means "tensorfold" from $PATH.
+	TensorFoldBin string
 	// LlamaServerPort is a fixed port for the llama-server runtime. Only used
 	// when Runtime is "llama-server"; zero allocates an ephemeral port per
 	// process (the historical behavior).
@@ -174,6 +180,12 @@ type MetalAgentConfig struct {
 	// (DefaultMLXServerStartupTimeout). MLX weight load grows with model
 	// size; the 120s default works for ~35B models on M5 Max.
 	MLXServerStartupTimeout time.Duration
+
+	// TensorFoldStartupTimeout is how long the agent waits for tensorfold to
+	// respond on /health. Zero means use the executor default
+	// (DefaultTensorFoldStartupTimeout), which leaves room for a first run's
+	// kernel warmup and exactness self-check.
+	TensorFoldStartupTimeout time.Duration
 
 	// ApplePowerEnabled launches the powermetrics-driven sampler that
 	// publishes apple_power_*_watts gauges. Defaults false because
@@ -398,6 +410,21 @@ func (a *MetalAgent) buildExecutors() {
 			mlxServerExec.SetStartupTimeout(a.config.MLXServerStartupTimeout)
 		}
 		a.executors[runtimeMLXServer] = mlxServerExec
+	}
+	if a.config.TensorFoldBin != "" || a.config.Runtime == runtimeTensorFold {
+		bin := a.config.TensorFoldBin
+		if bin == "" {
+			bin = runtimeTensorFold // resolved from $PATH by exec
+		}
+		tensorFoldExec := NewTensorFoldExecutor(
+			bin,
+			a.config.ModelStorePath,
+			a.logger.With("subsystem", "executor"),
+		)
+		if a.config.TensorFoldStartupTimeout > 0 {
+			tensorFoldExec.SetStartupTimeout(a.config.TensorFoldStartupTimeout)
+		}
+		a.executors[runtimeTensorFold] = tensorFoldExec
 	}
 }
 
@@ -728,6 +755,11 @@ func (a *MetalAgent) validateRuntimeFormat(model *inferencev1alpha1.Model, runti
 		// directories; gguf is the only incompatible format.
 		bad = modelFormat == formatGGUF
 		runtimeLabel = runtimeMLXServer
+	case runtimeTensorFold:
+		// tensorfold serves an MLX model directory; gguf (and the empty
+		// format, which means gguf) cannot load.
+		bad = modelFormat == formatGGUF
+		runtimeLabel = runtimeTensorFold
 	default:
 		bad = modelFormat == formatMLX
 		runtimeLabel = runtimeLlamaServer
