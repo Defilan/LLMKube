@@ -1,6 +1,7 @@
 # InferenceService served by vllm-swift on the metal-agent path with
-# TurboQuant KV cache compression. Requires the metal-agent to be running
-# with `--runtime vllm-swift` against this cluster.
+# TurboQuant KV cache compression. spec.runtime selects vllm-swift for this
+# service only; the metal-agent registers the vllm-swift executor when started
+# with `--vllm-swift-bin <path>` or `--runtime vllm-swift`.
 #
 # Reference: TheTom/vllm-swift v0.3.1+ (the bf16 TurboFlash + dim=512 kernel
 # work that landed in v0.3.0 enables Gemma 4 31B too once vllm-swift gains a
@@ -28,6 +29,7 @@ metadata:
   name: qwen-tq
 spec:
   modelRef: qwen3-4b-tq
+  runtime: vllm-swift
   replicas: 1
   contextSize: 8192
   parallelSlots: 4

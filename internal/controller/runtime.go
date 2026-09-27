@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
@@ -125,6 +126,31 @@ func directoryOrientedRuntime(runtime string) bool {
 	default:
 		return false
 	}
+}
+
+// validateRuntimePlacement rejects a metal-agent-only runtime (mlx-server,
+// omlx, vllm-swift, ollama) on a Model the metal-agent will not pick up. Those
+// runtimes have no in-cluster backend: resolveBackend would fall through to
+// llama.cpp and serve something other than what the CR asked for. Placement is
+// decided by the referenced Model's accelerator (the same test the agent's
+// watcher applies), which CEL on the InferenceService cannot see, so this runs
+// in the validating webhook and again at reconcile. A nil Model (not created
+// yet at admission) is undecidable and passes; the reconciler re-checks with
+// the real Model.
+func validateRuntimePlacement(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) error {
+	runtime := isvc.Spec.Runtime
+	if !inferencev1alpha1.IsMetalOnlyRuntime(runtime) || model == nil || isMetalModel(model) {
+		return nil
+	}
+	accel := "accelerator unset"
+	if model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator != "" {
+		accel = fmt.Sprintf("accelerator %q", model.Spec.Hardware.Accelerator)
+	}
+	return fmt.Errorf(
+		"spec.runtime %q is served only by the metal-agent on Apple Silicon, but Model %q has "+
+			"hardware.%s; set the Model's hardware.accelerator to metal, or choose an in-cluster "+
+			"runtime (llamacpp, llamacpp-router, vllm, sglang, tgi, personaplex, generic)",
+		runtime, model.Name, accel)
 }
 
 // runtimeNameLabel returns a stable, lowercase identifier for the runtime

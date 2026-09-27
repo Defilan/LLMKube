@@ -66,6 +66,31 @@ const (
 	DefaultAgentHeartbeatTimeout = 3 * time.Minute
 )
 
+// InferenceService spec.runtime values served only by the metal-agent on
+// Apple Silicon hosts (#525). They have no in-cluster backend, so the
+// controller refuses them on a Model whose hardware.accelerator is not
+// "metal". Shared here because the metal-agent keys its executors on the same
+// strings and pkg/agent cannot import internal/controller. The values are
+// CRD-visible (spec.runtime enum) and must not change without an API bump.
+const (
+	RuntimeMLXServer = "mlx-server"
+	RuntimeOMLX      = "omlx"
+	RuntimeOllama    = "ollama"
+	RuntimeVLLMSwift = "vllm-swift"
+)
+
+// IsMetalOnlyRuntime reports whether runtime is served only by the
+// metal-agent. The empty runtime is not: it means llama.cpp in-cluster and the
+// agent's --runtime flag on a Mac.
+func IsMetalOnlyRuntime(runtime string) bool {
+	switch runtime {
+	case RuntimeMLXServer, RuntimeOMLX, RuntimeOllama, RuntimeVLLMSwift:
+		return true
+	default:
+		return false
+	}
+}
+
 // InferenceService and Model lifecycle phase strings written to
 // status.phase by both the operator (internal/controller) and the
 // metal-agent (pkg/agent). Hoisted here so a rename on either side is a

@@ -458,6 +458,42 @@ Everything on one machine — simpler but minikube consumes resources:
 └─────────────────────────────────────────────────┘
 ```
 
+## Choosing a Runtime per InferenceService
+
+The agent picks the runtime for each InferenceService in this order:
+
+1. `spec.runtime` on the InferenceService, if set. The metal-agent runtimes are
+   `llamacpp`, `mlx-server`, `omlx`, `vllm-swift`, and `ollama`.
+2. The agent's `--runtime` flag, when `spec.runtime` is unset.
+3. `llama-server` (llama.cpp), when neither is set.
+
+One agent can serve several runtimes at once, as long as each binary is
+configured (`--mlx-server-bin`, `--omlx-bin`, `--vllm-swift-bin`, or
+`--ollama-port`) or selected with `--runtime`:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen-mlx
+spec:
+  modelRef: qwen3-4b-mlx   # a Model with hardware.accelerator: metal
+  runtime: mlx-server
+```
+
+`mlx-server`, `omlx`, `vllm-swift`, and `ollama` only work on the metal-agent.
+The operator rejects them on an InferenceService whose Model does not set
+`hardware.accelerator: metal`.
+
+InferenceServices created with LLMKube 0.9.30 or earlier were stored with
+`runtime: llamacpp`, because the CRD used to set that default. They keep
+serving llama.cpp and ignore `--runtime`. To hand one of them back to the
+agent's flag, remove the field:
+
+```bash
+kubectl patch inferenceservice <name> --type=json -p '[{"op":"remove","path":"/spec/runtime"}]'
+```
+
 ## oMLX Runtime (MLX Backend)
 
 The Metal Agent supports an alternative runtime using [oMLX](https://github.com/jundot/omlx), an MLX-based inference server for Apple Silicon. oMLX provides roughly 40% faster generation compared to llama-server Metal on the same hardware.

@@ -28,7 +28,7 @@ Honest comparison, not a sales pitch. We use vLLM, llama.cpp, and TGI as runtime
 
 | Project | K8s-native | Apple Silicon | Memory-pressure protection | Engines | Multi-GPU | License |
 |---|---|---|---|---|---|---|
-| **LLMKube** | ✓ operator + Model and InferenceService CRDs | ✓ native via the metal-agent (no containers) | ✓ watchdog, priority-based eviction, per-service opt-out | llama.cpp, vLLM, SGLang, TGI, PersonaPlex, generic; llama-server / mlx-server / vllm-swift via the metal-agent | Layer-based sharding across GPUs on a node | Apache 2.0 |
+| **LLMKube** | ✓ operator + Model and InferenceService CRDs | ✓ native via the metal-agent (no containers) | ✓ watchdog, priority-based eviction, per-service opt-out | llama.cpp, vLLM, SGLang, TGI, PersonaPlex, generic; llama-server / mlx-server / vllm-swift / oMLX / Ollama via the metal-agent | Layer-based sharding across GPUs on a node | Apache 2.0 |
 | **KubeAI** | ✓ operator + Model CRD | — Linux containers only | — | vLLM, Ollama, Faster-Whisper, Infinity (embeddings) | Multi-GPU pods via `resourceProfile`, tensor-parallel args passed to vLLM | Apache 2.0 |
 | **llm-d** | ✓ Helm + Gateway API + `InferencePool` | — datacenter accelerators only (NVIDIA, AMD, Intel, TPU) | — | vLLM (primary), SGLang | Wide expert parallelism + disaggregated multi-node serving | Apache 2.0 |
 | **Ollama** | — single binary on a host | ✓ native (its sweet spot) | — | Forked llama.cpp (GGUF), MLX engine (Safetensors, macOS) | Automatic spreading across GPUs on one node | MIT |

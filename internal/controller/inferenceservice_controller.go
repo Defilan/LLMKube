@@ -485,6 +485,16 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		return nil, replicaCounts{Ready: snap.ReadyReplicas, Observed: snap.ReadyReplicas}, snap, nil, nil
 	}
 
+	// A metal-agent-only runtime off Metal is fatal: resolveBackend would
+	// build a llama.cpp Deployment for a CR that asked for something else.
+	// The validating webhook rejects this at admission when enabled; this
+	// backstop covers default installs.
+	if err := validateRuntimePlacement(isvc, model); err != nil {
+		log.Info("Rejecting InferenceService with a metal-only runtime off Metal", "reason", err.Error())
+		result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", fmt.Sprintf("Invalid runtime: %v", err), nil)
+		return nil, replicaCounts{}, nil, &result, updateErr
+	}
+
 	// Surface non-fatal runtime spec problems as a status condition before we
 	// build the Deployment. A failure here never blocks reconciliation — the
 	// Deployment is still produced with the offending flags silently skipped

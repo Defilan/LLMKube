@@ -47,13 +47,17 @@ import (
 // runtimeLlamaServer ("llama-server") is the metal-agent's historical
 // key and the global --runtime default. Both map to the same llama.cpp
 // executor (#784) so CRs authored with either value resolve correctly.
+// Only "llamacpp" and the Metal-only runtimes are accepted by the CRD enum;
+// "llama-server" is reachable only through the --runtime flag. The
+// Metal-only names come from the API package so the controller's placement
+// check and the agent's executor keys cannot drift apart.
 const (
 	runtimeLlamaServer = "llama-server"
 	runtimeLlamaCPP    = "llamacpp"
-	runtimeOMLX        = "omlx"
-	runtimeOllama      = "ollama"
-	runtimeVLLMSwift   = "vllm-swift"
-	runtimeMLXServer   = "mlx-server"
+	runtimeOMLX        = inferencev1alpha1.RuntimeOMLX
+	runtimeOllama      = inferencev1alpha1.RuntimeOllama
+	runtimeVLLMSwift   = inferencev1alpha1.RuntimeVLLMSwift
+	runtimeMLXServer   = inferencev1alpha1.RuntimeMLXServer
 )
 
 // Model format identifiers (Model.Spec.Format) the agent recognizes for
@@ -88,7 +92,10 @@ type MetalAgentConfig struct {
 	// to assert on the event stream. Closes #390.
 	EventRecorder record.EventRecorder
 
-	// Runtime selects the inference backend: "llama-server" (default), "omlx", or "ollama".
+	// Runtime is the agent-wide default inference backend, used for any
+	// InferenceService that leaves spec.runtime empty (#525): "llama-server"
+	// (default), "omlx", "ollama", "vllm-swift", or "mlx-server". A CR that
+	// sets spec.runtime overrides it (see resolveRuntime).
 	Runtime string
 	// OMLXBin is the path to the omlx binary. Only used when Runtime is "omlx".
 	OMLXBin string
