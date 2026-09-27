@@ -64,8 +64,16 @@ case "yourengine":
 In `api/v1alpha1/inferenceservice_types.go`, update the runtime validation:
 
 ```go
-// +kubebuilder:validation:Enum=llamacpp;personaplex;vllm;tgi;yourengine;generic
+// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic;yourengine;mlx-server;omlx;vllm-swift;ollama
 ```
+
+Do not add a `+kubebuilder:default` to this field. An unset runtime must stay
+empty: the controller treats it as `llamacpp`, and the metal-agent treats it as
+"use my `--runtime` flag" (#525).
+
+A runtime served only by the metal-agent (no in-cluster backend) also goes in
+`IsMetalOnlyRuntime` in `api/v1alpha1/constants.go`, so the controller refuses
+it on non-Metal Models instead of falling through to llama.cpp.
 
 ### 6. Regenerate and sync
 
@@ -106,3 +114,7 @@ Add `--runtime yourengine` handling in `pkg/cli/deploy.go`.
 | `tgi` | TGI | 80 | HTTP /health | No (HF download) | tgi:queue_size |
 | `sglang` | SGLang | 30000 | HTTP /health_generate | Yes (curl) | sglang:num_running_reqs |
 | `generic` | Any container | 8080 | TCP socket | No | — |
+
+The metal-agent runtimes `mlx-server`, `omlx`, `vllm-swift`, and `ollama` run as
+native processes on Apple Silicon hosts, not as pods. They need a Model with
+`hardware.accelerator: metal`. See `deployment/macos/README.md`.

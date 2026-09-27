@@ -76,6 +76,11 @@ func TestChartRestartRuleCoversEveryBackend(t *testing.T) {
 	// "" is a valid spec.Runtime and resolves to llamacpp.
 	want := map[string]bool{}
 	for _, runtime := range append(runtimeEnumValues(t), "") {
+		// Metal-agent-only runtimes never produce a pod (validateRuntimePlacement
+		// refuses them off Metal), so they have no container to select.
+		if inferencev1alpha1.IsMetalOnlyRuntime(runtime) {
+			continue
+		}
 		isvc := &inferencev1alpha1.InferenceService{}
 		isvc.Spec.Runtime = runtime
 		want[resolveBackend(isvc).ContainerName()] = true

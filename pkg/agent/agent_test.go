@@ -119,13 +119,11 @@ func TestBuildExecutors_RegistersLlamaCppAlias(t *testing.T) {
 }
 
 // TestMetalAgentServesCRDLlamaCppRuntime is a producer->consumer contract test
-// for the #784 regression. The InferenceService CRD declares
-//
-//	+kubebuilder:validation:Enum=llamacpp;personaplex;vllm;tgi;generic
-//	+kubebuilder:default=llamacpp
-//
-// (api/v1alpha1/inferenceservice_types.go) and the in-cluster controller emits
-// "llamacpp" as the canonical llama.cpp runtime (resolveBackend's default). A
+// for the #784 regression. The InferenceService CRD accepts "llamacpp" in its
+// spec.runtime enum (api/v1alpha1/inferenceservice_types.go), and CRs written
+// before the #525 fix carry it persisted from the old CRD default. The
+// in-cluster controller treats it as the canonical llama.cpp runtime
+// (resolveBackend's default). A
 // default metal-agent — only a llama-server binary configured, as on a real Mac
 // — must therefore resolve AND register an executor for the literal CRD value
 // "llamacpp", or every default-runtime CR fails to serve with "no executor
@@ -135,7 +133,7 @@ func TestBuildExecutors_RegistersLlamaCppAlias(t *testing.T) {
 // (the exact failure mode of #784, where the agent keyed on "llama-server"
 // while every CR used "llamacpp").
 func TestMetalAgentServesCRDLlamaCppRuntime(t *testing.T) {
-	const crdDefaultRuntime = "llamacpp" // mirror of the CRD Runtime +kubebuilder:default
+	const crdDefaultRuntime = "llamacpp" // the CRD enum's canonical llama.cpp value
 
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
@@ -1767,62 +1765,6 @@ func TestHeartbeatOnce_NotFound(t *testing.T) {
 	}
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("heartbeatOnce_NotFound: unexpected error checking EndpointSlice: %v", err)
-	}
-}
-
-// TestResolveRuntime_Fallback verifies that when isvc.Spec.Runtime is empty,
-// resolveRuntime falls back to the agent's global --runtime flag.
-func TestResolveRuntime_Fallback(t *testing.T) {
-	scheme := newTestScheme()
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	agent := NewMetalAgent(MetalAgentConfig{
-		K8sClient: k8sClient,
-		Runtime:   "mlx-server",
-	})
-
-	isvc := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-isvc",
-			Namespace: "default",
-		},
-		Spec: inferencev1alpha1.InferenceServiceSpec{
-			ModelRef: "test-model",
-			// Runtime left empty
-		},
-	}
-
-	resolvedRuntime := agent.resolveRuntime(isvc)
-	if resolvedRuntime != "mlx-server" {
-		t.Errorf("resolveRuntime = %q, want %q", resolvedRuntime, "mlx-server")
-	}
-}
-
-// TestResolveRuntime_Override verifies that isvc.Spec.Runtime takes precedence
-// over the agent's global --runtime flag.
-func TestResolveRuntime_Override(t *testing.T) {
-	scheme := newTestScheme()
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	agent := NewMetalAgent(MetalAgentConfig{
-		K8sClient: k8sClient,
-		Runtime:   "llama-server",
-	})
-
-	isvc := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-isvc",
-			Namespace: "default",
-		},
-		Spec: inferencev1alpha1.InferenceServiceSpec{
-			ModelRef: "test-model",
-			Runtime:  "mlx-server",
-		},
-	}
-
-	resolvedRuntime := agent.resolveRuntime(isvc)
-	if resolvedRuntime != "mlx-server" {
-		t.Errorf("resolveRuntime = %q, want %q", resolvedRuntime, "mlx-server")
 	}
 }
 

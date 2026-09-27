@@ -139,6 +139,14 @@ func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inf
 		return fmt.Errorf("invalid gpuSharing spec: %w", err)
 	}
 
+	// A metal-agent-only runtime on a non-Metal Model is a spec error too
+	// (#525): reject it here instead of letting the reconciler park it at
+	// Phase=Failed. The Model is best-effort; an absent one is re-checked at
+	// reconcile.
+	if err := validateRuntimePlacement(isvc, v.fetchModel(ctx, isvc)); err != nil {
+		return fmt.Errorf("invalid runtime: %w", err)
+	}
+
 	// Kueue-managed services defer quota gating to Kueue. Spec validation
 	// above still applies; only the GPUQuota accounting is skipped. The
 	// GPUQuota status reconciler continues to include these services in

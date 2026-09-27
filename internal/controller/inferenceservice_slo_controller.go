@@ -130,7 +130,7 @@ func (r *InferenceServiceSLOReconciler) Reconcile(ctx context.Context, req ctrl.
 		}
 		return ctrl.Result{}, r.setSLOCondition(ctx, isvc, metav1.ConditionFalse, sloReasonUnsupported,
 			fmt.Sprintf("indicator %q has no metric source on runtime %q (see docs/observability/slo.md)",
-				isvc.Spec.SLO.Indicator, isvc.Spec.Runtime))
+				isvc.Spec.SLO.Indicator, runtimeNameLabel(isvc)))
 	}
 
 	desired := newServiceLevelObjective(isvc)

@@ -333,15 +333,21 @@ type InferenceServiceSpec struct {
 	ModelRef string `json:"modelRef"`
 
 	// Runtime selects the inference server backend.
-	// "llamacpp" (default): llama.cpp server with auto-generated args and /health probes.
+	// Unset: in-cluster, the same as "llamacpp"; on the metal-agent, the
+	// agent's --runtime flag (llama-server unless configured otherwise).
+	// "llamacpp": llama.cpp server with auto-generated args and /health probes.
 	// "llamacpp-router": llama.cpp server in router mode for multi-model dynamic loading.
 	// "generic": user-provided container with custom command, args, env, and probes.
 	// "personaplex": NVIDIA PersonaPlex (Moshi) speech-to-speech server.
 	// "vllm": vLLM OpenAI-compatible server with PagedAttention.
 	// "tgi": HuggingFace Text Generation Inference server.
 	// "sglang": SGLang OpenAI-compatible server with RadixAttention prefix caching.
-	// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic
-	// +kubebuilder:default=llamacpp
+	// Metal-agent only (the Model must set hardware.accelerator: metal):
+	// "mlx-server", "omlx", "vllm-swift", "ollama". The agent must have the
+	// matching binary configured.
+	// No schema default: an unset value must reach the metal-agent as empty so
+	// its --runtime flag applies (#525).
+	// +kubebuilder:validation:Enum=llamacpp;llamacpp-router;personaplex;vllm;tgi;sglang;generic;mlx-server;omlx;vllm-swift;ollama
 	// +optional
 	Runtime string `json:"runtime,omitempty"`
 
