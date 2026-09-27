@@ -77,6 +77,13 @@ type ExecutorConfig struct {
 	// evict our Metal GPU buffers under memory pressure. Defaults true.
 	Mlock bool
 
+	// LoadModeSupported selects how Mlock is spelled. llama.cpp 0.5.0 (build
+	// 11146) removed --mlock in favour of --load-mode, and the old flag now
+	// fails startup with "invalid argument: --mlock". This is a property of
+	// the llama-server binary, not the spec: MetalExecutor fills it from its
+	// --help probe, so it never reaches computeSpecHash.
+	LoadModeSupported bool
+
 	// Threads sets --threads. Zero means auto-detect from performance core
 	// count via detectPerfCoreCount(); a non-positive detection result causes
 	// the flag to be omitted (let llama-server pick).
@@ -198,6 +205,12 @@ type MetalExecutor struct {
 	namespace string
 	k8sClient client.Client
 	caCerts   [][]byte
+
+	// helpProbe returns llama-server's --help output; a seam so tests can fake
+	// the binary. loadMode caches the result of probing it (see
+	// supportsLoadMode).
+	helpProbe func(ctx context.Context, bin string) (string, error)
+	loadMode  loadModeCache
 }
 
 // Option configures a MetalExecutor. Used to wire the Kubernetes client and
@@ -223,6 +236,7 @@ func NewMetalExecutor(llamaServerBin, modelStorePath string, logger *zap.Sugared
 		modelStorePath: modelStorePath,
 		logger:         logger,
 		startupTimeout: DefaultLlamaServerStartupTimeout,
+		helpProbe:      execHelpProbe,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -265,7 +279,7 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 		}
 	}
 
-	args := buildLlamaServerArgs(modelPath, port, config)
+	args := e.llamaServerArgs(ctx, modelPath, port, config)
 
 	cmd := exec.Command(e.llamaServerBin, args...)
 
@@ -797,6 +811,22 @@ func hasMatchingExtraArg(extraArgs []string, argName string) bool {
 	return false
 }
 
+// hasLoadModeExtraArg reports whether the user already chose how the model is
+// loaded, in either the pre-0.5.0 spelling (--mlock) or the current one
+// (--load-mode / -lm). Either one means the operator adds no load flag of its
+// own, so the two never collide on the command line.
+func hasLoadModeExtraArg(extraArgs []string) bool {
+	if hasMatchingExtraArg(extraArgs, "mlock") || hasMatchingExtraArg(extraArgs, "load-mode") {
+		return true
+	}
+	for _, v := range extraArgs {
+		if v == "-lm" || strings.HasPrefix(v, "-lm=") {
+			return true
+		}
+	}
+	return false
+}
+
 // appendModeArgs wires the llama.cpp flags for embedding and rerank serving,
 // mirroring the controller's runtime_llamacpp arg builder. A reranker needs
 // both --reranking and --embedding; flags already in extraArgs win and are not
@@ -888,8 +918,13 @@ func buildLlamaServerArgs(modelPath string, port int, config ExecutorConfig) []s
 		args = append(args, "--flash-attn", "on")
 	}
 
-	if config.Mlock {
-		args = append(args, "--mlock")
+	if config.Mlock && !hasLoadModeExtraArg(config.ExtraArgs) {
+		if config.LoadModeSupported {
+			// mmap+mlock is the exact equivalent of the removed --mlock.
+			args = append(args, "--load-mode", "mmap+mlock")
+		} else {
+			args = append(args, "--mlock")
+		}
 	}
 
 	if config.CacheTypeK != "" {
