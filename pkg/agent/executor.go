@@ -434,6 +434,13 @@ func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string, se
 		return localPath, nil
 	}
 
+	// A local source lives on this host and is loaded in place (#1919); the
+	// Model controller marks it Ready without a download for exactly that
+	// reason. Handing it to fetchModel would GET a bare path.
+	if isLocalModelSource(source) {
+		return resolveLocalModelSource(source)
+	}
+
 	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
 		return "", fmt.Errorf("failed to create model directory: %w", err)
 	}
@@ -445,6 +452,51 @@ func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string, se
 
 	e.logger.Infow("model downloaded", "path", localPath)
 	return localPath, nil
+}
+
+// isLocalModelSource reports whether source names a file on this host: an
+// absolute path or a file:// URI (scheme matched case-insensitively). It
+// mirrors isLocalSource in internal/controller/source.go, which decides that
+// the controller leaves such a source to the agent.
+func isLocalModelSource(source string) bool {
+	return hasFileScheme(source) || strings.HasPrefix(source, "/")
+}
+
+func hasFileScheme(source string) bool {
+	const scheme = "file://"
+	return len(source) >= len(scheme) && strings.EqualFold(source[:len(scheme)], scheme)
+}
+
+// resolveLocalModelSource returns the path llama-server should load for a
+// local source, or an error naming the path when it cannot be loaded. The path
+// is returned as given, not symlink-resolved: llama.cpp looks for split GGUF
+// siblings next to the path it is handed, and a Hugging Face cache snapshot
+// links each shard to a hash-named blob, so resolving would break split loads.
+// os.Stat still follows the link, so a dangling one is reported as missing.
+func resolveLocalModelSource(source string) (string, error) {
+	path := source
+	if hasFileScheme(source) {
+		path = source[len("file://"):]
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("local model source %q must be an absolute path on the Metal host", path)
+	}
+	path = filepath.Clean(path)
+
+	info, err := os.Stat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "", fmt.Errorf("local model source %q not found on this host: the file must exist on the Metal host", path)
+	case err != nil:
+		return "", fmt.Errorf("local model source %q is not readable on this host: %w", path, err)
+	case info.IsDir():
+		return "", fmt.Errorf("local model source %q is a directory; llama-server needs a GGUF file", path)
+	case !info.Mode().IsRegular():
+		return "", fmt.Errorf("local model source %q is not a regular file", path)
+	case info.Size() == 0:
+		return "", fmt.Errorf("local model source %q is empty", path)
+	}
+	return path, nil
 }
 
 // fetchModel downloads source to filePath. s3:// sources are routed through a
