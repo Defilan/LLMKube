@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -211,6 +212,12 @@ type MetalExecutor struct {
 	// supportsLoadMode).
 	helpProbe func(ctx context.Context, bin string) (string, error)
 	loadMode  loadModeCache
+	// children maps the PID of every llama-server this executor spawned to
+	// its reaper, so StopProcess can learn the child is gone without a second
+	// wait. PIDs absent here (a process adopted after an agent restart) fall
+	// back to signalling and waiting on the PID directly.
+	childMu  sync.Mutex
+	children map[int]*childExit
 }
 
 // Option configures a MetalExecutor. Used to wire the Kubernetes client and
@@ -237,6 +244,7 @@ func NewMetalExecutor(llamaServerBin, modelStorePath string, logger *zap.Sugared
 		logger:         logger,
 		startupTimeout: DefaultLlamaServerStartupTimeout,
 		helpProbe:      execHelpProbe,
+		children:       map[int]*childExit{},
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -288,9 +296,25 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 		"GGML_METAL_PATH_RESOURCES=/usr/local/share/llama.cpp",
 	)
 
+	// Capture child stdout/stderr to a per-process log file, mirroring the
+	// mlx-server executor. Without it a llama-server that rejects a flag and
+	// exits leaves no trail. The path is stable per (namespace, name) so
+	// operators can tail it across restarts.
+	logPath := e.processLogPath(config.Namespace, config.Name)
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open llama-server log file %s: %w", logPath, err)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
 	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
 		return nil, fmt.Errorf("failed to start llama-server: %w", err)
 	}
+	// The child holds the fd; close our handle.
+	_ = logFile.Close()
+	exit := e.trackChild(cmd)
 
 	process := &ManagedProcess{
 		Name:      config.Name,
@@ -302,12 +326,19 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 		Healthy:   false,
 	}
 
-	if err := e.waitForHealthy(port, e.startupTimeout); err != nil {
+	if err := e.waitForHealthy(port, e.startupTimeout, exit.done); err != nil {
+		if errors.Is(err, errChildExited) {
+			// Already reaped: nothing to stop, and its PID may be reused.
+			e.untrackChild(process.PID)
+			return nil, withLogTail(
+				fmt.Errorf("llama-server %w (%s)", err, exit.status()), logPath)
+		}
 		if stopErr := e.StopProcess(process.PID); stopErr != nil {
 			e.logger.Warnw("failed to stop unhealthy process after health check failure",
 				"pid", process.PID, "port", port, "error", stopErr)
 		}
-		return nil, fmt.Errorf("process failed health check after %s: %w", e.startupTimeout, err)
+		return nil, withLogTail(
+			fmt.Errorf("process failed health check after %s: %w", e.startupTimeout, err), logPath)
 	}
 
 	process.Healthy = true
@@ -315,6 +346,10 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 }
 
 func (e *MetalExecutor) StopProcess(pid int) error {
+	if exit := e.trackedChild(pid); exit != nil {
+		return e.stopTrackedChild(pid, exit)
+	}
+
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return fmt.Errorf("failed to find process %d: %w", pid, err)
@@ -337,6 +372,57 @@ func (e *MetalExecutor) StopProcess(pid int) error {
 	case err := <-done:
 		return err
 	}
+}
+
+// stopTrackedChild stops a child this executor spawned. Its reaper owns the
+// wait, so this only signals and watches done.
+func (e *MetalExecutor) stopTrackedChild(pid int, exit *childExit) error {
+	defer e.untrackChild(pid)
+
+	select {
+	case <-exit.done:
+		// Exited and reaped already; signalling now could hit a reused PID.
+		return nil
+	default:
+	}
+
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
+	}
+
+	select {
+	case <-time.After(10 * time.Second):
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
+	case <-exit.done:
+		return nil
+	}
+}
+
+func (e *MetalExecutor) trackChild(cmd *exec.Cmd) *childExit {
+	exit := watchChild(cmd)
+	e.childMu.Lock()
+	e.children[cmd.Process.Pid] = exit
+	e.childMu.Unlock()
+	return exit
+}
+
+func (e *MetalExecutor) trackedChild(pid int) *childExit {
+	e.childMu.Lock()
+	defer e.childMu.Unlock()
+	return e.children[pid]
+}
+
+func (e *MetalExecutor) untrackChild(pid int) {
+	e.childMu.Lock()
+	delete(e.children, pid)
+	e.childMu.Unlock()
+}
+
+// processLogPath returns the per-process log file for llama-server's
+// stdout/stderr, named like the mlx-server and vllm-swift logs beside it.
+func (e *MetalExecutor) processLogPath(namespace, name string) string {
+	return filepath.Join(e.modelStorePath, fmt.Sprintf("llama-server-%s-%s.log", namespace, name))
 }
 
 func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string, secretRef s3SecretRef) (string, error) {
@@ -771,7 +857,12 @@ func (e *MetalExecutor) copyToFileResume(
 	return nil
 }
 
-func (e *MetalExecutor) waitForHealthy(port int, timeout time.Duration) error {
+// waitForHealthy polls /health until it returns 200, the timeout fires, or
+// exited closes. The last returns errChildExited at once: a llama-server that
+// died on startup (a rejected flag, say) will never answer, and polling it for
+// the full timeout would stall every other InferenceService the agent is
+// waiting to reconcile.
+func (e *MetalExecutor) waitForHealthy(port int, timeout time.Duration, exited <-chan struct{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -784,6 +875,8 @@ func (e *MetalExecutor) waitForHealthy(port int, timeout time.Duration) error {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("timeout waiting for health check")
+		case <-exited:
+			return errChildExited
 		case <-ticker.C:
 			resp, err := http.Get(healthURL)
 			if err == nil && resp.StatusCode == http.StatusOK {
