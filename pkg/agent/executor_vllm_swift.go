@@ -19,13 +19,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -48,6 +46,15 @@ type VLLMSwiftExecutor struct {
 	modelStorePath string
 	logger         *zap.SugaredLogger
 	startupTimeout time.Duration
+
+	// allocatePort picks the port for each spawned child; a seam so tests can
+	// point the health wait at a fake /health server.
+	allocatePort func() (int, error)
+
+	// childTracker holds the reaper of every vllm-swift this executor spawned,
+	// so a child that dies on startup ends the health wait at once and
+	// StopProcess never waits on a PID twice.
+	childTracker
 }
 
 // NewVLLMSwiftExecutor creates an executor that spawns one vllm-swift
@@ -58,6 +65,7 @@ func NewVLLMSwiftExecutor(bin, modelStorePath string, logger *zap.SugaredLogger)
 		modelStorePath: modelStorePath,
 		logger:         logger,
 		startupTimeout: DefaultVLLMSwiftStartupTimeout,
+		allocatePort:   allocateLoopbackPort,
 	}
 }
 
@@ -71,7 +79,10 @@ func (e *VLLMSwiftExecutor) SetStartupTimeout(d time.Duration) {
 }
 
 // StartProcess resolves the model directory, allocates a port, and spawns
-// vllm-swift. It blocks until /health returns 200 or startupTimeout fires.
+// vllm-swift. It blocks until /health returns 200, the child exits, or
+// startupTimeout fires. A child that exits during startup (a bad flag, an
+// unsupported model) ends the wait at once and surfaces its own stderr,
+// instead of stalling every other InferenceService behind the full timeout.
 func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorConfig) (*ManagedProcess, error) {
 	modelPath := e.resolveModelPath(config)
 	if _, err := os.Stat(modelPath); err != nil {
@@ -115,6 +126,7 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 	// The child holds the fd; we can close our handle. The OS keeps the
 	// inode alive until the child closes (or exits, which closes its fds).
 	_ = logFile.Close()
+	exit := e.trackChild(cmd)
 
 	process := &ManagedProcess{
 		Name:      config.Name,
@@ -127,13 +139,19 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 		Healthy:   false,
 	}
 
-	if err := e.waitForHealthy(port, e.startupTimeout); err != nil {
-		if killErr := cmd.Process.Kill(); killErr != nil {
-			e.logger.Warnw("failed to kill unhealthy vllm-swift process",
-				"pid", cmd.Process.Pid, "error", killErr)
+	if err := waitForChildHealthy(port, e.startupTimeout, exit.done); err != nil {
+		if errors.Is(err, errChildExited) {
+			// Already reaped: nothing to stop, and its PID may be reused.
+			e.untrackChild(process.PID)
+			return nil, withLogTail(
+				fmt.Errorf("vllm-swift %w (%s)", err, exit.status()), logPath)
 		}
-		return nil, fmt.Errorf("vllm-swift failed health check after %s: %w",
-			e.startupTimeout, err)
+		if stopErr := e.StopProcess(process.PID); stopErr != nil {
+			e.logger.Warnw("failed to stop unhealthy vllm-swift process",
+				"pid", process.PID, "port", port, "error", stopErr)
+		}
+		return nil, withLogTail(
+			fmt.Errorf("vllm-swift failed health check after %s: %w", e.startupTimeout, err), logPath)
 	}
 
 	process.Healthy = true
@@ -141,32 +159,13 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 	return process, nil
 }
 
-// StopProcess sends SIGTERM with a 10s grace period before SIGKILL.
-// vllm-swift's underlying Python api_server respects SIGTERM and shuts down
-// the engine cleanly.
+// StopProcess sends SIGTERM with a 10s grace period before SIGKILL. A child
+// this executor spawned is stopped through its reaper (which owns the Wait);
+// a PID it did not spawn (adopted after an agent restart) falls back to
+// signalling and waiting on it directly. vllm-swift's underlying Python
+// api_server respects SIGTERM and shuts down the engine cleanly.
 func (e *VLLMSwiftExecutor) StopProcess(pid int) error {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process %d: %w", pid, err)
-	}
-
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := process.Wait()
-		done <- err
-	}()
-
-	select {
-	case <-time.After(10 * time.Second):
-		_ = process.Kill()
-		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
-	case err := <-done:
-		return err
-	}
+	return e.stopChild(pid)
 }
 
 // processLogPath returns the per-process log file path for vllm-swift's
@@ -203,45 +202,6 @@ func (e *VLLMSwiftExecutor) resolveModelPath(config ExecutorConfig) string {
 		return candidate
 	}
 	return resolved
-}
-
-// allocatePort asks the kernel for an unused TCP port. Same TOCTOU
-// behavior as MetalExecutor.allocatePort (microsecond window before the
-// child binds). Reused via a free function to avoid coupling executors.
-func (e *VLLMSwiftExecutor) allocatePort() (int, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = ln.Close() }()
-	return ln.Addr().(*net.TCPAddr).Port, nil
-}
-
-// waitForHealthy polls /health on the allocated port until 200 or timeout.
-func (e *VLLMSwiftExecutor) waitForHealthy(port int, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for vllm-swift /health")
-		case <-ticker.C:
-			resp, err := http.Get(healthURL)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				_ = resp.Body.Close()
-				return nil
-			}
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-		}
-	}
 }
 
 // buildVLLMSwiftArgs constructs the command-line argument vector for the
