@@ -18,12 +18,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -47,6 +46,8 @@ type MLXServerExecutor struct {
 	port           int
 	logger         *zap.SugaredLogger
 	startupTimeout time.Duration
+
+	childTracker
 }
 
 // NewMLXServerExecutor creates an executor that spawns one mlx-server
@@ -71,8 +72,8 @@ func (e *MLXServerExecutor) SetStartupTimeout(d time.Duration) {
 }
 
 // StartProcess resolves the model directory and spawns mlx-server on the
-// executor's fixed port. It blocks until /health returns 200 or
-// startupTimeout fires.
+// executor's fixed port. It blocks until /health answers 200, the child exits,
+// or startupTimeout fires.
 func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfig) (*ManagedProcess, error) {
 	modelPath := e.resolveModelPath(config)
 	if _, err := os.Stat(modelPath); err != nil {
@@ -109,6 +110,7 @@ func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfi
 	// The child holds the fd; close our handle. The OS keeps the inode alive
 	// until the child exits.
 	_ = logFile.Close()
+	exit := e.trackChild(cmd)
 
 	process := &ManagedProcess{
 		Name:      config.Name,
@@ -121,13 +123,19 @@ func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfi
 		Healthy:   false,
 	}
 
-	if err := e.waitForHealthy(e.port, e.startupTimeout); err != nil {
-		if killErr := cmd.Process.Kill(); killErr != nil {
-			e.logger.Warnw("failed to kill unhealthy mlx-server process",
-				"pid", cmd.Process.Pid, "error", killErr)
+	if err := waitForChildHealthy(e.port, e.startupTimeout, exit.done); err != nil {
+		if errors.Is(err, errChildExited) {
+			// Already reaped: nothing to stop, and its PID may be reused.
+			e.untrackChild(process.PID)
+			return nil, withLogTail(
+				fmt.Errorf("mlx-server %w (%s)", err, exit.status()), logPath)
 		}
-		return nil, fmt.Errorf("mlx-server failed health check after %s: %w",
-			e.startupTimeout, err)
+		if stopErr := e.StopProcess(process.PID); stopErr != nil {
+			e.logger.Warnw("failed to stop unhealthy mlx-server process",
+				"pid", process.PID, "port", e.port, "error", stopErr)
+		}
+		return nil, withLogTail(
+			fmt.Errorf("mlx-server failed health check after %s: %w", e.startupTimeout, err), logPath)
 	}
 
 	process.Healthy = true
@@ -135,30 +143,10 @@ func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfi
 	return process, nil
 }
 
-// StopProcess sends SIGTERM with a 10s grace period before SIGKILL.
+// StopProcess sends SIGTERM with a 10s grace period before SIGKILL, through
+// the reaper for a child this executor spawned.
 func (e *MLXServerExecutor) StopProcess(pid int) error {
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process %d: %w", pid, err)
-	}
-
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := process.Wait()
-		done <- err
-	}()
-
-	select {
-	case <-time.After(10 * time.Second):
-		_ = process.Kill()
-		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
-	case err := <-done:
-		return err
-	}
+	return e.stopChild(pid)
 }
 
 // processLogPath returns the per-process log file path for mlx-server's
@@ -189,33 +177,6 @@ func (e *MLXServerExecutor) resolveModelPath(config ExecutorConfig) string {
 		return candidate
 	}
 	return resolved
-}
-
-// waitForHealthy polls /health on the given port until 200 or timeout.
-func (e *MLXServerExecutor) waitForHealthy(port int, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for mlx-server /health")
-		case <-ticker.C:
-			resp, err := http.Get(healthURL)
-			if err == nil && resp.StatusCode == http.StatusOK {
-				_ = resp.Body.Close()
-				return nil
-			}
-			if resp != nil {
-				_ = resp.Body.Close()
-			}
-		}
-	}
 }
 
 // buildMLXServerArgs constructs the command-line argument vector for the
