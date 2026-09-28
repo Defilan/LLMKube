@@ -104,6 +104,7 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 		"bin", e.bin, "modelPath", modelPath, "port", port, "ctx", config.ContextSize)
 
 	cmd := exec.Command(e.bin, args...)
+	cmd.Dir = e.modelStorePath // relative paths in engine flags resolve inside the model store
 	cmd.Env = os.Environ()
 
 	// Capture child stdout/stderr to a per-process log file. Without this,

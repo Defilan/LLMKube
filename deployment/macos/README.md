@@ -111,6 +111,59 @@ The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
 </array>
 ```
 
+### `--allowed-model-roots` flag (local model paths)
+
+By default, the agent only allows a Model's local source and an oMLX `pagedSSDCacheDir` to resolve into the model store (`--model-store`). Everything else is refused before the model is admitted or an engine starts.
+
+To allow local model sources outside the model store, pass a comma-separated list of absolute directories:
+
+```bash
+llmkube-metal-agent --allowed-model-roots /Users/you/llmkube-models
+```
+
+Symlinks are followed, so a model store entry (or an `owner/repo` source resolved under the store) that is itself a symlink into the Hugging Face cache needs the cache's real directory added, not just the model store. Add the cache root itself (`/Users/you/.cache/huggingface/hub`), not a `models--org--name/snapshots/<rev>` subdirectory: the snapshot's files are symlinks into the cache's `blobs/` directory, and a GGUF's shards resolve there too, outside any narrower root you might otherwise pick:
+
+```bash
+llmkube-metal-agent --allowed-model-roots /Users/you/.cache/huggingface/hub
+```
+
+To set this in the launchd plist, add these lines to the `ProgramArguments` array:
+
+```xml
+    <string>--allowed-model-roots</string>
+    <string>/Users/you/llmkube-models,/Users/you/.cache/huggingface/hub</string>
+```
+
+`~` in a root expands to the agent user's home directory (for example `~/llmkube-models`); launchd runs the agent as a specific user, so this is the same home `--allowed-model-roots` sees whether you invoke the binary directly or through the plist.
+
+A relative path, or a root the agent cannot resolve at startup, stops the agent from starting. A root that does not exist is logged and ignored until the agent restarts: roots are resolved once at startup, so creating the directory later does not retroactively allow it.
+
+The root match is case-sensitive, so spell a root exactly as it exists on disk; on the default case-insensitive APFS volume, a path that differs from a configured root only in case is still treated as outside it and refused.
+
+Every model source is checked, whatever its scheme: an absolute local path, a `file://` URL, and a scheme-less relative source such as an `owner/repo` id (resolved under the model store). Sources with a scheme other than `file://` (`https`, `hf`, `s3`, `pvc`, `oci`) are not path-checked; any source with a `..` path segment is refused, no matter its scheme.
+
+A refusal shows up as a Warning event on the InferenceService:
+
+```bash
+kubectl describe inferenceservice <name>
+```
+
+```
+Warning  ModelSourceNotAllowed  ...  model path /Users/you/other-models/model.gguf resolves to
+/Users/you/other-models/model.gguf, outside the allowed model roots [/Users/you/llmkube-models];
+add its directory to the agent's --allowed-model-roots to allow it
+```
+
+(macOS resolves `/tmp` to `/private/tmp`, so a root or a resolved path under `/tmp` prints with that `/private` prefix.)
+
+The same message is on the status:
+
+```bash
+kubectl get isvc <name> -o jsonpath='{.status.schedulingMessage}'
+```
+
+Upgrade note: if you already point local model sources, or a `pagedSSDCacheDir`, outside the model store, add their root to `--allowed-model-roots` before upgrading, or the agent will start refusing them. This mirrors the controller's own `--allowed-host-path-roots` (Helm `modelSource.allowedHostPathRoots`), which is enforced separately, at the controller. A Model the controller already marked `Failed` (for example with reason `SourceNotAllowed`) is now also refused by the agent, instead of being served anyway.
+
 ### `--host-ip` flag (remote cluster)
 
 When your Kubernetes cluster runs on a different machine (Linux server, cloud, etc.), the Metal Agent needs to register the Mac's reachable IP address so that pods in the cluster can route traffic to `llama-server`:

@@ -106,6 +106,7 @@ func (e *TensorFoldExecutor) StartProcess(_ context.Context, config ExecutorConf
 		"bin", e.bin, "modelPath", modelPath, "port", port, "ctx", config.ContextSize)
 
 	cmd := exec.Command(e.bin, args...)
+	cmd.Dir = e.modelStorePath // relative paths in engine flags resolve inside the model store
 	cmd.Env = tensorFoldEnv(os.Environ())
 
 	// Per-process log, truncated on every start so it holds only this run.

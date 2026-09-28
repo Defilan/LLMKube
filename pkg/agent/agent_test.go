@@ -1413,9 +1413,10 @@ func TestEnsureProcess_InFlightGuard(t *testing.T) {
 		Build()
 
 	agent := NewMetalAgent(MetalAgentConfig{
-		K8sClient:      k8sClient,
-		Namespace:      "default",
-		MemoryProvider: &mockMemoryProvider{totalBytes: 128 << 30, availableBytes: 120 << 30},
+		K8sClient:         k8sClient,
+		Namespace:         "default",
+		MemoryProvider:    &mockMemoryProvider{totalBytes: 128 << 30, availableBytes: 120 << 30},
+		AllowedModelRoots: []string{filepath.Dir(modelPath)},
 	})
 	exec := &blockingExecutor{entered: make(chan struct{}), release: make(chan struct{})}
 	agent.executors["llama-server"] = exec
@@ -1841,16 +1842,17 @@ func TestValidateRuntimeFormat_PerISvcRuntime(t *testing.T) {
 func TestEnsureProcess_UsesPerISvcRuntime(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	store := t.TempDir()
 
 	agent := NewMetalAgent(MetalAgentConfig{
 		K8sClient:      k8sClient,
 		Namespace:      "default",
-		ModelStorePath: "/tmp/models",
+		ModelStorePath: store,
 		LlamaServerBin: "/fake/llama-server",
 		Runtime:        "llama-server",
 	})
 	agent.watcher = NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
-	agent.executors["llama-server"] = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
+	agent.executors["llama-server"] = NewMetalExecutor("/fake/llama-server", store, newNopLogger())
 	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	// Create an MLX-format model that is compatible with mlx-server.
@@ -1860,7 +1862,7 @@ func TestEnsureProcess_UsesPerISvcRuntime(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: inferencev1alpha1.ModelSpec{
-			Source:   "/tmp/models/test-model",
+			Source:   filepath.Join(store, "test-model"),
 			Format:   "mlx",
 			Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
 		},
@@ -1904,16 +1906,17 @@ func TestEnsureProcess_UsesPerISvcRuntime(t *testing.T) {
 func TestEnsureProcess_DefaultRuntime(t *testing.T) {
 	scheme := newTestScheme()
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	store := t.TempDir()
 
 	agent := NewMetalAgent(MetalAgentConfig{
 		K8sClient:      k8sClient,
 		Namespace:      "default",
-		ModelStorePath: "/tmp/models",
+		ModelStorePath: store,
 		LlamaServerBin: "/fake/llama-server",
 		Runtime:        "llama-server",
 	})
 	agent.watcher = NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
-	agent.executors["llama-server"] = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
+	agent.executors["llama-server"] = NewMetalExecutor("/fake/llama-server", store, newNopLogger())
 	agent.registry = NewServiceRegistry(k8sClient, "", newNopLogger(), "")
 
 	// Create a GGUF model that is compatible with llama-server.
@@ -1923,7 +1926,7 @@ func TestEnsureProcess_DefaultRuntime(t *testing.T) {
 			Namespace: "default",
 		},
 		Spec: inferencev1alpha1.ModelSpec{
-			Source:   "/tmp/models/test-model.gguf",
+			Source:   filepath.Join(store, "test-model.gguf"),
 			Format:   "gguf",
 			Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
 		},

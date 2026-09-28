@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
 // Inference runtime identifiers used by MetalAgentConfig.Runtime and
@@ -203,6 +204,12 @@ type MetalAgentConfig struct {
 	// means use DefaultPowermetricsBin (/usr/bin/powermetrics). Only used
 	// when ApplePowerEnabled is true.
 	PowermetricsBin string
+
+	// AllowedModelRoots lists directories, in addition to the model store
+	// (which is always allowed), that local model sources and the oMLX
+	// pagedSSDCacheDir may resolve into (symlinks followed). Empty means the
+	// model store only.
+	AllowedModelRoots []string
 }
 
 // MetalAgent watches Kubernetes InferenceService resources and manages
@@ -247,6 +254,15 @@ type MetalAgent struct {
 	// stale check and each spawns a runtime process — loading the model
 	// twice, enough to exhaust host memory.
 	starting map[string]bool
+
+	// roots is the set of directories local model sources and the oMLX
+	// pagedSSDCacheDir must resolve into. Derived from
+	// config.AllowedModelRoots, defaulting to the model store.
+	roots policy.Roots
+	// home is the agent process's home directory, used to expand a leading
+	// "~" in a path checked against roots. Empty when it cannot be
+	// determined, in which case a "~"-prefixed path is refused.
+	home string
 }
 
 // ManagedProcess represents a running inference process (llama-server, oMLX, or Ollama model).
@@ -283,6 +299,28 @@ type ManagedProcess struct {
 	// so deleteProcess and Shutdown can pick the correct executor even
 	// when the agent hosts multiple runtimes concurrently (#525).
 	Runtime string
+}
+
+// EffectiveModelRoots returns the root paths NewMetalAgent resolves into
+// policy.Roots: modelStorePath (when non-empty) always comes first, followed
+// by every entry of allowedRoots that is not an exact duplicate of it.
+// Exported so cmd/metal-agent can validate the very same effective set at
+// startup, before constructing the agent, using policy.NewRoots directly.
+func EffectiveModelRoots(modelStorePath string, allowedRoots []string) []string {
+	var paths []string
+	seen := make(map[string]bool)
+	if modelStorePath != "" {
+		paths = append(paths, modelStorePath)
+		seen[modelStorePath] = true
+	}
+	for _, p := range allowedRoots {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	return paths
 }
 
 // NewMetalAgent creates a new Metal agent instance
@@ -322,12 +360,43 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 			"mode", config.MemoryCheckMode)
 	}
 
+	// Resolve home first: NewRoots needs it to expand a leading "~" in a
+	// configured root, and CheckPath needs it to expand "~" in a checked
+	// path.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		logger.Warnw("could not determine home directory; a \"~\"-prefixed path will be refused", "error", err)
+	}
+
+	// Resolve the allowed model roots. The model store is always a root:
+	// downloaded model sources and Model.spec local paths land there
+	// regardless of --allowed-model-roots, so leaving it out would break
+	// every deployment that also configures extra roots. Configured roots
+	// are added on top of it; an exact duplicate of the model store is
+	// skipped rather than resolved twice. A root that fails to resolve
+	// discards the whole configured set (model store included) rather than
+	// silently dropping just that one entry, since NewRoots returns an
+	// all-or-nothing Roots{} on error; the agent still starts (it will
+	// simply refuse every local model path check) because this constructor
+	// has no error return.
+	rootPaths := EffectiveModelRoots(config.ModelStorePath, config.AllowedModelRoots)
+	roots, ignoredRoots, err := policy.NewRoots(rootPaths, home)
+	if err != nil {
+		logger.Errorw("invalid allowed model roots; the whole configured set (model store included) "+
+			"is discarded, so local model paths will all be refused", "error", err)
+	}
+	for _, r := range ignoredRoots {
+		logger.Warnw("allowed model root does not exist; ignoring it", "root", r)
+	}
+
 	return &MetalAgent{
 		config:              config,
 		executors:           make(map[string]ProcessExecutor),
 		processes:           make(map[string]*ManagedProcess),
 		logger:              logger.With("component", "metal-agent"),
 		memoryProvider:      provider,
+		roots:               roots,
+		home:                home,
 		memoryFraction:      fraction,
 		memoryCheckWarnOnly: warnOnly,
 		pressureBlocked:     make(map[string]bool),
@@ -970,6 +1039,15 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 			return a.refuseStart(ctx, isvc, EventReasonEndpointNameConflict, conflict.Error())
 		}
 		return fmt.Errorf("failed to check endpoint name: %w", err)
+	}
+
+	// Refuse a Model the controller marked Failed, and any local model source
+	// or pagedSSDCacheDir that resolves outside the allowed roots, before
+	// memory admission runs. checkModelPaths' refusal writes SchedulingStatus;
+	// running it after memory admission's success path (which clears that
+	// field) would flap the status on every reconcile.
+	if err := a.checkModelPaths(ctx, isvc, model, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
+		return err
 	}
 
 	if err := a.validateRuntimeFormat(model, runtime); err != nil {

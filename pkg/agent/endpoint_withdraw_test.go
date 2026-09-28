@@ -121,7 +121,11 @@ func (e *switchableExecutor) StartProcess(_ context.Context, cfg ExecutorConfig)
 
 func (e *switchableExecutor) StopProcess(_ int) error { return nil }
 
-func newWithdrawTestAgent(t *testing.T, objs ...client.Object) (*MetalAgent, client.Client) {
+// newWithdrawTestAgent builds an agent with no allowed model roots beyond
+// roots. Tests whose Model uses a local absolute source (real or fabricated)
+// must pass its directory in roots, or checkModelPaths refuses it before
+// ensureProcess ever reaches the behavior under test.
+func newWithdrawTestAgent(t *testing.T, roots []string, objs ...client.Object) (*MetalAgent, client.Client) {
 	t.Helper()
 	scheme := newTestScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -132,9 +136,10 @@ func newWithdrawTestAgent(t *testing.T, objs ...client.Object) (*MetalAgent, cli
 		WithObjects(objs...).
 		Build()
 	agent := NewMetalAgent(MetalAgentConfig{
-		K8sClient:      k8sClient,
-		Namespace:      "default",
-		MemoryProvider: &mockMemoryProvider{totalBytes: 128 << 30, availableBytes: 120 << 30},
+		K8sClient:         k8sClient,
+		Namespace:         "default",
+		MemoryProvider:    &mockMemoryProvider{totalBytes: 128 << 30, availableBytes: 120 << 30},
+		AllowedModelRoots: roots,
 	})
 	agent.registry = NewServiceRegistry(k8sClient, "10.0.0.1", newNopLogger(), "")
 	return agent, k8sClient
@@ -161,10 +166,11 @@ func ggufModel(t *testing.T, name string) *inferencev1alpha1.Model {
 // and the slice from the previous start must stop advertising Ready.
 func TestEnsureProcess_FormatIncompatibleWithdrawsInheritedEndpoint(t *testing.T) {
 	const name = "mlx-on-llama"
+	dir := t.TempDir()
 	model := &inferencev1alpha1.Model{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec: inferencev1alpha1.ModelSpec{
-			Source:   "/tmp/models/" + name,
+			Source:   filepath.Join(dir, name),
 			Format:   "mlx",
 			Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
 		},
@@ -174,7 +180,7 @@ func TestEnsureProcess_FormatIncompatibleWithdrawsInheritedEndpoint(t *testing.T
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: name},
 	}
 	svc, slice := inheritedEndpoint(name)
-	agent, c := newWithdrawTestAgent(t, model, isvc, svc, slice)
+	agent, c := newWithdrawTestAgent(t, []string{dir}, model, isvc, svc, slice)
 	agent.executors[runtimeLlamaServer] = &switchableExecutor{}
 
 	err := agent.handleEvent(context.Background(), InferenceServiceEvent{Type: EventTypeCreated, InferenceService: isvc})
@@ -201,7 +207,7 @@ func TestEnsureProcess_StartFailureWithdrawsThenRecovers(t *testing.T) {
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: name},
 	}
 	svc, slice := inheritedEndpoint(name)
-	agent, c := newWithdrawTestAgent(t, model, isvc, svc, slice)
+	agent, c := newWithdrawTestAgent(t, []string{filepath.Dir(model.Spec.Source)}, model, isvc, svc, slice)
 	exec := &switchableExecutor{err: errors.New("llama-server exited during startup")}
 	agent.executors[runtimeLlamaServer] = exec
 
@@ -234,7 +240,7 @@ func TestEnsureProcess_StartFailureCreatesNoEndpoint(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: name},
 	}
-	agent, c := newWithdrawTestAgent(t, model, isvc)
+	agent, c := newWithdrawTestAgent(t, []string{filepath.Dir(model.Spec.Source)}, model, isvc)
 	agent.executors[runtimeLlamaServer] = &switchableExecutor{err: errors.New("boom")}
 
 	if err := agent.ensureProcess(context.Background(), isvc); err == nil {
@@ -268,7 +274,7 @@ func TestWithdrawInheritedEndpoints_RespectsAllowlist(t *testing.T) {
 	}
 	ownedSvc, ownedSlice := inheritedEndpoint(owned)
 	foreignSvc, foreignSlice := inheritedEndpoint(foreign)
-	agent, c := newWithdrawTestAgent(t,
+	agent, c := newWithdrawTestAgent(t, nil,
 		ownedModel, foreignModel, ownedISVC, foreignISVC,
 		ownedSvc, ownedSlice, foreignSvc, foreignSlice)
 	agent.watcher = NewInferenceServiceWatcher(c, "default", newNopLogger())
@@ -304,7 +310,7 @@ func TestWithdrawEndpointIfPresent_SkipsRecentWithdrawalAndForeignSlices(t *test
 	_, foreign := inheritedEndpoint("foreign")
 	foreign.Labels["llmkube.ai/managed-by"] = "someone-else"
 
-	_, c := newWithdrawTestAgent(t, recent, aged, foreign)
+	_, c := newWithdrawTestAgent(t, nil, recent, aged, foreign)
 	reg := NewServiceRegistry(c, "10.0.0.1", newNopLogger(), "")
 	reg.now = func() time.Time { return now }
 

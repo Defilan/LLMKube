@@ -292,6 +292,7 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context) error {
 		pagedSSDCacheMaxSize: e.pagedSSDCacheMaxSize,
 	}
 	cmd := exec.Command(e.omlxBin, buildOMLXServeArgs(e.modelDir, e.port, cfg)...)
+	cmd.Dir = e.modelDir // relative paths in engine flags resolve inside the model store
 	cmd.Env = os.Environ()
 
 	if err := cmd.Start(); err != nil {

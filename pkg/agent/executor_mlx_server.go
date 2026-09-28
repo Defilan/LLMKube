@@ -92,6 +92,7 @@ func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfi
 		"bin", e.bin, "modelPath", modelPath, "port", e.port)
 
 	cmd := exec.Command(e.bin, args...)
+	cmd.Dir = e.modelStorePath // relative paths in engine flags resolve inside the model store
 	cmd.Env = os.Environ()
 
 	// Capture child stdout/stderr to a per-process log file. Without this a
