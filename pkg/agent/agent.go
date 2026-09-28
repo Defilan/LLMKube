@@ -1772,15 +1772,25 @@ func (a *MetalAgent) estimateModelMemory(
 	var fileSizeBytes uint64
 	var reasons []string
 
-	// A model with an absolute local-path source is loaded in place by the
-	// host agent (the Metal path) and is never copied into the model store,
-	// so the model-store lookup below would miss it. Size it from the source
-	// path directly.
-	if filepath.IsAbs(model.Spec.Source) {
-		if size, err := localModelSize(model.Spec.Source); err == nil {
-			fileSizeBytes = size
-		} else {
-			reasons = append(reasons, fmt.Sprintf("local source not readable: %v", err))
+	// A local source (absolute path or file:// URI, per isLocalModelSource)
+	// is loaded in place by the host agent (the Metal path) and is never
+	// copied into the model store, so the model-store lookup below would miss
+	// it. Size it from the source path directly. A file:// source that points
+	// at a missing or unreadable path is not an error here: fall back to the
+	// status/remote chain like any other unsized source; the executor's
+	// resolveLocalModelSource fails the load with a precise message if the
+	// path really does not exist.
+	if isLocalModelSource(model.Spec.Source) {
+		src := model.Spec.Source
+		if hasFileScheme(src) {
+			src = src[len("file://"):]
+		}
+		if filepath.IsAbs(src) {
+			if size, err := localModelSize(src); err == nil {
+				fileSizeBytes = size
+			} else {
+				reasons = append(reasons, fmt.Sprintf("local source not readable: %v", err))
+			}
 		}
 	}
 
