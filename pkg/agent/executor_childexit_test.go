@@ -83,6 +83,43 @@ func healthyPort(t *testing.T) int {
 	return port
 }
 
+// trackedExecutor is the child-exit surface the TensorFold and vllm-swift
+// suites drive: a StartProcess that returns a ManagedProcess, the embedded
+// childTracker, and a StopProcess. Both executors embed childTracker and
+// expose these, so the shared stop-after-exit flow below is testable once.
+type trackedExecutor interface {
+	StartProcess(ctx context.Context, config ExecutorConfig) (*ManagedProcess, error)
+	trackedChild(pid int) *childExit
+	StopProcess(pid int) error
+}
+
+// stopAfterChildExited spawns a healthy child, kills it out of band, and
+// confirms StopProcess succeeds through the reaper without signalling a PID
+// that may be reused. Shared by the TensorFold and vllm-swift suites; the two
+// executors differ only in how the fake binary and fixture are built.
+func stopAfterChildExited(t *testing.T, e trackedExecutor, cfg ExecutorConfig) {
+	t.Helper()
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess with a healthy child: %v", err)
+	}
+	exit := e.trackedChild(proc.PID)
+	if exit == nil {
+		t.Fatal("started child is not tracked")
+	}
+	if err := syscall.Kill(proc.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exit.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not observe the child's exit")
+	}
+	if err := e.StopProcess(proc.PID); err != nil {
+		t.Errorf("StopProcess on an already-exited child: %v", err)
+	}
+}
+
 // TestMetalStartProcess_ChildExitFailsFast is the regression for a
 // llama-server that dies on startup (a rejected flag, say). The executor used
 // to poll /health for the whole startup timeout and report only "timeout

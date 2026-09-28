@@ -23,7 +23,6 @@ import (
 	"reflect"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -377,25 +376,7 @@ func TestTensorFoldStopProcess_ChildAlreadyExited(t *testing.T) {
 	e.allocatePort = func() (int, error) { return port, nil }
 	e.SetStartupTimeout(10 * time.Second)
 
-	proc, err := e.StartProcess(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("StartProcess with a healthy child: %v", err)
-	}
-	exit := e.trackedChild(proc.PID)
-	if exit == nil {
-		t.Fatal("started child is not tracked")
-	}
-	if err := syscall.Kill(proc.PID, syscall.SIGKILL); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-exit.done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("watcher did not observe the child's exit")
-	}
-	if err := e.StopProcess(proc.PID); err != nil {
-		t.Errorf("StopProcess on an already-exited child: %v", err)
-	}
+	stopAfterChildExited(t, e, cfg)
 }
 
 func TestTensorFoldSetStartupTimeout(t *testing.T) {
