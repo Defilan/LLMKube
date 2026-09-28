@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -169,6 +171,95 @@ func TestEstimateModelMemory_AllSourcesExhausted(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cannot determine model size") {
 		t.Errorf("error %q should mention being unable to determine model size", err)
+	}
+}
+
+// Local sources (absolute paths and file:// URIs, #1920/#1926) are loaded in
+// place by the host agent and never copied into the model store, so the
+// estimate must be sized from the file on disk rather than falling back to
+// status (or zero). These tests assert file:// sources size the same way
+// absolute-path sources do.
+func TestEstimateModelMemory_LocalAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	const wantSize = uint64(50 * 1024 * 1024)
+	if err := os.WriteFile(filepath.Join(dir, "model.gguf"), make([]byte, wantSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Status size is deliberately absent: the file on disk is the only source.
+	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{})
+	model := newAdmissionTestModel(filepath.Join(dir, "model.gguf"), "")
+
+	estimate, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err != nil {
+		t.Fatalf("estimateModelMemory returned error: %v", err)
+	}
+	if estimate.WeightsBytes != wantSize {
+		t.Errorf("WeightsBytes = %d, want %d", estimate.WeightsBytes, wantSize)
+	}
+}
+
+func TestEstimateModelMemory_FileURISizesFromFile(t *testing.T) {
+	dir := t.TempDir()
+	const wantSize = uint64(50 * 1024 * 1024)
+	if err := os.WriteFile(filepath.Join(dir, "model.gguf"), make([]byte, wantSize), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A populated status size that would win if the file:// path were skipped
+	// (the bug in #1926); the on-disk size must take precedence.
+	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{})
+	model := newAdmissionTestModel("file://"+filepath.Join(dir, "model.gguf"), "1.0 GiB")
+
+	estimate, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err != nil {
+		t.Fatalf("estimateModelMemory returned error: %v", err)
+	}
+	if estimate.WeightsBytes != wantSize {
+		t.Errorf("WeightsBytes = %d, want %d", estimate.WeightsBytes, wantSize)
+	}
+}
+
+func TestEstimateModelMemory_FileURIDirectorySumsFiles(t *testing.T) {
+	dir := t.TempDir()
+	modelDir := filepath.Join(dir, "mlx-model")
+	if err := os.MkdirAll(filepath.Join(modelDir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelDir, "a.safetensors"), make([]byte, 2048), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modelDir, "sub", "b.safetensors"), make([]byte, 512), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const wantSize = uint64(2048 + 512)
+
+	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{})
+	model := newAdmissionTestModel("file://"+modelDir, "")
+
+	estimate, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err != nil {
+		t.Fatalf("estimateModelMemory returned error: %v", err)
+	}
+	if estimate.WeightsBytes != wantSize {
+		t.Errorf("WeightsBytes = %d, want %d", estimate.WeightsBytes, wantSize)
+	}
+}
+
+// A missing file:// path must not fail admission: the estimate falls back to
+// the other size sources (here the status size) without error.
+func TestEstimateModelMemory_FileURIMissingFallsBackWithoutError(t *testing.T) {
+	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{})
+	model := newAdmissionTestModel(
+		"file://"+filepath.Join(t.TempDir(), "does-not-exist", "model.gguf"),
+		"20.0 GiB",
+	)
+
+	estimate, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err != nil {
+		t.Fatalf("a missing file:// path should fall back without error, got: %v", err)
+	}
+	want := uint64(20 * 1024 * 1024 * 1024)
+	if estimate.WeightsBytes != want {
+		t.Errorf("WeightsBytes = %d, want %d (status size fallback)", estimate.WeightsBytes, want)
 	}
 }
 
