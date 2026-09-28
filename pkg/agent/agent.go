@@ -960,6 +960,18 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
 	}
 
+	// Refuse a taken endpoint name before anything else is evaluated or
+	// started. Checking only at registration (after StartProcess) turns every
+	// watch re-delivery into a full model load followed by a kill, and lets
+	// memory admission's success path clear the refusal status in between.
+	if err := a.registry.CheckEndpointName(ctx, isvc); err != nil {
+		var conflict *EndpointNameConflictError
+		if errors.As(err, &conflict) {
+			return a.refuseStart(ctx, isvc, EventReasonEndpointNameConflict, conflict.Error())
+		}
+		return fmt.Errorf("failed to check endpoint name: %w", err)
+	}
+
 	if err := a.validateRuntimeFormat(model, runtime); err != nil {
 		return err
 	}
@@ -1049,6 +1061,16 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 
 	// Register service endpoint in Kubernetes
 	if err := a.registry.RegisterEndpointWithRetry(ctx, isvc, process.Port); err != nil {
+		var conflict *EndpointNameConflictError
+		if errors.As(err, &conflict) {
+			// Race backstop: CheckEndpointName above saw the name free, but a
+			// foreign object took it while the engine was starting. The name
+			// belongs to someone else: do not serve under it.
+			if stopErr := a.deleteProcess(ctx, key); stopErr != nil {
+				a.logger.Warnw("failed to stop process after endpoint conflict", "key", key, "error", stopErr)
+			}
+			return a.refuseStart(ctx, isvc, EventReasonEndpointNameConflict, conflict.Error())
+		}
 		a.logger.Errorw(
 			"failed to register endpoint",
 			"namespace", isvc.Namespace,
