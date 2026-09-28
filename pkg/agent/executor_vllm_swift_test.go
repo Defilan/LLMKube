@@ -17,17 +17,17 @@ limitations under the License.
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -355,50 +355,6 @@ func TestVLLMSwiftAllocatePort(t *testing.T) {
 	_ = ln.Close()
 }
 
-func TestVLLMSwiftWaitForHealthy_OK(t *testing.T) {
-	// Mock health server that responds 200 immediately.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer srv.Close()
-
-	port := mustExtractPort(t, srv.URL)
-	executor := NewVLLMSwiftExecutor("/bin/vllm-swift", "/models", newNopLogger())
-
-	if err := executor.waitForHealthy(port, 5*time.Second); err != nil {
-		t.Errorf("waitForHealthy returned error against healthy server: %v", err)
-	}
-}
-
-func TestVLLMSwiftWaitForHealthy_Timeout(t *testing.T) {
-	// Server that returns 503 forever — waitForHealthy should give up after
-	// the deadline rather than hanging or false-positive-ing.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
-
-	port := mustExtractPort(t, srv.URL)
-	executor := NewVLLMSwiftExecutor("/bin/vllm-swift", "/models", newNopLogger())
-
-	start := time.Now()
-	err := executor.waitForHealthy(port, 1500*time.Millisecond)
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("waitForHealthy must return error when server is never healthy")
-	}
-	if !strings.Contains(err.Error(), "timeout") {
-		t.Errorf("error must mention timeout, got: %v", err)
-	}
-	if elapsed < 1400*time.Millisecond || elapsed > 3*time.Second {
-		t.Errorf("waitForHealthy elapsed = %v, want roughly 1.5s", elapsed)
-	}
-}
-
 func TestVLLMSwiftStopProcess_HappyPath(t *testing.T) {
 	// Spawn a `sleep` child the executor doesn't manage, then ask
 	// StopProcess to send it SIGTERM. The default SIGTERM handler exits the
@@ -416,6 +372,186 @@ func TestVLLMSwiftStopProcess_HappyPath(t *testing.T) {
 	executor := NewVLLMSwiftExecutor("/bin/vllm-swift", "/models", newNopLogger())
 	if err := executor.StopProcess(cmd.Process.Pid); err != nil {
 		t.Errorf("StopProcess returned error on graceful SIGTERM exit: %v", err)
+	}
+}
+
+// fakeVLLMSwift writes an executable shell script standing in for
+// vllm-swift and returns its path.
+func fakeVLLMSwift(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "vllm-swift")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatalf("write fake vllm-swift: %v", err)
+	}
+	return path
+}
+
+// vllmSwiftFixture returns an executor over a model store holding a model
+// directory, the config that resolves to it, and the per-process log path.
+func vllmSwiftFixture(t *testing.T, bin string) (*VLLMSwiftExecutor, ExecutorConfig, string) {
+	t.Helper()
+	store := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(store, "qwen"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "qwen", "config.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := NewVLLMSwiftExecutor(bin, store, newNopLogger())
+	cfg := ExecutorConfig{
+		Name:        "isvc",
+		Namespace:   "ns",
+		ModelSource: "qwen",
+		ModelName:   "qwen-model",
+		ContextSize: 32768,
+	}
+	return e, cfg, filepath.Join(store, "vllm-swift-ns-isvc.log")
+}
+
+// TestVLLMSwiftStartProcess_ChildExitFailsFast is the regression for a
+// vllm-swift that dies on startup (a bad flag, an unsupported model). The
+// executor used to poll /health for the whole startup timeout and report only
+// a health timeout, blocking every other InferenceService on the node behind
+// it. It must now return as soon as the child exits, carrying the exit status
+// and the child's own stderr.
+func TestVLLMSwiftStartProcess_ChildExitFailsFast(t *testing.T) {
+	bin := fakeVLLMSwift(t, "echo 'error: unsupported model type: qwen3' >&2\nexit 1\n")
+	e, cfg, logPath := vllmSwiftFixture(t, bin)
+	e.SetStartupTimeout(60 * time.Second)
+
+	start := time.Now()
+	proc, err := e.StartProcess(context.Background(), cfg)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("StartProcess succeeded with a child that exited; process: %+v", proc)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("StartProcess took %s against a 60s timeout; it waited on a dead child", elapsed)
+	}
+	for _, want := range []string{"unsupported model type: qwen3", "exit status 1", logPath} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "failed health check") {
+		t.Errorf("error still reports a health failure: %v", err)
+	}
+
+	info, statErr := os.Stat(logPath)
+	if statErr != nil {
+		t.Fatalf("per-process log not written: %v", statErr)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("log file mode = %o, want 600", perm)
+	}
+	data, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(data), "unsupported model type: qwen3") {
+		t.Errorf("log file does not hold the child's stderr: %q", data)
+	}
+	if e.trackedChild(0) != nil || len(e.children) != 0 {
+		t.Errorf("exited child left tracked: %v", e.children)
+	}
+}
+
+// TestVLLMSwiftStartProcess_HealthyChildThenStop covers the path the exit
+// watcher must not break: a child that stays up becomes healthy, and
+// StopProcess then stops it cleanly through the reaper. The reaper collects
+// the exit status, so StopProcess must not also wait on the PID (a second
+// wait loses the race and sees "no child processes" instead of the signal).
+func TestVLLMSwiftStartProcess_HealthyChildThenStop(t *testing.T) {
+	bin := fakeVLLMSwift(t, "exec sleep 60\n")
+	e, cfg, logPath := vllmSwiftFixture(t, bin)
+	port := healthyPort(t)
+	e.allocatePort = func() (int, error) { return port, nil }
+	e.SetStartupTimeout(10 * time.Second)
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess with a healthy child: %v", err)
+	}
+	if !proc.Healthy || proc.Port != port {
+		t.Errorf("process = %+v, want healthy on port %d", proc, port)
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		t.Errorf("per-process log not created for a healthy child: %v", err)
+	}
+
+	exit := e.trackedChild(proc.PID)
+	if exit == nil {
+		t.Fatal("started child is not tracked")
+	}
+
+	start := time.Now()
+	if err := e.StopProcess(proc.PID); err != nil {
+		t.Fatalf("StopProcess on a live tracked child: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("StopProcess took %s; SIGTERM should end sleep at once", elapsed)
+	}
+	select {
+	case <-exit.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaper did not observe the child's exit")
+	}
+	if got := exit.status(); got != "signal: terminated" {
+		t.Errorf("reaped status = %q, want %q (a second waiter raced the reaper)", got, "signal: terminated")
+	}
+	if e.trackedChild(proc.PID) != nil {
+		t.Error("StopProcess left the child tracked")
+	}
+}
+
+// TestVLLMSwiftStopProcess_ChildAlreadyExited: a child that died after it
+// became healthy has been reaped, so its PID may be reused. StopProcess must
+// succeed without signalling.
+func TestVLLMSwiftStopProcess_ChildAlreadyExited(t *testing.T) {
+	bin := fakeVLLMSwift(t, "exec sleep 60\n")
+	e, cfg, _ := vllmSwiftFixture(t, bin)
+	port := healthyPort(t)
+	e.allocatePort = func() (int, error) { return port, nil }
+	e.SetStartupTimeout(10 * time.Second)
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess with a healthy child: %v", err)
+	}
+	exit := e.trackedChild(proc.PID)
+	if exit == nil {
+		t.Fatal("started child is not tracked")
+	}
+	if err := syscall.Kill(proc.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exit.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not observe the child's exit")
+	}
+
+	if err := e.StopProcess(proc.PID); err != nil {
+		t.Errorf("StopProcess on an already-exited child: %v", err)
+	}
+	if e.trackedChild(proc.PID) != nil {
+		t.Error("StopProcess left the exited child tracked")
+	}
+}
+
+// TestVLLMSwiftStartProcess_HungChildStillTimesOut keeps the timeout path
+// intact for a child that stays up but never answers /health.
+func TestVLLMSwiftStartProcess_HungChildStillTimesOut(t *testing.T) {
+	bin := fakeVLLMSwift(t, "echo 'loading model' >&2\nexec sleep 60\n")
+	e, cfg, _ := vllmSwiftFixture(t, bin)
+	e.SetStartupTimeout(1500 * time.Millisecond)
+
+	_, err := e.StartProcess(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("StartProcess succeeded with a child that never became healthy")
+	}
+	for _, want := range []string{"failed health check", "loading model"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
 	}
 }
 
