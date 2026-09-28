@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -110,6 +111,19 @@ func splitCSV(s string) []string {
 		return nil
 	}
 	return out
+}
+
+// loadKubeconfig defers to controller-runtime's standard discovery chain:
+// the auto-registered --kubeconfig flag, then $KUBECONFIG, then in-cluster,
+// then ~/.kube/config. A non-empty contextName selects that context instead
+// of the kubeconfig's current one, so the agent stays on its cluster when the
+// operator switches kubectl contexts.
+func loadKubeconfig(contextName string) (*restclient.Config, error) {
+	cfg, err := config.GetConfigWithContext(contextName)
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	return cfg, nil
 }
 
 func parseLogLevel(level string) zapcore.Level {
@@ -418,7 +432,10 @@ func main() {
 	cfg := &AgentConfig{}
 
 	// Parse command-line flags
-	var llamaServerFlag string
+	var llamaServerFlag, kubeContext string
+	flag.StringVar(&kubeContext, "kube-context", "",
+		"kubeconfig context to connect with (default: the kubeconfig's current context). "+
+			"Pick the kubeconfig file with --kubeconfig or $KUBECONFIG.")
 	flag.StringVar(&cfg.Namespace, "namespace", "default", "Kubernetes namespace to watch")
 	flag.StringVar(&cfg.ModelStorePath, "model-store", "",
 		"Path to store downloaded models: absolute, or starting with ~/. "+
@@ -635,8 +652,8 @@ func main() {
 	}
 
 	// Get Kubernetes client
-	logger.Infow("connecting to Kubernetes")
-	k8sConfig, err := config.GetConfig()
+	logger.Infow("connecting to Kubernetes", "context", kubeContext)
+	k8sConfig, err := loadKubeconfig(kubeContext)
 	if err != nil {
 		logger.Errorw("failed to get kubeconfig", "error", err)
 		os.Exit(1)
@@ -653,7 +670,7 @@ func main() {
 		logger.Errorw("failed to create Kubernetes client", "error", err)
 		os.Exit(1)
 	}
-	logger.Infow("connected to Kubernetes cluster")
+	logger.Infow("connected to Kubernetes cluster", "host", k8sConfig.Host)
 
 	// EventRecorder feeds operator-facing Kubernetes events on managed
 	// InferenceService objects (memory-pressure transitions, evictions,

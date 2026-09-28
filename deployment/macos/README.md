@@ -243,6 +243,72 @@ When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source ag
 
 The agent remembers a mismatch so it does not re-download the same bad source on every reconcile. Changing the Model's `source` or `sha256` clears that memo automatically, since it is keyed to the exact source and digest it was recorded against; the next reconcile then retries the download. If the spec is unchanged (for example, the same URL now serves a corrected file), recreate the `Model` or the `InferenceService` instead: deleting either one clears the memo, so the next reconcile downloads and verifies it again.
 
+### Choosing the cluster (`--kubeconfig`, `--kube-context`)
+
+The agent finds its cluster the same way controller-runtime tools do: the
+`--kubeconfig` flag, then `$KUBECONFIG`, then `~/.kube/config`. By default it
+uses that kubeconfig's **current context**, so if you switch contexts with
+`kubectl config use-context` and the agent restarts, it connects to whatever
+cluster you last selected.
+
+Pin the agent to its cluster so your kubectl context never moves it:
+
+- `--kubeconfig /path/to/file` points the agent at a dedicated kubeconfig.
+- `--kube-context <name>` picks a context other than the current one.
+
+Both can be set at install time:
+
+```bash
+make install-metal-agent METAL_KUBECONFIG=$HOME/.kube/llmkube-metal-agent.yaml
+make install-metal-agent METAL_KUBE_CONTEXT=lab
+```
+
+or by adding them to `ProgramArguments` in the plist. The agent logs the
+context and API server it connected to at startup:
+
+```bash
+grep "connected to Kubernetes" /tmp/llmkube-metal-agent.log
+```
+
+### Dedicated kubeconfig with least-privilege RBAC
+
+The agent doesn't need your admin credentials.
+[`metal-agent-rbac.yaml`](metal-agent-rbac.yaml) creates a ServiceAccount
+with only the permissions the agent uses (read InferenceServices and Models,
+update InferenceService status, manage the Services and EndpointSlices that
+publish each server, write events, read `sourceSecretRef` secrets). Mint a
+kubeconfig from it:
+
+```bash
+NS=default                                  # the namespace the agent watches (--namespace)
+KC=$HOME/.kube/llmkube-metal-agent.yaml
+
+kubectl apply -n "$NS" -f deployment/macos/metal-agent-rbac.yaml
+
+SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+kubectl config view --minify --raw \
+  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > /tmp/llmkube-ca.crt
+TOKEN=$(kubectl create token llmkube-metal-agent -n "$NS" --duration=8760h)
+
+kubectl --kubeconfig "$KC" config set-cluster llmkube \
+  --server "$SERVER" --certificate-authority /tmp/llmkube-ca.crt --embed-certs
+kubectl --kubeconfig "$KC" config set-credentials llmkube-metal-agent --token "$TOKEN"
+kubectl --kubeconfig "$KC" config set-context llmkube \
+  --cluster llmkube --user llmkube-metal-agent --namespace "$NS"
+kubectl --kubeconfig "$KC" config use-context llmkube
+chmod 600 "$KC"; rm /tmp/llmkube-ca.crt
+
+# Check what the agent can do, then install with it
+kubectl --kubeconfig "$KC" auth can-i --list -n "$NS"
+make install-metal-agent METAL_KUBECONFIG="$KC"
+```
+
+`kubectl create token` issues a time-limited token, and the API server may
+cap `--duration` below what you ask for. When it expires the agent logs
+`Unauthorized`; rerun the `create token` and `set-credentials` steps. The
+manifest is namespace-scoped: running the agent with `--namespace ""` (all
+namespaces) needs the same rules in a ClusterRole and ClusterRoleBinding.
+
 ### `--host-ip` flag (remote cluster)
 
 When your Kubernetes cluster runs on a different machine (Linux server, cloud, etc.), the Metal Agent needs to register the Mac's reachable IP address so that the in-cluster relay can reach the agent's ingress (see "Network exposure" under "Security model"):
@@ -967,6 +1033,9 @@ kubectl config current-context
 
 # Check kubeconfig path
 echo $KUBECONFIG
+
+# See which cluster and context the agent actually connected to
+grep "connecting to Kubernetes\|connected to Kubernetes" /tmp/llmkube-metal-agent.log
 
 # If using minikube locally
 minikube status
