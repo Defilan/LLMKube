@@ -216,6 +216,18 @@ func TestMetalStopProcess_ChildAlreadyExited(t *testing.T) {
 	if exit == nil {
 		t.Fatal("started child is not tracked")
 	}
+	stopExitedTrackedChild(t, proc, exit, e.StopProcess)
+	if e.trackedChild(proc.PID) != nil {
+		t.Error("StopProcess left the exited child tracked")
+	}
+}
+
+// stopExitedTrackedChild runs the shared tail of the ChildAlreadyExited
+// StopProcess tests: SIGKILL the tracked child, wait for its reaper to reap
+// it (after which the PID may be reused by another process), then check
+// StopProcess succeeds without signalling.
+func stopExitedTrackedChild(t *testing.T, proc *ManagedProcess, exit *childExit, stop func(pid int) error) {
+	t.Helper()
 	if err := syscall.Kill(proc.PID, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
@@ -224,12 +236,8 @@ func TestMetalStopProcess_ChildAlreadyExited(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("watcher did not observe the child's exit")
 	}
-
-	if err := e.StopProcess(proc.PID); err != nil {
+	if err := stop(proc.PID); err != nil {
 		t.Errorf("StopProcess on an already-exited child: %v", err)
-	}
-	if e.trackedChild(proc.PID) != nil {
-		t.Error("StopProcess left the exited child tracked")
 	}
 }
 
