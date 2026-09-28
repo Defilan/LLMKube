@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -43,6 +44,52 @@ import (
 // slices by it. Kubernetes' built-in EndpointSliceMirroring controller stamps
 // the same label on slices it mirrors from a legacy Endpoints object.
 const labelServiceName = "kubernetes.io/service-name"
+
+const (
+	managedByLabel = "llmkube.ai/managed-by"
+	managedByValue = "metal-agent"
+)
+
+// EndpointNameConflictError reports that a Service or EndpointSlice with the
+// InferenceService's name already exists and is owned neither by this agent
+// (managed-by label) nor by the InferenceService itself (controller
+// ownerReference). The agent leaves it untouched; the conflict is permanent
+// until the InferenceService is renamed or the other object is removed.
+type EndpointNameConflictError struct {
+	Kind      string // "Service" or "EndpointSlice"
+	Namespace string
+	Name      string
+}
+
+func (e *EndpointNameConflictError) Error() string {
+	return fmt.Sprintf("%s %s/%s already exists and is not managed by the metal-agent "+
+		"(no %s=%s label); leaving it untouched; rename the InferenceService or remove that object",
+		e.Kind, e.Namespace, e.Name, managedByLabel, managedByValue)
+}
+
+// ownedByAgent reports whether an object's labels mark it as created by the
+// metal-agent.
+func ownedByAgent(labels map[string]string) bool {
+	return labels[managedByLabel] == managedByValue
+}
+
+// ownedFor reports whether the agent may write obj on behalf of the
+// InferenceService with UID isvcUID: either the agent created it
+// (ownedByAgent), or the InferenceService itself is its controller owner.
+// The second case is a Service the controller created while the
+// InferenceService ran on a CUDA Model; after a switch to a Metal Model the
+// agent takes it over instead of refusing a legitimate migration. Deletion
+// does not use this: deleteIfOwned stays label-only.
+func ownedFor(obj metav1.Object, isvcUID types.UID) bool {
+	if ownedByAgent(obj.GetLabels()) {
+		return true
+	}
+	if isvcUID == "" {
+		return false
+	}
+	ref := metav1.GetControllerOf(obj)
+	return ref != nil && ref.UID == isvcUID
+}
 
 // ServiceRegistry manages Kubernetes Service and Endpoint resources
 // to expose native Metal processes to the cluster
@@ -141,7 +188,7 @@ func (r *ServiceRegistry) WithdrawEndpointIfPresent(
 	if err != nil {
 		return false, fmt.Errorf("failed to get endpointslice: %w", err)
 	}
-	if slice.Labels["llmkube.ai/managed-by"] != "metal-agent" {
+	if !ownedByAgent(slice.Labels) {
 		return false, nil
 	}
 	port := 0
@@ -197,7 +244,7 @@ func (r *ServiceRegistry) WithdrawOwnedEndpoints(
 ) (int, error) {
 	services := &corev1.ServiceList{}
 	opts := []client.ListOption{
-		client.MatchingLabels{"llmkube.ai/managed-by": "metal-agent"},
+		client.MatchingLabels{managedByLabel: managedByValue},
 	}
 	if namespace != "" {
 		opts = append(opts, client.InNamespace(namespace))
@@ -237,6 +284,54 @@ func (r *ServiceRegistry) WithdrawOwnedEndpoints(
 	return withdrawn, nil
 }
 
+// CheckEndpointName reports whether the Service and EndpointSlice the agent
+// would register for isvc are free to write: it returns
+// *EndpointNameConflictError when either exists and is owned neither by this
+// agent nor by isvc (see ownedFor), a wrapped error when a lookup fails, and
+// nil otherwise. The agent calls it before starting an engine, so a taken
+// name is refused without loading the model.
+func (r *ServiceRegistry) CheckEndpointName(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	return r.checkEndpointOwnership(ctx, isvc.Namespace, sanitizeServiceName(isvc.Name), isvc.UID)
+}
+
+// checkEndpointOwnership reports a conflict if either the Service or the
+// EndpointSlice named (namespace, name) already exists and is not owned for
+// the InferenceService with UID isvcUID (ownedFor), checking the Service
+// first. Called before either object is
+// written: checking only inside each write's own mutate func (the in-write
+// guards below) lets a Slice-only conflict leak an owned Service, because the
+// Service write already committed by the time the Slice write fails and
+// nothing else would ever clean it up. A NotFound Get is not a conflict; any
+// other Get error is returned wrapped so the caller can tell it apart from a
+// real ownership conflict.
+func (r *ServiceRegistry) checkEndpointOwnership(
+	ctx context.Context, namespace, name string, isvcUID types.UID,
+) error {
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+
+	svc := &corev1.Service{}
+	switch err := r.client.Get(ctx, key, svc); {
+	case err == nil:
+		if !ownedFor(svc, isvcUID) {
+			return &EndpointNameConflictError{Kind: "Service", Namespace: namespace, Name: name}
+		}
+	case !apierrors.IsNotFound(err):
+		return fmt.Errorf("check existing service: %w", err)
+	}
+
+	slice := &discoveryv1.EndpointSlice{}
+	switch err := r.client.Get(ctx, key, slice); {
+	case err == nil:
+		if !ownedFor(slice, isvcUID) {
+			return &EndpointNameConflictError{Kind: "EndpointSlice", Namespace: namespace, Name: name}
+		}
+	case !apierrors.IsNotFound(err):
+		return fmt.Errorf("check existing endpointslice: %w", err)
+	}
+
+	return nil
+}
+
 // upsertEndpoint is the shared Service+EndpointSlice writer behind
 // RegisterEndpoint (ready=true) and WithdrawEndpoint (ready=false). The only
 // difference between the two is the endpoint's Conditions.Ready value; the
@@ -252,13 +347,28 @@ func (r *ServiceRegistry) upsertEndpoint(
 	// Sanitize service name (replace dots with dashes for DNS-1035 compliance)
 	serviceName := sanitizeServiceName(isvc.Name)
 
+	// Check both objects for a foreign owner before writing either. Without
+	// this, a Service-then-EndpointSlice conflict (Service name free, Slice
+	// name taken) would commit the Service write, then fail on the Slice,
+	// leaking a Service this agent now owns that nothing ever cleans up (the
+	// InferenceService still exists, so ReconcileOrphanEndpoints skips it,
+	// and a conflict is not retried).
+	if err := r.checkEndpointOwnership(ctx, isvc.Namespace, serviceName, isvc.UID); err != nil {
+		return err
+	}
+
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: isvc.Namespace},
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.client, service, func() error {
+		// Backstop for an object created between the check above and this
+		// write; the common case is already caught by checkEndpointOwnership.
+		if service.ResourceVersion != "" && !ownedFor(service, isvc.UID) {
+			return &EndpointNameConflictError{Kind: "Service", Namespace: service.Namespace, Name: service.Name}
+		}
 		service.Labels = map[string]string{
 			"app":                          isvc.Name,
-			"llmkube.ai/managed-by":        "metal-agent",
+			managedByLabel:                 managedByValue,
 			"llmkube.ai/inference-service": isvc.Name,
 		}
 		service.Annotations = map[string]string{
@@ -283,10 +393,15 @@ func (r *ServiceRegistry) upsertEndpoint(
 		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: isvc.Namespace},
 	}
 	if _, err := controllerutil.CreateOrUpdate(ctx, r.client, slice, func() error {
+		// Backstop for an object created between the check above and this
+		// write; the common case is already caught by checkEndpointOwnership.
+		if slice.ResourceVersion != "" && !ownedFor(slice, isvc.UID) {
+			return &EndpointNameConflictError{Kind: "EndpointSlice", Namespace: slice.Namespace, Name: slice.Name}
+		}
 		slice.Labels = map[string]string{
 			labelServiceName:               serviceName,
 			"app":                          isvc.Name,
-			"llmkube.ai/managed-by":        "metal-agent",
+			managedByLabel:                 managedByValue,
 			"llmkube.ai/inference-service": isvc.Name,
 		}
 		if slice.Annotations == nil {
@@ -375,10 +490,10 @@ func (r *ServiceRegistry) reapLegacyEndpoints(ctx context.Context, namespace, se
 	}
 
 	// Only reap the agent's own legacy artifact. Anything else is left alone.
-	if legacy.Labels["llmkube.ai/managed-by"] != "metal-agent" {
+	if !ownedByAgent(legacy.Labels) {
 		r.logger.Debugw("Endpoints exists but is not agent-managed; leaving untouched",
 			"namespace", namespace, "name", serviceName,
-			"managed-by", legacy.Labels["llmkube.ai/managed-by"])
+			"managed-by", legacy.Labels[managedByLabel])
 		return
 	}
 
@@ -406,6 +521,10 @@ func (r *ServiceRegistry) RegisterEndpointWithRetry(
 	var lastErr error
 	err := wait.ExponentialBackoffWithContext(ctx, r.retryBackoff, func(ctx context.Context) (bool, error) {
 		if lastErr = r.RegisterEndpoint(ctx, isvc, port); lastErr != nil {
+			var conflict *EndpointNameConflictError
+			if errors.As(lastErr, &conflict) {
+				return false, lastErr // permanent; stop backing off
+			}
 			r.logger.Warnw("endpoint registration failed; will retry",
 				"namespace", isvc.Namespace, "name", isvc.Name, "port", port, "error", lastErr)
 			return false, nil
@@ -413,6 +532,10 @@ func (r *ServiceRegistry) RegisterEndpointWithRetry(
 		return true, nil
 	})
 	if err != nil {
+		var conflict *EndpointNameConflictError
+		if errors.As(err, &conflict) {
+			return err
+		}
 		if lastErr == nil {
 			lastErr = err // ctx cancelled before the first attempt
 		}
@@ -421,48 +544,46 @@ func (r *ServiceRegistry) RegisterEndpointWithRetry(
 	return nil
 }
 
-// UnregisterEndpoint removes the Service and EndpointSlice for a process
+// UnregisterEndpoint removes the Service and EndpointSlice for a process,
+// deleting only objects this agent owns (deleteIfOwned). A same-named
+// Service/EndpointSlice that predates the agent, or that another owner
+// created, is left untouched.
 func (r *ServiceRegistry) UnregisterEndpoint(ctx context.Context, namespace, name string) error {
 	// Sanitize service name (replace dots with dashes for DNS-1035 compliance)
 	serviceName := sanitizeServiceName(name)
+	key := types.NamespacedName{Namespace: namespace, Name: serviceName}
 
-	// Delete Service
-	service := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: namespace,
-		},
+	if err := r.deleteIfOwned(ctx, key, &corev1.Service{}); err != nil {
+		return fmt.Errorf("failed to delete service: %w", err)
 	}
-	if err := r.client.Delete(ctx, service); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete service: %w", err)
-		}
-		r.logger.Debugw(
-			"service already deleted during endpoint cleanup",
-			"namespace", namespace,
-			"name", serviceName,
-		)
+	if err := r.deleteIfOwned(ctx, key, &discoveryv1.EndpointSlice{}); err != nil {
+		return fmt.Errorf("failed to delete endpointslice: %w", err)
 	}
-
-	// Delete EndpointSlice
-	slice := &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: namespace,
-		},
-	}
-	if err := r.client.Delete(ctx, slice); err != nil {
-		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete endpointslice: %w", err)
-		}
-		r.logger.Debugw(
-			"endpointslice already deleted during endpoint cleanup",
-			"namespace", namespace,
-			"name", serviceName,
-		)
-	}
-
 	return nil
+}
+
+// deleteIfOwned deletes the object at key only if it carries the metal-agent
+// ownership label. Missing objects are fine. The delete is preconditioned on
+// the UID and resourceVersion that were checked, so an object replaced in
+// between is not removed.
+func (r *ServiceRegistry) deleteIfOwned(ctx context.Context, key types.NamespacedName, obj client.Object) error {
+	if err := r.client.Get(ctx, key, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !ownedByAgent(obj.GetLabels()) {
+		r.logger.Warnw("not deleting an object the metal-agent does not own",
+			"kind", fmt.Sprintf("%T", obj), "namespace", key.Namespace, "name", key.Name)
+		return nil
+	}
+	uid, rv := obj.GetUID(), obj.GetResourceVersion()
+	err := r.client.Delete(ctx, obj, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // ReconcileOrphanEndpoints scans all Service objects labeled as managed by
@@ -485,7 +606,7 @@ func (r *ServiceRegistry) UnregisterEndpoint(ctx context.Context, namespace, nam
 func (r *ServiceRegistry) ReconcileOrphanEndpoints(ctx context.Context, namespace string) (int, error) {
 	services := &corev1.ServiceList{}
 	opts := []client.ListOption{
-		client.MatchingLabels{"llmkube.ai/managed-by": "metal-agent"},
+		client.MatchingLabels{managedByLabel: managedByValue},
 	}
 	if namespace != "" {
 		opts = append(opts, client.InNamespace(namespace))

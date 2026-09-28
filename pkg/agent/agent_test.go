@@ -43,6 +43,8 @@ const Q8_0 = "q8_0"
 func newTestScheme() *runtime.Scheme {
 	s := runtime.NewScheme()
 	_ = inferencev1alpha1.AddToScheme(s)
+	_ = corev1.AddToScheme(s)
+	_ = discoveryv1.AddToScheme(s)
 	return s
 }
 
@@ -554,16 +556,20 @@ func TestDeleteProcess_StopFailureStillUnregistersEndpoint(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = discoveryv1.AddToScheme(scheme)
 
+	// Labeled as agent-owned: this Service/EndpointSlice models the agent's
+	// own prior registration for the process being deleted below.
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 	}
 	slice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,
 	}
@@ -1390,9 +1396,13 @@ func TestEnsureProcess_InFlightGuard(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "race-isvc", Namespace: "default"},
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "race-model"},
 	}
-	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "race-isvc", Namespace: "default"}}
+	// The pre-existing endpoint objects are the agent's own (managed-by
+	// label): an unlabelled same-named object is a name conflict, which the
+	// agent refuses before StartProcess.
+	agentLabels := map[string]string{managedByLabel: managedByValue}
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "race-isvc", Namespace: "default", Labels: agentLabels}}
 	slice := &discoveryv1.EndpointSlice{
-		ObjectMeta:  metav1.ObjectMeta{Name: "race-isvc", Namespace: "default"},
+		ObjectMeta:  metav1.ObjectMeta{Name: "race-isvc", Namespace: "default", Labels: agentLabels},
 		AddressType: discoveryv1.AddressTypeIPv4,
 	}
 
@@ -1712,11 +1722,13 @@ func TestHeartbeatOnce_NotFound(t *testing.T) {
 	_ = discoveryv1.AddToScheme(scheme)
 
 	// The fake client starts with NO InferenceService for "gone-model".
-	// Pre-populate the EndpointSlice so UnregisterEndpoint has something to delete.
+	// Pre-populate the EndpointSlice, labeled as agent-owned, so
+	// UnregisterEndpoint has something it will actually delete.
 	existingSlice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "gone-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,
 	}

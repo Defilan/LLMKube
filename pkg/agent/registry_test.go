@@ -19,6 +19,8 @@ package agent
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,7 +30,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -361,17 +365,20 @@ func TestUnregisterEndpoint(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = discoveryv1.AddToScheme(scheme)
 
-	// Pre-create Service and Endpoints
+	// Pre-create Service and Endpoints, labeled as agent-owned so the guarded
+	// delete in UnregisterEndpoint actually removes them.
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 	}
 	slice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,
 	}
@@ -439,18 +446,20 @@ func TestUnregisterEndpoint_Idempotent(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	_ = discoveryv1.AddToScheme(scheme)
 
-	// Pre-create resources so first cleanup does actual deletes; second call should
-	// tolerate NotFound and still return nil.
+	// Pre-create resources, labeled as agent-owned, so first cleanup does
+	// actual deletes; second call should tolerate NotFound and still return nil.
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "idempotent-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 	}
 	slice := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "idempotent-model",
 			Namespace: "default",
+			Labels:    map[string]string{managedByLabel: managedByValue},
 		},
 		AddressType: discoveryv1.AddressTypeIPv4,
 	}
@@ -466,6 +475,29 @@ func TestUnregisterEndpoint_Idempotent(t *testing.T) {
 	}
 	if err := registry.UnregisterEndpoint(context.Background(), "default", "idempotent-model"); err != nil {
 		t.Fatalf("second UnregisterEndpoint should be idempotent, got error: %v", err)
+	}
+}
+
+// Deleting an InferenceService whose name matches an unrelated Service and
+// EndpointSlice must not delete them.
+func TestUnregisterEndpoint_KeepsUnownedObjects(t *testing.T) {
+	svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"}}
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta:  metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		AddressType: discoveryv1.AddressTypeIPv4,
+	}
+	c := newRegistryTestClient(t, svc, slice)
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+
+	if err := r.UnregisterEndpoint(context.Background(), "default", "db"); err != nil {
+		t.Fatalf("UnregisterEndpoint: %v", err)
+	}
+	dbKey := types.NamespacedName{Name: "db", Namespace: "default"}
+	if err := c.Get(context.Background(), dbKey, &corev1.Service{}); err != nil {
+		t.Errorf("unowned Service was deleted: %v", err)
+	}
+	if err := c.Get(context.Background(), dbKey, &discoveryv1.EndpointSlice{}); err != nil {
+		t.Errorf("unowned EndpointSlice was deleted: %v", err)
 	}
 }
 
@@ -1050,5 +1082,233 @@ func TestRegisterEndpoint_NoLegacyEndpoints(t *testing.T) {
 		Namespace: "default",
 	}, &discoveryv1.EndpointSlice{}); err != nil {
 		t.Fatalf("EndpointSlice should be present after registration: %v", err)
+	}
+}
+
+func newRegistryTestClient(t *testing.T, objs ...client.Object) client.Client {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	_ = inferencev1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+}
+
+// An InferenceService named after a Service the agent did not create must not
+// modify that Service in any field, and must report a typed conflict.
+func TestRegisterEndpoint_RefusesUnownedService(t *testing.T) {
+	foreign := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default",
+			Labels: map[string]string{"component": "apiserver"}},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: map[string]string{"app": "real"},
+			Ports:    []corev1.ServicePort{{Name: "https", Port: 443, TargetPort: intstr.FromInt(6443)}},
+		},
+	}
+	c := newRegistryTestClient(t, foreign)
+	key := types.NamespacedName{Name: "kubernetes", Namespace: "default"}
+	before := &corev1.Service{}
+	if err := c.Get(context.Background(), key, before); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "kubernetes", Namespace: "default"}}
+	err := r.RegisterEndpoint(context.Background(), isvc, 9000)
+
+	var conflict *EndpointNameConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("RegisterEndpoint error = %v, want *EndpointNameConflictError", err)
+	}
+	if conflict.Kind != "Service" || conflict.Name != "kubernetes" {
+		t.Errorf("conflict = %+v, want Kind=Service Name=kubernetes", conflict)
+	}
+	after := &corev1.Service{}
+	if err := c.Get(context.Background(), key, after); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("unowned Service was modified:\nbefore %+v\nafter  %+v", before, after)
+	}
+	slice := &discoveryv1.EndpointSlice{}
+	if err := c.Get(context.Background(), key, slice); err == nil {
+		t.Error("an EndpointSlice was created despite the Service conflict")
+	}
+}
+
+// Same guard for an existing EndpointSlice the agent does not own, when the
+// Service is free (or owned).
+func TestRegisterEndpoint_RefusesUnownedEndpointSlice(t *testing.T) {
+	foreign := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default",
+			Labels: map[string]string{"kubernetes.io/service-name": "shared"}},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{"10.9.9.9"}}},
+	}
+	c := newRegistryTestClient(t, foreign)
+	before := &discoveryv1.EndpointSlice{}
+	_ = c.Get(context.Background(), types.NamespacedName{Name: "shared", Namespace: "default"}, before)
+
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"}}
+	err := r.RegisterEndpoint(context.Background(), isvc, 9000)
+
+	var conflict *EndpointNameConflictError
+	if !errors.As(err, &conflict) || conflict.Kind != "EndpointSlice" {
+		t.Fatalf("RegisterEndpoint error = %v, want EndpointSlice conflict", err)
+	}
+	after := &discoveryv1.EndpointSlice{}
+	_ = c.Get(context.Background(), types.NamespacedName{Name: "shared", Namespace: "default"}, after)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("unowned EndpointSlice was modified")
+	}
+	// The Service name was free; a Slice-only conflict must not leak a Service
+	// the agent now owns (nothing would ever clean it up: the InferenceService
+	// still exists, so ReconcileOrphanEndpoints skips it, and a conflict is
+	// not retried).
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "shared", Namespace: "default"},
+		&corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("a Service was created despite the EndpointSlice conflict (get err = %v), want NotFound", err)
+	}
+}
+
+// Objects the agent created keep updating normally.
+func TestRegisterEndpoint_UpdatesOwnedObjects(t *testing.T) {
+	c := newRegistryTestClient(t)
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	if err := r.RegisterEndpoint(context.Background(), isvc, 9000); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RegisterEndpoint(context.Background(), isvc, 9001); err != nil {
+		t.Fatalf("second register of an owned object failed: %v", err)
+	}
+	svc := &corev1.Service{}
+	_ = c.Get(context.Background(), types.NamespacedName{Name: "m", Namespace: "default"}, svc)
+	if got := svc.Spec.Ports[0].TargetPort.IntValue(); got != 9001 {
+		t.Errorf("targetPort = %d, want 9001", got)
+	}
+}
+
+// A conflict is permanent: RegisterEndpointWithRetry must return it at once
+// instead of backing off.
+func TestRegisterEndpointWithRetry_StopsOnConflict(t *testing.T) {
+	foreign := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "taken", Namespace: "default"}}
+	c := newRegistryTestClient(t, foreign)
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	r.retryBackoff = wait.Backoff{Duration: time.Second, Factor: 2, Steps: 5}
+	start := time.Now()
+	err := r.RegisterEndpointWithRetry(context.Background(),
+		&inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "taken", Namespace: "default"}}, 9000)
+	var conflict *EndpointNameConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("error = %v, want conflict", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("retried for %v; a conflict must not be retried", d)
+	}
+}
+
+// controllerOwnedService returns a Service named name whose controller
+// ownerReference points at an InferenceService with UID ownerUID, and which
+// carries no managed-by label: the Service the controller creates for a CUDA
+// InferenceService.
+func controllerOwnedService(name string, ownerUID types.UID) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default",
+			Labels: map[string]string{"app": name},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: inferencev1alpha1.GroupVersion.String(), Kind: "InferenceService",
+				Name: name, UID: ownerUID, Controller: ptr.To(true),
+			}}},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": name},
+			Ports:    []corev1.ServicePort{{Name: "http", Port: 8080}},
+		},
+	}
+}
+
+// A Service controlled by the same InferenceService (left over from a CUDA
+// Model before a switch to a Metal Model) is taken over: registration
+// succeeds, stamps the managed-by label and keeps the ownerReference.
+func TestRegisterEndpoint_AcceptsControllerOwnedService(t *testing.T) {
+	c := newRegistryTestClient(t, controllerOwnedService("migrated", "uid-1"))
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "migrated", Namespace: "default", UID: "uid-1"}}
+
+	if err := r.CheckEndpointName(context.Background(), isvc); err != nil {
+		t.Fatalf("CheckEndpointName: %v", err)
+	}
+	if err := r.RegisterEndpoint(context.Background(), isvc, 9000); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+	svc := &corev1.Service{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "migrated", Namespace: "default"}, svc); err != nil {
+		t.Fatal(err)
+	}
+	if svc.Labels[managedByLabel] != managedByValue {
+		t.Errorf("labels = %v, want %s=%s", svc.Labels, managedByLabel, managedByValue)
+	}
+	if svc.Spec.Selector != nil {
+		t.Errorf("selector = %v, want nil (agent-managed endpoints)", svc.Spec.Selector)
+	}
+	if ref := metav1.GetControllerOf(svc); ref == nil || ref.UID != "uid-1" {
+		t.Errorf("controller ownerReference = %+v, want UID uid-1 kept", ref)
+	}
+}
+
+// A controller ownerReference to a DIFFERENT InferenceService is still a
+// conflict, and the Service is left untouched.
+func TestRegisterEndpoint_RefusesServiceControlledByOtherUID(t *testing.T) {
+	c := newRegistryTestClient(t, controllerOwnedService("shared", "uid-other"))
+	key := types.NamespacedName{Name: "shared", Namespace: "default"}
+	before := &corev1.Service{}
+	if err := c.Get(context.Background(), key, before); err != nil {
+		t.Fatal(err)
+	}
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default", UID: "uid-mine"}}
+
+	var conflict *EndpointNameConflictError
+	if err := r.CheckEndpointName(context.Background(), isvc); !errors.As(err, &conflict) {
+		t.Fatalf("CheckEndpointName error = %v, want *EndpointNameConflictError", err)
+	}
+	if err := r.RegisterEndpoint(context.Background(), isvc, 9000); !errors.As(err, &conflict) {
+		t.Fatalf("RegisterEndpoint error = %v, want *EndpointNameConflictError", err)
+	}
+	if conflict.Kind != "Service" {
+		t.Errorf("conflict kind = %q, want Service", conflict.Kind)
+	}
+	after := &corev1.Service{}
+	if err := c.Get(context.Background(), key, after); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("Service controlled by another InferenceService was modified")
+	}
+}
+
+// The conflict message tells the user how to resolve it.
+func TestEndpointNameConflictError_NamesRemedy(t *testing.T) {
+	msg := (&EndpointNameConflictError{Kind: "Service", Namespace: "default", Name: "x"}).Error()
+	if !strings.Contains(msg, "rename the InferenceService or remove that object") {
+		t.Errorf("Error() = %q, want the remedy", msg)
+	}
+}
+
+// Deletion stays label-only: a Service controlled by the InferenceService but
+// not labelled by the agent is not deleted by UnregisterEndpoint.
+func TestUnregisterEndpoint_KeepsControllerOwnedUnlabelledService(t *testing.T) {
+	c := newRegistryTestClient(t, controllerOwnedService("migrated", "uid-1"))
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	if err := r.UnregisterEndpoint(context.Background(), "default", "migrated"); err != nil {
+		t.Fatalf("UnregisterEndpoint: %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "migrated", Namespace: "default"},
+		&corev1.Service{}); err != nil {
+		t.Errorf("controller-owned, unlabelled Service was deleted: %v", err)
 	}
 }
