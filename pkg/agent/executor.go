@@ -284,6 +284,7 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 	args := e.llamaServerArgs(ctx, modelPath, port, config)
 
 	cmd := exec.Command(e.llamaServerBin, args...)
+	cmd.Dir = e.modelStorePath // relative paths in engine flags resolve inside the model store
 
 	cmd.Env = append(os.Environ(),
 		"GGML_METAL_ENABLE=1",

@@ -18,6 +18,8 @@ package agent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -303,5 +305,345 @@ func TestEnsureProcess_ControllerOwnedServiceIsTakenOver(t *testing.T) {
 	svc := getService(t, a.config.K8sClient, "migrated")
 	if svc.Labels[managedByLabel] != managedByValue {
 		t.Errorf("Service labels = %v, want %s=%s", svc.Labels, managedByLabel, managedByValue)
+	}
+}
+
+// With no roots configured, the model store is the only root.
+func TestNewMetalAgent_DefaultRootIsModelStore(t *testing.T) {
+	store := t.TempDir()
+	a := NewMetalAgent(MetalAgentConfig{ModelStorePath: store})
+	want, _ := filepath.EvalSymlinks(store)
+	if got := a.roots.Dirs(); len(got) != 1 || got[0] != want {
+		t.Errorf("roots = %v, want [%s]", got, want)
+	}
+}
+
+// The model store is always a root: configuring AllowedModelRoots adds to it,
+// it never replaces it, so downloads that land in the store keep passing.
+func TestNewMetalAgent_ConfiguredRoots(t *testing.T) {
+	store, extra := t.TempDir(), t.TempDir()
+	a := NewMetalAgent(MetalAgentConfig{ModelStorePath: store, AllowedModelRoots: []string{extra}})
+	wantStore, _ := filepath.EvalSymlinks(store)
+	wantExtra, _ := filepath.EvalSymlinks(extra)
+	got := a.roots.Dirs()
+	if len(got) != 2 {
+		t.Fatalf("roots = %v, want the model store and the configured extra root", got)
+	}
+	want := map[string]bool{wantStore: true, wantExtra: true}
+	for _, d := range got {
+		if !want[d] {
+			t.Errorf("roots = %v, unexpected entry %q", got, d)
+		}
+	}
+}
+
+// Listing the model store again in AllowedModelRoots does not duplicate it.
+func TestNewMetalAgent_ConfiguredRootsDedupesModelStore(t *testing.T) {
+	store, extra := t.TempDir(), t.TempDir()
+	a := NewMetalAgent(MetalAgentConfig{ModelStorePath: store, AllowedModelRoots: []string{store, extra}})
+	if got := a.roots.Dirs(); len(got) != 2 {
+		t.Errorf("roots = %v, want 2 (the model store deduped against AllowedModelRoots)", got)
+	}
+}
+
+// A "~"-prefixed AllowedModelRoots entry expands against the process's home
+// directory, the same way NewMetalAgent resolves it via os.UserHomeDir().
+// --allowed-model-roots ~/llmkube-models must not be rejected as relative
+// (the pre-fix behavior, which made cmd/metal-agent exit 1 and launchd
+// restart-loop it).
+func TestNewMetalAgent_ConfiguredRootsExpandsTilde(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	store := t.TempDir()
+	mkTestFile(t, filepath.Join(home, "llmkube-models", "placeholder"))
+
+	a := NewMetalAgent(MetalAgentConfig{ModelStorePath: store, AllowedModelRoots: []string{"~/llmkube-models"}})
+
+	if a.home != home {
+		t.Errorf("a.home = %q, want %q", a.home, home)
+	}
+	wantStore, _ := filepath.EvalSymlinks(store)
+	wantExtra, _ := filepath.EvalSymlinks(filepath.Join(home, "llmkube-models"))
+	got := a.roots.Dirs()
+	if len(got) != 2 {
+		t.Fatalf("roots = %v, want the model store and the expanded ~/llmkube-models root", got)
+	}
+	want := map[string]bool{wantStore: true, wantExtra: true}
+	for _, d := range got {
+		if !want[d] {
+			t.Errorf("roots = %v, unexpected entry %q", got, d)
+		}
+	}
+}
+
+// mkTestFile writes a small stub file, creating its parent directory.
+func mkTestFile(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A local model source outside every allowed root is refused before the
+// engine starts.
+func TestEnsureProcess_RefusesLocalSourceOutsideRoots(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "m.gguf")
+	mkTestFile(t, outside)
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.Source = outside
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+
+	err := a.ensureProcess(context.Background(), isvc)
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("error = %v, want %s", err, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 0 {
+		t.Errorf("engine started %d times; want 0", ex.starts)
+	}
+	if !strings.Contains(strings.Join(drainEvents(rec), "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+		t.Error("no ModelSourceNotAllowed Warning event")
+	}
+}
+
+// A Model the controller marked Failed is refused; the agent must not serve a
+// Model the controller already rejected.
+func TestEnsureProcess_RefusesFailedModel(t *testing.T) {
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Status.Phase = inferencev1alpha1.PhaseFailed
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+	err := a.ensureProcess(context.Background(), isvc)
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) || ex.starts != 0 {
+		t.Fatalf("error = %v starts = %d, want refusal and no start", err, ex.starts)
+	}
+}
+
+// A Failed Model refusal happens before memory admission ever runs: two
+// ensureProcess calls in a row must not flap the status between the refusal
+// reason and "" (which the memory-admission success path would otherwise
+// clear on an admitted model). The model here is sized and budgeted so it
+// WOULD pass memory admission if checkModelPaths ran after it, and every
+// status write in between the two calls is captured via an interceptor so a
+// clear-then-set within a single call cannot hide behind the final read.
+func TestEnsureProcess_RefusesFailedModelNoFlap(t *testing.T) {
+	var written []string
+	funcs := &interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if is, ok := obj.(*inferencev1alpha1.InferenceService); ok && sub == "status" {
+				written = append(written, is.Status.SchedulingStatus)
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.Hardware.MemoryBudget = "1Ti"
+	model.Status.Size = "1 GiB"
+	model.Status.Phase = inferencev1alpha1.PhaseFailed
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, funcs, isvc, model)
+
+	for i := range 2 {
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.ensureProcess(context.Background(), cur); err == nil {
+			t.Fatalf("call %d: ensureProcess succeeded, want a refusal", i+1)
+		}
+	}
+
+	if ex.starts != 0 {
+		t.Errorf("starts = %d after two refused evaluations, want 0", ex.starts)
+	}
+	if len(written) == 0 {
+		t.Fatal("no status writes recorded; the refusal must be reported on the status")
+	}
+	for i, s := range written {
+		if s != EventReasonModelSourceNotAllowed {
+			t.Errorf("status write %d set schedulingStatus = %q, want %q (writes: %q)",
+				i, s, EventReasonModelSourceNotAllowed, written)
+		}
+	}
+}
+
+// A local source inside a root starts, and the engine receives the path as
+// written (unresolved), preserving split-GGUF sibling lookup (#1920).
+func TestEnsureProcess_LocalSourceInsideSymlinkedRootStarts(t *testing.T) {
+	store, hf := t.TempDir(), t.TempDir()
+	mkTestFile(t, filepath.Join(hf, "snap", "m.gguf"))
+	link := filepath.Join(store, "linked")
+	if err := os.Symlink(filepath.Join(hf, "snap"), link); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(link, "m.gguf")
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.Source = src
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{ModelStorePath: store, AllowedModelRoots: []string{store, hf}},
+		isvc, model)
+	if err := a.ensureProcess(context.Background(), isvc); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	if ex.starts != 1 || ex.lastCfg.ModelSource != src {
+		t.Errorf("starts=%d ModelSource=%q, want 1 start with the unresolved %q", ex.starts, ex.lastCfg.ModelSource, src)
+	}
+}
+
+// oMLX's pagedSSDCacheDir is checked against the allowed roots just like a
+// local model source, even when the model itself streams from a remote
+// source.
+func TestEnsureProcess_RefusesPagedSSDCacheDirOutsideRoots(t *testing.T) {
+	isvc := refusalISVC("svc")
+	isvc.Spec.Runtime = runtimeOMLX
+	isvc.Spec.PagedSSDCacheDir = ptr.To(t.TempDir())
+	model := refusalModel()
+	model.Spec.Format = formatMLX
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+	a.executors[runtimeOMLX] = ex
+
+	err := a.ensureProcess(context.Background(), isvc)
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("error = %v, want %s", err, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 0 {
+		t.Errorf("engine started %d times; want 0", ex.starts)
+	}
+	if !strings.Contains(strings.Join(drainEvents(rec), "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+		t.Error("no ModelSourceNotAllowed Warning event")
+	}
+}
+
+// A scheme-less relative model source (no "://", no leading "/") that
+// contains a ".." component is refused before the engine starts. Every
+// executor's resolveModelPath joins a relative ModelSource onto the model
+// store with filepath.Join, which cleans ".." out of the joined path, so an
+// unchecked value like this would otherwise resolve outside the store.
+func TestEnsureProcess_RefusesRelativeSourceEscape(t *testing.T) {
+	isvc := refusalISVC("svc")
+	isvc.Spec.Runtime = runtimeMLXServer
+	model := refusalModel()
+	model.Spec.Format = formatMLX
+	model.Spec.Source = "a/../../outside"
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+	a.executors[runtimeMLXServer] = ex
+
+	err := a.ensureProcess(context.Background(), isvc)
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("error = %v, want %s", err, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 0 {
+		t.Errorf("engine started %d times; want 0", ex.starts)
+	}
+	if !strings.Contains(strings.Join(drainEvents(rec), "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+		t.Error("no ModelSourceNotAllowed Warning event")
+	}
+}
+
+// A relative source that is a plain repository id (no ".." component, no
+// scheme) resolves under the model store even though nothing exists there
+// yet, so it is not refused: it starts like any other not-yet-downloaded
+// source.
+func TestEnsureProcess_RelativeRepoIDStillStarts(t *testing.T) {
+	isvc := refusalISVC("svc")
+	isvc.Spec.Runtime = runtimeMLXServer
+	model := refusalModel()
+	model.Spec.Format = formatMLX
+	model.Spec.Source = "lmstudio-community/Qwen3.8-27B-MLX-4bit"
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+	a.executors[runtimeMLXServer] = ex
+
+	if err := a.ensureProcess(context.Background(), isvc); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	if ex.starts != 1 {
+		t.Errorf("starts = %d, want 1", ex.starts)
+	}
+}
+
+// A relative source resolved against a symlink inside the store that points
+// outside every root is refused: ResolvePath resolves the symlink component
+// before the root containment check runs.
+func TestEnsureProcess_RefusesRelativeSourceThroughSymlinkEscape(t *testing.T) {
+	store, outside := t.TempDir(), t.TempDir()
+	mkTestFile(t, filepath.Join(outside, "model", "weights.gguf"))
+	if err := os.Symlink(filepath.Join(outside, "model"), filepath.Join(store, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.Source = "linked/weights.gguf"
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{ModelStorePath: store}, isvc, model)
+
+	err := a.ensureProcess(context.Background(), isvc)
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("error = %v, want %s", err, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 0 {
+		t.Errorf("engine started %d times; want 0", ex.starts)
+	}
+	if !strings.Contains(strings.Join(drainEvents(rec), "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+		t.Error("no ModelSourceNotAllowed Warning event")
+	}
+}
+
+// A ".." path segment in the model source is refused regardless of scheme.
+// mlx-server, vllm-swift and tensorfold's resolveModelPath all filepath.Join
+// a non-absolute ModelSource onto the model store even when it carries a
+// scheme (only an absolute local path is left as-is), so a value like
+// "https://../../../../Users/victim/x" walks the joined path back out of the
+// store. The CRD's Source pattern allows any character after a scheme, and
+// the controller marks a remote-looking source Ready (never Failed), so
+// neither the pattern nor the Failed-Model check catches this.
+func TestEnsureProcess_RefusesDotDotInAnySource(t *testing.T) {
+	cases := []string{
+		"https://../../../../Users/x",
+		"hf://a/../../../x",
+		"s3://bucket/../../x",
+		"pvc://claim/../../x",
+	}
+	for _, source := range cases {
+		t.Run(source, func(t *testing.T) {
+			isvc := refusalISVC("svc")
+			isvc.Spec.Runtime = runtimeMLXServer
+			model := refusalModel()
+			model.Spec.Format = formatMLX
+			model.Spec.Source = source
+			a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+			a.executors[runtimeMLXServer] = ex
+
+			err := a.ensureProcess(context.Background(), isvc)
+			if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+				t.Fatalf("error = %v, want %s", err, EventReasonModelSourceNotAllowed)
+			}
+			if ex.starts != 0 {
+				t.Errorf("engine started %d times; want 0", ex.starts)
+			}
+			if !strings.Contains(strings.Join(drainEvents(rec), "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+				t.Error("no ModelSourceNotAllowed Warning event")
+			}
+		})
+	}
+}
+
+// A normal remote source with no ".." segment is not refused by the ".."
+// rule. Status.Size is set so the pre-flight memory check resolves from it
+// instead of issuing a real HEAD request against the (fake) URL.
+func TestEnsureProcess_NormalRemoteSourceNotRefusedByDotDotRule(t *testing.T) {
+	isvc := refusalISVC("svc")
+	isvc.Spec.Runtime = runtimeLlamaCPP
+	model := refusalModel()
+	model.Spec.Source = "https://huggingface.co/org/repo/resolve/main/m.gguf"
+	model.Status.Size = "1 GiB"
+	a, _, _ := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+
+	if err := a.ensureProcess(context.Background(), isvc); err != nil &&
+		strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("ensureProcess refused a normal remote source: %v", err)
 	}
 }

@@ -40,6 +40,7 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/platform"
 	"github.com/defilantech/llmkube/pkg/agent"
+	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
 var (
@@ -82,6 +83,7 @@ type AgentConfig struct {
 	ApplePowerEnabled         bool
 	ApplePowerInterval        time.Duration
 	PowermetricsBin           string
+	AllowedModelRoots         string
 }
 
 // splitCSV parses a comma-separated string into a trimmed []string,
@@ -411,6 +413,10 @@ func main() {
 		"powermetrics sampling cadence. Only meaningful with --apple-power-enabled.")
 	flag.StringVar(&cfg.PowermetricsBin, "powermetrics-bin", agent.DefaultPowermetricsBin,
 		"Path to the macOS powermetrics binary. Only used with --apple-power-enabled.")
+	flag.StringVar(&cfg.AllowedModelRoots, "allowed-model-roots", "",
+		"Comma-separated absolute directories that local model sources and the oMLX pagedSSDCacheDir "+
+			"must resolve into (symlinks followed), in addition to the model store. "+
+			"Default: the model store only.")
 	showVersion := flag.Bool("version", false, "Show version information")
 	flag.Parse()
 
@@ -430,6 +436,23 @@ func main() {
 		_ = baseLogger.Sync()
 	}()
 	logger := baseLogger.Sugar()
+
+	// Validate the effective allowed-model-roots set eagerly: the same list
+	// NewMetalAgent resolves (the model store plus --allowed-model-roots, see
+	// agent.EffectiveModelRoots). A relative --model-store or a relative
+	// --allowed-model-roots entry is a config mistake, and failing fast here
+	// beats starting an agent that silently refuses every local model path.
+	// home is looked up the same way NewMetalAgent looks it up, so a "~"
+	// entry validates here exactly as it will resolve at construction time.
+	allowedModelRoots := splitCSV(cfg.AllowedModelRoots)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		logger.Warnw("could not determine home directory; a \"~\"-prefixed allowed model root will be refused", "error", err)
+	}
+	if _, _, err := policy.NewRoots(agent.EffectiveModelRoots(cfg.ModelStorePath, allowedModelRoots), home); err != nil {
+		logger.Errorw("invalid allowed model roots (model store plus --allowed-model-roots)", "error", err)
+		os.Exit(1)
+	}
 
 	// TODO: Wire this logger into controller-runtime via ctrl.SetLogger(...) so
 	// Kubernetes client/controller-runtime logs share the same configuration.
@@ -584,6 +607,7 @@ func main() {
 		ApplePowerInterval:        cfg.ApplePowerInterval,
 		PowermetricsBin:           cfg.PowermetricsBin,
 		EvictionEnabled:           cfg.EvictionEnabled,
+		AllowedModelRoots:         allowedModelRoots,
 	}
 	if cfg.WatchdogInterval > 0 {
 		agentCfg.WatchdogConfig = &agent.MemoryWatchdogConfig{
