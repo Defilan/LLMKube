@@ -17,15 +17,65 @@ limitations under the License.
 package agent
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
 const mlxTestModelStore = "/models"
+
+// deadPort asks the kernel for an unused port and returns it with the listener
+// closed, so a health probe to it finds nothing listening. Tests whose child
+// never becomes healthy use it: mlx-server binds a fixed port, so a live test
+// server standing in as "unhealthy" is not possible (the probe would hit it).
+func deadPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	return port
+}
+
+// fakeMLXServer writes an executable shell script standing in for mlx-server.
+func fakeMLXServer(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "mlx-server")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatalf("write fake mlx-server: %v", err)
+	}
+	return path
+}
+
+// mlxServerFixture returns an executor over a model store holding a model
+// directory, the config that resolves to it, and the per-process log path.
+func mlxServerFixture(t *testing.T, bin string, port int) (*MLXServerExecutor, ExecutorConfig, string) {
+	t.Helper()
+	store := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(store, "qwen"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "qwen", "config.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e := NewMLXServerExecutor(bin, store, port, newNopLogger())
+	cfg := ExecutorConfig{
+		Name:        "isvc",
+		Namespace:   "ns",
+		ModelSource: "qwen",
+		ModelName:   "qwen-model",
+	}
+	return e, cfg, filepath.Join(store, "mlx-server-ns-isvc.log")
+}
 
 func TestNewMLXServerExecutor(t *testing.T) {
 	executor := NewMLXServerExecutor("/opt/homebrew/bin/mlx-server", mlxTestModelStore, 8080, newNopLogger())
@@ -136,7 +186,13 @@ func TestMLXServerStopProcess_InvalidPID(t *testing.T) {
 	}
 }
 
-func TestMLXServerWaitForHealthy_OK(t *testing.T) {
+// The executor no longer carries a private health loop: it uses the shared
+// waitForChildHealthy, so the mlx-server health semantics are covered by the
+// start/stop tests below (a healthy child is covered by
+// TestMLXServerStartProcess_HealthyChildThenStop, a timed-out one by
+// TestMLXServerStartProcess_HungChildStillTimesOut).
+
+func TestMLXServerWaitForChildHealthy_OK(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			w.WriteHeader(http.StatusOK)
@@ -147,27 +203,162 @@ func TestMLXServerWaitForHealthy_OK(t *testing.T) {
 	defer srv.Close()
 
 	port := mustExtractPort(t, srv.URL)
-	executor := NewMLXServerExecutor("/bin/mlx-server", mlxTestModelStore, port, newNopLogger())
+	done := make(chan struct{})
 
-	if err := executor.waitForHealthy(port, 5*time.Second); err != nil {
-		t.Errorf("waitForHealthy returned error against healthy server: %v", err)
+	if err := waitForChildHealthy(port, 5*time.Second, done); err != nil {
+		t.Errorf("waitForChildHealthy returned error against healthy server: %v", err)
 	}
 }
 
-func TestMLXServerWaitForHealthy_Timeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer srv.Close()
+// TestMLXServerStartProcess_ChildExitFailsFast is the regression for a
+// mlx-server that dies on startup (a bad flag, an unsupported model). The
+// executor used to poll /health for the whole startup timeout and report only
+// a health timeout, blocking every other InferenceService on the node behind
+// it. It must now return as soon as the child exits, carrying the exit status
+// and the child's own stderr.
+func TestMLXServerStartProcess_ChildExitFailsFast(t *testing.T) {
+	bin := fakeMLXServer(t, "echo 'error: unsupported model family: llama4' >&2\nexit 1\n")
+	e, cfg, logPath := mlxServerFixture(t, bin, deadPort(t))
+	e.SetStartupTimeout(60 * time.Second)
 
-	port := mustExtractPort(t, srv.URL)
-	executor := NewMLXServerExecutor("/bin/mlx-server", mlxTestModelStore, port, newNopLogger())
+	start := time.Now()
+	proc, err := e.StartProcess(context.Background(), cfg)
+	elapsed := time.Since(start)
 
-	err := executor.waitForHealthy(port, 1500*time.Millisecond)
 	if err == nil {
-		t.Fatal("waitForHealthy must return error when server is never healthy")
+		t.Fatalf("StartProcess succeeded with a child that exited; process: %+v", proc)
 	}
-	if !strings.Contains(err.Error(), "timeout") {
-		t.Errorf("error must mention timeout, got: %v", err)
+	if elapsed > 5*time.Second {
+		t.Errorf("StartProcess took %s against a 60s timeout; it waited on a dead child", elapsed)
+	}
+	for _, want := range []string{"unsupported model family: llama4", "exit status 1", logPath} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "timeout") {
+		t.Errorf("error still reports a health timeout: %v", err)
+	}
+	e.childMu.Lock()
+	n := len(e.children)
+	e.childMu.Unlock()
+	if n != 0 {
+		t.Errorf("exited child left tracked: %d children", n)
+	}
+}
+
+// TestMLXServerStartProcess_LogTruncatedOnStart: the per-process log holds
+// only the current run, so a stale failure from a previous spawn cannot be
+// mistaken for this one.
+func TestMLXServerStartProcess_LogTruncatedOnStart(t *testing.T) {
+	bin := fakeMLXServer(t, "echo 'fresh run' >&2\nexit 2\n")
+	e, cfg, logPath := mlxServerFixture(t, bin, deadPort(t))
+	if err := os.WriteFile(logPath, []byte("stale failure from last run\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.StartProcess(context.Background(), cfg); err == nil {
+		t.Fatal("StartProcess succeeded with a child that exited")
+	}
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "stale failure") || !strings.Contains(string(data), "fresh run") {
+		t.Errorf("log not truncated on start: %q", data)
+	}
+}
+
+// TestMLXServerStartProcess_HealthyChildThenStop covers the path the exit
+// watcher must not break: a child that stays up becomes healthy, and
+// StopProcess then stops it cleanly through the reaper (so the reaper — not a
+// second waiter — records its exit status).
+func TestMLXServerStartProcess_HealthyChildThenStop(t *testing.T) {
+	bin := fakeMLXServer(t, "exec sleep 60\n")
+	e, cfg, logPath := mlxServerFixture(t, bin, healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess with a healthy child: %v", err)
+	}
+	if !proc.Healthy || proc.Port != e.port {
+		t.Errorf("process = %+v, want healthy on port %d", proc, e.port)
+	}
+	if _, err := os.Stat(logPath); err != nil {
+		t.Errorf("per-process log not created: %v", err)
+	}
+
+	exit := e.trackedChild(proc.PID)
+	if exit == nil {
+		t.Fatal("started child is not tracked")
+	}
+	start := time.Now()
+	if err := e.StopProcess(proc.PID); err != nil {
+		t.Fatalf("StopProcess on a live tracked child: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("StopProcess took %s; SIGTERM should end sleep at once", elapsed)
+	}
+	select {
+	case <-exit.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaper did not observe the child's exit")
+	}
+	if got := exit.status(); got != "signal: terminated" {
+		t.Errorf("reaped status = %q, want %q (a second waiter raced the reaper)", got, "signal: terminated")
+	}
+	if e.trackedChild(proc.PID) != nil {
+		t.Error("StopProcess left the child tracked")
+	}
+}
+
+// TestMLXServerStopProcess_ChildAlreadyExited: a child that died after it
+// became healthy has been reaped, so its PID may be reused. StopProcess must
+// succeed without signalling.
+func TestMLXServerStopProcess_ChildAlreadyExited(t *testing.T) {
+	bin := fakeMLXServer(t, "exec sleep 60\n")
+	e, cfg, _ := mlxServerFixture(t, bin, healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess with a healthy child: %v", err)
+	}
+	exit := e.trackedChild(proc.PID)
+	if exit == nil {
+		t.Fatal("started child is not tracked")
+	}
+	if err := syscall.Kill(proc.PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exit.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watcher did not observe the child's exit")
+	}
+	if err := e.StopProcess(proc.PID); err != nil {
+		t.Errorf("StopProcess on an already-exited child: %v", err)
+	}
+	if e.trackedChild(proc.PID) != nil {
+		t.Error("StopProcess left the exited child tracked")
+	}
+}
+
+// TestMLXServerStartProcess_HungChildStillTimesOut keeps the timeout path
+// intact for a child that stays up but never answers /health. mlx-server binds
+// a fixed port, so the test server trick of the other tests cannot serve as
+// "unhealthy": the probe would hit it and return 200. The wait must time out
+// against a port nothing listens on.
+func TestMLXServerStartProcess_HungChildStillTimesOut(t *testing.T) {
+	bin := fakeMLXServer(t, "echo 'loading model' >&2\nexec sleep 60\n")
+	e, cfg, _ := mlxServerFixture(t, bin, deadPort(t))
+	e.SetStartupTimeout(1500 * time.Millisecond)
+
+	_, err := e.StartProcess(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("StartProcess succeeded with a child that never became healthy")
+	}
+	for _, want := range []string{"failed health check", "loading model"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %v", want, err)
+		}
 	}
 }
