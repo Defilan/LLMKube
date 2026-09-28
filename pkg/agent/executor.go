@@ -391,6 +391,15 @@ func hasFileScheme(source string) bool {
 	return len(source) >= len(scheme) && strings.EqualFold(source[:len(scheme)], scheme)
 }
 
+// localSourcePath strips a file:// scheme (matched case-insensitively) from a
+// local model source, returning the path as given (not cleaned or resolved).
+func localSourcePath(source string) string {
+	if hasFileScheme(source) {
+		return source[len("file://"):]
+	}
+	return source
+}
+
 // resolveLocalModelSource returns the path llama-server should load for a
 // local source, or an error naming the path when it cannot be loaded. The path
 // is returned as given, not symlink-resolved: llama.cpp looks for split GGUF
@@ -398,10 +407,7 @@ func hasFileScheme(source string) bool {
 // links each shard to a hash-named blob, so resolving would break split loads.
 // os.Stat still follows the link, so a dangling one is reported as missing.
 func resolveLocalModelSource(source string) (string, error) {
-	path := source
-	if hasFileScheme(source) {
-		path = source[len("file://"):]
-	}
+	path := localSourcePath(source)
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("local model source %q must be an absolute path on the Metal host", path)
 	}
