@@ -282,32 +282,55 @@ publish each server, write events, read the relay token Secret and
 ```bash
 NS=default                                  # the namespace the agent watches (--namespace)
 KC=$HOME/.kube/llmkube-metal-agent.yaml
+CA=/tmp/llmkube-ca.crt
 
 kubectl apply -n "$NS" -f deployment/macos/metal-agent-rbac.yaml
 
 SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-kubectl config view --minify --raw \
-  -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d > /tmp/llmkube-ca.crt
+CA_DATA=$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+CA_FILE=$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+if [ -n "$CA_DATA" ]; then
+  echo "$CA_DATA" | base64 -d > "$CA"
+elif [ -n "$CA_FILE" ]; then
+  cp "$CA_FILE" "$CA"
+fi
+test -s "$CA" || { echo "no cluster CA found in either certificate-authority-data or certificate-authority; set --certificate-authority on the set-cluster command below by hand" >&2; exit 1; }
+
 TOKEN=$(kubectl create token llmkube-metal-agent -n "$NS" --duration=8760h)
 
 kubectl --kubeconfig "$KC" config set-cluster llmkube \
-  --server "$SERVER" --certificate-authority /tmp/llmkube-ca.crt --embed-certs
+  --server "$SERVER" --certificate-authority "$CA" --embed-certs
 kubectl --kubeconfig "$KC" config set-credentials llmkube-metal-agent --token "$TOKEN"
 kubectl --kubeconfig "$KC" config set-context llmkube \
   --cluster llmkube --user llmkube-metal-agent --namespace "$NS"
 kubectl --kubeconfig "$KC" config use-context llmkube
-chmod 600 "$KC"; rm /tmp/llmkube-ca.crt
+chmod 600 "$KC"; rm "$CA"
 
 # Check what the agent can do, then install with it
 kubectl --kubeconfig "$KC" auth can-i --list -n "$NS"
 make install-metal-agent METAL_KUBECONFIG="$KC"
 ```
 
+The current context's cluster entry usually carries `certificate-authority-data`
+(the CA embedded inline, base64-encoded); some kubeconfigs instead carry
+`certificate-authority` as a file path, and a cluster with no CA configured at
+all (for example one already using `insecure-skip-tls-verify`) has neither.
+The recipe above tries the inline data first, falls back to copying the file,
+and refuses to continue rather than minting a kubeconfig with an empty,
+unusable CA.
+
 `kubectl create token` issues a time-limited token, and the API server may
 cap `--duration` below what you ask for. When it expires the agent logs
 `Unauthorized`; rerun the `create token` and `set-credentials` steps. The
 manifest is namespace-scoped: running the agent with `--namespace ""` (all
 namespaces) needs the same rules in a ClusterRole and ClusterRoleBinding.
+
+The agent's client also looks up API groups through the API server's
+discovery endpoints (`/api`, `/apis`), which any authenticated identity can
+normally read through the default `system:discovery` ClusterRoleBinding. If
+your cluster's admins removed that binding, the ServiceAccount above needs it
+granted explicitly, for example
+`kubectl create clusterrolebinding llmkube-metal-agent-discovery --clusterrole=system:discovery --serviceaccount="$NS:llmkube-metal-agent"`.
 
 ### `--host-ip` flag (remote cluster)
 

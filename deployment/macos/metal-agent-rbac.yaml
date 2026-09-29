@@ -10,6 +10,11 @@
 # with --namespace "" (all namespaces) needs a ClusterRole and
 # ClusterRoleBinding with the same rules instead.
 #
+# The agent's client also needs API discovery (/api, /apis), normally granted
+# to every authenticated identity by the default system:discovery
+# ClusterRoleBinding; grant it explicitly to this ServiceAccount if your
+# cluster removed that binding.
+#
 #   kubectl apply -n <namespace> -f deployment/macos/metal-agent-rbac.yaml
 apiVersion: v1
 kind: ServiceAccount
