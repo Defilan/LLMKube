@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -143,6 +144,10 @@ func New(cfg Config, logger *slog.Logger) (*Relay, error) {
 			InsecureSkipVerify: true, //nolint:gosec // G402: replaced by SPKI pinning in VerifyConnection
 			VerifyConnection:   r.verifyPin,
 		},
+		// Bound connection setup so an unreachable Mac fails fast; the
+		// response header wait stays unbounded for long first tokens.
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
 		ForceAttemptHTTP2:     true,
 		ResponseHeaderTimeout: 0,
 		IdleConnTimeout:       90 * time.Second,

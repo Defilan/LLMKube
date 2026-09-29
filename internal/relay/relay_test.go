@@ -234,7 +234,9 @@ func TestRelay_StreamsSSE(t *testing.T) {
 	upstream, pin := newIngress(t, func(w http.ResponseWriter, _ *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
-			t.Fatal("ResponseWriter does not support flushing")
+			// t.Fatal must not run outside the test goroutine.
+			t.Error("ResponseWriter does not support flushing")
+			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
