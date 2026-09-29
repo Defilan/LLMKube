@@ -75,10 +75,32 @@ func main() {
 			"anti-thrash swapping. Requires in-cluster RBAC to get/list/"+
 			"watch/patch InferenceServices in the router namespace. When "+
 			"disabled, pooled backends dispatch as ordinary local backends.")
+	relayMode := flag.Bool("relay", false,
+		"Run as a metal-agent relay instead of a router: forward every "+
+			"request on --listen to a pinned metal-agent ingress. No router "+
+			"config, no ModelRouter CRD, no Kubernetes client. Set by the "+
+			"controller for in-cluster relay pods.")
+	relayTarget := flag.String("relay-target", "",
+		"Relay mode: the InferenceService this relay serves, as "+
+			"<namespace>/<name>. Falls back to RELAY_TARGET.")
+	relayUpstream := flag.String("relay-upstream", "",
+		"Relay mode: the metal-agent ingress URL to forward to "+
+			"(https://...). Falls back to RELAY_UPSTREAM.")
+	relayPin := flag.String("relay-spki-pin", "",
+		"Relay mode: base64 SHA-256 SPKI pin of the ingress certificate. "+
+			"Falls back to RELAY_SPKI_PIN.")
+	relayTokenFile := flag.String("relay-token-file", "",
+		"Relay mode: path to the per-namespace relay token file (a "+
+			"projected Secret volume). Falls back to RELAY_TOKEN_FILE.")
 	flag.Parse()
 
 	logger := newLogger(*logFormat)
 	slog.SetDefault(logger)
+
+	if *relayMode {
+		os.Exit(runRelay(logger, *listen, *metricsListen, *shutdownTimeout,
+			relayConfigFromFlags(*relayTarget, *relayUpstream, *relayPin, *relayTokenFile)))
+	}
 
 	// Checked before anything binds. Two listeners on one address is otherwise
 	// a race whose outcome depends on which one loses, so the same flags can

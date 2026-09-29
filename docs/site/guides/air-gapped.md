@@ -39,10 +39,11 @@ Three workloads need to land inside the air gap:
    only schedules pods using these; it doesn't pull weights into
    them.
 3. **The router-proxy** (`ghcr.io/defilantech/llmkube-router-proxy:0.9.14`)
-   if you use `ModelRouter`. Only needed when you want the
-   policy-aware routing layer. The release pipeline publishes a
-   versioned router-proxy image alongside the controller on every
-   release; mirror the tag that matches your controller version.
+   if you use `ModelRouter`, or if you run Metal InferenceServices even
+   with no `ModelRouter` at all: the controller's Metal relay pods use
+   this same image. The release pipeline publishes a versioned
+   router-proxy image alongside the controller on every release; mirror
+   the tag that matches your controller version.
 
 Plus the model weights themselves, which the operator either copies
 from a local source or mounts from a PVC. There is no model-weight

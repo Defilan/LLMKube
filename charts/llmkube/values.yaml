@@ -125,6 +125,10 @@ controllerManager:
   # InferenceServices and external provider backends, speaks
   # OpenAI chat completions, and enforces policy routing.
   #
+  # This same image also runs the per-InferenceService relay Deployment the
+  # controller creates for Metal InferenceServices, once their Mac's
+  # metal-agent publishes an authenticated ingress.
+  #
   # The release pipeline publishes ghcr.io/defilantech/llmkube-router-proxy
   # alongside the controller image with matching version tags (#449), so the
   # empty tag below resolves to the chart appVersion.
