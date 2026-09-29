@@ -283,12 +283,6 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	return nil
 }
 
-func (s *Server) listenAddr() net.Addr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.addr
-}
-
 // parseTarget splits "<ns>/<name>"; both parts must be non-empty and name
 // must not contain another slash.
 func parseTarget(v string) (ns, name string, ok bool) {
