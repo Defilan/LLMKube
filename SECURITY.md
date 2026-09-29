@@ -6,9 +6,9 @@ We support the latest minor release plus the previous one. Older minors receive 
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.7.x   | :white_check_mark: |
-| 0.6.x   | :white_check_mark: |
-| < 0.6   | :x:                |
+| 0.10.x  | :white_check_mark: |
+| 0.9.x   | :white_check_mark: |
+| < 0.9   | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -37,6 +37,8 @@ We take security seriously. If you discover a security vulnerability in LLMKube,
 
 This security policy applies to:
 - LLMKube controller
+- Metal agent (`llmkube-metal-agent`, macOS)
+- Foreman operator and agents
 - CLI (`llmkube`)
 - Helm charts
 - Container images published to GHCR
@@ -56,3 +58,4 @@ When deploying LLMKube:
 3. **Resource Limits**: Always set CPU/memory limits to prevent DoS
 4. **Image Verification**: Use image digests in production Helm values
 5. **Air-gapped Models**: Pre-download models for sensitive environments
+6. **Apple Silicon hosts**: Run the Metal agent at 0.10.0 or later, list model directories in `--allowed-model-roots`, and leave `--allow-unsafe-extra-args` off unless every InferenceService author is trusted with the Mac. See the [macOS agent security model](deployment/macos/README.md)
