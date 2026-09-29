@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -464,5 +465,165 @@ var _ = Describe("metal relay mode", func() {
 
 		// A missing Deployment is not an error.
 		Expect(reconciler.teardownRelay(ctx, owned)).To(Succeed())
+	})
+
+	Context("full Reconcile", func() {
+		// metalModel creates the Ready metal Model newISVC refers to.
+		metalModel := func(isvcName string) {
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName + "-model", Namespace: namespace},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
+				},
+			}
+			create(model)
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+		}
+
+		reconcileISVC := func(name string) *inferencev1alpha1.InferenceService {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
+			return got
+		}
+
+		// serveThroughRelay drives name into relay mode on a fresh pinned
+		// agent slice and marks the relay available, returning the slice.
+		serveThroughRelay := func(name string) *discoveryv1.EndpointSlice {
+			metalModel(name)
+			newISVC(name)
+			cleanupRelay(name)
+			slice := agentSlice(name, now(), pinA)
+			create(slice)
+
+			got := reconcileISVC(name)
+			dep := &appsv1.Deployment{}
+			depKey := types.NamespacedName{Name: relayDeploymentName(name), Namespace: namespace}
+			Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, &corev1.Service{})).To(Succeed())
+			// envtest runs no Deployment controller, so the relay has no
+			// available replica yet and the service must not be Ready.
+			Expect(got.Status.Phase).NotTo(Equal(PhaseReady))
+			Expect(got.Status.ReadyReplicas).To(BeZero())
+
+			// The API rejects availableReplicas above replicas or
+			// readyReplicas, so report one replica throughout.
+			dep.Status.Replicas = 1
+			dep.Status.ReadyReplicas = 1
+			dep.Status.AvailableReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+
+			got = reconcileISVC(name)
+			Expect(got.Status.Phase).To(Equal(PhaseReady))
+			Expect(got.Status.ReadyReplicas).To(Equal(int32(1)))
+			return slice
+		}
+
+		It("metal ISVC in relay mode becomes Ready only when the relay is available", func() {
+			serveThroughRelay("relay-full-ready")
+		})
+
+		It("rollback hands the Service back", func() {
+			name := "relay-full-rollback"
+			slice := serveThroughRelay(name)
+
+			create(metalEndpoints(name, now()))
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(slice), slice)).To(Succeed())
+			slice.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat] = tenMinutesAgo()
+			Expect(k8sClient.Update(ctx, slice)).To(Succeed())
+
+			svcKey := types.NamespacedName{Name: name, Namespace: namespace}
+			before := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, svcKey, before)).To(Succeed())
+
+			reconcileISVC(name)
+
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: relayDeploymentName(name), Namespace: namespace}, &appsv1.Deployment{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "relay Deployment should be deleted on hand-back, got %v", err)
+			after := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, svcKey, after)).To(Succeed())
+			Expect(after.ResourceVersion).To(Equal(before.ResourceVersion), "legacy reconcile must not touch <isvc>")
+
+			By("the rolled-back agent clears the selector; the controller leaves it cleared")
+			after.Spec.Selector = nil
+			Expect(k8sClient.Update(ctx, after)).To(Succeed())
+			reconcileISVC(name)
+			final := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, svcKey, final)).To(Succeed())
+			Expect(final.Spec.Selector).To(BeNil())
+		})
+
+		It("surfaces a foreign Service as a reconcile error and never goes Ready", func() {
+			name := "relay-full-foreign"
+			metalModel(name)
+			newISVC(name)
+			cleanupRelay(name)
+			create(agentSlice(name, now(), pinA))
+			create(&corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{"app": "someone-else"}},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{"app": "someone-else"},
+					Ports:    []corev1.ServicePort{{Name: "web", Port: 80, Protocol: corev1.ProtocolTCP}},
+				},
+			})
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+			})
+			Expect(err).To(MatchError(ContainSubstring("is not managed by the metal-agent or this InferenceService")))
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
+			Expect(got.Status.Phase).NotTo(Equal(PhaseReady))
+		})
+
+		It("requeues with the error when the mode decision cannot list slices", func() {
+			name := "relay-full-listerr"
+			metalModel(name)
+			newISVC(name)
+			reconciler.Client = &sliceListFailingClient{Client: k8sClient, serviceName: agentServiceName(name)}
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+			})
+			Expect(err).To(MatchError(errInjectedSliceList))
+		})
+	})
+
+	Context("findInferenceServiceForEndpoints", func() {
+		requestNames := func(reqs []reconcile.Request) []string {
+			names := make([]string, 0, len(reqs))
+			for _, r := range reqs {
+				Expect(r.Namespace).To(Equal(namespace))
+				names = append(names, r.Name)
+			}
+			return names
+		}
+
+		It("the EndpointSlice mapper enqueues the ISVC for an agent slice", func() {
+			reqs := reconciler.findInferenceServiceForEndpoints(ctx, agentSlice("relay-mapper", now(), pinA))
+			Expect(requestNames(reqs)).To(ConsistOf("relay-mapper-agent", "relay-mapper"))
+		})
+
+		It("still enqueues an ISVC literally named with the -agent suffix for its legacy slice", func() {
+			reqs := reconciler.findInferenceServiceForEndpoints(ctx, metalEndpoints("chat-agent", now()))
+			Expect(requestNames(reqs)).To(ConsistOf("chat-agent", "chat"))
+		})
+
+		It("does not strip -agent from a slice not written by the metal-agent", func() {
+			slice := agentSlice("relay-mapper-mirrored", now(), "")
+			delete(slice.Labels, inferencev1alpha1.LabelManagedBy)
+			reqs := reconciler.findInferenceServiceForEndpoints(ctx, slice)
+			Expect(requestNames(reqs)).To(ConsistOf("relay-mapper-mirrored-agent"))
+		})
+
+		It("maps a legacy slice to its ISVC only", func() {
+			reqs := reconciler.findInferenceServiceForEndpoints(ctx, metalEndpoints("relay-mapper-legacy", now()))
+			Expect(requestNames(reqs)).To(ConsistOf("relay-mapper-legacy"))
+		})
 	})
 })

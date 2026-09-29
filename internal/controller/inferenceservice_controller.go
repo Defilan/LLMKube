@@ -462,6 +462,48 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 	return draft, true, nil, nil
 }
 
+// reconcileMetal serves a Metal InferenceService. There is no inference
+// Deployment: the host metal-agent runs the engine natively and registers
+// EndpointSlices once the model is fetched and the server is healthy, so ready
+// replicas come from those slices rather than desiredReplicas, otherwise Phase
+// reports Ready before the agent has done anything (issue #374).
+//
+// In relay mode the agent exposes only its authenticated ingress
+// ("<isvc>-agent") and traffic reaches it through the controller's relay
+// Deployment, so a replica counts as ready only while the relay is available
+// too. In legacy mode the agent owns "<isvc>"; any relay this InferenceService
+// ran is torn down and "<isvc>" is left to the agent (hand-back).
+func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (int32, *metalSnapshot, error) {
+	mode, pin, err := r.decideMetalMode(ctx, isvc)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	if mode == metalModeRelay {
+		snap := r.metalEndpointSnapshot(ctx, isvc, agentServiceName(isvc.Name))
+		if snap.Kind == metalHBStale {
+			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+		}
+		available, err := r.reconcileRelay(ctx, isvc, pin)
+		if err != nil {
+			return 0, nil, err
+		}
+		if !available {
+			return 0, snap, nil
+		}
+		return snap.ReadyReplicas, snap, nil
+	}
+
+	if err := r.teardownRelay(ctx, isvc); err != nil {
+		return 0, nil, err
+	}
+	snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
+	if snap.Kind == metalHBStale {
+		r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+	}
+	return snap.ReadyReplicas, snap, nil
+}
+
 // replicaCounts carries the two replica observations a reconcile feeds the
 // status writer: Ready gates the phase, Observed is what /scale must expose so
 // an HPA reads a truthful current count.
@@ -480,18 +522,13 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	log := logf.FromContext(ctx)
 
 	if isMetal {
-		// No Deployment for metal: the host metal-agent runs llama-server natively
-		// and registers the InferenceService's Endpoints once the model is fetched
-		// and the server is healthy. Derive readyReplicas from the Endpoints rather
-		// than blindly returning desiredReplicas, otherwise Phase reports Ready
-		// before the agent has done anything (issue #374).
-		snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
-		if snap.Kind == metalHBStale {
-			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+		ready, snap, err := r.reconcileMetal(ctx, isvc)
+		if err != nil {
+			return nil, replicaCounts{}, nil, nil, err
 		}
-		log.Info("Metal accelerator detected, skipping Deployment creation",
-			"readyEndpoints", snap.ReadyReplicas, "desiredReplicas", desiredReplicas)
-		return nil, replicaCounts{Ready: snap.ReadyReplicas, Observed: snap.ReadyReplicas}, snap, nil, nil
+		log.Info("Metal accelerator detected, skipping inference Deployment creation",
+			"readyEndpoints", ready, "desiredReplicas", desiredReplicas)
+		return nil, replicaCounts{Ready: ready, Observed: ready}, snap, nil, nil
 	}
 
 	// A metal-agent-only runtime off Metal is fatal: resolveBackend would
@@ -1097,14 +1134,21 @@ func (r *InferenceServiceReconciler) findInferenceServiceForEndpoints(ctx contex
 	if name == "" {
 		name = obj.GetName()
 	}
-	return []reconcile.Request{
-		{
-			NamespacedName: types.NamespacedName{
-				Name:      name,
-				Namespace: obj.GetNamespace(),
-			},
-		},
+	reqs := []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: obj.GetNamespace()},
+	}}
+	// A relay-mode agent writes "<isvc>-agent"; also enqueue "<isvc>". The
+	// unstripped name stays enqueued because an InferenceService may itself be
+	// named "x-agent" with a legacy slice, and reconciling a name that has no
+	// InferenceService is a no-op.
+	if labels["llmkube.ai/managed-by"] == "metal-agent" {
+		if isvc, ok := strings.CutSuffix(svcName, inferencev1alpha1.MetalAgentServiceSuffix); ok && isvc != "" {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvc, Namespace: obj.GetNamespace()},
+			})
+		}
 	}
+	return reqs
 }
 
 // reconcileWorkload picks the serving shape. A spec.multiNode group replaces
