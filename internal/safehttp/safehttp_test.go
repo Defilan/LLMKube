@@ -20,13 +20,18 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
 )
 
 // testHint is the refusal-message hint used by tests that do not care what
@@ -245,11 +250,11 @@ func TestGuardedClientHostnameAllowlist(t *testing.T) {
 	defer srv.Close()
 
 	// Rewrite 127.0.0.1 -> localhost so the dialer takes the DNS path.
-	url := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	target := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
 
 	t.Run("hostname not allowlisted is refused", func(t *testing.T) {
 		client := NewClient(ParseAllowlist(nil), 5*time.Second, testHint)
-		resp, err := client.Get(url)
+		resp, err := client.Get(target)
 		if err == nil {
 			_ = resp.Body.Close()
 			t.Fatal("expected the SSRF guard to block localhost")
@@ -258,7 +263,7 @@ func TestGuardedClientHostnameAllowlist(t *testing.T) {
 
 	t.Run("hostname allowlisted is permitted", func(t *testing.T) {
 		client := NewClient(ParseAllowlist([]string{"LocalHost"}), 5*time.Second, testHint)
-		resp, err := client.Get(url)
+		resp, err := client.Get(target)
 		if err != nil {
 			t.Fatalf("expected hostname-allowlisted request to succeed, got: %v", err)
 		}
@@ -303,11 +308,11 @@ func TestWithResolver(t *testing.T) {
 		}
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 	}
-	url := strings.Replace(srv.URL, "127.0.0.1", "mirror.test", 1)
+	target := strings.Replace(srv.URL, "127.0.0.1", "mirror.test", 1)
 
 	t.Run("resolved loopback refused when not allowlisted", func(t *testing.T) {
 		client := NewClient(ParseAllowlist(nil), 5*time.Second, testHint, WithResolver(loopback))
-		resp, err := client.Get(url)
+		resp, err := client.Get(target)
 		if err == nil {
 			_ = resp.Body.Close()
 			t.Fatal("expected the SSRF guard to block mirror.test resolved to loopback")
@@ -320,7 +325,7 @@ func TestWithResolver(t *testing.T) {
 	t.Run("allowlisted hostname dials the resolved address", func(t *testing.T) {
 		client := NewClient(ParseAllowlist([]string{"mirror.test"}), 5*time.Second, testHint,
 			WithResolver(loopback))
-		resp, err := client.Get(url)
+		resp, err := client.Get(target)
 		if err != nil {
 			t.Fatalf("expected allowlisted mirror.test to succeed, got: %v", err)
 		}
@@ -350,6 +355,7 @@ func proxyEnv(t *testing.T, proxyURL, noProxy string) {
 		t.Setenv(k, "")
 	}
 	t.Setenv("HTTP_PROXY", proxyURL)
+	t.Setenv("HTTPS_PROXY", proxyURL)
 	t.Setenv("NO_PROXY", noProxy)
 }
 
@@ -490,21 +496,166 @@ func TestGuardedClientProxy(t *testing.T) {
 			}
 			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
 		}
-		url := strings.Replace(direct.URL, "127.0.0.1", "direct.test", 1)
+		target := strings.Replace(direct.URL, "127.0.0.1", "direct.test", 1)
 
 		refused := NewClient(ParseAllowlist(nil), 5*time.Second, hint, WithResolver(lookup))
-		if resp, err := refused.Get(url); err == nil {
+		if resp, err := refused.Get(target); err == nil {
 			_ = resp.Body.Close()
 			t.Fatal("NO_PROXY host resolving to loopback was not refused by the direct dial guard")
 		}
 		allowed := NewClient(ParseAllowlist([]string{"direct.test"}), 5*time.Second, hint, WithResolver(lookup))
-		resp, err := allowed.Get(url)
+		resp, err := allowed.Get(target)
 		if err != nil {
 			t.Fatalf("allowlisted NO_PROXY host: %v", err)
 		}
 		_ = resp.Body.Close()
 		if directHits.Load() != 1 || proxyHits.Load() != 0 {
 			t.Errorf("direct hits = %d, proxy hits = %d; want 1 and 0", directHits.Load(), proxyHits.Load())
+		}
+	})
+}
+
+// loopbackLookup resolves localhost and alias.test to 127.0.0.1, so a test
+// can name the proxy's address with a hostname the direct path resolves.
+func loopbackLookup(_ context.Context, _, host string) ([]netip.Addr, error) {
+	switch host {
+	case "localhost", "alias.test":
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	return nil, errors.New("test resolver: no record for " + host)
+}
+
+// No spelling of the proxy's own address may reach the trusted proxy dial on
+// the direct path. net/http and httpproxy map a non-ASCII host through IDNA
+// before deciding "direct" and before dialing, so fullwidth digits and dots
+// (U+FF10.., U+FF0E) become 127.0.0.1 and fullwidth letters become
+// localhost; a hostname that resolves to the proxy's address, sent direct by
+// NO_PROXY, is the same address under another name.
+func TestGuardedClientProxyAddressSpellings(t *testing.T) {
+	const hint = "--allowed-download-hosts"
+	const fullwidthIP = "\uff11\uff12\uff17\uff0e\uff10\uff0e\uff10\uff0e\uff11"        // 127.0.0.1
+	const fullwidthLocalhost = "\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54" // localhost
+
+	proxy, hits := fakeProxy(t, nil)
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(proxy.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split proxy URL: %v", err)
+	}
+	for _, proxyHost := range []string{"127.0.0.1", "localhost"} {
+		for _, target := range []string{fullwidthIP, fullwidthLocalhost, "alias.test"} {
+			t.Run(proxyHost+"/"+target, func(t *testing.T) {
+				hits.Store(0)
+				proxyEnv(t, "http://"+net.JoinHostPort(proxyHost, port), "alias.test")
+				client := NewClient(ParseAllowlist(nil), 5*time.Second, hint, WithResolver(loopbackLookup))
+				resp, err := client.Get("http://" + net.JoinHostPort(target, port) + "/admin")
+				if err == nil {
+					_ = resp.Body.Close()
+					t.Fatal("a spelling of the proxy's address reached the proxy on the direct path")
+				}
+				if n := hits.Load(); n != 0 {
+					t.Errorf("proxy received %d requests, want 0 (err %v)", n, err)
+				}
+			})
+		}
+	}
+}
+
+// targetsTrustedProxy matches by resolved address, not only by spelling: a
+// NO_PROXY hostname that resolves to the proxy's IP and port targets it.
+func TestTargetsTrustedProxyByResolvedAddress(t *testing.T) {
+	tr := newProxyTrust(&httpproxy.Config{HTTPProxy: "http://127.0.0.1:3128"}, loopbackLookup)
+	cases := []struct {
+		target string
+		want   bool
+	}{
+		{"http://127.0.0.1:3128/", true},
+		{"http://alias.test:3128/", true},  // resolves to the proxy's IP
+		{"http://alias.test:3129/", false}, // same IP, different port
+		{"http://unknown.test:3128/", false},
+	}
+	for _, tc := range cases {
+		u, _ := url.Parse(tc.target)
+		got, err := tr.targets(t.Context(), u)
+		if err != nil {
+			t.Fatalf("targets(%s): %v", tc.target, err)
+		}
+		if got != tc.want {
+			t.Errorf("targets(%s) = %v, want %v", tc.target, got, tc.want)
+		}
+	}
+}
+
+// A host that IDNA cannot map to ASCII is refused, never passed through.
+func TestCanonicalHostFailsClosed(t *testing.T) {
+	if _, err := canonicalHost("\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54"); err != nil {
+		t.Fatalf("fullwidth localhost should map to ASCII: %v", err)
+	}
+	if h, _ := canonicalHost("\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54"); h != "localhost" {
+		t.Errorf("canonicalHost(fullwidth localhost) = %q, want localhost", h)
+	}
+	if h, _ := canonicalHost("Mirror.TEST"); h != "mirror.test" {
+		t.Errorf("canonicalHost(Mirror.TEST) = %q, want mirror.test", h)
+	}
+	if _, err := canonicalHost("bad\u200d\u0000host"); err == nil {
+		t.Error("an unmappable host should be refused")
+	}
+}
+
+// fakeConnectProxy answers CONNECT with 502 after recording the authority it
+// was asked to tunnel to, so a test can see that an HTTPS request reached the
+// trusted proxy (and for which target) without any tunnel being built.
+func fakeConnectProxy(t *testing.T) (*httptest.Server, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var authorities []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		authorities = append(authorities, r.Method+" "+r.Host)
+		mu.Unlock()
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), authorities...)
+	}
+}
+
+// HTTPS through a proxy is a CONNECT tunnel. The target is judged before the
+// CONNECT is sent: a blocked host never reaches the proxy, an allowed one
+// issues CONNECT for the right authority to the trusted (loopback) proxy.
+func TestGuardedClientProxyConnect(t *testing.T) {
+	const hint = "--allowed-download-hosts"
+
+	t.Run("blocked https target refused before CONNECT", func(t *testing.T) {
+		proxy, seen := fakeConnectProxy(t)
+		proxyEnv(t, proxy.URL, "")
+		client := NewClient(ParseAllowlist(nil), 5*time.Second, hint, WithResolver(proxyTestLookup))
+		resp, err := client.Get("https://internal.test/model.gguf")
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatal("blocked https target via proxy was not refused")
+		}
+		if !strings.Contains(err.Error(), "SSRF guard") {
+			t.Errorf("want the guard refusal, got: %v", err)
+		}
+		if got := seen(); len(got) != 0 {
+			t.Errorf("proxy saw %v, want nothing", got)
+		}
+	})
+
+	t.Run("allowed https target issues CONNECT to the proxy", func(t *testing.T) {
+		proxy, seen := fakeConnectProxy(t)
+		proxyEnv(t, proxy.URL, "")
+		client := NewClient(ParseAllowlist(nil), 5*time.Second, hint, WithResolver(proxyTestLookup))
+		resp, err := client.Get("https://public.test/model.gguf")
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatal("the fake proxy refuses every CONNECT; the request should fail")
+		}
+		if got := seen(); len(got) != 1 || got[0] != "CONNECT public.test:443" {
+			t.Errorf("proxy saw %v, want exactly [CONNECT public.test:443]", got)
 		}
 	})
 }

@@ -28,8 +28,10 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/http/httpproxy"
+	"golang.org/x/net/idna"
 )
 
 // Allowlist permits specific hostnames and CIDRs back through the
@@ -193,7 +195,12 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 	// checkHost resolves host (unless it is an IP literal) and applies the
 	// strict guard: every resolved IP must be permitted, so a multi-record
 	// rebind (one public + one 127.0.0.1) cannot pass.
-	checkHost := func(ctx context.Context, host string) ([]netip.Addr, error) {
+	checkHost := func(ctx context.Context, rawHost string) ([]netip.Addr, error) {
+		// Judge the host net/http will actually dial: IDNA-mapped to ASCII.
+		host, err := canonicalHost(rawHost)
+		if err != nil {
+			return nil, err
+		}
 		hostAllowed := allow.hostAllowed(host)
 		var ips []netip.Addr
 		if ip, err := netip.ParseAddr(host); err == nil {
@@ -223,11 +230,11 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 	// read per client instead of cached once per process.
 	proxyCfg := httpproxy.FromEnvironment()
 	envProxy := proxyCfg.ProxyFunc()
-	trustedProxies := proxyDialAddrs(proxyCfg)
+	trust := newProxyTrust(proxyCfg, o.lookup)
 
 	base := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if _, ok := trustedProxies[strings.ToLower(addr)]; ok {
+		if trust.isProxyDialAddr(addr) {
 			// The operator-configured proxy: trusted, dialed as configured.
 			return base.DialContext(ctx, network, addr)
 		}
@@ -258,9 +265,14 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 		}
 		if proxyURL == nil {
 			// Direct (no proxy, NO_PROXY, loopback): the dial guard applies,
-			// except that a target naming the proxy's own address would ride
-			// the trusted proxy dial, so judge that one here.
-			if _, isProxy := trustedProxies[targetDialAddr(req.URL)]; isProxy {
+			// except that a target that is the proxy's own address, under any
+			// spelling or name, would ride the trusted proxy dial. Judge it
+			// here instead.
+			hit, err := trust.targets(req.Context(), req.URL)
+			if err != nil {
+				return nil, err
+			}
+			if hit {
 				if _, err := checkHost(req.Context(), req.URL.Hostname()); err != nil {
 					return nil, err
 				}
@@ -290,12 +302,45 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 	}
 }
 
-// proxyDialAddrs returns the lowercased host:port dial addresses of the
-// proxies configured in cfg, with the scheme's default port filled in the way
-// net/http does when it dials a proxy. A dial to one of these is the
-// operator's own proxy, not a source-derived target.
-func proxyDialAddrs(cfg *httpproxy.Config) map[string]struct{} {
-	addrs := map[string]struct{}{}
+// canonicalHost returns host the way net/http and httpproxy see it before
+// deciding "direct" and before dialing: ASCII hosts unchanged, non-ASCII
+// hosts mapped through IDNA (so fullwidth 127.0.0.1 is 127.0.0.1), then
+// lowercased. A host IDNA cannot map is refused rather than passed through.
+func canonicalHost(host string) (string, error) {
+	if isASCII(host) {
+		return strings.ToLower(host), nil
+	}
+	ascii, err := idna.Lookup.ToASCII(host)
+	if err != nil {
+		return "", fmt.Errorf("host %q is not a valid hostname; refused by SSRF guard: %w", host, err)
+	}
+	return strings.ToLower(ascii), nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// proxyTrust records the operator-configured proxies (HTTP_PROXY and
+// HTTPS_PROXY), whose own addresses the dial trusts.
+type proxyTrust struct {
+	lookup LookupFunc
+	// dialAddrs are the canonical host:port dial addresses of the proxies.
+	dialAddrs map[string]struct{}
+	proxies   []proxyEndpoint
+}
+
+type proxyEndpoint struct {
+	host, port string // canonical
+}
+
+func newProxyTrust(cfg *httpproxy.Config, lookup LookupFunc) *proxyTrust {
+	t := &proxyTrust{lookup: lookup, dialAddrs: map[string]struct{}{}}
 	for _, raw := range []string{cfg.HTTPProxy, cfg.HTTPSProxy} {
 		if raw == "" {
 			continue
@@ -307,17 +352,78 @@ func proxyDialAddrs(cfg *httpproxy.Config) map[string]struct{} {
 				continue
 			}
 		}
-		addrs[targetDialAddr(u)] = struct{}{}
+		host, err := canonicalHost(u.Hostname())
+		if err != nil {
+			continue // net/http cannot dial it either
+		}
+		port := defaultPort(u)
+		t.dialAddrs[net.JoinHostPort(host, port)] = struct{}{}
+		t.proxies = append(t.proxies, proxyEndpoint{host: host, port: port})
 	}
-	return addrs
+	return t
 }
 
-// targetDialAddr is the lowercased host:port net/http dials for u, with the
-// scheme's default port filled in.
-func targetDialAddr(u *url.URL) string {
-	port := u.Port()
-	if port == "" {
-		port = map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
+// isProxyDialAddr reports whether addr, as the transport hands it to the
+// dialer (already IDNA-mapped), is one of the configured proxies.
+func (t *proxyTrust) isProxyDialAddr(addr string) bool {
+	_, ok := t.dialAddrs[strings.ToLower(addr)]
+	return ok
+}
+
+// targets reports whether a direct request to u would dial one of the
+// proxies: by canonical spelling, or by resolved address (a hostname that
+// resolves to the proxy's IP on the proxy's port). A host IDNA cannot map is
+// an error. A lookup failure is not a match; the dial's own guarded lookup
+// then decides.
+func (t *proxyTrust) targets(ctx context.Context, u *url.URL) (bool, error) {
+	if len(t.proxies) == 0 {
+		return false, nil
 	}
-	return strings.ToLower(net.JoinHostPort(u.Hostname(), port))
+	host, err := canonicalHost(u.Hostname())
+	if err != nil {
+		return false, err
+	}
+	port := defaultPort(u)
+	if _, ok := t.dialAddrs[net.JoinHostPort(host, port)]; ok {
+		return true, nil
+	}
+	var targetIPs []netip.Addr
+	for _, p := range t.proxies {
+		if p.port != port {
+			continue
+		}
+		if targetIPs == nil {
+			if targetIPs = t.resolve(ctx, host); len(targetIPs) == 0 {
+				return false, nil
+			}
+		}
+		for _, pip := range t.resolve(ctx, p.host) {
+			for _, tip := range targetIPs {
+				if pip.Unmap() == tip.Unmap() {
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+func (t *proxyTrust) resolve(ctx context.Context, host string) []netip.Addr {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return []netip.Addr{ip}
+	}
+	ips, err := t.lookup(ctx, "ip", host)
+	if err != nil {
+		return nil
+	}
+	return ips
+}
+
+// defaultPort returns u's port, or the scheme's default the way net/http
+// fills it in when dialing.
+func defaultPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	return map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
 }
