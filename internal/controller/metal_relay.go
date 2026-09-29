@@ -94,32 +94,31 @@ func relayPodSelector(isvc string) map[string]string {
 //     this InferenceService's relay Deployment exists, pinned to its current
 //     RELAY_SPKI_PIN.
 func (r *InferenceServiceReconciler) decideMetalMode(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (metalMode, string, error) {
-	agentName := agentServiceName(isvc.Name)
-	if r.metalEndpointSnapshot(ctx, isvc, agentName).Kind == metalHBFresh {
-		slice, err := r.freshestAgentSlice(ctx, isvc.Namespace, agentName)
-		if err != nil {
-			return metalModeLegacy, "", err
-		}
-		if slice != nil {
-			if pin := slice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI]; pin != "" {
-				return metalModeRelay, pin, nil
-			}
+	// Both rules read slices through freshestAgentSlice, which propagates
+	// List errors. metalEndpointSnapshot is for readiness only: it logs a
+	// List error and reports "no slice", and a swallowed error here would
+	// fall through to rule 3 and pick relay while a fresh legacy slice
+	// exists.
+	ingressSlice, err := r.freshestAgentSlice(ctx, isvc.Namespace, agentServiceName(isvc.Name))
+	if err != nil {
+		return metalModeLegacy, "", err
+	}
+	if ingressSlice != nil {
+		if pin := ingressSlice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI]; pin != "" {
+			return metalModeRelay, pin, nil
 		}
 	}
 
-	legacyName := sanitizeDNSName(isvc.Name)
-	if r.metalEndpointSnapshot(ctx, isvc, legacyName).Kind == metalHBFresh {
-		slice, err := r.freshestAgentSlice(ctx, isvc.Namespace, legacyName)
-		if err != nil {
-			return metalModeLegacy, "", err
-		}
-		if slice != nil {
-			return metalModeLegacy, "", nil
-		}
+	legacySlice, err := r.freshestAgentSlice(ctx, isvc.Namespace, sanitizeDNSName(isvc.Name))
+	if err != nil {
+		return metalModeLegacy, "", err
+	}
+	if legacySlice != nil {
+		return metalModeLegacy, "", nil
 	}
 
 	dep := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: relayDeploymentName(isvc.Name), Namespace: isvc.Namespace}, dep)
+	err = r.Get(ctx, types.NamespacedName{Name: relayDeploymentName(isvc.Name), Namespace: isvc.Namespace}, dep)
 	switch {
 	case apierrors.IsNotFound(err):
 		return metalModeLegacy, "", nil

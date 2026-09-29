@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,6 +28,7 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
@@ -69,6 +71,31 @@ func agentSlice(isvc, heartbeat, pin string) *discoveryv1.EndpointSlice {
 		slice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI] = pin
 	}
 	return slice
+}
+
+// sliceListFailingClient fails List for EndpointSlices of one Service name
+// (matched by the kubernetes.io/service-name label selector) and passes every
+// other call through.
+type sliceListFailingClient struct {
+	client.Client
+	serviceName string
+}
+
+var errInjectedSliceList = errors.New("injected EndpointSlice List failure")
+
+func (c *sliceListFailingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*discoveryv1.EndpointSliceList); ok {
+		lo := &client.ListOptions{}
+		lo.ApplyOptions(opts)
+		target := labels.Set{
+			"kubernetes.io/service-name":     c.serviceName,
+			inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent,
+		}
+		if lo.LabelSelector != nil && lo.LabelSelector.Matches(target) {
+			return errInjectedSliceList
+		}
+	}
+	return c.Client.List(ctx, list, opts...)
 }
 
 var _ = Describe("metal relay mode", func() {
@@ -208,6 +235,26 @@ var _ = Describe("metal relay mode", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(mode).To(Equal(metalModeLegacy))
 		})
+
+		// A List failure must not read as "no slice": with a fresh legacy
+		// slice and an owned relay Deployment, falling through to rule 3
+		// would pick relay and set a selector on an agent-owned "<isvc>".
+		DescribeTable("fails instead of keeping relay mode when a slice List errors",
+			func(isvcName string, failFor func(string) string) {
+				isvc := newISVC(isvcName)
+				create(metalEndpoints(isvc.Name, now()))
+				dep := reconciler.newRelayDeployment(isvc, pinA)
+				Expect(setControllerReferenceUnblocked(isvc, dep, k8sClient.Scheme())).To(Succeed())
+				create(dep)
+
+				reconciler.Client = &sliceListFailingClient{Client: k8sClient, serviceName: failFor(isvc.Name)}
+				mode, _, err := reconciler.decideMetalMode(ctx, isvc)
+				Expect(err).To(MatchError(errInjectedSliceList))
+				Expect(mode).NotTo(Equal(metalModeRelay))
+			},
+			Entry("agent slices", "relay-mode-listerr-agent", agentServiceName),
+			Entry("legacy slices", "relay-mode-listerr-legacy", sanitizeDNSName),
+		)
 	})
 
 	It("newRelayDeployment", func() {
