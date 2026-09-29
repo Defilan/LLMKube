@@ -99,7 +99,7 @@ func TestDownloadFile_RefusesLoopbackByDefault(t *testing.T) {
 			dst := filepath.Join(dir, "model.gguf")
 
 			err := NewMetalExecutor("/bin/llama-server", dir, newNopLogger()).
-				downloadFile(t.Context(), srv.URL+"/model.gguf", dst, token)
+				downloadFile(t.Context(), srv.URL+"/model.gguf", dst, token, "")
 
 			assertGuardRefusal(t, err, "127.0.0.1")
 			if n := hits.Load(); n != 0 {
@@ -120,7 +120,7 @@ func TestDownloadFile_AllowlistedHostDownloads(t *testing.T) {
 
 	e := NewMetalExecutor("/bin/llama-server", dir, newNopLogger(),
 		WithAllowedDownloadHosts([]string{"127.0.0.1"}))
-	if err := e.downloadFile(t.Context(), srv.URL+"/model.gguf", dst, ""); err != nil {
+	if err := e.downloadFile(t.Context(), srv.URL+"/model.gguf", dst, "", ""); err != nil {
 		t.Fatalf("downloadFile from an allowlisted host: %v", err)
 	}
 	if b, _ := os.ReadFile(dst); string(b) != "weights" {
@@ -155,7 +155,7 @@ func TestDownloadFile_RedirectFromAllowlistedHostToBlockedAddressRefused(t *test
 				WithAllowedDownloadHosts([]string{"mirror.test"}),
 				withLookup(map[string]string{"mirror.test": "127.0.0.1"}))
 
-			err = e.downloadFile(t.Context(), "http://mirror.test:"+port+"/model.gguf", dst, token)
+			err = e.downloadFile(t.Context(), "http://mirror.test:"+port+"/model.gguf", dst, token, "")
 
 			assertGuardRefusal(t, err, "127.0.0.1")
 			if mirrorHits.Load() == 0 {
@@ -194,7 +194,7 @@ func TestDownloadFile_PublicHostNotRefused(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
-	err := e.downloadFile(ctx, "http://models.example:9/model.gguf", filepath.Join(dir, "m.gguf"), "")
+	err := e.downloadFile(ctx, "http://models.example:9/model.gguf", filepath.Join(dir, "m.gguf"), "", "")
 	if err == nil {
 		t.Fatal("download to an unrouted documentation address unexpectedly succeeded")
 	}
@@ -266,7 +266,7 @@ func TestDownloadS3_BlockedEndpointRefusedUnlessAllowlisted(t *testing.T) {
 				WithKubeClient("default", s3SecretClient(t, tc.endpoint), nil),
 				WithAllowedDownloadHosts(tc.allow), resolve)
 
-			path, err := e.ensureModel(t.Context(), source, "s3-model", ref)
+			path, err := e.ensureModel(t.Context(), source, "s3-model", ref, "")
 			if tc.wantHost != "" {
 				assertGuardRefusal(t, err, tc.wantHost)
 				if n := hits.Load(); n != 0 {
@@ -308,7 +308,7 @@ func TestBuildExecutors_PlumbsAllowedDownloadHosts(t *testing.T) {
 		if !ok {
 			t.Fatalf("executors[%q] is %T, want *MetalExecutor", runtimeLlamaServer, a.executors[runtimeLlamaServer])
 		}
-		err := e.downloadFile(t.Context(), srv.URL+"/model.gguf", filepath.Join(dir, "m.gguf"), "")
+		err := e.downloadFile(t.Context(), srv.URL+"/model.gguf", filepath.Join(dir, "m.gguf"), "", "")
 		if tc.wantErr {
 			assertGuardRefusal(t, err, "127.0.0.1")
 		} else if err != nil {

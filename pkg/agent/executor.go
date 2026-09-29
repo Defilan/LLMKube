@@ -55,9 +55,15 @@ type ExecutorConfig struct {
 	// credentials for s3:// fetches on the metal path. May be nil for non-s3
 	// sources.
 	SourceSecretRef *corev1.LocalObjectReference
-	GPULayers       int32
-	ContextSize     int
-	Jinja           bool
+	// SHA256 is the Model's spec.sha256: the expected hex digest of a
+	// downloaded source, mirroring the controller's own verifySHA256. Empty
+	// skips verification entirely. A local source (absolute path or
+	// file://) is loaded in place and is never hashed, matching the
+	// controller's out-of-scope treatment of local sources.
+	SHA256      string
+	GPULayers   int32
+	ContextSize int
+	Jinja       bool
 
 	// RopeScaling* map to llama.cpp's RoPE context-extension flags, resolved
 	// from InferenceService.spec.ropeScaling at the agent boundary. Empty
@@ -293,7 +299,7 @@ func (e *MetalExecutor) SetPort(port int) {
 }
 
 func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig) (*ManagedProcess, error) {
-	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName, config.SourceSecretRef)
+	modelPath, err := e.ensureModel(ctx, config.ModelSource, config.ModelName, config.SourceSecretRef, config.SHA256)
 	if err != nil {
 		return nil, fmt.Errorf("failed to ensure model: %w", err)
 	}
@@ -376,19 +382,40 @@ func (e *MetalExecutor) processLogPath(namespace, name string) string {
 	return filepath.Join(e.modelStorePath, fmt.Sprintf("llama-server-%s-%s.log", namespace, name))
 }
 
-func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string, secretRef s3SecretRef) (string, error) {
+func (e *MetalExecutor) ensureModel(
+	ctx context.Context, source, name string, secretRef s3SecretRef, expectedSHA256 string,
+) (string, error) {
 	filename := filepath.Base(source)
 	localPath := filepath.Join(e.modelStorePath, name, filename)
+	local := isLocalModelSource(source)
 
 	if info, err := os.Stat(localPath); err == nil && info.Size() > 0 {
-		e.logger.Debugw("model already downloaded", "path", localPath)
-		return localPath, nil
+		// A local source is loaded in place, never through the model store's
+		// cache slot, so a file that happens to sit there is not this
+		// source's cache and is never digest-checked. Same for a Model with
+		// no spec.sha256: keep the historical trust-by-presence behavior.
+		if local || expectedSHA256 == "" {
+			e.logger.Debugw("model already downloaded", "path", localPath)
+			return localPath, nil
+		}
+		verified, err := e.verifyCachedDigest(localPath, expectedSHA256)
+		if err != nil {
+			return "", err
+		}
+		if verified {
+			e.logger.Debugw("model already downloaded", "path", localPath)
+			return localPath, nil
+		}
+		e.logger.Warnw("cached model failed SHA256 verification; re-downloading",
+			"path", localPath)
+		_ = os.Remove(localPath)
+		_ = os.Remove(sha256StampPath(localPath))
 	}
 
 	// A local source lives on this host and is loaded in place (#1919); the
 	// Model controller marks it Ready without a download for exactly that
 	// reason. Handing it to fetchModel would GET a bare path.
-	if isLocalModelSource(source) {
+	if local {
 		return resolveLocalModelSource(source)
 	}
 
@@ -397,12 +424,37 @@ func (e *MetalExecutor) ensureModel(ctx context.Context, source, name string, se
 	}
 
 	e.logger.Infow("downloading model", "source", source, "destination", localPath)
-	if err := e.fetchModel(ctx, source, localPath, secretRef); err != nil {
+	if err := e.fetchModel(ctx, source, localPath, secretRef, expectedSHA256); err != nil {
 		return "", fmt.Errorf("failed to download model: %w", err)
 	}
 
 	e.logger.Infow("model downloaded", "path", localPath)
 	return localPath, nil
+}
+
+// verifyCachedDigest reports whether the model file already at localPath
+// satisfies expectedSHA256 (assumed non-empty; callers skip this entirely
+// when Model.spec.sha256 is unset). The sidecar stamp is consulted first so a
+// repeat StartProcess for an already-verified model does not re-hash a
+// potentially huge file on every restart; a stamp that is missing or does not
+// match expectedSHA256 falls back to hashing the file once, and a successful
+// hash writes a fresh stamp so the next check is free again.
+func (e *MetalExecutor) verifyCachedDigest(localPath, expectedSHA256 string) (bool, error) {
+	if stamp := readSHA256Stamp(localPath); stamp != "" && strings.EqualFold(stamp, expectedSHA256) {
+		return true, nil
+	}
+
+	computed, err := hashFile(localPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to compute SHA256 of cached model %s: %w", localPath, err)
+	}
+	if !strings.EqualFold(computed, expectedSHA256) {
+		return false, nil
+	}
+	if err := writeSHA256Stamp(localPath, computed); err != nil {
+		e.logger.Warnw("failed to write SHA256 stamp", "path", localPath, "error", err)
+	}
+	return true, nil
 }
 
 // isLocalModelSource reports whether source names a file on this host: an
@@ -459,9 +511,11 @@ func resolveLocalModelSource(source string) (string, error) {
 // fetchModel downloads source to filePath. s3:// sources are routed through a
 // sigv4-signed client (the metal half of #1449, which #1450 fixed for the
 // controller path): the raw source never reaches a plain GET.
-func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string, secretRef s3SecretRef) error {
+func (e *MetalExecutor) fetchModel(
+	ctx context.Context, source, filePath string, secretRef s3SecretRef, expectedSHA256 string,
+) error {
 	if isS3Source(source) {
-		return e.downloadS3(ctx, source, filePath, secretRef)
+		return e.downloadS3(ctx, source, filePath, secretRef, expectedSHA256)
 	}
 	// Gated and private Hugging Face repositories need a bearer token (#1750),
 	// and so does a Hugging Face mirror named by HF_ENDPOINT (#1900). Both come
@@ -477,7 +531,7 @@ func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string,
 			token = secretToken
 		}
 	}
-	return e.downloadFile(ctx, source, filePath, token)
+	return e.downloadFile(ctx, source, filePath, token, expectedSHA256)
 }
 
 // downloadS3 fetches an s3:// source into filePath using AWS SigV4 signing and
@@ -486,7 +540,9 @@ func (e *MetalExecutor) fetchModel(ctx context.Context, source, filePath string,
 // (buildS3DownloadCommand, internal/controller/model_storage.go). secretRef is
 // the Model's spec.sourceSecretRef; when nil the fetch fails clearly rather than
 // falling back to an anonymous GET.
-func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string, secretRef s3SecretRef) error {
+func (e *MetalExecutor) downloadS3(
+	ctx context.Context, source, filePath string, secretRef s3SecretRef, expectedSHA256 string,
+) error {
 	bucket, _, err := parseS3Source(source)
 	if err != nil {
 		return err
@@ -528,7 +584,7 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 	// S3 does not resume: it writes the plain ".partial" path and starts from
 	// zero every attempt (sigv4 range signing is unverified). This is the same
 	// behaviour it had before resume existed (#1765).
-	return e.copyToFileNoResume(filePath, resp.Body, resp.ContentLength)
+	return e.copyToFileNoResume(filePath, resp.Body, resp.ContentLength, expectedSHA256)
 }
 
 // hfNormalize is the source resolver the download path applies before the
@@ -564,7 +620,14 @@ var hfNormalize = hfsource.NormalizeHFSource
 // scoped to huggingface.co has no business reaching a content host either way,
 // which is also why huggingface_hub does not send it there. hfRedirectStripper
 // therefore drops the header on ANY change of host.
-func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token string) error {
+//
+// expectedSHA256, when non-empty, is Model.spec.sha256: every publish point
+// below (the already-complete-partial shortcut and both branches that reach
+// copyToFileResume) verifies it against the complete, resume-assembled bytes
+// before the rename that makes them visible at filePath, so a download
+// interrupted and resumed across several attempts is still checked exactly
+// once, on the final file, never on an in-flight partial.
+func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token, expectedSHA256 string) error {
 	url = hfNormalize(url)
 
 	httpClient := e.downloadClient()
@@ -578,7 +641,7 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 		// A failed probe is not fatal to the download: treat the content as
 		// unknown, start from zero, and let the GET below surface any real error.
 		e.logger.Debugw("validator probe failed; downloading without resume", "url", url, "error", err)
-		return e.downloadFull(ctx, httpClient, url, filePath, token, "")
+		return e.downloadFull(ctx, httpClient, url, filePath, token, "", expectedSHA256)
 	}
 
 	partPath := validatorPartialPath(filePath, validator)
@@ -605,8 +668,10 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 			// path would rewrite identical bytes anyway, so publish the partial
 			// as-is. Renaming the content-keyed partial onto the final path also
 			// clears the key, so a later content change re-downloads cleanly
-			// instead of splicing onto these bytes.
-			return os.Rename(partPath, filePath)
+			// instead of splicing onto these bytes. This partial was itself
+			// assembled by a previous attempt and never verified, so it still
+			// gets the same digest check every other publish point does.
+			return e.verifyAndPublish(partPath, filePath, expectedSHA256)
 		default:
 			_ = os.Remove(partPath)
 		}
@@ -639,20 +704,20 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 		// appended to (that would splice). resumeFrom is 0 here, so os.Create
 		// truncates the probed validator's partial and the transfer starts from
 		// zero, keeping that partial resumable if this attempt is interrupted.
-		return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0)
+		return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0, expectedSHA256)
 	case http.StatusPartialContent:
 		if resumeFrom == 0 {
 			// A 206 with no partial to append to cannot be trusted; restart.
-			return e.downloadFull(ctx, httpClient, url, filePath, token, validator)
+			return e.downloadFull(ctx, httpClient, url, filePath, token, validator, expectedSHA256)
 		}
 		// ContentLength is the remaining bytes; total on disk is resumeFrom +
 		// written, which must equal the full size the probe saw.
 		expected := resumeFrom + resp.ContentLength
 		if full := probeFullSize(validator, resp); full > 0 && expected != full {
 			_ = os.Remove(partPath)
-			return e.downloadFull(ctx, httpClient, url, filePath, token, validator)
+			return e.downloadFull(ctx, httpClient, url, filePath, token, validator, expectedSHA256)
 		}
-		return e.copyToFileResume(partPath, filePath, resp.Body, expected, resumeFrom)
+		return e.copyToFileResume(partPath, filePath, resp.Body, expected, resumeFrom, expectedSHA256)
 	default:
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
@@ -666,7 +731,7 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token s
 func (e *MetalExecutor) downloadFull(
 	ctx context.Context,
 	httpClient *http.Client,
-	url, filePath, token, partValidator string,
+	url, filePath, token, partValidator, expectedSHA256 string,
 ) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -684,7 +749,7 @@ func (e *MetalExecutor) downloadFull(
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
 	partPath := validatorPartialPath(filePath, partValidator)
-	return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0)
+	return e.copyToFileResume(partPath, filePath, resp.Body, resp.ContentLength, 0, expectedSHA256)
 }
 
 // probeValidator HEADs url on the given client and returns the raw validator
@@ -836,14 +901,17 @@ func hfRedirectStripper(base *http.Client) *http.Client {
 // contentLength > 0 it verifies the byte count matches, so a mid-stream
 // connection drop does not leave a truncated model. This is the non-resuming
 // path (S3), byte-for-byte the behaviour it had before resume was added.
-func (e *MetalExecutor) copyToFileNoResume(filePath string, r io.Reader, contentLength int64) error {
-	return e.copyToFileResume(filePath+".partial", filePath, r, contentLength, 0)
+func (e *MetalExecutor) copyToFileNoResume(
+	filePath string, r io.Reader, contentLength int64, expectedSHA256 string,
+) error {
+	return e.copyToFileResume(filePath+".partial", filePath, r, contentLength, 0, expectedSHA256)
 }
 
 // copyToFileResume streams r into partPath (opened for append at resumeFrom, or
-// created/truncated at 0), then renames it onto filePath on success. It reports
-// an error, without publishing, if the total size does not match contentLength
-// (when known) so a truncated transfer is never mistaken for a complete one.
+// created/truncated at 0), then verifies and renames it onto filePath on
+// success. It reports an error, without publishing, if the total size does not
+// match contentLength (when known) so a truncated transfer is never mistaken
+// for a complete one.
 //
 // The partial is deliberately kept on a mid-stream failure and only removed on a
 // size mismatch or a rename failure: a resumable error leaves the partial in
@@ -853,6 +921,7 @@ func (e *MetalExecutor) copyToFileResume(
 	partPath, filePath string,
 	r io.Reader,
 	contentLength, resumeFrom int64,
+	expectedSHA256 string,
 ) error {
 	var out *os.File
 	var err error
@@ -881,11 +950,92 @@ func (e *MetalExecutor) copyToFileResume(
 		return fmt.Errorf("download truncated: expected %d bytes, got %d", contentLength, total)
 	}
 
-	if err := os.Rename(partPath, filePath); err != nil {
-		_ = os.Remove(partPath)
+	return e.verifyAndPublish(partPath, filePath, expectedSHA256)
+}
+
+// verifyAndPublish is the single point every download path renames its
+// assembled bytes through. When expectedSHA256 is set it hashes assembledPath
+// (which, by construction, always holds the complete, resume-assembled
+// content, never an in-flight partial) and refuses to publish a mismatch,
+// deleting both assembledPath and any stale file already at destPath and
+// naming both digests in the error, mirroring the controller's verifySHA256
+// (internal/controller/model_controller.go). A verified file is renamed onto
+// destPath and stamped at destPath+".sha256" (lowercase hex, mode 0600) so a
+// later cache hit can skip re-hashing. An empty expectedSHA256 (no
+// Model.spec.sha256) reduces to the historical rename-only publish.
+func (e *MetalExecutor) verifyAndPublish(assembledPath, destPath, expectedSHA256 string) error {
+	if expectedSHA256 == "" {
+		if err := os.Rename(assembledPath, destPath); err != nil {
+			_ = os.Remove(assembledPath)
+			return fmt.Errorf("failed to rename downloaded model: %w", err)
+		}
+		return nil
+	}
+
+	computed, err := hashFile(assembledPath)
+	if err != nil {
+		_ = os.Remove(assembledPath)
+		return fmt.Errorf("failed to compute SHA256 of downloaded model: %w", err)
+	}
+	if !strings.EqualFold(computed, expectedSHA256) {
+		_ = os.Remove(assembledPath)
+		_ = os.Remove(destPath)
+		return fmt.Errorf("SHA256 mismatch for downloaded model: expected %s, got %s", expectedSHA256, computed)
+	}
+
+	if err := os.Rename(assembledPath, destPath); err != nil {
+		_ = os.Remove(assembledPath)
 		return fmt.Errorf("failed to rename downloaded model: %w", err)
 	}
+	if err := writeSHA256Stamp(destPath, computed); err != nil {
+		e.logger.Warnw("failed to write SHA256 stamp", "path", destPath, "error", err)
+	}
 	return nil
+}
+
+// hashFile computes the SHA256 hex digest of the file at path. It is a
+// package-level variable rather than a plain function so tests can substitute
+// a call-counting wrapper, proving for example that a cache hit whose stamp
+// already matches Model.spec.sha256 never re-hashes the file.
+var hashFile = computeFileSHA256
+
+func computeFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// sha256StampPath names the sidecar file a verified download's digest is
+// stamped into: <file>.sha256.
+func sha256StampPath(filePath string) string {
+	return filePath + ".sha256"
+}
+
+// writeSHA256Stamp records digest (lowercase hex) as filePath's verified
+// SHA256, so a later ensureModel cache hit can skip re-hashing when the stamp
+// still matches Model.spec.sha256. Mode 0600: it is written only after a
+// successful verification and never needs to be group- or world-readable.
+func writeSHA256Stamp(filePath, digest string) error {
+	return os.WriteFile(sha256StampPath(filePath), []byte(strings.ToLower(digest)), 0o600)
+}
+
+// readSHA256Stamp reads and trims filePath's stamp, returning "" (never an
+// error) when it is missing or unreadable: an absent stamp just means the
+// caller must hash the file itself.
+func readSHA256Stamp(filePath string) string {
+	data, err := os.ReadFile(sha256StampPath(filePath))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // waitForHealthy polls /health until it returns 200, the timeout fires, or

@@ -778,6 +778,7 @@ func buildExecutorConfig(
 		ModelName:              model.Name,
 		ServedModelName:        servedModelName(isvc, model),
 		SourceSecretRef:        model.Spec.SourceSecretRef,
+		SHA256:                 model.Spec.SHA256,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
 		RopeScalingType:        ropeType,

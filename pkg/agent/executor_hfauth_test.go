@@ -37,7 +37,7 @@ func TestDownloadFile_SendsBearerToken(t *testing.T) {
 
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "model.gguf")
-	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), srv.URL+"/model.gguf", dst, "hf_secret"); err != nil {
+	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), srv.URL+"/model.gguf", dst, "hf_secret", ""); err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	if got != "Bearer hf_secret" {
@@ -60,7 +60,7 @@ func TestDownloadFile_NoTokenSendsNoHeader(t *testing.T) {
 
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "m.gguf")
-	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), srv.URL+"/m.gguf", dst, ""); err != nil {
+	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), srv.URL+"/m.gguf", dst, "", ""); err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	if present {
@@ -92,7 +92,8 @@ func TestDownloadFile_TokenNotForwardedAcrossHosts(t *testing.T) {
 
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "model.gguf")
-	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), origin.URL+"/model.gguf", dst, "hf_secret"); err != nil {
+	err := hfTestExecutor(t, dir).downloadFile(t.Context(), origin.URL+"/model.gguf", dst, "hf_secret", "")
+	if err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	if originAuth != "Bearer hf_secret" {
@@ -194,7 +195,7 @@ func TestDownloadFile_HFSchemeResolvedBeforeRequest(t *testing.T) {
 
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "m.gguf")
-	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), "hf://org/repo", dst, ""); err != nil {
+	if err := hfTestExecutor(t, dir).downloadFile(t.Context(), "hf://org/repo", dst, "", ""); err != nil {
 		t.Fatalf("downloadFile(hf://org/repo): %v", err)
 	}
 	if gotPath != "/org/repo/resolve/main/" {
@@ -246,7 +247,7 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 			executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
 				WithKubeClient("default", k8sClient, nil), allowTestServers())
 
-			dst, err := executor.ensureModel(t.Context(), "hf://org/repo", "hf-model", tc.secretRef)
+			dst, err := executor.ensureModel(t.Context(), "hf://org/repo", "hf-model", tc.secretRef, "")
 			if err != nil {
 				t.Fatalf("ensureModel(hf://org/repo): %v", err)
 			}
@@ -302,7 +303,8 @@ func TestEnsureModel_MirrorHostSendsToken(t *testing.T) {
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
 		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
-	dst, err := executor.ensureModel(t.Context(), source, "mirror-model", &corev1.LocalObjectReference{Name: "hf-token"})
+	dst, err := executor.ensureModel(t.Context(), source, "mirror-model",
+		&corev1.LocalObjectReference{Name: "hf-token"}, "")
 	if err != nil {
 		t.Fatalf("ensureModel(%q): %v", source, err)
 	}
@@ -346,7 +348,7 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), srv.URL+"/m.gguf", "other-model",
-		&corev1.LocalObjectReference{Name: "hf-token"})
+		&corev1.LocalObjectReference{Name: "hf-token"}, "")
 	if err != nil {
 		t.Fatalf("ensureModel: %v", err)
 	}
