@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -40,12 +41,13 @@ func CheckModelStore(path string) error {
 //
 // The resolved target is judged, not the link: a link the agent owns
 // pointing at a shared directory is still a shared store. The target must
-// exist, be a directory, be owned by the agent's uid and have no group or
-// other write bit. Every ancestor up to / must be owned by root or the
-// agent's uid, and be unwritable by group and other unless it has the sticky
-// bit (so the root-owned, sticky /private/tmp passes): otherwise another user
-// could rename the store away and put their own directory in its place after
-// this check.
+// exist, be a directory outside the shared temporary directories (/tmp,
+// /var/tmp and their /private forms), be owned by the agent's uid and have
+// no group or other write bit. Every ancestor up to / must be owned by root
+// or the agent's uid, and be unwritable by group and other unless it has the
+// sticky bit (so a root-owned, sticky directory such as /Users/Shared
+// passes): otherwise another user could rename the store away and put their
+// own directory in its place after this check.
 //
 // Callers must use the returned path from then on, never path itself: path
 // is re-resolved on every use, so a symlink in it could be repointed after
@@ -59,6 +61,9 @@ func ResolveModelStore(path string) (string, error) {
 		return "", fmt.Errorf("model store %s: %w", path, err)
 	}
 	where := describeStore(path, resolved)
+	if err := checkStoreNotInTmp(where, path, resolved); err != nil {
+		return "", err
+	}
 	info, err := os.Lstat(resolved)
 	if err != nil {
 		return "", fmt.Errorf("model store %s: %w", where, err)
@@ -86,6 +91,37 @@ func ResolveModelStore(path string) (string, error) {
 		return "", err
 	}
 	return resolved, nil
+}
+
+// tmpStoreRoots are the shared temporary directories a model store must not
+// live in. /tmp and /var/tmp are symlinks to /private/... on macOS, so both
+// spellings are listed: the resolved path normally carries the /private form,
+// and the literal form catches a configured path whose resolution differs.
+var tmpStoreRoots = []string{"/private/tmp", "/private/var/tmp", "/tmp", "/var/tmp"}
+
+// checkStoreNotInTmp refuses a store at or under a shared temporary
+// directory. Even a store the agent owns there is not safe: /tmp is emptied
+// at boot, so another local user can create the store directory first after
+// a reboot and either own it (the agent then refuses to start) or wait for
+// the agent to trust whatever they put in it. 0.10.0 plists pinned
+// --model-store /tmp/llmkube-models, and `launchctl kickstart -k` keeps an
+// old plist across a binary upgrade, so the error names the re-render step.
+func checkStoreNotInTmp(where, path, resolved string) error {
+	literal := path
+	if abs, err := filepath.Abs(path); err == nil {
+		literal = abs
+	}
+	for _, candidate := range []string{resolved, filepath.Clean(literal)} {
+		for _, root := range tmpStoreRoots {
+			if candidate == root || strings.HasPrefix(candidate, root+"/") {
+				return fmt.Errorf("model store %s is under %s, a shared temporary directory any local user "+
+					"can recreate after a reboot: run `make install-metal-agent` to re-render the launchd plist "+
+					"with the new default store (0.10.0 plists pinned --model-store /tmp/llmkube-models), "+
+					"or pass a --model-store the agent owns outside /tmp", where, root)
+			}
+		}
+	}
+	return nil
 }
 
 // checkStoreAncestors refuses the store when any ancestor of the resolved,

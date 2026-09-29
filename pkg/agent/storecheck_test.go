@@ -337,6 +337,69 @@ func TestCheckModelStore_Ancestors(t *testing.T) {
 	})
 }
 
+// tmpDirForTest makes a private directory directly under /tmp (not
+// t.TempDir(), which on macOS lives under /var/folders) and removes it when
+// the test ends.
+func tmpDirForTest(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "llmkube-store-test-")
+	if err != nil {
+		t.Skipf("cannot create a directory under /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// A store under /tmp is refused even when the agent owns it and it is 0700:
+// /tmp is emptied at boot, so another local user can recreate the path
+// first. 0.10.0 plists pinned --model-store /tmp/llmkube-models, so the
+// error must name the plist re-render.
+func TestCheckModelStore_RefusesStoreUnderTmp(t *testing.T) {
+	wantAll := func(t *testing.T, err error, path string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("CheckModelStore(%s) = nil, want a refusal", path)
+		}
+		for _, want := range []string{path, "make install-metal-agent", "outside /tmp"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+	}
+
+	t.Run("owned private store under /tmp", func(t *testing.T) {
+		store := filepath.Join(tmpDirForTest(t), "models")
+		if err := os.Mkdir(store, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		wantAll(t, CheckModelStore(store), store)
+	})
+
+	t.Run("symlink outside /tmp resolving into /tmp", func(t *testing.T) {
+		store := filepath.Join(tmpDirForTest(t), "models")
+		if err := os.Mkdir(store, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(t.TempDir(), "store-link")
+		if err := os.Symlink(store, link); err != nil {
+			t.Fatal(err)
+		}
+		wantAll(t, CheckModelStore(link), link)
+	})
+
+	t.Run("literal /tmp path whose target is outside /tmp", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "models")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(tmpDirForTest(t), "store-link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		wantAll(t, CheckModelStore(link), link)
+	})
+}
+
 // ResolveModelStore returns the checked, symlink-free absolute path, so the
 // agent keeps using the directory that was judged even if the configured
 // symlink is repointed afterwards.
