@@ -88,18 +88,48 @@ func (p *ClientProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rp := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: addr})
-	// Flush each chunk immediately so SSE / stream:true completions are not
-	// buffered by the proxy.
-	rp.FlushInterval = -1
-	rp.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
-		p.logger.Warnw("client proxy upstream error", "target", addr, "err", err.Error())
-		writeClientProxyError(rw, http.StatusBadGateway, "upstream inference process unreachable")
-	}
-
+	rp := p.reverseProxy(addr)
 	sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	rp.ServeHTTP(sw, r)
 	clientProxyRequests.WithLabelValues(statusClass(sw.status)).Inc()
+}
+
+// reverseProxy builds the reverse proxy to the current child on addr
+// (127.0.0.1:<port>). This mirrors pkg/agent/ingress/server.go's Server.proxy
+// (see the sibling there): a Rewrite hook is used instead of the legacy
+// NewSingleHostReverseProxy Director, because only ProxyRequest.SetURL clears
+// the outbound Host header. NewSingleHostReverseProxy's Director leaves the
+// caller's original Host (e.g. "localhost:<client-proxy port>") on the
+// outbound request, which Go's Transport then sends to the child verbatim
+// instead of the child's own address.
+//
+// Rewrite also deletes the inbound Upgrade and Connection headers and clears
+// request trailers, for the same reasons the ingress does: ReverseProxy
+// re-adds Upgrade/Connection after stripping hop-by-hop headers otherwise, an
+// upgraded connection is a raw byte tunnel the path allowlist can no longer
+// see, and trailers are headers that arrive after the checks in ServeHTTP
+// already ran. ModifyResponse shares the ingress's ingress.RefuseUpgrade, so
+// an engine that upgrades unsolicited still never reaches the caller as a
+// 101; ErrorHandler turns that refusal into the same 502 JSON body as any
+// other upstream failure.
+func (p *ClientProxy) reverseProxy(addr string) *httputil.ReverseProxy {
+	target := &url.URL{Scheme: "http", Host: addr}
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Header.Del("Upgrade")
+			pr.Out.Header.Del("Connection")
+			pr.Out.Trailer = nil
+		},
+		ModifyResponse: ingress.RefuseUpgrade,
+		// Flush each chunk immediately so SSE / stream:true completions are
+		// not buffered by the proxy.
+		FlushInterval: -1,
+		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			p.logger.Warnw("client proxy upstream error", "target", addr, "err", err.Error())
+			writeClientProxyError(rw, http.StatusBadGateway, "upstream inference process unreachable")
+		},
+	}
 }
 
 // hostAllowed reports whether host (r.Host) names this loopback proxy: an

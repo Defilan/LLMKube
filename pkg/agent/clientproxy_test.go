@@ -226,6 +226,126 @@ func TestClientProxy_HostAndPathChecks(t *testing.T) {
 	}
 }
 
+// TestClientProxy_RewritesHostToBackend guards against the legacy
+// httputil.NewSingleHostReverseProxy Director, which never clears the
+// outbound Host header: it would send the caller's loopback Host (e.g.
+// "localhost:<client-proxy port>") to the child instead of the child's own
+// address. ClientProxy.reverseProxy uses Rewrite+SetURL instead, mirroring
+// pkg/agent/ingress/server.go's Server.proxy, and SetURL clears the outbound
+// Host so Go's Transport derives it from the target URL.
+func TestClientProxy_RewritesHostToBackend(t *testing.T) {
+	var gotHost atomic.Value
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost.Store(r.Host)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(backend.Close)
+	addr := backend.Listener.Addr().String()
+
+	p := NewClientProxy(&fakeBackend{addr: addr, runtime: runtimeLlamaServer, ok: true},
+		testClientProxyPort, zap.NewNop().Sugar())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Host = "localhost:9443"
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: want 200 got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	got, _ := gotHost.Load().(string)
+	if got != addr {
+		t.Errorf("backend saw Host %q, want its own address %q; the caller's loopback Host must not be forwarded",
+			got, addr)
+	}
+}
+
+// TestClientProxy_RefusesProtocolUpgrade mirrors
+// pkg/agent/ingress/server_test.go's TestServer_RefusesProtocolUpgrade: an
+// Upgrade request still reaches the engine, but as a plain request, since
+// ClientProxy.reverseProxy's Rewrite hook strips Upgrade and Connection
+// before forwarding (ReverseProxy re-adds both after stripping hop-by-hop
+// headers otherwise).
+func TestClientProxy_RefusesProtocolUpgrade(t *testing.T) {
+	var lastUpgrade, lastConnection atomic.Value
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastUpgrade.Store(r.Header.Get("Upgrade"))
+		lastConnection.Store(r.Header.Get("Connection"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(backend.Close)
+
+	p := NewClientProxy(&fakeBackend{addr: backend.Listener.Addr().String(), runtime: runtimeLlamaServer, ok: true},
+		testClientProxyPort, zap.NewNop().Sugar())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Host = "127.0.0.1:9443"
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusSwitchingProtocols {
+		t.Fatal("client proxy relayed a 101 Switching Protocols to the caller")
+	}
+	if up, _ := lastUpgrade.Load().(string); up != "" {
+		t.Errorf("engine saw Upgrade: %q, want none", up)
+	}
+	if c, _ := lastConnection.Load().(string); strings.Contains(strings.ToLower(c), "upgrade") {
+		t.Errorf("engine saw Connection: %q, want no upgrade token", c)
+	}
+}
+
+// TestClientProxy_RefusesUnsolicited101 mirrors
+// pkg/agent/ingress/server_test.go's TestServer_RefusesUnsolicited101: even if
+// an engine answers 101 without being asked, the client proxy turns it into
+// the same 502 JSON error as any other upstream failure rather than relaying
+// it (ClientProxy.reverseProxy's ModifyResponse shares ingress.RefuseUpgrade).
+//
+// This is a regression/documentation test, not a discriminating one: given
+// the Rewrite hook above unconditionally strips the outbound request's
+// Upgrade/Connection headers on every request, net/http's own machinery
+// already makes a real protocol-switch pass-through unreachable independent
+// of ModifyResponse (Response.isProtocolSwitch requires the response to
+// carry matching Upgrade/Connection headers to expose a writable Body at
+// all, and httputil's handleUpgradeResponse separately refuses whenever the
+// outbound request's Upgrade type, always empty here, doesn't match the
+// response's). See the task-5 fix-round-1 report for the full trace. This
+// test still documents the intended contract and guards the observable
+// status/body.
+func TestClientProxy_RefusesUnsolicited101(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = buf.Flush()
+	}))
+	t.Cleanup(backend.Close)
+
+	p := NewClientProxy(&fakeBackend{addr: backend.Listener.Addr().String(), runtime: runtimeLlamaServer, ok: true},
+		testClientProxyPort, zap.NewNop().Sugar())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Host = "127.0.0.1:9443"
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status: want 502 got %d (body=%q)", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("502 should be JSON, got Content-Type %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "error") {
+		t.Errorf("502 body should carry a JSON error, got %q", rec.Body.String())
+	}
+}
+
 func TestStatusClass(t *testing.T) {
 	tests := []struct {
 		code     int
