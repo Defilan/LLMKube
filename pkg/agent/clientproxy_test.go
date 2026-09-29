@@ -111,6 +111,7 @@ func TestClientProxy_HostAndPathChecks(t *testing.T) {
 		method     string
 		path       string
 		runtime    string
+		port       int // the proxy's configured port; 0 means testClientProxyPort
 		wantStatus int
 		wantHits   int32
 	}{
@@ -178,6 +179,54 @@ func TestClientProxy_HostAndPathChecks(t *testing.T) {
 			wantHits:   0,
 		},
 		{
+			name:       "a Host with no port is refused when the proxy is not on port 80",
+			host:       "localhost",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusMisdirectedRequest,
+			wantHits:   0,
+		},
+		{
+			name:       "a Host with no port is accepted when the proxy is on port 80",
+			host:       "localhost",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			port:       80,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "a bracketed IPv6 loopback with no port is accepted on port 80",
+			host:       "[::1]",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			port:       80,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "a foreign Host with no port is refused even on port 80",
+			host:       "evil.example",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			port:       80,
+			wantStatus: http.StatusMisdirectedRequest,
+			wantHits:   0,
+		},
+		{
+			name:       "uppercase LOCALHOST with the proxy's port is accepted",
+			host:       "LOCALHOST:9443",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
 			name:       "runtime-specific route allowed for the backend's runtime",
 			host:       "127.0.0.1:9443",
 			method:     http.MethodGet,
@@ -200,8 +249,12 @@ func TestClientProxy_HostAndPathChecks(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			addr, hits := newRecordingBackend(t)
+			port := tt.port
+			if port == 0 {
+				port = testClientProxyPort
+			}
 			p := NewClientProxy(&fakeBackend{addr: addr, runtime: tt.runtime, ok: true},
-				testClientProxyPort, zap.NewNop().Sugar())
+				port, zap.NewNop().Sugar())
 
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			req.Host = tt.host
