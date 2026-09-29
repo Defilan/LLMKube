@@ -123,32 +123,59 @@ something went wrong.
 
 0.10.1 tightens the metal-agent's SSRF guard on model downloads, adds
 `spec.sha256` verification, moves the model store and its ownership checks,
-and locks down the client proxy and vllm-swift's `extraArgs`. Before
-upgrading the metal-agents on any Mac:
+and locks down the client proxy and vllm-swift's `extraArgs`.
 
+#### Upgrade blockers
+
+Each of these stops an agent, or an InferenceService, after the upgrade until
+it is fixed. Check them on every Mac before upgrading its metal-agent:
+
+- **Re-render the launchd plist (required when upgrading from 0.10.0).** The
+  0.10.0 plist passed `--model-store /tmp/llmkube-models` explicitly and
+  logged to `/tmp/llmkube-metal-agent.log`. A binary swap followed by
+  `launchctl kickstart -k` keeps that plist, and 0.10.1 refuses a model store
+  under `/tmp`, so the agent will not start. Boot the job out and reinstall:
+
+  ```bash
+  launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+  make install-metal-agent
+  ```
+
+  `make install-metal-agent` alone is not enough while the job is loaded:
+  launchd keeps the old definition until it is booted out. The new plist uses
+  the default store `~/Library/Application Support/llmkube/models` and logs to
+  `~/Library/Logs/llmkube/metal-agent.log`. For a hand-maintained plist,
+  remove the `--model-store /tmp/...` pair (or point it at a directory the
+  agent owns outside `/tmp`), move `StandardOutPath` and `StandardErrorPath`
+  out of `/tmp`, and set `WorkingDirectory` to the agent user's home. Nothing
+  moves by itself.
+- **Check the model store and every directory above it.** The agent refuses
+  to start unless the store is owned by the agent's user and not group- or
+  other-writable, and every ancestor up to `/` is owned by root or the
+  agent's user and not group- or other-writable unless it has the sticky bit.
+  A store on an exFAT or FAT volume (for example under `/Volumes`) always
+  fails, because those volumes report every directory as mode 0777; use an
+  APFS or HFS+ volume. Print each directory's owner and mode (works in `sh`,
+  `bash` and `zsh`; set `STORE` to your `--model-store` if you set one):
+
+  ```bash
+  STORE="$HOME/Library/Application Support/llmkube/models"; p=$(cd "$STORE" 2>/dev/null && pwd -P || echo "$STORE"); while :; do ls -ld "$p" 2>/dev/null || echo "not created yet: $p"; [ "$p" = / ] && break; p=$(dirname "$p"); done
+  ```
+
+  Each line must show the agent's user or `root` as owner, and no group or
+  other `w` unless the mode ends in `t`. The refusal names the path, owner
+  and fix.
+- **Replace symlinked cache slots.** Serving a hand-placed GGUF by putting it,
+  or a symlink to it, at `<model-store>/<model>/<file>` with an `https`, `hf`
+  or `s3` URL in `spec.source` now fails with `ModelSourceNotAllowed`. Set the
+  Model's `spec.source` to the file's absolute path (or a `file://` URI) and
+  add its directory to `--allowed-model-roots`.
 - **Allowlist any LAN model mirror.** Every download (`http`, `https`, `hf`,
   `s3`, and the memory-check HEAD probe) now refuses a host that resolves to
   a private, loopback or link-local address unless it is listed in
-  `--allowed-download-hosts`. If a Model source or oMLX `pagedSSDCacheDir`
-  points at an internal MinIO or registry, add its host or CIDR to that flag
-  before upgrading, for example `--allowed-download-hosts=minio.lan,10.20.0.0/16`.
-- **Check the model store's ownership.** The agent now refuses to start
-  against a store it does not own, that other users can write, or that sits
-  under a directory other users can write. Check the default path, or your
-  configured `--model-store` path if you set one:
-
-  ```bash
-  ls -ld "$HOME/Library/Application Support/llmkube/models"
-  ```
-
-  Fix a bad owner or mode before restarting the agent; the refusal names the
-  path, owner and fix.
-- **Expect a one-time re-download on the old default.** Agents that were
-  still using the pre-0.10.1 `/tmp` default store move to
-  `~/Library/Application Support/llmkube/models`, a directory they have
-  never populated, so every model re-downloads once on first start.
-- **Note the new log path**: `~/Library/Logs/llmkube/metal-agent.log`,
-  not the old flat `~/Library/Logs/llmkube-metal-agent.log`.
+  `--allowed-download-hosts`. If a Model source points at an internal MinIO or
+  registry, add its host or CIDR to that flag before upgrading, for example
+  `--allowed-download-hosts=minio.lan,10.20.0.0/16`.
 - **Audit vllm-swift `extraArgs` on every affected InferenceService.**
   `--trust-request-chat-template`, `--enable-prompt-embeds` and
   `--enable-mm-embeds` are now refused, as is pointing `--tokenizer`,
@@ -167,6 +194,22 @@ upgrading the metal-agents on any Mac:
   `ExtraArgsRejected` after the upgrade; fix its `extraArgs` or set
   `--allow-unsafe-extra-args` on that agent. See the "extraArgs typed
   allowlist" section in `deployment/macos/README.md` for the full policy.
+
+After the plist is re-rendered, every model re-downloads once on first start:
+the new default store is a directory the agent has never populated.
+
+#### Behavior changes in 0.10.1
+
+- The controller's GGUF metadata reads honor `HTTP_PROXY`, `HTTPS_PROXY` and
+  `NO_PROXY` (and their lowercase forms), as the agent's downloads do. The
+  target host is still checked against the allowlist when a proxy is used.
+- A NAT64 address in `64:ff9b::/96` is judged by its embedded IPv4 address.
+- Downloads follow at most 5 redirects (the agent allowed 10 before).
+- The download dial timeout is 10 seconds (it was 30).
+- Downloads use HTTP/1.1 only.
+- `spec.sha256` is enforced for sources the agent downloads for llama-server
+  (`http`, `https`, `hf`, `s3`). Local sources are not hashed, and the other
+  Metal runtimes ignore it in 0.10.1.
 
 ## Verify the upgrade
 

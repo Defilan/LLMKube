@@ -447,8 +447,9 @@ doesn't mount PVCs at reconcile time. Compute the hash externally
 when seeding the PVC if you need provenance.
 
 As of 0.10.1, a Metal InferenceService gets the same `spec.sha256`
-enforcement from the metal-agent, for sources it downloads itself
-rather than the controller: a mismatch deletes the file and refuses
+enforcement from the metal-agent, for sources it downloads itself for
+llama-server rather than the controller (local sources and the other
+Metal runtimes are not checked): a mismatch deletes the file and refuses
 to start the InferenceService with reason `ModelDigestMismatch`
 instead of serving an unverified model. See "`spec.sha256` digest
 verification" in

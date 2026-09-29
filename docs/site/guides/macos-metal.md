@@ -166,7 +166,8 @@ A public Hugging Face URL like the one above works out of the box. If
 model mirror), add it to the agent's `--allowed-download-hosts` first: the
 agent refuses to download from a private or loopback address unless it is
 allowlisted. Set `spec.sha256` on the `Model` to have the agent verify the
-download and refuse to start on a mismatch. See "Security model" in
+download (llama-server sources the agent downloads) and refuse to start on a
+mismatch. See "Security model" in
 [`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#security-model)
 for both.
 

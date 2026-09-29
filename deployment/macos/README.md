@@ -117,14 +117,40 @@ The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
 
 Downloaded models and the per-engine logs live in the model store, by default
 `~/Library/Application Support/llmkube/models`. The agent creates it (mode
-0700) on first start. It refuses to start if the store, or the directory a
-symlinked store points at, is not owned by the agent's user or is writable by
-the group or other users, or if any directory above it is group- or
-other-writable without the sticky bit; the error names the path, its owner uid
-and mode, and the fix (`chown` or `chmod go-w`). The agent then uses the
+0700) on first start. The store is judged on the directory it resolves to (the
+target of a symlinked store), and the agent refuses to start unless:
+
+- the store is not at or under `/tmp`, `/var/tmp` or their `/private` forms
+  (macOS resolves `/tmp` to `/private/tmp`), even when the agent owns it:
+  those directories are emptied at boot, so another local user could create
+  the path first,
+- the store is owned by the agent's user and is not writable by the group or
+  other users,
+- every directory above it, up to `/`, is owned by root or by the agent's
+  user, and is not group- or other-writable unless it has the sticky bit
+  (like `/Users/Shared`). Otherwise the owner of that directory, or anyone who
+  can write it, could move the store aside and put their own in its place.
+
+The error names the path, its owner uid and mode, and the fix (`chown`,
+`chmod go-w`, or a different `--model-store`). The agent then uses the
 resolved directory, so repointing a symlinked `--model-store` needs a restart.
 `--model-store` must be absolute or start with `~/` (expanded against the
-agent user's home). Do not point it at a shared directory such as `/tmp`.
+agent user's home).
+
+A volume that does not store Unix permissions, such as an exFAT or FAT
+external disk under `/Volumes`, reports every directory as mode 0777, so a
+store there always fails the check. Put the store on an APFS or HFS+ volume.
+
+To see the owner and mode of the store and every directory above it, set
+`STORE` to your store path and run this in `sh`, `bash` or `zsh`:
+
+```bash
+STORE="$HOME/Library/Application Support/llmkube/models"; p=$(cd "$STORE" 2>/dev/null && pwd -P || echo "$STORE"); while :; do ls -ld "$p" 2>/dev/null || echo "not created yet: $p"; [ "$p" = / ] && break; p=$(dirname "$p"); done
+```
+
+Each line must show the agent's user or `root` as the owner, and no `w` in
+the group or other position unless the mode ends in `t` (sticky). A store
+that does not exist yet prints `not created yet`; the agent creates it 0700.
 
 ### `--allowed-model-roots` flag (local model paths)
 
@@ -136,11 +162,13 @@ To allow local model sources outside the model store, pass a comma-separated lis
 llmkube-metal-agent --allowed-model-roots /Users/you/llmkube-models
 ```
 
-Symlinks are followed, so a model store entry (or an `owner/repo` source resolved under the store) that is itself a symlink into the Hugging Face cache needs the cache's real directory added, not just the model store. Add the cache root itself (`/Users/you/.cache/huggingface/hub`), not a `models--org--name/snapshots/<rev>` subdirectory: the snapshot's files are symlinks into the cache's `blobs/` directory, and a GGUF's shards resolve there too, outside any narrower root you might otherwise pick:
+Symlinks in a local source are followed, so a local source (or an `owner/repo` source resolved under the store) that is itself a symlink into the Hugging Face cache needs the cache's real directory added, not just the model store. Add the cache root itself (`/Users/you/.cache/huggingface/hub`), not a `models--org--name/snapshots/<rev>` subdirectory: the snapshot's files are symlinks into the cache's `blobs/` directory, and a GGUF's shards resolve there too, outside any narrower root you might otherwise pick:
 
 ```bash
 llmkube-metal-agent --allowed-model-roots /Users/you/.cache/huggingface/hub
 ```
+
+To serve a GGUF that is already on the Mac, set the Model's `spec.source` to its absolute path (or a `file://` URI) and add its directory to `--allowed-model-roots`. Do not place the file, or a symlink to it, in the cache slot of a downloaded source (`<model-store>/<model>/<file>` for an `https`, `hf` or `s3` source): the agent writes that slot itself and refuses to start from a symlink there, with reason `ModelSourceNotAllowed`.
 
 To set this in the launchd plist, add these lines to the `ProgramArguments` array:
 
@@ -211,7 +239,7 @@ A few behavior notes:
 
 When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source against it before the file is used. A mismatch deletes the file and refuses to start the InferenceService with reason `ModelDigestMismatch` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). A verified file gets a `<file>.sha256` stamp beside it, so a later restart does not re-hash a potentially huge model unless the stamp is missing or stale.
 
-A local-path source is loaded in place and is never hashed; `spec.sha256` only applies to a source the agent downloads.
+`spec.sha256` is enforced for sources the agent downloads for llama-server (the `llamacpp` runtime): `http`, `https`, `hf` and `s3`. A local-path or `file://` source is loaded in place and is never hashed. The other Metal runtimes (mlx-server, vllm-swift, oMLX, TensorFold and Ollama) do not download through the agent and ignore `spec.sha256` in 0.10.1.
 
 The agent remembers a mismatch so it does not re-download the same bad source on every reconcile. Changing the Model's `source` or `sha256` clears that memo automatically, since it is keyed to the exact source and digest it was recorded against; the next reconcile then retries the download. If the spec is unchanged (for example, the same URL now serves a corrected file), recreate the `Model` or the `InferenceService` instead: deleting either one clears the memo, so the next reconcile downloads and verifies it again.
 
@@ -471,6 +499,9 @@ kubectl describe inferenceservice <name>
 - **Digest mismatch** (`ModelDigestMismatch`): when `spec.sha256` is set, a
   downloaded source that does not match it is deleted and refused. See
   "`spec.sha256` digest verification" above.
+- **Cache slot** (`ModelSourceNotAllowed`): for a downloaded source, the
+  file at `<model-store>/<model>/<file>` must be a regular file the agent
+  wrote. A symlink there is refused, not followed.
 
 ### The extraArgs typed allowlist
 
@@ -546,6 +577,13 @@ It never relaxes:
 - extraArgs on a runtime this policy does not otherwise recognize.
 
 Turn this on only for a Mac whose InferenceService authors are fully trusted.
+
+With it set, llama-server's own download flags (`-hf`/`--hf-repo`,
+`-hff`/`--hf-file`, `-mu`/`--model-url`, `-dr`/`--docker-repo`,
+`--hf-repo-draft`, `-mmu`/`--mmproj-url`, and similar) are allowed, and the
+engine then fetches that file itself. Those downloads bypass the agent's SSRF
+guard (`--allowed-download-hosts`) and the `spec.sha256` check, which apply
+only to downloads the agent makes.
 
 ### Practical notes
 
@@ -698,6 +736,14 @@ The client proxy has no token or certificate check of its own: any process
 on the Mac that can reach `127.0.0.1:<client-port>` is trusted, but only for
 the paths on the allowlist above.
 
+The engines themselves still listen without authentication on their own
+loopback ports (`127.0.0.1:<engine-port>`), with no `Host` check and no path
+allowlist. The client proxy's checks do not cover a process that dials an
+engine port directly, so any local process on the Mac can reach an engine's
+admin endpoints (for example llama-server's `/slots`). Loopback is the trust
+boundary: treat every local user and process on the Mac as able to use the
+engines.
+
 #### NetworkPolicy and metrics
 
 Relay pods carry the label `inference.llmkube.dev/service: <isvc>`, the same
@@ -767,32 +813,75 @@ controller predates relay support.
 #### Upgrading to 0.10.1
 
 0.10.1 hardens downloads, the model store, the client proxy and vllm-swift's
-`extraArgs`. Before upgrading:
+`extraArgs`.
 
-- If any Model source or oMLX `pagedSSDCacheDir` is fetched from a LAN
-  mirror (an internal MinIO, registry, or similar), add its host or CIDR to
+##### Upgrade blockers
+
+Each of these stops an agent, or an InferenceService, after the upgrade until
+it is fixed. Check them before upgrading:
+
+- **Re-render the launchd plist (required when upgrading from 0.10.0).** The
+  0.10.0 plist passed `--model-store /tmp/llmkube-models` explicitly and sent
+  the agent's output to `/tmp/llmkube-metal-agent.log`. Swapping the binary
+  and running `launchctl kickstart -k` keeps that plist, and 0.10.1 refuses a
+  model store under `/tmp`, so the agent will not start. Boot the job out and
+  reinstall, which renders the new plist (default store
+  `~/Library/Application Support/llmkube/models`, logs in
+  `~/Library/Logs/llmkube/metal-agent.log`) and loads it:
+
+  ```bash
+  launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+  make install-metal-agent
+  ```
+
+  `make install-metal-agent` alone is not enough for a job that is already
+  loaded: launchd keeps running the old definition until the job is booted
+  out. If you maintain your own plist, remove the `--model-store /tmp/...`
+  pair (or point it at a directory the agent owns outside `/tmp`), move
+  `StandardOutPath` and `StandardErrorPath` out of `/tmp`, and set
+  `WorkingDirectory` to the agent user's home. Nothing moves by itself: until
+  the plist changes, the agent refuses to start.
+- **Model store ownership.** The store and every directory above it must pass
+  the checks in "Model store" above: the store owned by the agent's user and
+  not group- or other-writable, and every ancestor owned by root or the agent's
+  user and not group- or other-writable unless sticky. A store on an exFAT or
+  FAT volume always fails; use APFS or HFS+. Run the one-liner in "Model
+  store" against your store path to see each directory's owner and mode.
+- **A symlink in a downloaded source's cache slot.** Serving a hand-placed
+  GGUF by putting it, or a symlink to it, at `<model-store>/<model>/<file>`
+  with an `https`, `hf` or `s3` URL in `spec.source` no longer works: the
+  InferenceService is refused with `ModelSourceNotAllowed`. Set the Model's
+  `spec.source` to the file's absolute path (or a `file://` URI) and add its
+  directory to `--allowed-model-roots`.
+- **LAN download sources.** If any Model source is fetched from a LAN mirror
+  (an internal MinIO, registry, or similar), add its host or CIDR to
   `--allowed-download-hosts`, or the agent will refuse to fetch it. See
   "`--allowed-download-hosts` flag (remote model sources)" above.
-- Confirm the model store, the default
-  `~/Library/Application Support/llmkube/models` or your configured
-  `--model-store` path, is owned by the agent's user and not group- or
-  other-writable (`ls -ld` the path, or the resolved target of a symlinked
-  store); the agent now refuses to start otherwise. See "Model store" above.
-- If the agent was using the old `/tmp` default store, expect a one-time
-  re-download of every model on first start after the upgrade: the new
-  default, `~/Library/Application Support/llmkube/models`, is a directory
-  the agent has never populated. The old `/tmp` cache was cleared on every
-  reboot anyway, so this is not a net-new download burden on a Mac that
-  restarts occasionally.
-- Logs moved with the store: `~/Library/Logs/llmkube/metal-agent.log`, not
-  the old `~/Library/Logs/llmkube-metal-agent.log`.
-- If any InferenceService's `extraArgs` sets vllm-swift's
-  `--trust-request-chat-template`, `--enable-prompt-embeds` or
+- **vllm-swift `extraArgs`.** If any InferenceService's `extraArgs` sets
+  vllm-swift's `--trust-request-chat-template`, `--enable-prompt-embeds` or
   `--enable-mm-embeds`, or points `--tokenizer`, `--hf-config-path`,
   `--generation-config` or a `--lora-modules` path at a Hugging Face repo id
   instead of a path already on disk, it will start failing
   `ExtraArgsRejected` after the upgrade. Fix the InferenceService or set
   `--allow-unsafe-extra-args` on that agent. See "Practical notes" above.
+
+After the plist is re-rendered, expect a one-time re-download of every model
+on first start: the new default store is a directory the agent has never
+populated. The old `/tmp` store was cleared on every reboot anyway.
+
+##### Behavior changes in 0.10.1
+
+- The controller's GGUF metadata reads honor `HTTP_PROXY`, `HTTPS_PROXY` and
+  `NO_PROXY` (and their lowercase forms), as the agent's downloads do. The
+  target host is still checked against the allowlist when a proxy is used.
+- A NAT64 address in `64:ff9b::/96` is judged by the IPv4 address embedded in
+  it, so a public IPv4-only host stays reachable on a DNS64 network while
+  loopback and private ranges stay blocked.
+- Downloads follow at most 5 redirects (the agent allowed 10 before).
+- The dial timeout for downloads is 10 seconds (it was 30).
+- Downloads use HTTP/1.1 only.
+- `spec.sha256` is now enforced for sources the agent downloads for
+  llama-server; see "`spec.sha256` digest verification" above.
 
 #### `--legacy-direct-endpoints` (deprecated)
 
