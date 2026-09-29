@@ -151,6 +151,60 @@ func TestDownloadFile_SHA256Mismatch_DeletesAndErrors(t *testing.T) {
 	}
 }
 
+// A stamp left beside an old file must not survive a publish that does not
+// write a fresh one: verifyCachedDigest trusts a matching stamp without
+// hashing, so a stale stamp would vouch for bytes it never saw.
+func TestVerifyAndPublish_DropsStaleStamp(t *testing.T) {
+	oldDigest := sha256Hex([]byte("the file that was stamped"))
+	setup := func(t *testing.T) (e *MetalExecutor, assembled, dest string) {
+		t.Helper()
+		dir := t.TempDir()
+		e = NewMetalExecutor("/bin/llama-server", dir, newNopLogger())
+		dest = filepath.Join(dir, "model.gguf")
+		if err := os.WriteFile(dest, []byte("the file that was stamped"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeSHA256Stamp(dest, oldDigest); err != nil {
+			t.Fatal(err)
+		}
+		assembled = dest + ".partial"
+		if err := os.WriteFile(assembled, []byte("different bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return e, assembled, dest
+	}
+	stampGone := func(t *testing.T, dest string) {
+		t.Helper()
+		if _, err := os.Lstat(sha256StampPath(dest)); !os.IsNotExist(err) {
+			t.Errorf("stamp %s survived (err=%v), want it removed", sha256StampPath(dest), err)
+		}
+	}
+
+	t.Run("unverified publish", func(t *testing.T) {
+		e, assembled, dest := setup(t)
+		if err := e.verifyAndPublish(assembled, dest, ""); err != nil {
+			t.Fatalf("verifyAndPublish = %v", err)
+		}
+		stampGone(t, dest)
+		verified, err := e.verifyCachedDigest(dest, oldDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if verified {
+			t.Error("verifyCachedDigest trusted the old digest for different bytes")
+		}
+	})
+
+	t.Run("digest mismatch", func(t *testing.T) {
+		e, assembled, dest := setup(t)
+		err := e.verifyAndPublish(assembled, dest, sha256Hex([]byte("something else")))
+		if err == nil {
+			t.Fatal("verifyAndPublish on a mismatch = nil, want an error")
+		}
+		stampGone(t, dest)
+	})
+}
+
 func TestEnsureModel_CacheHit_MatchingStamp_SkipsHash(t *testing.T) {
 	tmpDir := t.TempDir()
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())

@@ -1033,8 +1033,16 @@ func (e *ModelDigestMismatchError) Error() string {
 // destPath and stamped at destPath+".sha256" (lowercase hex, mode 0600) so a
 // later cache hit can skip re-hashing. An empty expectedSHA256 (no
 // Model.spec.sha256) reduces to the historical rename-only publish.
+//
+// Every path that does not end in a fresh stamp (an unverified publish, a
+// mismatch) removes any existing stamp first. verifyCachedDigest trusts a
+// matching stamp without re-hashing, so a stamp left over from an earlier
+// verified file would otherwise vouch for different bytes: for example a
+// file stamped X, then re-downloaded unverified after spec.sha256 was
+// cleared, would pass as X once spec.sha256 is set back.
 func (e *MetalExecutor) verifyAndPublish(assembledPath, destPath, expectedSHA256 string) error {
 	if expectedSHA256 == "" {
+		_ = os.Remove(sha256StampPath(destPath))
 		if err := os.Rename(assembledPath, destPath); err != nil {
 			_ = os.Remove(assembledPath)
 			return fmt.Errorf("failed to rename downloaded model: %w", err)
@@ -1050,6 +1058,7 @@ func (e *MetalExecutor) verifyAndPublish(assembledPath, destPath, expectedSHA256
 	if !strings.EqualFold(computed, expectedSHA256) {
 		_ = os.Remove(assembledPath)
 		_ = os.Remove(destPath)
+		_ = os.Remove(sha256StampPath(destPath))
 		return &ModelDigestMismatchError{Path: destPath, Expected: expectedSHA256, Computed: computed}
 	}
 
