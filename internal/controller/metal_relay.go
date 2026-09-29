@@ -28,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -63,6 +64,10 @@ const (
 	// "app" it forms the relay Deployment's selector and the adopted
 	// Service's selector.
 	relayPodLabel = "inference.llmkube.dev/metal-relay"
+
+	// relayConflictRequeueAfter is how soon a reconcile whose relay write
+	// lost an optimistic-lock race runs again.
+	relayConflictRequeueAfter = time.Second
 )
 
 // Event reasons for the relay lifecycle on the InferenceService.
@@ -371,7 +376,11 @@ func relayProbe(path string, initialDelay, period int32) *corev1.Probe {
 		InitialDelaySeconds: initialDelay,
 		PeriodSeconds:       period,
 		TimeoutSeconds:      3,
-		FailureThreshold:    3,
+		// Set to the API default: relayDeploymentConverged compares the
+		// template derivatively, which skips unset strings and pointers but
+		// not integers, so a zero here would never match the defaulted 1.
+		SuccessThreshold: 1,
+		FailureThreshold: 3,
 	}
 }
 
@@ -416,12 +425,51 @@ func (r *InferenceServiceReconciler) reconcileRelayDeployment(ctx context.Contex
 		return nil, fmt.Errorf("relay: Deployment %s/%s exists and is not controlled by this InferenceService",
 			existing.Namespace, existing.Name)
 	}
+	if relayDeploymentConverged(desired, existing) {
+		return existing, nil
+	}
 	existing.Spec.Template = desired.Spec.Template
 	existing.Spec.Replicas = desired.Spec.Replicas
 	if err := r.Update(ctx, existing); err != nil {
 		return nil, fmt.Errorf("update relay Deployment %s/%s: %w", existing.Namespace, existing.Name, err)
 	}
 	return existing, nil
+}
+
+// relayDeploymentConverged reports whether existing already carries the pod
+// template and replica count desired sets. The API server defaults many
+// template fields the controller never sets, so the template comparison is
+// derivative: unset strings, pointers, slices and maps in desired are not
+// compared (integer fields always are, so desired sets them to the API
+// default). Skipping the no-op
+// Update keeps the controller from racing the Deployment controller's writes
+// on every reconcile.
+func relayDeploymentConverged(desired, existing *appsv1.Deployment) bool {
+	return apiequality.Semantic.DeepEqual(desired.Spec.Replicas, existing.Spec.Replicas) &&
+		apiequality.Semantic.DeepDerivative(desired.Spec.Template, existing.Spec.Template)
+}
+
+// relayServiceConverged reports whether the adopted Service already matches
+// what reconcileRelayService would write: controlled by isvc, no metal-agent
+// managed-by label, desired labels present, and the selector, type and ports
+// (ports already merged with the existing nodePorts) in place. Ports compare
+// derivatively because the API server defaults fields such as appProtocol.
+func relayServiceConverged(isvc *inferencev1alpha1.InferenceService, desired, existing *corev1.Service, ports []corev1.ServicePort) bool {
+	if !metav1.IsControlledBy(existing, isvc) {
+		return false
+	}
+	if _, ok := existing.Labels[inferencev1alpha1.LabelManagedBy]; ok {
+		return false
+	}
+	for k, v := range desired.Labels {
+		if got, ok := existing.Labels[k]; !ok || got != v {
+			return false
+		}
+	}
+	return existing.Spec.Type == desired.Spec.Type &&
+		apiequality.Semantic.DeepEqual(existing.Spec.Selector, desired.Spec.Selector) &&
+		len(existing.Spec.Ports) == len(ports) &&
+		apiequality.Semantic.DeepDerivative(ports, existing.Spec.Ports)
 }
 
 // reconcileRelayService points "<isvc>" at the relay pods. Type, port and
@@ -457,6 +505,11 @@ func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, 
 			existing.Namespace, existing.Name)
 	}
 
+	ports := mergeServicePorts(existing.Spec.Ports, desired.Spec.Ports, desired.Spec.Type)
+	if relayServiceConverged(isvc, desired, existing, ports) {
+		return nil
+	}
+
 	adopting := !metav1.IsControlledBy(existing, isvc)
 	if err := setControllerReferenceUnblocked(isvc, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner on Service %s/%s: %w", existing.Namespace, existing.Name, err)
@@ -472,7 +525,7 @@ func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, 
 	// The agent always writes ClusterIP; keeping that type while desired
 	// carries a nodePort is rejected by the API on every reconcile.
 	existing.Spec.Type = desired.Spec.Type
-	existing.Spec.Ports = mergeServicePorts(existing.Spec.Ports, desired.Spec.Ports, desired.Spec.Type)
+	existing.Spec.Ports = ports
 	// Spec.ClusterIP is left as observed: adoption must not change the
 	// address clients already resolve.
 	if err := r.Update(ctx, existing); err != nil {

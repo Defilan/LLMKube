@@ -100,6 +100,44 @@ func (c *sliceListFailingClient) List(ctx context.Context, list client.ObjectLis
 	return c.Client.List(ctx, list, opts...)
 }
 
+// deploymentUpdateConflictClient fails every Deployment Update with an
+// optimistic-lock Conflict, as the API server does when the Deployment
+// controller wrote the object between our Get and Update, and counts the
+// attempts. Every other call passes through.
+type deploymentUpdateConflictClient struct {
+	client.Client
+	attempts int
+}
+
+func (c *deploymentUpdateConflictClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	if dep, ok := obj.(*appsv1.Deployment); ok {
+		c.attempts++
+		return apierrors.NewConflict(appsv1.Resource("deployments"), dep.Name,
+			errors.New("the object has been modified; please apply your changes to the latest version and try again"))
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
+// updateCountingClient counts Deployment and Service Updates and passes every
+// call through. resourceVersion alone cannot prove a pass skipped its Update:
+// the API server drops an Update whose object is unchanged after defaulting
+// without bumping resourceVersion, yet that Update still carries the stale
+// cached resourceVersion that conflicts with the Deployment controller.
+type updateCountingClient struct {
+	client.Client
+	deployments, services int
+}
+
+func (c *updateCountingClient) Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
+	switch obj.(type) {
+	case *appsv1.Deployment:
+		c.deployments++
+	case *corev1.Service:
+		c.services++
+	}
+	return c.Client.Update(ctx, obj, opts...)
+}
+
 var _ = Describe("metal relay mode", func() {
 	const (
 		namespace = "default"
@@ -526,6 +564,56 @@ var _ = Describe("metal relay mode", func() {
 			Expect(got.Spec.Ports[0].TargetPort).To(Equal(intstr.FromInt(8080)))
 		})
 
+		// expectSteadyState runs a second reconcileRelay with nothing changed
+		// and asserts neither relay object was written: an unconditional
+		// Update from a cached copy races the Deployment controller's own
+		// writes and surfaces as an optimistic-lock conflict.
+		expectSteadyState := func(isvc *inferencev1alpha1.InferenceService) {
+			depKey := types.NamespacedName{Name: relayDeploymentName(isvc.Name), Namespace: namespace}
+			svcKey := types.NamespacedName{Name: sanitizeDNSName(isvc.Name), Namespace: namespace}
+			depBefore, svcBefore := &appsv1.Deployment{}, &corev1.Service{}
+			Expect(k8sClient.Get(ctx, depKey, depBefore)).To(Succeed())
+			Expect(k8sClient.Get(ctx, svcKey, svcBefore)).To(Succeed())
+
+			counting := &updateCountingClient{Client: k8sClient}
+			reconciler.Client = counting
+			_, err := reconciler.reconcileRelay(ctx, isvc, pinA)
+			reconciler.Client = k8sClient
+			Expect(err).NotTo(HaveOccurred())
+			Expect(counting.deployments).To(BeZero(), "no-op pass must not Update the relay Deployment")
+			Expect(counting.services).To(BeZero(), "no-op pass must not Update the Service")
+
+			depAfter, svcAfter := &appsv1.Deployment{}, &corev1.Service{}
+			Expect(k8sClient.Get(ctx, depKey, depAfter)).To(Succeed())
+			Expect(k8sClient.Get(ctx, svcKey, svcAfter)).To(Succeed())
+			Expect(depAfter.ResourceVersion).To(Equal(depBefore.ResourceVersion), "no-op pass must not Update the relay Deployment")
+			Expect(svcAfter.ResourceVersion).To(Equal(svcBefore.ResourceVersion), "no-op pass must not Update the Service")
+		}
+
+		It("leaves an adopted ClusterIP Service and the relay Deployment untouched on a no-op pass", func() {
+			isvc := newISVC("relay-steady-clusterip")
+			cleanupRelay(isvc.Name)
+			// The agent wrote another port; adoption moves it to 8080 first.
+			Expect(k8sClient.Create(ctx, agentService(isvc.Name, 8000))).To(Succeed())
+
+			_, err := reconciler.reconcileRelay(ctx, isvc, pinA)
+			Expect(err).NotTo(HaveOccurred())
+			expectSteadyState(isvc)
+		})
+
+		It("leaves a NodePort Service with an allocated node port untouched on a no-op pass", func() {
+			isvc := newEndpointISVC("relay-steady-nodeport", &inferencev1alpha1.EndpointSpec{Type: "NodePort"})
+			cleanupRelay(isvc.Name)
+			Expect(k8sClient.Create(ctx, agentService(isvc.Name, 8080))).To(Succeed())
+
+			_, err := reconciler.reconcileRelay(ctx, isvc, pinA)
+			Expect(err).NotTo(HaveOccurred())
+			got := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: namespace}, got)).To(Succeed())
+			Expect(got.Spec.Ports[0].NodePort).NotTo(BeZero(), "the API allocates a node port")
+			expectSteadyState(isvc)
+		})
+
 		It("creates the Service when absent", func() {
 			isvc := newISVC("relay-create")
 			cleanupRelay(isvc.Name)
@@ -734,6 +822,34 @@ var _ = Describe("metal relay mode", func() {
 			got := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
 			Expect(got.Status.Phase).NotTo(Equal(PhaseReady))
+		})
+
+		It("requeues quietly when a relay Deployment Update conflicts", func() {
+			name := "relay-full-conflict"
+			slice := serveThroughRelay(name)
+
+			By("a pin change makes the next pass Update the relay Deployment")
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(slice), slice)).To(Succeed())
+			slice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI] = pinB
+			Expect(k8sClient.Update(ctx, slice)).To(Succeed())
+
+			conflicting := &deploymentUpdateConflictClient{Client: k8sClient}
+			reconciler.Client = conflicting
+			result, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred(), "a lost optimistic-lock race is not a reconcile error")
+			Expect(conflicting.attempts).To(Equal(1), "the Update must have been attempted and conflicted")
+			Expect(result.RequeueAfter).To(Equal(relayConflictRequeueAfter))
+			Expect(drainEvents()).NotTo(ContainElement(HavePrefix("Warning")))
+
+			By("the requeued pass converges once the conflict clears")
+			reconciler.Client = k8sClient
+			reconcileISVC(name)
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: relayDeploymentName(name), Namespace: namespace}, dep)).To(Succeed())
+			Expect(relayEnv(dep, relayPinEnv)).To(Equal(pinB))
+			Expect(drainEvents()).NotTo(ContainElement(HavePrefix("Warning")))
 		})
 
 		It("requeues with the error when the mode decision cannot list slices", func() {

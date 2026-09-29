@@ -473,11 +473,16 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 // Deployment, so a replica counts as ready only while the relay is available
 // too. In legacy mode the agent owns "<isvc>"; any relay this InferenceService
 // ran is torn down and "<isvc>" is left to the agent (hand-back).
-func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (int32, *metalSnapshot, error) {
+//
+// A relay write that loses an optimistic-lock race (the Deployment controller
+// updated the object between our Get and Update) is not a failure: it returns
+// a short requeue result with no error and no RelayReconcileFailed event, and
+// the next reconcile works from the fresh object.
+func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (int32, *metalSnapshot, *ctrl.Result, error) {
 	mode, pin, err := r.decideMetalMode(ctx, isvc)
 	if err != nil {
 		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Deciding the metal serving mode failed: %v", err)
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 
 	if mode == metalModeRelay {
@@ -486,25 +491,29 @@ func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *i
 			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
 		}
 		available, err := r.reconcileRelay(ctx, isvc, pin)
+		if apierrors.IsConflict(err) {
+			logf.FromContext(ctx).V(1).Info("Relay object changed under the reconcile; requeueing", "reason", err.Error())
+			return 0, nil, &ctrl.Result{RequeueAfter: relayConflictRequeueAfter}, nil
+		}
 		if err != nil {
 			r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Reconciling the metal relay failed: %v", err)
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		if !available {
-			return 0, snap, nil
+			return 0, snap, nil, nil
 		}
-		return snap.ReadyReplicas, snap, nil
+		return snap.ReadyReplicas, snap, nil, nil
 	}
 
 	if err := r.teardownRelay(ctx, isvc); err != nil {
 		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Removing the metal relay failed: %v", err)
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 	if snap.Kind == metalHBStale {
 		r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
 	}
-	return snap.ReadyReplicas, snap, nil
+	return snap.ReadyReplicas, snap, nil, nil
 }
 
 // replicaCounts carries the two replica observations a reconcile feeds the
@@ -525,9 +534,9 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	log := logf.FromContext(ctx)
 
 	if isMetal {
-		ready, snap, err := r.reconcileMetal(ctx, isvc)
-		if err != nil {
-			return nil, replicaCounts{}, nil, nil, err
+		ready, snap, result, err := r.reconcileMetal(ctx, isvc)
+		if err != nil || result != nil {
+			return nil, replicaCounts{}, nil, result, err
 		}
 		log.Info("Metal accelerator detected, skipping inference Deployment creation",
 			"readyEndpoints", ready, "desiredReplicas", desiredReplicas)
