@@ -119,6 +119,54 @@ Look for `RelayCreated`, `ServiceAdopted`, and `RelayRemoved` (Normal), and
 for `RelayReconcileFailed` or `InvalidAgentIngressPin` (Warning) if
 something went wrong.
 
+### Metal agent 0.10.1: security hardening
+
+0.10.1 tightens the metal-agent's SSRF guard on model downloads, adds
+`spec.sha256` verification, moves the model store and its ownership checks,
+and locks down the client proxy and vllm-swift's `extraArgs`. Before
+upgrading the metal-agents on any Mac:
+
+- **Allowlist any LAN model mirror.** Every download (`http`, `https`, `hf`,
+  `s3`, and the memory-check HEAD probe) now refuses a host that resolves to
+  a private, loopback or link-local address unless it is listed in
+  `--allowed-download-hosts`. If a Model source or oMLX `pagedSSDCacheDir`
+  points at an internal MinIO or registry, add its host or CIDR to that flag
+  before upgrading, for example `--allowed-download-hosts=minio.lan,10.20.0.0/16`.
+- **Check the model store's ownership.** The agent now refuses to start
+  against a store it does not own, that other users can write, or that sits
+  under a directory other users can write:
+
+  ```bash
+  ls -ld "$HOME/Library/Application Support/llmkube/models"
+  ```
+
+  Fix a bad owner or mode before restarting the agent; the refusal names the
+  path, owner and fix.
+- **Expect a one-time re-download on the old default.** Agents that were
+  still using the pre-0.10.1 `/tmp` default store move to
+  `~/Library/Application Support/llmkube/models`, a directory they have
+  never populated, so every model re-downloads once on first start.
+- **Note the new log path**: `~/Library/Logs/llmkube/metal-agent.log`,
+  not the old flat `~/Library/Logs/llmkube-metal-agent.log`.
+- **Audit vllm-swift `extraArgs` on every affected InferenceService.**
+  `--trust-request-chat-template`, `--enable-prompt-embeds` and
+  `--enable-mm-embeds` are now refused, as is pointing `--tokenizer`,
+  `--hf-config-path`, `--generation-config` or a `--lora-modules` path at a
+  Hugging Face repo id instead of a path already on disk:
+
+  ```bash
+  kubectl get inferenceservice -A -o json | jq -r '
+    .items[] | select(.spec.extraArgs != null) |
+    select(.spec.extraArgs | any(test(
+      "trust-request-chat-template|enable-prompt-embeds|enable-mm-embeds"
+    ))) | "\(.metadata.namespace)/\(.metadata.name)"'
+  ```
+
+  An InferenceService that trips one of these starts failing
+  `ExtraArgsRejected` after the upgrade; fix its `extraArgs` or set
+  `--allow-unsafe-extra-args` on that agent. See the "extraArgs typed
+  allowlist" section in `deployment/macos/README.md` for the full policy.
+
 ## Verify the upgrade
 
 1. **Controller pod replaced and Ready.**

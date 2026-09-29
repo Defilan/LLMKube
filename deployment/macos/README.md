@@ -181,6 +181,40 @@ kubectl get isvc <name> -o jsonpath='{.status.schedulingMessage}'
 
 Upgrade note: if you already point local model sources, or a `pagedSSDCacheDir`, outside the model store, add their root to `--allowed-model-roots` before upgrading, or the agent will start refusing them. This mirrors the controller's own `--allowed-host-path-roots` (Helm `modelSource.allowedHostPathRoots`), which is enforced separately, at the controller. A Model the controller already marked `Failed` (for example with reason `SourceNotAllowed`) is now also refused by the agent, instead of being served anyway.
 
+### `--allowed-download-hosts` flag (remote model sources)
+
+Every download the agent makes for a Model source (`http`, `https`, `hf`, `s3`, the HEAD probes used for memory sizing, and any redirect along the way) is refused if the host resolves to a loopback, link-local (including the cloud metadata address `169.254.169.254`), RFC 1918, CGNAT, unique-local or unspecified address. The guard checks the resolved IP, not the hostname, so it also catches a public name that redirects or DNS-rebinds to one of those ranges.
+
+To allow a specific internal source anyway, for example a LAN MinIO, pass a comma-separated list of hostnames or CIDRs:
+
+```bash
+llmkube-metal-agent --allowed-download-hosts=minio.lan,10.20.0.0/16
+```
+
+To set this in the launchd plist:
+
+```xml
+    <string>--allowed-download-hosts</string>
+    <string>minio.lan,10.20.0.0/16</string>
+```
+
+A refused download names the flag in its error and Event message. The controller enforces the same rule on its own downloads via `modelSource.allowedRemoteHosts` (Helm), from the same shared guard package; the two allowlists are configured separately and are not merged.
+
+A few behavior notes:
+
+- HTTP proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and their lowercase forms) are honored. The target host is still checked against the allowlist even when the request goes through a proxy; the proxy's own address is trusted as configured.
+- Redirects are capped at 5 hops, and each hop's target is checked again before it is dialed.
+- The dial timeout is 10 seconds; there is no overall download timeout, so a slow but healthy transfer of a large model is not cut short.
+- A DNS64 address is judged by its embedded IPv4 address, so a public IPv4-only host stays reachable on a DNS64 network while the loopback and private ranges stay blocked.
+
+### `spec.sha256` digest verification
+
+When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source against it before the file is used. A mismatch deletes the file and refuses to start the InferenceService with reason `ModelDigestMismatch` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). A verified file gets a `<file>.sha256` stamp beside it, so a later restart does not re-hash a potentially huge model unless the stamp is missing or stale.
+
+A local-path source is loaded in place and is never hashed; `spec.sha256` only applies to a source the agent downloads.
+
+To retry after fixing the digest or the source, recreate the `Model` or the `InferenceService`: the agent remembers a mismatch so it does not re-download the same bad source on every reconcile, and that memo is cleared by editing the Model's `source` or `sha256`, or by deleting and recreating either object.
+
 ### `--host-ip` flag (remote cluster)
 
 When your Kubernetes cluster runs on a different machine (Linux server, cloud, etc.), the Metal Agent needs to register the Mac's reachable IP address so that the in-cluster relay can reach the agent's ingress (see "Network exposure" under "Security model"):
@@ -227,6 +261,8 @@ model" for the full flow.
 | `--client-port` | `9999` | Listener on `127.0.0.1:<port>` that forwards `/v1/*` to the current engine, for clients on the Mac itself. `0` disables it. |
 
 `--ingress-port` must differ from `--port` and `--client-port`.
+
+The client-proxy listener only answers a request whose `Host` header names this loopback proxy (`127.0.0.1`, `localhost` or `[::1]` on `--client-port`); anything else gets 421, which blocks DNS rebinding. It also applies the same runtime path allowlist as the ingress. See "Network exposure" under "Security model" below for the full behavior.
 
 ### `--memory-fraction` flag (memory budget)
 
@@ -354,6 +390,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_apple_power_cpu_watts` | Gauge | CPU subsystem power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_ane_watts` | Gauge | Apple Neural Engine power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_ingress_requests_total` | Counter | Requests answered by the authenticated ingress. Labels: `code` (HTTP status) |
+| `llmkube_metal_agent_client_proxy_requests_total` | Counter | Requests answered by the host-side client proxy. Labels: `outcome` (`bad_host`, `no_backend`, `path_forbidden`, or the response's status class) |
 
 Standard Go runtime and process metrics (`go_*`, `process_*`) are also available.
 
@@ -427,6 +464,13 @@ kubectl describe inferenceservice <name>
   "`--allowed-model-roots` flag (local model paths)" above.
 - **extraArgs** (`ExtraArgsRejected`): every flag in `spec.extraArgs` is
   checked against a typed, per-engine allowlist. See below.
+- **Remote sources** (download refused by the SSRF guard): a Model source
+  that resolves to a private, loopback or link-local address is refused
+  unless it is in `--allowed-download-hosts`. See "`--allowed-download-hosts`
+  flag (remote model sources)" above.
+- **Digest mismatch** (`ModelDigestMismatch`): when `spec.sha256` is set, a
+  downloaded source that does not match it is deleted and refused. See
+  "`spec.sha256` digest verification" above.
 
 ### The extraArgs typed allowlist
 
@@ -517,6 +561,21 @@ Turn this on only for a Mac whose InferenceService authors are fully trusted.
   a path inside the allowed roots.
 - llama-server's `--no-mmap` is not a flag in the pinned 0.5.0 build and is
   refused as unknown.
+- vllm-swift's `--trust-request-chat-template`, `--enable-prompt-embeds` and
+  `--enable-mm-embeds` are refused: the first lets any API client, not only
+  the InferenceService writer, supply a chat template for the server to
+  render, and the other two let any API client submit a serialized tensor
+  the server deserializes with `torch.load` (the class of bug fixed as
+  CVE-2025-62164). All three are relaxable with `--allow-unsafe-extra-args`.
+- vllm-swift's `--tokenizer`, `--hf-config-path` and `--generation-config`,
+  and the path half of a `--lora-modules name=path` entry, must resolve to a
+  path that already exists inside the allowed roots; a Hugging Face
+  `owner/name` repo id is not accepted there. Without this, a repo id would
+  pass as a not-yet-existing path and vLLM would download it into the
+  Hugging Face cache, outside every allowed root.
+- A `--no-X=value` spelling (for example `--no-enable-prompt-embeds=false`)
+  is refused exactly like `X` itself, on any runtime. Only a bare `--no-X`,
+  with no value, is treated as the negation that turns `X` off.
 
 ### Network exposure
 
@@ -583,6 +642,9 @@ The ingress answers:
 The pin is rooted in Kubernetes write access: anyone who can write Services
 or EndpointSlices in the namespace could already redirect the
 InferenceService's traffic, so publishing the pin there adds no new trust.
+Write access to a legacy core/v1 `Endpoints` object of the same name is
+equivalent, since Kubernetes mirrors it into an EndpointSlice: treat both as
+sensitive.
 
 #### Path allowlist
 
@@ -614,6 +676,27 @@ Additions per runtime:
 Everything else answers 403, including admin endpoints such as llama-server's
 `/slots` and `POST /props`, vLLM's `/sleep` and LoRA loading, and Ollama's
 pull, push, delete, create, copy and blob endpoints.
+
+#### Client proxy
+
+The client proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy
+flags" above) is for callers on the Mac itself, not the cluster, but it
+applies the same rules:
+
+- It answers 421 unless the request's `Host` header is `127.0.0.1`,
+  `localhost` or `[::1]` on the proxy's own port. This blocks DNS rebinding:
+  a page served from a public domain that resolves to `127.0.0.1` presents
+  that domain as `Host`, not `localhost`, so it is rejected before it can
+  reach a child process or even learn whether one is running.
+- It applies the same runtime path allowlist the TLS ingress does (see
+  "Path allowlist" above), so an admin path such as `/slots` still answers
+  403.
+- It rewrites the outbound `Host` header to the current engine's address and
+  refuses protocol upgrades, the same as the ingress.
+
+The client proxy has no token or certificate check of its own: any process
+on the Mac that can reach `127.0.0.1:<client-port>` is trusted, but only for
+the paths on the allowlist above.
 
 #### NetworkPolicy and metrics
 
@@ -653,8 +736,8 @@ On a Metal InferenceService (`kubectl describe inferenceservice <name>`):
 - From the controller: `RelayCreated`, `ServiceAdopted`, `RelayRemoved`
   (Normal); `RelayReconcileFailed`, `InvalidAgentIngressPin` (Warning).
 - From the agent: `RelayNotAdopted`, `ExtraArgsRejected`,
-  `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`
-  (Warning).
+  `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`,
+  `ModelDigestMismatch` (Warning).
 
 `ServiceNameTooLong` means the InferenceService name is too long for the
 `<isvc>-agent` Service (at most 57 characters, since the name plus `-agent`
@@ -680,6 +763,34 @@ controller predates relay support.
   design. Call the Service instead, or, on the Mac itself, the agent's client
   proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy flags"
   above).
+
+#### Upgrading to 0.10.1
+
+0.10.1 hardens downloads, the model store, the client proxy and vllm-swift's
+`extraArgs`. Before upgrading:
+
+- If any Model source or oMLX `pagedSSDCacheDir` is fetched from a LAN
+  mirror (an internal MinIO, registry, or similar), add its host or CIDR to
+  `--allowed-download-hosts`, or the agent will refuse to fetch it. See
+  "`--allowed-download-hosts` flag (remote model sources)" above.
+- Confirm the model store is owned by the agent's user and not group- or
+  other-writable (`ls -ld` the path, or the resolved target of a symlinked
+  store); the agent now refuses to start otherwise. See "Model store" above.
+- If the agent was using the old `/tmp` default store, expect a one-time
+  re-download of every model on first start after the upgrade: the new
+  default, `~/Library/Application Support/llmkube/models`, is a directory
+  the agent has never populated. The old `/tmp` cache was cleared on every
+  reboot anyway, so this is not a net-new download burden on a Mac that
+  restarts occasionally.
+- Logs moved with the store: `~/Library/Logs/llmkube/metal-agent.log`, not
+  the old `~/Library/Logs/llmkube-metal-agent.log`.
+- If any InferenceService's `extraArgs` sets vllm-swift's
+  `--trust-request-chat-template`, `--enable-prompt-embeds` or
+  `--enable-mm-embeds`, or points `--tokenizer`, `--hf-config-path`,
+  `--generation-config` or a `--lora-modules` path at a Hugging Face repo id
+  instead of a path already on disk, it will start failing
+  `ExtraArgsRejected` after the upgrade. Fix the InferenceService or set
+  `--allow-unsafe-extra-args` on that agent. See "Practical notes" above.
 
 #### `--legacy-direct-endpoints` (deprecated)
 
@@ -733,6 +844,21 @@ To resolve:
 - **Reduce context size** in the InferenceService spec to lower KV cache requirements
 - **Increase the memory fraction** with `--memory-fraction 0.9` if this is a dedicated inference machine
 - **Close other applications** to free unified memory
+
+### Model download blocked by the SSRF guard
+
+The Model's source resolves to a private, loopback or link-local address, which the agent refuses to fetch from by default:
+
+```bash
+kubectl describe inferenceservice <name>
+# Warning  ...  connection to <host> (<ip>) blocked by SSRF guard (GHSA-jw3m-8q7m-f35r); allowlist via --allowed-download-hosts
+```
+
+If the source is a LAN mirror you trust (an internal MinIO or registry), add its host or CIDR to `--allowed-download-hosts` and restart the agent. See "`--allowed-download-hosts` flag (remote model sources)" above.
+
+### `ModelDigestMismatch`
+
+The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad file was already deleted; fix `spec.sha256` or `spec.source` and recreate the Model (or the InferenceService) to retry. See "`spec.sha256` digest verification" above.
 
 ### Can't connect to Kubernetes
 
