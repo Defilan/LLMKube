@@ -264,8 +264,9 @@ func formatMemory(bytes uint64) string {
 // returns its Content-Length. It is the last-resort size source for the
 // pre-flight memory check: used when the model is not on disk yet and the
 // Model CR carries no usable status size, so admission can still be decided
-// before the download begins instead of failing open.
-func remoteModelSize(ctx context.Context, source string) (uint64, error) {
+// before the download begins instead of failing open. httpClient must be the
+// SSRF-guarded client (safehttp.NewClient): the source is user-supplied.
+func remoteModelSize(ctx context.Context, httpClient *http.Client, source string) (uint64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -273,7 +274,7 @@ func remoteModelSize(ctx context.Context, source string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, err
 	}

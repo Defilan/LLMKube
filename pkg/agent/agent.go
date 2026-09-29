@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/safehttp"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
@@ -212,6 +213,13 @@ type MetalAgentConfig struct {
 	// followed). Empty means the model store only.
 	AllowedModelRoots []string
 
+	// AllowedDownloadHosts lists hostnames and CIDRs the agent may download
+	// models from even though they resolve to a private, loopback or
+	// link-local address, for example a LAN MinIO (--allowed-download-hosts).
+	// Every other such address is refused by the SSRF guard. Nil allowlists
+	// nothing.
+	AllowedDownloadHosts []string
+
 	// AllowUnsafeExtraArgs relaxes the extraArgs policy on a Mac whose
 	// InferenceService authors are fully trusted: unknown flags, stray
 	// tokens, refused non-listener flags, path checks and vllm-swift
@@ -252,6 +260,11 @@ type MetalAgent struct {
 	// MemoryCheckModeWarn; an incomplete admission check then logs and
 	// proceeds instead of failing closed.
 	memoryCheckWarnOnly bool
+
+	// downloadAllow is config.AllowedDownloadHosts parsed once. The pre-flight
+	// size probe HEADs the Model source, so it dials through the same SSRF
+	// guard and allowlist as the executor's downloads.
+	downloadAllow safehttp.Allowlist
 
 	// pressureBlocked records namespacedName keys of processes the agent
 	// evicted under memory pressure. Subsequent ensureProcess calls for these
@@ -441,6 +454,7 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		home:                home,
 		memoryFraction:      fraction,
 		memoryCheckWarnOnly: warnOnly,
+		downloadAllow:       safehttp.ParseAllowlist(config.AllowedDownloadHosts),
 		pressureBlocked:     make(map[string]bool),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
@@ -464,6 +478,7 @@ func (a *MetalAgent) buildExecutors() {
 		a.config.ModelStorePath,
 		a.logger.With("subsystem", "executor"),
 		WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
+		WithAllowedDownloadHosts(a.config.AllowedDownloadHosts),
 	)
 	if a.config.LlamaServerStartupTimeout > 0 {
 		metalExec.SetStartupTimeout(a.config.LlamaServerStartupTimeout)
@@ -1999,7 +2014,9 @@ func (a *MetalAgent) estimateModelMemory(
 	// Last resort: HEAD the source for its Content-Length.
 	if fileSizeBytes == 0 &&
 		(strings.HasPrefix(model.Spec.Source, "http://") || strings.HasPrefix(model.Spec.Source, "https://")) {
-		size, err := remoteModelSize(ctx, model.Spec.Source)
+		probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
+		size, err := remoteModelSize(ctx, probeClient, model.Spec.Source)
+		probeClient.CloseIdleConnections()
 		if err != nil {
 			reasons = append(reasons, fmt.Sprintf("remote size probe failed: %v", err))
 		} else {

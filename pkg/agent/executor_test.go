@@ -133,7 +133,7 @@ func TestEnsureModel_AlreadyExists(t *testing.T) {
 		t.Fatalf("Failed to create model file: %v", err)
 	}
 
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	// source URL basename must match the file we created
 	path, err := executor.ensureModel(
@@ -152,7 +152,7 @@ func TestEnsureModel_AlreadyExists(t *testing.T) {
 
 func TestEnsureModel_DownloadFails(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	// Use an invalid URL that will fail to download
 	_, err := executor.ensureModel(
@@ -491,7 +491,7 @@ func TestStopProcess_InvalidPID(t *testing.T) {
 
 func TestDownloadFile_FailedDownloadLeavesNoFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	// Server that returns 401 (e.g. gated Hugging Face repo)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -524,7 +524,7 @@ func TestDownloadFile_FailedDownloadLeavesNoFile(t *testing.T) {
 
 func TestEnsureModel_ZeroByteFileTriggersRedownload(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "stub-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -564,7 +564,7 @@ func TestEnsureModel_ZeroByteFileTriggersRedownload(t *testing.T) {
 
 func TestDownloadFile_TruncatedDownloadFails(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "trunc-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -593,7 +593,7 @@ func TestDownloadFile_TruncatedDownloadFails(t *testing.T) {
 
 func TestDownloadFile_SuccessRenamesTempFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "ok-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -639,7 +639,7 @@ func TestDownloadFile_SuccessRenamesTempFile(t *testing.T) {
 
 func TestDownloadFile_NoContentLength(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "no-cl-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -671,7 +671,7 @@ func TestDownloadFile_NoContentLength(t *testing.T) {
 
 func TestDownloadFile_ContextCancellation(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "cancel-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {

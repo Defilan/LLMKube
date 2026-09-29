@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/safehttp"
 )
 
 func newAdmissionTestModel(source, statusSize string) *inferencev1alpha1.Model {
@@ -87,7 +89,7 @@ func TestRemoteModelSize_UsesContentLength(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	size, err := remoteModelSize(context.Background(), ts.URL+"/model.gguf")
+	size, err := remoteModelSize(context.Background(), testProbeClient(), ts.URL+"/model.gguf")
 	if err != nil {
 		t.Fatalf("remoteModelSize returned error: %v", err)
 	}
@@ -102,7 +104,7 @@ func TestRemoteModelSize_NonOKStatus(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	if _, err := remoteModelSize(context.Background(), ts.URL+"/gated.gguf"); err == nil {
+	if _, err := remoteModelSize(context.Background(), testProbeClient(), ts.URL+"/gated.gguf"); err == nil {
 		t.Fatal("expected error for 401 response, got nil")
 	}
 }
@@ -114,7 +116,7 @@ func TestRemoteModelSize_MissingContentLength(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	if _, err := remoteModelSize(context.Background(), ts.URL+"/model.gguf"); err == nil {
+	if _, err := remoteModelSize(context.Background(), testProbeClient(), ts.URL+"/model.gguf"); err == nil {
 		t.Fatal("expected error for missing Content-Length, got nil")
 	}
 }
@@ -131,7 +133,7 @@ func TestEstimateModelMemory_RemoteHEADFallback(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{})
+	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{AllowedDownloadHosts: []string{"127.0.0.1"}})
 	model := newAdmissionTestModel(ts.URL+"/model.gguf", "0")
 
 	estimate, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
@@ -140,6 +142,28 @@ func TestEstimateModelMemory_RemoteHEADFallback(t *testing.T) {
 	}
 	if estimate.WeightsBytes != wantSize {
 		t.Errorf("WeightsBytes = %d, want %d", estimate.WeightsBytes, wantSize)
+	}
+}
+
+// The HEAD size probe is a Model-source fetch like the download itself, so it
+// dials through the same SSRF guard: a loopback source is never contacted
+// unless --allowed-download-hosts names it, and the failure says so.
+func TestEstimateModelMemory_RemoteHEADRefusesBlockedSource(t *testing.T) {
+	var hits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", "20000000000")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	agent := newAdmissionTestAgent(t, nil, MetalAgentConfig{})
+	model := newAdmissionTestModel(ts.URL+"/model.gguf", "0")
+
+	_, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	assertGuardRefusal(t, err, "127.0.0.1")
+	if n := hits.Load(); n != 0 {
+		t.Errorf("blocked source received %d HEAD requests, want 0", n)
 	}
 }
 
@@ -280,4 +304,10 @@ func TestCheckMemoryAdmission_ClearsStaleSchedulingStatus(t *testing.T) {
 	if updated.Status.SchedulingMessage != "" {
 		t.Errorf("SchedulingMessage = %q, want empty (stale message should be cleared)", updated.Status.SchedulingMessage)
 	}
+}
+
+// testProbeClient is a guarded client that allowlists httptest's loopback
+// address, for remoteModelSize tests about response handling.
+func testProbeClient() *http.Client {
+	return safehttp.NewClient(safehttp.ParseAllowlist([]string{"127.0.0.1"}), 0, downloadHostsFlag)
 }

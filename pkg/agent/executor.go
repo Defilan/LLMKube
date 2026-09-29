@@ -37,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/safehttp"
 	"github.com/defilantech/llmkube/pkg/hfsource"
 )
 
@@ -211,6 +212,16 @@ type MetalExecutor struct {
 	k8sClient client.Client
 	caCerts   [][]byte
 
+	// downloadAllow is the parsed --allowed-download-hosts list: hosts and
+	// CIDRs the SSRF guard lets through even though they resolve to a
+	// private, loopback or link-local address. Parsed once, by
+	// WithAllowedDownloadHosts; the zero value allowlists nothing.
+	downloadAllow safehttp.Allowlist
+	// lookupNetIP resolves hostnames for the download clients. Nil (the
+	// production value) keeps the system resolver; tests pin a hostname to a
+	// local server through it.
+	lookupNetIP safehttp.LookupFunc
+
 	// helpProbe returns llama-server's --help output; a seam so tests can fake
 	// the binary. loadMode caches the result of probing it (see
 	// supportsLoadMode).
@@ -235,6 +246,15 @@ func WithKubeClient(namespace string, c client.Client, caCerts [][]byte) Option 
 		e.namespace = namespace
 		e.k8sClient = c
 		e.caCerts = caCerts
+	}
+}
+
+// WithAllowedDownloadHosts sets the hostnames and CIDRs that model downloads
+// may reach even though they resolve to a private, loopback or link-local
+// address (the --allowed-download-hosts flag), for example a LAN MinIO.
+func WithAllowedDownloadHosts(entries []string) Option {
+	return func(e *MetalExecutor) {
+		e.downloadAllow = safehttp.ParseAllowlist(entries)
 	}
 }
 
@@ -485,6 +505,9 @@ func (e *MetalExecutor) downloadS3(ctx context.Context, source, filePath string,
 	if err != nil {
 		return err
 	}
+	// Each s3 download builds its own transport; release its idle
+	// connections when the transfer ends rather than holding them forever.
+	defer httpClient.CloseIdleConnections()
 
 	e.logger.Infow("downloading model from S3", "bucket", bucket, "destination", filePath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL, nil)
@@ -544,9 +567,10 @@ var hfNormalize = hfsource.NormalizeHFSource
 func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token string) error {
 	url = hfNormalize(url)
 
-	httpClient := http.DefaultClient
+	httpClient := e.downloadClient()
+	defer httpClient.CloseIdleConnections()
 	if token != "" {
-		httpClient = hfRedirectStripper()
+		httpClient = hfRedirectStripper(httpClient)
 	}
 
 	validator, size, err := probeValidator(ctx, httpClient, url, token)
@@ -769,15 +793,33 @@ func sweepStalePartials(filePath, keep string) {
 	}
 }
 
-// hfRedirectStripper returns a client that removes the Authorization header
-// whenever a redirect changes the host, comparing host and port rather than
-// registrable domain. Everything else matches http.DefaultClient, including
-// the ten-redirect ceiling that CheckRedirect is expected to enforce.
-func hfRedirectStripper() *http.Client {
-	c := *http.DefaultClient
+// downloadHostsFlag is the operator-facing setting the SSRF guard's refusal
+// message names, so a blocked LAN mirror points straight at the fix.
+const downloadHostsFlag = "--allowed-download-hosts"
+
+// downloadClient returns the SSRF-guarded client every model download dials
+// through (GHSA-jw3m-8q7m-f35r): loopback, link-local, private and CGNAT
+// addresses are refused unless allowlisted by --allowed-download-hosts. The
+// guard runs at dial time on the resolved addresses, so a redirect from an
+// allowlisted host to a blocked address is refused too. No overall timeout,
+// matching the http.DefaultClient it replaces: a multi-GB model transfer is
+// bounded by the caller's context, not a wall clock.
+func (e *MetalExecutor) downloadClient() *http.Client {
+	return safehttp.NewClient(e.downloadAllow, 0, downloadHostsFlag, safehttp.WithResolver(e.lookupNetIP))
+}
+
+// hfRedirectStripper returns a copy of base that removes the Authorization
+// header whenever a redirect changes the host, comparing host and port rather
+// than registrable domain. base's own redirect policy (the SSRF-guarded
+// client's hop cap) runs first, and base's transport is shared, so every hop
+// still dials through the guard.
+func hfRedirectStripper(base *http.Client) *http.Client {
+	c := *base
 	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if len(via) >= 10 {
-			return errors.New("stopped after 10 redirects")
+		if base.CheckRedirect != nil {
+			if err := base.CheckRedirect(req, via); err != nil {
+				return err
+			}
 		}
 		if len(via) > 0 && req.URL.Host != via[0].URL.Host {
 			req.Header.Del("Authorization")

@@ -87,7 +87,7 @@ func TestEnsureModel_S3UsesSigV4(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "s3-model")
 	path, err := executor.ensureModel(
@@ -154,7 +154,7 @@ func TestEnsureModel_S3MissingSecretRefFails(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(
 		t.Context(),
@@ -192,7 +192,7 @@ func TestEnsureModel_S3IncompleteSecretFails(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(
 		t.Context(),

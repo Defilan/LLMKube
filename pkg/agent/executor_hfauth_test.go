@@ -20,7 +20,9 @@ import (
 func hfTestExecutor(t *testing.T, store string) *MetalExecutor {
 	t.Helper()
 	lg, _ := zap.NewDevelopment()
-	return &MetalExecutor{modelStorePath: store, logger: lg.Sugar()}
+	e := &MetalExecutor{modelStorePath: store, logger: lg.Sugar()}
+	allowTestServers()(e)
+	return e
 }
 
 // A gated repository 401s without a bearer token. This asserts the token
@@ -242,7 +244,7 @@ func TestEnsureModel_HFSchemeSendsToken(t *testing.T) {
 			gotPath, gotAuth = "", ""
 			k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 			executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-				WithKubeClient("default", k8sClient, nil))
+				WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 			dst, err := executor.ensureModel(t.Context(), "hf://org/repo", "hf-model", tc.secretRef)
 			if err != nil {
@@ -298,7 +300,7 @@ func TestEnsureModel_MirrorHostSendsToken(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), source, "mirror-model", &corev1.LocalObjectReference{Name: "hf-token"})
 	if err != nil {
@@ -341,7 +343,7 @@ func TestEnsureModel_OtherHostSendsNoToken(t *testing.T) {
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 	executor := NewMetalExecutor("/bin/llama-server", t.TempDir(), newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	dst, err := executor.ensureModel(t.Context(), srv.URL+"/m.gguf", "other-model",
 		&corev1.LocalObjectReference{Name: "hf-token"})

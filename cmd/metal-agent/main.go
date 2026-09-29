@@ -84,6 +84,7 @@ type AgentConfig struct {
 	ApplePowerInterval        time.Duration
 	PowermetricsBin           string
 	AllowedModelRoots         string
+	AllowedDownloadHosts      string
 	AllowUnsafeExtraArgs      bool
 	IngressPort               int
 	StateDir                  string
@@ -429,6 +430,9 @@ func main() {
 		"Comma-separated absolute directories that local model sources, the oMLX pagedSSDCacheDir "+
 			"and path-valued extraArgs must resolve into (symlinks followed), in addition to the model "+
 			"store. Default: the model store only.")
+	flag.StringVar(&cfg.AllowedDownloadHosts, "allowed-download-hosts", "",
+		"Comma-separated hostnames or CIDRs the agent may download models from even though they "+
+			"resolve to a private, loopback or link-local address, e.g. a LAN MinIO. Default: none.")
 	flag.BoolVar(&cfg.AllowUnsafeExtraArgs, "allow-unsafe-extra-args", false,
 		"Relax the extraArgs policy (unknown flags, stray tokens, refused non-listener flags, path checks, "+
 			"vllm-swift code-loading) for Macs whose InferenceService authors are fully trusted; flags that "+
@@ -626,6 +630,7 @@ func main() {
 		PowermetricsBin:           cfg.PowermetricsBin,
 		EvictionEnabled:           cfg.EvictionEnabled,
 		AllowedModelRoots:         allowedModelRoots,
+		AllowedDownloadHosts:      splitCSV(cfg.AllowedDownloadHosts),
 		AllowUnsafeExtraArgs:      cfg.AllowUnsafeExtraArgs,
 		IngressPort:               cfg.IngressPort,
 		StateDir:                  cfg.StateDir,

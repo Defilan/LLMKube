@@ -17,6 +17,8 @@ limitations under the License.
 package safehttp
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -275,4 +277,54 @@ func TestNewClientRefusalIncludesHint(t *testing.T) {
 	if !strings.Contains(err.Error(), hint) {
 		t.Errorf("expected the refusal error to mention hint %q, got: %v", hint, err)
 	}
+}
+
+// TestWithResolver proves the resolver seam replaces DNS for hostname dials
+// and that the guard still judges the addresses it returns: a hostname that
+// resolves to loopback is refused unless the hostname is allowlisted, and a
+// nil resolver keeps the default.
+func TestWithResolver(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	loopback := func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		if host != "mirror.test" {
+			return nil, errors.New("unexpected lookup of " + host)
+		}
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	url := strings.Replace(srv.URL, "127.0.0.1", "mirror.test", 1)
+
+	t.Run("resolved loopback refused when not allowlisted", func(t *testing.T) {
+		client := NewClient(ParseAllowlist(nil), 5*time.Second, testHint, WithResolver(loopback))
+		resp, err := client.Get(url)
+		if err == nil {
+			_ = resp.Body.Close()
+			t.Fatal("expected the SSRF guard to block mirror.test resolved to loopback")
+		}
+		if !strings.Contains(err.Error(), "mirror.test") {
+			t.Errorf("refusal should name the host, got: %v", err)
+		}
+	})
+
+	t.Run("allowlisted hostname dials the resolved address", func(t *testing.T) {
+		client := NewClient(ParseAllowlist([]string{"mirror.test"}), 5*time.Second, testHint,
+			WithResolver(loopback))
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("expected allowlisted mirror.test to succeed, got: %v", err)
+		}
+		_ = resp.Body.Close()
+	})
+
+	t.Run("nil resolver keeps the default", func(t *testing.T) {
+		client := NewClient(ParseAllowlist([]string{"localhost"}), 5*time.Second, testHint, WithResolver(nil))
+		resp, err := client.Get(strings.Replace(srv.URL, "127.0.0.1", "localhost", 1))
+		if err != nil {
+			t.Fatalf("expected default resolution of localhost to succeed, got: %v", err)
+		}
+		_ = resp.Body.Close()
+	})
 }

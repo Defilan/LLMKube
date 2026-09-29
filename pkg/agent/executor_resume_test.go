@@ -125,7 +125,7 @@ func parseBytesStart(rng string) int {
 }
 
 func executorFor(dir string) *MetalExecutor {
-	return NewMetalExecutor("/bin/llama-server", dir, newNopLogger())
+	return NewMetalExecutor("/bin/llama-server", dir, newNopLogger(), allowTestServers())
 }
 
 // modelDirPath builds the same per-model directory layout ensureModel uses so the

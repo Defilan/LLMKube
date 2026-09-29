@@ -127,6 +127,30 @@ func IPBlocked(ip netip.Addr) bool {
 	return false
 }
 
+// LookupFunc resolves host to its IP addresses, with the signature of
+// (*net.Resolver).LookupNetIP.
+type LookupFunc func(ctx context.Context, network, host string) ([]netip.Addr, error)
+
+// Option configures NewClient.
+type Option func(*clientOptions)
+
+type clientOptions struct {
+	lookup LookupFunc
+}
+
+// WithResolver replaces the DNS lookup the guarded dialer uses for hostname
+// targets. The guard still judges every address the lookup returns, so this
+// changes only where names resolve, never what is permitted. A nil lookup
+// keeps net.DefaultResolver, which is what production callers pass; tests
+// pass a fake so a hostname can be pinned to a local server without real DNS.
+func WithResolver(lookup LookupFunc) Option {
+	return func(o *clientOptions) {
+		if lookup != nil {
+			o.lookup = lookup
+		}
+	}
+}
+
 // NewClient returns an *http.Client whose dialer refuses to connect to
 // blocked IP ranges unless the target host/IP is allowlisted. The check runs
 // on the RESOLVED IPs and dials only those pinned IPs, so DNS rebinding
@@ -137,8 +161,13 @@ func IPBlocked(ip netip.Addr) bool {
 //
 // hint is the operator-facing setting named in the refusal message, for
 // example "modelSource.allowedRemoteHosts" for the controller or
-// "--allowed-download-hosts" for the metal-agent.
-func NewClient(allow Allowlist, timeout time.Duration, hint string) *http.Client {
+// "--allowed-download-hosts" for the metal-agent. opts are optional; see
+// WithResolver.
+func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Option) *http.Client {
+	o := clientOptions{lookup: net.DefaultResolver.LookupNetIP}
+	for _, opt := range opts {
+		opt(&o)
+	}
 	base := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -150,7 +179,7 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string) *http.Client
 		if ip, err := netip.ParseAddr(host); err == nil {
 			ips = []netip.Addr{ip}
 		} else {
-			addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+			addrs, err := o.lookup(ctx, "ip", host)
 			if err != nil {
 				return nil, err
 			}
