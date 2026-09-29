@@ -446,6 +446,14 @@ hands the bad file to a runtime pod.
 doesn't mount PVCs at reconcile time. Compute the hash externally
 when seeding the PVC if you need provenance.
 
+As of 0.10.1, a Metal InferenceService gets the same `spec.sha256`
+enforcement from the metal-agent, for sources it downloads itself
+rather than the controller: a mismatch deletes the file and refuses
+to start the InferenceService with reason `ModelDigestMismatch`
+instead of serving an unverified model. See "`spec.sha256` digest
+verification" in
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#specsha256-digest-verification).
+
 ## Next steps
 
 - [`OpenShift install`](./openshift-install) for restricted-v2 SCC

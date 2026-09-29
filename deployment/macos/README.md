@@ -213,7 +213,7 @@ When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source ag
 
 A local-path source is loaded in place and is never hashed; `spec.sha256` only applies to a source the agent downloads.
 
-To retry after fixing the digest or the source, recreate the `Model` or the `InferenceService`: the agent remembers a mismatch so it does not re-download the same bad source on every reconcile, and that memo is cleared by editing the Model's `source` or `sha256`, or by deleting and recreating either object.
+The agent remembers a mismatch so it does not re-download the same bad source on every reconcile. Changing the Model's `source` or `sha256` clears that memo automatically, since it is keyed to the exact source and digest it was recorded against; the next reconcile then retries the download. If the spec is unchanged (for example, the same URL now serves a corrected file), recreate the `Model` or the `InferenceService` instead: deleting either one clears the memo, so the next reconcile downloads and verifies it again.
 
 ### `--host-ip` flag (remote cluster)
 
@@ -773,7 +773,9 @@ controller predates relay support.
   mirror (an internal MinIO, registry, or similar), add its host or CIDR to
   `--allowed-download-hosts`, or the agent will refuse to fetch it. See
   "`--allowed-download-hosts` flag (remote model sources)" above.
-- Confirm the model store is owned by the agent's user and not group- or
+- Confirm the model store, the default
+  `~/Library/Application Support/llmkube/models` or your configured
+  `--model-store` path, is owned by the agent's user and not group- or
   other-writable (`ls -ld` the path, or the resolved target of a symlinked
   store); the agent now refuses to start otherwise. See "Model store" above.
 - If the agent was using the old `/tmp` default store, expect a one-time

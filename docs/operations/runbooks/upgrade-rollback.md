@@ -134,7 +134,8 @@ upgrading the metal-agents on any Mac:
   before upgrading, for example `--allowed-download-hosts=minio.lan,10.20.0.0/16`.
 - **Check the model store's ownership.** The agent now refuses to start
   against a store it does not own, that other users can write, or that sits
-  under a directory other users can write:
+  under a directory other users can write. Check the default path, or your
+  configured `--model-store` path if you set one:
 
   ```bash
   ls -ld "$HOME/Library/Application Support/llmkube/models"
