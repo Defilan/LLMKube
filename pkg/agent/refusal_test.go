@@ -837,41 +837,118 @@ func TestEnsureProcess_PlainStartFailureNotRefused(t *testing.T) {
 	}
 }
 
-// TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason guards the two
-// hand-maintained lists this package used to have (the agent's own
-// EventReason constants, and internal/controller/scheduling.go's
-// agentRefusalReasons) against drifting apart again: ServiceNameTooLong was
-// added to the agent in 0.10.0 with no matching controller-side entry, so
-// determinePhase overwrote that refusal with "WaitingForMetalAgent" on every
-// reconcile. Both sides now build from inferencev1alpha1.MetalAgentRefusalReasons;
-// this test is the forcing function that keeps `used` (and therefore this
-// package's own constants) in sync with that shared list as new refusal
-// reasons are added.
-func TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason(t *testing.T) {
-	// Every SchedulingStatus value written by refuseStart or the two memory
-	// admission paths (checkMemoryAdmission, failMemoryCheck).
-	used := []string{
-		EventReasonInsufficientMemory,
-		EventReasonMemoryCheckFailed,
-		EventReasonEndpointNameConflict,
-		EventReasonModelSourceNotAllowed,
-		EventReasonExtraArgsRejected,
-		EventReasonServiceNameTooLong,
-		EventReasonModelDigestMismatch,
+// TestEnsureProcess_DigestMismatchMemoized_NoRepeatedDownload is the
+// regression test for the download-storm fix: without the pre-flight
+// checkModelDigestMemo check, a persistent digest mismatch is discovered
+// inside StartProcess, which runs AFTER checkMemoryAdmission; admission's
+// success path clears Status.SchedulingStatus (a Status().Update) and the
+// subsequent refusal writes it back (another Status().Update), bumping the
+// resourceVersion each time so the watcher sees UPDATED and reconciles again
+// — each pass re-running StartProcess's ensureModel, i.e. re-downloading the
+// entire model. With the memo, only the FIRST reconcile reaches StartProcess;
+// the next two hit the memo in the pre-flight check and refuse immediately,
+// so the executor is invoked exactly once and SchedulingStatus is never
+// cleared in between (every write recorded via the interceptor is the same
+// refusal reason).
+func TestEnsureProcess_DigestMismatchMemoized_NoRepeatedDownload(t *testing.T) {
+	var written []string
+	funcs := &interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if is, ok := obj.(*inferencev1alpha1.InferenceService); ok && sub == "status" {
+				written = append(written, is.Status.SchedulingStatus)
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
 	}
-	known := make(map[string]bool, len(inferencev1alpha1.MetalAgentRefusalReasons))
-	for _, r := range inferencev1alpha1.MetalAgentRefusalReasons {
-		known[r] = true
-	}
-	for _, reason := range used {
-		if !known[reason] {
-			t.Errorf("refusal reason %q is used by the agent but missing from "+
-				"inferencev1alpha1.MetalAgentRefusalReasons; the controller's determinePhase "+
-				"would overwrite this refusal with WaitingForMetalAgent on every reconcile", reason)
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.SHA256 = "aaaa"
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, funcs, isvc, model)
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelDigestMismatchError{Path: "/models/m/model.gguf", Expected: "aaaa", Computed: "bbbb"})
+
+	for i := range 3 {
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.ensureProcess(context.Background(), cur); err == nil {
+			t.Fatalf("call %d: ensureProcess succeeded, want a digest-mismatch refusal", i+1)
 		}
 	}
-	if len(known) != len(used) {
-		t.Errorf("inferencev1alpha1.MetalAgentRefusalReasons has %d entries but this test only "+
-			"exercises %d; update `used` alongside any new agent refusal reason", len(known), len(used))
+
+	if ex.starts != 1 {
+		t.Errorf("StartProcess invoked %d time(s) over 3 reconciles of an unchanged mismatching spec, want exactly 1 "+
+			"(the pre-flight memo should have refused the other 2 without downloading)", ex.starts)
+	}
+	if len(written) == 0 {
+		t.Fatal("no status writes recorded; the refusal must be reported on the status")
+	}
+	for i, s := range written {
+		if s != EventReasonModelDigestMismatch {
+			t.Errorf("status write %d = %q, want %q (writes: %q); a clear-then-set in between would mean "+
+				"memory admission's success path ran, which is exactly the status churn this memo prevents",
+				i, s, EventReasonModelDigestMismatch, written)
+		}
 	}
 }
+
+// TestEnsureProcess_DigestMismatchMemo_ClearsOnSHA256Change proves the memo
+// self-invalidates on a spec edit rather than permanently wedging a Model:
+// correcting spec.sha256 to match the file's real digest must retry the
+// download, not be blocked by a memo recorded against the old, wrong digest.
+func TestEnsureProcess_DigestMismatchMemo_ClearsOnSHA256Change(t *testing.T) {
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.SHA256 = "aaaa"
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelDigestMismatchError{Path: "/models/m/model.gguf", Expected: "aaaa", Computed: "bbbb"})
+
+	get := func() *inferencev1alpha1.InferenceService {
+		t.Helper()
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		return cur
+	}
+
+	if err := a.ensureProcess(context.Background(), get()); err == nil {
+		t.Fatal("first ensureProcess succeeded, want a digest-mismatch refusal")
+	}
+	if err := a.ensureProcess(context.Background(), get()); err == nil {
+		t.Fatal("second ensureProcess succeeded, want the memoized refusal")
+	}
+	if ex.starts != 1 {
+		t.Fatalf("starts after two reconciles of an unchanged mismatching spec = %d, want 1", ex.starts)
+	}
+
+	// Correct the Model's sha256 to what the (simulated) file actually
+	// hashes to. The memo was keyed on the OLD sha256, so it must not apply.
+	curModel := &inferencev1alpha1.Model{}
+	if err := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: refusalModelName, Namespace: "default"}, curModel); err != nil {
+		t.Fatal(err)
+	}
+	curModel.Spec.SHA256 = "bbbb"
+	if err := a.config.K8sClient.Update(context.Background(), curModel); err != nil {
+		t.Fatal(err)
+	}
+	ex.startErr = nil // the corrected digest verifies successfully this time
+
+	if err := a.ensureProcess(context.Background(), get()); err != nil {
+		t.Fatalf("ensureProcess after correcting sha256: %v", err)
+	}
+	if ex.starts != 2 {
+		t.Errorf("starts after correcting sha256 = %d, want 2 (a spec change must not be blocked by the stale memo)",
+			ex.starts)
+	}
+}
+
+// TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason (a structural
+// AST scan, not a hand-maintained table) lives in
+// refusal_reasons_scan_test.go.

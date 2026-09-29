@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
@@ -66,23 +67,66 @@ func (a *MetalAgent) refuseStart(
 }
 
 // handleStartProcessError turns a StartProcess failure into the error
-// reconcileProcess returns. A *ModelDigestMismatchError is refused through
-// refuseStart (Spec F3: refuse a digest mismatch with an event), the same way
-// an endpoint-name conflict or a bad model path is refused, so it is visible
-// as a status field and a Warning Event instead of only a log line. Every
-// other StartProcess failure (network error, bad status, truncated download,
-// health-check timeout, ...) keeps the historical plain-wrapped-error,
-// log-only behavior. Split out of reconcileProcess, rather than inlined as an
-// extra branch there, to keep its cyclomatic complexity from crossing the
-// linter's threshold.
+// reconcileProcess returns. A *ModelDigestMismatchError is remembered in
+// a.digestMismatches (so checkModelDigestMemo can refuse the next reconcile
+// without downloading again) and refused through refuseStart (Spec F3: refuse
+// a digest mismatch with an event), the same way an endpoint-name conflict or
+// a bad model path is refused, so it is visible as a status field and a
+// Warning Event instead of only a log line. Every other StartProcess failure
+// (network error, bad status, truncated download, health-check timeout, ...)
+// keeps the historical plain-wrapped-error, log-only behavior. Split out of
+// reconcileProcess, rather than inlined as an extra branch there, to keep its
+// cyclomatic complexity from crossing the linter's threshold.
 func (a *MetalAgent) handleStartProcessError(
-	ctx context.Context, isvc *inferencev1alpha1.InferenceService, startErr error,
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, startErr error,
 ) error {
 	var digestErr *ModelDigestMismatchError
 	if errors.As(startErr, &digestErr) {
+		a.digestMismatches.record(
+			types.NamespacedName{Namespace: model.Namespace, Name: model.Name},
+			model.Spec.Source, model.Spec.SHA256, digestErr,
+		)
 		return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
 	}
 	return fmt.Errorf("failed to start process: %w", startErr)
+}
+
+// checkModelPreflight runs the two Model-derived pre-flight refusal checks
+// that must both happen before memory admission (checkModelPaths, then
+// checkModelDigestMemo), returning the first refusal. Combined into one call
+// from reconcileProcess, rather than two sequential `if err != nil { return
+// err }` blocks there, purely to keep that function's cyclomatic complexity
+// under the linter's threshold — see handleStartProcessError's doc comment
+// for the same reasoning applied to the StartProcess error path.
+func (a *MetalAgent) checkModelPreflight(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, pagedSSDCacheDir string,
+) error {
+	if err := a.checkModelPaths(ctx, isvc, model, pagedSSDCacheDir); err != nil {
+		return err
+	}
+	return a.checkModelDigestMemo(ctx, isvc, model)
+}
+
+// checkModelDigestMemo refuses a Model this agent already found to have a
+// mismatching SHA256 for its CURRENT spec.source and spec.sha256, without
+// letting StartProcess download it again: the memo (a.digestMismatches) was
+// populated by handleStartProcessError on a prior reconcile and
+// self-invalidates the moment source or sha256 changes (digestMismatchMemo.check),
+// so an edited Model always gets a fresh download attempt. A no-op when the
+// Model has no recorded mismatch, or no spec.sha256 at all (nothing to
+// memoize).
+func (a *MetalAgent) checkModelDigestMemo(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model,
+) error {
+	if model.Spec.SHA256 == "" {
+		return nil
+	}
+	modelKey := types.NamespacedName{Namespace: model.Namespace, Name: model.Name}
+	digestErr := a.digestMismatches.check(modelKey, model.Spec.Source, model.Spec.SHA256)
+	if digestErr == nil {
+		return nil
+	}
+	return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
 }
 
 // checkModelPaths refuses a Model the controller marked Failed and any local

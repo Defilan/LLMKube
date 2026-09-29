@@ -312,6 +312,11 @@ type MetalAgent struct {
 	// relayNotAdoptedSent records keys that already received their one
 	// RelayNotAdopted Event in this agent process.
 	relayNotAdoptedSent map[string]bool
+
+	// digestMismatches remembers a Model's most recent SHA256 mismatch, so
+	// reconcileProcess can refuse a persistently-mismatching Model without
+	// re-downloading the whole file (tens of GB) every reconcile.
+	digestMismatches *digestMismatchMemo
 }
 
 // ManagedProcess represents a running inference process (llama-server, oMLX, or Ollama model).
@@ -461,6 +466,7 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		now:                 time.Now,
 		relayRegisteredAt:   make(map[string]time.Time),
 		relayNotAdoptedSent: make(map[string]bool),
+		digestMismatches:    newDigestMismatchMemo(),
 	}
 }
 
@@ -997,6 +1003,31 @@ func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
 	}
 }
 
+// fetchModelForReconcile gets the Model isvc.Spec.ModelRef names. A NotFound
+// result clears any remembered digest mismatch for it (nothing else revisits
+// a NamespacedName once its Get starts 404ing, so this is the only place that
+// notices the Model is gone); a successful Get records which Model isvcKey
+// currently resolves to, so deleteProcess can clear that entry when the
+// InferenceService itself is deleted (digestMismatchMemo.forgetISVC: a
+// persistently-refused InferenceService never reaches a.processes, so that is
+// the only place this association is available). Split out of
+// reconcileProcess, rather than inlined there, to keep its cyclomatic
+// complexity from crossing the linter's threshold.
+func (a *MetalAgent) fetchModelForReconcile(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, isvcKey string,
+) (*inferencev1alpha1.Model, error) {
+	model := &inferencev1alpha1.Model{}
+	modelKey := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Spec.ModelRef}
+	if err := a.config.K8sClient.Get(ctx, modelKey, model); err != nil {
+		if apierrors.IsNotFound(err) {
+			a.digestMismatches.clear(modelKey)
+		}
+		return nil, fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
+	}
+	a.digestMismatches.noteRef(isvcKey, modelKey)
+	return model, nil
+}
+
 // reconcileProcess is the body of ensureProcess; see ensureProcess for the
 // start-failure withdrawal wrapped around it.
 func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
@@ -1085,12 +1116,9 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	runtime := a.resolveRuntime(isvc)
 
 	// Get the Model resource
-	model := &inferencev1alpha1.Model{}
-	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
-		Namespace: isvc.Namespace,
-		Name:      isvc.Spec.ModelRef,
-	}, model); err != nil {
-		return fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
+	model, err := a.fetchModelForReconcile(ctx, isvc, key)
+	if err != nil {
+		return err
 	}
 
 	// Relay mode appends "-agent" to the Service name; refuse a name that no
@@ -1116,12 +1144,13 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return fmt.Errorf("failed to check endpoint name: %w", err)
 	}
 
-	// Refuse a Model the controller marked Failed, and any local model source
-	// or pagedSSDCacheDir that resolves outside the allowed roots, before
-	// memory admission runs. checkModelPaths' refusal writes SchedulingStatus;
-	// running it after memory admission's success path (which clears that
-	// field) would flap the status on every reconcile.
-	if err := a.checkModelPaths(ctx, isvc, model, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
+	// Refuse a Model the controller marked Failed, any local model source or
+	// pagedSSDCacheDir that resolves outside the allowed roots, and a Model
+	// this agent already found to have a mismatching SHA256 (refused without
+	// downloading it again) — all before memory admission runs, since
+	// admission's success path clears SchedulingStatus and a refusal placed
+	// after it would flap the status on every reconcile.
+	if err := a.checkModelPreflight(ctx, isvc, model, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
 		return err
 	}
 
@@ -1199,7 +1228,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// Start the process using the runtime-specific executor.
 	process, err := exec.StartProcess(ctx, cfg)
 	if err != nil {
-		return a.handleStartProcessError(ctx, isvc, err)
+		return a.handleStartProcessError(ctx, isvc, model, err)
 	}
 
 	// Stamp the spec hash onto the process so future ensureProcess calls
@@ -1263,6 +1292,13 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 // registry, so multi-runtime agents can stop each process with its own
 // backend (#525).
 func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
+	// Clear any remembered digest mismatch for the Model this InferenceService
+	// referenced, before the early-return below: a persistently-refused
+	// InferenceService (the exact case a digest-mismatch memo exists for)
+	// never reaches a.processes, since refuseStart returns before a process
+	// is ever stored there.
+	a.digestMismatches.forgetISVC(key)
+
 	a.mu.Lock()
 	process, exists := a.processes[key]
 	if !exists {
