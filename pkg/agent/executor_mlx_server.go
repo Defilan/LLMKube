@@ -99,9 +99,9 @@ func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfi
 	// model-load failure becomes a silent crashloop with no trail. The path
 	// is stable per (namespace, name) so operators can tail it across restarts.
 	logPath := e.processLogPath(config.Namespace, config.Name)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	logFile, err := openEngineLog("mlx-server", logPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open mlx-server log file %s: %w", logPath, err)
+		return nil, err
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

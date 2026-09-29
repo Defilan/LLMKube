@@ -37,7 +37,7 @@ One or more of:
    `wired`, and `totalRSS` fields:
 
    ```bash
-   grep 'memory pressure detected' /tmp/llmkube-metal-agent.log | tail -5
+   grep 'memory pressure detected' ~/Library/Logs/llmkube/metal-agent.log | tail -5
    ```
 
    The level is computed from **available** memory as a fraction of total,

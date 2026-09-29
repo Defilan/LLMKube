@@ -1,0 +1,289 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package agent
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// storeWithMode returns a fresh directory owned by the test user with mode
+// set explicitly (Chmod, so the umask does not interfere).
+func storeWithMode(t *testing.T, mode os.FileMode) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "store")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, mode); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestCheckModelStore_OwnedPrivateStorePasses(t *testing.T) {
+	for _, mode := range []os.FileMode{0o700, 0o755, 0o750} {
+		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
+			if err := CheckModelStore(storeWithMode(t, mode)); err != nil {
+				t.Fatalf("CheckModelStore(owned %o) = %v, want nil", mode, err)
+			}
+		})
+	}
+}
+
+func TestCheckModelStore_RefusesGroupOrOtherWritable(t *testing.T) {
+	for _, mode := range []os.FileMode{0o775, 0o757, 0o770, 0o702, 0o777} {
+		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
+			dir := storeWithMode(t, mode)
+			err := CheckModelStore(dir)
+			if err == nil {
+				t.Fatalf("CheckModelStore(owned %o) = nil, want a refusal", mode)
+			}
+			msg := err.Error()
+			for _, want := range []string{
+				dir,
+				fmt.Sprintf("owner uid %d", os.Getuid()),
+				fmt.Sprintf("mode %04o", mode),
+				"chmod go-w",
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error %q does not mention %q", msg, want)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckModelStore_SymlinkJudgedOnTarget(t *testing.T) {
+	t.Run("symlink to a group-writable dir is refused", func(t *testing.T) {
+		target := storeWithMode(t, 0o775)
+		link := filepath.Join(t.TempDir(), "store-link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		err := CheckModelStore(link)
+		if err == nil {
+			t.Fatal("CheckModelStore(symlink to 0775 dir) = nil, want a refusal")
+		}
+		resolved, _ := filepath.EvalSymlinks(target)
+		if !strings.Contains(err.Error(), resolved) {
+			t.Errorf("error %q does not name the resolved target %q", err, resolved)
+		}
+	})
+
+	t.Run("symlink to an owned 0700 dir passes", func(t *testing.T) {
+		target := storeWithMode(t, 0o700)
+		link := filepath.Join(t.TempDir(), "store-link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if err := CheckModelStore(link); err != nil {
+			t.Fatalf("CheckModelStore(symlink to owned 0700 dir) = %v, want nil", err)
+		}
+	})
+
+	t.Run("symlink to a dir owned by another uid is refused", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("running as root: / is owned by the agent uid here, so no second user is available")
+		}
+		// "/" is owned by root (uid 0) and is not group/other-writable on
+		// macOS and Linux, so only the ownership rule can refuse it.
+		link := filepath.Join(t.TempDir(), "store-link")
+		if err := os.Symlink("/", link); err != nil {
+			t.Fatal(err)
+		}
+		err := CheckModelStore(link)
+		if err == nil {
+			t.Fatal("CheckModelStore(symlink to a root-owned dir) = nil, want a refusal")
+		}
+		for _, want := range []string{"owner uid 0", "chown"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+	})
+}
+
+func TestCheckModelStore_RefusesMissingOrNonDirectory(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope")
+	if err := CheckModelStore(missing); err == nil {
+		t.Error("CheckModelStore(missing) = nil, want an error")
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckModelStore(file); err == nil {
+		t.Error("CheckModelStore(regular file) = nil, want an error")
+	}
+}
+
+func TestCreateNoFollow_RefusesSymlinkedPath(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "engine.log")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := createNoFollow(link)
+	if err == nil {
+		_ = f.Close()
+		t.Fatal("createNoFollow(symlink) succeeded, want an error")
+	}
+	got, _ := os.ReadFile(victim)
+	if string(got) != "keep me" {
+		t.Fatalf("symlink target was truncated or written: %q", got)
+	}
+}
+
+func TestCreateNoFollow_CreatesAndTruncatesRegularFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "engine.log")
+	if err := os.WriteFile(p, []byte("old run"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := createNoFollow(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("size = %d, want 0 (truncated)", info.Size())
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+// Every engine that captures child output must refuse a symlinked log path:
+// the per-process logs live in the model store, and a planted symlink there
+// would otherwise have the agent truncate and write whatever it points at.
+// Each case reuses the executor's existing fixture, plants the symlink, and
+// starts the process the normal way; the start must fail before the engine
+// runs and leave the symlink target untouched.
+func TestEngineStartProcess_RefusesSymlinkedLog(t *testing.T) {
+	type fixture func(t *testing.T) (start func() error, logPath string)
+	const body = "echo ran >&2\nexit 3\n"
+	cases := map[string]fixture{
+		"llama-server": func(t *testing.T) (func() error, string) {
+			e, cfg, logPath := childExitFixture(t, fakeLlamaServer(t, body))
+			return func() error { _, err := e.StartProcess(context.Background(), cfg); return err }, logPath
+		},
+		"mlx-server": func(t *testing.T) (func() error, string) {
+			e, cfg, logPath := mlxServerFixture(t, fakeMLXServer(t, body), 0)
+			return func() error { _, err := e.StartProcess(context.Background(), cfg); return err }, logPath
+		},
+		"tensorfold": func(t *testing.T) (func() error, string) {
+			e, cfg, logPath := tensorFoldFixture(t, fakeTensorFold(t, body))
+			return func() error { _, err := e.StartProcess(context.Background(), cfg); return err }, logPath
+		},
+		"vllm-swift": func(t *testing.T) (func() error, string) {
+			e, cfg, logPath := vllmSwiftFixture(t, fakeVLLMSwift(t, body))
+			return func() error { _, err := e.StartProcess(context.Background(), cfg); return err }, logPath
+		},
+	}
+	for name, fx := range cases {
+		t.Run(name, func(t *testing.T) {
+			start, logPath := fx(t)
+			victim := filepath.Join(t.TempDir(), "victim")
+			if err := os.WriteFile(victim, []byte("keep me"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_ = os.Remove(logPath)
+			if err := os.Symlink(victim, logPath); err != nil {
+				t.Fatal(err)
+			}
+			err := start()
+			if err == nil {
+				t.Fatal("StartProcess with a symlinked log succeeded, want an error")
+			}
+			if !strings.Contains(err.Error(), logPath) {
+				t.Errorf("error %q does not name the log path %q", err, logPath)
+			}
+			got, _ := os.ReadFile(victim)
+			if string(got) != "keep me" {
+				t.Fatalf("symlink target was truncated or written: %q", got)
+			}
+		})
+	}
+}
+
+// The agent also creates files inside the store for downloads: the .part
+// file (fresh and resumed) and the <file>.sha256 stamp. None of them may
+// follow a planted symlink.
+func TestStoreWrites_RefuseSymlinks(t *testing.T) {
+	plant := func(t *testing.T, p string) string {
+		t.Helper()
+		victim := filepath.Join(t.TempDir(), "victim")
+		if err := os.WriteFile(victim, []byte("keep me"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(victim, p); err != nil {
+			t.Fatal(err)
+		}
+		return victim
+	}
+	untouched := func(t *testing.T, victim string) {
+		t.Helper()
+		if got, _ := os.ReadFile(victim); string(got) != "keep me" {
+			t.Fatalf("symlink target was modified: %q", got)
+		}
+	}
+	e := &MetalExecutor{}
+
+	t.Run("sha256 stamp", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "model.gguf")
+		victim := plant(t, sha256StampPath(file))
+		if err := writeSHA256Stamp(file, strings.Repeat("a", 64)); err == nil {
+			t.Fatal("writeSHA256Stamp through a symlink succeeded, want an error")
+		}
+		untouched(t, victim)
+	})
+
+	t.Run("fresh part file", func(t *testing.T) {
+		dir := t.TempDir()
+		part := filepath.Join(dir, "model.gguf.part")
+		victim := plant(t, part)
+		err := e.copyToFileResume(part, filepath.Join(dir, "model.gguf"), strings.NewReader("data"), 4, 0, "")
+		if err == nil {
+			t.Fatal("copyToFileResume into a symlinked part file succeeded, want an error")
+		}
+		untouched(t, victim)
+	})
+
+	t.Run("resumed part file", func(t *testing.T) {
+		dir := t.TempDir()
+		part := filepath.Join(dir, "model.gguf.part")
+		victim := plant(t, part)
+		err := e.copyToFileResume(part, filepath.Join(dir, "model.gguf"), strings.NewReader("data"), 11, 7, "")
+		if err == nil {
+			t.Fatal("copyToFileResume appending to a symlinked part file succeeded, want an error")
+		}
+		untouched(t, victim)
+	})
+}

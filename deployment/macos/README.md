@@ -40,9 +40,12 @@ make build-metal-agent
 # Copy to /usr/local/bin
 sudo cp bin/llmkube-metal-agent /usr/local/bin/
 
-# Install launchd plist
+# Install launchd plist (launchd does not expand ~ or $HOME, so render the
+# __HOME__ placeholder in the log paths; `make install-metal-agent` does this)
 mkdir -p ~/Library/LaunchAgents
-cp deployment/macos/com.llmkube.metal-agent.plist ~/Library/LaunchAgents/
+mkdir -p -m 0700 ~/Library/Logs/llmkube
+sed 's|__HOME__|'"$HOME"'|g' deployment/macos/com.llmkube.metal-agent.plist \
+  > ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 
 # Load the service
 launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
@@ -70,7 +73,7 @@ llmkube deploy my-model --accelerator metal \
 launchctl list | grep llmkube
 
 # View agent logs
-tail -f /tmp/llmkube-metal-agent.log
+tail -f ~/Library/Logs/llmkube/metal-agent.log
 
 # Check running processes
 ps aux | grep llmkube-metal-agent
@@ -102,14 +105,23 @@ The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
     <string>/usr/local/bin/llmkube-metal-agent</string>
     <string>--namespace</string>
     <string>default</string>              <!-- Kubernetes namespace to watch -->
-    <string>--model-store</string>
-    <string>/tmp/llmkube-models</string>  <!-- Where to store downloaded models -->
+    <!-- Optional: --model-store <path>; default ~/Library/Application Support/llmkube/models -->
     <string>--llama-server</string>
     <string>/usr/local/bin/llama-server</string>  <!-- Path to llama-server binary -->
     <string>--port</string>
     <string>9090</string>                 <!-- Agent metrics port -->
 </array>
 ```
+
+### Model store
+
+Downloaded models and the per-engine logs live in the model store, by default
+`~/Library/Application Support/llmkube/models`. The agent creates it (mode
+0700) on first start. It refuses to start if the store, or the directory a
+symlinked store points at, is not owned by the agent's user or is writable by
+the group or other users; the error names the path, its owner uid and mode, and
+the fix (`chown` or `chmod go-w`). Do not point `--model-store` at a shared
+directory such as `/tmp`.
 
 ### `--allowed-model-roots` flag (local model paths)
 
@@ -682,7 +694,7 @@ trusted network, behind its own firewall, or reachable only over Tailscale.
 
 ```bash
 # Check logs
-cat /tmp/llmkube-metal-agent.log
+cat ~/Library/Logs/llmkube/metal-agent.log
 
 # Verify llama-server is installed
 which llama-server

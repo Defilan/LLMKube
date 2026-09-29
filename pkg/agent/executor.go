@@ -328,9 +328,9 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 	// exits leaves no trail. The path is stable per (namespace, name) so
 	// operators can tail it across restarts.
 	logPath := e.processLogPath(config.Namespace, config.Name)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	logFile, err := openEngineLog("llama-server", logPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open llama-server log file %s: %w", logPath, err)
+		return nil, err
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -925,12 +925,12 @@ func (e *MetalExecutor) copyToFileResume(
 ) error {
 	var out *os.File
 	var err error
+	// Both branches refuse to follow a symlink planted at partPath inside the
+	// model store, and a fresh partial is created 0600 like a resumed one.
 	if resumeFrom > 0 {
-		// The file is published (renamed) to the same path a full download
-		// writes; 0600 matches the umask-collapsed result and gosec's default.
-		out, err = os.OpenFile(partPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		out, err = appendNoFollow(partPath)
 	} else {
-		out, err = os.Create(partPath)
+		out, err = createNoFollow(partPath)
 	}
 	if err != nil {
 		return err
@@ -1038,9 +1038,18 @@ func sha256StampPath(filePath string) string {
 // writeSHA256Stamp records digest (lowercase hex) as filePath's verified
 // SHA256, so a later ensureModel cache hit can skip re-hashing when the stamp
 // still matches Model.spec.sha256. Mode 0600: it is written only after a
-// successful verification and never needs to be group- or world-readable.
+// successful verification and never needs to be group- or world-readable,
+// and it is opened without following a symlink planted at the stamp path.
 func writeSHA256Stamp(filePath, digest string) error {
-	return os.WriteFile(sha256StampPath(filePath), []byte(strings.ToLower(digest)), 0o600)
+	f, err := createNoFollow(sha256StampPath(filePath))
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(strings.ToLower(digest)); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // readSHA256Stamp reads and trims filePath's stamp, returning "" (never an

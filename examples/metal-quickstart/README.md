@@ -142,7 +142,7 @@ curl http://localhost:9090/readyz    # Readiness: "ready" when processes are hea
 curl -s http://localhost:9090/metrics | grep llmkube_metal_agent
 
 # Check Metal agent logs
-tail -f /tmp/llmkube-metal-agent.log
+tail -f ~/Library/Logs/llmkube/metal-agent.log
 
 # Monitor GPU usage
 sudo powermetrics --samplers gpu_power -i 1000
@@ -247,7 +247,7 @@ kubectl patch deployment -n llmkube-system llmkube-controller-manager \
 
 ```bash
 # Check logs
-cat /tmp/llmkube-metal-agent.log
+cat ~/Library/Logs/llmkube/metal-agent.log
 
 # Verify llama-server is installed
 llama-server --version
@@ -281,11 +281,11 @@ Fix options:
 df -h
 
 # Check model store
-ls -lh /tmp/llmkube-models/
+ls -lh ~/Library/Application\ Support/llmkube/models/
 
 # Manually download model
 curl -L https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf \
-  -o /tmp/llmkube-models/llama-3.1-8b/model.gguf
+  -o ~/Library/Application\ Support/llmkube/models/llama-3.1-8b/model.gguf
 ```
 
 ### Service not accessible
@@ -317,7 +317,7 @@ sudo powermetrics --samplers gpu_power -i 1000
 
 # Verify all layers offloaded to GPU
 # Check Metal agent logs for "n-gpu-layers"
-grep "n-gpu-layers" /tmp/llmkube-metal-agent.log
+grep "n-gpu-layers" ~/Library/Logs/llmkube/metal-agent.log
 ```
 
 ## Cleanup

@@ -249,7 +249,11 @@ install-metal-agent: build-metal-agent ## Install Metal agent and launchd servic
 	sudo cp bin/llmkube-metal-agent /usr/local/bin/llmkube-metal-agent
 	@echo "Installing launchd service..."
 	mkdir -p ~/Library/LaunchAgents
-	cp deployment/macos/com.llmkube.metal-agent.plist ~/Library/LaunchAgents/
+	@# The agent's stdout/stderr go to ~/Library/Logs/llmkube (private to the
+	@# user), not the world-writable /tmp. launchd does not expand ~ or $$HOME,
+	@# so the plist's __HOME__ placeholder is rendered here.
+	mkdir -p -m 0700 "$$HOME/Library/Logs/llmkube"
+	sed 's|__HOME__|'"$$HOME"'|g' deployment/macos/com.llmkube.metal-agent.plist > ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 	@echo "Starting Metal agent service..."
 	@# Bootstrap the plist the first time (noop if already bootstrapped).
 	@launchctl bootstrap gui/$$(id -u) ~/Library/LaunchAgents/$(LLMKUBE_METAL_AGENT_LABEL).plist 2>/dev/null || true
@@ -260,7 +264,7 @@ install-metal-agent: build-metal-agent ## Install Metal agent and launchd servic
 	@echo "Metal agent installed and restarted"
 	@echo ""
 	@echo "To check status: launchctl list | grep llmkube"
-	@echo "To view logs: tail -f /tmp/llmkube-metal-agent.log"
+	@echo "To view logs: tail -f ~/Library/Logs/llmkube/metal-agent.log"
 
 .PHONY: uninstall-metal-agent
 uninstall-metal-agent: ## Uninstall Metal agent and launchd service.

@@ -113,9 +113,9 @@ func (e *TensorFoldExecutor) StartProcess(_ context.Context, config ExecutorConf
 	// TensorFold prints why it refused a checkpoint and exits; without the
 	// capture that reason would be lost.
 	logPath := e.processLogPath(config.Namespace, config.Name)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	logFile, err := openEngineLog("tensorfold", logPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open tensorfold log file %s: %w", logPath, err)
+		return nil, err
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

@@ -10,8 +10,6 @@
         <string>/usr/local/bin/llmkube-metal-agent</string>
         <string>--namespace</string>
         <string>default</string>
-        <string>--model-store</string>
-        <string>/tmp/llmkube-models</string>
         <string>--llama-server</string>
         <string>/opt/homebrew/bin/llama-server</string>
         <string>--port</string>
@@ -29,11 +27,14 @@
         <false/>
     </dict>
 
+    <!-- __HOME__ is replaced with $HOME by `make install-metal-agent`
+         (launchd does not expand ~ or $HOME). The model store defaults to
+         ~/Library/Application Support/llmkube/models. -->
     <key>StandardOutPath</key>
-    <string>/tmp/llmkube-metal-agent.log</string>
+    <string>__HOME__/Library/Logs/llmkube/metal-agent.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/llmkube-metal-agent.log</string>
+    <string>__HOME__/Library/Logs/llmkube/metal-agent.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
