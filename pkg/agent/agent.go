@@ -920,31 +920,35 @@ func (a *MetalAgent) validateRuntimeFormat(model *inferencev1alpha1.Model, runti
 // hash; if it changed, the existing process is stopped before a fresh one is
 // spawned so the new flags actually take effect. Replicas=0 stops the process
 // without restarting.
-// currentBackend returns the loopback address of the inference child the
-// host-side client proxy should forward to, satisfying backendProvider (#406).
-// The agent tracks one process per InferenceService but in practice runs one
-// at a time on a single Mac, so we return the first running child with an
+// currentBackend returns the loopback address and runtime of the inference
+// child the host-side client proxy should forward to, satisfying
+// backendProvider (#406). The runtime is the same string the ingress uses
+// (ManagedProcess.Runtime, mirrored into ingress.Route.Runtime by Route), so
+// the client proxy can apply the identical ingress.Allowed path policy. The
+// agent tracks one process per InferenceService but in practice runs one at a
+// time on a single Mac, so we return the first running child with an
 // allocated port, preferring a healthy one. ok is false when none is running.
-func (a *MetalAgent) currentBackend() (string, bool) {
+func (a *MetalAgent) currentBackend() (addr, runtime string, ok bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	var fallback string
+	var fallbackAddr, fallbackRuntime string
 	for _, p := range a.processes {
 		if p == nil || p.Port <= 0 {
 			continue
 		}
-		addr := fmt.Sprintf("127.0.0.1:%d", p.Port)
+		candidate := fmt.Sprintf("127.0.0.1:%d", p.Port)
 		if p.Healthy {
-			return addr, true
+			return candidate, p.Runtime, true
 		}
-		if fallback == "" {
-			fallback = addr
+		if fallbackAddr == "" {
+			fallbackAddr = candidate
+			fallbackRuntime = p.Runtime
 		}
 	}
-	if fallback != "" {
-		return fallback, true
+	if fallbackAddr != "" {
+		return fallbackAddr, fallbackRuntime, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // isvcStopped reports whether the InferenceService desires zero running

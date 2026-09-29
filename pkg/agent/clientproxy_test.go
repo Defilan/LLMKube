@@ -21,34 +21,53 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"go.uber.org/zap"
 )
 
+// testClientProxyPort is the loopback port every test in this file configures
+// the ClientProxy with, so Host header expectations below (Host checks care
+// about the exact port a proxy is told to listen on) have a fixed value to
+// test against.
+const testClientProxyPort = 9443
+
 // fakeBackend is a test backendProvider standing in for the MetalAgent's
 // view of the currently-running child process.
 type fakeBackend struct {
-	addr string
-	ok   bool
+	addr    string
+	runtime string
+	ok      bool
 }
 
-func (f *fakeBackend) currentBackend() (string, bool) { return f.addr, f.ok }
+func (f *fakeBackend) currentBackend() (string, string, bool) { return f.addr, f.runtime, f.ok }
 
-func TestClientProxy_ForwardsToCurrentBackend(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/models" {
-			t.Errorf("backend got unexpected path %q", r.URL.Path)
-		}
+// newRecordingBackend starts a backend that answers 200 with a small JSON
+// body and counts how many requests it actually received, so a test can
+// assert the engine was never called when the proxy is expected to refuse a
+// request itself.
+func newRecordingBackend(t *testing.T) (addr string, hits *atomic.Int32) {
+	t.Helper()
+	hits = &atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"object":"list","data":[]}`)
 	}))
-	defer backend.Close()
+	t.Cleanup(srv.Close)
+	return srv.Listener.Addr().String(), hits
+}
 
-	p := NewClientProxy(&fakeBackend{addr: backend.Listener.Addr().String(), ok: true}, 0, zap.NewNop().Sugar())
+func TestClientProxy_ForwardsToCurrentBackend(t *testing.T) {
+	addr, hits := newRecordingBackend(t)
+	p := NewClientProxy(&fakeBackend{addr: addr, runtime: runtimeLlamaServer, ok: true},
+		testClientProxyPort, zap.NewNop().Sugar())
 
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Host = "127.0.0.1:9443"
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	p.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status: want 200 got %d (body=%q)", rec.Code, rec.Body.String())
@@ -56,13 +75,18 @@ func TestClientProxy_ForwardsToCurrentBackend(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"object":"list"`) {
 		t.Errorf("response not forwarded from backend: %q", rec.Body.String())
 	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("backend hits: want 1 got %d", got)
+	}
 }
 
 func TestClientProxy_503WhenNoBackend(t *testing.T) {
-	p := NewClientProxy(&fakeBackend{ok: false}, 0, zap.NewNop().Sugar())
+	p := NewClientProxy(&fakeBackend{ok: false}, testClientProxyPort, zap.NewNop().Sugar())
 
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Host = "localhost:9443"
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	p.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status: want 503 got %d", rec.Code)
@@ -72,6 +96,133 @@ func TestClientProxy_503WhenNoBackend(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "error") {
 		t.Errorf("503 body should carry a JSON error, got %q", rec.Body.String())
+	}
+}
+
+// TestClientProxy_HostAndPathChecks is the table for #406's DNS-rebinding
+// Host check and the ingress path allowlist, both applied to the host-side
+// client proxy. Each case names how many times the backend should have been
+// hit, so a check that lets a refused request slip through to the engine
+// fails loudly rather than merely returning the wrong status.
+func TestClientProxy_HostAndPathChecks(t *testing.T) {
+	tests := []struct {
+		name       string
+		host       string
+		method     string
+		path       string
+		runtime    string
+		wantStatus int
+		wantHits   int32
+	}{
+		{
+			name:       "common route allowed",
+			host:       "127.0.0.1:9443",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "path outside every allowlist is forbidden",
+			host:       "127.0.0.1:9443",
+			method:     http.MethodGet,
+			path:       "/slots",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusForbidden,
+			wantHits:   0,
+		},
+		{
+			name:       "rebinding host is refused before the backend is asked",
+			host:       "evil.example:9999",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusMisdirectedRequest,
+			wantHits:   0,
+		},
+		{
+			name:       "localhost with the proxy's port is accepted",
+			host:       "localhost:9443",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "127.0.0.1 with the proxy's port is accepted",
+			host:       "127.0.0.1:9443",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "bracketed IPv6 loopback with the proxy's port is accepted",
+			host:       "[::1]:9443",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "the right host with the wrong port is refused",
+			host:       "127.0.0.1:9444",
+			method:     http.MethodGet,
+			path:       "/v1/models",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusMisdirectedRequest,
+			wantHits:   0,
+		},
+		{
+			name:       "runtime-specific route allowed for the backend's runtime",
+			host:       "127.0.0.1:9443",
+			method:     http.MethodGet,
+			path:       "/props",
+			runtime:    runtimeLlamaServer,
+			wantStatus: http.StatusOK,
+			wantHits:   1,
+		},
+		{
+			name:       "the same route is forbidden for a different runtime",
+			host:       "127.0.0.1:9443",
+			method:     http.MethodGet,
+			path:       "/props",
+			runtime:    runtimeOllama,
+			wantStatus: http.StatusForbidden,
+			wantHits:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, hits := newRecordingBackend(t)
+			p := NewClientProxy(&fakeBackend{addr: addr, runtime: tt.runtime, ok: true},
+				testClientProxyPort, zap.NewNop().Sugar())
+
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req.Host = tt.host
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status: want %d got %d (body=%q)", tt.wantStatus, rec.Code, rec.Body.String())
+			}
+			if got := hits.Load(); got != tt.wantHits {
+				t.Errorf("backend hits: want %d got %d", tt.wantHits, got)
+			}
+			if tt.wantStatus != http.StatusOK {
+				if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+					t.Errorf("%d body should be JSON, got Content-Type %q", tt.wantStatus, ct)
+				}
+				if !strings.Contains(rec.Body.String(), "error") {
+					t.Errorf("%d body should carry a JSON error, got %q", tt.wantStatus, rec.Body.String())
+				}
+			}
+		})
 	}
 }
 
