@@ -1,5 +1,5 @@
 /*
-Copyright 2025.
+Copyright 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -286,4 +286,146 @@ func TestStoreWrites_RefuseSymlinks(t *testing.T) {
 		}
 		untouched(t, victim)
 	})
+}
+
+// An ancestor another user can write (and that lacks the sticky bit) lets
+// them rename the store away and put their own directory in its place after
+// the check, so it is refused just like a writable store.
+func TestCheckModelStore_Ancestors(t *testing.T) {
+	mk := func(t *testing.T, parentMode os.FileMode) (parent, store string) {
+		t.Helper()
+		parent = filepath.Join(t.TempDir(), "parent")
+		if err := os.Mkdir(parent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		store = filepath.Join(parent, "store")
+		if err := os.Mkdir(store, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(parent, parentMode); err != nil {
+			t.Fatal(err)
+		}
+		return parent, store
+	}
+
+	t.Run("group-writable non-sticky ancestor is refused", func(t *testing.T) {
+		parent, store := mk(t, 0o775)
+		err := CheckModelStore(store)
+		if err == nil {
+			t.Fatal("CheckModelStore under a 0775 ancestor = nil, want a refusal")
+		}
+		resolvedParent, _ := filepath.EvalSymlinks(parent)
+		for _, want := range []string{"ancestor " + resolvedParent, "mode 0775"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not mention %q", err, want)
+			}
+		}
+	})
+
+	t.Run("other-writable non-sticky ancestor is refused", func(t *testing.T) {
+		_, store := mk(t, 0o757)
+		if err := CheckModelStore(store); err == nil {
+			t.Fatal("CheckModelStore under a 0757 ancestor = nil, want a refusal")
+		}
+	})
+
+	t.Run("sticky world-writable ancestor passes", func(t *testing.T) {
+		_, store := mk(t, 0o777|os.ModeSticky)
+		if err := CheckModelStore(store); err != nil {
+			t.Fatalf("CheckModelStore under a sticky 1777 ancestor = %v, want nil", err)
+		}
+	})
+}
+
+// ResolveModelStore returns the checked, symlink-free absolute path, so the
+// agent keeps using the directory that was judged even if the configured
+// symlink is repointed afterwards.
+func TestResolveModelStore_PinsResolvedTarget(t *testing.T) {
+	good := storeWithMode(t, 0o700)
+	other := storeWithMode(t, 0o700)
+	link := filepath.Join(t.TempDir(), "store-link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ResolveModelStore(link)
+	if err != nil {
+		t.Fatalf("ResolveModelStore = %v", err)
+	}
+	want, _ := filepath.EvalSymlinks(good)
+	if got != want {
+		t.Fatalf("ResolveModelStore = %q, want the resolved target %q", got, want)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(other, link); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("pinned path changed after the symlink moved: %q", got)
+	}
+}
+
+func TestEnsureModel_RefusesNonRegularCacheEntry(t *testing.T) {
+	store := t.TempDir()
+	e := NewMetalExecutor("/bin/llama-server", store, newNopLogger())
+	md := filepath.Join(store, "m")
+	if err := os.Mkdir(md, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(t.TempDir(), "elsewhere.gguf")
+	if err := os.WriteFile(victim, []byte("not the model"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(md, "model.gguf")
+	if err := os.Symlink(victim, localPath); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.ensureModel(t.Context(), "https://example.invalid/model.gguf", "m", nil, "")
+	if err == nil {
+		t.Fatalf("ensureModel with a symlinked cache entry = %q, nil; want a refusal", got)
+	}
+	if !strings.Contains(err.Error(), localPath) {
+		t.Errorf("error %q does not name the cache path", err)
+	}
+}
+
+// A complete-size partial is published by rename. If a symlink planted at
+// the partial path were accepted (os.Stat follows it), the published model
+// would be that symlink.
+func TestDownloadFile_SymlinkedCompletePartialNotPublished(t *testing.T) {
+	dir := t.TempDir()
+	ex := executorFor(dir)
+	md := modelDirPath(t, dir, "m")
+	localPath := filepath.Join(md, "model.gguf")
+	o := newDLOrigin(t, true, true)
+	validator := "CL" + fmt.Sprint(dlSizeA) + "ET" + `"vA"`
+	part := validatorPartialPath(localPath, validator)
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte(strings.Repeat("A", dlSizeA)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, part); err != nil {
+		t.Fatal(err)
+	}
+	_ = ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, "", "")
+	if fi, err := os.Lstat(localPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("a symlinked partial was published as the model")
+	}
+}
+
+func TestEnsureModel_CreatesModelDirPrivate(t *testing.T) {
+	dir := t.TempDir()
+	ex := executorFor(dir)
+	o := newDLOrigin(t, true, true)
+	if _, err := ex.ensureModel(t.Context(), o.srv.URL+"/model.gguf", "fresh", nil, ""); err != nil {
+		t.Fatalf("ensureModel: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "fresh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o700 {
+		t.Errorf("model dir mode = %o, want 0700", perm)
+	}
 }

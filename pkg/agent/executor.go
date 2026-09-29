@@ -389,7 +389,15 @@ func (e *MetalExecutor) ensureModel(
 	localPath := filepath.Join(e.modelStorePath, name, filename)
 	local := isLocalModelSource(source)
 
-	if info, err := os.Stat(localPath); err == nil && info.Size() > 0 {
+	// Lstat, not Stat: the cache slot is written only by this agent, so
+	// anything other than a regular file there (a planted symlink above all)
+	// is refused rather than followed and loaded.
+	info, statErr := os.Lstat(localPath)
+	if statErr == nil && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("refusing model cache entry %s: not a regular file (mode %s); remove it to re-download",
+			localPath, info.Mode())
+	}
+	if statErr == nil && info.Size() > 0 {
 		// A local source is loaded in place, never through the model store's
 		// cache slot, so a file that happens to sit there is not this
 		// source's cache and is never digest-checked. Same for a Model with
@@ -419,7 +427,7 @@ func (e *MetalExecutor) ensureModel(
 		return resolveLocalModelSource(source)
 	}
 
-	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o700); err != nil {
 		return "", fmt.Errorf("failed to create model directory: %w", err)
 	}
 
@@ -656,7 +664,9 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token, 
 	sweepStalePartials(filePath, partPath)
 
 	var resumeFrom int64
-	if fi, statErr := os.Stat(partPath); statErr == nil && fi.Mode().IsRegular() {
+	// Lstat so a symlink planted at partPath is never resumed into or
+	// published by rename; the fresh-download create then refuses it.
+	if fi, statErr := os.Lstat(partPath); statErr == nil && fi.Mode().IsRegular() {
 		// The partial is keyed on the validator, so its very name proves it
 		// belongs to the current content: a change in length or ETag yields a
 		// different key and this stat would miss it.

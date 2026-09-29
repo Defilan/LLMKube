@@ -25,47 +25,88 @@ import (
 )
 
 // CheckModelStore refuses a model store another local user could tamper with.
-// The store holds the model files engines load and the per-process engine
-// logs, and it is always an allowed model root, so a store someone else owns
-// or can write lets them swap a model, plant a symlink the agent then writes
-// through, or widen what the root policy admits.
-//
-// path is resolved through symlinks first and the target is judged: a link
-// the agent owns pointing at a shared directory is still a shared store. The
-// resolved directory must exist, be owned by the agent's uid, and have no
-// group or other write bit. The error names the path, the owner uid, the mode
-// and the fix.
+// It is ResolveModelStore without the resolved path; see there for the rules.
 func CheckModelStore(path string) error {
+	_, err := ResolveModelStore(path)
+	return err
+}
+
+// ResolveModelStore resolves path to an absolute, symlink-free directory,
+// checks it, and returns it. The store holds the model files engines load and
+// the per-process engine logs, and it is always an allowed model root, so a
+// store someone else owns or can write lets them swap a model, plant a
+// symlink the agent then writes through, or widen what the root policy
+// admits.
+//
+// The resolved target is judged, not the link: a link the agent owns
+// pointing at a shared directory is still a shared store. The target must
+// exist, be a directory, be owned by the agent's uid and have no group or
+// other write bit. Every ancestor up to / must also be unwritable by group
+// and other unless it has the sticky bit (so the root-owned, sticky
+// /private/tmp passes): otherwise another user could rename the store away
+// and put their own directory in its place after this check.
+//
+// Callers must use the returned path from then on, never path itself: path
+// is re-resolved on every use, so a symlink in it could be repointed after
+// the check. Errors name the path, owner uid, mode and the fix.
+func ResolveModelStore(path string) (string, error) {
 	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return fmt.Errorf("model store %s: %w", path, err)
+		return "", fmt.Errorf("model store %s: %w", path, err)
+	}
+	if resolved, err = filepath.Abs(resolved); err != nil {
+		return "", fmt.Errorf("model store %s: %w", path, err)
 	}
 	where := describeStore(path, resolved)
-	info, err := os.Stat(resolved)
+	info, err := os.Lstat(resolved)
 	if err != nil {
-		return fmt.Errorf("model store %s: %w", where, err)
+		return "", fmt.Errorf("model store %s: %w", where, err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("model store %s is not a directory", where)
+		return "", fmt.Errorf("model store %s is not a directory", where)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return fmt.Errorf("model store %s: cannot read its owner", where)
+		return "", fmt.Errorf("model store %s: cannot read its owner", where)
 	}
 	uid := os.Getuid()
 	owner := int(st.Uid)
 	mode := info.Mode().Perm()
 	if owner != uid {
-		return fmt.Errorf("model store %s has owner uid %d and mode %04o, but the agent runs as uid %d "+
-			"and refuses a store another user owns: run `chown %d %s` or pass a --model-store the agent owns",
+		return "", fmt.Errorf("model store %s has owner uid %d and mode %04o, but the agent runs as uid %d "+
+			"and refuses a store another user owns: run `sudo chown %d %s` or pass a --model-store the agent owns",
 			where, owner, mode, uid, uid, resolved)
 	}
 	if mode&0o022 != 0 {
-		return fmt.Errorf("model store %s has owner uid %d and mode %04o, which lets other users write to it: "+
+		return "", fmt.Errorf("model store %s has owner uid %d and mode %04o, which lets other users write to it: "+
 			"run `chmod go-w %s` or pass a private --model-store",
 			where, owner, mode, resolved)
 	}
-	return nil
+	if err := checkStoreAncestors(where, resolved); err != nil {
+		return "", err
+	}
+	return resolved, nil
+}
+
+// checkStoreAncestors refuses the store when any ancestor of the resolved,
+// absolute store directory is group- or other-writable without the sticky
+// bit.
+func checkStoreAncestors(where, resolved string) error {
+	for dir := filepath.Dir(resolved); ; dir = filepath.Dir(dir) {
+		info, err := os.Lstat(dir)
+		if err != nil {
+			return fmt.Errorf("model store %s: ancestor %s: %w", where, dir, err)
+		}
+		m := info.Mode()
+		if m.Perm()&0o022 != 0 && m&os.ModeSticky == 0 {
+			return fmt.Errorf("model store %s has ancestor %s with mode %04o, which lets other users replace "+
+				"the store: run `chmod go-w %s` (or `chmod +t` if it must stay shared) or pass a --model-store "+
+				"under a private directory", where, dir, m.Perm(), dir)
+		}
+		if parent := filepath.Dir(dir); parent == dir {
+			return nil
+		}
+	}
 }
 
 // describeStore names the configured path and, when it differs, the

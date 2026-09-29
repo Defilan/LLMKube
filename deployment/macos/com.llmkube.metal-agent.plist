@@ -27,8 +27,9 @@
         <false/>
     </dict>
 
-    <!-- __HOME__ is replaced with $HOME by `make install-metal-agent`
-         (launchd does not expand ~ or $HOME). The model store defaults to
+    <!-- The log paths and WorkingDirectory start with a home placeholder
+         that `make install-metal-agent` replaces with $HOME (launchd does not
+         expand ~ or $HOME). The model store defaults to
          ~/Library/Application Support/llmkube/models. -->
     <key>StandardOutPath</key>
     <string>__HOME__/Library/Logs/llmkube/metal-agent.log</string>
@@ -45,7 +46,7 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/tmp</string>
+    <string>__HOME__</string>
 
     <!-- Restart on failure with throttle -->
     <key>ThrottleInterval</key>

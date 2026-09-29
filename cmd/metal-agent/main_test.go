@@ -194,6 +194,42 @@ func TestResolveModelStorePath(t *testing.T) {
 		}
 	})
 
+	t.Run("a bare ~ expands to the home directory", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		got, err := resolveModelStorePath("~")
+		if err != nil || got != "/Users/tester" {
+			t.Fatalf("resolveModelStorePath(\"~\") = %q, %v; want /Users/tester", got, err)
+		}
+	})
+
+	t.Run("a leading ~/ expands against the home directory", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		got, err := resolveModelStorePath("~/models")
+		if err != nil || got != "/Users/tester/models" {
+			t.Fatalf("resolveModelStorePath(\"~/models\") = %q, %v; want /Users/tester/models", got, err)
+		}
+	})
+
+	t.Run("~ with unknown home is an error", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "", errors.New("no home") }
+		if got, err := resolveModelStorePath("~/models"); err == nil {
+			t.Fatalf("got %q, nil; want an error", got)
+		}
+	})
+
+	t.Run("a relative path is refused", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		for _, rel := range []string{"models", "./models", "~user/models"} {
+			got, err := resolveModelStorePath(rel)
+			if err == nil {
+				t.Fatalf("resolveModelStorePath(%q) = %q, nil; want an error", rel, got)
+			}
+			if !strings.Contains(err.Error(), "absolute") {
+				t.Errorf("error %q does not say the path must be absolute", err)
+			}
+		}
+	})
+
 	t.Run("empty flag with unknown home is an error", func(t *testing.T) {
 		userHomeDir = func() (string, error) { return "", errors.New("no home") }
 		if got, err := resolveModelStorePath(""); err == nil {
@@ -206,7 +242,7 @@ func TestPrepareModelStore(t *testing.T) {
 	t.Run("creates a missing store and its parents 0700", func(t *testing.T) {
 		base := t.TempDir()
 		store := filepath.Join(base, "Application Support", "llmkube", "models")
-		if err := prepareModelStore(store); err != nil {
+		if _, err := prepareModelStore(store); err != nil {
 			t.Fatalf("prepareModelStore = %v", err)
 		}
 		for _, p := range []string{store, filepath.Dir(store), filepath.Dir(filepath.Dir(store))} {
@@ -228,7 +264,7 @@ func TestPrepareModelStore(t *testing.T) {
 		if err := os.Chmod(store, 0o775); err != nil { //nolint:gosec // G302: the fixture must be group-writable
 			t.Fatal(err)
 		}
-		err := prepareModelStore(store)
+		_, err := prepareModelStore(store)
 		if err == nil || !strings.Contains(err.Error(), "chmod go-w") {
 			t.Fatalf("prepareModelStore(0775) = %v, want a refusal naming the fix", err)
 		}
@@ -242,8 +278,50 @@ func TestPrepareModelStore(t *testing.T) {
 		if err := os.Chmod(store, 0o755); err != nil { //nolint:gosec // G302: a pre-existing 0755 store must stay accepted
 			t.Fatal(err)
 		}
-		if err := prepareModelStore(store); err != nil {
+		if _, err := prepareModelStore(store); err != nil {
 			t.Fatalf("prepareModelStore(owned 0755) = %v, want nil", err)
 		}
 	})
+}
+
+// configureModelStore pins cfg.ModelStorePath to the checked, resolved
+// directory: repointing the configured symlink afterwards must not change
+// the path the agent (NewMetalAgent, executors) goes on to use.
+func TestConfigureModelStore_PinsResolvedStore(t *testing.T) {
+	base := t.TempDir()
+	good := filepath.Join(base, "good")
+	evil := filepath.Join(base, "evil")
+	for _, d := range []string{good, evil} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(base, "store-link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &AgentConfig{ModelStorePath: link}
+	if err := configureModelStore(cfg); err != nil {
+		t.Fatalf("configureModelStore = %v", err)
+	}
+	want, _ := filepath.EvalSymlinks(good)
+	if cfg.ModelStorePath != want {
+		t.Fatalf("cfg.ModelStorePath = %q, want the resolved dir %q", cfg.ModelStorePath, want)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelStorePath != want {
+		t.Fatalf("cfg.ModelStorePath moved with the symlink: %q", cfg.ModelStorePath)
+	}
+}
+
+func TestConfigureModelStore_RefusesRelative(t *testing.T) {
+	cfg := &AgentConfig{ModelStorePath: "models"}
+	if err := configureModelStore(cfg); err == nil {
+		t.Fatal("configureModelStore(relative) = nil, want an error")
+	}
 }

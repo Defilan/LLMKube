@@ -119,9 +119,12 @@ Downloaded models and the per-engine logs live in the model store, by default
 `~/Library/Application Support/llmkube/models`. The agent creates it (mode
 0700) on first start. It refuses to start if the store, or the directory a
 symlinked store points at, is not owned by the agent's user or is writable by
-the group or other users; the error names the path, its owner uid and mode, and
-the fix (`chown` or `chmod go-w`). Do not point `--model-store` at a shared
-directory such as `/tmp`.
+the group or other users, or if any directory above it is group- or
+other-writable without the sticky bit; the error names the path, its owner uid
+and mode, and the fix (`chown` or `chmod go-w`). The agent then uses the
+resolved directory, so repointing a symlinked `--model-store` needs a restart.
+`--model-store` must be absolute or start with `~/` (expanded against the
+agent user's home). Do not point it at a shared directory such as `/tmp`.
 
 ### `--allowed-model-roots` flag (local model paths)
 

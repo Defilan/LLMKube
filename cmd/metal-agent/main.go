@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -233,33 +232,79 @@ var defaultTensorFoldPaths = []string{
 // userHomeDir is os.UserHomeDir, overridden in tests.
 var userHomeDir = os.UserHomeDir
 
-// resolveModelStorePath returns the --model-store value, or the default
+// resolveModelStorePath returns the absolute model store path: the default
 // "~/Library/Application Support/llmkube/models" under the agent user's home
-// when the flag is empty. The default lives beside the --state-dir default,
-// out of the world-writable /tmp the store used to default to.
+// when the flag is empty (beside the --state-dir default, out of the
+// world-writable /tmp the store used to default to), otherwise the flag with
+// a leading "~" or "~/" resolved against home exactly as --state-dir does
+// (launchd passes "~" literally). "~user" is not expanded. Anything still
+// relative is refused: it would resolve against the agent's working
+// directory rather than a directory the operator chose.
 func resolveModelStorePath(flagValue string) (string, error) {
-	if flagValue != "" {
-		return flagValue, nil
+	if flagValue == "" {
+		home, err := modelStoreHome("--model-store is not set")
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "Library", "Application Support", "llmkube", "models"), nil
 	}
+	path := flagValue
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := modelStoreHome(fmt.Sprintf("--model-store %q starts with ~", flagValue))
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("--model-store %q must be an absolute path (or start with ~/)", flagValue)
+	}
+	return filepath.Clean(path), nil
+}
+
+// modelStoreHome returns the agent user's home directory for resolving the
+// model store, or an error that starts with why it was needed.
+func modelStoreHome(why string) (string, error) {
 	home, err := userHomeDir()
 	if err != nil {
-		return "", fmt.Errorf("--model-store is not set and the home directory is unknown: %w", err)
+		return "", fmt.Errorf("%s but the home directory is unknown: %w", why, err)
 	}
 	if home == "" {
-		return "", errors.New("--model-store is not set and the home directory is unknown")
+		return "", fmt.Errorf("%s but the home directory is unknown", why)
 	}
-	return filepath.Join(home, "Library", "Application Support", "llmkube", "models"), nil
+	return home, nil
 }
 
 // prepareModelStore creates the model store if it is missing (0700, and 0700
-// for any parent it has to create) and then refuses it unless the agent owns
-// it and no other user can write it (agent.CheckModelStore). An existing store
-// keeps its mode; the check alone decides whether it is safe.
-func prepareModelStore(path string) error {
+// for any parent it has to create), refuses it unless the agent owns it and
+// no other user can write it or replace it (agent.ResolveModelStore), and
+// returns the resolved, symlink-free path the agent must use from then on.
+// An existing store keeps its mode; the check alone decides whether it is
+// safe.
+func prepareModelStore(path string) (string, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("create model store %s: %w", path, err)
+		return "", fmt.Errorf("create model store %s: %w", path, err)
 	}
-	return agent.CheckModelStore(path)
+	return agent.ResolveModelStore(path)
+}
+
+// configureModelStore resolves --model-store, prepares and checks the store,
+// and pins cfg.ModelStorePath to the checked directory. It must run before
+// anything else uses the store: the allowed-roots validation, NewMetalAgent
+// (which makes the store an allowed root) and the executors all read
+// cfg.ModelStorePath, and pinning the resolved path means a symlink in the
+// configured path cannot be repointed after the check.
+func configureModelStore(cfg *AgentConfig) error {
+	path, err := resolveModelStorePath(cfg.ModelStorePath)
+	if err != nil {
+		return err
+	}
+	resolved, err := prepareModelStore(path)
+	if err != nil {
+		return err
+	}
+	cfg.ModelStorePath = resolved
+	return nil
 }
 
 // resolveTensorFoldBin returns the tensorfold binary path. If override is
@@ -376,8 +421,9 @@ func main() {
 	var llamaServerFlag string
 	flag.StringVar(&cfg.Namespace, "namespace", "default", "Kubernetes namespace to watch")
 	flag.StringVar(&cfg.ModelStorePath, "model-store", "",
-		"Path to store downloaded models. Default: ~/Library/Application Support/llmkube/models. "+
-			"The agent refuses a store it does not own or that other users can write.")
+		"Path to store downloaded models: absolute, or starting with ~/. "+
+			"Default: ~/Library/Application Support/llmkube/models. The agent refuses a store it does "+
+			"not own, that other users can write, or that sits under a directory other users can write.")
 	flag.StringVar(&llamaServerFlag, "llama-server", "", "Path to llama-server binary (auto-detected if not set)")
 	flag.IntVar(&cfg.LlamaServerPort, "llama-server-port", 0,
 		"Fixed port for the llama-server runtime. 0 (default) allocates an "+
@@ -489,12 +535,11 @@ func main() {
 	}()
 	logger := baseLogger.Sugar()
 
-	storePath, err := resolveModelStorePath(cfg.ModelStorePath)
-	if err != nil {
-		logger.Errorw("cannot determine the model store", "error", err)
+	// Create, vet and pin the model store before anything uses it.
+	if err := configureModelStore(cfg); err != nil {
+		logger.Errorw("refusing to use the model store", "model-store", cfg.ModelStorePath, "error", err)
 		os.Exit(1)
 	}
-	cfg.ModelStorePath = storePath
 
 	// Validate the effective allowed-model-roots set eagerly: the same list
 	// NewMetalAgent resolves (the model store plus --allowed-model-roots, see
@@ -569,13 +614,6 @@ func main() {
 		"metalVersion", caps.MetalVersion,
 	)
 
-	// Create and vet the model store before anything uses it: NewMetalAgent
-	// makes it an allowed model root, and downloads and engine logs land in
-	// it.
-	if err := prepareModelStore(cfg.ModelStorePath); err != nil {
-		logger.Errorw("refusing to use the model store", "path", cfg.ModelStorePath, "error", err)
-		os.Exit(1)
-	}
 	// Log which runtimes are available. llama-server is always available
 	// (resolved above). Other runtimes are available when their binary
 	// path was resolved successfully.
