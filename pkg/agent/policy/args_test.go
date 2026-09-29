@@ -1291,6 +1291,54 @@ func TestRule3_TrustRequestChatTemplateAndEmbeds(t *testing.T) {
 	}
 }
 
+// TestNegation_InlineValueIsNotANegation: Ruling 14 (Task 6 fix round 1). A
+// "--no-X" (or "-no-X") spelling that carries an inline "=value" is not
+// treated as a negation: isNegation requires !a.Inline. Without that,
+// "--no-enable-prompt-embeds=false" and "--no-trust-request-chat-template=true"
+// matched the "--no-" prefix check and skipped Rule 3 entirely (the same gap
+// existed in checkFlag's Rule 1 merge), even though vLLM's own zero-arg bool
+// option never takes a value. Such a token is refused exactly as its
+// canonical flag would be; a bare "--no-X" (no "="), and a Rule 1 flag's
+// bare negation, both still turn the flag off and stay allowed.
+func TestNegation_InlineValueIsNotANegation(t *testing.T) {
+	f := newTypedFixture(t)
+	v := func(args ...string) ArgsInput { return f.in(RuntimeVLLMSwift, args...) }
+
+	// Rule 3 (vllmRefused): an inline-valued negation is refused the same
+	// way its canonical flag is.
+	for _, c := range []struct{ flag, reason string }{
+		{"--no-enable-prompt-embeds=false", "torch.load"},
+		{"--no-trust-request-chat-template=true", "chat template"},
+		{"--no-enable-mm-embeds=1", "torch.load"},
+	} {
+		flag, _, _ := strings.Cut(c.flag, "=")
+		err := CheckExtraArgs(v(c.flag))
+		var re *RejectedError
+		if !errors.As(err, &re) || re.Flag != flag || re.Rule != "code-loading" || !re.Relaxable {
+			t.Errorf("%s = %v, want a relaxable code-loading *RejectedError for %s", c.flag, err, flag)
+			continue
+		}
+		if !strings.Contains(re.Why, c.reason) {
+			t.Errorf("%s reason = %q, want it to mention %q", c.flag, re.Why, c.reason)
+		}
+	}
+	// The bare forms (no "=value") are still plain negations and stay
+	// allowed.
+	for _, flag := range []string{
+		"--no-enable-prompt-embeds", "--no-trust-request-chat-template", "--no-enable-mm-embeds",
+	} {
+		allowed(t, v(flag))
+	}
+
+	// Rule 1: llama-server's --agent (relaxable, non-bind) has a --no-agent
+	// negation. An inline value on the negation is refused exactly as
+	// --agent itself; the bare negation stays allowed.
+	la := func(args ...string) ArgsInput { return f.in(RuntimeLlamaCPP, args...) }
+	rejectedRule(t, CheckExtraArgs(la("--no-agent=1")), "--no-agent", "refused-flag")
+	relaxable(t, la("--no-agent=1"), "refused-flag")
+	allowed(t, la("--no-agent"))
+}
+
 // TestRule3_OtherRuntimesUnaffected: Rule 3 is vllm-swift only.
 func TestRule3_OtherRuntimesUnaffected(t *testing.T) {
 	f := newTypedFixture(t)

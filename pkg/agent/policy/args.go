@@ -694,7 +694,7 @@ func checkFlag(in ArgsInput, table map[string]flagRule, a Arg) error {
 		}
 	}
 	r, ok := table[a.Name]
-	if !ok && !isNegation(a.Name, canonical) {
+	if !ok && !isNegation(a, canonical) {
 		r, ok = table[canonical]
 	}
 	if ok && (r.bind || !in.AllowUnsafe) {
@@ -747,11 +747,24 @@ func prefixesKnownFlag(runtime, name string) bool {
 	return false
 }
 
-// isNegation reports whether name is the "--no-X" (or llama-server "-no-X")
-// negation of its canonical name X. A negation only turns its option off, so
-// a Rule 1 entry on X ("--agent", "--ui-mcp-proxy") must not refuse it.
-func isNegation(name, canonical string) bool {
-	return name != canonical && (strings.HasPrefix(name, "--no-") || strings.HasPrefix(name, "-no-"))
+// isNegation reports whether a is the "--no-X" (or llama-server "-no-X")
+// negation of its canonical name X, written with no attached value. A bare
+// negation only turns its option off, so a Rule 1 or Rule 3 entry on X
+// ("--agent", "--ui-mcp-proxy", "--enable-prompt-embeds") must not refuse it.
+//
+// A "--no-X" (or "-no-X") spelling that carries an inline "=value"
+// ("--no-agent=1", "--no-enable-prompt-embeds=false") is NOT a negation:
+// argparse's zero-arg bool options do not take a value, so this is either a
+// caller error or an attempt to smuggle X's effect past the negation check.
+// vLLM's own FlexibleArgumentParser happens to reject "=value" on a
+// zero-arg flag today, but the policy must not depend on that staying true,
+// so a.Inline routes it to the same refusal its canonical flag X would get
+// (Ruling 14, Task 6 fix round 1: without this, "--no-enable-prompt-embeds=false"
+// and "--no-trust-request-chat-template=true" skipped Rule 3 entirely, and a
+// Rule 1 entry with a "--no-" form would be skipped the same way).
+func isNegation(a Arg, canonical string) bool {
+	return !a.Inline && a.Name != canonical &&
+		(strings.HasPrefix(a.Name, "--no-") || strings.HasPrefix(a.Name, "-no-"))
 }
 
 // extraArgsPathHint is the PathError.Hint checkPaths attaches to every
@@ -1098,7 +1111,7 @@ func checkCodeLoading(in ArgsInput, parsed []Arg) error {
 			}
 		}
 		canonical := a.Canonical()
-		if why, ok := vllmRefused[canonical]; ok && !isNegation(a.Name, canonical) {
+		if why, ok := vllmRefused[canonical]; ok && !isNegation(a, canonical) {
 			return refuse(a.Flag, why)
 		}
 		if !vllmConfigAllowed[canonical] && (strings.HasSuffix(canonical, "-cls") ||
