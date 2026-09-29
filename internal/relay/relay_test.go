@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -216,9 +217,21 @@ func TestRelay_MissingTokenFileIs503(t *testing.T) {
 	}
 }
 
+// TestRelay_StreamsSSE proves the relay flushes bytes to the client as they
+// arrive rather than buffering until the upstream response completes. It
+// serves the relay behind a real net/http server (httptest.NewServer) and
+// reads over a real connection with a real http.Get, rather than a fake
+// http.ResponseWriter: a real *http.Server response writer buffers writes
+// internally (net/http's bufio.Writer) and only pushes partial data to the
+// socket when explicitly flushed. That is exactly the path statusWriter.Flush
+// exists for, and exactly what an in-process ResponseRecorder/pipe pair
+// cannot exercise, since it has no such buffering to defeat.
 func TestRelay_StreamsSSE(t *testing.T) {
 	release := make(chan struct{})
-	srv, pin := newIngress(t, func(w http.ResponseWriter, _ *http.Request) {
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+
+	upstream, pin := newIngress(t, func(w http.ResponseWriter, _ *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			t.Fatal("ResponseWriter does not support flushing")
@@ -234,7 +247,7 @@ func TestRelay_StreamsSSE(t *testing.T) {
 
 	r, err := New(Config{
 		Target:    "default/qwen",
-		Upstream:  srv.URL,
+		Upstream:  upstream.URL,
 		SPKIPin:   pin,
 		TokenFile: writeToken(t, "tok123"),
 	}, testLogger())
@@ -242,78 +255,48 @@ func TestRelay_StreamsSSE(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
-	pr, pw := io.Pipe()
-	rec := &streamingRecorder{ResponseRecorder: httptest.NewRecorder(), body: pw}
-	done := make(chan struct{})
-	go func() {
-		r.ServeHTTP(rec, req)
-		_ = pw.Close()
-		close(done)
-	}()
+	front := httptest.NewServer(r)
+	// Registered before closeRelease so it runs LAST (t.Cleanup is LIFO):
+	// front.Close (and the upstream test server's own Close, registered
+	// inside newIngress even earlier) block until their in-flight request
+	// finishes, which requires the upstream handler above to be unblocked
+	// first. Without this, a failure below (t.Fatal, which unwinds via
+	// runtime.Goexit) would leave the upstream handler parked on <-release
+	// forever and deadlock teardown.
+	t.Cleanup(front.Close)
+	t.Cleanup(closeRelease)
 
-	// Drain continuously rather than doing a single read: io.Pipe is
-	// unbuffered, so a write for the *second* SSE event would otherwise
-	// block forever once the test stops reading after the first one,
-	// wedging ServeHTTP and this test along with it.
-	br := bufio.NewReader(pr)
-	firstLine := make(chan string, 1)
+	// A bounded client, not the default http.Get: with a broken flush, a
+	// real *http.Server buffers the status line and headers together with
+	// the body and never puts either on the wire until the handler returns
+	// or a buffer fills, so the regression this test targets hangs the GET
+	// itself waiting on headers, not just the later body read. Without this
+	// timeout that failure mode would hang until go test's own -timeout
+	// kills the whole binary instead of failing this test.
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(front.URL + "/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	lineCh := make(chan string, 1)
 	go func() {
-		for {
-			line, err := br.ReadString('\n')
-			if line != "" {
-				select {
-				case firstLine <- line:
-				default:
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
+		line, _ := bufio.NewReader(resp.Body).ReadString('\n')
+		lineCh <- line
 	}()
 
 	select {
-	case line := <-firstLine:
+	case line := <-lineCh:
 		if line != "data: 1\n" {
 			t.Fatalf("first line = %q, want %q", line, "data: 1\n")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first SSE event; proxy is buffering")
+		t.Fatal("timed out waiting for the first SSE event over a real connection; the relay is not flushing")
 	}
 
-	close(release)
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("relay did not finish streaming after release")
-	}
+	closeRelease()
 }
-
-// streamingRecorder adapts httptest.ResponseRecorder so writes are also
-// mirrored to a pipe as they happen, letting the test observe bytes before
-// the handler returns (proving the proxy does not buffer).
-type streamingRecorder struct {
-	*httptest.ResponseRecorder
-	body        *io.PipeWriter
-	wroteHeader bool
-}
-
-func (s *streamingRecorder) WriteHeader(code int) {
-	s.wroteHeader = true
-	s.ResponseRecorder.WriteHeader(code)
-}
-
-func (s *streamingRecorder) Write(b []byte) (int, error) {
-	if !s.wroteHeader {
-		s.WriteHeader(http.StatusOK)
-	}
-	_, _ = s.ResponseRecorder.Write(b)
-	return s.body.Write(b)
-}
-
-func (s *streamingRecorder) Flush() {}
 
 func TestRelay_Ready(t *testing.T) {
 	srv, pin := newIngress(t, func(w http.ResponseWriter, r *http.Request) {
