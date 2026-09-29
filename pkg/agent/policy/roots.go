@@ -78,17 +78,6 @@ func NewRoots(paths []string, home string) (Roots, []string, error) {
 // Dirs returns the resolved root directories.
 func (r Roots) Dirs() []string { return append([]string(nil), r.dirs...) }
 
-// IsPathShaped reports whether a flag value names a filesystem path by its
-// prefix: absolute, home-relative, explicitly relative, or a file:// URI.
-func IsPathShaped(v string) bool {
-	switch {
-	case strings.HasPrefix(v, "/"), strings.HasPrefix(v, "~"),
-		strings.HasPrefix(v, "./"), strings.HasPrefix(v, "../"):
-		return true
-	}
-	return len(v) >= len("file://") && strings.EqualFold(v[:len("file://")], "file://")
-}
-
 // StripFileScheme removes a case-insensitive file:// prefix.
 func StripFileScheme(v string) string {
 	if len(v) >= len("file://") && strings.EqualFold(v[:len("file://")], "file://") {
@@ -197,17 +186,33 @@ type PathError struct {
 	Resolved string
 	Roots    []string
 	Err      error
+	// Hint, when set, replaces Error()'s default "widen --allowed-model-roots"
+	// advice with a caller-supplied one appropriate to what kind of path this
+	// is. A Model source or pagedSSDCacheDir (checked directly through
+	// Roots.CheckPath by checkModelPaths) has no other escape hatch, so it
+	// leaves Hint empty and keeps the roots-widening advice. An extraArgs
+	// value (checked by the policy package's checkPaths) is governed by the
+	// same roots but can also be overridden by --allow-unsafe-extra-args, so
+	// that caller sets a Hint naming both.
+	Hint string
 }
 
 // Unwrap exposes the underlying resolve error, if any, to errors.Is/As.
 func (e *PathError) Unwrap() error { return e.Err }
 
 func (e *PathError) Error() string {
-	if e.Err != nil {
+	switch {
+	case e.Err != nil && e.Hint != "":
+		return fmt.Sprintf("%s %s cannot be resolved: %v; %s", e.What, e.Path, e.Err, e.Hint)
+	case e.Err != nil:
 		return fmt.Sprintf("%s %s cannot be resolved: %v", e.What, e.Path, e.Err)
+	case e.Hint != "":
+		return fmt.Sprintf("%s %s resolves to %s, outside the allowed model roots %v; %s",
+			e.What, e.Path, e.Resolved, e.Roots, e.Hint)
+	default:
+		return fmt.Sprintf("%s %s resolves to %s, outside the allowed model roots %v; "+
+			"add its directory to the agent's --allowed-model-roots to allow it", e.What, e.Path, e.Resolved, e.Roots)
 	}
-	return fmt.Sprintf("%s %s resolves to %s, outside the allowed model roots %v; "+
-		"add its directory to the agent's --allowed-model-roots to allow it", e.What, e.Path, e.Resolved, e.Roots)
 }
 
 // CheckPath resolves p and returns a *PathError if it cannot be resolved or

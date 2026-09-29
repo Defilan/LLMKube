@@ -647,3 +647,114 @@ func TestEnsureProcess_NormalRemoteSourceNotRefusedByDotDotRule(t *testing.T) {
 		t.Fatalf("ensureProcess refused a normal remote source: %v", err)
 	}
 }
+
+// A dangerous extraArgs flag (llama-server's --path serves the model store
+// over HTTP) is refused before the engine starts.
+func TestEnsureProcess_RefusesDangerousExtraArgs(t *testing.T) {
+	isvc := refusalISVC("svc")
+	isvc.Spec.ExtraArgs = []string{"--path", "/"}
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+
+	err := a.ensureProcess(context.Background(), isvc)
+	if err == nil || !strings.Contains(err.Error(), EventReasonExtraArgsRejected) || ex.starts != 0 {
+		t.Fatalf("error = %v starts = %d, want ExtraArgsRejected and no start", err, ex.starts)
+	}
+	if !strings.Contains(strings.Join(drainEvents(rec), "\n"), `Warning ExtraArgsRejected extraArgs flag "--path"`) {
+		t.Error("event does not name the refused flag")
+	}
+}
+
+// Tuning flags the policy allows (a plain value flag and a negative-number
+// value) are not treated as paths or bind flags and start normally, with the
+// args passed to the executor unchanged.
+func TestEnsureProcess_TuningExtraArgsStillPass(t *testing.T) {
+	isvc := refusalISVC("svc")
+	isvc.Spec.ExtraArgs = []string{"--spec-type", "draft-mtp", "--cache-ram", "-1"}
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+
+	if err := a.ensureProcess(context.Background(), isvc); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	if ex.starts != 1 || !reflect.DeepEqual(ex.lastCfg.ExtraArgs, isvc.Spec.ExtraArgs) {
+		t.Errorf("starts=%d extraArgs=%v, want 1 start with the args unchanged", ex.starts, ex.lastCfg.ExtraArgs)
+	}
+}
+
+// Re-evaluating a refused InferenceService must not flap the status through ""
+// between calls, mirroring TestEnsureProcess_EndpointNameConflictNoStatusFlap:
+// the model here is sized and budgeted so it WOULD pass memory admission if
+// checkExtraArgs ran after it instead (the flap this test guards against), and
+// every status write across two ensureProcess calls is captured so a
+// clear-then-set within a single call cannot hide behind the final read.
+func TestEnsureProcess_ExtraArgsRejectedNoStatusFlap(t *testing.T) {
+	var written []string
+	funcs := &interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if is, ok := obj.(*inferencev1alpha1.InferenceService); ok && sub == "status" {
+				written = append(written, is.Status.SchedulingStatus)
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
+	isvc := refusalISVC("svc")
+	isvc.Spec.ExtraArgs = []string{"--path", "/"}
+	model := refusalModel()
+	model.Spec.Hardware.MemoryBudget = "1Ti"
+	model.Status.Size = "1 GiB"
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, funcs, isvc, model)
+
+	for i := range 2 {
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.ensureProcess(context.Background(), cur); err == nil {
+			t.Fatalf("call %d: ensureProcess succeeded, want a refusal", i+1)
+		}
+	}
+
+	if ex.starts != 0 {
+		t.Errorf("starts = %d after two refused evaluations, want 0", ex.starts)
+	}
+	if len(written) == 0 {
+		t.Fatal("no status writes recorded; the refusal must be reported on the status")
+	}
+	for i, s := range written {
+		if s != EventReasonExtraArgsRejected {
+			t.Errorf("status write %d set schedulingStatus = %q, want %q (writes: %q)",
+				i, s, EventReasonExtraArgsRejected, written)
+		}
+	}
+}
+
+// --allow-unsafe-extra-args relaxes a Rule 1 refused-but-not-bind flag
+// (--log-file writes a file) but never a bind flag (--host sets the bind
+// address): the hatch cannot be used to move where the engine listens.
+func TestEnsureProcess_AllowUnsafeExtraArgsRelaxesButNotBind(t *testing.T) {
+	t.Run("relaxed flag passes", func(t *testing.T) {
+		isvc := refusalISVC("svc")
+		isvc.Spec.ExtraArgs = []string{"--log-file", "/tmp/x"}
+		a, ex, _ := refusalFixture(t, MetalAgentConfig{AllowUnsafeExtraArgs: true}, isvc, refusalModel())
+
+		if err := a.ensureProcess(context.Background(), isvc); err != nil {
+			t.Fatalf("ensureProcess: %v", err)
+		}
+		if ex.starts != 1 {
+			t.Errorf("starts = %d, want 1 (AllowUnsafe should let --log-file through)", ex.starts)
+		}
+	})
+
+	t.Run("bind flag still refused", func(t *testing.T) {
+		isvc := refusalISVC("svc")
+		isvc.Spec.ExtraArgs = []string{"--host", "0.0.0.0"}
+		a, ex, _ := refusalFixture(t, MetalAgentConfig{AllowUnsafeExtraArgs: true}, isvc, refusalModel())
+
+		err := a.ensureProcess(context.Background(), isvc)
+		if err == nil || !strings.Contains(err.Error(), EventReasonExtraArgsRejected) || ex.starts != 0 {
+			t.Fatalf("error = %v starts = %d, want ExtraArgsRejected and no start even with AllowUnsafe",
+				err, ex.starts)
+		}
+	})
+}

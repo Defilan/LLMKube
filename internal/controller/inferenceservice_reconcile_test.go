@@ -356,6 +356,48 @@ var _ = Describe("determinePhase", func() {
 		Expect(phase).To(Equal("Creating"))
 	})
 
+	// A service the agent refused never registers an endpoint, so it sits in
+	// the not-ready metal branch. Replacing the refusal with
+	// WaitingForMetalAgent hid it and bumped the resourceVersion, which the
+	// agent's poll treated as a change and refused again every few seconds.
+	DescribeTable("should keep an agent refusal on a not-ready metal service",
+		func(reason string) {
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			}
+			isvc.Status.SchedulingStatus = reason
+			phase, info := reconciler.determinePhase(context.Background(), isvc, 0, 1, true, nil, nil)
+			Expect(phase).To(Equal(PhaseCreating))
+			Expect(info).To(BeNil())
+		},
+		Entry("memory admission", "InsufficientMemory"),
+		Entry("memory check failure", "MemoryCheckFailed"),
+		Entry("endpoint name conflict", "EndpointNameConflict"),
+		Entry("model source outside the roots", "ModelSourceNotAllowed"),
+		Entry("rejected extraArgs", "ExtraArgsRejected"),
+	)
+
+	It("should replace a controller-written status with WaitingForMetalAgent on a not-ready metal service", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		}
+		isvc.Status.SchedulingStatus = "AgentHeartbeatStale"
+		_, info := reconciler.determinePhase(context.Background(), isvc, 0, 1, true, nil, nil)
+		Expect(info).NotTo(BeNil())
+		Expect(info.Status).To(Equal("WaitingForMetalAgent"))
+	})
+
+	It("should let a stale heartbeat replace an agent refusal", func() {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		}
+		isvc.Status.SchedulingStatus = "ExtraArgsRejected"
+		snap := &metalSnapshot{Kind: metalHBStale, RawHeartbeat: "2026-01-01T00:00:00Z"}
+		_, info := reconciler.determinePhase(context.Background(), isvc, 0, 1, true, nil, snap)
+		Expect(info).NotTo(BeNil())
+		Expect(info.Status).To(Equal("AgentHeartbeatStale"))
+	})
+
 	It("should return Stopped when replicas=0 on generic path", func() {
 		isvc := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},

@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
 // Event reasons for starts the agent refuses before (or instead of) serving.
@@ -114,6 +115,35 @@ func (a *MetalAgent) checkModelPaths(
 		if err := a.roots.CheckPath("pagedSSDCacheDir", pagedSSDCacheDir, workDir, a.home); err != nil {
 			return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, err.Error())
 		}
+	}
+	return nil
+}
+
+// checkExtraArgs applies the extraArgs policy for runtime and refuses the
+// start on a violation. It is a no-op when args is empty. Called from
+// reconcileProcess right after checkModelPaths, before checkMemoryAdmission,
+// for the same reason checkModelPaths runs there: memory admission's success
+// path clears SchedulingStatus, so a refusal check placed after it would flap
+// the status on every watch poll of an otherwise-admittable spec.
+func (a *MetalAgent) checkExtraArgs(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	runtime string,
+	args []string,
+) error {
+	if len(args) == 0 {
+		return nil
+	}
+	err := policy.CheckExtraArgs(policy.ArgsInput{
+		Runtime:     runtime,
+		Args:        args,
+		Roots:       a.roots,
+		WorkDir:     a.config.ModelStorePath,
+		Home:        a.home,
+		AllowUnsafe: a.config.AllowUnsafeExtraArgs,
+	})
+	if err != nil {
+		return a.refuseStart(ctx, isvc, EventReasonExtraArgsRejected, err.Error())
 	}
 	return nil
 }
