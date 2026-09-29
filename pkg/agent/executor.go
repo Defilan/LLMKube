@@ -389,11 +389,18 @@ func (e *MetalExecutor) ensureModel(
 	localPath := filepath.Join(e.modelStorePath, name, filename)
 	local := isLocalModelSource(source)
 
-	// Lstat, not Stat: the cache slot is written only by this agent, so
-	// anything other than a regular file there (a planted symlink above all)
-	// is refused rather than followed and loaded.
-	info, statErr := os.Lstat(localPath)
-	if statErr == nil && !info.Mode().IsRegular() {
+	// For a source the agent downloads, the cache slot is written only by
+	// this agent, so it is examined with Lstat and anything other than a
+	// regular file there (a planted symlink above all) is refused rather than
+	// followed and loaded. A local source keeps the historical Stat: it is
+	// loaded in place and the allowed-roots policy governs its path, which may
+	// legitimately be a symlink inside a root.
+	stat := os.Lstat
+	if local {
+		stat = os.Stat
+	}
+	info, statErr := stat(localPath)
+	if statErr == nil && !local && !info.Mode().IsRegular() {
 		return "", fmt.Errorf("refusing model cache entry %s: not a regular file (mode %s); remove it to re-download",
 			localPath, info.Mode())
 	}

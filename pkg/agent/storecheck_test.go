@@ -479,3 +479,36 @@ func TestCheckModelStore_AncestorOwnedByAnotherUser_RealChown(t *testing.T) {
 		t.Fatalf("CheckModelStore under a uid-4242 ancestor = %v, want a refusal naming the owner", err)
 	}
 }
+
+// The non-regular cache-slot refusal covers only sources the agent downloads
+// into the store. A local-source Model (absolute path or file://) is loaded
+// in place and governed by the allowed-roots policy, so one whose path is a
+// symlink inside the store (an allowed root) keeps resolving as before, even
+// when that path is the same as the cache slot.
+func TestEnsureModel_LocalSourceSymlinkInRootResolvesAsBefore(t *testing.T) {
+	for _, scheme := range []string{"", "file://"} {
+		t.Run("scheme="+scheme, func(t *testing.T) {
+			store := t.TempDir()
+			e := NewMetalExecutor("/bin/llama-server", store, newNopLogger())
+			real := filepath.Join(store, "real.gguf")
+			if err := os.WriteFile(real, []byte("gguf-bytes"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			md := filepath.Join(store, "m")
+			if err := os.Mkdir(md, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			link := filepath.Join(md, "model.gguf")
+			if err := os.Symlink(real, link); err != nil {
+				t.Fatal(err)
+			}
+			got, err := e.ensureModel(t.Context(), scheme+link, "m", nil, "")
+			if err != nil {
+				t.Fatalf("ensureModel(local symlink source) = %v, want it to resolve", err)
+			}
+			if got != link {
+				t.Errorf("ensureModel = %q, want %q (the pre-change in-place path)", got, link)
+			}
+		})
+	}
+}
