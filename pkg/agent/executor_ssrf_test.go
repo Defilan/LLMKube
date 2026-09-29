@@ -138,7 +138,9 @@ func TestDownloadFile_RedirectFromAllowlistedHostToBlockedAddressRefused(t *test
 	for _, token := range []string{"", "hf_secret"} {
 		t.Run("token="+token, func(t *testing.T) {
 			target, targetHits := countingServer(t, "internal-secret")
+			var mirrorHits atomic.Int32
 			mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mirrorHits.Add(1)
 				http.Redirect(w, r, target.URL+"/model.gguf", http.StatusFound)
 			}))
 			t.Cleanup(mirror.Close)
@@ -156,6 +158,9 @@ func TestDownloadFile_RedirectFromAllowlistedHostToBlockedAddressRefused(t *test
 			err = e.downloadFile(t.Context(), "http://mirror.test:"+port+"/model.gguf", dst, token)
 
 			assertGuardRefusal(t, err, "127.0.0.1")
+			if mirrorHits.Load() == 0 {
+				t.Error("the allowlisted mirror was never reached; the redirect was not exercised")
+			}
 			if n := targetHits.Load(); n != 0 {
 				t.Errorf("redirect target received %d requests, want 0", n)
 			}
@@ -171,9 +176,21 @@ func TestDownloadFile_RedirectFromAllowlistedHostToBlockedAddressRefused(t *test
 // download fails, but with a dial error, not a guard refusal. No real host is
 // contacted.
 func TestDownloadFile_PublicHostNotRefused(t *testing.T) {
+	// A proxy in the developer's environment would change the path taken;
+	// this test is about the direct guarded dial.
+	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"} {
+		t.Setenv(k, "")
+	}
+	var lookups atomic.Int32
 	dir := t.TempDir()
-	e := NewMetalExecutor("/bin/llama-server", dir, newNopLogger(),
-		withLookup(map[string]string{"models.example": "192.0.2.1"}))
+	e := NewMetalExecutor("/bin/llama-server", dir, newNopLogger())
+	e.lookupNetIP = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		if host != "models.example" {
+			return nil, errors.New("test resolver: no record for " + host)
+		}
+		return []netip.Addr{netip.MustParseAddr("192.0.2.1")}, nil
+	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
@@ -181,8 +198,18 @@ func TestDownloadFile_PublicHostNotRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("download to an unrouted documentation address unexpectedly succeeded")
 	}
+	if lookups.Load() < 1 {
+		t.Fatal("the test resolver was never consulted; the download did not take the guarded dial path")
+	}
 	if strings.Contains(err.Error(), "SSRF guard") {
 		t.Fatalf("public address was refused by the SSRF guard: %v", err)
+	}
+	// The failure must come from actually dialing 192.0.2.1 (a dial error or
+	// the context deadline), not from resolution or any earlier step.
+	var opErr *net.OpError
+	isDial := errors.As(err, &opErr) && opErr.Op == "dial"
+	if !isDial && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want a dial *net.OpError or context.DeadlineExceeded, got %T: %v", err, err)
 	}
 }
 

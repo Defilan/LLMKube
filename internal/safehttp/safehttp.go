@@ -25,8 +25,11 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http/httpproxy"
 )
 
 // Allowlist permits specific hostnames and CIDRs back through the
@@ -89,7 +92,6 @@ var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments (RFC 6890)
 	netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking (RFC 2544)
 	netip.MustParsePrefix("192.88.99.0/24"), // 6to4 relay anycast (RFC 3068)
-	netip.MustParsePrefix("64:ff9b::/96"),   // NAT64 well-known prefix (RFC 6052)
 	netip.MustParsePrefix("64:ff9b:1::/48"), // NAT64 local-use (RFC 8215)
 }
 
@@ -97,6 +99,13 @@ var blockedPrefixes = []netip.Prefix{
 // (::a.b.c.d, RFC 4291 §2.5.5.1). Some stacks route these to the embedded
 // IPv4 target, so they classify by the embedded address, not as IPv6.
 var v4CompatPrefix = netip.MustParsePrefix("::/96")
+
+// nat64Prefix is the NAT64 well-known prefix (RFC 6052). On a DNS64 network
+// every IPv4-only host resolves to 64:ff9b::a.b.c.d, so blocking the prefix
+// outright would refuse every public IPv4-only host there. It classifies by
+// the embedded IPv4 address instead: public stays reachable, 64:ff9b::7f00:1
+// (127.0.0.1) and friends stay blocked.
+var nat64Prefix = netip.MustParsePrefix("64:ff9b::/96")
 
 // IPBlocked reports whether an IP is in a range we refuse to connect to
 // unless explicitly allowlisted: loopback, link-local (incl. 169.254.169.254
@@ -115,12 +124,13 @@ func IPBlocked(ip netip.Addr) bool {
 			return true
 		}
 	}
-	// IPv4-compatible IPv6: in ::/96 but not :: or ::1 (both already returned
-	// true above). Extract the embedded IPv4 address and classify by it, so
-	// ::169.254.169.254 and ::127.0.0.1 are blocked like their IPv4 selves.
+	// IPv4-compatible IPv6 (::/96, but not :: or ::1, both already returned
+	// true above) and NAT64 (64:ff9b::/96): extract the embedded IPv4 address
+	// and classify by it, so ::169.254.169.254 and 64:ff9b::7f00:1 are blocked
+	// like their IPv4 selves while 64:ff9b::808:808 (8.8.8.8) is not.
 	// Recursion terminates: the embedded address is Is4 and cannot re-enter
 	// this branch.
-	if ip.Is6() && v4CompatPrefix.Contains(ip) {
+	if ip.Is6() && (v4CompatPrefix.Contains(ip) || nat64Prefix.Contains(ip)) {
 		b := ip.As16()
 		return IPBlocked(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
 	}
@@ -159,6 +169,18 @@ func WithResolver(lookup LookupFunc) Option {
 // is rejected outright). Redirect targets dial through the same guard; hops
 // are capped.
 //
+// Proxy settings (HTTP_PROXY, HTTPS_PROXY, NO_PROXY and their lowercase
+// forms) are read from the environment when NewClient is called. A request
+// that goes through a proxy is judged by its target before it is handed to
+// the proxy: the target host is resolved and put through the same strict
+// check the dial applies, on every request including each redirect hop. The
+// proxy's own address is operator-configured and trusted, so a proxy on a
+// private or loopback address is dialed. Limit: the proxy resolves the target
+// name again itself, so DNS rebinding between our check and the proxy's
+// lookup is not closed; the operator controls the proxy and its resolver.
+// Requests the environment sends direct (NO_PROXY, loopback) use the guarded
+// dial unchanged.
+//
 // hint is the operator-facing setting named in the refusal message, for
 // example "modelSource.allowedRemoteHosts" for the controller or
 // "--allowed-download-hosts" for the metal-agent. opts are optional; see
@@ -168,12 +190,10 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 	for _, opt := range opts {
 		opt(&o)
 	}
-	base := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
+	// checkHost resolves host (unless it is an IP literal) and applies the
+	// strict guard: every resolved IP must be permitted, so a multi-record
+	// rebind (one public + one 127.0.0.1) cannot pass.
+	checkHost := func(ctx context.Context, host string) ([]netip.Addr, error) {
 		hostAllowed := allow.hostAllowed(host)
 		var ips []netip.Addr
 		if ip, err := netip.ParseAddr(host); err == nil {
@@ -188,8 +208,6 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 		if len(ips) == 0 {
 			return nil, fmt.Errorf("no addresses for host %q", host)
 		}
-		// Strict: every resolved IP must be permitted, so a multi-record rebind
-		// (one public + one 127.0.0.1) cannot pass.
 		for _, ip := range ips {
 			permitted := hostAllowed || allow.ipAllowed(ip) || !IPBlocked(ip)
 			if !permitted {
@@ -197,6 +215,29 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 					"connection to %s (%s) blocked by SSRF guard (GHSA-jw3m-8q7m-f35r); "+
 						"allowlist via %s", host, ip, hint)
 			}
+		}
+		return ips, nil
+	}
+
+	// httpproxy.FromEnvironment is what http.ProxyFromEnvironment wraps, but
+	// read per client instead of cached once per process.
+	proxyCfg := httpproxy.FromEnvironment()
+	envProxy := proxyCfg.ProxyFunc()
+	trustedProxies := proxyDialAddrs(proxyCfg)
+
+	base := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if _, ok := trustedProxies[strings.ToLower(addr)]; ok {
+			// The operator-configured proxy: trusted, dialed as configured.
+			return base.DialContext(ctx, network, addr)
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		ips, err := checkHost(ctx, host)
+		if err != nil {
+			return nil, err
 		}
 		// Dial the pinned, already-checked IPs in resolver order, falling back
 		// across them (dual-stack hosts may not listen on every address).
@@ -210,9 +251,31 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 		}
 		return nil, dialErr
 	}
+	proxy := func(req *http.Request) (*url.URL, error) {
+		proxyURL, err := envProxy(req.URL)
+		if err != nil {
+			return nil, err
+		}
+		if proxyURL == nil {
+			// Direct (no proxy, NO_PROXY, loopback): the dial guard applies,
+			// except that a target naming the proxy's own address would ride
+			// the trusted proxy dial, so judge that one here.
+			if _, isProxy := trustedProxies[targetDialAddr(req.URL)]; isProxy {
+				if _, err := checkHost(req.Context(), req.URL.Hostname()); err != nil {
+					return nil, err
+				}
+			}
+			return nil, nil
+		}
+		if _, err := checkHost(req.Context(), req.URL.Hostname()); err != nil {
+			return nil, err
+		}
+		return proxyURL, nil
+	}
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
+			Proxy:                 proxy,
 			DialContext:           dial,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ResponseHeaderTimeout: timeout,
@@ -225,4 +288,36 @@ func NewClient(allow Allowlist, timeout time.Duration, hint string, opts ...Opti
 			return nil
 		},
 	}
+}
+
+// proxyDialAddrs returns the lowercased host:port dial addresses of the
+// proxies configured in cfg, with the scheme's default port filled in the way
+// net/http does when it dials a proxy. A dial to one of these is the
+// operator's own proxy, not a source-derived target.
+func proxyDialAddrs(cfg *httpproxy.Config) map[string]struct{} {
+	addrs := map[string]struct{}{}
+	for _, raw := range []string{cfg.HTTPProxy, cfg.HTTPSProxy} {
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			// Bare "host:port", which httpproxy also accepts as http://.
+			if u, err = url.Parse("http://" + raw); err != nil {
+				continue
+			}
+		}
+		addrs[targetDialAddr(u)] = struct{}{}
+	}
+	return addrs
+}
+
+// targetDialAddr is the lowercased host:port net/http dials for u, with the
+// scheme's default port filled in.
+func targetDialAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
+	}
+	return strings.ToLower(net.JoinHostPort(u.Hostname(), port))
 }
