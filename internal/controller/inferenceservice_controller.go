@@ -123,6 +123,10 @@ type InferenceServiceReconciler struct {
 	// effort); the production operator wires a kubernetes-clientset-backed
 	// reader.
 	PodLogReader PodLogReader
+
+	// RelayImage is the image for Metal relay pods (router-proxy in --relay
+	// mode). Wired from --router-proxy-image; empty uses the router-proxy default.
+	RelayImage string
 }
 
 func sanitizeDNSName(name string) string {
@@ -173,6 +177,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=core,resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
@@ -480,7 +485,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		// and the server is healthy. Derive readyReplicas from the Endpoints rather
 		// than blindly returning desiredReplicas, otherwise Phase reports Ready
 		// before the agent has done anything (issue #374).
-		snap := r.metalEndpointSnapshot(ctx, isvc)
+		snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 		if snap.Kind == metalHBStale {
 			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
 		}
@@ -810,9 +815,10 @@ type metalSnapshot struct {
 	staleSlices []discoveryv1.EndpointSlice
 }
 
-// metalEndpointSnapshot lists the EndpointSlices for isvc and returns a
-// metalSnapshot summarising both the ready-replica count and the heartbeat
-// state. It is the single source of truth for the metal path: it makes the
+// metalEndpointSnapshot lists the EndpointSlices of the Service name (the
+// InferenceService's own "<isvc>" in legacy mode, "<isvc>-agent" in relay
+// mode) and returns a metalSnapshot summarising both the ready-replica count
+// and the heartbeat state. It is the single source of truth for the metal path: it makes the
 // one List call, and metalHeartbeatRequeueDuration then derives the requeue
 // interval from the snapshot it returns without calling the API again.
 //
@@ -823,9 +829,8 @@ type metalSnapshot struct {
 // When multiple slices carry a heartbeat annotation we classify against the
 // freshest one. Mirrored slices have no heartbeat annotation, so an upgrade
 // window degrades gracefully to the legacy-exempt path.
-func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, isvc *inferencev1alpha1.InferenceService) *metalSnapshot {
+func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, isvc *inferencev1alpha1.InferenceService, name string) *metalSnapshot {
 	log := logf.FromContext(ctx)
-	name := sanitizeDNSName(isvc.Name)
 	slices := &discoveryv1.EndpointSliceList{}
 	err := r.List(ctx, slices,
 		client.InNamespace(isvc.Namespace),

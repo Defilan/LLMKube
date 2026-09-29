@@ -95,7 +95,7 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 			Expect(snap.ReadyReplicas).To(Equal(int32(1)))
 			// Kind, not just the count: it selects the requeue interval
 			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
@@ -114,7 +114,7 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 			Expect(snap.ReadyReplicas).To(Equal(int32(0)))
 			// Kind, not just the count: it selects the requeue interval
 			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
@@ -132,7 +132,7 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 			Expect(snap.ReadyReplicas).To(Equal(int32(0)))
 			// Kind, not just the count: it selects the requeue interval
 			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
@@ -150,7 +150,7 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 			isvc := &inferencev1alpha1.InferenceService{
 				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
 			}
-			snap := reconciler.metalEndpointSnapshot(ctx, isvc)
+			snap := reconciler.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 			Expect(snap.ReadyReplicas).To(Equal(int32(1)))
 			// Kind, not just the count: it selects the requeue interval
 			// (metalHeartbeatRequeueDuration) and the SchedulingStatus
