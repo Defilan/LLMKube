@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+// Package safehttp provides an SSRF-guarded HTTP client shared by any code
+// path that fetches a source-derived URL: the controller's Model source
+// reads today, the metal-agent's downloader next. See GHSA-jw3m-8q7m-f35r.
+package safehttp
 
 import (
 	"context"
@@ -26,20 +29,21 @@ import (
 	"time"
 )
 
-// remoteHostAllowlist permits specific hostnames and CIDRs back through the
+// Allowlist permits specific hostnames and CIDRs back through the
 // private-range SSRF guard. Hostnames match the request URL host
 // (case-insensitive); CIDRs match resolved IPs.
-type remoteHostAllowlist struct {
+type Allowlist struct {
 	hosts    map[string]struct{}
 	prefixes []netip.Prefix
 }
 
-// parseRemoteHostAllowlist builds an allowlist from operator-supplied entries
-// (--allowed-remote-hosts). Each entry is a CIDR (10.20.0.0/16), a bare IP
-// (treated as a single-address prefix), or a hostname. Blank entries are
-// ignored; an unparseable CIDR falls back to hostname matching.
-func parseRemoteHostAllowlist(entries []string) remoteHostAllowlist {
-	al := remoteHostAllowlist{hosts: map[string]struct{}{}}
+// ParseAllowlist builds an allowlist from operator-supplied entries (for
+// example --allowed-remote-hosts or --allowed-download-hosts). Each entry is
+// a CIDR (10.20.0.0/16), a bare IP (treated as a single-address prefix), or a
+// hostname. Blank entries are ignored; an unparseable CIDR falls back to
+// hostname matching.
+func ParseAllowlist(entries []string) Allowlist {
+	al := Allowlist{hosts: map[string]struct{}{}}
 	for _, e := range entries {
 		e = strings.TrimSpace(e)
 		if e == "" {
@@ -61,12 +65,12 @@ func parseRemoteHostAllowlist(entries []string) remoteHostAllowlist {
 	return al
 }
 
-func (al remoteHostAllowlist) hostAllowed(host string) bool {
+func (al Allowlist) hostAllowed(host string) bool {
 	_, ok := al.hosts[strings.ToLower(host)]
 	return ok
 }
 
-func (al remoteHostAllowlist) ipAllowed(ip netip.Addr) bool {
+func (al Allowlist) ipAllowed(ip netip.Addr) bool {
 	ip = ip.Unmap()
 	for _, p := range al.prefixes {
 		if p.Contains(ip) {
@@ -79,7 +83,7 @@ func (al remoteHostAllowlist) ipAllowed(ip netip.Addr) bool {
 // blockedPrefixes lists non-public ranges that Go's stdlib classifiers
 // (IsPrivate, IsLoopback, IsLinkLocal*) do NOT cover but that must never be
 // reachable from source-derived URLs unless allowlisted. Parsed once at
-// package init; ipIsBlocked runs on every dial, so no per-call parsing.
+// package init; IPBlocked runs on every dial, so no per-call parsing.
 var blockedPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("100.64.0.0/10"),  // CGNAT / shared address space (RFC 6598), incl. Tailscale
 	netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments (RFC 6890)
@@ -94,13 +98,13 @@ var blockedPrefixes = []netip.Prefix{
 // IPv4 target, so they classify by the embedded address, not as IPv6.
 var v4CompatPrefix = netip.MustParsePrefix("::/96")
 
-// ipIsBlocked reports whether an IP is in a range we refuse to connect to
+// IPBlocked reports whether an IP is in a range we refuse to connect to
 // unless explicitly allowlisted: loopback, link-local (incl. 169.254.169.254
 // and fe80::/10), RFC-1918 private, ULA (fc00::/7), unspecified, or any of
 // blockedPrefixes (CGNAT, benchmarking, NAT64, ...). Unmap() first so
 // IPv4-in-IPv6 forms (::ffff:127.0.0.1) classify as their IPv4 self;
 // IPv4-compatible forms (::127.0.0.1) recurse on the embedded IPv4 address.
-func ipIsBlocked(ip netip.Addr) bool {
+func IPBlocked(ip netip.Addr) bool {
 	ip = ip.Unmap()
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsPrivate() || ip.IsUnspecified() {
@@ -118,19 +122,23 @@ func ipIsBlocked(ip netip.Addr) bool {
 	// this branch.
 	if ip.Is6() && v4CompatPrefix.Contains(ip) {
 		b := ip.As16()
-		return ipIsBlocked(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
+		return IPBlocked(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
 	}
 	return false
 }
 
-// newGuardedHTTPClient returns an *http.Client whose dialer refuses to connect
-// to blocked IP ranges unless the target host/IP is allowlisted. The check runs
-// on the RESOLVED IPs and dials only those pinned IPs, so DNS rebinding cannot
-// slip a blocked address in after the check. Every resolved IP must be
+// NewClient returns an *http.Client whose dialer refuses to connect to
+// blocked IP ranges unless the target host/IP is allowlisted. The check runs
+// on the RESOLVED IPs and dials only those pinned IPs, so DNS rebinding
+// cannot slip a blocked address in after the check. Every resolved IP must be
 // permitted (a multi-record answer mixing one public and one loopback address
 // is rejected outright). Redirect targets dial through the same guard; hops
 // are capped.
-func newGuardedHTTPClient(allow remoteHostAllowlist, timeout time.Duration) *http.Client {
+//
+// hint is the operator-facing setting named in the refusal message, for
+// example "modelSource.allowedRemoteHosts" for the controller or
+// "--allowed-download-hosts" for the metal-agent.
+func NewClient(allow Allowlist, timeout time.Duration, hint string) *http.Client {
 	base := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -154,11 +162,11 @@ func newGuardedHTTPClient(allow remoteHostAllowlist, timeout time.Duration) *htt
 		// Strict: every resolved IP must be permitted, so a multi-record rebind
 		// (one public + one 127.0.0.1) cannot pass.
 		for _, ip := range ips {
-			permitted := hostAllowed || allow.ipAllowed(ip) || !ipIsBlocked(ip)
+			permitted := hostAllowed || allow.ipAllowed(ip) || !IPBlocked(ip)
 			if !permitted {
 				return nil, fmt.Errorf(
 					"connection to %s (%s) blocked by SSRF guard (GHSA-jw3m-8q7m-f35r); "+
-						"allowlist via modelSource.allowedRemoteHosts", host, ip)
+						"allowlist via %s", host, ip, hint)
 			}
 		}
 		// Dial the pinned, already-checked IPs in resolver order, falling back
