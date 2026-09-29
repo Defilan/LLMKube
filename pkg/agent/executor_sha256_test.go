@@ -363,7 +363,7 @@ func TestEnsureModel_CacheHit_Mismatch_DeletesAndRedownloads(t *testing.T) {
 }
 
 // TestDownloadFile_ResumeThenSHA256VerifiedOnFinalFile is the load-bearing
-// case for review focus #3: a resumed download must be digest-checked on the
+// resume case: a resumed download must be digest-checked on the
 // complete, assembled file, not on the freshly-fetched remainder or the
 // in-flight partial. hashFile is asserted to run exactly once, over the whole
 // published file, even though the bytes arrived across a seeded partial and a
@@ -418,7 +418,7 @@ func TestDownloadFile_ResumeThenSHA256VerifiedOnFinalFile(t *testing.T) {
 }
 
 // TestDownloadFile_ResumeThenSHA256MismatchDeletesPartialAndFinal covers the
-// resumed-download failure side of review focus #3: a mismatch on the
+// resumed-download failure side: a mismatch on the
 // assembled file must remove the partial (never published) and must not
 // leave anything at the final path.
 func TestDownloadFile_ResumeThenSHA256MismatchDeletesPartialAndFinal(t *testing.T) {
@@ -453,7 +453,7 @@ func TestDownloadFile_ResumeThenSHA256MismatchDeletesPartialAndFinal(t *testing.
 }
 
 // TestDownloadFile_CompletePartialShortcut_VerifiesDigestBeforePublish covers
-// the other resumed-download path in review focus #3: a partial left already
+// the other resumed-download path: a partial left already
 // complete by a previous attempt is republished via a rename-only shortcut
 // that bypasses copyToFileResume, and must still be verified on that
 // assembled content before publish.
@@ -518,8 +518,9 @@ func TestDownloadFile_CompletePartialShortcut_MismatchDeletesPartial(t *testing.
 
 // TestEnsureModel_LocalSource_NotHashed pins that a local source (loaded in
 // place, never copied into the model store) is never hashed, even when
-// Model.spec.sha256 is set: local sources are out of scope per the plan, and
-// hashing a file the executor did not itself download would be surprising.
+// Model.spec.sha256 is set: the digest check covers bytes the agent downloads
+// itself, and hashing a file an operator placed on this Mac on every start
+// would be surprising (and slow for a large model).
 func TestEnsureModel_LocalSource_NotHashed(t *testing.T) {
 	store := t.TempDir()
 	e := NewMetalExecutor("/bin/false", store, newNopLogger())

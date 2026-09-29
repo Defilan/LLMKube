@@ -226,10 +226,10 @@ const (
 // writes them) and the controller's determinePhase (internal/controller/
 // scheduling.go, which must not overwrite a refusal with "WaitingForMetalAgent"
 // on the next reconcile) share one list instead of two hand-maintained ones
-// that silently drift out of sync (#1927-class bug: ServiceNameTooLong was
+// that silently drift out of sync. They did once: ServiceNameTooLong was
 // added to the agent in 0.10.0 without a matching controller-side entry, so
 // the controller cleared the refusal every poll and the agent re-refused
-// every poll).
+// every poll, in a loop.
 const (
 	// ReasonInsufficientMemory is set when a Model does not fit the host's
 	// memory budget (memory admission, pkg/agent/agent.go).

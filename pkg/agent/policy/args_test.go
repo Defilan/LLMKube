@@ -894,7 +894,7 @@ func TestTyped_DrafterAndGenerationConfig(t *testing.T) {
 	relaxable(t, f.in(RuntimeVLLMSwift, "--generation-config", f.outside), "path")
 }
 
-// TestVLLMSwift_PathFlagsMustExist: Ruling 11. --tokenizer, --hf-config-path,
+// TestVLLMSwift_PathFlagsMustExist: --tokenizer, --hf-config-path,
 // --generation-config and the path half of a --lora-modules name=path entry
 // are FlagSpec.MustExist for vllm-swift: a value that resolves inside the
 // roots but does not exist there is refused (Roots.CheckPathExists), closing
@@ -903,7 +903,7 @@ func TestTyped_DrafterAndGenerationConfig(t *testing.T) {
 // then downloaded it into the HF cache, outside every root. An existing path
 // inside a root still passes, and a symlink whose target lies outside the
 // roots is still refused the same way CheckPath refuses one, existing target
-// or not. Other vllm-swift path flags this ruling does not cover, and every
+// or not. Other vllm-swift path flags, and every
 // llama-server and tensorfold path flag (an output path the engine has not
 // created yet), are unaffected.
 func TestVLLMSwift_PathFlagsMustExist(t *testing.T) {
@@ -920,7 +920,7 @@ func TestVLLMSwift_PathFlagsMustExist(t *testing.T) {
 		relaxable(t, v(flag, f.store+"/nope"), "path")
 		relaxable(t, v(flag, "nope"), "path")
 		// A Hugging Face repo-id-shaped value that does not exist: the exact
-		// gap Ruling 11 closes.
+		// gap MustExist closes.
 		relaxable(t, v(flag, "owner/name"), "path")
 		// A symlink inside the store whose target lies outside every root is
 		// still refused (its target, "outside/b.gguf", exists).
@@ -935,7 +935,7 @@ func TestVLLMSwift_PathFlagsMustExist(t *testing.T) {
 	relaxable(t, v("--lora-modules", "a="+f.store+"/nope"), "path")
 	relaxable(t, v("--lora-modules", "a=owner/name"), "path")
 
-	// A vllm-swift path flag Ruling 11 does not cover keeps accepting a
+	// A vllm-swift path flag without MustExist keeps accepting a
 	// not-yet-existing value.
 	allowed(t, v("--chat-template", f.store+"/nope.jinja"))
 
@@ -1251,7 +1251,7 @@ func TestRule3_VLLMSwiftCodeLoading(t *testing.T) {
 	allowed(t, v(all...))
 }
 
-// TestRule3_TrustRequestChatTemplateAndEmbeds: Ruling 9 and 10. vllm-swift's
+// TestRule3_TrustRequestChatTemplateAndEmbeds: vllm-swift's
 // --trust-request-chat-template widens who can get the server to render a
 // Jinja chat template: without it vLLM refuses one submitted in a request
 // body, so setting it lets any network client of the service render its own
@@ -1291,7 +1291,7 @@ func TestRule3_TrustRequestChatTemplateAndEmbeds(t *testing.T) {
 	}
 }
 
-// TestNegation_InlineValueIsNotANegation: Ruling 14 (Task 6 fix round 1). A
+// TestNegation_InlineValueIsNotANegation: a
 // "--no-X" (or "-no-X") spelling that carries an inline "=value" is not
 // treated as a negation: isNegation requires !a.Inline. Without that,
 // "--no-enable-prompt-embeds=false" and "--no-trust-request-chat-template=true"

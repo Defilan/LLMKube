@@ -771,9 +771,9 @@ func TestEnsureProcess_AllowUnsafeExtraArgsRelaxesButNotBind(t *testing.T) {
 // A SHA256 mismatch surfaces from the real executor as a *ModelDigestMismatchError
 // wrapped inside StartProcess's "failed to ensure model" and "failed to start
 // process" errors (ensureModel -> StartProcess); reconcileProcess must unwrap
-// it with errors.As and route it through refuseStart (Spec F3: "refuse with
-// an event"), exactly like the *EndpointNameConflictError handling a few
-// lines below the StartProcess call. Every other StartProcess failure keeps
+// it with errors.As and route it through refuseStart, so the mismatch shows
+// as an Event and a status field, exactly like the *EndpointNameConflictError
+// handling a few lines below the StartProcess call. Every other StartProcess failure keeps
 // the old plain-wrapped-error, log-only behavior (TestEnsureProcess_
 // EndpointNameConflictBackstopStopsEngine and friends above cover that this
 // branch was not broadly widened).
@@ -913,9 +913,9 @@ func TestEnsureProcess_PlainStartFailureNotRefused(t *testing.T) {
 // inside StartProcess, which runs AFTER checkMemoryAdmission; admission's
 // success path clears Status.SchedulingStatus (a Status().Update) and the
 // subsequent refusal writes it back (another Status().Update), bumping the
-// resourceVersion each time so the watcher sees UPDATED and reconciles again
-// — each pass re-running StartProcess's ensureModel, i.e. re-downloading the
-// entire model. With the memo, only the FIRST reconcile reaches StartProcess;
+// resourceVersion each time so the watcher sees UPDATED and reconciles
+// again, each pass re-running StartProcess's ensureModel, i.e. re-downloading
+// the entire model. With the memo, only the FIRST reconcile reaches StartProcess;
 // the next two hit the memo in the pre-flight check and refuse immediately,
 // so the executor is invoked exactly once and SchedulingStatus is never
 // cleared in between (every write recorded via the interceptor is the same

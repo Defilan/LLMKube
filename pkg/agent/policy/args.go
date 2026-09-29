@@ -758,10 +758,10 @@ func prefixesKnownFlag(runtime, name string) bool {
 // caller error or an attempt to smuggle X's effect past the negation check.
 // vLLM's own FlexibleArgumentParser happens to reject "=value" on a
 // zero-arg flag today, but the policy must not depend on that staying true,
-// so a.Inline routes it to the same refusal its canonical flag X would get
-// (Ruling 14, Task 6 fix round 1: without this, "--no-enable-prompt-embeds=false"
-// and "--no-trust-request-chat-template=true" skipped Rule 3 entirely, and a
-// Rule 1 entry with a "--no-" form would be skipped the same way).
+// so a.Inline routes it to the same refusal its canonical flag X would get.
+// Without this, "--no-enable-prompt-embeds=false" and
+// "--no-trust-request-chat-template=true" skipped Rule 3 entirely, and a
+// Rule 1 entry with a "--no-" form would be skipped the same way.
 func isNegation(a Arg, canonical string) bool {
 	return !a.Inline && a.Name != canonical &&
 		(strings.HasPrefix(a.Name, "--no-") || strings.HasPrefix(a.Name, "-no-"))
@@ -1004,7 +1004,7 @@ var vllmRefused = map[string]string{
 	"--allow-credentials":        "changes CORS",
 	"--otlp-traces-endpoint":     "sends traces to a remote endpoint",
 
-	// Ruling 9: vLLM refuses a chat_template supplied in a request body
+	// vLLM refuses a chat_template supplied in a request body
 	// unless this is set; it is a security default, not ordinary tuning. The
 	// policy already lets the InferenceService writer supply an inline
 	// --chat-template, but this flag widens that to every network client of
@@ -1013,7 +1013,7 @@ var vllmRefused = map[string]string{
 	"--trust-request-chat-template": "lets any API client, not only the InferenceService writer, " +
 		"supply a chat template for the server to render",
 
-	// Ruling 10: both let an API client submit a base64-serialized tensor
+	// Both let an API client submit a base64-serialized tensor
 	// that the server deserializes with torch.load; that exact path was
 	// CVE-2025-62164 (memory corruption, potential RCE, fixed in vLLM
 	// 0.11.1). The pinned 0.19.1 has the fix, but the flags still expose the
@@ -1022,7 +1022,7 @@ var vllmRefused = map[string]string{
 	"--enable-mm-embeds":     torchLoadEmbedsWhy,
 }
 
-// torchLoadEmbedsWhy is the shared Ruling-10 reason for vllm-swift's
+// torchLoadEmbedsWhy is the shared torch.load reason for vllm-swift's
 // --enable-prompt-embeds and --enable-mm-embeds.
 const torchLoadEmbedsWhy = "lets any API client submit a serialized tensor the server deserializes with torch.load"
 

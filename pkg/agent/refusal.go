@@ -35,7 +35,9 @@ import (
 // package is the single source of truth MetalAgentRefusalReasons draws from,
 // which internal/controller/scheduling.go's agentRefusalReasons set is built
 // from in turn, so the agent and the controller can never drift onto two
-// different lists of refusal reasons again (#1927-class bug).
+// different lists of refusal reasons again. That drift once left a refusal
+// the controller did not recognize: it cleared the status every poll and the
+// agent refused again every poll, in a loop.
 const (
 	EventReasonEndpointNameConflict  = inferencev1alpha1.ReasonEndpointNameConflict
 	EventReasonModelSourceNotAllowed = inferencev1alpha1.ReasonModelSourceNotAllowed

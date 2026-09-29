@@ -40,7 +40,7 @@ type digestMismatchEntry struct {
 // and the subsequent refusal writes it back (another Status().Update); each
 // write bumps the InferenceService's resourceVersion, the watcher sees
 // UPDATED, and the next reconcile re-downloads the entire model (tens of GB)
-// only to fail the identical check again — a download storm.
+// only to fail the identical check again: a download storm.
 //
 // Each entry records the source+sha256 it was observed against, so editing
 // the Model (a corrected source or a corrected sha256) invalidates the memo

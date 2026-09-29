@@ -17,13 +17,13 @@ limitations under the License.
 package agent
 
 // This file replaces a hand-maintained table of "every refusal reason the
-// agent uses" (which itself existed to guard against exactly the kind of
-// drift that produced the #1927-class bug: ServiceNameTooLong added to the
-// agent in 0.10.0 with no matching entry in internal/controller/
-// scheduling.go's agentRefusalReasons) with a structural scan: it parses
-// this package's own non-test source with go/parser/go/ast (no type
-// checking, no golang.org/x/tools/go/packages, no subprocess — pure syntax,
-// so it stays fast) and finds every call to refuseStart and every direct
+// agent uses" (which itself existed to guard against the drift behind a
+// refusal the controller did not recognize, which then looped:
+// ServiceNameTooLong was added to the agent in 0.10.0 with no matching entry
+// in internal/controller/scheduling.go's agentRefusalReasons) with a
+// structural scan: it parses this package's own non-test source with
+// go/parser/go/ast (no type checking, no golang.org/x/tools/go/packages, no
+// subprocess; pure syntax, so it stays fast) and finds every call to refuseStart and every direct
 // assignment to Status.SchedulingStatus, then asserts each one's reason
 // argument resolves to a known EventReason constant whose value is in
 // inferencev1alpha1.MetalAgentRefusalReasons. A hand-maintained *table* of
@@ -64,7 +64,7 @@ var knownReasonConstants = map[string]string{
 
 // emptyStringLit is the source text go/ast.BasicLit.Value carries for the
 // literal `""`, used to recognize (and ignore) a status-clearing assignment
-// like `isvc.Status.SchedulingStatus = ""` — clearing is not a refusal.
+// like `isvc.Status.SchedulingStatus = ""`: clearing is not a refusal.
 const emptyStringLit = `""`
 
 func TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason(t *testing.T) {

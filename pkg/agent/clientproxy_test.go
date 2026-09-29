@@ -365,8 +365,7 @@ func TestClientProxy_RefusesProtocolUpgrade(t *testing.T) {
 // carry matching Upgrade/Connection headers to expose a writable Body at
 // all, and httputil's handleUpgradeResponse separately refuses whenever the
 // outbound request's Upgrade type, always empty here, doesn't match the
-// response's). See the task-5 fix-round-1 report for the full trace. This
-// test still documents the intended contract and guards the observable
+// response's). This test still documents the intended contract and guards the observable
 // status/body.
 func TestClientProxy_RefusesUnsolicited101(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

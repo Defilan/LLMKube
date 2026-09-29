@@ -116,8 +116,8 @@ type FlagSpec struct {
 	// llama-server output path (--slot-save-path, a lookup cache file, ...)
 	// the engine has not created yet.
 	//
-	// vllm-swift's --tokenizer, --hf-config-path and --generation-config
-	// (Ruling 11): a value shaped like a Hugging Face "owner/name" repo id
+	// vllm-swift's --tokenizer, --hf-config-path and --generation-config: a
+	// value shaped like a Hugging Face "owner/name" repo id
 	// passes the ordinary check as a not-yet-existing relative path under the
 	// model store, and vLLM then downloads it into the HF cache, outside
 	// every allowed root. Requiring existence closes that gap without
@@ -156,7 +156,8 @@ var (
 	fPathCSV       = FlagSpec{Kind: KindPath, Decode: DecodeCSV}
 	fPathCSVColon  = FlagSpec{Kind: KindPath, Decode: DecodeCSVColon}
 	// fPathNameEqPathMultiExists is currently vllm-swift --lora-modules'
-	// only spec; the path half of every entry is MustExist (Ruling 11). If a
+	// only spec; the path half of every entry is MustExist (a bare repo id
+	// there would be downloaded by vLLM, outside every root). If a
 	// future flag of this decode/arity shape must NOT require existence, add
 	// back a plain fPathNameEqPathMulti alongside it rather than dropping
 	// MustExist here.
