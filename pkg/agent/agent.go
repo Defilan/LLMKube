@@ -1199,7 +1199,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// Start the process using the runtime-specific executor.
 	process, err := exec.StartProcess(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to start process: %w", err)
+		return a.handleStartProcessError(ctx, isvc, err)
 	}
 
 	// Stamp the spec hash onto the process so future ensureProcess calls
@@ -1890,7 +1890,7 @@ func (a *MetalAgent) checkMemoryAdmission(
 			"budget", formatMemory(budget.BudgetBytes),
 			"source", resolved.Source,
 		)
-		isvc.Status.SchedulingStatus = "InsufficientMemory"
+		isvc.Status.SchedulingStatus = EventReasonInsufficientMemory
 		isvc.Status.SchedulingMessage = msg
 		if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
 			a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
@@ -1938,7 +1938,7 @@ func (a *MetalAgent) failMemoryCheck(
 	// condition already surfaced via status and a Kubernetes event.
 	a.logger.Warnw("memory check incomplete, refusing to start process",
 		"reason", reason, "namespace", isvc.Namespace, "name", isvc.Name)
-	isvc.Status.SchedulingStatus = "MemoryCheckFailed"
+	isvc.Status.SchedulingStatus = EventReasonMemoryCheckFailed
 	isvc.Status.SchedulingMessage = reason
 	if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
 		a.logger.Warnw("failed to update InferenceService status", "error", updateErr)

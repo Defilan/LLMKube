@@ -953,6 +953,22 @@ func (e *MetalExecutor) copyToFileResume(
 	return e.verifyAndPublish(partPath, filePath, expectedSHA256)
 }
 
+// ModelDigestMismatchError reports that a downloaded model's SHA256 does not
+// match Model.spec.sha256. It is a distinct type (rather than a plain
+// fmt.Errorf) so reconcileProcess (pkg/agent/agent.go) can route it into
+// refuseStart with EventReasonModelDigestMismatch via errors.As, the same way
+// it already routes *EndpointNameConflictError into refuseStart: every other
+// download failure keeps the plain-wrapped-error, log-only behavior.
+type ModelDigestMismatchError struct {
+	Path     string
+	Expected string
+	Computed string
+}
+
+func (e *ModelDigestMismatchError) Error() string {
+	return fmt.Sprintf("SHA256 mismatch for downloaded model %s: expected %s, got %s", e.Path, e.Expected, e.Computed)
+}
+
 // verifyAndPublish is the single point every download path renames its
 // assembled bytes through. When expectedSHA256 is set it hashes assembledPath
 // (which, by construction, always holds the complete, resume-assembled
@@ -980,7 +996,7 @@ func (e *MetalExecutor) verifyAndPublish(assembledPath, destPath, expectedSHA256
 	if !strings.EqualFold(computed, expectedSHA256) {
 		_ = os.Remove(assembledPath)
 		_ = os.Remove(destPath)
-		return fmt.Errorf("SHA256 mismatch for downloaded model: expected %s, got %s", expectedSHA256, computed)
+		return &ModelDigestMismatchError{Path: destPath, Expected: expectedSHA256, Computed: computed}
 	}
 
 	if err := os.Rename(assembledPath, destPath); err != nil {

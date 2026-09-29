@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -29,11 +30,17 @@ import (
 )
 
 // Event reasons for starts the agent refuses before (or instead of) serving.
+// These equal the api/v1alpha1.Reason* constants of the same name: that
+// package is the single source of truth MetalAgentRefusalReasons draws from,
+// which internal/controller/scheduling.go's agentRefusalReasons set is built
+// from in turn, so the agent and the controller can never drift onto two
+// different lists of refusal reasons again (#1927-class bug).
 const (
-	EventReasonEndpointNameConflict  = "EndpointNameConflict"
-	EventReasonModelSourceNotAllowed = "ModelSourceNotAllowed"
-	EventReasonExtraArgsRejected     = "ExtraArgsRejected"
-	EventReasonServiceNameTooLong    = "ServiceNameTooLong"
+	EventReasonEndpointNameConflict  = inferencev1alpha1.ReasonEndpointNameConflict
+	EventReasonModelSourceNotAllowed = inferencev1alpha1.ReasonModelSourceNotAllowed
+	EventReasonExtraArgsRejected     = inferencev1alpha1.ReasonExtraArgsRejected
+	EventReasonServiceNameTooLong    = inferencev1alpha1.ReasonServiceNameTooLong
+	EventReasonModelDigestMismatch   = inferencev1alpha1.ReasonModelDigestMismatch
 )
 
 // refuseStart records why the agent will not serve an InferenceService: it
@@ -56,6 +63,26 @@ func (a *MetalAgent) refuseStart(
 	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
 		corev1.EventTypeWarning, reason, "%s", message)
 	return fmt.Errorf("%s: %s", reason, message)
+}
+
+// handleStartProcessError turns a StartProcess failure into the error
+// reconcileProcess returns. A *ModelDigestMismatchError is refused through
+// refuseStart (Spec F3: refuse a digest mismatch with an event), the same way
+// an endpoint-name conflict or a bad model path is refused, so it is visible
+// as a status field and a Warning Event instead of only a log line. Every
+// other StartProcess failure (network error, bad status, truncated download,
+// health-check timeout, ...) keeps the historical plain-wrapped-error,
+// log-only behavior. Split out of reconcileProcess, rather than inlined as an
+// extra branch there, to keep its cyclomatic complexity from crossing the
+// linter's threshold.
+func (a *MetalAgent) handleStartProcessError(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, startErr error,
+) error {
+	var digestErr *ModelDigestMismatchError
+	if errors.As(startErr, &digestErr) {
+		return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
+	}
+	return fmt.Errorf("failed to start process: %w", startErr)
 }
 
 // checkModelPaths refuses a Model the controller marked Failed and any local

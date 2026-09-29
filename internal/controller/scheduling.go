@@ -61,12 +61,23 @@ var priorityValues = map[string]int32{
 // when it declines to start a service (memory admission in pkg/agent/agent.go,
 // start refusals in pkg/agent/refusal.go). The agent clears them itself on the
 // next admitted start (#777); a stale heartbeat still replaces them.
-var agentRefusalReasons = map[string]bool{
-	"InsufficientMemory":    true,
-	"MemoryCheckFailed":     true,
-	"EndpointNameConflict":  true,
-	"ModelSourceNotAllowed": true,
-	"ExtraArgsRejected":     true,
+//
+// Built from inferencev1alpha1.MetalAgentRefusalReasons rather than
+// hand-listed here: this map and the agent's own list used to be two
+// independently maintained copies of the same set, and they drifted
+// (ServiceNameTooLong was added to the agent in 0.10.0 without a matching
+// entry here, so determinePhase overwrote that refusal with
+// "WaitingForMetalAgent" on every reconcile and the agent re-refused on every
+// poll). A shared source in api/v1alpha1 makes that drift a compile-time
+// impossibility.
+var agentRefusalReasons = buildAgentRefusalReasons()
+
+func buildAgentRefusalReasons() map[string]bool {
+	reasons := make(map[string]bool, len(inferencev1alpha1.MetalAgentRefusalReasons))
+	for _, r := range inferencev1alpha1.MetalAgentRefusalReasons {
+		reasons[r] = true
+	}
+	return reasons
 }
 
 // SchedulingInfo contains information about pod scheduling status

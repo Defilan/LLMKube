@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,12 +41,17 @@ import (
 
 // recordingExecutor records starts and stops without spawning anything.
 // onStart, when set, runs inside StartProcess (after the agent's pre-start
-// checks), so a test can change the cluster mid-start.
+// checks), so a test can change the cluster mid-start. startErr, when set,
+// makes StartProcess fail with that error instead of succeeding, so a test
+// can drive reconcileProcess's post-StartProcess error handling (e.g. a
+// *ModelDigestMismatchError from a real executor's ensureModel) without a
+// real download.
 type recordingExecutor struct {
-	starts  int
-	lastCfg ExecutorConfig
-	stopped []int
-	onStart func()
+	starts   int
+	lastCfg  ExecutorConfig
+	stopped  []int
+	onStart  func()
+	startErr error
 }
 
 func (e *recordingExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) (*ManagedProcess, error) {
@@ -53,6 +59,9 @@ func (e *recordingExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) 
 	e.lastCfg = cfg
 	if e.onStart != nil {
 		e.onStart()
+	}
+	if e.startErr != nil {
+		return nil, e.startErr
 	}
 	return &ManagedProcess{Name: cfg.Name, Namespace: cfg.Namespace, PID: 4242, Port: 18080, Healthy: true}, nil
 }
@@ -757,4 +766,112 @@ func TestEnsureProcess_AllowUnsafeExtraArgsRelaxesButNotBind(t *testing.T) {
 				err, ex.starts)
 		}
 	})
+}
+
+// A SHA256 mismatch surfaces from the real executor as a *ModelDigestMismatchError
+// wrapped inside StartProcess's "failed to ensure model" and "failed to start
+// process" errors (ensureModel -> StartProcess); reconcileProcess must unwrap
+// it with errors.As and route it through refuseStart (Spec F3: "refuse with
+// an event"), exactly like the *EndpointNameConflictError handling a few
+// lines below the StartProcess call. Every other StartProcess failure keeps
+// the old plain-wrapped-error, log-only behavior (TestEnsureProcess_
+// EndpointNameConflictBackstopStopsEngine and friends above cover that this
+// branch was not broadly widened).
+func TestEnsureProcess_ModelDigestMismatchRefusedWithEvent(t *testing.T) {
+	isvc := refusalISVC("svc")
+	digestErr := &ModelDigestMismatchError{
+		Path:     "/models/m/model.gguf",
+		Expected: "aaaa",
+		Computed: "bbbb",
+	}
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: %w", digestErr)
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelDigestMismatch) {
+		t.Fatalf("ensureProcess error = %v, want it to name %s", err, EventReasonModelDigestMismatch)
+	}
+	events := drainEvents(rec)
+	if !strings.Contains(strings.Join(events, "\n"), "Warning "+EventReasonModelDigestMismatch) {
+		t.Errorf("events = %v, want a Warning %s", events, EventReasonModelDigestMismatch)
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if gErr := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "svc", Namespace: "default"}, got); gErr != nil {
+		t.Fatalf("get InferenceService: %v", gErr)
+	}
+	if got.Status.SchedulingStatus != EventReasonModelDigestMismatch {
+		t.Errorf("status.schedulingStatus = %q, want %q", got.Status.SchedulingStatus, EventReasonModelDigestMismatch)
+	}
+	if ex.starts != 1 {
+		t.Errorf("starts = %d, want 1 (the executor was invoked and itself reported the mismatch)", ex.starts)
+	}
+}
+
+// A plain (non-digest) StartProcess failure must NOT be routed through
+// refuseStart: it keeps the historical plain-wrapped-error, log-only
+// behavior, so a transient network or process-spawn failure is retried by
+// the next watch event rather than parked behind a status refusal an
+// operator would have to clear.
+func TestEnsureProcess_PlainStartFailureNotRefused(t *testing.T) {
+	isvc := refusalISVC("svc")
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: connection refused")
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || strings.Contains(err.Error(), EventReasonModelDigestMismatch) {
+		t.Fatalf("ensureProcess error = %v, want a plain failure not naming %s", err, EventReasonModelDigestMismatch)
+	}
+	if len(drainEvents(rec)) != 0 {
+		t.Errorf("events = %v, want none for a plain start failure", drainEvents(rec))
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if gErr := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "svc", Namespace: "default"}, got); gErr != nil {
+		t.Fatalf("get InferenceService: %v", gErr)
+	}
+	if got.Status.SchedulingStatus != "" {
+		t.Errorf("status.schedulingStatus = %q, want empty for a plain start failure", got.Status.SchedulingStatus)
+	}
+}
+
+// TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason guards the two
+// hand-maintained lists this package used to have (the agent's own
+// EventReason constants, and internal/controller/scheduling.go's
+// agentRefusalReasons) against drifting apart again: ServiceNameTooLong was
+// added to the agent in 0.10.0 with no matching controller-side entry, so
+// determinePhase overwrote that refusal with "WaitingForMetalAgent" on every
+// reconcile. Both sides now build from inferencev1alpha1.MetalAgentRefusalReasons;
+// this test is the forcing function that keeps `used` (and therefore this
+// package's own constants) in sync with that shared list as new refusal
+// reasons are added.
+func TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason(t *testing.T) {
+	// Every SchedulingStatus value written by refuseStart or the two memory
+	// admission paths (checkMemoryAdmission, failMemoryCheck).
+	used := []string{
+		EventReasonInsufficientMemory,
+		EventReasonMemoryCheckFailed,
+		EventReasonEndpointNameConflict,
+		EventReasonModelSourceNotAllowed,
+		EventReasonExtraArgsRejected,
+		EventReasonServiceNameTooLong,
+		EventReasonModelDigestMismatch,
+	}
+	known := make(map[string]bool, len(inferencev1alpha1.MetalAgentRefusalReasons))
+	for _, r := range inferencev1alpha1.MetalAgentRefusalReasons {
+		known[r] = true
+	}
+	for _, reason := range used {
+		if !known[reason] {
+			t.Errorf("refusal reason %q is used by the agent but missing from "+
+				"inferencev1alpha1.MetalAgentRefusalReasons; the controller's determinePhase "+
+				"would overwrite this refusal with WaitingForMetalAgent on every reconcile", reason)
+		}
+	}
+	if len(known) != len(used) {
+		t.Errorf("inferencev1alpha1.MetalAgentRefusalReasons has %d entries but this test only "+
+			"exercises %d; update `used` alongside any new agent refusal reason", len(known), len(used))
+	}
 }
