@@ -356,6 +356,7 @@ func tmpDirForTest(t *testing.T) string {
 // first. 0.10.0 plists pinned --model-store /tmp/llmkube-models, so the
 // error must name the plist re-render.
 func TestCheckModelStore_RefusesStoreUnderTmp(t *testing.T) {
+	withSystemTempRoots(t)
 	wantAll := func(t *testing.T, err error, path string) {
 		t.Helper()
 		if err == nil {

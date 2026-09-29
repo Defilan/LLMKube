@@ -12,56 +12,13 @@ import (
 	"github.com/defilantech/llmkube/pkg/agent"
 )
 
-// TestMain moves t.TempDir() out of /tmp when that is where it lives (Linux
-// CI, where TMPDIR is unset): the model store check refuses any store under
-// /tmp, and the store tests here build theirs in t.TempDir(). On macOS
-// TMPDIR is under /var/folders and nothing moves.
+// TestMain clears agent.SystemTempRoots: the store tests here build their
+// store in t.TempDir(), which is under /tmp wherever TMPDIR is unset (Linux
+// CI), and the store check would refuse all of them. The /tmp refusal test
+// sets it back explicitly.
 func TestMain(m *testing.M) {
-	cleanup := moveTempDirOutOfTmp()
-	code := m.Run()
-	cleanup()
-	os.Exit(code)
-}
-
-// moveTempDirOutOfTmp points TMPDIR at a fresh directory that passes the
-// model store check when the current temp dir does not, trying the user
-// cache dir and then /dev/shm. It returns a cleanup that removes the
-// directory it made, and leaves TMPDIR alone when no candidate works.
-func moveTempDirOutOfTmp() func() {
-	if storeCheckPassesUnder(os.TempDir()) {
-		return func() {}
-	}
-	var candidates []string
-	if cache, err := os.UserCacheDir(); err == nil {
-		candidates = append(candidates, cache)
-	}
-	candidates = append(candidates, "/dev/shm")
-	for _, parent := range candidates {
-		if err := os.MkdirAll(parent, 0o700); err != nil {
-			continue
-		}
-		dir, err := os.MkdirTemp(parent, "llmkube-metal-agent-test-")
-		if err != nil {
-			continue
-		}
-		if storeCheckPassesUnder(dir) {
-			_ = os.Setenv("TMPDIR", dir)
-			return func() { _ = os.RemoveAll(dir) }
-		}
-		_ = os.RemoveAll(dir)
-	}
-	return func() {}
-}
-
-// storeCheckPassesUnder reports whether a private directory created under
-// parent passes agent.CheckModelStore.
-func storeCheckPassesUnder(parent string) bool {
-	probe, err := os.MkdirTemp(parent, "store-probe-")
-	if err != nil {
-		return false
-	}
-	defer func() { _ = os.RemoveAll(probe) }()
-	return agent.CheckModelStore(probe) == nil
+	agent.SystemTempRoots = nil
+	os.Exit(m.Run())
 }
 
 func TestParseLogLevel(t *testing.T) {
@@ -336,6 +293,25 @@ func TestPrepareModelStore(t *testing.T) {
 			t.Fatalf("prepareModelStore(owned 0755) = %v, want nil", err)
 		}
 	})
+}
+
+// prepareModelStore refuses a store under /tmp, which the 0.10.0 plist
+// pinned, even though it creates the store 0700 and owns it.
+func TestPrepareModelStore_RefusesStoreUnderTmp(t *testing.T) {
+	prev := agent.SystemTempRoots
+	agent.SystemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
+	t.Cleanup(func() { agent.SystemTempRoots = prev })
+
+	base, err := os.MkdirTemp("/tmp", "llmkube-prepare-test-")
+	if err != nil {
+		t.Skipf("cannot create a directory under /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	store := filepath.Join(base, "llmkube-models")
+	_, err = prepareModelStore(store)
+	if err == nil || !strings.Contains(err.Error(), "make install-metal-agent") {
+		t.Fatalf("prepareModelStore(%s) = %v, want a refusal naming the plist re-render", store, err)
+	}
 }
 
 // configureModelStore pins cfg.ModelStorePath to the checked, resolved

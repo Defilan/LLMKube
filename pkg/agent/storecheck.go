@@ -93,11 +93,13 @@ func ResolveModelStore(path string) (string, error) {
 	return resolved, nil
 }
 
-// tmpStoreRoots are the shared temporary directories a model store must not
-// live in. /tmp and /var/tmp are symlinks to /private/... on macOS, so both
-// spellings are listed: the resolved path normally carries the /private form,
-// and the literal form catches a configured path whose resolution differs.
-var tmpStoreRoots = []string{"/private/tmp", "/private/var/tmp", "/tmp", "/var/tmp"}
+// SystemTempRoots are the shared temporary directories a model store must
+// not live in. /tmp and /var/tmp are symlinks to /private/... on macOS, so
+// both spellings are listed: the resolved path normally carries the /private
+// form, and the literal form catches a configured path whose resolution
+// differs. It is a variable only so tests whose t.TempDir() is under /tmp
+// (Linux, where TMPDIR is usually unset) can clear it; nothing else writes it.
+var SystemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
 
 // checkStoreNotInTmp refuses a store at or under a shared temporary
 // directory. Even a store the agent owns there is not safe: /tmp is emptied
@@ -113,7 +115,7 @@ func checkStoreNotInTmp(where, path, resolved string) error {
 		literal = abs
 	}
 	for _, candidate := range []string{resolved, filepath.Clean(literal)} {
-		for _, root := range tmpStoreRoots {
+		for _, root := range SystemTempRoots {
 			if candidate == root || strings.HasPrefix(candidate, root+"/") {
 				return fmt.Errorf("model store %s is under %s, a shared temporary directory any local user "+
 					"can recreate after a reboot: re-render the launchd plist with the new default store "+
