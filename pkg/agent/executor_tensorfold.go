@@ -239,7 +239,7 @@ func buildTensorFoldArgs(modelPath string, port int, config ExecutorConfig) []st
 	extra := config.ExtraArgs
 	args := []string{"serve", modelPath}
 	if !hasMatchingExtraArg(extra, "host") {
-		args = append(args, "--host", "0.0.0.0")
+		args = append(args, "--host", bindHost(config))
 	}
 	if !hasMatchingExtraArg(extra, "port") {
 		args = append(args, "--port", strconv.Itoa(port))

@@ -192,7 +192,7 @@ func (e *MLXServerExecutor) resolveModelPath(config ExecutorConfig) string {
 func buildMLXServerArgs(modelPath string, port int, config ExecutorConfig) []string {
 	args := []string{
 		"--model", modelPath,
-		"--host", "0.0.0.0",
+		"--host", bindHost(config),
 		"--port", fmt.Sprintf("%d", port),
 	}
 

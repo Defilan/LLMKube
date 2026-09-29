@@ -2393,11 +2393,11 @@ func (e *NativeAgentLoopExecutor) resolveAuthToken(
 //  1. InferenceBaseURLOverride: full URL replacement. Used by tests
 //     and stub OAI servers.
 //  2. InferenceBaseURLHostOverride: read InferenceService.status.endpoint
-//     for scheme + path, read the v1 Endpoints object the metal-agent
-//     maintains for the live port, substitute the override host. Used
-//     by off-cluster, same-host installs (foreman-agent on the M5 Max
-//     where cluster DNS does not resolve but the metal-agent rewrites
-//     Endpoints on every llama-server respawn).
+//     for scheme + path, then read the live engine port off the
+//     metal-agent's EndpointSlice(s) and substitute the override host
+//     (rewriteHostFromEndpoints). Used by off-cluster, same-host installs
+//     (foreman-agent on the M5 Max where cluster DNS does not resolve but
+//     the metal-agent rewrites Endpoints on every llama-server respawn).
 //  3. Default: trust status.endpoint as the cluster-DNS form, used by
 //     in-cluster foreman-agents.
 func (e *NativeAgentLoopExecutor) resolveInferenceBaseURL(
@@ -2431,13 +2431,22 @@ func (e *NativeAgentLoopExecutor) resolveInferenceBaseURL(
 	return endpoint, nil
 }
 
-// rewriteHostFromEndpoints replaces the host of baseURL with the
-// configured InferenceBaseURLHostOverride and the live port from the
-// InferenceService's EndpointSlice. Slices are listed by the well-known
-// kubernetes.io/service-name label (== sanitizeDNSName(isvcName); dots
-// become hyphens; see internal/controller/inferenceservice_controller.go)
-// because the metal-agent and the EndpointSliceMirroring controller may
-// each produce one.
+// rewriteHostFromEndpoints replaces the host of baseURL with the configured
+// InferenceBaseURLHostOverride and the live engine port on that host. In
+// relay mode the controller adopts the "<isvc>" Service+EndpointSlice for
+// the relay pod, so their port is the relay's listener, not the engine's;
+// the metal-agent instead carries the engine's loopback port in the
+// llmkube.ai/agent-engine-port annotation on the "<isvc>-agent" EndpointSlice
+// it writes for its TLS ingress. enginePortFromAgentSlice tries that lookup
+// first. When it yields no usable port (older, pre-relay agent; no ready
+// endpoint; or a missing/invalid annotation) this falls back to the original
+// behavior of reading the port straight off the "<isvc>" slice, which still
+// works against a pre-relay metal-agent. Slices are listed by the
+// well-known kubernetes.io/service-name label (== sanitizeDNSName(isvcName);
+// dots become hyphens; see
+// internal/controller/inferenceservice_controller.go) because the
+// metal-agent and the EndpointSliceMirroring controller may each produce
+// one.
 func (e *NativeAgentLoopExecutor) rewriteHostFromEndpoints(
 	ctx context.Context, namespace, isvcName, baseURL string,
 ) (string, error) {
@@ -2446,6 +2455,12 @@ func (e *NativeAgentLoopExecutor) rewriteHostFromEndpoints(
 		return "", fmt.Errorf("parse status.endpoint %q: %w", baseURL, err)
 	}
 	svcName := strings.ReplaceAll(isvcName, ".", "-")
+
+	if port, ok := e.enginePortFromAgentSlice(ctx, namespace, svcName); ok {
+		u.Host = fmt.Sprintf("%s:%d", e.InferenceBaseURLHostOverride, port)
+		return strings.TrimRight(u.String(), "/"), nil
+	}
+
 	var slices discoveryv1.EndpointSliceList
 	if err := e.Client.List(ctx, &slices,
 		client.InNamespace(namespace),
@@ -2461,23 +2476,84 @@ func (e *NativeAgentLoopExecutor) rewriteHostFromEndpoints(
 	return strings.TrimRight(u.String(), "/"), nil
 }
 
+// enginePortFromAgentSlice looks up the metal-agent's relay-mode
+// "<svcName>-agent" EndpointSlice (labelled kubernetes.io/service-name and
+// llmkube.ai/managed-by=metal-agent) and returns the engine's loopback port
+// carried in its llmkube.ai/agent-engine-port annotation. ok is false
+// whenever that does not yield a usable port: no such slice (older agent),
+// none of them has a ready endpoint and a fresh heartbeat (agentSliceFresh),
+// or the annotation is missing or not a
+// valid positive integer. The caller then falls back to the older "<svcName>"
+// slice lookup, so a List error here is logged at debug and never fails
+// resolution outright.
+func (e *NativeAgentLoopExecutor) enginePortFromAgentSlice(
+	ctx context.Context, namespace, svcName string,
+) (int32, bool) {
+	agentSvcName := svcName + inferencev1alpha1.MetalAgentServiceSuffix
+	var slices discoveryv1.EndpointSliceList
+	if err := e.Client.List(ctx, &slices,
+		client.InNamespace(namespace),
+		client.MatchingLabels{
+			"kubernetes.io/service-name":     agentSvcName,
+			inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent,
+		},
+	); err != nil {
+		logf.FromContext(ctx).V(1).Info("list metal-agent EndpointSlice failed; falling back to the <isvc> slice",
+			"namespace", namespace, "service", agentSvcName, "error", err.Error())
+		return 0, false
+	}
+	for i := range slices.Items {
+		slice := &slices.Items[i]
+		if !sliceHasReadyEndpoint(slice) || !agentSliceFresh(slice, time.Now()) {
+			continue
+		}
+		raw, ok := slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort]
+		if !ok {
+			continue
+		}
+		port, err := strconv.Atoi(raw)
+		if err != nil || port <= 0 {
+			continue
+		}
+		return int32(port), true //nolint:gosec // G115: TCP ports fit in int32
+	}
+	return 0, false
+}
+
+// agentSliceFresh reports whether slice carries an RFC3339 agent heartbeat no
+// older than DefaultAgentHeartbeatTimeout at now. It is the controller's
+// freshestAgentSlice rule: a slice left behind by a dead or rolled-back agent
+// keeps its Ready endpoint and engine-port annotation, and trusting it would
+// send the loop to a port nothing listens on.
+func agentSliceFresh(slice *discoveryv1.EndpointSlice, now time.Time) bool {
+	ts, err := time.Parse(time.RFC3339, slice.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat])
+	if err != nil {
+		return false
+	}
+	return now.Sub(ts) <= inferencev1alpha1.DefaultAgentHeartbeatTimeout
+}
+
+// sliceHasReadyEndpoint reports whether slice has at least one endpoint with
+// Conditions.Ready true or unset. An unset Ready condition is treated as
+// ready, matching the EndpointSlice convention.
+func sliceHasReadyEndpoint(slice *discoveryv1.EndpointSlice) bool {
+	for j := range slice.Endpoints {
+		if cond := slice.Endpoints[j].Conditions.Ready; cond == nil || *cond {
+			return true
+		}
+	}
+	return false
+}
+
 // firstReadyPort returns the first port advertised by a slice that has at
 // least one ready endpoint. metal-agent registers one address + one port per
 // InferenceService today; a future multi-replica metal path would need a
 // smarter selector, but for the v0.2 same-host case "the only port" is the
-// right port. An endpoint with Conditions.Ready unset is treated as ready,
-// matching the EndpointSlice convention.
+// right port.
 func firstReadyPort(slices discoveryv1.EndpointSliceList) (int32, error) {
 	for i := range slices.Items {
 		slice := &slices.Items[i]
-		hasReady := false
-		for j := range slice.Endpoints {
-			if cond := slice.Endpoints[j].Conditions.Ready; cond == nil || *cond {
-				hasReady = true
-				break
-			}
-		}
-		if !hasReady {
+		if !sliceHasReadyEndpoint(slice) {
 			continue
 		}
 		for _, p := range slice.Ports {

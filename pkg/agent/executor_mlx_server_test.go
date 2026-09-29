@@ -71,7 +71,7 @@ func TestBuildMLXServerArgs_Defaults(t *testing.T) {
 
 	want := map[string]string{
 		"--model": "/models/Qwen3.6-35B-A3B-8bit",
-		"--host":  "0.0.0.0",
+		"--host":  "127.0.0.1",
 		"--port":  "8080",
 	}
 	for flag, expected := range want {

@@ -67,7 +67,7 @@ Suddenly you're building an entire platform instead of shipping your product.
 
 ## Architecture
 
-Two cooperating processes. An in-cluster controller owns Kubernetes-side desired state. An out-of-cluster `metal-agent` (optional, only needed for Apple Silicon hosts) owns OS-level process supervision and registers Endpoints back into the cluster.
+Two cooperating processes. An in-cluster controller owns Kubernetes-side desired state. An out-of-cluster `metal-agent` (optional, only needed for Apple Silicon hosts) owns OS-level process supervision and registers its authenticated ingress back into the cluster; the controller fronts that ingress with an in-cluster relay, so Metal InferenceServices are ordinary Services.
 
 ```mermaid
 %%{init: {'theme':'neutral','flowchart':{'curve':'linear'}}}%%
@@ -77,18 +77,21 @@ flowchart TB
         CTRL["LLMKube controller"]
         CRD["Model · InferenceService<br/>(custom resources)"]
         POD["Runtime pods<br/>llama.cpp · vLLM · TGI"]
+        RELAY["Relay pod<br/>(per Metal InferenceService)"]
         CRD -- watched by --> CTRL
         CTRL -- schedules --> POD
+        CTRL -- creates --> RELAY
     end
 
     subgraph HOST["Apple Silicon host (optional)"]
         direction LR
-        AGENT["metal-agent"]
+        AGENT["metal-agent<br/>(TLS ingress)"]
         NATIVE["llama-server · mlx-server · vllm-swift<br/>(native processes)"]
         AGENT -- supervises --> NATIVE
     end
 
-    AGENT -- "registers Endpoints" --> CLUSTER
+    AGENT -- "registers ingress" --> CLUSTER
+    RELAY -- "pinned TLS + token" --> AGENT
 ```
 
 Same operator manages Linux/GPU pods and Apple Silicon hosts; both surface as `InferenceService` objects to `kubectl`.
@@ -176,7 +179,7 @@ LLMKube's **Metal Agent** inverts the model. Instead of stuffing inference into 
 
 1. **Watches the Kubernetes API** for `InferenceService` resources with `accelerator: metal`
 2. **Spawns `llama-server` natively** on macOS with full Metal GPU access
-3. **Registers endpoints back into Kubernetes** so the rest of your cluster can route to it
+3. **Registers its authenticated ingress back into Kubernetes**; the controller fronts it with an in-cluster relay, so the rest of your cluster calls an ordinary Service
 
 Your Mac dedicates 100% of its unified memory to inference. Kubernetes handles orchestration. The same CRD works across NVIDIA, Intel, and Apple Silicon by selecting the accelerator in the model spec.
 

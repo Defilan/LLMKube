@@ -158,6 +158,7 @@ func TestMetalRelayWireConstants(t *testing.T) {
 	//nolint:gosec // G101: constant names and their wire values, not credentials
 	cases := map[string]string{
 		AnnotationAgentIngressSPKI: "llmkube.ai/agent-ingress-spki",
+		AnnotationAgentEnginePort:  "llmkube.ai/agent-engine-port",
 		HeaderRelayToken:           "X-LLMKube-Relay-Token",
 		HeaderRelayTarget:          "X-LLMKube-Target",
 		MetalRelaySecretName:       "llmkube-metal-relay",

@@ -169,7 +169,7 @@ func (e *OllamaExecutor) UnloadModel(ctx context.Context, modelID string) error 
 		KeepAlive: &keepAlive,
 	}
 
-	url := fmt.Sprintf("http://localhost:%d/api/generate", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/generate", e.port)
 	resp, err := postJSON(ctx, e.httpClient, url, payload)
 	if err != nil {
 		return fmt.Errorf("failed to unload model %s: %w", modelID, err)
@@ -188,7 +188,7 @@ func (e *OllamaExecutor) UnloadModel(ctx context.Context, modelID string) error 
 
 // isHealthy checks if the Ollama daemon is responding at GET /.
 func (e *OllamaExecutor) isHealthy(ctx context.Context) bool {
-	url := fmt.Sprintf("http://localhost:%d/", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/", e.port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false
@@ -217,7 +217,7 @@ func (e *OllamaExecutor) pullModel(ctx context.Context, ollamaModel string) erro
 	e.logger.Infow("pulling Ollama model (this may take a while)",
 		"model", ollamaModel)
 
-	url := fmt.Sprintf("http://localhost:%d/api/pull", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/pull", e.port)
 	resp, err := postJSON(ctx, pullClient, url, payload)
 	if err != nil {
 		return fmt.Errorf("pull request failed: %w", err)
@@ -245,7 +245,7 @@ func (e *OllamaExecutor) loadModel(ctx context.Context, ollamaModel string) erro
 	// Use a 2-minute timeout for model loading
 	loadClient := &http.Client{Timeout: 2 * time.Minute}
 
-	url := fmt.Sprintf("http://localhost:%d/api/generate", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/generate", e.port)
 	resp, err := postJSON(ctx, loadClient, url, payload)
 	if err != nil {
 		// Loading may timeout for large models — we poll /api/ps separately.
@@ -286,7 +286,7 @@ func (e *OllamaExecutor) waitForModelLoaded(
 func (e *OllamaExecutor) isModelLoaded(
 	ctx context.Context, ollamaModel string,
 ) (bool, error) {
-	url := fmt.Sprintf("http://localhost:%d/api/ps", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/ps", e.port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, err

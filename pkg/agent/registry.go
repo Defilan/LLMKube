@@ -18,9 +18,12 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,9 +48,13 @@ import (
 // the same label on slices it mirrors from a legacy Endpoints object.
 const labelServiceName = "kubernetes.io/service-name"
 
+// labelInferenceService ties an agent-written Service or EndpointSlice to the
+// InferenceService it serves.
+const labelInferenceService = "llmkube.ai/inference-service"
+
 const (
-	managedByLabel = "llmkube.ai/managed-by"
-	managedByValue = "metal-agent"
+	managedByLabel = inferencev1alpha1.LabelManagedBy
+	managedByValue = inferencev1alpha1.ManagedByMetalAgent
 )
 
 // EndpointNameConflictError reports that a Service or EndpointSlice with the
@@ -103,6 +110,10 @@ type ServiceRegistry struct {
 	// now returns the current time. Defaults to time.Now; overridable in tests
 	// to assert deterministic heartbeat annotation values.
 	now func() time.Time
+	// ingressPort and ingressPin are set by EnableIngress (relay mode). With
+	// ingressPort zero the registry runs in legacy mode.
+	ingressPort int
+	ingressPin  string
 }
 
 // NewServiceRegistry creates a new service registry.
@@ -130,6 +141,51 @@ func NewServiceRegistry(
 		},
 		now: time.Now,
 	}
+}
+
+// EnableIngress switches the registry to relay mode: every endpoint is
+// registered as "<isvc>-agent" (Service port 8443 -> the agent's TLS ingress
+// port) with the ingress certificate's SPKI pin on the EndpointSlice, instead
+// of "<isvc>" pointing at the engine port. The engine port callers pass is then
+// ignored for the Service and slice. The agent's own legacy "<isvc>"
+// EndpointSlice is removed after each relay write; the "<isvc>" Service is
+// never touched in relay mode (the controller owns it for the relay). Call it
+// once, before the registry is used. Without it the registry behaves as the
+// legacy (pre-relay) writer.
+//
+// It returns an error, leaving the registry in legacy mode, when port is not
+// positive or pin is not the standard base64 encoding of a SHA-256 digest:
+// the controller refuses such a pin, so registering it would publish an
+// ingress no relay can ever reach.
+func (r *ServiceRegistry) EnableIngress(port int, pin string) error {
+	if port <= 0 {
+		return fmt.Errorf("ingress port %d must be positive", port)
+	}
+	raw, err := base64.StdEncoding.DecodeString(pin)
+	if err != nil || len(raw) != sha256.Size {
+		return fmt.Errorf("ingress SPKI pin %q is not the base64-std encoding of a %d-byte SHA-256 digest",
+			pin, sha256.Size)
+	}
+	r.ingressPort = port
+	r.ingressPin = pin
+	return nil
+}
+
+// relayMode reports whether EnableIngress configured an ingress port.
+func (r *ServiceRegistry) relayMode() bool {
+	return r.ingressPort > 0
+}
+
+// serviceNameFor returns the Service and EndpointSlice name the agent writes
+// for the InferenceService isvcName: the sanitized name in legacy mode, with
+// MetalAgentServiceSuffix appended in relay mode. Every registry lookup keyed
+// by InferenceService goes through it.
+func (r *ServiceRegistry) serviceNameFor(isvcName string) string {
+	name := sanitizeServiceName(isvcName)
+	if r.relayMode() {
+		return name + inferencev1alpha1.MetalAgentServiceSuffix
+	}
+	return name
 }
 
 // RegisterEndpoint creates/updates a Kubernetes Service and EndpointSlice
@@ -180,7 +236,7 @@ func (r *ServiceRegistry) WithdrawEndpointIfPresent(
 	slice := &discoveryv1.EndpointSlice{}
 	err := r.client.Get(ctx, types.NamespacedName{
 		Namespace: isvc.Namespace,
-		Name:      sanitizeServiceName(isvc.Name),
+		Name:      r.serviceNameFor(isvc.Name),
 	}, slice)
 	if apierrors.IsNotFound(err) {
 		return false, nil
@@ -291,7 +347,7 @@ func (r *ServiceRegistry) WithdrawOwnedEndpoints(
 // nil otherwise. The agent calls it before starting an engine, so a taken
 // name is refused without loading the model.
 func (r *ServiceRegistry) CheckEndpointName(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
-	return r.checkEndpointOwnership(ctx, isvc.Namespace, sanitizeServiceName(isvc.Name), isvc.UID)
+	return r.checkEndpointOwnership(ctx, isvc.Namespace, r.serviceNameFor(isvc.Name), isvc.UID)
 }
 
 // checkEndpointOwnership reports a conflict if either the Service or the
@@ -344,8 +400,14 @@ func (r *ServiceRegistry) upsertEndpoint(
 	port int,
 	ready bool,
 ) error {
-	// Sanitize service name (replace dots with dashes for DNS-1035 compliance)
-	serviceName := sanitizeServiceName(isvc.Name)
+	// Sanitized (DNS-1035) name, with the "-agent" suffix in relay mode.
+	serviceName := r.serviceNameFor(isvc.Name)
+	// In relay mode the Service and slice front the agent's TLS ingress; the
+	// engine port the caller passed is loopback-only and never published.
+	portName, servicePort, endpointPort := "http", int32(8080), port
+	if r.relayMode() {
+		portName, servicePort, endpointPort = "https", inferencev1alpha1.MetalAgentServicePort, r.ingressPort
+	}
 
 	// Check both objects for a foreign owner before writing either. Without
 	// this, a Service-then-EndpointSlice conflict (Service name free, Slice
@@ -377,9 +439,9 @@ func (r *ServiceRegistry) upsertEndpoint(
 		}
 		service.Spec.Type = corev1.ServiceTypeClusterIP
 		service.Spec.Ports = []corev1.ServicePort{{
-			Name:       "http",
-			Port:       8080,
-			TargetPort: intstr.FromInt(port),
+			Name:       portName,
+			Port:       servicePort,
+			TargetPort: intstr.FromInt(endpointPort),
 			Protocol:   corev1.ProtocolTCP,
 		}}
 		// No selector: Endpoints are managed manually.
@@ -411,6 +473,28 @@ func (r *ServiceRegistry) upsertEndpoint(
 		if r.version != "" {
 			slice.Annotations[inferencev1alpha1.AnnotationAgentVersion] = r.version
 		}
+		if r.relayMode() {
+			slice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI] = r.ingressPin
+			// The engine's own loopback port, for a foreman-agent using
+			// --inference-base-url-host-override on the same host: the
+			// "<isvc>" slice it would otherwise read now points at the
+			// relay pod once the controller adopts it, not the engine.
+			//
+			// Only written on a ready registration. WithdrawEndpoint and
+			// WithdrawEndpointIfPresent call this with ready=false and a
+			// port that is not the live engine port (WithdrawEndpointIfPresent
+			// reconstructs it from the slice's own Ports, which in relay mode
+			// is the ingress port; a caller of WithdrawEndpoint may not know
+			// the engine port either, e.g. a failed start). Writing it here
+			// unconditionally would clobber the last known-good engine port
+			// with that other value on every withdrawal (ruling 16). Leaving
+			// the annotation untouched on a withdrawal preserves whatever
+			// value CreateOrUpdate's Get already loaded into slice.Annotations
+			// (or leaves it absent if it was never set).
+			if ready {
+				slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort] = strconv.Itoa(port)
+			}
+		}
 		// resolveHostIP returns an IPv4 in every routable case and in the
 		// minikube/Docker-Desktop DNS fallback (host.minikube.internal ->
 		// 192.168.65.254). The fallback never yields a hostname, so IPv4 is a
@@ -426,8 +510,8 @@ func (r *ServiceRegistry) upsertEndpoint(
 			},
 		}}
 		slice.Ports = []discoveryv1.EndpointPort{{
-			Name:     ptr.To("http"),
-			Port:     ptr.To(int32(port)), //nolint:gosec // G115: TCP ports fit in int32
+			Name:     ptr.To(portName),
+			Port:     ptr.To(int32(endpointPort)), //nolint:gosec // G115: TCP ports fit in int32
 			Protocol: ptr.To(corev1.ProtocolTCP),
 		}}
 		return nil
@@ -440,24 +524,43 @@ func (r *ServiceRegistry) upsertEndpoint(
 	// left behind under the same name. Done after the live slice is written so
 	// there is no window where neither the slice nor the legacy object exists.
 	r.reapLegacyEndpoints(ctx, isvc.Namespace, serviceName)
-
-	if ready {
-		r.logger.Infow("registered endpoint",
-			"namespace", isvc.Namespace,
-			"name", isvc.Name,
-			"hostIP", r.resolveHostIP(),
-			"port", port,
-		)
-	} else {
-		r.logger.Infow("withdrew endpoint",
-			"namespace", isvc.Namespace,
-			"name", isvc.Name,
-			"hostIP", r.resolveHostIP(),
-			"port", port,
-		)
+	if r.relayMode() {
+		r.removeLegacySlice(ctx, isvc.Namespace, isvc.Name)
 	}
 
+	msg := "registered endpoint"
+	if !ready {
+		msg = "withdrew endpoint"
+	}
+	r.logger.Infow(msg,
+		"namespace", isvc.Namespace,
+		"name", isvc.Name,
+		"service", serviceName,
+		"hostIP", r.resolveHostIP(),
+		"port", endpointPort,
+		"enginePort", port,
+	)
+
 	return nil
+}
+
+// removeLegacySlice best-effort deletes the agent's own pre-relay "<isvc>"
+// EndpointSlice after a relay-mode write. In relay mode that slice would point
+// at a loopback-only engine port, so kube-proxy could only blackhole traffic to
+// it. Only a slice carrying both the agent's managed-by label and the
+// inference-service label for isvcName is deleted: InferenceService "m-agent"
+// has the legacy name "m-agent", which is also InferenceService "m"'s relay
+// slice, and must not remove it. The "<isvc>" Service is deliberately not
+// touched: the controller owns it for the relay. A failure is logged and
+// retried on the next write (every heartbeat), never propagated: registration
+// itself succeeded.
+func (r *ServiceRegistry) removeLegacySlice(ctx context.Context, namespace, isvcName string) {
+	name := sanitizeServiceName(isvcName)
+	key := types.NamespacedName{Namespace: namespace, Name: name}
+	if _, err := r.deleteOwned(ctx, key, &discoveryv1.EndpointSlice{}, isvcName); err != nil {
+		r.logger.Warnw("failed to delete legacy EndpointSlice after relay registration; will retry",
+			"namespace", namespace, "name", name, "error", err)
+	}
 }
 
 // reapLegacyEndpoints best-effort deletes a legacy core/v1 Endpoints object
@@ -549,41 +652,59 @@ func (r *ServiceRegistry) RegisterEndpointWithRetry(
 // Service/EndpointSlice that predates the agent, or that another owner
 // created, is left untouched.
 func (r *ServiceRegistry) UnregisterEndpoint(ctx context.Context, namespace, name string) error {
-	// Sanitize service name (replace dots with dashes for DNS-1035 compliance)
-	serviceName := sanitizeServiceName(name)
+	serviceName := r.serviceNameFor(name)
 	key := types.NamespacedName{Namespace: namespace, Name: serviceName}
 
-	if err := r.deleteIfOwned(ctx, key, &corev1.Service{}); err != nil {
+	if _, err := r.deleteIfOwned(ctx, key, &corev1.Service{}); err != nil {
 		return fmt.Errorf("failed to delete service: %w", err)
 	}
-	if err := r.deleteIfOwned(ctx, key, &discoveryv1.EndpointSlice{}); err != nil {
+	if _, err := r.deleteIfOwned(ctx, key, &discoveryv1.EndpointSlice{}); err != nil {
 		return fmt.Errorf("failed to delete endpointslice: %w", err)
 	}
 	return nil
 }
 
 // deleteIfOwned deletes the object at key only if it carries the metal-agent
-// ownership label. Missing objects are fine. The delete is preconditioned on
-// the UID and resourceVersion that were checked, so an object replaced in
-// between is not removed.
-func (r *ServiceRegistry) deleteIfOwned(ctx context.Context, key types.NamespacedName, obj client.Object) error {
+// ownership label, reporting whether this call deleted it. Missing objects are
+// fine. The delete is preconditioned on the UID and resourceVersion that were
+// checked, so an object replaced in between is not removed.
+func (r *ServiceRegistry) deleteIfOwned(
+	ctx context.Context, key types.NamespacedName, obj client.Object,
+) (bool, error) {
+	return r.deleteOwned(ctx, key, obj, "")
+}
+
+// deleteOwned is deleteIfOwned that, when isvcName is non-empty, also requires
+// the object's inference-service label to equal isvcName.
+func (r *ServiceRegistry) deleteOwned(
+	ctx context.Context, key types.NamespacedName, obj client.Object, isvcName string,
+) (bool, error) {
 	if err := r.client.Get(ctx, key, obj); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	if !ownedByAgent(obj.GetLabels()) {
 		r.logger.Warnw("not deleting an object the metal-agent does not own",
 			"kind", fmt.Sprintf("%T", obj), "namespace", key.Namespace, "name", key.Name)
-		return nil
+		return false, nil
+	}
+	if isvcName != "" && obj.GetLabels()[labelInferenceService] != isvcName {
+		r.logger.Debugw("not deleting an agent object that belongs to another InferenceService",
+			"kind", fmt.Sprintf("%T", obj), "namespace", key.Namespace, "name", key.Name,
+			"isvc", obj.GetLabels()[labelInferenceService], "want", isvcName)
+		return false, nil
 	}
 	uid, rv := obj.GetUID(), obj.GetResourceVersion()
 	err := r.client.Delete(ctx, obj, client.Preconditions{UID: &uid, ResourceVersion: &rv})
 	if apierrors.IsNotFound(err) {
-		return nil
+		return false, nil
 	}
-	return err
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ReconcileOrphanEndpoints scans all Service objects labeled as managed by
@@ -600,9 +721,15 @@ func (r *ServiceRegistry) deleteIfOwned(ctx context.Context, key types.Namespace
 // agent-managed-by label as the authoritative inventory of "things this
 // agent created" and cross-checking each one against the live API.
 //
-// Returns the number of orphan endpoints actually cleaned. Errors looking up
-// any individual InferenceService are logged and skipped so one transient
-// failure doesn't block cleanup of unrelated orphans.
+// Each orphan is deleted by the listed Service's own name (and its same-named
+// EndpointSlice), not by a name derived from the registry's mode, so the sweep
+// removes legacy "<isvc>" leftovers and relay "<isvc>-agent" objects alike. A
+// legacy "<isvc>" Service the controller adopted for the relay no longer
+// carries the managed-by label, so it is never listed and never touched.
+//
+// Returns the number of orphaned Services this call actually deleted. Errors
+// looking up any individual InferenceService are logged and skipped so one
+// transient failure doesn't block cleanup of unrelated orphans.
 func (r *ServiceRegistry) ReconcileOrphanEndpoints(ctx context.Context, namespace string) (int, error) {
 	services := &corev1.ServiceList{}
 	opts := []client.ListOption{
@@ -659,17 +786,89 @@ func (r *ServiceRegistry) ReconcileOrphanEndpoints(ctx context.Context, namespac
 			"service", svc.Name,
 			"isvc", isvcName,
 		)
-		if err := r.UnregisterEndpoint(ctx, svc.Namespace, isvcName); err != nil {
-			r.logger.Warnw("failed to unregister orphan endpoint",
+		deleted, err := r.deleteOrphanPair(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name})
+		if err != nil {
+			r.logger.Warnw("failed to delete orphan endpoint",
 				"namespace", svc.Namespace,
 				"service", svc.Name,
 				"error", err,
 			)
 			continue
 		}
-		cleaned++
+		if deleted {
+			cleaned++
+		}
 	}
 	return cleaned, nil
+}
+
+// deleteOrphanPair deletes the agent-owned EndpointSlice and Service at key,
+// the slice first: the Service is the sweep's inventory, so if the slice
+// delete fails the Service stays listed and the next startup retries both.
+// It reports whether the Service was deleted by this call.
+func (r *ServiceRegistry) deleteOrphanPair(ctx context.Context, key types.NamespacedName) (bool, error) {
+	if _, err := r.deleteIfOwned(ctx, key, &discoveryv1.EndpointSlice{}); err != nil {
+		return false, fmt.Errorf("delete endpointslice: %w", err)
+	}
+	deleted, err := r.deleteIfOwned(ctx, key, &corev1.Service{})
+	if err != nil {
+		return false, fmt.Errorf("delete service: %w", err)
+	}
+	return deleted, nil
+}
+
+// RemoveRelayRegistrations deletes the agent-owned "<isvc>-agent" Service and
+// EndpointSlice of every InferenceService that still exists and for which owns
+// reports true. It runs at startup in legacy mode: after a relay-to-legacy
+// switch those objects would otherwise keep a fresh relay registration
+// competing with the direct "<isvc>" one. A Service counts as a relay
+// registration only when its name is the sanitized inference-service label
+// plus MetalAgentServiceSuffix, so the legacy Service of an InferenceService
+// literally named "x-agent" is kept. Pairs whose InferenceService is gone are
+// left to ReconcileOrphanEndpoints. Per-object errors are logged and skipped.
+// Returns the number of Services deleted.
+func (r *ServiceRegistry) RemoveRelayRegistrations(
+	ctx context.Context,
+	namespace string,
+	owns func(context.Context, *inferencev1alpha1.InferenceService) bool,
+) (int, error) {
+	services := &corev1.ServiceList{}
+	opts := []client.ListOption{client.MatchingLabels{managedByLabel: managedByValue}}
+	if namespace != "" {
+		opts = append(opts, client.InNamespace(namespace))
+	}
+	if err := r.client.List(ctx, services, opts...); err != nil {
+		return 0, fmt.Errorf("list managed services: %w", err)
+	}
+	removed := 0
+	for i := range services.Items {
+		svc := &services.Items[i]
+		isvcName := svc.Labels[labelInferenceService]
+		if isvcName == "" || svc.Name != sanitizeServiceName(isvcName)+inferencev1alpha1.MetalAgentServiceSuffix {
+			continue
+		}
+		isvc := &inferencev1alpha1.InferenceService{}
+		if err := r.client.Get(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: isvcName}, isvc); err != nil {
+			if !apierrors.IsNotFound(err) {
+				r.logger.Warnw("failed to look up InferenceService for relay registration cleanup",
+					"namespace", svc.Namespace, "isvc", isvcName, "error", err)
+			}
+			continue
+		}
+		if !owns(ctx, isvc) {
+			continue
+		}
+		deleted, err := r.deleteOrphanPair(ctx, types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name})
+		if err != nil {
+			r.logger.Warnw("failed to delete relay registration in legacy mode",
+				"namespace", svc.Namespace, "service", svc.Name, "error", err)
+			continue
+		}
+		if deleted {
+			removed++
+		}
+	}
+	return removed, nil
 }
 
 // sanitizeServiceName converts a name to be DNS-1035 compliant

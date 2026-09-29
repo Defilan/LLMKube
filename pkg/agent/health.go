@@ -46,7 +46,7 @@ func NewDefaultProcessHealthChecker(timeout time.Duration) *DefaultProcessHealth
 
 // Check sends a GET request to the llama-server /health endpoint.
 func (c *DefaultProcessHealthChecker) Check(ctx context.Context, port int) (bool, error) {
-	url := fmt.Sprintf("http://localhost:%d/health", port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, err

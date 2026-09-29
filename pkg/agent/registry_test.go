@@ -1312,3 +1312,441 @@ func TestUnregisterEndpoint_KeepsControllerOwnedUnlabelledService(t *testing.T) 
 		t.Errorf("controller-owned, unlabelled Service was deleted: %v", err)
 	}
 }
+
+// --- Relay mode (EnableIngress): the agent registers <isvc>-agent pointing at
+// its TLS ingress, annotated with the ingress SPKI pin, and never the <isvc>
+// Service.
+
+func relayKey(name string) types.NamespacedName {
+	return types.NamespacedName{Namespace: "default", Name: name + inferencev1alpha1.MetalAgentServiceSuffix}
+}
+
+func newRelayRegistry(c client.Client) *ServiceRegistry {
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "v1.2.3")
+	if err := r.EnableIngress(9443, testIngressPin); err != nil {
+		panic(err)
+	}
+	return r
+}
+
+func TestEnableIngress_RejectsBadInput(t *testing.T) {
+	cases := []struct {
+		name string
+		port int
+		pin  string
+	}{
+		{"zero port", 0, testIngressPin},
+		{"negative port", -1, testIngressPin},
+		{"empty pin", 9443, ""},
+		{"not base64", 9443, "PIN!"},
+		{"wrong length", 9443, "AAAA"},
+		{"url encoding", 9443, strings.Repeat("_", 43) + "="},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewServiceRegistry(newRegistryTestClient(t), "10.0.0.5", newNopLogger(), "")
+			if err := r.EnableIngress(tc.port, tc.pin); err == nil {
+				t.Errorf("EnableIngress(%d, %q) = nil, want error", tc.port, tc.pin)
+			}
+			if r.relayMode() {
+				t.Error("a rejected EnableIngress left the registry in relay mode")
+			}
+		})
+	}
+	r := NewServiceRegistry(newRegistryTestClient(t), "10.0.0.5", newNopLogger(), "")
+	if err := r.EnableIngress(9443, testIngressPin); err != nil || !r.relayMode() {
+		t.Errorf("EnableIngress(valid) = %v, relay=%t; want nil, true", err, r.relayMode())
+	}
+}
+
+func TestRegisterEndpoint_RelayWritesAgentService(t *testing.T) {
+	c := newRegistryTestClient(t)
+	r := newRelayRegistry(c)
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m.v1", Namespace: "default"}}
+	if err := r.RegisterEndpoint(context.Background(), isvc, 51234); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+	ctx := context.Background()
+	key := relayKey("m-v1")
+
+	svc := &corev1.Service{}
+	if err := c.Get(ctx, key, svc); err != nil {
+		t.Fatalf("get %s Service: %v", key.Name, err)
+	}
+	if len(svc.Spec.Ports) != 1 {
+		t.Fatalf("Service ports = %d, want 1", len(svc.Spec.Ports))
+	}
+	p := svc.Spec.Ports[0]
+	if p.Name != "https" || p.Port != inferencev1alpha1.MetalAgentServicePort || p.TargetPort.IntValue() != 9443 {
+		t.Errorf("Service port = %s %d -> %s, want https 8443 -> 9443", p.Name, p.Port, p.TargetPort.String())
+	}
+	if svc.Spec.Selector != nil {
+		t.Errorf("Service selector = %v, want nil", svc.Spec.Selector)
+	}
+	if svc.Labels[managedByLabel] != managedByValue || svc.Labels["llmkube.ai/inference-service"] != "m.v1" {
+		t.Errorf("Service labels = %v, want managed-by and inference-service=m.v1", svc.Labels)
+	}
+
+	slice := &discoveryv1.EndpointSlice{}
+	if err := c.Get(ctx, key, slice); err != nil {
+		t.Fatalf("get %s EndpointSlice: %v", key.Name, err)
+	}
+	if got := slice.Labels[labelServiceName]; got != key.Name {
+		t.Errorf("slice %s = %q, want %q", labelServiceName, got, key.Name)
+	}
+	if slice.Labels[managedByLabel] != managedByValue || slice.Labels["llmkube.ai/inference-service"] != "m.v1" {
+		t.Errorf("slice labels = %v, want managed-by and inference-service=m.v1", slice.Labels)
+	}
+	if len(slice.Ports) != 1 || slice.Ports[0].Port == nil || *slice.Ports[0].Port != 9443 ||
+		slice.Ports[0].Name == nil || *slice.Ports[0].Name != "https" {
+		t.Errorf("slice ports = %+v, want https 9443", slice.Ports)
+	}
+	if got := slice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI]; got != testIngressPin {
+		t.Errorf("slice SPKI annotation = %q, want %q", got, testIngressPin)
+	}
+	if got := slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort]; got != "51234" {
+		t.Errorf("slice engine-port annotation = %q, want %q (the engine port passed to RegisterEndpoint)", got, "51234")
+	}
+	if slice.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat] == "" {
+		t.Error("slice heartbeat annotation missing")
+	}
+	if len(slice.Endpoints) != 1 || slice.Endpoints[0].Addresses[0] != "10.0.0.5" ||
+		slice.Endpoints[0].Conditions.Ready == nil || !*slice.Endpoints[0].Conditions.Ready {
+		t.Errorf("slice endpoints = %+v, want one Ready 10.0.0.5", slice.Endpoints)
+	}
+
+	legacy := types.NamespacedName{Namespace: "default", Name: "m-v1"}
+	if err := c.Get(ctx, legacy, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("legacy <isvc> Service get err = %v, want NotFound", err)
+	}
+	if err := c.Get(ctx, legacy, &discoveryv1.EndpointSlice{}); !apierrors.IsNotFound(err) {
+		t.Errorf("legacy <isvc> EndpointSlice get err = %v, want NotFound", err)
+	}
+}
+
+// A re-register with a new engine port (a respawn onto a fresh loopback
+// port) updates the annotation in place: foreman-agent's host-override
+// lookup must see the current port, not the one from the process it
+// replaced.
+func TestRegisterEndpoint_RelayEnginePortAnnotationUpdatesOnReregister(t *testing.T) {
+	c := newRegistryTestClient(t)
+	r := newRelayRegistry(c)
+	ctx := context.Background()
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+
+	if err := r.RegisterEndpoint(ctx, isvc, 51234); err != nil {
+		t.Fatalf("first RegisterEndpoint: %v", err)
+	}
+	if err := r.RegisterEndpoint(ctx, isvc, 60177); err != nil {
+		t.Fatalf("second RegisterEndpoint: %v", err)
+	}
+
+	slice := &discoveryv1.EndpointSlice{}
+	if err := c.Get(ctx, relayKey("m"), slice); err != nil {
+		t.Fatalf("get EndpointSlice: %v", err)
+	}
+	if got := slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort]; got != "60177" {
+		t.Errorf("slice engine-port annotation after re-register = %q, want %q", got, "60177")
+	}
+}
+
+// Legacy mode (no EnableIngress call) never sets the engine-port annotation:
+// the "<isvc>" slice's own Port already carries the engine port, so a
+// foreman-agent talking to an older, non-relay metal-agent has no need for
+// it and must not be misled by a stale one.
+func TestRegisterEndpoint_LegacyModeOmitsEnginePortAnnotation(t *testing.T) {
+	c := newRegistryTestClient(t)
+	r := NewServiceRegistry(c, "10.0.0.5", newNopLogger(), "")
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	if err := r.RegisterEndpoint(context.Background(), isvc, 51234); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+
+	slice := &discoveryv1.EndpointSlice{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "m"}, slice); err != nil {
+		t.Fatalf("get EndpointSlice: %v", err)
+	}
+	if _, ok := slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort]; ok {
+		t.Errorf("legacy-mode slice annotations = %v, want no %s annotation",
+			slice.Annotations, inferencev1alpha1.AnnotationAgentEnginePort)
+	}
+}
+
+// Ruling 16 regression: WithdrawEndpointIfPresent and WithdrawEndpoint both
+// reconstruct their port argument from the slice's own Ports field (or take
+// a caller-supplied one) rather than the live engine port; in relay mode
+// that field is the ingress port (e.g. 9443), never the engine's. Writing
+// it into AnnotationAgentEnginePort on every withdrawal would clobber the
+// last known-good engine port a foreman-agent host-override lookup depends
+// on. upsertEndpoint must (re)write that annotation only on a ready
+// registration and leave whatever value the slice already carries alone on
+// a withdrawal.
+func TestWithdraw_PreservesEnginePortAnnotation(t *testing.T) {
+	c := newRegistryTestClient(t)
+	r := newRelayRegistry(c)
+	ctx := context.Background()
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	key := relayKey("m")
+
+	assertEnginePortAndReady := func(t *testing.T, wantPort string, wantReady bool) {
+		t.Helper()
+		slice := &discoveryv1.EndpointSlice{}
+		if err := c.Get(ctx, key, slice); err != nil {
+			t.Fatalf("get EndpointSlice: %v", err)
+		}
+		if got := slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort]; got != wantPort {
+			t.Errorf("engine-port annotation = %q, want %q", got, wantPort)
+		}
+		if len(slice.Endpoints) != 1 || slice.Endpoints[0].Conditions.Ready == nil ||
+			*slice.Endpoints[0].Conditions.Ready != wantReady {
+			t.Errorf("endpoint = %+v, want Ready=%t", slice.Endpoints, wantReady)
+		}
+	}
+
+	if err := r.RegisterEndpoint(ctx, isvc, 51234); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+	assertEnginePortAndReady(t, "51234", true)
+
+	if _, err := r.WithdrawEndpointIfPresent(ctx, isvc); err != nil {
+		t.Fatalf("WithdrawEndpointIfPresent: %v", err)
+	}
+	assertEnginePortAndReady(t, "51234", false)
+
+	// A direct WithdrawEndpoint call, e.g. from a failed-start path that
+	// does not know the live engine port either, must not clobber it.
+	if err := r.WithdrawEndpoint(ctx, isvc, 9443); err != nil {
+		t.Fatalf("WithdrawEndpoint: %v", err)
+	}
+	assertEnginePortAndReady(t, "51234", false)
+}
+
+// A slice that has never carried the annotation (an older agent's slice, or
+// one written before a ready registration ever landed) stays without it
+// after a withdrawal: upsertEndpoint must not introduce the annotation on a
+// ready=false write.
+func TestWithdrawEndpointIfPresent_NoAnnotationStaysAbsent(t *testing.T) {
+	slice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "m-agent",
+			Namespace: "default",
+			Labels: map[string]string{
+				labelServiceName:               "m-agent",
+				managedByLabel:                 managedByValue,
+				"llmkube.ai/inference-service": "m",
+			},
+		},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Ports:       []discoveryv1.EndpointPort{{Port: ptr.To(int32(9443))}},
+		Endpoints: []discoveryv1.Endpoint{{
+			Addresses:  []string{"10.0.0.5"},
+			Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+		}},
+	}
+	c := newRegistryTestClient(t, slice)
+	r := newRelayRegistry(c)
+	ctx := context.Background()
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+
+	ok, err := r.WithdrawEndpointIfPresent(ctx, isvc)
+	if err != nil || !ok {
+		t.Fatalf("WithdrawEndpointIfPresent = (%t, %v), want (true, nil)", ok, err)
+	}
+
+	after := &discoveryv1.EndpointSlice{}
+	if err := c.Get(ctx, relayKey("m"), after); err != nil {
+		t.Fatalf("get EndpointSlice: %v", err)
+	}
+	if got, ok := after.Annotations[inferencev1alpha1.AnnotationAgentEnginePort]; ok {
+		t.Errorf("engine-port annotation = %q, want absent", got)
+	}
+	if len(after.Endpoints) != 1 || after.Endpoints[0].Conditions.Ready == nil || *after.Endpoints[0].Conditions.Ready {
+		t.Errorf("endpoint = %+v, want Ready=false", after.Endpoints)
+	}
+}
+
+func TestRegisterEndpoint_RelayDeletesOwnedLegacySliceKeepsService(t *testing.T) {
+	legacySvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default",
+			Labels: map[string]string{managedByLabel: managedByValue, "llmkube.ai/inference-service": "m"}},
+		Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "http", Port: 8080, TargetPort: intstr.FromInt(51234)}}},
+	}
+	legacySlice := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default",
+			Labels: map[string]string{managedByLabel: managedByValue, labelServiceName: "m",
+				"llmkube.ai/inference-service": "m"}},
+		AddressType: discoveryv1.AddressTypeIPv4,
+	}
+	c := newRegistryTestClient(t, legacySvc, legacySlice)
+	ctx := context.Background()
+	legacy := types.NamespacedName{Namespace: "default", Name: "m"}
+	before := &corev1.Service{}
+	if err := c.Get(ctx, legacy, before); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newRelayRegistry(c)
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	if err := r.RegisterEndpoint(ctx, isvc, 51234); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+
+	if err := c.Get(ctx, legacy, &discoveryv1.EndpointSlice{}); !apierrors.IsNotFound(err) {
+		t.Errorf("agent-owned legacy slice get err = %v, want NotFound (deleted)", err)
+	}
+	after := &corev1.Service{}
+	if err := c.Get(ctx, legacy, after); err != nil {
+		t.Fatalf("legacy Service must survive relay registration: %v", err)
+	}
+	if after.ResourceVersion != before.ResourceVersion {
+		t.Errorf("legacy Service resourceVersion %s -> %s; relay mode must never touch <isvc>",
+			before.ResourceVersion, after.ResourceVersion)
+	}
+	// A heartbeat re-register must not touch it either.
+	if err := r.RegisterEndpoint(ctx, isvc, 51234); err != nil {
+		t.Fatalf("second RegisterEndpoint: %v", err)
+	}
+	again := &corev1.Service{}
+	_ = c.Get(ctx, legacy, again)
+	if again.ResourceVersion != before.ResourceVersion {
+		t.Errorf("legacy Service modified on re-register")
+	}
+}
+
+func TestRegisterEndpoint_RelayKeepsUnownedLegacySlice(t *testing.T) {
+	foreign := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default",
+			Labels: map[string]string{labelServiceName: "m"}},
+		AddressType: discoveryv1.AddressTypeIPv4,
+	}
+	c := newRegistryTestClient(t, foreign)
+	ctx := context.Background()
+	legacy := types.NamespacedName{Namespace: "default", Name: "m"}
+	before := &discoveryv1.EndpointSlice{}
+	_ = c.Get(ctx, legacy, before)
+
+	r := newRelayRegistry(c)
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	if err := r.RegisterEndpoint(ctx, isvc, 51234); err != nil {
+		t.Fatalf("RegisterEndpoint: %v", err)
+	}
+	after := &discoveryv1.EndpointSlice{}
+	if err := c.Get(ctx, legacy, after); err != nil {
+		t.Fatalf("unowned legacy slice was deleted: %v", err)
+	}
+	if !reflect.DeepEqual(before, after) {
+		t.Error("unowned legacy slice was modified")
+	}
+}
+
+func TestRegisterEndpoint_RelayRefusesUnownedAgentObjects(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		obj  client.Object
+	}{
+		{"Service", &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "m-agent", Namespace: "default"}}},
+		{"EndpointSlice", &discoveryv1.EndpointSlice{
+			ObjectMeta:  metav1.ObjectMeta{Name: "m-agent", Namespace: "default"},
+			AddressType: discoveryv1.AddressTypeIPv4,
+		}},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			c := newRegistryTestClient(t, tc.obj)
+			r := newRelayRegistry(c)
+			isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+			err := r.RegisterEndpoint(context.Background(), isvc, 51234)
+			var conflict *EndpointNameConflictError
+			if !errors.As(err, &conflict) {
+				t.Fatalf("RegisterEndpoint error = %v, want *EndpointNameConflictError", err)
+			}
+			if conflict.Kind != tc.kind || conflict.Name != "m-agent" {
+				t.Errorf("conflict = %+v, want Kind=%s Name=m-agent", conflict, tc.kind)
+			}
+			if err := r.CheckEndpointName(context.Background(), isvc); !errors.As(err, &conflict) {
+				t.Errorf("CheckEndpointName error = %v, want *EndpointNameConflictError", err)
+			}
+		})
+	}
+}
+
+func TestUnregisterEndpoint_RelayDeletesAgentObjectsOnly(t *testing.T) {
+	owned := map[string]string{managedByLabel: managedByValue, "llmkube.ai/inference-service": "m"}
+	objs := []client.Object{
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default", Labels: owned}},
+		&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default", Labels: owned},
+			AddressType: discoveryv1.AddressTypeIPv4},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "m-agent", Namespace: "default", Labels: owned}},
+		&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "m-agent", Namespace: "default", Labels: owned},
+			AddressType: discoveryv1.AddressTypeIPv4},
+	}
+	c := newRegistryTestClient(t, objs...)
+	r := newRelayRegistry(c)
+	ctx := context.Background()
+	if err := r.UnregisterEndpoint(ctx, "default", "m"); err != nil {
+		t.Fatalf("UnregisterEndpoint: %v", err)
+	}
+	agent := relayKey("m")
+	if err := c.Get(ctx, agent, &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("m-agent Service get err = %v, want NotFound", err)
+	}
+	if err := c.Get(ctx, agent, &discoveryv1.EndpointSlice{}); !apierrors.IsNotFound(err) {
+		t.Errorf("m-agent EndpointSlice get err = %v, want NotFound", err)
+	}
+	legacy := types.NamespacedName{Namespace: "default", Name: "m"}
+	if err := c.Get(ctx, legacy, &corev1.Service{}); err != nil {
+		t.Errorf("legacy <isvc> Service must survive relay unregister: %v", err)
+	}
+	if err := c.Get(ctx, legacy, &discoveryv1.EndpointSlice{}); err != nil {
+		t.Errorf("legacy <isvc> EndpointSlice must survive relay unregister: %v", err)
+	}
+}
+
+func TestWithdrawEndpointIfPresent_RelayUsesAgentSlice(t *testing.T) {
+	c := newRegistryTestClient(t)
+	r := newRelayRegistry(c)
+	ctx := context.Background()
+	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"}}
+	if err := r.RegisterEndpoint(ctx, isvc, 51234); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := r.WithdrawEndpointIfPresent(ctx, isvc)
+	if err != nil || !ok {
+		t.Fatalf("WithdrawEndpointIfPresent = %v, %v; want true, nil", ok, err)
+	}
+	slice := &discoveryv1.EndpointSlice{}
+	if err := c.Get(ctx, relayKey("m"), slice); err != nil {
+		t.Fatal(err)
+	}
+	if slice.Endpoints[0].Conditions.Ready == nil || *slice.Endpoints[0].Conditions.Ready {
+		t.Error("m-agent slice still Ready after withdrawal")
+	}
+	if *slice.Ports[0].Port != 9443 {
+		t.Errorf("withdrawn slice port = %d, want 9443", *slice.Ports[0].Port)
+	}
+	legacy := types.NamespacedName{Namespace: "default", Name: "m"}
+	if err := c.Get(ctx, legacy, &discoveryv1.EndpointSlice{}); !apierrors.IsNotFound(err) {
+		t.Errorf("withdrawal created a legacy <isvc> slice (err = %v)", err)
+	}
+}
+
+func TestReconcileOrphanEndpoints_RelayRemovesAgentObjects(t *testing.T) {
+	owned := map[string]string{managedByLabel: managedByValue, "llmkube.ai/inference-service": "gone"}
+	objs := []client.Object{
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "gone-agent", Namespace: "default", Labels: owned}},
+		&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: "gone-agent", Namespace: "default", Labels: owned},
+			AddressType: discoveryv1.AddressTypeIPv4},
+	}
+	c := newRegistryTestClient(t, objs...)
+	r := newRelayRegistry(c)
+	ctx := context.Background()
+	n, err := r.ReconcileOrphanEndpoints(ctx, "default")
+	if err != nil || n != 1 {
+		t.Fatalf("ReconcileOrphanEndpoints = %d, %v; want 1, nil", n, err)
+	}
+	if err := c.Get(ctx, relayKey("gone"), &corev1.Service{}); !apierrors.IsNotFound(err) {
+		t.Errorf("orphan gone-agent Service get err = %v, want NotFound", err)
+	}
+	if err := c.Get(ctx, relayKey("gone"), &discoveryv1.EndpointSlice{}); !apierrors.IsNotFound(err) {
+		t.Errorf("orphan gone-agent EndpointSlice get err = %v, want NotFound", err)
+	}
+}

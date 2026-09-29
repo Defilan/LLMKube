@@ -15,9 +15,10 @@ a container.
 The shape: a native macOS daemon (the agent) watches the
 Kubernetes API for `InferenceService` resources marked
 `accelerator: metal`, spawns `llama-server` processes natively
-with full Metal GPU access, and registers endpoints back into the
-cluster so any pod can route traffic to your Mac over LAN /
-Tailscale / WireGuard.
+with full Metal GPU access, and registers its authenticated TLS
+ingress back into the cluster. The controller fronts that ingress
+with an in-cluster relay, so any pod reaches your Mac over LAN /
+Tailscale / WireGuard through an ordinary Service.
 
 This guide gets you from a fresh Apple Silicon machine to a
 running Metal-accelerated InferenceService in about ten minutes.
@@ -98,8 +99,8 @@ tail -f /tmp/llmkube-metal-agent.log
 
 If your Kubernetes cluster runs on a different machine (a Linux
 server or cloud cluster, as opposed to local kind / minikube), the
-agent needs to register your Mac's reachable IP so cluster pods
-can route to `llama-server` on your Mac.
+agent needs to register your Mac's reachable IP so the in-cluster
+relay can reach the agent's ingress on your Mac.
 
 ```bash
 # Find your Mac's IP on the LAN
@@ -128,6 +129,10 @@ launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 Without `--host-ip` the agent registers `localhost` as the
 endpoint, which only works when Kubernetes lives on the same Mac
 (local minikube or Docker Desktop kind).
+
+Engines on the Mac listen on `127.0.0.1` only. The cluster reaches
+them through the agent's TLS ingress on `--ingress-port` (default
+9443), so that is the one port to allow in the macOS firewall.
 
 ## Step 5: Deploy a model with Metal
 
@@ -160,38 +165,35 @@ The agent's log should show:
 
 ```
 "msg":"starting inference service","name":"phi-4-mini"
-"msg":"registered endpoint","hostIP":"192.168.1.50","port":<allocated>
+"msg":"registered endpoint","service":"phi-4-mini-agent","hostIP":"192.168.1.50","port":9443,"enginePort":<allocated>
 "msg":"started inference service","name":"phi-4-mini","pid":<llama-server-pid>
 ```
 
-### Find the endpoint
+### How traffic reaches the Mac
 
-The metal-agent picks the port `llama-server` listens on at spawn
-time and registers it as the Service's Endpoint. Unless you started
-the agent with `--llama-server-port <N>`, the port is not 8080 — it
-is allocated from the ephemeral range and changes across restarts.
-Always read the endpoint from the cluster rather than assuming a port:
+The agent starts `llama-server` on `127.0.0.1` and registers its
+TLS ingress as the Service and EndpointSlice `phi-4-mini-agent`.
+The controller then creates a relay Deployment `phi-4-mini-relay`
+in the cluster and points the `phi-4-mini` Service at it. The relay
+pins the agent's certificate and authenticates with a per-namespace
+token; the ingress forwards only an allowlist of inference paths to
+the engine. Clients never need the Mac's IP or the engine port.
 
 ```bash
-kubectl get endpoints phi-4-mini \
-  -o jsonpath='{.subsets[0].addresses[0].ip}:{.subsets[0].ports[0].port}{"\n"}'
-# example: 192.168.1.50:63344
+kubectl get svc phi-4-mini
+kubectl get pods -l inference.llmkube.dev/service=phi-4-mini
+# the relay pod: phi-4-mini-relay-<hash>
 ```
-
-The IP is your Mac's reachable address (LAN, Tailscale, etc., set via
-`--host-ip` in Step 4). The port is whatever the agent allocated. The
-two together are how every client — including pods inside the cluster
-— reaches the model.
 
 ### Query the model
 
-From the Mac that runs metal-agent, `localhost` works because
-`llama-server` is bound to `0.0.0.0` on the host. Read the port from
-the cluster and curl it:
+From a pod in the cluster, call the Service like any other
+InferenceService. The port follows `spec.endpoint.port` (default
+8080):
 
 ```bash
-PORT=$(kubectl get endpoints phi-4-mini -o jsonpath='{.subsets[0].ports[0].port}')
-curl -sS "http://localhost:${PORT}/v1/chat/completions" \
+kubectl run curl --rm -it --restart=Never --image=curlimages/curl -- \
+  curl -sS http://phi-4-mini.default.svc:8080/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"phi-4-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -200,35 +202,41 @@ If your shell or paste medium strips backslash line-continuations,
 the equivalent one-liner is safer to copy:
 
 ```bash
-curl -sS "http://localhost:${PORT}/v1/chat/completions" -H 'content-type: application/json' -d '{"model":"phi-4-mini","messages":[{"role":"user","content":"hi"}]}'
+kubectl run curl --rm -it --restart=Never --image=curlimages/curl -- curl -sS http://phi-4-mini.default.svc:8080/v1/chat/completions -H 'content-type: application/json' -d '{"model":"phi-4-mini","messages":[{"role":"user","content":"hi"}]}'
+```
+
+On the Mac that runs metal-agent, use the agent's client proxy on
+`127.0.0.1:9999` (set with `--client-port`), which forwards `/v1/*`
+to the running engine:
+
+```bash
+curl -sS http://127.0.0.1:9999/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"phi-4-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ### Reaching the service from elsewhere
 
-The InferenceService Service on the metal path is selector-less by
-design: the metal-agent registers the host as the Endpoint, so the
-Service has no Pods to target. That means
-`kubectl port-forward svc/phi-4-mini ...` returns
-`error: cannot attach to *v1.Service: ... Service is defined without
-a selector` and cannot be used here. Two supported ways to reach the
-service from a machine that is not the Mac:
+The `phi-4-mini` Service selects the relay pod, so the usual tools
+work:
 
-1. **Hit the host directly.** Use the address `kubectl get endpoints`
-   printed above. From any client on the same network:
+1. **Port-forward** from a workstation with cluster access:
 
    ```bash
-   curl -sS "http://192.168.1.50:63344/v1/chat/completions" \
+   kubectl port-forward svc/phi-4-mini 8080:8080
+   curl -sS http://localhost:8080/v1/chat/completions \
      -H 'content-type: application/json' \
      -d '{"model":"phi-4-mini","messages":[{"role":"user","content":"hi"}]}'
    ```
+2. **Set `spec.endpoint.type: NodePort`** (and optionally
+   `spec.endpoint.nodePort`) on the InferenceService for a stable,
+   externally reachable port on the cluster's nodes.
 
-   Substitute your own IP and port. This is the same address that
-   in-cluster pods route to via the Service's ClusterIP, so a NodePort
-   is not required for LAN clients.
-2. **Pin the agent's port + set `spec.endpoint.type: NodePort`** if
-   you want a stable, externally-advertised port that survives agent
-   restarts. Start metal-agent with `--llama-server-port 8080` (or any
-   fixed value you choose) and set the NodePort on the InferenceService.
+Dialling `<mac-ip>:<engine-port>` directly does not work: the
+engine is not listening on the network. For what the ingress
+authenticates, the path allowlist, token and key rotation, and the
+upgrade order, see "Network exposure" in the
+[`deployment/macos/README.md` security model](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#network-exposure).
 
 ## Memory budgets
 
@@ -300,8 +308,9 @@ spec:
 ```
 
 The router-proxy pod (which the controller schedules in the
-cluster, *not* on the Mac) dials the agent-registered endpoint
-when the rule resolves to `local-mac`. From the router's
+cluster, *not* on the Mac) calls the `phi-4-mini` Service, and so
+the relay in front of the agent's ingress, when the rule resolves
+to `local-mac`. From the router's
 perspective the Mac-served backend is indistinguishable from a
 container-served one — same `InferenceServiceRef` shape, same
 fail-closed semantics, same per-rule timeout budgets.
@@ -370,23 +379,28 @@ launchd plist) for the first-launch error. Most common cause:
 `llama-server` not on PATH or at the configured `--llama-server`
 path.
 
-**Pods can't reach llama-server (remote cluster)**
-The agent registered `localhost`. Confirm `--host-ip` is set in
-the plist and points at an address reachable from your cluster's
-worker nodes:
+**Pods can't reach the model (remote cluster)**
+Confirm `--host-ip` is set in the plist and points at an address
+reachable from your cluster's worker nodes on the ingress port
+(`--ingress-port`, default 9443). The engine port is not reachable
+from the network by design.
 
 ```bash
 # From a worker node:
 ping <your-mac-ip>
-curl http://<your-mac-ip>:<allocated-port>/v1/models
+nc -vz <your-mac-ip> 9443
 ```
 
-If those work but routing through the cluster Service fails, check
-the registered Endpoints object:
+Then check the agent's registration and the relay:
 
 ```bash
-kubectl get endpoints <inferenceservice-name>
-# expect: subsets[0].addresses[0].ip = your Mac's --host-ip
+kubectl get endpointslice <inferenceservice-name>-agent -o yaml
+# expect: your Mac's --host-ip, port 9443, and the
+# llmkube.ai/agent-ingress-spki annotation
+kubectl get pods -l inference.llmkube.dev/service=<inferenceservice-name>
+kubectl logs deploy/<inferenceservice-name>-relay
+kubectl describe inferenceservice <inferenceservice-name>
+# look for RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed
 ```
 
 **InferenceService stuck in `InsufficientMemory`**
@@ -409,9 +423,10 @@ risk.
 
 **macOS firewall prompt on first run**
 The Metal Agent listens on `127.0.0.1:9090` for its own
-health/metrics, and `llama-server` listens on an allocated port
-for inbound inference. macOS will prompt to allow incoming
-connections on first run. Allow them.
+health/metrics and serves its TLS ingress on `--ingress-port`
+(default 9443) for inbound inference; engines listen on
+`127.0.0.1` only. macOS will prompt to allow incoming connections
+on first run. Allow them for the ingress port.
 
 **Agent log shows `replicas=0; stopping process` unexpectedly**
 A controller-side reconcile saw `spec.replicas=0` on the

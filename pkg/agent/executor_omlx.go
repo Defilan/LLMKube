@@ -67,6 +67,10 @@ type OMLXExecutor struct {
 	// (--paged-ssd-cache-max-size). Set once when the daemon starts; shared
 	// across all models served by this daemon. Empty means no limit.
 	pagedSSDCacheMaxSize string
+	// bindHost is the ExecutorConfig.BindHost override for the daemon's
+	// --host flag. Set once when the daemon starts; shared across all models
+	// served by this daemon. Empty resolves to engineBindHost (loopback).
+	bindHost string
 }
 
 // NewOMLXExecutor creates an executor that manages models via the oMLX daemon.
@@ -131,6 +135,7 @@ func (e *OMLXExecutor) StartProcess(ctx context.Context, config ExecutorConfig) 
 	e.pagedSSDCacheDir = config.PagedSSDCacheDir
 	e.hotCacheMaxSize = config.HotCacheMaxSize
 	e.pagedSSDCacheMaxSize = config.PagedSSDCacheMaxSize
+	e.bindHost = config.BindHost
 	e.mu.Unlock()
 
 	// Ensure the oMLX daemon is running
@@ -196,7 +201,7 @@ func (e *OMLXExecutor) UnloadModel(ctx context.Context, modelID string) error {
 		return fmt.Errorf("cannot unload model: empty model ID")
 	}
 
-	url := fmt.Sprintf("http://localhost:%d/v1/models/%s/unload", e.port, modelID)
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models/%s/unload", e.port, modelID)
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
 	if err != nil {
@@ -228,7 +233,7 @@ func buildOMLXServeArgs(modelDir string, port int, cfg omlxServeConfig) []string
 		"serve",
 		"--model-dir", modelDir,
 		"--port", fmt.Sprint(port),
-		"--host", "0.0.0.0",
+		"--host", resolveBindHost(cfg.bindHost),
 	}
 
 	// TurboQuant KV cache quantization (oMLX v0.3.4+). Maps to --kv-cache-quant
@@ -270,6 +275,10 @@ type omlxServeConfig struct {
 	pagedSSDCacheDir     string
 	hotCacheMaxSize      string
 	pagedSSDCacheMaxSize string
+	// bindHost is the ExecutorConfig.BindHost override for the daemon's
+	// --host flag. Empty resolves to engineBindHost (loopback) via
+	// resolveBindHost in buildOMLXServeArgs.
+	bindHost string
 }
 
 // ensureOMLXRunning starts the oMLX daemon if it is not already responding.
@@ -290,6 +299,7 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context) error {
 		pagedSSDCacheDir:     e.pagedSSDCacheDir,
 		hotCacheMaxSize:      e.hotCacheMaxSize,
 		pagedSSDCacheMaxSize: e.pagedSSDCacheMaxSize,
+		bindHost:             e.bindHost,
 	}
 	cmd := exec.Command(e.omlxBin, buildOMLXServeArgs(e.modelDir, e.port, cfg)...)
 	cmd.Dir = e.modelDir // relative paths in engine flags resolve inside the model store
@@ -317,7 +327,7 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context) error {
 
 // isHealthy checks if the oMLX daemon is responding at /health.
 func (e *OMLXExecutor) isHealthy(ctx context.Context) bool {
-	url := fmt.Sprintf("http://localhost:%d/health", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", e.port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false
@@ -355,7 +365,7 @@ func (e *OMLXExecutor) waitForHealthy(ctx context.Context, timeout time.Duration
 // triggerModelLoad sends a minimal chat completion request to oMLX which causes
 // it to lazily load the requested model.
 func (e *OMLXExecutor) triggerModelLoad(ctx context.Context, modelID string) error {
-	url := fmt.Sprintf("http://localhost:%d/v1/chat/completions", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/chat/completions", e.port)
 
 	payload := map[string]interface{}{
 		"model": modelID,
@@ -399,7 +409,7 @@ func (e *OMLXExecutor) waitForModelLoaded(ctx context.Context, modelID string, t
 
 // isModelLoaded checks whether the specified model is loaded in oMLX.
 func (e *OMLXExecutor) isModelLoaded(ctx context.Context, modelID string) (bool, error) {
-	url := fmt.Sprintf("http://localhost:%d/v1/models/status", e.port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/v1/models/status", e.port)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, err

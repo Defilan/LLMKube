@@ -85,6 +85,9 @@ type AgentConfig struct {
 	PowermetricsBin           string
 	AllowedModelRoots         string
 	AllowUnsafeExtraArgs      bool
+	IngressPort               int
+	StateDir                  string
+	LegacyDirectEndpoints     bool
 }
 
 // splitCSV parses a comma-separated string into a trimmed []string,
@@ -360,6 +363,14 @@ func main() {
 	flag.IntVar(&cfg.Port, "port", 9090, "Agent metrics/health port")
 	flag.IntVar(&cfg.ClientPort, "client-port", 9999,
 		"Stable host-side listener (127.0.0.1:<port>) that forwards /v1/* to the current inference child; 0 disables")
+	flag.IntVar(&cfg.IngressPort, "ingress-port", 9443,
+		"TLS port of the authenticated ingress that in-cluster relays use to reach engines (engines listen on "+
+			"127.0.0.1 only). Open this port, not engine ports, in the macOS firewall.")
+	flag.StringVar(&cfg.StateDir, "state-dir", "",
+		"Directory for agent state (the ingress TLS key). Default: ~/Library/Application Support/llmkube/metal-agent.")
+	flag.BoolVar(&cfg.LegacyDirectEndpoints, "legacy-direct-endpoints", false,
+		"DEPRECATED, removed in a future release: bind engines on all interfaces without authentication and "+
+			"register them directly, as before the ingress. Only for a controller that predates relay support.")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.HostIP, "host-ip", "", "IP address to register in Kubernetes endpoints (auto-detected if empty)")
 	flag.Float64Var(&cfg.MemoryFraction, "memory-fraction", 0,
@@ -494,6 +505,8 @@ func main() {
 		"omlxBin", cfg.OMLXBin,
 		"vllmSwiftBin", cfg.VLLMSwiftBin,
 		"agentPort", cfg.Port,
+		"ingressPort", cfg.IngressPort,
+		"legacyDirectEndpoints", cfg.LegacyDirectEndpoints,
 		"hostIP", hostIP,
 		"logLevel", cfg.LogLevel,
 	)
@@ -614,6 +627,9 @@ func main() {
 		EvictionEnabled:           cfg.EvictionEnabled,
 		AllowedModelRoots:         allowedModelRoots,
 		AllowUnsafeExtraArgs:      cfg.AllowUnsafeExtraArgs,
+		IngressPort:               cfg.IngressPort,
+		StateDir:                  cfg.StateDir,
+		LegacyDirectEndpoints:     cfg.LegacyDirectEndpoints,
 	}
 	if cfg.WatchdogInterval > 0 {
 		agentCfg.WatchdogConfig = &agent.MemoryWatchdogConfig{

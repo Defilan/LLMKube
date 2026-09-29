@@ -173,7 +173,7 @@ func TestBuildLlamaServerArgs_Defaults(t *testing.T) {
 
 	want := map[string]string{
 		"--model":        "/models/test.gguf",
-		"--host":         "0.0.0.0",
+		"--host":         "127.0.0.1",
 		"--port":         "8080",
 		"--n-gpu-layers": "99",
 		"--ctx-size":     "32768",
@@ -921,7 +921,7 @@ func TestBuildOMLXServeArgs_Defaults(t *testing.T) {
 	want := map[string]string{
 		"--model-dir": "/models/test",
 		"--port":      "8000",
-		"--host":      "0.0.0.0",
+		"--host":      "127.0.0.1",
 	}
 	for flag, expected := range want {
 		if got := flagValue(args, flag); got != expected {

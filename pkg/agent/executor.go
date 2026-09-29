@@ -141,6 +141,12 @@ type ExecutorConfig struct {
 	// override any earlier flag llama-server emitted (last-wins).
 	ExtraArgs []string
 
+	// BindHost overrides the address an inference engine binds to. Empty
+	// means engineBindHost (loopback). The agent's deprecated
+	// --legacy-direct-endpoints mode sets this to "0.0.0.0" to restore the
+	// pre-trust-boundary behavior of exposing engines directly on the LAN.
+	BindHost string
+
 	// TurboQuantBits sets the KV cache quantization bit width for the oMLX
 	// runtime (3, 6, or 8). Maps to oMLX --kv-cache-quant. When set, the
 	// oMLX daemon uses TurboQuant to compress the KV cache, reducing memory
@@ -846,6 +852,27 @@ func (e *MetalExecutor) waitForHealthy(port int, timeout time.Duration, exited <
 	return waitForChildHealthy(port, timeout, exited)
 }
 
+// engineBindHost is the address an inference engine the metal-agent spawns
+// binds to by default. Binding to 0.0.0.0 would expose the engine's
+// unauthenticated OpenAI-compatible API to the LAN; the agent's own reverse
+// proxy is the only intended ingress. ExecutorConfig.BindHost overrides this.
+const engineBindHost = "127.0.0.1"
+
+// resolveBindHost returns the effective bind address for an inference
+// engine: the configured override if set, otherwise engineBindHost.
+func resolveBindHost(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	return engineBindHost
+}
+
+// bindHost returns the address an inference engine should bind to, per
+// config.BindHost (or engineBindHost by default).
+func bindHost(config ExecutorConfig) string {
+	return resolveBindHost(config.BindHost)
+}
+
 // hasMatchingExtraArg reports whether extraArgs already carries argName in
 // either the "--name" or "--name=value" form. Mirrors the controller helper so
 // the agent path does not duplicate flags the user set explicitly.
@@ -926,7 +953,7 @@ func buildLlamaServerArgs(modelPath string, port int, config ExecutorConfig) []s
 
 	args := []string{
 		"--model", modelPath,
-		"--host", "0.0.0.0",
+		"--host", bindHost(config),
 		"--port", fmt.Sprintf("%d", port),
 		"--n-gpu-layers", fmt.Sprintf("%d", gpuLayers),
 		"--ctx-size", fmt.Sprintf("%d", config.ContextSize),

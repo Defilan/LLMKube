@@ -107,13 +107,18 @@ Why each native-mode flag:
 - `--inference-base-url-host-override`: required when foreman-agent
   runs on the host (where `*.svc.cluster.local` does not resolve).
   The executor still reads `InferenceService.status.endpoint` for the
-  scheme and path; it substitutes this host and re-reads the live
-  port from the v1 Endpoints object the metal-agent rewrites on every
-  llama-server respawn. Set to `127.0.0.1` for the launchd-on-M5-Max
-  case. (`--inference-base-url-override` is still available for tests
-  and stub OAI servers as a full-URL replacement, but it locks the
-  port at install time and breaks on every metal-agent respawn,
-  which is exactly the bug #540 fixes.)
+  scheme and path, then substitutes this host and re-reads the live
+  engine port from the metal-agent's `<isvc>-agent` EndpointSlice
+  annotation `llmkube.ai/agent-engine-port` (falling back to the
+  `<isvc>` slice's own port for older agents that predate it). This
+  works because the engine listens on `127.0.0.1` on the same Mac as
+  foreman-agent, so the annotated loopback port is always reachable
+  from here even once the `<isvc>` Service and slice are adopted for
+  the relay pod. Set to `127.0.0.1` for the launchd-on-M5-Max case.
+  (`--inference-base-url-override` is still available for tests and
+  stub OAI servers as a full-URL replacement, but it locks the port
+  at install time and breaks on every metal-agent respawn, which is
+  exactly the bug #540 fixes.)
 - `--commit-author-email`: required; the executor refuses to start
   without it because DCO sign-off needs a real email.
 - `--installed-models`, `--max-context-tokens`, `--tokens-per-second`:

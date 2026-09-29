@@ -21,6 +21,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/defilantech/llmkube/pkg/agent/ingress"
 )
 
 func TestAgentMetricsRegistered(t *testing.T) {
@@ -43,6 +45,7 @@ func TestAgentMetricsRegistered(t *testing.T) {
 		{"llmkube_metal_agent_apple_power_gpu_watts", applePowerGPUWatts},
 		{"llmkube_metal_agent_apple_power_cpu_watts", applePowerCPUWatts},
 		{"llmkube_metal_agent_apple_power_ane_watts", applePowerANEWatts},
+		{"llmkube_metal_agent_ingress_requests_total", ingress.RequestsTotal},
 	}
 
 	for _, c := range collectors {

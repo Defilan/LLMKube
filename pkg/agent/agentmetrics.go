@@ -19,6 +19,8 @@ package agent
 import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+
+	"github.com/defilantech/llmkube/pkg/agent/ingress"
 )
 
 // AgentRegistry is a standalone Prometheus registry for the Metal agent.
@@ -192,6 +194,7 @@ var clientProxyRequests = prometheus.NewCounterVec(
 func init() {
 	AgentRegistry.MustRegister(
 		clientProxyRequests,
+		ingress.RequestsTotal,
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		managedProcesses,

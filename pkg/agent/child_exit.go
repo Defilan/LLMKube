@@ -193,7 +193,7 @@ func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 	}
 }
 
-// waitForChildHealthy polls http://localhost:<port>/health until it returns
+// waitForChildHealthy polls http://127.0.0.1:<port>/health until it returns
 // 200, the timeout fires, or exited closes. The last returns errChildExited at
 // once: a child that died on startup will never answer, and polling it for the
 // full timeout would stall every other InferenceService the agent is waiting
@@ -205,7 +205,7 @@ func waitForChildHealthy(port int, timeout time.Duration, exited <-chan struct{}
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
-	healthURL := fmt.Sprintf("http://localhost:%d/health", port)
+	healthURL := fmt.Sprintf("http://127.0.0.1:%d/health", port)
 
 	for {
 		select {

@@ -50,7 +50,7 @@ Verified against project repos and official docs. If you spot anything inaccurat
 
 Three things LLMKube does that, as a combination, no other project on this list does:
 
-1. **Apple Silicon participates in the same control plane as your GPU nodes.** The metal-agent runs as a native macOS process, supervises llama-server, oMLX, or Ollama directly on the host, and registers Endpoints back into the cluster. A Mac mini and an L4 node both look like `InferenceService` objects to `kubectl`. Ollama is great on a single Mac but doesn't speak Kubernetes; the K8s operators don't run native Mac processes.
+1. **Apple Silicon participates in the same control plane as your GPU nodes.** The metal-agent runs as a native macOS process, supervises llama-server, oMLX, or Ollama directly on the host, and registers its authenticated ingress back into the cluster, where the controller fronts it with a relay so it is an ordinary Service. A Mac mini and an L4 node both look like `InferenceService` objects to `kubectl`. Ollama is great on a single Mac but doesn't speak Kubernetes; the K8s operators don't run native Mac processes.
 2. **One operator, mixed runtimes across heterogeneous hosts.** The `runtime` field on InferenceService selects llama.cpp, vLLM, TGI, oMLX, or Ollama. Mix runtimes on the same cluster, mix Linux GPU nodes with Mac hosts, without standing up a different operator per topology.
 3. **Per-process memory-pressure protection** with priority-aware eviction, per-service opt-out, and a friendly-fire guard so the watchdog doesn't kill your workloads when the pressure is from outside LLMKube. [See the live demo](/docs/memory-pressure-protection).
 
