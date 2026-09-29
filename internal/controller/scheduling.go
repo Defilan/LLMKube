@@ -57,6 +57,18 @@ var priorityValues = map[string]int32{
 	"batch":    100,
 }
 
+// agentRefusalReasons are the SchedulingStatus values the metal agent writes
+// when it declines to start a service (memory admission in pkg/agent/agent.go,
+// start refusals in pkg/agent/refusal.go). The agent clears them itself on the
+// next admitted start (#777); a stale heartbeat still replaces them.
+var agentRefusalReasons = map[string]bool{
+	"InsufficientMemory":    true,
+	"MemoryCheckFailed":     true,
+	"EndpointNameConflict":  true,
+	"ModelSourceNotAllowed": true,
+	"ExtraArgsRejected":     true,
+}
+
 // SchedulingInfo contains information about pod scheduling status
 type SchedulingInfo struct {
 	Status     string
@@ -114,6 +126,13 @@ func (r *InferenceServiceReconciler) determinePhase(ctx context.Context, isvc *i
 					Message: fmt.Sprintf("metal-agent heartbeat unparseable (value %q); host may be offline", snap.RawHeartbeat),
 				}
 			}
+		}
+		// A refused service never registers an endpoint, so it always lands
+		// here. Overwriting the agent's refusal hid it from status and bumped
+		// the resourceVersion, which the agent's poll saw as a change and
+		// refused again every few seconds.
+		if agentRefusalReasons[isvc.Status.SchedulingStatus] {
+			return PhaseCreating, nil
 		}
 		return PhaseCreating, &SchedulingInfo{
 			Status:  "WaitingForMetalAgent",

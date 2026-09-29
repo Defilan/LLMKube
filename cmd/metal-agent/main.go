@@ -84,6 +84,7 @@ type AgentConfig struct {
 	ApplePowerInterval        time.Duration
 	PowermetricsBin           string
 	AllowedModelRoots         string
+	AllowUnsafeExtraArgs      bool
 }
 
 // splitCSV parses a comma-separated string into a trimmed []string,
@@ -414,9 +415,13 @@ func main() {
 	flag.StringVar(&cfg.PowermetricsBin, "powermetrics-bin", agent.DefaultPowermetricsBin,
 		"Path to the macOS powermetrics binary. Only used with --apple-power-enabled.")
 	flag.StringVar(&cfg.AllowedModelRoots, "allowed-model-roots", "",
-		"Comma-separated absolute directories that local model sources and the oMLX pagedSSDCacheDir "+
-			"must resolve into (symlinks followed), in addition to the model store. "+
-			"Default: the model store only.")
+		"Comma-separated absolute directories that local model sources, the oMLX pagedSSDCacheDir "+
+			"and path-valued extraArgs must resolve into (symlinks followed), in addition to the model "+
+			"store. Default: the model store only.")
+	flag.BoolVar(&cfg.AllowUnsafeExtraArgs, "allow-unsafe-extra-args", false,
+		"Relax the extraArgs policy (unknown flags, stray tokens, refused non-listener flags, path checks, "+
+			"vllm-swift code-loading) for Macs whose InferenceService authors are fully trusted; flags that "+
+			"set or move the engine's listener or registration, or start multi-node or distributed backends, stay refused.")
 	showVersion := flag.Bool("version", false, "Show version information")
 	flag.Parse()
 
@@ -608,6 +613,7 @@ func main() {
 		PowermetricsBin:           cfg.PowermetricsBin,
 		EvictionEnabled:           cfg.EvictionEnabled,
 		AllowedModelRoots:         allowedModelRoots,
+		AllowUnsafeExtraArgs:      cfg.AllowUnsafeExtraArgs,
 	}
 	if cfg.WatchdogInterval > 0 {
 		agentCfg.WatchdogConfig = &agent.MemoryWatchdogConfig{

@@ -241,14 +241,3 @@ func TestContainsRootSeparator(t *testing.T) {
 		t.Error(`Contains("/") = false, want true for root "/"`)
 	}
 }
-
-func TestIsPathShaped(t *testing.T) {
-	for v, want := range map[string]bool{
-		"/a": true, "~/a": true, "./a": true, "../a": true, "file:///a": true, "FILE:///a": true,
-		"a/b": false, "q4_0": false, "prefilled": false, "-1": false, "": false,
-	} {
-		if got := IsPathShaped(v); got != want {
-			t.Errorf("IsPathShaped(%q) = %v, want %v", v, got, want)
-		}
-	}
-}

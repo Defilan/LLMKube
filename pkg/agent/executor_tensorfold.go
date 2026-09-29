@@ -231,8 +231,10 @@ func tensorFoldServedName(config ExecutorConfig) string {
 // process. A flag the user already set in extraArgs is not emitted here, so
 // the command line never carries it twice; extraArgs come last.
 //
-// TensorFold-specific knobs (--drafter, --thinking/--no-thinking, --alias,
+// TensorFold-specific knobs (--drafter, --thinking/--no-thinking,
 // --max-tokens) are not modelled on the CRD and ride through extraArgs.
+// --alias and --name override the model id the agent sets, so the extraArgs
+// policy refuses them unless --allow-unsafe-extra-args is set.
 func buildTensorFoldArgs(modelPath string, port int, config ExecutorConfig) []string {
 	extra := config.ExtraArgs
 	args := []string{"serve", modelPath}

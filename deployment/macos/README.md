@@ -113,7 +113,7 @@ The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
 
 ### `--allowed-model-roots` flag (local model paths)
 
-By default, the agent only allows a Model's local source and an oMLX `pagedSSDCacheDir` to resolve into the model store (`--model-store`). Everything else is refused before the model is admitted or an engine starts.
+By default, the agent only allows a Model's local source, an oMLX `pagedSSDCacheDir`, and the path values of path-valued `extraArgs` (for example `--chat-template-file`, `--lora`, `--mmproj`) to resolve into the model store (`--model-store`). A relative `extraArgs` path value resolves under the model store. Everything else is refused before the model is admitted or an engine starts.
 
 To allow local model sources outside the model store, pass a comma-separated list of absolute directories:
 
@@ -141,6 +141,8 @@ A relative path, or a root the agent cannot resolve at startup, stops the agent 
 The root match is case-sensitive, so spell a root exactly as it exists on disk; on the default case-insensitive APFS volume, a path that differs from a configured root only in case is still treated as outside it and refused.
 
 Every model source is checked, whatever its scheme: an absolute local path, a `file://` URL, and a scheme-less relative source such as an `owner/repo` id (resolved under the model store). Sources with a scheme other than `file://` (`https`, `hf`, `s3`, `pvc`, `oci`) are not path-checked; any source with a `..` path segment is refused, no matter its scheme.
+
+Path-valued `extraArgs` are checked against these same roots; a refusal suggests adding the directory to `--allowed-model-roots`, or setting `--allow-unsafe-extra-args`. See "Security model" below for the full `extraArgs` policy.
 
 A refusal shows up as a Warning event on the InferenceService:
 
@@ -360,6 +362,135 @@ curl http://localhost:9090/metrics   # → Prometheus text format
 curl -s http://localhost:9090/metrics | grep llmkube_metal_agent_managed_processes
 ```
 
+## Security model
+
+### Trust boundary
+
+Anyone who can create or update `InferenceService` and `Model` objects in the
+agent's watched namespace is untrusted for the Mac. They can pick any allowed
+model and tune the engine, but they cannot choose where it reads or writes
+files, what address or port it listens on, or what code it runs. The operator
+who sets the agent's own flags, in the launchd plist, is trusted.
+
+### What the agent checks before an engine starts
+
+The agent runs these checks before starting any engine. A refusal starts
+nothing: no engine process, no Service or EndpointSlice write. It shows up as
+a Warning event, and the reason and message land in
+`status.schedulingStatus` and `status.schedulingMessage` (the phase stays
+`Creating`, or `Pending` while the Model is not ready):
+
+```bash
+kubectl describe inferenceservice <name>
+```
+
+- **Endpoint names** (`EndpointNameConflict`): the agent never overwrites a
+  Service or EndpointSlice it does not already own. An InferenceService named
+  after an unrelated object (for example `kubernetes`) is refused instead of
+  taking over that object.
+- **Model sources and roots** (`ModelSourceNotAllowed`): a `Model` the
+  controller already marked `Failed` is refused, and any local model source
+  (or oMLX `pagedSSDCacheDir`) must resolve inside the allowed roots. See
+  "`--allowed-model-roots` flag (local model paths)" above.
+- **extraArgs** (`ExtraArgsRejected`): every flag in `spec.extraArgs` is
+  checked against a typed, per-engine allowlist. See below.
+
+### The extraArgs typed allowlist
+
+Every flag an engine's own `--help` lists is pinned from a recorded build and
+typed as one of: a flag that takes no value, a flag that takes a value the
+engine never opens as a file (numbers, enum names, sampling parameters,
+inline templates, repo ids), or a flag that takes a path.
+
+Pinned engine versions:
+
+- llama-server 0.5.0 (build 11146, commit `7fe450e19`)
+- mlx-server, defilantech build of 2026-05-15
+- tensorfold v0.3.4.1
+- vllm-swift 0.4.2
+
+A flag is refused when it would change where or how the engine listens or
+is registered (`--host`, `--port`, and the other listener, registration and
+multi-node flags listed under `--allow-unsafe-extra-args` below), what it
+serves or logs to disk (`--path`, `--log-file`, `--slot-save-path`, and
+similar), set auth keys or TLS material (`--api-key`, `--ssl-key-file`, and
+similar), download a model (`-hf`, `--model-url`, and similar), override the
+model or model id the agent chose (`--model`, `--alias`, `--served-model-name`,
+TensorFold's `--name`), enable built-in tools or an MCP server (`--tools`,
+`--mcp-servers-config`, and similar), or select a llama-server preset (the
+`--fim-*` and `*-default` flags). For vllm-swift, flags that load Python code
+(`--trust-remote-code`, anything ending in `-cls`, `-plugin` or `-config`
+other than `--generation-config` and `--override-generation-config`),
+dotted-key flags (`--flag.key value`), and inline JSON values are refused
+too.
+
+Path flags (`--chat-template-file`, `--model-draft`, `--mmproj`, `--lora`,
+and their equivalents on other engines) must resolve inside the roots
+configured by `--allowed-model-roots`.
+
+A flag the pinned table does not know at all, for example one added in a
+newer engine release, is refused as unknown rather than silently allowed.
+
+### `--allow-unsafe-extra-args`
+
+`--allow-unsafe-extra-args` relaxes:
+
+- unknown flags (not in the pinned table),
+- stray, non-flag arguments,
+- the refused flags that do not touch the listener: file serving, logging,
+  auth keys and TLS material; model downloads; model and model id
+  overrides; built-in tools and MCP servers; llama-server presets,
+- vllm-swift's code-loading, dotted-key and inline-JSON rules,
+- the path checks (path-inside-roots, and a path value that does not
+  decode).
+
+It never relaxes:
+
+- listener and registration flags: `--host`, `--port`, llama-server's
+  `--reuse-port`, and vllm-swift's `--uds`, `--headless` and
+  `--api-server-count`/`-asc`,
+- multi-node and distributed flags: vllm-swift's `--data-parallel-address`,
+  `--data-parallel-size`, `--data-parallel-size-local`,
+  `--data-parallel-rpc-port`, `--data-parallel-external-lb`,
+  `--data-parallel-hybrid-lb`, `--data-parallel-start-rank`,
+  `--data-parallel-rank`, `--data-parallel-backend` (and their `-dp*` short
+  forms), `--master-addr`, `--master-port`, `--nnodes`/`-n`,
+  `--node-rank`/`-r`, `--kv-events-config`, `--kv-transfer-config`,
+  `--ec-transfer-config`, `--weight-transfer-config` and
+  `--distributed-executor-backend`; TensorFold's `--tp`, `--rank`, `--master`
+  and `--master-port`,
+- vllm-swift's `--config`, and any `-O` token other than `-O0` to `-O3`,
+  `-O=N` or `-O N` with N from 0 to 3 (vLLM rewrites other `-O` tokens,
+  which can carry other flags),
+- other spellings an engine accepts for any of these: argparse
+  abbreviations (tensorfold, vllm-swift), `_` spellings (llama-server,
+  vllm-swift) and dotted spellings (vllm-swift),
+- a bare `--` or `-` separator on tensorfold and vllm-swift,
+- extraArgs on a runtime this policy does not otherwise recognize.
+
+Turn this on only for a Mac whose InferenceService authors are fully trusted.
+
+### Practical notes
+
+- On vllm-swift, any `-config` flag other than `--generation-config` and
+  `--override-generation-config`, and any inline JSON value other than one
+  given to `--override-generation-config`, need
+  `--allow-unsafe-extra-args`. `--config` itself is never allowed.
+- On vllm-swift, pass a negative decimal value in the `--flag=value` form
+  (`--flag=-0.5`, not `--flag -0.5`): as a separate token, vLLM's parser
+  reads `-0.5` as a dotted-key flag, so the policy refuses it unless
+  `--allow-unsafe-extra-args` is set.
+- TensorFold's `--drafter` accepts `auto`, `none`, a Hugging Face repo id, or
+  a path inside the allowed roots.
+- llama-server's `--no-mmap` is not a flag in the pinned 0.5.0 build and is
+  refused as unknown.
+
+### Network exposure
+
+Engines currently listen on all interfaces without authentication. Until the
+agent ships an authenticated ingress in front of them, keep the Mac on a
+trusted network, behind its own firewall, or reachable only over Tailscale.
+
 ## Troubleshooting
 
 ### Agent won't start
@@ -505,7 +636,7 @@ Everything on one machine — simpler but minikube consumes resources:
 │                     ↓                            │
 │  ┌──────────────────────────────────────────┐   │
 │  │   llama-server (Metal Accelerated)       │   │
-│  │   - Runs on localhost:8080+              │   │
+│  │   - Listens on all interfaces, :8080+    │   │
 │  │   - Direct Metal GPU access ✅           │   │
 │  └──────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────┘
@@ -601,9 +732,11 @@ How the agent runs it:
 - `spec.contextSize` becomes `--context`. Set it: when it is unset the agent
   uses 2048, as for the other metal runtimes, rather than the model's full
   window.
-- TensorFold's own flags (`--no-thinking`, `--drafter`, `--alias`,
-  `--max-tokens`) go in `spec.extraArgs`. A flag set there replaces the one the
-  agent would add.
+- TensorFold's own flags (`--no-thinking`, `--drafter`, `--max-tokens`) go in
+  `spec.extraArgs`. A flag set there replaces the one the agent would add.
+  `--alias` and `--name` are refused unless `--allow-unsafe-extra-args` is
+  set: the agent sets the model id itself. See "Security model" above for the
+  full `extraArgs` policy.
 - Output goes to `<model-store>/tensorfold-<namespace>-<name>.log`. When
   TensorFold refuses a checkpoint and exits, the InferenceService error carries
   the exit status and the last lines of that log. `--tensorfold-startup-timeout`
@@ -753,10 +886,9 @@ oMLX and Ollama (0.19+) both use Apple's MLX framework for Apple Silicon inferen
 
 ## Security
 
-- Agent runs as your user (not root)
-- Models stored in `/tmp/llmkube-models` (configurable)
-- Processes bind to localhost only
-- Service endpoints use ClusterIP (not exposed externally)
+See "Security model" above for the trust boundary, the checks the agent runs
+before starting an engine, the `extraArgs` policy, and network exposure
+(engines listen on all interfaces).
 
 ## Support
 

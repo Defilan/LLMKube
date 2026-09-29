@@ -206,10 +206,18 @@ type MetalAgentConfig struct {
 	PowermetricsBin string
 
 	// AllowedModelRoots lists directories, in addition to the model store
-	// (which is always allowed), that local model sources and the oMLX
-	// pagedSSDCacheDir may resolve into (symlinks followed). Empty means the
-	// model store only.
+	// (which is always allowed), that local model sources, the oMLX
+	// pagedSSDCacheDir and path-valued extraArgs may resolve into (symlinks
+	// followed). Empty means the model store only.
 	AllowedModelRoots []string
+
+	// AllowUnsafeExtraArgs relaxes the extraArgs policy on a Mac whose
+	// InferenceService authors are fully trusted: unknown flags, stray
+	// tokens, refused non-listener flags, path checks and vllm-swift
+	// code-loading checks are skipped. Flags that set or move the engine's
+	// listener or registration, or start multi-node or distributed backends, stay refused.
+	// Logged at Warn on startup.
+	AllowUnsafeExtraArgs bool
 }
 
 // MetalAgent watches Kubernetes InferenceService resources and manages
@@ -387,6 +395,12 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 	}
 	for _, r := range ignoredRoots {
 		logger.Warnw("allowed model root does not exist; ignoring it", "root", r)
+	}
+
+	if config.AllowUnsafeExtraArgs {
+		logger.Warnw("extraArgs policy relaxed by --allow-unsafe-extra-args: unknown flags, stray tokens, " +
+			"refused non-listener flags, paths and vllm-swift code-loading flags from InferenceServices " +
+			"are not checked; listener, registration, multi-node and distributed flags stay refused")
 	}
 
 	return &MetalAgent{
@@ -1047,6 +1061,17 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// running it after memory admission's success path (which clears that
 	// field) would flap the status on every reconcile.
 	if err := a.checkModelPaths(ctx, isvc, model, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
+		return err
+	}
+
+	// Refuse a dangerous or unrecognized extraArgs flag before memory
+	// admission runs, for the same reason as checkModelPaths above: admission's
+	// success path clears SchedulingStatus, so a refusal placed after it would
+	// flap the status on every reconcile of an otherwise-admittable spec.
+	// buildExecutorConfig passes isvc.Spec.ExtraArgs straight through to
+	// ExecutorConfig.ExtraArgs with no transformation, so checking it here
+	// checks exactly what the executor will receive.
+	if err := a.checkExtraArgs(ctx, isvc, runtime, isvc.Spec.ExtraArgs); err != nil {
 		return err
 	}
 
