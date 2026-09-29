@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"time"
@@ -63,6 +65,31 @@ const (
 	relayPodLabel = "inference.llmkube.dev/metal-relay"
 )
 
+// Event reasons for the relay lifecycle on the InferenceService.
+const (
+	EventRelayReconcileFailed   = "RelayReconcileFailed"
+	EventInvalidAgentIngressPin = "InvalidAgentIngressPin"
+	EventRelayCreated           = "RelayCreated"
+	EventServiceAdopted         = "ServiceAdopted"
+	EventRelayRemoved           = "RelayRemoved"
+)
+
+// relayEvent records an Event on isvc when a Recorder is configured.
+func (r *InferenceServiceReconciler) relayEvent(isvc *inferencev1alpha1.InferenceService, eventType, reason, note string, args ...any) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(isvc, nil, eventType, reason, "Reconcile", note, args...)
+}
+
+// validIngressPin reports whether pin is the standard base64 encoding of a
+// SHA-256 SPKI digest, the only form the relay accepts. Checking it here keeps
+// a malformed pin from rolling out a relay that can never start.
+func validIngressPin(pin string) bool {
+	raw, err := base64.StdEncoding.DecodeString(pin)
+	return err == nil && len(raw) == sha256.Size
+}
+
 // relayDeploymentName is the controller-owned relay Deployment "<isvc>-relay".
 func relayDeploymentName(isvc string) string {
 	return sanitizeDNSName(isvc) + inferencev1alpha1.MetalRelayDeploymentSuffix
@@ -104,8 +131,15 @@ func (r *InferenceServiceReconciler) decideMetalMode(ctx context.Context, isvc *
 		return metalModeLegacy, "", err
 	}
 	if ingressSlice != nil {
-		if pin := ingressSlice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI]; pin != "" {
+		pin := ingressSlice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI]
+		switch {
+		case validIngressPin(pin):
 			return metalModeRelay, pin, nil
+		case pin != "":
+			// A malformed pin counts as no pin: fall through to legacy.
+			r.relayEvent(isvc, corev1.EventTypeWarning, EventInvalidAgentIngressPin,
+				"EndpointSlice %s carries an ingress SPKI pin that is not base64 of a SHA-256 digest; not entering relay mode",
+				ingressSlice.Name)
 		}
 	}
 
@@ -128,7 +162,14 @@ func (r *InferenceServiceReconciler) decideMetalMode(ctx context.Context, isvc *
 		// Someone else's Deployment under our name is not a relay we run.
 		return metalModeLegacy, "", nil
 	}
-	return metalModeRelay, relayDeploymentPin(dep), nil
+	pin := relayDeploymentPin(dep)
+	if !validIngressPin(pin) {
+		r.relayEvent(isvc, corev1.EventTypeWarning, EventInvalidAgentIngressPin,
+			"relay Deployment %s runs with an SPKI pin that is not base64 of a SHA-256 digest; leaving relay mode",
+			dep.Name)
+		return metalModeLegacy, "", nil
+	}
+	return metalModeRelay, pin, nil
 }
 
 // freshestAgentSlice returns the metal-agent-written EndpointSlice of the
@@ -234,6 +275,14 @@ func (r *InferenceServiceReconciler) newRelayDeployment(isvc *inferencev1alpha1.
 	for k, v := range selector {
 		labels[k] = v
 	}
+	// Pods also carry the InferenceService label so NetworkPolicies written
+	// for pod-backed services select the relay too. The Deployment selector
+	// stays relayPodSelector; every controller pod List that uses this label
+	// also requires app=<isvc>, which relay pods do not carry.
+	podLabels := map[string]string{"inference.llmkube.dev/service": isvc.Name}
+	for k, v := range labels {
+		podLabels[k] = v
+	}
 	replicas := int32(1)
 	revisionHistoryLimit := int32(2)
 	// 0440 with the pod's fsGroup: the non-root relay user reads the token
@@ -251,7 +300,7 @@ func (r *InferenceServiceReconciler) newRelayDeployment(isvc *inferencev1alpha1.
 			RevisionHistoryLimit: &revisionHistoryLimit,
 			Selector:             &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: boolPtr(false),
 					SecurityContext:              routerProxyPodSecurityContext(),
@@ -354,6 +403,8 @@ func (r *InferenceServiceReconciler) reconcileRelayDeployment(ctx context.Contex
 		if err := r.Create(ctx, desired); err != nil {
 			return nil, fmt.Errorf("create relay Deployment %s/%s: %w", desired.Namespace, desired.Name, err)
 		}
+		r.relayEvent(isvc, corev1.EventTypeNormal, EventRelayCreated,
+			"Created relay Deployment %s for the metal-agent ingress", desired.Name)
 		return desired, nil
 	}
 	if err != nil {
@@ -371,12 +422,14 @@ func (r *InferenceServiceReconciler) reconcileRelayDeployment(ctx context.Contex
 	return existing, nil
 }
 
-// reconcileRelayService points "<isvc>" at the relay pods. The Service port
-// keeps spec.endpoint.port (default 8080) so clients are unaffected; every
-// port targets the relay's listener.
+// reconcileRelayService points "<isvc>" at the relay pods. Type, port and
+// nodePort follow spec.endpoint exactly as for a pod-backed InferenceService
+// (constructService); every port targets the relay's listener.
 func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
 	desired := r.constructService(isvc)
 	desired.Spec.Selector = relayPodSelector(isvc.Name)
+	// Deliberate: adoption moves the port to spec.endpoint.port (what status
+	// already advertises), even when the agent-written Service used another.
 	for i := range desired.Spec.Ports {
 		desired.Spec.Ports[i].TargetPort = intstr.FromInt(relayListenPort)
 	}
@@ -402,6 +455,7 @@ func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, 
 			existing.Namespace, existing.Name)
 	}
 
+	adopting := !metav1.IsControlledBy(existing, isvc)
 	if err := setControllerReferenceUnblocked(isvc, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner on Service %s/%s: %w", existing.Namespace, existing.Name, err)
 	}
@@ -413,21 +467,32 @@ func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, 
 		existing.Labels[k] = v
 	}
 	existing.Spec.Selector = desired.Spec.Selector
-	existing.Spec.Ports = mergeServicePorts(existing.Spec.Ports, desired.Spec.Ports)
+	// The agent always writes ClusterIP; keeping that type while desired
+	// carries a nodePort is rejected by the API on every reconcile.
+	existing.Spec.Type = desired.Spec.Type
+	existing.Spec.Ports = mergeServicePorts(existing.Spec.Ports, desired.Spec.Ports, desired.Spec.Type)
 	// Spec.ClusterIP is left as observed: adoption must not change the
 	// address clients already resolve.
 	if err := r.Update(ctx, existing); err != nil {
 		return fmt.Errorf("update Service %s/%s: %w", existing.Namespace, existing.Name, err)
+	}
+	if adopting {
+		r.relayEvent(isvc, corev1.EventTypeNormal, EventServiceAdopted,
+			"Adopted Service %s from the metal-agent and pointed it at the relay", existing.Name)
 	}
 	return nil
 }
 
 // mergeServicePorts returns desired, carrying over an allocated NodePort from
 // the same-named existing port when desired does not ask for one, so an
-// update does not churn a NodePort Service's node port.
-func mergeServicePorts(existing, desired []corev1.ServicePort) []corev1.ServicePort {
+// update does not churn a NodePort Service's node port. A ClusterIP Service
+// has no node ports, so nothing is carried over for that type.
+func mergeServicePorts(existing, desired []corev1.ServicePort, svcType corev1.ServiceType) []corev1.ServicePort {
 	out := make([]corev1.ServicePort, len(desired))
 	copy(out, desired)
+	if svcType == corev1.ServiceTypeClusterIP || svcType == "" {
+		return out
+	}
 	for i := range out {
 		if out[i].NodePort != 0 {
 			continue
@@ -455,8 +520,13 @@ func (r *InferenceServiceReconciler) teardownRelay(ctx context.Context, isvc *in
 	if !metav1.IsControlledBy(dep, isvc) {
 		return nil
 	}
-	if err := r.Delete(ctx, dep); err != nil && !apierrors.IsNotFound(err) {
+	if err := r.Delete(ctx, dep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("delete relay Deployment %s/%s: %w", dep.Namespace, dep.Name, err)
 	}
+	r.relayEvent(isvc, corev1.EventTypeNormal, EventRelayRemoved,
+		"Removed relay Deployment %s; the Service is handed back", dep.Name)
 	return nil
 }

@@ -476,6 +476,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (int32, *metalSnapshot, error) {
 	mode, pin, err := r.decideMetalMode(ctx, isvc)
 	if err != nil {
+		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Deciding the metal serving mode failed: %v", err)
 		return 0, nil, err
 	}
 
@@ -486,6 +487,7 @@ func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *i
 		}
 		available, err := r.reconcileRelay(ctx, isvc, pin)
 		if err != nil {
+			r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Reconciling the metal relay failed: %v", err)
 			return 0, nil, err
 		}
 		if !available {
@@ -495,6 +497,7 @@ func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *i
 	}
 
 	if err := r.teardownRelay(ctx, isvc); err != nil {
+		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Removing the metal relay failed: %v", err)
 		return 0, nil, err
 	}
 	snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
@@ -1162,6 +1165,13 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 	desiredReplicas int32,
 	modelReady, isMetal bool,
 ) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
+	// A relay only serves Metal. After a model switch off Metal (for
+	// example to CUDA) the "<isvc>-relay" Deployment would otherwise linger.
+	if !isMetal {
+		if err := r.teardownRelay(ctx, isvc); err != nil {
+			return nil, replicaCounts{}, nil, nil, err
+		}
+	}
 	if isvc.Spec.MultiNode != nil {
 		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, model, draftModel, desiredReplicas, modelReady)
 		// A multiNode group has no Deployment to read an observed total from,

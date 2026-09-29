@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -102,14 +103,29 @@ func (c *sliceListFailingClient) List(ctx context.Context, list client.ObjectLis
 var _ = Describe("metal relay mode", func() {
 	const (
 		namespace = "default"
-		pinA      = "cGluQS1zcGtpLXNoYTI1Ni1iYXNlNjQtcGxhY2Vob2xkZXI="
-		pinB      = "cGluQi1zcGtpLXNoYTI1Ni1iYXNlNjQtcGxhY2Vob2xkZXI="
+		pinA      = "cGluQS1zcGtpLXNoYTI1Ni1wbGFjZWhvbGRlci0zMmI="
+		pinB      = "cGluQi1zcGtpLXNoYTI1Ni1wbGFjZWhvbGRlci0zMmI="
 	)
 
 	var (
 		ctx        context.Context
 		reconciler *InferenceServiceReconciler
+		recorder   *events.FakeRecorder
 	)
+
+	// drainEvents empties the FakeRecorder channel into a slice of
+	// "<type> <reason> <note>" strings.
+	drainEvents := func() []string {
+		var out []string
+		for {
+			select {
+			case e := <-recorder.Events:
+				out = append(out, e)
+			default:
+				return out
+			}
+		}
+	}
 
 	now := func() string { return time.Now().UTC().Format(time.RFC3339) }
 	tenMinutesAgo := func() string { return time.Now().Add(-10 * time.Minute).UTC().Format(time.RFC3339) }
@@ -153,9 +169,11 @@ var _ = Describe("metal relay mode", func() {
 
 	BeforeEach(func() {
 		ctx = context.Background()
+		recorder = events.NewFakeRecorder(100)
 		reconciler = &InferenceServiceReconciler{
-			Client: k8sClient,
-			Scheme: k8sClient.Scheme(),
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: recorder,
 		}
 	})
 
@@ -256,6 +274,36 @@ var _ = Describe("metal relay mode", func() {
 			Entry("agent slices", "relay-mode-listerr-agent", agentServiceName),
 			Entry("legacy slices", "relay-mode-listerr-legacy", sanitizeDNSName),
 		)
+
+		DescribeTable("treats a malformed agent pin as no pin and warns",
+			func(isvcName, badPin string) {
+				isvc := newISVC(isvcName)
+				create(agentSlice(isvc.Name, now(), badPin))
+
+				mode, pin, err := reconciler.decideMetalMode(ctx, isvc)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(mode).To(Equal(metalModeLegacy))
+				Expect(pin).To(BeEmpty())
+				Expect(drainEvents()).To(ContainElement(SatisfyAll(
+					HavePrefix("Warning"), ContainSubstring("InvalidAgentIngressPin"))))
+			},
+			Entry("not base64", "relay-mode-badpin-text", "not-base64"),
+			// base64 of 16 bytes: valid encoding, wrong digest length.
+			Entry("16-byte digest", "relay-mode-badpin-short", "c2l4dGVlbi1ieXRlcy0xNg=="),
+		)
+
+		It("leaves relay mode when the offline relay Deployment carries a malformed pin", func() {
+			isvc := newISVC("relay-mode-badpin-offline")
+			dep := reconciler.newRelayDeployment(isvc, "c2l4dGVlbi1ieXRlcy0xNg==")
+			Expect(setControllerReferenceUnblocked(isvc, dep, k8sClient.Scheme())).To(Succeed())
+			create(dep)
+
+			mode, pin, err := reconciler.decideMetalMode(ctx, isvc)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(mode).To(Equal(metalModeLegacy))
+			Expect(pin).To(BeEmpty())
+			Expect(drainEvents()).To(ContainElement(ContainSubstring("InvalidAgentIngressPin")))
+		})
 	})
 
 	It("newRelayDeployment", func() {
@@ -280,6 +328,17 @@ var _ = Describe("metal relay mode", func() {
 		}
 		Expect(podLabels).To(HaveKeyWithValue("app.kubernetes.io/component", "metal-relay"))
 		Expect(podLabels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "llmkube-controller"))
+		// NetworkPolicy parity: pods carry the service label, the selector does not.
+		Expect(podLabels).To(HaveKeyWithValue("inference.llmkube.dev/service", "relay-build"))
+		Expect(dep.Spec.Selector.MatchLabels).NotTo(HaveKey("inference.llmkube.dev/service"))
+		Expect(dep.Labels).NotTo(HaveKey("inference.llmkube.dev/service"))
+		// A relay pod event maps back to its InferenceService, and pod Lists
+		// that pair the label with app=<isvc> never match a relay pod.
+		relayPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Labels: podLabels}}
+		reqs := reconciler.findInferenceServiceForPod(ctx, relayPod)
+		Expect(reqs).To(HaveLen(1))
+		Expect(reqs[0].Name).To(Equal("relay-build"))
+		Expect(podLabels["app"]).NotTo(Equal("relay-build"))
 
 		pod := dep.Spec.Template.Spec
 		Expect(pod.AutomountServiceAccountToken).To(HaveValue(BeFalse()))
@@ -378,6 +437,93 @@ var _ = Describe("metal relay mode", func() {
 			dep := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: relayDeploymentName(isvc.Name), Namespace: namespace}, dep)).To(Succeed())
 			Expect(metav1.IsControlledBy(dep, isvc)).To(BeTrue())
+
+			evs := drainEvents()
+			Expect(evs).To(ContainElement(SatisfyAll(HavePrefix("Normal"), ContainSubstring("ServiceAdopted"))))
+			Expect(evs).To(ContainElement(SatisfyAll(HavePrefix("Normal"), ContainSubstring("RelayCreated"))))
+
+			By("a second pass neither re-adopts nor re-creates")
+			_, err = reconciler.reconcileRelay(ctx, isvc, pinA)
+			Expect(err).NotTo(HaveOccurred())
+			evs = drainEvents()
+			Expect(evs).NotTo(ContainElement(ContainSubstring("ServiceAdopted")))
+			Expect(evs).NotTo(ContainElement(ContainSubstring("RelayCreated")))
+		})
+
+		// agentService is the Service a metal-agent writes: ClusterIP,
+		// selectorless, managed-by metal-agent.
+		agentService := func(name string, port int32) *corev1.Service {
+			return &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: namespace,
+					Labels:    map[string]string{inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeClusterIP,
+					Ports: []corev1.ServicePort{{Name: "http", Port: port, Protocol: corev1.ProtocolTCP}},
+				},
+			}
+		}
+
+		newEndpointISVC := func(name string, endpoint *inferencev1alpha1.EndpointSpec) *inferencev1alpha1.InferenceService {
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: name + "-model",
+					Replicas: &replicas,
+					Endpoint: endpoint,
+				},
+			}
+			create(isvc)
+			return isvc
+		}
+
+		It("adopts an agent ClusterIP Service as NodePort when spec.endpoint asks for one", func() {
+			// A fixed port in the upper NodePort range no other spec uses.
+			nodePort := int32(32611)
+			isvc := newEndpointISVC("relay-adopt-nodeport", &inferencev1alpha1.EndpointSpec{
+				Type:     "NodePort",
+				NodePort: &nodePort,
+			})
+			cleanupRelay(isvc.Name)
+			svc := agentService(isvc.Name, 8080)
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+			clusterIP := svc.Spec.ClusterIP
+			Expect(clusterIP).NotTo(BeEmpty())
+
+			_, err := reconciler.reconcileRelay(ctx, isvc, pinA)
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), got)).To(Succeed())
+			Expect(got.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
+			Expect(got.Spec.Ports).To(HaveLen(1))
+			Expect(got.Spec.Ports[0].NodePort).To(Equal(nodePort))
+			Expect(got.Spec.ClusterIP).To(Equal(clusterIP))
+
+			By("a steady-state pass keeps the node port")
+			_, err = reconciler.reconcileRelay(ctx, isvc, pinA)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), got)).To(Succeed())
+			Expect(got.Spec.Ports[0].NodePort).To(Equal(nodePort))
+		})
+
+		It("moves an adopted Service to spec.endpoint.port", func() {
+			isvc := newEndpointISVC("relay-adopt-port", &inferencev1alpha1.EndpointSpec{Port: 9000})
+			cleanupRelay(isvc.Name)
+			svc := agentService(isvc.Name, 8080)
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+
+			_, err := reconciler.reconcileRelay(ctx, isvc, pinA)
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), got)).To(Succeed())
+			Expect(got.Spec.Ports).To(HaveLen(1))
+			Expect(got.Spec.Ports[0].Port).To(Equal(int32(9000)))
+			Expect(got.Spec.Ports[0].TargetPort).To(Equal(intstr.FromInt(8080)))
 		})
 
 		It("creates the Service when absent", func() {
@@ -458,13 +604,15 @@ var _ = Describe("metal relay mode", func() {
 
 		Expect(reconciler.teardownRelay(ctx, owned)).To(Succeed())
 		Expect(reconciler.teardownRelay(ctx, foreign)).To(Succeed())
+		Expect(drainEvents()).To(ConsistOf(SatisfyAll(HavePrefix("Normal"), ContainSubstring("RelayRemoved"))))
 
 		err := k8sClient.Get(ctx, client.ObjectKeyFromObject(ownedDep), &appsv1.Deployment{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "owned relay Deployment should be deleted, got %v", err)
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignDep), &appsv1.Deployment{})).To(Succeed())
 
-		// A missing Deployment is not an error.
+		// A missing Deployment is not an error, and nothing was removed.
 		Expect(reconciler.teardownRelay(ctx, owned)).To(Succeed())
+		Expect(drainEvents()).To(BeEmpty())
 	})
 
 	Context("full Reconcile", func() {
@@ -502,6 +650,7 @@ var _ = Describe("metal relay mode", func() {
 			create(slice)
 
 			got := reconcileISVC(name)
+			Expect(drainEvents()).To(ContainElement(ContainSubstring("RelayCreated")))
 			dep := &appsv1.Deployment{}
 			depKey := types.NamespacedName{Name: relayDeploymentName(name), Namespace: namespace}
 			Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
@@ -521,6 +670,7 @@ var _ = Describe("metal relay mode", func() {
 			got = reconcileISVC(name)
 			Expect(got.Status.Phase).To(Equal(PhaseReady))
 			Expect(got.Status.ReadyReplicas).To(Equal(int32(1)))
+			Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("RelayCreated")))
 			return slice
 		}
 
@@ -542,6 +692,7 @@ var _ = Describe("metal relay mode", func() {
 			Expect(k8sClient.Get(ctx, svcKey, before)).To(Succeed())
 
 			reconcileISVC(name)
+			Expect(drainEvents()).To(ContainElement(ContainSubstring("RelayRemoved")))
 
 			err := k8sClient.Get(ctx, types.NamespacedName{Name: relayDeploymentName(name), Namespace: namespace}, &appsv1.Deployment{})
 			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "relay Deployment should be deleted on hand-back, got %v", err)
@@ -553,6 +704,7 @@ var _ = Describe("metal relay mode", func() {
 			after.Spec.Selector = nil
 			Expect(k8sClient.Update(ctx, after)).To(Succeed())
 			reconcileISVC(name)
+			Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("RelayRemoved")))
 			final := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, svcKey, final)).To(Succeed())
 			Expect(final.Spec.Selector).To(BeNil())
@@ -576,6 +728,9 @@ var _ = Describe("metal relay mode", func() {
 				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
 			})
 			Expect(err).To(MatchError(ContainSubstring("is not managed by the metal-agent or this InferenceService")))
+			Expect(drainEvents()).To(ContainElement(SatisfyAll(
+				HavePrefix("Warning"), ContainSubstring("RelayReconcileFailed"),
+				ContainSubstring("is not managed by the metal-agent or this InferenceService"))))
 			got := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
 			Expect(got.Status.Phase).NotTo(Equal(PhaseReady))
@@ -592,6 +747,34 @@ var _ = Describe("metal relay mode", func() {
 			})
 			Expect(err).To(MatchError(errInjectedSliceList))
 		})
+	})
+
+	It("removes the relay when the model moves off Metal", func() {
+		name := "relay-to-cuda"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: namespace},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+		}
+		create(model)
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+		isvc := newISVC(name)
+		cleanupRelay(name)
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(context.Background(), &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: sanitizeDNSName(name), Namespace: namespace}})
+		})
+		dep := reconciler.newRelayDeployment(isvc, pinA)
+		Expect(setControllerReferenceUnblocked(isvc, dep, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, dep)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		err = k8sClient.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue(), "relay Deployment should be removed off Metal, got %v", err)
+		Expect(drainEvents()).To(ContainElement(ContainSubstring("RelayRemoved")))
 	})
 
 	Context("findInferenceServiceForEndpoints", func() {
