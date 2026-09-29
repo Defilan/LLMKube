@@ -92,6 +92,33 @@ kubectl apply --server-side \
   -f https://raw.githubusercontent.com/defilantech/LLMKube/v<target>/config/crd/bases/inference.llmkube.dev_models.yaml
 ```
 
+### Metal: chart-then-agent upgrade order
+
+Clusters running Metal InferenceServices have a second moving part outside
+Helm: the metal-agent on each Mac. Order matters between the two: upgrade
+the chart (controller-manager) first, then the metal-agents.
+
+The controller's per-InferenceService relay Deployments run the same
+router-proxy image as `controllerManager.routerProxy.*`, and that image
+version must match the controller version (the chart defaults already keep
+them in step). A pinned router-proxy tag older than the controller's
+release does not know the relay behavior the newer controller expects, and
+the relay pod would crashloop.
+
+If you roll the chart back (see Rollback below), roll the metal-agents
+back first, then roll back the chart, same order reversed.
+
+After either direction, check the Metal-related Events on the affected
+InferenceServices:
+
+```bash
+kubectl describe inferenceservice <name> -n <namespace>
+```
+
+Look for `RelayCreated`, `ServiceAdopted`, and `RelayRemoved` (Normal), and
+for `RelayReconcileFailed` or `InvalidAgentIngressPin` (Warning) if
+something went wrong.
+
 ## Verify the upgrade
 
 1. **Controller pod replaced and Ready.**

@@ -34,8 +34,18 @@ rules:
   - namespaces
   - nodes
   - pods
+  verbs:
+  - get
+  - list
+  - watch
+# Secrets get their own rule so the create verb (the per-namespace Metal relay
+# token, llmkube-metal-relay) does not widen namespaces, nodes or pods.
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
+  - create
   - get
   - list
   - watch

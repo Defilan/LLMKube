@@ -548,6 +548,7 @@ func main() {
 		GPUSharingSharedPool:  gpuSharingSharedPool,
 		RuntimeImageOverrides: runtimeImageOverrides,
 		PodLogReader:          podLogReader,
+		RelayImage:            routerProxyImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
 		os.Exit(1)

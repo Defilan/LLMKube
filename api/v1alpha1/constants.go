@@ -33,6 +33,50 @@ const (
 	// agents that predate this annotation.
 	AnnotationAgentVersion = "llmkube.ai/agent-version"
 
+	// Metal relay wire protocol (S4). The controller runs a relay pod per
+	// Metal InferenceService; the relay authenticates to the metal-agent's
+	// TLS ingress on the Mac, which forwards to the engine on loopback.
+
+	// AnnotationAgentIngressSPKI is set by the metal-agent on its
+	// "<isvc>-agent" EndpointSlice: the base64 (std) SHA-256 of the ingress
+	// certificate's SubjectPublicKeyInfo. The relay accepts only a server
+	// certificate matching it.
+	AnnotationAgentIngressSPKI = "llmkube.ai/agent-ingress-spki"
+
+	// HeaderRelayToken carries the per-namespace relay token from the relay
+	// to the ingress. It is not Authorization, so a client's own
+	// Authorization header passes through untouched.
+	//
+	//nolint:gosec // G101: header name, not a credential value
+	HeaderRelayToken = "X-LLMKube-Relay-Token"
+	// HeaderRelayTarget names the target InferenceService as "<ns>/<name>".
+	HeaderRelayTarget = "X-LLMKube-Target"
+
+	// MetalRelaySecretName is the per-namespace Secret holding the relay
+	// token under MetalRelaySecretKey (64 hex chars).
+	//
+	//nolint:gosec // G101: Secret object name, not a credential value
+	MetalRelaySecretName = "llmkube-metal-relay"
+	MetalRelaySecretKey  = "token"
+
+	// MetalAgentServiceSuffix names the agent-written Service and
+	// EndpointSlice ("<isvc>-agent") that point at the ingress.
+	MetalAgentServiceSuffix = "-agent"
+	// MetalRelayDeploymentSuffix names the controller-owned relay Deployment.
+	MetalRelayDeploymentSuffix = "-relay"
+	// MetalAgentServicePort is the port of the "<isvc>-agent" Service.
+	MetalAgentServicePort int32 = 8443
+
+	// IngressReadyPath is answered by the ingress itself (never proxied):
+	// 200 when the target named in HeaderRelayTarget is running on this
+	// agent.
+	IngressReadyPath = "/_llmkube/ready"
+
+	// LabelManagedBy marks objects by writer.
+	LabelManagedBy      = "llmkube.ai/managed-by"
+	ManagedByMetalAgent = "metal-agent"
+	ManagedByController = "llmkube-controller"
+
 	// AnnotationIdleEndpoint lets operators declare a custom HTTP path that
 	// returns 2xx when a replica is idle. Used by the generic runtime to opt
 	// in to drain-before-roll. Set on InferenceService metadata.annotations.

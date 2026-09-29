@@ -123,6 +123,10 @@ type InferenceServiceReconciler struct {
 	// effort); the production operator wires a kubernetes-clientset-backed
 	// reader.
 	PodLogReader PodLogReader
+
+	// RelayImage is the image for Metal relay pods (router-proxy in --relay
+	// mode). Wired from --router-proxy-image; empty uses the router-proxy default.
+	RelayImage string
 }
 
 func sanitizeDNSName(name string) string {
@@ -173,6 +177,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=core,resources=pods/eviction,verbs=create
 // +kubebuilder:rbac:groups=core,resources=pods/log,verbs=get
 // +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch
@@ -457,6 +462,60 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 	return draft, true, nil, nil
 }
 
+// reconcileMetal serves a Metal InferenceService. There is no inference
+// Deployment: the host metal-agent runs the engine natively and registers
+// EndpointSlices once the model is fetched and the server is healthy, so ready
+// replicas come from those slices rather than desiredReplicas, otherwise Phase
+// reports Ready before the agent has done anything (issue #374).
+//
+// In relay mode the agent exposes only its authenticated ingress
+// ("<isvc>-agent") and traffic reaches it through the controller's relay
+// Deployment, so a replica counts as ready only while the relay is available
+// too. In legacy mode the agent owns "<isvc>"; any relay this InferenceService
+// ran is torn down and "<isvc>" is left to the agent (hand-back).
+//
+// A relay write that loses an optimistic-lock race (the Deployment controller
+// updated the object between our Get and Update) is not a failure: it returns
+// a short requeue result with no error and no RelayReconcileFailed event, and
+// the next reconcile works from the fresh object.
+func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (int32, *metalSnapshot, *ctrl.Result, error) {
+	mode, pin, err := r.decideMetalMode(ctx, isvc)
+	if err != nil {
+		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Deciding the metal serving mode failed: %v", err)
+		return 0, nil, nil, err
+	}
+
+	if mode == metalModeRelay {
+		snap := r.metalEndpointSnapshot(ctx, isvc, agentServiceName(isvc.Name))
+		if snap.Kind == metalHBStale {
+			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+		}
+		available, err := r.reconcileRelay(ctx, isvc, pin)
+		if apierrors.IsConflict(err) {
+			logf.FromContext(ctx).V(1).Info("Relay object changed under the reconcile; requeueing", "reason", err.Error())
+			return 0, nil, &ctrl.Result{RequeueAfter: relayConflictRequeueAfter}, nil
+		}
+		if err != nil {
+			r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Reconciling the metal relay failed: %v", err)
+			return 0, nil, nil, err
+		}
+		if !available {
+			return 0, snap, nil, nil
+		}
+		return snap.ReadyReplicas, snap, nil, nil
+	}
+
+	if err := r.teardownRelay(ctx, isvc); err != nil {
+		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Removing the metal relay failed: %v", err)
+		return 0, nil, nil, err
+	}
+	snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
+	if snap.Kind == metalHBStale {
+		r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+	}
+	return snap.ReadyReplicas, snap, nil, nil
+}
+
 // replicaCounts carries the two replica observations a reconcile feeds the
 // status writer: Ready gates the phase, Observed is what /scale must expose so
 // an HPA reads a truthful current count.
@@ -475,18 +534,13 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	log := logf.FromContext(ctx)
 
 	if isMetal {
-		// No Deployment for metal: the host metal-agent runs llama-server natively
-		// and registers the InferenceService's Endpoints once the model is fetched
-		// and the server is healthy. Derive readyReplicas from the Endpoints rather
-		// than blindly returning desiredReplicas, otherwise Phase reports Ready
-		// before the agent has done anything (issue #374).
-		snap := r.metalEndpointSnapshot(ctx, isvc)
-		if snap.Kind == metalHBStale {
-			r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
+		ready, snap, result, err := r.reconcileMetal(ctx, isvc)
+		if err != nil || result != nil {
+			return nil, replicaCounts{}, nil, result, err
 		}
-		log.Info("Metal accelerator detected, skipping Deployment creation",
-			"readyEndpoints", snap.ReadyReplicas, "desiredReplicas", desiredReplicas)
-		return nil, replicaCounts{Ready: snap.ReadyReplicas, Observed: snap.ReadyReplicas}, snap, nil, nil
+		log.Info("Metal accelerator detected, skipping inference Deployment creation",
+			"readyEndpoints", ready, "desiredReplicas", desiredReplicas)
+		return nil, replicaCounts{Ready: ready, Observed: ready}, snap, nil, nil
 	}
 
 	// A metal-agent-only runtime off Metal is fatal: resolveBackend would
@@ -810,9 +864,10 @@ type metalSnapshot struct {
 	staleSlices []discoveryv1.EndpointSlice
 }
 
-// metalEndpointSnapshot lists the EndpointSlices for isvc and returns a
-// metalSnapshot summarising both the ready-replica count and the heartbeat
-// state. It is the single source of truth for the metal path: it makes the
+// metalEndpointSnapshot lists the EndpointSlices of the Service name (the
+// InferenceService's own "<isvc>" in legacy mode, "<isvc>-agent" in relay
+// mode) and returns a metalSnapshot summarising both the ready-replica count
+// and the heartbeat state. It is the single source of truth for the metal path: it makes the
 // one List call, and metalHeartbeatRequeueDuration then derives the requeue
 // interval from the snapshot it returns without calling the API again.
 //
@@ -823,9 +878,8 @@ type metalSnapshot struct {
 // When multiple slices carry a heartbeat annotation we classify against the
 // freshest one. Mirrored slices have no heartbeat annotation, so an upgrade
 // window degrades gracefully to the legacy-exempt path.
-func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, isvc *inferencev1alpha1.InferenceService) *metalSnapshot {
+func (r *InferenceServiceReconciler) metalEndpointSnapshot(ctx context.Context, isvc *inferencev1alpha1.InferenceService, name string) *metalSnapshot {
 	log := logf.FromContext(ctx)
-	name := sanitizeDNSName(isvc.Name)
 	slices := &discoveryv1.EndpointSliceList{}
 	err := r.List(ctx, slices,
 		client.InNamespace(isvc.Namespace),
@@ -1092,14 +1146,21 @@ func (r *InferenceServiceReconciler) findInferenceServiceForEndpoints(ctx contex
 	if name == "" {
 		name = obj.GetName()
 	}
-	return []reconcile.Request{
-		{
-			NamespacedName: types.NamespacedName{
-				Name:      name,
-				Namespace: obj.GetNamespace(),
-			},
-		},
+	reqs := []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Name: name, Namespace: obj.GetNamespace()},
+	}}
+	// A relay-mode agent writes "<isvc>-agent"; also enqueue "<isvc>". The
+	// unstripped name stays enqueued because an InferenceService may itself be
+	// named "x-agent" with a legacy slice, and reconciling a name that has no
+	// InferenceService is a no-op.
+	if labels["llmkube.ai/managed-by"] == "metal-agent" {
+		if isvc, ok := strings.CutSuffix(svcName, inferencev1alpha1.MetalAgentServiceSuffix); ok && isvc != "" {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: isvc, Namespace: obj.GetNamespace()},
+			})
+		}
 	}
+	return reqs
 }
 
 // reconcileWorkload picks the serving shape. A spec.multiNode group replaces
@@ -1113,6 +1174,13 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 	desiredReplicas int32,
 	modelReady, isMetal bool,
 ) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
+	// A relay only serves Metal. After a model switch off Metal (for
+	// example to CUDA) the "<isvc>-relay" Deployment would otherwise linger.
+	if !isMetal {
+		if err := r.teardownRelay(ctx, isvc); err != nil {
+			return nil, replicaCounts{}, nil, nil, err
+		}
+	}
 	if isvc.Spec.MultiNode != nil {
 		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, model, draftModel, desiredReplicas, modelReady)
 		// A multiNode group has no Deployment to read an observed total from,
