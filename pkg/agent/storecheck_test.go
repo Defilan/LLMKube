@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -450,6 +451,10 @@ func TestEnsureModel_RefusesNonRegularCacheEntry(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), localPath) {
 		t.Errorf("error %q does not name the cache path", err)
+	}
+	var slotErr *ModelCacheEntryNotRegularError
+	if !errors.As(err, &slotErr) {
+		t.Errorf("error %T is not a *ModelCacheEntryNotRegularError, so it would not be refused with an event", err)
 	}
 }
 

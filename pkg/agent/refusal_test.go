@@ -809,6 +809,76 @@ func TestEnsureProcess_ModelDigestMismatchRefusedWithEvent(t *testing.T) {
 	}
 }
 
+// A symlink in a downloaded source's cache slot (<store>/<model>/<file>) is
+// refused before memory admission with ModelSourceNotAllowed, as a status
+// field and a Warning Event naming the supported replacement, and the
+// executor is never invoked.
+func TestEnsureProcess_SymlinkedCacheSlotRefusedBeforeStart(t *testing.T) {
+	isvc := refusalISVC("svc")
+	store := t.TempDir()
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{ModelStorePath: store}, isvc, refusalModel())
+	slotDir := filepath.Join(store, refusalModelName)
+	if err := os.Mkdir(slotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handPlaced := filepath.Join(t.TempDir(), "hand-placed.gguf")
+	if err := os.WriteFile(handPlaced, []byte("gguf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(handPlaced, filepath.Join(slotDir, "m.gguf")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("ensureProcess error = %v, want it to name %s", err, EventReasonModelSourceNotAllowed)
+	}
+	for _, want := range []string{"file://", "--allowed-model-roots"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name the remedy %q", err, want)
+		}
+	}
+	events := drainEvents(rec)
+	if !strings.Contains(strings.Join(events, "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+		t.Errorf("events = %v, want a Warning %s", events, EventReasonModelSourceNotAllowed)
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if gErr := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "svc", Namespace: "default"}, got); gErr != nil {
+		t.Fatalf("get InferenceService: %v", gErr)
+	}
+	if got.Status.SchedulingStatus != EventReasonModelSourceNotAllowed {
+		t.Errorf("status.schedulingStatus = %q, want %q", got.Status.SchedulingStatus, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 0 {
+		t.Errorf("starts = %d, want 0 (refused before the executor ran)", ex.starts)
+	}
+}
+
+// If the cache slot becomes a symlink after the pre-flight check, the
+// executor's *ModelCacheEntryNotRegularError still reaches refuseStart with
+// ModelSourceNotAllowed rather than the log-only plain-failure path.
+func TestEnsureProcess_CacheSlotErrorFromStartRefused(t *testing.T) {
+	isvc := refusalISVC("svc")
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelCacheEntryNotRegularError{Path: "/models/m/m.gguf", Mode: os.ModeSymlink | 0o755})
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("ensureProcess error = %v, want it to name %s", err, EventReasonModelSourceNotAllowed)
+	}
+	if events := drainEvents(rec); !strings.Contains(strings.Join(events, "\n"),
+		"Warning "+EventReasonModelSourceNotAllowed) {
+		t.Errorf("events = %v, want a Warning %s", events, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 1 {
+		t.Errorf("starts = %d, want 1", ex.starts)
+	}
+}
+
 // A plain (non-digest) StartProcess failure must NOT be routed through
 // refuseStart: it keeps the historical plain-wrapped-error, log-only
 // behavior, so a transient network or process-spawn failure is retried by

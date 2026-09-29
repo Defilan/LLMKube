@@ -69,10 +69,12 @@ func (a *MetalAgent) refuseStart(
 // handleStartProcessError turns a StartProcess failure into the error
 // reconcileProcess returns. A *ModelDigestMismatchError is remembered in
 // a.digestMismatches (so checkModelDigestMemo can refuse the next reconcile
-// without downloading again) and refused through refuseStart (Spec F3: refuse
-// a digest mismatch with an event), the same way an endpoint-name conflict or
-// a bad model path is refused, so it is visible as a status field and a
-// Warning Event instead of only a log line. Every other StartProcess failure
+// without downloading again) and refused through refuseStart, the same way
+// an endpoint-name conflict or a bad model path is refused, so it is visible
+// as a status field and a Warning Event instead of only a log line. A
+// *ModelCacheEntryNotRegularError (a symlink in a downloaded source's cache
+// slot that appeared after checkModelCacheSlot ran) is refused the same way
+// as ModelSourceNotAllowed. Every other StartProcess failure
 // (network error, bad status, truncated download, health-check timeout, ...)
 // keeps the historical plain-wrapped-error, log-only behavior. Split out of
 // reconcileProcess, rather than inlined as an extra branch there, to keep its
@@ -88,23 +90,55 @@ func (a *MetalAgent) handleStartProcessError(
 		)
 		return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
 	}
+	var slotErr *ModelCacheEntryNotRegularError
+	if errors.As(startErr, &slotErr) {
+		return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, slotErr.Error())
+	}
 	return fmt.Errorf("failed to start process: %w", startErr)
 }
 
-// checkModelPreflight runs the two Model-derived pre-flight refusal checks
-// that must both happen before memory admission (checkModelPaths, then
-// checkModelDigestMemo), returning the first refusal. Combined into one call
-// from reconcileProcess, rather than two sequential `if err != nil { return
-// err }` blocks there, purely to keep that function's cyclomatic complexity
-// under the linter's threshold — see handleStartProcessError's doc comment
-// for the same reasoning applied to the StartProcess error path.
+// checkModelPreflight runs the Model-derived pre-flight refusal checks that
+// must all happen before memory admission (checkModelPaths, then
+// checkModelCacheSlot, then checkModelDigestMemo), returning the first
+// refusal. Combined into one call from reconcileProcess, rather than
+// sequential `if err != nil { return err }` blocks there, purely to keep that
+// function's cyclomatic complexity under the linter's threshold; see
+// handleStartProcessError's doc comment for the same reasoning applied to the
+// StartProcess error path.
 func (a *MetalAgent) checkModelPreflight(
-	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, pagedSSDCacheDir string,
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model,
+	runtime, pagedSSDCacheDir string,
 ) error {
 	if err := a.checkModelPaths(ctx, isvc, model, pagedSSDCacheDir); err != nil {
 		return err
 	}
+	if err := a.checkModelCacheSlot(ctx, isvc, model, runtime); err != nil {
+		return err
+	}
 	return a.checkModelDigestMemo(ctx, isvc, model)
+}
+
+// checkModelCacheSlot refuses, before memory admission, a llama-server start
+// whose downloaded source's cache slot is not a regular file (a symlink
+// above all). ensureModel refuses the same slot inside StartProcess, but
+// that runs after admission, whose success path clears SchedulingStatus, so
+// relying on it alone would flap the status on every reconcile. Only the
+// llama-server executor caches downloads in that slot, and a local source
+// is loaded in place, so both are left alone.
+func (a *MetalAgent) checkModelCacheSlot(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, runtime string,
+) error {
+	if runtime != runtimeLlamaServer && runtime != runtimeLlamaCPP {
+		return nil
+	}
+	if isLocalModelSource(model.Spec.Source) {
+		return nil
+	}
+	slot := modelCacheSlot(a.config.ModelStorePath, model.Name, model.Spec.Source)
+	if err := checkModelCacheSlot(slot); err != nil {
+		return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, err.Error())
+	}
+	return nil
 }
 
 // checkModelDigestMemo refuses a Model this agent already found to have a

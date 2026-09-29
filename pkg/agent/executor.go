@@ -385,8 +385,7 @@ func (e *MetalExecutor) processLogPath(namespace, name string) string {
 func (e *MetalExecutor) ensureModel(
 	ctx context.Context, source, name string, secretRef s3SecretRef, expectedSHA256 string,
 ) (string, error) {
-	filename := filepath.Base(source)
-	localPath := filepath.Join(e.modelStorePath, name, filename)
+	localPath := modelCacheSlot(e.modelStorePath, name, source)
 	local := isLocalModelSource(source)
 
 	// For a source the agent downloads, the cache slot is written only by
@@ -401,8 +400,7 @@ func (e *MetalExecutor) ensureModel(
 	}
 	info, statErr := stat(localPath)
 	if statErr == nil && !local && !info.Mode().IsRegular() {
-		return "", fmt.Errorf("refusing model cache entry %s: not a regular file (mode %s); remove it to re-download",
-			localPath, info.Mode())
+		return "", &ModelCacheEntryNotRegularError{Path: localPath, Mode: info.Mode()}
 	}
 	if statErr == nil && info.Size() > 0 {
 		// A local source is loaded in place, never through the model store's
@@ -445,6 +443,45 @@ func (e *MetalExecutor) ensureModel(
 
 	e.logger.Infow("model downloaded", "path", localPath)
 	return localPath, nil
+}
+
+// ModelCacheEntryNotRegularError reports that the cache slot a downloaded
+// model source is stored in (<store>/<model>/<file>) holds something other
+// than a regular file, typically a symlink. The agent refuses to follow it:
+// that slot is written only by the agent, and a link there would make the
+// engine load whatever file it names, outside the allowed roots and the
+// digest check. Before local sources existed, a symlink placed in that slot
+// was a common way to serve a hand-placed GGUF, so the message names the
+// supported replacement. It is a distinct type so handleStartProcessError can
+// refuse it with EventReasonModelSourceNotAllowed (a status field and a
+// Warning Event) instead of a log line repeated on every reconcile.
+type ModelCacheEntryNotRegularError struct {
+	Path string
+	Mode os.FileMode
+}
+
+func (e *ModelCacheEntryNotRegularError) Error() string {
+	return fmt.Sprintf("refusing model cache entry %s: not a regular file (mode %s); the agent does not follow "+
+		"a symlink in the cache slot of a downloaded source. Remove it to re-download, or to serve a file already "+
+		"on this Mac set the Model's spec.source to its absolute path or a file:// URI and add its directory "+
+		"to --allowed-model-roots", e.Path, e.Mode)
+}
+
+// checkModelCacheSlot refuses a cache slot for a downloaded source that
+// exists and is not a regular file. A missing slot is fine: it is about to
+// be downloaded.
+func checkModelCacheSlot(localPath string) error {
+	info, err := os.Lstat(localPath)
+	if err != nil || info.Mode().IsRegular() {
+		return nil
+	}
+	return &ModelCacheEntryNotRegularError{Path: localPath, Mode: info.Mode()}
+}
+
+// modelCacheSlot is where the llama-server executor caches a downloaded
+// source: <store>/<model name>/<basename of the source>.
+func modelCacheSlot(modelStorePath, modelName, source string) string {
+	return filepath.Join(modelStorePath, modelName, filepath.Base(source))
 }
 
 // verifyCachedDigest reports whether the model file already at localPath

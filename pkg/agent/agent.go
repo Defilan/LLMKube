@@ -1149,12 +1149,13 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	}
 
 	// Refuse a Model the controller marked Failed, any local model source or
-	// pagedSSDCacheDir that resolves outside the allowed roots, and a Model
-	// this agent already found to have a mismatching SHA256 (refused without
-	// downloading it again) — all before memory admission runs, since
-	// admission's success path clears SchedulingStatus and a refusal placed
-	// after it would flap the status on every reconcile.
-	if err := a.checkModelPreflight(ctx, isvc, model, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
+	// pagedSSDCacheDir that resolves outside the allowed roots, a symlink in
+	// a downloaded source's cache slot, and a Model this agent already found
+	// to have a mismatching SHA256 (refused without downloading it again).
+	// All of these run before memory admission, since admission's success
+	// path clears SchedulingStatus and a refusal placed after it would flap
+	// the status on every reconcile.
+	if err := a.checkModelPreflight(ctx, isvc, model, runtime, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
 		return err
 	}
 
