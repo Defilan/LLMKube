@@ -223,8 +223,10 @@ func relayDeploymentPin(dep *appsv1.Deployment) string {
 }
 
 // ensureRelaySecret creates the namespace's relay token Secret when it is
-// missing. An existing Secret is never updated: rotation is an operator
-// deleting it, after which the next reconcile creates a new token.
+// missing. An existing Secret is never updated, so an operator rotates the
+// token by updating the Secret in place (the agent accepts the old and new
+// token for a grace window). Deleting it revokes the token at once; the next
+// reconcile then creates a new one.
 func (r *InferenceServiceReconciler) ensureRelaySecret(ctx context.Context, namespace string) error {
 	key := types.NamespacedName{Name: inferencev1alpha1.MetalRelaySecretName, Namespace: namespace}
 	err := r.Get(ctx, key, &corev1.Secret{})
