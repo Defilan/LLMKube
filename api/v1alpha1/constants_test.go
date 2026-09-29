@@ -149,3 +149,32 @@ func TestPhaseConstants(t *testing.T) {
 		})
 	}
 }
+
+// TestMetalRelayWireConstants pins the Metal relay wire-protocol constants
+// (S4): the controller-owned relay and the metal-agent's TLS ingress must
+// agree on these values byte-for-byte, so the test asserts the literal
+// strings rather than round-tripping through the constant itself.
+func TestMetalRelayWireConstants(t *testing.T) {
+	//nolint:gosec // G101: constant names and their wire values, not credentials
+	cases := map[string]string{
+		AnnotationAgentIngressSPKI: "llmkube.ai/agent-ingress-spki",
+		HeaderRelayToken:           "X-LLMKube-Relay-Token",
+		HeaderRelayTarget:          "X-LLMKube-Target",
+		MetalRelaySecretName:       "llmkube-metal-relay",
+		MetalRelaySecretKey:        "token",
+		MetalAgentServiceSuffix:    "-agent",
+		MetalRelayDeploymentSuffix: "-relay",
+		IngressReadyPath:           "/_llmkube/ready",
+		LabelManagedBy:             "llmkube.ai/managed-by",
+		ManagedByMetalAgent:        "metal-agent",
+		ManagedByController:        "llmkube-controller",
+	}
+	for got, want := range cases {
+		if got != want {
+			t.Errorf("constant = %q, want %q", got, want)
+		}
+	}
+	if MetalAgentServicePort != 8443 {
+		t.Errorf("MetalAgentServicePort = %d, want 8443", MetalAgentServicePort)
+	}
+}
