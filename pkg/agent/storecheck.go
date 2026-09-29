@@ -104,8 +104,9 @@ var tmpStoreRoots = []string{"/private/tmp", "/private/var/tmp", "/tmp", "/var/t
 // at boot, so another local user can create the store directory first after
 // a reboot and either own it (the agent then refuses to start) or wait for
 // the agent to trust whatever they put in it. 0.10.0 plists pinned
-// --model-store /tmp/llmkube-models, and `launchctl kickstart -k` keeps an
-// old plist across a binary upgrade, so the error names the re-render step.
+// --model-store /tmp/llmkube-models, and launchd keeps running a loaded job's
+// old definition across `launchctl kickstart -k` (and across a re-rendered
+// plist file) until the job is booted out, so the error names both steps.
 func checkStoreNotInTmp(where, path, resolved string) error {
 	literal := path
 	if abs, err := filepath.Abs(path); err == nil {
@@ -115,8 +116,10 @@ func checkStoreNotInTmp(where, path, resolved string) error {
 		for _, root := range tmpStoreRoots {
 			if candidate == root || strings.HasPrefix(candidate, root+"/") {
 				return fmt.Errorf("model store %s is under %s, a shared temporary directory any local user "+
-					"can recreate after a reboot: run `make install-metal-agent` to re-render the launchd plist "+
-					"with the new default store (0.10.0 plists pinned --model-store /tmp/llmkube-models), "+
+					"can recreate after a reboot: re-render the launchd plist with the new default store "+
+					"(0.10.0 plists pinned --model-store /tmp/llmkube-models) by running "+
+					"`launchctl bootout gui/$(id -u)/com.llmkube.metal-agent` and then `make install-metal-agent` "+
+					"(launchd keeps the old plist until the job is booted out), "+
 					"or pass a --model-store the agent owns outside /tmp", where, root)
 			}
 		}
