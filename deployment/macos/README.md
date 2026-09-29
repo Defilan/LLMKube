@@ -276,8 +276,8 @@ The agent doesn't need your admin credentials.
 [`metal-agent-rbac.yaml`](metal-agent-rbac.yaml) creates a ServiceAccount
 with only the permissions the agent uses (read InferenceServices and Models,
 update InferenceService status, manage the Services and EndpointSlices that
-publish each server, write events, read `sourceSecretRef` secrets). Mint a
-kubeconfig from it:
+publish each server, write events, read the relay token Secret and
+`sourceSecretRef` secrets). Mint a kubeconfig from it:
 
 ```bash
 NS=default                                  # the namespace the agent watches (--namespace)

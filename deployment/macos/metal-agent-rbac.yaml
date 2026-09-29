@@ -47,9 +47,12 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Model.spec.sourceSecretRef credentials (HF_TOKEN, AWS_*). Drop this rule
-  # if no Model uses sourceSecretRef, or pin it to those secrets with
-  # resourceNames.
+  # The per-namespace relay token Secret (fixed name "llmkube-metal-relay",
+  # read on every relayed request unless the agent runs with
+  # --legacy-direct-endpoints) and Model.spec.sourceSecretRef credentials
+  # (HF_TOKEN, AWS_*, arbitrary name). Pin to resourceNames
+  # ["llmkube-metal-relay", ...] to narrow this if no Model in the namespace
+  # uses sourceSecretRef.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
