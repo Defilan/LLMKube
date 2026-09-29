@@ -138,11 +138,17 @@ it is fixed. Check them on every Mac before upgrading its metal-agent:
 
   ```bash
   launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+  while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
   make install-metal-agent
+  launchctl print gui/$(id -u)/com.llmkube.metal-agent | grep 'state = running'
   ```
 
   `make install-metal-agent` alone is not enough while the job is loaded:
-  launchd keeps the old definition until it is booted out. The new plist uses
+  launchd keeps the old definition until it is booted out. Wait for the
+  unload before reinstalling: a `bootstrap` that runs too soon after
+  `bootout` can fail with `Bootstrap failed: 5: Input/output error` and leave
+  the agent unloaded. The last command prints `state = running` once the
+  agent is back. The new plist uses
   the default store `~/Library/Application Support/llmkube/models` and logs to
   `~/Library/Logs/llmkube/metal-agent.log`. For a hand-maintained plist,
   remove the `--model-store /tmp/...` pair (or point it at a directory the

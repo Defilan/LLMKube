@@ -119,9 +119,9 @@ func checkStoreNotInTmp(where, path, resolved string) error {
 			if candidate == root || strings.HasPrefix(candidate, root+"/") {
 				return fmt.Errorf("model store %s is under %s, a shared temporary directory any local user "+
 					"can recreate after a reboot: re-render the launchd plist with the new default store "+
-					"(0.10.0 plists pinned --model-store /tmp/llmkube-models) by running "+
-					"`launchctl bootout gui/$(id -u)/com.llmkube.metal-agent` and then `make install-metal-agent` "+
-					"(launchd keeps the old plist until the job is booted out), "+
+					"(0.10.0 plists pinned --model-store /tmp/llmkube-models): run "+
+					"`launchctl bootout gui/$(id -u)/com.llmkube.metal-agent`, wait until it has unloaded, then "+
+					"`make install-metal-agent` (see \"Upgrading to 0.10.1\" in deployment/macos/README.md), "+
 					"or pass a --model-store the agent owns outside /tmp", where, root)
 			}
 		}

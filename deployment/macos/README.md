@@ -831,12 +831,17 @@ it is fixed. Check them before upgrading:
 
   ```bash
   launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+  while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
   make install-metal-agent
+  launchctl print gui/$(id -u)/com.llmkube.metal-agent | grep 'state = running'
   ```
 
   `make install-metal-agent` alone is not enough for a job that is already
   loaded: launchd keeps running the old definition until the job is booted
-  out. If you maintain your own plist, remove the `--model-store /tmp/...`
+  out. Wait for the unload before reinstalling: `bootout` returns before
+  launchd has finished, and a `bootstrap` that runs too soon can fail with
+  `Bootstrap failed: 5: Input/output error` and leave the agent unloaded.
+  The last command prints `state = running` once the agent is back. If you maintain your own plist, remove the `--model-store /tmp/...`
   pair (or point it at a directory the agent owns outside `/tmp`), move
   `StandardOutPath` and `StandardErrorPath` out of `/tmp`, and set
   `WorkingDirectory` to the agent user's home. Nothing moves by itself: until
