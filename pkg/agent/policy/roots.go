@@ -186,6 +186,12 @@ type PathError struct {
 	Resolved string
 	Roots    []string
 	Err      error
+	// NotExist reports that p resolved cleanly inside the roots (Resolved is
+	// set) but names nothing there: set only by CheckPathExists, for a
+	// FlagSpec.MustExist value. It is distinct from the plain Resolved case
+	// (which means "outside every root"): here the path is exactly where it
+	// is allowed to be, just not created yet.
+	NotExist bool
 	// Hint, when set, replaces Error()'s default "widen --allowed-model-roots"
 	// advice with a caller-supplied one appropriate to what kind of path this
 	// is. A Model source or pagedSSDCacheDir (checked directly through
@@ -201,7 +207,13 @@ type PathError struct {
 func (e *PathError) Unwrap() error { return e.Err }
 
 func (e *PathError) Error() string {
+	const notExistWhy = "must exist inside an allowed root; a Hugging Face repo id or other value that " +
+		"does not already name a file or directory there is not accepted here"
 	switch {
+	case e.NotExist && e.Hint != "":
+		return fmt.Sprintf("%s %s %s; %s", e.What, e.Path, notExistWhy, e.Hint)
+	case e.NotExist:
+		return fmt.Sprintf("%s %s %s", e.What, e.Path, notExistWhy)
 	case e.Err != nil && e.Hint != "":
 		return fmt.Sprintf("%s %s cannot be resolved: %v; %s", e.What, e.Path, e.Err, e.Hint)
 	case e.Err != nil:
@@ -224,6 +236,30 @@ func (r Roots) CheckPath(what, p, workDir, home string) error {
 	}
 	if !r.Contains(resolved) {
 		return &PathError{What: what, Path: p, Resolved: resolved, Roots: r.Dirs()}
+	}
+	return nil
+}
+
+// CheckPathExists is CheckPath plus one more requirement: p must already
+// exist on disk. It resolves and root-checks exactly like CheckPath (so a
+// symlink whose target lies outside every root is refused the same way,
+// before existence is even considered), then Lstats the same resolved path
+// CheckPath already accepted. A value that resolves cleanly inside the roots
+// but does not exist there, including one shaped like a Hugging Face
+// "owner/name" repo id, comes back as a *PathError with NotExist set instead
+// of the ordinary not-yet-existing-is-fine pass CheckPath would give it: used
+// for a FlagSpec.MustExist flag, where the engine treats a not-yet-existing
+// value as something to fetch on its own rather than a local file to open.
+func (r Roots) CheckPathExists(what, p, workDir, home string) error {
+	resolved, err := ResolvePath(p, workDir, home)
+	if err != nil {
+		return &PathError{What: what, Path: p, Err: err, Roots: r.Dirs()}
+	}
+	if !r.Contains(resolved) {
+		return &PathError{What: what, Path: p, Resolved: resolved, Roots: r.Dirs()}
+	}
+	if _, err := os.Lstat(resolved); err != nil {
+		return &PathError{What: what, Path: p, Resolved: resolved, Roots: r.Dirs(), NotExist: true}
 	}
 	return nil
 }

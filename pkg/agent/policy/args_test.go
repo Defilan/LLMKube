@@ -894,6 +894,57 @@ func TestTyped_DrafterAndGenerationConfig(t *testing.T) {
 	relaxable(t, f.in(RuntimeVLLMSwift, "--generation-config", f.outside), "path")
 }
 
+// TestVLLMSwift_PathFlagsMustExist: Ruling 11. --tokenizer, --hf-config-path,
+// --generation-config and the path half of a --lora-modules name=path entry
+// are FlagSpec.MustExist for vllm-swift: a value that resolves inside the
+// roots but does not exist there is refused (Roots.CheckPathExists), closing
+// the gap where a Hugging Face "owner/name" repo id passed the ordinary
+// not-yet-existing-is-fine check as a relative path under the store and vLLM
+// then downloaded it into the HF cache, outside every root. An existing path
+// inside a root still passes, and a symlink whose target lies outside the
+// roots is still refused the same way CheckPath refuses one, existing target
+// or not. Other vllm-swift path flags this ruling does not cover, and every
+// llama-server and tensorfold path flag (an output path the engine has not
+// created yet), are unaffected.
+func TestVLLMSwift_PathFlagsMustExist(t *testing.T) {
+	f := newTypedFixture(t)
+	v := func(args ...string) ArgsInput { return f.in(RuntimeVLLMSwift, args...) }
+
+	for _, flag := range []string{"--tokenizer", "--hf-config-path", "--generation-config"} {
+		// Exists inside a root: passes, absolute or relative.
+		allowed(t, v(flag, f.store+"/d"))
+		allowed(t, v(flag, "d"))
+		// Does not exist: refused, even though it resolves lexically inside
+		// the store (the ordinary CheckPath would have passed it as
+		// not-yet-existing).
+		relaxable(t, v(flag, f.store+"/nope"), "path")
+		relaxable(t, v(flag, "nope"), "path")
+		// A Hugging Face repo-id-shaped value that does not exist: the exact
+		// gap Ruling 11 closes.
+		relaxable(t, v(flag, "owner/name"), "path")
+		// A symlink inside the store whose target lies outside every root is
+		// still refused (its target, "outside/b.gguf", exists).
+		relaxable(t, v(flag, "link"), "path")
+	}
+	// --generation-config keeps its documented literals.
+	allowed(t, v("--generation-config", "auto"))
+	allowed(t, v("--generation-config", "vllm"))
+
+	// --lora-modules: the path half of each entry must exist.
+	allowed(t, v("--lora-modules", "a="+f.store+"/a.gguf"))
+	relaxable(t, v("--lora-modules", "a="+f.store+"/nope"), "path")
+	relaxable(t, v("--lora-modules", "a=owner/name"), "path")
+
+	// A vllm-swift path flag Ruling 11 does not cover keeps accepting a
+	// not-yet-existing value.
+	allowed(t, v("--chat-template", f.store+"/nope.jinja"))
+
+	// A llama-server path flag (a different runtime, unaffected by a
+	// vllm-swift-table change) still accepts an output path the engine has
+	// not created yet.
+	allowed(t, f.in(RuntimeLlamaCPP, "--lookup-cache-dynamic", "nope.bin"))
+}
+
 func TestTyped_PathDecode(t *testing.T) {
 	f := newTypedFixture(t)
 	for _, c := range []struct {
@@ -1198,6 +1249,46 @@ func TestRule3_VLLMSwiftCodeLoading(t *testing.T) {
 		all = append(all, args...)
 	}
 	allowed(t, v(all...))
+}
+
+// TestRule3_TrustRequestChatTemplateAndEmbeds: Ruling 9 and 10. vllm-swift's
+// --trust-request-chat-template widens who can get the server to render a
+// Jinja chat template: without it vLLM refuses one submitted in a request
+// body, so setting it lets any network client of the service render its own
+// template, not only the InferenceService writer (who can already supply one
+// inline via --chat-template). --enable-prompt-embeds and --enable-mm-embeds
+// let a client submit a base64-serialized tensor the server deserializes
+// with torch.load, the exact path CVE-2025-62164 was found in. All three are
+// Rule 3 vllmRefused entries: relaxable by the hatch, and their "--no-" forms
+// only turn the feature off.
+func TestRule3_TrustRequestChatTemplateAndEmbeds(t *testing.T) {
+	f := newTypedFixture(t)
+	v := func(args ...string) ArgsInput { return f.in(RuntimeVLLMSwift, args...) }
+
+	cases := []struct {
+		flag       string
+		noFlag     string
+		wantReason string
+	}{
+		{"--trust-request-chat-template", "--no-trust-request-chat-template", "chat template"},
+		{"--enable-prompt-embeds", "--no-enable-prompt-embeds", "torch.load"},
+		{"--enable-mm-embeds", "--no-enable-mm-embeds", "torch.load"},
+	}
+	for _, c := range cases {
+		err := CheckExtraArgs(v(c.flag))
+		var re *RejectedError
+		if !errors.As(err, &re) || re.Flag != c.flag || re.Rule != "code-loading" || !re.Relaxable {
+			t.Errorf("%s = %v, want a relaxable code-loading *RejectedError", c.flag, err)
+			continue
+		}
+		if !strings.Contains(re.Why, c.wantReason) {
+			t.Errorf("%s reason = %q, want it to mention %q", c.flag, re.Why, c.wantReason)
+		}
+		// The hatch relaxes it.
+		relaxable(t, v(c.flag), "code-loading")
+		// The "--no-" negation only turns it off and stays allowed.
+		allowed(t, v(c.noFlag))
+	}
 }
 
 // TestRule3_OtherRuntimesUnaffected: Rule 3 is vllm-swift only.
