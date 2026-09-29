@@ -41,10 +41,11 @@ func CheckModelStore(path string) error {
 // The resolved target is judged, not the link: a link the agent owns
 // pointing at a shared directory is still a shared store. The target must
 // exist, be a directory, be owned by the agent's uid and have no group or
-// other write bit. Every ancestor up to / must also be unwritable by group
-// and other unless it has the sticky bit (so the root-owned, sticky
-// /private/tmp passes): otherwise another user could rename the store away
-// and put their own directory in its place after this check.
+// other write bit. Every ancestor up to / must be owned by root or the
+// agent's uid, and be unwritable by group and other unless it has the sticky
+// bit (so the root-owned, sticky /private/tmp passes): otherwise another user
+// could rename the store away and put their own directory in its place after
+// this check.
 //
 // Callers must use the returned path from then on, never path itself: path
 // is re-resolved on every use, so a symlink in it could be repointed after
@@ -65,12 +66,11 @@ func ResolveModelStore(path string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("model store %s is not a directory", where)
 	}
-	st, ok := info.Sys().(*syscall.Stat_t)
+	owner, ok := fileOwner(resolved, info)
 	if !ok {
 		return "", fmt.Errorf("model store %s: cannot read its owner", where)
 	}
 	uid := os.Getuid()
-	owner := int(st.Uid)
 	mode := info.Mode().Perm()
 	if owner != uid {
 		return "", fmt.Errorf("model store %s has owner uid %d and mode %04o, but the agent runs as uid %d "+
@@ -89,24 +89,46 @@ func ResolveModelStore(path string) (string, error) {
 }
 
 // checkStoreAncestors refuses the store when any ancestor of the resolved,
-// absolute store directory is group- or other-writable without the sticky
-// bit.
+// absolute store directory is owned by a uid other than root or the agent
+// (its owner could chmod it and swap the store: the ssh StrictModes rule), or
+// is group- or other-writable without the sticky bit.
 func checkStoreAncestors(where, resolved string) error {
+	uid := os.Getuid()
 	for dir := filepath.Dir(resolved); ; dir = filepath.Dir(dir) {
 		info, err := os.Lstat(dir)
 		if err != nil {
 			return fmt.Errorf("model store %s: ancestor %s: %w", where, dir, err)
 		}
+		owner, ok := fileOwner(dir, info)
+		if !ok {
+			return fmt.Errorf("model store %s: ancestor %s: cannot read its owner", where, dir)
+		}
 		m := info.Mode()
+		if owner != 0 && owner != uid {
+			return fmt.Errorf("model store %s has ancestor %s with owner uid %d and mode %04o; every directory "+
+				"above the store must be owned by root or the agent (uid %d), or its owner could swap the store: "+
+				"pass a --model-store under a directory you or root own", where, dir, owner, m.Perm(), uid)
+		}
 		if m.Perm()&0o022 != 0 && m&os.ModeSticky == 0 {
-			return fmt.Errorf("model store %s has ancestor %s with mode %04o, which lets other users replace "+
-				"the store: run `chmod go-w %s` (or `chmod +t` if it must stay shared) or pass a --model-store "+
-				"under a private directory", where, dir, m.Perm(), dir)
+			return fmt.Errorf("model store %s has ancestor %s with owner uid %d and mode %04o, which lets other "+
+				"users replace the store: run `chmod go-w %s` (or `chmod +t` if it must stay shared) or pass a "+
+				"--model-store under a private directory", where, dir, owner, m.Perm(), dir)
 		}
 		if parent := filepath.Dir(dir); parent == dir {
 			return nil
 		}
 	}
+}
+
+// fileOwner returns the owner uid recorded in info (the Lstat result for
+// path). It is a variable so tests can report a foreign owner for one path
+// without a second account.
+var fileOwner = func(_ string, info os.FileInfo) (int, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
 }
 
 // describeStore names the configured path and, when it differs, the

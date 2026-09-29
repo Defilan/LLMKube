@@ -429,3 +429,53 @@ func TestEnsureModel_CreatesModelDirPrivate(t *testing.T) {
 		t.Errorf("model dir mode = %o, want 0700", perm)
 	}
 }
+
+// An ancestor owned by another non-root user is refused even when it is not
+// writable: its owner could chmod it and then swap the store (the ssh
+// StrictModes rule). The owner lookup seam reports a foreign uid for one
+// ancestor so the case runs without a second account.
+func TestCheckModelStore_AncestorOwnedByAnotherUser(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "parent")
+	store := filepath.Join(parent, "store")
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolvedParent, _ := filepath.EvalSymlinks(parent)
+
+	orig := fileOwner
+	t.Cleanup(func() { fileOwner = orig })
+	fileOwner = func(path string, info os.FileInfo) (int, bool) {
+		if path == resolvedParent {
+			return 4242, true
+		}
+		return orig(path, info)
+	}
+
+	err := CheckModelStore(store)
+	if err == nil {
+		t.Fatal("CheckModelStore under an ancestor owned by uid 4242 = nil, want a refusal")
+	}
+	for _, want := range []string{"ancestor " + resolvedParent, "owner uid 4242", "mode 0700"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// With real ownership: only root can chown a directory to another uid.
+func TestCheckModelStore_AncestorOwnedByAnotherUser_RealChown(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to chown an ancestor to another uid; the seam test covers the logic")
+	}
+	parent := filepath.Join(t.TempDir(), "parent")
+	store := filepath.Join(parent, "store")
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chown(parent, 4242, 4242); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckModelStore(store); err == nil || !strings.Contains(err.Error(), "owner uid 4242") {
+		t.Fatalf("CheckModelStore under a uid-4242 ancestor = %v, want a refusal naming the owner", err)
+	}
+}
