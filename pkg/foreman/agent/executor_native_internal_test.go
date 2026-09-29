@@ -355,6 +355,44 @@ func TestResolveInferenceBaseURL(t *testing.T) {
 		}
 		return slice
 	}
+	// mkAgentSlice builds the metal-agent's relay-mode "<name>-agent"
+	// EndpointSlice: labelled kubernetes.io/service-name=<name>-agent and
+	// llmkube.ai/managed-by=metal-agent, carrying the engine's loopback port
+	// in the AnnotationAgentEnginePort annotation. enginePortAnnotation == ""
+	// omits the annotation entirely (modelling an older agent, or one that
+	// has not yet set it). The slice's own Port is deliberately the relay's
+	// ingress port (8443), never the engine's: rewriteHostFromEndpoints must
+	// read the engine port from the annotation, not from this slice's Ports.
+	mkAgentSlice := func(name, enginePortAnnotation string, withAddress bool) *discoveryv1.EndpointSlice {
+		agentName := name + inferencev1alpha1.MetalAgentServiceSuffix
+		slice := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      agentName,
+				Namespace: "default",
+				Labels: map[string]string{
+					"kubernetes.io/service-name":     agentName,
+					inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent,
+				},
+			},
+			AddressType: discoveryv1.AddressTypeIPv4,
+			Ports:       []discoveryv1.EndpointPort{{Port: ptr.To(int32(8443))}},
+		}
+		// A live agent refreshes the heartbeat on every write; the stale case
+		// overrides it below.
+		slice.Annotations = map[string]string{
+			inferencev1alpha1.AnnotationAgentHeartbeat: time.Now().UTC().Format(time.RFC3339),
+		}
+		if enginePortAnnotation != "" {
+			slice.Annotations[inferencev1alpha1.AnnotationAgentEnginePort] = enginePortAnnotation
+		}
+		if withAddress {
+			slice.Endpoints = []discoveryv1.Endpoint{{
+				Addresses:  []string{"10.42.0.6"},
+				Conditions: discoveryv1.EndpointConditions{Ready: ptr.To(true)},
+			}}
+		}
+		return slice
+	}
 
 	cases := []struct {
 		name        string
@@ -413,6 +451,129 @@ func TestResolveInferenceBaseURL(t *testing.T) {
 				func() *foremanv1alpha1.Agent { return mkAgent("inf.svc.dotted") }(),
 				mkISvc("inf.svc.dotted", "http://inf-svc-dotted.default.svc.cluster.local:80/v1/chat/completions"),
 				mkEndpoints("inf-svc-dotted", 60177, true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: relay-mode <isvc>-agent slice's engine-port annotation wins over the adopted <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				// The controller has adopted the <isvc> Service+slice for the
+				// relay pod once relay mode is on: its port is the relay's
+				// listener, not the engine's.
+				mkEndpoints("test-svc", 8080, true),
+				mkAgentSlice("test-svc", "53421", true),
+			},
+			want: "http://127.0.0.1:53421/v1",
+		},
+		{
+			name: "host override: no <isvc>-agent slice falls back to the <isvc> slice (pre-relay agent)",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: <isvc>-agent slice with a missing annotation falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				mkAgentSlice("test-svc", "", true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: <isvc>-agent slice with a garbage annotation falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				mkAgentSlice("test-svc", "not-a-port", true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: <isvc>-agent slice with a non-positive annotation falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				mkAgentSlice("test-svc", "0", true),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: <isvc>-agent slice with no ready endpoint falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				mkAgentSlice("test-svc", "53421", false),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: stale <isvc>-agent slice (old heartbeat) falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				func() *discoveryv1.EndpointSlice {
+					s := mkAgentSlice("test-svc", "53421", true)
+					s.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat] = time.Now().
+						Add(-2 * inferencev1alpha1.DefaultAgentHeartbeatTimeout).UTC().Format(time.RFC3339)
+					return s
+				}(),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: <isvc>-agent slice without a heartbeat falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				func() *discoveryv1.EndpointSlice {
+					s := mkAgentSlice("test-svc", "53421", true)
+					delete(s.Annotations, inferencev1alpha1.AnnotationAgentHeartbeat)
+					return s
+				}(),
+			},
+			want: "http://127.0.0.1:60177/v1",
+		},
+		{
+			name: "host override: <isvc>-agent slice with an unparseable heartbeat falls back to the <isvc> slice",
+			executor: NativeAgentLoopExecutor{
+				InferenceBaseURLHostOverride: "127.0.0.1",
+			},
+			seedObjects: []any{
+				mkISvc("test-svc", "http://test-svc.default.svc.cluster.local:80/v1/chat/completions"),
+				mkEndpoints("test-svc", 60177, true),
+				func() *discoveryv1.EndpointSlice {
+					s := mkAgentSlice("test-svc", "53421", true)
+					s.Annotations[inferencev1alpha1.AnnotationAgentHeartbeat] = "yesterday"
+					return s
+				}(),
 			},
 			want: "http://127.0.0.1:60177/v1",
 		},

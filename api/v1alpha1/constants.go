@@ -43,6 +43,17 @@ const (
 	// certificate matching it.
 	AnnotationAgentIngressSPKI = "llmkube.ai/agent-ingress-spki"
 
+	// AnnotationAgentEnginePort is set by the metal-agent on its
+	// "<isvc>-agent" EndpointSlice in relay mode: the engine's own port on
+	// the agent's loopback interface (127.0.0.1). The "<isvc>" Service and
+	// slice front the relay pod once the controller adopts them, so their
+	// port is the relay's listener, not the engine's; an off-cluster
+	// foreman-agent using --inference-base-url-host-override reads this
+	// annotation to find the engine directly on the same host instead.
+	// Loopback-only and not sensitive. Absent on EndpointSlices written by
+	// older agents that predate relay mode.
+	AnnotationAgentEnginePort = "llmkube.ai/agent-engine-port"
+
 	// HeaderRelayToken carries the per-namespace relay token from the relay
 	// to the ingress. It is not Authorization, so a client's own
 	// Authorization header passes through untouched.

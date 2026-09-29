@@ -14,7 +14,7 @@ This directory contains the macOS launchd configuration for the LLMKube Metal Ag
    ```bash
    kubectl apply -f https://github.com/defilantech/llmkube/releases/latest/download/install.yaml
    ```
-5. **`--host-ip` flag** (required when using a remote cluster): the Metal Agent must be started with `--host-ip <your-mac-ip>` so that Kubernetes endpoints point to the Mac's reachable IP address instead of `localhost`
+5. **`--host-ip` flag** (required when using a remote cluster): the Metal Agent must be started with `--host-ip <your-mac-ip>` so that the agent's ingress is registered in Kubernetes at the Mac's reachable IP address instead of `localhost`
 
 ## Installation
 
@@ -168,7 +168,7 @@ Upgrade note: if you already point local model sources, or a `pagedSSDCacheDir`,
 
 ### `--host-ip` flag (remote cluster)
 
-When your Kubernetes cluster runs on a different machine (Linux server, cloud, etc.), the Metal Agent needs to register the Mac's reachable IP address so that pods in the cluster can route traffic to `llama-server`:
+When your Kubernetes cluster runs on a different machine (Linux server, cloud, etc.), the Metal Agent needs to register the Mac's reachable IP address so that the in-cluster relay can reach the agent's ingress (see "Network exposure" under "Security model"):
 
 ```bash
 # Find your Mac's IP on the local network
@@ -183,6 +183,8 @@ llmkube-metal-agent --host-ip 100.64.0.10
 
 Without `--host-ip`, the agent registers `localhost` as the endpoint — which only works when K8s is on the same machine (e.g. minikube).
 
+The IP must be reachable from the cluster's nodes on `--ingress-port` (below).
+
 To set this in the launchd plist, add these lines to the `ProgramArguments` array:
 
 ```xml
@@ -195,6 +197,21 @@ After editing, reload the service:
 launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
+
+### Ingress and client-proxy flags
+
+Engines listen on `127.0.0.1` only; the cluster reaches them through the
+agent's authenticated TLS ingress. See "Network exposure" under "Security
+model" for the full flow.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--ingress-port` | `9443` | TLS port of the ingress, on all interfaces. Open this port, not engine ports, in the macOS firewall. |
+| `--state-dir` | `~/Library/Application Support/llmkube/metal-agent` | Agent state. The ingress key and certificate live in `<state-dir>/ingress/`. A leading `~` is expanded to the agent's home and a relative path is made absolute; the resolved path is logged at startup. |
+| `--legacy-direct-endpoints` | `false` | DEPRECATED, removed in a future release. Engines on all interfaces without authentication, registered directly, no ingress. Only for a controller that predates relay support. |
+| `--client-port` | `9999` | Listener on `127.0.0.1:<port>` that forwards `/v1/*` to the current engine, for clients on the Mac itself. `0` disables it. |
+
+`--ingress-port` must differ from `--port` and `--client-port`.
 
 ### `--memory-fraction` flag (memory budget)
 
@@ -321,6 +338,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_apple_power_gpu_watts` | Gauge | GPU subsystem power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_cpu_watts` | Gauge | CPU subsystem power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_ane_watts` | Gauge | Apple Neural Engine power. Zero unless `--apple-power-enabled`. |
+| `llmkube_metal_agent_ingress_requests_total` | Counter | Requests answered by the authenticated ingress. Labels: `code` (HTTP status) |
 
 Standard Go runtime and process metrics (`go_*`, `process_*`) are also available.
 
@@ -487,8 +505,175 @@ Turn this on only for a Mac whose InferenceService authors are fully trusted.
 
 ### Network exposure
 
-Engines currently listen on all interfaces without authentication. Until the
-agent ships an authenticated ingress in front of them, keep the Mac on a
+Engines never listen on the network. The agent starts llama-server,
+mlx-server, TensorFold, vllm-swift and oMLX bound to `127.0.0.1`, and serves
+one authenticated TLS ingress on all interfaces, on `--ingress-port` (default
+9443). Traffic from the cluster reaches an engine only through that ingress.
+
+Ollama is the exception because the operator starts it, not the agent. Make
+sure `OLLAMA_HOST` is not set to `0.0.0.0` (unset it, or set it to
+`127.0.0.1`) so the Ollama daemon binds loopback. At startup the agent checks
+whether the Ollama port answers on the host IP and logs a warning if it does:
+an Ollama reachable there bypasses the ingress. It runs the same check on the
+oMLX port (`--omlx-port`): an oMLX daemon still running from an earlier agent
+may be bound to all interfaces, so stop it and let the agent start it on
+`127.0.0.1`.
+
+#### How a request reaches the Mac
+
+1. The agent registers a Service and EndpointSlice named `<isvc>-agent`
+   (Service port 8443, named `https`, pointing at the Mac's host IP and the
+   ingress port). It no longer writes an `<isvc>` EndpointSlice and deletes
+   the one an earlier version left behind.
+2. The controller creates a relay Deployment `<isvc>-relay` (the
+   router-proxy image in `--relay` mode) and adopts the `<isvc>` Service in
+   place: its selector moves to the relay pods, while its ClusterIP and DNS
+   name stay the same. The Service port follows `spec.endpoint.port` (default
+   8080) and its type follows `spec.endpoint.type` (`NodePort` is honored).
+3. Clients keep calling `<isvc>.<ns>.svc:<port>`. The relay forwards each
+   request to `<isvc>-agent`, and the ingress forwards it to the engine on
+   loopback. SSE streaming passes through.
+
+```
+client pod ──▶ <isvc> Service ──▶ <isvc>-relay pod ──TLS──▶ agent ingress :9443 ──▶ engine on 127.0.0.1
+               (ClusterIP, port    (in the cluster)          (on the Mac)
+                unchanged)
+```
+
+#### What is authenticated
+
+- **The agent, to the relay.** On first start the agent generates a private
+  key and a self-signed certificate in `<state-dir>/ingress/` (default
+  `~/Library/Application Support/llmkube/metal-agent/ingress/`; the key file
+  is mode 0600, and the agent will not load a key that is readable by group
+  or others). It publishes the certificate's SPKI SHA-256 pin as the annotation
+  `llmkube.ai/agent-ingress-spki` on the `<isvc>-agent` EndpointSlice. The
+  relay accepts only a certificate matching that pin.
+- **The relay, to the agent.** The controller creates a Secret
+  `llmkube-metal-relay` (key `token`) in each namespace with Metal
+  InferenceServices. The relay mounts it and sends the token in the
+  `X-LLMKube-Relay-Token` header, along with `X-LLMKube-Target: <ns>/<name>`
+  naming the InferenceService. The agent reads the same Secret.
+
+The ingress answers:
+
+| Status | When |
+|--------|------|
+| 400 | The `X-LLMKube-Target` header is missing or malformed |
+| 401 | The token is missing, wrong, or belongs to another namespace, or the agent serves nothing in the target's namespace |
+| 404 | The target is not running on this agent |
+| 503 | The target's engine is not ready |
+| 403 | The method and path are not on the runtime's allowlist |
+
+The pin is rooted in Kubernetes write access: anyone who can write Services
+or EndpointSlices in the namespace could already redirect the
+InferenceService's traffic, so publishing the pin there adds no new trust.
+
+#### Path allowlist
+
+An authenticated caller still reaches only these paths. Matching is exact
+(method and path, case-sensitive); the query string is ignored, and a
+non-canonical path (`..`, `.`, `//`, a trailing slash) is refused rather
+than cleaned. Every runtime gets the common set:
+
+| Method | Path |
+|--------|------|
+| GET | `/health` |
+| GET | `/v1/models` |
+| GET | `/v1/models/{id}` (one path segment) |
+| POST | `/v1/chat/completions` |
+| POST | `/v1/completions` |
+| POST | `/v1/embeddings` |
+| POST | `/v1/responses` |
+| GET | `/metrics` |
+
+Additions per runtime:
+
+| Runtime | Additional paths |
+|---------|------------------|
+| llama-server (`llamacpp`) | POST `/completion`, `/completions`, `/tokenize`, `/detokenize`, `/apply-template`, `/embedding`, `/embeddings`, `/infill`, `/rerank`, `/reranking`, `/v1/rerank`, `/v1/messages`, `/v1/messages/count_tokens`; GET `/props`, `/models` |
+| vllm-swift | POST `/tokenize`, `/detokenize`, `/v1/messages`, `/pooling`, `/score`, `/v1/score`, `/rerank`, `/v1/rerank`, `/v2/rerank`; GET `/version`, `/ping` |
+| ollama | GET `/`, `/api/tags`, `/api/version`, `/api/ps`; POST `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/show` |
+| mlx-server, tensorfold, omlx | none (common set only) |
+
+Everything else answers 403, including admin endpoints such as llama-server's
+`/slots` and `POST /props`, vLLM's `/sleep` and LoRA loading, and Ollama's
+pull, push, delete, create, copy and blob endpoints.
+
+#### NetworkPolicy and metrics
+
+Relay pods carry the label `inference.llmkube.dev/service: <isvc>`, the same
+label pod-backed InferenceService pods carry. A NetworkPolicy that selects
+InferenceService pods by that label also decides who can call a Metal
+InferenceService. The chart's inference PodMonitor scrapes the engine's
+`/metrics` through the relay. Engines without a `/metrics` endpoint (such as
+TensorFold) scrape as an empty 200, so the target is not marked down.
+
+#### Rotation
+
+- **Token:** update the Secret `llmkube-metal-relay` in place with a new
+  value:
+
+  ```bash
+  kubectl -n <ns> create secret generic llmkube-metal-relay \
+    --from-literal=token=$(openssl rand -hex 32) \
+    --dry-run=client -o yaml | kubectl apply -f -
+  ```
+
+  The agent accepts both the old and the new token for 10 minutes, and relays
+  pick up the new file when the kubelet syncs the mounted Secret (typically
+  within a minute or two), so traffic keeps flowing.
+- **Revoking a token:** delete the Secret. The agent stops accepting the old
+  token immediately (within its 5-second cache), so relays get 401 until the
+  controller recreates the Secret with a new token and the relays reload it.
+  Expect a short outage; use the in-place update above for routine rotation.
+- **Ingress key:** stop the agent, delete `<state-dir>/ingress`, and start
+  it. It generates a new key and publishes the new pin, and the controller
+  rolls the relay to it.
+
+#### Events
+
+On a Metal InferenceService (`kubectl describe inferenceservice <name>`):
+
+- From the controller: `RelayCreated`, `ServiceAdopted`, `RelayRemoved`
+  (Normal); `RelayReconcileFailed`, `InvalidAgentIngressPin` (Warning).
+- From the agent: `RelayNotAdopted`, `ExtraArgsRejected`,
+  `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`
+  (Warning).
+
+`ServiceNameTooLong` means the InferenceService name is too long for the
+`<isvc>-agent` Service (at most 57 characters, since the name plus `-agent`
+must fit a 63-character DNS label); rename it.
+
+`RelayNotAdopted` means the controller had not adopted `<isvc>` for a relay
+5 minutes after the agent registered `<isvc>-agent`, usually because the
+controller predates relay support.
+
+#### Upgrading
+
+- Upgrade the Helm chart (controller) first, then the agents. The
+  router-proxy image must match the controller version; the chart defaults
+  do.
+- In the macOS firewall, allow incoming connections on `--ingress-port`.
+  Engine ports no longer need to be open.
+- On its first relay registration for an InferenceService, the agent
+  removes its own legacy `<isvc>` EndpointSlice. Until that InferenceService's
+  relay pod is Ready (the first start pulls the router-proxy image), its
+  Service has no endpoints, so expect a short window of failed requests per
+  Metal Service during the upgrade.
+- Anything that dialled `<mac-ip>:<engine-port>` directly stops working by
+  design. Call the Service instead, or, on the Mac itself, the agent's client
+  proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy flags"
+  above).
+
+#### `--legacy-direct-endpoints` (deprecated)
+
+`--legacy-direct-endpoints` restores the old behavior: engines bind all
+interfaces without authentication, the agent registers `<isvc>` directly,
+and no ingress runs. At startup in this mode the agent deletes its own
+`<isvc>-agent` Service and EndpointSlice left from relay mode. It exists only
+for a controller that predates relay support and will be removed in a future
+release. With it, keep the Mac on a
 trusted network, behind its own firewall, or reachable only over Tailscale.
 
 ## Troubleshooting
@@ -550,17 +735,23 @@ echo $KUBECONFIG
 minikube status
 ```
 
-### Remote cluster: pods can't reach llama-server
+### Remote cluster: pods can't reach the model
 
 ```bash
 # Verify --host-ip was set correctly
 # The IP must be reachable from the K8s nodes
 ping <your-mac-ip>   # run from a K8s node
 
-# Check that the endpoint was registered with the right IP
-kubectl get endpoints -l llmkube.dev/accelerator=metal
+# Check that the agent registered its ingress with the right IP and the
+# ingress port, and published the llmkube.ai/agent-ingress-spki annotation
+kubectl get endpointslice <isvc>-agent -o yaml
 
-# Verify firewall isn't blocking the llama-server port (default 8080+)
+# Check the relay pod and the adopted Service
+kubectl get deploy,pods -l inference.llmkube.dev/metal-relay=<isvc>
+kubectl logs deploy/<isvc>-relay
+kubectl describe inferenceservice <isvc>   # look for RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed
+
+# Verify the firewall isn't blocking the ingress port (--ingress-port, default 9443)
 # macOS may prompt to allow incoming connections on first run
 
 # If using Tailscale / WireGuard, verify the tunnel is up
@@ -586,10 +777,10 @@ rm ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 3. **Downloads** models from HuggingFace when needed
 4. **Validates** that the model fits in the system's memory budget
 5. **Spawns** llama-server processes with Metal acceleration
-6. **Registers** service endpoints back to Kubernetes
+6. **Registers** its authenticated TLS ingress back to Kubernetes as `<isvc>-agent` (engines themselves listen on `127.0.0.1` only)
 7. **Monitors** process health every 30s and auto-restarts on failure
 8. **Exposes** health checks and Prometheus metrics on port 9090
-9. **Pods** access the Metal-accelerated inference via Service endpoints
+9. **Pods** call the `<isvc>` Service, which the controller points at an in-cluster relay (`<isvc>-relay`) that forwards to the ingress
 
 ### Remote cluster (Recommended)
 
@@ -600,12 +791,13 @@ K8s runs on a Linux server or cloud; the Mac dedicates all resources to inferenc
 │ Linux Server / Cloud         │        │ macOS (Your Mac)             │
 │                              │        │                              │
 │  ┌────────────────────────┐  │  LAN/  │  ┌────────────────────────┐  │
-│  │ Kubernetes             │  │  VPN/  │  │ Metal Agent            │  │
-│  │  LLMKube Operator      │  │  TLS   │  │  --host-ip <mac-ip>   │  │
-│  │  InferenceService CRD  │◄─┼────────┼─►│  Watches K8s API      │  │
-│  │  Service → Mac IP      │  │        │  │  Spawns llama-server  │  │
-│  └────────────────────────┘  │        │  └────────────────────────┘  │
-│                              │        │               ↓              │
+│  │ Kubernetes             │  │  VPN   │  │ Metal Agent            │  │
+│  │  LLMKube Operator      │  │        │  │  --host-ip <mac-ip>   │  │
+│  │  InferenceService CRD  │◄─┼────────┼──│  Watches K8s API      │  │
+│  │  <isvc> Service        │  │        │  │  Spawns llama-server  │  │
+│  │   → <isvc>-relay pod   │──┼─TLS────┼─►│  Ingress :9443 (TLS)  │  │
+│  └────────────────────────┘  │ pinned │  └────────────────────────┘  │
+│                              │ +token │               ↓ 127.0.0.1    │
 │                              │        │  ┌────────────────────────┐  │
 │                              │        │  │ llama-server (Metal)   │  │
 │                              │        │  │  Direct GPU access ✅  │  │
@@ -625,7 +817,7 @@ Everything on one machine — simpler but minikube consumes resources:
 │  ┌──────────────────────────────────────────┐   │
 │  │   Minikube (Kubernetes in VM)            │   │
 │  │   - Creates InferenceService CRD         │   │
-│  │   - Service points to host               │   │
+│  │   - Service → relay → agent ingress      │   │
 │  └──────────────────────────────────────────┘   │
 │                     ↓                            │
 │  ┌──────────────────────────────────────────┐   │
@@ -636,7 +828,7 @@ Everything on one machine — simpler but minikube consumes resources:
 │                     ↓                            │
 │  ┌──────────────────────────────────────────┐   │
 │  │   llama-server (Metal Accelerated)       │   │
-│  │   - Listens on all interfaces, :8080+    │   │
+│  │   - Listens on 127.0.0.1 only            │   │
 │  │   - Direct Metal GPU access ✅           │   │
 │  └──────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────┘
@@ -727,7 +919,7 @@ How the agent runs it:
   `--allowed-host-path-roots`). A Hugging Face style `owner/repo` source is
   read from `<model-store>/owner/repo`.
 - Each InferenceService gets its own `tensorfold serve` process on an
-  ephemeral port, bound to `0.0.0.0`, with `--name` set to `spec.modelRef` (the
+  ephemeral port, bound to `127.0.0.1`, with `--name` set to `spec.modelRef` (the
   model ID clients send) and `--no-update-check`.
 - `spec.contextSize` becomes `--context`. Set it: when it is unset the agent
   uses 2048, as for the other metal runtimes, rather than the model's full
@@ -844,6 +1036,10 @@ Start Ollama (if not already running as a menu bar app):
 ollama serve
 ```
 
+Leave `OLLAMA_HOST` unset (or set it to `127.0.0.1`) so Ollama binds loopback;
+the agent serves it to the cluster through its ingress. See "Network
+exposure" under "Security model".
+
 Start the Metal Agent with the Ollama runtime:
 
 ```bash
@@ -888,7 +1084,8 @@ oMLX and Ollama (0.19+) both use Apple's MLX framework for Apple Silicon inferen
 
 See "Security model" above for the trust boundary, the checks the agent runs
 before starting an engine, the `extraArgs` policy, and network exposure
-(engines listen on all interfaces).
+(engines listen on `127.0.0.1`; the cluster reaches them through the agent's
+authenticated ingress and an in-cluster relay).
 
 ## Support
 

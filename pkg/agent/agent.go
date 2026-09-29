@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -218,6 +219,21 @@ type MetalAgentConfig struct {
 	// listener or registration, or start multi-node or distributed backends, stay refused.
 	// Logged at Warn on startup.
 	AllowUnsafeExtraArgs bool
+
+	// IngressPort is the TLS port of the authenticated ingress that
+	// in-cluster relays use to reach engines. The ingress listens on all
+	// interfaces; engines listen on 127.0.0.1 only. Must differ from Port and
+	// ClientPort. Ignored in legacy mode.
+	IngressPort int
+	// StateDir holds agent state (the ingress TLS identity, under
+	// "<StateDir>/ingress"). Empty means
+	// ~/Library/Application Support/llmkube/metal-agent.
+	StateDir string
+	// LegacyDirectEndpoints is the deprecated pre-ingress mode: engines bind
+	// on all interfaces without authentication and are registered directly
+	// as "<isvc>", no ingress is started. Only for a controller that
+	// predates relay support; removed in a future release.
+	LegacyDirectEndpoints bool
 }
 
 // MetalAgent watches Kubernetes InferenceService resources and manages
@@ -271,6 +287,18 @@ type MetalAgent struct {
 	// "~" in a path checked against roots. Empty when it cannot be
 	// determined, in which case a "~"-prefixed path is refused.
 	home string
+
+	// now returns the current time for the RelayNotAdopted watchdog.
+	// Defaults to time.Now; tests inject a fake clock.
+	now func() time.Time
+	// relayMu guards relayRegisteredAt and relayNotAdoptedSent.
+	relayMu sync.Mutex
+	// relayRegisteredAt records, per namespacedName key, the first
+	// successful "<isvc>-agent" registration in relay mode.
+	relayRegisteredAt map[string]time.Time
+	// relayNotAdoptedSent records keys that already received their one
+	// RelayNotAdopted Event in this agent process.
+	relayNotAdoptedSent map[string]bool
 }
 
 // ManagedProcess represents a running inference process (llama-server, oMLX, or Ollama model).
@@ -416,6 +444,9 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		pressureBlocked:     make(map[string]bool),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
+		now:                 time.Now,
+		relayRegisteredAt:   make(map[string]time.Time),
+		relayNotAdoptedSent: make(map[string]bool),
 	}
 }
 
@@ -512,6 +543,10 @@ func (a *MetalAgent) buildExecutors() {
 }
 
 func (a *MetalAgent) Start(ctx context.Context) error {
+	if err := a.config.validateIngress(); err != nil {
+		return err
+	}
+
 	// Log effective memory budget and set gauge
 	if total, err := a.memoryProvider.TotalMemory(); err == nil {
 		budget := uint64(float64(total) * a.memoryFraction)
@@ -533,7 +568,7 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 	// fatalErrChan carries terminal failures from background subsystems
 	// (watcher, health server) up to the main select loop, so the agent can
 	// return cleanly and let the supervisor restart the process.
-	fatalErrChan := make(chan error, 2)
+	fatalErrChan := make(chan error, 3)
 
 	// Initialize components
 	a.watcher = NewInferenceServiceWatcher(a.config.K8sClient, a.config.Namespace, a.logger.With("subsystem", "watcher"))
@@ -557,21 +592,20 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		a.config.Version,
 	)
 
-	// Reconcile orphaned Service+Endpoints from prior agent sessions. The
-	// watcher's `seen` map starts fresh each Watch() call, so InferenceServices
-	// deleted while the agent was down don't trigger the cleanup path. This
-	// pass closes that gap by treating the agent-managed-by label as the
-	// authoritative inventory and cross-checking each Service against the API.
-	if cleaned, err := a.registry.ReconcileOrphanEndpoints(ctx, a.config.Namespace); err != nil {
-		a.logger.Warnw("orphan endpoint reconciliation failed", "error", err)
-	} else if cleaned > 0 {
-		a.logger.Infow("cleaned up orphaned endpoints from prior sessions", "count", cleaned)
+	// Put the registry in its mode (relay mode: identity + "<isvc>-agent"
+	// registrations) and clean up what earlier agent processes left behind,
+	// in that order; see prepareRegistry.
+	ingressSrv, err := a.prepareRegistry(ctx)
+	if err != nil {
+		return err
 	}
 
-	// This process serves nothing yet, so any slice a previous agent process
-	// left Ready points at a child that is gone. Withdraw them before the
-	// watcher starts; each successful ensureProcess re-registers Ready (#1918).
-	a.withdrawInheritedEndpoints(ctx)
+	// The ingress is the only way the cluster reaches an engine in relay
+	// mode, so losing it (a bind failure included) is fatal.
+	if ingressSrv != nil {
+		go a.runIngress(ctx, ingressSrv, fatalErrChan)
+		go a.warnIfDaemonsExposed()
+	}
 
 	// Start health server. An unexpected exit here (port binding lost,
 	// listener crashed) is fatal — the management plane is how operators
@@ -1043,6 +1077,17 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
 	}
 
+	// Relay mode appends "-agent" to the Service name; refuse a name that no
+	// longer fits a DNS label before starting anything.
+	if a.relayActive() {
+		if svcName := a.registry.serviceNameFor(isvc.Name); len(svcName) > validation.DNS1035LabelMaxLength {
+			return a.refuseStart(ctx, isvc, EventReasonServiceNameTooLong, fmt.Sprintf(
+				"Service name %q is %d characters, over the %d-character limit; shorten the InferenceService "+
+					"name to at most %d characters", svcName, len(svcName), validation.DNS1035LabelMaxLength,
+				validation.DNS1035LabelMaxLength-len(inferencev1alpha1.MetalAgentServiceSuffix)))
+		}
+	}
+
 	// Refuse a taken endpoint name before anything else is evaluated or
 	// started. Checking only at registration (after StartProcess) turns every
 	// watch re-delivery into a full model load followed by a kill, and lets
@@ -1133,6 +1178,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		BatchSize:      batchSize,
 		UBatchSize:     uBatchSize,
 	})
+	cfg.BindHost = a.engineBindHost()
 
 	// Start the process using the runtime-specific executor.
 	process, err := exec.StartProcess(ctx, cfg)
@@ -1181,6 +1227,8 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 			"port", process.Port,
 			"error", err,
 		)
+	} else {
+		a.noteRelayRegistered(key)
 	}
 
 	a.logger.Infow(
@@ -1576,7 +1624,9 @@ func (a *MetalAgent) registerEndpoint(ctx context.Context, name, namespace strin
 	if err := a.registry.RegisterEndpoint(ctx, isvc, port); err != nil {
 		a.logger.Warnw("failed to register endpoint",
 			"name", name, "namespace", namespace, "error", err)
+		return
 	}
+	a.noteRelayRegistered(types.NamespacedName{Namespace: namespace, Name: name}.String())
 }
 
 // heartbeatOnce re-registers the endpoint for every currently-running managed
@@ -1664,8 +1714,12 @@ func (a *MetalAgent) heartbeatOnce(ctx context.Context) {
 		if err := a.registry.RegisterEndpoint(ctx, isvc, e.port); err != nil {
 			a.logger.Warnw("heartbeat: failed to re-register endpoint",
 				"namespace", e.namespace, "name", e.name, "error", err)
+			continue
 		}
+		a.noteRelayRegistered(types.NamespacedName{Namespace: e.namespace, Name: e.name}.String())
 	}
+
+	a.checkRelayAdoption(ctx)
 }
 
 // runHeartbeatLoop periodically re-registers every running process's

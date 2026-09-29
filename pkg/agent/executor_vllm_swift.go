@@ -220,7 +220,7 @@ func buildVLLMSwiftArgs(modelPath string, port int, config ExecutorConfig) []str
 	args := []string{
 		"serve", modelPath,
 		"--port", fmt.Sprintf("%d", port),
-		"--host", "0.0.0.0",
+		"--host", bindHost(config),
 		"--max-model-len", fmt.Sprintf("%d", config.ContextSize),
 	}
 

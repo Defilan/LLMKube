@@ -33,6 +33,7 @@ const (
 	EventReasonEndpointNameConflict  = "EndpointNameConflict"
 	EventReasonModelSourceNotAllowed = "ModelSourceNotAllowed"
 	EventReasonExtraArgsRejected     = "ExtraArgsRejected"
+	EventReasonServiceNameTooLong    = "ServiceNameTooLong"
 )
 
 // refuseStart records why the agent will not serve an InferenceService: it

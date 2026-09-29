@@ -72,10 +72,11 @@ model.
        │ Apple Silicon host (optional, on the LAN/VPN)      │
        │                                                    │
        │   metal-agent ──supervises──▶ llama-server          │
-       │      (native macOS daemon)    (Metal GPU access)   │
+       │      (native macOS daemon)    (127.0.0.1 only)     │
        │                                                    │
-       │   metal-agent ──registers──▶ Kubernetes Endpoints  │
-       │       (host IP + allocated port)                   │
+       │   metal-agent ──serves──▶ TLS ingress (host IP:9443)│
+       │      ▲ pinned TLS + per-namespace token, from the  │
+       │        <isvc>-relay pod in the cluster             │
        └────────────────────────────────────────────────────┘
 ```
 
@@ -89,13 +90,19 @@ the cluster on Apple Silicon hosts. It also watches the
 Kubernetes API for `InferenceService` resources with
 `accelerator: metal`, but instead of scheduling a Pod it spawns
 `llama-server` natively on the Mac with full Metal GPU access,
-then registers a Kubernetes `Endpoints` object pointing at the
-Mac's host IP. Any pod in the cluster can route to the Mac via
-the resulting `Service` URL.
+bound to `127.0.0.1`. It serves one authenticated TLS ingress on
+the Mac's host IP and registers it as the `<isvc>-agent` Service
+and EndpointSlice, with the ingress certificate's pin. The
+controller then runs a relay Deployment (`<isvc>-relay`) in the
+cluster and points the `<isvc>` Service at it; the relay pins the
+agent's certificate and sends a per-namespace token. Any pod
+calls the Mac-served model through the ordinary `<isvc>` Service
+URL.
 
 The two cooperate without overlap: the in-cluster controller
 manages everything *inside* Kubernetes (CRD status, container
-pods, Services, ConfigMaps); the metal-agent manages everything
+pods, Services, ConfigMaps, and the relay in front of each Metal
+InferenceService); the metal-agent manages everything
 *outside* (native processes, Metal context, host memory
 pressure). The CRD is the protocol between them.
 

@@ -35,7 +35,7 @@ import (
 
 func TestBuildTensorFoldArgs(t *testing.T) {
 	const dir = "/models/qwen"
-	base := []string{"serve", dir, "--host", "0.0.0.0", "--port", "9123"}
+	base := []string{"serve", dir, "--host", "127.0.0.1", "--port", "9123"}
 
 	tests := []struct {
 		name string
@@ -96,7 +96,7 @@ func TestBuildTensorFoldArgs(t *testing.T) {
 			name: "user --port wins",
 			cfg: ExecutorConfig{Name: "isvc", ServedModelName: "qwen38",
 				ExtraArgs: []string{"--port=9123"}},
-			want: []string{"serve", dir, "--host", "0.0.0.0",
+			want: []string{"serve", dir, "--host", "127.0.0.1",
 				"--name", "qwen38", "--no-update-check", "--port=9123"},
 		},
 	}
