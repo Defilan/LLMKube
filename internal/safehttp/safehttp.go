@@ -427,3 +427,27 @@ func defaultPort(u *url.URL) string {
 	}
 	return map[string]string{"http": "80", "https": "443", "socks5": "1080", "socks5h": "1080"}[u.Scheme]
 }
+
+// SameOrigin reports whether a and b name the same scheme, host and port:
+// the scheme and host compare case-insensitively (a non-ASCII host through
+// IDNA, as canonicalHost maps it), and a missing port is the scheme's
+// default, so https://Store:443 and https://store are the same origin. A host
+// IDNA cannot map never matches.
+//
+// Request signers use it to sign only requests to the endpoint they were
+// configured for, so a redirect to another host does not carry their
+// credentials (#1955).
+func SameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	ah, err := canonicalHost(a.Hostname())
+	if err != nil || ah == "" {
+		return false
+	}
+	bh, err := canonicalHost(b.Hostname())
+	if err != nil || ah != bh {
+		return false
+	}
+	return defaultPort(a) == defaultPort(b)
+}

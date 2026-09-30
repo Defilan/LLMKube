@@ -20,6 +20,8 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -132,6 +134,7 @@ func TestSigV4RoundTripperSignsRequest(t *testing.T) {
 
 	signer := &sigv4RoundTripper{
 		base:      base,
+		endpoint:  &url.URL{Scheme: "http", Host: "minio.local"},
 		accessKey: "AKIAEXAMPLE",
 		secretKey: "secret",
 		region:    "us-east-1",
@@ -169,4 +172,173 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+// sigv4HeadersIn lists the headers the signer adds that hdr carries.
+func sigv4HeadersIn(hdr http.Header) []string {
+	var found []string
+	for k := range hdr {
+		if strings.EqualFold(k, "Authorization") || strings.HasPrefix(strings.ToLower(k), "x-amz-") {
+			found = append(found, k)
+		}
+	}
+	return found
+}
+
+// testS3Client builds the controller's s3 client for endpoint through the
+// SSRF-guarded metadata transport, with loopback allowlisted for httptest.
+func testS3Client(t *testing.T, endpoint string) *http.Client {
+	t.Helper()
+	r := &ModelReconciler{AllowedRemoteHosts: []string{"127.0.0.1"}}
+	c, err := r.s3Client(s3Creds{
+		AccessKeyID:     "AKIAEXAMPLE",
+		SecretAccessKey: "secret",
+		Region:          "us-east-1",
+		Endpoint:        endpoint,
+	})
+	if err != nil {
+		t.Fatalf("s3Client: %v", err)
+	}
+	return c
+}
+
+// An s3 endpoint that 307-redirects GET and HEAD to another host must not
+// hand that host a SigV4 signature: the redirected requests carry neither
+// Authorization nor any x-amz-* header, and the object is still read from
+// the second server (#1955).
+func TestS3ClientDoesNotSignCrossHostRedirect(t *testing.T) {
+	var secondHeaders []http.Header
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondHeaders = append(secondHeaders, r.Header.Clone())
+		w.Header().Set("Content-Length", "15")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("presigned-bytes"))
+		}
+	}))
+	defer other.Close()
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		http.Redirect(w, r, other.URL+"/presigned/model.gguf?X-Amz-Signature=abc", http.StatusTemporaryRedirect)
+	}))
+	defer endpoint.Close()
+
+	c := testS3Client(t, endpoint.URL)
+	objectURL := endpoint.URL + "/models/org/model.gguf"
+	resp, err := c.Get(objectURL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "presigned-bytes" {
+		t.Errorf("GET = %d %q, want 200 from the second server", resp.StatusCode, body)
+	}
+	if size := (&ModelReconciler{}).s3ContentLength(context.Background(), c, objectURL); size != 15 {
+		t.Errorf("HEAD size = %d, want 15 from the second server", size)
+	}
+
+	if len(secondHeaders) != 2 {
+		t.Fatalf("second server saw %d requests, want a GET and a HEAD", len(secondHeaders))
+	}
+	for i, hdr := range secondHeaders {
+		if found := sigv4HeadersIn(hdr); len(found) > 0 {
+			t.Errorf("cross-host redirect hop %d carried signing headers %v", i, found)
+		}
+	}
+}
+
+// A redirect to another path on the endpoint is still signed, as is a plain
+// request.
+func TestS3ClientSignsSameHostRedirect(t *testing.T) {
+	var signedPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/") ||
+			r.Header.Get("x-amz-date") == "" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		signedPaths = append(signedPaths, r.URL.Path)
+		if r.URL.Path == "/models/old.gguf" {
+			http.Redirect(w, r, "/models/new.gguf", http.StatusTemporaryRedirect)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	c := testS3Client(t, srv.URL)
+	for _, path := range []string{"/models/plain.gguf", "/models/old.gguf"} {
+		resp, err := c.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200 (every hop signed)", path, resp.StatusCode)
+		}
+	}
+	want := []string{"/models/plain.gguf", "/models/old.gguf", "/models/new.gguf"}
+	if strings.Join(signedPaths, ",") != strings.Join(want, ",") {
+		t.Errorf("signed paths = %v, want %v", signedPaths, want)
+	}
+}
+
+// The signer passes a request to any other origin through untouched, and does
+// not write its headers into the caller's request.
+func TestSigV4RoundTripperSignsOnlyItsEndpoint(t *testing.T) {
+	var got http.Header
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		got = req.Header.Clone()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	})
+	signer := &sigv4RoundTripper{
+		base:      base,
+		endpoint:  &url.URL{Scheme: "https", Host: "MinIO.lan"},
+		accessKey: "AKIAEXAMPLE",
+		secretKey: "secret",
+		region:    "us-east-1",
+	}
+	for _, tc := range []struct {
+		url  string
+		sign bool
+	}{
+		{"https://minio.lan:443/models/m.gguf", true},
+		{"https://minio.lan:9000/models/m.gguf", false},
+		{"http://minio.lan/models/m.gguf", false},
+		{"https://elsewhere.example/models/m.gguf?X-Amz-Signature=x", false},
+	} {
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := signer.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip(%s): %v", tc.url, err)
+		}
+		_ = resp.Body.Close()
+		if signed := got.Get("Authorization") != ""; signed != tc.sign {
+			t.Errorf("%s: signed = %v, want %v", tc.url, signed, tc.sign)
+		}
+		if !tc.sign && len(sigv4HeadersIn(got)) > 0 {
+			t.Errorf("%s: unsigned request carried %v", tc.url, sigv4HeadersIn(got))
+		}
+		if len(sigv4HeadersIn(req.Header)) > 0 {
+			t.Errorf("%s: signer wrote %v into the caller's request", tc.url, sigv4HeadersIn(req.Header))
+		}
+	}
+}
+
+// A malformed or relative endpoint is refused instead of producing a signer
+// that matches nothing.
+func TestS3ClientRejectsRelativeEndpoint(t *testing.T) {
+	if _, err := (&ModelReconciler{}).s3Client(s3Creds{Endpoint: "minio.lan:9000"}); err == nil {
+		t.Error("s3Client accepted an endpoint without a scheme and host")
+	}
 }
