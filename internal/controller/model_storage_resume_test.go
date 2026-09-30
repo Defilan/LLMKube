@@ -217,6 +217,7 @@ func TestModelDownloadResume_Behavioral(t *testing.T) {
 		})
 	}
 	t.Run("MultiFileSweepsDebrisAfterLoop", testMultiFileSweepsDebrisAfterLoop)
+	t.Run("MultiFileFailedLoopKeepsPartials", testMultiFileFailedLoopKeepsPartials)
 }
 
 // testMultiFileSweepsDebrisAfterLoop pins the #1435 guarantee for the
@@ -242,6 +243,48 @@ func testMultiFileSweepsDebrisAfterLoop(t *testing.T) {
 	}
 	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
 		t.Errorf("orphaned partial survived a completed loop (#1435)")
+	}
+}
+
+// testMultiFileFailedLoopKeepsPartials pins the other half of the post-loop
+// sweep: a loop that fails must not sweep, because the partials it leaves are
+// what the next attempt resumes from. The sweep is joined to the loop with &&,
+// and nothing else would notice it becoming unconditional.
+func testMultiFileFailedLoopKeepsPartials(t *testing.T) {
+	for _, policy := range []string{RefreshPolicyIfNotPresent, RefreshPolicyOnChange} {
+		t.Run(policy, func(t *testing.T) {
+			o := newRangeOrigin(t, true)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/missing.gguf") {
+					http.NotFound(w, r)
+					return
+				}
+				o.handle(w, r)
+			}))
+			t.Cleanup(srv.Close)
+
+			dir := t.TempDir()
+			kept := filepath.Join(dir, "old", "dropped.gguf.0123456789ab.tmp")
+			if err := os.MkdirAll(filepath.Dir(kept), 0o755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			if err := os.WriteFile(kept, []byte("partial"), 0o644); err != nil {
+				t.Fatalf("seed partial: %v", err)
+			}
+
+			cmd := exec.Command("sh", "-c", buildMultiFileInitCommand(true, false, false, policy))
+			cmd.Env = append(os.Environ(),
+				"MODEL_SOURCE="+srv.URL,
+				"CACHE_DIR="+dir,
+				"MODEL_FILES=model.gguf\nmissing.gguf",
+			)
+			if out, err := cmd.CombinedOutput(); err == nil {
+				t.Fatalf("expected the loop to fail on missing.gguf\n%s", out)
+			}
+			if _, err := os.Stat(kept); err != nil {
+				t.Errorf("a failed loop swept a partial it should keep: %v", err)
+			}
+		})
 	}
 }
 
