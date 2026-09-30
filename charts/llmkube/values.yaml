@@ -564,6 +564,18 @@ webhook:
 multitenancy:
   enabled: false
 
+# Metal relay (macOS metal-agent) settings.
+metalRelay:
+  secretCreatePolicy:
+    # Install a ValidatingAdmissionPolicy that lets only the controller's
+    # ServiceAccount CREATE the per-namespace relay token Secret
+    # (llmkube-metal-relay), so someone who can create Secrets but not read
+    # them cannot plant a token they know (#1957). Updates (rotation) and
+    # deletes (revocation) are not restricted. Rendered only when the cluster
+    # serves admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy
+    # (Kubernetes 1.30 or newer).
+    enabled: true
+
 # Network policies for the controller manager pod
 networkPolicies:
   enabled: false

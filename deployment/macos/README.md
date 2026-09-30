@@ -751,10 +751,31 @@ client pod ──▶ <isvc> Service ──▶ <isvc>-relay pod ──TLS──�
   `llmkube.ai/agent-ingress-spki` on the `<isvc>-agent` EndpointSlice. The
   relay accepts only a certificate matching that pin.
 - **The relay, to the agent.** The controller creates a Secret
-  `llmkube-metal-relay` (key `token`) in each namespace with Metal
+  `llmkube-metal-relay` (key `token`, label
+  `llmkube.ai/managed-by: llmkube-controller`) in each namespace with Metal
   InferenceServices. The relay mounts it and sends the token in the
   `X-LLMKube-Relay-Token` header, along with `X-LLMKube-Target: <ns>/<name>`
   naming the InferenceService. The agent reads the same Secret.
+
+Only the controller may create that Secret. Otherwise someone who can create
+Secrets in a namespace, but not read them, could create it first with a
+token they know. Three checks enforce this:
+
+- The Helm chart installs a ValidatingAdmissionPolicy (Kubernetes 1.30 or
+  newer, value `metalRelay.secretCreatePolicy.enabled`, default `true`) that
+  refuses to create `llmkube-metal-relay` for anyone but the controller's
+  ServiceAccount. Updates and deletes are allowed, so rotation and
+  revocation below still work.
+- The controller does not use an existing `llmkube-metal-relay` without the
+  label. It records a `RelaySecretNotManaged` Warning Event and
+  `status.schedulingStatus` on the InferenceService, and does not create or
+  update the relay Deployment in that namespace.
+- The agent treats a Secret without the label as holding no token, so its
+  ingress answers 401 for that namespace, and logs a warning naming the
+  Secret.
+
+To recover from `RelaySecretNotManaged`, delete the Secret; the controller
+recreates it with a new token and the label.
 
 The ingress answers:
 
@@ -845,17 +866,19 @@ TensorFold) scrape as an empty 200, so the target is not marked down.
 #### Rotation
 
 - **Token:** update the Secret `llmkube-metal-relay` in place with a new
-  value:
+  value, keeping its `llmkube.ai/managed-by: llmkube-controller` label:
 
   ```bash
-  kubectl -n <ns> create secret generic llmkube-metal-relay \
-    --from-literal=token=$(openssl rand -hex 32) \
-    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n <ns> patch secret llmkube-metal-relay --type merge \
+    -p "{\"stringData\":{\"token\":\"$(openssl rand -hex 32)\"}}"
   ```
 
   The agent accepts both the old and the new token for 10 minutes, and relays
   pick up the new file when the kubelet syncs the mounted Secret (typically
-  within a minute or two), so traffic keeps flowing.
+  within a minute or two), so traffic keeps flowing. Do not delete and
+  recreate the Secret by hand to rotate: the admission policy refuses the
+  create, and a Secret without the label is ignored, so relays in the
+  namespace stop until it is deleted and the controller recreates it.
 - **Revoking a token:** delete the Secret. The agent stops accepting the old
   token immediately (within its 5-second cache), so relays get 401 until the
   controller recreates the Secret with a new token and the relays reload it.
@@ -869,7 +892,8 @@ TensorFold) scrape as an empty 200, so the target is not marked down.
 On a Metal InferenceService (`kubectl describe inferenceservice <name>`):
 
 - From the controller: `RelayCreated`, `ServiceAdopted`, `RelayRemoved`
-  (Normal); `RelayReconcileFailed`, `InvalidAgentIngressPin` (Warning).
+  (Normal); `RelayReconcileFailed`, `InvalidAgentIngressPin`,
+  `RelaySecretNotManaged` (Warning).
 - From the agent: `RelayNotAdopted`, `ExtraArgsRejected`,
   `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`,
   `ModelDigestMismatch` (Warning).
@@ -1085,7 +1109,7 @@ kubectl get endpointslice <isvc>-agent -o yaml
 # Check the relay pod and the adopted Service
 kubectl get deploy,pods -l inference.llmkube.dev/metal-relay=<isvc>
 kubectl logs deploy/<isvc>-relay
-kubectl describe inferenceservice <isvc>   # look for RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed
+kubectl describe inferenceservice <isvc>   # look for RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed, RelaySecretNotManaged
 
 # Verify the firewall isn't blocking the ingress port (--ingress-port, default 9443)
 # macOS may prompt to allow incoming connections on first run

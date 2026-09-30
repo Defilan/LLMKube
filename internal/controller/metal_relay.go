@@ -68,6 +68,11 @@ const (
 	// relayConflictRequeueAfter is how soon a reconcile whose relay write
 	// lost an optimistic-lock race runs again.
 	relayConflictRequeueAfter = time.Second
+
+	// relaySecretNotManagedRequeueAfter is how soon a reconcile blocked on an
+	// unmanaged relay Secret checks again. The controller does not watch
+	// Secrets, so deleting the Secret generates no event of its own.
+	relaySecretNotManagedRequeueAfter = 30 * time.Second
 )
 
 // Event reasons for the relay lifecycle on the InferenceService.
@@ -77,6 +82,7 @@ const (
 	EventRelayCreated           = "RelayCreated"
 	EventServiceAdopted         = "ServiceAdopted"
 	EventRelayRemoved           = "RelayRemoved"
+	EventRelaySecretNotManaged  = inferencev1alpha1.ReasonRelaySecretNotManaged
 )
 
 // relayEvent records an Event on isvc when a Recorder is configured.
@@ -227,15 +233,46 @@ func relayDeploymentPin(dep *appsv1.Deployment) string {
 	return ""
 }
 
+// relaySecretNotManagedError reports a relay token Secret that exists
+// without the controller's managed-by label. The controller did not create
+// it, so its token may be known to whoever did: someone who can create
+// Secrets in the namespace but not read them could otherwise plant a token
+// and authenticate at the agent ingress (#1957).
+type relaySecretNotManagedError struct {
+	key types.NamespacedName
+}
+
+func (e *relaySecretNotManagedError) Error() string {
+	return fmt.Sprintf("Secret %s exists without the label %s=%s, so the controller did not create it and "+
+		"will not use it; relays in this namespace stay stopped until it is deleted. "+
+		"Delete it and the controller recreates it with a new token",
+		e.key, inferencev1alpha1.LabelManagedBy, inferencev1alpha1.ManagedByController)
+}
+
+// relaySecretManaged reports whether s carries the controller's managed-by
+// label, which every Secret ensureRelaySecret creates has and an in-place
+// rotation keeps.
+func relaySecretManaged(s *corev1.Secret) bool {
+	return s.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByController
+}
+
 // ensureRelaySecret creates the namespace's relay token Secret when it is
 // missing. An existing Secret is never updated, so an operator rotates the
 // token by updating the Secret in place (the agent accepts the old and new
 // token for a grace window). Deleting it revokes the token at once; the next
 // reconcile then creates a new one.
+//
+// An existing Secret without the controller's managed-by label is not
+// adopted: ensureRelaySecret returns a *relaySecretNotManagedError and the
+// caller must not wire the Secret into a relay.
 func (r *InferenceServiceReconciler) ensureRelaySecret(ctx context.Context, namespace string) error {
 	key := types.NamespacedName{Name: inferencev1alpha1.MetalRelaySecretName, Namespace: namespace}
-	err := r.Get(ctx, key, &corev1.Secret{})
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, key, existing)
 	if err == nil {
+		if !relaySecretManaged(existing) {
+			return &relaySecretNotManagedError{key: key}
+		}
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -259,8 +296,20 @@ func (r *InferenceServiceReconciler) ensureRelaySecret(ctx context.Context, name
 			inferencev1alpha1.MetalRelaySecretKey: []byte(hex.EncodeToString(raw)),
 		},
 	}
-	if err := r.Create(ctx, secret); err != nil && !apierrors.IsAlreadyExists(err) {
+	err = r.Create(ctx, secret)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create relay Secret %s: %w", key, err)
+	}
+	// Someone created it between the Get and the Create: apply the same
+	// check to what is there now.
+	if err := r.Get(ctx, key, existing); err != nil {
+		return fmt.Errorf("get relay Secret %s: %w", key, err)
+	}
+	if !relaySecretManaged(existing) {
+		return &relaySecretNotManagedError{key: key}
 	}
 	return nil
 }

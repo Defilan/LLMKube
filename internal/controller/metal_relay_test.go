@@ -436,6 +436,50 @@ var _ = Describe("metal relay mode", func() {
 		Expect(list.Items[0].Data["token"]).To(Equal(first.Data["token"]))
 	})
 
+	It("ensureRelaySecret refuses an existing Secret the controller did not create", func() {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "relay-secret-planted-"}}
+		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+		planted := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "llmkube-metal-relay", Namespace: ns.Name},
+			Data:       map[string][]byte{"token": []byte("known-to-the-attacker")},
+		}
+		Expect(k8sClient.Create(ctx, planted)).To(Succeed())
+
+		err := reconciler.ensureRelaySecret(ctx, ns.Name)
+		var unmanaged *relaySecretNotManagedError
+		Expect(errors.As(err, &unmanaged)).To(BeTrue(), "want *relaySecretNotManagedError, got %v", err)
+		Expect(err.Error()).To(SatisfyAll(
+			ContainSubstring(ns.Name+"/llmkube-metal-relay"),
+			ContainSubstring("llmkube.ai/managed-by=llmkube-controller"),
+			ContainSubstring("Delete it")))
+		Expect(err.Error()).NotTo(ContainSubstring("known-to-the-attacker"))
+
+		got := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(planted), got)).To(Succeed())
+		Expect(got.ResourceVersion).To(Equal(planted.ResourceVersion), "the planted Secret must be left untouched")
+
+		By("a label with another value is not the controller's either")
+		got.Labels = map[string]string{"llmkube.ai/managed-by": "someone-else"}
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+		Expect(errors.As(reconciler.ensureRelaySecret(ctx, ns.Name), &unmanaged)).To(BeTrue())
+	})
+
+	It("ensureRelaySecret keeps using a controller Secret rotated in place", func() {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "relay-secret-rotated-"}}
+		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+		Expect(reconciler.ensureRelaySecret(ctx, ns.Name)).To(Succeed())
+
+		secret := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "llmkube-metal-relay", Namespace: ns.Name}, secret)).To(Succeed())
+		secret.Data["token"] = []byte("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+		Expect(k8sClient.Update(ctx, secret)).To(Succeed())
+
+		Expect(reconciler.ensureRelaySecret(ctx, ns.Name)).To(Succeed())
+		got := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(secret), got)).To(Succeed())
+		Expect(got.Data["token"]).To(Equal(secret.Data["token"]))
+	})
+
 	Context("reconcileRelay", func() {
 		It("adopts an agent-written Service in place", func() {
 			isvc := newISVC("relay-adopt")
@@ -862,6 +906,123 @@ var _ = Describe("metal relay mode", func() {
 				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
 			})
 			Expect(err).To(MatchError(errInjectedSliceList))
+		})
+
+		// Runs in its own namespace: the relay Secret is per namespace and
+		// the other relay specs share "default".
+		It("refuses an unmanaged relay Secret without touching the relay Deployment", func() {
+			ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "relay-unmanaged-"}}
+			Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+			name := "relay-unmanaged"
+			nsKey := types.NamespacedName{Name: name, Namespace: ns.Name}
+			secretKey := types.NamespacedName{Name: "llmkube-metal-relay", Namespace: ns.Name}
+			depKey := types.NamespacedName{Name: relayDeploymentName(name), Namespace: ns.Name}
+			// envtest deletes neither namespaces nor owned objects, and specs
+			// such as the federation summary count InferenceServices in every
+			// namespace, so remove everything this spec leaves behind.
+			DeferCleanup(func() {
+				bg := context.Background()
+				for _, obj := range []client.Object{
+					&inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name}},
+					&inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: ns.Name}},
+					&discoveryv1.EndpointSlice{ObjectMeta: metav1.ObjectMeta{Name: agentServiceName(name), Namespace: ns.Name}},
+					&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: depKey.Name, Namespace: ns.Name}},
+					&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: sanitizeDNSName(name), Namespace: ns.Name}},
+					&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretKey.Name, Namespace: ns.Name}},
+				} {
+					_ = k8sClient.Delete(bg, obj)
+				}
+			})
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: ns.Name},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+			replicas := int32(1)
+			Expect(k8sClient.Create(ctx, &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns.Name},
+				Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: name + "-model", Replicas: &replicas},
+			})).To(Succeed())
+			slice := agentSlice(name, now(), pinA)
+			slice.Namespace = ns.Name
+			Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+
+			plant := func() {
+				Expect(k8sClient.Create(ctx, &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: secretKey.Name, Namespace: ns.Name},
+					Data:       map[string][]byte{"token": []byte("known-to-the-attacker")},
+				})).To(Succeed())
+			}
+			reconcileNS := func() (reconcile.Result, *inferencev1alpha1.InferenceService) {
+				result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: nsKey})
+				Expect(err).NotTo(HaveOccurred())
+				got := &inferencev1alpha1.InferenceService{}
+				Expect(k8sClient.Get(ctx, nsKey, got)).To(Succeed())
+				return result, got
+			}
+			expectRefused := func(result reconcile.Result, got *inferencev1alpha1.InferenceService) {
+				GinkgoHelper()
+				Expect(drainEvents()).To(ContainElement(SatisfyAll(
+					HavePrefix("Warning"), ContainSubstring("RelaySecretNotManaged"),
+					ContainSubstring(ns.Name+"/llmkube-metal-relay"), ContainSubstring("Delete it"))))
+				Expect(got.Status.SchedulingStatus).To(Equal("RelaySecretNotManaged"))
+				Expect(got.Status.SchedulingMessage).To(ContainSubstring("Delete it"))
+				Expect(got.Status.Phase).NotTo(Equal(PhaseReady))
+				Expect(result.RequeueAfter).To(BeNumerically(">", 0))
+				Expect(result.RequeueAfter).To(BeNumerically("<=", relaySecretNotManagedRequeueAfter))
+			}
+
+			By("a planted Secret blocks the relay before its Deployment exists")
+			plant()
+			result, got := reconcileNS()
+			expectRefused(result, got)
+			err := k8sClient.Get(ctx, depKey, &appsv1.Deployment{})
+			Expect(apierrors.IsNotFound(err)).To(BeTrue(), "no relay Deployment may mount a planted Secret, got %v", err)
+
+			By("deleting it lets the controller create its own Secret and the relay")
+			Expect(k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretKey.Name, Namespace: ns.Name}})).To(Succeed())
+			_, got = reconcileNS()
+			Expect(drainEvents()).To(ContainElement(ContainSubstring("RelayCreated")))
+			Expect(got.Status.SchedulingStatus).NotTo(Equal("RelaySecretNotManaged"))
+			own := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, secretKey, own)).To(Succeed())
+			Expect(own.Labels).To(HaveKeyWithValue("llmkube.ai/managed-by", "llmkube-controller"))
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, depKey, dep)).To(Succeed())
+			Expect(relayEnv(dep, relayPinEnv)).To(Equal(pinA))
+
+			By("a Secret replaced by an unlabelled one stops relay updates")
+			Expect(k8sClient.Delete(ctx, own)).To(Succeed())
+			plant()
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(slice), slice)).To(Succeed())
+			slice.Annotations[inferencev1alpha1.AnnotationAgentIngressSPKI] = pinB
+			Expect(k8sClient.Update(ctx, slice)).To(Succeed())
+			result, got = reconcileNS()
+			expectRefused(result, got)
+			after := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, depKey, after)).To(Succeed())
+			Expect(after.ResourceVersion).To(Equal(dep.ResourceVersion), "the relay Deployment must not be updated")
+			Expect(relayEnv(after, relayPinEnv)).To(Equal(pinA))
+
+			By("deleting it again goes straight to Ready and drops the diagnosis")
+			// envtest runs no Deployment controller: report the relay available.
+			after.Status.Replicas = 1
+			after.Status.ReadyReplicas = 1
+			after.Status.AvailableReplicas = 1
+			Expect(k8sClient.Status().Update(ctx, after)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: secretKey.Name, Namespace: ns.Name}})).To(Succeed())
+			_, got = reconcileNS()
+			Expect(got.Status.Phase).To(Equal(PhaseReady))
+			Expect(got.Status.SchedulingStatus).To(BeEmpty())
+			Expect(got.Status.SchedulingMessage).To(BeEmpty())
+			Expect(k8sClient.Get(ctx, depKey, after)).To(Succeed())
+			Expect(relayEnv(after, relayPinEnv)).To(Equal(pinB))
 		})
 	})
 

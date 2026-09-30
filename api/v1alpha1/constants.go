@@ -279,3 +279,12 @@ var MetalAgentRefusalReasons = []string{
 	ReasonServiceNameTooLong,
 	ReasonModelDigestMismatch,
 }
+
+// ReasonRelaySecretNotManaged is the Status.SchedulingStatus (and Warning
+// Event reason) the controller writes on a Metal InferenceService in relay
+// mode when the namespace's llmkube-metal-relay Secret exists without the
+// controller's managed-by label. The controller did not create that Secret,
+// so it neither uses it nor creates or updates the relay Deployment until the
+// Secret is deleted (#1957). It is controller-written, so it is deliberately
+// not in MetalAgentRefusalReasons, which lists only agent refusals.
+const ReasonRelaySecretNotManaged string = "RelaySecretNotManaged"

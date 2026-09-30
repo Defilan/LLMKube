@@ -327,6 +327,12 @@ hand-imported.
 | `webhook.certManager.issuerRef` | cert-manager `ObjectReference` for the signing issuer: `{name, kind, group}`. Empty renders the chart's own self-signed `Issuer`. `name` is required once any field is set. | `{}` |
 | `webhook.certManager.issuerRef.group` | API group of the issuer. Defaults to `cert-manager.io`; required for an external issuer (AWS PCA, google-cas, step, Venafi). | unset |
 
+### Metal Relay Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `metalRelay.secretCreatePolicy.enabled` | Install a `ValidatingAdmissionPolicy` and binding that let only the controller's ServiceAccount create the per-namespace Metal relay token Secret `llmkube-metal-relay`. Updates (token rotation) and deletes (revocation) are not restricted. Rendered only when the cluster serves `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` (Kubernetes 1.30 or newer). | `true` |
+
 ## Examples
 
 ### Basic Installation
