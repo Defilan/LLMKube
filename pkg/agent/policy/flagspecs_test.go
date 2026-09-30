@@ -93,6 +93,9 @@ func TestFlagSpecsWellFormed(t *testing.T) {
 					t.Errorf("%s %s: value flag with a decode rule", rt, flag)
 				}
 			}
+			if s.MustExist && s.Kind != KindPath {
+				t.Errorf("%s %s: MustExist on a non-path flag %+v", rt, flag, s)
+			}
 		}
 	}
 }
@@ -149,11 +152,12 @@ func TestFlagSpecSpotChecks(t *testing.T) {
 		{RuntimeVLLMSwift, "-asc", FlagSpec{Kind: KindValue}},
 		{RuntimeVLLMSwift, "--served-model-name", FlagSpec{Kind: KindValue, Multi: true}},
 		{RuntimeVLLMSwift, "--hf-token", FlagSpec{Kind: KindValue, OptionalValue: true}},
-		{RuntimeVLLMSwift, "--lora-modules", FlagSpec{Kind: KindPath, Decode: DecodeNameEqPath, Multi: true}},
+		{RuntimeVLLMSwift, "--lora-modules",
+			FlagSpec{Kind: KindPath, Decode: DecodeNameEqPath, Multi: true, MustExist: true}},
 		{RuntimeVLLMSwift, "--chat-template", FlagSpec{Kind: KindPath, Decode: DecodeWhole}},
-		{RuntimeVLLMSwift, "--tokenizer", FlagSpec{Kind: KindPath, Decode: DecodeWhole}},
-		{RuntimeVLLMSwift, "--generation-config", FlagSpec{Kind: KindPath, Decode: DecodeWhole}},
-		{RuntimeVLLMSwift, "--hf-config-path", FlagSpec{Kind: KindPath, Decode: DecodeWhole}},
+		{RuntimeVLLMSwift, "--tokenizer", FlagSpec{Kind: KindPath, Decode: DecodeWhole, MustExist: true}},
+		{RuntimeVLLMSwift, "--generation-config", FlagSpec{Kind: KindPath, Decode: DecodeWhole, MustExist: true}},
+		{RuntimeVLLMSwift, "--hf-config-path", FlagSpec{Kind: KindPath, Decode: DecodeWhole, MustExist: true}},
 		{RuntimeVLLMSwift, "--download-dir", FlagSpec{Kind: KindPath, Decode: DecodeWhole}},
 		{RuntimeVLLMSwift, "--root-path", FlagSpec{Kind: KindValue}},
 		{RuntimeVLLMSwift, "--disable-access-log-for-endpoints", FlagSpec{Kind: KindValue}},

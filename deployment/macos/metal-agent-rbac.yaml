@@ -1,0 +1,75 @@
+# Least-privilege identity for the macOS Metal agent.
+#
+# The agent runs outside the cluster, so it authenticates with a kubeconfig.
+# Instead of handing it your personal admin credentials, create this
+# ServiceAccount and mint a kubeconfig from its token (see "Dedicated
+# kubeconfig" in deployment/macos/README.md).
+#
+# Everything is namespace-scoped: apply it to the namespace the agent watches
+# (its --namespace flag, "default" unless you changed it). Running the agent
+# with --namespace "" (all namespaces) needs a ClusterRole and
+# ClusterRoleBinding with the same rules instead.
+#
+# The agent's client also needs API discovery (/api, /apis), normally granted
+# to every authenticated identity by the default system:discovery
+# ClusterRoleBinding; grant it explicitly to this ServiceAccount if your
+# cluster removed that binding.
+#
+#   kubectl apply -n <namespace> -f deployment/macos/metal-agent-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: llmkube-metal-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: llmkube-metal-agent
+rules:
+  # Discover Metal InferenceServices and report their phase.
+  - apiGroups: ["inference.llmkube.dev"]
+    resources: ["inferenceservices"]
+    verbs: ["get", "list"]
+  - apiGroups: ["inference.llmkube.dev"]
+    resources: ["inferenceservices/status"]
+    verbs: ["update"]
+  - apiGroups: ["inference.llmkube.dev"]
+    resources: ["models"]
+    verbs: ["get"]
+  # Publish each native server to the cluster as a selector-less Service plus
+  # an EndpointSlice pointing at this Mac, and clean them up afterwards.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create", "update", "delete"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "create", "update", "delete"]
+  # Remove the legacy Endpoints object older agents created.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "delete"]
+  # Memory-pressure, eviction and startup events on InferenceServices.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # The per-namespace relay token Secret (fixed name "llmkube-metal-relay",
+  # read on every relayed request unless the agent runs with
+  # --legacy-direct-endpoints) and Model.spec.sourceSecretRef credentials
+  # (HF_TOKEN, AWS_*, arbitrary name). Pin to resourceNames
+  # ["llmkube-metal-relay", ...] to narrow this if no Model in the namespace
+  # uses sourceSecretRef.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: llmkube-metal-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: llmkube-metal-agent
+subjects:
+  - kind: ServiceAccount
+    name: llmkube-metal-agent

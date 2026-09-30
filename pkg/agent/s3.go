@@ -191,7 +191,13 @@ func (e *MetalExecutor) s3DownloadClient(source string, creds s3Credentials) (*h
 	}
 	objectURL := strings.TrimRight(creds.Endpoint, "/") + "/" + bucket + "/" + key
 
-	var transport http.RoundTripper = http.DefaultTransport.(*http.Transport).Clone()
+	// The endpoint comes from the Model's sourceSecretRef, which anyone who can
+	// write Secrets in the namespace controls, so it dials through the SSRF
+	// guard like any other source: a LAN MinIO must be named in
+	// --allowed-download-hosts. The custom CA trust is applied to the guarded
+	// transport and the signer wraps it, so both survive unchanged.
+	guarded := e.downloadClient()
+	transport := guarded.Transport
 	if len(e.caCerts) > 0 {
 		transport = withCACerts(transport, e.caCerts)
 	}
@@ -202,7 +208,8 @@ func (e *MetalExecutor) s3DownloadClient(source string, creds s3Credentials) (*h
 		secretKey: creds.SecretAccessKey,
 		region:    creds.Region,
 	}
-	return &http.Client{Transport: signer}, objectURL, nil
+	guarded.Transport = signer
+	return guarded, objectURL, nil
 }
 
 // withCACerts returns a RoundTripper whose TLS config trusts the supplied PEM CA
@@ -216,7 +223,7 @@ func withCACerts(base http.RoundTripper, caCerts [][]byte) http.RoundTripper {
 		return base
 	}
 	if t.TLSClientConfig == nil {
-		t.TLSClientConfig = &tls.Config{} //nolint:gosec // MinVersion inherited from Clone()
+		t.TLSClientConfig = &tls.Config{} //nolint:gosec // zero MinVersion means Go's client default, TLS 1.2
 	}
 	t.TLSClientConfig.RootCAs = withCACertPool(t.TLSClientConfig.RootCAs, caCerts)
 	return t
@@ -300,6 +307,15 @@ func (t *sigv4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	req.Header.Set("Authorization", auth)
 
 	return t.base.RoundTrip(req)
+}
+
+// CloseIdleConnections forwards to the wrapped transport, so
+// (*http.Client).CloseIdleConnections reaches the connections the signer's
+// base transport holds.
+func (t *sigv4RoundTripper) CloseIdleConnections() {
+	if c, ok := t.base.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
 }
 
 // canonicalURI percent-encodes each path segment, matching AWS SigV4's

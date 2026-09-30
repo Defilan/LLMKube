@@ -15,7 +15,7 @@ Carnice model.
 
 - LLMKube core operator + metal-agent running on the M5 Max (the
   standard local dev setup; the metal-agent log at
-  `~/Library/Logs/llmkube-metal-agent.log` should be live).
+  `~/Library/Logs/llmkube/metal-agent.log` should be live).
 - The `qwen36-35b-carnice-mtp` InferenceService is `Ready`:
   ```sh
   kubectl get inferenceservice qwen36-35b-carnice-mtp -n default

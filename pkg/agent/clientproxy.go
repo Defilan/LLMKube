@@ -21,19 +21,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/defilantech/llmkube/pkg/agent/ingress"
 )
 
-// backendProvider returns the loopback address (host:port) of the inference
-// child the client proxy should currently forward to. ok is false when no
-// child is running.
+// backendProvider returns the loopback address (host:port) and runtime of the
+// inference child the client proxy should currently forward to. runtime is
+// the same string the ingress uses for that child (ingress.Route.Runtime),
+// so ServeHTTP can apply the identical ingress.Allowed path policy. ok is
+// false when no child is running.
 type backendProvider interface {
-	currentBackend() (addr string, ok bool)
+	currentBackend() (addr, runtime string, ok bool)
 }
 
 // ClientProxy is a stable host-side HTTP listener that forwards requests to
@@ -54,35 +61,121 @@ func NewClientProxy(provider backendProvider, port int, logger *zap.SugaredLogge
 	return &ClientProxy{provider: provider, port: port, logger: logger}
 }
 
-// ServeHTTP forwards the request to the current child. When no child is
-// running it returns 503 with a JSON error body (mirroring the prior
-// standalone vllm-swift-proxy.py behavior).
+// ServeHTTP applies, in order: a Host check (421) that rejects DNS rebinding
+// before anything else can learn whether a child is even running, the
+// existing no-backend check (503), then the same runtime path allowlist the
+// TLS ingress enforces (403, see ingress.Allowed). Only a request that clears
+// all three is proxied to the current child.
 func (p *ClientProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	addr, ok := p.provider.currentBackend()
-	if !ok {
-		clientProxyRequests.WithLabelValues("no_backend").Inc()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error": "no inference process is currently running on this agent",
-		})
+	if !p.hostAllowed(r.Host) {
+		clientProxyRequests.WithLabelValues("bad_host").Inc()
+		writeClientProxyError(w, http.StatusMisdirectedRequest,
+			"Host header does not match this loopback proxy")
 		return
 	}
 
-	rp := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: addr})
-	// Flush each chunk immediately so SSE / stream:true completions are not
-	// buffered by the proxy.
-	rp.FlushInterval = -1
-	rp.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
-		p.logger.Warnw("client proxy upstream error", "target", addr, "err", err.Error())
-		rw.Header().Set("Content-Type", "application/json")
-		rw.WriteHeader(http.StatusBadGateway)
-		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "upstream inference process unreachable"})
+	addr, runtime, ok := p.provider.currentBackend()
+	if !ok {
+		clientProxyRequests.WithLabelValues("no_backend").Inc()
+		writeClientProxyError(w, http.StatusServiceUnavailable,
+			"no inference process is currently running on this agent")
+		return
 	}
 
+	if !ingress.Allowed(runtime, r.Method, r.URL.EscapedPath()) {
+		clientProxyRequests.WithLabelValues("path_forbidden").Inc()
+		writeClientProxyError(w, http.StatusForbidden, "path is not allowed for this runtime")
+		return
+	}
+
+	rp := p.reverseProxy(addr)
 	sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	rp.ServeHTTP(sw, r)
 	clientProxyRequests.WithLabelValues(statusClass(sw.status)).Inc()
+}
+
+// reverseProxy builds the reverse proxy to the current child on addr
+// (127.0.0.1:<port>). This mirrors pkg/agent/ingress/server.go's Server.proxy
+// (see the sibling there): a Rewrite hook is used instead of the legacy
+// NewSingleHostReverseProxy Director, because only ProxyRequest.SetURL clears
+// the outbound Host header. NewSingleHostReverseProxy's Director leaves the
+// caller's original Host (e.g. "localhost:<client-proxy port>") on the
+// outbound request, which Go's Transport then sends to the child verbatim
+// instead of the child's own address.
+//
+// Rewrite also deletes the inbound Upgrade and Connection headers and clears
+// request trailers, for the same reasons the ingress does: ReverseProxy
+// re-adds Upgrade/Connection after stripping hop-by-hop headers otherwise, an
+// upgraded connection is a raw byte tunnel the path allowlist can no longer
+// see, and trailers are headers that arrive after the checks in ServeHTTP
+// already ran. ModifyResponse shares the ingress's ingress.RefuseUpgrade, so
+// an engine that upgrades unsolicited still never reaches the caller as a
+// 101; ErrorHandler turns that refusal into the same 502 JSON body as any
+// other upstream failure.
+func (p *ClientProxy) reverseProxy(addr string) *httputil.ReverseProxy {
+	target := &url.URL{Scheme: "http", Host: addr}
+	return &httputil.ReverseProxy{
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			pr.Out.Header.Del("Upgrade")
+			pr.Out.Header.Del("Connection")
+			pr.Out.Trailer = nil
+		},
+		ModifyResponse: ingress.RefuseUpgrade,
+		// Flush each chunk immediately so SSE / stream:true completions are
+		// not buffered by the proxy.
+		FlushInterval: -1,
+		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
+			p.logger.Warnw("client proxy upstream error", "target", addr, "err", err.Error())
+			writeClientProxyError(rw, http.StatusBadGateway, "upstream inference process unreachable")
+		},
+	}
+}
+
+// hostAllowed reports whether host (r.Host) names this loopback proxy: an
+// exact match, case-insensitive for "localhost", against "localhost",
+// "127.0.0.1" or "::1", on the port this proxy is configured to listen on. A
+// host with no port at all is accepted only when that port is 80. This
+// refuses DNS rebinding: a page served from an attacker-controlled public
+// domain that resolves to 127.0.0.1 and is fetched by a browser on this
+// machine presents that domain as the Host header, not "localhost", so it is
+// rejected here before the request can reach a child or even learn whether
+// one is running.
+func (p *ClientProxy) hostAllowed(host string) bool {
+	h, portStr, err := net.SplitHostPort(host)
+	if err != nil {
+		return p.port == 80 && isLoopbackHost(trimBrackets(host))
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port != p.port {
+		return false
+	}
+	return isLoopbackHost(h)
+}
+
+// isLoopbackHost reports whether h (already stripped of any port and
+// brackets) is one of the loopback names this proxy answers to.
+func isLoopbackHost(h string) bool {
+	return strings.EqualFold(h, "localhost") || h == "127.0.0.1" || h == "::1"
+}
+
+// trimBrackets strips a literal IPv6 host's surrounding brackets, e.g. "[::1]"
+// to "::1". net.SplitHostPort already does this when a port is present; this
+// covers the no-port case, where the brackets are the only signal that the
+// host is a literal address rather than a name.
+func trimBrackets(h string) string {
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		return h[1 : len(h)-1]
+	}
+	return h
+}
+
+// writeClientProxyError writes a JSON error body, the shape every client
+// proxy failure response uses.
+func writeClientProxyError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // Start runs the listener on 127.0.0.1:<port> until ctx is cancelled. A

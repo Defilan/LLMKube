@@ -10,8 +10,6 @@
         <string>/usr/local/bin/llmkube-metal-agent</string>
         <string>--namespace</string>
         <string>default</string>
-        <string>--model-store</string>
-        <string>/tmp/llmkube-models</string>
         <string>--llama-server</string>
         <string>/opt/homebrew/bin/llama-server</string>
         <string>--port</string>
@@ -29,11 +27,15 @@
         <false/>
     </dict>
 
+    <!-- The log paths and WorkingDirectory start with a home placeholder
+         that `make install-metal-agent` replaces with $HOME (launchd does not
+         expand ~ or $HOME). The model store defaults to
+         ~/Library/Application Support/llmkube/models. -->
     <key>StandardOutPath</key>
-    <string>/tmp/llmkube-metal-agent.log</string>
+    <string>__HOME__/Library/Logs/llmkube/metal-agent.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/llmkube-metal-agent.log</string>
+    <string>__HOME__/Library/Logs/llmkube/metal-agent.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -44,7 +46,7 @@
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>/tmp</string>
+    <string>__HOME__</string>
 
     <!-- Restart on failure with throttle -->
     <key>ThrottleInterval</key>

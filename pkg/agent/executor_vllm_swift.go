@@ -113,9 +113,9 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 	// trail. The log path is stable per (namespace, name) so operators
 	// can `tail -f` it during demos and post-mortem after bad rollouts.
 	logPath := e.processLogPath(config.Namespace, config.Name)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	logFile, err := openEngineLog("vllm-swift", logPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open vllm-swift log file %s: %w", logPath, err)
+		return nil, err
 	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

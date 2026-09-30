@@ -46,6 +46,7 @@ import (
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
+	"github.com/defilantech/llmkube/internal/safehttp"
 	"github.com/defilantech/llmkube/pkg/cachekey"
 	"github.com/defilantech/llmkube/pkg/gguf"
 	"github.com/defilantech/llmkube/pkg/license"
@@ -127,7 +128,7 @@ type ModelReconciler struct {
 	// and CIDRs that remote (http/https) Model sources may target even when
 	// they resolve to private/link-local/loopback ranges. Empty (the secure
 	// default) blocks all such ranges; public hosts are always allowed. See
-	// newGuardedHTTPClient and GHSA-jw3m-8q7m-f35r.
+	// safehttp.NewClient and GHSA-jw3m-8q7m-f35r.
 	AllowedRemoteHosts []string
 
 	// ServerVersion is the control plane's Kubernetes gitVersion (for example
@@ -160,8 +161,9 @@ type ModelReconciler struct {
 // requests, building it on first use.
 func (r *ModelReconciler) metadataClient() *http.Client {
 	r.metadataHTTPClientOnce.Do(func() {
-		r.metadataHTTPClient = newGuardedHTTPClient(
-			parseRemoteHostAllowlist(r.AllowedRemoteHosts), remoteMetadataTimeout)
+		r.metadataHTTPClient = safehttp.NewClient(
+			safehttp.ParseAllowlist(r.AllowedRemoteHosts), remoteMetadataTimeout,
+			"modelSource.allowedRemoteHosts")
 	})
 	return r.metadataHTTPClient
 }

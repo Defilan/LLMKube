@@ -195,6 +195,11 @@ MLX = [
 
 # Spec shorthands (Go identifiers defined in flagspecs.go).
 BOOL, VALUE, PATH = 'fBool', 'fValue', 'fPath'
+# PATH_EXISTS (fPathExists) is PATH plus MustExist: the value must resolve to
+# something that already exists inside the roots. Used only where a
+# not-yet-existing value makes the engine fetch something on its own instead
+# of opening a local file, e.g. a bare Hugging Face "owner/name" repo id.
+PATH_EXISTS = 'fPathExists'
 # OVERRIDES[runtime][flag] = Go spec identifier. Applied to every alias of an entry
 # when keyed by any one of its spellings.
 OVERRIDES = {
@@ -218,7 +223,10 @@ OVERRIDES = {
         '--ssl-ca-certs': PATH,  # "The CA certificates file."
         '--chat-template': PATH,  # brief override: file path or inline template
         '--tool-parser-plugin': PATH,  # vLLM imports it from a file path
-        '--lora-modules': 'fPathNameEqPathMulti',
+        '--lora-modules': 'fPathNameEqPathMultiExists',  # name=path; the path half must exist (a repo id would download)
+        '--tokenizer': PATH_EXISTS,  # else a bare repo id downloads outside every root
+        '--hf-config-path': PATH_EXISTS,  # same gap as --tokenizer
+        '--generation-config': PATH_EXISTS,  # same gap; keeps its "auto"/"vllm" literals
         '--hf-token': 'fValueOptional',  # nargs='?'
     },
     'mlx': {},
@@ -238,7 +246,8 @@ def spec_for(rt, e):
     return VALUE
 
 KIND = {'fBool': 'bool', 'fValue': 'value', 'fValue2': 'value', 'fValueMulti': 'value', 'fValueOptional': 'value',
-        'fPath': 'path', 'fPathCSV': 'path', 'fPathCSVColon': 'path', 'fPathNameEqPathMulti': 'path'}
+        'fPath': 'path', 'fPathCSV': 'path', 'fPathCSVColon': 'path',
+        'fPathExists': 'path', 'fPathNameEqPathMultiExists': 'path'}
 
 def emit(rt, goname, entries):
     lines, counts, paths = [], {'bool': 0, 'value': 0, 'path': 0}, []
@@ -293,14 +302,20 @@ vllm-swift:
 
 - `--chat-template`, `--config`, `--ssl-ca-certs`, `--tool-parser-plugin`: `path` whole (not caught by the automatic
   rule; `--tool-parser-plugin` is a Python file vLLM imports from a path).
-- `--lora-modules`: `path`, decode `name-eq-path`, `Multi`.
+- `--lora-modules`: `path`, decode `name-eq-path`, `Multi`, `MustExist` on the path half of each entry
+  (overridden to `fPathNameEqPathMultiExists`, since the automatic rule and the decode-rule override alone don't set
+  it).
 - `--hf-token`: `value` with `OptionalValue` (`nargs="?"`).
 - `--middleware`, `--scheduler-cls` (import paths), `--root-path` (FastAPI URL root),
   `--disable-access-log-for-endpoints` (URL endpoint paths such as `/health,/metrics`), `--mm-tensor-ipc` (enum whose
   help says "shared memory"), `--profiler-config` (inline JSON): `value`. The automatic rule matched "path" or
   "file" in their help; none of them names a file on disk. All but `--mm-tensor-ipc` are also refused by Rule 3.
-- `--generation-config`: `path` whole (automatic); literals `auto` and `vllm` via `isNonPathLiteral`.
-- `--tokenizer`, `--hf-config-path`, `--download-dir`: `path` whole (automatic).
+- `--generation-config`, `--hf-config-path`, `--tokenizer`: `path` whole, `MustExist` (overridden to
+  `fPathExists`; the automatic rule alone gives plain `fPath`). `--generation-config` keeps its `auto`/`vllm` literals
+  via `isNonPathLiteral`, checked before the path/existence check ever runs. See "Judgment calls" below for why these
+  three need `MustExist` and no other path flag does.
+- `--download-dir`: `path` whole (automatic), no `MustExist`: it is where vLLM writes downloads, not a value that
+  should already exist.
 
 ## Path-typed flags
 
@@ -316,9 +331,9 @@ mlx-server (1): whole: `--model`.
 tensorfold (2): whole: `--drafter` (except its literals), `--snapshot-dir`.
 
 vllm-swift (17): whole: `--config`, `--chat-template`, `--default-mm-loras`, `--log-config-file`, `--ssl-ca-certs`, `--ssl-certfile`,
-`--ssl-keyfile`, `--tool-parser-plugin`, `--uds`, `--allowed-local-media-path`, `--generation-config` (except `auto`,
-`vllm`), `--hf-config-path`, `--model`, `--tokenizer`, `--download-dir`, `--reasoning-parser-plugin`; name-eq-path
-(multi): `--lora-modules`.
+`--ssl-keyfile`, `--tool-parser-plugin`, `--uds`, `--allowed-local-media-path`, `--generation-config` (`MustExist`,
+except `auto`, `vllm`), `--hf-config-path` (`MustExist`), `--model`, `--tokenizer` (`MustExist`), `--download-dir`,
+`--reasoning-parser-plugin`; name-eq-path (multi): `--lora-modules` (`MustExist` on the path half).
 
 ## Judgment calls
 
@@ -342,6 +357,12 @@ vllm-swift (17): whole: `--config`, `--chat-template`, `--default-mm-loras`, `--
   and inline JSON values; there is no decode rule for paths inside JSON.
 - vllm `--logits-processors`, `--worker-cls`, `--worker-extension-cls`, `--scheduler-cls`, `--middleware`,
   `--io-processor-plugin`: class or module names, `value`; Rule 3 refuses them.
+- vllm `--tokenizer`, `--hf-config-path`, `--generation-config` and the path half of `--lora-modules`: `MustExist`.
+  Without it, a value shaped like a Hugging Face `owner/name` repo id resolves as an
+  ordinary not-yet-existing relative path under the model store and passes `Roots.CheckPath`, and vLLM then treats it
+  as a Hub id and downloads it into the HF cache (outside every allowed root, with network egress). No other
+  vllm-swift path flag gets this: `--chat-template`, `--config`, `--download-dir`, `--default-mm-loras`, ... are all
+  either output paths, refused outright, or inert as a bare repo id in vLLM's own handling.
 - `\bpaths?\b` in the help rule: the plural changed exactly three flags versus the singular-only pattern: llama
   `--host` (to `path`, bind, harmless), vllm `--default-mm-loras` (to `path`, wanted) and vllm
   `--disable-access-log-for-endpoints` (URL endpoint paths, overridden back to `value`).

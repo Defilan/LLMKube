@@ -87,7 +87,7 @@ func TestEnsureModel_S3UsesSigV4(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "s3-model")
 	path, err := executor.ensureModel(
@@ -95,6 +95,7 @@ func TestEnsureModel_S3UsesSigV4(t *testing.T) {
 		"s3://models/org/repo/model-Q4_K_M.gguf",
 		"s3-model",
 		&corev1.LocalObjectReference{Name: "minio-models"},
+		"",
 	)
 	if err != nil {
 		t.Fatalf("ensureModel: %v", err)
@@ -139,6 +140,97 @@ func TestEnsureModel_S3UsesSigV4(t *testing.T) {
 	}
 }
 
+// An s3:// source with Model.spec.sha256 set is verified and stamped exactly
+// like the http(s) and hf:// download paths: s3 uses the non-resuming
+// copyToFileNoResume, which shares copyToFileResume's verify-then-publish
+// step, so this is the s3-specific slice of that same coverage.
+func TestEnsureModel_S3SHA256MatchWritesStamp(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	body := []byte("fake-gguf-bytes-for-sha256")
+	digest := sha256Hex(body)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add inference scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
+			"AWS_REGION":            []byte("us-east-1"),
+			"AWS_ENDPOINT_URL":      []byte(srv.URL),
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
+
+	path, err := executor.ensureModel(t.Context(), "s3://models/org/repo/model.gguf", "s3-sha-model",
+		&corev1.LocalObjectReference{Name: "minio-models"}, digest)
+	if err != nil {
+		t.Fatalf("ensureModel: %v", err)
+	}
+	stamp, err := os.ReadFile(path + ".sha256")
+	if err != nil {
+		t.Fatalf("stamp missing: %v", err)
+	}
+	if strings.TrimSpace(string(stamp)) != digest {
+		t.Errorf("stamp = %q, want %q", strings.TrimSpace(string(stamp)), digest)
+	}
+}
+
+// An s3:// source whose object bytes do not match Model.spec.sha256 must be
+// refused, with the object deleted rather than published.
+func TestEnsureModel_S3SHA256MismatchDeletesFile(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	body := []byte("fake-gguf-bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add inference scheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
+			"AWS_REGION":            []byte("us-east-1"),
+			"AWS_ENDPOINT_URL":      []byte(srv.URL),
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
+
+	_, err := executor.ensureModel(t.Context(), "s3://models/org/repo/model.gguf", "s3-sha-mismatch-model",
+		&corev1.LocalObjectReference{Name: "minio-models"}, sha256Hex([]byte("not-the-right-bytes")))
+	if err == nil {
+		t.Fatal("ensureModel should fail on SHA256 mismatch for an s3 source")
+	}
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "s3-sha-mismatch-model", "model.gguf")); !os.IsNotExist(statErr) {
+		t.Errorf("mismatched s3 download left the final file")
+	}
+}
+
 // A missing sourceSecretRef must fail clearly rather than fall through to an
 // anonymous GET that 403s confusingly.
 func TestEnsureModel_S3MissingSecretRefFails(t *testing.T) {
@@ -154,13 +246,14 @@ func TestEnsureModel_S3MissingSecretRefFails(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(
 		t.Context(),
 		"s3://models/org/repo/model.gguf",
 		"s3-model",
 		nil, // no sourceSecretRef
+		"",
 	)
 	if err == nil {
 		t.Fatal("ensureModel with an s3:// source and no sourceSecretRef should fail, not fall through to an anonymous GET")
@@ -192,13 +285,14 @@ func TestEnsureModel_S3IncompleteSecretFails(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 
 	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
-		WithKubeClient("default", k8sClient, nil))
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
 
 	_, err := executor.ensureModel(
 		t.Context(),
 		"s3://models/org/repo/model.gguf",
 		"s3-model",
 		&corev1.LocalObjectReference{Name: "partial-creds"},
+		"",
 	)
 	if err == nil {
 		t.Fatal("ensureModel with an s3:// source and an incomplete secret should fail")

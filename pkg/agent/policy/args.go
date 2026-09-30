@@ -694,7 +694,7 @@ func checkFlag(in ArgsInput, table map[string]flagRule, a Arg) error {
 		}
 	}
 	r, ok := table[a.Name]
-	if !ok && !isNegation(a.Name, canonical) {
+	if !ok && !isNegation(a, canonical) {
 		r, ok = table[canonical]
 	}
 	if ok && (r.bind || !in.AllowUnsafe) {
@@ -747,11 +747,24 @@ func prefixesKnownFlag(runtime, name string) bool {
 	return false
 }
 
-// isNegation reports whether name is the "--no-X" (or llama-server "-no-X")
-// negation of its canonical name X. A negation only turns its option off, so
-// a Rule 1 entry on X ("--agent", "--ui-mcp-proxy") must not refuse it.
-func isNegation(name, canonical string) bool {
-	return name != canonical && (strings.HasPrefix(name, "--no-") || strings.HasPrefix(name, "-no-"))
+// isNegation reports whether a is the "--no-X" (or llama-server "-no-X")
+// negation of its canonical name X, written with no attached value. A bare
+// negation only turns its option off, so a Rule 1 or Rule 3 entry on X
+// ("--agent", "--ui-mcp-proxy", "--enable-prompt-embeds") must not refuse it.
+//
+// A "--no-X" (or "-no-X") spelling that carries an inline "=value"
+// ("--no-agent=1", "--no-enable-prompt-embeds=false") is NOT a negation:
+// argparse's zero-arg bool options do not take a value, so this is either a
+// caller error or an attempt to smuggle X's effect past the negation check.
+// vLLM's own FlexibleArgumentParser happens to reject "=value" on a
+// zero-arg flag today, but the policy must not depend on that staying true,
+// so a.Inline routes it to the same refusal its canonical flag X would get.
+// Without this, "--no-enable-prompt-embeds=false" and
+// "--no-trust-request-chat-template=true" skipped Rule 3 entirely, and a
+// Rule 1 entry with a "--no-" form would be skipped the same way.
+func isNegation(a Arg, canonical string) bool {
+	return !a.Inline && a.Name != canonical &&
+		(strings.HasPrefix(a.Name, "--no-") || strings.HasPrefix(a.Name, "-no-"))
 }
 
 // extraArgsPathHint is the PathError.Hint checkPaths attaches to every
@@ -772,6 +785,14 @@ const extraArgsPathHint = "add its directory to --allowed-model-roots, " +
 // non-path literals of a path flag (tensorfold --drafter auto|none, vllm-swift
 // --generation-config auto|vllm) skip the check. KindValue flags are never
 // path-checked.
+//
+// A FlagSpec.MustExist flag (vllm-swift's --tokenizer, --hf-config-path,
+// --generation-config, and the path half of a --lora-modules name=path entry)
+// is checked through Roots.CheckPathExists instead: the same resolve and
+// root check, plus a requirement that the resolved path already exists. That
+// closes the gap where a Hugging Face "owner/name" repo id would otherwise
+// pass as an ordinary not-yet-existing relative path and vLLM would then
+// download it outside every root.
 func checkPaths(in ArgsInput, args []Arg) error {
 	for _, a := range args {
 		if !a.Known || a.Spec.Kind != KindPath {
@@ -787,15 +808,18 @@ func checkPaths(in ArgsInput, args []Arg) error {
 				return &RejectedError{Runtime: in.Runtime, Flag: a.Flag, Rule: "path", Why: err.Error(), Relaxable: true}
 			}
 			for _, p := range paths {
-				if err := checkPath(in, what, p); err != nil {
+				if err := checkPath(in, what, p, a.Spec.MustExist); err != nil {
 					return err
 				}
 			}
 			// Only after the value itself passed: the hooks derive their
-			// paths lexically from a value that resolved cleanly.
+			// paths lexically from a value that resolved cleanly. A derived
+			// path (e.g. tensorfold's session-snapshots sibling) is never
+			// MustExist: it is a directory the engine creates, not the value
+			// itself.
 			if extra := extraPathsFor(in.Runtime, a.Spec.Canonical); extra != nil {
 				for _, p := range extra(v, in.WorkDir, in.Home) {
-					if err := checkPath(in, what, p); err != nil {
+					if err := checkPath(in, what, p, false); err != nil {
 						return err
 					}
 				}
@@ -878,9 +902,16 @@ func decodePaths(d PathDecode, v string) ([]string, error) {
 
 // checkPath resolves one decoded path against the roots and, on refusal,
 // attaches extraArgsPathHint so the message names both fixes that apply to
-// an extraArgs value.
-func checkPath(in ArgsInput, what, p string) error {
-	err := in.Roots.CheckPath(what, p, in.WorkDir, in.Home)
+// an extraArgs value. mustExist additionally requires the path to already
+// exist (Roots.CheckPathExists instead of Roots.CheckPath), for a
+// FlagSpec.MustExist flag (see checkPaths).
+func checkPath(in ArgsInput, what, p string, mustExist bool) error {
+	var err error
+	if mustExist {
+		err = in.Roots.CheckPathExists(what, p, in.WorkDir, in.Home)
+	} else {
+		err = in.Roots.CheckPath(what, p, in.WorkDir, in.Home)
+	}
 	if err == nil {
 		return nil
 	}
@@ -972,7 +1003,28 @@ var vllmRefused = map[string]string{
 	"--allowed-origins":          "changes CORS",
 	"--allow-credentials":        "changes CORS",
 	"--otlp-traces-endpoint":     "sends traces to a remote endpoint",
+
+	// vLLM refuses a chat_template supplied in a request body
+	// unless this is set; it is a security default, not ordinary tuning. The
+	// policy already lets the InferenceService writer supply an inline
+	// --chat-template, but this flag widens that to every network client of
+	// the service, which then gets server-side Jinja rendering of a template
+	// it supplies itself.
+	"--trust-request-chat-template": "lets any API client, not only the InferenceService writer, " +
+		"supply a chat template for the server to render",
+
+	// Both let an API client submit a base64-serialized tensor
+	// that the server deserializes with torch.load; that exact path was
+	// CVE-2025-62164 (memory corruption, potential RCE, fixed in vLLM
+	// 0.11.1). The pinned 0.19.1 has the fix, but the flags still expose the
+	// deserializer to every API client.
+	"--enable-prompt-embeds": torchLoadEmbedsWhy,
+	"--enable-mm-embeds":     torchLoadEmbedsWhy,
 }
+
+// torchLoadEmbedsWhy is the shared torch.load reason for vllm-swift's
+// --enable-prompt-embeds and --enable-mm-embeds.
+const torchLoadEmbedsWhy = "lets any API client submit a serialized tensor the server deserializes with torch.load"
 
 // vllmConfigAllowed lists the "-config" flags that carry no code: they
 // select or override sampling defaults only.
@@ -1059,7 +1111,7 @@ func checkCodeLoading(in ArgsInput, parsed []Arg) error {
 			}
 		}
 		canonical := a.Canonical()
-		if why, ok := vllmRefused[canonical]; ok && !isNegation(a.Name, canonical) {
+		if why, ok := vllmRefused[canonical]; ok && !isNegation(a, canonical) {
 			return refuse(a.Flag, why)
 		}
 		if !vllmConfigAllowed[canonical] && (strings.HasSuffix(canonical, "-cls") ||

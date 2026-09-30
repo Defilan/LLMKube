@@ -207,6 +207,68 @@ func TestCheckPath(t *testing.T) {
 	}
 }
 
+// TestCheckPathExists: CheckPathExists is CheckPath plus a requirement that
+// the resolved path already exist. Used by the policy package for a
+// FlagSpec.MustExist flag (vllm-swift's --tokenizer, --hf-config-path,
+// --generation-config, and the path half of a --lora-modules entry), to
+// close the gap where a Hugging Face "owner/name" repo id would otherwise
+// resolve as an ordinary not-yet-existing relative path under the store and
+// pass.
+func TestCheckPathExists(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := filepath.Join(base, "store")
+	outside := filepath.Join(base, "outside")
+	mkfile(t, filepath.Join(store, "m.gguf"))
+	mkfile(t, filepath.Join(outside, "secret"))
+	if err := os.Symlink(filepath.Join(outside, "secret"), filepath.Join(store, "link-out")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "nope"), filepath.Join(store, "dangle")); err != nil {
+		t.Fatal(err)
+	}
+	roots, _, err := NewRoots([]string{store}, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name         string
+		path         string
+		wantNotExist bool // only meaningful when a *PathError is expected
+	}{
+		{"exists inside store", filepath.Join(store, "m.gguf"), false},
+		{"relative exists inside store", "m.gguf", false},
+		{"not yet existing under store", filepath.Join(store, "nope.bin"), true},
+		{"repo-id-shaped, not yet existing", "owner/name", true},
+		{"outside the store", filepath.Join(outside, "secret"), false},
+		{"symlink out of store", filepath.Join(store, "link-out"), false},
+		{"dangling symlink", filepath.Join(store, "dangle"), false},
+		{"empty string", "", false},
+	}
+	allowed := map[string]bool{"exists inside store": true, "relative exists inside store": true}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := roots.CheckPathExists("extraArgs value", tt.path, store, base)
+			if allowed[tt.name] {
+				if err != nil {
+					t.Errorf("CheckPathExists(%q) = %v, want allowed", tt.path, err)
+				}
+				return
+			}
+			var pe *PathError
+			if !errors.As(err, &pe) {
+				t.Errorf("CheckPathExists(%q) = %v, want *PathError", tt.path, err)
+				return
+			}
+			if pe.NotExist != tt.wantNotExist {
+				t.Errorf("CheckPathExists(%q) NotExist = %v, want %v (err: %v)", tt.path, pe.NotExist, tt.wantNotExist, err)
+			}
+		})
+	}
+}
+
 // A "~"-prefixed path must fail closed when the caller could not determine a
 // home directory, rather than silently resolving relative to workDir.
 func TestResolvePath_TildeWithUnknownHome(t *testing.T) {

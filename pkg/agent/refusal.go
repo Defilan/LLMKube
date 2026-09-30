@@ -18,22 +18,32 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
 // Event reasons for starts the agent refuses before (or instead of) serving.
+// These equal the api/v1alpha1.Reason* constants of the same name: that
+// package is the single source of truth MetalAgentRefusalReasons draws from,
+// which internal/controller/scheduling.go's agentRefusalReasons set is built
+// from in turn, so the agent and the controller can never drift onto two
+// different lists of refusal reasons again. That drift once left a refusal
+// the controller did not recognize: it cleared the status every poll and the
+// agent refused again every poll, in a loop.
 const (
-	EventReasonEndpointNameConflict  = "EndpointNameConflict"
-	EventReasonModelSourceNotAllowed = "ModelSourceNotAllowed"
-	EventReasonExtraArgsRejected     = "ExtraArgsRejected"
-	EventReasonServiceNameTooLong    = "ServiceNameTooLong"
+	EventReasonEndpointNameConflict  = inferencev1alpha1.ReasonEndpointNameConflict
+	EventReasonModelSourceNotAllowed = inferencev1alpha1.ReasonModelSourceNotAllowed
+	EventReasonExtraArgsRejected     = inferencev1alpha1.ReasonExtraArgsRejected
+	EventReasonServiceNameTooLong    = inferencev1alpha1.ReasonServiceNameTooLong
+	EventReasonModelDigestMismatch   = inferencev1alpha1.ReasonModelDigestMismatch
 )
 
 // refuseStart records why the agent will not serve an InferenceService: it
@@ -56,6 +66,103 @@ func (a *MetalAgent) refuseStart(
 	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
 		corev1.EventTypeWarning, reason, "%s", message)
 	return fmt.Errorf("%s: %s", reason, message)
+}
+
+// handleStartProcessError turns a StartProcess failure into the error
+// reconcileProcess returns. A *ModelDigestMismatchError is remembered in
+// a.digestMismatches (so checkModelDigestMemo can refuse the next reconcile
+// without downloading again) and refused through refuseStart, the same way
+// an endpoint-name conflict or a bad model path is refused, so it is visible
+// as a status field and a Warning Event instead of only a log line. A
+// *ModelCacheEntryNotRegularError (a symlink in a downloaded source's cache
+// slot that appeared after checkModelCacheSlot ran) is refused the same way
+// as ModelSourceNotAllowed. Every other StartProcess failure
+// (network error, bad status, truncated download, health-check timeout, ...)
+// keeps the historical plain-wrapped-error, log-only behavior. Split out of
+// reconcileProcess, rather than inlined as an extra branch there, to keep its
+// cyclomatic complexity from crossing the linter's threshold.
+func (a *MetalAgent) handleStartProcessError(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, startErr error,
+) error {
+	var digestErr *ModelDigestMismatchError
+	if errors.As(startErr, &digestErr) {
+		a.digestMismatches.record(
+			types.NamespacedName{Namespace: model.Namespace, Name: model.Name},
+			model.Spec.Source, model.Spec.SHA256, digestErr,
+		)
+		return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
+	}
+	var slotErr *ModelCacheEntryNotRegularError
+	if errors.As(startErr, &slotErr) {
+		return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, slotErr.Error())
+	}
+	return fmt.Errorf("failed to start process: %w", startErr)
+}
+
+// checkModelPreflight runs the Model-derived pre-flight refusal checks that
+// must all happen before memory admission (checkModelPaths, then
+// checkModelCacheSlot, then checkModelDigestMemo), returning the first
+// refusal. Combined into one call from reconcileProcess, rather than
+// sequential `if err != nil { return err }` blocks there, purely to keep that
+// function's cyclomatic complexity under the linter's threshold; see
+// handleStartProcessError's doc comment for the same reasoning applied to the
+// StartProcess error path.
+func (a *MetalAgent) checkModelPreflight(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model,
+	runtime, pagedSSDCacheDir string,
+) error {
+	if err := a.checkModelPaths(ctx, isvc, model, pagedSSDCacheDir); err != nil {
+		return err
+	}
+	if err := a.checkModelCacheSlot(ctx, isvc, model, runtime); err != nil {
+		return err
+	}
+	return a.checkModelDigestMemo(ctx, isvc, model)
+}
+
+// checkModelCacheSlot refuses, before memory admission, a llama-server start
+// whose downloaded source's cache slot is not a regular file (a symlink
+// above all). ensureModel refuses the same slot inside StartProcess, but
+// that runs after admission, whose success path clears SchedulingStatus, so
+// relying on it alone would flap the status on every reconcile. Only the
+// llama-server executor caches downloads in that slot, and a local source
+// is loaded in place, so both are left alone.
+func (a *MetalAgent) checkModelCacheSlot(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, runtime string,
+) error {
+	if runtime != runtimeLlamaServer && runtime != runtimeLlamaCPP {
+		return nil
+	}
+	if isLocalModelSource(model.Spec.Source) {
+		return nil
+	}
+	slot := modelCacheSlot(a.config.ModelStorePath, model.Name, model.Spec.Source)
+	if err := checkModelCacheSlot(slot); err != nil {
+		return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, err.Error())
+	}
+	return nil
+}
+
+// checkModelDigestMemo refuses a Model this agent already found to have a
+// mismatching SHA256 for its CURRENT spec.source and spec.sha256, without
+// letting StartProcess download it again: the memo (a.digestMismatches) was
+// populated by handleStartProcessError on a prior reconcile and
+// self-invalidates the moment source or sha256 changes (digestMismatchMemo.check),
+// so an edited Model always gets a fresh download attempt. A no-op when the
+// Model has no recorded mismatch, or no spec.sha256 at all (nothing to
+// memoize).
+func (a *MetalAgent) checkModelDigestMemo(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model,
+) error {
+	if model.Spec.SHA256 == "" {
+		return nil
+	}
+	modelKey := types.NamespacedName{Namespace: model.Namespace, Name: model.Name}
+	digestErr := a.digestMismatches.check(modelKey, model.Spec.Source, model.Spec.SHA256)
+	if digestErr == nil {
+		return nil
+	}
+	return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
 }
 
 // checkModelPaths refuses a Model the controller marked Failed and any local

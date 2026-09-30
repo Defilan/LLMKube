@@ -40,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/safehttp"
 	"github.com/defilantech/llmkube/pkg/agent/policy"
 )
 
@@ -212,6 +213,13 @@ type MetalAgentConfig struct {
 	// followed). Empty means the model store only.
 	AllowedModelRoots []string
 
+	// AllowedDownloadHosts lists hostnames and CIDRs the agent may download
+	// models from even though they resolve to a private, loopback or
+	// link-local address, for example a LAN MinIO (--allowed-download-hosts).
+	// Every other such address is refused by the SSRF guard. Nil allowlists
+	// nothing.
+	AllowedDownloadHosts []string
+
 	// AllowUnsafeExtraArgs relaxes the extraArgs policy on a Mac whose
 	// InferenceService authors are fully trusted: unknown flags, stray
 	// tokens, refused non-listener flags, path checks and vllm-swift
@@ -252,6 +260,11 @@ type MetalAgent struct {
 	// MemoryCheckModeWarn; an incomplete admission check then logs and
 	// proceeds instead of failing closed.
 	memoryCheckWarnOnly bool
+
+	// downloadAllow is config.AllowedDownloadHosts parsed once. The pre-flight
+	// size probe HEADs the Model source, so it dials through the same SSRF
+	// guard and allowlist as the executor's downloads.
+	downloadAllow safehttp.Allowlist
 
 	// pressureBlocked records namespacedName keys of processes the agent
 	// evicted under memory pressure. Subsequent ensureProcess calls for these
@@ -299,6 +312,11 @@ type MetalAgent struct {
 	// relayNotAdoptedSent records keys that already received their one
 	// RelayNotAdopted Event in this agent process.
 	relayNotAdoptedSent map[string]bool
+
+	// digestMismatches remembers a Model's most recent SHA256 mismatch, so
+	// reconcileProcess can refuse a persistently-mismatching Model without
+	// re-downloading the whole file (tens of GB) every reconcile.
+	digestMismatches *digestMismatchMemo
 }
 
 // ManagedProcess represents a running inference process (llama-server, oMLX, or Ollama model).
@@ -441,12 +459,14 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		home:                home,
 		memoryFraction:      fraction,
 		memoryCheckWarnOnly: warnOnly,
+		downloadAllow:       safehttp.ParseAllowlist(config.AllowedDownloadHosts),
 		pressureBlocked:     make(map[string]bool),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
 		now:                 time.Now,
 		relayRegisteredAt:   make(map[string]time.Time),
 		relayNotAdoptedSent: make(map[string]bool),
+		digestMismatches:    newDigestMismatchMemo(),
 	}
 }
 
@@ -464,6 +484,7 @@ func (a *MetalAgent) buildExecutors() {
 		a.config.ModelStorePath,
 		a.logger.With("subsystem", "executor"),
 		WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
+		WithAllowedDownloadHosts(a.config.AllowedDownloadHosts),
 	)
 	if a.config.LlamaServerStartupTimeout > 0 {
 		metalExec.SetStartupTimeout(a.config.LlamaServerStartupTimeout)
@@ -763,6 +784,7 @@ func buildExecutorConfig(
 		ModelName:              model.Name,
 		ServedModelName:        servedModelName(isvc, model),
 		SourceSecretRef:        model.Spec.SourceSecretRef,
+		SHA256:                 model.Spec.SHA256,
 		GPULayers:              base.GPULayers,
 		ContextSize:            base.ContextSize,
 		RopeScalingType:        ropeType,
@@ -898,31 +920,35 @@ func (a *MetalAgent) validateRuntimeFormat(model *inferencev1alpha1.Model, runti
 // hash; if it changed, the existing process is stopped before a fresh one is
 // spawned so the new flags actually take effect. Replicas=0 stops the process
 // without restarting.
-// currentBackend returns the loopback address of the inference child the
-// host-side client proxy should forward to, satisfying backendProvider (#406).
-// The agent tracks one process per InferenceService but in practice runs one
-// at a time on a single Mac, so we return the first running child with an
+// currentBackend returns the loopback address and runtime of the inference
+// child the host-side client proxy should forward to, satisfying
+// backendProvider (#406). The runtime is the same string the ingress uses
+// (ManagedProcess.Runtime, mirrored into ingress.Route.Runtime by Route), so
+// the client proxy can apply the identical ingress.Allowed path policy. The
+// agent tracks one process per InferenceService but in practice runs one at a
+// time on a single Mac, so we return the first running child with an
 // allocated port, preferring a healthy one. ok is false when none is running.
-func (a *MetalAgent) currentBackend() (string, bool) {
+func (a *MetalAgent) currentBackend() (addr, runtime string, ok bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	var fallback string
+	var fallbackAddr, fallbackRuntime string
 	for _, p := range a.processes {
 		if p == nil || p.Port <= 0 {
 			continue
 		}
-		addr := fmt.Sprintf("127.0.0.1:%d", p.Port)
+		candidate := fmt.Sprintf("127.0.0.1:%d", p.Port)
 		if p.Healthy {
-			return addr, true
+			return candidate, p.Runtime, true
 		}
-		if fallback == "" {
-			fallback = addr
+		if fallbackAddr == "" {
+			fallbackAddr = candidate
+			fallbackRuntime = p.Runtime
 		}
 	}
-	if fallback != "" {
-		return fallback, true
+	if fallbackAddr != "" {
+		return fallbackAddr, fallbackRuntime, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // isvcStopped reports whether the InferenceService desires zero running
@@ -979,6 +1005,31 @@ func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
 	if n > 0 {
 		a.logger.Infow("withdrew endpoints inherited from a previous agent process", "count", n)
 	}
+}
+
+// fetchModelForReconcile gets the Model isvc.Spec.ModelRef names. A NotFound
+// result clears any remembered digest mismatch for it (nothing else revisits
+// a NamespacedName once its Get starts 404ing, so this is the only place that
+// notices the Model is gone); a successful Get records which Model isvcKey
+// currently resolves to, so deleteProcess can clear that entry when the
+// InferenceService itself is deleted (digestMismatchMemo.forgetISVC: a
+// persistently-refused InferenceService never reaches a.processes, so that is
+// the only place this association is available). Split out of
+// reconcileProcess, rather than inlined there, to keep its cyclomatic
+// complexity from crossing the linter's threshold.
+func (a *MetalAgent) fetchModelForReconcile(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, isvcKey string,
+) (*inferencev1alpha1.Model, error) {
+	model := &inferencev1alpha1.Model{}
+	modelKey := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Spec.ModelRef}
+	if err := a.config.K8sClient.Get(ctx, modelKey, model); err != nil {
+		if apierrors.IsNotFound(err) {
+			a.digestMismatches.clear(modelKey)
+		}
+		return nil, fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
+	}
+	a.digestMismatches.noteRef(isvcKey, modelKey)
+	return model, nil
 }
 
 // reconcileProcess is the body of ensureProcess; see ensureProcess for the
@@ -1069,12 +1120,9 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	runtime := a.resolveRuntime(isvc)
 
 	// Get the Model resource
-	model := &inferencev1alpha1.Model{}
-	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
-		Namespace: isvc.Namespace,
-		Name:      isvc.Spec.ModelRef,
-	}, model); err != nil {
-		return fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
+	model, err := a.fetchModelForReconcile(ctx, isvc, key)
+	if err != nil {
+		return err
 	}
 
 	// Relay mode appends "-agent" to the Service name; refuse a name that no
@@ -1100,12 +1148,14 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return fmt.Errorf("failed to check endpoint name: %w", err)
 	}
 
-	// Refuse a Model the controller marked Failed, and any local model source
-	// or pagedSSDCacheDir that resolves outside the allowed roots, before
-	// memory admission runs. checkModelPaths' refusal writes SchedulingStatus;
-	// running it after memory admission's success path (which clears that
-	// field) would flap the status on every reconcile.
-	if err := a.checkModelPaths(ctx, isvc, model, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
+	// Refuse a Model the controller marked Failed, any local model source or
+	// pagedSSDCacheDir that resolves outside the allowed roots, a symlink in
+	// a downloaded source's cache slot, and a Model this agent already found
+	// to have a mismatching SHA256 (refused without downloading it again).
+	// All of these run before memory admission, since admission's success
+	// path clears SchedulingStatus and a refusal placed after it would flap
+	// the status on every reconcile.
+	if err := a.checkModelPreflight(ctx, isvc, model, runtime, derefString(isvc.Spec.PagedSSDCacheDir)); err != nil {
 		return err
 	}
 
@@ -1183,7 +1233,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// Start the process using the runtime-specific executor.
 	process, err := exec.StartProcess(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to start process: %w", err)
+		return a.handleStartProcessError(ctx, isvc, model, err)
 	}
 
 	// Stamp the spec hash onto the process so future ensureProcess calls
@@ -1247,6 +1297,13 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 // registry, so multi-runtime agents can stop each process with its own
 // backend (#525).
 func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
+	// Clear any remembered digest mismatch for the Model this InferenceService
+	// referenced, before the early-return below: a persistently-refused
+	// InferenceService (the exact case a digest-mismatch memo exists for)
+	// never reaches a.processes, since refuseStart returns before a process
+	// is ever stored there.
+	a.digestMismatches.forgetISVC(key)
+
 	a.mu.Lock()
 	process, exists := a.processes[key]
 	if !exists {
@@ -1874,7 +1931,7 @@ func (a *MetalAgent) checkMemoryAdmission(
 			"budget", formatMemory(budget.BudgetBytes),
 			"source", resolved.Source,
 		)
-		isvc.Status.SchedulingStatus = "InsufficientMemory"
+		isvc.Status.SchedulingStatus = EventReasonInsufficientMemory
 		isvc.Status.SchedulingMessage = msg
 		if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
 			a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
@@ -1922,7 +1979,7 @@ func (a *MetalAgent) failMemoryCheck(
 	// condition already surfaced via status and a Kubernetes event.
 	a.logger.Warnw("memory check incomplete, refusing to start process",
 		"reason", reason, "namespace", isvc.Namespace, "name", isvc.Name)
-	isvc.Status.SchedulingStatus = "MemoryCheckFailed"
+	isvc.Status.SchedulingStatus = EventReasonMemoryCheckFailed
 	isvc.Status.SchedulingMessage = reason
 	if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
 		a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
@@ -1999,7 +2056,9 @@ func (a *MetalAgent) estimateModelMemory(
 	// Last resort: HEAD the source for its Content-Length.
 	if fileSizeBytes == 0 &&
 		(strings.HasPrefix(model.Spec.Source, "http://") || strings.HasPrefix(model.Spec.Source, "https://")) {
-		size, err := remoteModelSize(ctx, model.Spec.Source)
+		probeClient := safehttp.NewClient(a.downloadAllow, 0, downloadHostsFlag)
+		size, err := remoteModelSize(ctx, probeClient, model.Spec.Source)
+		probeClient.CloseIdleConnections()
 		if err != nil {
 			reasons = append(reasons, fmt.Sprintf("remote size probe failed: %v", err))
 		} else {

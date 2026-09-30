@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -40,12 +41,17 @@ import (
 
 // recordingExecutor records starts and stops without spawning anything.
 // onStart, when set, runs inside StartProcess (after the agent's pre-start
-// checks), so a test can change the cluster mid-start.
+// checks), so a test can change the cluster mid-start. startErr, when set,
+// makes StartProcess fail with that error instead of succeeding, so a test
+// can drive reconcileProcess's post-StartProcess error handling (e.g. a
+// *ModelDigestMismatchError from a real executor's ensureModel) without a
+// real download.
 type recordingExecutor struct {
-	starts  int
-	lastCfg ExecutorConfig
-	stopped []int
-	onStart func()
+	starts   int
+	lastCfg  ExecutorConfig
+	stopped  []int
+	onStart  func()
+	startErr error
 }
 
 func (e *recordingExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) (*ManagedProcess, error) {
@@ -53,6 +59,9 @@ func (e *recordingExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) 
 	e.lastCfg = cfg
 	if e.onStart != nil {
 		e.onStart()
+	}
+	if e.startErr != nil {
+		return nil, e.startErr
 	}
 	return &ManagedProcess{Name: cfg.Name, Namespace: cfg.Namespace, PID: 4242, Port: 18080, Healthy: true}, nil
 }
@@ -758,3 +767,258 @@ func TestEnsureProcess_AllowUnsafeExtraArgsRelaxesButNotBind(t *testing.T) {
 		}
 	})
 }
+
+// A SHA256 mismatch surfaces from the real executor as a *ModelDigestMismatchError
+// wrapped inside StartProcess's "failed to ensure model" and "failed to start
+// process" errors (ensureModel -> StartProcess); reconcileProcess must unwrap
+// it with errors.As and route it through refuseStart, so the mismatch shows
+// as an Event and a status field, exactly like the *EndpointNameConflictError
+// handling a few lines below the StartProcess call. Every other StartProcess failure keeps
+// the old plain-wrapped-error, log-only behavior (TestEnsureProcess_
+// EndpointNameConflictBackstopStopsEngine and friends above cover that this
+// branch was not broadly widened).
+func TestEnsureProcess_ModelDigestMismatchRefusedWithEvent(t *testing.T) {
+	isvc := refusalISVC("svc")
+	digestErr := &ModelDigestMismatchError{
+		Path:     "/models/m/model.gguf",
+		Expected: "aaaa",
+		Computed: "bbbb",
+	}
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: %w", digestErr)
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelDigestMismatch) {
+		t.Fatalf("ensureProcess error = %v, want it to name %s", err, EventReasonModelDigestMismatch)
+	}
+	events := drainEvents(rec)
+	if !strings.Contains(strings.Join(events, "\n"), "Warning "+EventReasonModelDigestMismatch) {
+		t.Errorf("events = %v, want a Warning %s", events, EventReasonModelDigestMismatch)
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if gErr := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "svc", Namespace: "default"}, got); gErr != nil {
+		t.Fatalf("get InferenceService: %v", gErr)
+	}
+	if got.Status.SchedulingStatus != EventReasonModelDigestMismatch {
+		t.Errorf("status.schedulingStatus = %q, want %q", got.Status.SchedulingStatus, EventReasonModelDigestMismatch)
+	}
+	if ex.starts != 1 {
+		t.Errorf("starts = %d, want 1 (the executor was invoked and itself reported the mismatch)", ex.starts)
+	}
+}
+
+// A symlink in a downloaded source's cache slot (<store>/<model>/<file>) is
+// refused before memory admission with ModelSourceNotAllowed, as a status
+// field and a Warning Event naming the supported replacement, and the
+// executor is never invoked.
+func TestEnsureProcess_SymlinkedCacheSlotRefusedBeforeStart(t *testing.T) {
+	isvc := refusalISVC("svc")
+	store := t.TempDir()
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{ModelStorePath: store}, isvc, refusalModel())
+	slotDir := filepath.Join(store, refusalModelName)
+	if err := os.Mkdir(slotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	handPlaced := filepath.Join(t.TempDir(), "hand-placed.gguf")
+	if err := os.WriteFile(handPlaced, []byte("gguf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(handPlaced, filepath.Join(slotDir, "m.gguf")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("ensureProcess error = %v, want it to name %s", err, EventReasonModelSourceNotAllowed)
+	}
+	for _, want := range []string{"file://", "--allowed-model-roots"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name the remedy %q", err, want)
+		}
+	}
+	events := drainEvents(rec)
+	if !strings.Contains(strings.Join(events, "\n"), "Warning "+EventReasonModelSourceNotAllowed) {
+		t.Errorf("events = %v, want a Warning %s", events, EventReasonModelSourceNotAllowed)
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if gErr := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "svc", Namespace: "default"}, got); gErr != nil {
+		t.Fatalf("get InferenceService: %v", gErr)
+	}
+	if got.Status.SchedulingStatus != EventReasonModelSourceNotAllowed {
+		t.Errorf("status.schedulingStatus = %q, want %q", got.Status.SchedulingStatus, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 0 {
+		t.Errorf("starts = %d, want 0 (refused before the executor ran)", ex.starts)
+	}
+}
+
+// If the cache slot becomes a symlink after the pre-flight check, the
+// executor's *ModelCacheEntryNotRegularError still reaches refuseStart with
+// ModelSourceNotAllowed rather than the log-only plain-failure path.
+func TestEnsureProcess_CacheSlotErrorFromStartRefused(t *testing.T) {
+	isvc := refusalISVC("svc")
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelCacheEntryNotRegularError{Path: "/models/m/m.gguf", Mode: os.ModeSymlink | 0o755})
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelSourceNotAllowed) {
+		t.Fatalf("ensureProcess error = %v, want it to name %s", err, EventReasonModelSourceNotAllowed)
+	}
+	if events := drainEvents(rec); !strings.Contains(strings.Join(events, "\n"),
+		"Warning "+EventReasonModelSourceNotAllowed) {
+		t.Errorf("events = %v, want a Warning %s", events, EventReasonModelSourceNotAllowed)
+	}
+	if ex.starts != 1 {
+		t.Errorf("starts = %d, want 1", ex.starts)
+	}
+}
+
+// A plain (non-digest) StartProcess failure must NOT be routed through
+// refuseStart: it keeps the historical plain-wrapped-error, log-only
+// behavior, so a transient network or process-spawn failure is retried by
+// the next watch event rather than parked behind a status refusal an
+// operator would have to clear.
+func TestEnsureProcess_PlainStartFailureNotRefused(t *testing.T) {
+	isvc := refusalISVC("svc")
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: connection refused")
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || strings.Contains(err.Error(), EventReasonModelDigestMismatch) {
+		t.Fatalf("ensureProcess error = %v, want a plain failure not naming %s", err, EventReasonModelDigestMismatch)
+	}
+	if len(drainEvents(rec)) != 0 {
+		t.Errorf("events = %v, want none for a plain start failure", drainEvents(rec))
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if gErr := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: "svc", Namespace: "default"}, got); gErr != nil {
+		t.Fatalf("get InferenceService: %v", gErr)
+	}
+	if got.Status.SchedulingStatus != "" {
+		t.Errorf("status.schedulingStatus = %q, want empty for a plain start failure", got.Status.SchedulingStatus)
+	}
+}
+
+// TestEnsureProcess_DigestMismatchMemoized_NoRepeatedDownload is the
+// regression test for the download-storm fix: without the pre-flight
+// checkModelDigestMemo check, a persistent digest mismatch is discovered
+// inside StartProcess, which runs AFTER checkMemoryAdmission; admission's
+// success path clears Status.SchedulingStatus (a Status().Update) and the
+// subsequent refusal writes it back (another Status().Update), bumping the
+// resourceVersion each time so the watcher sees UPDATED and reconciles
+// again, each pass re-running StartProcess's ensureModel, i.e. re-downloading
+// the entire model. With the memo, only the FIRST reconcile reaches StartProcess;
+// the next two hit the memo in the pre-flight check and refuse immediately,
+// so the executor is invoked exactly once and SchedulingStatus is never
+// cleared in between (every write recorded via the interceptor is the same
+// refusal reason).
+func TestEnsureProcess_DigestMismatchMemoized_NoRepeatedDownload(t *testing.T) {
+	var written []string
+	funcs := &interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if is, ok := obj.(*inferencev1alpha1.InferenceService); ok && sub == "status" {
+				written = append(written, is.Status.SchedulingStatus)
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.SHA256 = "aaaa"
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, funcs, isvc, model)
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelDigestMismatchError{Path: "/models/m/model.gguf", Expected: "aaaa", Computed: "bbbb"})
+
+	for i := range 3 {
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.ensureProcess(context.Background(), cur); err == nil {
+			t.Fatalf("call %d: ensureProcess succeeded, want a digest-mismatch refusal", i+1)
+		}
+	}
+
+	if ex.starts != 1 {
+		t.Errorf("StartProcess invoked %d time(s) over 3 reconciles of an unchanged mismatching spec, want exactly 1 "+
+			"(the pre-flight memo should have refused the other 2 without downloading)", ex.starts)
+	}
+	if len(written) == 0 {
+		t.Fatal("no status writes recorded; the refusal must be reported on the status")
+	}
+	for i, s := range written {
+		if s != EventReasonModelDigestMismatch {
+			t.Errorf("status write %d = %q, want %q (writes: %q); a clear-then-set in between would mean "+
+				"memory admission's success path ran, which is exactly the status churn this memo prevents",
+				i, s, EventReasonModelDigestMismatch, written)
+		}
+	}
+}
+
+// TestEnsureProcess_DigestMismatchMemo_ClearsOnSHA256Change proves the memo
+// self-invalidates on a spec edit rather than permanently wedging a Model:
+// correcting spec.sha256 to match the file's real digest must retry the
+// download, not be blocked by a memo recorded against the old, wrong digest.
+func TestEnsureProcess_DigestMismatchMemo_ClearsOnSHA256Change(t *testing.T) {
+	isvc := refusalISVC("svc")
+	model := refusalModel()
+	model.Spec.SHA256 = "aaaa"
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, model)
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelDigestMismatchError{Path: "/models/m/model.gguf", Expected: "aaaa", Computed: "bbbb"})
+
+	get := func() *inferencev1alpha1.InferenceService {
+		t.Helper()
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		return cur
+	}
+
+	if err := a.ensureProcess(context.Background(), get()); err == nil {
+		t.Fatal("first ensureProcess succeeded, want a digest-mismatch refusal")
+	}
+	if err := a.ensureProcess(context.Background(), get()); err == nil {
+		t.Fatal("second ensureProcess succeeded, want the memoized refusal")
+	}
+	if ex.starts != 1 {
+		t.Fatalf("starts after two reconciles of an unchanged mismatching spec = %d, want 1", ex.starts)
+	}
+
+	// Correct the Model's sha256 to what the (simulated) file actually
+	// hashes to. The memo was keyed on the OLD sha256, so it must not apply.
+	curModel := &inferencev1alpha1.Model{}
+	if err := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: refusalModelName, Namespace: "default"}, curModel); err != nil {
+		t.Fatal(err)
+	}
+	curModel.Spec.SHA256 = "bbbb"
+	if err := a.config.K8sClient.Update(context.Background(), curModel); err != nil {
+		t.Fatal(err)
+	}
+	ex.startErr = nil // the corrected digest verifies successfully this time
+
+	if err := a.ensureProcess(context.Background(), get()); err != nil {
+		t.Fatalf("ensureProcess after correcting sha256: %v", err)
+	}
+	if ex.starts != 2 {
+		t.Errorf("starts after correcting sha256 = %d, want 2 (a spec change must not be blocked by the stale memo)",
+			ex.starts)
+	}
+}
+
+// TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason (a structural
+// AST scan, not a hand-maintained table) lives in
+// refusal_reasons_scan_test.go.

@@ -40,9 +40,12 @@ make build-metal-agent
 # Copy to /usr/local/bin
 sudo cp bin/llmkube-metal-agent /usr/local/bin/
 
-# Install launchd plist
+# Install launchd plist (launchd does not expand ~ or $HOME, so render the
+# __HOME__ placeholder in the log paths; `make install-metal-agent` does this)
 mkdir -p ~/Library/LaunchAgents
-cp deployment/macos/com.llmkube.metal-agent.plist ~/Library/LaunchAgents/
+mkdir -p -m 0700 ~/Library/Logs/llmkube
+sed 's|__HOME__|'"$HOME"'|g' deployment/macos/com.llmkube.metal-agent.plist \
+  > ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 
 # Load the service
 launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
@@ -70,7 +73,7 @@ llmkube deploy my-model --accelerator metal \
 launchctl list | grep llmkube
 
 # View agent logs
-tail -f /tmp/llmkube-metal-agent.log
+tail -f ~/Library/Logs/llmkube/metal-agent.log
 
 # Check running processes
 ps aux | grep llmkube-metal-agent
@@ -102,14 +105,52 @@ The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
     <string>/usr/local/bin/llmkube-metal-agent</string>
     <string>--namespace</string>
     <string>default</string>              <!-- Kubernetes namespace to watch -->
-    <string>--model-store</string>
-    <string>/tmp/llmkube-models</string>  <!-- Where to store downloaded models -->
+    <!-- Optional: --model-store <path>; default ~/Library/Application Support/llmkube/models -->
     <string>--llama-server</string>
     <string>/usr/local/bin/llama-server</string>  <!-- Path to llama-server binary -->
     <string>--port</string>
     <string>9090</string>                 <!-- Agent metrics port -->
 </array>
 ```
+
+### Model store
+
+Downloaded models and the per-engine logs live in the model store, by default
+`~/Library/Application Support/llmkube/models`. The agent creates it (mode
+0700) on first start. The store is judged on the directory it resolves to (the
+target of a symlinked store), and the agent refuses to start unless:
+
+- the store is not at or under `/tmp`, `/var/tmp` or their `/private` forms
+  (macOS resolves `/tmp` to `/private/tmp`), even when the agent owns it:
+  those directories are emptied at boot, so another local user could create
+  the path first,
+- the store is owned by the agent's user and is not writable by the group or
+  other users,
+- every directory above it, up to `/`, is owned by root or by the agent's
+  user, and is not group- or other-writable unless it has the sticky bit
+  (like `/Users/Shared`). Otherwise the owner of that directory, or anyone who
+  can write it, could move the store aside and put their own in its place.
+
+The error names the path, its owner uid and mode, and the fix (`chown`,
+`chmod go-w`, or a different `--model-store`). The agent then uses the
+resolved directory, so repointing a symlinked `--model-store` needs a restart.
+`--model-store` must be absolute or start with `~/` (expanded against the
+agent user's home).
+
+A volume that does not store Unix permissions, such as an exFAT or FAT
+external disk under `/Volumes`, reports every directory as mode 0777, so a
+store there always fails the check. Put the store on an APFS or HFS+ volume.
+
+To see the owner and mode of the store and every directory above it, set
+`STORE` to your store path and run this in `sh`, `bash` or `zsh`:
+
+```bash
+STORE="$HOME/Library/Application Support/llmkube/models"; p=$(cd "$STORE" 2>/dev/null && pwd -P || echo "$STORE"); while :; do ls -ld "$p" 2>/dev/null || echo "not created yet: $p"; [ "$p" = / ] && break; p=$(dirname "$p"); done
+```
+
+Each line must show the agent's user or `root` as the owner, and no `w` in
+the group or other position unless the mode ends in `t` (sticky). A store
+that does not exist yet prints `not created yet`; the agent creates it 0700.
 
 ### `--allowed-model-roots` flag (local model paths)
 
@@ -121,11 +162,13 @@ To allow local model sources outside the model store, pass a comma-separated lis
 llmkube-metal-agent --allowed-model-roots /Users/you/llmkube-models
 ```
 
-Symlinks are followed, so a model store entry (or an `owner/repo` source resolved under the store) that is itself a symlink into the Hugging Face cache needs the cache's real directory added, not just the model store. Add the cache root itself (`/Users/you/.cache/huggingface/hub`), not a `models--org--name/snapshots/<rev>` subdirectory: the snapshot's files are symlinks into the cache's `blobs/` directory, and a GGUF's shards resolve there too, outside any narrower root you might otherwise pick:
+Symlinks in a local source are followed, so a local source (or an `owner/repo` source resolved under the store) that is itself a symlink into the Hugging Face cache needs the cache's real directory added, not just the model store. Add the cache root itself (`/Users/you/.cache/huggingface/hub`), not a `models--org--name/snapshots/<rev>` subdirectory: the snapshot's files are symlinks into the cache's `blobs/` directory, and a GGUF's shards resolve there too, outside any narrower root you might otherwise pick:
 
 ```bash
 llmkube-metal-agent --allowed-model-roots /Users/you/.cache/huggingface/hub
 ```
+
+To serve a GGUF that is already on the Mac, set the Model's `spec.source` to its absolute path (or a `file://` URI) and add its directory to `--allowed-model-roots`. Do not place the file, or a symlink to it, in the cache slot of a downloaded source (`<model-store>/<model>/<file>` for an `https`, `hf` or `s3` source): the agent writes that slot itself and refuses to start from a symlink there, with reason `ModelSourceNotAllowed`.
 
 To set this in the launchd plist, add these lines to the `ProgramArguments` array:
 
@@ -165,6 +208,129 @@ kubectl get isvc <name> -o jsonpath='{.status.schedulingMessage}'
 ```
 
 Upgrade note: if you already point local model sources, or a `pagedSSDCacheDir`, outside the model store, add their root to `--allowed-model-roots` before upgrading, or the agent will start refusing them. This mirrors the controller's own `--allowed-host-path-roots` (Helm `modelSource.allowedHostPathRoots`), which is enforced separately, at the controller. A Model the controller already marked `Failed` (for example with reason `SourceNotAllowed`) is now also refused by the agent, instead of being served anyway.
+
+### `--allowed-download-hosts` flag (remote model sources)
+
+Every download the agent makes for a Model source (`http`, `https`, `hf`, `s3`, the HEAD probes used for memory sizing, and any redirect along the way) is refused if the host resolves to a loopback, link-local (including the cloud metadata address `169.254.169.254`), RFC 1918, CGNAT, unique-local or unspecified address. The guard checks the resolved IP, not the hostname, so it also catches a public name that redirects or DNS-rebinds to one of those ranges.
+
+To allow a specific internal source anyway, for example a LAN MinIO, pass a comma-separated list of hostnames or CIDRs:
+
+```bash
+llmkube-metal-agent --allowed-download-hosts=minio.lan,10.20.0.0/16
+```
+
+To set this in the launchd plist:
+
+```xml
+    <string>--allowed-download-hosts</string>
+    <string>minio.lan,10.20.0.0/16</string>
+```
+
+A refused download names the flag in its error and Event message. The controller enforces the same rule on its own downloads via `modelSource.allowedRemoteHosts` (Helm), from the same shared guard package; the two allowlists are configured separately and are not merged.
+
+A few behavior notes:
+
+- HTTP proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and their lowercase forms) are honored. The target host is still checked against the allowlist even when the request goes through a proxy; the proxy's own address is trusted as configured.
+- Redirects are capped at 5 hops, and each hop's target is checked again before it is dialed.
+- The dial timeout is 10 seconds; there is no overall download timeout, so a slow but healthy transfer of a large model is not cut short.
+- A DNS64 address is judged by its embedded IPv4 address, so a public IPv4-only host stays reachable on a DNS64 network while the loopback and private ranges stay blocked.
+
+### `spec.sha256` digest verification
+
+When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source against it before the file is used. A mismatch deletes the file and refuses to start the InferenceService with reason `ModelDigestMismatch` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). A verified file gets a `<file>.sha256` stamp beside it, so a later restart does not re-hash a potentially huge model unless the stamp is missing or stale.
+
+`spec.sha256` is enforced for sources the agent downloads for llama-server (the `llamacpp` runtime): `http`, `https`, `hf` and `s3`. A local-path or `file://` source is loaded in place and is never hashed. The other Metal runtimes (mlx-server, vllm-swift, oMLX, TensorFold and Ollama) do not download through the agent and ignore `spec.sha256` in 0.10.1.
+
+The agent remembers a mismatch so it does not re-download the same bad source on every reconcile. Changing the Model's `source` or `sha256` clears that memo automatically, since it is keyed to the exact source and digest it was recorded against; the next reconcile then retries the download. If the spec is unchanged (for example, the same URL now serves a corrected file), recreate the `Model` or the `InferenceService` instead: deleting either one clears the memo, so the next reconcile downloads and verifies it again.
+
+### Choosing the cluster (`--kubeconfig`, `--kube-context`)
+
+The agent finds its cluster the same way controller-runtime tools do: the
+`--kubeconfig` flag, then `$KUBECONFIG`, then `~/.kube/config`. By default it
+uses that kubeconfig's **current context**, so if you switch contexts with
+`kubectl config use-context` and the agent restarts, it connects to whatever
+cluster you last selected.
+
+Pin the agent to its cluster so your kubectl context never moves it:
+
+- `--kubeconfig /path/to/file` points the agent at a dedicated kubeconfig.
+- `--kube-context <name>` picks a context other than the current one.
+
+Both can be set at install time:
+
+```bash
+make install-metal-agent METAL_KUBECONFIG=$HOME/.kube/llmkube-metal-agent.yaml
+make install-metal-agent METAL_KUBE_CONTEXT=lab
+```
+
+or by adding them to `ProgramArguments` in the plist. The agent logs the
+context and API server it connected to at startup:
+
+```bash
+grep "connected to Kubernetes" ~/Library/Logs/llmkube/metal-agent.log
+```
+
+### Dedicated kubeconfig with least-privilege RBAC
+
+The agent doesn't need your admin credentials.
+[`metal-agent-rbac.yaml`](metal-agent-rbac.yaml) creates a ServiceAccount
+with only the permissions the agent uses (read InferenceServices and Models,
+update InferenceService status, manage the Services and EndpointSlices that
+publish each server, write events, read the relay token Secret and
+`sourceSecretRef` secrets). Mint a kubeconfig from it:
+
+```bash
+NS=default                                  # the namespace the agent watches (--namespace)
+KC=$HOME/.kube/llmkube-metal-agent.yaml
+CA=$(mktemp)                                # private temp file for the cluster CA
+
+kubectl apply -n "$NS" -f deployment/macos/metal-agent-rbac.yaml
+
+SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+CA_DATA=$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
+CA_FILE=$(kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority}')
+if [ -n "$CA_DATA" ]; then
+  echo "$CA_DATA" | base64 -d > "$CA"
+elif [ -n "$CA_FILE" ]; then
+  cp "$CA_FILE" "$CA"
+fi
+test -s "$CA" || { echo "no cluster CA found in either certificate-authority-data or certificate-authority; set --certificate-authority on the set-cluster command below by hand" >&2; exit 1; }
+
+TOKEN=$(kubectl create token llmkube-metal-agent -n "$NS" --duration=8760h)
+
+kubectl --kubeconfig "$KC" config set-cluster llmkube \
+  --server "$SERVER" --certificate-authority "$CA" --embed-certs
+kubectl --kubeconfig "$KC" config set-credentials llmkube-metal-agent --token "$TOKEN"
+kubectl --kubeconfig "$KC" config set-context llmkube \
+  --cluster llmkube --user llmkube-metal-agent --namespace "$NS"
+kubectl --kubeconfig "$KC" config use-context llmkube
+chmod 600 "$KC"; rm "$CA"
+
+# Check what the agent can do, then install with it
+kubectl --kubeconfig "$KC" auth can-i --list -n "$NS"
+make install-metal-agent METAL_KUBECONFIG="$KC"
+```
+
+The current context's cluster entry usually carries `certificate-authority-data`
+(the CA embedded inline, base64-encoded); some kubeconfigs instead carry
+`certificate-authority` as a file path, and a cluster with no CA configured at
+all (for example one already using `insecure-skip-tls-verify`) has neither.
+The recipe above tries the inline data first, falls back to copying the file,
+and refuses to continue rather than minting a kubeconfig with an empty,
+unusable CA.
+
+`kubectl create token` issues a time-limited token, and the API server may
+cap `--duration` below what you ask for. When it expires the agent logs
+`Unauthorized`; rerun the `create token` and `set-credentials` steps. The
+manifest is namespace-scoped: running the agent with `--namespace ""` (all
+namespaces) needs the same rules in a ClusterRole and ClusterRoleBinding.
+
+The agent's client also looks up API groups through the API server's
+discovery endpoints (`/api`, `/apis`), which any authenticated identity can
+normally read through the default `system:discovery` ClusterRoleBinding. If
+your cluster's admins removed that binding, the ServiceAccount above needs it
+granted explicitly, for example
+`kubectl create clusterrolebinding llmkube-metal-agent-discovery --clusterrole=system:discovery --serviceaccount="$NS:llmkube-metal-agent"`.
 
 ### `--host-ip` flag (remote cluster)
 
@@ -212,6 +378,8 @@ model" for the full flow.
 | `--client-port` | `9999` | Listener on `127.0.0.1:<port>` that forwards `/v1/*` to the current engine, for clients on the Mac itself. `0` disables it. |
 
 `--ingress-port` must differ from `--port` and `--client-port`.
+
+The client-proxy listener only answers a request whose `Host` header names this loopback proxy (`127.0.0.1`, `localhost` or `[::1]` on `--client-port`); anything else gets 421, which blocks DNS rebinding. It also applies the same runtime path allowlist as the ingress. See "Network exposure" under "Security model" below for the full behavior.
 
 ### `--memory-fraction` flag (memory budget)
 
@@ -339,6 +507,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_apple_power_cpu_watts` | Gauge | CPU subsystem power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_ane_watts` | Gauge | Apple Neural Engine power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_ingress_requests_total` | Counter | Requests answered by the authenticated ingress. Labels: `code` (HTTP status) |
+| `llmkube_metal_agent_client_proxy_requests_total` | Counter | Requests answered by the host-side client proxy. Labels: `outcome` (`bad_host`, `no_backend`, `path_forbidden`, or the response's status class) |
 
 Standard Go runtime and process metrics (`go_*`, `process_*`) are also available.
 
@@ -412,6 +581,16 @@ kubectl describe inferenceservice <name>
   "`--allowed-model-roots` flag (local model paths)" above.
 - **extraArgs** (`ExtraArgsRejected`): every flag in `spec.extraArgs` is
   checked against a typed, per-engine allowlist. See below.
+- **Remote sources** (download refused by the SSRF guard): a Model source
+  that resolves to a private, loopback or link-local address is refused
+  unless it is in `--allowed-download-hosts`. See "`--allowed-download-hosts`
+  flag (remote model sources)" above.
+- **Digest mismatch** (`ModelDigestMismatch`): when `spec.sha256` is set, a
+  downloaded source that does not match it is deleted and refused. See
+  "`spec.sha256` digest verification" above.
+- **Cache slot** (`ModelSourceNotAllowed`): for a downloaded source, the
+  file at `<model-store>/<model>/<file>` must be a regular file the agent
+  wrote. A symlink there is refused, not followed.
 
 ### The extraArgs typed allowlist
 
@@ -488,6 +667,13 @@ It never relaxes:
 
 Turn this on only for a Mac whose InferenceService authors are fully trusted.
 
+With it set, llama-server's own download flags (`-hf`/`--hf-repo`,
+`-hff`/`--hf-file`, `-mu`/`--model-url`, `-dr`/`--docker-repo`,
+`--hf-repo-draft`, `-mmu`/`--mmproj-url`, and similar) are allowed, and the
+engine then fetches that file itself. Those downloads bypass the agent's SSRF
+guard (`--allowed-download-hosts`) and the `spec.sha256` check, which apply
+only to downloads the agent makes.
+
 ### Practical notes
 
 - On vllm-swift, any `-config` flag other than `--generation-config` and
@@ -502,6 +688,21 @@ Turn this on only for a Mac whose InferenceService authors are fully trusted.
   a path inside the allowed roots.
 - llama-server's `--no-mmap` is not a flag in the pinned 0.5.0 build and is
   refused as unknown.
+- vllm-swift's `--trust-request-chat-template`, `--enable-prompt-embeds` and
+  `--enable-mm-embeds` are refused: the first lets any API client, not only
+  the InferenceService writer, supply a chat template for the server to
+  render, and the other two let any API client submit a serialized tensor
+  the server deserializes with `torch.load` (the class of bug fixed as
+  CVE-2025-62164). All three are relaxable with `--allow-unsafe-extra-args`.
+- vllm-swift's `--tokenizer`, `--hf-config-path` and `--generation-config`,
+  and the path half of a `--lora-modules name=path` entry, must resolve to a
+  path that already exists inside the allowed roots; a Hugging Face
+  `owner/name` repo id is not accepted there. Without this, a repo id would
+  pass as a not-yet-existing path and vLLM would download it into the
+  Hugging Face cache, outside every allowed root.
+- A `--no-X=value` spelling (for example `--no-enable-prompt-embeds=false`)
+  is refused exactly like `X` itself, on any runtime. Only a bare `--no-X`,
+  with no value, is treated as the negation that turns `X` off.
 
 ### Network exposure
 
@@ -568,6 +769,9 @@ The ingress answers:
 The pin is rooted in Kubernetes write access: anyone who can write Services
 or EndpointSlices in the namespace could already redirect the
 InferenceService's traffic, so publishing the pin there adds no new trust.
+Write access to a legacy core/v1 `Endpoints` object of the same name is
+equivalent, since Kubernetes mirrors it into an EndpointSlice: treat both as
+sensitive.
 
 #### Path allowlist
 
@@ -599,6 +803,35 @@ Additions per runtime:
 Everything else answers 403, including admin endpoints such as llama-server's
 `/slots` and `POST /props`, vLLM's `/sleep` and LoRA loading, and Ollama's
 pull, push, delete, create, copy and blob endpoints.
+
+#### Client proxy
+
+The client proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy
+flags" above) is for callers on the Mac itself, not the cluster, but it
+applies the same rules:
+
+- It answers 421 unless the request's `Host` header is `127.0.0.1`,
+  `localhost` or `[::1]` on the proxy's own port. This blocks DNS rebinding:
+  a page served from a public domain that resolves to `127.0.0.1` presents
+  that domain as `Host`, not `localhost`, so it is rejected before it can
+  reach a child process or even learn whether one is running.
+- It applies the same runtime path allowlist the TLS ingress does (see
+  "Path allowlist" above), so an admin path such as `/slots` still answers
+  403.
+- It rewrites the outbound `Host` header to the current engine's address and
+  refuses protocol upgrades, the same as the ingress.
+
+The client proxy has no token or certificate check of its own: any process
+on the Mac that can reach `127.0.0.1:<client-port>` is trusted, but only for
+the paths on the allowlist above.
+
+The engines themselves still listen without authentication on their own
+loopback ports (`127.0.0.1:<engine-port>`), with no `Host` check and no path
+allowlist. The client proxy's checks do not cover a process that dials an
+engine port directly, so any local process on the Mac can reach an engine's
+admin endpoints (for example llama-server's `/slots`). Loopback is the trust
+boundary: treat every local user and process on the Mac as able to use the
+engines.
 
 #### NetworkPolicy and metrics
 
@@ -638,8 +871,8 @@ On a Metal InferenceService (`kubectl describe inferenceservice <name>`):
 - From the controller: `RelayCreated`, `ServiceAdopted`, `RelayRemoved`
   (Normal); `RelayReconcileFailed`, `InvalidAgentIngressPin` (Warning).
 - From the agent: `RelayNotAdopted`, `ExtraArgsRejected`,
-  `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`
-  (Warning).
+  `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`,
+  `ModelDigestMismatch` (Warning).
 
 `ServiceNameTooLong` means the InferenceService name is too long for the
 `<isvc>-agent` Service (at most 57 characters, since the name plus `-agent`
@@ -666,6 +899,87 @@ controller predates relay support.
   proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy flags"
   above).
 
+#### Upgrading to 0.10.1
+
+0.10.1 hardens downloads, the model store, the client proxy and vllm-swift's
+`extraArgs`.
+
+##### Upgrade blockers
+
+Each of these stops an agent, or an InferenceService, after the upgrade until
+it is fixed. Check them before upgrading:
+
+- **Re-render the launchd plist (required when upgrading from 0.10.0).** The
+  0.10.0 plist passed `--model-store /tmp/llmkube-models` explicitly and sent
+  the agent's output to `/tmp/llmkube-metal-agent.log`. Swapping the binary
+  and running `launchctl kickstart -k` keeps that plist, and 0.10.1 refuses a
+  model store under `/tmp`, so the agent will not start. Boot the job out and
+  reinstall, which renders the new plist (default store
+  `~/Library/Application Support/llmkube/models`, logs in
+  `~/Library/Logs/llmkube/metal-agent.log`) and loads it:
+
+  ```bash
+  launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+  while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+  make install-metal-agent
+  launchctl print gui/$(id -u)/com.llmkube.metal-agent | grep 'state = running'
+  ```
+
+  `make install-metal-agent` alone is not enough for a job that is already
+  loaded: launchd keeps running the old definition until the job is booted
+  out. Wait for the unload before reinstalling: `bootout` returns before
+  launchd has finished, and a `bootstrap` that runs too soon can fail with
+  `Bootstrap failed: 5: Input/output error` and leave the agent unloaded.
+  The last command prints `state = running` once the agent is back. If you maintain your own plist, remove the `--model-store /tmp/...`
+  pair (or point it at a directory the agent owns outside `/tmp`), move
+  `StandardOutPath` and `StandardErrorPath` out of `/tmp`, and set
+  `WorkingDirectory` to the agent user's home. Nothing moves by itself: until
+  the plist changes, the agent refuses to start.
+- **Model store ownership.** The store and every directory above it must pass
+  the checks in "Model store" above: the store owned by the agent's user and
+  not group- or other-writable, and every ancestor owned by root or the agent's
+  user and not group- or other-writable unless sticky. A store on an exFAT or
+  FAT volume always fails; use APFS or HFS+. Run the one-liner in "Model
+  store" against your store path to see each directory's owner and mode.
+- **A symlink in a downloaded source's cache slot.** Serving a hand-placed
+  GGUF by putting it, or a symlink to it, at `<model-store>/<model>/<file>`
+  with an `https`, `hf` or `s3` URL in `spec.source` no longer works: the
+  InferenceService is refused with `ModelSourceNotAllowed`. Set the Model's
+  `spec.source` to the file's absolute path (or a `file://` URI) and add its
+  directory to `--allowed-model-roots`.
+- **LAN download sources.** If any Model source is fetched from a LAN mirror
+  (an internal MinIO, registry, or similar), add its host or CIDR to
+  `--allowed-download-hosts`, or the agent will refuse to fetch it. See
+  "`--allowed-download-hosts` flag (remote model sources)" above. Also
+  expect macOS to revoke the new binary's Local Network access; see "LAN
+  download fails with `no route to host` after an upgrade" under
+  Troubleshooting.
+- **vllm-swift `extraArgs`.** If any InferenceService's `extraArgs` sets
+  vllm-swift's `--trust-request-chat-template`, `--enable-prompt-embeds` or
+  `--enable-mm-embeds`, or points `--tokenizer`, `--hf-config-path`,
+  `--generation-config` or a `--lora-modules` path at a Hugging Face repo id
+  instead of a path already on disk, it will start failing
+  `ExtraArgsRejected` after the upgrade. Fix the InferenceService or set
+  `--allow-unsafe-extra-args` on that agent. See "Practical notes" above.
+
+After the plist is re-rendered, expect a one-time re-download of every model
+on first start: the new default store is a directory the agent has never
+populated. The old `/tmp` store was cleared on every reboot anyway.
+
+##### Behavior changes in 0.10.1
+
+- The controller's GGUF metadata reads honor `HTTP_PROXY`, `HTTPS_PROXY` and
+  `NO_PROXY` (and their lowercase forms), as the agent's downloads do. The
+  target host is still checked against the allowlist when a proxy is used.
+- A NAT64 address in `64:ff9b::/96` is judged by the IPv4 address embedded in
+  it, so a public IPv4-only host stays reachable on a DNS64 network while
+  loopback and private ranges stay blocked.
+- Downloads follow at most 5 redirects (the agent allowed 10 before).
+- The dial timeout for downloads is 10 seconds (it was 30).
+- Downloads use HTTP/1.1 only.
+- `spec.sha256` is now enforced for sources the agent downloads for
+  llama-server; see "`spec.sha256` digest verification" above.
+
 #### `--legacy-direct-endpoints` (deprecated)
 
 `--legacy-direct-endpoints` restores the old behavior: engines bind all
@@ -682,7 +996,7 @@ trusted network, behind its own firewall, or reachable only over Tailscale.
 
 ```bash
 # Check logs
-cat /tmp/llmkube-metal-agent.log
+cat ~/Library/Logs/llmkube/metal-agent.log
 
 # Verify llama-server is installed
 which llama-server
@@ -719,6 +1033,25 @@ To resolve:
 - **Increase the memory fraction** with `--memory-fraction 0.9` if this is a dedicated inference machine
 - **Close other applications** to free unified memory
 
+### Model download blocked by the SSRF guard
+
+The Model's source resolves to a private, loopback or link-local address, which the agent refuses to fetch from by default:
+
+```bash
+kubectl describe inferenceservice <name>
+# Warning  ...  connection to <host> (<ip>) blocked by SSRF guard (GHSA-jw3m-8q7m-f35r); allowlist via --allowed-download-hosts
+```
+
+If the source is a LAN mirror you trust (an internal MinIO or registry), add its host or CIDR to `--allowed-download-hosts` and restart the agent. See "`--allowed-download-hosts` flag (remote model sources)" above.
+
+### LAN download fails with `no route to host` after an upgrade
+
+The guard allowed the host, but macOS blocked the connection. macOS Local Network Privacy ties its permission to the agent binary, so a new binary loses access to the local network until it is granted again, and the refusal surfaces as `connect: no route to host` rather than a permission error. Downloads from the internet and the cluster's traffic to the agent's ingress are not affected. Grant the agent access in System Settings, Privacy & Security, Local Network, or reach the mirror over a route macOS does not treat as local (for example a VPN or tailnet address).
+
+### `ModelDigestMismatch`
+
+The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad file was already deleted. Fixing `spec.sha256` or `spec.source` retries on the next reconcile; if the spec was already right and the source was fixed upstream, recreate the Model (or the InferenceService) to retry. See "`spec.sha256` digest verification" above.
+
 ### Can't connect to Kubernetes
 
 ```bash
@@ -730,6 +1063,9 @@ kubectl config current-context
 
 # Check kubeconfig path
 echo $KUBECONFIG
+
+# See which cluster and context the agent actually connected to
+grep "connecting to Kubernetes\|connected to Kubernetes" ~/Library/Logs/llmkube/metal-agent.log
 
 # If using minikube locally
 minikube status

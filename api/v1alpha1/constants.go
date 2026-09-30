@@ -218,3 +218,64 @@ const (
 	// idleness when waiting for idle before rollout.
 	DefaultIdleCheckInterval = 5 * time.Second
 )
+
+// Metal-agent refusal reasons: the Status.SchedulingStatus (and matching
+// Kubernetes Event reason) values the metal-agent writes when it declines to
+// start a service on a Metal InferenceService. These are exported here, and
+// pkg/agent's EventReason constants equal them, so both the agent (which
+// writes them) and the controller's determinePhase (internal/controller/
+// scheduling.go, which must not overwrite a refusal with "WaitingForMetalAgent"
+// on the next reconcile) share one list instead of two hand-maintained ones
+// that silently drift out of sync. They did once: ServiceNameTooLong was
+// added to the agent in 0.10.0 without a matching controller-side entry, so
+// the controller cleared the refusal every poll and the agent re-refused
+// every poll, in a loop.
+const (
+	// ReasonInsufficientMemory is set when a Model does not fit the host's
+	// memory budget (memory admission, pkg/agent/agent.go).
+	ReasonInsufficientMemory string = "InsufficientMemory"
+
+	// ReasonMemoryCheckFailed is set when the memory admission check itself
+	// could not complete (resolution or estimation failure) and the agent
+	// fails closed rather than starting an unchecked process.
+	ReasonMemoryCheckFailed string = "MemoryCheckFailed"
+
+	// ReasonEndpointNameConflict is set when the "<isvc>[-agent]" Service or
+	// EndpointSlice name the agent would register is already owned by another
+	// object.
+	ReasonEndpointNameConflict string = "EndpointNameConflict"
+
+	// ReasonModelSourceNotAllowed is set when a Model is Failed, or its
+	// source (or pagedSSDCacheDir) resolves outside the agent's allowed
+	// filesystem roots.
+	ReasonModelSourceNotAllowed string = "ModelSourceNotAllowed"
+
+	// ReasonExtraArgsRejected is set when spec.extraArgs fails the runtime's
+	// extra-args policy (an unrecognized or dangerous flag).
+	ReasonExtraArgsRejected string = "ExtraArgsRejected"
+
+	// ReasonServiceNameTooLong is set when relay mode's "-agent"-suffixed
+	// Service name would exceed the DNS label length limit.
+	ReasonServiceNameTooLong string = "ServiceNameTooLong"
+
+	// ReasonModelDigestMismatch is set when a downloaded model's SHA256 does
+	// not match Model.spec.sha256.
+	ReasonModelDigestMismatch string = "ModelDigestMismatch"
+)
+
+// MetalAgentRefusalReasons lists every SchedulingStatus value the metal agent
+// writes when it refuses to start a service. internal/controller/scheduling.go
+// builds its agentRefusalReasons set from this list rather than maintaining a
+// second, independent copy; pkg/agent/refusal.go and pkg/agent/pressure.go's
+// EventReason constants for these reasons are defined equal to the constants
+// above, and a pkg/agent test asserts every reason actually used with
+// refuseStart or the memory refusal path appears here.
+var MetalAgentRefusalReasons = []string{
+	ReasonInsufficientMemory,
+	ReasonMemoryCheckFailed,
+	ReasonEndpointNameConflict,
+	ReasonModelSourceNotAllowed,
+	ReasonExtraArgsRejected,
+	ReasonServiceNameTooLong,
+	ReasonModelDigestMismatch,
+}

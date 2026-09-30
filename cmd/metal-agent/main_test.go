@@ -3,11 +3,23 @@ package main
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"go.uber.org/zap/zapcore"
+
+	"github.com/defilantech/llmkube/pkg/agent"
 )
+
+// TestMain clears agent.SystemTempRoots: the store tests here build their
+// store in t.TempDir(), which is under /tmp wherever TMPDIR is unset (Linux
+// CI), and the store check would refuse all of them. The /tmp refusal test
+// sets it back explicitly.
+func TestMain(m *testing.M) {
+	agent.SystemTempRoots = nil
+	os.Exit(m.Run())
+}
 
 func TestParseLogLevel(t *testing.T) {
 	tests := []struct {
@@ -170,4 +182,176 @@ func TestResolveTensorFoldBin(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestResolveModelStorePath(t *testing.T) {
+	origHome := userHomeDir
+	t.Cleanup(func() { userHomeDir = origHome })
+
+	t.Run("empty flag defaults under the home directory", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		got, err := resolveModelStorePath("")
+		want := "/Users/tester/Library/Application Support/llmkube/models"
+		if err != nil || got != want {
+			t.Fatalf("resolveModelStorePath(\"\") = %q, %v; want %q", got, err, want)
+		}
+	})
+
+	t.Run("explicit flag is kept and home is not consulted", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "", errors.New("no home") }
+		got, err := resolveModelStorePath("/Volumes/models")
+		if err != nil || got != "/Volumes/models" {
+			t.Fatalf("got %q, %v; want /Volumes/models", got, err)
+		}
+	})
+
+	t.Run("a bare ~ expands to the home directory", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		got, err := resolveModelStorePath("~")
+		if err != nil || got != "/Users/tester" {
+			t.Fatalf("resolveModelStorePath(\"~\") = %q, %v; want /Users/tester", got, err)
+		}
+	})
+
+	t.Run("a leading ~/ expands against the home directory", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		got, err := resolveModelStorePath("~/models")
+		if err != nil || got != "/Users/tester/models" {
+			t.Fatalf("resolveModelStorePath(\"~/models\") = %q, %v; want /Users/tester/models", got, err)
+		}
+	})
+
+	t.Run("~ with unknown home is an error", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "", errors.New("no home") }
+		if got, err := resolveModelStorePath("~/models"); err == nil {
+			t.Fatalf("got %q, nil; want an error", got)
+		}
+	})
+
+	t.Run("a relative path is refused", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "/Users/tester", nil }
+		for _, rel := range []string{"models", "./models", "~user/models"} {
+			got, err := resolveModelStorePath(rel)
+			if err == nil {
+				t.Fatalf("resolveModelStorePath(%q) = %q, nil; want an error", rel, got)
+			}
+			if !strings.Contains(err.Error(), "absolute") {
+				t.Errorf("error %q does not say the path must be absolute", err)
+			}
+		}
+	})
+
+	t.Run("empty flag with unknown home is an error", func(t *testing.T) {
+		userHomeDir = func() (string, error) { return "", errors.New("no home") }
+		if got, err := resolveModelStorePath(""); err == nil {
+			t.Fatalf("got %q, nil; want an error", got)
+		}
+	})
+}
+
+func TestPrepareModelStore(t *testing.T) {
+	t.Run("creates a missing store and its parents 0700", func(t *testing.T) {
+		base := t.TempDir()
+		store := filepath.Join(base, "Application Support", "llmkube", "models")
+		if _, err := prepareModelStore(store); err != nil {
+			t.Fatalf("prepareModelStore = %v", err)
+		}
+		for _, p := range []string{store, filepath.Dir(store), filepath.Dir(filepath.Dir(store))} {
+			info, err := os.Stat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o700 {
+				t.Errorf("%s mode = %o, want 0700", p, perm)
+			}
+		}
+	})
+
+	t.Run("refuses an existing group-writable store", func(t *testing.T) {
+		store := filepath.Join(t.TempDir(), "models")
+		if err := os.Mkdir(store, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(store, 0o775); err != nil { //nolint:gosec // G302: the fixture must be group-writable
+			t.Fatal(err)
+		}
+		_, err := prepareModelStore(store)
+		if err == nil || !strings.Contains(err.Error(), "chmod go-w") {
+			t.Fatalf("prepareModelStore(0775) = %v, want a refusal naming the fix", err)
+		}
+	})
+
+	t.Run("keeps an existing owned 0755 store", func(t *testing.T) {
+		store := filepath.Join(t.TempDir(), "models")
+		if err := os.Mkdir(store, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(store, 0o755); err != nil { //nolint:gosec // G302: a pre-existing 0755 store must stay accepted
+			t.Fatal(err)
+		}
+		if _, err := prepareModelStore(store); err != nil {
+			t.Fatalf("prepareModelStore(owned 0755) = %v, want nil", err)
+		}
+	})
+}
+
+// prepareModelStore refuses a store under /tmp, which the 0.10.0 plist
+// pinned, even though it creates the store 0700 and owns it.
+func TestPrepareModelStore_RefusesStoreUnderTmp(t *testing.T) {
+	prev := agent.SystemTempRoots
+	agent.SystemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
+	t.Cleanup(func() { agent.SystemTempRoots = prev })
+
+	base, err := os.MkdirTemp("/tmp", "llmkube-prepare-test-")
+	if err != nil {
+		t.Skipf("cannot create a directory under /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	store := filepath.Join(base, "llmkube-models")
+	_, err = prepareModelStore(store)
+	if err == nil || !strings.Contains(err.Error(), "make install-metal-agent") {
+		t.Fatalf("prepareModelStore(%s) = %v, want a refusal naming the plist re-render", store, err)
+	}
+}
+
+// configureModelStore pins cfg.ModelStorePath to the checked, resolved
+// directory: repointing the configured symlink afterwards must not change
+// the path the agent (NewMetalAgent, executors) goes on to use.
+func TestConfigureModelStore_PinsResolvedStore(t *testing.T) {
+	base := t.TempDir()
+	good := filepath.Join(base, "good")
+	evil := filepath.Join(base, "evil")
+	for _, d := range []string{good, evil} {
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(base, "store-link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &AgentConfig{ModelStorePath: link}
+	if err := configureModelStore(cfg); err != nil {
+		t.Fatalf("configureModelStore = %v", err)
+	}
+	want, _ := filepath.EvalSymlinks(good)
+	if cfg.ModelStorePath != want {
+		t.Fatalf("cfg.ModelStorePath = %q, want the resolved dir %q", cfg.ModelStorePath, want)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(evil, link); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ModelStorePath != want {
+		t.Fatalf("cfg.ModelStorePath moved with the symlink: %q", cfg.ModelStorePath)
+	}
+}
+
+func TestConfigureModelStore_RefusesRelative(t *testing.T) {
+	cfg := &AgentConfig{ModelStorePath: "models"}
+	if err := configureModelStore(cfg); err == nil {
+		t.Fatal("configureModelStore(relative) = nil, want an error")
+	}
 }

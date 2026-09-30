@@ -105,6 +105,24 @@ type FlagSpec struct {
 	// Every alias key (short or alternate long spelling) records it; for a
 	// key that is its own canonical name, Canonical equals the key.
 	Canonical string
+	// MustExist requires a KindPath value (each decoded path, including the
+	// path half of a DecodeNameEqPath entry) to resolve to something that
+	// already exists inside the roots; a value that resolves cleanly but
+	// names nothing there is refused (checkPaths, via Roots.CheckPathExists),
+	// same as one outside the roots. It is false by default (the ordinary
+	// CheckPath rule: a relative path that does not exist yet resolves under
+	// WorkDir and passes), so it only ever narrows a specific flag and never
+	// changes behavior for a flag that does not opt in, such as an
+	// llama-server output path (--slot-save-path, a lookup cache file, ...)
+	// the engine has not created yet.
+	//
+	// vllm-swift's --tokenizer, --hf-config-path and --generation-config: a
+	// value shaped like a Hugging Face "owner/name" repo id
+	// passes the ordinary check as a not-yet-existing relative path under the
+	// model store, and vLLM then downloads it into the HF cache, outside
+	// every allowed root. Requiring existence closes that gap without
+	// touching the not-yet-existing-is-fine rule everywhere else.
+	MustExist bool
 }
 
 // as returns s with Canonical set; the tables use it on alias keys.
@@ -128,15 +146,24 @@ func selfCanonical(table map[string]FlagSpec) map[string]FlagSpec {
 
 // Shorthands used by the tables below.
 var (
-	fBool                = FlagSpec{Kind: KindBool}
-	fValue               = FlagSpec{Kind: KindValue}
-	fValue2              = FlagSpec{Kind: KindValue, Arity: 2}
-	fValueMulti          = FlagSpec{Kind: KindValue, Multi: true}
-	fValueOptional       = FlagSpec{Kind: KindValue, OptionalValue: true}
-	fPath                = FlagSpec{Kind: KindPath, Decode: DecodeWhole}
-	fPathCSV             = FlagSpec{Kind: KindPath, Decode: DecodeCSV}
-	fPathCSVColon        = FlagSpec{Kind: KindPath, Decode: DecodeCSVColon}
-	fPathNameEqPathMulti = FlagSpec{Kind: KindPath, Decode: DecodeNameEqPath, Multi: true}
+	fBool          = FlagSpec{Kind: KindBool}
+	fValue         = FlagSpec{Kind: KindValue}
+	fValue2        = FlagSpec{Kind: KindValue, Arity: 2}
+	fValueMulti    = FlagSpec{Kind: KindValue, Multi: true}
+	fValueOptional = FlagSpec{Kind: KindValue, OptionalValue: true}
+	fPath          = FlagSpec{Kind: KindPath, Decode: DecodeWhole}
+	fPathExists    = FlagSpec{Kind: KindPath, Decode: DecodeWhole, MustExist: true}
+	fPathCSV       = FlagSpec{Kind: KindPath, Decode: DecodeCSV}
+	fPathCSVColon  = FlagSpec{Kind: KindPath, Decode: DecodeCSVColon}
+	// fPathNameEqPathMultiExists is currently vllm-swift --lora-modules'
+	// only spec; the path half of every entry is MustExist (a bare repo id
+	// there would be downloaded by vLLM, outside every root). If a
+	// future flag of this decode/arity shape must NOT require existence, add
+	// back a plain fPathNameEqPathMulti alongside it rather than dropping
+	// MustExist here.
+	fPathNameEqPathMultiExists = FlagSpec{
+		Kind: KindPath, Decode: DecodeNameEqPath, Multi: true, MustExist: true,
+	}
 )
 
 // flagSpecs is runtime -> flag spelling (every long and short alias) -> spec.
@@ -706,7 +733,7 @@ var vllmSwiftFlagSpecs = map[string]FlagSpec{
 	"--log-config-file":                        fPath,
 	"--log-error-stack":                        fBool,
 	"--no-log-error-stack":                     fBool.as("--log-error-stack"),
-	"--lora-modules":                           fPathNameEqPathMulti,
+	"--lora-modules":                           fPathNameEqPathMultiExists,
 	"--max-log-len":                            fValue,
 	"--middleware":                             fValue,
 	"--port":                                   fValue,
@@ -748,8 +775,8 @@ var vllmSwiftFlagSpecs = map[string]FlagSpec{
 	"--no-enable-sleep-mode":                   fBool.as("--enable-sleep-mode"),
 	"--enforce-eager":                          fBool,
 	"--no-enforce-eager":                       fBool.as("--enforce-eager"),
-	"--generation-config":                      fPath,
-	"--hf-config-path":                         fPath,
+	"--generation-config":                      fPathExists,
+	"--hf-config-path":                         fPathExists,
 	"--hf-overrides":                           fValue,
 	"--hf-token":                               fValueOptional,
 	"--io-processor-plugin":                    fValue,
@@ -771,7 +798,7 @@ var vllmSwiftFlagSpecs = map[string]FlagSpec{
 	"--served-model-name":                      fValueMulti,
 	"--skip-tokenizer-init":                    fBool,
 	"--no-skip-tokenizer-init":                 fBool.as("--skip-tokenizer-init"),
-	"--tokenizer":                              fPath,
+	"--tokenizer":                              fPathExists,
 	"--tokenizer-mode":                         fValue,
 	"--tokenizer-revision":                     fValue,
 	"--trust-remote-code":                      fBool,

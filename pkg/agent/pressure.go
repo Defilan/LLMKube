@@ -52,7 +52,11 @@ const (
 	EventReasonEvicted                    = "Evicted"
 	EventReasonEvictionSkipped            = "EvictionSkipped"
 	EventReasonRespawnBlocked             = "RespawnBlocked"
-	EventReasonMemoryCheckFailed          = "MemoryCheckFailed"
+	// EventReasonMemoryCheckFailed and EventReasonInsufficientMemory equal
+	// the api/v1alpha1.Reason* constants of the same name; see the doc
+	// comment on inferencev1alpha1.MetalAgentRefusalReasons for why.
+	EventReasonMemoryCheckFailed  = inferencev1alpha1.ReasonMemoryCheckFailed
+	EventReasonInsufficientMemory = inferencev1alpha1.ReasonInsufficientMemory
 )
 
 // emitInferenceEvent publishes a Kubernetes event on the InferenceService

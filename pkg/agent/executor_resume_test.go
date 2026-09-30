@@ -125,7 +125,7 @@ func parseBytesStart(rng string) int {
 }
 
 func executorFor(dir string) *MetalExecutor {
-	return NewMetalExecutor("/bin/llama-server", dir, newNopLogger())
+	return NewMetalExecutor("/bin/llama-server", dir, newNopLogger(), allowTestServers())
 }
 
 // modelDirPath builds the same per-model directory layout ensureModel uses so the
@@ -160,7 +160,7 @@ func TestDownloadFile_SpliceRegression(t *testing.T) {
 		t.Fatalf("seed stale partial: %v", err)
 	}
 
-	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, ""); err != nil {
+	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, "", ""); err != nil {
 		t.Fatalf("downloadFile: %v", err)
 	}
 
@@ -198,7 +198,7 @@ func TestDownloadFile_ResumeFromPartial(t *testing.T) {
 
 	o.rangeRequests.Store(0)
 	o.fullFromZero.Store(0)
-	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, ""); err != nil {
+	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, "", ""); err != nil {
 		t.Fatalf("downloadFile: %v", err)
 	}
 
@@ -232,7 +232,7 @@ func TestDownloadFile_CompletePartialPublishes(t *testing.T) {
 
 	o.rangeRequests.Store(0)
 	o.fullFromZero.Store(0)
-	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, ""); err != nil {
+	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, "", ""); err != nil {
 		t.Fatalf("downloadFile: %v", err)
 	}
 
@@ -263,7 +263,7 @@ func TestDownloadFile_RangeIgnoredRewrites(t *testing.T) {
 		t.Fatalf("seed partial: %v", err)
 	}
 
-	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, ""); err != nil {
+	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, "", ""); err != nil {
 		t.Fatalf("downloadFile: %v", err)
 	}
 	got, err := os.ReadFile(localPath)
@@ -291,7 +291,7 @@ func TestDownloadFile_NoETagKeysOnContentLength(t *testing.T) {
 
 	o.rangeRequests.Store(0)
 	o.fullFromZero.Store(0)
-	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, ""); err != nil {
+	if err := ex.downloadFile(t.Context(), o.srv.URL+"/model.gguf", localPath, "", ""); err != nil {
 		t.Fatalf("downloadFile: %v", err)
 	}
 	got, err := os.ReadFile(localPath)
@@ -344,13 +344,13 @@ func TestDownloadFile_InterruptedTransferThenResume(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, ""); err == nil {
+	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", ""); err == nil {
 		t.Fatal("the interrupted first attempt should return an error, else this test proves nothing")
 	}
 
 	fullFromZero.Store(0)
 	rangeRequests.Store(0)
-	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, ""); err != nil {
+	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", ""); err != nil {
 		t.Fatalf("resuming retry failed: %v", err)
 	}
 
@@ -410,7 +410,7 @@ func TestDownloadFile_InvalidatedResumeKeepsValidatorKey(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, ""); err == nil {
+	if err := ex.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", ""); err == nil {
 		t.Fatal("the interrupted from-zero fallback should return an error")
 	}
 

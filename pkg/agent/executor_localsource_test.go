@@ -196,7 +196,7 @@ func TestMetalEnsureModel_LocalSourceUnusable(t *testing.T) {
 			e := NewMetalExecutor("/bin/false", store, newNopLogger())
 
 			start := time.Now()
-			_, err := e.ensureModel(t.Context(), tc.source, "draft-model", nil)
+			_, err := e.ensureModel(t.Context(), tc.source, "draft-model", nil, "")
 			if err == nil {
 				t.Fatal("ensureModel succeeded for an unusable local source")
 			}
@@ -236,7 +236,7 @@ func TestMetalEnsureModel_LocalSourceNameMatchesStore(t *testing.T) {
 	}
 	e := NewMetalExecutor("/bin/false", store, newNopLogger())
 
-	got, err := e.ensureModel(t.Context(), want, "ornith-35b-m5", nil)
+	got, err := e.ensureModel(t.Context(), want, "ornith-35b-m5", nil, "")
 	if err != nil {
 		t.Fatalf("ensureModel: %v", err)
 	}

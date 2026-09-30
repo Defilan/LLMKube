@@ -91,7 +91,7 @@ launchctl list | grep llmkube
 curl -s http://localhost:9090/healthz
 # expected: {"status":"ok"}
 
-tail -f /tmp/llmkube-metal-agent.log
+tail -f ~/Library/Logs/llmkube/metal-agent.log
 # leave this tab open; we'll watch it pick up the first InferenceService
 ```
 
@@ -160,6 +160,16 @@ kubectl apply -f phi-4-mini.yaml
 kubectl get inferenceservice phi-4-mini -w
 # wait for PHASE=Ready
 ```
+
+A public Hugging Face URL like the one above works out of the box. If
+`spec.source` instead points at a host on your LAN (an internal MinIO or
+model mirror), add it to the agent's `--allowed-download-hosts` first: the
+agent refuses to download from a private or loopback address unless it is
+allowlisted. Set `spec.sha256` on the `Model` to have the agent verify the
+download (llama-server sources the agent downloads) and refuse to start on a
+mismatch. See "Security model" in
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#security-model)
+for both.
 
 The agent's log should show:
 
@@ -373,7 +383,7 @@ inspect each step before running it.
 ## Troubleshooting
 
 **Agent process not running after install**
-Check `/tmp/llmkube-metal-agent.log` (the
+Check `~/Library/Logs/llmkube/metal-agent.log` (the
 `StandardOutPath`/`StandardErrorPath` configured in the bundled
 launchd plist) for the first-launch error. Most common cause:
 `llama-server` not on PATH or at the configured `--llama-server`
@@ -420,6 +430,15 @@ Fix the source so it can be probed, wait for the Model controller
 to populate `status.size`, or start the agent with
 `--memory-check-mode warn` to admit unsized models at your own
 risk.
+
+**Model download blocked by the SSRF guard, or `ModelDigestMismatch`**
+The Model's source resolves to a private, loopback or link-local
+address, which the agent refuses to fetch by default; the event
+names `--allowed-download-hosts`. Or `spec.sha256` didn't match what
+was downloaded, the bad file was deleted, and the InferenceService is
+refused with reason `ModelDigestMismatch`. Both are covered in
+"Security model" in
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#security-model).
 
 **macOS firewall prompt on first run**
 The Metal Agent listens on `127.0.0.1:9090` for its own

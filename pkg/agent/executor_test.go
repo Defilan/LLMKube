@@ -133,7 +133,7 @@ func TestEnsureModel_AlreadyExists(t *testing.T) {
 		t.Fatalf("Failed to create model file: %v", err)
 	}
 
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	// source URL basename must match the file we created
 	path, err := executor.ensureModel(
@@ -141,6 +141,7 @@ func TestEnsureModel_AlreadyExists(t *testing.T) {
 		"https://huggingface.co/org/repo/resolve/main/model.gguf",
 		"test-model",
 		nil,
+		"",
 	)
 	if err != nil {
 		t.Fatalf("ensureModel returned error: %v", err)
@@ -152,7 +153,7 @@ func TestEnsureModel_AlreadyExists(t *testing.T) {
 
 func TestEnsureModel_DownloadFails(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	// Use an invalid URL that will fail to download
 	_, err := executor.ensureModel(
@@ -160,6 +161,7 @@ func TestEnsureModel_DownloadFails(t *testing.T) {
 		"http://localhost:1/nonexistent-model.gguf",
 		"bad-model",
 		nil,
+		"",
 	)
 	if err == nil {
 		t.Error("ensureModel with invalid URL should return error")
@@ -491,7 +493,7 @@ func TestStopProcess_InvalidPID(t *testing.T) {
 
 func TestDownloadFile_FailedDownloadLeavesNoFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	// Server that returns 401 (e.g. gated Hugging Face repo)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -505,7 +507,7 @@ func TestDownloadFile_FailedDownloadLeavesNoFile(t *testing.T) {
 	}
 	localPath := filepath.Join(modelDir, "model.gguf")
 
-	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "")
+	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", "")
 	if err == nil {
 		t.Fatal("downloadFile should return error for 401 response")
 	}
@@ -524,7 +526,7 @@ func TestDownloadFile_FailedDownloadLeavesNoFile(t *testing.T) {
 
 func TestEnsureModel_ZeroByteFileTriggersRedownload(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "stub-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -547,7 +549,7 @@ func TestEnsureModel_ZeroByteFileTriggersRedownload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := executor.ensureModel(t.Context(), srv.URL+"/model.gguf", "stub-model", nil)
+	_, err := executor.ensureModel(t.Context(), srv.URL+"/model.gguf", "stub-model", nil, "")
 	if err != nil {
 		t.Fatalf("ensureModel should succeed when stub is zero bytes: %v", err)
 	}
@@ -564,7 +566,7 @@ func TestEnsureModel_ZeroByteFileTriggersRedownload(t *testing.T) {
 
 func TestDownloadFile_TruncatedDownloadFails(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "trunc-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -580,7 +582,7 @@ func TestDownloadFile_TruncatedDownloadFails(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "")
+	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", "")
 	if err == nil {
 		t.Fatal("downloadFile should return error for truncated download")
 	}
@@ -593,7 +595,7 @@ func TestDownloadFile_TruncatedDownloadFails(t *testing.T) {
 
 func TestDownloadFile_SuccessRenamesTempFile(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "ok-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -609,7 +611,7 @@ func TestDownloadFile_SuccessRenamesTempFile(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "")
+	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", "")
 	if err != nil {
 		t.Fatalf("downloadFile should succeed: %v", err)
 	}
@@ -639,7 +641,7 @@ func TestDownloadFile_SuccessRenamesTempFile(t *testing.T) {
 
 func TestDownloadFile_NoContentLength(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "no-cl-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -655,7 +657,7 @@ func TestDownloadFile_NoContentLength(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "")
+	err := executor.downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", "")
 	if err != nil {
 		t.Fatalf("downloadFile should succeed without Content-Length: %v", err)
 	}
@@ -671,7 +673,7 @@ func TestDownloadFile_NoContentLength(t *testing.T) {
 
 func TestDownloadFile_ContextCancellation(t *testing.T) {
 	tmpDir := t.TempDir()
-	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(), allowTestServers())
 
 	modelDir := filepath.Join(tmpDir, "cancel-model")
 	if err := os.MkdirAll(modelDir, 0755); err != nil {
@@ -689,7 +691,7 @@ func TestDownloadFile_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel() // Cancel immediately.
 
-	err := executor.downloadFile(ctx, srv.URL+"/model.gguf", localPath, "")
+	err := executor.downloadFile(ctx, srv.URL+"/model.gguf", localPath, "", "")
 	if err == nil {
 		t.Fatal("downloadFile should return error when context is cancelled")
 	}

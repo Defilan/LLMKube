@@ -370,11 +370,13 @@ var _ = Describe("determinePhase", func() {
 			Expect(phase).To(Equal(PhaseCreating))
 			Expect(info).To(BeNil())
 		},
-		Entry("memory admission", "InsufficientMemory"),
-		Entry("memory check failure", "MemoryCheckFailed"),
-		Entry("endpoint name conflict", "EndpointNameConflict"),
-		Entry("model source outside the roots", "ModelSourceNotAllowed"),
-		Entry("rejected extraArgs", "ExtraArgsRejected"),
+		Entry("memory admission", inferencev1alpha1.ReasonInsufficientMemory),
+		Entry("memory check failure", inferencev1alpha1.ReasonMemoryCheckFailed),
+		Entry("endpoint name conflict", inferencev1alpha1.ReasonEndpointNameConflict),
+		Entry("model source outside the roots", inferencev1alpha1.ReasonModelSourceNotAllowed),
+		Entry("rejected extraArgs", inferencev1alpha1.ReasonExtraArgsRejected),
+		Entry("relay service name too long", inferencev1alpha1.ReasonServiceNameTooLong),
+		Entry("model digest mismatch", inferencev1alpha1.ReasonModelDigestMismatch),
 	)
 
 	It("should replace a controller-written status with WaitingForMetalAgent on a not-ready metal service", func() {

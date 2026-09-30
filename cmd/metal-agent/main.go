@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -84,6 +85,7 @@ type AgentConfig struct {
 	ApplePowerInterval        time.Duration
 	PowermetricsBin           string
 	AllowedModelRoots         string
+	AllowedDownloadHosts      string
 	AllowUnsafeExtraArgs      bool
 	IngressPort               int
 	StateDir                  string
@@ -109,6 +111,19 @@ func splitCSV(s string) []string {
 		return nil
 	}
 	return out
+}
+
+// loadKubeconfig defers to controller-runtime's standard discovery chain:
+// the auto-registered --kubeconfig flag, then $KUBECONFIG, then in-cluster,
+// then ~/.kube/config. A non-empty contextName selects that context instead
+// of the kubeconfig's current one, so the agent stays on its cluster when the
+// operator switches kubectl contexts.
+func loadKubeconfig(contextName string) (*restclient.Config, error) {
+	cfg, err := config.GetConfigWithContext(contextName)
+	if err != nil {
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
+	}
+	return cfg, nil
 }
 
 func parseLogLevel(level string) zapcore.Level {
@@ -231,6 +246,81 @@ var defaultTensorFoldPaths = []string{
 // userHomeDir is os.UserHomeDir, overridden in tests.
 var userHomeDir = os.UserHomeDir
 
+// resolveModelStorePath returns the absolute model store path: the default
+// "~/Library/Application Support/llmkube/models" under the agent user's home
+// when the flag is empty (beside the --state-dir default, out of the
+// world-writable /tmp the store used to default to), otherwise the flag with
+// a leading "~" or "~/" resolved against home exactly as --state-dir does
+// (launchd passes "~" literally). "~user" is not expanded. Anything still
+// relative is refused: it would resolve against the agent's working
+// directory rather than a directory the operator chose.
+func resolveModelStorePath(flagValue string) (string, error) {
+	if flagValue == "" {
+		home, err := modelStoreHome("--model-store is not set")
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(home, "Library", "Application Support", "llmkube", "models"), nil
+	}
+	path := flagValue
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := modelStoreHome(fmt.Sprintf("--model-store %q starts with ~", flagValue))
+		if err != nil {
+			return "", err
+		}
+		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("--model-store %q must be an absolute path (or start with ~/)", flagValue)
+	}
+	return filepath.Clean(path), nil
+}
+
+// modelStoreHome returns the agent user's home directory for resolving the
+// model store, or an error that starts with why it was needed.
+func modelStoreHome(why string) (string, error) {
+	home, err := userHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("%s but the home directory is unknown: %w", why, err)
+	}
+	if home == "" {
+		return "", fmt.Errorf("%s but the home directory is unknown", why)
+	}
+	return home, nil
+}
+
+// prepareModelStore creates the model store if it is missing (0700, and 0700
+// for any parent it has to create), refuses it unless the agent owns it and
+// no other user can write it or replace it (agent.ResolveModelStore), and
+// returns the resolved, symlink-free path the agent must use from then on.
+// An existing store keeps its mode; the check alone decides whether it is
+// safe.
+func prepareModelStore(path string) (string, error) {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return "", fmt.Errorf("create model store %s: %w", path, err)
+	}
+	return agent.ResolveModelStore(path)
+}
+
+// configureModelStore resolves --model-store, prepares and checks the store,
+// and pins cfg.ModelStorePath to the checked directory. It must run before
+// anything else uses the store: the allowed-roots validation, NewMetalAgent
+// (which makes the store an allowed root) and the executors all read
+// cfg.ModelStorePath, and pinning the resolved path means a symlink in the
+// configured path cannot be repointed after the check.
+func configureModelStore(cfg *AgentConfig) error {
+	path, err := resolveModelStorePath(cfg.ModelStorePath)
+	if err != nil {
+		return err
+	}
+	resolved, err := prepareModelStore(path)
+	if err != nil {
+		return err
+	}
+	cfg.ModelStorePath = resolved
+	return nil
+}
+
 // resolveTensorFoldBin returns the tensorfold binary path. If override is
 // non-empty it is returned as-is. Otherwise the function searches
 // defaultTensorFoldPaths.
@@ -342,9 +432,15 @@ func main() {
 	cfg := &AgentConfig{}
 
 	// Parse command-line flags
-	var llamaServerFlag string
+	var llamaServerFlag, kubeContext string
+	flag.StringVar(&kubeContext, "kube-context", "",
+		"kubeconfig context to connect with (default: the kubeconfig's current context). "+
+			"Pick the kubeconfig file with --kubeconfig or $KUBECONFIG.")
 	flag.StringVar(&cfg.Namespace, "namespace", "default", "Kubernetes namespace to watch")
-	flag.StringVar(&cfg.ModelStorePath, "model-store", "/tmp/llmkube-models", "Path to store downloaded models")
+	flag.StringVar(&cfg.ModelStorePath, "model-store", "",
+		"Path to store downloaded models: absolute, or starting with ~/. "+
+			"Default: ~/Library/Application Support/llmkube/models. The agent refuses a store it does "+
+			"not own, that other users can write, or that sits under a directory other users can write.")
 	flag.StringVar(&llamaServerFlag, "llama-server", "", "Path to llama-server binary (auto-detected if not set)")
 	flag.IntVar(&cfg.LlamaServerPort, "llama-server-port", 0,
 		"Fixed port for the llama-server runtime. 0 (default) allocates an "+
@@ -429,6 +525,9 @@ func main() {
 		"Comma-separated absolute directories that local model sources, the oMLX pagedSSDCacheDir "+
 			"and path-valued extraArgs must resolve into (symlinks followed), in addition to the model "+
 			"store. Default: the model store only.")
+	flag.StringVar(&cfg.AllowedDownloadHosts, "allowed-download-hosts", "",
+		"Comma-separated hostnames or CIDRs the agent may download models from even though they "+
+			"resolve to a private, loopback or link-local address, e.g. a LAN MinIO. Default: none.")
 	flag.BoolVar(&cfg.AllowUnsafeExtraArgs, "allow-unsafe-extra-args", false,
 		"Relax the extraArgs policy (unknown flags, stray tokens, refused non-listener flags, path checks, "+
 			"vllm-swift code-loading) for Macs whose InferenceService authors are fully trusted; flags that "+
@@ -452,6 +551,12 @@ func main() {
 		_ = baseLogger.Sync()
 	}()
 	logger := baseLogger.Sugar()
+
+	// Create, vet and pin the model store before anything uses it.
+	if err := configureModelStore(cfg); err != nil {
+		logger.Errorw("refusing to use the model store", "model-store", cfg.ModelStorePath, "error", err)
+		os.Exit(1)
+	}
 
 	// Validate the effective allowed-model-roots set eagerly: the same list
 	// NewMetalAgent resolves (the model store plus --allowed-model-roots, see
@@ -526,11 +631,6 @@ func main() {
 		"metalVersion", caps.MetalVersion,
 	)
 
-	// Create model store directory
-	if err := os.MkdirAll(cfg.ModelStorePath, 0755); err != nil {
-		logger.Errorw("failed to create model store directory", "path", cfg.ModelStorePath, "error", err)
-		os.Exit(1)
-	}
 	// Log which runtimes are available. llama-server is always available
 	// (resolved above). Other runtimes are available when their binary
 	// path was resolved successfully.
@@ -552,8 +652,8 @@ func main() {
 	}
 
 	// Get Kubernetes client
-	logger.Infow("connecting to Kubernetes")
-	k8sConfig, err := config.GetConfig()
+	logger.Infow("connecting to Kubernetes", "context", kubeContext)
+	k8sConfig, err := loadKubeconfig(kubeContext)
 	if err != nil {
 		logger.Errorw("failed to get kubeconfig", "error", err)
 		os.Exit(1)
@@ -570,7 +670,7 @@ func main() {
 		logger.Errorw("failed to create Kubernetes client", "error", err)
 		os.Exit(1)
 	}
-	logger.Infow("connected to Kubernetes cluster")
+	logger.Infow("connected to Kubernetes cluster", "host", k8sConfig.Host)
 
 	// EventRecorder feeds operator-facing Kubernetes events on managed
 	// InferenceService objects (memory-pressure transitions, evictions,
@@ -626,6 +726,7 @@ func main() {
 		PowermetricsBin:           cfg.PowermetricsBin,
 		EvictionEnabled:           cfg.EvictionEnabled,
 		AllowedModelRoots:         allowedModelRoots,
+		AllowedDownloadHosts:      splitCSV(cfg.AllowedDownloadHosts),
 		AllowUnsafeExtraArgs:      cfg.AllowUnsafeExtraArgs,
 		IngressPort:               cfg.IngressPort,
 		StateDir:                  cfg.StateDir,

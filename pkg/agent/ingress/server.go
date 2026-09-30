@@ -157,9 +157,26 @@ func (s *Server) serveReady(w http.ResponseWriter, route Route) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
-// errUpgradeRefused is returned from ModifyResponse when an engine answers
-// 101 Switching Protocols.
-var errUpgradeRefused = errors.New("engine attempted a protocol upgrade; the ingress does not proxy upgrades")
+// ErrUpgradeRefused is returned by RefuseUpgrade when an engine answers 101
+// Switching Protocols. It is exported so pkg/agent's host-side client proxy
+// (clientproxy.go) can share RefuseUpgrade instead of duplicating it; that is
+// the only reason either is exported.
+var ErrUpgradeRefused = errors.New("engine attempted a protocol upgrade; proxying does not support upgrades")
+
+// RefuseUpgrade is an httputil.ReverseProxy ModifyResponse hook: it turns an
+// engine's 101 Switching Protocols response into ErrUpgradeRefused, which the
+// proxy's ErrorHandler then turns into a 502. Pairing this with a Rewrite
+// hook that deletes the inbound Upgrade and Connection headers (ReverseProxy
+// re-adds them after stripping hop-by-hop headers otherwise) means an engine
+// only reaches this path by upgrading unsolicited. Either way the response
+// must never reach the caller: an upgraded connection is a raw byte tunnel
+// that a path allowlist can no longer see.
+func RefuseUpgrade(resp *http.Response) error {
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		return ErrUpgradeRefused
+	}
+	return nil
+}
 
 const (
 	// metricsPath is the Prometheus scrape path the chart's inference
@@ -222,8 +239,8 @@ func (s *Server) proxy(port int) *httputil.ReverseProxy {
 			pr.Out.Trailer = nil
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			if resp.StatusCode == http.StatusSwitchingProtocols {
-				return errUpgradeRefused
+			if err := RefuseUpgrade(resp); err != nil {
+				return err
 			}
 			answerMissingMetrics(resp)
 			return nil
