@@ -267,7 +267,7 @@ or by adding them to `ProgramArguments` in the plist. The agent logs the
 context and API server it connected to at startup:
 
 ```bash
-grep "connected to Kubernetes" /tmp/llmkube-metal-agent.log
+grep "connected to Kubernetes" ~/Library/Logs/llmkube/metal-agent.log
 ```
 
 ### Dedicated kubeconfig with least-privilege RBAC
@@ -282,7 +282,7 @@ publish each server, write events, read the relay token Secret and
 ```bash
 NS=default                                  # the namespace the agent watches (--namespace)
 KC=$HOME/.kube/llmkube-metal-agent.yaml
-CA=/tmp/llmkube-ca.crt
+CA=$(mktemp)                                # private temp file for the cluster CA
 
 kubectl apply -n "$NS" -f deployment/macos/metal-agent-rbac.yaml
 
@@ -950,7 +950,10 @@ it is fixed. Check them before upgrading:
 - **LAN download sources.** If any Model source is fetched from a LAN mirror
   (an internal MinIO, registry, or similar), add its host or CIDR to
   `--allowed-download-hosts`, or the agent will refuse to fetch it. See
-  "`--allowed-download-hosts` flag (remote model sources)" above.
+  "`--allowed-download-hosts` flag (remote model sources)" above. Also
+  expect macOS to revoke the new binary's Local Network access; see "LAN
+  download fails with `no route to host` after an upgrade" under
+  Troubleshooting.
 - **vllm-swift `extraArgs`.** If any InferenceService's `extraArgs` sets
   vllm-swift's `--trust-request-chat-template`, `--enable-prompt-embeds` or
   `--enable-mm-embeds`, or points `--tokenizer`, `--hf-config-path`,
@@ -1041,9 +1044,13 @@ kubectl describe inferenceservice <name>
 
 If the source is a LAN mirror you trust (an internal MinIO or registry), add its host or CIDR to `--allowed-download-hosts` and restart the agent. See "`--allowed-download-hosts` flag (remote model sources)" above.
 
+### LAN download fails with `no route to host` after an upgrade
+
+The guard allowed the host, but macOS blocked the connection. macOS Local Network Privacy ties its permission to the agent binary, so a new binary loses access to the local network until it is granted again, and the refusal surfaces as `connect: no route to host` rather than a permission error. Downloads from the internet and the cluster's traffic to the agent's ingress are not affected. Grant the agent access in System Settings, Privacy & Security, Local Network, or reach the mirror over a route macOS does not treat as local (for example a VPN or tailnet address).
+
 ### `ModelDigestMismatch`
 
-The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad file was already deleted; fix `spec.sha256` or `spec.source` and recreate the Model (or the InferenceService) to retry. See "`spec.sha256` digest verification" above.
+The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad file was already deleted. Fixing `spec.sha256` or `spec.source` retries on the next reconcile; if the spec was already right and the source was fixed upstream, recreate the Model (or the InferenceService) to retry. See "`spec.sha256` digest verification" above.
 
 ### Can't connect to Kubernetes
 
@@ -1058,7 +1065,7 @@ kubectl config current-context
 echo $KUBECONFIG
 
 # See which cluster and context the agent actually connected to
-grep "connecting to Kubernetes\|connected to Kubernetes" /tmp/llmkube-metal-agent.log
+grep "connecting to Kubernetes\|connected to Kubernetes" ~/Library/Logs/llmkube/metal-agent.log
 
 # If using minikube locally
 minikube status

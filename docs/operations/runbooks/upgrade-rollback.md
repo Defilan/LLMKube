@@ -181,7 +181,10 @@ it is fixed. Check them on every Mac before upgrading its metal-agent:
   a private, loopback or link-local address unless it is listed in
   `--allowed-download-hosts`. If a Model source points at an internal MinIO or
   registry, add its host or CIDR to that flag before upgrading, for example
-  `--allowed-download-hosts=minio.lan,10.20.0.0/16`.
+  `--allowed-download-hosts=minio.lan,10.20.0.0/16`. A new agent binary also
+  loses its macOS Local Network permission, so LAN downloads can fail with
+  `no route to host` until access is granted again in System Settings,
+  Privacy & Security, Local Network.
 - **Audit vllm-swift `extraArgs` on every affected InferenceService.**
   `--trust-request-chat-template`, `--enable-prompt-embeds` and
   `--enable-mm-embeds` are now refused, as is pointing `--tokenizer`,
