@@ -208,10 +208,12 @@ type readResult struct {
 // NotFound.
 //
 // A Secret without the controller's managed-by label counts as having no
-// token (unmanaged is set): the controller did not create it, so whoever did
-// may know its token, and someone who can create Secrets but not read them
-// could otherwise plant one (#1957). The controller refuses such a Secret
-// too, and the chart's admission policy stops it being created by hand.
+// token (unmanaged is set). This is a safety net, not the control against a
+// planted token (#1957): whoever creates the Secret can set the label too.
+// It catches a Secret created before the chart's admission policy existed,
+// or created by hand by mistake. The control is that policy, which lets only
+// the controller create the Secret; without it (Kubernetes older than 1.30,
+// or the policy disabled) the protection is RBAC on Secret create.
 func (s *TokenStore) read(ctx context.Context, namespace string) (readResult, error) {
 	getCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
 	defer cancel()

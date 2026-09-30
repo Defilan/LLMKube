@@ -331,7 +331,7 @@ hand-imported.
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `metalRelay.secretCreatePolicy.enabled` | Install a `ValidatingAdmissionPolicy` and binding that let only the controller's ServiceAccount create the per-namespace Metal relay token Secret `llmkube-metal-relay`. Updates (token rotation) and deletes (revocation) are not restricted. Rendered only when the cluster serves `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` (Kubernetes 1.30 or newer). | `true` |
+| `metalRelay.secretCreatePolicy.enabled` | Install a `ValidatingAdmissionPolicy` and binding that let only the controller's ServiceAccount create the per-namespace Metal relay token Secret `llmkube-metal-relay`. Updates (token rotation) and deletes (revocation) are not restricted. Rendered only when the cluster serves `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` (Kubernetes 1.30 or newer). Tools that render offline, such as `helm template` or Argo CD, must pass `--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`, or the policy is skipped. | `true` |
 
 ## Examples
 
