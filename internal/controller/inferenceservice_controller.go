@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -478,6 +479,12 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 // updated the object between our Get and Update) is not a failure: it returns
 // a short requeue result with no error and no RelayReconcileFailed event, and
 // the next reconcile works from the fresh object.
+//
+// A relay token Secret the controller did not create (no managed-by label)
+// stops relay mode for the namespace: reconcileMetal records a
+// RelaySecretNotManaged Warning Event and returns the
+// *relaySecretNotManagedError before any relay Deployment is created or
+// updated; reconcileDeployment turns it into status and a timed requeue.
 func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (int32, *metalSnapshot, *ctrl.Result, error) {
 	mode, pin, err := r.decideMetalMode(ctx, isvc)
 	if err != nil {
@@ -495,10 +502,18 @@ func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *i
 			logf.FromContext(ctx).V(1).Info("Relay object changed under the reconcile; requeueing", "reason", err.Error())
 			return 0, nil, &ctrl.Result{RequeueAfter: relayConflictRequeueAfter}, nil
 		}
+		var unmanaged *relaySecretNotManagedError
+		if errors.As(err, &unmanaged) {
+			// Not a transient failure: the caller records it on status and
+			// requeues on a timer instead of backing off on an error.
+			r.relayEvent(isvc, corev1.EventTypeWarning, EventRelaySecretNotManaged, "%s", unmanaged.Error())
+			return 0, nil, nil, err
+		}
 		if err != nil {
 			r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Reconciling the metal relay failed: %v", err)
 			return 0, nil, nil, err
 		}
+		clearRelaySecretNotManaged(isvc)
 		if !available {
 			return 0, snap, nil, nil
 		}
@@ -509,11 +524,26 @@ func (r *InferenceServiceReconciler) reconcileMetal(ctx context.Context, isvc *i
 		r.relayEvent(isvc, corev1.EventTypeWarning, EventRelayReconcileFailed, "Removing the metal relay failed: %v", err)
 		return 0, nil, nil, err
 	}
+	clearRelaySecretNotManaged(isvc)
 	snap := r.metalEndpointSnapshot(ctx, isvc, sanitizeDNSName(isvc.Name))
 	if snap.Kind == metalHBStale {
 		r.withdrawStaleMetalEndpoints(ctx, snap.staleSlices)
 	}
 	return snap.ReadyReplicas, snap, nil, nil
+}
+
+// clearRelaySecretNotManaged drops the RelaySecretNotManaged diagnosis this
+// controller wrote once the relay Secret is usable again (or relay mode no
+// longer applies). The status writer preserves scheduling fields when a pass
+// returns no SchedulingInfo, which a Ready metal service does, so without
+// this a recovered service would keep advertising the refusal.
+func clearRelaySecretNotManaged(isvc *inferencev1alpha1.InferenceService) {
+	if isvc.Status.SchedulingStatus != inferencev1alpha1.ReasonRelaySecretNotManaged {
+		return
+	}
+	isvc.Status.SchedulingStatus = ""
+	isvc.Status.SchedulingMessage = ""
+	isvc.Status.WaitingFor = ""
 }
 
 // replicaCounts carries the two replica observations a reconcile feeds the
@@ -535,6 +565,14 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 
 	if isMetal {
 		ready, snap, result, err := r.reconcileMetal(ctx, isvc)
+		var unmanaged *relaySecretNotManagedError
+		if errors.As(err, &unmanaged) {
+			log.Info("Relay token Secret was not created by the controller; not serving through a relay", "secret", unmanaged.key.String())
+			res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseCreating, modelReady, 0, 0, desiredReplicas, isvc.Status.Endpoint, "",
+				&SchedulingInfo{Status: inferencev1alpha1.ReasonRelaySecretNotManaged, Message: unmanaged.Error()})
+			res.RequeueAfter = earliestPositive(res.RequeueAfter, relaySecretNotManagedRequeueAfter)
+			return nil, replicaCounts{}, nil, &res, updateErr
+		}
 		if err != nil || result != nil {
 			return nil, replicaCounts{}, nil, result, err
 		}

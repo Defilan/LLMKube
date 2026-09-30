@@ -39,8 +39,12 @@ import (
 type fakeSecrets struct {
 	mu     sync.Mutex
 	tokens map[string]string // namespace -> token; absent = NotFound
-	calls  map[string]int
-	errs   map[string][]error // namespace -> queued errors, returned before tokens
+	// unmanaged marks namespaces whose Secret lacks the controller's
+	// managed-by label; every other Secret carries it, as the controller
+	// creates them.
+	unmanaged map[string]bool
+	calls     map[string]int
+	errs      map[string][]error // namespace -> queued errors, returned before tokens
 	// maxDeadline records the longest remaining deadline seen on a Get ctx;
 	// noDeadline is set if any Get ctx had none.
 	maxDeadline time.Duration
@@ -54,7 +58,16 @@ type fakeSecrets struct {
 }
 
 func newFakeSecrets() *fakeSecrets {
-	return &fakeSecrets{tokens: map[string]string{}, calls: map[string]int{}, errs: map[string][]error{}}
+	return &fakeSecrets{
+		tokens: map[string]string{}, unmanaged: map[string]bool{},
+		calls: map[string]int{}, errs: map[string][]error{},
+	}
+}
+
+func (f *fakeSecrets) setUnmanaged(ns string, unmanaged bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unmanaged[ns] = unmanaged
 }
 
 func (f *fakeSecrets) set(ns, tok string) {
@@ -129,6 +142,9 @@ func (f *fakeSecrets) Get(ctx context.Context, key client.ObjectKey, obj client.
 	s.Namespace = key.Namespace
 	s.Name = key.Name
 	s.Data = map[string][]byte{inferencev1alpha1.MetalRelaySecretKey: []byte(tok)}
+	if !f.unmanaged[key.Namespace] {
+		s.Labels = map[string]string{inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByController}
+	}
 	return nil
 }
 
@@ -668,6 +684,92 @@ func TestTokenStoreWarnsOncePerErrorTransition(t *testing.T) {
 	try(nil) // NotFound is not a warning
 	if got := warns(); got != 3 {
 		t.Errorf("NotFound logged a Warn: %d, want 3", got)
+	}
+	for _, e := range logs.All() {
+		if strings.Contains(fmt.Sprint(e.Message, e.ContextMap()), tokA) {
+			t.Errorf("log entry contains the token: %v", e)
+		}
+	}
+}
+
+// A Secret without the controller's managed-by label holds no token for the
+// store (#1957): a planted token is rejected from the first read, and a
+// Secret that loses the label revokes the current and previous tokens at the
+// next refresh. Adding the label back restores it.
+func TestTokenStoreIgnoresUnmanagedSecret(t *testing.T) {
+	ctx := context.Background()
+	s, f, clk := newTestStore()
+
+	f.set("planted", tokA)
+	f.setUnmanaged("planted", true)
+	if s.Valid(ctx, "planted", tokA) {
+		t.Error("a token from an unlabelled Secret was accepted")
+	}
+
+	f.set("a", tokA)
+	if !s.Valid(ctx, "a", tokA) {
+		t.Fatal("token from the controller's Secret rejected")
+	}
+	f.set("a", tokB)
+	clk.advance(testTTL)
+	if !s.Valid(ctx, "a", tokB) || !s.Valid(ctx, "a", tokA) {
+		t.Fatal("rotation should accept the new token and the old one within grace")
+	}
+
+	f.setUnmanaged("a", true)
+	clk.advance(testTTL)
+	if s.Valid(ctx, "a", tokB) {
+		t.Error("the current token survived the Secret losing its label")
+	}
+	if s.Valid(ctx, "a", tokA) {
+		t.Error("the grace-window token survived the Secret losing its label")
+	}
+
+	f.setUnmanaged("a", false)
+	clk.advance(testTTL)
+	if !s.Valid(ctx, "a", tokB) {
+		t.Error("token rejected after the label came back")
+	}
+}
+
+// An ignored unmanaged Secret is logged at Warn once per change, naming the
+// Secret and never its token.
+func TestTokenStoreWarnsOncePerUnmanagedTransition(t *testing.T) {
+	ctx := context.Background()
+	core, logs := observer.New(zap.DebugLevel)
+	f := newFakeSecrets()
+	clk := &fakeClock{t: time.Date(2026, 9, 28, 12, 0, 0, 0, time.UTC)}
+	s := NewTokenStore(f, testTTL, testGrace, clk.now, WithLogger(zap.New(core).Sugar()))
+	f.set("a", tokA)
+	f.setUnmanaged("a", true)
+
+	warns := func() int { return logs.FilterLevelExact(zap.WarnLevel).Len() }
+	refresh := func() {
+		s.Valid(ctx, "a", tokA)
+		clk.advance(testTTL + time.Second)
+	}
+
+	refresh()
+	refresh()
+	refresh()
+	if got := warns(); got != 1 {
+		t.Fatalf("after three reads of an unmanaged Secret: %d Warn logs, want 1", got)
+	}
+	f.setUnmanaged("a", false)
+	refresh()
+	f.setUnmanaged("a", true)
+	refresh()
+	if got := warns(); got != 2 {
+		t.Fatalf("after unmanaged, managed, unmanaged: %d Warn logs, want 2", got)
+	}
+	for _, e := range logs.FilterLevelExact(zap.WarnLevel).All() {
+		fields := e.ContextMap()
+		if fields["secret"] != inferencev1alpha1.MetalRelaySecretName || fields["namespace"] != "a" {
+			t.Errorf("Warn does not name the Secret and namespace: %v", fields)
+		}
+		if !strings.Contains(e.Message, "deleted") {
+			t.Errorf("Warn does not say how to fix it: %q", e.Message)
+		}
 	}
 	for _, e := range logs.All() {
 		if strings.Contains(fmt.Sprint(e.Message, e.ContextMap()), tokA) {

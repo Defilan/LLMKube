@@ -40,6 +40,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/defilantech/llmkube/internal/safehttp"
 	"github.com/defilantech/llmkube/pkg/hfsource"
 )
 
@@ -172,8 +173,9 @@ func (e *MetalExecutor) resolveS3Credentials(ctx context.Context, source, secret
 	return creds, nil
 }
 
-// s3DownloadClient builds an *http.Client that signs every request with AWS
-// SigV4 for the s3 service, routing through a transport that trusts the
+// s3DownloadClient builds an *http.Client that signs every request to the
+// configured endpoint with AWS SigV4 for the s3 service (a redirect to another
+// host is followed unsigned), routing through a transport that trusts the
 // configured custom CA (when any). objectURL is the path-style endpoint the
 // caller should GET: <endpoint>/<bucket>/<key>, matching the controller's
 // parseS3GGUFMetadata shape (internal/controller/model_controller.go).
@@ -190,6 +192,10 @@ func (e *MetalExecutor) s3DownloadClient(source string, creds s3Credentials) (*h
 		return nil, "", perr
 	}
 	objectURL := strings.TrimRight(creds.Endpoint, "/") + "/" + bucket + "/" + key
+	endpoint, err := url.Parse(creds.Endpoint)
+	if err != nil || endpoint.Host == "" {
+		return nil, "", fmt.Errorf("s3 source %q: AWS_ENDPOINT_URL %q is not an absolute URL", source, creds.Endpoint)
+	}
 
 	// The endpoint comes from the Model's sourceSecretRef, which anyone who can
 	// write Secrets in the namespace controls, so it dials through the SSRF
@@ -204,6 +210,7 @@ func (e *MetalExecutor) s3DownloadClient(source string, creds s3Credentials) (*h
 
 	signer := &sigv4RoundTripper{
 		base:      transport,
+		endpoint:  endpoint,
 		accessKey: creds.AccessKeyID,
 		secretKey: creds.SecretAccessKey,
 		region:    creds.Region,
@@ -248,23 +255,38 @@ func withCACertPool(base *x509.CertPool, caCerts [][]byte) *x509.CertPool {
 	return pool
 }
 
-// sigv4RoundTripper signs every request with AWS Signature Version 4 for the s3
-// service, then delegates to the wrapped transport. This is the in-process
-// equivalent of the init container's
+// sigv4RoundTripper signs each request to endpoint with AWS Signature Version 4
+// for the s3 service, then delegates to the wrapped transport. This is the
+// in-process equivalent of the init container's
 //
 //	curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" \
 //	  -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
 //
 // and is a faithful copy of the controller's sigv4RoundTripper
-// (internal/controller/model_controller.go).
+// (internal/controller/model_controller.go); the two share the origin check,
+// safehttp.SameOrigin.
+//
+// A request to any other origin (a redirect the store answered with) passes
+// through unsigned and unmodified. The client runs every redirect hop through
+// this RoundTripper after it has already dropped Authorization for a
+// cross-host redirect, so signing here would hand the access key ID and a
+// signature to whatever host the store named (#1955). A presigned-URL redirect
+// still works: it carries its own query-string signature.
 type sigv4RoundTripper struct {
 	base      http.RoundTripper
+	endpoint  *url.URL
 	accessKey string
 	secretKey string
 	region    string
 }
 
 func (t *sigv4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !safehttp.SameOrigin(req.URL, t.endpoint) {
+		return t.base.RoundTrip(req)
+	}
+	// Sign a clone: a RoundTripper must not modify the caller's request.
+	req = req.Clone(req.Context())
+
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")

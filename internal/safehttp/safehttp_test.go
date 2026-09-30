@@ -659,3 +659,38 @@ func TestGuardedClientProxyConnect(t *testing.T) {
 		}
 	})
 }
+
+func TestSameOrigin(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"https://minio.lan:9000/bucket/key", "https://minio.lan:9000/other", true},
+		{"https://MinIO.LAN:9000", "https://minio.lan:9000/x", true},
+		{"https://store.example", "https://store.example:443/x", true},
+		{"http://store.example:80", "http://store.example/x", true},
+		{"https://store.example", "https://other.example/x", false},
+		{"https://store.example", "https://store.example.evil.test/x", false},
+		{"http://127.0.0.1:9000", "http://127.0.0.1:9001/x", false},
+		{"https://store.example", "http://store.example/x", false},
+		{"https://store.example:443", "http://store.example:443/x", false},
+		{"https://store.example", "https://store.example:8443/x", false},
+		{"https://ｓｔｏｒｅ.example", "https://store.example/x", true},
+	}
+	for _, tc := range cases {
+		a, err := url.Parse(tc.a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := url.Parse(tc.b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := SameOrigin(a, b); got != tc.want {
+			t.Errorf("SameOrigin(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+	if SameOrigin(nil, &url.URL{}) || SameOrigin(&url.URL{}, &url.URL{}) {
+		t.Error("nil or empty URLs must not match")
+	}
+}

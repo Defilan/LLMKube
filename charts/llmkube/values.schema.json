@@ -515,6 +515,21 @@
         "enabled": { "type": "boolean" }
       }
     },
+    "metalRelay": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Metal relay (macOS metal-agent) settings.",
+      "properties": {
+        "secretCreatePolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "ValidatingAdmissionPolicy that lets only the controller create the llmkube-metal-relay Secret (#1957).",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
     "gpuSharing": {
       "type": "object",
       "additionalProperties": false,

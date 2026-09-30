@@ -1338,16 +1338,9 @@ func (r *ModelReconciler) parseS3GGUFMetadata(ctx context.Context, model *infere
 	// Path-style endpoint: <endpoint>/<bucket>/<key>. The init container's
 	// signed curl uses the same shape (${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}).
 	objectURL := strings.TrimRight(creds.Endpoint, "/") + "/" + bucket + "/" + key
-
-	signer := &sigv4RoundTripper{
-		base:      r.metadataClient().Transport,
-		accessKey: creds.AccessKeyID,
-		secretKey: creds.SecretAccessKey,
-		region:    creds.Region,
-	}
-	s3Client := &http.Client{
-		Timeout:   remoteMetadataTimeout,
-		Transport: signer,
+	s3Client, err := r.s3Client(creds)
+	if err != nil {
+		return nil, 0, fmt.Errorf("s3 source %q: %w", model.Spec.Source, err)
 	}
 
 	parsed, err := gguf.ParseFromURLWithClient(ctx, s3Client, objectURL)
@@ -1369,6 +1362,26 @@ func (r *ModelReconciler) parseS3GGUFMetadata(ctx context.Context, model *infere
 	}
 
 	return meta, r.s3ContentLength(ctx, s3Client, objectURL), nil
+}
+
+// s3Client returns an *http.Client that signs requests to creds.Endpoint with
+// SigV4 over the SSRF-guarded metadata transport. A redirect to another origin
+// is followed unsigned (see sigv4RoundTripper).
+func (r *ModelReconciler) s3Client(creds s3Creds) (*http.Client, error) {
+	endpoint, err := url.Parse(creds.Endpoint)
+	if err != nil || endpoint.Host == "" {
+		return nil, fmt.Errorf("AWS_ENDPOINT_URL %q is not an absolute URL", creds.Endpoint)
+	}
+	return &http.Client{
+		Timeout: remoteMetadataTimeout,
+		Transport: &sigv4RoundTripper{
+			base:      r.metadataClient().Transport,
+			endpoint:  endpoint,
+			accessKey: creds.AccessKeyID,
+			secretKey: creds.SecretAccessKey,
+			region:    creds.Region,
+		},
+	}, nil
 }
 
 // s3Credentials resolves the AWS_* env values from the Model's sourceSecretRef.
@@ -1417,18 +1430,34 @@ func (r *ModelReconciler) s3ContentLength(ctx context.Context, httpClient *http.
 	return resp.ContentLength
 }
 
-// sigv4RoundTripper signs every request with AWS Signature Version 4 for the
-// s3 service, then delegates to the wrapped transport (the SSRF-guarded one).
-// This is the in-process equivalent of the init container's
+// sigv4RoundTripper signs each request to endpoint with AWS Signature Version
+// 4 for the s3 service, then delegates to the wrapped transport (the
+// SSRF-guarded one). This is the in-process equivalent of the init container's
 // `curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"`.
+// pkg/agent/s3.go carries a copy for the metal-agent; the two share the
+// origin check, safehttp.SameOrigin.
+//
+// A request to any other origin (a redirect the store answered with) passes
+// through unsigned and unmodified. The client runs every redirect hop through
+// this RoundTripper after it has already dropped Authorization for a
+// cross-host redirect, so signing here would hand the access key ID and a
+// signature to whatever host the store named (#1955). A presigned-URL redirect
+// still works: it carries its own query-string signature.
 type sigv4RoundTripper struct {
 	base      http.RoundTripper
+	endpoint  *url.URL
 	accessKey string
 	secretKey string
 	region    string
 }
 
 func (t *sigv4RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !safehttp.SameOrigin(req.URL, t.endpoint) {
+		return t.base.RoundTrip(req)
+	}
+	// Sign a clone: a RoundTripper must not modify the caller's request.
+	req = req.Clone(req.Context())
+
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	dateStamp := now.Format("20060102")

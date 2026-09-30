@@ -48,7 +48,8 @@ type TokenStore struct {
 	ttl   time.Duration
 	grace time.Duration
 	now   func() time.Time
-	// logger receives Warn logs for Secret read failures; nil means no logs.
+	// logger receives Warn logs for Secret read failures and unmanaged
+	// Secrets; nil means no logs.
 	logger *zap.SugaredLogger
 
 	mu      sync.Mutex
@@ -71,6 +72,10 @@ type tokenEntry struct {
 	// lastErr is the message of the last logged read failure, cleared by a
 	// successful read, so a repeated identical failure is logged once.
 	lastErr string
+	// unmanaged is set while the last successful read found a Secret
+	// without the controller's managed-by label, so the Warn is logged
+	// once per change rather than on every refresh.
+	unmanaged bool
 }
 
 const (
@@ -87,8 +92,9 @@ const (
 type TokenStoreOption func(*TokenStore)
 
 // WithLogger makes the TokenStore log Secret read failures other than
-// NotFound at Warn, once per namespace per transition (see apply). Token
-// values are never logged.
+// NotFound, and Secrets it ignores for lacking the controller's managed-by
+// label, at Warn, once per namespace per transition (see apply). Token values
+// are never logged.
 func WithLogger(l *zap.SugaredLogger) TokenStoreOption {
 	return func(s *TokenStore) { s.logger = l }
 }
@@ -154,12 +160,12 @@ func (s *TokenStore) Valid(ctx context.Context, namespace, presented string) boo
 	e.done = make(chan struct{})
 	e.mu.Unlock()
 
-	fresh, err := s.read(ctx, namespace)
+	res, err := s.read(ctx, namespace)
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := s.now() // after the read, so a slow read cannot leave nextRefresh already past
-	s.apply(e, namespace, fresh, err, now)
+	s.apply(e, namespace, res, err, now)
 	e.refreshing = false
 	close(e.done)
 	return e.matches(p, now)
@@ -185,6 +191,14 @@ func (s *TokenStore) entry(namespace string) *tokenEntry {
 	return e
 }
 
+// readResult is one Secret read: the trimmed token, and whether the Secret
+// exists but lacks the controller's managed-by label (in which case token is
+// nil).
+type readResult struct {
+	token     []byte
+	unmanaged bool
+}
+
 // read fetches namespace's relay token under context.WithoutCancel(ctx)
 // with its own refreshTimeout, so the answer does not depend on whether this
 // particular caller has gone away. Surrounding whitespace is trimmed, as the
@@ -192,7 +206,15 @@ func (s *TokenStore) entry(namespace string) *tokenEntry {
 // still matches. It returns a nil token for a missing Secret or an empty (or
 // whitespace-only) key, and a non-nil error only for failures other than
 // NotFound.
-func (s *TokenStore) read(ctx context.Context, namespace string) ([]byte, error) {
+//
+// A Secret without the controller's managed-by label counts as having no
+// token (unmanaged is set). This is a safety net, not the control against a
+// planted token (#1957): whoever creates the Secret can set the label too.
+// It catches a Secret created before the chart's admission policy existed,
+// or created by hand by mistake. The control is that policy, which lets only
+// the controller create the Secret; without it (Kubernetes older than 1.30,
+// or the policy disabled) the protection is RBAC on Secret create.
+func (s *TokenStore) read(ctx context.Context, namespace string) (readResult, error) {
 	getCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
 	defer cancel()
 
@@ -200,27 +222,32 @@ func (s *TokenStore) read(ctx context.Context, namespace string) ([]byte, error)
 	key := client.ObjectKey{Namespace: namespace, Name: inferencev1alpha1.MetalRelaySecretName}
 	err := s.c.Get(getCtx, key, &secret)
 	if apierrors.IsNotFound(err) {
-		return nil, nil
+		return readResult{}, nil
 	}
 	if err != nil {
-		return nil, err
+		return readResult{}, err
 	}
-	return bytes.TrimSpace(secret.Data[inferencev1alpha1.MetalRelaySecretKey]), nil
+	if secret.Labels[inferencev1alpha1.LabelManagedBy] != inferencev1alpha1.ManagedByController {
+		return readResult{unmanaged: true}, nil
+	}
+	return readResult{token: bytes.TrimSpace(secret.Data[inferencev1alpha1.MetalRelaySecretKey])}, nil
 }
 
 // apply folds a read result into e. Caller holds e.mu; now is read after the
 // read returned.
 //
 // A successful read or NotFound is cached for ttl, so a flood of requests
-// costs at most one Get per ttl per namespace. A missing Secret or empty
-// token revokes both current and previous. Any other read error (API server
+// costs at most one Get per ttl per namespace. A missing Secret, an empty
+// token or an unmanaged Secret (no controller managed-by label) revokes both
+// current and previous; an unmanaged Secret is logged at Warn once each time
+// it is first seen, without its token. Any other read error (API server
 // unreachable, timeout, RBAC) keeps the last-known tokens until a later read
 // succeeds, and retries transientRetry after the failed read ended rather
 // than a full ttl. With no last-known tokens this is fail-closed. Such an
 // error is logged at Warn when it differs from the last one logged for the
 // namespace (the first failure after a success, or a changed message); the
 // token values are never logged.
-func (s *TokenStore) apply(e *tokenEntry, namespace string, fresh []byte, err error, now time.Time) {
+func (s *TokenStore) apply(e *tokenEntry, namespace string, res readResult, err error, now time.Time) {
 	if err != nil {
 		e.nextRefresh = now.Add(transientRetry)
 		if msg := err.Error(); msg != e.lastErr {
@@ -235,6 +262,15 @@ func (s *TokenStore) apply(e *tokenEntry, namespace string, fresh []byte, err er
 	e.lastErr = ""
 	e.fetched = true
 	e.nextRefresh = now.Add(s.ttl)
+	if res.unmanaged && !e.unmanaged && s.logger != nil {
+		s.logger.Warnw("ignoring the relay token Secret: it lacks the controller's managed-by label, "+
+			"so the controller did not create it; relays in this namespace get 401 until it is deleted "+
+			"and the controller recreates it",
+			"namespace", namespace, "secret", inferencev1alpha1.MetalRelaySecretName,
+			"label", inferencev1alpha1.LabelManagedBy+"="+inferencev1alpha1.ManagedByController)
+	}
+	e.unmanaged = res.unmanaged
+	fresh := res.token
 	if len(fresh) == 0 {
 		e.current, e.previous, e.prevUntil = nil, nil, time.Time{}
 		return

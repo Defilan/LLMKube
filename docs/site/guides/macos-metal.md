@@ -410,7 +410,7 @@ kubectl get endpointslice <inferenceservice-name>-agent -o yaml
 kubectl get pods -l inference.llmkube.dev/service=<inferenceservice-name>
 kubectl logs deploy/<inferenceservice-name>-relay
 kubectl describe inferenceservice <inferenceservice-name>
-# look for RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed
+# look for RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed, RelaySecretNotManaged
 ```
 
 **InferenceService stuck in `InsufficientMemory`**

@@ -21,9 +21,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -358,6 +360,7 @@ func TestSigV4RoundTripperSignsRequest(t *testing.T) {
 
 	signer := &sigv4RoundTripper{
 		base:      base,
+		endpoint:  &url.URL{Scheme: "http", Host: "minio.local"},
 		accessKey: "AKIAEXAMPLE",
 		secretKey: "secret",
 		region:    "us-east-1",
@@ -395,4 +398,188 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+// s3RedirectHop records the requests one server in a redirect test sees.
+type s3RedirectHop struct {
+	mu     sync.Mutex
+	hits   int
+	header http.Header
+}
+
+func (h *s3RedirectHop) record(r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.hits++
+	h.header = r.Header.Clone()
+}
+
+func (h *s3RedirectHop) snapshot() (int, http.Header) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.hits, h.header
+}
+
+// hasSigV4 reports whether hdr carries any of the headers the signer adds.
+func hasSigV4(hdr http.Header) []string {
+	var found []string
+	for k := range hdr {
+		if strings.EqualFold(k, "Authorization") || strings.HasPrefix(strings.ToLower(k), "x-amz-") {
+			found = append(found, k)
+		}
+	}
+	return found
+}
+
+// ensureS3ModelVia runs ensureModel for an s3:// source whose secret points
+// AWS_ENDPOINT_URL at endpoint, and returns the downloaded bytes.
+func ensureS3ModelVia(t *testing.T, endpoint string) (string, error) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
+			"AWS_REGION":            []byte("us-east-1"),
+			"AWS_ENDPOINT_URL":      []byte(endpoint),
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+	executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger(),
+		WithKubeClient("default", k8sClient, nil), allowTestServers())
+	path, err := executor.ensureModel(t.Context(), "s3://models/org/repo/model-Q4_K_M.gguf", "s3-model",
+		&corev1.LocalObjectReference{Name: "minio-models"}, "")
+	if err != nil {
+		return "", err
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read downloaded model: %v", err)
+	}
+	return string(got), nil
+}
+
+// An s3 endpoint that 307-redirects the object GET to another host (here a
+// second server on another port, as a presigned-URL redirect would) must not
+// hand that host a SigV4 signature: the redirected request carries neither
+// Authorization nor any x-amz-* header, and the download still completes
+// from the second server (#1955).
+func TestEnsureModel_S3CrossHostRedirectIsNotSigned(t *testing.T) {
+	var first, second s3RedirectHop
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		second.record(r)
+		_, _ = w.Write([]byte("presigned-bytes"))
+	}))
+	defer other.Close()
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		first.record(r)
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		http.Redirect(w, r, other.URL+"/presigned/model.gguf?X-Amz-Signature=abc", http.StatusTemporaryRedirect)
+	}))
+	defer endpoint.Close()
+
+	body, err := ensureS3ModelVia(t, endpoint.URL)
+	if err != nil {
+		t.Fatalf("ensureModel: %v", err)
+	}
+	if body != "presigned-bytes" {
+		t.Errorf("downloaded body = %q, want the second server's bytes", body)
+	}
+	if hits, _ := first.snapshot(); hits == 0 {
+		t.Fatal("the endpoint was never asked")
+	}
+	hits, hdr := second.snapshot()
+	if hits == 0 {
+		t.Fatal("the redirect target was never asked")
+	}
+	if found := hasSigV4(hdr); len(found) > 0 {
+		t.Errorf("cross-host redirect hop carried signing headers %v: %v", found, hdr)
+	}
+}
+
+// A redirect to another path on the configured endpoint is still signed.
+func TestEnsureModel_S3SameHostRedirectIsSigned(t *testing.T) {
+	var redirected s3RedirectHop
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE0000000/") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		if r.URL.Path != "/moved/model.gguf" {
+			http.Redirect(w, r, "/moved/model.gguf", http.StatusTemporaryRedirect)
+			return
+		}
+		redirected.record(r)
+		_, _ = w.Write([]byte("moved-bytes"))
+	}))
+	defer srv.Close()
+
+	body, err := ensureS3ModelVia(t, srv.URL)
+	if err != nil {
+		t.Fatalf("ensureModel: %v", err)
+	}
+	if body != "moved-bytes" {
+		t.Errorf("downloaded body = %q, want %q", body, "moved-bytes")
+	}
+	if hits, hdr := redirected.snapshot(); hits == 0 || hdr.Get("x-amz-date") == "" {
+		t.Errorf("same-host redirect hop was not signed: hits=%d header=%v", hits, hdr)
+	}
+}
+
+// The signer passes a request to any other origin through untouched, and does
+// not write its headers into the caller's request (the client builds each
+// redirect hop from those headers).
+func TestSigV4RoundTripperSignsOnlyItsEndpoint(t *testing.T) {
+	var got http.Header
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		got = req.Header.Clone()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	})
+	signer := &sigv4RoundTripper{
+		base:      base,
+		endpoint:  &url.URL{Scheme: "https", Host: "MinIO.lan"},
+		accessKey: "AKIAEXAMPLE",
+		secretKey: "secret",
+		region:    "us-east-1",
+	}
+	for _, tc := range []struct {
+		url  string
+		sign bool
+	}{
+		{"https://minio.lan:443/models/m.gguf", true},
+		{"https://minio.lan:9000/models/m.gguf", false},
+		{"http://minio.lan/models/m.gguf", false},
+		{"https://elsewhere.example/models/m.gguf?X-Amz-Signature=x", false},
+	} {
+		req, err := http.NewRequest(http.MethodGet, tc.url, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := signer.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip(%s): %v", tc.url, err)
+		}
+		_ = resp.Body.Close()
+		if signed := got.Get("Authorization") != ""; signed != tc.sign {
+			t.Errorf("%s: signed = %v, want %v", tc.url, signed, tc.sign)
+		}
+		if !tc.sign && len(hasSigV4(got)) > 0 {
+			t.Errorf("%s: unsigned request carried %v", tc.url, hasSigV4(got))
+		}
+		if len(hasSigV4(req.Header)) > 0 {
+			t.Errorf("%s: signer wrote %v into the caller's request", tc.url, hasSigV4(req.Header))
+		}
+	}
 }
