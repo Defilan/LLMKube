@@ -148,7 +148,7 @@ rather than guessed:
 
 | Fact | Where | Consequence |
 |---|---|---|
-| `GenericBackend.NeedsModelInit()` is `false` | `internal/controller/runtime_generic.go` | No init container, no `/models` mount. The pack arrives **only** through `spec.extraVolumes`. |
+| `GenericBackend.NeedsModelInit()` is `false` | `internal/controller/runtime_generic.go` | No init container, no `/models` mount unless `spec.stageModel: true` opts in. This lab leaves it off: the pack is a pre-staged volume that stays warm in page cache, so it arrives through `spec.extraVolumes`. |
 | `spec.resources.memory` sets request **and** limit | `buildContainerResources`, `deployment_builder.go` | A cgroup ceiling is charged against the aliased page cache, so the sample imposes none on first boot. |
 | `generic` idle probe needs an annotation | `docs/site/concepts/drain-before-roll.md` | With no `inference.llmkube.dev/idle-endpoint`, drain defers fail-closed. `waitForIdle` is left unset, so this does not fire. |
 
