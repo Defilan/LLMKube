@@ -5615,6 +5615,17 @@ spec:
                     draftModel (a file in Model.files), not both
                   rule: '!((has(self.draftModelRef) && self.draftModelRef.size() >
                     0) && (has(self.draftModel) && self.draftModel.size() > 0))'
+              stageModel:
+                description: |-
+                  StageModel opts a runtime that does not stage models by default (generic) into
+                  Model-managed staging: the operator downloads the referenced Model into the model
+                  cache with the same init containers and read-only /models mount the built-in
+                  runtimes use, and sets LLMKUBE_MODEL_PATH (the primary file) and LLMKUBE_MODEL_DIR
+                  (the staged directory; for a single file, its directory) in the serving
+                  container's env. Kubernetes expands $(VAR) in args, so args can name
+                  $(LLMKUBE_MODEL_PATH). Runtimes that stage by default ignore it. Cannot be
+                  combined with skipModelInit.
+                type: boolean
               suspend:
                 default: false
                 description: |-
@@ -6159,6 +6170,10 @@ spec:
             - message: multiNode is supported for runtime vllm in this release
               rule: '!has(self.multiNode) || (has(self.runtime) && self.runtime ==
                 ''vllm'')'
+            - message: 'stageModel and skipModelInit cannot both be true: one asks
+                the operator to stage the Model, the other declines staging'
+              rule: '!(has(self.stageModel) && self.stageModel && has(self.skipModelInit)
+                && self.skipModelInit)'
           status:
             description: status defines the observed state of InferenceService
             properties:

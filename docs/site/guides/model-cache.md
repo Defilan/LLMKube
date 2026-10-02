@@ -225,6 +225,42 @@ pod starts, the same as the S3 credentials. An `HF_ENDPOINT` change is also
 picked up on the next reconcile or pod restart, not the moment the Secret is
 edited.
 
+## Custom servers on the generic runtime
+
+`runtime: generic` runs your own image with your own `args`, so by default it
+stages nothing: no `model-downloader` init container and no `/models` mount.
+Set `spec.stageModel: true` to have the operator stage the referenced Model
+exactly as it does for the built-in runtimes (same cache mode, credentials and
+`spec.files` handling) and mount it read-only at `/models`.
+
+The serving container then gets two environment variables. Kubernetes expands
+`$(VAR)` in `args`, so point your server at them:
+
+| Variable | Value |
+|---|---|
+| `LLMKUBE_MODEL_PATH` | The Model's primary file (the first entry of `spec.files`, or the single file). |
+| `LLMKUBE_MODEL_DIR` | The staged directory of a multi-file Model, with `spec.files` paths preserved below it; for a single file, that file's directory. |
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: my-server
+spec:
+  modelRef: my-model          # spec.files: [weights/model-00001-of-00002.gguf, weights/model-00002-of-00002.gguf, draft/mtp.gguf]
+  runtime: generic
+  stageModel: true
+  image: registry.example.com/my-server@sha256:...
+  args:
+  - --model
+  - $(LLMKUBE_MODEL_PATH)
+  - --draft-model
+  - $(LLMKUBE_MODEL_DIR)/draft/mtp.gguf
+```
+
+`stageModel` and `skipModelInit` cannot both be true. Runtimes that stage by
+default ignore `stageModel`.
+
 ## Troubleshooting
 
 ### Pending PVC with `hostpath-provisioner-<node>-*` showing `untolerated taint`

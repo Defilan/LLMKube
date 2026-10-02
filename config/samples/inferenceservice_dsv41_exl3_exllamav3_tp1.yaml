@@ -10,10 +10,12 @@
 #    tempting the vLLM ring's advice looks: dropping the cache evicts exactly the
 #    pages this loader needs to alias.
 #
-# 2. `generic` mounts NO model volume. GenericBackend.NeedsModelInit() is false,
-#    so the operator injects no init container and no /models mount; the pack
-#    arrives only through spec.extraVolumes below. The Model CR is therefore
-#    declarative on this path: nothing downloads or stages it.
+# 2. `generic` mounts NO model volume by default. GenericBackend.NeedsModelInit()
+#    is false, so the operator injects no init container and no /models mount;
+#    the pack arrives through spec.extraVolumes below and the Model CR is
+#    declarative on this path. (spec.stageModel: true would have the operator
+#    stage the Model and set LLMKUBE_MODEL_PATH / LLMKUBE_MODEL_DIR; this sample
+#    keeps a pre-staged volume because the pack must stay warm in page cache.)
 #
 # PREREQUISITE, not yet published: ghcr.io/defilantech/llmkube-exllamav3-cuda-gb10-dsv41-exl3
 # does not exist in llmkube-runtimes today. Building it (the recipe's native

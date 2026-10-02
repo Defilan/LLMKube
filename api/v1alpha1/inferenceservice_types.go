@@ -327,6 +327,7 @@ type MultiNodeStatus struct {
 
 // +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || !has(self.replicas) || self.replicas <= 1",message="multiNode serves one group: replicas must be 1 or unset"
 // +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || (has(self.runtime) && self.runtime == 'vllm')",message="multiNode is supported for runtime vllm in this release"
+// +kubebuilder:validation:XValidation:rule="!(has(self.stageModel) && self.stageModel && has(self.skipModelInit) && self.skipModelInit)",message="stageModel and skipModelInit cannot both be true: one asks the operator to stage the Model, the other declines staging"
 type InferenceServiceSpec struct {
 	// ModelRef references the Model CR that contains the model to serve
 	// +kubebuilder:validation:Required
@@ -732,6 +733,17 @@ type InferenceServiceSpec struct {
 	// container itself (e.g., via HF_TOKEN).
 	// +optional
 	SkipModelInit *bool `json:"skipModelInit,omitempty"`
+
+	// StageModel opts a runtime that does not stage models by default (generic) into
+	// Model-managed staging: the operator downloads the referenced Model into the model
+	// cache with the same init containers and read-only /models mount the built-in
+	// runtimes use, and sets LLMKUBE_MODEL_PATH (the primary file) and LLMKUBE_MODEL_DIR
+	// (the staged directory; for a single file, its directory) in the serving
+	// container's env. Kubernetes expands $(VAR) in args, so args can name
+	// $(LLMKUBE_MODEL_PATH). Runtimes that stage by default ignore it. Cannot be
+	// combined with skipModelInit.
+	// +optional
+	StageModel *bool `json:"stageModel,omitempty"`
 
 	// ModelCache overrides where this InferenceService caches model weights:
 	// when claimName is set, the named user-owned PVC is mounted as the

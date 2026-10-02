@@ -1549,3 +1549,120 @@ func TestBuildContainerResources_MemoryLimit(t *testing.T) {
 		}
 	})
 }
+
+// lookupEnv returns the value of the env var name in env, and whether it is set.
+func lookupEnv(env []corev1.EnvVar, name string) (string, bool) {
+	for _, e := range env {
+		if e.Name == name {
+			return e.Value, true
+		}
+	}
+	return "", false
+}
+
+// TestConstructDeployment_GenericStageModel covers #1961: spec.stageModel opts a runtime
+// that does not stage by default (generic) into Model-managed staging, and tells the
+// container where the weights landed so its args can say $(LLMKUBE_MODEL_PATH).
+func TestConstructDeployment_GenericStageModel(t *testing.T) {
+	on, off := true, false
+	multi := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "flashnext-q4", Namespace: "default"},
+		Spec: inferencev1alpha1.ModelSpec{
+			Format: "gguf",
+			Source: "s3://models/unsloth/Qwen3.8-Flash-Next-GGUF",
+			Files: []string{
+				"UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00002.gguf",
+				"UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00002.gguf",
+				"MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+			},
+		},
+		Status: inferencev1alpha1.ModelStatus{CacheKey: "fnq4"},
+	}
+	newISvc := func(runtime string, stage, skip *bool) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:      "flashnext-q4",
+				Runtime:       runtime,
+				Image:         "example.invalid/gufo@sha256:" + strings.Repeat("a", 64),
+				StageModel:    stage,
+				SkipModelInit: skip,
+				Args:          []string{"serve", "--model", "$(LLMKUBE_MODEL_PATH)", "--mtp-model", "$(LLMKUBE_MODEL_DIR)/MTP/x.gguf"},
+			},
+		}
+	}
+	build := func(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) corev1.PodSpec {
+		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+		return r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec
+	}
+
+	t.Run("generic with stageModel stages the Model and exports its paths", func(t *testing.T) {
+		pod := build(newISvc("generic", &on, nil), multi)
+		if got := containerNames(pod.InitContainers); len(got) != 2 || got[0] != "model-cache-prep" || got[1] != "model-downloader" {
+			t.Fatalf("initContainers = %v, want [model-cache-prep model-downloader]", got)
+		}
+		if got := volumeNames(pod.Volumes); len(got) != 1 || got[0] != "model-cache" {
+			t.Errorf("volumes = %v, want [model-cache]", got)
+		}
+		c := pod.Containers[0]
+		var mounted bool
+		for _, m := range c.VolumeMounts {
+			if m.Name == "model-cache" && m.MountPath == "/models" && m.ReadOnly {
+				mounted = true
+			}
+		}
+		if !mounted {
+			t.Errorf("container mounts %v, want model-cache read-only at /models", c.VolumeMounts)
+		}
+		if v, _ := lookupEnv(c.Env, "LLMKUBE_MODEL_PATH"); v != "/models/fnq4/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00002.gguf" {
+			t.Errorf("LLMKUBE_MODEL_PATH = %q, want the primary file under the staged directory", v)
+		}
+		if v, _ := lookupEnv(c.Env, "LLMKUBE_MODEL_DIR"); v != "/models/fnq4" {
+			t.Errorf("LLMKUBE_MODEL_DIR = %q, want /models/fnq4", v)
+		}
+		if got := strings.Join(c.Args, " "); !strings.Contains(got, "$(LLMKUBE_MODEL_PATH)") {
+			t.Errorf("args = %q, want the user's args verbatim (Kubernetes expands $(VAR))", got)
+		}
+	})
+
+	t.Run("single-file Model exports the file's directory", func(t *testing.T) {
+		pod := build(newISvc("generic", &on, nil), cachedGGUFModel("one", "onekey"))
+		c := pod.Containers[0]
+		p, _ := lookupEnv(c.Env, "LLMKUBE_MODEL_PATH")
+		d, _ := lookupEnv(c.Env, "LLMKUBE_MODEL_DIR")
+		if p == "" || d == "" || !pathIsUnder(p, d) || p == d {
+			t.Errorf("LLMKUBE_MODEL_PATH = %q, LLMKUBE_MODEL_DIR = %q, want a file inside its directory", p, d)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+	}{
+		{"generic without stageModel stays unstaged", newISvc("generic", nil, nil)},
+		{"generic with stageModel false stays unstaged", newISvc("generic", &off, nil)},
+		{"skipModelInit still opts out", newISvc("generic", &on, &on)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := build(tc.isvc, multi)
+			if len(pod.InitContainers) != 0 || len(pod.Volumes) != 0 || len(pod.Containers[0].VolumeMounts) != 0 {
+				t.Errorf("initContainers %v, volumes %v, mounts %d; want none",
+					containerNames(pod.InitContainers), volumeNames(pod.Volumes), len(pod.Containers[0].VolumeMounts))
+			}
+			if _, ok := lookupEnv(pod.Containers[0].Env, "LLMKUBE_MODEL_PATH"); ok {
+				t.Error("LLMKUBE_MODEL_PATH set on a service that staged nothing")
+			}
+		})
+	}
+
+	t.Run("a runtime that already stages ignores stageModel", func(t *testing.T) {
+		with := build(newISvc("llamacpp", &on, nil), cachedGGUFModel("m", "k"))
+		without := build(newISvc("llamacpp", nil, nil), cachedGGUFModel("m", "k"))
+		if a, b := strings.Join(containerNames(with.InitContainers), ","), strings.Join(containerNames(without.InitContainers), ","); a != b {
+			t.Errorf("initContainers with stageModel %s, without %s; want identical", a, b)
+		}
+		if _, ok := lookupEnv(with.Containers[0].Env, "LLMKUBE_MODEL_PATH"); ok {
+			t.Error("LLMKUBE_MODEL_PATH set on llamacpp, which builds its own --model")
+		}
+	})
+}

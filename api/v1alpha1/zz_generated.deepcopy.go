@@ -831,6 +831,11 @@ func (in *InferenceServiceSpec) DeepCopyInto(out *InferenceServiceSpec) {
 		*out = new(bool)
 		**out = **in
 	}
+	if in.StageModel != nil {
+		in, out := &in.StageModel, &out.StageModel
+		*out = new(bool)
+		**out = **in
+	}
 	if in.ModelCache != nil {
 		in, out := &in.ModelCache, &out.ModelCache
 		*out = new(ModelCacheSpec)

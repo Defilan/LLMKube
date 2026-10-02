@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -339,6 +340,63 @@ func servedModelPath(isvc *inferencev1alpha1.InferenceService, model *inferencev
 	return sc.modelPath
 }
 
+// servingStorage builds the model storage the serving pod mounts and the paths handed to
+// the runtime. It stages when the runtime stages by default, or when spec.stageModel opts
+// a runtime that does not into the same staging (#1961); skipModelInit always opts out.
+// optIn reports the second case, whose container learns the paths from LLMKUBE_MODEL_*.
+func (r *InferenceServiceReconciler) servingStorage(
+	isvc *inferencev1alpha1.InferenceService,
+	model, draftModel *inferencev1alpha1.Model,
+	backend RuntimeBackend,
+	hfEndpoint, draftHFEndpoint string,
+) (storageConfig modelStorageConfig, modelPath, draftPath string, optIn bool) {
+	skipInit := isvc.Spec.SkipModelInit != nil && *isvc.Spec.SkipModelInit
+	optIn = !backend.NeedsModelInit() && isvc.Spec.StageModel != nil && *isvc.Spec.StageModel
+	if !(backend.NeedsModelInit() || optIn) || skipInit {
+		return modelStorageConfig{}, "", "", false
+	}
+	// Same predicate as the provisioning side (modelNeedsCachePVC), so a
+	// service that declined the cache mounts an emptyDir instead of a claim
+	// nobody created (#1451).
+	useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
+	storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpoint)
+	modelPath = servedModelPath(isvc, model, storageConfig)
+
+	// The draft's weights ride in the same pod, under the SAME gate as the
+	// target's. A runtime that does not auto-mount /models (the llamacpp
+	// router documents exactly that) or a service that set skipModelInit
+	// must not have a cache volume and two init containers injected behind
+	// its back just because a draft model is referenced.
+	if draftModel != nil {
+		draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
+		draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
+			r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, draftHFEndpoint)
+		// The path comes from the merge's rewritten draft config, not from
+		// draftStorage: the merge may have remounted the draft's volume to
+		// clear a collision with the target's, and -md must follow it.
+		var placedDraft modelStorageConfig
+		storageConfig, placedDraft = mergeStorageConfigs(storageConfig, draftStorage)
+		draftPath = servedModelPath(isvc, draftModel, placedDraft)
+	}
+	return storageConfig, modelPath, draftPath, optIn
+}
+
+// stagedModelEnv tells a runtime that builds no model arguments itself (spec.stageModel
+// on generic) where staging put the weights: LLMKUBE_MODEL_PATH is the primary file and
+// LLMKUBE_MODEL_DIR the staged directory of a multi-file Model, or the primary file's
+// directory. Kubernetes expands $(VAR) in args from the container's env, so the user's
+// args can name these without any templating here.
+func stagedModelEnv(modelPath string, sc modelStorageConfig) []corev1.EnvVar {
+	dir := sc.stagedDir
+	if dir == "" {
+		dir = path.Dir(modelPath)
+	}
+	return []corev1.EnvVar{
+		{Name: "LLMKUBE_MODEL_PATH", Value: modelPath},
+		{Name: "LLMKUBE_MODEL_DIR", Value: dir},
+	}
+}
+
 // setCommandAndArgs resolves the container's entrypoint and argv. A custom
 // entrypoint owns its args, but only where the runtime would otherwise have
 // injected its own CLI: a bring-your-own launcher (e.g. a tuned vLLM image
@@ -403,37 +461,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		port = isvc.Spec.Endpoint.Port
 	}
 
-	skipInit := isvc.Spec.SkipModelInit != nil && *isvc.Spec.SkipModelInit
-
-	var storageConfig modelStorageConfig
-	var modelPath string
-	draftPath := ""
-	if backend.NeedsModelInit() && !skipInit {
-		// Same predicate as the provisioning side (modelNeedsCachePVC), so a
-		// service that declined the cache mounts an emptyDir instead of a claim
-		// nobody created (#1451).
-		useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
-		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpoint)
-		modelPath = servedModelPath(isvc, model, storageConfig)
-
-		// The draft's weights ride in the same pod, under the SAME gate as the
-		// target's. A runtime that does not auto-mount /models (the llamacpp
-		// router documents exactly that) or a service that set skipModelInit
-		// must not have a cache volume and two init containers injected behind
-		// its back just because a draft model is referenced.
-		if draftModel != nil {
-			draftUseCache := modelWantsCacheVolume(draftModel, isvc, r.ModelCachePath)
-			draftStorage := buildModelStorageConfig(draftModel, isvc, isvc.Namespace, draftUseCache,
-				r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, draftHFEndpoint)
-			// The path comes from the merge's rewritten draft config, not from
-			// draftStorage: the merge may have remounted the draft's volume to
-			// clear a collision with the target's, and -md must follow it.
-			var placedDraft modelStorageConfig
-			storageConfig, placedDraft = mergeStorageConfigs(storageConfig, draftStorage)
-			draftPath = servedModelPath(isvc, draftModel, placedDraft)
-		}
-	}
-
+	storageConfig, modelPath, draftPath, optInStaging := r.servingStorage(isvc, model, draftModel, backend, hfEndpoint, draftHFEndpoint)
 	args := backend.BuildArgs(isvc, model, modelPath, draftPath, port)
 
 	startupProbe, livenessProbe, readinessProbe := backend.BuildProbes(port)
@@ -474,7 +502,11 @@ func (r *InferenceServiceReconciler) constructDeployment(
 
 	setCommandAndArgs(&container, isvc, backend, args)
 
-	// Add runtime-generated env vars, then user-specified env vars (user wins on conflict)
+	// Staged model paths for opt-in staging, then runtime-generated env vars, then
+	// user-specified env vars (user wins on conflict).
+	if optInStaging {
+		container.Env = append(container.Env, stagedModelEnv(modelPath, storageConfig)...)
+	}
 	if eb, ok := backend.(EnvBuilder); ok {
 		container.Env = append(container.Env, eb.BuildEnv(isvc)...)
 	}
