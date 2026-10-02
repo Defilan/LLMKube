@@ -336,6 +336,18 @@ spec:
                   source remains the alternative there. Ignored for local and pvc://
                   sources, which need no remote fetch.
                 type: boolean
+              prefetchNodeSelector:
+                additionalProperties:
+                  type: string
+                description: |-
+                  PrefetchNodeSelector is applied to the prefetch Job's pod and governs
+                  nothing else: like PrefetchTolerations it says where the download may
+                  run, not where the model will be served. It exists because prefetch
+                  honors a claimName override (#1676), and a node-pinned claim (a
+                  WaitForFirstConsumer local-path PVC) binds to whichever node the
+                  prefetch pod schedules to; without a selector the PV can bind to a
+                  node the InferenceService never runs on (#1964).
+                type: object
               prefetchTolerations:
                 description: |-
                   PrefetchTolerations are applied to the prefetch Job's pod, and govern

@@ -110,6 +110,27 @@ namespace's shared cache PVC (`llmkube-model-cache`, created on demand).
 `status.phase` moves `Downloading` -> `Ready`; once `Ready`, the first
 `InferenceService` starts from a cache hit instead of a cold download.
 
+### Placing the prefetch pod
+
+A node-pinned cache (a `WaitForFirstConsumer` local-path claim referenced by
+an `InferenceService`'s `spec.modelCache.claimName`) binds to whichever node
+the prefetch pod schedules to. `spec.prefetchTolerations` and
+`spec.prefetchNodeSelector` steer that placement so the model lands on the
+node that will serve it:
+
+```yaml
+spec:
+  prefetch: true
+  prefetchTolerations:
+    - key: example-gpu
+      operator: Exists
+  prefetchNodeSelector:
+    example.com/node-pool: gpu
+```
+
+Both fields govern only where the download runs, never where the model is
+served.
+
 Limitations:
 
 - Prefetch applies to remote sources (`https://`, `hf://`). Local paths and

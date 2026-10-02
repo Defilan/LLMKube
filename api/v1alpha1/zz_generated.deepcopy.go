@@ -1553,6 +1553,13 @@ func (in *ModelSpec) DeepCopyInto(out *ModelSpec) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.PrefetchNodeSelector != nil {
+		in, out := &in.PrefetchNodeSelector, &out.PrefetchNodeSelector
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.Hardware != nil {
 		in, out := &in.Hardware, &out.Hardware
 		*out = new(HardwareSpec)

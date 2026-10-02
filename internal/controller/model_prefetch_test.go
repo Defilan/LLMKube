@@ -117,6 +117,25 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(job.Spec.Template.Spec.Tolerations).To(BeEmpty())
 		})
+
+		// #1964: a node-pinned claim (#1676) binds wherever the prefetch pod
+		// schedules, so the prefetch placement has to be steerable.
+		It("carries the Model's nodeSelector onto the Job pod", func() {
+			m := newPrefetchModel("node-selected")
+			m.Spec.PrefetchNodeSelector = map[string]string{"example.com/node-pool": "gpu"}
+			seedPrefetchCacheKey(m)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("example.com/node-pool", "gpu"))
+		})
+
+		It("emits no node selector when the Model declares none", func() {
+			m := newPrefetchModel("plain-placement")
+			seedPrefetchCacheKey(m)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.NodeSelector).To(BeEmpty())
+		})
 	})
 
 	Describe("reconcilePrefetch", func() {
@@ -193,6 +212,23 @@ var _ = Describe("Model Prefetch", func() {
 			handled, _, err = r.reconcilePrefetch(ctx, updated)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(handled).To(BeFalse())
+		})
+
+		// Pins that the new field survives the API server round trip (CRD schema +
+		// DeepCopy) and lands on the created Job, not just the built object.
+		It("persists prefetchNodeSelector onto the created Job", func() {
+			model := newPrefetchModel("model-prefetch-selector")
+			model.Spec.PrefetchNodeSelector = map[string]string{"kubernetes.io/hostname": "worker-1"}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			handled, _, err := prefetchReconciler().reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeTrue())
+
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "model-prefetch-selector-prefetch", Namespace: ns}, job)).To(Succeed())
+			Expect(job.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("kubernetes.io/hostname", "worker-1"))
 		})
 
 		It("marks the Model Failed when the Job fails", func() {

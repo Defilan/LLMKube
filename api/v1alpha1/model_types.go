@@ -127,6 +127,16 @@ type ModelSpec struct {
 	// +optional
 	PrefetchTolerations []corev1.Toleration `json:"prefetchTolerations,omitempty"`
 
+	// PrefetchNodeSelector is applied to the prefetch Job's pod and governs
+	// nothing else: like PrefetchTolerations it says where the download may
+	// run, not where the model will be served. It exists because prefetch
+	// honors a claimName override (#1676), and a node-pinned claim (a
+	// WaitForFirstConsumer local-path PVC) binds to whichever node the
+	// prefetch pod schedules to; without a selector the PV can bind to a
+	// node the InferenceService never runs on (#1964).
+	// +optional
+	PrefetchNodeSelector map[string]string `json:"prefetchNodeSelector,omitempty"`
+
 	// Format specifies the model file format.
 	// "gguf" is used with the llama-server runtime; "mlx" is used with the oMLX runtime;
 	// "safetensors", "pytorch", and "custom" are used with the generic runtime.

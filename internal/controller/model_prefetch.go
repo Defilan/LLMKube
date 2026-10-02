@@ -374,7 +374,11 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 					// The Model's own tolerations, so the download can reach
 					// tainted nodes whose local storage backs the shared
 					// cache (#1621).
-					Tolerations:    model.Spec.PrefetchTolerations,
+					Tolerations: model.Spec.PrefetchTolerations,
+					// A node-pinned claim (#1676) binds wherever this pod
+					// schedules, so placement here decides which node the cache
+					// lands on (#1964).
+					NodeSelector:   model.Spec.PrefetchNodeSelector,
 					InitContainers: storage.initContainers,
 					Containers: []corev1.Container{{
 						Name:    "prefetch-done",
