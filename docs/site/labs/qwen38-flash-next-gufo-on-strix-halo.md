@@ -490,10 +490,10 @@ harness, same box for both columns: `UD-Q4_K_XL` with the MTP head,
 | | Gufo v0.3.0 | Gufo v0.5.0 code |
 |---|---:|---:|
 | Turns completed in 3 hours | 102, over 2 conversations | 379, over 6 conversations |
-| Stalls | | 0 |
-| Errors | | 0 |
-| Empty replies | | 0 |
-| Repetitive-tail replies | | 2 |
+| Stalls | 0 | 0 |
+| Errors | 0 | 0 |
+| Empty replies | 0 | 0 |
+| Repetitive-tail replies | 0 | 2 |
 | Battery, thinking on | | 12/12 |
 | Decode, median | 35 to 39 tok/s | 35 to 39 tok/s |
 | Lowest host memory available | | 8 GiB |
