@@ -5,6 +5,12 @@ description: A 176B MoE with a multi-token-prediction head served on a single Ry
 
 # Qwen3.8-Flash-Next with MTP on one Strix Halo
 
+> **Superseded on this box.** Since 2026-10-02 this Strix Halo serves the same
+> model on Gufo at the full 262,144-token context. See
+> [Qwen3.8-Flash-Next on Gufo on one Strix Halo](/docs/labs/qwen38-flash-next-gufo-on-strix-halo)
+> for the current engine and the bake-off behind the swap. This page stays as
+> the record of the llama.cpp Vulkan build.
+
 This build serves Qwen3.8-Flash-Next (`qwen4exp`) on a single AMD Ryzen AI Max+
 395, on Vulkan, with multi-token-prediction speculative decoding. It is the
 lab's second-opinion code reviewer: the endpoint a review agent points at when
