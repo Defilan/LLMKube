@@ -347,10 +347,44 @@ Behavior:
   `WaitForFirstConsumer` local class binds on the first consumer; a pre-bound
   RWO PVC pins the pod).
 - `llmkube cache list` discovers the shared cache and operator-managed
-  per-service cache PVCs. A user-managed `spec.modelCache.claimName` PVC is
-  outside the operator's cache label/discovery contract and may not appear in
-  the listing. Cache inspection may need a running pod or a transient inspector
-  pod for Pending `WaitForFirstConsumer` claims.
+   per-service cache PVCs. A user-managed `spec.modelCache.claimName` PVC is
+   outside the operator's cache label/discovery contract and may not appear in
+   the listing. Cache inspection may need a running pod or a transient inspector
+   pod for Pending `WaitForFirstConsumer` claims.
+
+### Per-Service Storage Class
+
+`spec.modelCache.storageClassName` overrides the operator-global
+`--model-cache-storage-class` flag for the cache claim the operator creates,
+so a mixed cluster can cache on local disk where the cluster's default class
+cannot attach, while the operator still creates and garbage-collects the PVC:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: onprem-llama
+spec:
+  modelRef: llama-3b
+  modelCache:
+    persistence: Cached
+    storageClassName: local-path   # overrides --model-cache-storage-class
+```
+
+Behavior:
+
+- In `perService` mode the field is authoritative: the operator creates
+  `<isvc>-model-cache` with that class.
+- In `shared` mode the namespace has one claim shared by every service, so
+  the first creator chooses its class. A later service whose request differs
+  runs on the claim as created and gets a `ModelCacheStorageClassIgnored`
+  warning event; `storageClassName` is immutable on an existing claim, and
+  the operator never mutates one.
+- The field cannot combine with `claimName` (the claim is user-owned) or with
+  `persistence: Ephemeral` (no PVC is created to class); both are rejected at
+  admission.
+- Existing claims are unaffected: the field applies only to PVCs created
+  after it is set.
 
 ## CLI Commands
 

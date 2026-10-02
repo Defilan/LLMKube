@@ -158,6 +158,8 @@ const (
 )
 
 // +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.claimName))",message="claimName cannot be set when persistence is Ephemeral: one names a cache volume to use, the other declines to use any"
+// +kubebuilder:validation:XValidation:rule="!(has(self.storageClassName) && has(self.claimName))",message="storageClassName cannot be set together with claimName: the named claim is user-owned and its storage class was chosen when the claim itself was created"
+// +kubebuilder:validation:XValidation:rule="!(has(self.persistence) && self.persistence == 'Ephemeral' && has(self.storageClassName))",message="storageClassName cannot be set when persistence is Ephemeral: the weights land in an emptyDir and no PVC is created to class"
 type ModelCacheSpec struct {
 	// Persistence selects whether weights survive a Pod restart.
 	//
@@ -210,6 +212,28 @@ type ModelCacheSpec struct {
 	// +kubebuilder:validation:MaxLength=253
 	// +optional
 	ClaimName string `json:"claimName,omitempty"`
+
+	// StorageClassName overrides the operator's --model-cache-storage-class
+	// flag for the model-cache PVC this operator creates for the service
+	// (#1963). A mixed cluster can then cache on local disk where a
+	// cloud-default class cannot attach, without hand-managing a claimName
+	// PVC per service.
+	//
+	// In perService mode the field is authoritative: the per-service claim is
+	// created with this class. In shared mode the namespace has one claim
+	// that every service shares, so the field is honored only at first
+	// creation (first writer wins); a service whose request differs from the
+	// existing claim's class gets a ModelCacheStorageClassIgnored warning and
+	// uses the claim as created, because storageClassName is immutable once
+	// bound. An empty value falls back to the flag; with neither set, the
+	// cluster default applies. Existing PVCs are never mutated.
+	//
+	// Mutually exclusive with claimName (the claim is user-owned) and with
+	// persistence Ephemeral (no PVC exists to class).
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	StorageClassName string `json:"storageClassName,omitempty"`
 }
 
 // DefaultMultiNodeRendezvousPort is the torch.distributed rendezvous port rank 0
