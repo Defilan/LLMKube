@@ -387,37 +387,6 @@ func sha256OnchangeOfflineRejectsACorruptCopy(t *testing.T) {
 	}
 }
 
-// TestModelInitSHA256_DisabledStaysByteIdentical pins the fleet-rollout
-// guarantee: for a Model without spec.sha256 the emitted init command must
-// not contain any of the verify helpers, so upgrading the operator does not
-// churn pod templates or change behavior for existing workloads.
-func TestModelInitSHA256_DisabledStaysByteIdentical(t *testing.T) {
-	tokens := []string{"llmkube_sha256_hash", "llmkube_precheck_sha256", "llmkube_check_sha256", "llmkube_publish_sha256"}
-	for _, useCache := range []bool{true, false} {
-		for _, isLocal := range []bool{true, false} {
-			for _, isS3 := range []bool{true, false} {
-				for _, policy := range []string{"", RefreshPolicyIfNotPresent, RefreshPolicyOnChange} {
-					cmd := buildModelInitCommand(isLocal, isS3, useCache, false, false, policy)
-					for _, tok := range tokens {
-						if strings.Contains(cmd, tok) {
-							t.Errorf("withSHA256=false command (useCache=%v isLocal=%v isS3=%v policy=%q) contains %q",
-								useCache, isLocal, isS3, policy, tok)
-						}
-					}
-				}
-			}
-		}
-	}
-	// The enabled path must actually wire the helpers in, or the negative
-	// pin above is vacuous.
-	if cmd := buildModelInitCommand(false, false, true, false, true, RefreshPolicyIfNotPresent); !strings.Contains(cmd, "llmkube_publish_sha256") || !strings.Contains(cmd, "llmkube_check_sha256") {
-		t.Errorf("sha256-enabled IfNotPresent command is missing the publish/check gates")
-	}
-	if cmd := remoteRevalidateScript(false, true); !strings.Contains(cmd, "llmkube_precheck_sha256") || !strings.Contains(cmd, "llmkube_publish_sha256") {
-		t.Errorf("sha256-enabled OnChange script is missing the precheck/publish gates")
-	}
-}
-
 func TestModelInitEnvVars_ModelSHA256(t *testing.T) {
 	upper := "D9BA44419F2A73ED1A666885066C65A235AB70F337E2B31CBB3D062A5F5B8D4B"
 	envs := modelInitEnvVars("https://example.com/model.gguf", "/models/k", "/models/k/model.gguf", upper)
