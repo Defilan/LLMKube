@@ -94,19 +94,27 @@ A mismatch fails the init container, so the pod never starts the inference
 container with bad weights.
 
 - The transfer lands in a partial file and is renamed onto the final path only
-  after the hash matches. On a mismatch the partial is kept for post-mortem and
-  `<model>.sha256-rejected` records the rejected hash.
-- A verified artifact gets a `<model>.sha256` stamp holding the digest, so a
-  later start accepts the file without re-hashing gigabytes (the same
-  convention the metal-agent uses). A warm cache with no stamp, or a stamp
-  naming a different hash, is hashed once and re-stamped.
-- A start against a rejected marker fails immediately, before any network
-  transfer. Correcting `spec.sha256` leaves the marker inert; deleting the
-  marker retries the download.
+  after the hash matches. On a mismatch the partial is kept for post-mortem
+  and `<model>.sha256-rejected` records the rejected hash. That marker means
+  the origin served the wrong bytes: the guard that reads it runs before any
+  probe, transfer or cleanup, so the kept partial survives crash-loop
+  restarts and the next start fails without touching the network. Correcting
+  `spec.sha256` leaves the marker stale and inert; deleting it retries.
+- A verified artifact gets a `<model>.sha256` stamp recording the digest, the
+  file size and its modification time, so a stamp can only vouch for the
+  exact bytes that were hashed. A later start skips re-hashing gigabytes only
+  while all three still agree; a missing, stale or differently-sized file is
+  hashed once and re-stamped.
+- A cached file that fails the re-hash was corrupted outside any download. It
+  is discarded, stamp and all, and re-downloaded within the same start.
+  Local corruption never leaves a rejection marker, because the marker
+  accuses the origin.
+- The gates fail closed: a download built for a digest-pinned Model aborts if
+  the digest does not reach the container instead of transferring unchecked.
 - Verification also runs on prefetch Jobs, which reuse the same init
   container.
-- Multi-file staging (`spec.files` / `spec.mmproj`) does not verify digests;
-  `spec.sha256` applies to single-file Models.
+- Digest pinning covers single-file Models. Combining `spec.sha256` with
+  multi-file staging (`spec.files` / `spec.mmproj`) is rejected at admission.
 
 ## Prefetch (Eager Download)
 

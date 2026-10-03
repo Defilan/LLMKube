@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -80,6 +81,25 @@ func mustNotExist(t *testing.T, path string) {
 	}
 }
 
+// stampTriple is what llmkube_stamp_sha256 writes: the digest, the file
+// size and its mtime, space separated. A stamp hit requires all three to
+// still describe the file on disk.
+func stampTriple(t *testing.T, path, digest string) string {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	return fmt.Sprintf("%s %d %d", digest, fi.Size(), fi.ModTime().Unix())
+}
+
+func writeStamp(t *testing.T, path, digest string) {
+	t.Helper()
+	if err := os.WriteFile(path+".sha256", []byte(stampTriple(t, path, digest)), 0o644); err != nil {
+		t.Fatalf("write stamp: %v", err)
+	}
+}
+
 func partialsOf(t *testing.T, modelPath string) []string {
 	t.Helper()
 	matches, err := filepath.Glob(modelPath + ".*.tmp")
@@ -96,10 +116,12 @@ func TestModelInitSHA256_Behavioral(t *testing.T) {
 	t.Run("correcting spec.sha256 makes the marker inert", sha256CorrectingSpecSha256MakesTheMarkerInert)
 	t.Run("warm cache verifies stamps and skips the download", sha256WarmCacheVerifiesStampsAndSkipsTheDownload)
 	t.Run("stamp hit skips re-hashing", sha256StampHitSkipsReHashing)
-	t.Run("corrupt warm cache without stamp fails and markers", sha256CorruptWarmCacheWithoutStampFailsAndMarkers)
+	t.Run("corrupt warm cache discards and refetches", sha256CorruptWarmCacheDiscardsAndRefetches)
+	t.Run("corrupt cache and rejecting origin fails the start", sha256CorruptCacheAndRejectingOriginFailsTheStart)
+	t.Run("empty digest fails closed", sha256EmptyDigestFailsClosed)
 	t.Run("OnChange download mismatch rejects before publish", sha256OnchangeDownloadMismatchRejectsBeforePublish)
 	t.Run("OnChange unchanged skip still verifies", sha256OnchangeUnchangedSkipStillVerifies)
-	t.Run("OnChange size-match corrupt rehashes and fails", sha256OnchangeSizeMatchCorruptRehashesAndFails)
+	t.Run("OnChange size-match corrupt discards and refetches", sha256OnchangeSizeMatchCorruptDiscardsAndRefetches)
 	t.Run("OnChange offline keeps a verified copy", sha256OnchangeOfflineKeepsAVerifiedCopy)
 	t.Run("OnChange offline rejects a corrupt copy", sha256OnchangeOfflineRejectsACorruptCopy)
 }
@@ -109,7 +131,9 @@ func sha256ResumeScript() string {
 }
 
 func sha256RevalidateScript() string {
-	return sha256VerifyFns + remoteRevalidateScript(false, true)
+	// Composed through the builder so the hoisted known-rejected guard is in
+	// the script, as it is in the real init container.
+	return buildModelInitCommand(false, false, false, false, true, RefreshPolicyOnChange)
 }
 
 func sha256DownloadPublishesStamp(t *testing.T) {
@@ -125,8 +149,8 @@ func sha256DownloadPublishesStamp(t *testing.T) {
 	if got := readOrFail(t, modelPath); got != string(o.content()) {
 		t.Errorf("published bytes are wrong")
 	}
-	if got := readOrFail(t, modelPath+".sha256"); got != want {
-		t.Errorf("stamp = %q, want %q", got, want)
+	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
+		t.Errorf("stamp = %q, want %q", got, stampTriple(t, modelPath, want))
 	}
 	mustNotExist(t, modelPath+".sha256-rejected")
 	if p := partialsOf(t, modelPath); len(p) != 0 {
@@ -217,8 +241,8 @@ func sha256WarmCacheVerifiesStampsAndSkipsTheDownload(t *testing.T) {
 	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
 		t.Errorf("verified warm cache issued %d GETs, want 0", n)
 	}
-	if got := readOrFail(t, modelPath+".sha256"); got != want {
-		t.Errorf("stamp written on warm cache = %q, want %q", got, want)
+	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
+		t.Errorf("stamp written on warm cache = %q, want %q", got, stampTriple(t, modelPath, want))
 	}
 }
 
@@ -227,17 +251,14 @@ func sha256StampHitSkipsReHashing(t *testing.T) {
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
 	want := sha256Hex(o.content())
-	// Trust artifact semantics, pinned: a stamp naming the expected hash
-	// accepts the file without reading it (mirrors verifyCachedDigest in
-	// pkg/agent/executor.go). The file here is deliberately not the real
-	// bytes; rewriting the stamp on every start would cost a full
-	// multi-gigabyte hash per pod start.
+	// Trust artifact semantics, pinned: a stamp whose digest, size and mtime
+	// all still describe the file accepts it without reading it. The file
+	// here is deliberately not the real bytes; re-hashing on every start
+	// would cost a full multi-gigabyte hash per pod start.
 	if err := os.WriteFile(modelPath, []byte("corrupt bytes"), 0o644); err != nil {
 		t.Fatalf("seed corrupt file: %v", err)
 	}
-	if err := os.WriteFile(modelPath+".sha256", []byte(want), 0o644); err != nil {
-		t.Fatalf("seed stamp: %v", err)
-	}
+	writeStamp(t, modelPath, want)
 
 	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, want)
 	if err != nil {
@@ -248,7 +269,7 @@ func sha256StampHitSkipsReHashing(t *testing.T) {
 	}
 }
 
-func sha256CorruptWarmCacheWithoutStampFailsAndMarkers(t *testing.T) {
+func sha256CorruptWarmCacheDiscardsAndRefetches(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
@@ -257,26 +278,77 @@ func sha256CorruptWarmCacheWithoutStampFailsAndMarkers(t *testing.T) {
 	}
 	want := sha256Hex(o.content())
 
+	// A cache file that fails the re-hash was corrupted outside any download:
+	// the check deletes it with its stamp and the same start re-downloads,
+	// mirroring the corrupt cache-file recovery in pkg/agent/executor.go. No
+	// rejection marker: the marker accuses the origin, not the disk.
 	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, want)
-	if err == nil {
-		t.Fatalf("expected failure for corrupt cached bytes\n%s", out)
+	if err != nil {
+		t.Fatalf("corrupt warm cache must self-heal: %v\n%s", err, out)
 	}
-	if got := readOrFail(t, modelPath+".sha256-rejected"); got != want {
-		t.Errorf("marker = %q, want %q", got, want)
+	if !strings.Contains(out, "removed the file and its stamp") {
+		t.Errorf("expected the discard notice: %s", out)
 	}
-	mustNotExist(t, modelPath+".sha256")
+	if got := readOrFail(t, modelPath); got != string(o.content()) {
+		t.Errorf("cache was not replaced with the verified bytes")
+	}
+	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
+		t.Errorf("stamp after self-heal = %q, want %q", got, stampTriple(t, modelPath, want))
+	}
+	mustNotExist(t, modelPath+".sha256-rejected")
+}
 
-	o.fullFromZero.Store(0)
-	o.rangeRequests.Store(0)
-	out2, err2 := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, want)
-	if err2 == nil {
-		t.Fatalf("expected the marker to reject the restart\n%s", out2)
+func sha256CorruptCacheAndRejectingOriginFailsTheStart(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	want := sha256Hex(o.content())
+	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, want); err != nil {
+		t.Fatalf("clean download failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(out2, "were rejected") {
-		t.Errorf("warm-cache restart must fail on the marker, not re-hash: %s", out2)
+	// Bytes swapped under a valid stamp: hand-edited cache, or a snapshot
+	// restore that lands different content on the same path.
+	if err := os.WriteFile(modelPath, []byte("tampered bytes"), 0o644); err != nil {
+		t.Fatalf("tamper: %v", err)
 	}
-	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
-		t.Errorf("restart against a corrupt cache issued %d GETs, want 0", n)
+	// The stamp can no longer describe the file, so the start re-hashes,
+	// discards, and re-downloads. The digest pins bytes the origin no longer
+	// serves, so the re-download must fail at publish with a marker and a
+	// kept partial, and the start must fail.
+	writeStamp(t, modelPath, want)
+	other := sha256Hex([]byte("a hash from another artifact"))
+	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, other)
+	if err == nil {
+		t.Fatalf("expected the start to fail\n%s", out)
+	}
+	if !strings.Contains(out, "removed the file and its stamp") {
+		t.Errorf("stale stamp should have been discarded and re-hashed: %s", out)
+	}
+	mustNotExist(t, modelPath)
+	if got := readOrFail(t, modelPath+".sha256-rejected"); got != other {
+		t.Errorf("marker = %q, want %q", got, other)
+	}
+	if p := partialsOf(t, modelPath); len(p) == 0 {
+		t.Errorf("the rejected start dropped the kept partial")
+	}
+}
+
+func sha256EmptyDigestFailsClosed(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	// The gated command must abort with no MODEL_SHA256 rather than transfer
+	// unchecked (a gate that skips when its input is missing is a bypass).
+	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, "")
+	if err == nil {
+		t.Fatalf("gated script with empty MODEL_SHA256 must fail\n%s", out)
+	}
+	if !strings.Contains(out, "refusing to transfer unchecked") {
+		t.Errorf("expected the fail-closed message: %s", out)
+	}
+	mustNotExist(t, modelPath)
+	if p := partialsOf(t, modelPath); len(p) != 0 {
+		t.Errorf("fail-closed script left artifacts: %v", p)
 	}
 }
 
@@ -304,8 +376,11 @@ func sha256OnchangeUnchangedSkipStillVerifies(t *testing.T) {
 	if err := os.WriteFile(modelPath, o.content(), 0o644); err != nil {
 		t.Fatalf("seed cache: %v", err)
 	}
+	// A single-field stamp from an older release: the triple comparison
+	// treats it as a miss, re-hashes once and rewrites the stamp in the
+	// current format.
 	if err := os.WriteFile(modelPath+".sha256", []byte(want), 0o644); err != nil {
-		t.Fatalf("seed stamp: %v", err)
+		t.Fatalf("seed legacy stamp: %v", err)
 	}
 
 	o.fullFromZero.Store(0)
@@ -320,26 +395,35 @@ func sha256OnchangeUnchangedSkipStillVerifies(t *testing.T) {
 	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
 		t.Errorf("stamped unchanged skip issued %d GETs, want 0", n)
 	}
+	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
+		t.Errorf("legacy stamp should be rewritten as the triple: got %q, want %q", got, stampTriple(t, modelPath, want))
+	}
 }
 
-func sha256OnchangeSizeMatchCorruptRehashesAndFails(t *testing.T) {
+func sha256OnchangeSizeMatchCorruptDiscardsAndRefetches(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
 	// Same size as the origin (so the size-match branch fires), wrong
-	// bytes, no stamp: size equality must not substitute for the hash.
+	// bytes, no stamp: size equality must not substitute for the hash. The
+	// stamp check gates the skip, fails, discards, and the same run
+	// re-downloads the verified bytes.
 	if err := os.WriteFile(modelPath, []byte(strings.Repeat("x", contentALen)), 0o644); err != nil {
 		t.Fatalf("seed corrupt same-size file: %v", err)
 	}
 	want := sha256Hex(o.content())
 
 	out, err := runVerifyScript(t, sha256RevalidateScript(), o.srv.URL+"/model.gguf", modelPath, want)
-	if err == nil {
-		t.Fatalf("expected failure: size match must not skip verification\n%s", out)
+	if err != nil {
+		t.Fatalf("size-match with corrupt bytes must self-heal, not fail the start: %v\n%s", err, out)
 	}
-	if got := readOrFail(t, modelPath+".sha256-rejected"); got != want {
-		t.Errorf("marker = %q, want %q", got, want)
+	if !strings.Contains(out, "removed the file and its stamp") {
+		t.Errorf("expected the discard notice before the refetch: %s", out)
 	}
+	if got := readOrFail(t, modelPath); got != string(o.content()) {
+		t.Errorf("cache was not replaced with the verified bytes")
+	}
+	mustNotExist(t, modelPath+".sha256-rejected")
 }
 
 func sha256OnchangeOfflineKeepsAVerifiedCopy(t *testing.T) {
@@ -364,8 +448,8 @@ func sha256OnchangeOfflineKeepsAVerifiedCopy(t *testing.T) {
 	if !strings.Contains(out, "kept cached copy") {
 		t.Errorf("expected the offline fallback message: %s", out)
 	}
-	if got := readOrFail(t, modelPath+".sha256"); got != want {
-		t.Errorf("offline verification should write the stamp: %q", got)
+	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
+		t.Errorf("offline verification should write the stamp: got %q, want %q", got, stampTriple(t, modelPath, want))
 	}
 }
 
@@ -385,6 +469,9 @@ func sha256OnchangeOfflineRejectsACorruptCopy(t *testing.T) {
 	if err == nil {
 		t.Fatalf("offline fallback must not exit 0 on bytes that fail the check\n%s", out)
 	}
+	// The failing bytes are discarded rather than left behind to be
+	// size-matched by a later start with a reachable origin.
+	mustNotExist(t, modelPath)
 }
 
 func TestModelInitEnvVars_ModelSHA256(t *testing.T) {
@@ -405,7 +492,7 @@ func TestModelInitEnvVars_ModelSHA256(t *testing.T) {
 	}
 	for _, e := range modelInitEnvVars("https://example.com/model.gguf", "/models/k", "/models/k/model.gguf", "") {
 		if e.Name == "MODEL_SHA256" {
-			t.Errorf("MODEL_SHA256 must be absent when spec.sha256 is unset (the shell gates must no-op): %v", e)
+			t.Errorf("MODEL_SHA256 must be absent when spec.sha256 is unset (gated commands are not built for such Models either): %v", e)
 		}
 	}
 }

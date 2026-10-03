@@ -269,13 +269,21 @@ fails the init container, so the pod never starts with bad weights.
 
 - The transfer lands in a partial file and is renamed onto the final path only
   after the hash matches. On a mismatch the partial is kept and
-  `<model>.sha256-rejected` records the rejected hash.
-- A verified artifact gets a `<model>.sha256` stamp, so later starts skip
-  re-hashing. A warm cache without a stamp is hashed once and stamped.
-- A start against a rejected marker fails before any transfer. Correcting
-  `spec.sha256` makes the marker inert; delete the marker to retry.
-- `spec.sha256` applies to single-file Models; multi-file staging
-  (`spec.files` / `spec.mmproj`) does not verify digests yet.
+  `<model>.sha256-rejected` records the rejected hash; the guard that reads it
+  runs before any probe, transfer or cleanup, so the kept partial survives
+  crash-loop restarts. Correcting `spec.sha256` makes the marker inert; delete
+  it to retry.
+- A verified artifact gets a `<model>.sha256` stamp holding the digest plus
+  the file size and modification time, so a stamp can only vouch for the exact
+  bytes that were hashed. Later starts skip re-hashing while all three agree;
+  a missing, stale or differently-sized file is hashed once and re-stamped.
+- A cached file that fails the re-hash is discarded with its stamp and
+  re-downloaded within the same start. Local corruption never writes a
+  rejection marker, because the marker accuses the origin.
+- The gates fail closed: if the digest does not reach the container, the
+  download aborts instead of transferring unchecked.
+- `spec.sha256` covers single-file Models; combining it with multi-file
+  staging (`spec.files` / `spec.mmproj`) is rejected at admission.
 
 ## Troubleshooting
 

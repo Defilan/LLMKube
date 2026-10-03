@@ -87,7 +87,40 @@ func TestModelInitCommand_SHA256Branches_HasGates(t *testing.T) {
 	if cmd := buildModelInitCommand(false, false, true, false, true, RefreshPolicyIfNotPresent); !strings.Contains(cmd, "llmkube_publish_sha256") || !strings.Contains(cmd, "llmkube_check_sha256") {
 		t.Errorf("sha256-enabled IfNotPresent command is missing the publish/check gates")
 	}
-	if cmd := remoteRevalidateScript(false, true); !strings.Contains(cmd, "llmkube_precheck_sha256") || !strings.Contains(cmd, "llmkube_publish_sha256") {
-		t.Errorf("sha256-enabled OnChange script is missing the precheck/publish gates")
+	// The OnChange guard is hoisted to the head of the composed command (it
+	// must run before the debris sweep), so assert on the builder output.
+	cmd := buildModelInitCommand(false, false, true, false, true, RefreshPolicyOnChange)
+	for _, tok := range []string{"llmkube_precheck_sha256", "llmkube_check_sha256", "llmkube_publish_sha256"} {
+		if !strings.Contains(cmd, tok) {
+			t.Errorf("sha256-enabled OnChange command is missing the %s gate", tok)
+		}
+	}
+}
+
+// TestModelInitCommand_SHA256GuardRunsFirst pins that the known-rejected
+// guard runs before anything that could clear its evidence: every
+// sha256-enabled command issues llmkube_precheck_sha256 before the first
+// sweep, probe or transfer statement.
+func TestModelInitCommand_SHA256GuardRunsFirst(t *testing.T) {
+	cases := map[string]string{
+		"cached local":    buildModelInitCommand(true, false, true, false, true, RefreshPolicyIfNotPresent),
+		"cached s3":       buildModelInitCommand(false, true, true, false, true, RefreshPolicyIfNotPresent),
+		"cached http":     buildModelInitCommand(false, false, true, false, true, RefreshPolicyIfNotPresent),
+		"cached onchange": buildModelInitCommand(false, false, true, false, true, RefreshPolicyOnChange),
+		"uncached s3":     buildModelInitCommand(false, true, false, false, true, RefreshPolicyIfNotPresent),
+		"uncached http":   buildModelInitCommand(false, false, false, false, true, RefreshPolicyIfNotPresent),
+	}
+	for name, cmd := range cases {
+		guard := `llmkube_precheck_sha256 "$MODEL_PATH" || exit 1`
+		gi := strings.Index(cmd, guard)
+		if gi < 0 {
+			t.Errorf("%s: the precheck guard is missing", name)
+			continue
+		}
+		for _, late := range []string{`rm -f "$MODEL_PATH.tmp"`, `find "$(dirname`, `download_with_progress "$MODEL_PATH.tmp"`, `curlCmd`} {
+			if li := strings.Index(cmd, late); li >= 0 && li < gi {
+				t.Errorf("%s: %q is emitted before the guard", name, late)
+			}
+		}
 	}
 }
