@@ -62,6 +62,47 @@ spec:
           spec:
             description: spec defines the desired state of Model
             properties:
+              attestation:
+                description: |-
+                  Attestation references a Socair attestation for this Model's artifact:
+                  a DSSE-signed in-toto statement whose subject digest must equal
+                  spec.sha256. When the operator runs with --model-attestation=enforce, a
+                  Model without an attestation that a trusted key signed and the policy
+                  admits never becomes Ready, so no InferenceService serves it. With
+                  --model-attestation=warn the result is reported on the
+                  AttestationVerified condition without blocking.
+                properties:
+                  configMapKeyRef:
+                    description: |-
+                      ConfigMapKeyRef selects the key, in a ConfigMap in the Model's
+                      namespace, that holds the attestation's DSSE envelope (the
+                      attestation.dsse.json that `socair sign` writes).
+                    properties:
+                      key:
+                        description: |-
+                          The key to select from the ConfigMap's Data field.
+                          Keys in the BinaryData field are not currently propagated to container env vars.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the ConfigMap or its key must
+                          be defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - configMapKeyRef
+                type: object
               files:
                 description: |-
                   Files lists model weight artifacts to stage from Source. Entries are

@@ -21,6 +21,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// ModelAttestation locates a Model's Socair attestation.
+type ModelAttestation struct {
+	// ConfigMapKeyRef selects the key, in a ConfigMap in the Model's
+	// namespace, that holds the attestation's DSSE envelope (the
+	// attestation.dsse.json that `socair sign` writes).
+	// +kubebuilder:validation:Required
+	ConfigMapKeyRef corev1.ConfigMapKeySelector `json:"configMapKeyRef"`
+}
+
 // ModelSpec defines the desired state of Model
 type ModelSpec struct {
 	// Source defines where to obtain the model.
@@ -66,6 +75,16 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
 	// +optional
 	SHA256 string `json:"sha256,omitempty"`
+
+	// Attestation references a Socair attestation for this Model's artifact:
+	// a DSSE-signed in-toto statement whose subject digest must equal
+	// spec.sha256. When the operator runs with --model-attestation=enforce, a
+	// Model without an attestation that a trusted key signed and the policy
+	// admits never becomes Ready, so no InferenceService serves it. With
+	// --model-attestation=warn the result is reported on the
+	// AttestationVerified condition without blocking.
+	// +optional
+	Attestation *ModelAttestation `json:"attestation,omitempty"`
 
 	// SourceSecretRef names a Secret (in the Model's namespace) whose keys are
 	// wired as env into the model-downloader init container.

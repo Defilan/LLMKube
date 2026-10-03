@@ -139,6 +139,14 @@ type ModelReconciler struct {
 	// capability that actually matters.
 	ServerVersion string
 
+	// Attestation is the operator's Socair attestation policy for Models.
+	// The zero value is off. See checkAttestation.
+	Attestation AttestationPolicy
+
+	// APIReader reads the attestation ConfigMaps uncached; nil falls back to
+	// the client (tests).
+	APIReader client.Reader
+
 	// Prefetch (#904) configuration, mirrored from the InferenceService
 	// reconciler's cache settings so the prefetch Job writes into the same
 	// shared cache PVC the serving path mounts.
@@ -176,6 +184,7 @@ func (r *ModelReconciler) metadataClient() *http.Client {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
 
 func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()
@@ -208,6 +217,13 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	// runs before any source-type dispatch.
 	if handled, err := r.rejectDisallowedLocalSource(ctx, model); handled {
 		return ctrl.Result{}, err
+	}
+
+	// Socair attestation gate: an unattested Model never
+	// reaches a download or Ready when the policy enforces. Like the host-path
+	// gate it runs before any source dispatch.
+	if handled, result, err := r.checkAttestation(ctx, model); handled {
+		return result, err
 	}
 
 	if handled, result := r.validateMultiFileStagingSource(ctx, model); handled {

@@ -72,6 +72,19 @@ spec:
         # only when non-empty; the flag's empty default disables such sources.
         - --allowed-host-path-roots={{ join "," . }}
         {{- end }}
+        {{- $att := .Values.modelAttestation | default dict }}
+        {{- if and $att.mode (ne (toString $att.mode) "off") }}
+        # Socair attestation policy: warn reports on the AttestationVerified
+        # condition; enforce fails a Model without an admitted attestation.
+        - --model-attestation={{ $att.mode }}
+        - --model-attestation-trusted-keys={{ required "modelAttestation.trustedKeysConfigMap (namespace/name) is required when modelAttestation.mode is warn or enforce" $att.trustedKeysConfigMap }}
+        {{- if $att.allowConditions }}
+        - --model-attestation-allow-conditions
+        {{- end }}
+        {{- with $att.maxAge }}
+        - --model-attestation-max-age={{ . }}
+        {{- end }}
+        {{- end }}
         {{- $ri := .Values.runtimeImages | default dict }}
         {{- $pairs := list }}
         {{- range $k, $v := $ri }}{{- if $v }}{{- $pairs = append $pairs (printf "%s=%s" $k $v) }}{{- end }}{{- end }}

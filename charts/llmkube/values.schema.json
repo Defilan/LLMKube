@@ -372,6 +372,30 @@
         }
       }
     },
+    "modelAttestation": {
+      "type": "object",
+      "description": "Socair model attestation policy (see values.yaml).",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["off", "warn", "enforce"]
+        },
+        "trustedKeysConfigMap": {
+          "type": "string",
+          "description": "namespace/name of the ConfigMap holding the trusted *.pub keys",
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?/[a-z0-9]([-.a-z0-9]*[a-z0-9])?$"
+        },
+        "allowConditions": {
+          "type": "boolean"
+        },
+        "maxAge": {
+          "type": "string",
+          "description": "Go duration such as 2160h; empty disables the age check",
+          "pattern": "^$|^([0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h))+$"
+        }
+      }
+    },
     "modelSource": {
       "type": "object",
       "additionalProperties": false,

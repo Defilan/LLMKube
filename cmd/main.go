@@ -40,6 +40,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -178,6 +179,9 @@ func main() {
 	var gpuSharingVRAMPerDeviceGiB int
 	var runtimeImages string
 	var modelRevalidateInterval time.Duration
+	var modelAttestation, modelAttestationTrustedKeys string
+	var modelAttestationAllowConditions bool
+	var modelAttestationMaxAge time.Duration
 	var caCertConfigMap string
 	var initContainerImage string
 	var defaultFSGroup int64
@@ -225,6 +229,19 @@ func main() {
 		"Comma-separated hostnames/CIDRs permitted as remote (http/https) Model sources even if "+
 			"they resolve to private/link-local/loopback ranges. Public hosts are always allowed; "+
 			"this only re-permits internal hosts blocked by the SSRF guard (GHSA-jw3m-8q7m-f35r).")
+	flag.StringVar(&modelAttestation, "model-attestation", "off",
+		"Socair attestation policy for Models: off (default), warn (verify and report on the "+
+			"AttestationVerified condition, never block), or enforce (a Model without an admitted "+
+			"attestation for its spec.sha256 is Failed and never served).")
+	flag.StringVar(&modelAttestationTrustedKeys, "model-attestation-trusted-keys", "",
+		"namespace/name of the ConfigMap whose *.pub values are the trusted Ed25519 signing keys "+
+			"(PEM). Required when --model-attestation is warn or enforce.")
+	flag.BoolVar(&modelAttestationAllowConditions, "model-attestation-allow-conditions", false,
+		"Also admit authorized_with_conditions attestations (some checks NOT_TESTED, accepted by a "+
+			"named person). Default false: only fully authorized attestations are admitted.")
+	flag.DurationVar(&modelAttestationMaxAge, "model-attestation-max-age", 0,
+		"Refuse an attestation issued longer ago than this (for example 2160h). 0 (default) "+
+			"disables the age check.")
 	flag.DurationVar(&modelRevalidateInterval, "model-revalidate-interval", controller.DefaultRevalidateInterval,
 		"Minimum interval between upstream source revalidation checks for a Model. "+
 			"Bounds the HEAD traffic the controller generates; drift is surfaced via the "+
@@ -512,8 +529,32 @@ func main() {
 		serverVersion = ver.GitVersion
 	}
 
+	attestationMode, err := controller.ParseAttestationMode(modelAttestation)
+	if err != nil {
+		setupLog.Error(err, "invalid model attestation policy")
+		os.Exit(1)
+	}
+	attestationPolicy := controller.AttestationPolicy{
+		Mode:            attestationMode,
+		AllowConditions: modelAttestationAllowConditions,
+		MaxAge:          modelAttestationMaxAge,
+	}
+	if attestationMode != controller.AttestationOff {
+		ns, name, ok := strings.Cut(modelAttestationTrustedKeys, "/")
+		if !ok || ns == "" || name == "" {
+			setupLog.Error(fmt.Errorf("got %q", modelAttestationTrustedKeys),
+				"--model-attestation-trusted-keys must be namespace/name when --model-attestation is warn or enforce")
+			os.Exit(1)
+		}
+		attestationPolicy.TrustedKeys = types.NamespacedName{Namespace: ns, Name: name}
+		setupLog.Info("model attestation policy", "mode", attestationMode, "trustedKeys", modelAttestationTrustedKeys,
+			"allowConditions", modelAttestationAllowConditions, "maxAge", modelAttestationMaxAge)
+	}
+
 	if err := (&controller.ModelReconciler{
 		Client:               mgr.GetClient(),
+		APIReader:            mgr.GetAPIReader(),
+		Attestation:          attestationPolicy,
 		Scheme:               mgr.GetScheme(),
 		StoragePath:          modelCachePath,
 		RevalidateInterval:   modelRevalidateInterval,

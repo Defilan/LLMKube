@@ -263,6 +263,11 @@ const (
 	ReasonModelDigestMismatch string = "ModelDigestMismatch"
 )
 
+// ReasonModelAttestationRejected is set on a Model the attestation policy
+// refuses: its Socair attestation is missing, does not verify against the
+// trusted keys, is for another digest, or is not admitted by the policy.
+const ReasonModelAttestationRejected = "ModelAttestationRejected"
+
 // MetalAgentRefusalReasons lists every SchedulingStatus value the metal agent
 // writes when it refuses to start a service. internal/controller/scheduling.go
 // builds its agentRefusalReasons set from this list rather than maintaining a
