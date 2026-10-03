@@ -22,6 +22,7 @@ import (
 )
 
 // ModelSpec defines the desired state of Model
+// +kubebuilder:validation:XValidation:rule="!((has(self.sha256) && self.sha256 != '') && ((has(self.files) && self.files.size() > 0) || (has(self.mmproj) && self.mmproj != '')))",message="sha256 verifies a single artifact: it cannot be combined with files or mmproj"
 type ModelSpec struct {
 	// Source defines where to obtain the model.
 	// For GGUF models: URL or path to a .gguf file.
@@ -62,7 +63,10 @@ type ModelSpec struct {
 	Source string `json:"source"`
 
 	// SHA256 is the expected SHA256 hash of the model file for integrity verification.
-	// When set, the controller verifies the downloaded/copied file matches this hash.
+	// When set, the download verifies the bytes against this hash before they
+	// become the cache, on both the init-container and controller-side paths.
+	// Applies to single-file Models: setting it together with Files or Mmproj
+	// is rejected at admission (#1965).
 	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
 	// +optional
 	SHA256 string `json:"sha256,omitempty"`
