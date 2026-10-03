@@ -1,0 +1,44 @@
+suite: model attestation operator flags
+templates:
+  - deployment.yaml
+
+tests:
+  # Off by default: a cluster that has never heard of Socair must behave
+  # exactly as before.
+  - it: renders no attestation flags by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --model-attestation=enforce
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --model-attestation=warn
+
+  - it: renders enforce with its trusted keys
+    set:
+      modelAttestation.mode: enforce
+      modelAttestation.trustedKeysConfigMap: llmkube-system/socair-trusted-keys
+      modelAttestation.allowConditions: true
+      modelAttestation.maxAge: 2160h
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --model-attestation=enforce
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --model-attestation-trusted-keys=llmkube-system/socair-trusted-keys
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --model-attestation-allow-conditions
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --model-attestation-max-age=2160h
+
+  # warn or enforce without trusted keys would start an operator that refuses
+  # every Model (or reports every one rejected); fail the install instead.
+  - it: fails when a policy is set without trusted keys
+    set:
+      modelAttestation.mode: enforce
+    asserts:
+      - failedTemplate:
+          errorMessage: modelAttestation.trustedKeysConfigMap (namespace/name) is required when modelAttestation.mode is warn or enforce

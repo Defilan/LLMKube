@@ -428,6 +428,22 @@ modelCache:
   # Annotations for the shared PVC (e.g., for backup policies)
   annotations: {}
 
+# Socair model attestation policy. A Model references a Socair attestation (a
+# DSSE envelope from `socair sign`) in spec.attestation; the controller verifies
+# it against the trusted keys and checks its digest is spec.sha256.
+#   mode: off (default) | warn (report on the AttestationVerified condition,
+#         never block) | enforce (a Model without an admitted attestation is
+#         Failed and never served)
+#   trustedKeysConfigMap: namespace/name of a ConfigMap whose *.pub values are
+#         the trusted Ed25519 public keys (PEM); required for warn and enforce
+#   allowConditions: also admit authorized_with_conditions attestations
+#   maxAge: refuse attestations issued longer ago, e.g. 2160h; empty disables
+modelAttestation:
+  mode: "off"
+  trustedKeysConfigMap: ""
+  allowConditions: false
+  maxAge: ""
+
 # Host-path allowlist for local (/abs and file://) and hostPath model sources.
 # SECURITY (GHSA-jw3m-8q7m-f35r): empty list disables all such sources. To serve
 # a model from node-local disk, list the absolute directory roots you trust, e.g.
