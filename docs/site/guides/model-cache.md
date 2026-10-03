@@ -41,12 +41,15 @@ spec:
     storageClassName: local-path
 ```
 
-In `perService` mode the field is authoritative. In `shared` mode the
-namespace has one claim, so the first creator picks its class and a later
-service requesting a different one gets a `ModelCacheStorageClassIgnored`
-warning and runs on the claim as created; `storageClassName` is immutable
-once the claim exists. The field cannot combine with `claimName` (the claim
-is user-owned) or `persistence: Ephemeral` (no PVC is created).
+The field chooses the class of the claim the operator creates; the class of
+an existing claim never changes. In `shared` mode the first creator picks the
+namespace's class, and in `perService` mode an edit to the field on a service
+whose claim already exists is ignored. Either case raises a
+`ModelCacheStorageClassIgnored` warning; delete the claim to reprovision on
+the requested class. The field cannot combine with `claimName` (the claim is
+user-owned) or `persistence: Ephemeral` (no PVC is created). There is no
+allowlist of storage classes: anyone who can edit an InferenceService can
+pin its cache claim to any storage class in the cluster.
 
 ## Strictly tainted GPU nodes
 

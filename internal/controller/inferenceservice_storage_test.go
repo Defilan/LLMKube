@@ -1141,10 +1141,11 @@ var _ = Describe("modelCache.storageClassName (#1963)", func() {
 		forceDeletePVC("sc-per-service-model-cache")
 		forceDeletePVC("sc-flag-fallback-model-cache")
 		forceDeletePVC("sc-unclassed-model-cache")
+		forceDeletePVC("sc-edit-model-cache")
 	})
 
 	AfterEach(func() {
-		for _, name := range []string{"sc-per-service", "sc-flag-fallback", "sc-unclassed", "sc-conflict", "sc-ephemeral"} {
+		for _, name := range []string{"sc-per-service", "sc-flag-fallback", "sc-unclassed", "sc-conflict", "sc-ephemeral", "sc-edit"} {
 			o := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
 			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, o))
 		}
@@ -1152,6 +1153,7 @@ var _ = Describe("modelCache.storageClassName (#1963)", func() {
 		forceDeletePVC("sc-per-service-model-cache")
 		forceDeletePVC("sc-flag-fallback-model-cache")
 		forceDeletePVC("sc-unclassed-model-cache")
+		forceDeletePVC("sc-edit-model-cache")
 	})
 
 	It("creates the perService claim with the service's storageClassName", func() {
@@ -1195,6 +1197,30 @@ var _ = Describe("modelCache.storageClassName (#1963)", func() {
 
 		pvc := getPVC(ModelCachePVCName)
 		Expect(pvc.Spec.StorageClassName).NotTo(BeNil())
+		Expect(*pvc.Spec.StorageClassName).To(Equal("local-path"))
+		Expect(drainEvents()).To(ContainElement(SatisfyAll(
+			ContainSubstring("Warning"),
+			ContainSubstring("ModelCacheStorageClassIgnored"),
+			ContainSubstring("fast-ssd"),
+			ContainSubstring("local-path"),
+		)))
+	})
+
+	It("perService mode: editing storageClassName on an existing claim warns instead of being dropped silently", func() {
+		isvc := createCacheISVC(newCacheISVC("sc-edit", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "local-path"}))
+		Expect(reconciler.ensureModelCachePVC(ctx, isvc)).To(Succeed())
+		drainEvents()
+
+		// The claim exists and its class is immutable, so a later edit to the
+		// field is ignored; it must surface as a warning rather than vanish
+		// silently, the same contract shared mode already has (#1963).
+		updated := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sc-edit", Namespace: "default"}, updated)).To(Succeed())
+		updated.Spec.ModelCache.StorageClassName = "fast-ssd"
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+		Expect(reconciler.ensureModelCachePVC(ctx, updated)).To(Succeed())
+
+		pvc := getPVC("sc-edit-model-cache")
 		Expect(*pvc.Spec.StorageClassName).To(Equal("local-path"))
 		Expect(drainEvents()).To(ContainElement(SatisfyAll(
 			ContainSubstring("Warning"),

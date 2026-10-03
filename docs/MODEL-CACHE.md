@@ -347,10 +347,10 @@ Behavior:
   `WaitForFirstConsumer` local class binds on the first consumer; a pre-bound
   RWO PVC pins the pod).
 - `llmkube cache list` discovers the shared cache and operator-managed
-   per-service cache PVCs. A user-managed `spec.modelCache.claimName` PVC is
-   outside the operator's cache label/discovery contract and may not appear in
-   the listing. Cache inspection may need a running pod or a transient inspector
-   pod for Pending `WaitForFirstConsumer` claims.
+  per-service cache PVCs. A user-managed `spec.modelCache.claimName` PVC is
+  outside the operator's cache label/discovery contract and may not appear in
+  the listing. Cache inspection may need a running pod or a transient inspector
+  pod for Pending `WaitForFirstConsumer` claims.
 
 ### Per-Service Storage Class
 
@@ -373,18 +373,23 @@ spec:
 
 Behavior:
 
-- In `perService` mode the field is authoritative: the operator creates
-  `<isvc>-model-cache` with that class.
+- In `perService` mode the field is authoritative for the claim the operator
+  creates, `<isvc>-model-cache`.
 - In `shared` mode the namespace has one claim shared by every service, so
-  the first creator chooses its class. A later service whose request differs
-  runs on the claim as created and gets a `ModelCacheStorageClassIgnored`
-  warning event; `storageClassName` is immutable on an existing claim, and
-  the operator never mutates one.
+  the first creator chooses its class.
+- The class of an existing claim never changes: `storageClassName` is
+  immutable once bound and the operator never mutates a claim. Editing the
+  field against a claim that already exists (a differing later request in
+  `shared` mode, or an edit on your own claim in `perService` mode) is
+  ignored and raises a `ModelCacheStorageClassIgnored` warning event; delete
+  the claim to reprovision on the requested class.
 - The field cannot combine with `claimName` (the claim is user-owned) or with
   `persistence: Ephemeral` (no PVC is created to class); both are rejected at
   admission.
-- Existing claims are unaffected: the field applies only to PVCs created
-  after it is set.
+- There is no allowlist of storage classes: anyone who can edit an
+  InferenceService can pin its cache claim to any storage class in the
+  cluster. Scope who may edit InferenceServices if storage-class choice is
+  restricted in your cluster.
 
 ## CLI Commands
 

@@ -161,17 +161,17 @@ func (r *InferenceServiceReconciler) warnUnboundedEphemeralCache(
 }
 
 // warnIgnoredModelCacheStorageClass emits a ModelCacheStorageClassIgnored
-// warning event when spec.modelCache.storageClassName is set but the namespace's
-// shared model cache claim already exists with a different class. In shared mode
-// the claim is created once and the first writer's class is final
-// (storageClassName is immutable once bound), so a later service's request is
-// ignored rather than applied; surface it instead of dropping it silently
-// (#1963).
+// warning event when spec.modelCache.storageClassName is set but the claim the
+// service will mount already exists with a different class. The class of an
+// existing claim never changes (storageClassName is immutable once bound): in
+// shared mode the first writer's class is final for the namespace, and in
+// perService mode an edit against the service's own claim is ignored until the
+// claim is deleted. Neither case may pass silently (#1963).
 func (r *InferenceServiceReconciler) warnIgnoredModelCacheStorageClass(
 	isvc *inferencev1alpha1.InferenceService,
 	existing *corev1.PersistentVolumeClaim,
 ) {
-	if r.Recorder == nil || resolveCacheMode(r.ModelCacheMode) != ModelCacheModeShared {
+	if r.Recorder == nil {
 		return
 	}
 	requested := userModelCacheStorageClassName(isvc)
@@ -186,7 +186,7 @@ func (r *InferenceServiceReconciler) warnIgnoredModelCacheStorageClass(
 		return
 	}
 	r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "ModelCacheStorageClassIgnored", "Reconcile",
-		"spec.modelCache.storageClassName %q is ignored: the shared model cache PVC %q already exists with class %q and the field is immutable; only the operator that first creates the shared claim chooses its class",
+		"spec.modelCache.storageClassName %q is ignored: model cache PVC %q already exists with class %q and the field is immutable once the claim is created; the existing class stays in effect until the claim is deleted",
 		requested, existing.Name, existingClass)
 }
 
@@ -1709,7 +1709,7 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 	// A per-service spec.modelCache.storageClassName overrides the
 	// operator-global flag for the claim created here (#1963); the class of an
 	// already-existing claim is never changed, immutability aside, which is
-	// what warnIgnoredModelCacheStorageClass surfaces in shared mode.
+	// what warnIgnoredModelCacheStorageClass surfaces in both cache modes.
 	effectiveClass := userModelCacheStorageClassName(isvc)
 	if effectiveClass == "" {
 		effectiveClass = r.ModelCacheClass
