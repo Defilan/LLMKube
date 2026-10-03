@@ -99,6 +99,25 @@ kubectl describe pod -l app=amd-vulkan-service
 The PVC should show `Bound`, the pod should report the tainted GPU node, and
 `describe` should list the correct toleration and volume mount.
 
+### Warming a node-pinned claim with prefetch
+
+A `WaitForFirstConsumer` local-path claim binds to whichever pod schedules
+first. When `spec.prefetch: true` warms such a claim (#1676), that pod is the
+prefetch Job, so the placement decision belongs there: set
+`spec.prefetchNodeSelector` (and `spec.prefetchTolerations`) on the Model so
+the download lands on the node that will serve it. Without a selector the PV
+can bind to a node the InferenceService never runs on.
+
+```yaml
+spec:
+  prefetch: true
+  prefetchTolerations:
+    - key: example-gpu
+      operator: Exists
+  prefetchNodeSelector:
+    example.com/node-pool: gpu
+```
+
 ### Why a tolerated inference pod may still have a Pending PVC
 
 Some dynamic provisioners create a per-node helper pod to provision volumes.
