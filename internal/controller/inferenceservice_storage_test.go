@@ -1067,6 +1067,205 @@ var _ = Describe("ensureModelCachePVC (user claimName, #928)", func() {
 	})
 })
 
+var _ = Describe("modelCache.storageClassName (#1963)", func() {
+	ctx := context.Background()
+
+	var recorder *events.FakeRecorder
+	var reconciler *InferenceServiceReconciler
+	oneReplica := int32(1)
+
+	// drainEvents empties the FakeRecorder channel into a slice.
+	drainEvents := func() []string {
+		var out []string
+		for {
+			select {
+			case e := <-recorder.Events:
+				out = append(out, e)
+			default:
+				return out
+			}
+		}
+	}
+
+	forceDeletePVC := func(name string) {
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Name: name, Namespace: "default"}
+		if err := k8sClient.Get(ctx, key, pvc); err != nil {
+			return
+		}
+		if len(pvc.Finalizers) > 0 {
+			pvc.Finalizers = nil
+			_ = k8sClient.Update(ctx, pvc)
+		}
+		_ = k8sClient.Delete(ctx, pvc)
+		Eventually(func() bool {
+			return errors.IsNotFound(k8sClient.Get(ctx, key, &corev1.PersistentVolumeClaim{}))
+		}, "5s", "100ms").Should(BeTrue())
+	}
+
+	newCacheISVC := func(name string, cache *inferencev1alpha1.ModelCacheSpec) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:   "some-model",
+				Replicas:   &oneReplica,
+				Image:      "ghcr.io/ggml-org/llama.cpp:server",
+				ModelCache: cache,
+			},
+		}
+	}
+
+	// createCacheISVC persists the service: the perService claim owner-ref needs
+	// a real UID, so an in-memory object cannot stand in.
+	createCacheISVC := func(isvc *inferencev1alpha1.InferenceService) *inferencev1alpha1.InferenceService {
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		return isvc
+	}
+
+	getPVC := func(name string) *corev1.PersistentVolumeClaim {
+		pvc := &corev1.PersistentVolumeClaim{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, pvc)).To(Succeed())
+		return pvc
+	}
+
+	BeforeEach(func() {
+		recorder = events.NewFakeRecorder(20)
+		reconciler = &InferenceServiceReconciler{
+			Client:          k8sClient,
+			Scheme:          k8sClient.Scheme(),
+			Recorder:        recorder,
+			ModelCacheMode:  ModelCacheModePerService,
+			ModelCacheClass: "cloud-default",
+		}
+		forceDeletePVC(ModelCachePVCName)
+		forceDeletePVC("sc-per-service-model-cache")
+		forceDeletePVC("sc-flag-fallback-model-cache")
+		forceDeletePVC("sc-unclassed-model-cache")
+		forceDeletePVC("sc-edit-model-cache")
+	})
+
+	AfterEach(func() {
+		for _, name := range []string{"sc-per-service", "sc-flag-fallback", "sc-unclassed", "sc-conflict", "sc-ephemeral", "sc-edit"} {
+			o := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}}
+			_ = client.IgnoreNotFound(k8sClient.Delete(ctx, o))
+		}
+		forceDeletePVC(ModelCachePVCName)
+		forceDeletePVC("sc-per-service-model-cache")
+		forceDeletePVC("sc-flag-fallback-model-cache")
+		forceDeletePVC("sc-unclassed-model-cache")
+		forceDeletePVC("sc-edit-model-cache")
+	})
+
+	It("creates the perService claim with the service's storageClassName", func() {
+		isvc := createCacheISVC(newCacheISVC("sc-per-service", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "local-path"}))
+		Expect(reconciler.ensureModelCachePVC(ctx, isvc)).To(Succeed())
+
+		pvc := getPVC("sc-per-service-model-cache")
+		Expect(pvc.Spec.StorageClassName).NotTo(BeNil())
+		Expect(*pvc.Spec.StorageClassName).To(Equal("local-path"))
+	})
+
+	It("falls back to the operator flag when the field is unset", func() {
+		isvc := createCacheISVC(newCacheISVC("sc-flag-fallback", &inferencev1alpha1.ModelCacheSpec{}))
+		Expect(reconciler.ensureModelCachePVC(ctx, isvc)).To(Succeed())
+
+		pvc := getPVC("sc-flag-fallback-model-cache")
+		Expect(pvc.Spec.StorageClassName).NotTo(BeNil())
+		Expect(*pvc.Spec.StorageClassName).To(Equal("cloud-default"))
+	})
+
+	It("leaves the claim unclassed when neither the field nor the flag names a class", func() {
+		reconciler.ModelCacheClass = ""
+		isvc := createCacheISVC(newCacheISVC("sc-unclassed", nil))
+		Expect(reconciler.ensureModelCachePVC(ctx, isvc)).To(Succeed())
+
+		// No default-storageclass admission runs in envtest, so an unset
+		// class stays nil on the created claim: the cluster default would
+		// apply only against a real cluster.
+		pvc := getPVC("sc-unclassed-model-cache")
+		Expect(pvc.Spec.StorageClassName).To(BeNil())
+	})
+
+	It("shared mode: first creator wins and a later differing request warns instead of being dropped silently", func() {
+		reconciler.ModelCacheMode = ModelCacheModeShared
+		first := newCacheISVC("sc-first", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "local-path"})
+		Expect(reconciler.ensureModelCachePVC(ctx, first)).To(Succeed())
+		drainEvents()
+
+		second := newCacheISVC("sc-second", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "fast-ssd"})
+		Expect(reconciler.ensureModelCachePVC(ctx, second)).To(Succeed())
+
+		pvc := getPVC(ModelCachePVCName)
+		Expect(pvc.Spec.StorageClassName).NotTo(BeNil())
+		Expect(*pvc.Spec.StorageClassName).To(Equal("local-path"))
+		Expect(drainEvents()).To(ContainElement(SatisfyAll(
+			ContainSubstring("Warning"),
+			ContainSubstring("ModelCacheStorageClassIgnored"),
+			ContainSubstring("fast-ssd"),
+			ContainSubstring("local-path"),
+		)))
+	})
+
+	It("perService mode: editing storageClassName on an existing claim warns instead of being dropped silently", func() {
+		isvc := createCacheISVC(newCacheISVC("sc-edit", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "local-path"}))
+		Expect(reconciler.ensureModelCachePVC(ctx, isvc)).To(Succeed())
+		drainEvents()
+
+		// The claim exists and its class is immutable, so a later edit to the
+		// field is ignored; it must surface as a warning rather than vanish
+		// silently, the same contract shared mode already has (#1963).
+		updated := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "sc-edit", Namespace: "default"}, updated)).To(Succeed())
+		updated.Spec.ModelCache.StorageClassName = "fast-ssd"
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+		Expect(reconciler.ensureModelCachePVC(ctx, updated)).To(Succeed())
+
+		pvc := getPVC("sc-edit-model-cache")
+		Expect(*pvc.Spec.StorageClassName).To(Equal("local-path"))
+		Expect(drainEvents()).To(ContainElement(SatisfyAll(
+			ContainSubstring("Warning"),
+			ContainSubstring("ModelCacheStorageClassIgnored"),
+			ContainSubstring("fast-ssd"),
+			ContainSubstring("local-path"),
+		)))
+	})
+
+	It("shared mode: a matching request draws no warning", func() {
+		reconciler.ModelCacheMode = ModelCacheModeShared
+		first := newCacheISVC("sc-first", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "local-path"})
+		Expect(reconciler.ensureModelCachePVC(ctx, first)).To(Succeed())
+		drainEvents()
+
+		second := newCacheISVC("sc-second", &inferencev1alpha1.ModelCacheSpec{StorageClassName: "local-path"})
+		Expect(reconciler.ensureModelCachePVC(ctx, second)).To(Succeed())
+		Expect(drainEvents()).NotTo(ContainElement(ContainSubstring("ModelCacheStorageClassIgnored")))
+	})
+
+	It("rejects storageClassName combined with claimName at admission", func() {
+		isvc := newCacheISVC("sc-conflict", &inferencev1alpha1.ModelCacheSpec{
+			ClaimName:        "some-claim",
+			StorageClassName: "local-path",
+		})
+		isvc.Spec.Replicas = &oneReplica
+		isvc.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server"
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("storageClassName cannot be set together with claimName"))
+	})
+
+	It("rejects storageClassName with Ephemeral persistence at admission", func() {
+		isvc := newCacheISVC("sc-ephemeral", &inferencev1alpha1.ModelCacheSpec{
+			Persistence:      inferencev1alpha1.ModelCachePersistenceEphemeral,
+			StorageClassName: "local-path",
+		})
+		isvc.Spec.Replicas = &oneReplica
+		isvc.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server"
+		err := k8sClient.Create(ctx, isvc)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("storageClassName cannot be set when persistence is Ephemeral"))
+	})
+})
+
 var _ = Describe("ModelCacheClaimIgnored warning events (#928)", func() {
 	const namespace = "default"
 	const userClaim = "byo-event-cache"

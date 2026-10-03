@@ -83,6 +83,16 @@ func userModelCacheClaimName(isvc *inferencev1alpha1.InferenceService) string {
 	return isvc.Spec.ModelCache.ClaimName
 }
 
+// userModelCacheStorageClassName returns the user-supplied cache storage class
+// from spec.modelCache.storageClassName, or "" when the InferenceService does
+// not override the operator-global --model-cache-storage-class.
+func userModelCacheStorageClassName(isvc *inferencev1alpha1.InferenceService) string {
+	if isvc == nil || isvc.Spec.ModelCache == nil {
+		return ""
+	}
+	return isvc.Spec.ModelCache.StorageClassName
+}
+
 // warnIgnoredModelCacheClaim emits a ModelCacheClaimIgnored warning event when
 // spec.modelCache.claimName is set but has no effect. The field targets the
 // download-into-cache path, so it is meaningless whenever that path is
@@ -148,6 +158,36 @@ func (r *InferenceServiceReconciler) warnUnboundedEphemeralCache(
 			"model weights download to node local disk with no size limit and no scheduler "+
 			"accounting. Set spec.resources.ephemeralStorage above the model size so an "+
 			"overrun evicts this pod rather than filling the node")
+}
+
+// warnIgnoredModelCacheStorageClass emits a ModelCacheStorageClassIgnored
+// warning event when spec.modelCache.storageClassName is set but the claim the
+// service will mount already exists with a different class. The class of an
+// existing claim never changes (storageClassName is immutable once bound): in
+// shared mode the first writer's class is final for the namespace, and in
+// perService mode an edit against the service's own claim is ignored until the
+// claim is deleted. Neither case may pass silently (#1963).
+func (r *InferenceServiceReconciler) warnIgnoredModelCacheStorageClass(
+	isvc *inferencev1alpha1.InferenceService,
+	existing *corev1.PersistentVolumeClaim,
+) {
+	if r.Recorder == nil {
+		return
+	}
+	requested := userModelCacheStorageClassName(isvc)
+	if requested == "" {
+		return
+	}
+	existingClass := "the cluster default"
+	if existing.Spec.StorageClassName != nil && *existing.Spec.StorageClassName != "" {
+		existingClass = *existing.Spec.StorageClassName
+	}
+	if existingClass == requested {
+		return
+	}
+	r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "ModelCacheStorageClassIgnored", "Reconcile",
+		"spec.modelCache.storageClassName %q is ignored: model cache PVC %q already exists with class %q and the field is immutable once the claim is created; the existing class stays in effect until the claim is deleted",
+		requested, existing.Name, existingClass)
 }
 
 // modelNeedsCachePVC reports whether the operator should provision a model
@@ -1616,6 +1656,7 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
 	if err == nil {
+		r.warnIgnoredModelCacheStorageClass(isvc, pvc)
 		return nil
 	}
 	if !apierrors.IsNotFound(err) {
@@ -1665,8 +1706,16 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 	// whose binding mode (WaitForFirstConsumer for topology-aware provisioners
 	// like GKE PD, EBS, local-path) defers binding to first pod schedule. An
 	// explicitly-configured class is honored as-is.
-	if r.ModelCacheClass != "" {
-		newPVC.Spec.StorageClassName = &r.ModelCacheClass
+	// A per-service spec.modelCache.storageClassName overrides the
+	// operator-global flag for the claim created here (#1963); the class of an
+	// already-existing claim is never changed, immutability aside, which is
+	// what warnIgnoredModelCacheStorageClass surfaces in both cache modes.
+	effectiveClass := userModelCacheStorageClassName(isvc)
+	if effectiveClass == "" {
+		effectiveClass = r.ModelCacheClass
+	}
+	if effectiveClass != "" {
+		newPVC.Spec.StorageClassName = &effectiveClass
 	}
 
 	// Owner-ref per-isvc caches to their InferenceService so they are

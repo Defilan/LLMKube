@@ -373,6 +373,45 @@ Behavior:
   the listing. Cache inspection may need a running pod or a transient inspector
   pod for Pending `WaitForFirstConsumer` claims.
 
+### Per-Service Storage Class
+
+`spec.modelCache.storageClassName` overrides the operator-global
+`--model-cache-storage-class` flag for the cache claim the operator creates,
+so a mixed cluster can cache on local disk where the cluster's default class
+cannot attach, while the operator still creates and garbage-collects the PVC:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: onprem-llama
+spec:
+  modelRef: llama-3b
+  modelCache:
+    persistence: Cached
+    storageClassName: local-path   # overrides --model-cache-storage-class
+```
+
+Behavior:
+
+- In `perService` mode the field is authoritative for the claim the operator
+  creates, `<isvc>-model-cache`.
+- In `shared` mode the namespace has one claim shared by every service, so
+  the first creator chooses its class.
+- The class of an existing claim never changes: `storageClassName` is
+  immutable once bound and the operator never mutates a claim. Editing the
+  field against a claim that already exists (a differing later request in
+  `shared` mode, or an edit on your own claim in `perService` mode) is
+  ignored and raises a `ModelCacheStorageClassIgnored` warning event; delete
+  the claim to reprovision on the requested class.
+- The field cannot combine with `claimName` (the claim is user-owned) or with
+  `persistence: Ephemeral` (no PVC is created to class); both are rejected at
+  admission.
+- There is no allowlist of storage classes: anyone who can edit an
+  InferenceService can pin its cache claim to any storage class in the
+  cluster. Scope who may edit InferenceServices if storage-class choice is
+  restricted in your cluster.
+
 ## CLI Commands
 
 ### List Cached Models

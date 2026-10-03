@@ -17,6 +17,7 @@ init container and the serving container mount.
 | Multi-node with RWX | `shared` with `accessMode: ReadWriteMany` and an RWX StorageClass |
 | Multi-node without RWX, compatible topology-aware provisioner | `perService` |
 | Strictly tainted node with unsuitable dynamic provisioner | Pre-provision a node-aligned PVC and set `spec.modelCache.claimName` |
+| Mixed node types where the default class cannot attach everywhere | Set `spec.modelCache.storageClassName` per InferenceService |
 
 `shared` is the default. A single cluster-wide PVC named `llmkube-model-cache`
 is created (or reused if it already exists). When using an RWO storage class,
@@ -28,6 +29,27 @@ each InferenceService. Each per-service PVC uses RWO semantics and relies on the
 StorageClass's `WaitForFirstConsumer` volume binding behavior to bind on the
 node where the inference pod schedules. This avoids cross-node shared-RWO
 affinity but does not affect external provisioner helper pods (see below).
+
+### Per-service storage class
+
+The cache class is an operator-wide choice (`modelCache.storageClass`), but an
+InferenceService can override it for the claim the operator creates for it:
+
+```yaml
+spec:
+  modelCache:
+    storageClassName: local-path
+```
+
+The field chooses the class of the claim the operator creates; the class of
+an existing claim never changes. In `shared` mode the first creator picks the
+namespace's class, and in `perService` mode an edit to the field on a service
+whose claim already exists is ignored. Either case raises a
+`ModelCacheStorageClassIgnored` warning; delete the claim to reprovision on
+the requested class. The field cannot combine with `claimName` (the claim is
+user-owned) or `persistence: Ephemeral` (no PVC is created). There is no
+allowlist of storage classes: anyone who can edit an InferenceService can
+pin its cache claim to any storage class in the cluster.
 
 ## Strictly tainted GPU nodes
 
