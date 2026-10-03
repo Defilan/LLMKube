@@ -117,7 +117,7 @@ func TestModelInitCommand_SHA256GuardRunsFirst(t *testing.T) {
 			t.Errorf("%s: the precheck guard is missing", name)
 			continue
 		}
-		for _, late := range []string{`rm -f "$MODEL_PATH.tmp"`, `find "$(dirname`, `download_with_progress "$MODEL_PATH.tmp"`, `curlCmd`} {
+		for _, late := range []string{`rm -f "$MODEL_PATH.tmp"`, `find "$(dirname`, `cp /host-model/model.gguf`, `download_with_progress "$MODEL_PATH.tmp"`} {
 			if li := strings.Index(cmd, late); li >= 0 && li < gi {
 				t.Errorf("%s: %q is emitted before the guard", name, late)
 			}
