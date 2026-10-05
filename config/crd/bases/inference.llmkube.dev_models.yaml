@@ -500,8 +500,9 @@ spec:
             x-kubernetes-validations:
             - message: 'sha256 verifies a single artifact: it cannot be combined with
                 files or mmproj'
-              rule: '!((has(self.sha256) && self.sha256 != '''') && ((has(self.files)
-                && self.files.size() > 0) || (has(self.mmproj) && self.mmproj != '''')))'
+              rule: '!((has(self.sha256) && self.sha256.size() > 0) && ((has(self.files)
+                && self.files.size() > 0) || (has(self.mmproj) && self.mmproj.size()
+                > 0)))'
           status:
             description: status defines the observed state of Model
             properties:

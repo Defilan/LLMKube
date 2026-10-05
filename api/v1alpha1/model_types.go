@@ -22,7 +22,7 @@ import (
 )
 
 // ModelSpec defines the desired state of Model
-// +kubebuilder:validation:XValidation:rule="!((has(self.sha256) && self.sha256 != '') && ((has(self.files) && self.files.size() > 0) || (has(self.mmproj) && self.mmproj != '')))",message="sha256 verifies a single artifact: it cannot be combined with files or mmproj"
+// +kubebuilder:validation:XValidation:rule="!((has(self.sha256) && self.sha256.size() > 0) && ((has(self.files) && self.files.size() > 0) || (has(self.mmproj) && self.mmproj.size() > 0)))",message="sha256 verifies a single artifact: it cannot be combined with files or mmproj"
 type ModelSpec struct {
 	// Source defines where to obtain the model.
 	// For GGUF models: URL or path to a .gguf file.
