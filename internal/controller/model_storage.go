@@ -366,15 +366,15 @@ const downloadProgressFn = `download_with_progress() { _llmkube_dest="$1"; _llmk
 // --no-progress-meter is placed at the END of its arguments so the existing
 // `-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"` shape stays contiguous.
 func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, refreshPolicy string) string {
-	// fns defines the verify helpers; pre short-circuits a known-rejected
-	// artifact (and refuses to run a gated downloader unchecked) before any
-	// sweep, probe or transfer; publish names the publish step (the plain
-	// rename, or hash-then-rename when spec.sha256 is set); frames wraps the
-	// cache probe, accepting an existing file outright when unhashed and only
-	// on a passing stamp check when hashed. Every fragment is
-	// empty-or-absent when withSHA256 is false, so the emitted commands for
-	// unhashed Models stay byte-for-byte what they were (#1965): the field on
-	// one Model must not churn the pod templates of every other workload.
+	// fns defines the verify helpers; pre refuses to run a gated downloader
+	// whose MODEL_SHA256 did not reach it, before any sweep, probe or
+	// transfer; publish names the publish step (the plain rename, or
+	// hash-then-rename when spec.sha256 is set); frames wraps the cache
+	// probe, accepting an existing file outright when unhashed and only on a
+	// passing stamp check when hashed. Every fragment is empty-or-absent
+	// when withSHA256 is false, so the emitted commands for unhashed Models
+	// stay byte-for-byte what they were (#1965): the field on one Model must
+	// not churn the pod templates of every other workload.
 	fns := ""
 	pre := ""
 	if withSHA256 {
@@ -474,7 +474,7 @@ func remoteRevalidateScript(isHFAuth, withSHA256 bool) string {
 	// hit once the stamp check agrees, and the offline "kept cached copy"
 	// fallback must not serve bytes that fail the check either (hashing is
 	// local, so an air-gapped restart still verifies). The caller hoists
-	// the known-rejected guard to the head of the command and prepends
+	// the fail-closed guard to the head of the command and prepends
 	// sha256VerifyFns when withSHA256 is set.
 	sizeHit := ""
 	unchanged := `echo 'Model revalidated (unchanged, skipped download)'; `
@@ -521,41 +521,37 @@ func hfAuthPrefix(isHFAuth bool) string {
 // sha256VerifyFns defines the shell helpers a spec.sha256-pinned download
 // runs through (#1965). Like hfAuthFn this must be prepended to any script
 // that calls them, and llmkube_precheck_sha256 hoisted to the head of the
-// command so a known-rejected artifact fails before any sweep, probe or
-// transfer.
+// command so a gated downloader whose MODEL_SHA256 did not reach it refuses
+// to transfer unchecked.
 //
 // The invariants:
-//   - Publish only after verifying: llmkube_publish_sha256 hashes the partial
-//     and renames only on a match, so unverified bytes never become the cache.
+//   - Publish only after verifying: llmkube_publish_sha256 hashes the
+//     assembled bytes and renames them onto the cache only on a match, so
+//     unverified bytes never become the cache; a mismatch deletes them.
 //   - Every helper fails closed: a command built with these helpers but no
 //     MODEL_SHA256 is a wiring bug and must abort, not silently degrade to
 //     an unhashed download.
 //   - The stamp (<file>.sha256) attests to the exact bytes that were hashed:
 //     it holds the verified hash, the file size and its mtime, and a hit
-//     skips re-hashing only when all three still agree. A missing, stale or
-//     older single-field stamp re-hashes once and rewrites it. This extends
-//     the executor.go verifyCachedDigest convention (hash-only stamps) so a
-//     stamp can never vouch for bytes that are no longer on disk.
-//   - A cache hit that fails the re-hash is corrupted outside any download
-//     (disk corruption, a hand-edited cache): the file and its stamp are
-//     deleted so the same start re-downloads them, mirroring the corrupt
-//     cache-file handling in pkg/agent/executor.go. No rejection marker is
-//     written: the marker claims the origin served wrong bytes, and a local
-//     corruption must not permanently block a retry.
-//   - A rejected publish keeps its partial AND names the rejected hash in
-//     <file>.sha256-rejected. The marker is what makes "keep the partial"
-//     safe: the next start fails on the hoisted guard before any sweep,
-//     probe or transfer, instead of resuming into a complete partial (which
-//     surfaces as a confusing byte-range error) or, against an origin that
-//     answers ranged requests with 200, re-downloading the whole model every
-//     crash-loop cycle. The marker names the hash it rejected, so correcting
-//     spec.sha256 leaves it stale and inert; deleting it retries.
+//     skips re-hashing only when all three still agree. A missing or stale
+//     stamp re-hashes once and rewrites it. It is a stricter sibling of the
+//     pkg/agent/executor.go verifyCachedDigest stamp, which holds the hash
+//     alone under the same <file>.sha256 name; the two are not
+//     interchangeable.
+//   - A cache hit that fails the re-hash, and a publish that fails the
+//     digest, both delete the bytes: the corrupt cache file and its stamp, or
+//     the assembled partial. No durable rejection state is kept, because a
+//     single failed sample cannot distinguish a transient truncated transfer
+//     from a wrong artifact. The start fails and the kubelet's backoff bounds
+//     the retries, matching containerd's "remove ingest" on a digest mismatch
+//     and pkg/agent/executor.go ensureModel, which discards bad bytes and
+//     re-downloads.
 //
-// Stamps and markers are deliberately not *.tmp: the resume sweeps in
+// Stamps are deliberately not *.tmp: the resume sweeps in
 // validatorDeriveAndSweep and debrisSweep must never remove them. Hash
 // comparisons are plain string equality; MODEL_SHA256 is injected lowercased
 // so it compares equal to sha256sum output.
-const sha256VerifyFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; if [ -f "$1.sha256-rejected" ] && [ "$(cat "$1.sha256-rejected" 2>/dev/null)" = "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch: the bytes for $1 were rejected against spec.sha256 ($MODEL_SHA256); fix the Model or delete $1.sha256-rejected to retry"; return 1; fi; }; llmkube_stamp_sha256() { printf '%s %s' "$MODEL_SHA256" "$(stat -c '%s %Y' "$1" 2>/dev/null)" > "$1.sha256"; }; llmkube_check_sha256() { llmkube_precheck_sha256 "$1" || return 1; if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against spec.sha256 (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1" "$1.sha256"; echo "ERROR: SHA256 mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; removed the file and its stamp for a fresh download"; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { llmkube_precheck_sha256 "$2" || return 1; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then printf '%s' "$MODEL_SHA256" > "$2.sha256-rejected"; echo "ERROR: SHA256 mismatch: expected $MODEL_SHA256, computed $actual; partial kept at $1"; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2" && rm -f "$2.sha256-rejected"; }` + " && "
+const sha256VerifyFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; llmkube_stamp_sha256() { printf '%s %s' "$MODEL_SHA256" "$(stat -c '%s %Y' "$1" 2>/dev/null)" > "$1.sha256"; }; llmkube_check_sha256() { llmkube_precheck_sha256 "$1" || return 1; if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against spec.sha256 (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1" "$1.sha256"; echo "ERROR: SHA256 mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; removed the file and its stamp for a fresh download"; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { llmkube_precheck_sha256 "$2" || return 1; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1"; echo "ERROR: SHA256 mismatch: expected $MODEL_SHA256, computed $actual; discarded $1 and its stamp (the pod retries with the kubelet backoff)" >&2; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2"; }` + " && "
 
 // validatorDeriveAndSweep is the shell fragment that turns $remote_validator (an
 // upstream validator string: an ETag, or Content-Length when the origin sends no

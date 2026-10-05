@@ -94,12 +94,13 @@ A mismatch fails the init container, so the pod never starts the inference
 container with bad weights.
 
 - The transfer lands in a partial file and is renamed onto the final path only
-  after the hash matches. On a mismatch the partial is kept for post-mortem
-  and `<model>.sha256-rejected` records the rejected hash. That marker means
-  the origin served the wrong bytes: the guard that reads it runs before any
-  probe, transfer or cleanup, so the kept partial survives crash-loop
-  restarts and the next start fails without touching the network. Correcting
-  `spec.sha256` leaves the marker stale and inert; deleting it retries.
+  after the hash matches. On a mismatch the partial is deleted and the start
+  fails, so bad bytes never become the cache. No durable rejection state is
+  written: a single failed transfer cannot tell a truncated download from a
+  wrong artifact, so the next start retries, and the kubelet's
+  CrashLoopBackOff bounds the cadence. This mirrors containerd dropping a
+  mismatched ingest and the metal-agent's `ensureModel`, which discards bad
+  bytes and re-downloads.
 - A verified artifact gets a `<model>.sha256` stamp recording the digest, the
   file size and its modification time, so a stamp can only vouch for the
   exact bytes that were hashed. A later start skips re-hashing gigabytes only
@@ -107,8 +108,6 @@ container with bad weights.
   hashed once and re-stamped.
 - A cached file that fails the re-hash was corrupted outside any download. It
   is discarded, stamp and all, and re-downloaded within the same start.
-  Local corruption never leaves a rejection marker, because the marker
-  accuses the origin.
 - The gates fail closed: a download built for a digest-pinned Model aborts if
   the digest does not reach the container instead of transferring unchecked.
 - Verification also runs on prefetch Jobs, which reuse the same init

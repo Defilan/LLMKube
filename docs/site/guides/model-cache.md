@@ -268,18 +268,18 @@ artifact against that digest before anything becomes the cache. A mismatch
 fails the init container, so the pod never starts with bad weights.
 
 - The transfer lands in a partial file and is renamed onto the final path only
-  after the hash matches. On a mismatch the partial is kept and
-  `<model>.sha256-rejected` records the rejected hash; the guard that reads it
-  runs before any probe, transfer or cleanup, so the kept partial survives
-  crash-loop restarts. Correcting `spec.sha256` makes the marker inert; delete
-  it to retry.
+  after the hash matches. On a mismatch the partial is deleted and the start
+  fails, so bad bytes never become the cache. No durable rejection state is
+  written: a single failed transfer cannot tell a truncated download from a
+  wrong artifact, so the next start retries, and the kubelet's
+  CrashLoopBackOff bounds the cadence. This mirrors containerd dropping a
+  mismatched ingest and the metal-agent's `ensureModel`.
 - A verified artifact gets a `<model>.sha256` stamp holding the digest plus
   the file size and modification time, so a stamp can only vouch for the exact
   bytes that were hashed. Later starts skip re-hashing while all three agree;
   a missing, stale or differently-sized file is hashed once and re-stamped.
 - A cached file that fails the re-hash is discarded with its stamp and
-  re-downloaded within the same start. Local corruption never writes a
-  rejection marker, because the marker accuses the origin.
+  re-downloaded within the same start.
 - The gates fail closed: if the digest does not reach the container, the
   download aborts instead of transferring unchecked.
 - `spec.sha256` covers single-file Models; combining it with multi-file

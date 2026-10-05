@@ -27,8 +27,9 @@ import (
 )
 
 // #1965: an init-container download with Model.spec.sha256 set must verify
-// the bytes before anything becomes the cache, and a rejected artifact must
-// fail fast on every later start. Like the resume tests (#1765) and the
+// the bytes before anything becomes the cache, and a failed verify must
+// discard the bytes and fail the start without leaving durable rejection
+// state, so a later start can retry. Like the resume tests (#1765) and the
 // revalidation tests (#1326), these drive the generated shell against the
 // range-serving origin rather than string-matching curl claims.
 
@@ -112,12 +113,12 @@ func partialsOf(t *testing.T, modelPath string) []string {
 func TestModelInitSHA256_Behavioral(t *testing.T) {
 	requireInitShellEnvironment(t)
 	t.Run("download publishes stamp", sha256DownloadPublishesStamp)
-	t.Run("mismatch keeps partial and writes marker", sha256MismatchKeepsPartialAndWritesMarker)
-	t.Run("correcting spec.sha256 makes the marker inert", sha256CorrectingSpecSha256MakesTheMarkerInert)
+	t.Run("mismatch discards the partial and keeps no state", sha256MismatchDiscardsPartialAndKeepsNoState)
+	t.Run("correcting spec.sha256 retries cleanly", sha256CorrectingSpecSha256RetriesCleanly)
 	t.Run("warm cache verifies stamps and skips the download", sha256WarmCacheVerifiesStampsAndSkipsTheDownload)
 	t.Run("stamp hit skips re-hashing", sha256StampHitSkipsReHashing)
 	t.Run("corrupt warm cache discards and refetches", sha256CorruptWarmCacheDiscardsAndRefetches)
-	t.Run("corrupt cache and rejecting origin fails the start", sha256CorruptCacheAndRejectingOriginFailsTheStart)
+	t.Run("a rejected publish does not block a later start", sha256RejectedPublishDoesNotBlockALaterStart)
 	t.Run("empty digest fails closed", sha256EmptyDigestFailsClosed)
 	t.Run("OnChange download mismatch rejects before publish", sha256OnchangeDownloadMismatchRejectsBeforePublish)
 	t.Run("OnChange unchanged skip still verifies", sha256OnchangeUnchangedSkipStillVerifies)
@@ -131,8 +132,8 @@ func sha256ResumeScript() string {
 }
 
 func sha256RevalidateScript() string {
-	// Composed through the builder so the hoisted known-rejected guard is in
-	// the script, as it is in the real init container.
+	// Composed through the builder so the hoisted fail-closed guard is in the
+	// script, as it is in the real init container.
 	return buildModelInitCommand(false, false, false, false, true, RefreshPolicyOnChange)
 }
 
@@ -158,7 +159,7 @@ func sha256DownloadPublishesStamp(t *testing.T) {
 	}
 }
 
-func sha256MismatchKeepsPartialAndWritesMarker(t *testing.T) {
+func sha256MismatchDiscardsPartialAndKeepsNoState(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
@@ -171,39 +172,17 @@ func sha256MismatchKeepsPartialAndWritesMarker(t *testing.T) {
 	if !strings.Contains(out, "SHA256 mismatch") {
 		t.Errorf("output does not report the mismatch: %s", out)
 	}
+	if !strings.Contains(out, "discarded") {
+		t.Errorf("output does not report the discard: %s", out)
+	}
 	mustNotExist(t, modelPath)
-	if got := readOrFail(t, modelPath+".sha256-rejected"); got != wrong {
-		t.Errorf("marker = %q, want the rejected hash %q", got, wrong)
-	}
-	if p := partialsOf(t, modelPath); len(p) == 0 {
-		t.Errorf("the partial was removed instead of kept for post-mortem")
-	}
-
-	// The next start must fail on the marker before touching the network:
-	// resume would hit a byte-range error against a complete partial, and
-	// an origin answering ranged requests with 200 would restart the whole
-	// download every crash-loop cycle.
-	o.fullFromZero.Store(0)
-	o.rangeRequests.Store(0)
-	out2, err2 := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong)
-	if err2 == nil {
-		t.Fatalf("expected the marker to reject the second start\n%s", out2)
-	}
-	if !strings.Contains(out2, "rejected") {
-		t.Errorf("second start does not name the rejection: %s", out2)
-	}
-	if n := o.fullFromZero.Load(); n != 0 {
-		t.Errorf("rejected restart issued %d from-zero GETs, want 0\nfirst:\n%s\nsecond:\n%s", n, out, out2)
-	}
-	if n := o.rangeRequests.Load(); n != 0 {
-		t.Errorf("rejected restart issued %d ranged GETs, want 0", n)
-	}
-	if p := partialsOf(t, modelPath); len(p) == 0 {
-		t.Errorf("the rejected restart removed the kept partial")
+	mustNotExist(t, modelPath+".sha256-rejected")
+	if p := partialsOf(t, modelPath); len(p) != 0 {
+		t.Errorf("the rejected partial was not discarded: %v", p)
 	}
 }
 
-func sha256CorrectingSpecSha256MakesTheMarkerInert(t *testing.T) {
+func sha256CorrectingSpecSha256RetriesCleanly(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
@@ -298,38 +277,29 @@ func sha256CorruptWarmCacheDiscardsAndRefetches(t *testing.T) {
 	mustNotExist(t, modelPath+".sha256-rejected")
 }
 
-func sha256CorruptCacheAndRejectingOriginFailsTheStart(t *testing.T) {
+func sha256RejectedPublishDoesNotBlockALaterStart(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
-	want := sha256Hex(o.content())
-	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, want); err != nil {
-		t.Fatalf("clean download failed: %v\n%s", err, out)
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+
+	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong); err == nil {
+		t.Fatalf("expected the first start to fail on the digest\n%s", out)
 	}
-	// Bytes swapped under a valid stamp: hand-edited cache, or a snapshot
-	// restore that lands different content on the same path.
-	if err := os.WriteFile(modelPath, []byte("tampered bytes"), 0o644); err != nil {
-		t.Fatalf("tamper: %v", err)
-	}
-	// The stamp can no longer describe the file, so the start re-hashes,
-	// discards, and re-downloads. The digest pins bytes the origin no longer
-	// serves, so the re-download must fail at publish with a marker and a
-	// kept partial, and the start must fail.
-	writeStamp(t, modelPath, want)
-	other := sha256Hex([]byte("a hash from another artifact"))
-	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, other)
+	mustNotExist(t, modelPath+".sha256-rejected")
+
+	// No durable rejection: the next start reaches the origin again rather
+	// than short-circuiting on a marker. Kubernetes bounds the retry cadence
+	// with CrashLoopBackOff, the same way containerd's content store retries
+	// after it drops a mismatched ingest.
+	o.fullFromZero.Store(0)
+	o.rangeRequests.Store(0)
+	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong)
 	if err == nil {
-		t.Fatalf("expected the start to fail\n%s", out)
+		t.Fatalf("the wrong digest must still fail the start\n%s", out)
 	}
-	if !strings.Contains(out, "removed the file and its stamp") {
-		t.Errorf("stale stamp should have been discarded and re-hashed: %s", out)
-	}
-	mustNotExist(t, modelPath)
-	if got := readOrFail(t, modelPath+".sha256-rejected"); got != other {
-		t.Errorf("marker = %q, want %q", got, other)
-	}
-	if p := partialsOf(t, modelPath); len(p) == 0 {
-		t.Errorf("the rejected start dropped the kept partial")
+	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n == 0 {
+		t.Errorf("the second start issued no GETs: a durable rejection blocked the retry\n%s", out)
 	}
 }
 
@@ -363,8 +333,9 @@ func sha256OnchangeDownloadMismatchRejectsBeforePublish(t *testing.T) {
 		t.Fatalf("OnChange download must not publish unverified bytes\n%s", out)
 	}
 	mustNotExist(t, modelPath)
-	if got := readOrFail(t, modelPath+".sha256-rejected"); got != wrong {
-		t.Errorf("marker = %q, want %q", got, wrong)
+	mustNotExist(t, modelPath+".sha256-rejected")
+	if p := partialsOf(t, modelPath); len(p) != 0 {
+		t.Errorf("the rejected partial was not discarded: %v", p)
 	}
 }
 
