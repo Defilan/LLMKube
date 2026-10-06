@@ -72,7 +72,7 @@ var _ = Describe("Model sha256 CRD validation", func() {
 		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
 	})
 
-	It("rejects sha256 on a pre-staged pvc:// source", func() {
+	It("admits sha256 on a pre-staged pvc:// source", func() {
 		m := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: "sha256-cel-pvc", Namespace: "default"},
 			Spec: inferencev1alpha1.ModelSpec{
@@ -80,7 +80,8 @@ var _ = Describe("Model sha256 CRD validation", func() {
 				SHA256: digest,
 			},
 		}
-		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
 	})
 
 	It("rejects sha256 on a pre-staged oci:// source", func() {
@@ -124,5 +125,63 @@ var _ = Describe("Model sha256 CRD validation", func() {
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(m), fresh)).To(Succeed())
 		fresh.Spec.SHA256 = digest
 		Expect(k8sClient.Update(ctx, fresh)).ToNot(Succeed())
+	})
+
+	// fileSha256 (multi-file per-file digests, #1978).
+	newFileSHA := func(name string, source string, files []string, mmproj string, digests map[string]inferencev1alpha1.SHA256Digest) *inferencev1alpha1.Model {
+		return &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:     source,
+				Files:      files,
+				Mmproj:     mmproj,
+				FileSHA256: digests,
+			},
+		}
+	}
+
+	It("admits fileSha256 on a file that names a staged artifact", func() {
+		m := newFileSHA("file-sha-ok", "hf://org/repo", []string{"a.gguf", "b.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"a.gguf": digest})
+		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
+	})
+
+	It("admits fileSha256 keyed on mmproj", func() {
+		m := newFileSHA("file-sha-mmproj", "hf://org/repo", []string{"a.gguf"}, "proj.gguf", map[string]inferencev1alpha1.SHA256Digest{"proj.gguf": digest})
+		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
+	})
+
+	It("rejects fileSha256 without files", func() {
+		m := newFileSHA("file-sha-nofiles", "hf://org/repo", nil, "", map[string]inferencev1alpha1.SHA256Digest{"a.gguf": digest})
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects fileSha256 together with sha256", func() {
+		m := newFileSHA("file-sha-both", "hf://org/repo", []string{"a.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"a.gguf": digest})
+		m.Spec.SHA256 = digest
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects a fileSha256 value that is not 64 hex", func() {
+		m := newFileSHA("file-sha-badval", "hf://org/repo", []string{"a.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"a.gguf": "not-a-digest"})
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects a glob in files when fileSha256 is set", func() {
+		// The key equals the glob entry, so the key-membership rule is
+		// satisfied and only the no-glob rule can reject this.
+		m := newFileSHA("file-sha-glob", "hf://org/repo", []string{"*.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"*.gguf": digest})
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects a fileSha256 key that is not a staged file", func() {
+		m := newFileSHA("file-sha-orphankey", "hf://org/repo", []string{"a.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"b.gguf": digest})
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects fileSha256 on a pre-staged oci:// source", func() {
+		m := newFileSHA("file-sha-oci", "oci://registry.example.com/models/llama-3.1-8b@sha256:"+digest, []string{"a.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"a.gguf": digest})
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
 	})
 })

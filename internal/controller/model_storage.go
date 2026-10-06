@@ -607,7 +607,27 @@ func hfAuthPrefix(isHFAuth bool) string {
 // validatorDeriveAndSweep and debrisSweep must never remove them. Hash
 // comparisons are plain string equality; MODEL_SHA256 is injected lowercased
 // so it compares equal to sha256sum output.
-const sha256VerifyFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; llmkube_stamp_sha256() { llmkube_atomic_write "$1.sha256" "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)"; }; llmkube_marker_hit_sha256() { [ -f "$1.$MODEL_SHA256.sha256-rejected" ]; }; llmkube_check_sha256() { if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against spec.sha256 (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; leaving it in place (the cache dir may be shared); a fresh download replaces it" >&2; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1"; llmkube_atomic_write "$2.$MODEL_SHA256.sha256-rejected" "$MODEL_SHA256"; echo "ERROR: SHA256 mismatch: expected $MODEL_SHA256, computed $actual; discarded $1; recorded $2.$MODEL_SHA256.sha256-rejected" >&2; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2" && rm -f "$2.$MODEL_SHA256.sha256-rejected"; }` + " && "
+const sha256HashFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; `
+
+// sha256VerifyFns is the download-time gate set: sha256HashFns plus the
+// atomic stamp/marker writers and the verify-then-publish pair.
+// buildPVCVerifyCommand uses sha256HashFns alone, because a pvc:// mount is
+// read-only and cannot carry a stamp.
+const sha256VerifyFns = sha256HashFns + `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; llmkube_stamp_sha256() { llmkube_atomic_write "$1.sha256" "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)"; }; llmkube_marker_hit_sha256() { [ -f "$1.$MODEL_SHA256.sha256-rejected" ]; }; llmkube_check_sha256() { if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against spec.sha256 (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; leaving it in place (the cache dir may be shared); a fresh download replaces it" >&2; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1"; llmkube_atomic_write "$2.$MODEL_SHA256.sha256-rejected" "$MODEL_SHA256"; echo "ERROR: SHA256 mismatch: expected $MODEL_SHA256, computed $actual; discarded $1; recorded $2.$MODEL_SHA256.sha256-rejected" >&2; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2" && rm -f "$2.$MODEL_SHA256.sha256-rejected"; }` + " && "
+
+// sha256MultiFileFns defines the per-file verify helpers the multi-file loop
+// runs through (#1978). It is appended to sha256VerifyFns so the loop can set
+// MODEL_SHA256 per iteration and reuse llmkube_check_sha256 /
+// llmkube_publish_sha256 unchanged.
+//
+// A file with no digest in $MODEL_FILE_SHA256 gets an empty MODEL_SHA256, and
+// llmkube_accept_file / llmkube_publish_file fall back to existence and a plain
+// rename, so a partially pinned staging set stages the unpinned files exactly
+// as before. $MODEL_FILE_SHA256 is newline-delimited "<digest> <repo-relative
+// path>"; the digest comes first so a path containing spaces survives the
+// read. A command built with these gates aborts when MODEL_FILE_SHA256 did not
+// reach the container, matching the single-file precheck's fail-closed rule.
+const sha256MultiFileFns = `llmkube_file_digest() { printf '%s\n' "${MODEL_FILE_SHA256:-}" | while IFS=' ' read -r _llmkube_d _llmkube_p; do [ "$_llmkube_p" = "$1" ] && { printf '%s' "$_llmkube_d"; return 0; }; done; }; llmkube_precheck_file_sha256() { if [ -z "${MODEL_FILE_SHA256:-}" ]; then echo "ERROR: this multi-file downloader was built with SHA256 gates but MODEL_FILE_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; llmkube_accept_file() { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_check_sha256 "$1"; else [ -f "$1" ]; fi; }; llmkube_publish_file() { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_publish_sha256 "$1" "$2"; else mv "$1" "$2"; fi; }` + " && "
 
 // validatorDeriveAndSweep is the shell fragment that turns $remote_validator (an
 // upstream validator string: an ETag, or Content-Length when the origin sends no
@@ -881,12 +901,33 @@ func cachePrepInitContainer(initImage string, resolvedFSGroup int64) corev1.Cont
 // MODEL_FILES is newline-delimited. For s3:// sources, S3_BUCKET and
 // S3_PREFIX are emitted (the key prefix from the s3:// source); per-file
 // object keys are constructed as "${S3_PREFIX}/$rel" in the shell command.
-func multiFileInitEnvVars(source, cacheDir string, files []string) []corev1.EnvVar {
+//
+// digests, when non-empty, adds MODEL_FILE_SHA256: one "<digest> <path>" line
+// per pinned file, digest first so a path with spaces survives the shell read.
+// It is emitted only for resolvable entries, in files order, so the env is
+// deterministic and the command's per-file gates see only declared digests.
+func multiFileInitEnvVars(source, cacheDir string, files []string, digests map[string]inferencev1alpha1.SHA256Digest) []corev1.EnvVar {
 	normalized := resolveHFSourceURL(source)
 	envs := []corev1.EnvVar{
 		{Name: "MODEL_SOURCE", Value: normalized},
 		{Name: "CACHE_DIR", Value: cacheDir},
 		{Name: "MODEL_FILES", Value: strings.Join(files, "\n")},
+	}
+	if len(digests) > 0 {
+		var b strings.Builder
+		for _, f := range files {
+			d, ok := digests[f]
+			if !ok {
+				continue
+			}
+			b.WriteString(strings.ToLower(string(d)))
+			b.WriteString(" ")
+			b.WriteString(f)
+			b.WriteString("\n")
+		}
+		if b.Len() > 0 {
+			envs = append(envs, corev1.EnvVar{Name: "MODEL_FILE_SHA256", Value: strings.TrimSuffix(b.String(), "\n")})
+		}
 	}
 	if isS3Source(source) {
 		bucket, key, err := parseS3Source(source)
@@ -913,7 +954,7 @@ func multiFileInitEnvVars(source, cacheDir string, files []string) []corev1.EnvV
 // loop keeps its partial for the next attempt. The loop body assigns
 // MODEL_PATH and MODEL_SOURCE per file for those helpers; the loop runs in a
 // pipeline subshell, so the assignments do not leak.
-func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy string) string {
+func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refreshPolicy string) string {
 	prefix := `mkdir -p "$CACHE_DIR" && `
 	sweep := `find "$CACHE_DIR" -name '*.tmp' -delete`
 	if !useCache {
@@ -926,6 +967,37 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 
 	normalizeFn := `normalize_hf_source() { case "$1" in hf://*) src="${1#hf://}"; rev="${src#*@}"; if [ "$rev" != "$src" ]; then echo "https://huggingface.co/${src%%@*}/resolve/$rev/"; else echo "https://huggingface.co/$src/resolve/main/"; fi ;; *) echo "$1" ;; esac; }` + " && "
 
+	// Per-file verify gates (#1978). Every fragment below is empty when
+	// withSHA256 is false, so the unhashed command stays byte-for-byte what it
+	// was before this change (pinned by the initcmd_multi_* goldens).
+	fns := ""
+	pre := ""
+	digestAssign := ""
+	markerGuard := ""
+	sizeHit := ""
+	if withSHA256 {
+		fns = sha256VerifyFns + sha256MultiFileFns
+		pre = `llmkube_precheck_file_sha256 || exit 1; `
+		digestAssign = `MODEL_SHA256=$(llmkube_file_digest "$rel"); `
+		markerGuard = `if [ -n "${MODEL_SHA256:-}" ] && llmkube_marker_hit_sha256 "$dest"; then if llmkube_accept_file "$dest"; then echo "spec.sha256 no longer matches $rel; kept the pinned cached copy"; continue; else echo "ERROR: spec.sha256 mismatch for $rel; fix the Model or delete $dest.$MODEL_SHA256.sha256-rejected to retry" >&2; exit 1; fi; fi; `
+		sizeHit = ` && llmkube_accept_file "$dest"`
+	}
+	publishFile := func(partial string) string {
+		if withSHA256 {
+			return `llmkube_publish_file "` + partial + `" "$dest"`
+		}
+		return `mv "` + partial + `" "$dest"`
+	}
+	// downloadOrCached emits the IfNotPresent download-or-skip block. The
+	// unhashed shape keeps the historical `[ ! -f ]` test byte for byte; the
+	// hashed shape inverts it so a missing or stale stamp downloads.
+	downloadOrCached := func(download, cachedEcho string) string {
+		if withSHA256 {
+			return `if [ -f "$dest" ] && llmkube_accept_file "$dest"; then ` + cachedEcho + `; else ` + download + `fi; `
+		}
+		return `if [ ! -f "$dest" ]; then ` + download + `else ` + cachedEcho + `; fi; `
+	}
+
 	if isS3 {
 		if refreshPolicy == RefreshPolicyOnChange {
 			body := normalizeFn +
@@ -933,36 +1005,35 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 				`printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
 				`[ -n "$rel" ] || continue; ` +
 				`dest="$CACHE_DIR/$rel"; ` +
-				`mkdir -p "$(dirname "$dest")"; ` +
+				`mkdir -p "$(dirname "$dest")"; ` + digestAssign + markerGuard +
 				`key="${S3_PREFIX:+${S3_PREFIX}/}$rel"; ` +
 				`url="${AWS_ENDPOINT_URL}/${S3_BUCKET}/${key}"; ` +
 				`remote_size=$(curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -fsSL -I "$url" -o /dev/null -w '%header{content-length}' 2>/dev/null || echo 0); ` +
-				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
+				`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 				`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 				`else ` +
-				`if download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest"; then ` +
+				`if download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
 				`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 				`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
 				`fi; ` +
 				`done`
-			return prefix + sweep + " && " + body
+			return fns + pre + prefix + sweep + " && " + body
 		}
 
+		download := `echo "Downloading model artifact $rel..."; ` +
+			`download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + ` || { echo "ERROR: failed to download $rel"; exit 1; }; `
 		body := normalizeFn +
 			`SOURCE="$(normalize_hf_source "$MODEL_SOURCE")" && ` +
 			`printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
 			`[ -n "$rel" ] || continue; ` +
 			`dest="$CACHE_DIR/$rel"; ` +
-			`mkdir -p "$(dirname "$dest")"; ` +
+			`mkdir -p "$(dirname "$dest")"; ` + digestAssign + markerGuard +
 			`key="${S3_PREFIX:+${S3_PREFIX}/}$rel"; ` +
 			`url="${AWS_ENDPOINT_URL}/${S3_BUCKET}/${key}"; ` +
-			`if [ ! -f "$dest" ]; then ` +
-			`echo "Downloading model artifact $rel..."; ` +
-			`download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && mv "$dest.tmp" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
-			`else echo "Model artifact $rel already cached, skipping download"; fi; ` +
+			downloadOrCached(download, `echo "Model artifact $rel already cached, skipping download"`) +
 			`done`
-		return prefix + sweep + " && " + body
+		return fns + pre + prefix + sweep + " && " + body
 	}
 
 	if refreshPolicy == RefreshPolicyOnChange {
@@ -971,39 +1042,38 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth bool, refreshPolicy stri
 			`printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
 			`[ -n "$rel" ] || continue; ` +
 			`dest="$CACHE_DIR/$rel"; ` +
-			`mkdir -p "$(dirname "$dest")"; ` +
+			`mkdir -p "$(dirname "$dest")"; ` + digestAssign + markerGuard +
 			`url="${SOURCE%/}/$rel"; ` +
 			`MODEL_PATH="$dest"; MODEL_SOURCE="$url"; ` +
 			`remote_head=$(` + curlCmd(isHFAuth) + ` -fsSL -I "$url" -o /dev/null -w ` + headProbeFormat + ` 2>/dev/null || echo 'CL0ET'); ` +
 			splitHeadProbe +
 			`remote_size=${remote_validator#CL}; remote_size=${remote_size%%ET*}; ` +
-			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
+			`if [ -f "$dest" ] && [ "$(stat -c %s "$dest" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
 			validatorDeriveAndSweep() +
-			`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && mv "$MODEL_PARTIAL" "$dest"; then ` +
+			`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + publishFile("$MODEL_PARTIAL") + `; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
 			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
 			`fi; ` +
 			`done`
-		return prefix + body + " && " + sweep
+		return fns + pre + prefix + body + " && " + sweep
 	}
 
+	download := `echo "Downloading model artifact $rel..."; ` +
+		`MODEL_PATH="$dest"; MODEL_SOURCE="$url"; ` + resumePrologue(isHFAuth) +
+		`download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + publishFile("$MODEL_PARTIAL") + ` || { echo "ERROR: failed to download $rel"; exit 1; }; `
 	body := normalizeFn + hfAuthPrefix(isHFAuth) +
 		`SOURCE="$(normalize_hf_source "$MODEL_SOURCE")" && ` +
 		`printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
 		`[ -n "$rel" ] || continue; ` +
 		`dest="$CACHE_DIR/$rel"; ` +
-		`mkdir -p "$(dirname "$dest")"; ` +
+		`mkdir -p "$(dirname "$dest")"; ` + digestAssign + markerGuard +
 		`url="${SOURCE%/}/$rel"; ` +
-		`if [ ! -f "$dest" ]; then ` +
-		`echo "Downloading model artifact $rel..."; ` +
-		`MODEL_PATH="$dest"; MODEL_SOURCE="$url"; ` + resumePrologue(isHFAuth) +
-		`download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && mv "$MODEL_PARTIAL" "$dest" || { echo "ERROR: failed to download $rel"; exit 1; }; ` +
-		`else echo "Model artifact $rel already cached, skipping download"; fi; ` +
+		downloadOrCached(download, `echo "Model artifact $rel already cached, skipping download"`) +
 		`done`
-	return prefix + body + " && " + sweep
+	return fns + pre + prefix + body + " && " + sweep
 }
 
 type modelStorageConfig struct {
@@ -1047,7 +1117,7 @@ func buildModelStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1al
 		return disallowedLocalSourceStorageConfig(initContainerImage)
 	}
 	if isPVCSource(model.Spec.Source) {
-		return buildPVCStorageConfig(model)
+		return buildPVCStorageConfig(model, isvc, initContainerImage)
 	}
 	// OCI sources are pre-staged and read-only too, but delivered by a
 	// Kubernetes ImageVolume rather than a user PVC (#1379). Dispatched here,
@@ -1086,14 +1156,40 @@ func disallowedLocalSourceStorageConfig(initImage string) modelStorageConfig {
 }
 
 // buildPVCStorageConfig mounts the user's PVC directly as a read-only volume.
-// No init container is needed since the model is already on the PVC.
-func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
+// The model is already staged, so no download runs; but when the Model sets
+// spec.sha256 an init container hashes the mounted file once and fails the pod
+// on a mismatch (#1979).
+//
+// The mount is read-only, so the verify step cannot write a <file>.sha256
+// stamp beside the artifact. It therefore re-hashes on every pod start rather
+// than recording a stamp: writing a sidecar would require mounting the user's
+// PVC read-write (a posture change that also fails on ReadOnlyMany storage),
+// and a stamp in a per-pod emptyDir would not survive the next pod anyway.
+func buildPVCStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, initContainerImage string) modelStorageConfig {
 	claimName, modelFilePath, _ := parsePVCSource(model.Spec.Source)
 
 	modelPath := fmt.Sprintf("/model-source/%s", modelFilePath)
 
+	var initContainers []corev1.Container
+	if model.Spec.SHA256 != "" {
+		initContainers = []corev1.Container{{
+			Name:    "model-downloader",
+			Image:   initContainerImage,
+			Command: []string{"sh", "-c", buildPVCVerifyCommand()},
+			Env: []corev1.EnvVar{
+				{Name: "MODEL_PATH", Value: modelPath},
+				{Name: "MODEL_SHA256", Value: strings.ToLower(model.Spec.SHA256)},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "model-source", MountPath: "/model-source", ReadOnly: true},
+			},
+			SecurityContext: initContainerSecurityContext(isvc),
+		}}
+	}
+
 	return modelStorageConfig{
-		modelPath: modelPath,
+		modelPath:      modelPath,
+		initContainers: initContainers,
 		volumes: []corev1.Volume{
 			{
 				Name: "model-source",
@@ -1109,6 +1205,19 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model) modelStorageConfig {
 			{Name: "model-source", MountPath: "/model-source", ReadOnly: true},
 		},
 	}
+}
+
+// buildPVCVerifyCommand is the verify-only command for a pre-staged pvc://
+// artifact. It reuses llmkube_sha256_hash but deliberately does not call
+// llmkube_check_sha256, which would try to stamp the read-only mount. A
+// mismatch fails the init container; there is no marker, because the bytes
+// live on the user's PVC and a retry is a new pod, not a re-download.
+func buildPVCVerifyCommand() string {
+	return sha256HashFns +
+		`llmkube_precheck_sha256 || exit 1; ` +
+		`actual=$(llmkube_sha256_hash "$MODEL_PATH") || exit 1; ` +
+		`if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the pre-staged $MODEL_PATH: expected $MODEL_SHA256, computed $actual" >&2; exit 1; fi; ` +
+		`echo "Model verified against spec.sha256"`
 }
 
 // buildOCIStorageConfig mounts a model delivered as an OCI image through a
@@ -1271,8 +1380,8 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	}
 	if plan != nil {
 		modelPath := stagedCachePath(cacheDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
-		env := multiFileInitEnvVars(model.Spec.Source, cacheDir, plan.Files)
+		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
+		env := multiFileInitEnvVars(model.Spec.Source, cacheDir, plan.Files, model.Spec.FileSHA256)
 
 		initVolumeMounts := []corev1.VolumeMount{
 			{Name: "model-cache", MountPath: "/models"},
@@ -1402,8 +1511,8 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	if plan != nil {
 		stagedDir := fmt.Sprintf("/models/%s-%s", namespace, model.Name)
 		modelPath := fmt.Sprintf("%s/%s", stagedDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
-		env := multiFileInitEnvVars(model.Spec.Source, stagedDir, plan.Files)
+		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
+		env := multiFileInitEnvVars(model.Spec.Source, stagedDir, plan.Files, model.Spec.FileSHA256)
 
 		initVolumeMounts := []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}}
 		volumes := []corev1.Volume{

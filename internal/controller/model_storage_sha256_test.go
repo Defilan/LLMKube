@@ -18,20 +18,26 @@ package controller
 
 import (
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
 // #1965: an init-container download with Model.spec.sha256 set must verify
 // the bytes before anything becomes the cache, and a failed verify must
-// discard the bytes and fail the start without leaving durable rejection
-// state, so a later start can retry. Like the resume tests (#1765) and the
-// revalidation tests (#1326), these drive the generated shell against the
-// range-serving origin rather than string-matching curl claims.
+// discard the partial, fail the start, and leave a digest-keyed
+// <file>.<sha256>.sha256-rejected marker that bounds later retries until the
+// pin is corrected instead of re-downloading on every kubelet backoff
+// (a407e5c7e). Like the resume tests (#1765) and the revalidation tests
+// (#1326), these drive the generated shell against the range-serving origin
+// rather than string-matching curl claims.
 
 // runVerifyScript runs a generated init script under sh with MODEL_SHA256
 // set, mirroring runInitScript but returning the output and exit error for
@@ -47,6 +53,38 @@ func runVerifyScript(t *testing.T, script, modelSource, modelPath, sha256val str
 	)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// runVerifyScriptEnv is runVerifyScript plus extra NAME=value entries, for the
+// S3 (AWS_*) and Hugging Face (HF_TOKEN) branches that carry credentials.
+func runVerifyScriptEnv(t *testing.T, script, modelSource, modelPath, sha256val string, extraEnv ...string) (string, error) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"MODEL_SOURCE="+modelSource,
+		"MODEL_PATH="+modelPath,
+		"CACHE_DIR="+filepath.Dir(modelPath),
+		"MODEL_SHA256="+sha256val,
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// s3TestEnv points the generated S3 branch at a test origin. The bytes are what
+// matter; the SigV4 signature is ignored by the stub, exactly as an origin that
+// only checks the signature on a real bucket would not be exercised here. The
+// point of these cases is the verify-then-publish path, not signing (which
+// executor_s3_test.go covers for the agent's own signer).
+func s3TestEnv(endpoint string) []string {
+	return []string{
+		"AWS_ENDPOINT_URL=" + endpoint,
+		"AWS_REGION=us-east-1",
+		"AWS_ACCESS_KEY_ID=AKIAEXAMPLE0000000",
+		"AWS_SECRET_ACCESS_KEY=secretaccesskeyvalue0000000000000",
+		"S3_BUCKET=bucket",
+		"S3_KEY=model.gguf",
+	}
 }
 
 func requireInitShellEnvironment(t *testing.T) {
@@ -108,6 +146,15 @@ func writeStamp(t *testing.T, path, digest string) {
 	}
 }
 
+// mustStamp asserts the sidecar is the digest+size+mtime triple describing the
+// file, the format both the init container and the metal agent write (#1980).
+func mustStamp(t *testing.T, path, digest string) {
+	t.Helper()
+	if got := readOrFail(t, path+".sha256"); got != stampTriple(t, path, digest) {
+		t.Errorf("stamp = %q, want %q", got, stampTriple(t, path, digest))
+	}
+}
+
 func partialsOf(t *testing.T, modelPath string) []string {
 	t.Helper()
 	matches, err := filepath.Glob(modelPath + ".*.tmp")
@@ -135,7 +182,18 @@ func TestModelInitSHA256_Behavioral(t *testing.T) {
 	t.Run("OnChange moved upstream keeps the pinned copy and skips re-download", sha256OnchangeMovedUpstreamKeepsPinnedCopyAndSkipsRedownload)
 	t.Run("OnChange offline keeps a verified copy", sha256OnchangeOfflineKeepsAVerifiedCopy)
 	t.Run("OnChange offline rejects a corrupt copy", sha256OnchangeOfflineRejectsACorruptCopy)
+	t.Run("S3 download publishes a stamp", sha256S3DownloadPublishesStamp)
+	t.Run("S3 mismatch discards the partial and records the rejection", sha256S3MismatchDiscardsPartialAndRecordsRejection)
+	t.Run("S3 warm cache with a stamp skips the transfer", sha256S3WarmCacheSkipsTheTransfer)
+	t.Run("S3 uncached download publishes a stamp", sha256S3UncachedDownloadPublishesStamp)
+	t.Run("HF auth sends the token and publishes", sha256HFAuthSendsTokenAndPublishes)
+	t.Run("HF auth mismatch discards the partial and records the rejection", sha256HFAuthMismatchDiscardsPartialAndRecordsRejection)
 }
+
+// The local (file://) branch is not exercised behaviorally: its command copies
+// from a hardcoded /host-model/model.gguf, which a non-root CI runner cannot
+// create. It stays covered by the wiring and golden tests; only its publish
+// step (mv or llmkube_publish_sha256) is byte-identical to the branches here.
 
 func sha256ResumeScript() string {
 	return buildModelInitCommand(false, false, true, false, true, RefreshPolicyIfNotPresent)
@@ -545,6 +603,295 @@ func sha256OnchangeOfflineRejectsACorruptCopy(t *testing.T) {
 	// a co-tenant Model); what matters is that the offline fallback refused
 	// to exit 0 on them. A later start with a reachable origin replaces them.
 	mustExist(t, modelPath)
+}
+
+func sha256S3DownloadPublishesStamp(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	want := sha256Hex(o.content())
+	script := buildModelInitCommand(false, true, true, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, "s3://bucket/model.gguf", modelPath, want, s3TestEnv(o.srv.URL)...)
+	if err != nil {
+		t.Fatalf("S3 download with matching sha256 failed: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, modelPath); got != string(o.content()) {
+		t.Errorf("S3 published bytes are wrong")
+	}
+	mustStamp(t, modelPath, want)
+	mustNotExist(t, modelPath+"."+want+".sha256-rejected")
+}
+
+func sha256S3MismatchDiscardsPartialAndRecordsRejection(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+	script := buildModelInitCommand(false, true, true, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, "s3://bucket/model.gguf", modelPath, wrong, s3TestEnv(o.srv.URL)...)
+	if err == nil {
+		t.Fatalf("S3 mismatch must fail the start\n%s", out)
+	}
+	mustNotExist(t, modelPath)
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
+	if p := partialsOf(t, modelPath); len(p) != 0 {
+		t.Errorf("the rejected S3 partial was not discarded: %v", p)
+	}
+}
+
+func sha256S3WarmCacheSkipsTheTransfer(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, o.content(), 0o644); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	want := sha256Hex(o.content())
+	writeStamp(t, modelPath, want)
+	script := buildModelInitCommand(false, true, true, false, true, RefreshPolicyIfNotPresent)
+
+	o.fullFromZero.Store(0)
+	o.rangeRequests.Store(0)
+	out, err := runVerifyScriptEnv(t, script, "s3://bucket/model.gguf", modelPath, want, s3TestEnv(o.srv.URL)...)
+	if err != nil {
+		t.Fatalf("S3 warm cache failed: %v\n%s", err, out)
+	}
+	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
+		t.Errorf("S3 warm cache issued %d GETs, want 0", n)
+	}
+}
+
+func sha256S3UncachedDownloadPublishesStamp(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	want := sha256Hex(o.content())
+	script := buildModelInitCommand(false, true, false, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, "s3://bucket/model.gguf", modelPath, want, s3TestEnv(o.srv.URL)...)
+	if err != nil {
+		t.Fatalf("uncached S3 download with matching sha256 failed: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, modelPath); got != string(o.content()) {
+		t.Errorf("uncached S3 published bytes are wrong")
+	}
+	mustStamp(t, modelPath, want)
+}
+
+func sha256HFAuthSendsTokenAndPublishes(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	var auth atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a := r.Header.Get("Authorization"); a != "" {
+			auth.Store(a)
+		}
+		o.handle(w, r)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	want := sha256Hex(o.content())
+	script := buildModelInitCommand(false, false, true, true, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, srv.URL+"/model.gguf", modelPath, want, "HF_TOKEN=test-token")
+	if err != nil {
+		t.Fatalf("HF-auth download with matching sha256 failed: %v\n%s", err, out)
+	}
+	if got, _ := auth.Load().(string); got != "Bearer test-token" {
+		t.Errorf("Authorization header at the origin = %q, want %q", got, "Bearer test-token")
+	}
+	if got := readOrFail(t, modelPath); got != string(o.content()) {
+		t.Errorf("HF-auth published bytes are wrong")
+	}
+	mustStamp(t, modelPath, want)
+}
+
+func sha256HFAuthMismatchDiscardsPartialAndRecordsRejection(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+	script := buildModelInitCommand(false, false, true, true, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL+"/model.gguf", modelPath, wrong, "HF_TOKEN=test-token")
+	if err == nil {
+		t.Fatalf("HF-auth mismatch must fail the start\n%s", out)
+	}
+	mustNotExist(t, modelPath)
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
+	if p := partialsOf(t, modelPath); len(p) != 0 {
+		t.Errorf("the rejected HF-auth partial was not discarded: %v", p)
+	}
+}
+
+// TestModelMultiFileSHA256_Behavioral drives the multi-file loop with a
+// partially pinned staging set: the pinned file is verified and stamped, the
+// unpinned file is staged exactly as before, and a pinned mismatch fails the
+// start and records the digest-keyed rejection (#1978).
+func TestModelMultiFileSHA256_Behavioral(t *testing.T) {
+	requireInitShellEnvironment(t)
+	t.Run("pinned file verified, unpinned staged", multiFileSHA256PinnedAndUnpinned)
+	t.Run("pinned mismatch discards and records the rejection", multiFileSHA256MismatchRejects)
+	t.Run("pinned warm cache skips the transfer", multiFileSHA256WarmCacheSkips)
+	t.Run("gated command with no digest env fails closed", multiFileSHA256FailsClosed)
+}
+
+func multiFileSHA256FailsClosed(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "", "MODEL_FILES=model.gguf")
+	if err == nil {
+		t.Fatalf("gated multi-file command with no MODEL_FILE_SHA256 must fail\n%s", out)
+	}
+	if !strings.Contains(out, "refusing to transfer unchecked") {
+		t.Errorf("expected the fail-closed message: %s", out)
+	}
+	mustNotExist(t, primary)
+}
+
+func multiFileSHA256PinnedAndUnpinned(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	secondary := filepath.Join(dir, "other.gguf")
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf\nother.gguf",
+		"MODEL_FILE_SHA256="+want+" model.gguf")
+	if err != nil {
+		t.Fatalf("pinned multi-file download failed: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, primary); got != string(o.content()) {
+		t.Errorf("pinned primary bytes are wrong")
+	}
+	mustStamp(t, primary, want)
+	if got := readOrFail(t, secondary); got != string(o.content()) {
+		t.Errorf("unpinned secondary was not staged")
+	}
+	mustNotExist(t, secondary+".sha256")
+	mustNotExist(t, primary+"."+want+".sha256-rejected")
+}
+
+func multiFileSHA256MismatchRejects(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+wrong+" model.gguf")
+	if err == nil {
+		t.Fatalf("pinned multi-file mismatch must fail the start\n%s", out)
+	}
+	mustNotExist(t, primary)
+	mustExist(t, primary+"."+wrong+".sha256-rejected")
+	if p := partialsOf(t, primary); len(p) != 0 {
+		t.Errorf("the rejected multi-file partial was not discarded: %v", p)
+	}
+}
+
+func multiFileSHA256WarmCacheSkips(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(primary, o.content(), 0o644); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	want := sha256Hex(o.content())
+	writeStamp(t, primary, want)
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+
+	o.fullFromZero.Store(0)
+	o.rangeRequests.Store(0)
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+want+" model.gguf")
+	if err != nil {
+		t.Fatalf("pinned multi-file warm cache failed: %v\n%s", err, out)
+	}
+	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
+		t.Errorf("pinned multi-file warm cache issued %d GETs, want 0", n)
+	}
+}
+
+// TestModelPVCSHA256_Behavioral runs the verify-only command a pvc:// Model's
+// init container runs (#1979). The command reads $MODEL_PATH, so it points at
+// a temp file here instead of a mount; it must verify and must write no stamp,
+// because the mount it really runs against is read-only.
+func TestModelPVCSHA256_Behavioral(t *testing.T) {
+	requireInitShellEnvironment(t)
+	t.Run("matching bytes verify without stamping", pvcSHA256MatchingVerifies)
+	t.Run("mismatch fails the init container", pvcSHA256MismatchFails)
+}
+
+func pvcSHA256MatchingVerifies(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	body := []byte("pre-staged-model-bytes")
+	if err := os.WriteFile(modelPath, body, 0o644); err != nil {
+		t.Fatalf("seed pvc file: %v", err)
+	}
+	want := sha256Hex(body)
+	out, err := runVerifyScript(t, buildPVCVerifyCommand(), "pvc://models/model.gguf", modelPath, want)
+	if err != nil {
+		t.Fatalf("matching pvc verify failed: %v\n%s", err, out)
+	}
+	mustNotExist(t, modelPath+".sha256")
+}
+
+func pvcSHA256MismatchFails(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, []byte("corrupt"), 0o644); err != nil {
+		t.Fatalf("seed pvc file: %v", err)
+	}
+	wrong := sha256Hex([]byte("expected-other-bytes"))
+	out, err := runVerifyScript(t, buildPVCVerifyCommand(), "pvc://models/model.gguf", modelPath, wrong)
+	if err == nil {
+		t.Fatalf("pvc mismatch must fail the init container\n%s", out)
+	}
+	if !strings.Contains(out, "SHA256 mismatch for the pre-staged") {
+		t.Errorf("expected the mismatch message: %s", out)
+	}
+}
+
+func TestModelInitEnvVars_ModelFileSHA256(t *testing.T) {
+	files := []string{"a.gguf", "b.gguf", "sub/c.gguf"}
+	a := strings.Repeat("A", 64)
+	c := strings.Repeat("c", 64)
+	envs := multiFileInitEnvVars("https://example.com/repo", "/models/k", files, map[string]inferencev1alpha1.SHA256Digest{
+		"a.gguf":     inferencev1alpha1.SHA256Digest(a),
+		"sub/c.gguf": inferencev1alpha1.SHA256Digest(c),
+	})
+	var got string
+	var found bool
+	for _, e := range envs {
+		if e.Name == "MODEL_FILE_SHA256" {
+			got, found = e.Value, true
+		}
+	}
+	if !found {
+		t.Fatalf("MODEL_FILE_SHA256 not injected: %v", envs)
+	}
+	want := strings.ToLower(a) + " a.gguf\n" + strings.ToLower(c) + " sub/c.gguf"
+	if got != want {
+		t.Errorf("MODEL_FILE_SHA256 = %q, want %q (files order, digest first, lowercased)", got, want)
+	}
+	for _, e := range multiFileInitEnvVars("https://example.com/repo", "/models/k", files, nil) {
+		if e.Name == "MODEL_FILE_SHA256" {
+			t.Errorf("MODEL_FILE_SHA256 must be absent with no digests: %v", e)
+		}
+	}
 }
 
 func TestModelInitEnvVars_ModelSHA256(t *testing.T) {

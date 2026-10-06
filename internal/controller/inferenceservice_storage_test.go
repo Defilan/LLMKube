@@ -397,7 +397,7 @@ var _ = Describe("buildEmptyDirStorageConfig multi-file staging", func() {
 
 var _ = Describe("buildMultiFileInitCommand", func() {
 	It("generates download loop for IfNotPresent policy", func() {
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
 		Expect(cmd).To(ContainSubstring("printf '%s\\n' \"$MODEL_FILES\""))
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$(dirname "$dest")"`))
@@ -407,13 +407,13 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 	})
 
 	It("fails init container if any curl fails in IfNotPresent policy", func() {
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`exit 1`))
 		Expect(cmd).To(ContainSubstring("failed to download"))
 	})
 
 	It("generates HEAD revalidation for OnChange policy", func() {
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyOnChange)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyOnChange)
 		Expect(cmd).To(ContainSubstring(`mkdir -p "$CACHE_DIR"`))
 		Expect(cmd).To(ContainSubstring("remote_size"))
 		Expect(cmd).To(ContainSubstring("skipped download"))
@@ -421,18 +421,18 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 	})
 
 	It("uses emptyDir prefix without cache dir for non-cached storage", func() {
-		cmd := buildMultiFileInitCommand(false, false, false, RefreshPolicyIfNotPresent)
+		cmd := buildMultiFileInitCommand(false, false, false, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`mkdir -p /models`))
 		Expect(cmd).NotTo(ContainSubstring(`"$CACHE_DIR"`))
 	})
 
 	It("normalizes hf:// URLs via MODEL_SOURCE in the generated command", func() {
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring("normalize_hf_source"))
 	})
 
 	It("uses POSIX-compatible shell (no bashisms)", func() {
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).NotTo(ContainSubstring("[["))
 		Expect(cmd).To(ContainSubstring("case"))
 		Expect(cmd).To(ContainSubstring("esac"))
@@ -442,26 +442,26 @@ var _ = Describe("buildMultiFileInitCommand", func() {
 		// The bug: url="${SOURCE%/}$rel" strips trailing slash from SOURCE (which ends in /)
 		// and glues filename directly, producing ".../resolve/main" + "a.gguf" = ".../resolve/maina.gguf"
 		// The fix: url="${SOURCE%/}/$rel" adds the slash back, producing ".../resolve/main/a.gguf"
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyIfNotPresent)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyIfNotPresent)
 		Expect(cmd).To(ContainSubstring(`url="${SOURCE%/}/$rel"`))
 	})
 
 	It("preserves slash between resolve base and filename in OnChange policy (regression test for #1110)", func() {
-		cmd := buildMultiFileInitCommand(true, false, false, RefreshPolicyOnChange)
+		cmd := buildMultiFileInitCommand(true, false, false, false, RefreshPolicyOnChange)
 		Expect(cmd).To(ContainSubstring(`url="${SOURCE%/}/$rel"`))
 	})
 })
 
 var _ = Describe("multiFileInitEnvVars", func() {
 	It("sets MODEL_FILES as newline-delimited list", func() {
-		env := multiFileInitEnvVars("hf://org/repo", "/models/abc", []string{"a.gguf", "b.gguf"})
+		env := multiFileInitEnvVars("hf://org/repo", "/models/abc", []string{"a.gguf", "b.gguf"}, nil)
 		Expect(getEnvVar(env, "MODEL_SOURCE")).To(Equal("https://huggingface.co/org/repo/resolve/main/"))
 		Expect(getEnvVar(env, "CACHE_DIR")).To(Equal("/models/abc"))
 		Expect(getEnvVar(env, "MODEL_FILES")).To(Equal("a.gguf\nb.gguf"))
 	})
 
 	It("passes through https sources unchanged", func() {
-		env := multiFileInitEnvVars("https://example.com/model.gguf", "/models/abc", []string{"model.gguf"})
+		env := multiFileInitEnvVars("https://example.com/model.gguf", "/models/abc", []string{"model.gguf"}, nil)
 		Expect(getEnvVar(env, "MODEL_SOURCE")).To(Equal("https://example.com/model.gguf"))
 	})
 })
@@ -651,7 +651,7 @@ var _ = Describe("buildPVCStorageConfig", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "pvc-model"},
 			Spec:       inferencev1alpha1.ModelSpec{Source: "pvc://my-models/llama/model.gguf"},
 		}
-		config := buildPVCStorageConfig(model)
+		config := buildPVCStorageConfig(model, nil, "img:latest")
 
 		Expect(config.modelPath).To(Equal("/model-source/llama/model.gguf"))
 		Expect(config.initContainers).To(BeEmpty())
@@ -671,7 +671,7 @@ var _ = Describe("buildPVCStorageConfig", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "pvc-model-simple"},
 			Spec:       inferencev1alpha1.ModelSpec{Source: "pvc://storage/model.gguf"},
 		}
-		config := buildPVCStorageConfig(model)
+		config := buildPVCStorageConfig(model, nil, "img:latest")
 
 		Expect(config.modelPath).To(Equal("/model-source/model.gguf"))
 		Expect(config.volumes[0].PersistentVolumeClaim.ClaimName).To(Equal("storage"))

@@ -30,8 +30,16 @@ type ModelAttestation struct {
 	ConfigMapKeyRef corev1.ConfigMapKeySelector `json:"configMapKeyRef"`
 }
 
+// SHA256Digest is a hex-encoded SHA256 digest (64 characters, either case).
+// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
+type SHA256Digest string
+
 // ModelSpec defines the desired state of Model
-// +kubebuilder:validation:XValidation:rule="!((has(self.sha256) && self.sha256.size() > 0) && ((has(self.files) && self.files.size() > 0) || (has(self.mmproj) && self.mmproj.size() > 0) || self.source.startsWith('pvc://') || self.source.startsWith('oci://')))",message="sha256 verifies a single downloaded artifact: it cannot be combined with files or mmproj, or with a pre-staged pvc:// or oci:// source"
+// +kubebuilder:validation:XValidation:rule="!((has(self.sha256) && self.sha256.size() > 0) && ((has(self.files) && self.files.size() > 0) || (has(self.mmproj) && self.mmproj.size() > 0) || self.source.startsWith('oci://')))",message="sha256 verifies a single artifact: it cannot be combined with files or mmproj, or with a pre-staged oci:// source (use fileSha256 for multi-file staging)"
+// +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || (has(self.files) && self.files.size() > 0)",message="fileSha256 requires spec.files: it names the expected digest of each staged artifact"
+// +kubebuilder:validation:XValidation:rule="!(has(self.fileSha256) && self.fileSha256.size() > 0 && self.source.startsWith('oci://'))",message="fileSha256 cannot verify a pre-staged oci:// artifact, which is already pinned by its image digest"
+// +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || !has(self.files) || self.files.all(f, !f.contains('*') && !f.contains('?') && !f.contains('['))",message="fileSha256 needs concrete file paths: a glob cannot be keyed to an unknown expanded name"
+// +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || self.fileSha256.all(k, (has(self.files) && self.files.exists(f, f == k)) || (has(self.mmproj) && self.mmproj == k))",message="every fileSha256 key must name a spec.files entry or spec.mmproj"
 type ModelSpec struct {
 	// Source defines where to obtain the model.
 	// For GGUF models: URL or path to a .gguf file.
@@ -71,12 +79,13 @@ type ModelSpec struct {
 	// +kubebuilder:validation:Pattern=`^(https?|file|pvc|hf|s3|oci)://.*|^/[^\s]+$|^[a-zA-Z0-9][\w\-\.\/]+$`
 	Source string `json:"source"`
 
-	// SHA256 is the expected SHA256 hash of the model file for integrity verification.
-	// When set, a downloaded artifact verifies its bytes against this hash before
-	// they become the cache, on both the init-container and controller-side paths.
-	// Applies to single-file downloaded Models: setting it together with Files or
-	// Mmproj, or on a pre-staged pvc:// or oci:// source, is rejected at admission
-	// (#1965).
+	// SHA256 is the expected SHA256 hash of the model file for integrity
+	// verification. When set, a single-file artifact verifies its bytes against
+	// this hash: a downloaded artifact before it becomes the cache, and a
+	// pre-staged pvc:// artifact at pod start. Setting it together with Files or
+	// Mmproj, or on a pre-staged oci:// source, is rejected at admission; use
+	// spec.fileSha256 to pin the files of a multi-file staging set (#1965,
+	// #1978, #1979).
 	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
 	// +optional
 	SHA256 string `json:"sha256,omitempty"`
@@ -185,6 +194,8 @@ type ModelSpec struct {
 	// repo-relative for repository sources. The first entry is the primary model
 	// file passed to the runtime. When Files is empty, Source must name a single
 	// object directly.
+	// +kubebuilder:validation:MaxItems=256
+	// +kubebuilder:validation:items:MaxLength=512
 	// +optional
 	Files []string `json:"files,omitempty"`
 
@@ -192,6 +203,17 @@ type ModelSpec struct {
 	// pass to runtimes that support projector arguments.
 	// +optional
 	Mmproj string `json:"mmproj,omitempty"`
+
+	// FileSHA256 is a per-file SHA256 map for multi-file staging, keyed by
+	// repo-relative path (each key is a spec.files entry or spec.mmproj). Only
+	// listed files are verified; a file with no entry is staged as before. It
+	// is mutually exclusive with spec.sha256, and requires concrete file paths:
+	// a glob cannot be keyed to an unknown expanded name, and a pre-staged
+	// oci:// artifact carries its own digest, so both are rejected at admission
+	// (#1978).
+	// +kubebuilder:validation:MaxProperties=256
+	// +optional
+	FileSHA256 map[string]SHA256Digest `json:"fileSha256,omitempty"`
 }
 
 // HardwareSpec defines hardware acceleration settings

@@ -45,6 +45,10 @@ var sha256HelperTokens = []string{
 	"llmkube_marker_hit_sha256",
 	"llmkube_check_sha256",
 	"llmkube_publish_sha256",
+	"llmkube_precheck_file_sha256",
+	"llmkube_file_digest",
+	"llmkube_accept_file",
+	"llmkube_publish_file",
 }
 
 func sha256WiringModel(source string) *inferencev1alpha1.Model {
@@ -212,6 +216,98 @@ func TestPrefetchJob_SHA256Wiring(t *testing.T) {
 			if strings.Contains(cmd, tok) {
 				t.Errorf("prefetch command of an unhashed Model contains %q", tok)
 			}
+		}
+	})
+}
+
+// TestModelStorageConfig_MultiFileDigestWiring pins the per-file gate wiring at
+// the storage config builder for a multi-file Model, both with and without
+// spec.fileSha256 (#1978).
+func TestModelStorageConfig_MultiFileDigestWiring(t *testing.T) {
+	build := func(t *testing.T, digests map[string]inferencev1alpha1.SHA256Digest) (corev1.Container, string) {
+		t.Helper()
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "multi", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:     "https://models.example.com/repo",
+				Files:      []string{"a.gguf", "b.gguf"},
+				FileSHA256: digests,
+			},
+		}
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		}
+		cfg := buildModelStorageConfig(model, isvc, "default", true, ModelCacheModeShared,
+			"", "img:latest", 0, []string{"/data/models"}, "")
+		downloader, cmd := downloaderFrom(cfg)
+		if downloader.Name == "" {
+			t.Fatalf("no multi-file model-downloader container")
+		}
+		return downloader, cmd
+	}
+
+	t.Run("digest set", func(t *testing.T) {
+		downloader, cmd := build(t, map[string]inferencev1alpha1.SHA256Digest{"a.gguf": inferencev1alpha1.SHA256Digest(sha256WiredDigestUpper)})
+		if got, ok := envValueFor(downloader.Env, "MODEL_FILE_SHA256"); !ok || got != sha256WiredDigestLower+" a.gguf" {
+			t.Errorf("MODEL_FILE_SHA256 = %q (found=%v), want %q", got, ok, sha256WiredDigestLower+" a.gguf")
+		}
+		for _, tok := range []string{"llmkube_precheck_file_sha256", "llmkube_file_digest", "llmkube_accept_file", "llmkube_publish_file"} {
+			if !strings.Contains(cmd, tok) {
+				t.Errorf("multi-file command is missing %q:\n%s", tok, cmd)
+			}
+		}
+	})
+
+	t.Run("digest unset", func(t *testing.T) {
+		downloader, cmd := build(t, nil)
+		if v, ok := envValueFor(downloader.Env, "MODEL_FILE_SHA256"); ok {
+			t.Errorf("MODEL_FILE_SHA256 = %q without spec.fileSha256", v)
+		}
+		for _, tok := range sha256HelperTokens {
+			if strings.Contains(cmd, tok) {
+				t.Errorf("unhashed multi-file command contains %q", tok)
+			}
+		}
+	})
+}
+
+// TestPVCStorageConfig_SHA256Wiring pins the pvc:// verify wiring (#1979): a
+// digest adds a verify init container that must not try to stamp the read-only
+// mount; no digest adds nothing.
+func TestPVCStorageConfig_SHA256Wiring(t *testing.T) {
+	build := func(t *testing.T, sha string) modelStorageConfig {
+		t.Helper()
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "pvc-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "pvc://models-pvc/model.gguf",
+				SHA256: sha,
+			},
+		}
+		return buildModelStorageConfig(model, nil, "default", true, ModelCacheModeShared, "", "img:latest", 0, nil, "")
+	}
+
+	t.Run("digest set", func(t *testing.T) {
+		cfg := build(t, sha256WiredDigestUpper)
+		downloader, cmd := downloaderFrom(cfg)
+		if downloader.Name == "" {
+			t.Fatalf("pvc:// Model with spec.sha256 has no verify init container")
+		}
+		assertDigestEnv(t, downloader.Env)
+		for _, tok := range []string{"llmkube_precheck_sha256", "llmkube_sha256_hash"} {
+			if !strings.Contains(cmd, tok) {
+				t.Errorf("pvc verify command is missing %q:\n%s", tok, cmd)
+			}
+		}
+		if strings.Contains(cmd, "llmkube_check_sha256") || strings.Contains(cmd, "llmkube_publish_sha256") {
+			t.Errorf("pvc verify command must not try to stamp a read-only mount:\n%s", cmd)
+		}
+	})
+
+	t.Run("digest unset", func(t *testing.T) {
+		cfg := build(t, "")
+		if len(cfg.initContainers) != 0 {
+			t.Errorf("pvc:// Model without spec.sha256 grew init containers: %+v", cfg.initContainers)
 		}
 	})
 }

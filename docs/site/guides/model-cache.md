@@ -330,12 +330,41 @@ fails the init container, so the pod never starts with bad weights.
   may be shared) and replaced by a fresh verified download in the same start.
 - The gates fail closed: if the digest does not reach the container, the
   download aborts instead of transferring unchecked.
-- `spec.sha256` covers single-file downloaded Models; combining it with
-  multi-file staging (`spec.files` / `spec.mmproj`), or setting it on a
-  pre-staged `pvc://` or `oci://` source, is rejected at admission. Models
-  that set such a combination before this release had the digest silently
-  ignored; remove the ignored `spec.sha256` (or the multi-file / pre-staged
-  source) to keep the Model admissible.
+- A pre-staged `pvc://` source with `spec.sha256` verifies the mounted file in
+  an init container at pod start. The mount is read-only, so no stamp is
+  written and the file is hashed on every pod start; a mismatch fails the pod.
+  `oci://` stays digest-addressed and is rejected with `spec.sha256`.
+- Combining `spec.sha256` with multi-file staging (`spec.files` /
+  `spec.mmproj`) or an `oci://` source is rejected at admission; use
+  `spec.fileSha256` for a multi-file set. Models that set such a combination
+  before this release had the digest silently ignored; remove the ignored
+  `spec.sha256` (or the multi-file / `oci://` source) to keep the Model
+  admissible.
+
+### Multi-file staging (`spec.fileSha256`)
+
+`spec.sha256` attests to one artifact, so a multi-file set uses
+`spec.fileSha256`, a map from repo-relative path to digest:
+
+```yaml
+spec:
+  source: hf://org/repo-GGUF
+  files:
+    - Model-00001-of-00002.gguf
+    - Model-00002-of-00002.gguf
+  fileSha256:
+    Model-00001-of-00002.gguf: 9f2c...   # 64 hex characters
+    Model-00002-of-00002.gguf: 1ab3...
+```
+
+- Only listed files are verified; a file with no entry stages as before, so a
+  partially pinned set is allowed.
+- A mismatch discards that file's partial, records its own
+  `<file>.<sha256>.sha256-rejected` marker, and stops the loop.
+- Every key must name a `spec.files` entry or `spec.mmproj`. Globs in
+  `spec.files` are rejected when `fileSha256` is set, because a digest cannot
+  be keyed to an unknown expanded name. `spec.sha256` and `spec.fileSha256`
+  are mutually exclusive, and `fileSha256` is rejected on an `oci://` source.
 
 ## Troubleshooting
 

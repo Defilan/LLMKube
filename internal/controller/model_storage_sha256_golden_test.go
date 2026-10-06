@@ -80,6 +80,53 @@ func TestModelInitCommand_UnhashedBranches_Golden(t *testing.T) {
 	}
 }
 
+// Goldens of the generated multi-file init command for Models WITHOUT
+// per-file digests. Captured from the pre-#1978 builder, so they prove the
+// withSHA256=false branch is byte-for-byte what it was before per-file verify
+// gates were added. Regenerate with -update-init-goldens only when a change to
+// the unhashed multi-file command shape is intended and reviewed.
+func TestModelMultiFileInitCommand_UnhashedBranches_Golden(t *testing.T) {
+	kinds := []struct {
+		name     string
+		isS3     bool
+		isHFAuth bool
+	}{
+		{"http", false, false},
+		{"s3", true, false},
+		{"hf", false, true},
+	}
+	for _, useCache := range []bool{true, false} {
+		for _, kind := range kinds {
+			for _, policy := range []string{RefreshPolicyIfNotPresent, RefreshPolicyOnChange} {
+				name := fmt.Sprintf("initcmd_multi_usecache-%v_%s_%s.golden", useCache, kind.name, policy)
+				cmd := buildMultiFileInitCommand(useCache, kind.isS3, kind.isHFAuth, false, policy)
+				path := filepath.Join("testdata", name)
+				if *updateInitCmdGoldens {
+					if err := os.MkdirAll("testdata", 0o755); err != nil {
+						t.Fatalf("mkdir testdata: %v", err)
+					}
+					if err := os.WriteFile(path, []byte(cmd), 0o644); err != nil {
+						t.Fatalf("write golden %s: %v", name, err)
+					}
+					continue
+				}
+				want, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("read golden %s (generate with -update-init-goldens): %v", name, err)
+				}
+				if cmd != string(want) {
+					t.Errorf("unhashed multi-file command for %s drifted from the golden:\ngot:\n%s\nwanted:\n%s", name, cmd, want)
+				}
+				for _, tok := range sha256HelperTokens {
+					if strings.Contains(cmd, tok) {
+						t.Errorf("golden %s contains verify helper %q", name, tok)
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestModelInitCommand_SHA256Branches_HasGates keeps the positive half of the
 // byte-identity pin: the disabled goldens are only meaningful if the enabled
 // path demonstrably wires the gates in.
