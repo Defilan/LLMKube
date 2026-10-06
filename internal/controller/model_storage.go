@@ -975,12 +975,21 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 	digestAssign := ""
 	markerGuard := ""
 	sizeHit := ""
+	keepCachedTail := `elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
+		`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; `
 	if withSHA256 {
 		fns = sha256VerifyFns + sha256MultiFileFns
 		pre = `llmkube_precheck_file_sha256 || exit 1; `
 		digestAssign = `MODEL_SHA256=$(llmkube_file_digest "$rel"); `
-		markerGuard = `if [ -n "${MODEL_SHA256:-}" ] && llmkube_marker_hit_sha256 "$dest"; then if llmkube_accept_file "$dest"; then echo "spec.sha256 no longer matches $rel; kept the pinned cached copy"; continue; else echo "ERROR: spec.sha256 mismatch for $rel; fix the Model or delete $dest.$MODEL_SHA256.sha256-rejected to retry" >&2; exit 1; fi; fi; `
+		markerGuard = `if [ -n "${MODEL_SHA256:-}" ] && llmkube_marker_hit_sha256 "$dest"; then if llmkube_accept_file "$dest"; then echo "spec.fileSha256 no longer matches $rel; kept the pinned cached copy"; continue; else echo "ERROR: spec.fileSha256 mismatch for $rel; fix the Model or delete $dest.$MODEL_SHA256.sha256-rejected to retry" >&2; exit 1; fi; fi; `
 		sizeHit = ` && llmkube_accept_file "$dest"`
+		// The unreachable-origin fallback is part of the per-file gate: keep a
+		// cached copy only if it still passes the gate (stamp hit or a local
+		// hash match), otherwise fail the init. Mirrors remoteRevalidateScript's
+		// keepCached, so an Offline restart cannot serve bytes that fail the
+		// pin. The unhashed shape above stays byte-for-byte unchanged.
+		keepCachedTail = `elif [ -f "$dest" ] && llmkube_accept_file "$dest"; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
+			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; `
 	}
 	publishFile := func(partial string) string {
 		if withSHA256 {
@@ -1014,8 +1023,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 				`else ` +
 				`if download_with_progress "$dest.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$dest.tmp" "$url" --no-progress-meter && ` + publishFile("$dest.tmp") + `; then ` +
 				`echo "Model artifact $rel revalidated (downloaded)"; ` +
-				`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
-				`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
+				keepCachedTail +
 				`fi; ` +
 				`done`
 			return fns + pre + prefix + sweep + " && " + body
@@ -1054,8 +1062,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 			validatorDeriveAndSweep() +
 			`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + publishFile("$MODEL_PARTIAL") + `; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
-			`elif [ -f "$dest" ]; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
-			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; ` +
+			keepCachedTail +
 			`fi; ` +
 			`done`
 		return fns + pre + prefix + body + " && " + sweep

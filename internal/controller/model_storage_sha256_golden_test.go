@@ -171,3 +171,27 @@ func TestModelInitCommand_SHA256GuardRunsFirst(t *testing.T) {
 		}
 	}
 }
+
+// TestModelMultiFileInitCommand_OnChangeKeepCachedIsGated pins that the
+// unreachable-origin fallback on both gated OnChange branches (s3 and
+// http/hf) keeps a cached copy only through the per-file gate, so a pinned
+// file that fails its digest cannot be served from a stale cache (#1978).
+func TestModelMultiFileInitCommand_OnChangeKeepCachedIsGated(t *testing.T) {
+	gated := `elif [ -f "$dest" ] && llmkube_accept_file "$dest"; then echo "Revalidation unreachable for $rel; kept cached copy"`
+	for _, kind := range []struct {
+		name string
+		isS3 bool
+	}{
+		{"http", false},
+		{"s3", true},
+	} {
+		cmd := buildMultiFileInitCommand(true, kind.isS3, false, true, RefreshPolicyOnChange)
+		if !strings.Contains(cmd, gated) {
+			t.Errorf("%s: gated OnChange keep-cached fallback is not gated by llmkube_accept_file:\n%s", kind.name, cmd)
+		}
+		unhashed := buildMultiFileInitCommand(true, kind.isS3, false, false, RefreshPolicyOnChange)
+		if strings.Contains(unhashed, "llmkube_accept_file") {
+			t.Errorf("%s: unhashed OnChange command contains a verify helper", kind.name)
+		}
+	}
+}

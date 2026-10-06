@@ -737,6 +737,8 @@ func TestModelMultiFileSHA256_Behavioral(t *testing.T) {
 	t.Run("pinned mismatch discards and records the rejection", multiFileSHA256MismatchRejects)
 	t.Run("pinned warm cache skips the transfer", multiFileSHA256WarmCacheSkips)
 	t.Run("gated command with no digest env fails closed", multiFileSHA256FailsClosed)
+	t.Run("OnChange offline keeps a verified pinned copy", multiFileSHA256OnchangeOfflineKeepsAVerifiedCopy)
+	t.Run("OnChange offline rejects a corrupt pinned copy", multiFileSHA256OnchangeOfflineRejectsACorruptCopy)
 }
 
 func multiFileSHA256FailsClosed(t *testing.T) {
@@ -822,6 +824,58 @@ func multiFileSHA256WarmCacheSkips(t *testing.T) {
 	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
 		t.Errorf("pinned multi-file warm cache issued %d GETs, want 0", n)
 	}
+}
+
+func multiFileSHA256OnchangeOfflineKeepsAVerifiedCopy(t *testing.T) {
+	srv := httptest.NewServer(nil)
+	dead := srv.URL
+	srv.Close()
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(primary, o.content(), 0o644); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyOnChange)
+
+	// Air-gapped restart of an OnChange Model: the unreachable-origin fallback
+	// must still verify the cached file before keeping it.
+	out, err := runVerifyScriptEnv(t, script, dead, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+want+" model.gguf")
+	if err != nil {
+		t.Fatalf("offline verified pinned copy should exit 0: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "kept cached copy") {
+		t.Errorf("expected the offline fallback message: %s", out)
+	}
+	mustStamp(t, primary, want)
+}
+
+func multiFileSHA256OnchangeOfflineRejectsACorruptCopy(t *testing.T) {
+	srv := httptest.NewServer(nil)
+	dead := srv.URL
+	srv.Close()
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(primary, []byte("corrupt bytes"), 0o644); err != nil {
+		t.Fatalf("seed corrupt file: %v", err)
+	}
+	want := sha256Hex([]byte("expected other bytes"))
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyOnChange)
+
+	out, err := runVerifyScriptEnv(t, script, dead, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+want+" model.gguf")
+	if err == nil {
+		t.Fatalf("offline fallback must not exit 0 on bytes that fail the pin\n%s", out)
+	}
+	if strings.Contains(out, "kept cached copy") {
+		t.Errorf("the corrupt cached copy was reported kept: %s", out)
+	}
+	mustExist(t, primary)
+	mustNotExist(t, primary+"."+want+".sha256-rejected")
 }
 
 // TestModelPVCSHA256_Behavioral runs the verify-only command a pvc:// Model's
