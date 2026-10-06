@@ -160,7 +160,9 @@ func (r *InferenceServiceReconciler) determinePhase(ctx context.Context, isvc *i
 // controller writes (WaitingForMetalAgent, AgentHeartbeatStale) once the agent
 // has registered and the service is Ready. Reasons the agent writes (memory
 // admission, start refusals) are cleared by the agent itself (#777) and are
-// deliberately preserved.
+// deliberately preserved. The deployment path clears its own markers in the
+// reconcile write path; see the !isMetal && phase == PhaseReady block in
+// inferenceservice_controller.go.
 func clearControllerMetalScheduling(isvc *inferencev1alpha1.InferenceService) {
 	switch isvc.Status.SchedulingStatus {
 	case "WaitingForMetalAgent", "AgentHeartbeatStale":

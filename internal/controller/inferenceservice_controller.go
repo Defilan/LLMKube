@@ -321,8 +321,8 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// metal path, where the agent owns these fields and clears them itself
 	// (#777), but it also froze the controller's own InsufficientGPU /
 	// UnbindableModelCache: a recovered service kept advertising a resource it
-	// was no longer waiting on (#1632). Deployment path only, so the metal
-	// path's ownership is untouched.
+	// was no longer waiting on (#1632). This block handles the deployment
+	// path; the metal counterpart is clearControllerMetalScheduling.
 	if !isMetal && phase == PhaseReady {
 		inferenceService.Status.SchedulingStatus = ""
 		inferenceService.Status.SchedulingMessage = ""

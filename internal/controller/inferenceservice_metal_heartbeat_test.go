@@ -448,6 +448,32 @@ var _ = Describe("metal service scheduling status", func() {
 		Expect(got.Status.SchedulingStatus).To(BeEmpty())
 	})
 
+	It("clears a stale AgentHeartbeatStale once the agent is serving", func() {
+		const isvcName = "sched-hbstale-isvc"
+		isvc := readyMetalFixtures("sched-hbstale-model", isvcName)
+
+		fresh := time.Now().UTC().Format(time.RFC3339)
+		slice := metalEndpoints(isvcName, fresh)
+		Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, slice) })
+
+		key := types.NamespacedName{Name: isvcName, Namespace: namespace}
+		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
+		isvc.Status.SchedulingStatus = "AgentHeartbeatStale"
+		isvc.Status.SchedulingMessage = "metal-agent heartbeat stale (last seen 2026-01-01T00:00:00Z); host may be offline"
+		Expect(k8sClient.Status().Update(ctx, isvc)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(PhaseReady))
+		Expect(got.Status.SchedulingStatus).To(BeEmpty(),
+			"a Ready metal service must not keep advertising AgentHeartbeatStale")
+		Expect(got.Status.SchedulingMessage).To(BeEmpty())
+	})
+
 	It("keeps WaitingForMetalAgent while the agent has not registered", func() {
 		const isvcName = "sched-wait-isvc"
 		readyMetalFixtures("sched-wait-model", isvcName)
