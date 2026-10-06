@@ -18,6 +18,7 @@ package agent
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -26,7 +27,7 @@ import (
 // such as mirror.test to a real proxy. Tests that exercise proxy behavior
 // set these variables themselves with t.Setenv.
 //
-// It also clears SystemTempRoots: many tests build a model store in
+// It also clears systemTempRoots: many tests build a model store in
 // t.TempDir(), which is under /tmp wherever TMPDIR is unset (Linux CI), and
 // the store check would refuse all of them. The /tmp refusal tests set it
 // back explicitly with withSystemTempRoots.
@@ -35,14 +36,26 @@ func TestMain(m *testing.M) {
 		"NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy", "REQUEST_METHOD"} {
 		_ = os.Unsetenv(k)
 	}
-	SystemTempRoots = nil
+	systemTempRoots = nil
 	os.Exit(m.Run())
 }
 
-// withSystemTempRoots restores the production SystemTempRoots for one test.
+// withSystemTempRoots restores the production systemTempRoots for one test.
 func withSystemTempRoots(t *testing.T) {
 	t.Helper()
-	prev := SystemTempRoots
-	SystemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
-	t.Cleanup(func() { SystemTempRoots = prev })
+	prev := systemTempRoots
+	systemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
+	t.Cleanup(func() { systemTempRoots = prev })
+}
+
+// The production default refuses every shared temporary directory, not just
+// /tmp: checkStoreNotInTmp is judged on both spellings of each root.
+func TestCheckStoreNotInTmp_RefusesAllProductionRoots(t *testing.T) {
+	withSystemTempRoots(t)
+	for _, root := range []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"} {
+		where := filepath.Join(root, "llmkube-models")
+		if err := checkStoreNotInTmp(where, where, where); err == nil {
+			t.Errorf("checkStoreNotInTmp(%s) = nil, want a refusal", where)
+		}
+	}
 }
