@@ -298,8 +298,8 @@ func TestPrepareModelStore(t *testing.T) {
 // prepareModelStore refuses a store under /tmp, which the 0.10.0 plist
 // pinned, even though it creates the store 0700 and owns it.
 func TestPrepareModelStore_RefusesStoreUnderTmp(t *testing.T) {
-	agent.SetSystemTempRootsForTest([]string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"})
-	t.Cleanup(func() { agent.SetSystemTempRootsForTest(nil) })
+	prev := agent.SetSystemTempRootsForTest([]string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"})
+	t.Cleanup(func() { agent.SetSystemTempRootsForTest(prev) })
 
 	base, err := os.MkdirTemp("/tmp", "llmkube-prepare-test-")
 	if err != nil {
@@ -327,8 +327,8 @@ func TestSetSystemTempRootsForTest_ControlsRefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	agent.SetSystemTempRootsForTest(nil)
-	t.Cleanup(func() { agent.SetSystemTempRootsForTest(nil) })
+	prev := agent.SetSystemTempRootsForTest(nil)
+	t.Cleanup(func() { agent.SetSystemTempRootsForTest(prev) })
 	if err := agent.CheckModelStore(store); err != nil {
 		t.Fatalf("with the roots cleared, CheckModelStore(store under /tmp) = %v, want nil", err)
 	}

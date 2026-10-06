@@ -131,15 +131,17 @@ func checkStoreNotInTmp(where, path, resolved string) error {
 }
 
 // SetSystemTempRootsForTest overrides the shared temporary directories the
-// model-store check refuses. It is a no-op outside a test binary, so no
-// importer can change the production check at runtime; tests whose
-// t.TempDir() is under /tmp clear the list, and the refusal test restores the
-// production default.
-func SetSystemTempRootsForTest(roots []string) {
+// model-store check refuses and returns the previous list so a test can
+// restore it. It is a no-op outside a test binary, so no importer can change
+// the production check at runtime; tests whose t.TempDir() is under /tmp
+// clear the list, and the refusal test restores the production default.
+func SetSystemTempRootsForTest(roots []string) []string {
 	if !testing.Testing() {
-		return
+		return nil
 	}
+	prev := systemTempRoots
 	systemTempRoots = roots
+	return prev
 }
 
 // checkStoreAncestors refuses the store when any ancestor of the resolved,

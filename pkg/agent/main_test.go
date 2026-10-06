@@ -19,6 +19,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -40,19 +41,29 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// productionSystemTempRoots captures the production default before TestMain
+// clears the package variable, so a test can assert what ships.
+var productionSystemTempRoots = append([]string(nil), systemTempRoots...)
+
 // withSystemTempRoots restores the production systemTempRoots for one test.
 func withSystemTempRoots(t *testing.T) {
 	t.Helper()
 	prev := systemTempRoots
-	systemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
+	systemTempRoots = productionSystemTempRoots
 	t.Cleanup(func() { systemTempRoots = prev })
 }
 
 // The production default refuses every shared temporary directory, not just
 // /tmp: checkStoreNotInTmp is judged on both spellings of each root.
 func TestCheckStoreNotInTmp_RefusesAllProductionRoots(t *testing.T) {
+	want := []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
+	for _, root := range want {
+		if !slices.Contains(productionSystemTempRoots, root) {
+			t.Errorf("production systemTempRoots = %v, missing %s", productionSystemTempRoots, root)
+		}
+	}
 	withSystemTempRoots(t)
-	for _, root := range []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"} {
+	for _, root := range want {
 		where := filepath.Join(root, "llmkube-models")
 		if err := checkStoreNotInTmp(where, where, where); err == nil {
 			t.Errorf("checkStoreNotInTmp(%s) = nil, want a refusal", where)
