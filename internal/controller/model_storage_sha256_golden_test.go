@@ -111,7 +111,7 @@ func TestModelInitCommand_SHA256GuardRunsFirst(t *testing.T) {
 		"uncached http":   buildModelInitCommand(false, false, false, false, true, RefreshPolicyIfNotPresent),
 	}
 	for name, cmd := range cases {
-		guard := `llmkube_precheck_sha256 "$MODEL_PATH" || exit 1`
+		guard := `llmkube_precheck_sha256 || exit 1`
 		gi := strings.Index(cmd, guard)
 		if gi < 0 {
 			t.Errorf("%s: the precheck guard is missing", name)

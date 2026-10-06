@@ -29,10 +29,11 @@ import (
 )
 
 // These specs exercise the Model CRD's server-side CEL rule that keeps
-// spec.sha256 to single-file Models (#1965): the digest attests to one
-// artifact, and the init-container gates are built only for the single-file
-// branch, so a multi-file Model with a digest must be rejected at admission
-// rather than have its digest silently ignored by the download.
+// spec.sha256 to single-file downloaded Models (#1965): the digest attests to
+// one artifact, and the init-container gates are built only for the
+// single-file, controller-downloaded branch, so a multi-file Model, or a
+// pre-staged pvc:// / oci:// Model, with a digest must be rejected at
+// admission rather than have its digest silently ignored.
 var _ = Describe("Model sha256 CRD validation", func() {
 	ctx := context.Background()
 	const digest = "d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b"
@@ -69,6 +70,50 @@ var _ = Describe("Model sha256 CRD validation", func() {
 	It("rejects sha256 together with mmproj", func() {
 		m := newModel("sha256-cel-mmproj", digest, nil, "proj.gguf")
 		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects sha256 on a pre-staged pvc:// source", func() {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "sha256-cel-pvc", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "pvc://models-pvc/model.gguf",
+				SHA256: digest,
+			},
+		}
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("rejects sha256 on a pre-staged oci:// source", func() {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "sha256-cel-oci", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "oci://registry.example.com/models/llama-3.1-8b@sha256:" + digest,
+				SHA256: digest,
+			},
+		}
+		Expect(k8sClient.Create(ctx, m)).ToNot(Succeed())
+	})
+
+	It("admits a pvc:// source without sha256", func() {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "sha256-cel-pvc-ok", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "pvc://models-pvc/model.gguf",
+			},
+		}
+		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
+	})
+
+	It("admits an oci:// source without sha256", func() {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "sha256-cel-oci-ok", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "oci://registry.example.com/models/llama-3.1-8b@sha256:" + digest,
+			},
+		}
+		Expect(k8sClient.Create(ctx, m)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, m)).To(Succeed())
 	})
 
 	It("rejects adding sha256 to an existing multi-file Model", func() {

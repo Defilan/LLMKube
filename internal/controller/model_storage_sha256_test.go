@@ -82,6 +82,13 @@ func mustNotExist(t *testing.T, path string) {
 	}
 }
 
+func mustExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected %s to exist: %v", path, err)
+	}
+}
+
 // stampTriple is what llmkube_stamp_sha256 writes: the digest, the file
 // size and its mtime, space separated. A stamp hit requires all three to
 // still describe the file on disk.
@@ -113,16 +120,19 @@ func partialsOf(t *testing.T, modelPath string) []string {
 func TestModelInitSHA256_Behavioral(t *testing.T) {
 	requireInitShellEnvironment(t)
 	t.Run("download publishes stamp", sha256DownloadPublishesStamp)
-	t.Run("mismatch discards the partial and keeps no state", sha256MismatchDiscardsPartialAndKeepsNoState)
+	t.Run("mismatch discards the partial and records the rejection", sha256MismatchDiscardsPartialAndRecordsRejection)
 	t.Run("correcting spec.sha256 retries cleanly", sha256CorrectingSpecSha256RetriesCleanly)
 	t.Run("warm cache verifies stamps and skips the download", sha256WarmCacheVerifiesStampsAndSkipsTheDownload)
 	t.Run("stamp hit skips re-hashing", sha256StampHitSkipsReHashing)
-	t.Run("corrupt warm cache discards and refetches", sha256CorruptWarmCacheDiscardsAndRefetches)
-	t.Run("a rejected publish does not block a later start", sha256RejectedPublishDoesNotBlockALaterStart)
+	t.Run("corrupt warm cache is replaced and refetched", sha256CorruptWarmCacheIsReplacedAndRefetched)
+	t.Run("a rejection marker bounds later starts", sha256RejectionMarkerBoundsRetries)
+	t.Run("a wrong pin does not delete a co-tenant's cache", sha256WrongPinDoesNotDeleteACoTenantsCache)
+	t.Run("a co-tenant publish does not clear another's rejection", sha256CoTenantPublishDoesNotClearAnotherModelsRejection)
 	t.Run("empty digest fails closed", sha256EmptyDigestFailsClosed)
 	t.Run("OnChange download mismatch rejects before publish", sha256OnchangeDownloadMismatchRejectsBeforePublish)
 	t.Run("OnChange unchanged skip still verifies", sha256OnchangeUnchangedSkipStillVerifies)
-	t.Run("OnChange size-match corrupt discards and refetches", sha256OnchangeSizeMatchCorruptDiscardsAndRefetches)
+	t.Run("OnChange size-match corrupt is replaced and refetched", sha256OnchangeSizeMatchCorruptIsReplacedAndRefetched)
+	t.Run("OnChange moved upstream keeps the pinned copy and skips re-download", sha256OnchangeMovedUpstreamKeepsPinnedCopyAndSkipsRedownload)
 	t.Run("OnChange offline keeps a verified copy", sha256OnchangeOfflineKeepsAVerifiedCopy)
 	t.Run("OnChange offline rejects a corrupt copy", sha256OnchangeOfflineRejectsACorruptCopy)
 }
@@ -153,13 +163,13 @@ func sha256DownloadPublishesStamp(t *testing.T) {
 	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
 		t.Errorf("stamp = %q, want %q", got, stampTriple(t, modelPath, want))
 	}
-	mustNotExist(t, modelPath+".sha256-rejected")
+	mustNotExist(t, modelPath+"."+want+".sha256-rejected")
 	if p := partialsOf(t, modelPath); len(p) != 0 {
 		t.Errorf("partial survived a verified publish: %v", p)
 	}
 }
 
-func sha256MismatchDiscardsPartialAndKeepsNoState(t *testing.T) {
+func sha256MismatchDiscardsPartialAndRecordsRejection(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
@@ -176,7 +186,7 @@ func sha256MismatchDiscardsPartialAndKeepsNoState(t *testing.T) {
 		t.Errorf("output does not report the discard: %s", out)
 	}
 	mustNotExist(t, modelPath)
-	mustNotExist(t, modelPath+".sha256-rejected")
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
 	if p := partialsOf(t, modelPath); len(p) != 0 {
 		t.Errorf("the rejected partial was not discarded: %v", p)
 	}
@@ -199,7 +209,10 @@ func sha256CorrectingSpecSha256RetriesCleanly(t *testing.T) {
 	if got := readOrFail(t, modelPath); got != string(o.content()) {
 		t.Errorf("published bytes are wrong after recovery")
 	}
-	mustNotExist(t, modelPath+".sha256-rejected")
+	// The marker is keyed on the expected digest, so the corrected pin looks
+	// for a different file and the wrong pin's marker is left inert.
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
+	mustNotExist(t, modelPath+"."+want+".sha256-rejected")
 }
 
 func sha256WarmCacheVerifiesStampsAndSkipsTheDownload(t *testing.T) {
@@ -248,7 +261,7 @@ func sha256StampHitSkipsReHashing(t *testing.T) {
 	}
 }
 
-func sha256CorruptWarmCacheDiscardsAndRefetches(t *testing.T) {
+func sha256CorruptWarmCacheIsReplacedAndRefetched(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
@@ -257,16 +270,15 @@ func sha256CorruptWarmCacheDiscardsAndRefetches(t *testing.T) {
 	}
 	want := sha256Hex(o.content())
 
-	// A cache file that fails the re-hash was corrupted outside any download:
-	// the check deletes it with its stamp and the same start re-downloads,
-	// mirroring the corrupt cache-file recovery in pkg/agent/executor.go. No
-	// rejection marker: the marker accuses the origin, not the disk.
+	// A cache file that fails the re-hash was corrupted outside any download.
+	// The check leaves it in place (the cache dir might be shared with a
+	// co-tenant Model), and the same start's download branch replaces it with
+	// the verified bytes, mirroring the corrupt cache-file recovery in
+	// pkg/agent/executor.go. No rejection marker: the marker accuses the
+	// origin, not the disk.
 	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, want)
 	if err != nil {
 		t.Fatalf("corrupt warm cache must self-heal: %v\n%s", err, out)
-	}
-	if !strings.Contains(out, "removed the file and its stamp") {
-		t.Errorf("expected the discard notice: %s", out)
 	}
 	if got := readOrFail(t, modelPath); got != string(o.content()) {
 		t.Errorf("cache was not replaced with the verified bytes")
@@ -274,10 +286,10 @@ func sha256CorruptWarmCacheDiscardsAndRefetches(t *testing.T) {
 	if got := readOrFail(t, modelPath+".sha256"); got != stampTriple(t, modelPath, want) {
 		t.Errorf("stamp after self-heal = %q, want %q", got, stampTriple(t, modelPath, want))
 	}
-	mustNotExist(t, modelPath+".sha256-rejected")
+	mustNotExist(t, modelPath+"."+want+".sha256-rejected")
 }
 
-func sha256RejectedPublishDoesNotBlockALaterStart(t *testing.T) {
+func sha256RejectionMarkerBoundsRetries(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
@@ -286,21 +298,73 @@ func sha256RejectedPublishDoesNotBlockALaterStart(t *testing.T) {
 	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong); err == nil {
 		t.Fatalf("expected the first start to fail on the digest\n%s", out)
 	}
-	mustNotExist(t, modelPath+".sha256-rejected")
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
 
-	// No durable rejection: the next start reaches the origin again rather
-	// than short-circuiting on a marker. Kubernetes bounds the retry cadence
-	// with CrashLoopBackOff, the same way containerd's content store retries
-	// after it drops a mismatched ingest.
+	// The marker bounds the retries: the next start fails on the hoisted
+	// guard before any transfer, so a wrong multi-gigabyte pin cannot
+	// re-download the whole artifact on every kubelet backoff. This mirrors
+	// the metal agent's digestMismatchMemo.
 	o.fullFromZero.Store(0)
 	o.rangeRequests.Store(0)
 	out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong)
 	if err == nil {
 		t.Fatalf("the wrong digest must still fail the start\n%s", out)
 	}
-	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n == 0 {
-		t.Errorf("the second start issued no GETs: a durable rejection blocked the retry\n%s", out)
+	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
+		t.Errorf("the second start issued %d GETs; the rejection marker did not bound the retry\n%s", n, out)
 	}
+}
+
+// sha256WrongPinDoesNotDeleteACoTenantsCache pins #1971 review: the cache
+// directory is keyed on the source alone, so two Models on one source share
+// MODEL_PATH. A mis-pinned Model must fail without destroying the correct
+// co-tenant's verified file and stamp.
+func sha256WrongPinDoesNotDeleteACoTenantsCache(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	correct := sha256Hex(o.content())
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+
+	// Model B pins correctly and publishes the shared cache entry.
+	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, correct); err != nil {
+		t.Fatalf("co-tenant publish failed: %v\n%s", err, out)
+	}
+	bStamp := readOrFail(t, modelPath+".sha256")
+
+	// Model A pins the same source to a different digest and fails.
+	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong); err == nil {
+		t.Fatalf("the wrong pin must fail the start\n%s", out)
+	}
+	if got := readOrFail(t, modelPath); got != string(o.content()) {
+		t.Errorf("Model A deleted or changed Model B's cache file")
+	}
+	if got := readOrFail(t, modelPath+".sha256"); got != bStamp {
+		t.Errorf("Model A deleted or changed Model B's stamp: got %q, want %q", got, bStamp)
+	}
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
+}
+
+// sha256CoTenantPublishDoesNotClearAnotherModelsRejection keeps the marker
+// keyed on the expected digest: a co-tenant's successful publish must not
+// remove a different Model's rejection marker, or the mis-pinned Model would
+// re-download on its next start.
+func sha256CoTenantPublishDoesNotClearAnotherModelsRejection(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	correct := sha256Hex(o.content())
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+
+	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, wrong); err == nil {
+		t.Fatalf("the wrong pin must fail the start\n%s", out)
+	}
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
+
+	if out, err := runVerifyScript(t, sha256ResumeScript(), o.srv.URL+"/model.gguf", modelPath, correct); err != nil {
+		t.Fatalf("the correct co-tenant must still publish: %v\n%s", err, out)
+	}
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
 }
 
 func sha256EmptyDigestFailsClosed(t *testing.T) {
@@ -333,7 +397,7 @@ func sha256OnchangeDownloadMismatchRejectsBeforePublish(t *testing.T) {
 		t.Fatalf("OnChange download must not publish unverified bytes\n%s", out)
 	}
 	mustNotExist(t, modelPath)
-	mustNotExist(t, modelPath+".sha256-rejected")
+	mustExist(t, modelPath+"."+wrong+".sha256-rejected")
 	if p := partialsOf(t, modelPath); len(p) != 0 {
 		t.Errorf("the rejected partial was not discarded: %v", p)
 	}
@@ -371,14 +435,14 @@ func sha256OnchangeUnchangedSkipStillVerifies(t *testing.T) {
 	}
 }
 
-func sha256OnchangeSizeMatchCorruptDiscardsAndRefetches(t *testing.T) {
+func sha256OnchangeSizeMatchCorruptIsReplacedAndRefetched(t *testing.T) {
 	o := newRangeOrigin(t, true)
 	dir := t.TempDir()
 	modelPath := filepath.Join(dir, "model.gguf")
 	// Same size as the origin (so the size-match branch fires), wrong
 	// bytes, no stamp: size equality must not substitute for the hash. The
-	// stamp check gates the skip, fails, discards, and the same run
-	// re-downloads the verified bytes.
+	// stamp check gates the skip, fails, and the same run's download branch
+	// replaces the corrupt bytes with the verified ones.
 	if err := os.WriteFile(modelPath, []byte(strings.Repeat("x", contentALen)), 0o644); err != nil {
 		t.Fatalf("seed corrupt same-size file: %v", err)
 	}
@@ -388,13 +452,50 @@ func sha256OnchangeSizeMatchCorruptDiscardsAndRefetches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("size-match with corrupt bytes must self-heal, not fail the start: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "removed the file and its stamp") {
-		t.Errorf("expected the discard notice before the refetch: %s", out)
-	}
 	if got := readOrFail(t, modelPath); got != string(o.content()) {
 		t.Errorf("cache was not replaced with the verified bytes")
 	}
-	mustNotExist(t, modelPath+".sha256-rejected")
+	mustNotExist(t, modelPath+"."+want+".sha256-rejected")
+}
+
+// sha256OnchangeMovedUpstreamKeepsPinnedCopyAndSkipsRedownload drives the
+// moved-upstream case: the pinned artifact is still the right thing to serve,
+// so the run keeps it and exits 0, names the digest mismatch rather than
+// blaming reachability, and the marker makes the next start skip the HEAD and
+// the full re-download.
+func sha256OnchangeMovedUpstreamKeepsPinnedCopyAndSkipsRedownload(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	pin := sha256Hex(o.content())
+	if err := os.WriteFile(modelPath, o.content(), 0o644); err != nil {
+		t.Fatalf("seed pinned cache: %v", err)
+	}
+	writeStamp(t, modelPath, pin)
+	// The upstream moves to different bytes of a different size.
+	o.version.Store("B")
+
+	out, err := runVerifyScript(t, sha256RevalidateScript(), o.srv.URL+"/model.gguf", modelPath, pin)
+	if err != nil {
+		t.Fatalf("moved upstream with a valid pinned copy must exit 0: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "kept the pinned cached copy") {
+		t.Errorf("expected the pinned-copy message, got: %s", out)
+	}
+	if got := readOrFail(t, modelPath); got != strings.Repeat("A", contentALen) {
+		t.Errorf("the pinned copy was not kept")
+	}
+	mustExist(t, modelPath+"."+pin+".sha256-rejected")
+
+	o.fullFromZero.Store(0)
+	o.rangeRequests.Store(0)
+	out, err = runVerifyScript(t, sha256RevalidateScript(), o.srv.URL+"/model.gguf", modelPath, pin)
+	if err != nil {
+		t.Fatalf("the second start must keep serving the pinned copy: %v\n%s", err, out)
+	}
+	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
+		t.Errorf("the marker did not skip the re-download: %d GETs on the second start\n%s", n, out)
+	}
 }
 
 func sha256OnchangeOfflineKeepsAVerifiedCopy(t *testing.T) {
@@ -440,9 +541,10 @@ func sha256OnchangeOfflineRejectsACorruptCopy(t *testing.T) {
 	if err == nil {
 		t.Fatalf("offline fallback must not exit 0 on bytes that fail the check\n%s", out)
 	}
-	// The failing bytes are discarded rather than left behind to be
-	// size-matched by a later start with a reachable origin.
-	mustNotExist(t, modelPath)
+	// The failing bytes are left in place (the cache dir might be shared with
+	// a co-tenant Model); what matters is that the offline fallback refused
+	// to exit 0 on them. A later start with a reachable origin replaces them.
+	mustExist(t, modelPath)
 }
 
 func TestModelInitEnvVars_ModelSHA256(t *testing.T) {
