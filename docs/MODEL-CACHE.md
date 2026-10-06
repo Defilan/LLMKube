@@ -150,6 +150,7 @@ spec:
 
 - Only listed files are verified; a file with no entry is staged as before, so
   a partially pinned set is allowed.
+- `spec.files` is capped at 256 entries of 512 characters each.
 - Each pinned file is hashed before it is renamed onto the cache. A mismatch
   discards that file's partial and records its own
   `<file>.<sha256>.sha256-rejected` marker, and the loop stops.

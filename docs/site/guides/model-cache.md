@@ -359,6 +359,7 @@ spec:
 
 - Only listed files are verified; a file with no entry stages as before, so a
   partially pinned set is allowed.
+- `spec.files` is capped at 256 entries of 512 characters each.
 - A mismatch discards that file's partial, records its own
   `<file>.<sha256>.sha256-rejected` marker, and stops the loop.
 - Every key must name a `spec.files` entry or `spec.mmproj`. Globs in
