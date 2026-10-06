@@ -95,6 +95,9 @@ func (r *InferenceServiceReconciler) determinePhase(ctx context.Context, isvc *i
 	log := logf.FromContext(ctx)
 
 	if readyReplicas == desiredReplicas && readyReplicas > 0 {
+		if isMetal {
+			clearControllerMetalScheduling(isvc)
+		}
 		return PhaseReady, nil
 	}
 	if readyReplicas > 0 {
@@ -151,6 +154,20 @@ func (r *InferenceServiceReconciler) determinePhase(ctx context.Context, isvc *i
 		}
 	}
 	return PhaseCreating, nil
+}
+
+// clearControllerMetalScheduling drops the metal scheduling diagnosis this
+// controller writes (WaitingForMetalAgent, AgentHeartbeatStale) once the agent
+// has registered and the service is Ready. Reasons the agent writes (memory
+// admission, start refusals) are cleared by the agent itself (#777) and are
+// deliberately preserved.
+func clearControllerMetalScheduling(isvc *inferencev1alpha1.InferenceService) {
+	switch isvc.Status.SchedulingStatus {
+	case "WaitingForMetalAgent", "AgentHeartbeatStale":
+		isvc.Status.SchedulingStatus = ""
+		isvc.Status.SchedulingMessage = ""
+		isvc.Status.WaitingFor = ""
+	}
 }
 
 func (r *InferenceServiceReconciler) getPodSchedulingInfo(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (*SchedulingInfo, error) {
