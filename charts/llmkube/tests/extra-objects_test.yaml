@@ -111,6 +111,47 @@ tests:
       - hasDocuments:
           count: 0
 
+  # A tpl'd-off item in the middle of the list contributes no document and
+  # leaves its neighbours in place.
+  - it: omits a middle string entry and keeps its neighbours
+    set:
+      extraObjects:
+        - apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: first
+        - |
+          {{- if .Values.networkPolicies.enabled }}
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: {{ .Release.Name }}-extra
+          spec:
+            podSelector: {}
+            policyTypes: [Ingress]
+          {{- end }}
+        - apiVersion: v1
+          kind: Secret
+          metadata:
+            name: third
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ConfigMap
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: first
+        documentIndex: 0
+      - isKind:
+          of: Secret
+        documentIndex: 1
+      - equal:
+          path: metadata.name
+          value: third
+        documentIndex: 1
+
   - it: a string entry can use template control flow to emit itself
     set:
       networkPolicies.enabled: true
