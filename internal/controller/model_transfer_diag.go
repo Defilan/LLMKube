@@ -93,6 +93,16 @@ type modelTransferSignature struct {
 // wrong label is worse than the bare exit code the user already has.
 var modelTransferSignatures = []modelTransferSignature{
 	{
+		// The downloader's own spec.sha256 gate (#1965). Its message names
+		// the expected and computed digests, and the marker it left behind,
+		// so the operator can see the mismatch instead of only a pod wedged
+		// in Init.
+		reason: inferencev1alpha1.ReasonModelDigestMismatch,
+		remedy: "spec.sha256 does not match the bytes at spec.source; correct the digest " +
+			"(or the source), then delete the cached <file>.<sha256>.sha256-rejected marker to retry",
+		matches: []string{"sha256 mismatch", "rejected against spec.sha256"},
+	},
+	{
 		reason: ReasonModelSourceUntrusted,
 		remedy: "the endpoint's CA is not trusted by the downloader; " +
 			"publish it via the operator's --ca-cert-configmap (the ConfigMap must exist " +

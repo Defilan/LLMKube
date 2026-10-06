@@ -377,10 +377,10 @@ const downloadProgressFn = `download_with_progress() { _llmkube_dest="$1"; _llmk
 // on success; the S3 and local-copy branches still fill "$MODEL_PATH.tmp".
 // Two invariants the shape of the command exists to hold:
 //
-//   - Atomic publish. The cache guard is a bare existence check, so publishing
-//     non-atomically would let an interrupted transfer (OOM-kill, eviction,
-//     node reboot) leave a truncated artifact every later restart treats as
-//     cached. Every branch therefore writes a partial and `mv`s it onto the
+//   - Atomic publish. The cache guard accepts a cached file by existence (a
+//     digest-pinned Model adds a stamp check), so publishing non-atomically
+//     would let an interrupted transfer (OOM-kill, eviction, node reboot)
+//     leave a truncated artifact every later restart treats as cached. Every branch therefore writes a partial and `mv`s it onto the
 //     destination, never `-o` the live path (#1309, #1432). See
 //     remoteRevalidateScript for the same pattern.
 //   - Resume without splicing. The non-S3 HTTP transfers fetch a validator from
@@ -394,8 +394,8 @@ const downloadProgressFn = `download_with_progress() { _llmkube_dest="$1"; _llmk
 //     it makes cross-version splicing impossible (a `curl -C -` / `Range` resume
 //     sends no If-Range, so an abandoned partial from different bytes would
 //     otherwise splice onto the new content). The IfNotPresent probe runs only
-//     inside the `[ ! -f "$MODEL_PATH" ]` branch, so a warm cache starts the pod
-//     with no network request (#1765); the OnChange path probes unconditionally
+//     in the download branch, so a warm cache starts the pod with no network
+//     request (#1765); the OnChange path probes unconditionally
 //     by design, because the probe is what decides whether the cache is current.
 //
 // The s3:// and local `cp` branches still open with the plain
@@ -405,32 +405,69 @@ const downloadProgressFn = `download_with_progress() { _llmkube_dest="$1"; _llmk
 // Every curl transfer is wrapped in download_with_progress, and the transfer's
 // --no-progress-meter is placed at the END of its arguments so the existing
 // `-C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE"` shape stays contiguous.
-func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy string) string {
+func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, refreshPolicy string) string {
+	// fns defines the verify helpers; pre refuses to run a gated downloader
+	// whose MODEL_SHA256 did not reach it, then stops a pin already known to
+	// be rejected before any sweep, probe or transfer; publish names the
+	// publish step (the plain rename, or hash-then-rename when spec.sha256 is
+	// set); frames wraps the cache probe, accepting an existing file outright
+	// when unhashed and only on a passing stamp check when hashed. Every
+	// fragment is empty-or-absent when withSHA256 is false, so the emitted
+	// commands for unhashed Models stay byte-for-byte what they were (#1965):
+	// the field on one Model must not churn the pod templates of every other
+	// workload.
+	fns := ""
+	pre := ""
+	if withSHA256 {
+		fns = sha256VerifyFns
+		// `|| exit 1`, not `&&`: the resume prologue separates its statements
+		// with `;`, so an &&-chained guard would skip only the first
+		// assignment and then sweep, probe and transfer anyway.
+		//
+		// The marker guard runs next: a rejection on file for this digest
+		// means the upstream bytes did not match spec.sha256 on an earlier
+		// start. With a cached copy that still verifies, keep and serve it
+		// (RefreshPolicy=OnChange must tolerate an upstream that moved past
+		// the pin); otherwise fail fast, so a wrong pin cannot re-download
+		// the whole artifact on every kubelet backoff.
+		pre = `llmkube_precheck_sha256 || exit 1; if llmkube_marker_hit_sha256 "$MODEL_PATH"; then if [ -f "$MODEL_PATH" ] && llmkube_check_sha256 "$MODEL_PATH"; then echo 'spec.sha256 no longer matches the upstream bytes; kept the pinned cached copy'; exit 0; fi; echo "ERROR: spec.sha256 mismatch: the bytes for $MODEL_PATH were rejected against $MODEL_SHA256; fix the Model or delete $MODEL_PATH.$MODEL_SHA256.sha256-rejected to retry" >&2; exit 1; fi; `
+	}
+	publish := func(partial string) string {
+		if withSHA256 {
+			return `llmkube_publish_sha256 "` + partial + `" "$MODEL_PATH"`
+		}
+		return `mv "` + partial + `" "$MODEL_PATH"`
+	}
+	frames := func(download, cachedMsg string) string {
+		if withSHA256 {
+			return `if [ -f "$MODEL_PATH" ] && llmkube_check_sha256 "$MODEL_PATH"; then echo '` + cachedMsg + `'; else ` + download + `; fi`
+		}
+		return `if [ ! -f "$MODEL_PATH" ]; then ` + download + `; else echo '` + cachedMsg + `'; fi`
+	}
+
 	if useCache {
 		if isLocal {
-			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model copied successfully'; else echo 'Model already cached, skipping copy'; fi`
+			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && `+publish("$MODEL_PATH.tmp")+` && echo 'Model copied successfully'`, "Model already cached, skipping copy")
 		}
 		if isS3 {
-			return `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; ` + downloadProgressFn + `download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+`download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
-			return "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
+			return fns + pre + "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
 		}
-		return `mkdir -p "$CACHE_DIR" && ` + downloadProgressFn + hfAuthPrefix(isHFAuth) +
-			`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + `download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already cached, skipping download'; fi`
+		return fns + pre + `mkdir -p "$CACHE_DIR" && ` + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 	}
 
 	if isLocal {
 		return `echo 'ERROR: Local model source requires model cache to be configured.'; exit 1`
 	}
 	if isS3 {
-		return `if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model from S3...'; ` + downloadProgressFn + `download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+		return fns + pre + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+`download_with_progress "$MODEL_PATH.tmp" "" curl --aws-sigv4 "aws:amz:${AWS_REGION}:s3" -u "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
 	}
 	if refreshPolicy == RefreshPolicyOnChange {
-		return hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth)
+		return fns + pre + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
 	}
-	return downloadProgressFn + hfAuthPrefix(isHFAuth) +
-		`if [ ! -f "$MODEL_PATH" ]; then echo 'Downloading model...'; ` + resumePrologue(isHFAuth) + `download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && mv "$MODEL_PARTIAL" "$MODEL_PATH" && echo 'Model downloaded successfully'; else echo 'Model already exists, skipping download'; fi`
+	return fns + pre + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -463,8 +500,9 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 //     resume, so the partial is dropped (see validatorDeriveAndSweep). If the HEAD
 //     is rejected the probe yields its fallback and the script downloads into a
 //     fresh partial.
-//  2. If the local file exists and its size matches Content-Length, the cache
-//     is current: log "revalidated" and skip the transfer.
+//  2. If the local file exists and its size matches Content-Length (and, for
+//     a digest-pinned Model, the stamp check accepts it), the cache is
+//     current: log "revalidated" and skip the transfer.
 //  3. Otherwise key a partial on the validator (validatorDeriveAndSweep), sweep
 //     every other *.tmp in the destination dir, `curl -C -` into the partial so
 //     an interrupted transfer resumes, and `mv` it onto "$dest" on success. The
@@ -478,20 +516,38 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth bool, refreshPolicy
 // already exists, the script logs and exits 0, keeping the cached file. Only a
 // genuinely-missing file (nothing cached and the fetch failed) fails the init
 // container.
-func remoteRevalidateScript(isHFAuth bool) string {
+func remoteRevalidateScript(isHFAuth, withSHA256 bool) string {
 	c := curlCmd(isHFAuth)
+	// The two hash gates on this path: the size-match skip is only a cache
+	// hit once the stamp check agrees, and the offline "kept cached copy"
+	// fallback must not serve bytes that fail the check either (hashing is
+	// local, so an air-gapped restart still verifies). A rejected publish
+	// leaves a digest-keyed marker; when one is on file the kept copy is the
+	// pinned artifact the upstream moved past, so name that cause instead of
+	// blaming reachability. The caller hoists the fail-closed guard to the
+	// head of the command and prepends sha256VerifyFns when withSHA256 is
+	// set.
+	sizeHit := ""
+	unchanged := `echo 'Model revalidated (unchanged, skipped download)'; `
+	publish := `mv "$MODEL_PARTIAL" "$MODEL_PATH"`
+	keepCached := `echo 'Revalidation unreachable; kept cached copy'; exit 0; `
+	if withSHA256 {
+		sizeHit = ` && llmkube_check_sha256 "$MODEL_PATH"`
+		publish = `llmkube_publish_sha256 "$MODEL_PARTIAL" "$MODEL_PATH"`
+		keepCached = `if llmkube_marker_hit_sha256 "$MODEL_PATH"; then echo 'spec.sha256 no longer matches the upstream bytes; kept the pinned cached copy'; exit 0; fi; if llmkube_check_sha256 "$MODEL_PATH"; then echo 'Revalidation unreachable; kept cached copy'; exit 0; else exit 1; fi; `
+	}
 	return downloadProgressFn +
 		`echo 'Revalidating model against upstream (RefreshPolicy=OnChange)...'; ` +
 		`remote_head=$(` + c + ` -fsSL -I "$MODEL_SOURCE" -o /dev/null -w ` + headProbeFormat + ` 2>/dev/null || echo 'CL0ET'); ` +
 		splitHeadProbe +
 		`remote_size=${remote_validator#CL}; remote_size=${remote_size%%ET*}; ` +
-		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]; then ` +
-		`echo 'Model revalidated (unchanged, skipped download)'; ` +
+		`if [ -f "$MODEL_PATH" ] && [ "$(stat -c %s "$MODEL_PATH" 2>/dev/null || echo 0)" = "$remote_size" ] && [ "$remote_size" != "0" ]` + sizeHit + `; then ` +
+		unchanged +
 		`else ` +
 		validatorDeriveAndSweep() +
-		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && mv "$MODEL_PARTIAL" "$MODEL_PATH"; then ` +
+		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && ` + publish + `; then ` +
 		`echo 'Model revalidated (downloaded)'; ` +
-		`elif [ -f "$MODEL_PATH" ]; then echo 'Revalidation unreachable; kept cached copy'; exit 0; ` +
+		`elif [ -f "$MODEL_PATH" ]; then ` + keepCached +
 		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
 		`fi`
 }
@@ -512,6 +568,46 @@ func hfAuthPrefix(isHFAuth bool) string {
 	}
 	return ""
 }
+
+// sha256VerifyFns defines the shell helpers a spec.sha256-pinned download
+// runs through (#1965). Like hfAuthFn this must be prepended to any script
+// that calls them, and a fail-closed precheck hoisted to the head of the
+// command so a gated downloader whose MODEL_SHA256 did not reach it refuses
+// to transfer unchecked.
+//
+// The invariants:
+//   - Publish only after verifying: llmkube_publish_sha256 hashes the
+//     assembled bytes and renames them onto the cache only on a match, so
+//     unverified bytes never become the cache; a mismatch discards the
+//     assembled partial and records a rejection marker.
+//   - A cached file is never deleted on a re-hash mismatch. The cache
+//     directory is keyed on the source alone, so two Models on one source
+//     share it: deleting the file would let a mis-pinned Model destroy a
+//     correct co-tenant's warm cache on every retry. The caller's download
+//     branch replaces the bytes with a verified copy instead.
+//   - A publish mismatch writes <file>.<sha256>.sha256-rejected. Keying the
+//     marker on the expected digest keeps a co-tenant's successful publish
+//     from clearing another Model's rejection, and leaves a superseded pin's
+//     marker inert. The hoisted guard in buildModelInitCommand reads it: a
+//     still-valid cached copy is kept and served, otherwise the start fails
+//     before any transfer, so a wrong pin cannot re-download the whole
+//     artifact on every kubelet backoff. This mirrors the metal agent's
+//     digestMismatchMemo, minus its in-process lifetime.
+//   - The stamp (<file>.sha256) attests to the exact bytes that were hashed:
+//     it holds the verified hash, the file size and its mtime, and a hit
+//     skips re-hashing only when all three still agree. A missing or stale
+//     stamp re-hashes once and rewrites it. Stamps and markers are written
+//     through a temp file and renamed so a concurrent reader never sees a
+//     truncated one; mktemp leaves nothing matching the *.tmp sweep. The
+//     stamp is a stricter sibling of the pkg/agent/executor.go
+//     verifyCachedDigest stamp, which holds the hash alone under the same
+//     <file>.sha256 name; the two are not interchangeable.
+//
+// Stamps and markers are deliberately not *.tmp: the resume sweeps in
+// validatorDeriveAndSweep and debrisSweep must never remove them. Hash
+// comparisons are plain string equality; MODEL_SHA256 is injected lowercased
+// so it compares equal to sha256sum output.
+const sha256VerifyFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/null | cut -d" " -f1); if [ -z "$actual" ]; then echo "ERROR: could not compute the SHA256 of $1" >&2; return 1; fi; printf '%s' "$actual"; }; llmkube_precheck_sha256() { if [ -z "${MODEL_SHA256:-}" ]; then echo "ERROR: this downloader was built with SHA256 gates but MODEL_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; llmkube_stamp_sha256() { llmkube_atomic_write "$1.sha256" "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)"; }; llmkube_marker_hit_sha256() { [ -f "$1.$MODEL_SHA256.sha256-rejected" ]; }; llmkube_check_sha256() { if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against spec.sha256 (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; leaving it in place (the cache dir may be shared); a fresh download replaces it" >&2; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1"; llmkube_atomic_write "$2.$MODEL_SHA256.sha256-rejected" "$MODEL_SHA256"; echo "ERROR: SHA256 mismatch: expected $MODEL_SHA256, computed $actual; discarded $1; recorded $2.$MODEL_SHA256.sha256-rejected" >&2; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2" && rm -f "$2.$MODEL_SHA256.sha256-rejected"; }` + " && "
 
 // validatorDeriveAndSweep is the shell fragment that turns $remote_validator (an
 // upstream validator string: an ETag, or Content-Length when the origin sends no
@@ -602,11 +698,19 @@ func resumePrologue(isHFAuth bool) string {
 		validatorDeriveAndSweep()
 }
 
-func modelInitEnvVars(source, cacheDir, modelPath string) []corev1.EnvVar {
+// modelInitEnvVars builds the downloader env. sha256 (Model.spec.sha256) is
+// injected as MODEL_SHA256 lowercased, so the shell's string comparison
+// against sha256sum output is exact. The verify fragments are emitted exactly
+// when this env var is, and every gate fails closed if the value is absent
+// (#1965).
+func modelInitEnvVars(source, cacheDir, modelPath, sha256 string) []corev1.EnvVar {
 	envs := []corev1.EnvVar{
 		{Name: "MODEL_SOURCE", Value: source},
 		{Name: "CACHE_DIR", Value: cacheDir},
 		{Name: "MODEL_PATH", Value: modelPath},
+	}
+	if sha256 != "" {
+		envs = append(envs, corev1.EnvVar{Name: "MODEL_SHA256", Value: strings.ToLower(sha256)})
 	}
 	if isS3Source(source) {
 		bucket, key, err := parseS3Source(source)
@@ -1255,8 +1359,8 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		})
 	}
 
-	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), true, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
-	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath)
+	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), true, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.SHA256 != "", model.Spec.RefreshPolicy)
+	env := modelInitEnvVars(model.Spec.Source, cacheDir, modelPath, model.Spec.SHA256)
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
 	initContainers := []corev1.Container{
@@ -1343,8 +1447,8 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		},
 	}
 
-	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), false, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.RefreshPolicy)
-	env := modelInitEnvVars(model.Spec.Source, "", modelPath)
+	cmd := buildModelInitCommand(isLocalModelSource(model.Spec.Source), isS3Source(model.Spec.Source), false, isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), model.Spec.SHA256 != "", model.Spec.RefreshPolicy)
+	env := modelInitEnvVars(model.Spec.Source, "", modelPath, model.Spec.SHA256)
 	addCACertVolume(&volumes, &initVolumeMounts, &cmd, caCertConfigMap)
 
 	return modelStorageConfig{

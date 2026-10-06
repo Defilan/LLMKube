@@ -302,6 +302,41 @@ spec:
 `stageModel` and `skipModelInit` cannot both be true. Runtimes that stage by
 default ignore `stageModel`.
 
+## Integrity verification (`spec.sha256`)
+
+When a `Model` sets `spec.sha256`, the download init container verifies the
+artifact against that digest before anything becomes the cache. A mismatch
+fails the init container, so the pod never starts with bad weights.
+
+- The transfer lands in a partial file and is renamed onto the final path only
+  after the hash matches. On a mismatch the partial is discarded and the start
+  fails, so bad bytes never become the cache.
+- A rejected publish leaves a `<model>.<sha256>.sha256-rejected` marker, and
+  the next start fails before any transfer, so a wrong pin does not
+  re-download a multi-gigabyte artifact on every kubelet backoff. The marker
+  is keyed on the expected digest, so correcting `spec.sha256` makes it inert
+  and a co-tenant Model sharing the cache cannot clear it. Delete it to force
+  a retry. This mirrors the metal-agent's `digestMismatchMemo`.
+- With `RefreshPolicy: OnChange`, an upstream that moved past the pin keeps
+  the pinned cached copy and exits 0; the marker then skips the re-fetch on
+  later starts. The log names the digest mismatch, not reachability.
+- A verified artifact gets a `<model>.sha256` stamp holding the digest plus
+  the file size and modification time, so a stamp can only vouch for the exact
+  bytes that were hashed. Later starts skip re-hashing while all three agree;
+  a missing, stale or differently-sized file is hashed once and re-stamped.
+  The stamp is written to a temp file and renamed, so a concurrent reader
+  never sees a truncated one.
+- A cached file that fails the re-hash is left in place (the cache directory
+  may be shared) and replaced by a fresh verified download in the same start.
+- The gates fail closed: if the digest does not reach the container, the
+  download aborts instead of transferring unchecked.
+- `spec.sha256` covers single-file downloaded Models; combining it with
+  multi-file staging (`spec.files` / `spec.mmproj`), or setting it on a
+  pre-staged `pvc://` or `oci://` source, is rejected at admission. Models
+  that set such a combination before this release had the digest silently
+  ignored; remove the ignored `spec.sha256` (or the multi-file / pre-staged
+  source) to keep the Model admissible.
+
 ## Troubleshooting
 
 ### Pending PVC with `hostpath-provisioner-<node>-*` showing `untolerated taint`

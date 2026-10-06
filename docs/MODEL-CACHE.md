@@ -86,6 +86,49 @@ Cache Key: a3b8c9d4e5f67890
 Path: /models/a3b8c9d4e5f67890/model.gguf
 ```
 
+## Integrity Verification (spec.sha256)
+
+Setting `spec.sha256` on a `Model` makes the download init container verify the
+artifact's bytes against the expected digest before anything becomes the cache.
+A mismatch fails the init container, so the pod never starts the inference
+container with bad weights.
+
+- The transfer lands in a partial file and is renamed onto the final path only
+  after the hash matches. On a mismatch the partial is discarded and the start
+  fails, so bad bytes never become the cache.
+- A rejected publish leaves a `<model>.<sha256>.sha256-rejected` marker. The
+  next start fails before any transfer, so a wrong pin cannot re-download a
+  multi-gigabyte artifact on every kubelet backoff. The marker is keyed on the
+  expected digest: correcting `spec.sha256` makes it inert, and another Model
+  sharing the cache directory cannot clear it. Delete it to force a retry.
+  This mirrors the metal-agent's `digestMismatchMemo`, without its in-process
+  lifetime.
+- On `RefreshPolicy: OnChange`, an upstream that has moved past the pin keeps
+  the pinned cached copy and exits 0; the marker then makes later starts skip
+  the re-fetch, so a moved upstream does not re-download on every rollout. The
+  log names the digest mismatch rather than blaming reachability.
+- A verified artifact gets a `<model>.sha256` stamp recording the digest, the
+  file size and its modification time, so a stamp can only vouch for the
+  exact bytes that were hashed. A later start skips re-hashing gigabytes only
+  while all three still agree; a missing, stale or differently-sized file is
+  hashed once and re-stamped. The stamp is written to a temp file and renamed,
+  so a concurrent reader never sees a truncated one.
+- A cached file that fails the re-hash was corrupted outside any download. It
+  is left in place (the cache directory is keyed on the source alone and may
+  be shared with another Model) and the same start replaces it with a fresh
+  verified download.
+- The gates fail closed: a download built for a digest-pinned Model aborts if
+  the digest does not reach the container instead of transferring unchecked.
+- Verification also runs on prefetch Jobs, which reuse the same init
+  container.
+- Digest pinning covers single-file downloaded Models. Combining `spec.sha256`
+  with multi-file staging (`spec.files` / `spec.mmproj`), or setting it on a
+  pre-staged `pvc://` or `oci://` source, is rejected at admission. This is a
+  behavior change for a Model that set such a combination before this
+  release: the digest was accepted and silently ignored then. Remove the
+  ignored `spec.sha256` (or the multi-file / pre-staged source) to keep the
+  Model admissible.
+
 ## Prefetch (Eager Download)
 
 By default a `Model` with a remote source is only a declaration: nothing is

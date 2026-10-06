@@ -1,0 +1,1 @@
+mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && if [ ! -f "$MODEL_PATH" ]; then echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && mv "$MODEL_PATH.tmp" "$MODEL_PATH" && echo 'Model copied successfully'; else echo 'Model already cached, skipping copy'; fi

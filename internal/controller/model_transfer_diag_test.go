@@ -21,6 +21,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
 // Model-transfer diagnosis. The sibling of the CUDA driver diagnosis, for the
@@ -38,6 +40,14 @@ func TestMatchModelTransferFailure_Signatures(t *testing.T) {
 		msg        string
 		wantReason string
 	}{
+		{
+			name: "spec.sha256 does not match the downloaded bytes",
+			msg: "ERROR: SHA256 mismatch: expected d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b, " +
+				"computed 0000000000000000000000000000000000000000000000000000000000000000; " +
+				"discarded /models/k/model.gguf.a1b2c3d4e5f6.tmp; " +
+				"recorded /models/k/model.gguf.d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b.sha256-rejected",
+			wantReason: inferencev1alpha1.ReasonModelDigestMismatch,
+		},
 		{
 			name:       "curl 403 from a signed request with bad credentials",
 			msg:        "curl: (22) The requested URL returned error: 403",
