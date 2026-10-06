@@ -94,6 +94,7 @@ The following table lists the configurable parameters of the LLMKube chart and t
 | `namespace` | Namespace to deploy the controller | `llmkube-system` |
 | `nameOverride` | Override the chart name | `""` |
 | `fullnameOverride` | Override the full chart name | `""` |
+| `extraObjects` | Extra Kubernetes manifests to deploy with the chart. Each item is a map or a string rendered through `tpl`, so it can use chart values. Operator-controlled: anyone who can set chart values can already deploy the cluster-wide controller. | `[]` |
 
 Resource names are capped at 63 characters (the Kubernetes RFC 1035 label limit
 for a Service name). A long release name or `fullnameOverride` is truncated to

@@ -479,6 +479,21 @@ podAnnotations: {}
 # Pod labels
 podLabels: {}
 
+# Extra Kubernetes manifests to deploy with the chart. Each item is a map or a
+# string, and is rendered through `tpl`, so it can use chart values. A string
+# item is what a manifest needs to use template control flow.
+extraObjects: []
+#  - apiVersion: storage.k8s.io/v1
+#    kind: StorageClass
+#    metadata:
+#      name: llmkube-model-cache
+#    provisioner: file.csi.azure.com
+#    parameters:
+#      skuName: Premium_LRS
+#    mountOptions: [mfsymlinks, actimeo=30, nosharesock, cache=loose]
+#    reclaimPolicy: Delete
+#    volumeBindingMode: Immediate
+
 # Validating admission webhook for ModelRouter (#661). Promotes the gateway
 # honest-boundary checks (unsupported match, unsupported budget, invalid auth,
 # invalid authorization, unsupported auditLog, unsafe sensitive route) from a
