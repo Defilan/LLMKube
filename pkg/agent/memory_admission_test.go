@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -310,4 +311,175 @@ func TestCheckMemoryAdmission_ClearsStaleSchedulingStatus(t *testing.T) {
 // address, for remoteModelSize tests about response handling.
 func testProbeClient() *http.Client {
 	return safehttp.NewClient(safehttp.ParseAllowlist([]string{"127.0.0.1"}), 0, downloadHostsFlag)
+}
+
+// newS3AdmissionAgent builds a MetalAgent whose fake client holds the s3
+// credential Secret (and isvc, with the status subresource, when non-nil).
+// allowHosts is the download allowlist; nil refuses the loopback endpoint.
+func newS3AdmissionAgent(
+	t *testing.T, isvc *inferencev1alpha1.InferenceService, endpoint string, allowHosts []string,
+) *MetalAgent {
+	t.Helper()
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "minio-models", Namespace: "default"},
+		Data: map[string][]byte{
+			"AWS_ACCESS_KEY_ID":     []byte("AKIAEXAMPLE0000000"),
+			"AWS_SECRET_ACCESS_KEY": []byte("secretaccesskeyvalue0000000000000"),
+			"AWS_REGION":            []byte("us-east-1"),
+			"AWS_ENDPOINT_URL":      []byte(endpoint),
+		},
+	}
+	builder := fake.NewClientBuilder().WithScheme(newTestScheme()).WithObjects(secret)
+	if isvc != nil {
+		builder = builder.WithObjects(isvc).WithStatusSubresource(isvc)
+	}
+	return NewMetalAgent(MetalAgentConfig{
+		K8sClient:            builder.Build(),
+		Namespace:            "default",
+		ModelStorePath:       t.TempDir(),
+		AllowedDownloadHosts: allowHosts,
+		MemoryProvider:       &mockMemoryProvider{totalBytes: 128 * 1024 * 1024 * 1024},
+		MemoryFraction:       0.75,
+	})
+}
+
+// newS3AdmissionModel is an unsized s3:// Model whose sourceSecretRef names
+// the credential Secret newS3AdmissionAgent seeds.
+func newS3AdmissionModel(key string) *inferencev1alpha1.Model {
+	m := newAdmissionTestModel("s3://models/"+key, "0")
+	m.Spec.SourceSecretRef = &corev1.LocalObjectReference{Name: "minio-models"}
+	return m
+}
+
+// s3HeadServer stands in for MinIO: it rejects unsigned requests the way a
+// private bucket does and answers a signed HEAD with size in Content-Length.
+// It records the method and Authorization header it saw.
+func s3HeadServer(t *testing.T, size uint64, status int) (*httptest.Server, *string, *string) {
+	t.Helper()
+	var method, auth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		auth = r.Header.Get("Authorization")
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		if !strings.HasPrefix(auth, "AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE0000000/") {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &method, &auth
+}
+
+// A Metal Model whose source is s3:// (with a sourceSecretRef) must be sized
+// from a SigV4-signed HEAD of the object, so memory admission can decide
+// before the download instead of failing with "cannot determine model size".
+func TestEstimateModelMemory_S3SizesFromSignedHead(t *testing.T) {
+	const wantSize = uint64(12_000_000_000)
+	srv, method, auth := s3HeadServer(t, wantSize, http.StatusOK)
+
+	agent := newS3AdmissionAgent(t, nil, srv.URL, []string{"127.0.0.1"})
+	model := newS3AdmissionModel("org/repo/model.gguf")
+
+	estimate, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err != nil {
+		t.Fatalf("estimateModelMemory for an s3:// source returned error: %v", err)
+	}
+	if estimate.WeightsBytes != wantSize {
+		t.Errorf("WeightsBytes = %d, want %d", estimate.WeightsBytes, wantSize)
+	}
+	if *method != http.MethodHead {
+		t.Errorf("probe method = %q, want HEAD", *method)
+	}
+	if !strings.Contains(*auth, "/us-east-1/s3/aws4_request") {
+		t.Errorf("Authorization = %q, want a us-east-1/s3 SigV4 scope", *auth)
+	}
+}
+
+// The size probe must feed memory admission: an s3:// Model within budget
+// passes, using the object's HEAD size.
+func TestCheckMemoryAdmission_S3PassesWithHeadSize(t *testing.T) {
+	const wantSize = uint64(12_000_000_000)
+	srv, _, _ := s3HeadServer(t, wantSize, http.StatusOK)
+
+	isvc := newAdmissionTestISVC()
+	agent := newS3AdmissionAgent(t, isvc, srv.URL, []string{"127.0.0.1"})
+	model := newS3AdmissionModel("org/repo/model.gguf")
+
+	if err := agent.checkMemoryAdmission(context.Background(), isvc, model, 2048, "", ""); err != nil {
+		t.Fatalf("s3 model within budget should pass admission, got: %v", err)
+	}
+
+	updated := &inferencev1alpha1.InferenceService{}
+	if getErr := agent.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: "test-isvc"}, updated); getErr != nil {
+		t.Fatalf("failed to re-fetch InferenceService: %v", getErr)
+	}
+	if updated.Status.SchedulingStatus != "" {
+		t.Errorf("SchedulingStatus = %q, want empty after a passing s3 admission", updated.Status.SchedulingStatus)
+	}
+}
+
+// A non-2xx HEAD (for example a missing object) must fail closed.
+func TestEstimateModelMemory_S3Non2xxFailsClosed(t *testing.T) {
+	srv, _, _ := s3HeadServer(t, 0, http.StatusNotFound)
+
+	agent := newS3AdmissionAgent(t, nil, srv.URL, []string{"127.0.0.1"})
+	model := newS3AdmissionModel("org/repo/missing.gguf")
+
+	_, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err == nil || !strings.Contains(err.Error(), "cannot determine model size") ||
+		!strings.Contains(err.Error(), "remote size probe failed") ||
+		!strings.Contains(err.Error(), "404") {
+		t.Fatalf("estimateModelMemory for a 404 s3 HEAD = %v, want a fail-closed error naming the probe and 404", err)
+	}
+}
+
+// A 200 HEAD without a usable Content-Length must fail closed.
+func TestEstimateModelMemory_S3MissingContentLengthFailsClosed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	agent := newS3AdmissionAgent(t, nil, srv.URL, []string{"127.0.0.1"})
+	model := newS3AdmissionModel("org/repo/model.gguf")
+
+	_, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err == nil || !strings.Contains(err.Error(), "cannot determine model size") ||
+		!strings.Contains(err.Error(), "remote size probe failed") ||
+		!strings.Contains(err.Error(), "Content-Length") {
+		t.Fatalf("estimateModelMemory for an s3 HEAD without Content-Length = %v, "+
+			"want a fail-closed error naming the probe", err)
+	}
+}
+
+// A HEAD the SSRF guard refuses must fail closed and must not reach the
+// endpoint: the probe reuses the download path's guarded client.
+func TestEstimateModelMemory_S3GuardRefusalFailsClosed(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", "12000000000")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	agent := newS3AdmissionAgent(t, nil, srv.URL, nil)
+	model := newS3AdmissionModel("org/repo/model.gguf")
+
+	_, err := agent.estimateModelMemory(context.Background(), model, 2048, "", "")
+	if err == nil || !strings.Contains(err.Error(), "cannot determine model size") ||
+		!strings.Contains(err.Error(), "remote size probe failed") ||
+		!strings.Contains(err.Error(), downloadHostsFlag) {
+		t.Fatalf("estimateModelMemory for a guard-refused s3 endpoint = %v, "+
+			"want a fail-closed error naming the SSRF guard", err)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("guard-refused s3 endpoint received %d HEAD requests, want 0", n)
+	}
 }

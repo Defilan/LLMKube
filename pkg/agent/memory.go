@@ -291,6 +291,40 @@ func remoteModelSize(ctx context.Context, httpClient *http.Client, source string
 	return uint64(resp.ContentLength), nil
 }
 
+// s3ObjectSize returns an s3:// object's byte size from a SigV4-signed HEAD
+// through the same SSRF-guarded client and sourceSecretRef credentials the S3
+// download uses (pkg/agent/s3.go); it never opens a second, unsigned path.
+func s3ObjectSize(ctx context.Context, exec *MetalExecutor, source, secretName string) (uint64, error) {
+	creds, err := exec.resolveS3Credentials(ctx, source, secretName)
+	if err != nil {
+		return 0, err
+	}
+	client, objectURL, err := exec.s3DownloadClient(source, creds)
+	if err != nil {
+		return 0, err
+	}
+	defer client.CloseIdleConnections()
+	return remoteModelSize(ctx, client, objectURL)
+}
+
+// s3SizeProbe sizes an s3:// Model source for the pre-flight memory check.
+// It reuses the registered llama.cpp executor so the probe dials with the
+// same allowlist, resolver and CA trust as the download; a unit test that has
+// not called buildExecutors gets an equivalently wired stand-in.
+func (a *MetalAgent) s3SizeProbe(ctx context.Context, model *inferencev1alpha1.Model) (uint64, error) {
+	exec, _ := a.executors[runtimeLlamaServer].(*MetalExecutor)
+	if exec == nil {
+		exec = NewMetalExecutor(a.config.LlamaServerBin, a.config.ModelStorePath, a.logger,
+			WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
+			WithAllowedDownloadHosts(a.config.AllowedDownloadHosts))
+	}
+	secretName := ""
+	if model.Spec.SourceSecretRef != nil {
+		secretName = model.Spec.SourceSecretRef.Name
+	}
+	return s3ObjectSize(ctx, exec, model.Spec.Source, secretName)
+}
+
 // parseSize parses a human-readable size string (as produced by model_controller's
 // formatBytes, e.g. "4.5 GiB", "512.0 MiB", "1024 B") back to bytes.
 func parseSize(s string) (uint64, error) {

@@ -2066,6 +2066,18 @@ func (a *MetalAgent) estimateModelMemory(
 		}
 	}
 
+	// s3:// sources need the signed, credential-bearing client, so they are
+	// probed through the same executor the download uses rather than the
+	// plain client above.
+	if fileSizeBytes == 0 && isS3Source(model.Spec.Source) {
+		size, err := a.s3SizeProbe(ctx, model)
+		if err != nil {
+			reasons = append(reasons, fmt.Sprintf("remote size probe failed: %v", err))
+		} else {
+			fileSizeBytes = size
+		}
+	}
+
 	if fileSizeBytes == 0 {
 		return MemoryEstimate{}, fmt.Errorf(
 			"cannot determine model size: %s", strings.Join(reasons, "; "))
