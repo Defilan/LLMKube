@@ -479,6 +479,13 @@
       "type": "object",
       "additionalProperties": { "type": "string" }
     },
+    "extraObjects": {
+      "type": "array",
+      "description": "Extra Kubernetes manifests to deploy with the chart; each item is an object or a string rendered through tpl.",
+      "items": {
+        "type": ["object", "string"]
+      }
+    },
     "networkPolicies": {
       "type": "object",
       "additionalProperties": false,

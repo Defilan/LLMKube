@@ -1,0 +1,10 @@
+{{- /* Map items are converted to YAML and then run through `tpl`; string items
+       are run through `tpl` as-is. Both therefore see chart values. */}}
+{{- range .Values.extraObjects }}
+---
+{{ if typeIs "string" . }}
+{{- tpl . $ }}
+{{- else }}
+{{- tpl (toYaml .) $ }}
+{{- end }}
+{{- end }}
