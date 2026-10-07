@@ -121,13 +121,50 @@ container with bad weights.
   the digest does not reach the container instead of transferring unchecked.
 - Verification also runs on prefetch Jobs, which reuse the same init
   container.
-- Digest pinning covers single-file downloaded Models. Combining `spec.sha256`
-  with multi-file staging (`spec.files` / `spec.mmproj`), or setting it on a
-  pre-staged `pvc://` or `oci://` source, is rejected at admission. This is a
-  behavior change for a Model that set such a combination before this
-  release: the digest was accepted and silently ignored then. Remove the
-  ignored `spec.sha256` (or the multi-file / pre-staged source) to keep the
-  Model admissible.
+- A pre-staged `pvc://` source with `spec.sha256` verifies the mounted file in
+  an init container at pod start. The mount is read-only, so no stamp is
+  written: the file is hashed on every pod start. A mismatch fails the pod.
+  The hash is added to every pod start, rollout, reschedule and scale-out:
+  expect roughly (file size / hash throughput), which for a 100-400 GB
+  artifact on a network PVC can be many minutes. `oci://` sources stay
+  digest-addressed and are rejected with `spec.sha256`.
+- Combining `spec.sha256` with multi-file staging (`spec.files` / `spec.mmproj`)
+  or an `oci://` source is rejected at admission; use `spec.fileSha256` for a
+  multi-file set. This is a behavior change for a Model that set such a
+  combination before this release: the digest was accepted and silently
+  ignored then. Remove the ignored `spec.sha256` (or the multi-file / `oci://`
+  source) to keep the Model admissible.
+
+### Multi-file staging (`spec.fileSha256`)
+
+`spec.sha256` attests to a single artifact, so it cannot pin a multi-file
+staging set. Use `spec.fileSha256`, a map from repo-relative path to digest:
+
+```yaml
+spec:
+  source: hf://org/repo-GGUF
+  files:
+    - Model-00001-of-00002.gguf
+    - Model-00002-of-00002.gguf
+  fileSha256:
+    Model-00001-of-00002.gguf: 9f2c...   # 64 hex characters
+    Model-00002-of-00002.gguf: 1ab3...
+```
+
+- Only listed files are verified; a file with no entry is staged as before, so
+  a partially pinned set is allowed. An unpinned shard in a partially pinned
+  set gets no protection, so pinning the whole set is recommended.
+- `spec.files` is capped at 256 entries of 512 characters each.
+- Each pinned file is hashed before it is renamed onto the cache. A mismatch
+  discards that file's partial and records its own
+  `<file>.<sha256>.sha256-rejected` marker, and the loop stops. Once the
+  upload is fixed, delete the marker (`<file>.<sha256>.sha256-rejected`) to
+  let the next start re-download.
+- The per-file stamp and fail-closed behavior match the single-file path.
+- Every key must name a `spec.files` entry or `spec.mmproj`. Globs in
+  `spec.files` are rejected when `fileSha256` is set, because a digest cannot
+  be keyed to an unknown expanded name. `spec.sha256` and `spec.fileSha256`
+  are mutually exclusive, and `fileSha256` is rejected on an `oci://` source.
 
 ## Prefetch (Eager Download)
 

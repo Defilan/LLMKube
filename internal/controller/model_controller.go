@@ -488,6 +488,29 @@ func (r *ModelReconciler) validateMultiFileStagingSource(ctx context.Context, mo
 			model.Spec.Source)
 		return true, r.failInvalidFileSet(ctx, model, msg)
 	}
+	// fileSha256 names the expected digest of each staged file. The CEL rules
+	// already constrain the keys and reject globs, but a stale object or a
+	// client that bypassed admission is re-checked here so the download never
+	// builds a gate for a key it cannot resolve (#1978).
+	if len(model.Spec.FileSHA256) > 0 {
+		plan, planErr := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil)
+		if planErr != nil {
+			return true, r.failInvalidFileSet(ctx, model, planErr.Error())
+		}
+		if plan == nil {
+			return true, r.failInvalidFileSet(ctx, model, "fileSha256 requires spec.files")
+		}
+		staged := make(map[string]struct{}, len(plan.Files))
+		for _, f := range plan.Files {
+			staged[f] = struct{}{}
+		}
+		for k := range model.Spec.FileSHA256 {
+			if _, ok := staged[k]; !ok {
+				return true, r.failInvalidFileSet(ctx, model,
+					fmt.Sprintf("fileSha256 key %q is not one of the staged files", k))
+			}
+		}
+	}
 	return false, ctrl.Result{}
 }
 
