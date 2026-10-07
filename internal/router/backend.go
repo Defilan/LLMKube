@@ -451,16 +451,22 @@ func (d *Dispatcher) applyCredentials(b *Backend, req *http.Request) error {
 
 // outboundModel returns the model identifier this backend expects to see in
 // the request body. External backends declare it explicitly as Model. Local
-// backends serve whatever their InferenceService is named, which is also the
-// alias the controller registers upstream, so a request that reached this
-// backend under a different alias (a rule fall-through, an IfIdle skip past a
-// busy pool member) must be rewritten to it: llama.cpp ignores the field, but
-// vLLM / SGLang / TGI answer an unknown name with 404 "The model X does not
-// exist". A backend with neither set (a hand-written config, a backend whose
-// InferenceService did not resolve) keeps the historical pass-through.
+// backends normally serve whatever their InferenceService is named, which is
+// also the alias the controller registers upstream, so a request that reached
+// this backend under a different alias (a rule fall-through, an IfIdle skip
+// past a busy pool member) must be rewritten to it: llama.cpp ignores the
+// field, but vLLM / SGLang / TGI answer an unknown name with 404 "The model X
+// does not exist". ServedModel overrides the InferenceService name for a
+// runtime that serves a different id, such as oMLX, whose engine serves the
+// model-store directory basename. A backend with none of the three set (a
+// hand-written config, a backend whose InferenceService did not resolve)
+// keeps the historical pass-through.
 func (b *Backend) outboundModel() string {
 	if b.Model != "" {
 		return b.Model
+	}
+	if b.ServedModel != "" {
+		return b.ServedModel
 	}
 	return b.InferenceService
 }

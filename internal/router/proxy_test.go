@@ -327,6 +327,33 @@ func TestProxyModelsDisplayName(t *testing.T) {
 	}
 }
 
+// TestProxyModelsServedModelNotPublished proves ServedModel is a dispatch-only
+// id: a local backend that serves a different upstream id (oMLX) still
+// publishes its Name on /v1/models, so a client listing models keeps sending
+// the name the router matches on and the dispatcher rewrites it.
+func TestProxyModelsServedModelNotPublished(t *testing.T) {
+	h := newProxyHarness(t)
+	h.cfg.Backends[0].ServedModel = "Qwen3.8-27B-4bit"
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v1/models = %d, want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	data, _ := got["data"].([]any)
+	if len(data) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(data))
+	}
+	first, _ := data[0].(map[string]any)
+	if first["id"] != "local-qwen" {
+		t.Errorf("first model id = %v, want local-qwen (ServedModel must not be published)", first["id"])
+	}
+}
+
 func TestProxyRoutesPIIToLocal(t *testing.T) {
 	h := newProxyHarness(t)
 	resp := h.post(t, map[string]any{"model": "any"}, map[string]string{

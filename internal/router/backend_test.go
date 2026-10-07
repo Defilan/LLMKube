@@ -470,9 +470,9 @@ func TestApplyModelOverride(t *testing.T) {
 }
 
 // TestBackendOutboundModel pins which identifier each backend shape sends
-// upstream: an external backend's declared Model, a local backend's
-// InferenceService name (the name its runtime serves), and pass-through when
-// neither is known.
+// upstream: an external backend's declared Model, a local backend's ServedModel
+// when the runtime serves a different id (oMLX), otherwise its InferenceService
+// name, and pass-through when none is known.
 func TestBackendOutboundModel(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -481,7 +481,9 @@ func TestBackendOutboundModel(t *testing.T) {
 	}{
 		{"external declares model", Backend{Tier: "cloud", Model: "provider-large"}, "provider-large"},
 		{"local serves its InferenceService name", Backend{Tier: "local", InferenceService: "large"}, "large"},
-		{"model wins over InferenceService", Backend{Model: "provider-large", InferenceService: "large"}, "provider-large"},
+		{"local served model wins over InferenceService", Backend{Tier: "local", InferenceService: "qwen-omlx", ServedModel: "Qwen3.8-27B-4bit"}, "Qwen3.8-27B-4bit"},
+		{"model wins over served model", Backend{Model: "provider-large", ServedModel: "Qwen3.8-27B-4bit"}, "provider-large"},
+		{"served model alone", Backend{Tier: "local", ServedModel: "Qwen3.8-27B-4bit"}, "Qwen3.8-27B-4bit"},
 		{"neither set passes through", Backend{Tier: "local"}, ""},
 	}
 	for _, tc := range cases {
@@ -533,6 +535,55 @@ func TestDispatchRewritesModelForLocalBackend(t *testing.T) {
 			_ = resp.Body.Close()
 			if gotModel != "large" {
 				t.Errorf("upstream received model %q, want large (the InferenceService served name)", gotModel)
+			}
+		})
+	}
+}
+
+// TestDispatchRewritesModelForOMLXBackend is the regression test for #1972: an
+// oMLX backend serves the model-store directory basename, so a request that
+// names the InferenceService (the router's published id) must arrive carrying
+// the basename oMLX recognizes. A body already naming the basename is left
+// alone.
+func TestDispatchRewritesModelForOMLXBackend(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		gotModel = m.Model
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	cfg := &Config{Backends: []Backend{{
+		Name:             "omlx",
+		Tier:             "local",
+		Address:          srv.URL,
+		InferenceService: "qwen-omlx",
+		ServedModel:      "Qwen3.8-27B-4bit",
+	}}}
+	disp := NewDispatcher(cfg)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"InferenceService name is rewritten to the oMLX id", `{"model":"qwen-omlx","messages":[]}`},
+		{"oMLX id is left alone", `{"model":"Qwen3.8-27B-4bit","messages":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotModel = ""
+			resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
+				http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(tc.body))
+			if err != nil {
+				t.Fatalf("Dispatch: %v", err)
+			}
+			_ = resp.Body.Close()
+			if gotModel != "Qwen3.8-27B-4bit" {
+				t.Errorf("upstream received model %q, want Qwen3.8-27B-4bit (the oMLX served id)", gotModel)
 			}
 		})
 	}

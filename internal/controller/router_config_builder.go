@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -152,6 +153,7 @@ func (r *ModelRouterReconciler) resolveBackend(
 	switch {
 	case b.InferenceServiceRef != nil:
 		wire.InferenceService = b.InferenceServiceRef.Name
+		wire.ServedModel = r.localBackendServedModel(ctx, mr.Namespace, b.InferenceServiceRef.Name)
 		if wire.Tier == "" {
 			wire.Tier = backendTierLocal
 			status.Tier = backendTierLocal
@@ -273,6 +275,37 @@ func (r *ModelRouterReconciler) resolveInferenceServiceAddress(
 	}
 	svcName := sanitizeDNSName(isvc.Name)
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, isvc.Namespace, port), ""
+}
+
+// localBackendServedModel returns the model identifier the runtime behind an
+// InferenceService actually serves when that differs from the InferenceService
+// name, and "" when it does not. oMLX serves the model-store directory
+// basename, mirroring the agent's model-id derivation in
+// pkg/agent/executor_omlx.go (filepath.Base(ModelSource)); the two sides must
+// agree or the router rewrites to a name oMLX rejects. Every other runtime
+// serves the InferenceService name, so this returns "". A missing
+// InferenceService or Model, or an empty ModelRef, degrades to "" (the
+// InferenceService name fallback) rather than failing the compile; the address
+// path already reports the backend unhealthy.
+func (r *ModelRouterReconciler) localBackendServedModel(
+	ctx context.Context,
+	namespace, name string,
+) string {
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, isvc); err != nil {
+		return ""
+	}
+	if isvc.Spec.Runtime != inferencev1alpha1.RuntimeOMLX || isvc.Spec.ModelRef == "" {
+		return ""
+	}
+	model := &inferencev1alpha1.Model{}
+	if err := r.Get(ctx, types.NamespacedName{Name: isvc.Spec.ModelRef, Namespace: namespace}, model); err != nil {
+		return ""
+	}
+	if model.Spec.Source != "" {
+		return filepath.Base(model.Spec.Source)
+	}
+	return model.Name
 }
 
 // resolveInferenceServiceEndpoints returns one "http://<podIP>:<port>" URL per

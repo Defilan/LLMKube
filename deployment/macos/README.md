@@ -1367,6 +1367,26 @@ EOF
 
 The agent will start the oMLX daemon, load the model, and register the endpoint.
 
+### Model identifier
+
+oMLX serves each model under the basename of its model-store directory
+(the leaf directory in a two-level `org/model` layout), and `/v1/models`
+lists those names. A client that reaches the `<isvc>` Service directly or
+the agent's `--client-port` proxy must send that basename as the OpenAI
+`model` field, not the Model or InferenceService name. With the example
+above, the id is `Llama-3.2-3B-Instruct-4bit`, not `llama-3b-mlx`.
+
+A ModelRouter backend that points at an oMLX InferenceService whose
+`spec.runtime` is `omlx` translates the published model name to the
+basename, so clients routed through the ModelRouter can use the
+InferenceService name. Set `spec.runtime: omlx` explicitly; the
+controller cannot infer it from the agent's `--runtime` default.
+
+To serve a name other than the directory basename, set a per-model
+`model_alias` in the oMLX admin panel (persisted to
+`~/.omlx/model_settings.json`). oMLX then accepts both the alias and the
+directory name.
+
 ### Differences from llama-server
 
 | | llama-server | oMLX |
