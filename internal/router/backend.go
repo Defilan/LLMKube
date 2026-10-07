@@ -457,8 +457,9 @@ func (d *Dispatcher) applyCredentials(b *Backend, req *http.Request) error {
 // past a busy pool member) must be rewritten to it: llama.cpp ignores the
 // field, but vLLM / SGLang / TGI answer an unknown name with 404 "The model X
 // does not exist". ServedModel overrides the InferenceService name for a
-// runtime that serves a different id, such as oMLX, whose engine serves the
-// model-store directory basename. A backend with none of the three set (a
+// runtime that serves a different id, such as oMLX, which answers to the
+// InferenceService's modelRef (the alias the metal agent registers). A
+// backend with none of the three set (a
 // hand-written config, a backend whose InferenceService did not resolve)
 // keeps the historical pass-through.
 func (b *Backend) outboundModel() string {

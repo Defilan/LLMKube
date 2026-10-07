@@ -268,7 +268,7 @@ idle the rule behaves exactly like the default (`Wait`): the swap runs under
 is already in flight is waited on in both modes, because the incumbent is
 unloading and cannot serve anyway. The fall-through backend receives its own
 served model name in the outbound request (the InferenceService name, or the
-model-store directory basename for an oMLX backend) rather than the alias the
+`spec.modelRef` for an oMLX backend) rather than the alias the
 client asked for, so a runtime that validates the field (vLLM, SGLang, TGI,
 oMLX) accepts it instead of answering `404 The model ... does not exist`.
 

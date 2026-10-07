@@ -16,7 +16,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -277,16 +276,18 @@ func (r *ModelRouterReconciler) resolveInferenceServiceAddress(
 	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, isvc.Namespace, port), ""
 }
 
-// localBackendServedModel returns the model identifier the runtime behind an
-// InferenceService actually serves when that differs from the InferenceService
-// name, and "" when it does not. oMLX serves the model-store directory
-// basename, mirroring the agent's model-id derivation in
-// pkg/agent/executor_omlx.go (filepath.Base(ModelSource)); the two sides must
+// localBackendServedModel returns the model name the runtime behind an
+// InferenceService answers to when that differs from the InferenceService
+// name, and "" when it does not. oMLX answers to the served model name,
+// spec.modelRef: the metal agent registers it as the model's oMLX alias
+// (pkg/agent/executor_omlx.go, from servedModelName in pkg/agent/agent.go),
+// the same name llama-server takes as --alias and /v1/models lists. Router
+// and direct clients therefore reach oMLX under one name; the two sides must
 // agree or the router rewrites to a name oMLX rejects. Every other runtime
-// serves the InferenceService name, so this returns "". A missing
-// InferenceService or Model, or an empty ModelRef, degrades to "" (the
-// InferenceService name fallback) rather than failing the compile; the address
-// path already reports the backend unhealthy.
+// keeps the InferenceService name, so this returns "". A missing
+// InferenceService or an empty ModelRef degrades to "" (the InferenceService
+// name fallback) rather than failing the compile; the address path already
+// reports the backend unhealthy.
 func (r *ModelRouterReconciler) localBackendServedModel(
 	ctx context.Context,
 	namespace, name string,
@@ -295,17 +296,10 @@ func (r *ModelRouterReconciler) localBackendServedModel(
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, isvc); err != nil {
 		return ""
 	}
-	if isvc.Spec.Runtime != inferencev1alpha1.RuntimeOMLX || isvc.Spec.ModelRef == "" {
+	if isvc.Spec.Runtime != inferencev1alpha1.RuntimeOMLX {
 		return ""
 	}
-	model := &inferencev1alpha1.Model{}
-	if err := r.Get(ctx, types.NamespacedName{Name: isvc.Spec.ModelRef, Namespace: namespace}, model); err != nil {
-		return ""
-	}
-	if model.Spec.Source != "" {
-		return filepath.Base(model.Spec.Source)
-	}
-	return model.Name
+	return isvc.Spec.ModelRef
 }
 
 // resolveInferenceServiceEndpoints returns one "http://<podIP>:<port>" URL per

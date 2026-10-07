@@ -104,9 +104,10 @@ type Backend struct {
 
 	// ServedModel is the model identifier the upstream engine actually
 	// serves, when it differs from the InferenceService name. Set for
-	// oMLX backends, whose engine serves the model-store directory
-	// basename rather than an alias. Empty for backends that serve their
-	// InferenceService name, where InferenceService is the fallback.
+	// oMLX backends to the InferenceService's modelRef, which the metal
+	// agent registers as the model's oMLX alias. Empty for backends that
+	// serve their InferenceService name, where InferenceService is the
+	// fallback.
 	ServedModel string `json:"servedModel,omitempty"`
 
 	// InferenceService is the name of the InferenceService this backend

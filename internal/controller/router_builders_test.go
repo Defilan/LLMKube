@@ -171,9 +171,11 @@ func TestCompileRouterConfigResolvesLocalBackend(t *testing.T) {
 }
 
 // TestCompileRouterConfigOMLXServedModel pins the oMLX model-name translation
-// (#1972): oMLX serves a model under its model-store directory basename, not
-// the InferenceService name, so a backend pointing at an oMLX InferenceService
-// must carry that basename as the served model the proxy rewrites to.
+// (#1972): the metal agent registers spec.modelRef as the model's oMLX alias,
+// so a backend pointing at an oMLX InferenceService must carry the modelRef,
+// not the InferenceService name or the model-store directory basename, as the
+// served model the proxy rewrites to. The fixture's modelRef (qwen-mlx)
+// differs from both on purpose.
 func TestCompileRouterConfigOMLXServedModel(t *testing.T) {
 	newRouter := func() *inferencev1alpha1.ModelRouter {
 		return &inferencev1alpha1.ModelRouter{
@@ -197,24 +199,24 @@ func TestCompileRouterConfigOMLXServedModel(t *testing.T) {
 		wantServed  string
 	}{
 		{
-			name:        "omlx serves the source basename",
+			name:        "omlx serves the modelRef, not the source basename",
 			runtime:     inferencev1alpha1.RuntimeOMLX,
 			modelSource: "/models/mlx-community/Qwen3.8-27B-4bit",
 			seedModel:   true,
-			wantServed:  "Qwen3.8-27B-4bit",
+			wantServed:  "qwen-mlx",
 		},
 		{
-			name:        "omlx empty source falls back to the Model name",
+			name:        "omlx empty source still serves the modelRef",
 			runtime:     inferencev1alpha1.RuntimeOMLX,
 			modelSource: "",
 			seedModel:   true,
 			wantServed:  "qwen-mlx",
 		},
 		{
-			name:       "omlx missing Model leaves the InferenceService fallback",
+			name:       "omlx without a Model object still serves the modelRef",
 			runtime:    inferencev1alpha1.RuntimeOMLX,
 			seedModel:  false,
-			wantServed: "",
+			wantServed: "qwen-mlx",
 		},
 		{
 			name:        "non-omlx runtime keeps the InferenceService name",
@@ -298,7 +300,7 @@ func TestCompileRouterConfigOMLXServedModelWireTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compileRouterConfig: %v", err)
 	}
-	if !strings.Contains(string(compiled.JSON), `"servedModel": "Qwen3.8-27B-4bit"`) {
+	if !strings.Contains(string(compiled.JSON), `"servedModel": "qwen-mlx"`) {
 		t.Errorf("compiled JSON lacks the servedModel wire key:\n%s", compiled.JSON)
 	}
 }
