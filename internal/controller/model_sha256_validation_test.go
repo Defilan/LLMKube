@@ -189,7 +189,10 @@ var _ = Describe("Model sha256 CRD validation", func() {
 		m := newFileSHA("file-sha-badval", "hf://org/repo", []string{"a.gguf"}, "", map[string]inferencev1alpha1.SHA256Digest{"a.gguf": "not-a-digest"})
 		err := k8sClient.Create(ctx, m)
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("fileSha256"))
+		// The value is rejected by the SHA256Digest schema pattern on the map
+		// value, at the key's path, not by some unrelated fileSha256 rule.
+		Expect(err.Error()).To(ContainSubstring("spec.fileSha256.a.gguf"))
+		Expect(err.Error()).To(ContainSubstring("^[a-fA-F0-9]{64}$"))
 	})
 
 	It("rejects a glob in files when fileSha256 is set", func() {

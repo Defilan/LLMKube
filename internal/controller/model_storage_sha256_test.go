@@ -746,6 +746,7 @@ func TestModelMultiFileSHA256_Behavioral(t *testing.T) {
 	t.Run("marker bounds a repeat IfNotPresent start", multiFileSHA256MarkerBoundsIfNotPresent)
 	t.Run("marker bounds a repeat OnChange start", multiFileSHA256MarkerBoundsOnChange)
 	t.Run("orphan digest entry fails closed", multiFileSHA256OrphanDigestFailsClosed)
+	t.Run("whitespace-padded digest key fails closed", multiFileSHA256WhitespaceKeyFailsClosed)
 }
 
 func multiFileSHA256FailsClosed(t *testing.T) {
@@ -1036,8 +1037,7 @@ func multiFileSHA256MarkerBoundsOnChange(t *testing.T) {
 
 // multiFileSHA256OrphanDigestFailsClosed pins the fail-closed precheck: a
 // declared digest for a path that is not one of $MODEL_FILES must abort rather
-// than silently leave that file unpinned. The mangled whitespace key is the
-// concrete shape the CEL rule also rejects; here it is injected directly into
+// than silently leave that file unpinned. The entry is injected directly into
 // the env, bypassing admission.
 func multiFileSHA256OrphanDigestFailsClosed(t *testing.T) {
 	o := newRangeOrigin(t, true)
@@ -1056,6 +1056,40 @@ func multiFileSHA256OrphanDigestFailsClosed(t *testing.T) {
 		t.Errorf("expected the orphan-path message: %s", out)
 	}
 	mustNotExist(t, primary)
+}
+
+// multiFileSHA256WhitespaceKeyFailsClosed pins that the init precheck itself
+// refuses a digest key with leading or trailing whitespace, independently of
+// the CEL rule that also rejects it at admission. Such a key resolves to no
+// digest in llmkube_file_digest, so without the precheck the file would stage
+// unpinned. Injected directly into the env, bypassing admission.
+func multiFileSHA256WhitespaceKeyFailsClosed(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+	// The staged name is padded the same way as the key, so the orphan check
+	// alone would pass and llmkube_file_digest (which splits on spaces) would
+	// resolve no digest: the file would stage unpinned.
+	for name, rel := range map[string]string{
+		"trailing space": "model.gguf ",
+		"leading space":  " model.gguf",
+		"trailing tab":   "model.gguf\t",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			primary := filepath.Join(dir, "model.gguf")
+			out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+				"MODEL_FILES="+rel,
+				"MODEL_FILE_SHA256="+want+" "+rel)
+			if err == nil {
+				t.Fatalf("a whitespace-padded digest key must fail closed\n%s", out)
+			}
+			if !strings.Contains(out, "whitespace") {
+				t.Errorf("expected the whitespace-key message: %s", out)
+			}
+			mustNotExist(t, primary)
+		})
+	}
 }
 
 // TestModelPVCSHA256_Behavioral runs the verify-only command a pvc:// Model's

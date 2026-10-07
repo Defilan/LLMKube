@@ -102,13 +102,16 @@ type modelTransferSignature struct {
 // wrong label is worse than the bare exit code the user already has.
 var modelTransferSignatures = []modelTransferSignature{
 	{
-		// A multi-file staging failure. The per-file helpers name
-		// spec.fileSha256, so this must be matched before the single-file
-		// entry below, whose message it also contains.
+		// A multi-file staging failure. Every per-file failure prints
+		// "spec.fileSha256 mismatch", so this must be matched before the
+		// single-file entry below, whose message it also contains. Match the
+		// failure phrase, not the bare field name: success and keep lines
+		// (stamp hit, kept pinned copy) name spec.fileSha256 too, and must not
+		// turn a later shard's unrelated failure into a digest mismatch.
 		reason: ReasonModelFileDigestMismatch,
 		remedy: "spec.fileSha256 does not match the bytes at spec.source for at least one staged file; " +
 			"correct the digest (or the source), then delete the cached <file>.<sha256>.sha256-rejected marker to retry",
-		matches: []string{"spec.filesha256"},
+		matches: []string{"spec.filesha256 mismatch"},
 	},
 	{
 		// A pre-staged pvc:// artifact that fails spec.sha256 at pod start.

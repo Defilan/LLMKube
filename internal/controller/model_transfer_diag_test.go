@@ -55,6 +55,29 @@ func TestMatchModelTransferFailure_Signatures(t *testing.T) {
 			wantReason: ReasonModelFileDigestMismatch,
 		},
 		{
+			name: "spec.fileSha256 publish mismatch on a fresh download",
+			msg: "ERROR: spec.fileSha256 mismatch: expected d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b, " +
+				"computed 0000000000000000000000000000000000000000000000000000000000000000",
+			wantReason: ReasonModelFileDigestMismatch,
+		},
+		{
+			// A stamp-hit success line for one pinned shard names spec.fileSha256 too;
+			// it must not turn a later shard's 404 into a digest mismatch.
+			name: "verified shard followed by a 404 on another shard",
+			msg: "Model verified against spec.fileSha256 (stamp hit, skipped re-hashing)\n" +
+				"curl: (22) The requested URL returned error: 404",
+			wantReason: ReasonModelSourceNotFound,
+		},
+		{
+			// The marker-keep line is informational (the cached copy is kept); a later
+			// shard's 404 is the real failure.
+			name: "kept pinned shard followed by a 404 on another shard",
+			msg: "the origin served bytes for a.gguf that do not match the pinned spec.fileSha256; kept the pinned cached copy; " +
+				"fix the upload, then delete /models/k/a.gguf.d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b.sha256-rejected to retry\n" +
+				"curl: (22) The requested URL returned error: 404",
+			wantReason: ReasonModelSourceNotFound,
+		},
+		{
 			name:       "pre-staged pvc artifact fails its digest",
 			msg:        "ERROR: SHA256 mismatch for the pre-staged /model-source/model.gguf: expected d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b, computed 0000000000000000000000000000000000000000000000000000000000000000",
 			wantReason: ReasonModelPVCDigestMismatch,
