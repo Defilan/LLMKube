@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"testing"
 )
 
 // CheckModelStore refuses a model store another local user could tamper with.
@@ -93,13 +94,13 @@ func ResolveModelStore(path string) (string, error) {
 	return resolved, nil
 }
 
-// SystemTempRoots are the shared temporary directories a model store must
+// systemTempRoots are the shared temporary directories a model store must
 // not live in. /tmp and /var/tmp are symlinks to /private/... on macOS, so
 // both spellings are listed: the resolved path normally carries the /private
 // form, and the literal form catches a configured path whose resolution
-// differs. It is a variable only so tests whose t.TempDir() is under /tmp
-// (Linux, where TMPDIR is usually unset) can clear it; nothing else writes it.
-var SystemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
+// differs. Unexported so no importer can change the check at runtime; tests
+// override it through SetSystemTempRootsForTest.
+var systemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
 
 // checkStoreNotInTmp refuses a store at or under a shared temporary
 // directory. Even a store the agent owns there is not safe: /tmp is emptied
@@ -115,7 +116,7 @@ func checkStoreNotInTmp(where, path, resolved string) error {
 		literal = abs
 	}
 	for _, candidate := range []string{resolved, filepath.Clean(literal)} {
-		for _, root := range SystemTempRoots {
+		for _, root := range systemTempRoots {
 			if candidate == root || strings.HasPrefix(candidate, root+"/") {
 				return fmt.Errorf("model store %s is under %s, a shared temporary directory any local user "+
 					"can recreate after a reboot: re-render the launchd plist with the new default store "+
@@ -127,6 +128,20 @@ func checkStoreNotInTmp(where, path, resolved string) error {
 		}
 	}
 	return nil
+}
+
+// SetSystemTempRootsForTest overrides the shared temporary directories the
+// model-store check refuses and returns the previous list so a test can
+// restore it. It is a no-op outside a test binary, so no importer can change
+// the production check at runtime; tests whose t.TempDir() is under /tmp
+// clear the list, and the refusal test restores the production default.
+func SetSystemTempRootsForTest(roots []string) []string {
+	if !testing.Testing() {
+		return nil
+	}
+	prev := systemTempRoots
+	systemTempRoots = roots
+	return prev
 }
 
 // checkStoreAncestors refuses the store when any ancestor of the resolved,

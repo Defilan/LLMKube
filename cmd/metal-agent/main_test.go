@@ -12,12 +12,12 @@ import (
 	"github.com/defilantech/llmkube/pkg/agent"
 )
 
-// TestMain clears agent.SystemTempRoots: the store tests here build their
-// store in t.TempDir(), which is under /tmp wherever TMPDIR is unset (Linux
-// CI), and the store check would refuse all of them. The /tmp refusal test
-// sets it back explicitly.
+// TestMain clears the agent's system temp roots: the store tests here build
+// their store in t.TempDir(), which is under /tmp wherever TMPDIR is unset
+// (Linux CI), and the store check would refuse all of them. The /tmp refusal
+// test sets it back explicitly.
 func TestMain(m *testing.M) {
-	agent.SystemTempRoots = nil
+	agent.SetSystemTempRootsForTest(nil)
 	os.Exit(m.Run())
 }
 
@@ -298,9 +298,8 @@ func TestPrepareModelStore(t *testing.T) {
 // prepareModelStore refuses a store under /tmp, which the 0.10.0 plist
 // pinned, even though it creates the store 0700 and owns it.
 func TestPrepareModelStore_RefusesStoreUnderTmp(t *testing.T) {
-	prev := agent.SystemTempRoots
-	agent.SystemTempRoots = []string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"}
-	t.Cleanup(func() { agent.SystemTempRoots = prev })
+	prev := agent.SetSystemTempRootsForTest([]string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"})
+	t.Cleanup(func() { agent.SetSystemTempRootsForTest(prev) })
 
 	base, err := os.MkdirTemp("/tmp", "llmkube-prepare-test-")
 	if err != nil {
@@ -311,6 +310,34 @@ func TestPrepareModelStore_RefusesStoreUnderTmp(t *testing.T) {
 	_, err = prepareModelStore(store)
 	if err == nil || !strings.Contains(err.Error(), "make install-metal-agent") {
 		t.Fatalf("prepareModelStore(%s) = %v, want a refusal naming the plist re-render", store, err)
+	}
+}
+
+// SetSystemTempRootsForTest is the cross-package override this package's
+// store tests rely on: clearing it lets a store under /tmp through, and
+// restoring the production roots refuses the same store.
+func TestSetSystemTempRootsForTest_ControlsRefusal(t *testing.T) {
+	base, err := os.MkdirTemp("/tmp", "llmkube-roots-seam-")
+	if err != nil {
+		t.Skipf("cannot create a directory under /tmp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	store := filepath.Join(base, "models")
+	if err := os.Mkdir(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := agent.SetSystemTempRootsForTest(nil)
+	t.Cleanup(func() { agent.SetSystemTempRootsForTest(prev) })
+	if err := agent.CheckModelStore(store); err != nil {
+		t.Fatalf("with the roots cleared, CheckModelStore(store under /tmp) = %v, want nil", err)
+	}
+
+	agent.SetSystemTempRootsForTest([]string{"/private/tmp", "/tmp", "/private/var/tmp", "/var/tmp"})
+	err = agent.CheckModelStore(store)
+	if err == nil || !strings.Contains(err.Error(), "/tmp") {
+		t.Fatalf("with the production roots restored, CheckModelStore(store under /tmp) = %v, "+
+			"want a refusal naming /tmp", err)
 	}
 }
 
