@@ -40,6 +40,7 @@ type SHA256Digest string
 // +kubebuilder:validation:XValidation:rule="!(has(self.fileSha256) && self.fileSha256.size() > 0 && self.source.startsWith('oci://'))",message="fileSha256 cannot verify a pre-staged oci:// artifact, which is already pinned by its image digest"
 // +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || !has(self.files) || self.files.all(f, !f.contains('*') && !f.contains('?') && !f.contains('['))",message="fileSha256 needs concrete file paths: a glob cannot be keyed to an unknown expanded name"
 // +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || self.fileSha256.all(k, (has(self.files) && self.files.exists(f, f == k)) || (has(self.mmproj) && self.mmproj == k))",message="every fileSha256 key must name a spec.files entry or spec.mmproj"
+// +kubebuilder:validation:XValidation:rule="!has(self.fileSha256) || self.fileSha256.size() == 0 || self.fileSha256.all(k, !k.matches('[[:space:]]'))",message="fileSha256 keys must not contain whitespace"
 type ModelSpec struct {
 	// Source defines where to obtain the model.
 	// For GGUF models: URL or path to a .gguf file.

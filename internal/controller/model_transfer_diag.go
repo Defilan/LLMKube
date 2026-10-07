@@ -57,6 +57,15 @@ const (
 	// the object store did not accept.
 	ReasonModelSourceUnauthorized = "ModelSourceUnauthorized"
 
+	// ReasonModelFileDigestMismatch: a multi-file staging run hashed a staged
+	// file against spec.fileSha256 and rejected it. Distinct from
+	// ReasonModelDigestMismatch so the remedy names the right field.
+	ReasonModelFileDigestMismatch = "ModelFileDigestMismatch"
+
+	// ReasonModelPVCDigestMismatch: a pre-staged pvc:// artifact failed its
+	// spec.sha256 check at pod start. There is no rejection marker to clear.
+	ReasonModelPVCDigestMismatch = "ModelPVCDigestMismatch"
+
 	// ReasonModelSourceNotFound: the source returned 404. Usually a wrong
 	// bucket, key, or file name in spec.source.
 	ReasonModelSourceNotFound = "ModelSourceNotFound"
@@ -92,6 +101,24 @@ type modelTransferSignature struct {
 // cannot be tied to a real message does not belong here, because a confident
 // wrong label is worse than the bare exit code the user already has.
 var modelTransferSignatures = []modelTransferSignature{
+	{
+		// A multi-file staging failure. The per-file helpers name
+		// spec.fileSha256, so this must be matched before the single-file
+		// entry below, whose message it also contains.
+		reason: ReasonModelFileDigestMismatch,
+		remedy: "spec.fileSha256 does not match the bytes at spec.source for at least one staged file; " +
+			"correct the digest (or the source), then delete the cached <file>.<sha256>.sha256-rejected marker to retry",
+		matches: []string{"spec.filesha256"},
+	},
+	{
+		// A pre-staged pvc:// artifact that fails spec.sha256 at pod start.
+		// There is no marker on the read-only mount, so the remedy must not
+		// tell the user to delete one.
+		reason: ReasonModelPVCDigestMismatch,
+		remedy: "spec.sha256 does not match the bytes on the mounted pvc:// volume; " +
+			"correct the digest or re-stage the file",
+		matches: []string{"for the pre-staged"},
+	},
 	{
 		// The downloader's own spec.sha256 gate (#1965). Its message names
 		// the expected and computed digests, and the marker it left behind,

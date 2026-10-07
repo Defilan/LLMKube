@@ -49,6 +49,17 @@ func TestMatchModelTransferFailure_Signatures(t *testing.T) {
 			wantReason: inferencev1alpha1.ReasonModelDigestMismatch,
 		},
 		{
+			name: "spec.fileSha256 does not match a staged shard",
+			msg: "ERROR: spec.fileSha256 mismatch for a.gguf; the origin served bytes that do not match the pinned digest; " +
+				"fix the Model or the upload, then delete /models/k/a.gguf.d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b.sha256-rejected to retry",
+			wantReason: ReasonModelFileDigestMismatch,
+		},
+		{
+			name:       "pre-staged pvc artifact fails its digest",
+			msg:        "ERROR: SHA256 mismatch for the pre-staged /model-source/model.gguf: expected d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b, computed 0000000000000000000000000000000000000000000000000000000000000000",
+			wantReason: ReasonModelPVCDigestMismatch,
+		},
+		{
 			name:       "curl 403 from a signed request with bad credentials",
 			msg:        "curl: (22) The requested URL returned error: 403",
 			wantReason: ReasonModelSourceUnauthorized,

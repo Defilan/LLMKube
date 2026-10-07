@@ -613,12 +613,13 @@ const sha256HashFns = `llmkube_sha256_hash() { actual=$(sha256sum "$1" 2>/dev/nu
 // atomic stamp/marker writers and the verify-then-publish pair.
 // buildPVCVerifyCommand uses sha256HashFns alone, because a pvc:// mount is
 // read-only and cannot carry a stamp.
-const sha256VerifyFns = sha256HashFns + `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; llmkube_stamp_sha256() { llmkube_atomic_write "$1.sha256" "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)"; }; llmkube_marker_hit_sha256() { [ -f "$1.$MODEL_SHA256.sha256-rejected" ]; }; llmkube_check_sha256() { if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against spec.sha256 (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; leaving it in place (the cache dir may be shared); a fresh download replaces it" >&2; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1"; llmkube_atomic_write "$2.$MODEL_SHA256.sha256-rejected" "$MODEL_SHA256"; echo "ERROR: SHA256 mismatch: expected $MODEL_SHA256, computed $actual; discarded $1; recorded $2.$MODEL_SHA256.sha256-rejected" >&2; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2" && rm -f "$2.$MODEL_SHA256.sha256-rejected"; }` + " && "
+const sha256VerifyFns = sha256HashFns + `llmkube_atomic_write() { _llmkube_tmp=$(mktemp "$1.XXXXXX") || return 1; printf '%s' "$2" > "$_llmkube_tmp" && mv "$_llmkube_tmp" "$1"; }; llmkube_stamp_sha256() { llmkube_atomic_write "$1.sha256" "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)"; }; llmkube_marker_hit_sha256() { [ -f "$1.$MODEL_SHA256.sha256-rejected" ]; }; llmkube_check_sha256() { if [ "$(cat "$1.sha256" 2>/dev/null)" = "$MODEL_SHA256 $(stat -c '%s %Y' "$1" 2>/dev/null)" ]; then echo "Model verified against ${MODEL_DIGEST_FIELD:-spec.sha256} (stamp hit, skipped re-hashing)"; return 0; fi; actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: ${MODEL_DIGEST_FIELD:-spec.sha256} mismatch for the cached $1: expected $MODEL_SHA256, computed $actual; leaving it in place (the cache dir may be shared); a fresh download replaces it" >&2; return 1; fi; llmkube_stamp_sha256 "$1"; }; llmkube_publish_sha256() { actual=$(llmkube_sha256_hash "$1") || return 1; if [ "$actual" != "$MODEL_SHA256" ]; then rm -f "$1"; llmkube_atomic_write "$2.$MODEL_SHA256.sha256-rejected" "$MODEL_SHA256"; echo "ERROR: ${MODEL_DIGEST_FIELD:-spec.sha256} mismatch: expected $MODEL_SHA256, computed $actual; discarded $1; recorded $2.$MODEL_SHA256.sha256-rejected" >&2; return 1; fi; mv "$1" "$2" && llmkube_stamp_sha256 "$2" && rm -f "$2.$MODEL_SHA256.sha256-rejected"; }` + " && "
 
 // sha256MultiFileFns defines the per-file verify helpers the multi-file loop
 // runs through (#1978). It is appended to sha256VerifyFns so the loop can set
 // MODEL_SHA256 per iteration and reuse llmkube_check_sha256 /
-// llmkube_publish_sha256 unchanged.
+// llmkube_publish_sha256, which name MODEL_DIGEST_FIELD in their messages
+// (set to spec.fileSha256 for this loop).
 //
 // A file with no digest in $MODEL_FILE_SHA256 gets an empty MODEL_SHA256, and
 // llmkube_accept_file / llmkube_publish_file fall back to existence and a plain
@@ -627,7 +628,9 @@ const sha256VerifyFns = sha256HashFns + `llmkube_atomic_write() { _llmkube_tmp=$
 // path>"; the digest comes first so a path containing spaces survives the
 // read. A command built with these gates aborts when MODEL_FILE_SHA256 did not
 // reach the container, matching the single-file precheck's fail-closed rule.
-const sha256MultiFileFns = `llmkube_file_digest() { printf '%s\n' "${MODEL_FILE_SHA256:-}" | while IFS=' ' read -r _llmkube_d _llmkube_p; do [ "$_llmkube_p" = "$1" ] && { printf '%s' "$_llmkube_d"; return 0; }; done; }; llmkube_precheck_file_sha256() { if [ -z "${MODEL_FILE_SHA256:-}" ]; then echo "ERROR: this multi-file downloader was built with SHA256 gates but MODEL_FILE_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; }; llmkube_accept_file() { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_check_sha256 "$1"; else [ -f "$1" ]; fi; }; llmkube_publish_file() { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_publish_sha256 "$1" "$2"; else mv "$1" "$2"; fi; }` + " && "
+// The precheck also aborts when a declared path is not one of $MODEL_FILES, so
+// a mangled key cannot silently downgrade a pinned file to unpinned.
+const sha256MultiFileFns = `llmkube_file_digest() { printf '%s\n' "${MODEL_FILE_SHA256:-}" | while IFS=' ' read -r _llmkube_d _llmkube_p; do [ "$_llmkube_p" = "$1" ] && { printf '%s' "$_llmkube_d"; return 0; }; done; }; llmkube_precheck_file_sha256() { if [ -z "${MODEL_FILE_SHA256:-}" ]; then echo "ERROR: this multi-file downloader was built with SHA256 gates but MODEL_FILE_SHA256 is unset; refusing to transfer unchecked" >&2; return 1; fi; _llmkube_orphans=$(printf '%s\n' "$MODEL_FILE_SHA256" | while IFS= read -r _llmkube_entry; do [ -n "$_llmkube_entry" ] || continue; _llmkube_entry_path="${_llmkube_entry#* }"; if [ "$_llmkube_entry_path" = "$_llmkube_entry" ] || ! printf '%s\n' "$MODEL_FILES" | grep -Fqx -- "$_llmkube_entry_path"; then printf '%s ' "$_llmkube_entry_path"; fi; done); if [ -n "$_llmkube_orphans" ]; then echo "ERROR: MODEL_FILE_SHA256 names paths that are not staged files: $_llmkube_orphans; refusing to treat them as unpinned" >&2; return 1; fi; }; llmkube_accept_file() { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_check_sha256 "$1"; else [ -f "$1" ]; fi; }; llmkube_publish_file() { if [ -n "${MODEL_SHA256:-}" ]; then llmkube_publish_sha256 "$1" "$2"; else mv "$1" "$2"; fi; }` + " && "
 
 // validatorDeriveAndSweep is the shell fragment that turns $remote_validator (an
 // upstream validator string: an ETag, or Content-Length when the origin sends no
@@ -927,6 +930,7 @@ func multiFileInitEnvVars(source, cacheDir string, files []string, digests map[s
 		}
 		if b.Len() > 0 {
 			envs = append(envs, corev1.EnvVar{Name: "MODEL_FILE_SHA256", Value: strings.TrimSuffix(b.String(), "\n")})
+			envs = append(envs, corev1.EnvVar{Name: "MODEL_DIGEST_FIELD", Value: "spec.fileSha256"})
 		}
 	}
 	if isS3Source(source) {
@@ -981,14 +985,14 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 		fns = sha256VerifyFns + sha256MultiFileFns
 		pre = `llmkube_precheck_file_sha256 || exit 1; `
 		digestAssign = `MODEL_SHA256=$(llmkube_file_digest "$rel"); `
-		markerGuard = `if [ -n "${MODEL_SHA256:-}" ] && llmkube_marker_hit_sha256 "$dest"; then if llmkube_accept_file "$dest"; then echo "spec.fileSha256 no longer matches $rel; kept the pinned cached copy"; continue; else echo "ERROR: spec.fileSha256 mismatch for $rel; fix the Model or delete $dest.$MODEL_SHA256.sha256-rejected to retry" >&2; exit 1; fi; fi; `
+		markerGuard = `if [ -n "${MODEL_SHA256:-}" ] && llmkube_marker_hit_sha256 "$dest"; then if llmkube_accept_file "$dest"; then echo "the origin served bytes for $rel that do not match the pinned spec.fileSha256; kept the pinned cached copy; fix the upload, then delete $dest.$MODEL_SHA256.sha256-rejected to retry"; continue; else echo "ERROR: spec.fileSha256 mismatch for $rel; the origin served bytes that do not match the pinned digest; fix the Model or the upload, then delete $dest.$MODEL_SHA256.sha256-rejected to retry" >&2; exit 1; fi; fi; `
 		sizeHit = ` && llmkube_accept_file "$dest"`
 		// The unreachable-origin fallback is part of the per-file gate: keep a
 		// cached copy only if it still passes the gate (stamp hit or a local
 		// hash match), otherwise fail the init. Mirrors remoteRevalidateScript's
 		// keepCached, so an Offline restart cannot serve bytes that fail the
 		// pin. The unhashed shape above stays byte-for-byte unchanged.
-		keepCachedTail = `elif [ -f "$dest" ] && llmkube_accept_file "$dest"; then echo "Revalidation unreachable for $rel; kept cached copy"; ` +
+		keepCachedTail = `elif [ -f "$dest" ] && llmkube_accept_file "$dest"; then if llmkube_marker_hit_sha256 "$dest"; then echo "Model artifact $rel: the origin served bytes that do not match the pinned spec.fileSha256; kept the pinned cached copy"; else echo "Revalidation unreachable for $rel; kept cached copy"; fi; ` +
 			`else echo "ERROR: model artifact $rel missing and revalidation failed"; exit 1; fi; `
 	}
 	publishFile := func(partial string) string {
@@ -1222,6 +1226,9 @@ func buildPVCStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alph
 func buildPVCVerifyCommand() string {
 	return sha256HashFns +
 		`llmkube_precheck_sha256 || exit 1; ` +
+		`if [ ! -e "$MODEL_PATH" ]; then echo "ERROR: the pvc:// path $MODEL_PATH does not exist on the mounted volume" >&2; exit 1; fi; ` +
+		`if [ -d "$MODEL_PATH" ]; then echo "ERROR: the pvc:// path $MODEL_PATH is a directory, not a file" >&2; exit 1; fi; ` +
+		`if [ ! -r "$MODEL_PATH" ]; then echo "ERROR: the pvc:// file $MODEL_PATH is not readable by the init container user (uid 101 with the default image); check its mode and ownership on the share" >&2; exit 1; fi; ` +
 		`actual=$(llmkube_sha256_hash "$MODEL_PATH") || exit 1; ` +
 		`if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the pre-staged $MODEL_PATH: expected $MODEL_SHA256, computed $actual" >&2; exit 1; fi; ` +
 		`echo "Model verified against spec.sha256"`

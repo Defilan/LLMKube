@@ -333,7 +333,10 @@ fails the init container, so the pod never starts with bad weights.
 - A pre-staged `pvc://` source with `spec.sha256` verifies the mounted file in
   an init container at pod start. The mount is read-only, so no stamp is
   written and the file is hashed on every pod start; a mismatch fails the pod.
-  `oci://` stays digest-addressed and is rejected with `spec.sha256`.
+  The hash is added to every pod start, rollout, reschedule and scale-out:
+  expect roughly (file size / hash throughput), which for a 100-400 GB
+  artifact on a network PVC can be many minutes. `oci://` stays
+  digest-addressed and is rejected with `spec.sha256`.
 - Combining `spec.sha256` with multi-file staging (`spec.files` /
   `spec.mmproj`) or an `oci://` source is rejected at admission; use
   `spec.fileSha256` for a multi-file set. Models that set such a combination
@@ -358,10 +361,13 @@ spec:
 ```
 
 - Only listed files are verified; a file with no entry stages as before, so a
-  partially pinned set is allowed.
+  partially pinned set is allowed. An unpinned shard in a partially pinned set
+  gets no protection, so pinning the whole set is recommended.
 - `spec.files` is capped at 256 entries of 512 characters each.
 - A mismatch discards that file's partial, records its own
-  `<file>.<sha256>.sha256-rejected` marker, and stops the loop.
+  `<file>.<sha256>.sha256-rejected` marker, and stops the loop. Once the
+  upload is fixed, delete the marker (`<file>.<sha256>.sha256-rejected`) to
+  let the next start re-download.
 - Every key must name a `spec.files` entry or `spec.mmproj`. Globs in
   `spec.files` are rejected when `fileSha256` is set, because a digest cannot
   be keyed to an unknown expanded name. `spec.sha256` and `spec.fileSha256`

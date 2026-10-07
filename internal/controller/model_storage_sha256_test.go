@@ -237,7 +237,7 @@ func sha256MismatchDiscardsPartialAndRecordsRejection(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected failure on hash mismatch\n%s", out)
 	}
-	if !strings.Contains(out, "SHA256 mismatch") {
+	if !strings.Contains(out, "spec.sha256 mismatch") {
 		t.Errorf("output does not report the mismatch: %s", out)
 	}
 	if !strings.Contains(out, "discarded") {
@@ -737,8 +737,15 @@ func TestModelMultiFileSHA256_Behavioral(t *testing.T) {
 	t.Run("pinned mismatch discards and records the rejection", multiFileSHA256MismatchRejects)
 	t.Run("pinned warm cache skips the transfer", multiFileSHA256WarmCacheSkips)
 	t.Run("gated command with no digest env fails closed", multiFileSHA256FailsClosed)
+	t.Run("S3 pinned file verified and published", multiFileSHA256S3Publishes)
+	t.Run("OnChange online mismatch rejects before publish", multiFileSHA256OnchangeDownloadMismatchRejects)
+	t.Run("IfNotPresent corrupt warm cache is replaced", multiFileSHA256IfNotPresentCorruptCacheReplaced)
+	t.Run("OnChange size-match corrupt is replaced", multiFileSHA256OnchangeSizeMatchCorruptReplaced)
 	t.Run("OnChange offline keeps a verified pinned copy", multiFileSHA256OnchangeOfflineKeepsAVerifiedCopy)
 	t.Run("OnChange offline rejects a corrupt pinned copy", multiFileSHA256OnchangeOfflineRejectsACorruptCopy)
+	t.Run("marker bounds a repeat IfNotPresent start", multiFileSHA256MarkerBoundsIfNotPresent)
+	t.Run("marker bounds a repeat OnChange start", multiFileSHA256MarkerBoundsOnChange)
+	t.Run("orphan digest entry fails closed", multiFileSHA256OrphanDigestFailsClosed)
 }
 
 func multiFileSHA256FailsClosed(t *testing.T) {
@@ -878,6 +885,179 @@ func multiFileSHA256OnchangeOfflineRejectsACorruptCopy(t *testing.T) {
 	mustNotExist(t, primary+"."+want+".sha256-rejected")
 }
 
+// multiFileSHA256S3Publishes drives the S3 multi-file branch against the same
+// stub origin the single-file S3 cases use. The publish path is distinct from
+// the http path ($dest.tmp vs $MODEL_PARTIAL), so it needs its own behavioral
+// case to pin the verify-then-publish route there.
+func multiFileSHA256S3Publishes(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, true, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, "s3://bucket", primary, "",
+		append([]string{
+			"MODEL_FILES=model.gguf",
+			"MODEL_FILE_SHA256=" + want + " model.gguf",
+		}, s3TestEnv(o.srv.URL)...)...)
+	if err != nil {
+		t.Fatalf("S3 multi-file download with matching digest failed: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, primary); got != string(o.content()) {
+		t.Errorf("S3 multi-file published bytes are wrong")
+	}
+	mustStamp(t, primary, want)
+	mustNotExist(t, primary+"."+want+".sha256-rejected")
+}
+
+func multiFileSHA256OnchangeDownloadMismatchRejects(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyOnChange)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+wrong+" model.gguf")
+	if err == nil {
+		t.Fatalf("OnChange download must not publish unverified bytes\n%s", out)
+	}
+	mustNotExist(t, primary)
+	mustExist(t, primary+"."+wrong+".sha256-rejected")
+	if p := partialsOf(t, primary); len(p) != 0 {
+		t.Errorf("the rejected multi-file partial was not discarded: %v", p)
+	}
+}
+
+// multiFileSHA256IfNotPresentCorruptCacheReplaced pins the gated cache probe:
+// an existing file that fails the per-file digest must not be served just
+// because it exists, and the same start must replace it with verified bytes.
+func multiFileSHA256IfNotPresentCorruptCacheReplaced(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(primary, []byte("corrupt bytes"), 0o644); err != nil {
+		t.Fatalf("seed corrupt file: %v", err)
+	}
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+want+" model.gguf")
+	if err != nil {
+		t.Fatalf("IfNotPresent corrupt warm cache must self-heal: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, primary); got != string(o.content()) {
+		t.Errorf("cache was not replaced with the verified bytes")
+	}
+	mustStamp(t, primary, want)
+}
+
+func multiFileSHA256OnchangeSizeMatchCorruptReplaced(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	// Same size as the origin so the size-match branch fires, wrong bytes and
+	// no stamp: size equality alone must not skip the digest check.
+	if err := os.WriteFile(primary, []byte(strings.Repeat("x", contentALen)), 0o644); err != nil {
+		t.Fatalf("seed corrupt same-size file: %v", err)
+	}
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyOnChange)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+want+" model.gguf")
+	if err != nil {
+		t.Fatalf("size-match with corrupt bytes must self-heal: %v\n%s", err, out)
+	}
+	if got := readOrFail(t, primary); got != string(o.content()) {
+		t.Errorf("cache was not replaced with the verified bytes")
+	}
+	mustNotExist(t, primary+"."+want+".sha256-rejected")
+}
+
+// multiFileMarkerBounds drives two starts of the same failed pin: the first
+// writes the digest-keyed rejection marker, and the second must fail on the
+// marker before any transfer, leaving the cached file untouched. Without the
+// guard a CrashLoopBackOff re-downloads the whole pinned shard on every
+// restart.
+func multiFileMarkerBounds(t *testing.T, policy string) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	stale := []byte("stale corrupt bytes")
+	if err := os.WriteFile(primary, stale, 0o644); err != nil {
+		t.Fatalf("seed stale file: %v", err)
+	}
+	wrong := sha256Hex([]byte("a hash from another artifact"))
+	script := buildMultiFileInitCommand(true, false, false, true, policy)
+
+	if out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+wrong+" model.gguf"); err == nil {
+		t.Fatalf("the first start must fail the wrong pin\n%s", out)
+	}
+	mustExist(t, primary+"."+wrong+".sha256-rejected")
+	if got := readOrFail(t, primary); got != string(stale) {
+		t.Fatalf("the rejected start changed the cached file: %q", got)
+	}
+
+	o.fullFromZero.Store(0)
+	o.rangeRequests.Store(0)
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+wrong+" model.gguf")
+	if err == nil {
+		t.Fatalf("the second start must fail on the marker\n%s", out)
+	}
+	if !strings.Contains(out, "spec.fileSha256 mismatch for") || !strings.Contains(out, "sha256-rejected to retry") {
+		t.Errorf("the second start does not name the marker message: %s", out)
+	}
+	if n := o.fullFromZero.Load() + o.rangeRequests.Load(); n != 0 {
+		t.Errorf("the second start issued %d GETs; the marker did not bound the retry\n%s", n, out)
+	}
+	if got := readOrFail(t, primary); got != string(stale) {
+		t.Errorf("the marker-hit start changed the cached file: %q", got)
+	}
+	mustExist(t, primary+"."+wrong+".sha256-rejected")
+}
+
+func multiFileSHA256MarkerBoundsIfNotPresent(t *testing.T) {
+	multiFileMarkerBounds(t, RefreshPolicyIfNotPresent)
+}
+
+func multiFileSHA256MarkerBoundsOnChange(t *testing.T) {
+	multiFileMarkerBounds(t, RefreshPolicyOnChange)
+}
+
+// multiFileSHA256OrphanDigestFailsClosed pins the fail-closed precheck: a
+// declared digest for a path that is not one of $MODEL_FILES must abort rather
+// than silently leave that file unpinned. The mangled whitespace key is the
+// concrete shape the CEL rule also rejects; here it is injected directly into
+// the env, bypassing admission.
+func multiFileSHA256OrphanDigestFailsClosed(t *testing.T) {
+	o := newRangeOrigin(t, true)
+	dir := t.TempDir()
+	primary := filepath.Join(dir, "model.gguf")
+	want := sha256Hex(o.content())
+	script := buildMultiFileInitCommand(true, false, false, true, RefreshPolicyIfNotPresent)
+
+	out, err := runVerifyScriptEnv(t, script, o.srv.URL, primary, "",
+		"MODEL_FILES=model.gguf",
+		"MODEL_FILE_SHA256="+want+" other.gguf")
+	if err == nil {
+		t.Fatalf("a declared digest for an unstaged path must fail closed\n%s", out)
+	}
+	if !strings.Contains(out, "not staged files") {
+		t.Errorf("expected the orphan-path message: %s", out)
+	}
+	mustNotExist(t, primary)
+}
+
 // TestModelPVCSHA256_Behavioral runs the verify-only command a pvc:// Model's
 // init container runs (#1979). The command reads $MODEL_PATH, so it points at
 // a temp file here instead of a mount; it must verify and must write no stamp,
@@ -886,6 +1066,9 @@ func TestModelPVCSHA256_Behavioral(t *testing.T) {
 	requireInitShellEnvironment(t)
 	t.Run("matching bytes verify without stamping", pvcSHA256MatchingVerifies)
 	t.Run("mismatch fails the init container", pvcSHA256MismatchFails)
+	t.Run("missing path names the missing path", pvcSHA256MissingPath)
+	t.Run("a directory names the directory", pvcSHA256Directory)
+	t.Run("unreadable file names the permission problem", pvcSHA256Unreadable)
 }
 
 func pvcSHA256MatchingVerifies(t *testing.T) {
@@ -916,6 +1099,51 @@ func pvcSHA256MismatchFails(t *testing.T) {
 	}
 	if !strings.Contains(out, "SHA256 mismatch for the pre-staged") {
 		t.Errorf("expected the mismatch message: %s", out)
+	}
+}
+
+func pvcSHA256MissingPath(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "absent.gguf")
+	out, err := runVerifyScript(t, buildPVCVerifyCommand(), "pvc://models/absent.gguf", modelPath, sha256Hex([]byte("x")))
+	if err == nil {
+		t.Fatalf("a missing pvc path must fail the init container\n%s", out)
+	}
+	if !strings.Contains(out, "does not exist on the mounted volume") {
+		t.Errorf("expected the missing-path message: %s", out)
+	}
+}
+
+func pvcSHA256Directory(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "a-directory")
+	if err := os.Mkdir(modelPath, 0o755); err != nil {
+		t.Fatalf("seed directory: %v", err)
+	}
+	out, err := runVerifyScript(t, buildPVCVerifyCommand(), "pvc://models/a-directory", modelPath, sha256Hex([]byte("x")))
+	if err == nil {
+		t.Fatalf("a pvc directory must fail the init container\n%s", out)
+	}
+	if !strings.Contains(out, "is a directory, not a file") {
+		t.Errorf("expected the directory message: %s", out)
+	}
+}
+
+func pvcSHA256Unreadable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits; the unreadable branch cannot be provoked")
+	}
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "locked.gguf")
+	if err := os.WriteFile(modelPath, []byte("x"), 0o000); err != nil {
+		t.Fatalf("seed unreadable file: %v", err)
+	}
+	out, err := runVerifyScript(t, buildPVCVerifyCommand(), "pvc://models/locked.gguf", modelPath, sha256Hex([]byte("x")))
+	if err == nil {
+		t.Fatalf("an unreadable pvc file must fail the init container\n%s", out)
+	}
+	if !strings.Contains(out, "is not readable by the init container") {
+		t.Errorf("expected the unreadable message: %s", out)
 	}
 }
 
