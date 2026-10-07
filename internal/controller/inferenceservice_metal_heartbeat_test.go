@@ -369,3 +369,123 @@ var _ = Describe("metalEndpointSnapshot heartbeat expiry", func() {
 		})
 	})
 })
+
+var _ = Describe("metal service scheduling status", func() {
+	const namespace = "default"
+
+	var (
+		reconciler *InferenceServiceReconciler
+		ctx        context.Context
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		reconciler = &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+		}
+	})
+
+	// readyMetalFixtures creates a Ready metal Model and a one-replica
+	// InferenceService, the minimum the phase determination needs to reach
+	// PhaseReady once an EndpointSlice exists.
+	readyMetalFixtures := func(modelName, isvcName string) *inferencev1alpha1.InferenceService {
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: namespace},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/sched-model.gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, model) })
+		model.Status.Phase = PhaseReady
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		replicas := int32(1)
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: namespace},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: modelName,
+				Replicas: &replicas,
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, isvc) })
+		return isvc
+	}
+
+	It("clears a stale WaitingForMetalAgent once the agent is serving", func() {
+		const isvcName = "sched-clear-isvc"
+		isvc := readyMetalFixtures("sched-clear-model", isvcName)
+
+		fresh := time.Now().UTC().Format(time.RFC3339)
+		slice := metalEndpoints(isvcName, fresh)
+		Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, slice) })
+
+		key := types.NamespacedName{Name: isvcName, Namespace: namespace}
+		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
+		isvc.Status.SchedulingStatus = "WaitingForMetalAgent"
+		isvc.Status.SchedulingMessage = "Waiting for the host metal-agent to fetch the model and register Endpoints"
+		Expect(k8sClient.Status().Update(ctx, isvc)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(PhaseReady))
+		Expect(got.Status.SchedulingStatus).To(BeEmpty(),
+			"a Ready metal service must not keep advertising WaitingForMetalAgent")
+		Expect(got.Status.SchedulingMessage).To(BeEmpty())
+
+		// A second pass must not re-add the cleared status.
+		_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Status.SchedulingStatus).To(BeEmpty())
+	})
+
+	It("clears a stale AgentHeartbeatStale once the agent is serving", func() {
+		const isvcName = "sched-hbstale-isvc"
+		isvc := readyMetalFixtures("sched-hbstale-model", isvcName)
+
+		fresh := time.Now().UTC().Format(time.RFC3339)
+		slice := metalEndpoints(isvcName, fresh)
+		Expect(k8sClient.Create(ctx, slice)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, slice) })
+
+		key := types.NamespacedName{Name: isvcName, Namespace: namespace}
+		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
+		isvc.Status.SchedulingStatus = "AgentHeartbeatStale"
+		isvc.Status.SchedulingMessage = "metal-agent heartbeat stale (last seen 2026-01-01T00:00:00Z); host may be offline"
+		Expect(k8sClient.Status().Update(ctx, isvc)).To(Succeed())
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(PhaseReady))
+		Expect(got.Status.SchedulingStatus).To(BeEmpty(),
+			"a Ready metal service must not keep advertising AgentHeartbeatStale")
+		Expect(got.Status.SchedulingMessage).To(BeEmpty())
+	})
+
+	It("keeps WaitingForMetalAgent while the agent has not registered", func() {
+		const isvcName = "sched-wait-isvc"
+		readyMetalFixtures("sched-wait-model", isvcName)
+
+		key := types.NamespacedName{Name: isvcName, Namespace: namespace}
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+
+		got := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(PhaseCreating))
+		Expect(got.Status.SchedulingStatus).To(Equal("WaitingForMetalAgent"),
+			"an InferenceService whose agent has not registered must still report WaitingForMetalAgent")
+	})
+})
