@@ -225,6 +225,14 @@ curl -sS http://127.0.0.1:9999/v1/chat/completions \
   -d '{"model":"phi-4-mini","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+oMLX is the exception to the name above: it serves each model under its
+model-store directory basename, so a direct client (the `<isvc>` Service
+or the `:9999` proxy) must send that basename as the `model` field, not
+the InferenceService name. A `ModelRouter` backend pointing at an oMLX
+InferenceService with `spec.runtime: omlx` translates the name for you.
+See the "Model identifier" section of the
+[macOS agent guide](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#model-identifier).
+
 ### Reaching the service from elsewhere
 
 The `phi-4-mini` Service selects the relay pod, so the usual tools

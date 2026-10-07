@@ -170,6 +170,139 @@ func TestCompileRouterConfigResolvesLocalBackend(t *testing.T) {
 	}
 }
 
+// TestCompileRouterConfigOMLXServedModel pins the oMLX model-name translation
+// (#1972): oMLX serves a model under its model-store directory basename, not
+// the InferenceService name, so a backend pointing at an oMLX InferenceService
+// must carry that basename as the served model the proxy rewrites to.
+func TestCompileRouterConfigOMLXServedModel(t *testing.T) {
+	newRouter := func() *inferencev1alpha1.ModelRouter {
+		return &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: "omlx-router", Namespace: testBuilderNs},
+			Spec: inferencev1alpha1.ModelRouterSpec{
+				Backends: []inferencev1alpha1.RouterBackend{{
+					Name:                "omlx",
+					InferenceServiceRef: &corev1.LocalObjectReference{Name: "qwen-omlx"},
+					Tier:                "local",
+				}},
+				DefaultRoute: "omlx",
+			},
+		}
+	}
+
+	cases := []struct {
+		name        string
+		runtime     string
+		modelSource string
+		seedModel   bool
+		wantServed  string
+	}{
+		{
+			name:        "omlx serves the source basename",
+			runtime:     inferencev1alpha1.RuntimeOMLX,
+			modelSource: "/models/mlx-community/Qwen3.8-27B-4bit",
+			seedModel:   true,
+			wantServed:  "Qwen3.8-27B-4bit",
+		},
+		{
+			name:        "omlx empty source falls back to the Model name",
+			runtime:     inferencev1alpha1.RuntimeOMLX,
+			modelSource: "",
+			seedModel:   true,
+			wantServed:  "qwen-mlx",
+		},
+		{
+			name:       "omlx missing Model leaves the InferenceService fallback",
+			runtime:    inferencev1alpha1.RuntimeOMLX,
+			seedModel:  false,
+			wantServed: "",
+		},
+		{
+			name:        "non-omlx runtime keeps the InferenceService name",
+			runtime:     "",
+			modelSource: "/models/Qwen3.8-27B-4bit",
+			seedModel:   true,
+			wantServed:  "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := newRouter()
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "qwen-omlx", Namespace: testBuilderNs},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:  tc.runtime,
+					ModelRef: "qwen-mlx",
+				},
+			}
+			seeds := []client.Object{isvc}
+			if tc.seedModel {
+				seeds = append(seeds, &inferencev1alpha1.Model{
+					ObjectMeta: metav1.ObjectMeta{Name: "qwen-mlx", Namespace: testBuilderNs},
+					Spec:       inferencev1alpha1.ModelSpec{Source: tc.modelSource},
+				})
+			}
+			r := newRouterReconcilerForTest(t, mr, seeds...)
+
+			compiled, err := r.compileRouterConfig(context.Background(), mr)
+			if err != nil {
+				t.Fatalf("compileRouterConfig: %v", err)
+			}
+			if !compiled.Backends[0].Healthy {
+				t.Fatalf("backend should stay healthy, Message=%q", compiled.Backends[0].Message)
+			}
+			var cfg router.Config
+			if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+				t.Fatalf("unmarshal compiled JSON: %v", err)
+			}
+			if cfg.Backends[0].ServedModel != tc.wantServed {
+				t.Errorf("ServedModel = %q, want %q", cfg.Backends[0].ServedModel, tc.wantServed)
+			}
+			if cfg.Backends[0].InferenceService != "qwen-omlx" {
+				t.Errorf("InferenceService = %q, want qwen-omlx", cfg.Backends[0].InferenceService)
+			}
+		})
+	}
+}
+
+// TestCompileRouterConfigOMLXServedModelWireTag pins the on-disk "servedModel"
+// key the router-proxy decodes. Asserting the raw bytes, not a round-trip
+// through router.Config, catches a JSON tag rename that would stay green when
+// both sides share the Go type.
+func TestCompileRouterConfigOMLXServedModelWireTag(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "omlx-router", Namespace: testBuilderNs},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			Backends: []inferencev1alpha1.RouterBackend{{
+				Name:                "omlx",
+				InferenceServiceRef: &corev1.LocalObjectReference{Name: "qwen-omlx"},
+				Tier:                "local",
+			}},
+			DefaultRoute: "omlx",
+		},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen-omlx", Namespace: testBuilderNs},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime:  inferencev1alpha1.RuntimeOMLX,
+			ModelRef: "qwen-mlx",
+		},
+	}
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen-mlx", Namespace: testBuilderNs},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "/models/mlx-community/Qwen3.8-27B-4bit"},
+	}
+	r := newRouterReconcilerForTest(t, mr, isvc, model)
+
+	compiled, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compileRouterConfig: %v", err)
+	}
+	if !strings.Contains(string(compiled.JSON), `"servedModel": "Qwen3.8-27B-4bit"`) {
+		t.Errorf("compiled JSON lacks the servedModel wire key:\n%s", compiled.JSON)
+	}
+}
+
 // TestCompileRouterConfigEndpointResolution verifies opt-in endpoint resolution
 // (#1812): with resolution=endpoint the backend compiles one address per ready
 // pod and keeps the Service DNS name as the fallback.

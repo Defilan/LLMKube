@@ -102,13 +102,20 @@ type Backend struct {
 	// Empty for local backends (the request body carries the model name).
 	Model string `json:"model,omitempty"`
 
+	// ServedModel is the model identifier the upstream engine actually
+	// serves, when it differs from the InferenceService name. Set for
+	// oMLX backends, whose engine serves the model-store directory
+	// basename rather than an alias. Empty for backends that serve their
+	// InferenceService name, where InferenceService is the fallback.
+	ServedModel string `json:"servedModel,omitempty"`
+
 	// InferenceService is the name of the InferenceService this backend
-	// resolves to, and therefore the model name the runtime behind it
-	// serves. Empty for external backends, which carry Model instead.
-	// The proxy uses it to rewrite the outbound "model" field when a
-	// request reaches this backend under a different client-facing alias
-	// (a rule fall-through, an IfIdle skip): llama.cpp ignores the field
-	// but vLLM / SGLang / TGI reject an unknown name with a 404.
+	// resolves to. The proxy uses it to rewrite the outbound "model" field
+	// when a request reaches this backend under a different client-facing
+	// alias (a rule fall-through, an IfIdle skip) and ServedModel is empty:
+	// most local runtimes serve their InferenceService name, llama.cpp
+	// ignores the field, but vLLM / SGLang / TGI reject an unknown name
+	// with a 404. Empty for external backends, which carry Model instead.
 	InferenceService string `json:"inferenceService,omitempty"`
 
 	// Capabilities advertised by this backend (e.g. ["tools", "vision"]).
