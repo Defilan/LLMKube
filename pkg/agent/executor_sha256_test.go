@@ -331,9 +331,78 @@ func TestEnsureModel_CacheHit_LegacyBareStamp_RehashesOnce(t *testing.T) {
 	}
 }
 
+// TestEnsureModel_CacheHit_StampFieldMismatch_RehashesOnce pins that all three
+// fields of the stamp are load-bearing: a stamp whose digest still names the
+// expected hash but whose size or mtime no longer describes the file on disk is
+// a miss, so it hashes once and is rewritten rather than trusted (#1980).
+func TestEnsureModel_CacheHit_StampFieldMismatch_RehashesOnce(t *testing.T) {
+	cases := []struct {
+		name  string
+		stamp func(digest string, fi os.FileInfo) string
+	}{
+		{
+			name: "stale size",
+			stamp: func(digest string, fi os.FileInfo) string {
+				return fmt.Sprintf("%s %d %d", digest, fi.Size()+1, fi.ModTime().Unix())
+			},
+		},
+		{
+			name: "stale mtime",
+			stamp: func(digest string, fi os.FileInfo) string {
+				return fmt.Sprintf("%s %d %d", digest, fi.Size(), fi.ModTime().Unix()+1)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			executor := NewMetalExecutor("/bin/llama-server", tmpDir, newNopLogger())
+
+			modelDir := filepath.Join(tmpDir, "field-mismatch-model")
+			if err := os.MkdirAll(modelDir, 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+			payload := []byte("field-mismatch-gguf-bytes")
+			localPath := filepath.Join(modelDir, "model.gguf")
+			if err := os.WriteFile(localPath, payload, 0o644); err != nil {
+				t.Fatalf("seed cached file: %v", err)
+			}
+			fi, err := os.Stat(localPath)
+			if err != nil {
+				t.Fatalf("stat cached file: %v", err)
+			}
+			digest := sha256Hex(payload)
+			if err := os.WriteFile(localPath+".sha256", []byte(tc.stamp(digest, fi)), 0o600); err != nil {
+				t.Fatalf("seed %s stamp: %v", tc.name, err)
+			}
+
+			calls := withHashFileCounter(t)
+
+			_, err = executor.ensureModel(t.Context(), "https://example.invalid/model.gguf",
+				"field-mismatch-model", nil, digest)
+			if err != nil {
+				t.Fatalf("ensureModel: %v", err)
+			}
+			if *calls != 1 {
+				t.Errorf("hashFile called %d times, want exactly 1 (a %s stamp must not be trusted)", *calls, tc.name)
+			}
+			if !stampHasDigest(t, localPath+".sha256", digest) {
+				t.Errorf("the stale %s stamp was not rewritten to the current triple", tc.name)
+			}
+		})
+	}
+}
+
 // TestWriteSHA256Stamp_MatchesShellFormat pins the written sidecar's shape: the
 // lowercase digest, the file size and its mtime in Unix seconds, matching the
 // init container's `"$MODEL_SHA256 $(stat -c '%s %Y' "$1")"`.
+//
+// This test is the agent half of the cross-writer pair: the controller suite's
+// stampTriple/writeStamp (internal/controller/model_storage_sha256_test.go)
+// writes the same bytes, and llmkube_stamp_sha256/llmkube_check_sha256
+// (internal/controller/model_storage.go) parse them, so a change to one shape
+// must land with a change to the other.
 func TestWriteSHA256Stamp_MatchesShellFormat(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "model.gguf")
