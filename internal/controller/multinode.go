@@ -814,19 +814,7 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	desiredReplicas int32,
 	modelReady bool,
 ) (int32, *ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
-	// A Deployment from a previous single-node spec of the same name would
-	// fight the group for the GPU and the Service. Remove it.
-	var stale appsv1.Deployment
-	if err := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, &stale); err == nil {
-		if metav1.IsControlledBy(&stale, isvc) {
-			log.Info("multiNode: deleting the single-node Deployment this service used to own", "name", stale.Name)
-			if err := r.Delete(ctx, &stale); err != nil && !apierrors.IsNotFound(err) {
-				return 0, nil, err
-			}
-		}
-	} else if !apierrors.IsNotFound(err) {
+	if err := r.deleteStaleSingleNodeDeployment(ctx, isvc); err != nil {
 		return 0, nil, err
 	}
 
@@ -903,22 +891,8 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		}
 	}
 
-	// Every rank renders from one template, so one rank's volumes answer for
-	// the group. A member that cannot mount the CA would hold its pinned
-	// node's GPU in ContainerCreating; hold the creates instead.
-	caMissing, err := r.reconcileCACertConfigMap(ctx, isvc, &desired[0].Spec)
-	if err != nil {
-		return 0, nil, err
-	}
-	if caMissing {
-		for _, o := range obs {
-			if o.existing == nil {
-				log.Info("multiNode: CA ConfigMap missing in the service namespace; not creating members",
-					"configMap", r.CACertConfigMap, "namespace", isvc.Namespace)
-				result, updateErr := r.waitForCACertConfigMap(ctx, isvc, modelReady, desiredReplicas)
-				return 0, result, updateErr
-			}
-		}
+	if held, result, err := r.holdMembersForCACertConfigMap(ctx, isvc, desired, obs, modelReady, desiredReplicas); held || err != nil {
+		return 0, result, err
 	}
 
 	created := 0
@@ -951,6 +925,57 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	}
 	setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, "Starting", fmt.Sprintf("%d of %d members running", running, len(desired)))
 	return 0, nil, nil
+}
+
+// deleteStaleSingleNodeDeployment removes a Deployment this service owned
+// under a previous single-node spec of the same name: it would fight the
+// group for the GPU and the Service.
+func (r *InferenceServiceReconciler) deleteStaleSingleNodeDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	var stale appsv1.Deployment
+	err := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, &stale)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !metav1.IsControlledBy(&stale, isvc) {
+		return nil
+	}
+	logf.FromContext(ctx).Info("multiNode: deleting the single-node Deployment this service used to own", "name", stale.Name)
+	if err := r.Delete(ctx, &stale); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// holdMembersForCACertConfigMap holds member creation while the operator's
+// custom CA ConfigMap is missing from the service namespace. Every rank renders
+// from one template, so one rank's volumes answer for the group. A member that
+// cannot mount the CA would hold its pinned node's GPU in ContainerCreating, so
+// nothing is created until the ConfigMap exists. held is true when the caller
+// must return result and err without creating members.
+func (r *InferenceServiceReconciler) holdMembersForCACertConfigMap(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	desired []*corev1.Pod,
+	obs []memberObservation,
+	modelReady bool,
+	desiredReplicas int32,
+) (held bool, result *ctrl.Result, err error) {
+	caMissing, err := r.reconcileCACertConfigMap(ctx, isvc, &desired[0].Spec)
+	if err != nil || !caMissing {
+		return false, nil, err
+	}
+	for _, o := range obs {
+		if o.existing == nil {
+			logf.FromContext(ctx).Info("multiNode: CA ConfigMap missing in the service namespace; not creating members",
+				"configMap", r.CACertConfigMap, "namespace", isvc.Namespace)
+			result, updateErr := r.waitForCACertConfigMap(ctx, isvc, modelReady, desiredReplicas)
+			return true, result, updateErr
+		}
+	}
+	return false, nil, nil
 }
 
 // checkMemberClaims mirrors ensureModelCachePVC for per-member claims: they
