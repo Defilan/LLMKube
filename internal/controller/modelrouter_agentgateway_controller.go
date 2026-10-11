@@ -211,7 +211,16 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// The ref nil-check short-circuits before agentGatewayPolicyNamespace
 	// dereferences it.
 	sameNSPolicy := mr.Spec.AgentGatewayRef != nil && agentGatewayPolicyNamespace(mr) == mr.Namespace
-	if deleting || leaving || (hasFinalizer && sameNSPolicy) {
+	// Evidence the router ever used AgentGateway mode: the finalizer, a
+	// status.agentGateway block (set exactly when generation succeeded), or a
+	// TRUE AgentGatewayReady condition. A FALSE condition is not evidence:
+	// refusals set it without generating anything, and counting it would make
+	// every refusal reconcile re-run the three Lists below - the cost this
+	// gate exists to remove.
+	readyCond := apimeta.FindStatusCondition(mr.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	usedAgentGateway := hasFinalizer || mr.Status.AgentGateway != nil ||
+		(readyCond != nil && readyCond.Status == metav1.ConditionTrue)
+	if usedAgentGateway && (deleting || leaving || (hasFinalizer && sameNSPolicy)) {
 		if err := r.cleanupExtractionPolicies(ctx, mr, ""); err != nil {
 			// A status patch is futile on a terminating object; the event
 			// is the only visibility a stuck deletion has.
@@ -235,15 +244,23 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 				return ctrl.Result{}, err
 			}
 		}
-		if !leaving {
-			// Deleting, or the Gateway moved into the router's namespace:
-			// done here. Regeneration, when applicable, happens on the
-			// reconcile the finalizer removal triggers.
-			return ctrl.Result{}, nil
+		if leaving && !deleting {
+			// The router left AgentGateway mode for good: drop the status so
+			// later reconciles skip this sweep (no evidence left), and return
+			// instead of falling through - the AgentGatewayRefMissing refusal
+			// would re-set a condition and undo the skip. A never-used router
+			// (no evidence) still reports AgentGatewayRefMissing below.
+			patch := client.MergeFrom(mr.DeepCopy())
+			mr.Status.AgentGateway = nil
+			apimeta.RemoveStatusCondition(&mr.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+			if err := r.Status().Patch(ctx, mr, patch); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
-		// Leaving AgentGateway mode: fall through so a removed ref still
-		// reports AgentGatewayRefMissing and a Proxy/Gateway-mode router still
-		// early-returns untouched.
+		// Deleting, or the Gateway moved into the router's namespace: done
+		// here. Regeneration, when applicable, happens on the reconcile the
+		// finalizer removal triggers.
+		return ctrl.Result{}, nil
 	}
 
 	// Only the AgentGateway data plane is this reconciler's concern. Proxy mode

@@ -2109,6 +2109,133 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted(t *testing.T) {
 	})
 }
 
+// countingListClient counts List calls made through it, so a test can assert
+// exactly how many the reconciler performs. Reconciles run sequentially in
+// these tests, so no locking is needed.
+type countingListClient struct {
+	client.Client
+	lists int
+}
+
+func (c *countingListClient) List(ctx context.Context, l client.ObjectList, opts ...client.ListOption) error {
+	c.lists++
+	return c.Client.List(ctx, l, opts...)
+}
+
+// newCountingModelRouterAgentGatewayReconciler is
+// newModelRouterAgentGatewayReconciler with a List-counting client.
+func newCountingModelRouterAgentGatewayReconciler(t *testing.T, cfg *rest.Config) (*ModelRouterAgentGatewayReconciler, *countingListClient) {
+	t.Helper()
+	httpClient, err := rest.HTTPClientFor(cfg)
+	if err != nil {
+		t.Fatalf("http client: %v", err)
+	}
+	mapper, err := apiutil.NewDynamicRESTMapper(cfg, httpClient)
+	if err != nil {
+		t.Fatalf("rest mapper: %v", err)
+	}
+	c, err := client.New(cfg, client.Options{Scheme: scheme.Scheme, Mapper: mapper})
+	if err != nil {
+		t.Fatalf("new mapped client: %v", err)
+	}
+	wrapped := &countingListClient{Client: c}
+	return &ModelRouterAgentGatewayReconciler{Client: wrapped, Scheme: scheme.Scheme}, wrapped
+}
+
+// TestModelRouterAgentGateway_SweepOnlyForUsedRouters pins the evidence gate
+// on the leave-AgentGateway sweep: the sweep runs three uncached Lists
+// (cluster-wide policies, pools, routes), so a router that never used
+// AgentGateway mode must make none, and a router that switches away must be
+// swept exactly once - after the sweep clears the plane's status, later
+// reconciles find no evidence and skip it.
+func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+
+	t.Run("never-AgentGateway Proxy router makes zero Lists", func(t *testing.T) {
+		makeBackendISvc(t, c, "sweep0-cuda")
+		mr := &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: "sweep0-router", Namespace: testNS},
+			Spec: inferencev1alpha1.ModelRouterSpec{
+				DataPlane: inferencev1alpha1.ModelRouterDataPlaneProxy,
+				Backends: []inferencev1alpha1.RouterBackend{
+					{Name: "sweep0-cuda", InferenceServiceRef: corev1LocalRef("sweep0-cuda")},
+				},
+				DefaultRoute: "sweep0-cuda",
+			},
+		}
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		r, counter := newCountingModelRouterAgentGatewayReconciler(t, cfg)
+		for i := 0; i < 2; i++ {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+			}); err != nil {
+				t.Fatalf("reconcile %d: %v", i+1, err)
+			}
+		}
+		if counter.lists != 0 {
+			t.Errorf("a never-AgentGateway Proxy router made %d List calls across 2 reconciles, want 0", counter.lists)
+		}
+	})
+
+	t.Run("a router that switches away is swept exactly once", func(t *testing.T) {
+		makeBackendISvc(t, c, "sweep1-cuda")
+		mr := sameNamespaceRouterFixture("sweep1-router", "sweep1-cuda")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		r, counter := newCountingModelRouterAgentGatewayReconciler(t, cfg)
+		reconcileAgentGatewayRouter(t, r, mr)
+		getPolicyInNamespace(t, c, testNS, mr.Name)
+		before := counter.lists
+
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		fresh.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
+		if err := c.Update(context.Background(), fresh); err != nil {
+			t.Fatalf("switch dataPlane: %v", err)
+		}
+
+		// The switch reconcile sweeps: one List each for policies
+		// (cluster-wide), pools, and routes.
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile after switch: %v", err)
+		}
+		if got := counter.lists - before; got != 3 {
+			t.Errorf("the switch reconcile made %d List calls, want exactly 3 (one per swept kind)", got)
+		}
+		assertAllGoneLike(t, c, mr.Name, "sweep1-cuda")
+
+		// The sweep cleared the plane's status, so later reconciles find no
+		// evidence and make no Lists.
+		for i := 0; i < 2; i++ {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+			}); err != nil {
+				t.Fatalf("reconcile %d after sweep: %v", i+1, err)
+			}
+		}
+		if got := counter.lists - before - 3; got != 0 {
+			t.Errorf("later reconciles made %d List calls after the sweep, want 0", got)
+		}
+	})
+}
+
+func assertAllGoneLike(t *testing.T, c client.Client, name, svc string) {
+	t.Helper()
+	assertNotExists(t, c, agentGatewayPolicyGVK(), name)
+	assertNotExists(t, c, inferencePoolGVK(), svc)
+	assertNotExists(t, c, gatewayHTTPRouteGVK(), name)
+}
+
 // TestModelRouterAgentGateway_ProxyModeProducesNothing covers the no-op path: a
 // dataPlane: Proxy ModelRouter generates no agentgateway resources (the
 // agentgateway reconciler no-ops; the proxy path is owned by
@@ -2247,9 +2374,15 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, refless); err != nil {
 			t.Fatalf("get modelrouter: %v", err)
 		}
-		cond := apimeta.FindStatusCondition(refless.Status.Conditions, ModelRouterAgentGatewayConditionReady)
-		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNoRef {
-			t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonNoRef, cond)
+		// The router had artifacts, so the sweep cleared the plane's status
+		// entirely: no condition (a removed ref must not re-set one that would
+		// re-trigger the sweep on every later reconcile) and no
+		// status.agentGateway block.
+		if cond := apimeta.FindStatusCondition(refless.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond != nil {
+			t.Errorf("expected the AgentGatewayReady condition to be removed after leaving the mode, got %+v", cond)
+		}
+		if refless.Status.AgentGateway != nil {
+			t.Errorf("expected status.agentGateway to be cleared after leaving the mode, got %+v", refless.Status.AgentGateway)
 		}
 	})
 }
