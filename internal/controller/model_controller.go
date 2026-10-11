@@ -39,6 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -157,6 +158,10 @@ type ModelReconciler struct {
 	ModelCacheClass      string
 	ModelCacheAccessMode string
 
+	// Recorder emits Warning events on the Model (today only for a prefetch
+	// held on a missing CA ConfigMap). Nil disables events.
+	Recorder events.EventRecorder
+
 	// metadataHTTPClient is the SSRF-guarded client used for all controller-
 	// side requests to Model.spec.source (metadata reads and revalidation
 	// probes). Built lazily from AllowedRemoteHosts; never use
@@ -184,7 +189,7 @@ func (r *ModelReconciler) metadataClient() *http.Client {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
 func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()

@@ -634,6 +634,24 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		return r.persistGroupTeardown(ctx, isvc, PhaseCreating, modelReady, desiredReplicas)
 	}
 
+	// Every rank renders from one template, so one rank's volumes answer for
+	// the group. A member that cannot mount the CA would hold its pinned
+	// node's GPU in ContainerCreating; hold the creates instead.
+	caMissing, err := r.reconcileCACertConfigMap(ctx, isvc, &desired[0].Spec)
+	if err != nil {
+		return 0, nil, err
+	}
+	if caMissing {
+		for _, o := range obs {
+			if o.existing == nil {
+				log.Info("multiNode: CA ConfigMap missing in the service namespace; not creating members",
+					"configMap", r.CACertConfigMap, "namespace", isvc.Namespace)
+				result, updateErr := r.waitForCACertConfigMap(ctx, isvc, modelReady, desiredReplicas)
+				return 0, result, updateErr
+			}
+		}
+	}
+
 	created := 0
 	for _, o := range obs {
 		if o.existing != nil {

@@ -563,6 +563,7 @@ func main() {
 		AllowedRemoteHosts:   allowedRemoteHostList,
 		InitContainerImage:   initContainerImage,
 		CACertConfigMap:      caCertConfigMap,
+		Recorder:             mgr.GetEventRecorder("model-controller"),
 		DefaultFSGroup:       defaultFSGroup,
 		ModelCacheSize:       modelCacheSize,
 		ModelCacheClass:      modelCacheClass,

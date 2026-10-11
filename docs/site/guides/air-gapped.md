@@ -144,40 +144,75 @@ Most air-gapped corporate networks intercept TLS with an internal
 CA. The operator's init container needs that CA in its trust store
 to clone the model file over HTTPS from your internal model server.
 
-The controller binary accepts a `--ca-cert-configmap` flag that
-takes the name of a ConfigMap holding a `ca.crt` key. The Helm chart
-renders it from the `controllerManager.caCertConfigMap` value:
+The controller takes a `--ca-cert-configmap` flag naming a ConfigMap
+that holds your CA bundle (PEM; the key name is free, `ca.crt` is the
+convention). The Helm chart exposes it as
+`controllerManager.caCertConfigMap`. The operator mounts that ConfigMap
+into every model downloader it runs and combines it with the system
+trust store, so public sources keep verifying alongside your internal
+ones.
 
-1. Create a `ConfigMap` in every namespace where you will deploy
-   `InferenceService` objects (the init container runs in the
-   workload's namespace, not the operator's):
+A ConfigMap volume is resolved in the pod's own namespace, so the
+ConfigMap must exist in **every namespace where you create
+`InferenceService` objects** (and in the namespace of any `Model` with
+`spec.prefetch: true`). A copy in the operator's namespace alone is not
+enough.
+
+1. Create the ConfigMap in each workload namespace:
 
    ```bash
    kubectl -n default create configmap corporate-ca \
      --from-file=ca.crt=/path/to/corporate-root-ca.pem
    ```
 
-2. Set the value on the release:
+   To manage the copies with the release instead, render them through
+   the chart's `extraObjects`, one entry per namespace:
+
+   ```yaml
+   extraObjects:
+     - apiVersion: v1
+       kind: ConfigMap
+       metadata:
+         name: corporate-ca
+         namespace: team-a
+       data:
+         ca.crt: |
+           -----BEGIN CERTIFICATE-----
+           ...
+           -----END CERTIFICATE-----
+   ```
+
+2. Point the operator at it:
 
    ```bash
-   helm upgrade llmkube ./llmkube -n llmkube-system --reuse-values \
+   helm upgrade llmkube ./llmkube \
+     -n llmkube-system --reuse-values \
      --set controllerManager.caCertConfigMap=corporate-ca
    ```
 
-   The chart's `values.yaml` comment describes this ConfigMap as
-   living in the operator's namespace. It is mounted into the
-   workload's pod, so it must exist in each InferenceService
-   namespace, as in step 1.
+3. Model downloads from `https://model-server.internal` or an internal
+   `s3://` endpoint now verify against your CA without skipping TLS
+   verification.
 
-3. The operator now mounts that ConfigMap into every init container
-   it spawns, so model downloads from `https://model-server.internal`
-   or an internal `s3://` endpoint succeed without skipping
-   verification. The custom CA is added to the system trust store,
-   not substituted for it.
+If the ConfigMap is missing from a workload namespace, the operator
+does not create the serving pods (or the prefetch Job). Instead it
+sets the InferenceService (or Model) to `Pending`, records a
+`CACertConfigMapAvailable=False` condition with reason
+`CACertConfigMapMissing` that names the ConfigMap and the namespace,
+and emits a Warning event with the same text:
 
-Repeat step 1 for each application namespace; the operator looks up
-the ConfigMap in the InferenceService's own namespace at reconcile
-time.
+```bash
+kubectl -n team-a get inferenceservice my-llm \
+  -o jsonpath='{.status.conditions[?(@.type=="CACertConfigMapAvailable")].message}'
+```
+
+Copy the ConfigMap into that namespace and the service proceeds on
+its own: the operator watches the ConfigMap and creates the workload
+as soon as it appears. Holding the pods is deliberate. Without the
+ConfigMap a pod cannot mount its CA volume, so it would sit in
+`ContainerCreating` holding the GPU it was scheduled onto. Running the
+downloader without the CA instead would only fail later, on TLS
+verification against your internal endpoint.
 
 ## Step 4: Get model weights into the cluster
 
@@ -818,6 +853,12 @@ The init container couldn't reach the source URL. Confirm the
 your URL uses internal TLS, and that the named ConfigMap exists in
 the InferenceService's namespace. View the init log:
 `kubectl logs <pod> -c model-downloader`.
+
+**InferenceService `Pending` with `CACertConfigMapAvailable=False`**
+The operator runs with `--ca-cert-configmap`, but that ConfigMap is
+not in the service's namespace, so no pod was created. Copy it into
+the namespace named in the condition message (see Step 3); the
+service proceeds automatically once it exists.
 
 **Model stuck in `Pending` with `dial tcp ... no route to host`**
 The cluster's egress policy is blocking the connection. Confirm
