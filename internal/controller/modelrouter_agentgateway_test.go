@@ -999,26 +999,41 @@ func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 	}
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
-	reconcileAgentGatewayRouter(t, r, mr)
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// Nothing watches Gateways, so the refusal must requeue: a router applied
+	// before its Gateway (normal GitOps order) recovers on the next recheck.
+	if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the consent recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
+	}
 
 	assertNotExists(t, c, inferencePoolGVK(), "missing-gw-cuda")
 	assertNotExists(t, c, agentGatewayPolicyGVK(), "missing-gw-router")
 	assertNotExists(t, c, gatewayHTTPRouteGVK(), "missing-gw-router")
 
-	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	refused := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, refused); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
-	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	cond := apimeta.FindStatusCondition(refused.Status.Conditions, ModelRouterAgentGatewayConditionReady)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonGatewayNotFound {
 		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonGatewayNotFound, cond)
 	}
 	if !strings.Contains(cond.Message, testNS+"/ai-gateway") {
 		t.Errorf("condition message %q does not name the missing Gateway", cond.Message)
 	}
-	if controllerutil.ContainsFinalizer(fresh, modelRouterAgentGatewayFinalizer) {
+	if controllerutil.ContainsFinalizer(refused, modelRouterAgentGatewayFinalizer) {
 		t.Errorf("finalizer present on a refused router; nothing was generated")
 	}
+
+	// The Gateway appears: the next reconcile goes Ready.
+	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	reconcileAgentGatewayRouter(t, r, mr)
+	getPolicyInNamespace(t, c, testNS, "missing-gw-router")
 }
 
 // TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace covers the
@@ -1266,10 +1281,16 @@ func TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy(t *testing.T) {
 		t.Fatalf("revoke consent: %v", err)
 	}
 
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+	revokedRes, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile: %v", err)
+	}
+	// The refusal must requeue so restored consent is noticed without an
+	// unrelated event.
+	if revokedRes.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the consent recheck)", revokedRes.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
 	assertNoPolicyInNamespace(t, c, gwNS, policyName)
@@ -1284,6 +1305,19 @@ func TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy(t *testing.T) {
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNotAllowed {
 		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonNotAllowed, cond)
 	}
+
+	// The Gateway owner restores consent: the requeued reconcile goes Ready
+	// and regenerates the policy.
+	listeners, _, _ = unstructured.NestedSlice(gw.Object, "spec", "listeners")
+	listeners[0].(map[string]interface{})["allowedRoutes"] = map[string]interface{}{
+		"namespaces": map[string]interface{}{"from": "All"},
+	}
+	gw.Object["spec"].(map[string]interface{})["listeners"] = listeners
+	if err := c.Update(context.Background(), gw); err != nil {
+		t.Fatalf("restore consent: %v", err)
+	}
+	reconcileAgentGatewayRouter(t, r, mr)
+	getPolicyInNamespace(t, c, gwNS, policyName)
 }
 
 // condMessage is a small helper for failure output.

@@ -311,11 +311,14 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 			return ctrl.Result{}, err
 		}
 		// Consent cannot be verified, so withdraw whatever a previously
-		// admitted reconcile left in the Gateway's namespace.
+		// admitted reconcile left in the Gateway's namespace. Nothing watches
+		// Gateways, so the requeue is the only recovery for the normal GitOps
+		// order (router applied before its Gateway) - without it the router
+		// stays refused until an unrelated event.
 		if err := r.withdrawAgentGatewayPolicy(ctx, mr); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 	}
 
 	// Fail loud when no listener's allowedRoutes admits the ModelRouter's
@@ -335,11 +338,13 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		// Consent is gone: the HTTPRoute would be refused, so the Gateway-wide
 		// body parse this router left in the Gateway's namespace must go too.
 		// (A conflicting foreign policy is different: there the router's own
-		// policy is kept, documented oldest-wins.)
+		// policy is kept, documented oldest-wins.) Nothing watches Gateways,
+		// so the requeue is the only recovery when the Gateway owner restores
+		// consent.
 		if err := r.withdrawAgentGatewayPolicy(ctx, mr); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 	}
 
 	// Fail loud when the AgentgatewayPolicy this router would generate already
