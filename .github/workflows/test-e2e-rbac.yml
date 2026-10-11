@@ -1,0 +1,77 @@
+name: E2E RBAC (kind)
+
+# Runs the operator out of cluster under ONLY the RBAC generated from its
+# +kubebuilder:rbac markers and fails on any forbidden error or reconcile
+# error loop (hack/kind-e2e-rbac.sh, #2001). envtest runs as cluster-admin,
+# so a controller that calls an API with no marker passes every other check
+# and only fails in a real install.
+#
+# Scoped to the paths that change what the operator calls or what it is
+# granted, so unrelated PRs do not pay for it.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'api/**'
+      - 'cmd/main.go'
+      - 'config/crd/**'
+      - 'config/rbac/**'
+      - 'internal/controller/**'
+      - 'hack/kind-e2e-rbac.sh'
+      - 'test/e2e-rbac/**'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/test-e2e-rbac.yml'
+  pull_request:
+    paths:
+      - 'api/**'
+      - 'cmd/main.go'
+      - 'config/crd/**'
+      - 'config/rbac/**'
+      - 'internal/controller/**'
+      - 'hack/kind-e2e-rbac.sh'
+      - 'test/e2e-rbac/**'
+      - 'Makefile'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/test-e2e-rbac.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test-e2e-rbac:
+    name: Operator under generated RBAC (kind)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RBAC_E2E_DELETE_CLUSTER: "true"
+      RBAC_E2E_WATCH_SECONDS: "120"
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Run the operator under its generated RBAC
+        env:
+          RBAC_E2E_WORKDIR: ${{ runner.temp }}/rbac-e2e
+        run: make test-e2e-rbac
+
+      - name: Operator log on failure
+        if: failure()
+        env:
+          RBAC_E2E_WORKDIR: ${{ runner.temp }}/rbac-e2e
+        run: tail -n 300 "${RBAC_E2E_WORKDIR}/operator.log" || true

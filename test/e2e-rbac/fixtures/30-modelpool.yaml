@@ -1,0 +1,15 @@
+# A sticky ModelPool over two CPU members: the pool controller reads and
+# patches its member InferenceServices to keep one of them resident.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelPool
+metadata:
+  name: rbac-pool
+spec:
+  gpu: 0
+  swapPolicy: sticky
+  members:
+  - inferenceServiceRef:
+      name: rbac-pool-a
+  - inferenceServiceRef:
+      name: rbac-pool-b
+  default: rbac-pool-a

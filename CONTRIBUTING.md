@@ -230,6 +230,10 @@ make test
 # E2E tests (requires cluster)
 make test-e2e
 
+# Operator under its generated RBAC only, in its own Kind cluster
+# (fails on any forbidden error; run after adding an API call to a controller)
+make test-e2e-rbac
+
 # GPU E2E tests (requires GPU cluster)
 ./test/e2e/gpu_test.sh
 
