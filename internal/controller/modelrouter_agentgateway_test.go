@@ -1022,6 +1022,22 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 		return l
 	}
 
+	// listenerWith builds a listener with an explicit protocol and an optional
+	// allowedRoutes.kinds list. namespaces.from is All so the protocol and
+	// kinds criteria are what the subtest exercises.
+	listenerWith := func(protocol string, kinds []interface{}) map[string]interface{} {
+		ar := map[string]interface{}{
+			"namespaces": map[string]interface{}{"from": "All"},
+		}
+		if kinds != nil {
+			ar["kinds"] = kinds
+		}
+		return map[string]interface{}{
+			"name": "http", "port": map[string]interface{}{"number": int64(80)}, "protocol": protocol,
+			"allowedRoutes": ar,
+		}
+	}
+
 	cases := []struct {
 		name           string
 		listeners      []interface{}
@@ -1059,6 +1075,21 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 			name:      "invalid selector refuses (fail closed)",
 			listeners: []interface{}{listener("Selector", map[string]interface{}{"matchExpressions": []interface{}{map[string]interface{}{"key": "team", "operator": "Bogus", "values": []interface{}{"x"}}}})},
 			wantReady: false,
+		},
+		{
+			name:      "a listener that cannot carry HTTPRoute (TLS) refuses",
+			listeners: []interface{}{listenerWith("TLS", nil)},
+			wantReady: false,
+		},
+		{
+			name:      "allowedRoutes.kinds without HTTPRoute refuses",
+			listeners: []interface{}{listenerWith("HTTP", []interface{}{map[string]interface{}{"group": "gateway.networking.k8s.io", "kind": "GRPCRoute"}})},
+			wantReady: false,
+		},
+		{
+			name:      "allowedRoutes.kinds containing HTTPRoute admits",
+			listeners: []interface{}{listenerWith("HTTP", []interface{}{map[string]interface{}{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute"}})},
+			wantReady: true,
 		},
 	}
 	for i, tc := range cases {

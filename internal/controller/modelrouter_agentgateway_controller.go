@@ -683,9 +683,12 @@ func (r *ModelRouterAgentGatewayReconciler) getReferencedGateway(
 // Gateway's own namespace, so absence never admits a cross-namespace router),
 // All admits every namespace, and Selector matches the router NAMESPACE's
 // labels. Selector matching is fail-closed: an invalid selector admits
-// nothing. The HTTPRoute the operator generates would be refused by the
-// Gateway controller under exactly these rules, and the Gateway-wide
-// extraction policy must not be written without the same consent.
+// nothing. A listener must also be able to carry an HTTPRoute at all: the
+// protocol must be HTTP or HTTPS, and a non-empty allowedRoutes.kinds list
+// must contain HTTPRoute (an unset list defaults by protocol). The HTTPRoute
+// the operator generates would be refused by the Gateway controller under
+// exactly these rules, and the Gateway-wide extraction policy must not be
+// written without the same consent.
 func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 	ctx context.Context,
 	gateway *unstructured.Unstructured,
@@ -709,6 +712,24 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 	}
 
 	summary := make([]string, 0, len(listeners))
+	describeListener := func(from, proto string, kinds []interface{}) string {
+		entry := "from=" + from + ",proto=" + proto
+		if len(kinds) > 0 {
+			names := make([]string, 0, len(kinds))
+			for _, k := range kinds {
+				if km, ok := k.(map[string]interface{}); ok {
+					g, _, _ := unstructured.NestedString(km, "group")
+					n, _, _ := unstructured.NestedString(km, "kind")
+					if g == "" {
+						g = gatewayBackendRefGroupAPI
+					}
+					names = append(names, g+"/"+n)
+				}
+			}
+			entry += ",kinds=" + strings.Join(names, "|")
+		}
+		return entry
+	}
 	for i, l := range listeners {
 		listener, ok := l.(map[string]interface{})
 		if !ok {
@@ -719,7 +740,39 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 		if from == "" {
 			from = "Same" // Gateway API default for an unset allowedRoutes
 		}
-		summary = append(summary, "from="+from)
+		proto, _, _ := unstructured.NestedString(listener, "protocol")
+		kinds, _, _ := unstructured.NestedSlice(listener, "allowedRoutes", "kinds")
+		summary = append(summary, describeListener(from, proto, kinds))
+
+		// An HTTPRoute attaches only to HTTP/HTTPS listeners, and only to
+		// kinds the listener lists: an unset kinds list defaults by protocol
+		// (HTTP/HTTPS with no kinds admits HTTPRoute), while a non-empty list
+		// must contain HTTPRoute - group is optional and defaults to the
+		// Gateway API group. Unknown protocols and kind lists without
+		// HTTPRoute fail closed.
+		switch proto {
+		case "HTTP", "HTTPS":
+		default:
+			continue
+		}
+		if len(kinds) > 0 {
+			admits := false
+			for _, k := range kinds {
+				km, ok := k.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				kind, _, _ := unstructured.NestedString(km, "kind")
+				group, _, _ := unstructured.NestedString(km, "group")
+				if kind == "HTTPRoute" && (group == "" || group == gatewayBackendRefGroupAPI) {
+					admits = true
+					break
+				}
+			}
+			if !admits {
+				continue
+			}
+		}
 		switch from {
 		case "All":
 			return "", nil
@@ -748,7 +801,7 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
 			}
 		}
 	}
-	return fmt.Sprintf("Gateway %s/%s has no listener whose allowedRoutes admit namespace %q (listeners: %s); "+
+	return fmt.Sprintf("Gateway %s/%s has no listener that admits namespace %q for an HTTPRoute (listeners: %s); "+
 		"the generated HTTPRoute would be refused (NotAllowedByListeners), and the model-extraction AgentgatewayPolicy "+
 		"must not be written without that consent",
 		policyNS, mr.Spec.AgentGatewayRef.Name, mr.Namespace, strings.Join(summary, ", ")), nil
