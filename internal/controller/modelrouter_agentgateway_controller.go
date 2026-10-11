@@ -286,9 +286,17 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, err
 	}
 	if gateway == nil {
-		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonGatewayNotFound,
+		if err := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonGatewayNotFound,
 			fmt.Sprintf("agentGatewayRef targets Gateway %s/%s, which does not exist; agentgateway exposure is disabled",
-				agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name))
+				agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name)); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Consent cannot be verified, so withdraw whatever a previously
+		// admitted reconcile left in the Gateway's namespace.
+		if err := r.withdrawAgentGatewayPolicy(ctx, mr); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// Fail loud when no listener's allowedRoutes admits the ModelRouter's
@@ -302,7 +310,17 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	if msg, err := r.agentGatewayAllowedRoutesViolation(ctx, gateway, mr); err != nil {
 		return ctrl.Result{}, err
 	} else if msg != "" {
-		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonNotAllowed, msg)
+		if err := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonNotAllowed, msg); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Consent is gone: the HTTPRoute would be refused, so the Gateway-wide
+		// body parse this router left in the Gateway's namespace must go too.
+		// (A conflicting foreign policy is different: there the router's own
+		// policy is kept, documented oldest-wins.)
+		if err := r.withdrawAgentGatewayPolicy(ctx, mr); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// Fail loud when the AgentgatewayPolicy this router would generate already
@@ -986,6 +1004,26 @@ func (r *ModelRouterAgentGatewayReconciler) cleanupGeneratedPoolsAndRoutes(
 				return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)
 			}
 		}
+	}
+	return nil
+}
+
+// withdrawAgentGatewayPolicy deletes every AgentgatewayPolicy labeled with the
+// router's UID and, when the sweep succeeded, drops the finalizer (nothing
+// cross-namespace remains to guard). It runs when the consent check refuses a
+// previously Ready router: the Gateway owner revoked allowedRoutes or the
+// Gateway vanished, and a route that cannot attach must not leave a
+// Gateway-wide body parse behind. The sweep is label-based, so a
+// same-namespace policy a same-namespace router can no longer justify goes
+// too. Re-running is safe: a failed sweep returns the error and retries on the
+// next reconcile.
+func (r *ModelRouterAgentGatewayReconciler) withdrawAgentGatewayPolicy(ctx context.Context, mr *inferencev1alpha1.ModelRouter) error {
+	if err := r.cleanupExtractionPolicies(ctx, mr, ""); err != nil {
+		return err
+	}
+	if controllerutil.ContainsFinalizer(mr, modelRouterAgentGatewayFinalizer) {
+		controllerutil.RemoveFinalizer(mr, modelRouterAgentGatewayFinalizer)
+		return r.Update(ctx, mr)
 	}
 	return nil
 }

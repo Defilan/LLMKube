@@ -1156,6 +1156,74 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 	}
 }
 
+// TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy covers consent
+// withdrawal: the consent check gates creation but, before this fix, never
+// withdrew - a Gateway owner who flipped allowedRoutes from All to Same left
+// the Gateway-wide body-extraction policy in place (reproduced live: the
+// router flipped to GatewayDoesNotAllowRouterNamespace at the 2-minute requeue
+// while the policy stayed). A revoked (or vanished) Gateway must take the
+// policy and the finalizer with it.
+func TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeBackendISvc(t, c, "revoke-cuda")
+	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
+
+	mr := crossNamespaceRouterFixture("revoke-router", gwNS, "revoke-cuda")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	policyName := "default-revoke-router"
+	getPolicyInNamespace(t, c, gwNS, policyName)
+	ready := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, ready); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(ready, modelRouterAgentGatewayFinalizer) {
+		t.Fatal("expected the finalizer on a Ready cross-namespace router")
+	}
+
+	// The Gateway owner revokes consent.
+	gw := &unstructured.Unstructured{}
+	gw.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"})
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "ai-gateway", Namespace: gwNS}, gw); err != nil {
+		t.Fatalf("get gateway: %v", err)
+	}
+	listeners, _, _ := unstructured.NestedSlice(gw.Object, "spec", "listeners")
+	listeners[0].(map[string]interface{})["allowedRoutes"] = map[string]interface{}{
+		"namespaces": map[string]interface{}{"from": "Same"},
+	}
+	gw.Object["spec"].(map[string]interface{})["listeners"] = listeners
+	if err := c.Update(context.Background(), gw); err != nil {
+		t.Fatalf("revoke consent: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	assertNoPolicyInNamespace(t, c, gwNS, policyName)
+	revoked := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, revoked); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(revoked, modelRouterAgentGatewayFinalizer) {
+		t.Errorf("finalizer still present after consent was revoked; the withdrawal guard is gone")
+	}
+	cond := apimeta.FindStatusCondition(revoked.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNotAllowed {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonNotAllowed, cond)
+	}
+}
+
 // condMessage is a small helper for failure output.
 func condMessage(cond *metav1.Condition) string {
 	if cond == nil {
