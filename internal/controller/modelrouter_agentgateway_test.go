@@ -1036,6 +1036,67 @@ func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 	getPolicyInNamespace(t, c, testNS, "missing-gw-router")
 }
 
+// TestModelRouterAgentGateway_DeletedGatewayWithdrawsPolicy covers the
+// GatewayNotFound half of consent withdrawal. The NotAllowed half is covered
+// by TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy; without this
+// test, disabling the withdrawal on the GatewayNotFound path alone leaves the
+// suite green. A Gateway that vanishes must take the Gateway-wide policy and
+// the finalizer with it.
+func TestModelRouterAgentGateway_DeletedGatewayWithdrawsPolicy(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeBackendISvc(t, c, "gonegw-cuda")
+	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
+
+	mr := crossNamespaceRouterFixture("gonegw-router", gwNS, "gonegw-cuda")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	policyName := "default-gonegw-router"
+	getPolicyInNamespace(t, c, gwNS, policyName)
+	ready := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, ready); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(ready, modelRouterAgentGatewayFinalizer) {
+		t.Fatal("expected the finalizer on a Ready cross-namespace router")
+	}
+
+	// The Gateway disappears.
+	gw := &unstructured.Unstructured{}
+	gw.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"})
+	gw.SetName("ai-gateway")
+	gw.SetNamespace(gwNS)
+	if err := c.Delete(context.Background(), gw); err != nil {
+		t.Fatalf("delete gateway: %v", err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	assertNoPolicyInNamespace(t, c, gwNS, policyName)
+	gone := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, gone); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(gone, modelRouterAgentGatewayFinalizer) {
+		t.Errorf("finalizer still present after the Gateway disappeared; the withdrawal guard is gone")
+	}
+	cond := apimeta.FindStatusCondition(gone.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonGatewayNotFound {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonGatewayNotFound, cond)
+	}
+}
+
 // TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace covers the
 // consent check: writing the model-extraction AgentgatewayPolicy into the
 // Gateway's namespace requires a listener whose allowedRoutes admits the
