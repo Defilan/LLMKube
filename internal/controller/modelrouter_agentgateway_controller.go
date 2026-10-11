@@ -29,6 +29,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -72,6 +73,17 @@ const (
 	// single Endpoint Picker: a GIE EPP binds to exactly one pool, so the
 	// compiled shape would make endpoint decisions for the wrong pool.
 	modelRouterAgentGatewayReasonMultiPool = "MultipleInferencePoolsUnsupported"
+	// modelRouterAgentGatewayReasonGatewayNotFound marks an agentGatewayRef
+	// whose Gateway does not exist (or whose kind is not registered). The
+	// router previously went Ready against a missing Gateway; nothing it
+	// generates would serve traffic.
+	modelRouterAgentGatewayReasonGatewayNotFound = "GatewayNotFound"
+	// modelRouterAgentGatewayReasonNotAllowed marks a Gateway whose listeners
+	// do not admit the ModelRouter's namespace via allowedRoutes. This is the
+	// Gateway API consent mechanism: writing a Gateway-wide PreRouting policy
+	// into another namespace without it would let any router operator inject
+	// body parsing into every request on a Gateway they do not own.
+	modelRouterAgentGatewayReasonNotAllowed = "GatewayDoesNotAllowRouterNamespace"
 
 	// modelRouterAgentGatewayFinalizer guards the cross-namespace extraction
 	// policy. For a Gateway in another namespace the policy lives in the
@@ -135,6 +147,7 @@ type ModelRouterAgentGatewayReconciler struct {
 // +kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agentgateway.dev,resources=agentgatewaypolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
 
 // Reconcile compiles the agentgateway resources for a ModelRouter in dataPlane:
 // AgentGateway mode, or no-ops cleanly when the router is in Proxy or Gateway
@@ -207,6 +220,33 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 				strings.Join(names, ", "))
 	}
 
+	// The consent check and the conflict check both need the referenced
+	// Gateway; fetch it once. A missing Gateway is a refusal (nothing this
+	// reconciler generates would serve traffic), not a requeue loop.
+	gateway, err := r.getReferencedGateway(ctx, mr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if gateway == nil {
+		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonGatewayNotFound,
+			fmt.Sprintf("agentGatewayRef targets Gateway %s/%s, which does not exist; agentgateway exposure is disabled",
+				agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name))
+	}
+
+	// Fail loud when no listener's allowedRoutes admits the ModelRouter's
+	// namespace. allowedRoutes is Gateway API's consent mechanism for route
+	// attachment; the AgentgatewayPolicy has no equivalent, and without this
+	// check any router in any namespace could make the operator write a
+	// Gateway-wide PreRouting transformation into a namespace it does not own
+	// (a body parse plus a header write on every request through that Gateway).
+	// Unset allowedRoutes defaults to Same, so absence never admits a
+	// cross-namespace router.
+	if msg, err := r.agentGatewayAllowedRoutesViolation(ctx, gateway, mr); err != nil {
+		return ctrl.Result{}, err
+	} else if msg != "" {
+		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonNotAllowed, msg)
+	}
+
 	// Fail loud when the target Gateway already carries a PreRouting
 	// transformation policy this router does not own. agentgateway merges
 	// equal-specificity policies oldest-wins per whole field and never
@@ -214,16 +254,17 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// second transformation on the same Gateway either silently disables the
 	// generated model extraction or is silently disabled by it. Refuse before
 	// any generation so a conflicted router yields no partial resources.
-	conflicts, err := r.agentGatewayPreRoutingConflicts(ctx, mr)
+	conflicts, err := r.agentGatewayPreRoutingConflicts(ctx, mr, gateway.GetLabels())
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if len(conflicts) > 0 {
 		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyConflict,
-			fmt.Sprintf("Gateway %s already carries PreRouting transformation policy(ies) that LLMKube does not own: %s. "+
+			fmt.Sprintf("Gateway %s/%s already carries PreRouting transformation policy(ies) that LLMKube does not own: %s. "+
 				"agentgateway merges same-specificity policies oldest-wins per field without combining list entries, "+
 				"so the generated model extraction could be silently dropped, or silently shadow the existing policy. "+
-				"Remove or scope the other policy", agentGatewayPolicyNamespace(mr), strings.Join(conflicts, ", ")))
+				"Remove or scope the other policy", agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name,
+				strings.Join(conflicts, ", ")))
 	}
 
 	// Fail-loud on matches the agentgateway data plane cannot express. We
@@ -518,21 +559,166 @@ func agentGatewayPolicyNamespace(mr *inferencev1alpha1.ModelRouter) string {
 	return mr.Namespace
 }
 
+// getReferencedGateway fetches the agentGatewayRef'd Gateway from the policy
+// namespace. A missing Gateway (or an unregistered Gateway kind, which is how
+// a cluster without the Gateway API CRDs presents) returns (nil, nil): the
+// caller refuses with GatewayNotFound rather than requeueing, since nothing
+// this reconciler generates would serve traffic against a Gateway that is not
+// there.
+func (r *ModelRouterAgentGatewayReconciler) getReferencedGateway(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+) (*unstructured.Unstructured, error) {
+	gateway := &unstructured.Unstructured{}
+	gateway.SetGroupVersionKind(schema.GroupVersionKind{Group: gatewayBackendRefGroupAPI, Version: "v1", Kind: "Gateway"})
+	ns, name := agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name
+	err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, gateway)
+	if err == nil {
+		return gateway, nil
+	}
+	if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("get Gateway %s/%s: %w", ns, name, err)
+}
+
+// agentGatewayAllowedRoutesViolation returns a non-empty message when no
+// listener of the referenced Gateway admits the ModelRouter's namespace via
+// allowedRoutes, or an error for transient lookup failures. allowedRoutes is
+// Gateway API's consent mechanism for route attachment: per listener,
+// namespaces.from is Same by default (an unset allowedRoutes admits only the
+// Gateway's own namespace, so absence never admits a cross-namespace router),
+// All admits every namespace, and Selector matches the router NAMESPACE's
+// labels. Selector matching is fail-closed: an invalid selector admits
+// nothing. The HTTPRoute the operator generates would be refused by the
+// Gateway controller under exactly these rules, and the Gateway-wide
+// extraction policy must not be written without the same consent.
+func (r *ModelRouterAgentGatewayReconciler) agentGatewayAllowedRoutesViolation(
+	ctx context.Context,
+	gateway *unstructured.Unstructured,
+	mr *inferencev1alpha1.ModelRouter,
+) (string, error) {
+	policyNS := agentGatewayPolicyNamespace(mr)
+	listeners, _, _ := unstructured.NestedSlice(gateway.Object, "spec", "listeners")
+
+	nsLabels := map[string]string{}
+	nsFetched := false
+	fetchNamespaceLabels := func() (map[string]string, error) {
+		if nsFetched {
+			return nsLabels, nil
+		}
+		ns := &corev1.Namespace{}
+		if err := r.Get(ctx, types.NamespacedName{Name: mr.Namespace}, ns); err != nil {
+			return nil, fmt.Errorf("get namespace %q for allowedRoutes selector matching: %w", mr.Namespace, err)
+		}
+		nsLabels, nsFetched = ns.GetLabels(), true
+		return nsLabels, nil
+	}
+
+	summary := make([]string, 0, len(listeners))
+	for i, l := range listeners {
+		listener, ok := l.(map[string]interface{})
+		if !ok {
+			summary = append(summary, fmt.Sprintf("listener[%d] unreadable", i))
+			continue
+		}
+		from, _, _ := unstructured.NestedString(listener, "allowedRoutes", "namespaces", "from")
+		if from == "" {
+			from = "Same" // Gateway API default for an unset allowedRoutes
+		}
+		summary = append(summary, "from="+from)
+		switch from {
+		case "All":
+			return "", nil
+		case "Same":
+			if policyNS == mr.Namespace {
+				return "", nil
+			}
+		case "Selector":
+			selectorMap, _, _ := unstructured.NestedMap(listener, "allowedRoutes", "namespaces", "selector")
+			sel, err := labelSelectorFromUnstructured(selectorMap)
+			if err != nil {
+				// Fail closed: an unreadable selector admits nothing.
+				continue
+			}
+			selector, err := metav1.LabelSelectorAsSelector(sel)
+			if err != nil {
+				// Fail closed: an invalid selector admits nothing.
+				continue
+			}
+			nsLabels, err := fetchNamespaceLabels()
+			if err != nil {
+				return "", err
+			}
+			if selector.Matches(labels.Set(nsLabels)) {
+				return "", nil
+			}
+		}
+	}
+	return fmt.Sprintf("Gateway %s/%s has no listener whose allowedRoutes admit namespace %q (listeners: %s); "+
+		"the generated HTTPRoute would be refused (NotAllowedByListeners), and the model-extraction AgentgatewayPolicy "+
+		"must not be written without that consent",
+		policyNS, mr.Spec.AgentGatewayRef.Name, mr.Namespace, strings.Join(summary, ", ")), nil
+}
+
+// labelSelectorFromUnstructured converts an unstructured LabelSelector
+// (matchLabels + matchExpressions) into a metav1.LabelSelector.
+func labelSelectorFromUnstructured(m map[string]interface{}) (*metav1.LabelSelector, error) {
+	if m == nil {
+		return &metav1.LabelSelector{}, nil
+	}
+	sel := &metav1.LabelSelector{}
+	if matchLabels, ok := m["matchLabels"].(map[string]interface{}); ok {
+		sel.MatchLabels = make(map[string]string, len(matchLabels))
+		for k, v := range matchLabels {
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("matchLabels[%q] is not a string", k)
+			}
+			sel.MatchLabels[k] = s
+		}
+	}
+	if exprs, ok := m["matchExpressions"].([]interface{}); ok {
+		sel.MatchExpressions = make([]metav1.LabelSelectorRequirement, 0, len(exprs))
+		for _, e := range exprs {
+			em, ok := e.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("matchExpressions entry is not an object")
+			}
+			key, _ := em["key"].(string)
+			op, _ := em["operator"].(string)
+			req := metav1.LabelSelectorRequirement{Key: key, Operator: metav1.LabelSelectorOperator(op)}
+			if vals, ok := em["values"].([]interface{}); ok {
+				req.Values = make([]string, 0, len(vals))
+				for _, v := range vals {
+					s, ok := v.(string)
+					if !ok {
+						return nil, fmt.Errorf("matchExpressions value is not a string")
+					}
+					req.Values = append(req.Values, s)
+				}
+			}
+			sel.MatchExpressions = append(sel.MatchExpressions, req)
+		}
+	}
+	return sel, nil
+}
+
 // agentGatewayPreRoutingConflicts lists the AgentgatewayPolicies in the
 // Gateway's namespace that target the referenced Gateway with a PreRouting
 // transformation LLMKube does not own (no router-UID label), returning their
-// names. agentgateway
-// merges same-specificity policies oldest-wins per whole field and never
-// combines list entries, and every affected policy still reports Accepted and
-// Attached with no condition about the dropped field, so any such policy
-// silently disables the generated model extraction or is silently disabled by
-// it. Policies without a transformation (extAuth, CORS, ...) do not touch the
-// transformation field and do not conflict. A Gateway read is needed only to
-// match targetSelectors; when the Gateway is not found, selector-matched
-// policies cannot be identified and only targetRefs-matched ones are detected.
+// names. agentgateway merges same-specificity policies oldest-wins per whole
+// field and never combines list entries, and every affected policy still
+// reports Accepted and Attached with no condition about the dropped field, so
+// any such policy silently disables the generated model extraction or is
+// silently disabled by it. Policies without a transformation (extAuth, CORS,
+// ...) do not touch the transformation field and do not conflict. The
+// referenced Gateway's labels are passed in by the caller (fetched once for
+// the consent check); they back the targetSelectors matching.
 func (r *ModelRouterAgentGatewayReconciler) agentGatewayPreRoutingConflicts(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
+	gatewayLabels map[string]string,
 ) ([]string, error) {
 	policyNS := agentGatewayPolicyNamespace(mr)
 
@@ -549,18 +735,6 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayPreRoutingConflicts(
 		return nil, fmt.Errorf("list AgentgatewayPolicies in %q: %w", policyNS, err)
 	}
 
-	gatewayLabels := map[string]string{}
-	gateway := &unstructured.Unstructured{}
-	gateway.SetGroupVersionKind(schema.GroupVersionKind{Group: gatewayBackendRefGroupAPI, Version: "v1", Kind: "Gateway"})
-	gatewayRef := mr.Spec.AgentGatewayRef
-	if err := r.Get(ctx, types.NamespacedName{Namespace: policyNS, Name: gatewayRef.Name}, gateway); err == nil {
-		gatewayLabels = gateway.GetLabels()
-	} else if !apierrors.IsNotFound(err) && !apimeta.IsNoMatchError(err) {
-		// A missing Gateway (or kind) only degrades targetSelectors matching;
-		// anything else is transient.
-		return nil, fmt.Errorf("get Gateway %s/%s: %w", policyNS, gatewayRef.Name, err)
-	}
-
 	var conflicts []string
 	for i := range policies.Items {
 		p := &policies.Items[i]
@@ -572,7 +746,7 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayPreRoutingConflicts(
 			// conflict.
 			continue
 		}
-		if !agentGatewayPolicyTargetsGateway(p, gatewayRef.Name, gatewayLabels) {
+		if !agentGatewayPolicyTargetsGateway(p, mr.Spec.AgentGatewayRef.Name, gatewayLabels) {
 			continue
 		}
 		phase, _, _ := unstructured.NestedString(p.Object, "spec", "traffic", "phase")
