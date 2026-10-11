@@ -184,6 +184,39 @@ func TestModelRouterValidator_Create(t *testing.T) {
 	}
 }
 
+// validAgentGatewayRouter returns a valid dataPlane: AgentGateway router with
+// ONE backend, hence one generated InferencePool: the only multi-ref shape the
+// agentgateway plane compiles while a single Endpoint Picker serves it
+// (agentGatewayMultiplePoolsMessage). The Gateway reference is cross-namespace
+// (the common setup), which admission accepts.
+func validAgentGatewayRouter() *inferencev1alpha1.ModelRouter {
+	return &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "agw-router", Namespace: "default"},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name:               "ai-gateway",
+				Namespace:          "agentgateway-system",
+				EndpointPicker:     "llm-d-router-epp",
+				EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "qwen-cuda", InferenceServiceRef: corev1LocalRef("qwen-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{
+						Backends: []string{"qwen-cuda"},
+						Strategy: "primary-fallback",
+					},
+				},
+			},
+		},
+	}
+}
+
 // TestModelRouterValidator_AgentGatewayModeRejectsInexpressible proves the
 // agentgateway plane's honest-boundary checks are enforced at apply time, not
 // just at reconcile time: a config the agentgateway data plane cannot honor is
@@ -192,15 +225,7 @@ func TestModelRouterValidator_AgentGatewayModeRejectsInexpressible(t *testing.T)
 	v := &ModelRouterValidator{}
 	ctx := context.Background()
 
-	mr := validGatewayRouter()
-	mr.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneAgentGateway
-	mr.Spec.GatewayRef = nil
-	mr.Spec.AgentGatewayRef = &inferencev1alpha1.AgentGatewayReference{
-		Name:               "ai-gateway",
-		Namespace:          "ai-gateway",
-		EndpointPicker:     "llm-d-router-epp",
-		EndpointPickerPort: 9002,
-	}
+	mr := validAgentGatewayRouter()
 	// auth is not supported on the agentgateway Inference-Extension path.
 	mr.Spec.Policy = &inferencev1alpha1.RouterPolicy{
 		Auth: &inferencev1alpha1.RouterAuthSpec{
@@ -227,23 +252,63 @@ func TestModelRouterValidator_AgentGatewayModeRejectsInexpressible(t *testing.T)
 
 // TestModelRouterValidator_AgentGatewayModeAcceptsExpressible proves a router
 // that uses only what the agentgateway plane supports (model/header matches,
-// primary-fallback, no auth/budget/audit) passes apply-time validation.
+// primary-fallback, no auth/budget/audit, cross-namespace Gateway) passes
+// apply-time validation.
 func TestModelRouterValidator_AgentGatewayModeAcceptsExpressible(t *testing.T) {
 	v := &ModelRouterValidator{}
 	ctx := context.Background()
 
-	mr := validGatewayRouter()
-	mr.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneAgentGateway
-	mr.Spec.GatewayRef = nil
-	mr.Spec.AgentGatewayRef = &inferencev1alpha1.AgentGatewayReference{
-		Name:               "ai-gateway",
-		Namespace:          "ai-gateway",
-		EndpointPicker:     "llm-d-router-epp",
-		EndpointPickerPort: 9002,
-	}
-
-	if _, err := v.ValidateCreate(ctx, mr); err != nil {
+	if _, err := v.ValidateCreate(ctx, validAgentGatewayRouter()); err != nil {
 		t.Fatalf("expected a valid AgentGateway-mode router to pass, got %v", err)
+	}
+}
+
+// TestModelRouterValidator_AgentGatewayModeRejectsMultiplePools proves the
+// multi-pool rejection is enforced at apply time: backends on two distinct
+// InferenceServices compile to two InferencePools sharing one Endpoint Picker,
+// which a Gateway API Inference Extension EPP cannot serve (it binds to
+// exactly one pool).
+func TestModelRouterValidator_AgentGatewayModeRejectsMultiplePools(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	mr := validAgentGatewayRouter()
+	mr.Spec.Backends = append(mr.Spec.Backends,
+		inferencev1alpha1.RouterBackend{Name: "qwen-metal", InferenceServiceRef: corev1LocalRef("qwen-metal")})
+	mr.Spec.Rules[0].Route.Backends = []string{"qwen-cuda", "qwen-metal"}
+
+	_, err := v.ValidateCreate(ctx, mr)
+	if err == nil {
+		t.Fatal("expected a two-pool AgentGateway router to be rejected at apply time")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("expected an Invalid error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "exactly one pool") {
+		t.Errorf("expected the single-EPP message, got %v", err)
+	}
+}
+
+// TestModelRouterValidator_AgentGatewayModeRequiresAgentGatewayRef mirrors the
+// reconciler's AgentGatewayRefMissing guard at apply time: a dataPlane:
+// AgentGateway router without agentGatewayRef is rejected, not just marked
+// not-ready after admission.
+func TestModelRouterValidator_AgentGatewayModeRequiresAgentGatewayRef(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	mr := validAgentGatewayRouter()
+	mr.Spec.AgentGatewayRef = nil
+
+	_, err := v.ValidateCreate(ctx, mr)
+	if err == nil {
+		t.Fatal("expected an AgentGateway-mode router without agentGatewayRef to be rejected at apply time")
+	}
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("expected an Invalid error, got %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "agentGatewayRef is unset") {
+		t.Errorf("expected the missing-ref message, got %v", err)
 	}
 }
 

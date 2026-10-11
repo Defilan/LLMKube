@@ -133,7 +133,6 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	defer stop()
 
 	makeBackendISvc(t, c, "qwen-cuda")
-	makeBackendISvc(t, c, "qwen-metal")
 
 	mr := &inferencev1alpha1.ModelRouter{
 		ObjectMeta: metav1.ObjectMeta{Name: "agw-router", Namespace: testNS},
@@ -147,14 +146,13 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 			},
 			Backends: []inferencev1alpha1.RouterBackend{
 				{Name: "qwen-cuda", InferenceServiceRef: corev1LocalRef("qwen-cuda")},
-				{Name: "qwen-metal", InferenceServiceRef: corev1LocalRef("qwen-metal")},
 			},
 			Rules: []inferencev1alpha1.RouterRule{
 				{
 					Name:  "qwen",
 					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
 					Route: inferencev1alpha1.RuleRoute{
-						Backends: []string{"qwen-cuda", "qwen-metal"},
+						Backends: []string{"qwen-cuda"},
 						Strategy: "primary-fallback",
 					},
 				},
@@ -176,8 +174,11 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	// An InferencePool per backend, named after the referenced InferenceService.
-	for _, name := range []string{"qwen-cuda", "qwen-metal"} {
+	// An InferencePool for the backend, named after the referenced
+	// InferenceService. One backend: a router compiling to several pools is
+	// rejected (TestModelRouterAgentGateway_MultiPoolRejected), since a GIE EPP
+	// binds to exactly one pool.
+	for _, name := range []string{"qwen-cuda"} {
 		pool := getUnstructured(t, c, inferencePoolGVK(), name)
 		assertOwnedByRouter(t, pool, mr)
 		// The pool selects the referenced InferenceService's pods by the SAME
@@ -231,7 +232,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 
 	// One HTTPRoute named after the ModelRouter, attached to the Gateway, its
 	// single rule matching qwen35-27b on the extracted header and referencing
-	// both InferencePools directly (GIE v1: no InferenceModel indirection).
+	// the InferencePool directly (GIE v1: no InferenceModel indirection).
 	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "agw-router")
 	assertOwnedByRouter(t, route, mr)
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
@@ -243,20 +244,18 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 		t.Errorf("rule model match = %q, want qwen35-27b", got)
 	}
 	refs := rule0["backendRefs"].([]interface{})
-	if len(refs) != 2 {
-		t.Fatalf("rule has %d backendRefs, want 2", len(refs))
+	if len(refs) != 1 {
+		t.Fatalf("rule has %d backendRefs, want 1", len(refs))
 	}
-	for i, want := range []string{"qwen-cuda", "qwen-metal"} {
-		ref := refs[i].(map[string]interface{})
-		if ref["name"] != want {
-			t.Errorf("backendRefs[%d].name = %v, want %s", i, ref["name"], want)
-		}
-		if ref["kind"] != "InferencePool" {
-			t.Errorf("backendRefs[%d].kind = %v, want InferencePool", i, ref["kind"])
-		}
-		if ref["group"] != "inference.networking.k8s.io" {
-			t.Errorf("backendRefs[%d].group = %v, want inference.networking.k8s.io", i, ref["group"])
-		}
+	ref := refs[0].(map[string]interface{})
+	if ref["name"] != "qwen-cuda" {
+		t.Errorf("backendRefs[0].name = %v, want qwen-cuda", ref["name"])
+	}
+	if ref["kind"] != "InferencePool" {
+		t.Errorf("backendRefs[0].kind = %v, want InferencePool", ref["kind"])
+	}
+	if ref["group"] != "inference.networking.k8s.io" {
+		t.Errorf("backendRefs[0].group = %v, want inference.networking.k8s.io", ref["group"])
 	}
 
 	// status.agentGateway + AgentGatewayReady=True.
@@ -269,6 +268,129 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	}
 	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Errorf("AgentGatewayReady condition not True, got %+v", cond)
+	}
+}
+
+// TestModelRouterAgentGateway_MultiPoolRejected covers the single-picker
+// boundary: backends on two distinct InferenceServices compile to two
+// InferencePools, but agentGatewayRef names ONE Endpoint Picker and a GIE EPP
+// binds to exactly one pool, so the compiled shape would make endpoint
+// decisions for the wrong pool. The router is refused with a named condition
+// and generates nothing.
+func TestModelRouterAgentGateway_MultiPoolRejected(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "mp-cuda")
+	makeBackendISvc(t, c, "mp-metal")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "mp-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "mp-cuda", InferenceServiceRef: corev1LocalRef("mp-cuda")},
+				{Name: "mp-metal", InferenceServiceRef: corev1LocalRef("mp-metal")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "r",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"mp-cuda", "mp-metal"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	// Generates NOTHING.
+	assertNotExists(t, c, inferencePoolGVK(), "mp-cuda")
+	assertNotExists(t, c, inferencePoolGVK(), "mp-metal")
+	assertNotExists(t, c, agentGatewayPolicyGVK(), "mp-router")
+	assertNotExists(t, c, gatewayHTTPRouteGVK(), "mp-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonMultiPool {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonMultiPool, cond)
+	}
+	if !strings.Contains(cond.Message, "exactly one pool") {
+		t.Errorf("condition message %q does not explain the single-EPP constraint", cond.Message)
+	}
+}
+
+// TestModelRouterAgentGateway_PoolDedupSameInferenceService covers pool dedup:
+// two RouterBackends referencing the SAME InferenceService compile to ONE
+// InferencePool (one pool is one EPP's worth of routing), and a rule
+// referencing both backends renders a single backendRef. If the dedup in
+// compileAgentGatewayRouteBackendRefs is removed, this test fails on the
+// duplicated ref.
+func TestModelRouterAgentGateway_PoolDedupSameInferenceService(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "dedup-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "dedup-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+			},
+			// Two backends, one InferenceService: one distinct pool, allowed.
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "dedup-a", InferenceServiceRef: corev1LocalRef("dedup-cuda")},
+				{Name: "dedup-b", InferenceServiceRef: corev1LocalRef("dedup-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "r",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"dedup-a", "dedup-b"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	// Exactly ONE InferencePool, though two backends requested one each.
+	pools := &unstructured.UnstructuredList{}
+	pools.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: inferenceExtensionGroup, Version: inferenceExtensionVersion, Kind: "InferencePoolList",
+	})
+	if err := c.List(context.Background(), pools, client.InNamespace(testNS)); err != nil {
+		t.Fatalf("list pools: %v", err)
+	}
+	if len(pools.Items) != 1 {
+		t.Fatalf("expected exactly 1 InferencePool for 2 backends on one InferenceService, got %d", len(pools.Items))
+	}
+
+	// The rule references the pool ONCE.
+	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "dedup-router")
+	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+	if len(rules) != 1 {
+		t.Fatalf("route has %d rules, want 1", len(rules))
+	}
+	refs := rules[0].(map[string]interface{})["backendRefs"].([]interface{})
+	if len(refs) != 1 {
+		t.Errorf("rule has %d backendRefs, want 1 (pool dedup removed?)", len(refs))
 	}
 }
 
