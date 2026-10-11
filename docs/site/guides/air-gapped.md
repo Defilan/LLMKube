@@ -1,6 +1,6 @@
 ---
 title: Air-gapped install
-description: Deploy LLMKube and its models in clusters with no internet access. Covers offline operator install, private container registries, custom CA certificates, model storage strategies, and using ModelRouter without external providers.
+description: Deploy LLMKube and its models in clusters with no internet access. Covers offline operator install, private container registries, custom CA certificates, model storage strategies, serving vLLM and SGLang safetensors checkpoints without Hugging Face access, and using ModelRouter without external providers.
 ---
 
 # Air-gapped install
@@ -23,9 +23,9 @@ release. Image tags on ghcr are bare versions, without a `v` prefix.
   the `llmkube` CLI)
 - A "sneakernet path": some way to copy a few tens of GB of files
   from a connected machine into the air-gapped environment
-- One of: pre-downloaded GGUF model files, a private container
-  registry the cluster can reach, or a `ReadOnlyMany` PVC seeded
-  with model weights
+- One of: pre-downloaded GGUF model files or safetensors
+  checkpoints, a private container registry the cluster can reach,
+  or a `ReadOnlyMany` PVC seeded with model weights
 
 ## Architecture overview
 
@@ -113,8 +113,9 @@ container that pulls model weights via HTTP(S). In an air-gapped
 environment that container still runs for every source that has to
 be fetched or staged, including a `file://` path on the node. A
 `pvc://` source is the exception: those weights are pre-staged and
-mounted read-only, so no downloader runs at all. If
-your registry mirror requires a different image (your own distroless
+mounted read-only, so no downloader runs at all (only a short
+verify step, from the same image, when a single-file `pvc://` Model
+sets `spec.sha256`). If your registry mirror requires a different image (your own distroless
 curl, for example), point it here. The chart consumes these as two
 separate fields, not a single `image` value (see
 [`_helpers.tpl`](https://github.com/defilantech/LLMKube/blob/main/charts/llmkube/templates/_helpers.tpl)).
@@ -144,10 +145,8 @@ CA. The operator's init container needs that CA in its trust store
 to clone the model file over HTTPS from your internal model server.
 
 The controller binary accepts a `--ca-cert-configmap` flag that
-takes the name of a ConfigMap holding a `ca.crt` key. The Helm
-chart does not yet expose this as a top-level value (tracked
-upstream as a documentation/chart-coverage gap), so you wire it in
-by editing the controller Deployment args directly after install:
+takes the name of a ConfigMap holding a `ca.crt` key. The Helm chart
+renders it from the `controllerManager.caCertConfigMap` value:
 
 1. Create a `ConfigMap` in every namespace where you will deploy
    `InferenceService` objects (the init container runs in the
@@ -158,17 +157,23 @@ by editing the controller Deployment args directly after install:
      --from-file=ca.crt=/path/to/corporate-root-ca.pem
    ```
 
-2. Patch the controller Deployment to pass the flag:
+2. Set the value on the release:
 
    ```bash
-   kubectl -n llmkube-system patch deployment llmkube-controller-manager \
-     --type=json \
-     -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--ca-cert-configmap=corporate-ca"}]'
+   helm upgrade llmkube ./llmkube -n llmkube-system --reuse-values \
+     --set controllerManager.caCertConfigMap=corporate-ca
    ```
+
+   The chart's `values.yaml` comment describes this ConfigMap as
+   living in the operator's namespace. It is mounted into the
+   workload's pod, so it must exist in each InferenceService
+   namespace, as in step 1.
 
 3. The operator now mounts that ConfigMap into every init container
    it spawns, so model downloads from `https://model-server.internal`
-   succeed without skipping verification.
+   or an internal `s3://` endpoint succeed without skipping
+   verification. The custom CA is added to the system trust store,
+   not substituted for it.
 
 Repeat step 1 for each application namespace; the operator looks up
 the ConfigMap in the InferenceService's own namespace at reconcile
@@ -308,9 +313,12 @@ spec:
   mmproj: mmproj-model-f16.gguf
 ```
 
-> There is no HuggingFace-repo-ID source format. `spec.format` accepts
-> `gguf`, `mlx`, `safetensors`, `pytorch`, or `custom`, and a Model that
-> sets anything else is rejected at apply time.
+> `hf://org/repo` and bare `org/repo` sources do exist, but they
+> download from `huggingface.co` (in the init container, or in the
+> runtime itself), so they do not work inside an air gap. Mirror the
+> files into one of the sources above instead. `spec.format` accepts
+> `gguf`, `mlx`, `safetensors`, `pytorch`, or `custom`, and a Model
+> that sets anything else is rejected at apply time.
 
 ## Step 5: Verify
 
@@ -325,6 +333,420 @@ curl -sS http://localhost:8080/v1/chat/completions \
 ```
 
 If the call returns a token stream, the air-gap install is complete.
+
+## vLLM and SGLang: safetensors checkpoints
+
+Everything above uses a single GGUF file. vLLM and SGLang serve a
+Hugging Face checkpoint instead: a directory with `config.json`, the
+tokenizer files, and one or more `*.safetensors` shards. With a
+security policy that blocks Hugging Face, neither an `hf://` source
+nor a bare `org/repo` source can work, because both make the init
+container or the runtime itself download from `huggingface.co`. The
+directory has to be inside the perimeter before the `Model` exists.
+
+LLMKube hands vLLM and SGLang a directory, not a file, in two cases:
+
+- A `pvc://claim/dir` source. The claim is mounted read-only at
+  `/model-source`, and the runtime gets `/model-source/dir`.
+- A multi-file `s3://` source (a bucket prefix plus `spec.files`) with
+  `spec.format: safetensors`. The init container stages every listed
+  file into the model cache, and the runtime gets the staged directory
+  rather than `files[0]`. Set the format explicitly: it defaults to
+  `gguf`, and a GGUF Model hands the runtime `files[0]`.
+
+An `oci://` source does not fit this shape today: it mounts the
+artifact read-only at `/model-source`, but hands the runtime a file
+path inside it (`files[0]`, or a `.gguf` basename when `files` is
+empty) rather than the tree's root. Use `pvc://` or `s3://` for a
+safetensors checkpoint.
+
+The examples below use `Qwen/Qwen3-8B-FP8` (Apache 2.0, about 9.4 GB
+of FP8 weights in two shards) pinned to commit
+`220b46e3b2180893580a4454f21f22d3ebb187d3`. Substitute your own
+model; the steps do not change.
+
+### Stage and verify the checkpoint
+
+On a machine that can reach the Hub, download one exact commit, never
+a branch name, so that what you verify is what you ship:
+
+```bash
+REPO=Qwen/Qwen3-8B-FP8
+REV=220b46e3b2180893580a4454f21f22d3ebb187d3
+DIR=Qwen3-8B-FP8-${REV:0:8}
+
+hf download "$REPO" --revision "$REV" --local-dir "$DIR"
+rm -rf "$DIR/.cache"   # hf's own download bookkeeping, not part of the model
+```
+
+`--local-dir` writes plain files. Without it, `hf` builds a cache tree
+whose `snapshots/<rev>/` entries are relative symlinks into
+`../../blobs`, which dangle once the snapshot directory is copied or
+mounted on its own.
+
+Next, check every file against the digests the Hub publishes for that
+commit. Recent releases of the `hf` CLI do this themselves:
+
+```bash
+hf cache verify "$REPO" --revision "$REV" --local-dir "$DIR" \
+  --fail-on-missing-files --fail-on-extra-files
+```
+
+It exits non-zero on any mismatch. Run it after removing `.cache`:
+`--fail-on-extra-files` counts that bookkeeping directory as files the
+repo does not have.
+
+If the transfer host cannot run `huggingface_hub`, this standard
+library script makes the same check. The Hub's API lists each file of
+a commit with a digest: a sha256 for LFS files (the weights and large
+tokenizer files), and the git blob sha1 for small files such as
+`config.json`.
+
+```python
+#!/usr/bin/env python3
+"""usage: verify_hub.py REPO_ID REVISION LOCAL_DIR (stdlib only)"""
+import hashlib, json, os, sys, urllib.request
+
+repo, rev, root = sys.argv[1:4]
+req = urllib.request.Request(
+    f"https://huggingface.co/api/models/{repo}/revision/{rev}?blobs=true")
+if os.environ.get("HF_TOKEN"):  # gated or private repos
+    req.add_header("Authorization", f"Bearer {os.environ['HF_TOKEN']}")
+info = json.load(urllib.request.urlopen(req))
+if info["sha"] != rev:
+    sys.exit(f"pin the full commit sha: {rev} resolves to {info['sha']}")
+
+bad = 0
+for f in info["siblings"]:
+    name, path = f["rfilename"], os.path.join(root, f["rfilename"])
+    if not os.path.isfile(path):
+        print("MISSING ", name)
+        bad += 1
+        continue
+    lfs = f.get("lfs")
+    if lfs:
+        h, want = hashlib.sha256(), lfs["sha256"]
+    else:  # git blob sha1 of a small, non-LFS file
+        h, want = hashlib.sha1(b"blob %d\0" % os.path.getsize(path)), f["blobId"]
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    ok = h.hexdigest() == want
+    print("OK      " if ok else "MISMATCH", name)
+    bad += not ok
+sys.exit(1 if bad else 0)
+```
+
+Once the directory matches the Hub, record a sha256 for every file.
+This manifest is what you check on the far side, where the Hub is not
+reachable, and it is the source of the `spec.fileSha256` values in
+option B:
+
+```bash
+(cd "$DIR" && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+  > "$DIR.sha256"
+```
+
+(`shasum -a 256` stands in for `sha256sum` on macOS.) Carry the
+directory and the manifest across together. On the target side, check
+again before anything serves the weights:
+
+```bash
+cd /exports/models/Qwen3-8B-FP8-220b46e3 && sha256sum -c ../Qwen3-8B-FP8-220b46e3.sha256
+```
+
+Before you transfer, also look for custom model code:
+
+```bash
+grep -l '"auto_map"' "$DIR"/*.json; ls "$DIR"/*.py 2>/dev/null
+```
+
+No output means the architecture is built into vLLM and SGLang and
+nothing executable rides along. If `auto_map` is present, the model
+needs `trust_remote_code`, and the `*.py` files in the directory run
+inside your serving pod: review them like any other third-party code
+before they cross the boundary. An `auto_map` value of the form
+`org/repo--module.Class` points at code in a different repository,
+which the runtime will try to fetch from the Hub at load time; vendor
+that code into the directory or choose another checkpoint. If you do
+accept custom code, enable it explicitly: `extraArgs:
+["--trust-remote-code"]` for vLLM, `sglangConfig.trustRemoteCode:
+true` for SGLang.
+
+### Option A: a PersistentVolume and a `pvc://` directory
+
+Put the verified directory on storage the cluster can mount (an NFS
+export here), expose it through a static PersistentVolume, and point
+the `Model` at the directory inside the claim. Make the tree readable
+by the runtime container's user; `chmod -R a+rX` is the simplest
+choice for read-only weights.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: models-nfs
+spec:
+  capacity: { storage: 500Gi }
+  accessModes: [ReadOnlyMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  nfs:
+    server: nfs.internal.corp
+    path: /exports/models
+    readOnly: true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: models
+  namespace: default
+spec:
+  accessModes: [ReadOnlyMany]
+  storageClassName: ""        # static binding: no provisioner involved
+  volumeName: models-nfs
+  resources: { requests: { storage: 500Gi } }
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-8b-fp8
+  namespace: default
+spec:
+  source: pvc://models/Qwen3-8B-FP8-220b46e3   # a directory, not a file
+  format: safetensors
+  hardware:
+    accelerator: cuda
+    gpu: { enabled: true, count: 1, vendor: nvidia }
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen3-8b-fp8
+  namespace: default
+spec:
+  modelRef: qwen3-8b-fp8
+  runtime: vllm
+  # Your mirrored image, pinned by digest (see "Mirror the runtime images").
+  image: registry.internal.corp/vllm/vllm-openai@sha256:<digest>
+  vllmConfig:
+    maxModelLen: 32768
+  extraArgs: ["--served-model-name", "qwen3-8b-fp8"]
+  env:
+    - { name: HF_HUB_OFFLINE, value: "1" }   # fail fast on any Hub lookup
+  endpoint: { port: 8000, type: ClusterIP }
+  resources: { gpu: 1, cpu: "8", memory: 32Gi }
+```
+
+The `Model` goes Ready as soon as the claim is Bound, with
+`status.path` set to `/model-source/Qwen3-8B-FP8-220b46e3`. The pod
+mounts the claim read-only and runs no downloader at all. Binding the
+PVC to a named PV with `storageClassName: ""` keeps it out of any
+`WaitForFirstConsumer` storage class, so the claim binds immediately.
+
+For node-local disk, use a `local:` PersistentVolume with a
+`nodeAffinity` naming the node, and the same pre-bound PVC. That is
+a PV you create, not a host-path model source, so the
+`modelSource.allowedHostPathRoots` allowlist (GHSA-jw3m-8q7m-f35r)
+does not apply to it; the allowlist gates `file://` and absolute-path
+values of `spec.source`, which Option C above documents for single
+GGUF files. Pin the InferenceService to that node with `nodeSelector`.
+
+Encoding the revision in the directory name means a new revision is a
+new directory and a new `spec.source`, never an in-place overwrite of
+weights a running pod has mapped.
+
+Do not set `spec.sha256` on a `pvc://` directory. That field verifies
+a single pre-staged file at every pod start, and the verify step fails
+the pod when the path is a directory. `spec.files` and
+`spec.fileSha256` are not accepted with a `pvc://` source either:
+multi-file staging requires a Hugging Face, `s3://`, or `oci://`
+source, and the Model goes `Failed` with `InvalidFileSet` otherwise.
+For a `pvc://` checkpoint, the manifest check above, done when the
+volume is seeded, is the integrity control. If you want the cluster to
+verify every file on its own, use option B.
+
+### Option B: an internal S3-compatible store with `spec.files`
+
+Upload the verified directory under a prefix that includes the
+revision, keeping relative paths:
+
+```bash
+aws s3 cp "$DIR" "s3://models/Qwen/$DIR" --recursive \
+  --endpoint-url https://minio.internal:9000
+```
+
+Then list every file the runtime needs in `spec.files` and pin each
+one in `spec.fileSha256`, using the values from the manifest. The
+credentials Secret is the one from Option D above.
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen3-8b-fp8
+  namespace: default
+spec:
+  source: s3://models/Qwen/Qwen3-8B-FP8-220b46e3
+  format: safetensors
+  sourceSecretRef:
+    name: minio-creds
+  files:
+    - config.json
+    - generation_config.json
+    - model.safetensors.index.json
+    - model-00001-of-00002.safetensors
+    - model-00002-of-00002.safetensors
+    - tokenizer.json
+    - tokenizer_config.json
+    - vocab.json
+    - merges.txt
+  fileSha256:
+    model-00001-of-00002.safetensors: 83bb444edc7d4a1ed91ab67ad19620e2ed74724cdd62ede330fcaa7748c64404
+    model-00002-of-00002.safetensors: c59d27856ca358b24770802ea52f1785258830f61ff3ac72a4b3896fad648f9b
+    tokenizer.json: aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
+    # ...one line per file in spec.files, from the manifest
+  hardware:
+    accelerator: cuda
+    gpu: { enabled: true, count: 1, vendor: nvidia }
+```
+
+The three digests shown are the Hub's own LFS sha256 values for that
+commit, so they match your manifest exactly. The small files have no
+Hub sha256 (only a git blob sha1), so take theirs from the manifest.
+This turns the manifest into both lists:
+
+```bash
+sed 's|  \./| |' "$DIR.sha256" | awk '{print "    - " $2}'          # files
+sed 's|  \./| |' "$DIR.sha256" | awk '{print "    " $2 ": " $1}'    # fileSha256
+```
+
+What the cluster then enforces:
+
+- The downloader hashes each pinned file before it moves the file into
+  the model cache. A mismatch discards that file's partial download,
+  writes a `<file>.<sha256>.sha256-rejected` marker, and fails the init
+  container, so the runtime never starts on bad bytes. Once the upload
+  is fixed, delete the marker to let the next pod start retry.
+- A cached copy is reused on later pod starts only if it still passes
+  the same per-file check.
+- Only listed files are verified. A file in `spec.files` without a
+  `spec.fileSha256` entry is staged unchecked, so pin all of them.
+- Admission rejects the combinations that cannot be verified: a
+  `fileSha256` key that is not a `spec.files` entry (or
+  `spec.mmproj`), a glob in `spec.files` while `fileSha256` is set,
+  `fileSha256` without `spec.files`, and `spec.sha256` together with
+  `spec.files`. Without `fileSha256` a glob is admitted but cannot be
+  expanded, because there is no file listing to match it against, so
+  staging fails; name every file. `spec.files` takes at most 256
+  entries.
+
+The `files[0]` entry is the primary file for GGUF runtimes; for vLLM
+and SGLang with `format: safetensors` the runtime is handed the staged
+directory, so the order of the list does not matter beyond `files[0]`
+naming a real file. The files land in the model cache (see the
+[`Model cache`](./model-cache) guide for sizing it), and the
+InferenceService is the same as in option A.
+
+If MinIO serves TLS from an internal CA, the downloader needs that CA
+(Step 3).
+
+### Mirror the runtime images and pin digests
+
+A vLLM or SGLang service needs its runtime image inside the perimeter,
+plus the curl init image from Step 1 when the source is `s3://` (a
+`pvc://` directory source runs no init container). The defaults the
+operator falls back to are compiled into each release (for example
+`vllm/vllm-openai:v0.25.1`, `lmsysorg/sglang:v0.5.15.post1-cu129`, and
+`lmsysorg/sglang:v0.5.15-rocm720-mi30x` for AMD GPU Models), so set
+them explicitly rather than relying on whatever your controller
+version picks.
+
+Pull the platform your GPU nodes run, which is not necessarily the
+platform of the machine doing the pulling:
+
+```bash
+docker pull --platform linux/amd64 vllm/vllm-openai:v0.25.1
+docker save vllm/vllm-openai:v0.25.1 > vllm-openai-v0.25.1.tar
+# transfer, then on the air-gapped side:
+docker load < vllm-openai-v0.25.1.tar
+docker tag vllm/vllm-openai:v0.25.1 registry.internal.corp/vllm/vllm-openai:v0.25.1
+docker push registry.internal.corp/vllm/vllm-openai:v0.25.1
+crane digest registry.internal.corp/vllm/vllm-openai:v0.25.1
+```
+
+Pin the digest your registry reports. A `docker save`/`load` round
+trip carries one platform, so that digest can differ from the
+multi-arch index digest upstream publishes for the same tag; a
+transfer that copies the whole index unchanged keeps the upstream
+digest.
+
+Then point the operator at the mirror for every service, fleet-wide:
+
+```bash
+helm upgrade llmkube ./llmkube -n llmkube-system --reuse-values \
+  --set runtimeImages.vllm=registry.internal.corp/vllm/vllm-openai@sha256:<digest> \
+  --set runtimeImages.sglang=registry.internal.corp/lmsysorg/sglang@sha256:<digest>
+```
+
+`runtimeImages.*` (the controller's `--runtime-images` flag) replaces
+the built-in default for that runtime, including the vendor-specific
+choices such as the SGLang ROCm image. An InferenceService
+`spec.image`, as in the option A example, still wins over it. If the
+registry needs credentials, set `spec.imagePullSecrets` on the
+InferenceService.
+
+### Gotchas
+
+**`/dev/shm` for tensor parallel.** vLLM and SGLang move tensors
+between GPU worker processes through shared memory, and the container
+runtime's default `/dev/shm` is far too small for tensor parallel > 1.
+LLMKube does not add one for you today; mount a memory-backed
+`emptyDir` through `spec.extraVolumes` and `spec.extraVolumeMounts`:
+
+```yaml
+spec:
+  vllmConfig:
+    tensorParallelSize: 2
+  resources: { gpu: 2, cpu: "16", memory: 80Gi }
+  extraVolumes:
+    - name: dshm
+      emptyDir: { medium: Memory, sizeLimit: 16Gi }
+  extraVolumeMounts:
+    - { name: dshm, mountPath: /dev/shm }
+```
+
+Pages written to a `medium: Memory` volume are charged to the pod's
+memory, so `resources.memory` (or `memoryLimit`) has to cover the
+runtime's own usage plus whatever lands in `/dev/shm`. Size it as
+added headroom, not as free space.
+
+**Served model name.** vLLM is started with the model path as its
+positional argument and, unless you add one, no `--served-model-name`.
+It then reports and accepts the path itself (for example
+`/model-source/Qwen3-8B-FP8-220b46e3`) as the model id, which clients
+must echo in every request and which changes when the source moves.
+Add `extraArgs: ["--served-model-name", "<name>"]`, as in the example.
+SGLang gets `--served-model-name` set to `spec.modelRef`
+automatically, unless `extraArgs` already sets it. Check with:
+
+```bash
+kubectl -n default port-forward svc/qwen3-8b-fp8 8000:8000 &
+curl -sS http://localhost:8000/v1/models
+```
+
+**No Hub calls at serve time.** `HF_HUB_OFFLINE=1` in `spec.env` makes
+any Hugging Face lookup the runtime still attempts (custom code, a
+tokenizer reference to another repo) fail immediately with a clear
+error, instead of waiting out network timeouts against a blocked
+host.
+
+**Leave `skipModelInit` unset.** The repo's vLLM samples that pull
+straight from the Hub set `skipModelInit: true` and
+`vllmConfig.hfTokenSecretRef`. Neither belongs in an air-gapped
+service: with `skipModelInit` the `pvc://` or `s3://` storage is not
+mounted, and vLLM is handed the raw `spec.source` string in place of
+a mounted directory.
 
 ## ModelRouter in air-gapped clusters
 
@@ -382,6 +804,7 @@ Two air-gap-relevant properties:
 | `pvc://` with `ReadWriteOnce` local SSD | Single-node, fastest cold-start | One pod at a time per PVC |
 | Internal HTTPS server + SHA256 | Multi-cluster fleets that already have an artifact server | Controller computes hash on every download |
 | Node-local `file://` | Single-node demos, DaemonSet shape | Requires pinning workload to nodes that have the file |
+| Internal `s3://` + `spec.files` / `spec.fileSha256` | vLLM / SGLang safetensors checkpoints verified in-cluster | Files are copied into the model cache on first start |
 
 For ModelRouter installations the proxy is stateless and doesn't
 need its own storage. Only the runtime pods need model weight
@@ -443,8 +866,13 @@ marks the `Model` `Failed` with the mismatch message in
 hands the bad file to a runtime pod.
 
 `pvc://` sources don't get a `status.sha256` because the controller
-doesn't mount PVCs at reconcile time. Compute the hash externally
-when seeding the PVC if you need provenance.
+doesn't mount PVCs at reconcile time. A `pvc://` source that names a
+single file can still set `spec.sha256`: an init container hashes the
+mounted file at every pod start and fails the pod on a mismatch. A
+`pvc://` directory (a safetensors checkpoint) cannot be pinned this
+way; verify it when you seed the volume, as described under
+"vLLM and SGLang: safetensors checkpoints". Multi-file `s3://` and
+Hugging Face sources pin each file with `spec.fileSha256` instead.
 
 As of 0.10.1, a Metal InferenceService gets the same `spec.sha256`
 enforcement from the metal-agent, for sources it downloads itself for
