@@ -1861,6 +1861,111 @@ func TestModelRouterAgentGateway_ProxyModeProducesNothing(t *testing.T) {
 	}
 }
 
+// TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp covers the
+// round-3 MEDIUM bug: the cleanup sweep ran only when the finalizer was
+// present, and the finalizer is only ever added for cross-namespace policies,
+// so a same-namespace router that switched dataPlane to Proxy or dropped
+// agentGatewayRef kept its Gateway-wide body-extraction policy, its pools, and
+// its route until the router itself was deleted - the route kept serving
+// traffic through the Gateway the whole time (reproduced live). The sweep must
+// run with or without the finalizer, and take the pools and route with it.
+func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	// Same-namespace Gateway: the default from=Same admits the router, and a
+	// same-namespace router never gets the finalizer.
+	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+
+	startRouter := func(t *testing.T, name, svc string) *inferencev1alpha1.ModelRouter {
+		t.Helper()
+		makeBackendISvc(t, c, svc)
+		mr := &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+			Spec: inferencev1alpha1.ModelRouterSpec{
+				DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+				AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+					Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+				},
+				Backends: []inferencev1alpha1.RouterBackend{
+					{Name: svc, InferenceServiceRef: corev1LocalRef(svc)},
+				},
+				Rules: []inferencev1alpha1.RouterRule{
+					{Name: "r", Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}}, Route: inferencev1alpha1.RuleRoute{Backends: []string{svc}}},
+				},
+			},
+		}
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		reconcileAgentGatewayRouter(t, r, mr)
+		// The resources exist and the router is Ready before the mode change.
+		getPolicyInNamespace(t, c, testNS, name)
+		getUnstructured(t, c, inferencePoolGVK(), svc)
+		getUnstructured(t, c, gatewayHTTPRouteGVK(), name)
+		return mr
+	}
+
+	assertAllGone := func(t *testing.T, name, svc string) {
+		t.Helper()
+		assertNotExists(t, c, agentGatewayPolicyGVK(), name)
+		assertNotExists(t, c, inferencePoolGVK(), svc)
+		assertNotExists(t, c, gatewayHTTPRouteGVK(), name)
+	}
+
+	t.Run("switching dataPlane to Proxy", func(t *testing.T) {
+		mr := startRouter(t, "leave-router", "leave-cuda")
+
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		fresh.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
+		if err := c.Update(context.Background(), fresh); err != nil {
+			t.Fatalf("switch dataPlane: %v", err)
+		}
+
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		assertAllGone(t, mr.Name, "leave-cuda")
+	})
+
+	t.Run("removing agentGatewayRef", func(t *testing.T) {
+		mr := startRouter(t, "leave2-router", "leave2-cuda")
+
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		fresh.Spec.AgentGatewayRef = nil
+		if err := c.Update(context.Background(), fresh); err != nil {
+			t.Fatalf("remove agentGatewayRef: %v", err)
+		}
+
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile: %v", err)
+		}
+		assertAllGone(t, mr.Name, "leave2-cuda")
+
+		refless := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, refless); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(refless.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNoRef {
+			t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonNoRef, cond)
+		}
+	})
+}
+
 // TestModelRouterAgentGateway_UndeclaredBackendRefFailsLoud covers the
 // compile-time backend check: a rule (or defaultRoute) referencing a backend
 // that is not declared in spec.backends must fail the reconcile loudly. Refs

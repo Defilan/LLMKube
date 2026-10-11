@@ -100,12 +100,13 @@ const (
 	// deleted, moves to a different Gateway, or leaves AgentGateway mode.
 	modelRouterAgentGatewayFinalizer = "agentgateway.inference.llmkube.dev/finalizer"
 
-	// agentGatewayRouterUIDLabel marks an AgentgatewayPolicy the operator
-	// generated for a specific ModelRouter (value: the router's UID). The
-	// conflict detector uses it to tell the router's own policy from a foreign
-	// one in the same namespace, cleanup uses it to find every policy a router
-	// left behind across namespaces, and the cross-namespace apply refuses a
-	// name that another router's policy already holds.
+	// agentGatewayRouterUIDLabel marks every object the operator generated for
+	// a specific ModelRouter (value: the router's UID): the extraction policy,
+	// the per-backend InferencePools, and the HTTPRoute. The conflict detector
+	// uses it to tell the router's own policy from a foreign one in the same
+	// namespace, cleanup uses it to find every generated object a router left
+	// behind, the leaving-AgentGateway sweep matches pools and routes on it,
+	// and the apply refuses a policy name another router's object holds.
 	agentGatewayRouterUIDLabel = "inference.llmkube.dev/agentgateway-router-uid"
 
 	// agentGatewayConflictRequeueAfter is how often a Ready router (and a
@@ -193,31 +194,54 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, err
 	}
 
-	// Cleanup path. A finalizer means a cross-namespace extraction policy may
-	// exist outside the router's namespace, where owner-ref GC cannot reach.
-	// It must be removed (and the policy deleted) before the router goes away,
-	// and when the router no longer wants a cross-namespace policy (deleted,
-	// different data plane, ref unset, or the Gateway moved back into the
-	// router's namespace). Runs before the dataPlane early-return so a router
-	// switching to Proxy still cleans up.
-	if controllerutil.ContainsFinalizer(mr, modelRouterAgentGatewayFinalizer) {
-		if !mr.DeletionTimestamp.IsZero() || mr.Spec.DataPlane != inferencev1alpha1.ModelRouterDataPlaneAgentGateway ||
-			mr.Spec.AgentGatewayRef == nil || agentGatewayPolicyNamespace(mr) == mr.Namespace {
-			if err := r.cleanupExtractionPolicies(ctx, mr, ""); err != nil {
-				// A status patch is futile on a terminating object; the event
-				// is the only visibility a stuck deletion has.
-				if r.Recorder != nil {
-					r.Recorder.Eventf(mr, nil, corev1.EventTypeWarning, modelRouterAgentGatewayReasonReconcile, "Reconcile",
-						"deletion blocked: cleaning up the cross-namespace model-extraction AgentgatewayPolicy failed: %v", err)
-				}
+	// Cleanup path. The sweep must run with or without the finalizer: the
+	// finalizer is only ever added for cross-namespace policies, so a
+	// same-namespace router leaving AgentGateway mode would otherwise keep its
+	// Gateway-wide body-extraction policy, its pools, and its route until the
+	// router itself is deleted. It runs when the router is deleted, when it no
+	// longer compiles in AgentGateway mode (different data plane or ref unset),
+	// and - for a finalizer-bearing router - when the Gateway moved back into
+	// the router's namespace. Runs before the dataPlane early-return so a
+	// router switching to Proxy still cleans up.
+	deleting := !mr.DeletionTimestamp.IsZero()
+	leaving := mr.Spec.DataPlane != inferencev1alpha1.ModelRouterDataPlaneAgentGateway || mr.Spec.AgentGatewayRef == nil
+	hasFinalizer := controllerutil.ContainsFinalizer(mr, modelRouterAgentGatewayFinalizer)
+	// The ref nil-check short-circuits before agentGatewayPolicyNamespace
+	// dereferences it.
+	sameNSPolicy := mr.Spec.AgentGatewayRef != nil && agentGatewayPolicyNamespace(mr) == mr.Namespace
+	if deleting || leaving || (hasFinalizer && sameNSPolicy) {
+		if err := r.cleanupExtractionPolicies(ctx, mr, ""); err != nil {
+			// A status patch is futile on a terminating object; the event
+			// is the only visibility a stuck deletion has.
+			if r.Recorder != nil {
+				r.Recorder.Eventf(mr, nil, corev1.EventTypeWarning, modelRouterAgentGatewayReasonReconcile, "Reconcile",
+					"deletion blocked: cleaning up the cross-namespace model-extraction AgentgatewayPolicy failed: %v", err)
+			}
+			return ctrl.Result{}, err
+		}
+		if deleting || leaving {
+			// Pools and routes are owner-referenced, but owner-ref GC only
+			// fires when the router object goes away: a router that leaves
+			// AgentGateway mode must stop attaching to the Gateway now.
+			if err := r.cleanupGeneratedPoolsAndRoutes(ctx, mr); err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+		if hasFinalizer {
 			controllerutil.RemoveFinalizer(mr, modelRouterAgentGatewayFinalizer)
 			if err := r.Update(ctx, mr); err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+		if !leaving {
+			// Deleting, or the Gateway moved into the router's namespace:
+			// done here. Regeneration, when applicable, happens on the
+			// reconcile the finalizer removal triggers.
 			return ctrl.Result{}, nil
 		}
+		// Leaving AgentGateway mode: fall through so a removed ref still
+		// reports AgentGatewayRefMissing and a Proxy/Gateway-mode router still
+		// early-returns untouched.
 	}
 
 	// Only the AgentGateway data plane is this reconciler's concern. Proxy mode
@@ -545,15 +569,16 @@ func (r *ModelRouterAgentGatewayReconciler) applyAgentGatewayResource(
 				return fmt.Errorf("AgentgatewayPolicy %s/%s is not managed by this ModelRouter; "+
 					"refusing to adopt or overwrite it", live.GetNamespace(), live.GetName())
 			}
-			// The UID label marks the policy as ours for the conflict detector
-			// and cleanup; re-assert it on every update so drift cannot strip it.
-			labels := live.GetLabels()
-			if labels == nil {
-				labels = map[string]string{}
-			}
-			labels[agentGatewayRouterUIDLabel] = string(mr.UID)
-			live.SetLabels(labels)
 		}
+		// The UID label marks every generated object as this router's, for the
+		// conflict detector and the leaving-AgentGateway sweep; re-assert it on
+		// every update so drift cannot strip it.
+		labels := live.GetLabels()
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels[agentGatewayRouterUIDLabel] = string(mr.UID)
+		live.SetLabels(labels)
 		live.Object["spec"] = desiredSpec
 		if crossNamespace {
 			return nil
@@ -926,6 +951,40 @@ func (r *ModelRouterAgentGatewayReconciler) cleanupExtractionPolicies(
 		}
 		if err := r.Delete(ctx, p); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete stale AgentgatewayPolicy %s/%s: %w", p.GetNamespace(), p.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// cleanupGeneratedPoolsAndRoutes deletes the InferencePools and HTTPRoute this
+// router generated, matched by the router-UID label in the router's namespace.
+// It runs when the router leaves AgentGateway mode (dataPlane change or ref
+// removal) and on deletion: owner-ref GC only fires when the router object
+// goes away, but a router that leaves the mode must stop attaching to the
+// Gateway immediately. The sweep is label-based, not owner-ref-based, because
+// the Gateway plane also owner-references objects in the router's namespace;
+// the UID label is what makes it mode-precise. A missing CRD (NoMatch, or the
+// cached-mapping 404 after CRD removal) means the API server removed the CRs
+// with it, so there is nothing to clean.
+func (r *ModelRouterAgentGatewayReconciler) cleanupGeneratedPoolsAndRoutes(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+) error {
+	for _, gvk := range []schema.GroupVersionKind{inferencePoolGVK(), gatewayHTTPRouteGVK()} {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(gvk)
+		if err := r.List(ctx, list, client.InNamespace(mr.Namespace),
+			client.MatchingLabels{agentGatewayRouterUIDLabel: string(mr.UID)}); err != nil {
+			if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("list %s generated by router %s/%s: %w", gvk.Kind, mr.Namespace, mr.Name, err)
+		}
+		for i := range list.Items {
+			obj := &list.Items[i]
+			if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete %s %s/%s: %w", gvk.Kind, obj.GetNamespace(), obj.GetName(), err)
+			}
 		}
 	}
 	return nil
