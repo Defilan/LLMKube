@@ -5,9 +5,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -290,23 +292,23 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	if ok, n := groupReadiness(obs); !ok || n != 2 {
 		t.Errorf("head Ready + worker Running must be ready (got %v, %d)", ok, n)
 	}
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("healthy group must not recreate: %s", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodRunning, false, 1, "abc")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "MemberRestarted" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "MemberRestarted" {
 		t.Errorf("restarted worker: got %q", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodRunning, false, 0, "old")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "SpecChanged" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "SpecChanged" {
 		t.Errorf("stale hash: got %q", reason)
 	}
 	obs[1].existing = mk("w", corev1.PodFailed, false, 0, "abc")
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "MemberFailed" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "MemberFailed" {
 		t.Errorf("failed worker: got %q", reason)
 	}
 	obs[1].existing = nil
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("a missing member is created, not a recreate trigger: got %q", reason)
 	}
 	if ok, n := groupReadiness(obs); ok || n != 1 {
@@ -315,11 +317,11 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	obs[1].existing = mk("w", corev1.PodRunning, false, 0, "abc")
 	obs[0].existing = mk("h", corev1.PodRunning, false, 0, "abc")
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-multiNodeStartupBudget - time.Minute))
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "HeadNotReady" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "HeadNotReady" {
 		t.Errorf("head past budget: got %q", reason)
 	}
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
-	if reason, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("head inside budget must wait: got %q", reason)
 	}
 	if ok, _ := groupReadiness(obs); ok {
@@ -353,7 +355,7 @@ func TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate(t *testing.T) {
 				{rank: 0, existing: mk("h", 0)},
 				{rank: 1, existing: tt.worker},
 			}
-			reason, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Now(), time.Time{})
+			reason, _, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Now(), time.Time{})
 			if reason != tt.want {
 				t.Errorf("worker restart: got reason %q, want %q", reason, tt.want)
 			}
@@ -479,7 +481,7 @@ func TestGroupNeedsRecreateFormation(t *testing.T) {
 				// test, not the budget itself.
 				tt.obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-multiNodeStartupBudget - time.Minute))
 			}
-			reason, _ := groupNeedsRecreate(tt.obs, "abc", now, tt.formedAt, tt.stagedAt)
+			reason, _, _ := groupNeedsRecreate(tt.obs, "abc", now, tt.formedAt, tt.stagedAt)
 			if reason != tt.want {
 				t.Errorf("got reason %q, want %q", reason, tt.want)
 			}
@@ -528,12 +530,18 @@ func TestLastTerminationDetail(t *testing.T) {
 			t.Errorf("detail %q lacks %q", got, want)
 		}
 	}
+	// #1856: the retained excerpt is the exception, not the teardown tail.
+	cs.LastTerminationState.Terminated = &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error", Message: vllmKVCacheTermination}
+	got = lastTerminationDetail(cs)
+	if !strings.Contains(got, "ValueError: No available memory for the cache blocks.") || strings.Contains(got, "resource_tracker") {
+		t.Errorf("detail kept the wrong part of the message: %q", got)
+	}
 	// The formation-aware recreate rule (#1757) judges a termination against
 	// the group's formation timestamp, so the fixture terminates after the
 	// group formed: formedAt an hour ago, FinishedAt now.
 	obs := []memberObservation{{rank: 0, existing: &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "h", Annotations: map[string]string{AnnotationMultiNodeGroupHash: "abc"}},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, ContainerStatuses: []corev1.ContainerStatus{{Name: "vllm", RestartCount: 1, LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 137, Reason: "OOMKilled", FinishedAt: metav1.NewTime(time.Now())}}}}}}}}
-	reason, msg := groupNeedsRecreate(obs, "abc", time.Now(), time.Now().Add(-time.Hour), time.Time{})
+	reason, msg, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Now().Add(-time.Hour), time.Time{})
 	if reason != "MemberRestarted" || !strings.Contains(msg, "OOMKilled") || !strings.Contains(msg, "137") {
 		t.Fatalf("restart detail missing: %s / %s", reason, msg)
 	}
@@ -670,7 +678,183 @@ func TestSetMultiNodeStatusStagedClearedOnRestage(t *testing.T) {
 	for i := range obs {
 		obs[i].existing.Annotations = map[string]string{AnnotationMultiNodeGroupHash: "abc"}
 	}
-	if reason, msg := groupNeedsRecreate(obs, "abc", time.Now(), time.Time{}, multiNodeStagedAt(isvc)); reason != "" {
+	if reason, msg, _ := groupNeedsRecreate(obs, "abc", time.Now(), time.Time{}, multiNodeStagedAt(isvc)); reason != "" {
 		t.Errorf("the group must be held while a member re-stages; got %s: %s", reason, msg)
+	}
+}
+
+// vllmKVCacheTermination is the shape of the #1856 termination message: the
+// last chunk of a vLLM group member's log, as FallbackToLogsOnError hands it
+// over. The cause is the ValueError in the middle; the tail is shutdown noise.
+const vllmKVCacheTermination = `(Worker_TP0 pid=288) INFO [model_runner.py:408] Model loading took 83.88 GiB memory and 377.98 seconds
+(Worker_TP0 pid=288) INFO [gpu_worker.py:632] Available KV cache memory: -1.13 GiB
+(EngineCore pid=175) ERROR [core.py:1385] EngineCore failed to start.
+(EngineCore pid=175) ERROR [core.py:1385] Traceback (most recent call last):
+(EngineCore pid=175) ERROR [core.py:1385]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/engine/core.py", line 1376, in run_engine_core
+(EngineCore pid=175) ERROR [core.py:1385]     engine_core = EngineCoreProc(*args, **kwargs)
+(EngineCore pid=175) ERROR [core.py:1385]   File "/usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py", line 701, in check_enough_kv_cache_memory
+(EngineCore pid=175) ERROR [core.py:1385]     raise ValueError("No available memory for the cache blocks.")
+(EngineCore pid=175) ERROR [core.py:1385] ValueError: No available memory for the cache blocks. Try increasing gpu_memory_utilization when initializing the engine.
+(APIServer pid=1) Traceback (most recent call last):
+(APIServer pid=1)   File "/usr/local/bin/vllm", line 10, in <module>
+(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above.
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 1 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '`
+
+// TestTerminationExcerpt pins what lastTerminationDetail keeps of a long
+// termination message (#1856): the line that names the failure, not the
+// shutdown noise at the end of the log window.
+func TestTerminationExcerpt(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	tests := []struct {
+		name     string
+		msg      string
+		want     []string
+		wantNone []string
+		exact    string
+	}{
+		{
+			name:  "short message is kept whole, trimmed",
+			msg:   "  value_error: no config.json  ",
+			exact: "value_error: no config.json",
+		},
+		{
+			name:     "vLLM traceback keeps the root-cause exception, not the teardown tail",
+			msg:      vllmKVCacheTermination,
+			want:     []string{"ValueError: No available memory for the cache blocks."},
+			wantNone: []string{"resource_tracker", "RuntimeError", "(EngineCore pid=175)"},
+		},
+		{
+			name: "a runtime without exceptions keeps its first error line",
+			msg: strings.Repeat("llama_model_loader: - kv  12: general.name str = model\n", 6) +
+				"llama_model_load: error loading model: tensor 'blk.0.attn_q.weight' has wrong shape\n" +
+				"main: exiting due to model loading error\n" +
+				strings.Repeat("ggml_backend_cuda_free: freed buffer\n", 4),
+			want:     []string{"llama_model_load: error loading model: tensor 'blk.0.attn_q.weight' has wrong shape"},
+			wantNone: []string{"ggml_backend_cuda_free"},
+		},
+		{
+			name:     "with no recognisable failure line both ends survive",
+			msg:      "HEAD-" + long + "-TAIL",
+			want:     []string{"HEAD-", "-TAIL", " ... "},
+			wantNone: []string{long},
+		},
+		{
+			name: "an over-long exception line keeps its head",
+			msg:  "noise\ntorch.OutOfMemoryError: CUDA out of memory. " + long + "\nmore noise",
+			want: []string{"...torch.OutOfMemoryError: CUDA out of memory."},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := terminationExcerpt(tt.msg, terminationDetailLimit)
+			if tt.exact != "" && got != tt.exact {
+				t.Fatalf("got %q, want %q", got, tt.exact)
+			}
+			// The budget is the existing 200 bytes plus the ellipsis markers.
+			if len(got) > terminationDetailLimit+len("......") {
+				t.Errorf("excerpt is %d bytes, over the bound: %q", len(got), got)
+			}
+			for _, w := range tt.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("excerpt %q lacks %q", got, w)
+				}
+			}
+			for _, w := range tt.wantNone {
+				if strings.Contains(got, w) {
+					t.Errorf("excerpt %q should not carry %q", got, w)
+				}
+			}
+		})
+	}
+}
+
+// TestTerminationExcerptUTF8 keeps cuts on rune boundaries, so the excerpt a
+// condition message carries is valid UTF-8.
+func TestTerminationExcerptUTF8(t *testing.T) {
+	got := terminationExcerpt(strings.Repeat("é", 300), terminationDetailLimit)
+	if !utf8.ValidString(got) {
+		t.Fatalf("excerpt is not valid UTF-8: %q", got)
+	}
+}
+
+func TestMultiNodeRecreateBackoff(t *testing.T) {
+	want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute}
+	for i, w := range want {
+		if got := multiNodeRecreateBackoff(int32(i + 1)); got != w {
+			t.Errorf("backoff after failure %d: got %s, want %s", i+1, got, w)
+		}
+	}
+}
+
+// TestCountGroupFailure pins the #1856 retry policy: consecutive member
+// failures accumulate with a doubling backoff, one failure is counted once
+// however many reconciles observe it, a group that served for
+// multiNodeRecreateResetAfter starts over, and past the bound no recreate is
+// scheduled.
+func TestCountGroupFailure(t *testing.T) {
+	now := time.Now()
+	pod := func(uid string) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "ring-mn-1", UID: types.UID(uid)}}
+	}
+	prev := func(count int32, uid string) *inferencev1alpha1.MultiNodeRecreateStatus {
+		return &inferencev1alpha1.MultiNodeRecreateStatus{Count: count, GroupHash: "abc", PodUID: uid}
+	}
+	tests := []struct {
+		name        string
+		prev        *inferencev1alpha1.MultiNodeRecreateStatus
+		uid         string
+		readySince  time.Time
+		wantCount   int32
+		wantCounted bool
+		wantNext    time.Duration // 0: no recreate scheduled
+	}{
+		{name: "first failure", prev: nil, uid: "u1", wantCount: 1, wantCounted: true, wantNext: 30 * time.Second},
+		{name: "consecutive failure doubles the wait", prev: prev(1, "u1"), uid: "u2", wantCount: 2, wantCounted: true, wantNext: time.Minute},
+		{name: "the same pod observed again is not counted twice", prev: prev(2, "u2"), uid: "u2", wantCount: 2, wantCounted: false},
+		{name: "a brief Ready does not reset the count", prev: prev(2, "u2"), uid: "u3", readySince: now.Add(-time.Minute), wantCount: 3, wantCounted: true, wantNext: 2 * time.Minute},
+		{name: "a sustained Ready resets the count", prev: prev(3, "u3"), uid: "u4", readySince: now.Add(-multiNodeRecreateResetAfter - time.Second), wantCount: 1, wantCounted: true, wantNext: 30 * time.Second},
+		{name: "the failure past the bound schedules no recreate", prev: prev(multiNodeMaxRecreates, "u3"), uid: "u4", wantCount: multiNodeMaxRecreates + 1, wantCounted: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec, counted := countGroupFailure(tt.prev, "abc", pod(tt.uid), multiNodeReasonMemberRestarted, "ring-mn-1 restarted 1 time(s)", tt.readySince, now)
+			if counted != tt.wantCounted || rec.Count != tt.wantCount {
+				t.Fatalf("got count %d counted %v, want %d %v", rec.Count, counted, tt.wantCount, tt.wantCounted)
+			}
+			if !counted {
+				return
+			}
+			if rec.PodUID != tt.uid || rec.GroupHash != "abc" || rec.Reason != multiNodeReasonMemberRestarted || rec.LastFailureTime == nil {
+				t.Errorf("record does not carry the failure: %+v", rec)
+			}
+			switch {
+			case tt.wantNext == 0 && rec.NextRecreateTime != nil:
+				t.Errorf("no recreate expected past the bound, got %s", rec.NextRecreateTime)
+			case tt.wantNext != 0 && (rec.NextRecreateTime == nil || !rec.NextRecreateTime.Time.Equal(now.Add(tt.wantNext))):
+				t.Errorf("next recreate: got %v, want now+%s", rec.NextRecreateTime, tt.wantNext)
+			}
+		})
+	}
+}
+
+// TestMultiNodeRecreateResetRequeue: a Ready group with a failure count asks
+// to be reconciled when the count is due to be forgotten.
+func TestMultiNodeRecreateResetRequeue(t *testing.T) {
+	now := time.Now()
+	isvc, _ := multiNodeFixture()
+	if got := multiNodeRecreateResetRequeue(isvc, now); got != 0 {
+		t.Fatalf("no record, no requeue: got %s", got)
+	}
+	isvc.Status.MultiNode = &inferencev1alpha1.MultiNodeStatus{Recreates: &inferencev1alpha1.MultiNodeRecreateStatus{Count: 1}}
+	if got := multiNodeRecreateResetRequeue(isvc, now); got != 0 {
+		t.Fatalf("a group that is not Ready has nothing to wait for: got %s", got)
+	}
+	isvc.Status.Conditions = []metav1.Condition{{
+		Type: ConditionMultiNodeGroupReady, Status: metav1.ConditionTrue, Reason: "AllMembersRunning",
+		LastTransitionTime: metav1.NewTime(now.Add(-time.Minute)),
+	}}
+	if got := multiNodeRecreateResetRequeue(isvc, now); got != multiNodeRecreateResetAfter-time.Minute {
+		t.Fatalf("got %s, want %s", got, multiNodeRecreateResetAfter-time.Minute)
 	}
 }

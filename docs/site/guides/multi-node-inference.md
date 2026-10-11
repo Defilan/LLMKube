@@ -128,6 +128,53 @@ Any change to `spec.multiNode`, the model, the image, or the runtime config
 recreates the group as well. `replicas` must be 1 or unset; autoscaling does
 not apply.
 
+### Bounded recreates
+
+A recreate replaces every member pod, so the kubelet never gets to put a
+crashing container into `CrashLoopBackOff`, and the member pods always show
+`RESTARTS 0`. The operator keeps the count instead, in
+`status.multiNode.recreates`, and bounds it:
+
+- A member failure (a runtime restart, a failed pod, an init container loop,
+  or a rank 0 that is not Ready inside its 30 minute budget) tears the group
+  down and counts as one failure. A spec change or a deleted member pod does
+  not count.
+- The group is recreated after a backoff: 30 seconds after the first failure,
+  doubling for each further consecutive failure, capped at 5 minutes. While
+  it waits the `MultiNodeGroupReady` condition has reason `BackOff`.
+- The fourth consecutive failure (after three recreates) is terminal. The
+  group is deleted and not recreated, the service goes to phase `Failed`, and
+  the `Degraded` condition names the member and carries the failure.
+- The count resets once the group has stayed Ready for 10 minutes, so a node
+  reboot or a one-off OOM kill that recovers on retry never adds up to a
+  failure. Changing the spec also starts a fresh count.
+- To retry a `Failed` group without changing the spec, set `spec.suspend:
+  true` (or `replicas: 0`) and then back.
+
+Every counted failure also records a `MultiNodeGroupRecreating` Warning event
+on the InferenceService, and reaching the bound records
+`MultiNodeGroupFailed`, so `kubectl describe isvc` shows the history even
+though the pods it describes are gone:
+
+```yaml
+status:
+  phase: Failed
+  multiNode:
+    recreates:
+      count: 4
+      reason: MemberRestarted
+      message: >-
+        dsv41-ring-mn-0 restarted 1 time(s) (container vllm exit 1 Error:
+        ...ValueError: No available memory for the cache blocks. Try
+        increasing gpu_memory_utilization when initializing the engine....)
+```
+
+The failure message is an excerpt of the container's termination message,
+which for a member is the end of its log. The excerpt is the first exception
+line in it (the root cause of a Python traceback comes before the exceptions
+that wrap it and before the shutdown warnings that end the log), else the
+first line that reports an error, else the start and end of the message.
+
 Status shows each rank:
 
 ```yaml

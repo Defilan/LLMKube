@@ -21,9 +21,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -85,6 +87,47 @@ const (
 	// multiNodeRecreateRequeue is how soon the reconciler comes back after
 	// deleting a group, to recreate it once the pods are gone.
 	multiNodeRecreateRequeue = 5 * time.Second
+
+	// multiNodeMaxRecreates bounds the consecutive failure-driven recreates of
+	// a group that never serves in between (#1856). A recreate replaces every
+	// pod, so the kubelet's own CrashLoopBackOff never engages and a
+	// deterministic failure (a bad flag, no room for the KV cache) would
+	// otherwise reload the whole checkpoint on every member forever. The
+	// failure after the last allowed recreate marks the service Failed. It
+	// matches multiNodeMaxInitRestarts: three retries absorb a node reboot or
+	// a one-off OOM kill, and a fourth identical outcome is not transient.
+	multiNodeMaxRecreates = int32(3)
+
+	// multiNodeRecreateBackoffBase is the wait before the first recreate after
+	// a member failure; each further consecutive failure doubles it, up to
+	// multiNodeRecreateBackoffMax.
+	multiNodeRecreateBackoffBase = 30 * time.Second
+	multiNodeRecreateBackoffMax  = 5 * time.Minute
+
+	// multiNodeRecreateResetAfter is how long the group must stay Ready before
+	// its failure count is forgotten. A group that crashes on its first
+	// request becomes Ready for a moment every cycle; resetting on the first
+	// Ready would loop forever with the minimum backoff.
+	multiNodeRecreateResetAfter = 10 * time.Minute
+
+	// terminationDetailLimit bounds the excerpt of a termination message that
+	// lastTerminationDetail keeps.
+	terminationDetailLimit = 200
+)
+
+// Group recreate reasons that are member failures. Only these count toward
+// multiNodeMaxRecreates: a spec change or a member being deleted is intent or
+// disruption, not evidence that the group cannot start.
+const (
+	multiNodeReasonMemberRestarted = "MemberRestarted"
+	multiNodeReasonMemberFailed    = "MemberFailed"
+	multiNodeReasonMemberInitLoop  = "MemberInitLoop"
+	multiNodeReasonHeadNotReady    = "HeadNotReady"
+	// multiNodeReasonRecreateLimit is the group condition once the bound is
+	// reached and the group is no longer recreated.
+	multiNodeReasonRecreateLimit = "RecreateLimitReached"
+	// multiNodeReasonBackOff is the group condition while a recreate waits.
+	multiNodeReasonBackOff = "BackOff"
 )
 
 // memberPodName is <isvc>-mn-<rank>.
@@ -448,7 +491,10 @@ func multiNodeStagedAt(isvc *inferencev1alpha1.InferenceService) time.Time {
 // group that never forms cannot be masked forever. A staging member that hangs
 // without restarting (Running, RestartCount 0) is deliberately not bounded
 // here: a 184 GiB download legitimately exceeds any fixed budget.
-func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, formedAt, stagedAt time.Time) (reason, msg string) {
+//
+// trigger is the member the reason is about, so a failure can be attributed
+// to one pod and counted once however many reconciles its teardown spans.
+func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, formedAt, stagedAt time.Time) (reason, msg string, trigger *corev1.Pod) {
 	stagingAny := false
 	for _, o := range obs {
 		p := o.existing
@@ -456,10 +502,10 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 			continue
 		}
 		if got := p.Annotations[AnnotationMultiNodeGroupHash]; got != hash {
-			return "SpecChanged", fmt.Sprintf("%s carries group hash %q, want %q", p.Name, got, hash)
+			return "SpecChanged", fmt.Sprintf("%s carries group hash %q, want %q", p.Name, got, hash), p
 		}
 		if p.DeletionTimestamp != nil {
-			return "MemberTerminating", p.Name + " is terminating"
+			return "MemberTerminating", p.Name + " is terminating", p
 		}
 		switch p.Status.Phase {
 		case corev1.PodFailed, corev1.PodSucceeded, corev1.PodUnknown:
@@ -467,12 +513,12 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 			for _, cs := range p.Status.ContainerStatuses {
 				detail += lastTerminationDetail(cs)
 			}
-			return "MemberFailed", fmt.Sprintf("%s is %s%s", p.Name, p.Status.Phase, detail)
+			return multiNodeReasonMemberFailed, fmt.Sprintf("%s is %s%s", p.Name, p.Status.Phase, detail), p
 		}
 		if memberStaging(p) {
 			stagingAny = true
 			if n := initRestartCount(p); n > multiNodeMaxInitRestarts {
-				return "MemberInitLoop", fmt.Sprintf("%s init containers restarted %d time(s) while still staging", p.Name, n)
+				return multiNodeReasonMemberInitLoop, fmt.Sprintf("%s init containers restarted %d time(s) while still staging", p.Name, n), p
 			}
 		}
 	}
@@ -483,7 +529,7 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 		}
 		for _, cs := range p.Status.ContainerStatuses {
 			if cs.RestartCount > 0 && memberRestartFatal(cs, formedAt, stagedAt, now) {
-				return "MemberRestarted", fmt.Sprintf("%s restarted %d time(s)%s", p.Name, cs.RestartCount, lastTerminationDetail(cs))
+				return multiNodeReasonMemberRestarted, fmt.Sprintf("%s restarted %d time(s)%s", p.Name, cs.RestartCount, lastTerminationDetail(cs)), p
 			}
 		}
 	}
@@ -495,16 +541,17 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 			}
 			if o.rank == 0 && p.Status.Phase == corev1.PodRunning && !podReady(p) &&
 				!p.CreationTimestamp.IsZero() && now.Sub(p.CreationTimestamp.Time) > multiNodeStartupBudget {
-				return "HeadNotReady", fmt.Sprintf("%s not Ready after %s", p.Name, multiNodeStartupBudget)
+				return multiNodeReasonHeadNotReady, fmt.Sprintf("%s not Ready after %s", p.Name, multiNodeStartupBudget), p
 			}
 		}
 	}
-	return "", ""
+	return "", "", nil
 }
 
-// lastTerminationDetail renders the exit code, reason and trailing message of
-// a container's last termination, so the recreate condition keeps the
-// evidence the pod deletion is about to erase. Empty when nothing terminated.
+// lastTerminationDetail renders the exit code, reason and an excerpt of the
+// message of a container's last termination, so the recreate condition keeps
+// the evidence the pod deletion is about to erase. Empty when nothing
+// terminated.
 func lastTerminationDetail(cs corev1.ContainerStatus) string {
 	t := cs.LastTerminationState.Terminated
 	if t == nil {
@@ -513,14 +560,225 @@ func lastTerminationDetail(cs corev1.ContainerStatus) string {
 	if t == nil {
 		return ""
 	}
-	msg := strings.TrimSpace(t.Message)
-	if len(msg) > 200 {
-		msg = "..." + msg[len(msg)-200:]
-	}
+	msg := terminationExcerpt(t.Message, terminationDetailLimit)
 	if msg != "" {
 		msg = ": " + msg
 	}
 	return fmt.Sprintf(" (container %s exit %d %s%s)", cs.Name, t.ExitCode, t.Reason, msg)
+}
+
+var (
+	// exceptionLine matches a line that names a raised failure: a Python
+	// exception ("ValueError: ...", "torch.OutOfMemoryError: ..."), possibly
+	// behind a vLLM process prefix, a Go panic, a C++ terminate, or a fatal
+	// Python error. Warnings ("UserWarning:") deliberately do not match.
+	exceptionLine = regexp.MustCompile(`\b[A-Za-z_][\w.]*(?:Error|Exception)\b:|^panic:|terminate called after throwing|Fatal Python error`)
+	// errorLine is the weaker fallback: any line that says error, fatal or
+	// failed, which is how llama.cpp and most C++ runtimes report.
+	errorLine = regexp.MustCompile(`(?i)\b(?:error|fatal|failed)\b`)
+)
+
+// terminationExcerpt keeps the informative part of a termination message
+// within limit bytes (plus "..." markers where text was dropped).
+//
+// Member containers use FallbackToLogsOnError, so the message is the last
+// 2 KiB of the log, cut at an arbitrary point. Neither end of that window is
+// reliably the cause: a Python runtime ends with shutdown noise (leaked
+// shared_memory warnings) and the window's start is mid-log. The cause is the
+// first exception line: Python prints the root cause of a chained exception
+// first ("ValueError: No available memory for the cache blocks." before the
+// wrapping "RuntimeError: Engine core initialization failed."). So the
+// excerpt is the first exception line, else the first error line, else the
+// head and the tail of the message around an ellipsis.
+func terminationExcerpt(msg string, limit int) string {
+	msg = strings.TrimSpace(msg)
+	if len(msg) <= limit {
+		return msg
+	}
+	for _, re := range []*regexp.Regexp{exceptionLine, errorLine} {
+		offset := 0
+		for _, raw := range strings.SplitAfter(msg, "\n") {
+			line := strings.TrimSpace(raw)
+			start := offset + strings.Index(raw, line)
+			offset += len(raw)
+			loc := re.FindStringIndex(line)
+			if line == "" || loc == nil {
+				continue
+			}
+			if re == exceptionLine {
+				// Start at the exception itself: a log prefix such as
+				// "(EngineCore pid=175) ERROR [core.py:1385] " spends the
+				// budget the exception's own message needs.
+				line, start = line[loc[0]:], start+loc[0]
+			}
+			out := cutHead(line, limit)
+			if start > 0 {
+				out = "..." + out
+			}
+			if len(out) < len(line) || start+len(line) < len(msg) {
+				out += "..."
+			}
+			return out
+		}
+	}
+	half := limit / 2
+	return strings.TrimSpace(cutHead(msg, half)) + " ... " + strings.TrimSpace(cutTail(msg, limit-half))
+}
+
+// cutHead returns at most n bytes from the start of s without splitting a
+// UTF-8 sequence.
+func cutHead(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// cutTail returns at most n bytes from the end of s without splitting a UTF-8
+// sequence.
+func cutTail(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
+}
+
+// multiNodeFailureReason reports whether a recreate reason is a member failure
+// that counts toward multiNodeMaxRecreates.
+func multiNodeFailureReason(reason string) bool {
+	switch reason {
+	case multiNodeReasonMemberRestarted, multiNodeReasonMemberFailed, multiNodeReasonMemberInitLoop, multiNodeReasonHeadNotReady:
+		return true
+	}
+	return false
+}
+
+// multiNodeRecreateBackoff is the wait before the recreate that follows the
+// count-th consecutive failure: base, doubling, capped.
+func multiNodeRecreateBackoff(count int32) time.Duration {
+	d := multiNodeRecreateBackoffBase
+	for i := int32(1); i < count; i++ {
+		d *= 2
+		if d >= multiNodeRecreateBackoffMax {
+			return multiNodeRecreateBackoffMax
+		}
+	}
+	return d
+}
+
+// countGroupFailure folds one observed member failure into the recreate
+// record. counted is false when trigger's failure was already counted: a
+// teardown spans several reconciles, and a lagging cache can show the failed
+// member again before its deletion, which must not burn a second retry.
+//
+// The count carries over from prev unless the group had been Ready for
+// multiNodeRecreateResetAfter when it failed (readySince is when the group
+// last became Ready, zero if it is not Ready). Any member failure counts, not
+// only a repeat of the same message: the excerpt varies run to run (pids,
+// timestamps, interleaved multi-process output), and a group that fails in
+// different ways without ever serving is not converging either.
+func countGroupFailure(prev *inferencev1alpha1.MultiNodeRecreateStatus, hash string, trigger *corev1.Pod, reason, msg string, readySince, now time.Time) (*inferencev1alpha1.MultiNodeRecreateStatus, bool) {
+	uid := ""
+	if trigger != nil {
+		uid = string(trigger.UID)
+	}
+	if prev != nil && uid != "" && prev.PodUID == uid {
+		return prev, false
+	}
+	var count int32
+	if prev != nil && (readySince.IsZero() || now.Sub(readySince) < multiNodeRecreateResetAfter) {
+		count = prev.Count
+	}
+	count++
+	failedAt := metav1.NewTime(now)
+	rec := &inferencev1alpha1.MultiNodeRecreateStatus{
+		Count: count, Reason: reason, Message: msg,
+		LastFailureTime: &failedAt, GroupHash: hash, PodUID: uid,
+	}
+	if count <= multiNodeMaxRecreates {
+		next := metav1.NewTime(now.Add(multiNodeRecreateBackoff(count)))
+		rec.NextRecreateTime = &next
+	}
+	return rec, true
+}
+
+// multiNodeRecreates returns the recreate record for the current group, nil
+// when there is none.
+func multiNodeRecreates(isvc *inferencev1alpha1.InferenceService) *inferencev1alpha1.MultiNodeRecreateStatus {
+	if isvc.Status.MultiNode == nil {
+		return nil
+	}
+	return isvc.Status.MultiNode.Recreates
+}
+
+// setMultiNodeRecreates stores the recreate record, creating status.multiNode
+// if needed.
+func setMultiNodeRecreates(isvc *inferencev1alpha1.InferenceService, rec *inferencev1alpha1.MultiNodeRecreateStatus) {
+	if isvc.Status.MultiNode == nil {
+		if rec == nil {
+			return
+		}
+		isvc.Status.MultiNode = &inferencev1alpha1.MultiNodeStatus{}
+	}
+	isvc.Status.MultiNode.Recreates = rec
+}
+
+// multiNodeRecreateWait is how long the pending recreate still has to wait
+// out its backoff. Zero when no recreate is pending or the wait is over.
+func multiNodeRecreateWait(isvc *inferencev1alpha1.InferenceService, now time.Time) time.Duration {
+	rec := multiNodeRecreates(isvc)
+	if rec == nil || rec.NextRecreateTime == nil {
+		return 0
+	}
+	if wait := rec.NextRecreateTime.Sub(now); wait > 0 {
+		return wait
+	}
+	return 0
+}
+
+// multiNodeReadySince is when the group last became Ready, from the
+// MultiNodeGroupReady condition. Zero when the group is not Ready.
+func multiNodeReadySince(isvc *inferencev1alpha1.InferenceService) time.Time {
+	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeGroupReady)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		return time.Time{}
+	}
+	return cond.LastTransitionTime.Time
+}
+
+// multiNodeRecreateResetRequeue is how long until a Ready group with a
+// failure count has stayed Ready long enough to forget it. A healthy group
+// generates no watch events, so Reconcile requeues for this instead of
+// leaving a stale count to be picked up by the next failure. Zero when there
+// is nothing to reset.
+func multiNodeRecreateResetRequeue(isvc *inferencev1alpha1.InferenceService, now time.Time) time.Duration {
+	if multiNodeRecreates(isvc) == nil {
+		return 0
+	}
+	since := multiNodeReadySince(isvc)
+	if since.IsZero() {
+		return 0
+	}
+	if wait := since.Add(multiNodeRecreateResetAfter).Sub(now); wait > 0 {
+		return wait
+	}
+	// Already due: the Ready path of reconcileMultiNodeGroup clears it.
+	return 0
+}
+
+// multiNodeGroupFailedMessage is the Degraded message of a group that reached
+// the recreate bound: what failed, where, and how to retry.
+func multiNodeGroupFailedMessage(rec *inferencev1alpha1.MultiNodeRecreateStatus) string {
+	return fmt.Sprintf("multiNode group failed %d times in a row without serving and is no longer recreated; last failure (%s): %s. "+
+		"Fix the cause and change the spec, or set spec.suspend to true (or replicas to 0) and back, to retry",
+		rec.Count, rec.Reason, rec.Message)
 }
 
 // groupReadiness: the group serves when every member is Running and rank 0
@@ -599,8 +857,16 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		byName[existing.Items[i].Name] = &existing.Items[i]
 	}
 
-	// Suspended (desiredReplicas 0): the group must not exist.
+	// A failure count belongs to one group spec: once the hash moves, the
+	// user changed something and the new group starts with a clean record.
+	if rec := multiNodeRecreates(isvc); rec != nil && rec.GroupHash != hash {
+		setMultiNodeRecreates(isvc, nil)
+	}
+
+	// Suspended (desiredReplicas 0): the group must not exist. Suspending is
+	// also the operator's retry: the failure count is forgotten.
 	if desiredReplicas == 0 {
+		setMultiNodeRecreates(isvc, nil)
 		if len(existing.Items) > 0 {
 			setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, "Suspended", "spec.suspend or replicas 0")
 			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
@@ -614,24 +880,27 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 		return 0, nil, nil
 	}
 
+	// Past the bound the group stays down: no recreate until the spec
+	// changes or the service is suspended and resumed.
+	if rec := multiNodeRecreates(isvc); rec != nil && rec.Count > multiNodeMaxRecreates {
+		return r.holdFailedGroup(ctx, isvc, desired, existing.Items, rec, modelReady, desiredReplicas)
+	}
+
+	now := time.Now()
 	obs := make([]memberObservation, len(desired))
 	for i, d := range desired {
 		obs[i] = memberObservation{rank: i, desired: d, existing: byName[d.Name]}
 	}
-	if reason, msg := groupNeedsRecreate(obs, hash, time.Now(), multiNodeFormedAt(isvc), multiNodeStagedAt(isvc)); reason != "" {
-		// A teardown takes several reconciles (every member event requeues);
-		// log the decision once per reason, not once per requeue.
-		if cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeGroupReady); cond == nil || cond.Reason != reason {
-			log.Info("multiNode: recreating group", "reason", reason, "detail", msg)
+	if reason, msg, trigger := groupNeedsRecreate(obs, hash, now, multiNodeFormedAt(isvc), multiNodeStagedAt(isvc)); reason != "" {
+		return r.tearDownGroup(ctx, isvc, desired, existing.Items, groupTeardown{hash: hash, reason: reason, msg: msg, trigger: trigger}, now, modelReady, desiredReplicas)
+	}
+
+	// Back off before recreating a group that just failed, so a load that
+	// takes minutes is not repeated back to back.
+	if len(existing.Items) < len(desired) {
+		if wait := multiNodeRecreateWait(isvc, now); wait > 0 {
+			return r.waitRecreateBackoff(ctx, isvc, desired, existing.Items, multiNodeRecreates(isvc), wait, modelReady, desiredReplicas)
 		}
-		setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, reason, msg)
-		// The group is going away: the next formation must stamp a fresh
-		// timestamp, or the new pods' kubelet restarts would be judged against
-		// the old group's formation (#1757).
-		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
-		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
-		r.deleteMemberPods(ctx, existing.Items)
-		return r.persistGroupTeardown(ctx, isvc, PhaseCreating, modelReady, desiredReplicas)
 	}
 
 	// Every rank renders from one template, so one rank's volumes answer for
@@ -673,6 +942,11 @@ func (r *InferenceServiceReconciler) reconcileMultiNodeGroup(
 	ready, running := groupReadiness(obs)
 	if ready {
 		setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionTrue, "AllMembersRunning", "rank 0 is Ready and every member is Running")
+		// A group that has served for a while has recovered: whatever failed
+		// before was transient, so the next failure starts a fresh count.
+		if since := multiNodeReadySince(isvc); !since.IsZero() && now.Sub(since) >= multiNodeRecreateResetAfter {
+			setMultiNodeRecreates(isvc, nil)
+		}
 		return 1, nil, nil
 	}
 	setMultiNodeStatus(isvc, desired, existing.Items, metav1.ConditionFalse, "Starting", fmt.Sprintf("%d of %d members running", running, len(desired)))
@@ -724,6 +998,113 @@ func (r *InferenceServiceReconciler) persistGroupTeardown(ctx context.Context, i
 	return 0, &result, err
 }
 
+// groupTeardown is one recreate decision from groupNeedsRecreate.
+type groupTeardown struct {
+	hash, reason, msg string
+	trigger           *corev1.Pod
+}
+
+// tearDownGroup deletes the whole group for td. A member failure is counted
+// against multiNodeMaxRecreates first: inside the bound the group is torn
+// down for a recreate after its backoff, past it the group is held down and
+// the service fails.
+func (r *InferenceServiceReconciler) tearDownGroup(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	desired []*corev1.Pod,
+	existing []corev1.Pod,
+	td groupTeardown,
+	now time.Time,
+	modelReady bool,
+	desiredReplicas int32,
+) (int32, *ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	condMsg := td.msg
+	if multiNodeFailureReason(td.reason) {
+		rec, counted := countGroupFailure(multiNodeRecreates(isvc), td.hash, td.trigger, td.reason, td.msg, multiNodeReadySince(isvc), now)
+		setMultiNodeRecreates(isvc, rec)
+		if rec.Count > multiNodeMaxRecreates {
+			if counted {
+				log.Info("multiNode: recreate limit reached, not recreating the group", "reason", td.reason, "failures", rec.Count, "detail", td.msg)
+				r.multiNodeEvent(isvc, "MultiNodeGroupFailed", multiNodeGroupFailedMessage(rec))
+			}
+			return r.holdFailedGroup(ctx, isvc, desired, existing, rec, modelReady, desiredReplicas)
+		}
+		wait := multiNodeRecreateBackoff(rec.Count)
+		condMsg = fmt.Sprintf("%s; recreate %d of %d in %s", td.msg, rec.Count, multiNodeMaxRecreates, wait)
+		if counted {
+			r.multiNodeEvent(isvc, "MultiNodeGroupRecreating",
+				fmt.Sprintf("member failure (%s), recreate %d of %d in %s: %s", td.reason, rec.Count, multiNodeMaxRecreates, wait, td.msg))
+		}
+	}
+	// A teardown takes several reconciles (every member event requeues);
+	// log the decision once per reason, not once per requeue.
+	if cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionMultiNodeGroupReady); cond == nil || cond.Reason != td.reason {
+		log.Info("multiNode: recreating group", "reason", td.reason, "detail", td.msg)
+	}
+	setMultiNodeStatus(isvc, desired, existing, metav1.ConditionFalse, td.reason, condMsg)
+	// The group is going away: the next formation must stamp a fresh
+	// timestamp, or the new pods' kubelet restarts would be judged against
+	// the old group's formation (#1757).
+	meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
+	meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
+	r.deleteMemberPods(ctx, existing)
+	return r.persistGroupTeardown(ctx, isvc, PhaseCreating, modelReady, desiredReplicas)
+}
+
+// waitRecreateBackoff reports a group that is waiting out its recreate
+// backoff and comes back when the wait is over.
+func (r *InferenceServiceReconciler) waitRecreateBackoff(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	desired []*corev1.Pod,
+	existing []corev1.Pod,
+	rec *inferencev1alpha1.MultiNodeRecreateStatus,
+	wait time.Duration,
+	modelReady bool,
+	desiredReplicas int32,
+) (int32, *ctrl.Result, error) {
+	setMultiNodeStatus(isvc, desired, existing, metav1.ConditionFalse, multiNodeReasonBackOff,
+		fmt.Sprintf("recreate %d of %d in %s after %s: %s",
+			rec.Count, multiNodeMaxRecreates, wait.Round(time.Second), rec.Reason, rec.Message))
+	result, err := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseCreating, modelReady, 0, 0, desiredReplicas, "", "", nil)
+	result.RequeueAfter = earliestPositive(result.RequeueAfter, wait)
+	return 0, &result, err
+}
+
+// holdFailedGroup keeps a group that reached the recreate bound down: any
+// member still around is deleted, nothing is created, and the service reports
+// phase Failed with the last failure's evidence. The pods are not left
+// crashlooping: each kubelet restart would reload the whole checkpoint while
+// holding every member's GPUs, and the evidence is already in status.
+func (r *InferenceServiceReconciler) holdFailedGroup(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	desired []*corev1.Pod,
+	existing []corev1.Pod,
+	rec *inferencev1alpha1.MultiNodeRecreateStatus,
+	modelReady bool,
+	desiredReplicas int32,
+) (int32, *ctrl.Result, error) {
+	msg := multiNodeGroupFailedMessage(rec)
+	setMultiNodeStatus(isvc, desired, existing, metav1.ConditionFalse, multiNodeReasonRecreateLimit, msg)
+	meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeFormed)
+	meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
+	r.deleteMemberPods(ctx, existing)
+	result, err := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, 0, desiredReplicas, "", msg, nil)
+	return 0, &result, err
+}
+
+// multiNodeEvent records a Warning event on the service. The member pods
+// that would carry the kubelet's own events are deleted by every recreate,
+// so the service is the only object that keeps the history.
+func (r *InferenceServiceReconciler) multiNodeEvent(isvc *inferencev1alpha1.InferenceService, reason, note string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, reason, "Reconcile", "%s", note)
+}
+
 // setMultiNodeStatus fills status.multiNode from the desired ranks and the
 // observed pods, and sets the group condition. The caller's status write
 // persists it.
@@ -745,6 +1126,10 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 		byName[existing[i].Name] = &existing[i]
 	}
 	st := &inferencev1alpha1.MultiNodeStatus{Size: int32(len(desired))} //nolint:gosec // G115: bounded by the CRD's MaxItems=64
+	// The recreate record outlives the pods it counts; the caller owns it.
+	if isvc.Status.MultiNode != nil {
+		st.Recreates = isvc.Status.MultiNode.Recreates
+	}
 	formed := len(desired) > 0
 	staged := len(desired) > 0
 	for rank, d := range desired {
