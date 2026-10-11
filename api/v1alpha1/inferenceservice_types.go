@@ -347,6 +347,48 @@ type MultiNodeStatus struct {
 	// Members is per-rank detail in rank order.
 	// +optional
 	Members []MultiNodeMemberStatus `json:"members,omitempty"`
+	// Recreates records the failure-driven recreates of the group since it
+	// last served. A recreate replaces every member pod, so the per-member
+	// restart counts start from zero each time; this is the count that
+	// accumulates. Absent while the group has not failed, and cleared once
+	// the group has stayed Ready, the spec changes, or the service is scaled
+	// to zero.
+	// +optional
+	Recreates *MultiNodeRecreateStatus `json:"recreates,omitempty"`
+}
+
+// MultiNodeRecreateStatus is the bounded-retry record for a multiNode group.
+// Each member failure (a restart, a failed pod, an init loop, a rank 0 that
+// never became Ready) tears the whole group down; the group is recreated
+// after an exponential backoff, and once the consecutive failure count passes
+// the operator's bound the service goes to phase Failed instead of looping.
+type MultiNodeRecreateStatus struct {
+	// Count is the number of consecutive member failures that tore the group
+	// down without it serving in between.
+	Count int32 `json:"count"`
+	// Reason is the recreate reason of the most recent failure, for example
+	// MemberRestarted or MemberFailed.
+	Reason string `json:"reason,omitempty"`
+	// Message names the member and carries the evidence of the most recent
+	// failure (container, exit code, reason, and an excerpt of the
+	// termination message). It survives the deletion of the pod it describes.
+	// +optional
+	Message string `json:"message,omitempty"`
+	// LastFailureTime is when the most recent failure was observed.
+	// +optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+	// NextRecreateTime is the earliest time the group is recreated after the
+	// most recent failure. Unset once the bound is reached.
+	// +optional
+	NextRecreateTime *metav1.Time `json:"nextRecreateTime,omitempty"`
+	// GroupHash is the group hash the count belongs to: a spec change that
+	// moves the hash starts a fresh count.
+	// +optional
+	GroupHash string `json:"groupHash,omitempty"`
+	// PodUID is the member pod whose failure was counted last, so a teardown
+	// that spans several reconciles is counted once.
+	// +optional
+	PodUID string `json:"podUID,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || !has(self.replicas) || self.replicas <= 1",message="multiNode serves one group: replicas must be 1 or unset"

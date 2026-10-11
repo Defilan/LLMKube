@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -85,6 +87,20 @@ var _ = Describe("multiNode group reconcile", func() {
 			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
 		}}
 		Expect(k8sClient.Status().Update(ctx, &p)).To(Succeed())
+	}
+
+	// expireBackoff moves the pending recreate into the past so a spec does
+	// not sleep through the backoff between failure-driven recreates (#1856).
+	expireBackoff := func() {
+		var got inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &got)).To(Succeed())
+		Expect(got.Status.MultiNode).NotTo(BeNil())
+		rec := got.Status.MultiNode.Recreates
+		Expect(rec).NotTo(BeNil())
+		Expect(rec.NextRecreateTime).NotTo(BeNil())
+		past := metav1.NewTime(time.Now().Add(-time.Second))
+		rec.NextRecreateTime = &past
+		Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
 	}
 
 	BeforeEach(func() {
@@ -211,6 +227,9 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Reason).To(Equal("MemberFailed"))
 
+		reconcileOnce() // a failure-driven recreate waits out its backoff (#1856)
+		Expect(memberPods()).To(BeEmpty())
+		expireBackoff()
 		reconcileOnce() // recreates
 		Expect(memberPods()).To(HaveLen(2))
 	})
@@ -415,6 +434,196 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(cond.Reason).To(Equal("MemberRestarted"))
 		Expect(meta.FindStatusCondition(torn.Status.Conditions, ConditionMultiNodeStaged)).To(BeNil(),
 			"teardown clears the staging deadline")
+	})
+
+	Context("bounded recreates (#1856)", func() {
+		getISVC := func() inferencev1alpha1.InferenceService {
+			var got inferencev1alpha1.InferenceService
+			Expect(k8sClient.Get(ctx, key, &got)).To(Succeed())
+			return got
+		}
+		recreates := func() *inferencev1alpha1.MultiNodeRecreateStatus {
+			got := getISVC()
+			if got.Status.MultiNode == nil {
+				return nil
+			}
+			return got.Status.MultiNode.Recreates
+		}
+		groupCond := func() *metav1.Condition {
+			got := getISVC()
+			return meta.FindStatusCondition(got.Status.Conditions, ConditionMultiNodeGroupReady)
+		}
+		// failMember plays the kubelet reporting a member whose runtime
+		// exited for good with the #1856 KV cache traceback.
+		failMember := func(name string) {
+			var p corev1.Pod
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &p)).To(Succeed())
+			p.Status.Phase = corev1.PodFailed
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "vllm",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 1, Reason: "Error", Message: vllmKVCacheTermination, FinishedAt: metav1.Now(),
+				}},
+			}}
+			Expect(k8sClient.Status().Update(ctx, &p)).To(Succeed())
+		}
+		// markGroupReady plays the kubelet bringing every runtime up with
+		// rank 0 passing its readiness probe.
+		markGroupReady := func() {
+			for _, name := range []string{"mn-ring-mn-0", "mn-ring-mn-1"} {
+				var p corev1.Pod
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, &p)).To(Succeed())
+				p.Status.Phase = corev1.PodRunning
+				p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+					Name: "vllm", Ready: name == "mn-ring-mn-0",
+					State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+				}}
+				if name == "mn-ring-mn-0" {
+					p.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				}
+				Expect(k8sClient.Status().Update(ctx, &p)).To(Succeed())
+			}
+		}
+		// failAndTearDown fails the worker and lets the reconciler count it
+		// and delete the group.
+		failAndTearDown := func() {
+			failMember("mn-ring-mn-1")
+			reconcileOnce()
+			finishTerminating()
+			Eventually(memberPods).Should(BeEmpty())
+		}
+		drain := func(rec *events.FakeRecorder) []string {
+			var out []string
+			for {
+				select {
+				case e := <-rec.Events:
+					out = append(out, e)
+				default:
+					return out
+				}
+			}
+		}
+		countWith := func(evts []string, substr string) int {
+			n := 0
+			for _, e := range evts {
+				if strings.Contains(e, substr) {
+					n++
+				}
+			}
+			return n
+		}
+
+		It("backs off between recreates and marks a deterministic failure Failed after the bound", func() {
+			recorder := events.NewFakeRecorder(64)
+			reconciler.Recorder = recorder
+
+			reconcileOnce()
+			Expect(memberPods()).To(HaveLen(2))
+			for i := int32(1); i <= multiNodeMaxRecreates; i++ {
+				failAndTearDown()
+				Expect(getISVC().Status.Phase).NotTo(Equal(PhaseFailed), "failure %d is inside the bound", i)
+				rec := recreates()
+				Expect(rec).NotTo(BeNil())
+				Expect(rec.Count).To(Equal(i), "every recreate is counted where the per-pod restart count cannot")
+				Expect(rec.Message).To(ContainSubstring("mn-ring-mn-1"))
+				Expect(rec.Message).To(ContainSubstring("ValueError: No available memory for the cache blocks."))
+
+				// The group is not recreated before the backoff has passed.
+				res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(memberPods()).To(BeEmpty(), "recreate %d must wait out its backoff", i)
+				Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+				Expect(res.RequeueAfter).To(BeNumerically("<=", multiNodeRecreateBackoff(i)))
+				Expect(groupCond().Reason).To(Equal(multiNodeReasonBackOff))
+
+				expireBackoff()
+				reconcileOnce()
+				Expect(memberPods()).To(HaveLen(2), "the group is recreated once its backoff has passed")
+			}
+
+			// The failure after the last allowed recreate is terminal.
+			failAndTearDown()
+			for range 3 {
+				reconcileOnce()
+				Expect(memberPods()).To(BeEmpty(), "a group past the bound is not recreated")
+			}
+			failed := getISVC()
+			Expect(failed.Status.Phase).To(Equal(PhaseFailed))
+			Expect(failed.Status.MultiNode.Recreates.Count).To(Equal(multiNodeMaxRecreates + 1))
+			degraded := meta.FindStatusCondition(failed.Status.Conditions, ConditionDegraded)
+			Expect(degraded).NotTo(BeNil())
+			Expect(degraded.Message).To(ContainSubstring("mn-ring-mn-1"))
+			Expect(degraded.Message).To(ContainSubstring("ValueError: No available memory for the cache blocks."))
+			Expect(groupCond().Reason).To(Equal(multiNodeReasonRecreateLimit))
+
+			evts := drain(recorder)
+			Expect(countWith(evts, "MultiNodeGroupRecreating")).To(Equal(int(multiNodeMaxRecreates)), "one event per recreate: %v", evts)
+			Expect(countWith(evts, "MultiNodeGroupFailed")).To(Equal(1), "one event at the bound: %v", evts)
+
+			// Suspend and resume is the retry: the count is forgotten.
+			zero, one := int32(0), int32(1)
+			failed.Spec.Replicas = &zero
+			Expect(k8sClient.Update(ctx, &failed)).To(Succeed())
+			reconcileOnce()
+			Expect(recreates()).To(BeNil(), "suspending forgets the failure count")
+			resumed := getISVC()
+			resumed.Spec.Replicas = &one
+			Expect(k8sClient.Update(ctx, &resumed)).To(Succeed())
+			reconcileOnce()
+			Expect(memberPods()).To(HaveLen(2), "a resumed group is created at once")
+			Expect(getISVC().Status.Phase).NotTo(Equal(PhaseFailed))
+		})
+
+		It("recreates a group held at the bound once its spec changes", func() {
+			reconcileOnce()
+			Expect(memberPods()).To(HaveLen(2))
+			// A record left by an older spec: past the bound, but for a hash
+			// the current spec no longer renders.
+			got := getISVC()
+			got.Status.MultiNode.Recreates = &inferencev1alpha1.MultiNodeRecreateStatus{
+				Count: multiNodeMaxRecreates + 1, Reason: multiNodeReasonMemberFailed, GroupHash: "stale-hash",
+			}
+			Expect(k8sClient.Status().Update(ctx, &got)).To(Succeed())
+			reconcileOnce()
+			Expect(memberPods()).To(HaveLen(2), "a record for another spec does not hold the group")
+			Expect(recreates()).To(BeNil())
+			Expect(getISVC().Status.Phase).NotTo(Equal(PhaseFailed))
+		})
+
+		It("recovers from a transient failure and forgets it once the group has served", func() {
+			reconcileOnce()
+			Expect(memberPods()).To(HaveLen(2))
+			failAndTearDown()
+			expireBackoff()
+			reconcileOnce()
+			Expect(memberPods()).To(HaveLen(2))
+
+			// The retry comes up: the group serves.
+			markGroupReady()
+			res, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(groupCond().Status).To(Equal(metav1.ConditionTrue))
+			Expect(getISVC().Status.Phase).NotTo(Equal(PhaseFailed))
+			Expect(recreates()).NotTo(BeNil())
+			Expect(recreates().Count).To(Equal(int32(1)), "a moment of Ready does not forget the failure")
+			Expect(res.RequeueAfter).To(BeNumerically("~", multiNodeRecreateResetAfter, 5*time.Second),
+				"a healthy group raises no events, so the reset needs its own requeue")
+
+			// Ready for longer than the reset window: the failure is forgotten.
+			ready := getISVC()
+			cond := meta.FindStatusCondition(ready.Status.Conditions, ConditionMultiNodeGroupReady)
+			Expect(cond).NotTo(BeNil())
+			cond.LastTransitionTime = metav1.NewTime(time.Now().Add(-multiNodeRecreateResetAfter - time.Minute))
+			Expect(k8sClient.Status().Update(ctx, &ready)).To(Succeed())
+			reconcileOnce()
+			Expect(recreates()).To(BeNil(), "a group that served for the reset window starts over")
+
+			// The next failure starts a fresh count.
+			failMember("mn-ring-mn-1")
+			reconcileOnce()
+			Expect(recreates()).NotTo(BeNil())
+			Expect(recreates().Count).To(Equal(int32(1)))
+		})
 	})
 
 	It("clears the staging deadline when the group is scaled to zero", func() {

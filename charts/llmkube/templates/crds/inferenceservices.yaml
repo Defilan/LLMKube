@@ -6401,6 +6401,56 @@ spec:
                       additionally requires every member Running before the group serves.
                     format: int32
                     type: integer
+                  recreates:
+                    description: |-
+                      Recreates records the failure-driven recreates of the group since it
+                      last served. A recreate replaces every member pod, so the per-member
+                      restart counts start from zero each time; this is the count that
+                      accumulates. Absent while the group has not failed, and cleared once
+                      the group has stayed Ready, the spec changes, or the service is scaled
+                      to zero.
+                    properties:
+                      count:
+                        description: |-
+                          Count is the number of consecutive member failures that tore the group
+                          down without it serving in between.
+                        format: int32
+                        type: integer
+                      groupHash:
+                        description: |-
+                          GroupHash is the group hash the count belongs to: a spec change that
+                          moves the hash starts a fresh count.
+                        type: string
+                      lastFailureTime:
+                        description: LastFailureTime is when the most recent failure
+                          was observed.
+                        format: date-time
+                        type: string
+                      message:
+                        description: |-
+                          Message names the member and carries the evidence of the most recent
+                          failure (container, exit code, reason, and an excerpt of the
+                          termination message). It survives the deletion of the pod it describes.
+                        type: string
+                      nextRecreateTime:
+                        description: |-
+                          NextRecreateTime is the earliest time the group is recreated after the
+                          most recent failure. Unset once the bound is reached.
+                        format: date-time
+                        type: string
+                      podUID:
+                        description: |-
+                          PodUID is the member pod whose failure was counted last, so a teardown
+                          that spans several reconciles is counted once.
+                        type: string
+                      reason:
+                        description: |-
+                          Reason is the recreate reason of the most recent failure, for example
+                          MemberRestarted or MemberFailed.
+                        type: string
+                    required:
+                    - count
+                    type: object
                   size:
                     description: Size is the number of members in the spec.
                     format: int32
