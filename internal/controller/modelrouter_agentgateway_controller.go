@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -100,6 +101,19 @@ const (
 	// name that another router's policy already holds.
 	agentGatewayRouterUIDLabel = "inference.llmkube.dev/agentgateway-router-uid"
 
+	// agentGatewayConflictRequeueAfter is how often a Ready router (and a
+	// conflicted one) re-reconciles to notice AgentgatewayPolicy changes that
+	// no watch covers: a foreign PreRouting transformation created AFTER the
+	// router went Ready is silently shadowed until something re-checks, and a
+	// conflicted router's condition must clear when the foreign policy goes
+	// away. Only these two outcomes requeue: they are the only states whose
+	// truth depends on cluster state outside the router's spec; every other
+	// refusal is spec-determined and stays event-driven. A watch on
+	// AgentgatewayPolicies was rejected because registering it fails manager
+	// startup when the CRD is absent - the same hazard the Owns() comment in
+	// SetupWithManager documents.
+	agentGatewayConflictRequeueAfter = 2 * time.Minute
+
 	// The honest-boundary reasons mirror the Gateway plane exactly: a
 	// dataPlane: AgentGateway ModelRouter must enforce the SAME limits the
 	// Gateway plane does, so the same spec that is rejected in Gateway mode is
@@ -176,6 +190,12 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		if !mr.DeletionTimestamp.IsZero() || mr.Spec.DataPlane != inferencev1alpha1.ModelRouterDataPlaneAgentGateway ||
 			mr.Spec.AgentGatewayRef == nil || agentGatewayPolicyNamespace(mr) == mr.Namespace {
 			if err := r.cleanupExtractionPolicies(ctx, mr, ""); err != nil {
+				// A status patch is futile on a terminating object; the event
+				// is the only visibility a stuck deletion has.
+				if r.Recorder != nil {
+					r.Recorder.Eventf(mr, nil, corev1.EventTypeWarning, modelRouterAgentGatewayReasonReconcile, "Reconcile",
+						"deletion blocked: cleaning up the cross-namespace model-extraction AgentgatewayPolicy failed: %v", err)
+				}
 				return ctrl.Result{}, err
 			}
 			controllerutil.RemoveFinalizer(mr, modelRouterAgentGatewayFinalizer)
@@ -259,12 +279,17 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, err
 	}
 	if len(conflicts) > 0 {
-		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyConflict,
+		if err := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyConflict,
 			fmt.Sprintf("Gateway %s/%s already carries PreRouting transformation policy(ies) that LLMKube does not own: %s. "+
 				"agentgateway merges same-specificity policies oldest-wins per field without combining list entries, "+
 				"so the generated model extraction could be silently dropped, or silently shadow the existing policy. "+
 				"Remove or scope the other policy", agentGatewayPolicyNamespace(mr), mr.Spec.AgentGatewayRef.Name,
-				strings.Join(conflicts, ", ")))
+				strings.Join(conflicts, ", "))); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Recheck on the conflict cadence so the condition clears by itself
+		// when the foreign policy is deleted.
+		return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 	}
 
 	// Fail-loud on matches the agentgateway data plane cannot express. We
@@ -335,7 +360,13 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, r.setAgentGatewayReady(ctx, mr, ejected)
+	if err := r.setAgentGatewayReady(ctx, mr, ejected); err != nil {
+		return ctrl.Result{}, err
+	}
+	// Keep rechecking so a foreign PreRouting policy created after this
+	// reconcile is detected (and a cleared conflict is noticed) without
+	// waiting for an unrelated event.
+	return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 }
 
 // reconcileAgentGatewayResources resolves the router's backends to their
@@ -727,8 +758,9 @@ func (r *ModelRouterAgentGatewayReconciler) agentGatewayPreRoutingConflicts(
 		Group: agentGatewayPolicyGroup, Version: agentGatewayPolicyVersion, Kind: agentGatewayPolicyKind + "List",
 	})
 	if err := r.List(ctx, policies, client.InNamespace(policyNS)); err != nil {
-		if apimeta.IsNoMatchError(err) {
-			// The CRD disappeared between the gate and here; nothing to
+		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			// The CRD disappeared between the gate and here (NoMatch straight
+			// away, a cached-mapping 404 right after deletion); nothing to
 			// conflict with, and nothing could be generated either way.
 			return nil, nil
 		}
@@ -823,7 +855,13 @@ func (r *ModelRouterAgentGatewayReconciler) cleanupExtractionPolicies(
 		Group: agentGatewayPolicyGroup, Version: agentGatewayPolicyVersion, Kind: agentGatewayPolicyKind + "List",
 	})
 	if err := r.List(ctx, list, client.MatchingLabels{agentGatewayRouterUIDLabel: string(mr.UID)}); err != nil {
-		if apimeta.IsNoMatchError(err) {
+		if apimeta.IsNoMatchError(err) || apierrors.IsNotFound(err) {
+			// The CRD is gone. NoMatch is what discovery reports directly;
+			// after the CRD is deleted while the operator runs, the CACHED
+			// REST mapping keeps resolving and the LIST returns 404 - which
+			// wedged a router in Terminating live until an operator restart
+			// (round-2 review). Either way the API server removed the CRs
+			// with the CRD, so there is nothing to clean.
 			return nil
 		}
 		return fmt.Errorf("list AgentgatewayPolicies: %w", err)

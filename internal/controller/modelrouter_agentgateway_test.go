@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
@@ -169,10 +170,17 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	// SUCCEED; the assertions below require the compiled resources to exist.
 	// (External-backend rejection is covered by
 	// TestModelRouterAgentGateway_ExternalBackendFailsLoud.)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: mr.Namespace},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile: %v", err)
+	}
+	// Ready routers recheck periodically: a foreign PreRouting policy created
+	// after this reconcile would otherwise be silently shadowed until an
+	// unrelated event.
+	if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the conflict recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
 	// An InferencePool for the backend, named after the referenced
@@ -1143,6 +1151,91 @@ func condMessage(cond *metav1.Condition) string {
 	return cond.Message
 }
 
+// TestModelRouterAgentGateway_CleanupToleratesRemovedCRD covers the finalizer
+// wedge the round-2 review reproduced live: after the AgentgatewayPolicy CRD
+// is deleted while the operator runs, the CACHED REST mapping keeps resolving
+// and the List returns 404 (IsNotFound, not NoMatch), which looped a router in
+// Terminating until an operator restart. Cleanup and the conflict List must
+// treat NotFound like NoMatch (the API server removed the CRs with the CRD),
+// and a cleanup that still fails must surface a Warning event, because a
+// status patch is futile on a terminating object.
+func TestModelRouterAgentGateway_CleanupToleratesRemovedCRD(t *testing.T) {
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "crdgone-router", Namespace: testNS,
+			Finalizers: []string{modelRouterAgentGatewayFinalizer},
+		},
+	}
+	mr.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneAgentGateway
+	mr.Spec.AgentGatewayRef = &inferencev1alpha1.AgentGatewayReference{
+		Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+	}
+
+	notFoundList := interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			return apierrors.NewNotFound(schema.GroupResource{Group: "agentgateway.dev", Resource: "agentgatewaypolicies"}, "")
+		},
+	}
+
+	t.Run("cleanup tolerates the 404 a cached mapping returns after CRD removal", func(t *testing.T) {
+		s := runtime.NewScheme()
+		if err := inferencev1alpha1.AddToScheme(s); err != nil {
+			t.Fatalf("scheme: %v", err)
+		}
+		c := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(notFoundList).Build()
+		r := &ModelRouterAgentGatewayReconciler{Client: c, Scheme: s}
+		if err := r.cleanupExtractionPolicies(context.Background(), mr, ""); err != nil {
+			t.Fatalf("cleanup must tolerate NotFound like NoMatch, got %v", err)
+		}
+	})
+
+	t.Run("conflict list tolerates the same 404", func(t *testing.T) {
+		s := runtime.NewScheme()
+		if err := inferencev1alpha1.AddToScheme(s); err != nil {
+			t.Fatalf("scheme: %v", err)
+		}
+		c := fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(notFoundList).Build()
+		r := &ModelRouterAgentGatewayReconciler{Client: c, Scheme: s}
+		conflicts, err := r.agentGatewayPreRoutingConflicts(context.Background(), mr, nil)
+		if err != nil {
+			t.Fatalf("conflict list must tolerate NotFound like NoMatch, got %v", err)
+		}
+		if len(conflicts) != 0 {
+			t.Errorf("expected no conflicts, got %v", conflicts)
+		}
+	})
+
+	t.Run("cleanup failure emits a warning event", func(t *testing.T) {
+		s := runtime.NewScheme()
+		if err := inferencev1alpha1.AddToScheme(s); err != nil {
+			t.Fatalf("scheme: %v", err)
+		}
+		now := metav1.Now()
+		deleting := mr.DeepCopy()
+		deleting.DeletionTimestamp = &now
+		rec := events.NewFakeRecorder(4)
+		c := fake.NewClientBuilder().WithScheme(s).WithObjects(deleting).WithStatusSubresource(deleting).WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				return fmt.Errorf("rbac denied")
+			},
+		}).Build()
+		r := &ModelRouterAgentGatewayReconciler{Client: c, Scheme: s, Recorder: rec}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err == nil {
+			t.Fatal("expected an error from a failing cleanup")
+		}
+		select {
+		case ev := <-rec.Events:
+			if !strings.Contains(ev, "deletion blocked") {
+				t.Errorf("event %q does not say the deletion is blocked", ev)
+			}
+		default:
+			t.Fatal("no event emitted; a stuck deletion would be invisible")
+		}
+	})
+}
+
 // TestModelRouterAgentGateway_CrossNamespacePolicyCleanedUpOnDelete covers the
 // finalizer's reason to exist: deleting a router whose extraction policy lives
 // in another namespace (no owner reference could GC it) must delete that
@@ -1403,7 +1496,12 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 				t.Fatalf("create modelrouter: %v", err)
 			}
 			r := newModelRouterAgentGatewayReconciler(t, cfg)
-			reconcileAgentGatewayRouter(t, r, mr)
+			res, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: mr.Namespace},
+			})
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
 
 			fresh := &inferencev1alpha1.ModelRouter{}
 			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
@@ -1418,14 +1516,30 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 				if !strings.Contains(cond.Message, tc.foreignPolicy.GetName()) {
 					t.Errorf("condition message %q does not name the conflicting policy", cond.Message)
 				}
+				// Conflicted routers recheck too, so the condition clears by
+				// itself when the foreign policy is deleted (the round-2
+				// review saw it stick until an unrelated poke).
+				if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+					t.Errorf("requeue after = %v, want %v (the conflict recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
+				}
 				assertNotExists(t, c, inferencePoolGVK(), svc)
 				assertNoPolicyInNamespace(t, c, gwNS, policyName)
 				assertNotExists(t, c, gatewayHTTPRouteGVK(), routerName)
-				// Remove the foreign policy so later cases (which share this
-				// envtest env) are not poisoned by it.
+				// Remove the foreign policy: the next reconcile must go Ready
+				// and the condition must be gone.
 				if err := c.Delete(context.Background(), tc.foreignPolicy); err != nil {
 					t.Fatalf("delete foreign policy: %v", err)
 				}
+				reconcileAgentGatewayRouter(t, r, mr)
+				cleared := &inferencev1alpha1.ModelRouter{}
+				if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, cleared); err != nil {
+					t.Fatalf("get modelrouter after foreign policy deleted: %v", err)
+				}
+				clearedCond := apimeta.FindStatusCondition(cleared.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+				if clearedCond == nil || clearedCond.Status != metav1.ConditionTrue {
+					t.Errorf("AgentGatewayReady did not clear after the foreign policy was deleted, got %+v", clearedCond)
+				}
+				getPolicyInNamespace(t, c, gwNS, policyName)
 				return
 			}
 			if cond == nil || cond.Status != metav1.ConditionTrue {

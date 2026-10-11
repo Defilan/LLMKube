@@ -76,8 +76,13 @@ spec:
                   finalizer on this ModelRouter. Because that policy targets the whole
                   Gateway, its body-model extraction runs on EVERY request through that
                   Gateway, including routes LLMKube did not generate. The Gateway must not
-                  already carry another PreRouting transformation policy; the router is
+                  already carry another PreRouting transformation policy: the router is
                   refused (ConflictingPreRoutingPolicy) rather than silently shadowed.
+                  agentgateway keeps the OLDEST same-specificity policy's transformation,
+                  so LLMKube does not retract its policy on conflict; the condition clears
+                  when the foreign policy is removed, and the reconciler rechecks every
+                  two minutes (a foreign policy created after the router went Ready is
+                  otherwise silently shadowed).
                 properties:
                   endpointPicker:
                     description: |-
