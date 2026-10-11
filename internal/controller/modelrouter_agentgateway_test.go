@@ -1045,8 +1045,12 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 		wantReady      bool
 	}{
 		{
+			// One listener with NO allowedRoutes key: Gateway API defaults
+			// namespaces.from to Same, so absence never admits a
+			// cross-namespace router. The listener is built explicitly rather
+			// than relying on makeGateway's nil-listener default.
 			name:      "unset allowedRoutes defaults to Same and refuses a cross-namespace router",
-			listeners: nil,
+			listeners: []interface{}{listener("", nil)},
 			wantReady: false,
 		},
 		{
