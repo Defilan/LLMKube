@@ -165,6 +165,7 @@ func main() {
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var webhookPort int
 	var enableLeaderElection bool
+	var leaderElectionNamespace string
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
@@ -307,6 +308,9 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "",
+		"Namespace for the leader election Lease. Empty (the default) uses the namespace the pod runs in; "+
+			"set it when running the manager outside a cluster with --leader-elect, as hack/kind-e2e-rbac.sh does.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -484,12 +488,13 @@ func main() {
 
 	mgrCfg := ctrl.GetConfigOrDie()
 	mgr, err := ctrl.NewManager(mgrCfg, ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "882d6afe.llmkube.dev",
+		Scheme:                  scheme,
+		Metrics:                 metricsServerOptions,
+		WebhookServer:           webhookServer,
+		HealthProbeBindAddress:  probeAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "882d6afe.llmkube.dev",
+		LeaderElectionNamespace: leaderElectionNamespace,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly

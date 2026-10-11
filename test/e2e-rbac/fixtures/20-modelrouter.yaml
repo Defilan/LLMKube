@@ -1,0 +1,36 @@
+# A Proxy-mode ModelRouter: the controller renders a ConfigMap, a Deployment,
+# a Service, a ServiceAccount and an activation Role/RoleBinding, and reads the
+# external backend's credentials Secret. Creating the Role also requires the
+# operator to hold every permission the Role grants (the RBAC escalation
+# check), so a gap there shows up too.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: rbac-external-key
+type: Opaque
+stringData:
+  OPENAI_API_KEY: not-a-real-key
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: rbac-router
+spec:
+  dataPlane: Proxy
+  backends:
+  - name: local
+    tier: local
+    inferenceServiceRef:
+      name: rbac-cpu
+  - name: external
+    tier: cloud
+    external:
+      provider: openai
+      model: gpt-test
+      url: https://api.openai.com
+      credentialsSecretRef:
+        name: rbac-external-key
+  defaultRoute: local
+  proxy:
+    replicas: 1
+    image: registry.k8s.io/pause:3.10

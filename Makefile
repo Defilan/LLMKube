@@ -181,6 +181,14 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+# Runs the manager out of cluster under ONLY the RBAC generated from the
+# +kubebuilder:rbac markers and fails on any forbidden error or reconcile
+# error loop (#2001). Uses its own kind cluster (RBAC_E2E_CLUSTER, default
+# llmkube-rbac) and kubeconfig file; see hack/kind-e2e-rbac.sh for the knobs.
+.PHONY: test-e2e-rbac
+test-e2e-rbac: manifests kustomize ## Run the operator under its generated RBAC in kind; fail on forbidden errors.
+	KIND=$(KIND) KUBECTL=$(KUBECTL) KUSTOMIZE=$(KUSTOMIZE) ./hack/kind-e2e-rbac.sh
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run

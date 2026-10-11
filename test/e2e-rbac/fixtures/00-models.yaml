@@ -1,0 +1,72 @@
+# Models for the RBAC smoke run (hack/kind-e2e-rbac.sh). None of them needs a
+# GPU or a controller-side download: the https sources are runtime-resolved
+# (the controller only reads the GGUF header, and a failed read is non-fatal)
+# and the pvc:// one only needs a Bound claim. The script applies every file
+# here with `kubectl apply -n <fixtures namespace>`, so namespaced objects
+# carry no namespace of their own.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: rbac-tiny
+spec:
+  # 1.2 MB GGUF, so the InferenceService init container download is cheap
+  # when the cluster has egress. Nothing in the run depends on it finishing.
+  source: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+  format: gguf
+  hardware:
+    accelerator: cpu
+---
+# prefetch: true makes the Model controller create a download Job (the batch
+# grant that #1593 found missing from the chart).
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: rbac-prefetch
+spec:
+  source: https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf
+  format: gguf
+  prefetch: true
+  hardware:
+    accelerator: cpu
+---
+# A statically bound claim, so the pvc:// Model reaches Ready without a
+# consumer pod (kind's default class binds on first consumer).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: llmkube-rbac-e2e-model-source
+  labels:
+    llmkube.dev/rbac-e2e: "true"
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+  - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /tmp/llmkube-rbac-e2e-model-source
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rbac-model-source
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: ""
+  volumeName: llmkube-rbac-e2e-model-source
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: rbac-pvc
+spec:
+  source: pvc://rbac-model-source/model.gguf
+  format: gguf
+  hardware:
+    accelerator: cpu

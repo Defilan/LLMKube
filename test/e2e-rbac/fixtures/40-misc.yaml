@@ -1,0 +1,34 @@
+# The smaller reconcilers: LoRAAdapter (reports RuntimeMismatch against a
+# llama.cpp service, which is a status write), GPUQuota (aggregates
+# InferenceServices in namespaces matching its selector; the script labels the
+# fixtures namespace llmkube.dev/rbac-e2e=true), and a cluster-scoped
+# FederatedCluster for the hub controller.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: LoRAAdapter
+metadata:
+  name: rbac-lora
+spec:
+  inferenceServiceRef:
+    name: rbac-cpu
+  name: rbac-lora
+  path: /adapters/rbac-lora
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: GPUQuota
+metadata:
+  name: rbac-quota
+spec:
+  selector:
+    matchLabels:
+      llmkube.dev/rbac-e2e: "true"
+  gpuCount: 4
+---
+apiVersion: federation.llmkube.dev/v1alpha1
+kind: FederatedCluster
+metadata:
+  name: llmkube-rbac-e2e-edge
+  labels:
+    llmkube.dev/rbac-e2e: "true"
+spec:
+  displayName: RBAC e2e edge
+  heartbeatIntervalSeconds: 30

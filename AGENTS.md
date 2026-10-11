@@ -28,6 +28,9 @@ contributors share. The human onboarding narrative lives in
   unit tests.
 - `make test-chart` needs `helm` and the `helm-unittest` plugin.
 - `make test-e2e` requires Docker and Kind.
+- `make test-e2e-rbac` requires Docker, Kind and `jq`; it creates (or reuses)
+  its own Kind cluster and kubeconfig file, and never touches your current
+  kubectl context.
 
 ## Commands
 
@@ -41,6 +44,7 @@ contributors share. The human onboarding narrative lives in
 | envtest suites only (fixed seed)    | `make test-envtest`     |
 | Helm chart lint + unit tests        | `make test-chart`       |
 | E2E tests (needs Kind)              | `make test-e2e`         |
+| Generated-RBAC e2e (needs Kind)     | `make test-e2e-rbac`   |
 | Format                              | `make fmt`              |
 | Vet                                 | `make vet`              |
 | Lint (golangci-lint)                | `make lint`             |
@@ -95,6 +99,16 @@ A change is not done until all of these hold.
   need no live cluster. For the blessed envtest patterns and the common traps,
   see `docs/contributing/envtest-guide.md`.
 - Assert observable behavior, not internal implementation detail.
+- envtest runs as cluster-admin, so it cannot catch a missing
+  `+kubebuilder:rbac` marker. After a controller change that adds an API
+  call (a new resource, verb, or API group), run `make test-e2e-rbac`
+  (`hack/kind-e2e-rbac.sh`). It runs the manager out of cluster under only the
+  generated ClusterRole and leader-election Role, applies the smoke fixtures
+  in `test/e2e-rbac/fixtures`, and fails on any `forbidden` error or reconcile
+  error loop, naming the controller, verb, resource and API group. It does not
+  cover admission webhooks, the metrics endpoint, or reconcile paths the
+  fixtures do not reach (GPU scheduling, gateway and SLO integrations whose
+  CRDs are absent); add a fixture when you add such a path.
 - Do not weaken or delete a test to make a change pass. If a test is genuinely
   wrong, fix it and say why.
 - Do not test a contract against a double built from the consumer's own type. A
