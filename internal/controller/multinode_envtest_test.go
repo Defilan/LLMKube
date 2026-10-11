@@ -192,6 +192,40 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(owner.Status.Phase).NotTo(Equal(PhaseReady))
 	})
 
+	// Each member is pinned to a node and requests its GPU; a member that
+	// cannot mount the CA ConfigMap would hold that GPU in ContainerCreating.
+	It("holds member creation while the CA ConfigMap is missing, then forms the group", func() {
+		caName := "mn-corp-ca"
+		reconciler.CACertConfigMap = caName
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(memberPods()).To(BeEmpty(), "no member may be created without the CA ConfigMap")
+
+		var got inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, key, &got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal("Pending"))
+		cond := meta.FindStatusCondition(got.Status.Conditions, ConditionCACertConfigMapAvailable)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		Expect(cond.Message).To(ContainSubstring(caName))
+
+		cm := caConfigMap(caName, ns)
+		Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, cm) })
+
+		reconcileOnce()
+		pods := memberPods()
+		Expect(pods).To(HaveLen(2))
+		for i := range pods {
+			Expect(podSpecMountsConfigMap(&pods[i].Spec, caName)).To(BeTrue(), "%s keeps the CA mount", pods[i].Name)
+		}
+		Expect(k8sClient.Get(ctx, key, &got)).To(Succeed())
+		cond = meta.FindStatusCondition(got.Status.Conditions, ConditionCACertConfigMapAvailable)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
 	It("recreates the whole group when a member fails", func() {
 		reconcileOnce()
 		Expect(memberPods()).To(HaveLen(2))

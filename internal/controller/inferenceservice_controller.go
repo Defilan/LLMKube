@@ -189,6 +189,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaimtemplates,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 
 func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	reconcileStart := time.Now()
@@ -629,9 +630,25 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		return nil, replicaCounts{}, nil, nil, err
 	}
 
+	caMissing, err := r.reconcileCACertConfigMap(ctx, isvc, &deployment.Spec.Template.Spec)
+	if err != nil {
+		return nil, replicaCounts{}, nil, nil, err
+	}
+
 	existingDeployment := &appsv1.Deployment{}
-	err := r.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, existingDeployment)
+	err = r.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, existingDeployment)
 	if err != nil && apierrors.IsNotFound(err) {
+		// Hold the create rather than schedule a pod that can never mount
+		// its CA volume and would sit on a GPU in ContainerCreating. An
+		// existing Deployment is left to reconcile normally: its running
+		// pods already have the volume, and the condition explains any
+		// replacement pod that wedges.
+		if caMissing && desiredReplicas > 0 {
+			log.Info("CA ConfigMap missing in the service namespace; not creating the Deployment",
+				"configMap", r.CACertConfigMap, "namespace", isvc.Namespace)
+			result, updateErr := r.waitForCACertConfigMap(ctx, isvc, modelReady, desiredReplicas)
+			return nil, replicaCounts{}, nil, result, updateErr
+		}
 		log.Info("Creating new Deployment", "name", deployment.Name)
 		// Stamp desired-template hash on new deployment for change detection.
 		if deployment.Annotations == nil {
@@ -1139,7 +1156,7 @@ func (r *InferenceServiceReconciler) emitSpecAdvisoryEvents(isvc *inferencev1alp
 }
 
 func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.InferenceService{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
@@ -1155,9 +1172,17 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&discoveryv1.EndpointSlice{},
 			handler.EnqueueRequestsFromMapFunc(r.findInferenceServiceForEndpoints),
-		).
-		Named("inferenceservice").
-		Complete(r)
+		)
+	// A service blocked on a missing CA ConfigMap recovers on the ConfigMap's
+	// own create event instead of a timer. The ModelRouter controller already
+	// owns ConfigMaps, so this shares an informer the manager runs anyway.
+	if r.CACertConfigMap != "" {
+		b = b.Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.findInferenceServicesForCACertConfigMap),
+		)
+	}
+	return b.Named("inferenceservice").Complete(r)
 }
 
 // findInferenceServiceForEndpoints enqueues the InferenceService that an

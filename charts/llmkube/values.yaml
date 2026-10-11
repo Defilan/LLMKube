@@ -114,9 +114,13 @@ controllerManager:
   # Additional environment variables
   env: []
 
-  # Name of a ConfigMap (in the operator's namespace) holding a CA bundle for
-  # model downloads from endpoints signed by a private CA. Mounted into the
-  # model-downloader init container at /custom-certs.
+  # Name of a ConfigMap holding a CA bundle for model downloads from endpoints
+  # signed by a private CA. Mounted into the model-downloader init container at
+  # /custom-certs. The ConfigMap is read from each WORKLOAD's namespace (every
+  # namespace with an InferenceService, or a Model with spec.prefetch), not the
+  # operator's: copy it into each one (extraObjects can render the copies).
+  # While it is missing there the operator creates no pod and reports
+  # CACertConfigMapAvailable=False on the InferenceService or Model.
   caCertConfigMap: ""
 
   # Default container image for ModelRouter-managed router-proxy pods.

@@ -263,6 +263,28 @@ func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1a
 		return ctrl.Result{}, r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionFalse,
 			"PrefetchInvalid", err.Error())
 	}
+
+	// The Job pod mounts the CA ConfigMap from the Model's namespace like the
+	// serving pod does. Without it the pod wedges in ContainerCreating, the
+	// Job neither completes nor fails, and the Model reads Downloading
+	// forever. Hold the Job and name the cause instead.
+	required, caMissing, err := caCertConfigMapMissing(ctx, r.Client, r.CACertConfigMap, model.Namespace, &job.Spec.Template.Spec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	transitioned := setCACertConfigMapCondition(&model.Status.Conditions, model.Generation, r.CACertConfigMap, model.Namespace, required, caMissing)
+	if caMissing {
+		msg := caCertConfigMapMissingMessage(r.CACertConfigMap, model.Namespace)
+		if transitioned && r.Recorder != nil {
+			r.Recorder.Eventf(model, nil, corev1.EventTypeWarning, ReasonCACertConfigMapMissing, "Prefetch", "%s", msg)
+		}
+		logger.Info("CA ConfigMap missing in the Model namespace; not creating the prefetch Job",
+			"configMap", r.CACertConfigMap, "namespace", model.Namespace)
+		model.Status.Phase = "Pending"
+		return ctrl.Result{RequeueAfter: caCertConfigMapMissingRequeue}, r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionFalse,
+			ReasonCACertConfigMapMissing, msg)
+	}
+
 	if err := controllerutil.SetControllerReference(model, job, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("owner-ref prefetch job: %w", err)
 	}
