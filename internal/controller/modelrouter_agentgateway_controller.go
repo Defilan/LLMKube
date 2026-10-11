@@ -166,6 +166,13 @@ type ModelRouterAgentGatewayReconciler struct {
 // Reconcile compiles the agentgateway resources for a ModelRouter in dataPlane:
 // AgentGateway mode, or no-ops cleanly when the router is in Proxy or Gateway
 // mode or when the Inference Extension CRDs are not installed.
+//
+// The guard chain (ref, CRDs, Gateway consent, conflicts, unsupported fields)
+// is one linear refusal sequence; splitting it would scatter the refusals that
+// must all fire before anything is generated, so it sits just over the
+// gocyclo threshold now that the consent gate is part of it.
+//
+//nolint:gocyclo
 func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx).WithName(modelRouterAgentGatewayControllerName)
 

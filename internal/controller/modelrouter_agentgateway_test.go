@@ -778,11 +778,11 @@ func makeGateway(t *testing.T, c client.Client, ns, name string, labels map[stri
 	}
 }
 
-// gatewayListenerAllowingAll is a listener whose allowedRoutes admits routes
-// from every namespace.
-func gatewayListenerAllowingAll(name string) map[string]interface{} {
+// gatewayListenerAllowingAll is an HTTP listener whose allowedRoutes admits
+// routes from every namespace.
+func gatewayListenerAllowingAll() map[string]interface{} {
 	return map[string]interface{}{
-		"name": name, "port": map[string]interface{}{"number": int64(80)}, "protocol": "HTTP",
+		"name": "http", "port": map[string]interface{}{"number": int64(80)}, "protocol": "HTTP",
 		"allowedRoutes": map[string]interface{}{"namespaces": map[string]interface{}{"from": "All"}},
 	}
 }
@@ -895,7 +895,7 @@ func TestModelRouterAgentGateway_CrossNamespaceGatewayGeneratesPolicyInGatewayNS
 	gwNS := "agentgateway-system"
 	makeNamespace(t, c, gwNS)
 	makeBackendISvc(t, c, "crossns-cuda")
-	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll("http")})
+	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
 	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
@@ -1247,7 +1247,7 @@ func TestModelRouterAgentGateway_CrossNamespacePolicyCleanedUpOnDelete(t *testin
 	gwNS := "agentgateway-system"
 	makeNamespace(t, c, gwNS)
 	makeBackendISvc(t, c, "crossns-cuda")
-	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll("http")})
+	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
 	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
@@ -1287,7 +1287,7 @@ func TestModelRouterAgentGateway_CrossNamespaceRefChangePrunes(t *testing.T) {
 	gwNS := "agentgateway-system"
 	makeNamespace(t, c, gwNS)
 	makeBackendISvc(t, c, "crossns-cuda")
-	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll("http")})
+	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 	// When the ref moves back to the router's namespace, THIS is the Gateway
 	// the router references (the consent check must admit it too).
 	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
@@ -1342,8 +1342,8 @@ func TestModelRouterAgentGateway_CrossNamespaceGatewayMovePrunes(t *testing.T) {
 	makeNamespace(t, c, oldGwNS)
 	makeNamespace(t, c, newGwNS)
 	makeBackendISvc(t, c, "crossns-cuda")
-	makeGateway(t, c, oldGwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll("http")})
-	makeGateway(t, c, newGwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll("http")})
+	makeGateway(t, c, oldGwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
+	makeGateway(t, c, newGwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
 	mr := crossNamespaceRouterFixture("mover-router", oldGwNS, "crossns-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
@@ -1450,7 +1450,7 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 	// The referenced Gateway: admits the router's namespace (All) and carries
 	// labels so targetSelectors-based foreign policies have something real to
 	// match against.
-	makeGateway(t, c, gwNS, "ai-gateway", map[string]string{"team": "infra"}, []interface{}{gatewayListenerAllowingAll("http")})
+	makeGateway(t, c, gwNS, "ai-gateway", map[string]string{"team": "infra"}, []interface{}{gatewayListenerAllowingAll()})
 
 	cases := []struct {
 		name          string
@@ -1563,7 +1563,7 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 	makeNamespace(t, c, gwNS)
 	makeNamespace(t, c, "a-b")
 	makeNamespace(t, c, "a")
-	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll("http")})
+	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
 	// ns "a-b" + name "c" and ns "a" + name "b-c" both sanitize to "a-b-c".
 	routers := []struct{ ns, name, svc string }{
