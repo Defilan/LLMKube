@@ -8,13 +8,14 @@ Unlike the Envoy AI Gateway stubs (`../aigateway`), these are the real upstream
 schemas on purpose: the generated InferencePool spec must pass server-side
 validation (a flat `selector` map was once emitted here and only the real CRD's
 `matchLabels` requirement catches it), and the AgentgatewayPolicy CRD's CEL
-rules (PreRouting targets a Gateway, same-namespace targetRefs) are what the
-cross-namespace fail-loud guard exists to avoid hitting.
+rules (PreRouting targets a Gateway/ListenerSet, same-namespace targetRefs) are
+why the generated extraction policy lives in the Gateway's namespace.
 
 | File                     | Source                                                               | Pinned   | License    |
 |--------------------------|----------------------------------------------------------------------|----------|------------|
 | inferencepool.yaml       | kubernetes-sigs/gateway-api-inference-extension config/crd/bases      | v1.6.2   | Apache-2.0 |
 | agentgatewaypolicy.yaml  | agentgateway/agentgateway agentgateway-crds chart template            | v1.6.0   | Apache-2.0 |
+| gateway.yaml             | Hand-made minimal stub (Gateway API v1 Gateway; permissive spec)      | -        | -          |
 | httproute.yaml           | Hand-made minimal stub (Gateway API v1 HTTPRoute)                     | -        | -          |
 
 Both vendored upstreams are Apache-2.0 licensed (no NOTICE file); vendoring is

@@ -86,7 +86,12 @@ spec:
                   so LLMKube does not retract its policy on conflict; the condition clears
                   when the foreign policy is removed, and the reconciler rechecks every
                   two minutes (a foreign policy created after the router went Ready is
-                  otherwise silently shadowed).
+                  otherwise silently shadowed). agentgateway inspects at most 2 MiB of the
+                  request body by default (its DEFAULT_BUFFER_LIMIT); larger bodies (long
+                  contexts, images) are not routed on this path - the CEL extraction
+                  fails and the model header is removed. A Gateway owner can raise the
+                  limit with a frontend.http.maxBufferSize policy, a different field that
+                  does not conflict with the extraction policy.
                 properties:
                   endpointPicker:
                     description: |-
