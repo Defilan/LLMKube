@@ -815,6 +815,33 @@ func crossNamespaceRouterFixture(name, gwNS, svc string) *inferencev1alpha1.Mode
 	}
 }
 
+// sameNamespaceRouterFixture builds a dataPlane: AgentGateway router in the
+// test namespace whose agentGatewayRef has no namespace (a same-namespace
+// Gateway named ai-gateway) and whose single backend references svc.
+func sameNamespaceRouterFixture(name, svc string) *inferencev1alpha1.ModelRouter {
+	return &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name:               "ai-gateway",
+				EndpointPicker:     "epp",
+				EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: svc, InferenceServiceRef: corev1LocalRef(svc)},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "r",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{svc}},
+				},
+			},
+		},
+	}
+}
+
 // getPolicyInNamespace fetches one AgentgatewayPolicy from an explicit
 // namespace (getUnstructured is pinned to testNS).
 func getPolicyInNamespace(t *testing.T, c client.Client, ns, name string) *unstructured.Unstructured {
@@ -1755,8 +1782,8 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 		t.Fatalf("get second router: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(secondFresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonPolicyNameTaken {
-		t.Errorf("expected AgentGatewayReady=False/%s on the colliding router, got %+v", modelRouterAgentGatewayReasonPolicyNameTaken, cond)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
+		t.Errorf("expected AgentGatewayReady=False/%s on the colliding router, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 	}
 	if !strings.Contains(cond.Message, "already managed by another ModelRouter") {
 		t.Errorf("condition message %q does not name the collision", cond.Message)
@@ -1767,14 +1794,14 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), "a", "b-c")
 }
 
-// TestModelRouterAgentGateway_ForeignPolicyNameNotAdopted covers the round-3
+// TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted covers the round-3
 // HIGH bug: a pre-existing AgentgatewayPolicy with the generated name and NO
 // router-UID label was silently overwritten (spec replaced, label stamped) and
 // then deleted when the router went away, by the finalizer sweep
 // cross-namespace and by owner-ref adoption plus GC in the same namespace. The
 // reconciler must refuse with ExtractionPolicyNameTaken and leave the foreign
 // object byte-for-byte untouched, in both namespaces.
-func TestModelRouterAgentGateway_ForeignPolicyNameNotAdopted(t *testing.T) {
+func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
 
@@ -1831,8 +1858,8 @@ func TestModelRouterAgentGateway_ForeignPolicyNameNotAdopted(t *testing.T) {
 			t.Fatalf("get modelrouter: %v", err)
 		}
 		cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
-		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonPolicyNameTaken {
-			t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonPolicyNameTaken, cond)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
+			t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 		}
 		if !strings.Contains(cond.Message, ns+"/"+name) {
 			t.Errorf("condition message %q does not name the foreign object", cond.Message)
@@ -1855,6 +1882,12 @@ func TestModelRouterAgentGateway_ForeignPolicyNameNotAdopted(t *testing.T) {
 			t.Fatalf("reconcile after delete: %v", err)
 		}
 		foreignUntouched(t, foreign)
+		// Remove the foreign policy so later subtests (which share this
+		// envtest env and target the same Gateway namespace) are not poisoned
+		// by it in the conflict check.
+		if err := c.Delete(context.Background(), foreign); err != nil {
+			t.Fatalf("delete foreign policy: %v", err)
+		}
 	})
 
 	t.Run("same-namespace", func(t *testing.T) {
@@ -1898,8 +1931,8 @@ func TestModelRouterAgentGateway_ForeignPolicyNameNotAdopted(t *testing.T) {
 			t.Fatalf("get modelrouter: %v", err)
 		}
 		cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
-		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonPolicyNameTaken {
-			t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonPolicyNameTaken, cond)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
+			t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 		}
 		foreignUntouched(t, foreign)
 		assertNotExists(t, c, inferencePoolGVK(), "collide2-cuda")
@@ -1921,6 +1954,158 @@ func TestModelRouterAgentGateway_ForeignPolicyNameNotAdopted(t *testing.T) {
 			t.Fatalf("reconcile after delete: %v", err)
 		}
 		foreignUntouched(t, foreign)
+		// Remove the foreign policy so later subtests are not poisoned by it
+		// in the conflict check.
+		if err := c.Delete(context.Background(), foreign); err != nil {
+			t.Fatalf("delete foreign policy: %v", err)
+		}
+	})
+
+	t.Run("unowned InferencePool", func(t *testing.T) {
+		makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+		makeBackendISvc(t, c, "collide3-cuda")
+
+		mr := sameNamespaceRouterFixture("collide-router3", "collide3-cuda")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		poolName := sanitizeDNSName("collide3-cuda")
+		handmade := &unstructured.Unstructured{}
+		handmade.SetGroupVersionKind(inferencePoolGVK())
+		handmade.SetName(poolName)
+		handmade.SetNamespace(testNS)
+		handmade.Object["spec"] = map[string]interface{}{
+			"selector":          map[string]interface{}{"matchLabels": map[string]interface{}{"app": "handmade"}},
+			"targetPorts":       []interface{}{map[string]interface{}{"number": int64(9999)}},
+			"endpointPickerRef": map[string]interface{}{"name": "handmade-epp", "port": map[string]interface{}{"number": int64(9001)}},
+		}
+		if err := c.Create(context.Background(), handmade); err != nil {
+			t.Fatalf("create handmade pool: %v", err)
+		}
+
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile must refuse, not error: %v", err)
+		}
+
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
+			t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
+		}
+		if !strings.Contains(cond.Message, "InferencePool "+testNS+"/"+poolName) {
+			t.Errorf("condition message %q does not name the foreign pool", cond.Message)
+		}
+		// The refusal fires before ANY write: the pool is untouched and the
+		// policy and route were never created.
+		after := getUnstructured(t, c, inferencePoolGVK(), poolName)
+		if after.GetResourceVersion() != handmade.GetResourceVersion() {
+			t.Errorf("handmade pool was written during reconcile (rv %q -> %q)", handmade.GetResourceVersion(), after.GetResourceVersion())
+		}
+		if ports, _, _ := unstructured.NestedSlice(after.Object, "spec", "targetPorts"); len(ports) != 1 || fmt.Sprint(ports[0].(map[string]interface{})["number"]) != "9999" {
+			t.Errorf("handmade pool's targetPorts were overwritten: %v", ports)
+		}
+		if got := after.GetLabels()[agentGatewayRouterUIDLabel]; got != "" {
+			t.Errorf("handmade pool grew the router-UID label %q; it was adopted", got)
+		}
+		if len(after.GetOwnerReferences()) != 0 {
+			t.Errorf("handmade pool grew owner references; it was adopted")
+		}
+		assertNotExists(t, c, agentGatewayPolicyGVK(), mr.Name)
+		assertNotExists(t, c, gatewayHTTPRouteGVK(), mr.Name)
+
+		// A switch to Proxy must not sweep the unowned pool, and deleting the
+		// router must not delete it: only labeled objects are ours.
+		fresh = &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		fresh.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
+		if err := c.Update(context.Background(), fresh); err != nil {
+			t.Fatalf("switch dataPlane: %v", err)
+		}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile after switch: %v", err)
+		}
+		getUnstructured(t, c, inferencePoolGVK(), poolName)
+		if err := c.Delete(context.Background(), mr); err != nil {
+			t.Fatalf("delete modelrouter: %v", err)
+		}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile after delete: %v", err)
+		}
+		getUnstructured(t, c, inferencePoolGVK(), poolName)
+	})
+
+	t.Run("unowned HTTPRoute", func(t *testing.T) {
+		makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+		makeBackendISvc(t, c, "collide4-cuda")
+
+		mr := sameNamespaceRouterFixture("collide-router4", "collide4-cuda")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		handmade := &unstructured.Unstructured{}
+		handmade.SetGroupVersionKind(gatewayHTTPRouteGVK())
+		handmade.SetName(mr.Name)
+		handmade.SetNamespace(testNS)
+		handmade.Object["spec"] = map[string]interface{}{
+			"parentRefs": []interface{}{map[string]interface{}{"name": "ai-gateway"}},
+		}
+		if err := c.Create(context.Background(), handmade); err != nil {
+			t.Fatalf("create handmade route: %v", err)
+		}
+
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile must refuse, not error: %v", err)
+		}
+
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
+			t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
+		}
+		if !strings.Contains(cond.Message, "HTTPRoute "+testNS+"/"+mr.Name) {
+			t.Errorf("condition message %q does not name the foreign route", cond.Message)
+		}
+		after := getUnstructured(t, c, gatewayHTTPRouteGVK(), mr.Name)
+		if after.GetResourceVersion() != handmade.GetResourceVersion() {
+			t.Errorf("handmade route was written during reconcile (rv %q -> %q)", handmade.GetResourceVersion(), after.GetResourceVersion())
+		}
+		if got := after.GetLabels()[agentGatewayRouterUIDLabel]; got != "" {
+			t.Errorf("handmade route grew the router-UID label %q; it was adopted", got)
+		}
+		if len(after.GetOwnerReferences()) != 0 {
+			t.Errorf("handmade route grew owner references; it was adopted")
+		}
+		assertNotExists(t, c, agentGatewayPolicyGVK(), mr.Name)
+		// The pre-pass checks every desired object before ANY apply, so the
+		// route refusal left the pool uncreated too.
+		assertNotExists(t, c, inferencePoolGVK(), "collide4-cuda")
+		if err := c.Delete(context.Background(), mr); err != nil {
+			t.Fatalf("delete modelrouter: %v", err)
+		}
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		}); err != nil {
+			t.Fatalf("reconcile after delete: %v", err)
+		}
+		getUnstructured(t, c, gatewayHTTPRouteGVK(), mr.Name)
 	})
 }
 

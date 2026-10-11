@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -85,13 +86,13 @@ const (
 	// into another namespace without it would let any router operator inject
 	// body parsing into every request on a Gateway they do not own.
 	modelRouterAgentGatewayReasonNotAllowed = "GatewayDoesNotAllowRouterNamespace"
-	// modelRouterAgentGatewayReasonPolicyNameTaken marks a router whose
-	// generated policy name is held by an AgentgatewayPolicy LLMKube did not
-	// create. The generated name is derived from the router, so a foreign
-	// object can hold it: adopting it would overwrite the owner's spec and,
-	// via the router-UID label or an owner reference, delete it when this
-	// router goes away.
-	modelRouterAgentGatewayReasonPolicyNameTaken = "ExtractionPolicyNameTaken"
+	// modelRouterAgentGatewayReasonResourceNameTaken marks a router whose
+	// generated name is held by an object LLMKube did not create: the
+	// extraction policy, an InferencePool named after the InferenceService, or
+	// the HTTPRoute named after the router. Adopting such an object would
+	// overwrite the owner's spec and, via the router-UID label or an owner
+	// reference, delete it when this router goes away.
+	modelRouterAgentGatewayReasonResourceNameTaken = "GeneratedResourceNameTaken"
 
 	// modelRouterAgentGatewayFinalizer guards the cross-namespace extraction
 	// policy. For a Gateway in another namespace the policy lives in the
@@ -328,11 +329,15 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	// exists and LLMKube did not create it. Runs BEFORE the conflict check so
 	// a foreign policy that both holds our name and conflicts reports the more
 	// specific name-taken reason, and before any generation so a name-taken
-	// router yields no partial resources.
-	if msg, err := r.agentGatewayPolicyNameTaken(ctx, mr); err != nil {
+	// router yields no partial resources. The pools and the route are checked
+	// the same way inside reconcileAgentGatewayResources, once their names are
+	// known from the resolved backends.
+	if err := r.checkGeneratedNameAvailable(ctx, mr, newAgentGatewayModelExtractionPolicy(mr, mr.Spec.AgentGatewayRef)); err != nil {
+		var taken *agentGatewayNameTakenError
+		if errors.As(err, &taken) {
+			return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error())
+		}
 		return ctrl.Result{}, err
-	} else if msg != "" {
-		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyNameTaken, msg)
 	}
 
 	// Fail loud when the target Gateway already carries a PreRouting
@@ -424,6 +429,10 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 
 	ejected, err := r.reconcileAgentGatewayResources(ctx, mr)
 	if err != nil {
+		var taken *agentGatewayNameTakenError
+		if errors.As(err, &taken) {
+			return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error())
+		}
 		_ = r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonReconcile, err.Error())
 		return ctrl.Result{}, err
 	}
@@ -474,6 +483,17 @@ func (r *ModelRouterAgentGatewayReconciler) reconcileAgentGatewayResources(
 	rules, ejected := agentGatewayEjectUnhealthy(rules, backends)
 	desired = append(desired, newAgentGatewayModelExtractionPolicy(mr, mr.Spec.AgentGatewayRef))
 	desired = append(desired, newAgentGatewayHTTPRoute(mr, mr.Spec.AgentGatewayRef, rules, backends))
+
+	// Before ANY write (finalizer, prune, apply): refuse when any generated
+	// name is held by an object LLMKube did not create. The policy was
+	// already checked in the guard chain (its check must precede the conflict
+	// check); re-checking it here is one redundant Get that keeps this a
+	// single code path over every generated kind.
+	for _, obj := range desired {
+		if err := r.checkGeneratedNameAvailable(ctx, mr, obj); err != nil {
+			return nil, err
+		}
+	}
 
 	// A cross-namespace policy has no owner reference to fall back on, so the
 	// finalizer must exist BEFORE the policy is created: a crash between policy
@@ -578,15 +598,17 @@ func (r *ModelRouterAgentGatewayReconciler) applyAgentGatewayResource(
 	live.SetNamespace(desired.GetNamespace())
 
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, live, func() error {
-		if desired.GetKind() == agentGatewayPolicyKind {
-			// Belt against the race between the pre-flight name-taken check
-			// and this write: an object that appeared in between, or one whose
-			// label holds another router's UID, must never be adopted or
-			// overwritten, in either namespace. ResourceVersion is empty only
-			// when CreateOrUpdate is about to Create.
-			if live.GetResourceVersion() != "" && live.GetLabels()[agentGatewayRouterUIDLabel] != string(mr.UID) {
-				return fmt.Errorf("AgentgatewayPolicy %s/%s is not managed by this ModelRouter; "+
-					"refusing to adopt or overwrite it", live.GetNamespace(), live.GetName())
+		// Belt against the race between the generated-name pre-check and this
+		// write: an object that appeared in between, or one whose label holds
+		// another router's UID, must never be adopted or overwritten, for any
+		// generated kind and in either namespace. ResourceVersion is empty
+		// only when CreateOrUpdate is about to Create.
+		if live.GetResourceVersion() != "" && live.GetLabels()[agentGatewayRouterUIDLabel] != string(mr.UID) {
+			return &agentGatewayNameTakenError{
+				kind:  desired.GetKind(),
+				ns:    live.GetNamespace(),
+				name:  live.GetName(),
+				owner: live.GetLabels()[agentGatewayRouterUIDLabel],
 			}
 		}
 		// The UID label marks every generated object as this router's, for the
@@ -851,38 +873,54 @@ func labelSelectorFromUnstructured(m map[string]interface{}) (*metav1.LabelSelec
 	return sel, nil
 }
 
-// agentGatewayPolicyNameTaken reports whether the AgentgatewayPolicy this
-// router would generate already exists without this router's ownership label.
-// The generated name is derived from the router (or its namespace), so a
-// pre-existing object can hold it: adopting it would overwrite the owner's
-// spec with the extraction spec and stamp the router-UID label on it, after
-// which deleting this router deletes the owner's policy. Returns a non-empty
-// violation message naming the object when the name is taken, or an error for
-// transient lookup failures. NoMatch tolerates the CRD vanishing between the
-// gate and here; generation would fail on its own either way.
-func (r *ModelRouterAgentGatewayReconciler) agentGatewayPolicyNameTaken(
+// agentGatewayNameTakenError reports a generated object whose name is held by
+// an object LLMKube did not create. Reconcile converts it into the named
+// GeneratedResourceNameTaken refusal instead of a reconcile error.
+type agentGatewayNameTakenError struct {
+	kind, ns, name, owner string
+}
+
+func (e *agentGatewayNameTakenError) Error() string {
+	if e.owner != "" {
+		return fmt.Sprintf("%s %s/%s is already managed by another ModelRouter (uid %s); "+
+			"refusing to adopt or overwrite it; rename one of the routers", e.kind, e.ns, e.name, e.owner)
+	}
+	return fmt.Sprintf("%s %s/%s already exists and is not managed by this ModelRouter; refusing to adopt or overwrite it "+
+		"(LLMKube did not create it, or its %s ownership label was stripped - a stripped label means LLMKube has stopped "+
+		"managing it); delete or rename the object, or restore the label", e.kind, e.ns, e.name, agentGatewayRouterUIDLabel)
+}
+
+// checkGeneratedNameAvailable Gets one desired object before any write and
+// refuses unless it is absent or already carries this router's UID label. The
+// generated names are derived from the router (or its InferenceServices), so a
+// pre-existing object can hold one: adopting it would overwrite the owner's
+// spec with the generated spec and stamp the router-UID label on it, after
+// which deleting this router deletes the owner's object. NoMatch tolerates the
+// CRD vanishing between the gate and here; generation would fail on its own
+// either way.
+func (r *ModelRouterAgentGatewayReconciler) checkGeneratedNameAvailable(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
-) (string, error) {
-	ns, name := agentGatewayPolicyIdentity(mr)
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(agentGatewayPolicyGVK())
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, existing); err != nil {
+	desired *unstructured.Unstructured,
+) error {
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(desired.GroupVersionKind())
+	err := r.Get(ctx, types.NamespacedName{Namespace: desired.GetNamespace(), Name: desired.GetName()}, live)
+	if err != nil {
 		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
-			return "", nil
+			return nil
 		}
-		return "", fmt.Errorf("get AgentgatewayPolicy %s/%s: %w", ns, name, err)
+		return fmt.Errorf("check %s %s/%s: %w", desired.GetKind(), desired.GetNamespace(), desired.GetName(), err)
 	}
-	if existing.GetLabels()[agentGatewayRouterUIDLabel] == string(mr.UID) {
-		// Ours: drift correction in the apply proceeds as usual.
-		return "", nil
+	if live.GetLabels()[agentGatewayRouterUIDLabel] == string(mr.UID) {
+		return nil
 	}
-	if owner := existing.GetLabels()[agentGatewayRouterUIDLabel]; owner != "" {
-		return fmt.Sprintf("AgentgatewayPolicy %s/%s is already managed by another ModelRouter (uid %s); "+
-			"refusing to adopt or overwrite it; rename one of the routers", ns, name, owner), nil
+	return &agentGatewayNameTakenError{
+		kind:  desired.GetKind(),
+		ns:    desired.GetNamespace(),
+		name:  desired.GetName(),
+		owner: live.GetLabels()[agentGatewayRouterUIDLabel],
 	}
-	return fmt.Sprintf("AgentgatewayPolicy %s/%s already exists and is not managed by this ModelRouter; "+
-		"refusing to adopt or overwrite it (delete or rename the existing policy, or rename this router)", ns, name), nil
 }
 
 // agentGatewayPreRoutingConflicts lists the AgentgatewayPolicies in the
