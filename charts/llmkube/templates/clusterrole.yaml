@@ -235,6 +235,12 @@ rules:
   - update
   - watch
 - apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gateways
+  verbs:
+  - get
+- apiGroups:
   - grafana.integreatly.org
   resources:
   - grafanadashboards

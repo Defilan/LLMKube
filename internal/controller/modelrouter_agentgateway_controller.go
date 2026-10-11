@@ -60,14 +60,28 @@ const (
 	modelRouterAgentGatewayReasonReconcile   = "ReconcileFailed"
 	modelRouterAgentGatewayReasonUnsupported = "UnsupportedMatchInAgentGatewayMode"
 	modelRouterAgentGatewayReasonNoRef       = "AgentGatewayRefMissing"
-	// modelRouterAgentGatewayReasonCrossNSGateway marks a router whose
-	// agentGatewayRef points at a Gateway in another namespace. The generated
-	// model-extraction AgentgatewayPolicy must target that Gateway from its own
-	// namespace (AgentgatewayPolicy targetRefs are same-namespace, and
-	// PreRouting policies can only target a Gateway), and a cross-namespace
-	// object cannot carry an owner reference to the ModelRouter, so compilation
-	// is refused instead of generating an unowned, un-GC'd policy.
-	modelRouterAgentGatewayReasonCrossNSGateway = "CrossNamespaceGatewayUnsupported"
+	// modelRouterAgentGatewayReasonPolicyConflict marks a Gateway that already
+	// carries a PreRouting transformation policy LLMKube does not own.
+	// agentgateway merges same-specificity policies oldest-wins per whole field
+	// and never combines list entries, so a foreign policy either silently
+	// disables the generated model extraction or is silently disabled by it,
+	// and no condition reports the dropped field.
+	modelRouterAgentGatewayReasonPolicyConflict = "ConflictingPreRoutingPolicy"
+
+	// modelRouterAgentGatewayFinalizer guards the cross-namespace extraction
+	// policy. For a Gateway in another namespace the policy lives in the
+	// Gateway's namespace, where an owner reference to the ModelRouter is
+	// impossible, so the finalizer is what deletes it when the router is
+	// deleted, moves to a different Gateway, or leaves AgentGateway mode.
+	modelRouterAgentGatewayFinalizer = "agentgateway.inference.llmkube.dev/finalizer"
+
+	// agentGatewayRouterUIDLabel marks an AgentgatewayPolicy the operator
+	// generated for a specific ModelRouter (value: the router's UID). The
+	// conflict detector uses it to tell the router's own policy from a foreign
+	// one in the same namespace, cleanup uses it to find every policy a router
+	// left behind across namespaces, and the cross-namespace apply refuses a
+	// name that another router's policy already holds.
+	agentGatewayRouterUIDLabel = "inference.llmkube.dev/agentgateway-router-uid"
 
 	// The honest-boundary reasons mirror the Gateway plane exactly: a
 	// dataPlane: AgentGateway ModelRouter must enforce the SAME limits the
@@ -115,6 +129,7 @@ type ModelRouterAgentGatewayReconciler struct {
 
 // +kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agentgateway.dev,resources=agentgatewaypolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get
 
 // Reconcile compiles the agentgateway resources for a ModelRouter in dataPlane:
 // AgentGateway mode, or no-ops cleanly when the router is in Proxy or Gateway
@@ -130,6 +145,27 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Cleanup path. A finalizer means a cross-namespace extraction policy may
+	// exist outside the router's namespace, where owner-ref GC cannot reach.
+	// It must be removed (and the policy deleted) before the router goes away,
+	// and when the router no longer wants a cross-namespace policy (deleted,
+	// different data plane, ref unset, or the Gateway moved back into the
+	// router's namespace). Runs before the dataPlane early-return so a router
+	// switching to Proxy still cleans up.
+	if controllerutil.ContainsFinalizer(mr, modelRouterAgentGatewayFinalizer) {
+		if !mr.DeletionTimestamp.IsZero() || mr.Spec.DataPlane != inferencev1alpha1.ModelRouterDataPlaneAgentGateway ||
+			mr.Spec.AgentGatewayRef == nil || agentGatewayPolicyNamespace(mr) == mr.Namespace {
+			if err := r.cleanupExtractionPolicies(ctx, mr, ""); err != nil {
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(mr, modelRouterAgentGatewayFinalizer)
+			if err := r.Update(ctx, mr); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{}, nil
+		}
 	}
 
 	// Only the AgentGateway data plane is this reconciler's concern. Proxy mode
@@ -166,14 +202,23 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 				strings.Join(names, ", "))
 	}
 
-	// Fail loud when the referenced Gateway is in another namespace. The
-	// generated model-extraction AgentgatewayPolicy must target that Gateway
-	// from the Gateway's own namespace (same-namespace targetRefs), and an
-	// object in the Gateway's namespace cannot carry an owner reference to the
-	// ModelRouter, so it would be unowned and un-GC'd. Refuse before any
-	// generation so a rejected router yields no partial resources.
-	if msg := agentGatewayCrossNamespaceGatewayMessage(mr); msg != "" {
-		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonCrossNSGateway, msg)
+	// Fail loud when the target Gateway already carries a PreRouting
+	// transformation policy this router does not own. agentgateway merges
+	// equal-specificity policies oldest-wins per whole field and never
+	// combines list entries (and no condition reports the dropped field), so a
+	// second transformation on the same Gateway either silently disables the
+	// generated model extraction or is silently disabled by it. Refuse before
+	// any generation so a conflicted router yields no partial resources.
+	conflicts, err := r.agentGatewayPreRoutingConflicts(ctx, mr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if len(conflicts) > 0 {
+		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonPolicyConflict,
+			fmt.Sprintf("Gateway %s already carries PreRouting transformation policy(ies) that LLMKube does not own: %s. "+
+				"agentgateway merges same-specificity policies oldest-wins per field without combining list entries, "+
+				"so the generated model extraction could be silently dropped, or silently shadow the existing policy. "+
+				"Remove or scope the other policy", agentGatewayPolicyNamespace(mr), strings.Join(conflicts, ", ")))
 	}
 
 	// Fail-loud on matches the agentgateway data plane cannot express. We
@@ -241,7 +286,10 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 // reconcileAgentGatewayResources resolves the router's backends to their
 // InferenceService, compiles each into an InferencePool, generates the
 // model-extraction AgentgatewayPolicy, and compiles the rules into a multi-rule
-// HTTPRoute, creating-or-updating each one owner-referenced to the ModelRouter.
+// HTTPRoute, creating-or-updating each one. Pools and route live in the
+// ModelRouter's namespace and carry a controller owner reference; the
+// extraction policy lives in the Gateway's namespace and carries one only when
+// that is the same namespace.
 func (r *ModelRouterAgentGatewayReconciler) reconcileAgentGatewayResources(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
@@ -272,6 +320,24 @@ func (r *ModelRouterAgentGatewayReconciler) reconcileAgentGatewayResources(
 	rules, ejected := agentGatewayEjectUnhealthy(rules, backends)
 	desired = append(desired, newAgentGatewayModelExtractionPolicy(mr, mr.Spec.AgentGatewayRef))
 	desired = append(desired, newAgentGatewayHTTPRoute(mr, mr.Spec.AgentGatewayRef, rules, backends))
+
+	// A cross-namespace policy has no owner reference to fall back on, so the
+	// finalizer must exist BEFORE the policy is created: a crash between policy
+	// creation and finalizer addition would strand the policy.
+	policyNS := agentGatewayPolicyNamespace(mr)
+	if policyNS != mr.Namespace && !controllerutil.ContainsFinalizer(mr, modelRouterAgentGatewayFinalizer) {
+		controllerutil.AddFinalizer(mr, modelRouterAgentGatewayFinalizer)
+		if err := r.Update(ctx, mr); err != nil {
+			return nil, fmt.Errorf("add %s finalizer: %w", modelRouterAgentGatewayFinalizer, err)
+		}
+	}
+	// Prune a policy left in a previous Gateway's namespace when
+	// agentGatewayRef.namespace changed (the finalizer stays: the current
+	// policy is still cross-namespace). When no policy is cross-namespace this
+	// deletes nothing.
+	if err := r.cleanupExtractionPolicies(ctx, mr, policyNS); err != nil {
+		return nil, err
+	}
 
 	for _, obj := range desired {
 		if err := r.applyAgentGatewayResource(ctx, mr, obj); err != nil {
@@ -332,11 +398,15 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 	return resolved, nil
 }
 
-// applyAgentGatewayResource owner-references desired to the ModelRouter and
-// creates-or-updates it. The desired spec is captured before CreateOrUpdate so
-// the mutate function (which sees the live object on update) overwrites spec to
-// correct drift while preserving server-managed metadata. Mirrors the Gateway
-// plane's applyResource.
+// applyAgentGatewayResource creates-or-updates desired. Objects in the
+// ModelRouter's namespace (pools, route, same-namespace extraction policy) are
+// controller-referenced to the ModelRouter so owner-ref GC removes them. The
+// cross-namespace extraction policy cannot carry that reference (owner refs
+// cannot cross namespaces), so it is finalizer-managed instead, and its apply
+// refuses a name another router's policy already holds: the ns-name
+// concatenation behind the deterministic cross-namespace name is not
+// injective, and adopting a foreign policy would silently repoint its
+// targetRef.
 func (r *ModelRouterAgentGatewayReconciler) applyAgentGatewayResource(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
@@ -346,6 +416,22 @@ func (r *ModelRouterAgentGatewayReconciler) applyAgentGatewayResource(
 	if err != nil {
 		return err
 	}
+	crossNamespace := desired.GetNamespace() != mr.Namespace
+
+	if crossNamespace {
+		existing := &unstructured.Unstructured{}
+		existing.SetGroupVersionKind(desired.GroupVersionKind())
+		existing.SetName(desired.GetName())
+		existing.SetNamespace(desired.GetNamespace())
+		if err := r.Get(ctx, client.ObjectKeyFromObject(existing), existing); err == nil {
+			if owner := existing.GetLabels()[agentGatewayRouterUIDLabel]; owner != "" && owner != string(mr.UID) {
+				return fmt.Errorf("AgentgatewayPolicy %s/%s is already managed by another ModelRouter (uid %s); "+
+					"rename one of the routers", existing.GetNamespace(), existing.GetName(), owner)
+			}
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
 
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(desired.GroupVersionKind())
@@ -354,6 +440,19 @@ func (r *ModelRouterAgentGatewayReconciler) applyAgentGatewayResource(
 
 	_, err = controllerutil.CreateOrUpdate(ctx, r.Client, live, func() error {
 		live.Object["spec"] = desiredSpec
+		if desired.GetKind() == agentGatewayPolicyKind {
+			// The UID label marks the policy as ours for the conflict detector
+			// and cleanup; re-assert it on every update so drift cannot strip it.
+			labels := live.GetLabels()
+			if labels == nil {
+				labels = map[string]string{}
+			}
+			labels[agentGatewayRouterUIDLabel] = string(mr.UID)
+			live.SetLabels(labels)
+		}
+		if crossNamespace {
+			return nil
+		}
 		return setControllerReferenceUnblocked(mr, live, r.Scheme)
 	})
 	return err
@@ -369,20 +468,163 @@ func (r *ModelRouterAgentGatewayReconciler) requiredCRDsMissing(log logr.Logger)
 	return r.detector.PresentMissing(r.Client, log)
 }
 
-// agentGatewayCrossNamespaceGatewayMessage returns a non-empty message when the
-// referenced agentgateway Gateway is in a namespace other than the
-// ModelRouter's, or "" when it is local. Empty agentGatewayRef.namespace means
-// the ModelRouter's own namespace. See modelRouterAgentGatewayReasonCrossNSGateway
-// for why cross-namespace compilation is refused rather than attempted.
-func agentGatewayCrossNamespaceGatewayMessage(mr *inferencev1alpha1.ModelRouter) string {
-	ref := mr.Spec.AgentGatewayRef
-	if ref.Namespace == "" || ref.Namespace == mr.Namespace {
-		return ""
+// agentGatewayPolicyNamespace is the namespace the model-extraction
+// AgentgatewayPolicy lives in: the Gateway's namespace (agentGatewayRef
+// .namespace defaults to the ModelRouter's). Nil-safe: the cleanup path calls
+// it before the ref-nil guard.
+func agentGatewayPolicyNamespace(mr *inferencev1alpha1.ModelRouter) string {
+	if ref := mr.Spec.AgentGatewayRef; ref != nil && ref.Namespace != "" {
+		return ref.Namespace
 	}
-	return fmt.Sprintf("agentGatewayRef targets Gateway %s/%s, but the generated model-extraction AgentgatewayPolicy "+
-		"must target the Gateway from its own namespace and cannot be owner-referenced across namespaces; "+
-		"move this ModelRouter to namespace %q (or drop agentGatewayRef.namespace)",
-		ref.Namespace, ref.Name, ref.Namespace)
+	return mr.Namespace
+}
+
+// agentGatewayPreRoutingConflicts lists the AgentgatewayPolicies in the
+// Gateway's namespace that target the referenced Gateway with a PreRouting
+// transformation LLMKube does not own (no router-UID label), returning their
+// names. agentgateway
+// merges same-specificity policies oldest-wins per whole field and never
+// combines list entries, and every affected policy still reports Accepted and
+// Attached with no condition about the dropped field, so any such policy
+// silently disables the generated model extraction or is silently disabled by
+// it. Policies without a transformation (extAuth, CORS, ...) do not touch the
+// transformation field and do not conflict. A Gateway read is needed only to
+// match targetSelectors; when the Gateway is not found, selector-matched
+// policies cannot be identified and only targetRefs-matched ones are detected.
+func (r *ModelRouterAgentGatewayReconciler) agentGatewayPreRoutingConflicts(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+) ([]string, error) {
+	policyNS := agentGatewayPolicyNamespace(mr)
+
+	policies := &unstructured.UnstructuredList{}
+	policies.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: agentGatewayPolicyGroup, Version: agentGatewayPolicyVersion, Kind: agentGatewayPolicyKind + "List",
+	})
+	if err := r.List(ctx, policies, client.InNamespace(policyNS)); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			// The CRD disappeared between the gate and here; nothing to
+			// conflict with, and nothing could be generated either way.
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list AgentgatewayPolicies in %q: %w", policyNS, err)
+	}
+
+	gatewayLabels := map[string]string{}
+	gateway := &unstructured.Unstructured{}
+	gateway.SetGroupVersionKind(schema.GroupVersionKind{Group: gatewayBackendRefGroupAPI, Version: "v1", Kind: "Gateway"})
+	gatewayRef := mr.Spec.AgentGatewayRef
+	if err := r.Get(ctx, types.NamespacedName{Namespace: policyNS, Name: gatewayRef.Name}, gateway); err == nil {
+		gatewayLabels = gateway.GetLabels()
+	} else if !apierrors.IsNotFound(err) && !apimeta.IsNoMatchError(err) {
+		// A missing Gateway (or kind) only degrades targetSelectors matching;
+		// anything else is transient.
+		return nil, fmt.Errorf("get Gateway %s/%s: %w", policyNS, gatewayRef.Name, err)
+	}
+
+	var conflicts []string
+	for i := range policies.Items {
+		p := &policies.Items[i]
+		if label := p.GetLabels()[agentGatewayRouterUIDLabel]; label != "" {
+			// Any LLMKube-generated policy is skipped, including another
+			// router's: the extraction content is identical for every router
+			// (same header, same expression), so under oldest-wins the
+			// surviving policy behaves the same. Only foreign policies
+			// conflict.
+			continue
+		}
+		if !agentGatewayPolicyTargetsGateway(p, gatewayRef.Name, gatewayLabels) {
+			continue
+		}
+		phase, _, _ := unstructured.NestedString(p.Object, "spec", "traffic", "phase")
+		if phase != "PreRouting" {
+			continue
+		}
+		transformation, _, _ := unstructured.NestedMap(p.Object, "spec", "traffic", "transformation")
+		if len(transformation) == 0 {
+			continue
+		}
+		conflicts = append(conflicts, p.GetName())
+	}
+	sort.Strings(conflicts)
+	return conflicts, nil
+}
+
+// agentGatewayPolicyTargetsGateway reports whether an AgentgatewayPolicy
+// targets the named Gateway, via targetRefs or via targetSelectors matched
+// against the Gateway's own labels.
+func agentGatewayPolicyTargetsGateway(p *unstructured.Unstructured, gatewayName string, gatewayLabels map[string]string) bool {
+	isGatewayRef := func(ref map[string]interface{}) bool {
+		kind, _, _ := unstructured.NestedString(ref, "kind")
+		group, _, _ := unstructured.NestedString(ref, "group")
+		name, _, _ := unstructured.NestedString(ref, "name")
+		return kind == "Gateway" && (group == "" || group == gatewayBackendRefGroupAPI) && name == gatewayName
+	}
+	refs, _, _ := unstructured.NestedSlice(p.Object, "spec", "targetRefs")
+	for _, r := range refs {
+		if ref, ok := r.(map[string]interface{}); ok && isGatewayRef(ref) {
+			return true
+		}
+	}
+	selectors, _, _ := unstructured.NestedSlice(p.Object, "spec", "targetSelectors")
+	for _, s := range selectors {
+		sel, ok := s.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		kind, _, _ := unstructured.NestedString(sel, "kind")
+		group, _, _ := unstructured.NestedString(sel, "group")
+		if kind != "Gateway" || (group != "" && group != gatewayBackendRefGroupAPI) {
+			continue
+		}
+		matchLabels, _, _ := unstructured.NestedStringMap(sel, "matchLabels")
+		matches := true
+		for k, v := range matchLabels {
+			if gatewayLabels[k] != v {
+				matches = false
+				break
+			}
+		}
+		// An empty selector (if the CRD permitted one) selects every Gateway in
+		// the namespace, so it matches ours too.
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanupExtractionPolicies deletes every AgentgatewayPolicy this router
+// generated outside keepNamespace. Owner references cannot cross namespaces,
+// so the UID label is the only handle the router has on policies it left in a
+// previous Gateway's namespace (agentGatewayRef.namespace changed) or anywhere
+// at all (router deleted, dataPlane changed). When the AgentgatewayPolicy CRD
+// is gone the API server removed the CRs with it.
+func (r *ModelRouterAgentGatewayReconciler) cleanupExtractionPolicies(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+	keepNamespace string,
+) error {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: agentGatewayPolicyGroup, Version: agentGatewayPolicyVersion, Kind: agentGatewayPolicyKind + "List",
+	})
+	if err := r.List(ctx, list, client.MatchingLabels{agentGatewayRouterUIDLabel: string(mr.UID)}); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			return nil
+		}
+		return fmt.Errorf("list AgentgatewayPolicies: %w", err)
+	}
+	for i := range list.Items {
+		p := &list.Items[i]
+		if p.GetNamespace() == keepNamespace {
+			continue
+		}
+		if err := r.Delete(ctx, p); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("delete stale AgentgatewayPolicy %s/%s: %w", p.GetNamespace(), p.GetName(), err)
+		}
+	}
+	return nil
 }
 
 // setAgentGatewayReady writes the success status: AgentGatewayReady=True plus

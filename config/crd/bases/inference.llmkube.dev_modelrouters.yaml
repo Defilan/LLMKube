@@ -70,15 +70,22 @@ spec:
                   with Inference-Pool backendRef support (inferenceExtension.enabled=true in
                   the agentgateway chart). The EndpointPicker is referenced by every
                   generated InferencePool so agentgateway can select a model-server endpoint
-                  per request. The Gateway must be in the ModelRouter's namespace: the
-                  generated AgentgatewayPolicy targets it same-namespace (PreRouting
-                  policies cannot target cross-namespace objects).
+                  per request. The Gateway may be in another namespace: the generated
+                  AgentgatewayPolicy then lives in the Gateway's namespace (its targetRefs
+                  are same-namespace), is not owner-referenced, and is cleaned up via a
+                  finalizer on this ModelRouter. Because that policy targets the whole
+                  Gateway, its body-model extraction runs on EVERY request through that
+                  Gateway, including routes LLMKube did not generate. The Gateway must not
+                  already carry another PreRouting transformation policy; the router is
+                  refused (ConflictingPreRoutingPolicy) rather than silently shadowed.
                 properties:
                   endpointPicker:
                     description: |-
                       EndpointPicker names the EPP Service agentgateway consults for endpoint
                       selection. Required so each generated InferencePool can reference the
-                      picker; agentgateway cannot select endpoints without it.
+                      picker; agentgateway cannot select endpoints without it. The Service
+                      lives in this ModelRouter's namespace: GIE v1's endpointPickerRef has no
+                      namespace field, so the pool references it same-namespace.
                     type: string
                   endpointPickerPort:
                     description: |-
@@ -94,7 +101,13 @@ spec:
                   namespace:
                     description: |-
                       Namespace is the Gateway's namespace. Empty means the ModelRouter's own
-                      namespace.
+                      namespace. A different namespace is supported: the generated
+                      model-extraction AgentgatewayPolicy then lives in the Gateway's
+                      namespace (it cannot be owner-referenced across namespaces and is
+                      cleaned up via a finalizer on this ModelRouter), while the pools and
+                      route stay here. The pools, the referenced InferenceServices, and the
+                      EndpointPicker Service all live in this ModelRouter's namespace
+                      regardless.
                     type: string
                 required:
                 - endpointPicker

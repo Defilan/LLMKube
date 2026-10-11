@@ -137,23 +137,39 @@ func newAgentGatewayInferencePool(mr *inferencev1alpha1.ModelRouter, b agentGate
 	return u
 }
 
+// agentGatewayPolicyIdentity resolves where the model-extraction
+// AgentgatewayPolicy lives and what it is called. Same-namespace Gateway: the
+// policy lives beside the router, named after it, and is owner-referenced for
+// GC. Cross-namespace Gateway: the policy must live in the Gateway's namespace
+// (same-namespace targetRefs), where it cannot be owner-referenced, so it is
+// named after the router's namespace and name and managed by the ModelRouter
+// finalizer. The concatenation behind that name is not injective; the apply
+// refuses a name another router's policy already holds.
+func agentGatewayPolicyIdentity(mr *inferencev1alpha1.ModelRouter) (namespace, name string) {
+	ns := agentGatewayPolicyNamespace(mr)
+	if ns == mr.Namespace {
+		return ns, modelRouterAgentGatewayResourceName(mr)
+	}
+	return ns, sanitizeDNSName(mr.Namespace + "-" + mr.Name)
+}
+
 // newAgentGatewayModelExtractionPolicy builds the one-per-ModelRouter
 // AgentgatewayPolicy (agentgateway.dev/v1alpha1) that extracts the OpenAI
 // "model" field from the request body into agentGatewayHTTPModelHeader before
 // route selection, so the generated HTTPRoute rules can match on it. The phase
 // must be PreRouting (extraction decides routing), and the AgentgatewayPolicy
 // CRD's CEL rules restrict PreRouting policies to Gateway/ListenerSet targets
-// in the policy's own namespace, which is why the reconciler fails loud when
-// agentGatewayRef names a cross-namespace Gateway. The policy targets the
-// referenced Gateway, not the route, and lives in the ModelRouter namespace.
-// Multiple ModelRouters on one Gateway each generate an identical policy;
-// agentgateway merges traffic policies field-level, and identical
-// request.set entries for the same header cannot conflict.
+// in the policy's own namespace. The policy targets the referenced Gateway,
+// not the route, and lives in the Gateway's namespace (see
+// agentGatewayPolicyIdentity). The UID label marks it as this router's policy
+// for conflict detection, cross-namespace cleanup, and collision refusal.
 func newAgentGatewayModelExtractionPolicy(mr *inferencev1alpha1.ModelRouter, ref *inferencev1alpha1.AgentGatewayReference) *unstructured.Unstructured {
+	ns, name := agentGatewayPolicyIdentity(mr)
 	u := &unstructured.Unstructured{}
 	u.SetGroupVersionKind(agentGatewayPolicyGVK())
-	u.SetName(modelRouterAgentGatewayResourceName(mr))
-	u.SetNamespace(mr.Namespace)
+	u.SetName(name)
+	u.SetNamespace(ns)
+	u.SetLabels(map[string]string{agentGatewayRouterUIDLabel: string(mr.UID)})
 	u.Object["spec"] = map[string]interface{}{
 		"targetRefs": []interface{}{
 			map[string]interface{}{

@@ -18,15 +18,18 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -35,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -605,41 +609,126 @@ func TestModelRouterAgentGateway_PoolCRDAbsentNamesMissingKind(t *testing.T) {
 	}
 }
 
-// TestModelRouterAgentGateway_CrossNamespaceGatewayFailsLoud covers the
-// same-namespace boundary of the model-extraction AgentgatewayPolicy: the
-// AgentgatewayPolicy CRD requires targetRefs to be same-namespace and PreRouting
-// policies to target a Gateway, and a policy in the Gateway's namespace could
-// not carry an owner reference to the ModelRouter. So a router whose
-// agentGatewayRef points at a Gateway in another namespace is refused BEFORE any
-// generation, with a condition that says how to fix it.
-func TestModelRouterAgentGateway_CrossNamespaceGatewayFailsLoud(t *testing.T) {
-	c, cfg, stop := startAgentGatewayTestEnv(t, true)
-	defer stop()
+// makeNamespace creates a namespace for the cross-namespace tests; envtest
+// ships only the default namespace.
+func makeNamespace(t *testing.T, c client.Client, name string) {
+	t.Helper()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if err := c.Create(context.Background(), ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("create namespace %s: %v", name, err)
+	}
+}
 
-	makeBackendISvc(t, c, "crossns-cuda")
-
-	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "crossns-router", Namespace: testNS},
+// crossNamespaceRouterFixture builds a dataPlane: AgentGateway router in
+// testNS whose agentGatewayRef points at Gateway "ai-gateway" in gwNS. The
+// backend InferenceService (svc, in testNS) must exist before reconciling.
+func crossNamespaceRouterFixture(name, gwNS, svc string) *inferencev1alpha1.ModelRouter {
+	return &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
 				Name:               "ai-gateway",
-				Namespace:          "other-ns",
+				Namespace:          gwNS,
 				EndpointPicker:     "epp",
 				EndpointPickerPort: 9002,
 			},
 			Backends: []inferencev1alpha1.RouterBackend{
-				{Name: "crossns-cuda", InferenceServiceRef: corev1LocalRef("crossns-cuda")},
+				{Name: svc, InferenceServiceRef: corev1LocalRef(svc)},
 			},
 			Rules: []inferencev1alpha1.RouterRule{
 				{
 					Name:  "r",
 					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
-					Route: inferencev1alpha1.RuleRoute{Backends: []string{"crossns-cuda"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{svc}},
 				},
 			},
 		},
 	}
+}
+
+// getPolicyInNamespace fetches one AgentgatewayPolicy from an explicit
+// namespace (getUnstructured is pinned to testNS).
+func getPolicyInNamespace(t *testing.T, c client.Client, ns, name string) *unstructured.Unstructured {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(agentGatewayPolicyGVK())
+	u.SetNamespace(ns)
+	err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, u)
+	if err != nil {
+		t.Fatalf("get AgentgatewayPolicy %s/%s: %v", ns, name, err)
+	}
+	return u
+}
+
+// assertNoPolicyInNamespace asserts an AgentgatewayPolicy is absent from an
+// explicit namespace (assertNotExists is pinned to testNS).
+func assertNoPolicyInNamespace(t *testing.T, c client.Client, ns, name string) {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(agentGatewayPolicyGVK())
+	u.SetNamespace(ns)
+	err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, u)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected AgentgatewayPolicy %s/%s to not exist, get err = %v", ns, name, err)
+	}
+}
+
+// assertExtractionPolicyShape asserts the generated model-extraction
+// AgentgatewayPolicy: the documented BBR shape, the router-UID label, and (for
+// a same-namespace policy) a controller owner reference. Cross-namespace
+// policies cannot carry that reference.
+func assertExtractionPolicyShape(t *testing.T, p *unstructured.Unstructured, mr *inferencev1alpha1.ModelRouter, sameNamespace bool) {
+	t.Helper()
+	targetRefs, _, _ := unstructured.NestedSlice(p.Object, "spec", "targetRefs")
+	if len(targetRefs) != 1 {
+		t.Fatalf("policy has %d targetRefs, want 1", len(targetRefs))
+	}
+	targetRef := targetRefs[0].(map[string]interface{})
+	if targetRef["kind"] != "Gateway" || targetRef["group"] != "gateway.networking.k8s.io" || targetRef["name"] != "ai-gateway" {
+		t.Errorf("policy targetRef = %v, want Gateway gateway.networking.k8s.io/ai-gateway", targetRef)
+	}
+	if phase, _, _ := unstructured.NestedString(p.Object, "spec", "traffic", "phase"); phase != "PreRouting" {
+		t.Errorf("policy traffic.phase = %q, want PreRouting", phase)
+	}
+	sets, _, _ := unstructured.NestedSlice(p.Object, "spec", "traffic", "transformation", "request", "set")
+	if len(sets) != 1 {
+		t.Fatalf("policy transformation request.set = %d entries, want 1", len(sets))
+	}
+	set := sets[0].(map[string]interface{})
+	if set["name"] != "X-Gateway-Model-Name" {
+		t.Errorf("policy extracts header %v, want X-Gateway-Model-Name", set["name"])
+	}
+	if set["value"] != "json(request.body).model" {
+		t.Errorf("policy extraction expression = %v, want json(request.body).model", set["value"])
+	}
+	if got := p.GetLabels()[agentGatewayRouterUIDLabel]; got != string(mr.UID) {
+		t.Errorf("policy uid label = %q, want the router's uid %q", got, string(mr.UID))
+	}
+	refs := p.GetOwnerReferences()
+	if sameNamespace {
+		assertOwnedByRouter(t, p, mr)
+	} else if len(refs) != 0 {
+		t.Errorf("cross-namespace policy has %d owner references, want 0 (owner refs cannot cross namespaces)", len(refs))
+	}
+}
+
+// TestModelRouterAgentGateway_CrossNamespaceGatewayGeneratesPolicyInGatewayNS
+// covers the common setup the issue reporter runs: the ModelRouter in one
+// namespace, the agentgateway Gateway in another. The extraction policy cannot
+// be owner-referenced across namespaces and must target the Gateway
+// same-namespace, so it is generated in the GATEWAY's namespace, labeled with
+// the router's UID, and guarded by a finalizer on the router. Pools and the
+// route stay in the router's namespace.
+func TestModelRouterAgentGateway_CrossNamespaceGatewayGeneratesPolicyInGatewayNS(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeBackendISvc(t, c, "crossns-cuda")
+
+	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
@@ -647,21 +736,414 @@ func TestModelRouterAgentGateway_CrossNamespaceGatewayFailsLoud(t *testing.T) {
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
 
-	// Generates NOTHING.
-	assertNotExists(t, c, inferencePoolGVK(), "crossns-cuda")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "crossns-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "crossns-router")
+	// Pools and route in the router's namespace, owned as before.
+	pool := getUnstructured(t, c, inferencePoolGVK(), "crossns-cuda")
+	assertOwnedByRouter(t, pool, mr)
+	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "crossns-router")
+	assertOwnedByRouter(t, route, mr)
+
+	// The extraction policy in the GATEWAY's namespace: no owner reference,
+	// UID-labeled, same BBR shape as the same-namespace case.
+	policy := getPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	assertExtractionPolicyShape(t, policy, mr, false)
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "crossns-router", Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
-	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
-	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonCrossNSGateway {
-		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonCrossNSGateway, cond)
+	if !controllerutil.ContainsFinalizer(fresh, modelRouterAgentGatewayFinalizer) {
+		t.Errorf("router missing %s finalizer; the cross-namespace policy would be stranded on delete", modelRouterAgentGatewayFinalizer)
 	}
-	if !strings.Contains(cond.Message, "other-ns/ai-gateway") {
-		t.Errorf("condition message %q does not name the referenced Gateway", cond.Message)
+	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Errorf("AgentGatewayReady condition not True, got %+v", cond)
+	}
+}
+
+// TestModelRouterAgentGateway_CrossNamespacePolicyCleanedUpOnDelete covers the
+// finalizer's reason to exist: deleting a router whose extraction policy lives
+// in another namespace (no owner reference could GC it) must delete that
+// policy and release the router.
+func TestModelRouterAgentGateway_CrossNamespacePolicyCleanedUpOnDelete(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeBackendISvc(t, c, "crossns-cuda")
+
+	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+	// Sanity: the policy exists before the delete.
+	getPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+
+	if err := c.Delete(context.Background(), mr); err != nil {
+		t.Fatalf("delete modelrouter: %v", err)
+	}
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	assertNoPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	// With the finalizer removed, the API server completes the deletion.
+	fresh := &inferencev1alpha1.ModelRouter{}
+	err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("expected the router to be gone after finalizer cleanup, get err = %v", err)
+	}
+	// The pools and route in testNS are owner-referenced and are NOT asserted
+	// gone: envtest runs no garbage collector, so owner-ref'd objects linger
+	// here while a real cluster reclaims them.
+}
+
+// TestModelRouterAgentGateway_CrossNamespaceRefChangePrunes covers a router
+// whose agentGatewayRef.namespace moves back to the router's own namespace:
+// the policy left in the old Gateway's namespace must be deleted (nothing
+// owner-references it there), the finalizer dropped, and the same-namespace
+// policy generated owner-referenced instead.
+func TestModelRouterAgentGateway_CrossNamespaceRefChangePrunes(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeBackendISvc(t, c, "crossns-cuda")
+
+	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+	getPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+
+	// Move the Gateway back into the router's namespace.
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	fresh.Spec.AgentGatewayRef.Namespace = ""
+	if err := c.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update modelrouter: %v", err)
+	}
+	// First reconcile runs the cleanup path (prune + drop the finalizer) and
+	// returns; the second compiles the same-namespace policy.
+	reconcileAgentGatewayRouter(t, r, fresh)
+	reconcileAgentGatewayRouter(t, r, fresh)
+
+	assertNoPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	sameNSPolicy := getUnstructured(t, c, agentGatewayPolicyGVK(), "crossns-router")
+	assertExtractionPolicyShape(t, sameNSPolicy, fresh, true)
+
+	final := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, final); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if controllerutil.ContainsFinalizer(final, modelRouterAgentGatewayFinalizer) {
+		t.Errorf("finalizer still present after the Gateway moved into the router's namespace")
+	}
+}
+
+// TestModelRouterAgentGateway_CrossNamespaceGatewayMovePrunes covers a router
+// whose agentGatewayRef.namespace moves from one cross-namespace Gateway to
+// another: the policy left in the OLD Gateway's namespace must be deleted by
+// the generation-path sweep (the finalizer stays; the new policy is still
+// cross-namespace), and the new policy must appear in the new Gateway's
+// namespace. Without the sweep the old policy is stranded: nothing
+// owner-references it there.
+func TestModelRouterAgentGateway_CrossNamespaceGatewayMovePrunes(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	oldGwNS, newGwNS := "agentgateway-system", "other-gw-system"
+	makeNamespace(t, c, oldGwNS)
+	makeNamespace(t, c, newGwNS)
+	makeBackendISvc(t, c, "crossns-cuda")
+
+	mr := crossNamespaceRouterFixture("mover-router", oldGwNS, "crossns-cuda")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+	getPolicyInNamespace(t, c, oldGwNS, "default-mover-router")
+
+	// Move to a different cross-namespace Gateway.
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	fresh.Spec.AgentGatewayRef.Namespace = newGwNS
+	if err := c.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update modelrouter: %v", err)
+	}
+	reconcileAgentGatewayRouter(t, r, fresh)
+
+	assertNoPolicyInNamespace(t, c, oldGwNS, "default-mover-router")
+	getPolicyInNamespace(t, c, newGwNS, "default-mover-router")
+
+	still := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, still); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if !controllerutil.ContainsFinalizer(still, modelRouterAgentGatewayFinalizer) {
+		t.Errorf("finalizer missing while the policy is still cross-namespace")
+	}
+}
+
+// foreignExtractionPolicy builds an AgentgatewayPolicy the operator does not
+// own, targeting the named Gateway in gwNS, with a PreRouting transformation
+// (the shadowing shape) or without one (no conflict).
+func foreignExtractionPolicy(name, gwNS, gatewayName string, withTransformation bool) *unstructured.Unstructured {
+	p := &unstructured.Unstructured{}
+	p.SetGroupVersionKind(agentGatewayPolicyGVK())
+	p.SetName(name)
+	p.SetNamespace(gwNS)
+	traffic := map[string]interface{}{"phase": "PreRouting"}
+	if withTransformation {
+		traffic["transformation"] = map[string]interface{}{
+			"request": map[string]interface{}{
+				"set": []interface{}{map[string]interface{}{
+					"name":  "X-Gateway-Base-Model-Name",
+					"value": "json(request.body).model",
+				}},
+			},
+		}
+	}
+	p.Object["spec"] = map[string]interface{}{
+		"targetRefs": []interface{}{map[string]interface{}{
+			metadataNameField: gatewayName,
+			"kind":            "Gateway",
+			"group":           "gateway.networking.k8s.io",
+		}},
+		"traffic": traffic,
+	}
+	return p
+}
+
+// selectorForeignPolicy builds a foreign AgentgatewayPolicy that attaches to
+// Gateways via targetSelectors instead of targetRefs.
+func selectorForeignPolicy(name, gwNS string, matchLabels map[string]string, withTransformation bool) *unstructured.Unstructured {
+	p := foreignExtractionPolicy(name, gwNS, "unused", withTransformation)
+	p.Object["spec"] = map[string]interface{}{
+		"targetSelectors": []interface{}{map[string]interface{}{
+			"kind":        "Gateway",
+			"group":       "gateway.networking.k8s.io",
+			"matchLabels": matchLabels,
+		}},
+		"traffic": map[string]interface{}{
+			"phase": "PreRouting",
+			"transformation": map[string]interface{}{
+				"request": map[string]interface{}{
+					"set": []interface{}{map[string]interface{}{
+						"name":  "X-Gateway-Base-Model-Name",
+						"value": "json(request.body).model",
+					}},
+				},
+			},
+		},
+	}
+	return p
+}
+
+// TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts covers the
+// silent-shadowing hazard: agentgateway merges same-specificity policies
+// oldest-wins per whole field and never combines list entries, so a foreign
+// PreRouting transformation targeting the same Gateway either silently
+// disables the generated model extraction or is silently disabled by it, and
+// no condition reports the drop. The reconciler must refuse with a named
+// condition instead of reporting Ready. A foreign PreRouting policy WITHOUT a
+// transformation (or targeting a different Gateway) does not touch the
+// transformation field and must NOT be treated as a conflict.
+func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeBackendISvc(t, c, "crossns-cuda")
+
+	// The referenced Gateway, labeled so targetSelectors-based foreign policies
+	// have something real to match against.
+	gateway := &unstructured.Unstructured{}
+	gateway.SetGroupVersionKind(schema.GroupVersionKind{Group: "gateway.networking.k8s.io", Version: "v1", Kind: "Gateway"})
+	gateway.SetName("ai-gateway")
+	gateway.SetNamespace(gwNS)
+	gateway.SetLabels(map[string]string{"team": "infra"})
+	if err := c.Create(context.Background(), gateway); err != nil {
+		t.Fatalf("create gateway: %v", err)
+	}
+
+	cases := []struct {
+		name          string
+		foreignPolicy *unstructured.Unstructured
+		wantConflict  bool
+	}{
+		{
+			name:          "foreign PreRouting transformation on the same Gateway conflicts",
+			foreignPolicy: foreignExtractionPolicy("foreign-extraction", gwNS, "ai-gateway", true),
+			wantConflict:  true,
+		},
+		{
+			name:          "foreign PreRouting policy without a transformation does not conflict",
+			foreignPolicy: foreignExtractionPolicy("foreign-extauth", gwNS, "ai-gateway", false),
+			wantConflict:  false,
+		},
+		{
+			name:          "foreign transformation targeting another Gateway does not conflict",
+			foreignPolicy: foreignExtractionPolicy("foreign-elsewhere", gwNS, "other-gateway", true),
+			wantConflict:  false,
+		},
+		{
+			name:          "foreign transformation selector-matched to the Gateway conflicts",
+			foreignPolicy: selectorForeignPolicy("foreign-selector", gwNS, map[string]string{"team": "infra"}, true),
+			wantConflict:  true,
+		},
+		{
+			name:          "foreign transformation selector-matched to other Gateways does not conflict",
+			foreignPolicy: selectorForeignPolicy("foreign-selector-other", gwNS, map[string]string{"team": "other"}, true),
+			wantConflict:  false,
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			routerName := fmt.Sprintf("conflict-router-%d", i+1)
+			svc := fmt.Sprintf("conflict-svc-%d", i+1)
+			makeBackendISvc(t, c, svc)
+			if err := c.Create(context.Background(), tc.foreignPolicy); err != nil {
+				t.Fatalf("create foreign policy: %v", err)
+			}
+			mr := crossNamespaceRouterFixture(routerName, gwNS, svc)
+			if err := c.Create(context.Background(), mr); err != nil {
+				t.Fatalf("create modelrouter: %v", err)
+			}
+			r := newModelRouterAgentGatewayReconciler(t, cfg)
+			reconcileAgentGatewayRouter(t, r, mr)
+
+			fresh := &inferencev1alpha1.ModelRouter{}
+			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+				t.Fatalf("get modelrouter: %v", err)
+			}
+			cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+			policyName := "default-" + routerName
+			if tc.wantConflict {
+				if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonPolicyConflict {
+					t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonPolicyConflict, cond)
+				}
+				if !strings.Contains(cond.Message, tc.foreignPolicy.GetName()) {
+					t.Errorf("condition message %q does not name the conflicting policy", cond.Message)
+				}
+				assertNotExists(t, c, inferencePoolGVK(), svc)
+				assertNoPolicyInNamespace(t, c, gwNS, policyName)
+				assertNotExists(t, c, gatewayHTTPRouteGVK(), routerName)
+				// Remove the foreign policy so later cases (which share this
+				// envtest env) are not poisoned by it.
+				if err := c.Delete(context.Background(), tc.foreignPolicy); err != nil {
+					t.Fatalf("delete foreign policy: %v", err)
+				}
+				return
+			}
+			if cond == nil || cond.Status != metav1.ConditionTrue {
+				t.Fatalf("expected AgentGatewayReady=True for a non-conflicting foreign policy, got %+v", cond)
+			}
+			getPolicyInNamespace(t, c, gwNS, policyName)
+		})
+	}
+}
+
+// TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud covers the
+// deterministic cross-namespace policy name: it is the sanitized concatenation
+// of the router's namespace and name, which is not injective. Two routers
+// whose concatenations collide must not adopt each other's policy (that would
+// silently repoint the targetRef); the second router's apply must fail loud.
+func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	gwNS := "agentgateway-system"
+	makeNamespace(t, c, gwNS)
+	makeNamespace(t, c, "a-b")
+	makeNamespace(t, c, "a")
+
+	// ns "a-b" + name "c" and ns "a" + name "b-c" both sanitize to "a-b-c".
+	routers := []struct{ ns, name, svc string }{
+		{"a-b", "c", "svc1"},
+		{"a", "b-c", "svc1"},
+	}
+	for _, r := range routers {
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: r.svc, Namespace: r.ns},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: r.svc,
+				Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+			},
+		}
+		if err := c.Create(context.Background(), isvc); err != nil {
+			t.Fatalf("create isvc in %s: %v", r.ns, err)
+		}
+	}
+
+	var first *inferencev1alpha1.ModelRouter
+	for i, r := range routers {
+		mr := &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: r.name, Namespace: r.ns},
+			Spec: inferencev1alpha1.ModelRouterSpec{
+				DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+				AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+					Name: "ai-gateway", Namespace: gwNS, EndpointPicker: "epp", EndpointPickerPort: 9002,
+				},
+				Backends: []inferencev1alpha1.RouterBackend{
+					{Name: r.svc, InferenceServiceRef: corev1LocalRef(r.svc)},
+				},
+				Rules: []inferencev1alpha1.RouterRule{
+					{Name: "r", Route: inferencev1alpha1.RuleRoute{Backends: []string{r.svc}}},
+				},
+			},
+		}
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter %d: %v", i, err)
+		}
+		if i == 0 {
+			first = mr
+		}
+	}
+
+	rec := newModelRouterAgentGatewayReconciler(t, cfg)
+	_, err := rec.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: routers[0].name, Namespace: routers[0].ns},
+	})
+	if err != nil {
+		t.Fatalf("first router reconcile: %v", err)
+	}
+	_, err = rec.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: routers[1].name, Namespace: routers[1].ns},
+	})
+	if err == nil {
+		t.Fatal("expected the second router's reconcile to fail on the policy-name collision, got nil")
+	}
+
+	// The policy still belongs to the FIRST router; the second must not have
+	// adopted or overwritten it.
+	policy := getPolicyInNamespace(t, c, gwNS, "a-b-c")
+	firstFresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, firstFresh); err != nil {
+		t.Fatalf("get first router: %v", err)
+	}
+	if got := policy.GetLabels()[agentGatewayRouterUIDLabel]; got != string(firstFresh.UID) {
+		t.Errorf("policy uid label = %q, want the first router's uid %q", got, string(firstFresh.UID))
+	}
+
+	secondFresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: routers[1].name, Namespace: routers[1].ns}, secondFresh); err != nil {
+		t.Fatalf("get second router: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(secondFresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonReconcile {
+		t.Errorf("expected AgentGatewayReady=False/%s on the colliding router, got %+v", modelRouterAgentGatewayReasonReconcile, cond)
+	}
+	if !strings.Contains(cond.Message, "already managed by another ModelRouter") {
+		t.Errorf("condition message %q does not name the collision", cond.Message)
 	}
 }
 

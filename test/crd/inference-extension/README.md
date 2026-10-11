@@ -11,11 +11,14 @@ validation (a flat `selector` map was once emitted here and only the real CRD's
 rules (PreRouting targets a Gateway, same-namespace targetRefs) are what the
 cross-namespace fail-loud guard exists to avoid hitting.
 
-| File                     | Source                                                               | Pinned   |
-|--------------------------|----------------------------------------------------------------------|----------|
-| inferencepool.yaml       | kubernetes-sigs/gateway-api-inference-extension config/crd/bases      | v1.6.2   |
-| agentgatewaypolicy.yaml  | agentgateway/agentgateway agentgateway-crds chart template            | v1.6.0   |
-| httproute.yaml           | Hand-made minimal stub (Gateway API v1 HTTPRoute)                     | -        |
+| File                     | Source                                                               | Pinned   | License    |
+|--------------------------|----------------------------------------------------------------------|----------|------------|
+| inferencepool.yaml       | kubernetes-sigs/gateway-api-inference-extension config/crd/bases      | v1.6.2   | Apache-2.0 |
+| agentgatewaypolicy.yaml  | agentgateway/agentgateway agentgateway-crds chart template            | v1.6.0   | Apache-2.0 |
+| httproute.yaml           | Hand-made minimal stub (Gateway API v1 HTTPRoute)                     | -        | -          |
+
+Both vendored upstreams are Apache-2.0 licensed (no NOTICE file); vendoring is
+permitted with attribution, recorded here.
 
 The InferenceModel CRD stub was removed with the GIE v1 migration (#1725):
 GIE renamed InferenceModel to InferenceObjective (a priority resource, not a
