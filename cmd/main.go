@@ -683,8 +683,9 @@ func main() {
 	}
 	// ModelRouterAgentGateway compiles a ModelRouter in dataPlane: AgentGateway
 	// mode onto a pre-installed agentgateway data plane via the Gateway API
-	// Inference Extension (InferencePool / InferenceModel / HTTPRoute). Like the
-	// Envoy gateway controller it self-gates on the Inference Extension CRDs
+	// Inference Extension (InferencePool / HTTPRoute) plus the agentgateway.dev
+	// AgentgatewayPolicy that extracts the model name. Like the
+	// Envoy gateway controller it self-gates on the required CRDs
 	// being present, so a cluster without the agentgateway stack still starts the
 	// operator cleanly and this controller no-ops. A failed reconcile is emitted
 	// as a Warning Event so the operator sees it at the request path even though

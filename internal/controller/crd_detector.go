@@ -68,41 +68,54 @@ func newCRDDetector(name string, gvks []schema.GroupVersionKind) *crdDetector {
 // discovery error (not a missing kind) is returned so the caller requeues
 // instead of caching a false negative. The disabled message is logged once.
 func (d *crdDetector) Present(c client.Client, log logr.Logger) (bool, error) {
+	present, _, err := d.PresentMissing(c, log)
+	return present, err
+}
+
+// PresentMissing reports whether all required kinds are registered and, when
+// they are not, exactly which GVKs are missing, so callers can surface the
+// missing kinds in a condition message instead of a generic "not installed".
+// Caching semantics are Present's: a positive result is cached, a negative one
+// is recomputed (and so is the missing list) on every call, so a late CRD
+// install recovers without a restart.
+func (d *crdDetector) PresentMissing(c client.Client, log logr.Logger) (bool, []schema.GroupVersionKind, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
 	if d.present {
-		return true, nil
+		return true, nil, nil
 	}
 
-	present, err := d.detect(c)
+	missing, err := d.detect(c)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	if present {
+	if len(missing) == 0 {
 		d.present = true
-		return true, nil
+		return true, nil, nil
 	}
 	if !d.loggedAbsent {
 		log.Info(fmt.Sprintf("%s integration disabled (CRDs not installed)", d.name))
 		d.loggedAbsent = true
 	}
-	return false, nil
+	return false, missing, nil
 }
 
-// detect queries the RESTMapper for each required kind. A missing kind
-// (NoKindMatchError) means "not installed" and returns (false, nil). Any other
-// error is treated as transient (for example a lazy-discovery hiccup) and
-// returned so the caller requeues rather than caching a false negative.
-func (d *crdDetector) detect(c client.Client) (bool, error) {
+// detect queries the RESTMapper for each required kind and returns the GVKs
+// that are not registered. Any other error is treated as transient (for
+// example a lazy-discovery hiccup) and returned so the caller requeues rather
+// than caching a false negative.
+func (d *crdDetector) detect(c client.Client) ([]schema.GroupVersionKind, error) {
 	mapper := c.RESTMapper()
+	missing := make([]schema.GroupVersionKind, 0, len(d.gvks))
 	for _, gvk := range d.gvks {
 		if _, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version); err != nil {
 			if apimeta.IsNoMatchError(err) {
-				return false, nil
+				missing = append(missing, gvk)
+				continue
 			}
-			return false, fmt.Errorf("check %s CRD %s: %w", d.name, gvk.Kind, err)
+			return nil, fmt.Errorf("check %s CRD %s: %w", d.name, gvk.Kind, err)
 		}
 	}
-	return true, nil
+	return missing, nil
 }

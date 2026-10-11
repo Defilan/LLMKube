@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -39,20 +40,30 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
-// inferenceExtensionTestCRDDir is the directory of Inference Extension CRD stubs
-// (InferencePool, InferenceModel) the agentgateway tests load alongside the base
-// LLMKube CRDs, mirroring startGatewayTestEnv's aigw stubs.
+// inferenceExtensionTestCRDDir is the directory of VENDORED UPSTREAM CRDs the
+// agentgateway tests load alongside the base LLMKube CRDs: the real GIE v1
+// InferencePool and agentgateway.dev AgentgatewayPolicy schemas (see
+// test/crd/inference-extension/README.md), so envtest validates the generated
+// spec shapes server-side, and the minimal HTTPRoute stub.
 const inferenceExtensionTestCRDDir = "../../test/crd/inference-extension"
 
-// startAgentGatewayTestEnv starts an envtest with (or without) the Inference
-// Extension CRDs registered alongside the base LLMKube CRDs, mirroring
-// startGatewayTestEnv.
+// startAgentGatewayTestEnv starts an envtest with (or without) the vendored
+// Inference Extension / agentgateway CRDs registered alongside the base LLMKube
+// CRDs, mirroring startGatewayTestEnv.
 func startAgentGatewayTestEnv(t *testing.T, withCRDs bool) (client.Client, *rest.Config, func()) {
-	t.Helper()
-	crdPaths := []string{baseCRDPath}
-	if withCRDs {
-		crdPaths = append(crdPaths, inferenceExtensionTestCRDDir)
+	if !withCRDs {
+		return startAgentGatewayTestEnvWithCRDs(t)
 	}
+	return startAgentGatewayTestEnvWithCRDs(t, inferenceExtensionTestCRDDir)
+}
+
+// startAgentGatewayTestEnvWithCRDs starts an envtest loading baseCRDPath plus
+// the given extra CRD directories or single CRD files, so a test can load a
+// SUBSET of the vendored CRDs (for example InferencePool without
+// AgentgatewayPolicy) and pin the gate's missing-kind reporting.
+func startAgentGatewayTestEnvWithCRDs(t *testing.T, extraCRDPaths ...string) (client.Client, *rest.Config, func()) {
+	t.Helper()
+	crdPaths := append([]string{baseCRDPath}, extraCRDPaths...)
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     crdPaths,
 		ErrorIfCRDPathMissing: true,
@@ -109,8 +120,9 @@ func reconcileAgentGatewayRouter(t *testing.T, r *ModelRouterAgentGatewayReconci
 
 // TestModelRouterAgentGateway_CompilesInferenceExtension covers the happy path:
 // a dataPlane: AgentGateway ModelRouter with two backends and a model rule
-// produces an InferencePool + InferenceModel per backend and a multi-rule
-// HTTPRoute that matches the model name and references the InferenceModels, all
+// produces an InferencePool per backend, the model-extraction AgentgatewayPolicy
+// targeting the referenced Gateway, and a multi-rule HTTPRoute that matches the
+// extracted model header and references the InferencePools directly, all
 // owner-ref'd to the ModelRouter, and sets AgentGatewayReady=True.
 func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
@@ -125,7 +137,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
 				Name:               "ai-gateway",
-				Namespace:          "ai-gateway",
+				Namespace:          testNS,
 				EndpointPicker:     "llm-d-router-epp",
 				EndpointPickerPort: 9002,
 			},
@@ -160,16 +172,16 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	// An InferencePool + InferenceModel per backend, named after the
-	// RouterBackend.
+	// An InferencePool per backend, named after the referenced InferenceService.
 	for _, name := range []string{"qwen-cuda", "qwen-metal"} {
 		pool := getUnstructured(t, c, inferencePoolGVK(), name)
 		assertOwnedByRouter(t, pool, mr)
 		// The pool selects the referenced InferenceService's pods by the SAME
-		// selector the Deployment uses, and targets the Service port.
-		selector, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "selector")
+		// selector the Deployment uses, under the v1 matchLabels wrapper the real
+		// GIE CRD requires, and targets the Service port.
+		selector, _, _ := unstructured.NestedStringMap(pool.Object, "spec", "selector", "matchLabels")
 		if got := selector["app"]; got != name {
-			t.Errorf("pool %s selector app = %q, want %s", name, got, name)
+			t.Errorf("pool %s selector matchLabels app = %q, want %s", name, got, name)
 		}
 		ports, _, _ := unstructured.NestedSlice(pool.Object, "spec", "targetPorts")
 		if len(ports) != 1 {
@@ -183,24 +195,39 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 		if epRef["name"] != "llm-d-router-epp" {
 			t.Errorf("pool %s endpointPickerRef.name = %v, want llm-d-router-epp", name, epRef["name"])
 		}
+	}
 
-		model := getUnstructured(t, c, inferenceModelGVK(), name)
-		assertOwnedByRouter(t, model, mr)
-		modelName, _, _ := unstructured.NestedString(model.Object, "spec", "modelName")
-		if modelName != name {
-			t.Errorf("model %s modelName = %q, want %s", name, modelName, name)
-		}
-		poolRef, _, _ := unstructured.NestedMap(model.Object, "spec", "poolRef")
-		if poolRef["name"] != name {
-			t.Errorf("model %s poolRef.name = %v, want %s", name, poolRef["name"], name)
-		}
-		if poolRef["kind"] != inferencePoolKind {
-			t.Errorf("model %s poolRef.kind = %v, want %s", name, poolRef["kind"], inferencePoolKind)
-		}
+	// The model-extraction AgentgatewayPolicy: agentgateway populates no model
+	// header natively, so without this policy the route's model matches would
+	// never fire. Pinned to the documented agentgateway BBR shape.
+	policy := getUnstructured(t, c, agentGatewayPolicyGVK(), "agw-router")
+	assertOwnedByRouter(t, policy, mr)
+	targetRefs, _, _ := unstructured.NestedSlice(policy.Object, "spec", "targetRefs")
+	if len(targetRefs) != 1 {
+		t.Fatalf("policy has %d targetRefs, want 1", len(targetRefs))
+	}
+	targetRef := targetRefs[0].(map[string]interface{})
+	if targetRef["kind"] != "Gateway" || targetRef["group"] != "gateway.networking.k8s.io" || targetRef["name"] != "ai-gateway" {
+		t.Errorf("policy targetRef = %v, want Gateway gateway.networking.k8s.io/ai-gateway", targetRef)
+	}
+	if phase, _, _ := unstructured.NestedString(policy.Object, "spec", "traffic", "phase"); phase != "PreRouting" {
+		t.Errorf("policy traffic.phase = %q, want PreRouting", phase)
+	}
+	sets, _, _ := unstructured.NestedSlice(policy.Object, "spec", "traffic", "transformation", "request", "set")
+	if len(sets) != 1 {
+		t.Fatalf("policy transformation request.set = %d entries, want 1", len(sets))
+	}
+	set := sets[0].(map[string]interface{})
+	if set["name"] != "X-Gateway-Model-Name" {
+		t.Errorf("policy extracts header %v, want X-Gateway-Model-Name", set["name"])
+	}
+	if set["value"] != "json(request.body).model" {
+		t.Errorf("policy extraction expression = %v, want json(request.body).model", set["value"])
 	}
 
 	// One HTTPRoute named after the ModelRouter, attached to the Gateway, its
-	// single rule matching qwen35-27b and referencing both InferenceModels.
+	// single rule matching qwen35-27b on the extracted header and referencing
+	// both InferencePools directly (GIE v1: no InferenceModel indirection).
 	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "agw-router")
 	assertOwnedByRouter(t, route, mr)
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
@@ -220,8 +247,11 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 		if ref["name"] != want {
 			t.Errorf("backendRefs[%d].name = %v, want %s", i, ref["name"], want)
 		}
-		if ref["kind"] != inferenceModelKind {
-			t.Errorf("backendRefs[%d].kind = %v, want %s", i, ref["kind"], inferenceModelKind)
+		if ref["kind"] != "InferencePool" {
+			t.Errorf("backendRefs[%d].kind = %v, want InferencePool", i, ref["kind"])
+		}
+		if ref["group"] != "inference.networking.k8s.io" {
+			t.Errorf("backendRefs[%d].group = %v, want inference.networking.k8s.io", i, ref["group"])
 		}
 	}
 
@@ -272,9 +302,9 @@ func TestModelRouterAgentGateway_ExternalBackendFailsLoud(t *testing.T) {
 		t.Fatal("expected reconcile to fail on an External backend, got nil")
 	}
 
-	// Generates NOTHING: no pool, model, or route.
+	// Generates NOTHING: no pool, policy, or route.
 	assertNotExists(t, c, inferencePoolGVK(), "anthropic")
-	assertNotExists(t, c, inferenceModelGVK(), "anthropic")
+	assertNotExists(t, c, agentGatewayPolicyGVK(), "ext-router")
 	assertNotExists(t, c, gatewayHTTPRouteGVK(), "ext-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -331,7 +361,7 @@ func TestModelRouterAgentGateway_UnsupportedAuthFailsLoud(t *testing.T) {
 
 	// Generates NOTHING.
 	assertNotExists(t, c, inferencePoolGVK(), "local-cuda")
-	assertNotExists(t, c, inferenceModelGVK(), "local-cuda")
+	assertNotExists(t, c, agentGatewayPolicyGVK(), "auth-router")
 	assertNotExists(t, c, gatewayHTTPRouteGVK(), "auth-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -384,7 +414,7 @@ func TestModelRouterAgentGateway_UnsupportedMatchFailsLoud(t *testing.T) {
 	reconcileAgentGatewayRouter(t, r, mr)
 
 	assertNotExists(t, c, inferencePoolGVK(), "local-cuda")
-	assertNotExists(t, c, inferenceModelGVK(), "local-cuda")
+	assertNotExists(t, c, agentGatewayPolicyGVK(), "pii-router")
 	assertNotExists(t, c, gatewayHTTPRouteGVK(), "pii-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -436,7 +466,7 @@ func TestModelRouterAgentGateway_FailedReconcileEmitsWarningEvent(t *testing.T) 
 }
 
 // TestModelRouterAgentGateway_CRDsAbsentIsCleanNoOp covers the CRD-presence gate:
-// with the Inference Extension CRDs not installed, a dataPlane: AgentGateway
+// with the required CRDs not installed, a dataPlane: AgentGateway
 // ModelRouter does not error, creates nothing, and sets the disabled condition.
 func TestModelRouterAgentGateway_CRDsAbsentIsCleanNoOp(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, false)
@@ -471,6 +501,168 @@ func TestModelRouterAgentGateway_CRDsAbsentIsCleanNoOp(t *testing.T) {
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonCRDsMissing {
 		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonCRDsMissing, cond)
 	}
+	// The message must name each missing kind, so the operator does not have to
+	// read the detector to learn which CRD is meant (#1725).
+	for _, want := range []string{"InferencePool", "AgentgatewayPolicy"} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("condition message %q does not name missing kind %s", cond.Message, want)
+		}
+	}
+}
+
+// TestModelRouterAgentGateway_PolicyCRDAbsentNamesMissingKind covers the gate's
+// missing-kind reporting when only SOME CRDs are installed: with the GIE
+// InferencePool present but agentgateway.dev absent, the condition must name
+// AgentgatewayPolicy (and not InferencePool), and nothing may be generated.
+func TestModelRouterAgentGateway_PolicyCRDAbsentNamesMissingKind(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnvWithCRDs(t,
+		filepath.Join(inferenceExtensionTestCRDDir, "httproute.yaml"),
+		filepath.Join(inferenceExtensionTestCRDDir, "inferencepool.yaml"))
+	defer stop()
+
+	makeBackendISvc(t, c, "no-policy-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-policy-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "no-policy-cuda", InferenceServiceRef: corev1LocalRef("no-policy-cuda")},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "no-policy-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonCRDsMissing {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonCRDsMissing, cond)
+	}
+	if !strings.Contains(cond.Message, "AgentgatewayPolicy") {
+		t.Errorf("condition message %q does not name AgentgatewayPolicy", cond.Message)
+	}
+	if strings.Contains(cond.Message, "InferencePool (") {
+		t.Errorf("condition message %q must not report InferencePool as missing", cond.Message)
+	}
+	// The gate is the only thing between the reconciler and a loud create
+	// failure; with the gate disengaged nothing may be generated.
+	assertNotExists(t, c, inferencePoolGVK(), "no-policy-cuda")
+}
+
+// TestModelRouterAgentGateway_PoolCRDAbsentNamesMissingKind is the mirror case:
+// agentgateway.dev present but the GIE InferencePool absent; the condition must
+// name InferencePool.
+func TestModelRouterAgentGateway_PoolCRDAbsentNamesMissingKind(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnvWithCRDs(t,
+		filepath.Join(inferenceExtensionTestCRDDir, "agentgatewaypolicy.yaml"))
+	defer stop()
+
+	makeBackendISvc(t, c, "no-pool-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "no-pool-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "no-pool-cuda", InferenceServiceRef: corev1LocalRef("no-pool-cuda")},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "no-pool-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonCRDsMissing {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonCRDsMissing, cond)
+	}
+	if !strings.Contains(cond.Message, "InferencePool (inference.networking.k8s.io/v1)") {
+		t.Errorf("condition message %q does not name InferencePool with its group/version", cond.Message)
+	}
+	if strings.Contains(cond.Message, "AgentgatewayPolicy (") {
+		t.Errorf("condition message %q must not report AgentgatewayPolicy as missing", cond.Message)
+	}
+}
+
+// TestModelRouterAgentGateway_CrossNamespaceGatewayFailsLoud covers the
+// same-namespace boundary of the model-extraction AgentgatewayPolicy: the
+// AgentgatewayPolicy CRD requires targetRefs to be same-namespace and PreRouting
+// policies to target a Gateway, and a policy in the Gateway's namespace could
+// not carry an owner reference to the ModelRouter. So a router whose
+// agentGatewayRef points at a Gateway in another namespace is refused BEFORE any
+// generation, with a condition that says how to fix it.
+func TestModelRouterAgentGateway_CrossNamespaceGatewayFailsLoud(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "crossns-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "crossns-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name:               "ai-gateway",
+				Namespace:          "other-ns",
+				EndpointPicker:     "epp",
+				EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "crossns-cuda", InferenceServiceRef: corev1LocalRef("crossns-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "r",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"crossns-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	// Generates NOTHING.
+	assertNotExists(t, c, inferencePoolGVK(), "crossns-cuda")
+	assertNotExists(t, c, agentGatewayPolicyGVK(), "crossns-router")
+	assertNotExists(t, c, gatewayHTTPRouteGVK(), "crossns-router")
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "crossns-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonCrossNSGateway {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonCrossNSGateway, cond)
+	}
+	if !strings.Contains(cond.Message, "other-ns/ai-gateway") {
+		t.Errorf("condition message %q does not name the referenced Gateway", cond.Message)
+	}
 }
 
 // TestModelRouterAgentGateway_ProxyModeProducesNothing covers the no-op path: a
@@ -501,7 +693,7 @@ func TestModelRouterAgentGateway_ProxyModeProducesNothing(t *testing.T) {
 	reconcileAgentGatewayRouter(t, r, mr)
 
 	assertNotExists(t, c, inferencePoolGVK(), "proxy-cuda")
-	assertNotExists(t, c, inferenceModelGVK(), "proxy-cuda")
+	assertNotExists(t, c, agentGatewayPolicyGVK(), "proxy-router")
 	assertNotExists(t, c, gatewayHTTPRouteGVK(), "proxy-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -513,8 +705,93 @@ func TestModelRouterAgentGateway_ProxyModeProducesNothing(t *testing.T) {
 	}
 }
 
-// agentGatewayRouteModelOfRule extracts the x-ai-eg-model header match value
-// from the first match of a route rule map.
+// TestModelRouterAgentGateway_UndeclaredBackendRefFailsLoud covers the
+// compile-time backend check: a rule (or defaultRoute) referencing a backend
+// that is not declared in spec.backends must fail the reconcile loudly. Refs
+// resolve to InferencePools by backend name, so an undeclared name would
+// otherwise vanish silently at render time. The webhook rejects such a spec;
+// these tests construct the CR directly, the webhook-bypassed path the
+// reconciler must still survive.
+func TestModelRouterAgentGateway_UndeclaredBackendRefFailsLoud(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "local-cuda")
+
+	cases := []struct {
+		name   string
+		slug   string
+		mutate func(*inferencev1alpha1.ModelRouterSpec)
+	}{
+		{
+			name: "rule references an undeclared backend",
+			slug: "rule-ghost-backend",
+			mutate: func(s *inferencev1alpha1.ModelRouterSpec) {
+				s.Rules = []inferencev1alpha1.RouterRule{{
+					Name:  "r",
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"local-cuda", "ghost"}},
+				}}
+			},
+		},
+		{
+			name: "defaultRoute references an undeclared backend",
+			slug: "defaultroute-ghost-backend",
+			mutate: func(s *inferencev1alpha1.ModelRouterSpec) {
+				s.DefaultRoute = "ghost"
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := &inferencev1alpha1.ModelRouter{
+				ObjectMeta: metav1.ObjectMeta{Name: tc.slug, Namespace: testNS},
+				Spec: inferencev1alpha1.ModelRouterSpec{
+					DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+					AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+						Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+					},
+					Backends: []inferencev1alpha1.RouterBackend{
+						{Name: "local-cuda", InferenceServiceRef: corev1LocalRef("local-cuda")},
+					},
+				},
+			}
+			tc.mutate(&mr.Spec)
+			if err := c.Create(context.Background(), mr); err != nil {
+				t.Fatalf("create modelrouter: %v", err)
+			}
+
+			r := newModelRouterAgentGatewayReconciler(t, cfg)
+			_, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: mr.Namespace},
+			})
+			if err == nil {
+				t.Fatal("expected reconcile to fail on an undeclared backend ref, got nil")
+			}
+			if !strings.Contains(err.Error(), "not declared in spec.backends") {
+				t.Errorf("error %q does not name the undeclared backend", err.Error())
+			}
+
+			// Generates NOTHING, not even for the declared backend.
+			assertNotExists(t, c, inferencePoolGVK(), "local-cuda")
+			assertNotExists(t, c, agentGatewayPolicyGVK(), tc.slug)
+			assertNotExists(t, c, gatewayHTTPRouteGVK(), tc.slug)
+
+			fresh := &inferencev1alpha1.ModelRouter{}
+			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+				t.Fatalf("get modelrouter: %v", err)
+			}
+			cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+			if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonReconcile {
+				t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonReconcile, cond)
+			}
+		})
+	}
+}
+
+// agentGatewayRouteModelOfRule extracts the model header match value from the
+// first match of a route rule map, asserting the documented agentgateway BBR
+// header name (the generated AgentgatewayPolicy extracts into the SAME header;
+// the two must never drift apart).
 func agentGatewayRouteModelOfRule(t *testing.T, rule map[string]interface{}) string {
 	t.Helper()
 	matches, _, _ := unstructured.NestedSlice(rule, "matches")
@@ -526,8 +803,8 @@ func agentGatewayRouteModelOfRule(t *testing.T, rule map[string]interface{}) str
 		return ""
 	}
 	h := headers[0].(map[string]interface{})
-	if h["name"] != agentGatewayHTTPModelHeader {
-		t.Errorf("first header match name = %v, want %s", h["name"], agentGatewayHTTPModelHeader)
+	if h["name"] != "X-Gateway-Model-Name" {
+		t.Errorf("first header match name = %v, want X-Gateway-Model-Name", h["name"])
 	}
 	v, _ := h["value"].(string)
 	return v

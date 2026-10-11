@@ -79,6 +79,18 @@ rules:
   - create
   - patch
 - apiGroups:
+  - agentgateway.dev
+  resources:
+  - agentgatewaypolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - aigateway.envoyproxy.io
   resources:
   - aigatewayroutes
@@ -280,7 +292,6 @@ rules:
 - apiGroups:
   - inference.networking.k8s.io
   resources:
-  - inferencemodels
   - inferencepools
   verbs:
   - create
