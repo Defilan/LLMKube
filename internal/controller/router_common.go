@@ -13,6 +13,7 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -128,7 +129,12 @@ func ensureRouterProxyOwned(mr *inferencev1alpha1.ModelRouter, existing metav1.O
 	}
 	taken := &routerProxyNameTakenError{kind: kind, ns: existing.GetNamespace(), name: existing.GetName()}
 	if ref := metav1.GetControllerOf(existing); ref != nil && ref.Kind == "ModelRouter" {
-		taken.owner = string(ref.UID)
+		// The owner ref's APIVersion is "<group>/<version>" (or bare version
+		// for the core group); match the group so a same-Kind controller in
+		// another API group is not misreported as another ModelRouter.
+		if strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
+			taken.owner = string(ref.UID)
+		}
 	}
 	return taken
 }
