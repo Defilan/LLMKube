@@ -19,8 +19,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,18 +56,94 @@ const inferenceExtensionTestCRDDir = "../../test/crd/inference-extension"
 
 // startAgentGatewayTestEnv starts an envtest with (or without) the vendored
 // Inference Extension / agentgateway CRDs registered alongside the base LLMKube
-// CRDs, mirroring startGatewayTestEnv.
+// CRDs, mirroring startGatewayTestEnv. With CRDs, the API server is SHARED:
+// one envtest per distinct CRD set, started lazily, stopped by TestMain. Every
+// test works in its own generated namespace (newTestNamespace), so tests stay
+// independent on the shared server. Without CRDs - or with a SUBSET, which is
+// how the missing-kind tests pin the gate - the test keeps a private
+// environment, because those tests need CRDs ABSENT.
 func startAgentGatewayTestEnv(t *testing.T, withCRDs bool) (client.Client, *rest.Config, func()) {
 	if !withCRDs {
 		return startAgentGatewayTestEnvWithCRDs(t)
 	}
-	return startAgentGatewayTestEnvWithCRDs(t, inferenceExtensionTestCRDDir)
+	return startSharedAgentGatewayTestEnv(t, baseCRDPath, inferenceExtensionTestCRDDir)
+}
+
+// Shared envtest state. Starting an envtest is an apiserver plus an etcd
+// (~4s locally, more on CI); before sharing, this suite started 23 of them and
+// pushed the package past Go's 10 minute test timeout.
+var (
+	sharedAgentGatewayMu   sync.Mutex
+	sharedAgentGatewayEnvs = map[string]*sharedAgentGatewayEnv{}
+)
+
+type sharedAgentGatewayEnv struct {
+	env    *envtest.Environment
+	cfg    *rest.Config
+	client client.Client
+}
+
+// startSharedAgentGatewayTestEnv returns the shared envtest for the given CRD
+// path set, starting it lazily on first use. The returned stop function is a
+// no-op: the environment is stopped by TestMain after all tests have run.
+func startSharedAgentGatewayTestEnv(t *testing.T, crdPaths ...string) (client.Client, *rest.Config, func()) {
+	t.Helper()
+	key := strings.Join(crdPaths, "\x00")
+	sharedAgentGatewayMu.Lock()
+	shared, ok := sharedAgentGatewayEnvs[key]
+	if !ok {
+		env := &envtest.Environment{
+			CRDDirectoryPaths:     crdPaths,
+			ErrorIfCRDPathMissing: true,
+		}
+		if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
+			env.BinaryAssetsDirectory = dir
+		}
+		cfg, err := env.Start()
+		if err != nil {
+			sharedAgentGatewayMu.Unlock()
+			t.Fatalf("start shared envtest: %v", err)
+		}
+		if err := inferencev1alpha1.AddToScheme(scheme.Scheme); err != nil {
+			sharedAgentGatewayMu.Unlock()
+			t.Fatalf("add scheme: %v", err)
+		}
+		c, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
+		if err != nil {
+			sharedAgentGatewayMu.Unlock()
+			t.Fatalf("new shared client: %v", err)
+		}
+		shared = &sharedAgentGatewayEnv{env: env, cfg: cfg, client: c}
+		sharedAgentGatewayEnvs[key] = shared
+	}
+	sharedAgentGatewayMu.Unlock()
+	return shared.client, shared.cfg, func() {}
+}
+
+// stopSharedAgentGatewayEnvs stops every shared envtest environment. Called
+// from TestMain after all tests have run.
+func stopSharedAgentGatewayEnvs() {
+	sharedAgentGatewayMu.Lock()
+	defer sharedAgentGatewayMu.Unlock()
+	for _, shared := range sharedAgentGatewayEnvs {
+		_ = shared.env.Stop()
+	}
+	sharedAgentGatewayEnvs = map[string]*sharedAgentGatewayEnv{}
+}
+
+// TestMain stops the shared envtest environments after all tests have run; a
+// shared environment outlives any single test's stop function.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	stopSharedAgentGatewayEnvs()
+	os.Exit(code)
 }
 
 // startAgentGatewayTestEnvWithCRDs starts an envtest loading baseCRDPath plus
 // the given extra CRD directories or single CRD files, so a test can load a
 // SUBSET of the vendored CRDs (for example InferencePool without
-// AgentgatewayPolicy) and pin the gate's missing-kind reporting.
+// AgentgatewayPolicy) and pin the gate's missing-kind reporting. Private by
+// design: these tests need CRDs ABSENT.
 func startAgentGatewayTestEnvWithCRDs(t *testing.T, extraCRDPaths ...string) (client.Client, *rest.Config, func()) {
 	t.Helper()
 	crdPaths := append([]string{baseCRDPath}, extraCRDPaths...)
@@ -132,17 +210,18 @@ func reconcileAgentGatewayRouter(t *testing.T, r *ModelRouterAgentGatewayReconci
 func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "qwen-cuda")
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "qwen-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "agw-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "agw-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
 				Name:               "ai-gateway",
-				Namespace:          testNS,
+				Namespace:          ns,
 				EndpointPicker:     "llm-d-router-epp",
 				EndpointPickerPort: 9002,
 			},
@@ -188,7 +267,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	// rejected (TestModelRouterAgentGateway_MultiPoolRejected), since a GIE EPP
 	// binds to exactly one pool.
 	for _, name := range []string{"qwen-cuda"} {
-		pool := getUnstructured(t, c, inferencePoolGVK(), name)
+		pool := getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, name)
 		assertOwnedByRouter(t, pool, mr)
 		// The pool selects the referenced InferenceService's pods by the SAME
 		// selector the Deployment uses, under the v1 matchLabels wrapper the real
@@ -214,7 +293,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	// The model-extraction AgentgatewayPolicy: agentgateway populates no model
 	// header natively, so without this policy the route's model matches would
 	// never fire. Pinned to the documented agentgateway BBR shape.
-	policy := getUnstructured(t, c, agentGatewayPolicyGVK(), "agw-router")
+	policy := getUnstructuredInNamespace(t, c, agentGatewayPolicyGVK(), ns, "agw-router")
 	assertOwnedByRouter(t, policy, mr)
 	targetRefs, _, _ := unstructured.NestedSlice(policy.Object, "spec", "targetRefs")
 	if len(targetRefs) != 1 {
@@ -242,7 +321,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 	// One HTTPRoute named after the ModelRouter, attached to the Gateway, its
 	// single rule matching qwen35-27b on the extracted header and referencing
 	// the InferencePool directly (GIE v1: no InferenceModel indirection).
-	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "agw-router")
+	route := getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "agw-router")
 	assertOwnedByRouter(t, route, mr)
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
 	if len(rules) != 1 {
@@ -269,7 +348,7 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 
 	// status.agentGateway + AgentGatewayReady=True.
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "agw-router", Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "agw-router", Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter status: %v", err)
 	}
 	if fresh.Status.AgentGateway == nil || !fresh.Status.AgentGateway.PoolReady {
@@ -289,13 +368,14 @@ func TestModelRouterAgentGateway_CompilesInferenceExtension(t *testing.T) {
 func TestModelRouterAgentGateway_MultiPoolRejected(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "mp-cuda")
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
-	makeBackendISvc(t, c, "mp-metal")
+	makeBackendISvcInNamespace(t, c, ns, "mp-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "mp-metal")
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "mp-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "mp-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -322,13 +402,13 @@ func TestModelRouterAgentGateway_MultiPoolRejected(t *testing.T) {
 	reconcileAgentGatewayRouter(t, r, mr)
 
 	// Generates NOTHING.
-	assertNotExists(t, c, inferencePoolGVK(), "mp-cuda")
-	assertNotExists(t, c, inferencePoolGVK(), "mp-metal")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "mp-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "mp-router")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "mp-cuda")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "mp-metal")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, "mp-router")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "mp-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -349,12 +429,13 @@ func TestModelRouterAgentGateway_MultiPoolRejected(t *testing.T) {
 func TestModelRouterAgentGateway_PoolDedupSameInferenceService(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "dedup-cuda")
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "dedup-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "dedup-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "dedup-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -386,7 +467,7 @@ func TestModelRouterAgentGateway_PoolDedupSameInferenceService(t *testing.T) {
 	pools.SetGroupVersionKind(schema.GroupVersionKind{
 		Group: inferenceExtensionGroup, Version: inferenceExtensionVersion, Kind: "InferencePoolList",
 	})
-	if err := c.List(context.Background(), pools, client.InNamespace(testNS)); err != nil {
+	if err := c.List(context.Background(), pools, client.InNamespace(ns)); err != nil {
 		t.Fatalf("list pools: %v", err)
 	}
 	if len(pools.Items) != 1 {
@@ -394,7 +475,7 @@ func TestModelRouterAgentGateway_PoolDedupSameInferenceService(t *testing.T) {
 	}
 
 	// The rule references the pool ONCE.
-	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "dedup-router")
+	route := getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "dedup-router")
 	rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
 	if len(rules) != 1 {
 		t.Fatalf("route has %d rules, want 1", len(rules))
@@ -412,11 +493,12 @@ func TestModelRouterAgentGateway_PoolDedupSameInferenceService(t *testing.T) {
 func TestModelRouterAgentGateway_ExternalBackendFailsLoud(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "ext-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "ext-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -442,12 +524,12 @@ func TestModelRouterAgentGateway_ExternalBackendFailsLoud(t *testing.T) {
 	}
 
 	// Generates NOTHING: no pool, policy, or route.
-	assertNotExists(t, c, inferencePoolGVK(), "anthropic")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "ext-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "ext-router")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "anthropic")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, "ext-router")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "ext-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "ext-router", Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "ext-router", Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -463,12 +545,13 @@ func TestModelRouterAgentGateway_ExternalBackendFailsLoud(t *testing.T) {
 func TestModelRouterAgentGateway_UnsupportedAuthFailsLoud(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "local-cuda")
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "local-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "auth-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "auth-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -500,12 +583,12 @@ func TestModelRouterAgentGateway_UnsupportedAuthFailsLoud(t *testing.T) {
 	reconcileAgentGatewayRouter(t, r, mr)
 
 	// Generates NOTHING.
-	assertNotExists(t, c, inferencePoolGVK(), "local-cuda")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "auth-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "auth-router")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "local-cuda")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, "auth-router")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "auth-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "auth-router", Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "auth-router", Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -523,12 +606,13 @@ func TestModelRouterAgentGateway_UnsupportedAuthFailsLoud(t *testing.T) {
 func TestModelRouterAgentGateway_UnsupportedMatchFailsLoud(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "local-cuda")
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "local-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "pii-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "pii-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -554,12 +638,12 @@ func TestModelRouterAgentGateway_UnsupportedMatchFailsLoud(t *testing.T) {
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
 
-	assertNotExists(t, c, inferencePoolGVK(), "local-cuda")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "pii-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "pii-router")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "local-cuda")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, "pii-router")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "pii-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "pii-router", Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "pii-router", Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -790,9 +874,9 @@ func gatewayListenerAllowingAll() map[string]interface{} {
 // crossNamespaceRouterFixture builds a dataPlane: AgentGateway router in
 // testNS whose agentGatewayRef points at Gateway "ai-gateway" in gwNS. The
 // backend InferenceService (svc, in testNS) must exist before reconciling.
-func crossNamespaceRouterFixture(name, gwNS, svc string) *inferencev1alpha1.ModelRouter {
+func crossNamespaceRouterFixture(ns, name, gwNS, svc string) *inferencev1alpha1.ModelRouter {
 	return &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -815,12 +899,68 @@ func crossNamespaceRouterFixture(name, gwNS, svc string) *inferencev1alpha1.Mode
 	}
 }
 
+// newTestNamespace creates a namespace with a generated name on the shared
+// API server, so tests that share the server never collide.
+func newTestNamespace(t *testing.T, c client.Client) string {
+	t.Helper()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "agw-test-"}}
+	if err := c.Create(context.Background(), ns); err != nil {
+		t.Fatalf("create test namespace: %v", err)
+	}
+	return ns.Name
+}
+
+// makeBackendISvcInNamespace creates a ready backend InferenceService in an
+// explicit namespace (makeBackendISvc is pinned to testNS).
+func makeBackendISvcInNamespace(t *testing.T, c client.Client, ns, name string) {
+	t.Helper()
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: name,
+			Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+		},
+	}
+	if err := c.Create(context.Background(), isvc); err != nil {
+		t.Fatalf("create backend isvc %s: %v", name, err)
+	}
+	setISvcReadyReplicasInNamespace(t, c, ns, name, 1)
+}
+
+// setISvcReadyReplicasInNamespace writes Status.ReadyReplicas on a backend
+// InferenceService in an explicit namespace (setISvcReadyReplicas is pinned to
+// testNS).
+func setISvcReadyReplicasInNamespace(t *testing.T, c client.Client, ns, name string, replicas int32) {
+	t.Helper()
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, isvc); err != nil {
+		t.Fatalf("get backend isvc %s: %v", name, err)
+	}
+	isvc.Status.ReadyReplicas = replicas
+	if err := c.Status().Update(context.Background(), isvc); err != nil {
+		t.Fatalf("update backend isvc %s status: %v", name, err)
+	}
+}
+
+// getUnstructuredInNamespace fetches one unstructured object from an explicit
+// namespace (getUnstructured is pinned to testNS).
+func getUnstructuredInNamespace(t *testing.T, c client.Client, gvk schema.GroupVersionKind, ns, name string) *unstructured.Unstructured {
+	t.Helper()
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(gvk)
+	err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, u)
+	if err != nil {
+		t.Fatalf("get %s %s/%s: %v", gvk.Kind, ns, name, err)
+	}
+	return u
+}
+
 // sameNamespaceRouterFixture builds a dataPlane: AgentGateway router in the
 // test namespace whose agentGatewayRef has no namespace (a same-namespace
 // Gateway named ai-gateway) and whose single backend references svc.
-func sameNamespaceRouterFixture(name, svc string) *inferencev1alpha1.ModelRouter {
+func sameNamespaceRouterFixture(ns, name, svc string) *inferencev1alpha1.ModelRouter {
 	return &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -931,13 +1071,14 @@ func assertExtractionPolicyShape(t *testing.T, p *unstructured.Unstructured, mr 
 func TestModelRouterAgentGateway_CrossNamespaceGatewayGeneratesPolicyInGatewayNS(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
-	makeBackendISvc(t, c, "crossns-cuda")
+	gwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "crossns-cuda")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
-	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
+	mr := crossNamespaceRouterFixture(ns, "crossns-router", gwNS, "crossns-cuda")
+	_, policyName := agentGatewayPolicyIdentity(mr)
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
@@ -946,18 +1087,18 @@ func TestModelRouterAgentGateway_CrossNamespaceGatewayGeneratesPolicyInGatewayNS
 	reconcileAgentGatewayRouter(t, r, mr)
 
 	// Pools and route in the router's namespace, owned as before.
-	pool := getUnstructured(t, c, inferencePoolGVK(), "crossns-cuda")
+	pool := getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, "crossns-cuda")
 	assertOwnedByRouter(t, pool, mr)
-	route := getUnstructured(t, c, gatewayHTTPRouteGVK(), "crossns-router")
+	route := getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "crossns-router")
 	assertOwnedByRouter(t, route, mr)
 
 	// The extraction policy in the GATEWAY's namespace: no owner reference,
 	// UID-labeled, same BBR shape as the same-namespace case.
-	policy := getPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	policy := getPolicyInNamespace(t, c, gwNS, policyName)
 	assertExtractionPolicyShape(t, policy, mr, false)
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if !controllerutil.ContainsFinalizer(fresh, modelRouterAgentGatewayFinalizer) {
@@ -975,12 +1116,13 @@ func TestModelRouterAgentGateway_CrossNamespaceGatewayGeneratesPolicyInGatewayNS
 func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "missing-gw-cuda")
+	makeBackendISvcInNamespace(t, c, ns, "missing-gw-cuda")
 	// No Gateway created: the ref points at one that does not exist.
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "missing-gw-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "missing-gw-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -1000,7 +1142,7 @@ func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -1011,19 +1153,19 @@ func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 		t.Errorf("requeue after = %v, want %v (the consent recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
-	assertNotExists(t, c, inferencePoolGVK(), "missing-gw-cuda")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "missing-gw-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "missing-gw-router")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "missing-gw-cuda")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, "missing-gw-router")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "missing-gw-router")
 
 	refused := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, refused); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, refused); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(refused.Status.Conditions, ModelRouterAgentGatewayConditionReady)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonGatewayNotFound {
 		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonGatewayNotFound, cond)
 	}
-	if !strings.Contains(cond.Message, testNS+"/ai-gateway") {
+	if !strings.Contains(cond.Message, ns+"/ai-gateway") {
 		t.Errorf("condition message %q does not name the missing Gateway", cond.Message)
 	}
 	if controllerutil.ContainsFinalizer(refused, modelRouterAgentGatewayFinalizer) {
@@ -1031,9 +1173,9 @@ func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 	}
 
 	// The Gateway appears: the next reconcile goes Ready.
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 	reconcileAgentGatewayRouter(t, r, mr)
-	getPolicyInNamespace(t, c, testNS, "missing-gw-router")
+	getPolicyInNamespace(t, c, ns, "missing-gw-router")
 }
 
 // TestModelRouterAgentGateway_DeletedGatewayWithdrawsPolicy covers the
@@ -1045,23 +1187,23 @@ func TestModelRouterAgentGateway_GatewayNotFoundRefuses(t *testing.T) {
 func TestModelRouterAgentGateway_DeletedGatewayWithdrawsPolicy(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
-	makeBackendISvc(t, c, "gonegw-cuda")
+	gwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "gonegw-cuda")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
-	mr := crossNamespaceRouterFixture("gonegw-router", gwNS, "gonegw-cuda")
+	mr := crossNamespaceRouterFixture(ns, "gonegw-router", gwNS, "gonegw-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
 
-	policyName := "default-gonegw-router"
+	_, policyName := agentGatewayPolicyIdentity(mr)
 	getPolicyInNamespace(t, c, gwNS, policyName)
 	ready := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, ready); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, ready); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if !controllerutil.ContainsFinalizer(ready, modelRouterAgentGatewayFinalizer) {
@@ -1078,14 +1220,14 @@ func TestModelRouterAgentGateway_DeletedGatewayWithdrawsPolicy(t *testing.T) {
 	}
 
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
 	assertNoPolicyInNamespace(t, c, gwNS, policyName)
 	gone := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, gone); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, gone); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if controllerutil.ContainsFinalizer(gone, modelRouterAgentGatewayFinalizer) {
@@ -1107,9 +1249,9 @@ func TestModelRouterAgentGateway_DeletedGatewayWithdrawsPolicy(t *testing.T) {
 func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
+	gwNS := newTestNamespace(t, c)
 
 	listener := func(from string, selector map[string]interface{}) map[string]interface{} {
 		l := map[string]interface{}{
@@ -1201,7 +1343,7 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			routerNS := testNS
+			routerNS := ns
 			if tc.routerNSLabels != nil {
 				routerNS = fmt.Sprintf("consent-ns-%d", i+1)
 				makeNamespace(t, c, routerNS)
@@ -1284,8 +1426,8 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 			// Nothing may be written into the Gateway's namespace, and the
 			// router's own namespace stays empty too.
 			assertNoPolicyInNamespace(t, c, gwNS, policyName)
-			assertNotExists(t, c, inferencePoolGVK(), svc)
-			assertNotExists(t, c, gatewayHTTPRouteGVK(), mr.Name)
+			assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, svc)
+			assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
 			if controllerutil.ContainsFinalizer(fresh, modelRouterAgentGatewayFinalizer) {
 				t.Errorf("finalizer present on a refused router; nothing was generated")
 			}
@@ -1304,23 +1446,23 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 func TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
-	makeBackendISvc(t, c, "revoke-cuda")
+	gwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "revoke-cuda")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
-	mr := crossNamespaceRouterFixture("revoke-router", gwNS, "revoke-cuda")
+	mr := crossNamespaceRouterFixture(ns, "revoke-router", gwNS, "revoke-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
 
-	policyName := "default-revoke-router"
+	_, policyName := agentGatewayPolicyIdentity(mr)
 	getPolicyInNamespace(t, c, gwNS, policyName)
 	ready := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, ready); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, ready); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if !controllerutil.ContainsFinalizer(ready, modelRouterAgentGatewayFinalizer) {
@@ -1343,7 +1485,7 @@ func TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy(t *testing.T) {
 	}
 
 	revokedRes, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	})
 	if err != nil {
 		t.Fatalf("reconcile: %v", err)
@@ -1356,7 +1498,7 @@ func TestModelRouterAgentGateway_RevokedConsentWithdrawsPolicy(t *testing.T) {
 
 	assertNoPolicyInNamespace(t, c, gwNS, policyName)
 	revoked := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, revoked); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, revoked); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if controllerutil.ContainsFinalizer(revoked, modelRouterAgentGatewayFinalizer) {
@@ -1481,30 +1623,31 @@ func TestModelRouterAgentGateway_CleanupToleratesRemovedCRD(t *testing.T) {
 func TestModelRouterAgentGateway_CrossNamespacePolicyCleanedUpOnDelete(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
-	makeBackendISvc(t, c, "crossns-cuda")
+	gwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "crossns-cuda")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
-	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
+	mr := crossNamespaceRouterFixture(ns, "crossns-router", gwNS, "crossns-cuda")
+	_, policyName := agentGatewayPolicyIdentity(mr)
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
 	// Sanity: the policy exists before the delete.
-	getPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	getPolicyInNamespace(t, c, gwNS, policyName)
 
 	if err := c.Delete(context.Background(), mr); err != nil {
 		t.Fatalf("delete modelrouter: %v", err)
 	}
 	reconcileAgentGatewayRouter(t, r, mr)
 
-	assertNoPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	assertNoPolicyInNamespace(t, c, gwNS, policyName)
 	// With the finalizer removed, the API server completes the deletion.
 	fresh := &inferencev1alpha1.ModelRouter{}
-	err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh)
+	err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh)
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("expected the router to be gone after finalizer cleanup, get err = %v", err)
 	}
@@ -1521,26 +1664,27 @@ func TestModelRouterAgentGateway_CrossNamespacePolicyCleanedUpOnDelete(t *testin
 func TestModelRouterAgentGateway_CrossNamespaceRefChangePrunes(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
-	makeBackendISvc(t, c, "crossns-cuda")
+	gwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "crossns-cuda")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 	// When the ref moves back to the router's namespace, THIS is the Gateway
 	// the router references (the consent check must admit it too).
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
-	mr := crossNamespaceRouterFixture("crossns-router", gwNS, "crossns-cuda")
+	mr := crossNamespaceRouterFixture(ns, "crossns-router", gwNS, "crossns-cuda")
+	_, policyName := agentGatewayPolicyIdentity(mr)
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
-	getPolicyInNamespace(t, c, gwNS, "default-crossns-router")
+	getPolicyInNamespace(t, c, gwNS, policyName)
 
 	// Move the Gateway back into the router's namespace.
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	fresh.Spec.AgentGatewayRef.Namespace = ""
@@ -1552,12 +1696,12 @@ func TestModelRouterAgentGateway_CrossNamespaceRefChangePrunes(t *testing.T) {
 	reconcileAgentGatewayRouter(t, r, fresh)
 	reconcileAgentGatewayRouter(t, r, fresh)
 
-	assertNoPolicyInNamespace(t, c, gwNS, "default-crossns-router")
-	sameNSPolicy := getUnstructured(t, c, agentGatewayPolicyGVK(), "crossns-router")
+	assertNoPolicyInNamespace(t, c, gwNS, policyName)
+	sameNSPolicy := getUnstructuredInNamespace(t, c, agentGatewayPolicyGVK(), ns, "crossns-router")
 	assertExtractionPolicyShape(t, sameNSPolicy, fresh, true)
 
 	final := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, final); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, final); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if controllerutil.ContainsFinalizer(final, modelRouterAgentGatewayFinalizer) {
@@ -1575,25 +1719,26 @@ func TestModelRouterAgentGateway_CrossNamespaceRefChangePrunes(t *testing.T) {
 func TestModelRouterAgentGateway_CrossNamespaceGatewayMovePrunes(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	oldGwNS, newGwNS := "agentgateway-system", "other-gw-system"
-	makeNamespace(t, c, oldGwNS)
-	makeNamespace(t, c, newGwNS)
-	makeBackendISvc(t, c, "crossns-cuda")
+	oldGwNS := newTestNamespace(t, c)
+	newGwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "crossns-cuda")
 	makeGateway(t, c, oldGwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 	makeGateway(t, c, newGwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
-	mr := crossNamespaceRouterFixture("mover-router", oldGwNS, "crossns-cuda")
+	mr := crossNamespaceRouterFixture(ns, "mover-router", oldGwNS, "crossns-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
-	getPolicyInNamespace(t, c, oldGwNS, "default-mover-router")
+	_, policyName := agentGatewayPolicyIdentity(mr)
+	getPolicyInNamespace(t, c, oldGwNS, policyName)
 
 	// Move to a different cross-namespace Gateway.
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	fresh.Spec.AgentGatewayRef.Namespace = newGwNS
@@ -1602,11 +1747,11 @@ func TestModelRouterAgentGateway_CrossNamespaceGatewayMovePrunes(t *testing.T) {
 	}
 	reconcileAgentGatewayRouter(t, r, fresh)
 
-	assertNoPolicyInNamespace(t, c, oldGwNS, "default-mover-router")
-	getPolicyInNamespace(t, c, newGwNS, "default-mover-router")
+	assertNoPolicyInNamespace(t, c, oldGwNS, policyName)
+	getPolicyInNamespace(t, c, newGwNS, policyName)
 
 	still := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, still); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, still); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if !controllerutil.ContainsFinalizer(still, modelRouterAgentGatewayFinalizer) {
@@ -1681,10 +1826,10 @@ func selectorForeignPolicy(name, gwNS string, matchLabels map[string]string, wit
 func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
-	makeBackendISvc(t, c, "crossns-cuda")
+	gwNS := newTestNamespace(t, c)
+	makeBackendISvcInNamespace(t, c, ns, "crossns-cuda")
 	// The referenced Gateway: admits the router's namespace (All) and carries
 	// labels so targetSelectors-based foreign policies have something real to
 	// match against.
@@ -1725,11 +1870,11 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 		t.Run(tc.name, func(t *testing.T) {
 			routerName := fmt.Sprintf("conflict-router-%d", i+1)
 			svc := fmt.Sprintf("conflict-svc-%d", i+1)
-			makeBackendISvc(t, c, svc)
+			makeBackendISvcInNamespace(t, c, ns, svc)
 			if err := c.Create(context.Background(), tc.foreignPolicy); err != nil {
 				t.Fatalf("create foreign policy: %v", err)
 			}
-			mr := crossNamespaceRouterFixture(routerName, gwNS, svc)
+			mr := crossNamespaceRouterFixture(ns, routerName, gwNS, svc)
 			if err := c.Create(context.Background(), mr); err != nil {
 				t.Fatalf("create modelrouter: %v", err)
 			}
@@ -1742,11 +1887,11 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 			}
 
 			fresh := &inferencev1alpha1.ModelRouter{}
-			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 				t.Fatalf("get modelrouter: %v", err)
 			}
 			cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
-			policyName := "default-" + routerName
+			_, policyName := agentGatewayPolicyIdentity(mr)
 			if tc.wantConflict {
 				if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonPolicyConflict {
 					t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonPolicyConflict, cond)
@@ -1760,9 +1905,9 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 				if res.RequeueAfter != agentGatewayConflictRequeueAfter {
 					t.Errorf("requeue after = %v, want %v (the conflict recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 				}
-				assertNotExists(t, c, inferencePoolGVK(), svc)
+				assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, svc)
 				assertNoPolicyInNamespace(t, c, gwNS, policyName)
-				assertNotExists(t, c, gatewayHTTPRouteGVK(), routerName)
+				assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, routerName)
 				// Remove the foreign policy: the next reconcile must go Ready
 				// and the condition must be gone.
 				if err := c.Delete(context.Background(), tc.foreignPolicy); err != nil {
@@ -1770,7 +1915,7 @@ func TestModelRouterAgentGateway_ForeignPreRoutingPolicyConflicts(t *testing.T) 
 				}
 				reconcileAgentGatewayRouter(t, r, mr)
 				cleared := &inferencev1alpha1.ModelRouter{}
-				if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, cleared); err != nil {
+				if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, cleared); err != nil {
 					t.Fatalf("get modelrouter after foreign policy deleted: %v", err)
 				}
 				clearedCond := apimeta.FindStatusCondition(cleared.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -1798,8 +1943,7 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
+	gwNS := newTestNamespace(t, c)
 	makeNamespace(t, c, "a-b")
 	makeNamespace(t, c, "a")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
@@ -1939,18 +2083,18 @@ func assertForeignPolicyMarkerUnchanged(t *testing.T, c client.Client, ns, name 
 func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_CrossNamespace(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	gwNS := "agentgateway-system"
-	makeNamespace(t, c, gwNS)
+	gwNS := newTestNamespace(t, c)
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
-	makeBackendISvc(t, c, "collide-cuda")
+	makeBackendISvcInNamespace(t, c, ns, "collide-cuda")
 
-	mr := crossNamespaceRouterFixture("collide-router", gwNS, "collide-cuda")
+	mr := crossNamespaceRouterFixture(ns, "collide-router", gwNS, "collide-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
-	ns, name := agentGatewayPolicyIdentity(mr)
-	foreign := foreignExtractionPolicy(name, gwNS, "ai-gateway", true)
+	policyNS, policyName := agentGatewayPolicyIdentity(mr)
+	foreign := foreignExtractionPolicy(policyName, gwNS, "ai-gateway", true)
 	if err := c.Create(context.Background(), foreign); err != nil {
 		t.Fatalf("create foreign policy: %v", err)
 	}
@@ -1963,21 +2107,21 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_CrossNamespace(t
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
 		t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 	}
-	if !strings.Contains(cond.Message, ns+"/"+name) {
+	if !strings.Contains(cond.Message, policyNS+"/"+policyName) {
 		t.Errorf("condition message %q does not name the foreign object", cond.Message)
 	}
 	assertForeignObjectUntouched(t, c, foreign)
-	assertForeignPolicyMarkerUnchanged(t, c, gwNS, name)
+	assertForeignPolicyMarkerUnchanged(t, c, gwNS, policyName)
 	// Nothing else may be generated for a refused router.
-	assertNotExists(t, c, inferencePoolGVK(), "collide-cuda")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), mr.Name)
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "collide-cuda")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
 	if controllerutil.ContainsFinalizer(fresh, modelRouterAgentGatewayFinalizer) {
 		t.Errorf("finalizer present on a refused router; nothing was generated")
 	}
@@ -1992,36 +2136,37 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_CrossNamespace(t
 		t.Fatalf("reconcile after delete: %v", err)
 	}
 	assertForeignObjectUntouched(t, c, foreign)
-	assertForeignPolicyMarkerUnchanged(t, c, gwNS, name)
+	assertForeignPolicyMarkerUnchanged(t, c, gwNS, policyName)
 }
 
 func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_SameNamespace(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
 	// Same-namespace Gateway: the default from=Same admits the router.
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
-	makeBackendISvc(t, c, "collide2-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "collide2-cuda")
 
-	mr := sameNamespaceRouterFixture("collide-router2", "collide2-cuda")
+	mr := sameNamespaceRouterFixture(ns, "collide-router2", "collide2-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	_, name := agentGatewayPolicyIdentity(mr)
-	foreign := foreignExtractionPolicy(name, testNS, "ai-gateway", true)
+	foreign := foreignExtractionPolicy(name, ns, "ai-gateway", true)
 	if err := c.Create(context.Background(), foreign); err != nil {
 		t.Fatalf("create foreign policy: %v", err)
 	}
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -2029,9 +2174,9 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_SameNamespace(t 
 		t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 	}
 	assertForeignObjectUntouched(t, c, foreign)
-	assertForeignPolicyMarkerUnchanged(t, c, testNS, name)
-	assertNotExists(t, c, inferencePoolGVK(), "collide2-cuda")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), mr.Name)
+	assertForeignPolicyMarkerUnchanged(t, c, ns, name)
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "collide2-cuda")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
 
 	// The mutator guard backs the pre-check against a create race; it must
 	// refuse an unlabeled object in the router's own namespace too.
@@ -2044,7 +2189,7 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_SameNamespace(t 
 		t.Fatalf("delete modelrouter: %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile after delete: %v", err)
 	}
@@ -2054,11 +2199,12 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_SameNamespace(t 
 func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedInferencePool(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
-	makeBackendISvc(t, c, "collide3-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "collide3-cuda")
 
-	mr := sameNamespaceRouterFixture("collide-router3", "collide3-cuda")
+	mr := sameNamespaceRouterFixture(ns, "collide-router3", "collide3-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
@@ -2066,7 +2212,7 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedInference
 	handmade := &unstructured.Unstructured{}
 	handmade.SetGroupVersionKind(inferencePoolGVK())
 	handmade.SetName(poolName)
-	handmade.SetNamespace(testNS)
+	handmade.SetNamespace(ns)
 	handmade.Object["spec"] = map[string]interface{}{
 		"selector":          map[string]interface{}{"matchLabels": map[string]interface{}{"app": "handmade"}},
 		"targetPorts":       []interface{}{map[string]interface{}{"number": int64(9999)}},
@@ -2078,36 +2224,36 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedInference
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
 		t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 	}
-	if !strings.Contains(cond.Message, "InferencePool "+testNS+"/"+poolName) {
+	if !strings.Contains(cond.Message, "InferencePool "+ns+"/"+poolName) {
 		t.Errorf("condition message %q does not name the foreign pool", cond.Message)
 	}
 	// The refusal fires before ANY write: the pool is untouched and the
 	// policy and route were never created.
 	assertForeignObjectUntouched(t, c, handmade)
-	after := getUnstructured(t, c, inferencePoolGVK(), poolName)
+	after := getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, poolName)
 	if ports, _, _ := unstructured.NestedSlice(after.Object, "spec", "targetPorts"); len(ports) != 1 || fmt.Sprint(ports[0].(map[string]interface{})["number"]) != "9999" {
 		t.Errorf("handmade pool's targetPorts were overwritten: %v", ports)
 	}
-	assertNotExists(t, c, agentGatewayPolicyGVK(), mr.Name)
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), mr.Name)
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, mr.Name)
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
 
 	// A switch to Proxy must not sweep the unowned pool, and deleting the
 	// router must not delete it: only labeled objects are ours.
 	fresh = &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	fresh.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
@@ -2115,37 +2261,38 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedInference
 		t.Fatalf("switch dataPlane: %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile after switch: %v", err)
 	}
-	getUnstructured(t, c, inferencePoolGVK(), poolName)
+	getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, poolName)
 	if err := c.Delete(context.Background(), mr); err != nil {
 		t.Fatalf("delete modelrouter: %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile after delete: %v", err)
 	}
-	getUnstructured(t, c, inferencePoolGVK(), poolName)
+	getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, poolName)
 }
 
 func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedHTTPRoute(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
-	makeBackendISvc(t, c, "collide4-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "collide4-cuda")
 
-	mr := sameNamespaceRouterFixture("collide-router4", "collide4-cuda")
+	mr := sameNamespaceRouterFixture(ns, "collide-router4", "collide4-cuda")
 	if err := c.Create(context.Background(), mr); err != nil {
 		t.Fatalf("create modelrouter: %v", err)
 	}
 	handmade := &unstructured.Unstructured{}
 	handmade.SetGroupVersionKind(gatewayHTTPRouteGVK())
 	handmade.SetName(mr.Name)
-	handmade.SetNamespace(testNS)
+	handmade.SetNamespace(ns)
 	handmade.Object["spec"] = map[string]interface{}{
 		"parentRefs": []interface{}{map[string]interface{}{"name": "ai-gateway"}},
 	}
@@ -2155,36 +2302,36 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedHTTPRoute
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
 	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonResourceNameTaken {
 		t.Fatalf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonResourceNameTaken, cond)
 	}
-	if !strings.Contains(cond.Message, "HTTPRoute "+testNS+"/"+mr.Name) {
+	if !strings.Contains(cond.Message, "HTTPRoute "+ns+"/"+mr.Name) {
 		t.Errorf("condition message %q does not name the foreign route", cond.Message)
 	}
 	// The pre-check runs before ANY apply, so the refusal left the pool and
 	// the policy uncreated too.
 	assertForeignObjectUntouched(t, c, handmade)
-	assertNotExists(t, c, agentGatewayPolicyGVK(), mr.Name)
-	assertNotExists(t, c, inferencePoolGVK(), "collide4-cuda")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, mr.Name)
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "collide4-cuda")
 	if err := c.Delete(context.Background(), mr); err != nil {
 		t.Fatalf("delete modelrouter: %v", err)
 	}
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 	}); err != nil {
 		t.Fatalf("reconcile after delete: %v", err)
 	}
-	getUnstructured(t, c, gatewayHTTPRouteGVK(), mr.Name)
+	getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
 }
 
 // countingListClient counts List calls made through it, so a test can assert
@@ -2229,13 +2376,14 @@ func newCountingModelRouterAgentGatewayReconciler(t *testing.T, cfg *rest.Config
 func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	t.Run("never-AgentGateway Proxy router makes zero Lists", func(t *testing.T) {
-		makeBackendISvc(t, c, "sweep0-cuda")
+		makeBackendISvcInNamespace(t, c, ns, "sweep0-cuda")
 		mr := &inferencev1alpha1.ModelRouter{
-			ObjectMeta: metav1.ObjectMeta{Name: "sweep0-router", Namespace: testNS},
+			ObjectMeta: metav1.ObjectMeta{Name: "sweep0-router", Namespace: ns},
 			Spec: inferencev1alpha1.ModelRouterSpec{
 				DataPlane: inferencev1alpha1.ModelRouterDataPlaneProxy,
 				Backends: []inferencev1alpha1.RouterBackend{
@@ -2250,7 +2398,7 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 		r, counter := newCountingModelRouterAgentGatewayReconciler(t, cfg)
 		for i := 0; i < 2; i++ {
 			if _, err := r.Reconcile(context.Background(), ctrl.Request{
-				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 			}); err != nil {
 				t.Fatalf("reconcile %d: %v", i+1, err)
 			}
@@ -2261,18 +2409,18 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 	})
 
 	t.Run("a router that switches away is swept exactly once", func(t *testing.T) {
-		makeBackendISvc(t, c, "sweep1-cuda")
-		mr := sameNamespaceRouterFixture("sweep1-router", "sweep1-cuda")
+		makeBackendISvcInNamespace(t, c, ns, "sweep1-cuda")
+		mr := sameNamespaceRouterFixture(ns, "sweep1-router", "sweep1-cuda")
 		if err := c.Create(context.Background(), mr); err != nil {
 			t.Fatalf("create modelrouter: %v", err)
 		}
 		r, counter := newCountingModelRouterAgentGatewayReconciler(t, cfg)
 		reconcileAgentGatewayRouter(t, r, mr)
-		getPolicyInNamespace(t, c, testNS, mr.Name)
+		getPolicyInNamespace(t, c, ns, mr.Name)
 		before := counter.lists
 
 		fresh := &inferencev1alpha1.ModelRouter{}
-		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 			t.Fatalf("get modelrouter: %v", err)
 		}
 		fresh.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
@@ -2283,20 +2431,20 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 		// The switch reconcile sweeps: one List each for policies
 		// (cluster-wide), pools, and routes.
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{
-			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 		}); err != nil {
 			t.Fatalf("reconcile after switch: %v", err)
 		}
 		if got := counter.lists - before; got != 3 {
 			t.Errorf("the switch reconcile made %d List calls, want exactly 3 (one per swept kind)", got)
 		}
-		assertAllGoneLike(t, c, mr.Name, "sweep1-cuda")
+		assertAllGoneLike(t, c, ns, mr.Name, "sweep1-cuda")
 
 		// The sweep cleared the plane's status, so later reconciles find no
 		// evidence and make no Lists.
 		for i := 0; i < 2; i++ {
 			if _, err := r.Reconcile(context.Background(), ctrl.Request{
-				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 			}); err != nil {
 				t.Fatalf("reconcile %d after sweep: %v", i+1, err)
 			}
@@ -2307,11 +2455,11 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 	})
 }
 
-func assertAllGoneLike(t *testing.T, c client.Client, name, svc string) {
+func assertAllGoneLike(t *testing.T, c client.Client, ns, name, svc string) {
 	t.Helper()
-	assertNotExists(t, c, agentGatewayPolicyGVK(), name)
-	assertNotExists(t, c, inferencePoolGVK(), svc)
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), name)
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, name)
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, svc)
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, name)
 }
 
 // TestModelRouterAgentGateway_ProxyModeProducesNothing covers the no-op path: a
@@ -2321,11 +2469,12 @@ func assertAllGoneLike(t *testing.T, c client.Client, name, svc string) {
 func TestModelRouterAgentGateway_ProxyModeProducesNothing(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "proxy-cuda")
+	makeBackendISvcInNamespace(t, c, ns, "proxy-cuda")
 
 	mr := &inferencev1alpha1.ModelRouter{
-		ObjectMeta: metav1.ObjectMeta{Name: "proxy-router", Namespace: testNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "proxy-router", Namespace: ns},
 		Spec: inferencev1alpha1.ModelRouterSpec{
 			DataPlane: inferencev1alpha1.ModelRouterDataPlaneProxy,
 			Backends: []inferencev1alpha1.RouterBackend{
@@ -2341,12 +2490,12 @@ func TestModelRouterAgentGateway_ProxyModeProducesNothing(t *testing.T) {
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
 	reconcileAgentGatewayRouter(t, r, mr)
 
-	assertNotExists(t, c, inferencePoolGVK(), "proxy-cuda")
-	assertNotExists(t, c, agentGatewayPolicyGVK(), "proxy-router")
-	assertNotExists(t, c, gatewayHTTPRouteGVK(), "proxy-router")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "proxy-cuda")
+	assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, "proxy-router")
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "proxy-router")
 
 	fresh := &inferencev1alpha1.ModelRouter{}
-	if err := c.Get(context.Background(), types.NamespacedName{Name: "proxy-router", Namespace: testNS}, fresh); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "proxy-router", Namespace: ns}, fresh); err != nil {
 		t.Fatalf("get modelrouter: %v", err)
 	}
 	if fresh.Status.AgentGateway != nil {
@@ -2365,16 +2514,17 @@ func TestModelRouterAgentGateway_ProxyModeProducesNothing(t *testing.T) {
 func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
 	// Same-namespace Gateway: the default from=Same admits the router, and a
 	// same-namespace router never gets the finalizer.
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	startRouter := func(t *testing.T, name, svc string) *inferencev1alpha1.ModelRouter {
 		t.Helper()
-		makeBackendISvc(t, c, svc)
+		makeBackendISvcInNamespace(t, c, ns, svc)
 		mr := &inferencev1alpha1.ModelRouter{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 			Spec: inferencev1alpha1.ModelRouterSpec{
 				DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 				AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -2394,24 +2544,24 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 		r := newModelRouterAgentGatewayReconciler(t, cfg)
 		reconcileAgentGatewayRouter(t, r, mr)
 		// The resources exist and the router is Ready before the mode change.
-		getPolicyInNamespace(t, c, testNS, name)
-		getUnstructured(t, c, inferencePoolGVK(), svc)
-		getUnstructured(t, c, gatewayHTTPRouteGVK(), name)
+		getPolicyInNamespace(t, c, ns, name)
+		getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, svc)
+		getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, name)
 		return mr
 	}
 
 	assertAllGone := func(t *testing.T, name, svc string) {
 		t.Helper()
-		assertNotExists(t, c, agentGatewayPolicyGVK(), name)
-		assertNotExists(t, c, inferencePoolGVK(), svc)
-		assertNotExists(t, c, gatewayHTTPRouteGVK(), name)
+		assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, name)
+		assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, svc)
+		assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, name)
 	}
 
 	t.Run("switching dataPlane to Proxy", func(t *testing.T) {
 		mr := startRouter(t, "leave-router", "leave-cuda")
 
 		fresh := &inferencev1alpha1.ModelRouter{}
-		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 			t.Fatalf("get modelrouter: %v", err)
 		}
 		fresh.Spec.DataPlane = inferencev1alpha1.ModelRouterDataPlaneProxy
@@ -2421,7 +2571,7 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 
 		r := newModelRouterAgentGatewayReconciler(t, cfg)
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{
-			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 		}); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
@@ -2432,7 +2582,7 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 		mr := startRouter(t, "leave2-router", "leave2-cuda")
 
 		fresh := &inferencev1alpha1.ModelRouter{}
-		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 			t.Fatalf("get modelrouter: %v", err)
 		}
 		fresh.Spec.AgentGatewayRef = nil
@@ -2442,14 +2592,14 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 
 		r := newModelRouterAgentGatewayReconciler(t, cfg)
 		if _, err := r.Reconcile(context.Background(), ctrl.Request{
-			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: testNS},
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
 		}); err != nil {
 			t.Fatalf("reconcile: %v", err)
 		}
 		assertAllGone(t, mr.Name, "leave2-cuda")
 
 		refless := &inferencev1alpha1.ModelRouter{}
-		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, refless); err != nil {
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, refless); err != nil {
 			t.Fatalf("get modelrouter: %v", err)
 		}
 		// The router had artifacts, so the sweep cleared the plane's status
@@ -2475,9 +2625,10 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 func TestModelRouterAgentGateway_UndeclaredBackendRefFailsLoud(t *testing.T) {
 	c, cfg, stop := startAgentGatewayTestEnv(t, true)
 	defer stop()
+	ns := newTestNamespace(t, c)
 
-	makeBackendISvc(t, c, "local-cuda")
-	makeGateway(t, c, testNS, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "local-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
 
 	cases := []struct {
 		name   string
@@ -2505,7 +2656,7 @@ func TestModelRouterAgentGateway_UndeclaredBackendRefFailsLoud(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mr := &inferencev1alpha1.ModelRouter{
-				ObjectMeta: metav1.ObjectMeta{Name: tc.slug, Namespace: testNS},
+				ObjectMeta: metav1.ObjectMeta{Name: tc.slug, Namespace: ns},
 				Spec: inferencev1alpha1.ModelRouterSpec{
 					DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
 					AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
@@ -2533,12 +2684,12 @@ func TestModelRouterAgentGateway_UndeclaredBackendRefFailsLoud(t *testing.T) {
 			}
 
 			// Generates NOTHING, not even for the declared backend.
-			assertNotExists(t, c, inferencePoolGVK(), "local-cuda")
-			assertNotExists(t, c, agentGatewayPolicyGVK(), tc.slug)
-			assertNotExists(t, c, gatewayHTTPRouteGVK(), tc.slug)
+			assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "local-cuda")
+			assertNotExistsInNamespace(t, c, agentGatewayPolicyGVK(), ns, tc.slug)
+			assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), ns, tc.slug)
 
 			fresh := &inferencev1alpha1.ModelRouter{}
-			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: testNS}, fresh); err != nil {
+			if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
 				t.Fatalf("get modelrouter: %v", err)
 			}
 			cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
