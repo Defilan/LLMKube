@@ -246,10 +246,14 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		}
 		if leaving && !deleting {
 			// The router left AgentGateway mode for good: drop the status so
-			// later reconciles skip this sweep (no evidence left), and return
-			// instead of falling through - the AgentGatewayRefMissing refusal
-			// would re-set a condition and undo the skip. A never-used router
-			// (no evidence) still reports AgentGatewayRefMissing below.
+			// later reconciles skip this sweep (no evidence left). Fall
+			// through afterwards: a removed ref must still report
+			// AgentGatewayRefMissing, and that is now convergent because the
+			// refusal no longer allocates status.agentGateway - the cleared
+			// evidence stays cleared, the refusal's condition write is a
+			// no-op from the second reconcile on, and the sweep runs exactly
+			// once. A never-used router (no evidence) skips the sweep and
+			// reports the refusal directly.
 			patch := client.MergeFrom(mr.DeepCopy())
 			mr.Status.AgentGateway = nil
 			apimeta.RemoveStatusCondition(&mr.Status.Conditions, ModelRouterAgentGatewayConditionReady)
@@ -257,10 +261,15 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 				return ctrl.Result{}, err
 			}
 		}
-		// Deleting, or the Gateway moved into the router's namespace: done
-		// here. Regeneration, when applicable, happens on the reconcile the
-		// finalizer removal triggers.
-		return ctrl.Result{}, nil
+		if !leaving {
+			// Deleting, or the Gateway moved into the router's namespace: done
+			// here. Regeneration, when applicable, happens on the reconcile the
+			// finalizer removal triggers.
+			return ctrl.Result{}, nil
+		}
+		// Leaving AgentGateway mode: continue below (the dataPlane early-return
+		// ends Proxy/Gateway routers here; a ref-unset AgentGateway router
+		// reaches the AgentGatewayRefMissing refusal).
 	}
 
 	// Only the AgentGateway data plane is this reconciler's concern. Proxy mode
@@ -1183,10 +1192,14 @@ func (r *ModelRouterAgentGatewayReconciler) setAgentGatewayNotReady(
 	reason, message string,
 ) error {
 	patch := client.MergeFrom(mr.DeepCopy())
-	if mr.Status.AgentGateway == nil {
-		mr.Status.AgentGateway = &inferencev1alpha1.AgentGatewayStatus{}
+	// Do not allocate the block here: status.agentGateway is the sweep gate's
+	// evidence that generation succeeded at least once, and a refusal must not
+	// fabricate it (a ref-unset router would otherwise alternate between
+	// "refuse and allocate" and "sweep and clear" forever). Only tone down a
+	// block a successful generation wrote.
+	if mr.Status.AgentGateway != nil {
+		mr.Status.AgentGateway.PoolReady = false
 	}
-	mr.Status.AgentGateway.PoolReady = false
 	apimeta.SetStatusCondition(&mr.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterAgentGatewayConditionReady,
 		Status:  metav1.ConditionFalse,

@@ -2453,6 +2453,121 @@ func TestModelRouterAgentGateway_SweepOnlyForUsedRouters(t *testing.T) {
 			t.Errorf("later reconciles made %d List calls after the sweep, want 0", got)
 		}
 	})
+	t.Run("a router that generated and then lost its ref is swept exactly once", func(t *testing.T) {
+		makeBackendISvcInNamespace(t, c, ns, "sweep2-cuda")
+		mr := sameNamespaceRouterFixture(ns, "sweep2-router", "sweep2-cuda")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		r, counter := newCountingModelRouterAgentGatewayReconciler(t, cfg)
+		reconcileAgentGatewayRouter(t, r, mr)
+		getPolicyInNamespace(t, c, ns, mr.Name)
+		before := counter.lists
+
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		fresh.Spec.AgentGatewayRef = nil
+		if err := c.Update(context.Background(), fresh); err != nil {
+			t.Fatalf("remove agentGatewayRef: %v", err)
+		}
+
+		// The ref-removal reconcile sweeps: one List each for policies
+		// (cluster-wide), pools, and routes.
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+		}); err != nil {
+			t.Fatalf("reconcile after ref removal: %v", err)
+		}
+		if got := counter.lists - before; got != 3 {
+			t.Errorf("the ref-removal reconcile made %d List calls, want exactly 3 (one per swept kind)", got)
+		}
+		assertAllGoneLike(t, c, ns, mr.Name, "sweep2-cuda")
+
+		// The sweep cleared the evidence; later reconciles make no Lists and
+		// the router settles on AgentGatewayRefMissing.
+		for i := 0; i < 2; i++ {
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{
+				NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+			}); err != nil {
+				t.Fatalf("reconcile %d after sweep: %v", i+1, err)
+			}
+		}
+		if got := counter.lists - before - 3; got != 0 {
+			t.Errorf("later reconciles made %d List calls after the sweep, want 0", got)
+		}
+		refless := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, refless); err != nil {
+			t.Fatalf("get modelrouter: %v", err)
+		}
+		cond := apimeta.FindStatusCondition(refless.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNoRef {
+			t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonNoRef, cond)
+		}
+	})
+}
+
+// TestModelRouterAgentGateway_RefUnsetRouterConverges pins the ref-unset
+// convergence: a router in AgentGateway mode with no agentGatewayRef (admitted
+// while the validating webhook was off or not serving) used to alternate
+// forever - the refusal allocated status.agentGateway, the status event
+// re-enqueued, the sweep ran three uncached Lists and cleared the status, the
+// next reconcile found no evidence and refused again (312 reconciles in 20s
+// under a real manager). After the fix the refusal never fabricates the
+// sweep gate's evidence, so the router settles on AgentGatewayRefMissing with
+// no writes and no Lists after the first reconcile.
+func TestModelRouterAgentGateway_RefUnsetRouterConverges(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "refless-router", Namespace: ns},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			// No agentGatewayRef: the webhook would reject this at admission,
+			// but envtest has no webhook and real clusters admit it whenever
+			// the webhook is disabled or failing open.
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "refless-cuda", InferenceServiceRef: corev1LocalRef("refless-cuda")},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r, counter := newCountingModelRouterAgentGatewayReconciler(t, cfg)
+	lastRV := ""
+	for i := 1; i <= 4; i++ {
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+		}); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+		fresh := &inferencev1alpha1.ModelRouter{}
+		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+			t.Fatalf("get modelrouter after reconcile %d: %v", i, err)
+		}
+		cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNoRef {
+			t.Errorf("reconcile %d: expected AgentGatewayReady=False/%s, got %+v",
+				i, modelRouterAgentGatewayReasonNoRef, cond)
+		}
+		if i >= 2 && fresh.ResourceVersion != lastRV {
+			t.Errorf("reconcile %d: resourceVersion changed from %q to %q; the router is written on every reconcile",
+				i, lastRV, fresh.ResourceVersion)
+		}
+		lastRV = fresh.ResourceVersion
+		if fresh.Status.AgentGateway != nil {
+			t.Errorf("reconcile %d: status.agentGateway is %+v; a refusal must not fabricate the sweep gate's evidence",
+				i, fresh.Status.AgentGateway)
+		}
+	}
+	if counter.lists != 0 {
+		t.Errorf("the ref-unset router made %d List calls across 4 reconciles, want 0", counter.lists)
+	}
 }
 
 func assertAllGoneLike(t *testing.T, c client.Client, ns, name, svc string) {
@@ -2602,12 +2717,13 @@ func TestModelRouterAgentGateway_LeavingAgentGatewayModeCleansUp(t *testing.T) {
 		if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, refless); err != nil {
 			t.Fatalf("get modelrouter: %v", err)
 		}
-		// The router had artifacts, so the sweep cleared the plane's status
-		// entirely: no condition (a removed ref must not re-set one that would
-		// re-trigger the sweep on every later reconcile) and no
-		// status.agentGateway block.
-		if cond := apimeta.FindStatusCondition(refless.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond != nil {
-			t.Errorf("expected the AgentGatewayReady condition to be removed after leaving the mode, got %+v", cond)
+		// The router had artifacts, so the sweep cleared status.agentGateway;
+		// the ref-unset refusal then reports AgentGatewayRefMissing (and
+		// converges: the refusal does not re-allocate the evidence).
+		if cond := apimeta.FindStatusCondition(refless.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond == nil ||
+			cond.Status != metav1.ConditionFalse || cond.Reason != modelRouterAgentGatewayReasonNoRef {
+			t.Errorf("expected AgentGatewayReady=False/%s after leaving the mode via ref removal, got %+v",
+				modelRouterAgentGatewayReasonNoRef, cond)
 		}
 		if refless.Status.AgentGateway != nil {
 			t.Errorf("expected status.agentGateway to be cleared after leaving the mode, got %+v", refless.Status.AgentGateway)
