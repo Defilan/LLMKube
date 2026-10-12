@@ -2100,10 +2100,14 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_CrossNamespace(t
 	}
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: mr.Namespace},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
+	}
+	if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the name-taken recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -2159,10 +2163,14 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_SameNamespace(t 
 	}
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
+	}
+	if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the name-taken recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -2223,10 +2231,14 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedInference
 	}
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
+	}
+	if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the name-taken recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -2301,10 +2313,14 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedHTTPRoute
 	}
 
 	r := newModelRouterAgentGatewayReconciler(t, cfg)
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("reconcile must refuse, not error: %v", err)
+	}
+	if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+		t.Errorf("requeue after = %v, want %v (the name-taken recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
 	}
 
 	fresh := &inferencev1alpha1.ModelRouter{}
@@ -2332,6 +2348,96 @@ func TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted_UnownedHTTPRoute
 		t.Fatalf("reconcile after delete: %v", err)
 	}
 	getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, mr.Name)
+}
+
+// TestModelRouterAgentGateway_NameTakenRecovers pins the name-taken requeue:
+// the condition message tells the user to delete or rename the foreign object,
+// and after they do, the router must go Ready on its own - no unrelated event
+// required. The two subtests cover both refusal sites: the unowned policy
+// refused by the guard-chain pre-check, and the unowned pool refused inside
+// resource generation.
+func TestModelRouterAgentGateway_NameTakenRecovers(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+
+	ns := newTestNamespace(t, c)
+	gwNS := newTestNamespace(t, c)
+
+	t.Run("unowned policy", func(t *testing.T) {
+		makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
+		makeBackendISvcInNamespace(t, c, ns, "recov-cuda")
+
+		mr := crossNamespaceRouterFixture(ns, "recov-router", gwNS, "recov-cuda")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		_, policyName := agentGatewayPolicyIdentity(mr)
+		foreign := foreignExtractionPolicy(policyName, gwNS, "ai-gateway", true)
+		if err := c.Create(context.Background(), foreign); err != nil {
+			t.Fatalf("create foreign policy: %v", err)
+		}
+
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		res, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+		})
+		if err != nil {
+			t.Fatalf("reconcile must refuse, not error: %v", err)
+		}
+		if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+			t.Errorf("requeue after = %v, want %v (the name-taken recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
+		}
+
+		// The owner removes the foreign object: the requeued reconcile goes
+		// Ready and generates the router's own policy.
+		if err := c.Delete(context.Background(), foreign); err != nil {
+			t.Fatalf("delete foreign policy: %v", err)
+		}
+		reconcileAgentGatewayRouter(t, r, mr)
+		getPolicyInNamespace(t, c, gwNS, policyName)
+	})
+
+	t.Run("unowned pool", func(t *testing.T) {
+		makeGateway(t, c, ns, "ai-gateway", nil, nil)
+		makeBackendISvcInNamespace(t, c, ns, "recov2-cuda")
+
+		mr := sameNamespaceRouterFixture(ns, "recov2-router", "recov2-cuda")
+		if err := c.Create(context.Background(), mr); err != nil {
+			t.Fatalf("create modelrouter: %v", err)
+		}
+		poolName := sanitizeDNSName("recov2-cuda")
+		handmade := &unstructured.Unstructured{}
+		handmade.SetGroupVersionKind(inferencePoolGVK())
+		handmade.SetName(poolName)
+		handmade.SetNamespace(ns)
+		handmade.Object["spec"] = map[string]interface{}{
+			"selector":          map[string]interface{}{"matchLabels": map[string]interface{}{"app": "handmade"}},
+			"targetPorts":       []interface{}{map[string]interface{}{"number": int64(9999)}},
+			"endpointPickerRef": map[string]interface{}{"name": "handmade-epp", "port": map[string]interface{}{"number": int64(9001)}},
+		}
+		if err := c.Create(context.Background(), handmade); err != nil {
+			t.Fatalf("create handmade pool: %v", err)
+		}
+
+		r := newModelRouterAgentGatewayReconciler(t, cfg)
+		res, err := r.Reconcile(context.Background(), ctrl.Request{
+			NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+		})
+		if err != nil {
+			t.Fatalf("reconcile must refuse, not error: %v", err)
+		}
+		if res.RequeueAfter != agentGatewayConflictRequeueAfter {
+			t.Errorf("requeue after = %v, want %v (the name-taken recheck)", res.RequeueAfter, agentGatewayConflictRequeueAfter)
+		}
+
+		// The owner deletes the hand-made pool: the requeued reconcile goes
+		// Ready and generates the router's own pool.
+		if err := c.Delete(context.Background(), handmade); err != nil {
+			t.Fatalf("delete handmade pool: %v", err)
+		}
+		reconcileAgentGatewayRouter(t, r, mr)
+		getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, poolName)
+	})
 }
 
 // countingListClient counts List calls made through it, so a test can assert

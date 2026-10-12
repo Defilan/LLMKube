@@ -110,17 +110,19 @@ const (
 	// and the apply refuses a policy name another router's object holds.
 	agentGatewayRouterUIDLabel = "inference.llmkube.dev/agentgateway-router-uid"
 
-	// agentGatewayConflictRequeueAfter is how often a Ready router (and a
-	// conflicted one) re-reconciles to notice AgentgatewayPolicy changes that
-	// no watch covers: a foreign PreRouting transformation created AFTER the
-	// router went Ready is silently shadowed until something re-checks, and a
-	// conflicted router's condition must clear when the foreign policy goes
-	// away. Only these two outcomes requeue: they are the only states whose
-	// truth depends on cluster state outside the router's spec; every other
-	// refusal is spec-determined and stays event-driven. A watch on
-	// AgentgatewayPolicies was rejected because registering it fails manager
-	// startup when the CRD is absent - the same hazard the Owns() comment in
-	// SetupWithManager documents.
+	// agentGatewayConflictRequeueAfter is how often this reconciler rechecks
+	// state that no watch covers: a Ready router (and a conflicted one) looks
+	// for foreign PreRouting transformations created after it went Ready, and
+	// every refusal whose truth depends on cluster state outside the router's
+	// spec - the Gateway existing (GatewayNotFound), its allowedRoutes consent
+	// (GatewayDoesNotAllowRouterNamespace), and a generated name being free
+	// (GeneratedResourceNameTaken) - requeues on the same cadence so removing
+	// the blocker takes effect without an unrelated event. Spec-determined
+	// refusals (unsupported match, auth, budget, auditLog, sensitive-route,
+	// multi-pool) stay event-driven. A watch on AgentgatewayPolicies was
+	// rejected because registering it fails manager startup when the CRD is
+	// absent - the same hazard the Owns() comment in SetupWithManager
+	// documents.
 	agentGatewayConflictRequeueAfter = 2 * time.Minute
 
 	// The honest-boundary reasons mirror the Gateway plane exactly: a
@@ -366,7 +368,13 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	if err := r.checkGeneratedNameAvailable(ctx, mr, newAgentGatewayModelExtractionPolicy(mr, mr.Spec.AgentGatewayRef)); err != nil {
 		var taken *agentGatewayNameTakenError
 		if errors.As(err, &taken) {
-			return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error())
+			// Whether the name is free depends on objects outside the router's
+			// spec; requeue so deleting or renaming the foreign object takes
+			// effect without an unrelated event.
+			if serr := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error()); serr != nil {
+				return ctrl.Result{}, serr
+			}
+			return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 		}
 		return ctrl.Result{}, err
 	}
@@ -462,7 +470,13 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 	if err != nil {
 		var taken *agentGatewayNameTakenError
 		if errors.As(err, &taken) {
-			return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error())
+			// Same reasoning as the guard-chain name check: the pre-check and
+			// this write raced, and the foreign object is still there; requeue
+			// so its removal takes effect.
+			if serr := r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonResourceNameTaken, err.Error()); serr != nil {
+				return ctrl.Result{}, serr
+			}
+			return ctrl.Result{RequeueAfter: agentGatewayConflictRequeueAfter}, nil
 		}
 		_ = r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonReconcile, err.Error())
 		return ctrl.Result{}, err
