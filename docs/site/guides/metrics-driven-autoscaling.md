@@ -74,6 +74,21 @@ is an implementation detail. When you author or manage an autoscaler
 yourself, always target the `InferenceService` (see below), never the
 Deployment.
 
+The managed HPA has the same name as the `InferenceService`
+(`llama-3-8b` above). The `AutoscalingReady` condition on the
+`InferenceService` reports its state:
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `True` | `HPAManaged` | The controller created or updated the HPA. |
+| `False` | `HPANameTaken` | An HPA the controller did not create already has that name. The controller leaves it alone (no overwrite, no delete), keeps reconciling the rest of the service, emits a Warning event once, and rechecks about every 2 minutes. See [the pitfall below](#an-hpa-with-the-services-name-already-exists). |
+| absent | | Nothing to report: `spec.autoscaling` is not set, the service is suspended, or it is a Metal workload. |
+
+```bash
+kubectl get inferenceservice llama-3-8b \
+  -o jsonpath='{.status.conditions[?(@.type=="AutoscalingReady")]}'
+```
+
 ### Expose the metrics to the HPA
 
 The llama.cpp server already emits colon-form names
@@ -618,6 +633,29 @@ then snap back, the scaler is pointed at the inference Deployment
 instead of the `InferenceService`. Repoint `scaleTargetRef` at
 `inference.llmkube.dev/v1alpha1 InferenceService <name>`; the operator
 reverts direct writes to the Deployment's replica count by design.
+
+### An HPA with the service's name already exists
+
+If `AutoscalingReady` is `False` with reason `HPANameTaken`, an HPA the
+controller did not create (for example a hand-authored one, or one left
+by another tool) already uses the name the controller generates, which is
+the `InferenceService` name. The controller refuses to take it over: it
+does not overwrite its spec, adopt it, or delete it when autoscaling is
+cleared or the service is suspended. The rest of the service still
+reconciles.
+
+To fix it, either delete or rename the existing HPA (the controller
+creates its own on the next check, within about 2 minutes), or remove
+`spec.autoscaling` and keep the existing HPA as your hand-authored one.
+Give hand-authored HPAs a different name from the service (the examples
+here use `<service>-hpa`) so this cannot happen.
+
+The refusal also applies while the service is suspended: the controller
+does not delete an HPA it does not own. Suspension still scales the
+Deployment to zero. If that HPA targets the inference Deployment rather
+than the `InferenceService`, though, it fights the suspension: it scales
+the Deployment back up and the controller forces it to zero again on the
+next reconcile. Delete it before suspending.
 
 ### HPA cannot read the metric
 

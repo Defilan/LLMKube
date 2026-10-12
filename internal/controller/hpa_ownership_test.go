@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -124,6 +125,14 @@ func (c hpaGetFailingClient) Get(ctx context.Context, key client.ObjectKey, obj 
 	return c.Client.Get(ctx, key, obj, opts...)
 }
 
+// expectHPAManaged asserts AutoscalingReady=True/HPAManaged on the service.
+func expectHPAManaged(ctx context.Context, name string) {
+	cond := meta.FindStatusCondition(getHPAOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+	Expect(cond).NotTo(BeNil())
+	Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	Expect(cond.Reason).To(Equal(ReasonHPAManaged))
+}
+
 // getHPAOwnershipISVC reads the service status back after a reconcile.
 func getHPAOwnershipISVC(ctx context.Context, name string) *inferencev1alpha1.InferenceService {
 	isvc := &inferencev1alpha1.InferenceService{}
@@ -141,12 +150,16 @@ var _ = Describe("InferenceService HPA ownership", func() {
 				&inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(2), MaxReplicas: 8}, false)
 			defer cleanupHPAOwnershipFixture(ctx, name)
 
+			recorder := events.NewFakeRecorder(20)
+			r.Recorder = recorder
+
 			foreign := foreignHPA(name)
 			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 
 			result, err := reconcileHPAOwnershipFixture(ctx, r, name)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+			Expect(drainEvents(recorder)).To(ConsistOf(HavePrefix("Warning " + ReasonHPANameTaken)))
 
 			got := &autoscalingv2.HorizontalPodAutoscaler{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
@@ -167,6 +180,12 @@ var _ = Describe("InferenceService HPA ownership", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, dep)).To(Succeed())
 			svc := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, svc)).To(Succeed())
+
+			// One Warning per episode: a requeue that finds the same
+			// collision updates nothing and emits nothing.
+			_, err = reconcileHPAOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(drainEvents(recorder)).To(BeEmpty())
 		})
 
 		It("refuses to delete it when autoscaling is cleared", func() {
@@ -277,7 +296,7 @@ var _ = Describe("InferenceService HPA ownership", func() {
 			Expect(hpa.Spec.MaxReplicas).To(Equal(int32(8)))
 			Expect(hpa.OwnerReferences).To(HaveLen(1))
 			Expect(*hpa.OwnerReferences[0].Controller).To(BeTrue())
-			Expect(meta.FindStatusCondition(getHPAOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)).To(BeNil())
+			expectHPAManaged(ctx, name)
 
 			isvc := getHPAOwnershipISVC(ctx, name)
 			isvc.Spec.Autoscaling.MaxReplicas = 12
@@ -288,7 +307,7 @@ var _ = Describe("InferenceService HPA ownership", func() {
 			hpa = &autoscalingv2.HorizontalPodAutoscaler{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, hpa)).To(Succeed())
 			Expect(hpa.Spec.MaxReplicas).To(Equal(int32(12)))
-			Expect(meta.FindStatusCondition(getHPAOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)).To(BeNil())
+			expectHPAManaged(ctx, name)
 
 			isvc = getHPAOwnershipISVC(ctx, name)
 			isvc.Spec.Autoscaling = nil
@@ -321,6 +340,27 @@ var _ = Describe("InferenceService HPA ownership", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, hpa)).To(Succeed())
 			Expect(hpa.Spec.MaxReplicas).To(Equal(int32(8)))
 			Expect(hpa.OwnerReferences).To(HaveLen(1))
+			expectHPAManaged(ctx, name)
+		})
+
+		It("drops the condition when the service is suspended", func() {
+			name := "hpa-own-suspend"
+			r := setupHPAOwnershipFixture(ctx, name,
+				&inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(2), MaxReplicas: 8}, false)
+			defer cleanupHPAOwnershipFixture(ctx, name)
+
+			_, err := reconcileHPAOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			expectHPAManaged(ctx, name)
+
+			isvc := getHPAOwnershipISVC(ctx, name)
+			isvc.Spec.Suspend = true
+			Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+			_, err = reconcileHPAOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			err = k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, &autoscalingv2.HorizontalPodAutoscaler{})
+			Expect(err).To(HaveOccurred())
 			Expect(meta.FindStatusCondition(getHPAOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)).To(BeNil())
 		})
 	})
