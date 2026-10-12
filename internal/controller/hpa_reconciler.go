@@ -143,7 +143,11 @@ func (r *InferenceServiceReconciler) reconcileHPA(
 	// above zero on its own reconcile loop.
 	if isvc.Spec.Autoscaling == nil || isvc.Spec.Suspend {
 		existingHPA := &autoscalingv2.HorizontalPodAutoscaler{}
-		if err := r.Get(ctx, hpaName, existingHPA); err == nil {
+		err := r.Get(ctx, hpaName, existingHPA)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return 0, err
+		}
+		if err == nil {
 			if err := ensureHPAOwned(isvc, existingHPA); err != nil {
 				setHPANameTakenCondition(isvc, err)
 				logger.Info("Refusing to delete an HPA this InferenceService does not control",
