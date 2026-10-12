@@ -15,6 +15,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -49,7 +50,8 @@ func proxyObjectChecks(mrName string) []struct {
 }
 
 // getProxyObject fetches one router-proxy object by kind name for the
-// existence assertions, failing the test on anything but NotFound.
+// existence assertions. It returns the Get error untouched; the callers
+// assert on it, requiring exactly NotFound where absence is expected.
 func getProxyObject(t *testing.T, c client.Client, ns, kind, name string) error {
 	t.Helper()
 	var obj client.Object
@@ -87,6 +89,10 @@ func assertProxyObjectsGone(t *testing.T, c client.Client, ns, mrName string) {
 		err := getProxyObject(t, c, ns, check.kind, check.name)
 		if err == nil {
 			t.Errorf("router-proxy %s %s/%s still exists after leaving Proxy mode", check.kind, ns, check.name)
+		} else if !apierrors.IsNotFound(err) {
+			// Absence must be proven by NotFound: a forbidden or timed-out
+			// Get proves nothing and must fail the test, not pass it.
+			t.Errorf("expected NotFound for router-proxy %s %s/%s, got %v", check.kind, ns, check.name, err)
 		}
 	}
 }
@@ -318,14 +324,20 @@ func TestModelRouterProxySwitchDoesNotTouchForeignObjects(t *testing.T) {
 
 	cm := &corev1.ConfigMap{}
 	if err := c.Get(context.Background(), types.NamespacedName{Name: proxyName, Namespace: ns}, cm); err != nil {
-		t.Fatalf("foreign ConfigMap %s/%s was deleted by the sweep", ns, proxyName)
+		if apierrors.IsNotFound(err) {
+			t.Fatalf("foreign ConfigMap %s/%s was deleted by the sweep", ns, proxyName)
+		}
+		t.Fatalf("get foreign ConfigMap %s/%s: %v", ns, proxyName, err)
 	}
 	if cm.Data["config"] != "not-the-operators" || len(cm.OwnerReferences) != 0 {
 		t.Errorf("foreign ConfigMap was modified: data=%v ownerRefs=%v", cm.Data, cm.OwnerReferences)
 	}
 	deploy := &appsv1.Deployment{}
 	if err := c.Get(context.Background(), types.NamespacedName{Name: proxyName, Namespace: ns}, deploy); err != nil {
-		t.Fatalf("foreign Deployment %s/%s was deleted by the sweep", ns, proxyName)
+		if apierrors.IsNotFound(err) {
+			t.Fatalf("foreign Deployment %s/%s was deleted by the sweep", ns, proxyName)
+		}
+		t.Fatalf("get foreign Deployment %s/%s: %v", ns, proxyName, err)
 	}
 	if *deploy.Spec.Replicas != 1 || deploy.Spec.Template.Labels["app"] != "foreign" || len(deploy.OwnerReferences) != 0 {
 		t.Errorf("foreign Deployment was modified: replicas=%d labels=%v ownerRefs=%v",

@@ -186,8 +186,12 @@ func (r *ModelRouterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // Each object is fetched by its known name, never via a List: a non-Proxy
 // router pays a few cached Gets per reconcile in steady state, and a name
 // this router does not own resolves to NotFound or to someone else's object.
-// A same-name object this router does not control is left alone and never
-// adopted: deleting it would destroy another owner's workload, and adopting
+// The Gets go through the manager's shared cache, so on a cluster that never
+// provisioned a pooled Proxy router this sweep is what first starts the
+// informers for ServiceAccount, Role, and RoleBinding, the only cached reads
+// of those kinds in this controller. A same-name object this router does not
+// control is left alone and never adopted: deleting it would destroy another
+// owner's workload, and adopting
 // it would hand the operator objects it did not create.
 func (r *ModelRouterReconciler) removeRouterProxyObjects(
 	ctx context.Context,
