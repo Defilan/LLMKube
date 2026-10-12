@@ -157,6 +157,34 @@ func TestRemoteURL(t *testing.T) {
 	}
 }
 
+// TestRemoteURLGitConfigGlobalForwarding shows GIT_CONFIG_GLOBAL now
+// reaches the git subprocess: an insteadOf rule in the pointed-to
+// global config rewrites the URL git reports (#2013). Code that drops
+// the variable returns the verbatim https URL and fails here.
+func TestRemoteURLGitConfigGlobalForwarding(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "gitconfig-hostile")
+	rule := "[url \"git@github.com:\"]\n\tinsteadOf = https://github.com/\n"
+	if err := os.WriteFile(config, []byte(rule), 0o600); err != nil {
+		t.Fatalf("write hostile gitconfig: %v", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", config)
+
+	bare := initBareOrigin(t, dir)
+	seedOrigin(t, bare)
+	work := filepath.Join(dir, "work")
+	mustGit(t, "", "clone", bare, work)
+	mustGit(t, work, "remote", "add", "fork", "https://github.com/Defilan/LLMKube.git")
+
+	got, err := RemoteURL(context.Background(), work, "fork")
+	if err != nil {
+		t.Fatalf("RemoteURL(fork): %v", err)
+	}
+	if got != "git@github.com:Defilan/LLMKube.git" {
+		t.Errorf("RemoteURL(fork) = %q, want the insteadOf-rewritten URL (GIT_CONFIG_GLOBAL must reach git)", got)
+	}
+}
+
 // mustGitOut runs git and returns trimmed stdout, failing the test on error.
 func mustGitOut(t *testing.T, dir string, args ...string) string {
 	t.Helper()

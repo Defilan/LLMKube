@@ -70,9 +70,7 @@ func Clone(ctx context.Context, opts CloneOptions) error {
 		return fmt.Errorf("Clone: mkdir parent %q: %w", parent, err)
 	}
 
-	env := []string{
-		"HOME=" + envOr("HOME", "/tmp"),
-	}
+	env := baseEnv()
 	if opts.Auth != nil {
 		env = append(env, opts.Auth.Env()...)
 	}
