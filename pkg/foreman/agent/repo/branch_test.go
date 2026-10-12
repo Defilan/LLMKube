@@ -543,12 +543,26 @@ func TestBaseEnv(t *testing.T) {
 	t.Setenv("HOME", "/tmp/llmkube-baseenv-home")
 	t.Setenv("FOREMAN_TEST_SECRET", "do-not-forward")
 
+	// Failure messages name unexpected variables, never their values:
+	// printing the whole slice would dump the process environment into
+	// CI logs when the no-secrets invariant is broken.
+	unexpectedNames := func(got, want []string) []string {
+		var names []string
+		for _, e := range got {
+			if !slices.Contains(want, e) {
+				name, _, _ := strings.Cut(e, "=")
+				names = append(names, name)
+			}
+		}
+		return names
+	}
+
 	got := baseEnv()
 	sort.Strings(got)
 	want := []string{"HOME=/tmp/llmkube-baseenv-home"}
 	sort.Strings(want)
 	if !slices.Equal(got, want) {
-		t.Errorf("baseEnv() with no GIT_CONFIG_* set = %v, want %v", got, want)
+		t.Errorf("baseEnv() with no GIT_CONFIG_* set has unexpected variables %v, want %v", unexpectedNames(got, want), want)
 	}
 
 	t.Setenv("GIT_CONFIG_GLOBAL", "/cfg/global")
@@ -562,19 +576,23 @@ func TestBaseEnv(t *testing.T) {
 	}
 	sort.Strings(want)
 	if !slices.Equal(got, want) {
-		t.Errorf("baseEnv() with GIT_CONFIG_* set = %v, want %v", got, want)
+		t.Errorf("baseEnv() with GIT_CONFIG_* set has unexpected variables %v, want %v", unexpectedNames(got, want), want)
 	}
 
 	t.Setenv("GIT_CONFIG_SYSTEM", "")
 	got = baseEnv()
-	if slices.Contains(got, "GIT_CONFIG_SYSTEM=") {
-		t.Errorf("baseEnv() forwarded a set-but-empty GIT_CONFIG_SYSTEM: %v", got)
+	if names := unexpectedNames(got, want); len(names) > 0 {
+		t.Errorf("baseEnv() forwarded a set-but-empty GIT_CONFIG_SYSTEM: unexpected variables %v", names)
 	}
 
-	if slices.ContainsFunc(got, func(e string) bool { return strings.HasPrefix(e, "FOREMAN_TEST_SECRET=") }) {
-		t.Errorf("baseEnv() forwarded the sentinel secret: %v", got)
+	if secret := slices.IndexFunc(got, func(e string) bool {
+		return strings.HasPrefix(e, "FOREMAN_TEST_SECRET=")
+	}); secret >= 0 {
+		t.Errorf("baseEnv() forwarded the sentinel secret: %s", got[secret])
 	}
-	if slices.ContainsFunc(got, func(e string) bool { return strings.HasPrefix(e, "PATH=") }) {
-		t.Errorf("baseEnv() forwarded PATH; runGit owns that: %v", got)
+	if path := slices.IndexFunc(got, func(e string) bool {
+		return strings.HasPrefix(e, "PATH=")
+	}); path >= 0 {
+		t.Errorf("baseEnv() forwarded PATH; runGit owns that: %s", got[path])
 	}
 }
