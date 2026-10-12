@@ -364,3 +364,54 @@ func TestModelRouterProxyReturnsOnSwitchBack(t *testing.T) {
 	}
 	assertProxyObjectsExist(t, c, ns, mr.Name)
 }
+
+// TestModelRouterProxyRBACCoversDelete parses the generated ClusterRole and
+// pins get and delete on the six kinds the router-proxy sweep can delete.
+// The kind e2e never switches a router's data plane, so this is the only
+// RBAC guard for the delete path; envtest runs as cluster-admin and cannot
+// catch a missing marker on its own.
+func TestModelRouterProxyRBACCoversDelete(t *testing.T) {
+	data, err := os.ReadFile("../../config/rbac/role.yaml")
+	if err != nil {
+		t.Fatalf("read config/rbac/role.yaml: %v", err)
+	}
+	role := &rbacv1.ClusterRole{}
+	if err := yaml.Unmarshal(data, role); err != nil {
+		t.Fatalf("parse config/rbac/role.yaml: %v", err)
+	}
+
+	granted := map[string]map[string]bool{}
+	for _, rule := range role.Rules {
+		for _, group := range rule.APIGroups {
+			for _, res := range rule.Resources {
+				key := group + "/" + res
+				if granted[key] == nil {
+					granted[key] = map[string]bool{}
+				}
+				for _, v := range rule.Verbs {
+					granted[key][v] = true
+				}
+			}
+		}
+	}
+
+	required := []struct {
+		key   string
+		verbs []string
+	}{
+		{"apps/deployments", []string{"get", "delete"}},
+		{"/services", []string{"get", "delete"}},
+		{"/configmaps", []string{"get", "delete"}},
+		{"/serviceaccounts", []string{"get", "delete"}},
+		{"rbac.authorization.k8s.io/roles", []string{"get", "delete"}},
+		{"rbac.authorization.k8s.io/rolebindings", []string{"get", "delete"}},
+	}
+	for _, tc := range required {
+		for _, verb := range tc.verbs {
+			if !granted[tc.key][verb] {
+				t.Errorf("generated ClusterRole does not grant %q on %s; add or restore the "+
+					"+kubebuilder:rbac marker and re-run make manifests", verb, tc.key)
+			}
+		}
+	}
+}
