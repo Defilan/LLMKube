@@ -5,8 +5,12 @@
 # generates the pool, the Gateway-wide AgentgatewayPolicy, and the HTTPRoute),
 # and a ModelRouter in AgentGateway mode. This exercises inferencepools,
 # agentgatewaypolicies, and httproutes create/update plus gateways get under
-# the generated ClusterRole; deleting the fixtures with the operator still
-# running exercises the sweep's list and delete on all three generated kinds.
+# the generated ClusterRole. Deleting the fixtures with the operator still
+# running exercises owner-reference garbage collection of the three generated
+# kinds, not the sweep: a same-namespace router's objects carry owner
+# references, and the sweep's list/delete path exists for cross-namespace
+# policies, which this fixture set cannot reach because kubectl apply -n
+# cannot create the Gateway's namespace.
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:

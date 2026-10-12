@@ -173,7 +173,7 @@ type ModelRouterAgentGatewayReconciler struct {
 // +kubebuilder:rbac:groups=agentgateway.dev,resources=agentgatewaypolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile compiles the agentgateway resources for a ModelRouter in dataPlane:
 // AgentGateway mode, or no-ops cleanly when the router is in Proxy or Gateway

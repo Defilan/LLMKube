@@ -48,18 +48,26 @@ func TestModelRouterAgentGateway_RBACCoversClientVerbs(t *testing.T) {
 	// Delete policies, pools, and routes; the pre-flight name check Gets each
 	// generated object; status and finalizer writes update and patch the
 	// router; the Recorder emits events.
+	//
+	// The list/watch pins on inferenceservices and namespaces are not direct
+	// client calls: this reconciler Watches InferenceServices and reads the
+	// router's namespace through the manager's shared cache, whose informers
+	// List and Watch. Those verbs come from markers elsewhere in the package
+	// (the ClusterRole is the union), so the pin holds the union honest -
+	// envtest runs as cluster-admin and cannot catch the informer's List
+	// being forbidden; only make test-e2e-rbac exercises it live.
 	required := []struct {
 		key   string
 		verbs []string
 	}{
 		{"inference.llmkube.dev/modelrouters", []string{"get", "update", "patch"}},
 		{"inference.llmkube.dev/modelrouters/status", []string{"get", "patch"}},
-		{"inference.llmkube.dev/inferenceservices", []string{"get"}},
+		{"inference.llmkube.dev/inferenceservices", []string{"get", "list", "watch"}},
 		{"inference.networking.k8s.io/inferencepools", []string{"get", "list", "create", "update", "patch", "delete"}},
 		{"gateway.networking.k8s.io/httproutes", []string{"get", "list", "create", "update", "patch", "delete"}},
 		{"agentgateway.dev/agentgatewaypolicies", []string{"get", "list", "create", "update", "patch", "delete"}},
 		{"gateway.networking.k8s.io/gateways", []string{"get"}},
-		{"/namespaces", []string{"get"}},
+		{"/namespaces", []string{"get", "list", "watch"}},
 		{"/events", []string{"create", "patch"}},
 		{"events.k8s.io/events", []string{"create", "patch"}},
 	}
