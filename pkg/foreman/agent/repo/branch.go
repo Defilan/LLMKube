@@ -395,7 +395,17 @@ func RebaseUnresolved(ctx context.Context, workspace, baseSHA string) (bool, str
 
 // baseEnv is the minimal env for read/local-only git ops that do not
 // need GIT_ASKPASS (branch, status, log). HOME is carried through so
-// git can read ~/.gitconfig if present.
+// git can read ~/.gitconfig if present. Git's config-location variables
+// hold file paths and flags, not credentials, so they are forwarded
+// when set: a user or CI overrides git configuration the standard way
+// (#2013). Empty values are skipped because git has no defined behavior
+// for an empty filename; /dev/null is the documented way to skip a level.
 func baseEnv() []string {
-	return []string{"HOME=" + envOr("HOME", "/tmp")}
+	env := []string{"HOME=" + envOr("HOME", "/tmp")}
+	for _, name := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"} {
+		if value, ok := os.LookupEnv(name); ok && value != "" {
+			env = append(env, name+"="+value)
+		}
+	}
+	return env
 }
