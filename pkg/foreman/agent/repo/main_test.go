@@ -63,6 +63,10 @@ func TestMain(m *testing.M) {
 	mustEnv("GIT_CONFIG_GLOBAL", global)
 	mustEnv("GIT_CONFIG_SYSTEM", system)
 	mustEnv("GIT_CONFIG_NOSYSTEM", "1")
+	// GIT_CONFIG_COUNT injects config entries through the environment;
+	// baseEnv never forwards it, but the direct-exec test helpers
+	// (mustGit, seedOrigin) inherit the full process environment.
+	_ = os.Unsetenv("GIT_CONFIG_COUNT")
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -77,5 +81,8 @@ func TestGitEnvIsHermetic(t *testing.T) {
 	}
 	if nosystem := os.Getenv("GIT_CONFIG_NOSYSTEM"); nosystem != "1" {
 		t.Errorf("GIT_CONFIG_NOSYSTEM = %q, want \"1\" so /etc/gitconfig cannot leak in", nosystem)
+	}
+	if _, ok := os.LookupEnv("GIT_CONFIG_COUNT"); ok {
+		t.Errorf("GIT_CONFIG_COUNT must be unset so injected config entries cannot reach the direct-exec git helpers")
 	}
 }
