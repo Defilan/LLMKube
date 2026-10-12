@@ -11,6 +11,13 @@ You may obtain a copy of the License at
 package controller
 
 import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
@@ -82,4 +89,63 @@ func routerProxySelectorLabels(mr *inferencev1alpha1.ModelRouter) map[string]str
 		"app":                                routerProxyResourceName(mr.Name),
 		"inference.llmkube.dev/model-router": mr.Name,
 	}
+}
+
+// routerProxyNameTakenRequeueAfter is the bounded requeue for a name-taken
+// refusal. The refusal depends on cluster state outside the router's spec and
+// nothing watches the foreign object, so the requeue is the only way deleting
+// or renaming it takes effect without an unrelated event. Same cadence as the
+// AgentGateway plane's identical refusals (agentGatewayConflictRequeueAfter).
+const routerProxyNameTakenRequeueAfter = 2 * time.Minute
+
+// routerProxyNameTakenError reports a router-proxy object whose generated
+// name is held by an existing object this ModelRouter does not control.
+// Reconcile turns it into the RouterProxyNameTaken condition and a bounded
+// requeue instead of a reconcile error.
+type routerProxyNameTakenError struct {
+	kind, ns, name, owner string
+}
+
+func (e *routerProxyNameTakenError) Error() string {
+	if e.owner != "" {
+		return fmt.Sprintf("%s %s/%s is already controlled by another ModelRouter (uid %s); "+
+			"refusing to adopt or overwrite it; rename one of the routers", e.kind, e.ns, e.name, e.owner)
+	}
+	return fmt.Sprintf("%s %s/%s already exists and is not controlled by this ModelRouter; "+
+		"refusing to adopt or overwrite it (LLMKube did not create it); delete or rename the object, or the router",
+		e.kind, e.ns, e.name)
+}
+
+// ensureRouterProxyOwned is the single ownership gate every router-proxy
+// upsert calls before overwriting an existing object: write only what this
+// ModelRouter controls. An object with the generated name but no controller
+// reference, a foreign reference, or another ModelRouter's reference is
+// refused, never adopted, never overwritten, and never deleted (deletion is
+// the non-Proxy sweep's job, also controlled-only), so a router can neither
+// rewrite someone else's workload nor garbage-collect it.
+func ensureRouterProxyOwned(mr *inferencev1alpha1.ModelRouter, existing metav1.Object, kind string) error {
+	if metav1.IsControlledBy(existing, mr) {
+		return nil
+	}
+	taken := &routerProxyNameTakenError{kind: kind, ns: existing.GetNamespace(), name: existing.GetName()}
+	if ref := metav1.GetControllerOf(existing); ref != nil && ref.Kind == "ModelRouter" {
+		// The owner ref's APIVersion is "<group>/<version>" (or bare version
+		// for the core group); match the group so a same-Kind controller in
+		// another API group is not misreported as another ModelRouter.
+		if strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
+			taken.owner = string(ref.UID)
+		}
+	}
+	return taken
+}
+
+// routerProxyNameTaken extracts a typed refusal from err, or nil. Lives here
+// so callers that already import the apimachinery errors package do not need
+// the stdlib one.
+func routerProxyNameTaken(err error) *routerProxyNameTakenError {
+	var taken *routerProxyNameTakenError
+	if errors.As(err, &taken) {
+		return taken
+	}
+	return nil
 }

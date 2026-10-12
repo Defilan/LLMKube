@@ -1208,7 +1208,8 @@ func TestReconcileRouterDeploymentPreservesExternalAnnotations(t *testing.T) {
 	mr := canonicalModelRouter()
 
 	// Build the initial Deployment the way an earlier reconcile would
-	// have, then layer external metadata on top to simulate sidecar
+	// have (controller reference included, since every create path sets
+	// one), then layer external metadata on top to simulate sidecar
 	// injection / kubectl rollout-restart / GitOps annotations.
 	const gitopsInstance = "coding-router-fleet"
 	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
@@ -1219,6 +1220,9 @@ func TestReconcileRouterDeploymentPreservesExternalAnnotations(t *testing.T) {
 	initial.Labels["argocd.argoproj.io/instance"] = gitopsInstance
 
 	scheme := builderTestScheme(t)
+	if err := setControllerReferenceUnblocked(mr, initial, scheme); err != nil {
+		t.Fatalf("set controller reference on the seeded Deployment: %v", err)
+	}
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(mr, initial).

@@ -59,6 +59,9 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	case err != nil:
 		return err
 	}
+	if err := ensureRouterProxyOwned(mr, existing, "Deployment"); err != nil {
+		return err
+	}
 
 	// PodTemplate selector is immutable; copy mutable surface while
 	// preserving externally-set annotations and labels (sidecar

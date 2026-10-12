@@ -283,6 +283,15 @@ status:
 
 `phase` is the coarse summary; the conditions tell the full story.
 
+When the data plane cannot serve, `Available` flips to `False` with one of these reasons:
+
+| Reason | Meaning |
+| --- | --- |
+| `CompileFailed` | The routing spec did not compile into a proxy config. |
+| `ReconcileFailed` | Applying the ConfigMap, Deployment, Services, or activation RBAC to the API server failed. |
+| `RouterProxyNameTaken` | An object LLMKube did not create already holds a generated router-proxy name (the ConfigMap, Deployment, Services, ServiceAccount, Role, or RoleBinding named after the router). The operator refuses to adopt or overwrite it; delete or rename the foreign object, or the router, and the reconcile recovers on its next pass, rechecked about every 2 minutes. |
+| `DeploymentNotReady` | The proxy Deployment exists but its pods are not Ready yet. |
+
 ## Next steps
 
 - Read the [CRD reference](/docs/concepts/crds) for the full spec.
