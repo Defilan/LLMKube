@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -124,12 +125,17 @@ func (r *ModelRouterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, r.recordValidationFailure(ctx, mr, valErrors)
 	}
 
-	// dataPlane: Gateway is owned by ModelRouterGatewayReconciler, which compiles
-	// the router onto a pre-installed Envoy AI Gateway. In that mode the
-	// router-proxy is NOT provisioned, so skip the ConfigMap/Deployment/Service
-	// path here. Default (Proxy) mode is unchanged. This is the only touch to
-	// existing behavior and is back-compat since the default is Proxy.
-	if mr.Spec.DataPlane == inferencev1alpha1.ModelRouterDataPlaneGateway {
+	// Every mode except Proxy (empty means Proxy; the CRD defaults it) is
+	// compiled onto a gateway data plane by a sibling reconciler, so the
+	// router-proxy is not part of those modes. A router that previously ran
+	// in Proxy mode leaves its router-proxy objects behind as orphans of the
+	// switch: remove the ones this router controls, then return without
+	// provisioning and without writing Proxy-mode status - status in these
+	// modes belongs to the Gateway and AgentGateway reconcilers.
+	if mr.Spec.DataPlane != inferencev1alpha1.ModelRouterDataPlaneProxy {
+		if err := r.removeRouterProxyObjects(ctx, mr); err != nil {
+			return ctrl.Result{}, err
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -166,6 +172,75 @@ func (r *ModelRouterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: modelRouterBudgetPollInterval}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// removeRouterProxyObjects deletes the router-proxy objects this ModelRouter
+// controls, for a router that is not in Proxy mode. The proxy path creates
+// seven objects across six kinds, all named routerProxyResourceName(mr.Name)
+// in the router's namespace except the admin Service, which appends "-admin":
+// the ConfigMap (router_config_builder.go), the Deployment
+// (router_deployment_builder.go), the two Services
+// (router_service_builder.go), and the ServiceAccount, Role, and RoleBinding
+// (router_activation_rbac.go, only when the router had pools).
+//
+// Each object is fetched by its known name, never via a List: a non-Proxy
+// router pays a few cached Gets per reconcile in steady state, and a name
+// this router does not own resolves to NotFound or to someone else's object.
+// A same-name object this router does not control is left alone and never
+// adopted: deleting it would destroy another owner's workload, and adopting
+// it would hand the operator objects it did not create.
+func (r *ModelRouterReconciler) removeRouterProxyObjects(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+) error {
+	name := routerProxyResourceName(mr.Name)
+	if err := r.deleteIfControlled(ctx, mr, name, &corev1.ConfigMap{}, "ConfigMap"); err != nil {
+		return err
+	}
+	if err := r.deleteIfControlled(ctx, mr, name, &appsv1.Deployment{}, "Deployment"); err != nil {
+		return err
+	}
+	if err := r.deleteIfControlled(ctx, mr, name, &corev1.Service{}, "Service"); err != nil {
+		return err
+	}
+	if err := r.deleteIfControlled(ctx, mr, routerProxyAdminResourceName(mr.Name), &corev1.Service{}, "admin Service"); err != nil {
+		return err
+	}
+	if err := r.deleteIfControlled(ctx, mr, name, &corev1.ServiceAccount{}, "ServiceAccount"); err != nil {
+		return err
+	}
+	if err := r.deleteIfControlled(ctx, mr, name, &rbacv1.Role{}, "Role"); err != nil {
+		return err
+	}
+	return r.deleteIfControlled(ctx, mr, name, &rbacv1.RoleBinding{}, "RoleBinding")
+}
+
+// deleteIfControlled fetches one candidate object by name and deletes it only
+// when the ModelRouter is its managing controller. NotFound on the Get or on
+// the Delete is success: the steady state for a router that was never in
+// Proxy mode is a run of NotFound Gets, and a concurrent reconcile may delete
+// the object between this reconcile's Get and Delete.
+func (r *ModelRouterReconciler) deleteIfControlled(
+	ctx context.Context,
+	mr *inferencev1alpha1.ModelRouter,
+	name string,
+	obj client.Object,
+	kind string,
+) error {
+	key := types.NamespacedName{Name: name, Namespace: mr.Namespace}
+	if err := r.Get(ctx, key, obj); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get router-proxy %s: %w", kind, err)
+	}
+	if !metav1.IsControlledBy(obj, mr) {
+		return nil
+	}
+	if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("delete router-proxy %s: %w", kind, err)
+	}
+	return nil
 }
 
 // recordValidationFailure writes the validated=false branch of the
