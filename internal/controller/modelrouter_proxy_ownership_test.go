@@ -108,12 +108,7 @@ func foreignProxyFixtures() []foreignProxyFixture {
 			kind:    "ConfigMap",
 			msgKind: "ConfigMap",
 			absent:  []string{"Deployment", "Service", "admin Service", "ServiceAccount", "Role", "RoleBinding"},
-			build: func(name string) client.Object {
-				return &corev1.ConfigMap{
-					ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"foreign": "true"}},
-					Data:       map[string]string{routerProxyConfigKey: "foreign-data"},
-				}
-			},
+			build:   foreignConfigMap,
 			verify: func(t *testing.T, c client.Client, ns, name string) {
 				cm := &corev1.ConfigMap{}
 				if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, cm); err != nil {
@@ -218,6 +213,15 @@ func foreignProxyFixtures() []foreignProxyFixture {
 			build:   foreignService,
 			verify:  verifyForeignService,
 		},
+	}
+}
+
+// foreignConfigMap builds a foreign ConfigMap holding the generated name
+// with data the proxy path would overwrite.
+func foreignConfigMap(name string) client.Object {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{"foreign": "true"}},
+		Data:       map[string]string{routerProxyConfigKey: "foreign-data"},
 	}
 }
 
@@ -373,6 +377,152 @@ func TestModelRouterProxyRefusesForeignObject(t *testing.T) {
 				t.Errorf("RouterProxyNameTaken survives recovery: %s", cond.Message)
 			}
 		})
+	}
+}
+
+// TestEnsureRouterProxyOwnedOwnerMessage pins the refusal message branches:
+// a controller reference from another ModelRouter is named as the foreign
+// owner, while a same-Kind controller from a different API group is not
+// misreported as a ModelRouter.
+func TestEnsureRouterProxyOwnedOwnerMessage(t *testing.T) {
+	testScheme := builderTestScheme(t)
+	mr := &inferencev1alpha1.ModelRouter{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: "ns", UID: "uid-1"}}
+
+	other := &inferencev1alpha1.ModelRouter{ObjectMeta: metav1.ObjectMeta{Name: "r2", UID: "uid-2"}}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm", Namespace: "ns"}}
+	if err := setControllerReferenceUnblocked(other, cm, testScheme); err != nil {
+		t.Fatalf("set the other router's controller reference: %v", err)
+	}
+	err := ensureRouterProxyOwned(mr, cm, "ConfigMap")
+	if err == nil {
+		t.Fatal("ensureRouterProxyOwned returned nil, want a name-taken refusal")
+	}
+	if !strings.Contains(err.Error(), "another ModelRouter") || !strings.Contains(err.Error(), "uid-2") {
+		t.Errorf("refusal message %q does not name the foreign ModelRouter owner (uid-2)", err)
+	}
+
+	impostor := true
+	foreign := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm", Namespace: "ns",
+		OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "other.example.com/v1", Kind: "ModelRouter",
+			Name: "impostor", UID: "uid-9", Controller: &impostor,
+		}}}}
+	err = ensureRouterProxyOwned(mr, foreign, "ConfigMap")
+	if err == nil {
+		t.Fatal("ensureRouterProxyOwned returned nil, want a name-taken refusal")
+	}
+	if strings.Contains(err.Error(), "another ModelRouter") {
+		t.Errorf("same-Kind controller from another API group misreported as a ModelRouter: %s", err)
+	}
+}
+
+// TestModelRouterProxyRefusesSquattedNameAfterProvisioning pins the drift
+// case the per-object table cannot reach: the router provisioned its full
+// surface, then one generated name is squatted underneath the running proxy.
+// The refusal stops the sequence, the router's own objects keep running and
+// stay owned by the router (a refusal is a stop, not a rollback), and
+// recovery restores the squatted object once the squatter is gone.
+func TestModelRouterProxyRefusesSquattedNameAfterProvisioning(t *testing.T) {
+	c, _, stop := startBudgetTestEnv(t)
+	defer stop()
+	ns := newTestNamespace(t, c)
+	r := &ModelRouterReconciler{Client: c, Scheme: scheme.Scheme, RouterProxyImage: "test-image"}
+
+	makePooledBackend(t, c, ns, "drift-cuda", "drift-pool")
+	mr := pooledProxyRouter(ns, "drift-router", "drift-cuda", inferencev1alpha1.ModelRouterDataPlaneProxy)
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+	}); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	assertProxyObjectsExist(t, c, ns, mr.Name)
+
+	// Squat the ConfigMap name the way an operator hit would: delete ours,
+	// create someone else's under the same name.
+	base := routerProxyResourceName(mr.Name)
+	ours := &corev1.ConfigMap{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: base, Namespace: ns}, ours); err != nil {
+		t.Fatalf("get our ConfigMap: %v", err)
+	}
+	if err := c.Delete(context.Background(), ours); err != nil {
+		t.Fatalf("delete our ConfigMap: %v", err)
+	}
+	foreign := foreignConfigMap(base)
+	foreign.SetNamespace(ns)
+	if err := c.Create(context.Background(), foreign); err != nil {
+		t.Fatalf("create squatter ConfigMap: %v", err)
+	}
+
+	result, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+	})
+	if err != nil {
+		t.Fatalf("reconcile with squatted ConfigMap: %v (a refusal is not an error)", err)
+	}
+	if result.RequeueAfter != routerProxyNameTakenRequeueAfter {
+		t.Errorf("RequeueAfter = %v, want %v (bounded requeue on the refusal)",
+			result.RequeueAfter, routerProxyNameTakenRequeueAfter)
+	}
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := findCondition(fresh.Status.Conditions, ConditionAvailable)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ModelRouterReasonRouterProxyNameTaken {
+		t.Errorf("Available condition = %+v, want False/%s", cond, ModelRouterReasonRouterProxyNameTaken)
+	} else if !strings.Contains(cond.Message, base) {
+		t.Errorf("refusal message %q does not name the squatted ConfigMap", cond.Message)
+	}
+
+	// Stop, not rollback: the Deployment keeps running and stays ours, and
+	// the rest of the surface is untouched.
+	deploy := &appsv1.Deployment{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: base, Namespace: ns}, deploy); err != nil {
+		t.Fatalf("the squatted-name refusal must not tear down the running Deployment: %v", err)
+	}
+	refs := deploy.OwnerReferences
+	if len(refs) != 1 || refs[0].UID != fresh.UID {
+		t.Errorf("Deployment owner refs = %v, want exactly this router's controller ref", refs)
+	}
+	for _, kind := range []string{"Service", "admin Service", "ServiceAccount", "Role", "RoleBinding"} {
+		obj := getTypedProxyObject(t, c, ns, kind, proxyFixtureName(kind, base))
+		refs := obj.GetOwnerReferences()
+		if len(refs) != 1 || refs[0].UID != fresh.UID {
+			t.Errorf("router-proxy %s owner refs = %v, want exactly this router's controller ref", kind, refs)
+		}
+	}
+	for _, f := range foreignProxyFixtures() {
+		if f.kind != "ConfigMap" {
+			continue
+		}
+		f.verify(t, c, ns, base)
+	}
+
+	// Recovery: once the squatter is gone, the ConfigMap is ours again.
+	if err := c.Delete(context.Background(), foreign); err != nil {
+		t.Fatalf("delete squatter ConfigMap: %v", err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+	}); err != nil {
+		t.Fatalf("reconcile after removing the squatter: %v", err)
+	}
+	assertProxyObjectsExist(t, c, ns, mr.Name)
+	cm := getTypedProxyObject(t, c, ns, "ConfigMap", base)
+	refs = cm.GetOwnerReferences()
+	if len(refs) != 1 || refs[0].UID != fresh.UID {
+		t.Errorf("restored ConfigMap owner refs = %v, want exactly this router's controller ref", refs)
+	}
+	fresh = &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter after recovery: %v", err)
+	}
+	if cond := findCondition(fresh.Status.Conditions, ConditionAvailable); cond != nil && cond.Reason == ModelRouterReasonRouterProxyNameTaken {
+		t.Errorf("RouterProxyNameTaken survives recovery: %s", cond.Message)
 	}
 }
 
