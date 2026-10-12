@@ -290,7 +290,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	if err := r.reconcileHPA(ctx, inferenceService, inferenceService.Name, isMetal); err != nil {
+	// A name-taken refusal is soft on purpose: the HPA is optional, the
+	// AutoscalingReady condition is persisted by the status write below, and
+	// the refusal's requeue is merged into the final result at the end. A
+	// real error still aborts the reconcile.
+	hpaRequeue, err := r.reconcileHPA(ctx, inferenceService, inferenceService.Name, isMetal)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -340,6 +345,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return finalResult, err
 	}
 	finalResult.RequeueAfter = earliestPositive(finalResult.RequeueAfter, lifetimeRequeue)
+	finalResult.RequeueAfter = earliestPositive(finalResult.RequeueAfter, hpaRequeue)
 	// A Ready multiNode group with a failure count comes back once it has
 	// stayed Ready long enough for the count to be forgotten (#1856).
 	finalResult.RequeueAfter = earliestPositive(finalResult.RequeueAfter, multiNodeRecreateResetRequeue(inferenceService, time.Now()))

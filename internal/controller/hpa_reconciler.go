@@ -19,10 +19,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -31,18 +34,103 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
+// hpaNameTakenRequeueAfter is the bounded requeue for a name-taken refusal.
+// The refusal depends on cluster state outside the service's spec and nothing
+// watches the foreign HPA, so the requeue is the only way deleting or
+// renaming it takes effect without an unrelated event. Same cadence as the
+// router-proxy and AgentGateway planes' identical refusals
+// (routerProxyNameTakenRequeueAfter, agentGatewayConflictRequeueAfter).
+const hpaNameTakenRequeueAfter = 2 * time.Minute
+
+const (
+	// ConditionAutoscalingReady reports whether the reconciler may manage
+	// the HPA named after the service. Diagnostic only: it never feeds phase
+	// or the Available condition. Present only while a foreign same-name HPA
+	// blocks the reconciler; removed once the collision is gone.
+	ConditionAutoscalingReady = "AutoscalingReady"
+
+	// ReasonHPANameTaken is set when AutoscalingReady=False because an HPA
+	// this InferenceService did not create already holds the generated name,
+	// so the reconciler refuses to overwrite or delete it.
+	ReasonHPANameTaken = "HPANameTaken"
+)
+
+// hpaNameTakenError reports an HPA whose generated name is held by an
+// existing object this InferenceService does not control. reconcileHPA turns
+// it into the AutoscalingReady condition and a bounded requeue instead of a
+// reconcile error.
+type hpaNameTakenError struct {
+	ns, name, owner string
+}
+
+func (e *hpaNameTakenError) Error() string {
+	if e.owner != "" {
+		return fmt.Sprintf("HorizontalPodAutoscaler %s/%s is already controlled by another InferenceService (uid %s); "+
+			"refusing to overwrite or delete it; rename one of the services", e.ns, e.name, e.owner)
+	}
+	return fmt.Sprintf("HorizontalPodAutoscaler %s/%s already exists and is not controlled by this InferenceService; "+
+		"refusing to overwrite or delete it (LLMKube did not create it); delete or rename the object, or the service",
+		e.ns, e.name)
+}
+
+// ensureHPAOwned is the ownership gate for every HPA write and delete: write
+// only what this InferenceService controls. An HPA with the generated name
+// but no controller reference, a foreign reference, or another
+// InferenceService's reference is refused, never adopted, never overwritten,
+// and never deleted.
+func ensureHPAOwned(isvc *inferencev1alpha1.InferenceService, existing *autoscalingv2.HorizontalPodAutoscaler) error {
+	if metav1.IsControlledBy(existing, isvc) {
+		return nil
+	}
+	taken := &hpaNameTakenError{ns: existing.GetNamespace(), name: existing.GetName()}
+	if ref := metav1.GetControllerOf(existing); ref != nil && ref.Kind == "InferenceService" {
+		// The owner ref's APIVersion is "<group>/<version>" (or bare version
+		// for the core group); match the group so a same-Kind controller in
+		// another API group is not misreported as another InferenceService.
+		if strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
+			taken.owner = string(ref.UID)
+		}
+	}
+	return taken
+}
+
+// setHPANameTakenCondition reports a foreign same-name HPA on the service
+// status; the main status write later in the reconcile persists it.
+func setHPANameTakenCondition(isvc *inferencev1alpha1.InferenceService, err error) {
+	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
+		Type:               ConditionAutoscalingReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: isvc.Generation,
+		LastTransitionTime: metav1.Now(),
+		Reason:             ReasonHPANameTaken,
+		Message:            err.Error(),
+	})
+}
+
+// removeHPANameTakenCondition clears the refusal once no foreign same-name
+// HPA blocks the reconciler; the CA-cert condition from #1995 uses the same
+// removal semantics when the state it reports is gone.
+func removeHPANameTakenCondition(isvc *inferencev1alpha1.InferenceService) {
+	meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionAutoscalingReady)
+}
+
 // HorizontalPodAutoscaler lifecycle. Runs as part of the main reconcile when
 // spec.autoscaling is set; removes the HPA when it is cleared. Metal
 // accelerator workloads skip HPA entirely since they run outside a Deployment.
 // Metric selection falls through to the configured runtime's DefaultHPAMetric
 // when the CRD does not supply an explicit metrics list.
 
+// reconcileHPA manages the HPA named after the service. A foreign same-name
+// HPA is reported through the AutoscalingReady condition instead of an
+// error: the HPA is optional, so a refusal must not abort the rest of the
+// reconcile. The returned duration is the bounded requeue for a refusal, 0
+// otherwise.
 func (r *InferenceServiceReconciler) reconcileHPA(
 	ctx context.Context,
 	isvc *inferencev1alpha1.InferenceService,
 	deploymentName string,
 	isMetal bool,
-) error {
+) (time.Duration, error) {
 	logger := logf.FromContext(ctx)
 	hpaName := types.NamespacedName{
 		Name:      isvc.Name,
@@ -56,6 +144,12 @@ func (r *InferenceServiceReconciler) reconcileHPA(
 	if isvc.Spec.Autoscaling == nil || isvc.Spec.Suspend {
 		existingHPA := &autoscalingv2.HorizontalPodAutoscaler{}
 		if err := r.Get(ctx, hpaName, existingHPA); err == nil {
+			if err := ensureHPAOwned(isvc, existingHPA); err != nil {
+				setHPANameTakenCondition(isvc, err)
+				logger.Info("Refusing to delete an HPA this InferenceService does not control",
+					"error", err)
+				return hpaNameTakenRequeueAfter, nil
+			}
 			reason := "Autoscaling removed"
 			if isvc.Spec.Suspend {
 				reason = "InferenceService suspended"
@@ -63,16 +157,18 @@ func (r *InferenceServiceReconciler) reconcileHPA(
 			logger.Info(reason+", deleting HPA",
 				"name", isvc.Name)
 			if err := r.Delete(ctx, existingHPA); err != nil {
-				return fmt.Errorf("failed to delete HPA: %w", err)
+				return 0, fmt.Errorf("failed to delete HPA: %w", err)
 			}
 		}
-		return nil
+		removeHPANameTakenCondition(isvc)
+		return 0, nil
 	}
 
 	// Skip HPA for Metal accelerator (no Deployment to scale)
 	if isMetal {
 		logger.Info("Skipping HPA for Metal accelerator workload")
-		return nil
+		removeHPANameTakenCondition(isvc)
+		return 0, nil
 	}
 
 	hpa := r.constructHPA(isvc, deploymentName)
@@ -80,7 +176,7 @@ func (r *InferenceServiceReconciler) reconcileHPA(
 	if err := setControllerReferenceUnblocked(
 		isvc, hpa, r.Scheme,
 	); err != nil {
-		return fmt.Errorf(
+		return 0, fmt.Errorf(
 			"failed to set controller reference on HPA: %w", err,
 		)
 	}
@@ -91,14 +187,29 @@ func (r *InferenceServiceReconciler) reconcileHPA(
 			logger.Info("Creating HPA",
 				"name", isvc.Name,
 				"maxReplicas", isvc.Spec.Autoscaling.MaxReplicas)
-			return r.Create(ctx, hpa)
+			if err := r.Create(ctx, hpa); err != nil {
+				return 0, err
+			}
+			removeHPANameTakenCondition(isvc)
+			return 0, nil
 		}
-		return err
+		return 0, err
+	}
+
+	if err := ensureHPAOwned(isvc, existingHPA); err != nil {
+		setHPANameTakenCondition(isvc, err)
+		logger.Info("Refusing to update an HPA this InferenceService does not control",
+			"error", err)
+		return hpaNameTakenRequeueAfter, nil
 	}
 
 	// Update existing HPA
 	existingHPA.Spec = hpa.Spec
-	return r.Update(ctx, existingHPA)
+	if err := r.Update(ctx, existingHPA); err != nil {
+		return 0, err
+	}
+	removeHPANameTakenCondition(isvc)
+	return 0, nil
 }
 
 func (r *InferenceServiceReconciler) constructHPA(
