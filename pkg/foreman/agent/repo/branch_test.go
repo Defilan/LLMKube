@@ -22,6 +22,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -515,5 +517,64 @@ func TestRebaseUnresolved_GenuineResolvePasses(t *testing.T) {
 	unresolved, why := RebaseUnresolved(context.Background(), workspace, rce.BaseSHA)
 	if unresolved {
 		t.Errorf("a genuine completed rebase must not be unresolved; got true (%s)", why)
+	}
+}
+
+// TestBaseEnv pins the subprocess environment contract: HOME only by
+// default, git's config-location variables forwarded when set, nothing
+// else (no secrets, no PATH; runGit owns PATH), and set-but-empty
+// values skipped because git has no defined behavior for an empty
+// filename (#2013).
+func TestBaseEnv(t *testing.T) {
+	// Control all three variables regardless of the ambient environment,
+	// and restore TestMain's values afterwards so later tests stay
+	// hermetic.
+	for _, name := range []string{"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"} {
+		value, had := os.LookupEnv(name)
+		t.Cleanup(func() {
+			if had {
+				_ = os.Setenv(name, value)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+		_ = os.Unsetenv(name)
+	}
+	t.Setenv("HOME", "/tmp/llmkube-baseenv-home")
+	t.Setenv("FOREMAN_TEST_SECRET", "do-not-forward")
+
+	got := baseEnv()
+	sort.Strings(got)
+	want := []string{"HOME=/tmp/llmkube-baseenv-home"}
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("baseEnv() with no GIT_CONFIG_* set = %v, want %v", got, want)
+	}
+
+	t.Setenv("GIT_CONFIG_GLOBAL", "/cfg/global")
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	got = baseEnv()
+	sort.Strings(got)
+	want = []string{
+		"HOME=/tmp/llmkube-baseenv-home",
+		"GIT_CONFIG_GLOBAL=/cfg/global",
+		"GIT_CONFIG_NOSYSTEM=1",
+	}
+	sort.Strings(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("baseEnv() with GIT_CONFIG_* set = %v, want %v", got, want)
+	}
+
+	t.Setenv("GIT_CONFIG_SYSTEM", "")
+	got = baseEnv()
+	if slices.Contains(got, "GIT_CONFIG_SYSTEM=") {
+		t.Errorf("baseEnv() forwarded a set-but-empty GIT_CONFIG_SYSTEM: %v", got)
+	}
+
+	if slices.ContainsFunc(got, func(e string) bool { return strings.HasPrefix(e, "FOREMAN_TEST_SECRET=") }) {
+		t.Errorf("baseEnv() forwarded the sentinel secret: %v", got)
+	}
+	if slices.ContainsFunc(got, func(e string) bool { return strings.HasPrefix(e, "PATH=") }) {
+		t.Errorf("baseEnv() forwarded PATH; runGit owns that: %v", got)
 	}
 }
