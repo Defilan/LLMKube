@@ -79,6 +79,18 @@ rules:
   - create
   - patch
 - apiGroups:
+  - agentgateway.dev
+  resources:
+  - agentgatewaypolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - aigateway.envoyproxy.io
   resources:
   - aigatewayroutes
@@ -220,6 +232,24 @@ rules:
   - update
   - watch
 - apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gateways
+  verbs:
+  - get
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - grafana.integreatly.org
   resources:
   - grafanadashboards
@@ -280,7 +310,6 @@ rules:
 - apiGroups:
   - inference.networking.k8s.io
   resources:
-  - inferencemodels
   - inferencepools
   verbs:
   - create

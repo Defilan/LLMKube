@@ -19,6 +19,7 @@ on:
       - 'config/rbac/**'
       - 'internal/controller/**'
       - 'hack/kind-e2e-rbac.sh'
+      - 'test/crd/inference-extension/**'
       - 'test/e2e-rbac/**'
       - 'Makefile'
       - 'go.mod'
@@ -32,6 +33,7 @@ on:
       - 'config/rbac/**'
       - 'internal/controller/**'
       - 'hack/kind-e2e-rbac.sh'
+      - 'test/crd/inference-extension/**'
       - 'test/e2e-rbac/**'
       - 'Makefile'
       - 'go.mod'
@@ -49,6 +51,8 @@ jobs:
     env:
       RBAC_E2E_DELETE_CLUSTER: "true"
       RBAC_E2E_WATCH_SECONDS: "120"
+      RBAC_E2E_GATEWAY_API: "true"
+      RBAC_E2E_EXTRA_CRD_DIRS: test/e2e-rbac/crds
     steps:
       - name: Clone the code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

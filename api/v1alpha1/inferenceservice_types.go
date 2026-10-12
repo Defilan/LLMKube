@@ -1669,7 +1669,8 @@ type GatewayStatus struct {
 
 // AgentGatewayStatus reports the observed state of dataPlane: AgentGateway
 // exposure for a ModelRouter. It mirrors GatewayStatus for the agentgateway
-// data plane: whether the InferencePool / InferenceModel / HTTPRoute reconciled
+// data plane: whether the InferencePool / HTTPRoute / model-extraction
+// AgentgatewayPolicy reconciled
 // against the referenced agentgateway Gateway.
 type AgentGatewayStatus struct {
 	// PoolReady indicates the generated InferencePool(s) reconciled against the

@@ -116,12 +116,33 @@ type ModelRouterSpec struct {
 	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
 
 	// AgentGatewayRef identifies the pre-installed agentgateway data plane the
-	// generated InferencePool/InferenceModel/HTTPRoute attach to when DataPlane
-	// is "AgentGateway". Required in AgentGateway mode; ignored otherwise. The
-	// Gateway, the Gateway API Inference Extension CRDs, and an Endpoint Picker
-	// (EPP) service are documented prerequisites; LLMKube does not install or own
-	// them. The EndpointPicker is referenced by every generated InferencePool so
-	// agentgateway can select a model-server endpoint per request.
+	// generated InferencePool/HTTPRoute/model-extraction AgentgatewayPolicy
+	// attach to when DataPlane is "AgentGateway". Required in AgentGateway mode;
+	// ignored otherwise. The Gateway, the Gateway API Inference Extension CRDs
+	// (InferencePool at inference.networking.k8s.io/v1), the agentgateway.dev
+	// CRDs, and an Endpoint Picker (EPP) service are documented prerequisites;
+	// LLMKube does not install or own them. The agentgateway controller must run
+	// with Inference-Pool backendRef support (inferenceExtension.enabled=true in
+	// the agentgateway chart). The EndpointPicker is referenced by every
+	// generated InferencePool so agentgateway can select a model-server endpoint
+	// per request. The Gateway may be in another namespace: the generated
+	// AgentgatewayPolicy then lives in the Gateway's namespace (its targetRefs
+	// are same-namespace), is not owner-referenced, and is cleaned up via a
+	// finalizer on this ModelRouter. Because that policy targets the whole
+	// Gateway, its body-model extraction runs on EVERY request through that
+	// Gateway, including routes LLMKube did not generate. The Gateway must not
+	// already carry another PreRouting transformation policy: the router is
+	// refused (ConflictingPreRoutingPolicy) rather than silently shadowed.
+	// agentgateway keeps the OLDEST same-specificity policy's transformation,
+	// so LLMKube does not retract its policy on conflict; the condition clears
+	// when the foreign policy is removed, and the reconciler rechecks every
+	// two minutes (a foreign policy created after the router went Ready is
+	// otherwise silently shadowed). agentgateway inspects at most 2 MiB of the
+	// request body by default (its DEFAULT_BUFFER_LIMIT); larger bodies (long
+	// contexts, images) are not routed on this path - the CEL extraction
+	// fails and the model header is removed. A Gateway owner can raise the
+	// limit with a frontend.http.maxBufferSize policy, a different field that
+	// does not conflict with the extraction policy.
 	// +optional
 	AgentGatewayRef *AgentGatewayReference `json:"agentGatewayRef,omitempty"`
 
@@ -725,13 +746,21 @@ type AgentGatewayReference struct {
 	Name string `json:"name"`
 
 	// Namespace is the Gateway's namespace. Empty means the ModelRouter's own
-	// namespace.
+	// namespace. A different namespace is supported: the generated
+	// model-extraction AgentgatewayPolicy then lives in the Gateway's
+	// namespace (it cannot be owner-referenced across namespaces and is
+	// cleaned up via a finalizer on this ModelRouter), while the pools and
+	// route stay here. The pools, the referenced InferenceServices, and the
+	// EndpointPicker Service all live in this ModelRouter's namespace
+	// regardless.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
 	// EndpointPicker names the EPP Service agentgateway consults for endpoint
 	// selection. Required so each generated InferencePool can reference the
-	// picker; agentgateway cannot select endpoints without it.
+	// picker; agentgateway cannot select endpoints without it. The Service
+	// lives in this ModelRouter's namespace: GIE v1's endpointPickerRef has no
+	// namespace field, so the pool references it same-namespace.
 	// +kubebuilder:validation:Required
 	EndpointPicker string `json:"endpointPicker"`
 
@@ -782,7 +811,8 @@ type ModelRouterStatus struct {
 	Gateway *GatewayStatus `json:"gateway,omitempty"`
 
 	// AgentGateway reports the observed state of dataPlane: AgentGateway
-	// exposure: whether the InferencePool / InferenceModel / HTTPRoute reconciled
+	// exposure: whether the InferencePool / HTTPRoute / model-extraction
+	// AgentgatewayPolicy reconciled
 	// against the referenced agentgateway Gateway, and the resolved endpoint.
 	// nil in Proxy and Gateway modes. Also surfaced via the AgentGatewayReady
 	// condition.
