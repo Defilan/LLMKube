@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -109,6 +111,19 @@ func reconcileHPAOwnershipFixture(ctx context.Context, r *InferenceServiceReconc
 	})
 }
 
+// hpaGetFailingClient fails every HPA Get so a reconcile cannot read the
+// object it would delete or overwrite.
+type hpaGetFailingClient struct {
+	client.Client
+}
+
+func (c hpaGetFailingClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); ok {
+		return fmt.Errorf("injected HPA get failure")
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
 // getHPAOwnershipISVC reads the service status back after a reconcile.
 func getHPAOwnershipISVC(ctx context.Context, name string) *inferencev1alpha1.InferenceService {
 	isvc := &inferencev1alpha1.InferenceService{}
@@ -143,6 +158,7 @@ var _ = Describe("InferenceService HPA ownership", func() {
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(ReasonHPANameTaken))
+			Expect(cond.Message).To(ContainSubstring("HorizontalPodAutoscaler"))
 			Expect(cond.Message).To(ContainSubstring(name))
 
 			// The refusal must not block the rest of the reconcile: the
@@ -226,6 +242,21 @@ var _ = Describe("InferenceService HPA ownership", func() {
 			cond := meta.FindStatusCondition(getHPAOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Message).To(ContainSubstring("another InferenceService (uid uid-other)"))
+		})
+	})
+
+	Context("reports HPA get failures", func() {
+		ctx := context.Background()
+
+		It("aborts the reconcile instead of clearing the refusal on an unknown API error", func() {
+			name := "hpa-get-failure"
+			r := setupHPAOwnershipFixture(ctx, name, nil, false)
+			defer cleanupHPAOwnershipFixture(ctx, name)
+			r.Client = hpaGetFailingClient{Client: k8sClient}
+
+			_, err := reconcileHPAOwnershipFixture(ctx, r, name)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("injected HPA get failure"))
 		})
 	})
 
