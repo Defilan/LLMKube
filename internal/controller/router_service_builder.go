@@ -58,6 +58,9 @@ func (r *ModelRouterReconciler) reconcileServiceObject(
 	case err != nil:
 		return err
 	}
+	if err := ensureRouterProxyOwned(mr, existing, "Service"); err != nil {
+		return err
+	}
 
 	existing.Spec.Type = desired.Spec.Type
 	existing.Spec.Ports = desired.Spec.Ports

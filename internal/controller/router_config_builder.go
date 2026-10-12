@@ -590,6 +590,12 @@ func (r *ModelRouterReconciler) reconcileRouterConfigMap(
 	case err != nil:
 		return err
 	}
+	// Before the no-op fast path below: a foreign object that happens to hold
+	// identical data must still block the sequence, not silently succeed and
+	// let the Deployment provision against it.
+	if err := ensureRouterProxyOwned(mr, existing, "ConfigMap"); err != nil {
+		return err
+	}
 
 	if existing.Data[routerProxyConfigKey] == desired.Data[routerProxyConfigKey] &&
 		existing.Annotations[routerProxyConfigHashAnnotation] == compiled.Hash {

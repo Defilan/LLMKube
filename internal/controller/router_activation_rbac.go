@@ -118,8 +118,16 @@ func (r *ModelRouterReconciler) upsertActivationObject(
 	if apierrors.IsNotFound(err) {
 		return r.Create(ctx, desired)
 	}
-	// A ServiceAccount has no spec worth reconciling; existence is enough.
-	return err
+	if err != nil {
+		return err
+	}
+	// The proxy runs as this ServiceAccount, so a same-name SA the router did
+	// not create is a privilege boundary, not a convenience: refuse rather
+	// than run the proxy under it and bind it through the RoleBinding below.
+	if err := ensureRouterProxyOwned(mr, into, "ServiceAccount"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (r *ModelRouterReconciler) upsertActivationRole(
@@ -136,6 +144,9 @@ func (r *ModelRouterReconciler) upsertActivationRole(
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
+		return err
+	}
+	if err := ensureRouterProxyOwned(mr, existing, "Role"); err != nil {
 		return err
 	}
 	existing.Rules = desired.Rules
@@ -159,6 +170,12 @@ func (r *ModelRouterReconciler) upsertActivationBinding(
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
+		return err
+	}
+	// Overwriting the subjects of a binding the router did not create would
+	// hand this router's ServiceAccount to whatever role the existing binding
+	// references (roleRef is immutable), so the ownership gate comes first.
+	if err := ensureRouterProxyOwned(mr, existing, "RoleBinding"); err != nil {
 		return err
 	}
 	// RoleRef is immutable; only Subjects can change.

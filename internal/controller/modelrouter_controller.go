@@ -48,17 +48,24 @@ const (
 	ModelRouterConditionBackendsReady   = "BackendsReady"
 	ModelRouterConditionBudgetReporting = "BudgetReporting"
 
-	ModelRouterReasonSpecValid          = "SpecValid"
-	ModelRouterReasonSpecInvalid        = "SpecInvalid"
-	ModelRouterReasonCompileFailed      = "CompileFailed"
-	ModelRouterReasonReconcileFailed    = "ReconcileFailed"
-	ModelRouterReasonBackendsResolved   = "BackendsResolved"
-	ModelRouterReasonBackendsUnresolved = "BackendsUnresolved"
-	ModelRouterReasonDeploymentReady    = "DeploymentReady"
-	ModelRouterReasonDeploymentNotReady = "DeploymentNotReady"
-	ModelRouterReasonDeploymentDegraded = "DeploymentDegraded"
-	ModelRouterReasonBudgetReported     = "BudgetReported"
-	ModelRouterReasonBudgetUnreachable  = "BudgetUnreachable"
+	ModelRouterReasonSpecValid       = "SpecValid"
+	ModelRouterReasonSpecInvalid     = "SpecInvalid"
+	ModelRouterReasonCompileFailed   = "CompileFailed"
+	ModelRouterReasonReconcileFailed = "ReconcileFailed"
+	// ModelRouterReasonRouterProxyNameTaken marks a router whose generated
+	// router-proxy name is held by an object LLMKube did not create (any of
+	// the seven proxy objects: ConfigMap, Deployment, both Services,
+	// ServiceAccount, Role, RoleBinding). Adopting such an object would
+	// overwrite the owner's spec and, via the controller reference, delete it
+	// when this router goes away.
+	ModelRouterReasonRouterProxyNameTaken = "RouterProxyNameTaken"
+	ModelRouterReasonBackendsResolved     = "BackendsResolved"
+	ModelRouterReasonBackendsUnresolved   = "BackendsUnresolved"
+	ModelRouterReasonDeploymentReady      = "DeploymentReady"
+	ModelRouterReasonDeploymentNotReady   = "DeploymentNotReady"
+	ModelRouterReasonDeploymentDegraded   = "DeploymentDegraded"
+	ModelRouterReasonBudgetReported       = "BudgetReported"
+	ModelRouterReasonBudgetUnreachable    = "BudgetUnreachable"
 
 	modelRouterControllerName = "modelrouter"
 )
@@ -145,21 +152,21 @@ func (r *ModelRouterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if err := r.reconcileRouterConfigMap(ctx, mr, compiled); err != nil {
-		return ctrl.Result{}, r.recordReconcileFailure(ctx, mr, compiled, "ConfigMap", err)
+		return r.recordReconcileFailure(ctx, mr, compiled, "ConfigMap", err)
 	}
 	if err := r.reconcileRouterActivationRBAC(ctx, mr, compiled.HasPools); err != nil {
-		return ctrl.Result{}, r.recordReconcileFailure(ctx, mr, compiled, "ActivationRBAC", err)
+		return r.recordReconcileFailure(ctx, mr, compiled, "ActivationRBAC", err)
 	}
 	if err := r.reconcileRouterDeployment(ctx, mr, compiled.Hash, compiled.HasPools); err != nil {
-		return ctrl.Result{}, r.recordReconcileFailure(ctx, mr, compiled, "Deployment", err)
+		return r.recordReconcileFailure(ctx, mr, compiled, "Deployment", err)
 	}
 	if err := r.reconcileRouterService(ctx, mr); err != nil {
-		return ctrl.Result{}, r.recordReconcileFailure(ctx, mr, compiled, "Service", err)
+		return r.recordReconcileFailure(ctx, mr, compiled, "Service", err)
 	}
 
 	deployReady, deployMessage, err := r.fetchDeploymentReadiness(ctx, mr)
 	if err != nil {
-		return ctrl.Result{}, r.recordReconcileFailure(ctx, mr, compiled, "DeploymentReadiness", err)
+		return r.recordReconcileFailure(ctx, mr, compiled, "DeploymentReadiness", err)
 	}
 
 	if err := r.recordSuccess(ctx, mr, compiled, deployReady, deployMessage); err != nil {
@@ -297,17 +304,29 @@ func (r *ModelRouterReconciler) recordCompileFailure(
 
 // recordReconcileFailure writes the data-plane-reconcile-failed branch.
 // We keep Validated=True (spec was good) but flip Available=False with a
-// message identifying which child resource broke.
+// message identifying which child resource broke. As before, the returned
+// error is only the status patch's: the condition carries the failure
+// evidence and its write triggers the next reconcile, so the underlying
+// error is not returned.
+//
+// A routerProxyNameTakenError is a refusal, not a reconcile failure: the
+// condition carries the dedicated RouterProxyNameTaken reason and the result
+// requeues on routerProxyNameTakenRequeueAfter, because the refusal depends
+// on cluster state outside the spec and nothing watches the foreign object.
 func (r *ModelRouterReconciler) recordReconcileFailure(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
 	compiled *compiledConfig,
 	resourceKind string,
 	err error,
-) error {
+) (ctrl.Result, error) {
 	desired := mr.DeepCopy()
 	now := metav1.Now()
 	desired.Status.LastUpdated = &now
+	reason := ModelRouterReasonReconcileFailed
+	if routerProxyNameTaken(err) != nil {
+		reason = ModelRouterReasonRouterProxyNameTaken
+	}
 	apimeta.SetStatusCondition(&desired.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterConditionValidated,
 		Status:  metav1.ConditionTrue,
@@ -317,14 +336,20 @@ func (r *ModelRouterReconciler) recordReconcileFailure(
 	apimeta.SetStatusCondition(&desired.Status.Conditions, metav1.Condition{
 		Type:    ConditionAvailable,
 		Status:  metav1.ConditionFalse,
-		Reason:  ModelRouterReasonReconcileFailed,
+		Reason:  reason,
 		Message: resourceKind + ": " + err.Error(),
 	})
 	if compiled != nil {
 		desired.Status.Backends = compiled.Backends
 	}
 	desired.Status.Phase = PhaseFailed
-	return r.patchStatus(ctx, mr, desired)
+	if perr := r.patchStatus(ctx, mr, desired); perr != nil {
+		return ctrl.Result{}, perr
+	}
+	if reason == ModelRouterReasonRouterProxyNameTaken {
+		return ctrl.Result{RequeueAfter: routerProxyNameTakenRequeueAfter}, nil
+	}
+	return ctrl.Result{}, nil
 }
 
 // recordSuccess writes the happy-path status when the data plane is at
