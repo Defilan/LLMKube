@@ -1345,8 +1345,9 @@ func TestModelRouterAgentGateway_GatewayDoesNotAdmitRouterNamespace(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			routerNS := ns
 			if tc.routerNSLabels != nil {
-				routerNS = fmt.Sprintf("consent-ns-%d", i+1)
-				makeNamespace(t, c, routerNS)
+				// A generated name: fixed names (consent-ns-N) collide when
+				// the package runs twice against the shared API server.
+				routerNS = newTestNamespace(t, c)
 				ns := &corev1.Namespace{}
 				if err := c.Get(context.Background(), types.NamespacedName{Name: routerNS}, ns); err != nil {
 					t.Fatalf("get namespace: %v", err)
@@ -1944,14 +1945,16 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 	defer stop()
 
 	gwNS := newTestNamespace(t, c)
-	makeNamespace(t, c, "a-b")
-	makeNamespace(t, c, "a")
+	// The colliding namespaces derive from a generated base so repeated runs
+	// (-count=2) never recreate a fixed namespace on the shared API server.
+	p := newTestNamespace(t, c)
+	makeNamespace(t, c, p+"-b")
 	makeGateway(t, c, gwNS, "ai-gateway", nil, []interface{}{gatewayListenerAllowingAll()})
 
-	// ns "a-b" + name "c" and ns "a" + name "b-c" both sanitize to "a-b-c".
+	// ns p + name "b-c" and ns p+"-b" + name "c" both sanitize to p+"-b-c".
 	routers := []struct{ ns, name, svc string }{
-		{"a-b", "c", "svc1"},
-		{"a", "b-c", "svc1"},
+		{p, "b-c", "svc1"},
+		{p + "-b", "c", "svc1"},
 	}
 	for _, r := range routers {
 		isvc := &inferencev1alpha1.InferenceService{
@@ -2007,7 +2010,8 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 
 	// The policy still belongs to the FIRST router; the second must not have
 	// adopted or overwritten it.
-	policy := getPolicyInNamespace(t, c, gwNS, "a-b-c")
+	policyName := sanitizeDNSName(routers[0].ns + "-" + routers[0].name)
+	policy := getPolicyInNamespace(t, c, gwNS, policyName)
 	firstFresh := &inferencev1alpha1.ModelRouter{}
 	if err := c.Get(context.Background(), types.NamespacedName{Name: first.Name, Namespace: first.Namespace}, firstFresh); err != nil {
 		t.Fatalf("get first router: %v", err)
@@ -2029,8 +2033,8 @@ func TestModelRouterAgentGateway_PolicyNameCollisionFailsLoud(t *testing.T) {
 	}
 	// The refusal fires before any generation: the second router must have
 	// produced no pool and no route of its own.
-	assertNotExistsInNamespace(t, c, inferencePoolGVK(), "a", "svc1")
-	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), "a", "b-c")
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), routers[1].ns, routers[1].svc)
+	assertNotExistsInNamespace(t, c, gatewayHTTPRouteGVK(), routers[1].ns, routers[1].name)
 }
 
 // TestModelRouterAgentGateway_ForeignGeneratedNameNotAdopted covers the
