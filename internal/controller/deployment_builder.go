@@ -350,11 +350,10 @@ func (r *InferenceServiceReconciler) servingStorage(
 	backend RuntimeBackend,
 	hfEndpoint, draftHFEndpoint string,
 ) (storageConfig modelStorageConfig, modelPath, draftPath string, optIn bool) {
-	skipInit := isvc.Spec.SkipModelInit != nil && *isvc.Spec.SkipModelInit
-	optIn = !backend.NeedsModelInit() && isvc.Spec.StageModel != nil && *isvc.Spec.StageModel
-	if !(backend.NeedsModelInit() || optIn) || skipInit {
+	if !operatorStagesModel(isvc, backend) {
 		return modelStorageConfig{}, "", "", false
 	}
+	optIn = !backend.NeedsModelInit()
 	// Same predicate as the provisioning side (modelNeedsCachePVC), so a
 	// service that declined the cache mounts an emptyDir instead of a claim
 	// nobody created (#1451).
@@ -516,6 +515,8 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	if eb, ok := backend.(EnvBuilder); ok {
 		container.Env = append(container.Env, eb.BuildEnv(isvc)...)
 	}
+	mirrorEnv, _ := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint)
+	container.Env = append(container.Env, mirrorEnv...)
 	if len(isvc.Spec.Env) > 0 {
 		container.Env = append(container.Env, isvc.Spec.Env...)
 	}
