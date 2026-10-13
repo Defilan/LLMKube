@@ -43,6 +43,24 @@ func endpointAPIKeyRef(isvc *inferencev1alpha1.InferenceService) *corev1.SecretK
 	return isvc.Spec.Endpoint.APIKeySecretRef
 }
 
+// inferenceServiceRequiresAPIKey reports whether the server answers 401 to a
+// request without the key, in any form a user can set it: apiKeySecretRef,
+// --api-key in extraArgs, or --api-key in spec.args, which the native runtimes
+// pass through only when spec.command is set. endpointAPIKeyRef is not enough:
+// it returns nil when extraArgs already carries the flag.
+func inferenceServiceRequiresAPIKey(isvc *inferencev1alpha1.InferenceService) bool {
+	if isvc == nil {
+		return false
+	}
+	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.APIKeySecretRef != nil {
+		return true
+	}
+	if hasMatchingExtraArg(isvc.Spec.ExtraArgs, "api-key") {
+		return true
+	}
+	return len(isvc.Spec.Command) > 0 && hasMatchingExtraArg(isvc.Spec.Args, "api-key")
+}
+
 // apiKeyEnvVar renders the key as a non-optional secretKeyRef: a missing Secret
 // or key must fail the container rather than start the server unauthenticated.
 func apiKeyEnvVar(name string, ref *corev1.SecretKeySelector) corev1.EnvVar {

@@ -57,7 +57,13 @@ const (
 	LoRAReasonReconcileSuccess   = "ReconcileSuccess"
 	LoRAReasonFinalizerAdded     = "FinalizerAdded"
 	LoRAReasonAlreadyLoaded      = "AlreadyLoaded"
+	LoRAReasonAPIKeyUnsupported  = "APIKeyUnsupported"
 )
+
+// keyedBackendRequeue is how often an adapter whose InferenceService requires
+// an API key is rechecked. The controller does not watch InferenceServices, so
+// this backoff is what notices the key being removed.
+const keyedBackendRequeue = 5 * time.Minute
 
 // loadSkipWindow is the idempotency guard for shouldSkipLoad. If the
 // last successful load happened within this window AND the LoadedPath
@@ -299,6 +305,21 @@ func (r *LoRAAdapterReconciler) reconcileLoad(ctx context.Context, logc ctrlLog,
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, r.Status().Update(ctx, adapter)
 	}
 
+	// SGLang guards /load_lora_adapter with the API key and this controller
+	// sends none, so the call could only get 401. Refuse instead of retrying.
+	if inferenceServiceRequiresAPIKey(isvc) {
+		msg := fmt.Sprintf("referenced InferenceService/%s/%s requires an API key and the LoRAAdapter "+
+			"controller does not send one, so SGLang would answer 401; load the adapter at startup "+
+			"(SGLang --lora-paths in extraArgs) or remove the key", isvc.Namespace, isvc.Name)
+		r.setCondition(adapter, LoRAConditionAvailable, metav1.ConditionFalse,
+			LoRAReasonAPIKeyUnsupported, msg)
+		r.setCondition(adapter, LoRAConditionLoaded, metav1.ConditionFalse,
+			LoRAReasonAPIKeyUnsupported, msg)
+		r.setCondition(adapter, LoRAConditionError, metav1.ConditionTrue,
+			LoRAReasonAPIKeyUnsupported, msg)
+		return ctrl.Result{RequeueAfter: keyedBackendRequeue}, r.Status().Update(ctx, adapter)
+	}
+
 	baseURL, err := r.URLResolver(ctx, r.Client, isvc)
 	if err != nil {
 		r.setCondition(adapter, LoRAConditionAvailable, metav1.ConditionTrue,
@@ -367,7 +388,9 @@ func (r *LoRAAdapterReconciler) reconcileDelete(ctx context.Context, logc ctrlLo
 		return ctrl.Result{}, fmt.Errorf("get InferenceService: %w", err)
 	}
 
-	if isvc.Spec.Runtime == RuntimeSGLANG && isvc.Status.Endpoint != "" {
+	// A keyed SGLang guards /unload_lora_adapter too, and the load path refuses
+	// keyed backends, so this controller has loaded nothing there to unload.
+	if isvc.Spec.Runtime == RuntimeSGLANG && isvc.Status.Endpoint != "" && !inferenceServiceRequiresAPIKey(isvc) {
 		baseURL, err := r.URLResolver(ctx, r.Client, isvc)
 		if err == nil {
 			if unloadErr := r.AdapterClient.UnloadAdapter(ctx, baseURL, adapter.Spec.Name); unloadErr != nil {

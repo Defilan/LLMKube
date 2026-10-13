@@ -151,3 +151,38 @@ func TestEndpointAPIKeyUnsetRendersNothing(t *testing.T) {
 		}
 	}
 }
+
+// endpointAPIKeyRef answers "what should LLMKube wire"; this answers "will the
+// server want a key", which callers that talk to the server need instead.
+func TestInferenceServiceRequiresAPIKey(t *testing.T) {
+	withCommandArgs := func(command []string) *inferencev1alpha1.InferenceService {
+		isvc := keyedISvc(RuntimeSGLANG)
+		isvc.Spec.Endpoint = nil
+		isvc.Spec.Command = command
+		isvc.Spec.Args = []string{"--api-key", "$(MY_KEY)"}
+		return isvc
+	}
+	unkeyed := keyedISvc(RuntimeSGLANG)
+	unkeyed.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: 30000}
+	flagOnly := keyedISvc(RuntimeSGLANG, "--api-key", "$(MY_KEY)")
+	flagOnly.Spec.Endpoint = nil
+	for _, tc := range []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+		want bool
+	}{
+		{"nil", nil, false},
+		{"no key", unkeyed, false},
+		{"apiKeySecretRef", keyedISvc(RuntimeSGLANG), true},
+		{"apiKeySecretRef and the user flag", keyedISvc(RuntimeSGLANG, "--api-key=$(MY_KEY)"), true},
+		{"user flag only", flagOnly, true},
+		{"spec.args flag with spec.command", withCommandArgs([]string{"python3", "-m", "sglang.launch_server"}), true},
+		{"spec.args flag without spec.command", withCommandArgs(nil), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := inferenceServiceRequiresAPIKey(tc.isvc); got != tc.want {
+				t.Errorf("inferenceServiceRequiresAPIKey = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
