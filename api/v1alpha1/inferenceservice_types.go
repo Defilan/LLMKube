@@ -394,6 +394,8 @@ type MultiNodeRecreateStatus struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || !has(self.replicas) || self.replicas <= 1",message="multiNode serves one group: replicas must be 1 or unset"
 // +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || (has(self.runtime) && self.runtime == 'vllm')",message="multiNode is supported for runtime vllm in this release"
 // +kubebuilder:validation:XValidation:rule="!(has(self.stageModel) && self.stageModel && has(self.skipModelInit) && self.skipModelInit)",message="stageModel and skipModelInit cannot both be true: one asks the operator to stage the Model, the other declines staging"
+// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) || (has(self.runtime) && self.runtime in ['vllm','sglang'])",message="endpoint.apiKeySecretRef is supported for runtime vllm and sglang in this release"
+// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) || !has(self.runtime) || self.runtime != 'sglang' || !has(self.command) || self.command.size() == 0",message="with spec.command set LLMKube cannot add --api-key to the SGLang command line; pass --api-key in spec.args or drop spec.command"
 type InferenceServiceSpec struct {
 	// ModelRef references the Model CR that contains the model to serve
 	// +kubebuilder:validation:Required
@@ -992,6 +994,7 @@ type DisruptionSpec struct {
 }
 
 // EndpointSpec defines the service endpoint configuration
+// +kubebuilder:validation:XValidation:rule="!has(self.externalTrafficPolicy) || (has(self.type) && self.type in ['NodePort','LoadBalancer'])",message="externalTrafficPolicy requires endpoint.type NodePort or LoadBalancer"
 type EndpointSpec struct {
 	// Port is the service port
 	// +kubebuilder:validation:Minimum=1
@@ -1028,6 +1031,24 @@ type EndpointSpec struct {
 	// are a documented prerequisite; LLMKube does not install or own them.
 	// +optional
 	Gateway *GatewaySpec `json:"gateway,omitempty"`
+
+	// APIKeySecretRef names a Secret key holding the API key callers must
+	// present as "Authorization: Bearer <key>". vLLM reads it as VLLM_API_KEY;
+	// SGLang gets it as LLMKUBE_API_KEY plus "--api-key $(LLMKUBE_API_KEY)".
+	// Both runtimes leave /health and /metrics open, so probes keep working.
+	// Supported for runtime vllm and sglang. A key change takes effect when the
+	// pods restart. An --api-key already in extraArgs wins; LLMKube then adds
+	// nothing.
+	// +optional
+	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
+
+	// ExternalTrafficPolicy sets the Service's externalTrafficPolicy. Local
+	// preserves the client source IP on a NodePort or LoadBalancer, which an IP
+	// allowlist (NetworkPolicy) needs. Unset keeps the Kubernetes default
+	// (Cluster). Requires endpoint.type NodePort or LoadBalancer.
+	// +kubebuilder:validation:Enum=Cluster;Local
+	// +optional
+	ExternalTrafficPolicy string `json:"externalTrafficPolicy,omitempty"`
 }
 
 // GatewaySpec opts an InferenceService into Envoy AI Gateway exposure.
