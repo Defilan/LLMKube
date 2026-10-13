@@ -88,3 +88,48 @@ var _ = Describe("InferenceService endpoint auth CRD validation", func() {
 			"Unsupported value")
 	})
 })
+
+// spec.endpoint.apiKeySecretRef and externalTrafficPolicy are InferenceService
+// fields; the router-proxy (internal/controller/router_service_builder.go
+// newRouterService) only reads endpoint.port and endpoint.type, so a silently
+// accepted apiKeySecretRef would make a user believe the router endpoint is
+// authenticated when it is not. A failure here means the generated CRD does
+// not enforce the CEL rule that blocks both fields on ModelRouter.
+var _ = Describe("ModelRouter endpoint auth CRD validation", func() {
+	ctx := context.Background()
+	keyRef := &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
+	}
+	newMR := func(ep *inferencev1alpha1.EndpointSpec) *inferencev1alpha1.ModelRouter {
+		return &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: "mr-ep-auth-" + rand.String(6), Namespace: "default"},
+			Spec: inferencev1alpha1.ModelRouterSpec{
+				Backends: []inferencev1alpha1.RouterBackend{
+					{Name: "primary", External: &inferencev1alpha1.ExternalProvider{Provider: "anthropic", Model: "claude-opus-4-7"}},
+				},
+				Endpoint: ep,
+			},
+		}
+	}
+	admit := func(mr *inferencev1alpha1.ModelRouter) {
+		Expect(k8sClient.Create(ctx, mr)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, mr)).To(Succeed())
+	}
+	reject := func(mr *inferencev1alpha1.ModelRouter, substr string) {
+		err := k8sClient.Create(ctx, mr)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(substr))
+	}
+
+	It("admits a minimal endpoint", func() {
+		admit(newMR(&inferencev1alpha1.EndpointSpec{Port: 8080}))
+	})
+	It("rejects apiKeySecretRef", func() {
+		reject(newMR(&inferencev1alpha1.EndpointSpec{APIKeySecretRef: keyRef}),
+			"ModelRouter does not support them")
+	})
+	It("rejects externalTrafficPolicy", func() {
+		reject(newMR(&inferencev1alpha1.EndpointSpec{Type: "NodePort", ExternalTrafficPolicy: "Local"}),
+			"ModelRouter does not support them")
+	})
+})

@@ -1038,14 +1038,15 @@ type EndpointSpec struct {
 	// Both runtimes leave /health and /metrics open, so probes keep working.
 	// Supported for runtime vllm and sglang. A key change takes effect when the
 	// pods restart. An --api-key already in extraArgs wins; LLMKube then adds
-	// nothing.
+	// nothing. Not supported on ModelRouter.
 	// +optional
 	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 
 	// ExternalTrafficPolicy sets the Service's externalTrafficPolicy. Local
 	// preserves the client source IP on a NodePort or LoadBalancer, which an IP
 	// allowlist (NetworkPolicy) needs. Unset keeps the Kubernetes default
-	// (Cluster). Requires endpoint.type NodePort or LoadBalancer.
+	// (Cluster). Requires endpoint.type NodePort or LoadBalancer. Not supported
+	// on ModelRouter.
 	// +kubebuilder:validation:Enum=Cluster;Local
 	// +optional
 	ExternalTrafficPolicy string `json:"externalTrafficPolicy,omitempty"`
