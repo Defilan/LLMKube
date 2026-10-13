@@ -1887,10 +1887,17 @@ type SGLangConfig struct {
 	KVCacheCustomDtype string `json:"kvCacheCustomDtype,omitempty"`
 
 	// Attention
-	// AttentionBackend selects the attention implementation. flashinfer is
-	// fastest on recent NVIDIA GPUs; flash_attn is portable; torch_native is
-	// the fallback. Maps to SGLang --attention-backend flag.
-	// +kubebuilder:validation:Enum=flashinfer;flash_attn;torch_native
+	// AttentionBackend selects the attention implementation. Unset lets SGLang
+	// choose per model and GPU: fa3 on Hopper, trtllm_mha (MHA) or flashinfer
+	// (MLA) on Blackwell, flashinfer or triton elsewhere. Some models override
+	// that: Qwen3.5-family hybrid models on Blackwell get triton while the
+	// prefix cache runs without the mamba extra buffer, which is slow on long
+	// prompts; flashinfer is the typed fix (see the SGLang on Blackwell guide).
+	// The values are SGLang v0.5.15's --attention-backend choices. flash_attn
+	// is not one (SGLang exits with an invalid-choice error); it stays
+	// accepted so existing objects remain valid, and the SGLangSpecValid
+	// condition reports it. Maps to SGLang --attention-backend flag.
+	// +kubebuilder:validation:Enum=triton;torch_native;flex_attention;dsa;dsv4;cutlass_mla;fa3;fa4;flashinfer;flashmla;trtllm_mla;cutedsl_mla;tokenspeed_mla;trtllm_mha;dual_chunk_flash_attn;aiter;wave;intel_amx;ascend;intel_xpu;flash_attn
 	// +optional
 	AttentionBackend string `json:"attentionBackend,omitempty"`
 
