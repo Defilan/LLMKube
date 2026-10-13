@@ -143,6 +143,7 @@ func compileBudgetRules(budgets []Budget) []BudgetRule {
 // given mux. Callers attach the mux to an http.Server.
 func (p *Proxy) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/chat/completions", p.handleCompletion("/v1/chat/completions"))
+	mux.HandleFunc("POST /v1/completions", p.handleCompletion("/v1/completions"))
 	mux.HandleFunc("POST /v1/embeddings", p.handleCompletion("/v1/embeddings"))
 	mux.HandleFunc("POST /v1/rerank", p.handleCompletion("/v1/rerank"))
 	mux.HandleFunc("GET /v1/models", p.handleModels)
@@ -190,10 +191,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleCompletion is the shared handler for the OpenAI-compatible inference
-// endpoints the proxy fronts (/v1/chat/completions, /v1/embeddings,
-// /v1/rerank). It buffers the inbound request body (needs the "model" field for
-// matching), evaluates the rule set, dispatches to the chosen backend, and
-// streams the response back. SSE / chunked passthrough is automatic.
+// endpoints the proxy fronts (/v1/chat/completions, /v1/completions,
+// /v1/embeddings, /v1/rerank). It buffers the inbound request body (needs
+// the "model" field for matching), evaluates the rule set, dispatches to the
+// chosen backend, and streams the response back. SSE / chunked passthrough
+// is automatic.
 //
 // upstreamPath is forwarded verbatim to the chosen backend, so each mounted
 // endpoint must pass its own path: the surface the proxy fronts is not just
