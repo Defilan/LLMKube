@@ -1,0 +1,167 @@
+# promtool unit tests for the chart's llmkube-gpu-health group. Run with
+# `make test-chart-rules`, which renders the chart's PrometheusRule into
+# rules.yaml next to a copy of this file.
+#
+# The fault replayed here is a real B200 sequence: Xid 109 (context switch
+# timeout) twice, Xid 154 (recovery action changed to GPU Reset Required),
+# then 109 again, all within seconds. A 30s scrape of the last-value gauge
+# only ever sees 109.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # Stock GPU Operator exporter: only the last-value gauge exists. The faulted
+  # GPU must page on 109; a healthy GPU and a GPU whose last Xid is an
+  # application error (31, RESTART_APP in the catalog) must not.
+  - interval: 30s
+    input_series:
+      - series: 'DCGM_FI_DEV_XID_ERRORS{gpu="2",UUID="GPU-faulty",Hostname="node-a",namespace="default",pod="qwen-0"}'
+        values: '0 109x20'
+      - series: 'DCGM_FI_DEV_XID_ERRORS{gpu="1",UUID="GPU-healthy",Hostname="node-a"}'
+        values: '0x20'
+      - series: 'DCGM_FI_DEV_XID_ERRORS{gpu="3",UUID="GPU-appfault",Hostname="node-a"}'
+        values: '0 31x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GPUCriticalXidLastValue
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: gpu
+              gpu: "2"
+              UUID: GPU-faulty
+              Hostname: node-a
+              namespace: default
+              pod: qwen-0
+            exp_annotations:
+              summary: "GPU's most recent Xid needs a reset or hardware follow-up"
+              description: "GPU 2 (GPU-faulty) on node-a last reported Xid 109, while allocated to pod default/qwen-0. This exporter reports only the latest Xid, so an earlier one may be hidden; enable DCGM_EXP_XID_ERRORS_TOTAL to see all of them."
+      - eval_time: 2m
+        alertname: GPUCriticalXid
+        exp_alerts: []
+
+  # Full exporter: Xid counter and recovery action enabled. The counter must
+  # page on both 109 and the 154 the gauge lost, at their FIRST occurrence;
+  # the gauge fallback must stay quiet so one fault pages once; the recovery
+  # action must page after its 1m for.
+  - interval: 30s
+    input_series:
+      - series: 'DCGM_FI_DEV_XID_ERRORS{gpu="2",UUID="GPU-faulty",Hostname="node-a"}'
+        values: '0 109x60'
+      - series: 'DCGM_EXP_XID_ERRORS_TOTAL{gpu="2",UUID="GPU-faulty",Hostname="node-a",xid="109"}'
+        values: '_ 3x60'
+      - series: 'DCGM_EXP_XID_ERRORS_TOTAL{gpu="2",UUID="GPU-faulty",Hostname="node-a",xid="154"}'
+        values: '_ 1x60'
+      - series: 'DCGM_FI_DEV_GPU_RECOVERY_ACTION{gpu="2",UUID="GPU-faulty",Hostname="node-a"}'
+        values: '0 1x60'
+      - series: 'DCGM_FI_DEV_GPU_RECOVERY_ACTION{gpu="1",UUID="GPU-healthy",Hostname="node-a"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GPUCriticalXid
+        exp_alerts:
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a, xid: "109"}
+            exp_annotations:
+              summary: "GPU reported an Xid that needs a reset or hardware follow-up"
+              description: "GPU 2 (GPU-faulty) on node-a reported Xid 109 in the last 15 minutes. Check the NVIDIA Xid catalog for the resolution before scheduling more work on it."
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a, xid: "154"}
+            exp_annotations:
+              summary: "GPU reported an Xid that needs a reset or hardware follow-up"
+              description: "GPU 2 (GPU-faulty) on node-a reported Xid 154 in the last 15 minutes. Check the NVIDIA Xid catalog for the resolution before scheduling more work on it."
+      - eval_time: 2m
+        alertname: GPUCriticalXidLastValue
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: GPURecoveryActionRequired
+        exp_alerts:
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a}
+            exp_annotations:
+              summary: "GPU needs a recovery action before it can run work"
+              description: "GPU 2 (GPU-faulty) on node-a reports recovery action 1 (1=GPU reset, 2=node reboot, 3=drain P2P, 4=drain and reset). New CUDA contexts on it fail until the action is taken, and the device plugin may still schedule pods onto it."
+      # Event alert, not a latch: 20m after the faults with no new Xid it has
+      # resolved. The recovery action, which is state, keeps paging.
+      - eval_time: 20m
+        alertname: GPUCriticalXid
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GPURecoveryActionRequired
+        exp_alerts:
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a}
+            exp_annotations:
+              summary: "GPU needs a recovery action before it can run work"
+              description: "GPU 2 (GPU-faulty) on node-a reports recovery action 1 (1=GPU reset, 2=node reboot, 3=drain P2P, 4=drain and reset). New CUDA contexts on it fail until the action is taken, and the device plugin may still schedule pods onto it."
+
+  # A later recurrence on a GPU whose series already exists is caught by the
+  # increase() arm, and an application Xid counted alongside is not.
+  - interval: 1m
+    input_series:
+      - series: 'DCGM_EXP_XID_ERRORS_TOTAL{gpu="2",UUID="GPU-faulty",Hostname="node-a",xid="109"}'
+        values: '1x30 2x10'
+      - series: 'DCGM_EXP_XID_ERRORS_TOTAL{gpu="2",UUID="GPU-faulty",Hostname="node-a",xid="31"}'
+        values: '1x30 5x10'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: GPUCriticalXid
+        exp_alerts: []
+      - eval_time: 33m
+        alertname: GPUCriticalXid
+        exp_alerts:
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a, xid: "109"}
+            exp_annotations:
+              summary: "GPU reported an Xid that needs a reset or hardware follow-up"
+              description: "GPU 2 (GPU-faulty) on node-a reported Xid 109 in the last 15 minutes. Check the NVIDIA Xid catalog for the resolution before scheduling more work on it."
+
+  # Memory and DCGM health watches.
+  - interval: 1m
+    input_series:
+      - series: 'DCGM_FI_DEV_ROW_REMAP_FAILURE{gpu="2",UUID="GPU-faulty",Hostname="node-a"}'
+        values: '0 1x30'
+      - series: 'DCGM_FI_DEV_ROW_REMAP_FAILURE{gpu="1",UUID="GPU-healthy",Hostname="node-a"}'
+        values: '0x30'
+      - series: 'DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS{gpu="2",UUID="GPU-faulty",Hostname="node-a"}'
+        values: '0 0 2x90'
+      - series: 'DCGM_EXP_GPU_HEALTH_STATUS{gpu="2",UUID="GPU-faulty",Hostname="node-a",health_watch="MEM",health_error_code="DCGM_FR_ROW_REMAP_FAILURE"}'
+        values: '0 20x30'
+      - series: 'DCGM_EXP_GPU_HEALTH_STATUS{gpu="1",UUID="GPU-healthy",Hostname="node-a",health_watch="THERMAL",health_error_code="DCGM_FR_CLOCKS_EVENT_THERMAL"}'
+        values: '0 10x30'
+      - series: 'DCGM_EXP_GPU_HEALTH_STATUS{gpu="3",UUID="GPU-ok",Hostname="node-a",health_watch="PCIE",health_error_code="DCGM_FR_OK"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GPURowRemapFailure
+        exp_alerts:
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a}
+            exp_annotations:
+              summary: "GPU memory row remapping failed"
+              description: "GPU 2 (GPU-faulty) on node-a failed to remap a memory row. Take it out of service and open a support case."
+      - eval_time: 5m
+        alertname: GPUUncorrectableRowsRemapped
+        exp_alerts:
+          - exp_labels: {severity: warning, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a}
+            exp_annotations:
+              summary: "GPU remapped memory rows after uncorrectable errors"
+              description: "GPU 2 (GPU-faulty) on node-a remapped memory rows after uncorrectable ECC errors in the last hour. Check nvidia-smi -q -d ROW_REMAPPER for a pending remap, which takes effect after a GPU reset."
+      # Event, not a latch: no new remaps for over an hour clears it.
+      - eval_time: 90m
+        alertname: GPUUncorrectableRowsRemapped
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: GPUHealthCheckFailed
+        exp_alerts:
+          - exp_labels: {severity: critical, component: gpu, gpu: "2", UUID: GPU-faulty, Hostname: node-a, health_watch: MEM, health_error_code: DCGM_FR_ROW_REMAP_FAILURE}
+            exp_annotations:
+              summary: "DCGM health check reports a GPU failure"
+              description: "GPU 2 (GPU-faulty) on node-a fails the DCGM MEM health watch (DCGM_FR_ROW_REMAP_FAILURE)."
+      # A warning has to persist 15m before it pages.
+      - eval_time: 10m
+        alertname: GPUHealthCheckWarning
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GPUHealthCheckWarning
+        exp_alerts:
+          - exp_labels: {severity: warning, component: gpu, gpu: "1", UUID: GPU-healthy, Hostname: node-a, health_watch: THERMAL, health_error_code: DCGM_FR_CLOCKS_EVENT_THERMAL}
+            exp_annotations:
+              summary: "DCGM health check reports a GPU warning"
+              description: "GPU 1 (GPU-healthy) on node-a has warned on the DCGM THERMAL health watch (DCGM_FR_CLOCKS_EVENT_THERMAL) for 15 minutes."

@@ -143,6 +143,12 @@ test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest
 	helm lint charts/llmkube charts/foreman
 	helm unittest charts/llmkube charts/foreman
 
+# helm-unittest proves the rules render; promtool proves they fire on the
+# faults they name. Separate target so test-chart does not need promtool.
+.PHONY: test-chart-rules
+test-chart-rules: ## Run promtool unit tests against the chart's PrometheusRule (requires helm, yq, promtool).
+	hack/test-chart-rules.sh
+
 # The B200 validation harness self-test (#1376). No cluster and no GPU, so
 # this is the hardware-free guard on the matrix harness wiring.
 .PHONY: test-b200-harness

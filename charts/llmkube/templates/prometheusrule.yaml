@@ -82,6 +82,123 @@ spec:
         description: "No DCGM, amdgpu-sysfs, or drm-exporter utilization series for 15 minutes. Check that a GPU metrics exporter is running."
   {{- end }}
 
+  {{- if .Values.prometheus.prometheusRule.rules.gpuHealth.enabled }}
+  {{- $xids := .Values.prometheus.prometheusRule.rules.gpuHealth.criticalXids }}
+  {{- /* --set ...criticalXids=null deletes the key and skips the schema's
+         minItems; an empty list renders xid=~"" and an empty or-chain. */}}
+  {{- if not $xids }}
+  {{- fail "prometheus.prometheusRule.rules.gpuHealth.criticalXids must list at least one Xid; set gpuHealth.enabled=false to drop the GPU fault alerts instead" }}
+  {{- end }}
+  - name: llmkube-gpu-health
+    interval: 30s
+    rules:
+    # The driver's own verdict that the GPU needs recovery (Xid 154 carries
+    # it). Nothing else names the required action, and the device plugin
+    # keeps the GPU allocatable meanwhile. Not in the exporter's default
+    # counters: needs DCGM_FI_DEV_GPU_RECOVERY_ACTION in its CSV.
+    - alert: GPURecoveryActionRequired
+      expr: DCGM_FI_DEV_GPU_RECOVERY_ACTION > 0
+      for: 1m
+      labels:
+        severity: critical
+        component: gpu
+      annotations:
+        summary: "GPU needs a recovery action before it can run work"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} reports recovery action {{`{{ $value }}`}} (1=GPU reset, 2=node reboot, 3=drain P2P, 4=drain and reset){{`{{ if $labels.pod }}`}} while allocated to pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}}{{`{{ end }}`}}. New CUDA contexts on it fail until the action is taken, and the device plugin may still schedule pods onto it."
+
+    # Counts every Xid, including one the next Xid overwrites a few seconds
+    # later (154 followed by 109 is a real sequence); the last-value gauge
+    # below loses those. Needs DCGM_EXP_XID_ERRORS_TOTAL, dcgm-exporter
+    # 4.6.0-4.8.3 or newer.
+    #
+    # The exporter creates a GPU's series for an Xid at its first occurrence,
+    # already at 1, and increase() needs an earlier sample to see a jump, so
+    # increase() alone misses the first fault of each Xid on each GPU. The
+    # second arm catches a series that is new in the window.
+    - alert: GPUCriticalXid
+      expr: |
+        increase(DCGM_EXP_XID_ERRORS_TOTAL{xid=~"{{ join "|" $xids }}"}[15m]) > 0
+        or
+        (
+          DCGM_EXP_XID_ERRORS_TOTAL{xid=~"{{ join "|" $xids }}"}
+          unless DCGM_EXP_XID_ERRORS_TOTAL{xid=~"{{ join "|" $xids }}"} offset 15m
+        )
+      for: 0m
+      labels:
+        severity: critical
+        component: gpu
+      annotations:
+        summary: "GPU reported an Xid that needs a reset or hardware follow-up"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} reported Xid {{`{{ $labels.xid }}`}} in the last 15 minutes{{`{{ if $labels.pod }}`}}, while allocated to pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}}{{`{{ end }}`}}. Check the NVIDIA Xid catalog for the resolution before scheduling more work on it."
+
+    # Fallback for exporters without the Xid counter: the default
+    # DCGM_FI_DEV_XID_ERRORS holds only the most recent Xid. Value equality,
+    # not the err_code label, so older exporters without that label still
+    # match. The counter emits a series only for a GPU and Xid it has seen, so
+    # the unless hands a GPU over to GPUCriticalXid once the counter has
+    # counted a fault there, and one fault does not page twice.
+    - alert: GPUCriticalXidLastValue
+      expr: |
+        (
+          {{- range $i, $x := $xids }}
+          {{ if $i }}or {{ end }}DCGM_FI_DEV_XID_ERRORS == {{ $x }}
+          {{- end }}
+        )
+        unless on (UUID) DCGM_EXP_XID_ERRORS_TOTAL
+      for: 0m
+      labels:
+        severity: critical
+        component: gpu
+      annotations:
+        summary: "GPU's most recent Xid needs a reset or hardware follow-up"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} last reported Xid {{`{{ $value }}`}}{{`{{ if $labels.pod }}`}}, while allocated to pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}}{{`{{ end }}`}}. This exporter reports only the latest Xid, so an earlier one may be hidden; enable DCGM_EXP_XID_ERRORS_TOTAL to see all of them."
+
+    # Row remapping failed: the GPU can no longer retire bad memory rows.
+    # In the default counters.
+    - alert: GPURowRemapFailure
+      expr: DCGM_FI_DEV_ROW_REMAP_FAILURE > 0
+      for: 0m
+      labels:
+        severity: critical
+        component: gpu
+      annotations:
+        summary: "GPU memory row remapping failed"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} failed to remap a memory row. Take it out of service and open a support case."
+
+    # In the default counters.
+    - alert: GPUUncorrectableRowsRemapped
+      expr: increase(DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS[1h]) > 0
+      for: 0m
+      labels:
+        severity: warning
+        component: gpu
+      annotations:
+        summary: "GPU remapped memory rows after uncorrectable errors"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} remapped memory rows after uncorrectable ECC errors in the last hour. Check nvidia-smi -q -d ROW_REMAPPER for a pending remap, which takes effect after a GPU reset."
+
+    # DCGM's own health watches (20 = FAIL, 10 = WARN). Needs
+    # DCGM_EXP_GPU_HEALTH_STATUS, dcgm-exporter 4.6.0-4.8.3 or newer.
+    - alert: GPUHealthCheckFailed
+      expr: DCGM_EXP_GPU_HEALTH_STATUS == 20
+      for: 0m
+      labels:
+        severity: critical
+        component: gpu
+      annotations:
+        summary: "DCGM health check reports a GPU failure"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} fails the DCGM {{`{{ $labels.health_watch }}`}} health watch ({{`{{ $labels.health_error_code }}`}})."
+
+    - alert: GPUHealthCheckWarning
+      expr: DCGM_EXP_GPU_HEALTH_STATUS == 10
+      for: 15m
+      labels:
+        severity: warning
+        component: gpu
+      annotations:
+        summary: "DCGM health check reports a GPU warning"
+        description: "GPU {{`{{ $labels.gpu }}`}} ({{`{{ $labels.UUID }}`}}) on {{`{{ $labels.Hostname }}`}} has warned on the DCGM {{`{{ $labels.health_watch }}`}} health watch ({{`{{ $labels.health_error_code }}`}}) for 15 minutes."
+  {{- end }}
+
   {{- if and .Values.prometheus.prometheusRule.rules.serving.enabled .Values.prometheus.inferencePodMonitor.enabled }}
   - name: llmkube-serving
     interval: 30s

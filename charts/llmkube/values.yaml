@@ -302,6 +302,21 @@ prometheus:
           enabled: false
         memoryPressureThreshold: 90
         powerLimitThreshold: 250
+      # GPU fault alerts (NVIDIA, DCGM exporter). The NVIDIA device plugin
+      # ignores some Xids that NVIDIA's own catalog resolves with a GPU reset
+      # (109 among them), so a faulted GPU can stay allocatable and keep
+      # receiving pods. These alerts surface it. Three of the series they read
+      # are not in the DCGM exporter's default counter list; see
+      # docs/site/guides/gpu-fault-handling.md for the counters to enable. With
+      # the defaults alone, the last-Xid and row-remap alerts still work.
+      gpuHealth:
+        enabled: true
+        # Xids whose catalog resolution is RESET_GPU, RESTART_BM,
+        # CONTACT_SUPPORT, XID_154, or a hardware workflow (ECC, NVLink).
+        # Application Xids (RESTART_APP: 13, 31, 68, 69, 94) and IGNORE Xids
+        # are left out. Source:
+        # https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html
+        criticalXids: [48, 61, 62, 64, 74, 79, 95, 109, 110, 119, 120, 122, 123, 124, 125, 136, 140, 143, 144, 145, 146, 147, 148, 149, 150, 154, 155, 156]
       # Inference service alerts
       inference:
         enabled: true

@@ -289,6 +289,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
 
+      - name: Unit-test rule behavior with promtool
+        # check rules proves the PromQL parses; these prove the alerts fire on
+        # the faults they name and stay quiet otherwise (test/promrules).
+        run: PROMTOOL=./promtool make test-chart-rules
+
       - name: Test Alert Threshold Customization
         run: |
           helm template llmkube charts/llmkube \

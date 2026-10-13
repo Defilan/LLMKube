@@ -260,6 +260,19 @@
                     "powerLimitThreshold": { "type": "number", "minimum": 0 }
                   }
                 },
+                "gpuHealth": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "criticalXids": {
+                      "type": "array",
+                      "minItems": 1,
+                      "uniqueItems": true,
+                      "items": { "type": "integer", "minimum": 1 }
+                    }
+                  }
+                },
                 "inference": {
                   "type": "object",
                   "additionalProperties": false,

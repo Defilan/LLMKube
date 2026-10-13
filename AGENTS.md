@@ -27,6 +27,7 @@ contributors share. The human onboarding narrative lives in
 - `make test` downloads envtest binaries on first run; no cluster needed for
   unit tests.
 - `make test-chart` needs `helm` and the `helm-unittest` plugin.
+- `make test-chart-rules` needs `helm`, `yq` and `promtool`.
 - `make test-e2e` requires Docker and Kind.
 - `make test-e2e-rbac` requires Docker, Kind and `jq`; it creates (or reuses)
   its own Kind cluster and kubeconfig file, and never touches your current
@@ -43,6 +44,7 @@ contributors share. The human onboarding narrative lives in
 | Unit tests (envtest, all packages)  | `make test`             |
 | envtest suites only (fixed seed)    | `make test-envtest`     |
 | Helm chart lint + unit tests        | `make test-chart`       |
+| Alert rule behavior (promtool)      | `make test-chart-rules` |
 | E2E tests (needs Kind)              | `make test-e2e`         |
 | Generated-RBAC e2e (needs Kind)     | `make test-e2e-rbac`   |
 | Format                              | `make fmt`              |
@@ -62,7 +64,8 @@ A change is not done until all of these hold.
 
 1. The pre-commit gate passes: `make fmt`, `make vet`, `make lint`, `make test`.
 2. The pre-push gate passes: `make lint-all`. If `charts/` changed, run
-   `make test-chart`. If CRD types in `api/v1alpha1/` changed, run
+   `make test-chart`, plus `make test-chart-rules` if the PrometheusRule
+   changed. If CRD types in `api/v1alpha1/` changed, run
    `make generate` and `make chart-crds`, then `git status` must be clean.
    Uncommitted generated files mean a step was skipped, and the CI CRD sync
    check will fail.
