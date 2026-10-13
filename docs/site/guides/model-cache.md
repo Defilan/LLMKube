@@ -236,12 +236,53 @@ The value is trimmed, so a trailing newline from `kubectl create secret
 
 This covers every path the operator downloads on: single-file GGUF, multi-file
 `spec.files` staging, `RefreshPolicy: OnChange` revalidation, the prefetch Job,
-and the macOS Metal agent. It is separate from the runtime token settings
-(`vllmConfig.hfTokenSecretRef` and its equivalents), which hand a token to the
-serving container for the different case where the runtime downloads its own
-weights from a bare repo ID.
+and the macOS Metal agent.
 
-Three properties worth knowing:
+It also covers a runtime that downloads its own weights. A bare repo ID such as
+`Qwen/Qwen3.8-27B-FP8` served by vLLM or SGLang with `spec.skipModelInit: true`,
+or by TGI, never passes through the operator's downloader: the serving
+container fetches it with `huggingface_hub`. When that Model's
+`sourceSecretRef` names an `HF_ENDPOINT`, the serving container gets
+`HF_ENDPOINT` (the trimmed value) so it downloads through the mirror too:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen38-27b-fp8
+spec:
+  source: Qwen/Qwen3.8-27B-FP8
+  sourceSecretRef:
+    name: huggingface        # holds HF_ENDPOINT and HF_TOKEN
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen38
+spec:
+  modelRef: qwen38-27b-fp8
+  runtime: vllm
+  skipModelInit: true
+```
+
+The token follows the same rule as the operator's downloads. The runtime sends
+`HF_TOKEN` to `HF_ENDPOINT`, so:
+
+- with no `vllmConfig.hfTokenSecretRef` (or the SGLang or TGI equivalent), the
+  serving container gets `HF_TOKEN` from the Model's Secret, if it has one;
+- with an `hfTokenSecretRef` in the **same** Secret, that token is used;
+- with an `hfTokenSecretRef` in a **different** Secret, the mirror is not
+  applied, because that token would go to a mirror its Secret never named. The
+  runtime downloads from `huggingface.co` as before, and the InferenceService
+  gets a `HFMirrorNotApplied` Warning event naming the fix.
+
+A `spec.env` entry for `HF_ENDPOINT` or `HF_TOKEN` still wins.
+
+A Model can name one mirror origin. A speculative-decoding draft Model that
+the runtime downloads itself uses the target Model's mirror, because both run
+in the same container.
+
+Properties worth knowing:
 
 - **The token is only ever sent to `huggingface.co`, or to the origin named by
   `HF_ENDPOINT` in the same Secret.** A Model pointing at any other origin gets
@@ -260,6 +301,13 @@ Three properties worth knowing:
   request with the whole file and advertise no `Accept-Ranges`. The downloader
   then discards its partial rather than failing to resume it, so a restart is a
   full re-download instead of a pod that will not start.
+- **A mirror that redirects a file to its own URL fails the download.** This
+  has been seen with an Artifactory `huggingfaceml` remote for some files of a
+  repository while other files of the same repository downloaded fine. The
+  operator's downloader fails with `curl: (47) Maximum (50) redirects
+  followed` and `huggingface_hub` with `TooManyRedirects`. It is a mirror-side
+  problem: `curl -sI <file URL>` against the mirror shows a `Location` equal to
+  the requested URL. Take that output to the mirror's administrators.
 
 Rotating the token is a Secret edit; the new value is picked up the next time a
 pod starts, the same as the S3 credentials. An `HF_ENDPOINT` change is also
