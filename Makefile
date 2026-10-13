@@ -128,7 +128,7 @@ endif
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test GINKGO_SEED=$(GINKGO_SEED))"
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v '/test/e2e$$') -coverprofile cover.out
 
 # The envtest suites only, so CI can run a second fixed seed over just the
 # specs whose ordering matters (#1693). Not part of the Foreman gate: the
