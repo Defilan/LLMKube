@@ -956,7 +956,9 @@ func TestVLLMCustomizeProbes(t *testing.T) {
 				t.Errorf("exec interpreter = %q, want python3", got)
 			}
 			script := liveness.Exec.Command[2]
-			if !strings.Contains(script, "127.0.0.1:8000/metrics") {
+			// localhost, not 127.0.0.1: a server bound IPv6-only refuses
+			// IPv4 loopback (#2027).
+			if !strings.Contains(script, "localhost:8000/metrics") {
 				t.Errorf("stall script does not target the local metrics endpoint")
 			}
 			if !strings.Contains(script, strconv.FormatInt(int64(tc.wantWindow), 10)) {

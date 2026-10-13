@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -32,35 +33,57 @@ import (
 // (about 165s at the defaults).
 const vllmStallDefaultWindowSeconds int32 = 120
 
-// vllmStallScript is the stall detector the exec liveness probe runs. It is
-// the single source of the detection logic: the tests execute exactly these
-// bytes against a stub /metrics server. The script must contain no bare %
-// byte, so fmt.Sprintf stays safe. The LLMKUBE_STALL_STATE_FILE env var lets
-// the tests point the state file at a temp dir; production probes use the
-// /tmp default baked into the script.
+// stallSignals names the Prometheus series a runtime's stall detector reads.
+// Busy gauges decide whether the engine has work in flight; progress
+// counters advancing (or resetting) and progress gauges changing prove it is
+// still moving; required series must all be present or the probe fails
+// open, because a restart on missing telemetry would be a false positive.
+type stallSignals struct {
+	Busy     []string
+	Counters []string
+	Gauges   []string
+	Required []string
+}
+
+// vllmStallSignals: vLLM's prompt and generation counters only advance when
+// a prefill completes or a request finishes, so a long prefill leaves both
+// flat; vllm:kv_cache_usage_perc climbs throughout and is the mid-prefill
+// heartbeat (measured on vLLM v0.31.0, a ~200K-token prefill: counters flat
+// for 13.7s, kv usage rising every second). The kv gauge is optional.
+var vllmStallSignals = stallSignals{
+	Busy:     []string{"vllm:num_requests_running"},
+	Counters: []string{"vllm:generation_tokens_total", "vllm:prompt_tokens_total"},
+	Gauges:   []string{"vllm:kv_cache_usage_perc"},
+	Required: []string{"vllm:num_requests_running", "vllm:generation_tokens_total", "vllm:prompt_tokens_total"},
+}
+
+// stallScript is the stall detector the exec liveness probe runs, rendered
+// per runtime from stallSignals. It is the single source of the detection
+// logic: the tests execute exactly the rendered bytes against a stub
+// /metrics server. The template must contain no bare % byte, so fmt.Sprintf
+// stays safe. The LLMKUBE_STALL_STATE_FILE env var lets the tests point the
+// state file at a temp dir; production probes use the /tmp default baked
+// into the script.
 //
 // Behavior:
 //   - metrics unreachable: exit 1. This probe replaced the /health liveness,
 //     so an engine the probe cannot reach must still be restarted.
-//   - the running gauge or either token counter absent: exit 0. Older vLLM
-//     builds may not publish them; a restart on missing telemetry would be a
-//     false positive, so missing data fails open. Engine death is covered by
-//     the fetch-failure branch above.
-//   - running == 0: record the baseline and exit 0. An idle engine is never
-//     stalled.
-//   - running > 0 with a counter reset (a counter below its last recorded
-//     value): record a fresh baseline and exit 0. Counters are monotonic
-//     within an engine lifetime, so a decrease means the metrics world
-//     restarted, not that the engine unstalled.
-//   - running > 0 with progress (a counter above its last recorded value,
-//     or vllm:kv_cache_usage_perc changed beyond float noise): record and
-//     exit 0. Measured on vLLM v0.31.0, a ~200K-token prefill left BOTH
-//     token counters flat for its whole 13.7s while kv_cache_usage_perc
-//     climbed steadily, so the kv gauge is the mid-prefill heartbeat; it is
-//     optional, and absent keeps the counter-only judgment.
-//   - running > 0 with every signal flat for windowSeconds: exit 1. The
-//     baseline is kept, so later probes keep failing until kubelet restarts
-//     the container; the restart also clears the wedge.
+//   - a required series absent: exit 0. Missing telemetry fails open; engine
+//     death is covered by the fetch-failure branch above.
+//   - no busy gauge above zero: record the baseline and exit 0. An idle
+//     engine is never stalled.
+//   - busy with a counter below its last recorded value: record a fresh
+//     baseline and exit 0. Counters are monotonic within an engine lifetime,
+//     so a decrease means the metrics world restarted.
+//   - busy with progress (a counter above its last recorded value, or a
+//     progress gauge changed beyond float noise): record and exit 0.
+//   - busy with every signal flat for windowSeconds: exit 1. The baseline is
+//     kept, so later probes keep failing until kubelet restarts the
+//     container; the restart also clears the wedge.
+//
+// The host is localhost so the probe reaches the server whichever address
+// family it binds: urllib tries every address localhost resolves to. A probe
+// pinned to 127.0.0.1 is refused by a server bound IPv6-only (#2027).
 //
 // The timestamp is epoch seconds: each kubelet probe exec is a fresh
 // process, so a per-process monotonic clock cannot carry state between them.
@@ -69,17 +92,16 @@ const vllmStallDefaultWindowSeconds int32 = 120
 //
 // The parser mirrors parsePrometheusGaugeSum exactly, NaN included:
 // float("nan") parses and every comparison against it is false, so a NaN
-// counter reads as flat. The two vLLM counters are plain totals and do not
-// emit NaN; deviating from the Go parser here would split the semantics.
-const vllmStallScript = `import json, os, sys, tempfile, time, urllib.request
+// value reads as flat.
+const stallScript = `import json, os, sys, tempfile, time, urllib.request
 
-METRICS_URL = "http://127.0.0.1:%[1]d/metrics"
-WINDOW = %[2]d
-STATE_PATH = os.environ.get("LLMKUBE_STALL_STATE_FILE", "/tmp/llmkube-vllm-stall.json")
-RUNNING = "vllm:num_requests_running"
-GEN = "vllm:generation_tokens_total"
-PROMPT = "vllm:prompt_tokens_total"
-KV = "vllm:kv_cache_usage_perc"
+METRICS_URL = "http://%[1]s:%[2]d/metrics"
+WINDOW = %[3]d
+BUSY = %[4]s
+COUNTERS = %[5]s
+GAUGES = %[6]s
+REQUIRED = %[7]s
+STATE_PATH = os.environ.get("LLMKUBE_STALL_STATE_FILE", "/tmp/llmkube-stall.json")
 EPS = 1e-9
 
 
@@ -124,15 +146,13 @@ def read_state():
     try:
         with open(STATE_PATH) as f:
             state = json.load(f)
-        kv = state.get("kv")
-        return (float(state["gen"]), float(state["prompt"]),
-                None if kv is None else float(kv), float(state["ts"]))
+        return dict(state["values"]), float(state["ts"])
     except Exception:
         return None
 
 
-def write_state(running, gen, prompt, kv, ts):
-    state = {"running": running, "gen": gen, "prompt": prompt, "kv": kv, "ts": ts}
+def write_state(values, ts):
+    state = {"values": values, "ts": ts}
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH) or ".")
     try:
         with os.fdopen(fd, "w") as f:
@@ -150,58 +170,82 @@ body = fetch(METRICS_URL)
 if body is None:
     sys.exit(1)
 
-running, running_found = gauge_sum(body, RUNNING)
-gen, gen_found = gauge_sum(body, GEN)
-prompt, prompt_found = gauge_sum(body, PROMPT)
-if not running_found or not gen_found or not prompt_found:
-    print("stall-probe: required metrics absent; cannot judge", file=sys.stderr)
+values, found = {}, {}
+for name in set(BUSY + COUNTERS + GAUGES + REQUIRED):
+    values[name], found[name] = gauge_sum(body, name)
+missing = [name for name in REQUIRED if not found[name]]
+if missing:
+    print("stall-probe: required metrics absent; cannot judge:", missing, file=sys.stderr)
     sys.exit(0)
 
-kv_val, kv_found = gauge_sum(body, KV)
-kv = kv_val if kv_found else None
-
 now = time.time()
-if running <= 0:
-    write_state(running, gen, prompt, kv, now)
+current = {name: values[name] for name in COUNTERS + GAUGES if found[name]}
+if not any(found[name] and values[name] > 0 for name in BUSY):
+    write_state(current, now)
     sys.exit(0)
 
 prev = read_state()
 if prev is None:
-    write_state(running, gen, prompt, kv, now)
+    write_state(current, now)
     sys.exit(0)
+prev_values, prev_ts = prev
 
-prev_gen, prev_prompt, prev_kv, prev_ts = prev
+for name in COUNTERS:
+    if name in current and name in prev_values and current[name] < prev_values[name]:
+        write_state(current, now)
+        sys.exit(0)
 
-# Counters are monotonic within an engine lifetime; a decrease means the
-# metrics world restarted, so start a fresh window.
-if gen < prev_gen or prompt < prev_prompt:
-    write_state(running, gen, prompt, kv, now)
-    sys.exit(0)
-
-if gen > prev_gen or prompt > prev_prompt:
-    write_state(running, gen, prompt, kv, now)
-    sys.exit(0)
-
-# kv cache usage is the mid-prefill heartbeat: it climbs while a long
-# prefill fills the cache with both token counters flat. Any real change
-# counts, up or down; EPS sits above float-print noise.
-if prev_kv is not None and kv is not None and abs(kv - prev_kv) > EPS:
-    write_state(running, gen, prompt, kv, now)
+progress = any(name in current and name in prev_values and current[name] > prev_values[name]
+               for name in COUNTERS)
+progress = progress or any(name in current and name in prev_values
+                           and abs(current[name] - prev_values[name]) > EPS
+                           for name in GAUGES)
+if progress:
+    write_state(current, now)
     sys.exit(0)
 
 if now - prev_ts >= WINDOW:
-    print("stall-probe: running", running, "with no counter or kv-cache progress for",
+    print("stall-probe: busy with no counter or gauge progress for",
           now - prev_ts, "s (window", WINDOW, "s)", file=sys.stderr)
     sys.exit(1)
 
 sys.exit(0)
 `
 
-// stallProbeCommand builds the argv for the stall-detecting liveness probe.
-// The detector tests execute the returned bytes against a stub /metrics
-// server, so what is shipped is what is tested.
+// stallProbeHost is where the probe reaches the server from inside the pod.
+const stallProbeHost = "localhost"
+
+// pyList renders a Go string slice as a Python list literal (JSON's string
+// list syntax is valid Python).
+func pyList(names []string) string {
+	b, _ := json.Marshal(names)
+	return string(b)
+}
+
+// stallProbeCommandFor builds the argv for a runtime's stall-detecting
+// liveness probe. The detector tests execute the returned bytes against a
+// stub /metrics server, so what is shipped is what is tested.
+func stallProbeCommandFor(sig stallSignals, port, windowSeconds int32) []string {
+	return []string{"python3", "-c", fmt.Sprintf(stallScript, stallProbeHost, port, windowSeconds,
+		pyList(sig.Busy), pyList(sig.Counters), pyList(sig.Gauges), pyList(sig.Required))}
+}
+
+// stallProbeCommand is the vLLM stall probe argv.
 func stallProbeCommand(port, windowSeconds int32) []string {
-	return []string{"python3", "-c", fmt.Sprintf(vllmStallScript, port, windowSeconds)}
+	return stallProbeCommandFor(vllmStallSignals, port, windowSeconds)
+}
+
+// stallLivenessProbe wraps a stall probe argv in the liveness timings the
+// /health liveness it replaces used.
+func stallLivenessProbe(cmd []string) corev1.Probe {
+	return corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{Command: cmd},
+		},
+		PeriodSeconds:    15,
+		TimeoutSeconds:   5,
+		FailureThreshold: 3,
+	}
 }
 
 // stallDetectionEnabled resolves spec.vllmConfig.stallDetection: the window
@@ -234,12 +278,5 @@ func (b *VLLMBackend) CustomizeProbes(
 	if !enabled {
 		return
 	}
-	*liveness = corev1.Probe{
-		ProbeHandler: corev1.ProbeHandler{
-			Exec: &corev1.ExecAction{Command: stallProbeCommand(port, window)},
-		},
-		PeriodSeconds:    15,
-		TimeoutSeconds:   5,
-		FailureThreshold: 3,
-	}
+	*liveness = stallLivenessProbe(stallProbeCommand(port, window))
 }

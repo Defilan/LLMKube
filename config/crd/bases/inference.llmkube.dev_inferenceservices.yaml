@@ -5455,6 +5455,47 @@ spec:
                         minimum: 1
                         type: integer
                     type: object
+                  stallDetection:
+                    description: |-
+                      StallDetection opts the service into a liveness probe that detects a
+                      silently wedged SGLang engine: work in flight while it stops making
+                      progress, which /health does not see. The probe execs a small check
+                      against the local /metrics endpoint and fails once the engine is busy
+                      (sglang:num_running_reqs > 0 or sglang:kv_used_tokens > 0) with
+                      sglang:realtime_tokens_total, the prompt and generation counters, and
+                      sglang:kv_used_tokens all flat for windowSeconds.
+
+                      SGLang's signals differ from vLLM's (measured on SGLang v0.5.15): a
+                      request being prefilled is not counted in num_running_reqs, and the
+                      prompt and generation counters only advance when a request finishes.
+                      kv_used_tokens marks the engine busy through prefill and decode, and
+                      realtime_tokens_total advances on every prefill chunk and decode step,
+                      so a wedge mid-prefill is caught and a long prefill is not mistaken
+                      for one. Prefill chunks arrive further apart as context grows, so the
+                      window must exceed the slowest single chunk on the hardware.
+
+                      The check replaces the /health liveness probe only; startup and
+                      readiness stay on /health_generate. spec.probeOverrides.liveness still
+                      wins when set. The field is inert unless spec.runtime is "sglang". The
+                      probe execs python3 and keeps its state under /tmp, so it needs an
+                      image with python3 on PATH and a writable /tmp. Default off.
+                    properties:
+                      enabled:
+                        description: |-
+                          Enabled turns on the stall-detecting exec liveness probe. When nil
+                          or false, the liveness probe is the standard /health HTTP check.
+                        type: boolean
+                      windowSeconds:
+                        description: |-
+                          WindowSeconds is how long every progress signal must stay flat while
+                          the engine is busy before it is declared stalled. Defaults to 120
+                          when unset. Restart latency is roughly window + liveness period x
+                          failure threshold (about 165s at the defaults).
+                        format: int32
+                        maximum: 3600
+                        minimum: 10
+                        type: integer
+                    type: object
                   tensorParallelSize:
                     description: |-
                       Sharding
