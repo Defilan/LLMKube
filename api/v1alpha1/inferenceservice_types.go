@@ -995,6 +995,7 @@ type DisruptionSpec struct {
 
 // EndpointSpec defines the service endpoint configuration
 // +kubebuilder:validation:XValidation:rule="!has(self.externalTrafficPolicy) || (has(self.type) && self.type in ['NodePort','LoadBalancer'])",message="externalTrafficPolicy requires endpoint.type NodePort or LoadBalancer"
+// +kubebuilder:validation:XValidation:rule="!has(self.apiKeySecretRef) || !has(self.gateway) || !has(self.gateway.enabled) || !self.gateway.enabled",message="endpoint.apiKeySecretRef cannot be combined with endpoint.gateway.enabled: the gateway does not forward the key, so requests would get 401"
 type EndpointSpec struct {
 	// Port is the service port
 	// +kubebuilder:validation:Minimum=1
@@ -1038,7 +1039,8 @@ type EndpointSpec struct {
 	// Both runtimes leave /health and /metrics open, so probes keep working.
 	// Supported for runtime vllm and sglang. A key change takes effect when the
 	// pods restart. An --api-key already in extraArgs wins; LLMKube then adds
-	// nothing. Not supported on ModelRouter.
+	// nothing. Cannot be combined with gateway.enabled: the gateway does not
+	// forward the key. Not supported on ModelRouter.
 	// +optional
 	APIKeySecretRef *corev1.SecretKeySelector `json:"apiKeySecretRef,omitempty"`
 

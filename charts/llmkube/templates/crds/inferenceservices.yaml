@@ -1198,7 +1198,8 @@ spec:
                       Both runtimes leave /health and /metrics open, so probes keep working.
                       Supported for runtime vllm and sglang. A key change takes effect when the
                       pods restart. An --api-key already in extraArgs wins; LLMKube then adds
-                      nothing. Not supported on ModelRouter.
+                      nothing. Cannot be combined with gateway.enabled: the gateway does not
+                      forward the key. Not supported on ModelRouter.
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be
@@ -1312,6 +1313,10 @@ spec:
                     LoadBalancer
                   rule: '!has(self.externalTrafficPolicy) || (has(self.type) && self.type
                     in [''NodePort'',''LoadBalancer''])'
+                - message: 'endpoint.apiKeySecretRef cannot be combined with endpoint.gateway.enabled:
+                    the gateway does not forward the key, so requests would get 401'
+                  rule: '!has(self.apiKeySecretRef) || !has(self.gateway) || !has(self.gateway.enabled)
+                    || !self.gateway.enabled'
               env:
                 description: |-
                   Env adds environment variables to the inference container.

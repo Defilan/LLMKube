@@ -87,6 +87,25 @@ var _ = Describe("InferenceService endpoint auth CRD validation", func() {
 		reject(newISvc("vllm", &inferencev1alpha1.EndpointSpec{Type: "NodePort", ExternalTrafficPolicy: "Bogus"}),
 			"Unsupported value")
 	})
+
+	// The InferenceService gateway reconciler generates routes that carry no
+	// credential, so a keyed backend behind it would answer 401 to every
+	// request while GatewayReady reads True.
+	gateway := func(enabled bool) *inferencev1alpha1.GatewaySpec {
+		return &inferencev1alpha1.GatewaySpec{
+			Enabled: enabled, GatewayRef: inferencev1alpha1.GatewayReference{Name: "ai-gateway"},
+		}
+	}
+	It("rejects apiKeySecretRef with gateway.enabled", func() {
+		reject(newISvc("vllm", &inferencev1alpha1.EndpointSpec{APIKeySecretRef: keyRef, Gateway: gateway(true)}),
+			"endpoint.apiKeySecretRef cannot be combined with endpoint.gateway.enabled")
+	})
+	It("admits apiKeySecretRef with a gateway block that is not enabled", func() {
+		admit(newISvc("vllm", &inferencev1alpha1.EndpointSpec{APIKeySecretRef: keyRef, Gateway: gateway(false)}))
+	})
+	It("admits gateway.enabled without apiKeySecretRef", func() {
+		admit(newISvc("vllm", &inferencev1alpha1.EndpointSpec{Gateway: gateway(true)}))
+	})
 })
 
 // spec.endpoint.apiKeySecretRef and externalTrafficPolicy are InferenceService
