@@ -285,14 +285,18 @@ func (b *VLLMBackend) IdleProbe(_ *inferencev1alpha1.InferenceService, client *h
 }
 
 func (b *VLLMBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar {
+	var env []corev1.EnvVar
 	cfg := isvc.Spec.VLLMConfig
 	if cfg != nil && cfg.HFTokenSecretRef != nil {
-		return []corev1.EnvVar{{
+		env = append(env, corev1.EnvVar{
 			Name:      "HF_TOKEN",
 			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: cfg.HFTokenSecretRef},
-		}}
+		})
 	}
-	return nil
+	if ref := endpointAPIKeyRef(isvc); ref != nil {
+		env = append(env, apiKeyEnvVar(vllmAPIKeyEnv, ref))
+	}
+	return env
 }
 
 // BuildMultiNodeArgs renders vLLM's native multi-node flags for one rank.

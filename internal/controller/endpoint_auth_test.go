@@ -1,0 +1,123 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"slices"
+	"strings"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+)
+
+func keyedISvc(runtime string, extraArgs ...string) *inferencev1alpha1.InferenceService {
+	return &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime: runtime, ModelRef: "m", ExtraArgs: extraArgs,
+			Endpoint: &inferencev1alpha1.EndpointSpec{APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
+			}},
+		},
+	}
+}
+
+func renderContainer(t *testing.T, isvc *inferencev1alpha1.InferenceService) corev1.Container {
+	t.Helper()
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "m", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "org/model"},
+	}
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	return r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template.Spec.Containers[0]
+}
+
+func envNamed(c corev1.Container, name string) []corev1.EnvVar {
+	var out []corev1.EnvVar
+	for _, e := range c.Env {
+		if e.Name == name {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func TestEndpointAPIKeyVLLMEnv(t *testing.T) {
+	c := renderContainer(t, keyedISvc(RuntimeVLLM))
+	got := envNamed(c, "VLLM_API_KEY")
+	if len(got) != 1 || got[0].ValueFrom == nil || got[0].ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("VLLM_API_KEY = %+v, want one secretKeyRef entry", got)
+	}
+	ref := got[0].ValueFrom.SecretKeyRef
+	if ref.Name != "upstream-key" || ref.Key != "key" {
+		t.Errorf("secretKeyRef = %s/%s, want upstream-key/key", ref.Name, ref.Key)
+	}
+	// Review Focus 2: a missing Secret must stop the pod, not start it open.
+	if ref.Optional != nil && *ref.Optional {
+		t.Errorf("secretKeyRef is optional; a missing Secret would start vLLM without auth")
+	}
+	if slices.ContainsFunc(c.Args, func(a string) bool { return strings.Contains(a, "api-key") }) {
+		t.Errorf("vLLM args carry an api-key flag %v; the key must travel only as env", c.Args)
+	}
+}
+
+func TestEndpointAPIKeySGLangEnvAndArg(t *testing.T) {
+	c := renderContainer(t, keyedISvc(RuntimeSGLANG))
+	if got := envNamed(c, "LLMKUBE_API_KEY"); len(got) != 1 || got[0].ValueFrom.SecretKeyRef.Name != "upstream-key" {
+		t.Fatalf("LLMKUBE_API_KEY = %+v, want one secretKeyRef to upstream-key", got)
+	}
+	i := slices.Index(c.Args, "--api-key")
+	if i < 0 || i+1 >= len(c.Args) || c.Args[i+1] != "$(LLMKUBE_API_KEY)" {
+		t.Fatalf("args = %v, want --api-key $(LLMKUBE_API_KEY)", c.Args)
+	}
+}
+
+// Review Focus 5: a user-supplied --api-key wins, in both flag forms.
+func TestEndpointAPIKeyUserFlagWins(t *testing.T) {
+	for _, rt := range []string{RuntimeVLLM, RuntimeSGLANG} {
+		for _, extra := range [][]string{{"--api-key", "mine"}, {"--api-key=mine"}} {
+			c := renderContainer(t, keyedISvc(rt, extra...))
+			if len(envNamed(c, "VLLM_API_KEY"))+len(envNamed(c, "LLMKUBE_API_KEY")) != 0 {
+				t.Errorf("%s %v: LLMKube injected key env alongside the user's flag", rt, extra)
+			}
+			n := 0
+			for _, a := range c.Args {
+				if a == "--api-key" || strings.HasPrefix(a, "--api-key=") {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("%s %v: %d --api-key flags in %v, want only the user's", rt, extra, n, c.Args)
+			}
+		}
+	}
+}
+
+func TestEndpointAPIKeyUnsetRendersNothing(t *testing.T) {
+	for _, rt := range []string{RuntimeVLLM, RuntimeSGLANG} {
+		isvc := keyedISvc(rt)
+		isvc.Spec.Endpoint = nil
+		c := renderContainer(t, isvc)
+		if len(envNamed(c, "VLLM_API_KEY"))+len(envNamed(c, "LLMKUBE_API_KEY")) != 0 ||
+			slices.Contains(c.Args, "--api-key") {
+			t.Errorf("%s without apiKeySecretRef rendered key wiring: env=%v args=%v", rt, c.Env, c.Args)
+		}
+	}
+}

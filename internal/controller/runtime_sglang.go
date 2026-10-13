@@ -178,6 +178,13 @@ func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mode
 		args = append(args, "--is-embedding")
 	}
 
+	// Endpoint API key: SGLang has no env var for it, so the arg expands the
+	// env var BuildEnv adds. Kubernetes substitutes $(VAR) at container start;
+	// the pod spec shows only the literal.
+	if endpointAPIKeyRef(isvc) != nil {
+		args = append(args, "--api-key", "$("+sglangAPIKeyEnv+")")
+	}
+
 	// ExtraArgs last (user wins).
 	if len(isvc.Spec.ExtraArgs) > 0 {
 		args = append(args, isvc.Spec.ExtraArgs...)
@@ -298,16 +305,22 @@ func (b *SGLangBackend) IdleProbe(_ *inferencev1alpha1.InferenceService, client 
 	}
 }
 
-// BuildEnv returns HF_TOKEN from SGLangConfig.HFTokenSecretRef when set.
-// SGLang reads HF_TOKEN from the environment to authenticate gated-model
-// downloads from HuggingFace Hub.
+// BuildEnv returns HF_TOKEN from SGLangConfig.HFTokenSecretRef when set, plus
+// the endpoint API key under sglangAPIKeyEnv (SGLang reads HF_TOKEN from the
+// environment to authenticate gated-model downloads from HuggingFace Hub; the
+// API key has no SGLang-native env var, so BuildArgs expands this one as
+// --api-key $(LLMKUBE_API_KEY)).
 func (b *SGLangBackend) BuildEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar {
+	var env []corev1.EnvVar
 	cfg := isvc.Spec.SGLangConfig
 	if cfg != nil && cfg.HFTokenSecretRef != nil {
-		return []corev1.EnvVar{{
+		env = append(env, corev1.EnvVar{
 			Name:      "HF_TOKEN",
 			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: cfg.HFTokenSecretRef},
-		}}
+		})
 	}
-	return nil
+	if ref := endpointAPIKeyRef(isvc); ref != nil {
+		env = append(env, apiKeyEnvVar(sglangAPIKeyEnv, ref))
+	}
+	return env
 }
