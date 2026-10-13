@@ -18,6 +18,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -248,4 +249,57 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// TestIdleGuardIgnoresTimeBetweenReads: the guard measures upstream silence,
+// so time the proxy spends between Reads, blocked writing to a slow client
+// that is applying backpressure, must not count. Before the fix the timer ran
+// from construction and only re-armed after a Read, so a paused client
+// quarantined a healthy backend and cancelled its request.
+func TestIdleGuardIgnoresTimeBetweenReads(t *testing.T) {
+	var idle atomic.Bool
+	g := newIdleGuardBody(io.NopCloser(strings.NewReader(strings.Repeat("x", 64))),
+		50*time.Millisecond, func() { idle.Store(true) }, nil)
+	defer func() { _ = g.Close() }()
+
+	buf := make([]byte, 8)
+	for i := 0; i < 4; i++ {
+		// Before the first Read this is the proxy writing headers to a slow
+		// client; after it, a body write blocked on backpressure.
+		time.Sleep(150 * time.Millisecond)
+		if _, err := g.Read(buf); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+	}
+	if idle.Load() {
+		t.Fatal("idle guard fired although the upstream always had data; it timed the caller, not the upstream")
+	}
+}
+
+// TestIdleGuardFiresWhileReadBlocks: a Read blocked on a silent upstream is
+// exactly what the guard is for, and it must still fire.
+func TestIdleGuardFiresWhileReadBlocks(t *testing.T) {
+	pr, pw := io.Pipe()
+	fired := make(chan struct{})
+	g := newIdleGuardBody(pr, 50*time.Millisecond, func() {
+		close(fired)
+		// Production cancels the request context, which fails the upstream
+		// read; the pipe stands in for that.
+		_ = pw.CloseWithError(context.Canceled)
+	}, nil)
+	defer func() { _ = g.Close() }()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := g.Read(make([]byte, 8))
+		done <- err
+	}()
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle guard did not fire while Read was blocked on a silent upstream")
+	}
+	if err := <-done; !errors.Is(err, ErrStreamIdle) {
+		t.Fatalf("Read error = %v, want ErrStreamIdle", err)
+	}
 }

@@ -455,7 +455,9 @@ func (d *Dispatcher) Dispatch(
 var ErrStreamIdle = errors.New("upstream stream idle timeout")
 
 // idleGuardBody aborts a response body that produces no bytes for timeout.
-// Every Read that returns data re-arms the timer; Close disarms it.
+// The timer runs only while a Read is blocked on the upstream. Between Reads
+// the proxy is writing to the client, and a slow client applying backpressure
+// is not a wedged backend, so that time does not count. Close disarms it.
 type idleGuardBody struct {
 	rc      io.ReadCloser
 	timeout time.Duration
@@ -468,7 +470,10 @@ type idleGuardBody struct {
 
 func newIdleGuardBody(rc io.ReadCloser, timeout time.Duration, onIdle, onClose func()) *idleGuardBody {
 	g := &idleGuardBody{rc: rc, timeout: timeout, onIdle: onIdle, onClose: onClose}
+	// Disarmed until the first Read: the proxy writes the response headers to
+	// the client before it starts reading the body.
 	g.timer = time.AfterFunc(timeout, g.fire)
+	g.timer.Stop()
 	return g
 }
 
@@ -482,10 +487,11 @@ func (g *idleGuardBody) fire() {
 }
 
 func (g *idleGuardBody) Read(p []byte) (int, error) {
-	n, err := g.rc.Read(p)
-	if n > 0 && !g.fired.Load() {
+	if !g.fired.Load() {
 		g.timer.Reset(g.timeout)
 	}
+	n, err := g.rc.Read(p)
+	g.timer.Stop()
 	if err != nil && err != io.EOF && g.fired.Load() {
 		return n, fmt.Errorf("%w after %s: %v", ErrStreamIdle, g.timeout, err)
 	}
