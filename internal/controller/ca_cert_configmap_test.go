@@ -33,6 +33,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -317,6 +319,63 @@ var _ = Describe("CA ConfigMap preflight (Model prefetch Job)", func() {
 		cond = meta.FindStatusCondition(got.Status.Conditions, ConditionCACertConfigMapAvailable)
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	})
+
+	// The hold must settle. The Model controller has no predicate, so every
+	// status write re-triggers it; a reconcile that writes Progressing=True
+	// (PrefetchCacheIgnored, the normal no-claim-override case) and then
+	// Progressing=False (CA missing) changes the object every time and loops,
+	// about 100 writes a second in kind. Asserting on the writes, not the
+	// resourceVersion, keeps this independent of LastTransitionTime's
+	// one-second resolution.
+	It("writes only the hold condition while the ConfigMap is missing, so the reconcile settles", func() {
+		suffix := rand.String(6)
+		var progressingWrites []metav1.ConditionStatus
+		// interceptor wraps a WithWatch client; build one on the same apiserver.
+		base, err := client.NewWithWatch(cfg, client.Options{Scheme: k8sClient.Scheme()})
+		Expect(err).NotTo(HaveOccurred())
+		counting := interceptor.NewClient(base, interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				if m, ok := obj.(*inferencev1alpha1.Model); ok && sub == "status" {
+					if p := meta.FindStatusCondition(m.Status.Conditions, ConditionProgressing); p != nil {
+						progressingWrites = append(progressingWrites, p.Status)
+					}
+				}
+				return c.SubResource(sub).Update(ctx, obj, opts...)
+			},
+		})
+		r := &ModelReconciler{
+			Client:               counting,
+			Scheme:               k8sClient.Scheme(),
+			Recorder:             events.NewFakeRecorder(20),
+			CACertConfigMap:      "corp-ca-" + suffix,
+			InitContainerImage:   "docker.io/curlimages/curl:8.18.0",
+			DefaultFSGroup:       102,
+			ModelCacheSize:       "10Gi",
+			ModelCacheAccessMode: "ReadWriteOnce",
+		}
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "ca-prefetch-settle-" + suffix, Namespace: ns},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source:   "https://example.com/models/llama.gguf",
+				Prefetch: true,
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, model) })
+		modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+
+		for i := 0; i < 2; i++ {
+			var got inferencev1alpha1.Model
+			Expect(k8sClient.Get(ctx, modelKey, &got)).To(Succeed())
+			handled, _, err := r.reconcilePrefetch(ctx, &got)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(handled).To(BeTrue())
+		}
+
+		Expect(progressingWrites).NotTo(BeEmpty())
+		Expect(progressingWrites).To(HaveEach(metav1.ConditionFalse),
+			"a Progressing=True write on the hold path flips the condition back and forth on every reconcile")
 	})
 })
 
