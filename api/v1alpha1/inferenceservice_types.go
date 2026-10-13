@@ -1473,6 +1473,49 @@ type VLLMConfig struct {
 	// +kubebuilder:validation:Maximum=0.99
 	// +optional
 	GPUMemoryUtilization *float64 `json:"gpuMemoryUtilization,omitempty"`
+
+	// StallDetection opts into a liveness probe that detects a silently
+	// stalled vLLM engine: requests stay "running" while generation stops,
+	// yet /health keeps returning 200, so every probe LLMKube configures
+	// looks healthy and the router keeps sending traffic to a wedged pod
+	// (observed on vLLM v0.31.0; upstream vllm-project/vllm#58422).
+	//
+	// The probe execs a small Python check against the local /metrics
+	// endpoint: while vllm:num_requests_running > 0 and neither
+	// vllm:generation_tokens_total nor vllm:prompt_tokens_total has
+	// increased for the window, the probe fails and kubelet restarts the
+	// container. A restart clears the wedge (only deleting the pod
+	// recovered it in the field). Idle engines (running == 0) never fail
+	// the probe, and a long prefill does not either, because the prompt
+	// counter advances while generation is still flat.
+	//
+	// The check replaces the /health liveness probe only; startup and
+	// readiness stay on /health. spec.probeOverrides.liveness still wins
+	// when set. In-cluster only: metal-agent services run no Kubernetes
+	// probes, and the field is inert unless spec.runtime is "vllm".
+	// Default off; the /health liveness is unchanged when not enabled.
+	// +optional
+	StallDetection *VLLMStallDetection `json:"stallDetection,omitempty"`
+}
+
+// VLLMStallDetection configures the stall-detecting exec liveness probe.
+type VLLMStallDetection struct {
+	// Enabled turns on the stall-detecting exec liveness probe. When nil
+	// or false, the liveness probe is the standard /health HTTP check.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// WindowSeconds is how long both token counters must stay flat while
+	// vllm:num_requests_running > 0 before the engine is declared stalled.
+	// Defaults to 120 when unset. Long prefills complete in seconds on
+	// current GPUs, so 120s leaves wide margin; the minimum guards against
+	// restarting pods over ordinary scheduler hiccups between probes.
+	// Restart latency is roughly window + liveness period x failure
+	// threshold (about 165s at the defaults).
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=3600
+	// +optional
+	WindowSeconds *int32 `json:"windowSeconds,omitempty"`
 }
 
 // SpeculativeConfig configures draft-model speculative decoding for vLLM.

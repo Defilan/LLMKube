@@ -18,6 +18,7 @@ package controller
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -885,4 +886,90 @@ func envMap(env []corev1.EnvVar) map[string]string {
 		m[e.Name] = e.Value
 	}
 	return m
+}
+
+// TestVLLMCustomizeProbes pins the stall-detection wiring (#2020): the exec
+// liveness probe renders only when the feature is opted into, the window and
+// port land in the script, startup and readiness stay on /health, and the
+// off cases are byte-identical to the probes BuildProbes renders today.
+func TestVLLMCustomizeProbes(t *testing.T) {
+	on, off := true, false
+	w90 := int32(90)
+	cases := []struct {
+		name       string
+		vllmConfig *inferencev1alpha1.VLLMConfig
+		wantWindow int32 // 0 means the liveness probe must stay /health
+	}{
+		{name: "no vllmConfig", vllmConfig: nil, wantWindow: 0},
+		{name: "stallDetection absent", vllmConfig: &inferencev1alpha1.VLLMConfig{}, wantWindow: 0},
+		{name: "enabled absent", vllmConfig: &inferencev1alpha1.VLLMConfig{
+			StallDetection: &inferencev1alpha1.VLLMStallDetection{},
+		}, wantWindow: 0},
+		{name: "enabled false", vllmConfig: &inferencev1alpha1.VLLMConfig{
+			StallDetection: &inferencev1alpha1.VLLMStallDetection{Enabled: &off},
+		}, wantWindow: 0},
+		{name: "enabled, default window", vllmConfig: &inferencev1alpha1.VLLMConfig{
+			StallDetection: &inferencev1alpha1.VLLMStallDetection{Enabled: &on},
+		}, wantWindow: 120},
+		{name: "enabled, custom window", vllmConfig: &inferencev1alpha1.VLLMConfig{
+			StallDetection: &inferencev1alpha1.VLLMStallDetection{Enabled: &on, WindowSeconds: &w90},
+		}, wantWindow: 90},
+	}
+
+	const port = int32(8000)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isvc := &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{VLLMConfig: tc.vllmConfig},
+			}
+			backend := &VLLMBackend{}
+			startup, liveness, readiness := backend.BuildProbes(port)
+			startupBefore, livenessBefore, readinessBefore := *startup, *liveness, *readiness
+
+			backend.CustomizeProbes(isvc, port, startup, liveness, readiness)
+
+			if tc.wantWindow == 0 {
+				if !reflect.DeepEqual(&livenessBefore, liveness) {
+					t.Errorf("liveness probe changed with stall detection off: %+v", *liveness)
+				}
+				if !reflect.DeepEqual(&startupBefore, startup) {
+					t.Errorf("startup probe changed with stall detection off: %+v", *startup)
+				}
+				if !reflect.DeepEqual(&readinessBefore, readiness) {
+					t.Errorf("readiness probe changed with stall detection off: %+v", *readiness)
+				}
+				return
+			}
+
+			if liveness.Exec == nil {
+				t.Fatalf("liveness probe = %+v, want an exec probe", liveness)
+			}
+			if liveness.HTTPGet != nil {
+				t.Errorf("exec liveness still carries an HTTPGet handler")
+			}
+			wantCmd := stallProbeCommand(port, tc.wantWindow)
+			if !reflect.DeepEqual(liveness.Exec.Command, wantCmd) {
+				t.Errorf("exec command = %q, want the rendered stallProbeCommand %q",
+					liveness.Exec.Command, wantCmd)
+			}
+			if got := liveness.Exec.Command[0]; got != "python3" {
+				t.Errorf("exec interpreter = %q, want python3", got)
+			}
+			script := liveness.Exec.Command[2]
+			if !strings.Contains(script, "127.0.0.1:8000/metrics") {
+				t.Errorf("stall script does not target the local metrics endpoint")
+			}
+			if !strings.Contains(script, strconv.FormatInt(int64(tc.wantWindow), 10)) {
+				t.Errorf("stall script does not carry window %d", tc.wantWindow)
+			}
+			// Startup and readiness must stay on /health regardless.
+			if !reflect.DeepEqual(&startupBefore, startup) || !reflect.DeepEqual(&readinessBefore, readiness) {
+				t.Errorf("startup/readiness probes must stay on /health: %+v / %+v", *startup, *readiness)
+			}
+			if startup.HTTPGet == nil || startup.HTTPGet.Path != "/health" ||
+				readiness.HTTPGet == nil || readiness.HTTPGet.Path != "/health" {
+				t.Errorf("startup/readiness lost the /health handler: %+v / %+v", startup, readiness)
+			}
+		})
+	}
 }

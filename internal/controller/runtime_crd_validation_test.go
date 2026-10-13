@@ -76,3 +76,53 @@ var _ = Describe("InferenceService spec.runtime CRD validation", func() {
 		Expect(err.Error()).To(ContainSubstring("spec.runtime"))
 	})
 })
+
+// These specs exercise spec.vllmConfig.stallDetection through the envtest
+// apiserver, pinning the generated CRD schema: the window bounds are enforced
+// at apply time and the field admits without a window (the controller
+// resolves the 120s default).
+var _ = Describe("InferenceService spec.vllmConfig.stallDetection CRD validation", func() {
+	ctx := context.Background()
+
+	newStallISvc := func(name string, stall *inferencev1alpha1.VLLMStallDetection) *inferencev1alpha1.InferenceService {
+		enabled := true
+		stall.Enabled = &enabled
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "stall-crd-model",
+				Runtime:  "vllm",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{
+					StallDetection: stall,
+				},
+			},
+		}
+	}
+
+	It("rejects a windowSeconds below the minimum", func() {
+		tooSmall := int32(5)
+		err := k8sClient.Create(ctx, newStallISvc("stall-window-low",
+			&inferencev1alpha1.VLLMStallDetection{WindowSeconds: &tooSmall}))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("windowSeconds"))
+	})
+
+	It("rejects a windowSeconds above the maximum", func() {
+		tooBig := int32(4000)
+		err := k8sClient.Create(ctx, newStallISvc("stall-window-high",
+			&inferencev1alpha1.VLLMStallDetection{WindowSeconds: &tooBig}))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("windowSeconds"))
+	})
+
+	It("admits an enabled stall detection without a window", func() {
+		isvc := newStallISvc("stall-no-window",
+			&inferencev1alpha1.VLLMStallDetection{})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+
+		stored := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: "default"}, stored)).To(Succeed())
+		Expect(stored.Spec.VLLMConfig.StallDetection.WindowSeconds).To(BeNil())
+		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
+	})
+})
