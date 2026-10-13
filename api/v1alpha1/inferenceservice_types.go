@@ -395,7 +395,7 @@ type MultiNodeRecreateStatus struct {
 // +kubebuilder:validation:XValidation:rule="!has(self.multiNode) || (has(self.runtime) && self.runtime == 'vllm')",message="multiNode is supported for runtime vllm in this release"
 // +kubebuilder:validation:XValidation:rule="!(has(self.stageModel) && self.stageModel && has(self.skipModelInit) && self.skipModelInit)",message="stageModel and skipModelInit cannot both be true: one asks the operator to stage the Model, the other declines staging"
 // +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) || (has(self.runtime) && self.runtime in ['vllm','sglang'])",message="endpoint.apiKeySecretRef is supported for runtime vllm and sglang in this release"
-// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) || !has(self.runtime) || self.runtime != 'sglang' || !has(self.command) || self.command.size() == 0",message="with spec.command set LLMKube cannot add --api-key to the SGLang command line; pass --api-key in spec.args or drop spec.command"
+// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) || !has(self.runtime) || self.runtime != 'sglang' || !has(self.command) || self.command.size() == 0",message="with spec.command set, LLMKube cannot add --api-key to the SGLang command line; drop spec.command, or remove endpoint.apiKeySecretRef and pass --api-key $(VAR) in spec.args with VAR from spec.env"
 type InferenceServiceSpec struct {
 	// ModelRef references the Model CR that contains the model to serve
 	// +kubebuilder:validation:Required

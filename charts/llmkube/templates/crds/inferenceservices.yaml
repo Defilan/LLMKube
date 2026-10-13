@@ -6386,8 +6386,9 @@ spec:
                 sglang in this release
               rule: '!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) ||
                 (has(self.runtime) && self.runtime in [''vllm'',''sglang''])'
-            - message: with spec.command set LLMKube cannot add --api-key to the SGLang
-                command line; pass --api-key in spec.args or drop spec.command
+            - message: with spec.command set, LLMKube cannot add --api-key to the
+                SGLang command line; drop spec.command, or remove endpoint.apiKeySecretRef
+                and pass --api-key $(VAR) in spec.args with VAR from spec.env
               rule: '!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) ||
                 !has(self.runtime) || self.runtime != ''sglang'' || !has(self.command)
                 || self.command.size() == 0'
