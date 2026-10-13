@@ -996,6 +996,7 @@ type DisruptionSpec struct {
 // EndpointSpec defines the service endpoint configuration
 // +kubebuilder:validation:XValidation:rule="!has(self.externalTrafficPolicy) || (has(self.type) && self.type in ['NodePort','LoadBalancer'])",message="externalTrafficPolicy requires endpoint.type NodePort or LoadBalancer"
 // +kubebuilder:validation:XValidation:rule="!has(self.apiKeySecretRef) || !has(self.gateway) || !has(self.gateway.enabled) || !self.gateway.enabled",message="endpoint.apiKeySecretRef cannot be combined with endpoint.gateway.enabled: the gateway does not forward the key, so requests would get 401"
+// +kubebuilder:validation:XValidation:rule="!has(self.apiKeySecretRef) || (has(self.apiKeySecretRef.name) && size(self.apiKeySecretRef.name) > 0 && self.apiKeySecretRef.key.matches('^[-._a-zA-Z0-9]+$'))",message="endpoint.apiKeySecretRef needs a non-empty Secret name and a valid Secret key (letters, digits, '-', '_' and '.')"
 type EndpointSpec struct {
 	// Port is the service port
 	// +kubebuilder:validation:Minimum=1

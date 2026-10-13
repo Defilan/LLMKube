@@ -490,6 +490,10 @@ spec:
                     the gateway does not forward the key, so requests would get 401'
                   rule: '!has(self.apiKeySecretRef) || !has(self.gateway) || !has(self.gateway.enabled)
                     || !self.gateway.enabled'
+                - message: endpoint.apiKeySecretRef needs a non-empty Secret name
+                    and a valid Secret key (letters, digits, '-', '_' and '.')
+                  rule: '!has(self.apiKeySecretRef) || (has(self.apiKeySecretRef.name)
+                    && size(self.apiKeySecretRef.name) > 0 && self.apiKeySecretRef.key.matches(''^[-._a-zA-Z0-9]+$''))'
               gatewayRef:
                 description: |-
                   GatewayRef identifies the pre-installed Gateway (gateway.networking.k8s.io)

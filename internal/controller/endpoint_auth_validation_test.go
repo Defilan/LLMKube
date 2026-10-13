@@ -23,6 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/rand"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -105,6 +106,45 @@ var _ = Describe("InferenceService endpoint auth CRD validation", func() {
 	})
 	It("admits gateway.enabled without apiKeySecretRef", func() {
 		admit(newISvc("vllm", &inferencev1alpha1.EndpointSpec{Gateway: gateway(true)}))
+	})
+
+	// A nameless or malformed reference passes admission without these rules,
+	// then the Deployment update is rejected and the old keyless pods keep
+	// serving while the InferenceService reads Ready.
+	const badRefMsg = "endpoint.apiKeySecretRef needs a non-empty Secret name and a valid Secret key"
+	It("rejects apiKeySecretRef with no name", func() {
+		reject(newISvc("vllm", &inferencev1alpha1.EndpointSpec{
+			APIKeySecretRef: &corev1.SecretKeySelector{Key: "key"},
+		}), badRefMsg)
+	})
+	It("rejects apiKeySecretRef with an explicitly empty name", func() {
+		// The typed client drops name:"" (omitempty), so send it verbatim.
+		u := &unstructured.Unstructured{Object: map[string]any{
+			"apiVersion": inferencev1alpha1.GroupVersion.String(),
+			"kind":       "InferenceService",
+			"metadata":   map[string]any{"name": "ep-auth-" + rand.String(6), "namespace": "default"},
+			"spec": map[string]any{
+				"modelRef": "ep-auth-model", "runtime": "vllm",
+				"endpoint": map[string]any{"apiKeySecretRef": map[string]any{"name": "", "key": "key"}},
+			},
+		}}
+		err := k8sClient.Create(ctx, u)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(badRefMsg))
+	})
+	It("rejects apiKeySecretRef with a key that is not a valid Secret key", func() {
+		reject(newISvc("vllm", &inferencev1alpha1.EndpointSpec{
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "bad/key",
+			},
+		}), badRefMsg)
+	})
+	It("admits apiKeySecretRef with a valid name and a dotted key", func() {
+		admit(newISvc("vllm", &inferencev1alpha1.EndpointSpec{
+			APIKeySecretRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "api_key.v-2",
+			},
+		}))
 	})
 })
 
