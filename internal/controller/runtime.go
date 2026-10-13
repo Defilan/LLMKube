@@ -94,6 +94,14 @@ type IdleDetector interface {
 	IdleProbe(isvc *inferencev1alpha1.InferenceService, client *http.Client) func(ctx context.Context, baseURL string) (bool, error)
 }
 
+// ProbeCustomizer is optionally implemented by backends that derive probe
+// content from the service spec rather than the runtime alone. It runs after
+// BuildProbes and before spec.probeOverrides is applied, so a user override
+// still wins over anything the backend customizes.
+type ProbeCustomizer interface {
+	CustomizeProbes(isvc *inferencev1alpha1.InferenceService, port int32, startup, liveness, readiness *corev1.Probe)
+}
+
 // resolveBackend returns the RuntimeBackend for the given InferenceService.
 // Declared as a var so tests can stub it.
 var resolveBackend = func(isvc *inferencev1alpha1.InferenceService) RuntimeBackend {

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -1663,6 +1664,74 @@ func TestConstructDeployment_GenericStageModel(t *testing.T) {
 		}
 		if _, ok := lookupEnv(with.Containers[0].Env, "LLMKUBE_MODEL_PATH"); ok {
 			t.Error("LLMKUBE_MODEL_PATH set on llamacpp, which builds its own --model")
+		}
+	})
+}
+
+// TestConstructDeployment_VLLMStallLivenessAndOverrides pins the probe
+// pipeline order for #2020: the vLLM stall customizer runs after BuildProbes,
+// and spec.probeOverrides.liveness is applied after the customizer, so a
+// user override always wins.
+func TestConstructDeployment_VLLMStallLivenessAndOverrides(t *testing.T) {
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "target", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Format: "gguf", Source: "s3://bucket/m.gguf"},
+	}
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	enabled := true
+
+	newISvc := func() *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "target",
+				Runtime:  "vllm",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{
+					StallDetection: &inferencev1alpha1.VLLMStallDetection{Enabled: &enabled},
+				},
+			},
+		}
+	}
+	vllmContainer := func(dep *appsv1.Deployment) corev1.Container {
+		for _, c := range dep.Spec.Template.Spec.Containers {
+			if c.Name == "vllm" {
+				return c
+			}
+		}
+		t.Fatal("vllm container not found in deployment")
+		return corev1.Container{}
+	}
+
+	t.Run("stall detection renders the exec liveness probe", func(t *testing.T) {
+		dep := r.constructDeployment(newISvc(), model, nil, 1, "", "")
+		container := vllmContainer(dep)
+		if container.LivenessProbe == nil || container.LivenessProbe.Exec == nil {
+			t.Fatalf("liveness probe = %+v, want an exec probe", container.LivenessProbe)
+		}
+		if container.LivenessProbe.HTTPGet != nil {
+			t.Errorf("liveness probe kept an HTTPGet handler alongside the exec probe")
+		}
+		if got := container.LivenessProbe.Exec.Command[0]; got != "python3" {
+			t.Errorf("exec command interpreter = %q, want python3", got)
+		}
+	})
+
+	t.Run("probeOverrides.liveness still wins", func(t *testing.T) {
+		isvc := newISvc()
+		isvc.Spec.ProbeOverrides = &inferencev1alpha1.ProbeOverrides{
+			Liveness: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					HTTPGet: &corev1.HTTPGetAction{Path: "/custom-health"},
+				},
+			},
+		}
+		dep := r.constructDeployment(isvc, model, nil, 1, "", "")
+		container := vllmContainer(dep)
+		if container.LivenessProbe.Exec != nil {
+			t.Fatal("user probeOverrides.liveness was overridden by the stall exec probe")
+		}
+		if container.LivenessProbe.HTTPGet == nil || container.LivenessProbe.HTTPGet.Path != "/custom-health" {
+			t.Fatalf("liveness probe = %+v, want the user's /custom-health override", container.LivenessProbe)
 		}
 	})
 }

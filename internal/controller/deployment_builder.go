@@ -465,6 +465,12 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	args := backend.BuildArgs(isvc, model, modelPath, draftPath, port)
 
 	startupProbe, livenessProbe, readinessProbe := backend.BuildProbes(port)
+	// Spec-derived probe customization runs before probeOverrides so a user
+	// override always wins over what the backend customizes (e.g. the vLLM
+	// stall-detecting exec liveness probe, #2020).
+	if pc, ok := backend.(ProbeCustomizer); ok {
+		pc.CustomizeProbes(isvc, port, startupProbe, livenessProbe, readinessProbe)
+	}
 	if isvc.Spec.ProbeOverrides != nil {
 		if isvc.Spec.ProbeOverrides.Startup != nil {
 			startupProbe = isvc.Spec.ProbeOverrides.Startup
