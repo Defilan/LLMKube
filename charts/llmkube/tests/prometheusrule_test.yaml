@@ -331,3 +331,54 @@ tests:
       - notMatchRegex:
           path: spec.groups[*].name
           pattern: llmkube-serving
+
+  # --- GPU fault alerts (behavior is pinned by test/promrules; these pin the
+  # rendering contract: gating, the Xid list feeding both Xid alerts, and the
+  # render failure that stops an empty list from shipping broken PromQL) ---
+
+  - it: should render the GPU fault group by default when prometheusRule is enabled
+    template: prometheusrule.yaml
+    set:
+      prometheus.prometheusRule.enabled: true
+    asserts:
+      - lengthEqual:
+          path: spec.groups[?(@.name=="llmkube-gpu-health")].rules
+          count: 7
+      - equal:
+          path: spec.groups[?(@.name=="llmkube-gpu-health")].rules[?(@.alert=="GPURecoveryActionRequired")].expr
+          value: DCGM_FI_DEV_GPU_RECOVERY_ACTION > 0
+
+  - it: should feed a custom critical Xid list into both Xid alerts
+    template: prometheusrule.yaml
+    set:
+      prometheus.prometheusRule.enabled: true
+      prometheus.prometheusRule.rules.gpuHealth.criticalXids: [79, 154]
+    asserts:
+      - matchRegex:
+          path: spec.groups[?(@.name=="llmkube-gpu-health")].rules[?(@.alert=="GPUCriticalXid")].expr
+          pattern: 'xid=~"79\|154"'
+      - matchRegex:
+          path: spec.groups[?(@.name=="llmkube-gpu-health")].rules[?(@.alert=="GPUCriticalXidLastValue")].expr
+          pattern: 'DCGM_FI_DEV_XID_ERRORS == 79\s+or DCGM_FI_DEV_XID_ERRORS == 154\s+\)'
+      - notMatchRegex:
+          path: spec.groups[?(@.name=="llmkube-gpu-health")].rules[?(@.alert=="GPUCriticalXidLastValue")].expr
+          pattern: '== 109'
+
+  - it: should omit the GPU fault group when gpuHealth.enabled is false
+    template: prometheusrule.yaml
+    set:
+      prometheus.prometheusRule.enabled: true
+      prometheus.prometheusRule.rules.gpuHealth.enabled: false
+    asserts:
+      - notMatchRegex:
+          path: spec.groups[*].name
+          pattern: llmkube-gpu-health
+
+  - it: should refuse to render the GPU fault group without a critical Xid
+    template: prometheusrule.yaml
+    set:
+      prometheus.prometheusRule.enabled: true
+      prometheus.prometheusRule.rules.gpuHealth.criticalXids: null
+    asserts:
+      - failedTemplate:
+          errorPattern: criticalXids must list at least one Xid

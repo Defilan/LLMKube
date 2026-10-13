@@ -84,6 +84,9 @@ sections:
       - label: Karpenter GPU autoscaling
         slug: guides/karpenter-gpu-autoscaling
         file: guides/karpenter-gpu-autoscaling.md
+      - label: GPU fault handling
+        slug: guides/gpu-fault-handling
+        file: guides/gpu-fault-handling.md
 
   - title: Lab builds
     items:

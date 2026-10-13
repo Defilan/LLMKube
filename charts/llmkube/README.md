@@ -154,6 +154,8 @@ fit, keeping the role suffix that identifies the object.
 | `prometheus.prometheusRule.rules.gpu.highTemperatureThreshold` | GPU high temperature threshold (°C) | `85` |
 | `prometheus.prometheusRule.rules.gpu.memoryPressureThreshold` | GPU memory pressure threshold (%) | `90` |
 | `prometheus.prometheusRule.rules.gpu.powerLimitThreshold` | GPU power limit threshold (W) | `250` |
+| `prometheus.prometheusRule.rules.gpuHealth.enabled` | Enable GPU fault alerts: Xids, recovery action, row remapping, DCGM health watches. Some need DCGM exporter counters that are off by default; see the [GPU fault handling guide](../../docs/site/guides/gpu-fault-handling.md) | `true` |
+| `prometheus.prometheusRule.rules.gpuHealth.criticalXids` | Xids that page as critical, from the NVIDIA Xid catalog's reset, reboot and support resolutions | See values.yaml |
 | `prometheus.prometheusRule.rules.inference.enabled` | Enable inference alerts | `true` |
 | `prometheus.prometheusRule.rules.serving.enabled` | Enable serving-quality alerts (also requires `prometheus.inferencePodMonitor.enabled`) | `true` |
 | `prometheus.prometheusRule.rules.serving.queueTimeSecondsThreshold` | Mean per-pod queue wait threshold (s) | `30` |
