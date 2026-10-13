@@ -55,22 +55,57 @@ func TestIncludeUsageChunk(t *testing.T) {
 }
 
 func TestChunkDelayPacesTheStream(t *testing.T) {
-	srv := httptest.NewServer(newMux(stubConfig{label: "s", chunkDelay: 300 * time.Millisecond}, &recorder{}))
+	const delay = 300 * time.Millisecond
+	mux := newMux(stubConfig{label: "s", chunkDelay: delay}, &recorder{})
+	flushes := make(chan []time.Time, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fc := &flushClock{ResponseWriter: w}
+		mux.ServeHTTP(fc, r)
+		flushes <- fc.at
+	}))
 	defer srv.Close()
-	start := time.Now()
+
 	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close() //nolint:errcheck // verbatim test code from task-5-brief.md Step 1
-	buf := make([]byte, 64)
-	if _, err := resp.Body.Read(buf); err != nil {
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		t.Fatal(err)
 	}
-	first := time.Since(start)
-	_, _ = io.ReadAll(resp.Body)
-	if total := time.Since(start); total-first < 500*time.Millisecond {
-		t.Errorf("first chunk at %v, end at %v: chunks were not paced", first, total)
+	if n := strings.Count(string(body), "data: "); n != 4 {
+		t.Fatalf("got %d SSE events, want 3 chunks and [DONE]:\n%s", n, body)
+	}
+
+	var at []time.Time
+	select {
+	case at = <-flushes:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return")
+	}
+	if len(at) != 4 {
+		t.Fatalf("got %d flushes, want one per chunk plus [DONE]", len(at))
+	}
+	for i := 1; i < 3; i++ {
+		if gap := at[i].Sub(at[i-1]); gap < delay {
+			t.Errorf("chunk %d flushed %v after chunk %d, want at least %v", i, gap, i-1, delay)
+		}
+	}
+}
+
+// flushClock timestamps every Flush on the server side, so the pacing check
+// measures the gap between chunk boundaries as the stub emits them, not when
+// the client goroutine happened to be scheduled to read.
+type flushClock struct {
+	http.ResponseWriter
+	at []time.Time
+}
+
+func (f *flushClock) Flush() {
+	f.at = append(f.at, time.Now())
+	if fl, ok := f.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
 	}
 }
 
