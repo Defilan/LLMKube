@@ -24,7 +24,7 @@ func do(t *testing.T, h http.Handler, method, path, auth, body string) *httptest
 
 func TestKeyEnforcedOnV1Only(t *testing.T) {
 	h := newMux(stubConfig{label: "s", apiKey: "k"}, &recorder{})
-	if w := do(t, h, "POST", "/v1/chat/completions", "", `{}`); w.Code != 401 || !strings.Contains(w.Body.String(), "Unauthorized") { //nolint:lll // verbatim test code from task-5-brief.md Step 1
+	if w := do(t, h, "POST", "/v1/chat/completions", "", `{}`); w.Code != 401 || !strings.Contains(w.Body.String(), "Unauthorized") { //nolint:lll // long assertion kept on one line for readability
 		t.Errorf("no key: %d %s, want 401 Unauthorized", w.Code, w.Body)
 	}
 	if w := do(t, h, "POST", "/v1/chat/completions", "Bearer k", `{}`); w.Code != 200 {
@@ -109,7 +109,7 @@ func (f *flushClock) Flush() {
 	}
 }
 
-// --- Additional coverage beyond the brief's Step 1 tests ---
+// --- Additional coverage ---
 
 // TestUnauthorizedBodyMatchesVLLM pins the exact wire body, not just a
 // substring: APISIX / vLLM clients downstream may assert on the literal
@@ -126,7 +126,7 @@ func TestUnauthorizedBodyMatchesVLLM(t *testing.T) {
 }
 
 // TestKeyEnforcedOnV2AndInferenceToo checks the other two guarded
-// prefixes named in the brief, not just /v1.
+// prefixes vLLM guards (/v1, /v2, /inference), not just /v1.
 func TestKeyEnforcedOnV2AndInferenceToo(t *testing.T) {
 	h := newMux(stubConfig{label: "s", apiKey: "k"}, &recorder{})
 	for _, path := range []string{"/v2/models", "/inference/whatever"} {
@@ -156,7 +156,7 @@ func TestIntrospectAndHealthzStayOpenWithKeyConfigured(t *testing.T) {
 	}
 }
 
-// TestHealthRecordedSeparatelyFromIntrospect pins Ruling B: /health
+// TestHealthRecordedSeparatelyFromIntrospect records /health
 // requests must show up at the new /__introspect__/health endpoint and
 // must NOT pollute the existing /__introspect__ list that the router
 // e2e suite reads, since kubelet probes hit /health every few seconds
@@ -209,7 +209,7 @@ func TestResetClearsBothLists(t *testing.T) {
 	}
 }
 
-// TestNonStreamedAlwaysCarriesUsage pins the brief's "non-streamed
+// TestNonStreamedAlwaysCarriesUsage verifies that "non-streamed
 // responses always carry that usage" behavior, independent of
 // stream_options.
 func TestNonStreamedAlwaysCarriesUsage(t *testing.T) {
