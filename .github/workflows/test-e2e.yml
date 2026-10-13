@@ -99,6 +99,53 @@ jobs:
         if: always()
         run: make cleanup-test-e2e
 
+  test-e2e-apisix:
+    name: Run on Ubuntu (kind, APISIX ai-proxy-multi via Helm)
+    runs-on: ubuntu-latest
+    # Best-effort while this Helm-based Context is hardened in CI; the default
+    # kind job above remains the merge gate. It Helm-installs the operator chart
+    # and APISIX (standalone mode) and serves the stub upstream as keyed
+    # InferenceServices behind ai-proxy-multi, so it needs Helm and a
+    # self-contained cluster, hence its own focused job.
+    continue-on-error: true
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Install Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Running APISIX ai-proxy-multi e2e
+        env:
+          # Runs only the APISIX Context (test/e2e/apisix_e2e_test.go); BeforeSuite
+          # also builds and side-loads the stub-upstream image for it.
+          LLMKUBE_E2E_APISIX: "true"
+          # The operator chart self-signs its webhook serving cert, so
+          # cert-manager is not needed; skip its install to keep the job fast.
+          CERT_MANAGER_INSTALL_SKIP: "true"
+          # Match the cluster name `make setup-test-e2e` creates and the
+          # BeforeSuite image-load targets.
+          KIND_CLUSTER: llmkube-test-e2e
+          STUB_UPSTREAM_IMG: localhost/llmkube-stub-upstream:e2e
+        run: |
+          go mod tidy
+          make test-e2e-apisix
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: make cleanup-test-e2e
+
   test-e2e-longhorn:
     name: Run on Ubuntu (kind + Longhorn, restrictive storage)
     runs-on: ubuntu-latest

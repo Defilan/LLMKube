@@ -1,0 +1,64 @@
+routes:
+  - id: fast
+    uri: /fast/v1/chat/completions
+    plugins:
+      prometheus: {}
+      ai-proxy-multi:
+        timeout: 60000
+        instances:
+          - name: llmkube-fast
+            provider: openai-compatible
+            weight: 1
+            auth:
+              header:
+                Authorization: "Bearer e2e-api-key"
+            options:
+              model: stub
+            override:
+              endpoint: "http://apisix-e2e-fast.{{ .NS }}.svc.cluster.local:8000/v1/chat/completions"
+            checks:
+              active:
+                type: http
+                http_path: /health
+                healthy: {interval: 1, successes: 1}
+                unhealthy: {interval: 1, http_failures: 2}
+          # A second instance on the same InferenceService: APISIX 3.19.0 runs
+          # checks.active only when a route has two or more instances.
+          - name: llmkube-fast-b
+            provider: openai-compatible
+            weight: 1
+            auth:
+              header:
+                Authorization: "Bearer e2e-api-key"
+            options:
+              model: stub
+            override:
+              endpoint: "http://apisix-e2e-fast.{{ .NS }}.svc.cluster.local:8000/v1/chat/completions"
+            checks:
+              active:
+                type: http
+                http_path: /health
+                healthy: {interval: 1, successes: 1}
+                unhealthy: {interval: 1, http_failures: 2}
+  - id: slow-60s
+    uri: /t60/v1/chat/completions
+    plugins:
+      ai-proxy-multi:
+        timeout: 60000
+        instances:
+          - name: llmkube-slow-60
+            provider: openai-compatible
+            weight: 1
+            auth: {header: {Authorization: "Bearer e2e-api-key"}}
+            override: {endpoint: "http://apisix-e2e-slow.{{ .NS }}.svc.cluster.local:8000/v1/chat/completions"}
+  - id: slow-default
+    uri: /t30/v1/chat/completions
+    plugins:
+      ai-proxy-multi:
+        instances:
+          - name: llmkube-slow-30
+            provider: openai-compatible
+            weight: 1
+            auth: {header: {Authorization: "Bearer e2e-api-key"}}
+            override: {endpoint: "http://apisix-e2e-slow.{{ .NS }}.svc.cluster.local:8000/v1/chat/completions"}
+#END

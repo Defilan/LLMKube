@@ -51,6 +51,13 @@ var (
 	//   webhook ships only via the chart; the chart self-signs its serving
 	//   cert, so no cert-manager is needed. Runs in its own focused CI job
 	//   (test-e2e.yml, test-e2e-quota).
+	// - LLMKUBE_E2E_APISIX=true: Runs the "APISIX ai-proxy-multi in front of
+	//   an InferenceService" Context (test/e2e/apisix_e2e_test.go), which
+	//   Helm-installs the operator chart and APISIX (standalone mode) and
+	//   serves the stub-upstream image as keyed InferenceServices behind
+	//   APISIX's ai-proxy-multi plugin. Side-loads the stub-upstream image
+	//   built below (not the router-proxy). Runs in its own focused CI job
+	//   (test-e2e.yml, test-e2e-apisix) via `make test-e2e-apisix`.
 	// These variables are useful if CertManager is already installed, avoiding
 	// re-installation and conflicts.
 	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
@@ -70,8 +77,9 @@ var (
 	routerProxyImage = "ghcr.io/defilantech/llmkube-router-proxy:dev"
 
 	// stubUpstreamImage is the fake llama.cpp / cloud-provider used in
-	// the ModelRouter cluster Context. Only side-loaded when
-	// LLMKUBE_E2E_ROUTER_CLUSTER=true so unrelated jobs stay fast.
+	// the ModelRouter cluster Context and the APISIX Context. Only
+	// side-loaded when LLMKUBE_E2E_ROUTER_CLUSTER=true or
+	// LLMKUBE_E2E_APISIX=true so unrelated jobs stay fast.
 	stubUpstreamImage = "localhost/llmkube-stub-upstream:e2e"
 )
 
@@ -117,7 +125,9 @@ var _ = BeforeSuite(func() {
 			err = utils.LoadImageToKindClusterWithName(routerProxyImage)
 			ExpectWithOffset(1, err).NotTo(HaveOccurred(),
 				"Failed to load the router-proxy image into Kind")
+		}
 
+		if os.Getenv("LLMKUBE_E2E_ROUTER_CLUSTER") == "true" || os.Getenv("LLMKUBE_E2E_APISIX") == "true" {
 			By("building the stub-upstream image")
 			cmd = exec.Command("make", "docker-build-stub-upstream",
 				fmt.Sprintf("STUB_UPSTREAM_IMG=%s", stubUpstreamImage))
