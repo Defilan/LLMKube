@@ -527,6 +527,9 @@ func relayServiceConverged(isvc *inferencev1alpha1.InferenceService, desired, ex
 func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
 	desired := r.constructService(isvc)
 	desired.Spec.Selector = relayPodSelector(isvc.Name)
+	// externalTrafficPolicy is supported for pod-backed services only in this
+	// release; the relay's update path does not sync it.
+	desired.Spec.ExternalTrafficPolicy = ""
 	// Deliberate: adoption moves the port to spec.endpoint.port (what status
 	// already advertises), even when the agent-written Service used another.
 	for i := range desired.Spec.Ports {
