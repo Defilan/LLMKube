@@ -126,3 +126,43 @@ var _ = Describe("InferenceService spec.vllmConfig.stallDetection CRD validation
 		Expect(k8sClient.Delete(ctx, isvc)).To(Succeed())
 	})
 })
+
+// spec.sglangConfig.stallDetection carries the same schema bounds.
+var _ = Describe("InferenceService spec.sglangConfig.stallDetection CRD validation", func() {
+	ctx := context.Background()
+
+	newSGLangStallISvc := func(name string, stall *inferencev1alpha1.SGLangStallDetection) *inferencev1alpha1.InferenceService {
+		enabled := true
+		stall.Enabled = &enabled
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef:     "stall-crd-model",
+				Runtime:      "sglang",
+				SGLangConfig: &inferencev1alpha1.SGLangConfig{StallDetection: stall},
+			},
+		}
+	}
+
+	It("rejects a windowSeconds below the minimum", func() {
+		tooSmall := int32(5)
+		err := k8sClient.Create(ctx, newSGLangStallISvc("sglang-stall-window-low",
+			&inferencev1alpha1.SGLangStallDetection{WindowSeconds: &tooSmall}))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("windowSeconds"))
+	})
+
+	It("rejects a windowSeconds above the maximum", func() {
+		tooBig := int32(4000)
+		err := k8sClient.Create(ctx, newSGLangStallISvc("sglang-stall-window-high",
+			&inferencev1alpha1.SGLangStallDetection{WindowSeconds: &tooBig}))
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("windowSeconds"))
+	})
+
+	It("admits an enabled stall detection without a window", func() {
+		isvc := newSGLangStallISvc("sglang-stall-no-window", &inferencev1alpha1.SGLangStallDetection{})
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		_ = k8sClient.Delete(ctx, isvc)
+	})
+})

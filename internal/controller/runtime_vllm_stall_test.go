@@ -44,11 +44,15 @@ const stallStateFileEnv = "LLMKUBE_STALL_STATE_FILE"
 // verdict.
 func runStallProbe(t *testing.T, port int32, stateDir string) int {
 	t.Helper()
-	const window = int32(1)
+	return runStallProbeCmd(t, stallProbeCommand(port, 1), stateDir)
+}
 
+// runStallProbeCmd executes a rendered stall probe argv (any runtime's) with
+// the state file pointed inside stateDir, and returns the exit code.
+func runStallProbeCmd(t *testing.T, cmdParts []string, stateDir string) int {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmdParts := stallProbeCommand(port, window)
 	cmd := exec.CommandContext(ctx, cmdParts[0], cmdParts[1:]...)
 	cmd.Env = append(os.Environ(),
 		stallStateFileEnv+"="+stateDir+"/state.json")
