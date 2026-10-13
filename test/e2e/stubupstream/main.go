@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,8 +34,9 @@ type recordedRequest struct {
 }
 
 type recorder struct {
-	mu      sync.Mutex
-	records []recordedRequest
+	mu          sync.Mutex
+	records     []recordedRequest
+	healthCalls []recordedRequest
 }
 
 func (r *recorder) record(req recordedRequest) {
@@ -46,6 +48,15 @@ func (r *recorder) record(req recordedRequest) {
 	}
 }
 
+func (r *recorder) recordHealth(req recordedRequest) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.healthCalls = append(r.healthCalls, req)
+	if len(r.healthCalls) > 100 {
+		r.healthCalls = r.healthCalls[len(r.healthCalls)-100:]
+	}
+}
+
 func (r *recorder) snapshot() []recordedRequest {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -54,26 +65,61 @@ func (r *recorder) snapshot() []recordedRequest {
 	return out
 }
 
+func (r *recorder) healthSnapshot() []recordedRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]recordedRequest, len(r.healthCalls))
+	copy(out, r.healthCalls)
+	return out
+}
+
 func (r *recorder) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records = nil
+	r.healthCalls = nil
 }
 
-func main() {
-	label := flag.String("label", "stub",
-		"identifier returned in chat completion content so tests can tell upstreams apart")
-	listen := flag.String("listen", ":8080", "address to listen on")
-	responseDelay := flag.Duration("response-delay", 0,
-		"artificial delay before writing the chat-completion response. "+
-			"Lets the per-rule / per-backend timeout e2e tests force the "+
-			"proxy's context deadline to fire by simulating a slow upstream.")
-	flag.Parse()
+// stubConfig holds the runtime knobs for a stub-upstream instance,
+// assembled by main from CLI flags plus the VLLM_API_KEY environment
+// variable (so newMux can be exercised directly from unit tests without
+// touching flags or the environment).
+type stubConfig struct {
+	label         string
+	responseDelay time.Duration
+	chunkDelay    time.Duration
+	apiKey        string
+}
 
-	rec := &recorder{}
+// keyEnforcedPrefixes are the path prefixes vLLM's own server guards
+// with its API key middleware. /health, /healthz, and the test-only
+// /__introspect__* endpoints are intentionally left out: kubelet probes
+// and the e2e harness must be able to reach them regardless of
+// cfg.apiKey.
+var keyEnforcedPrefixes = []string{"/v1", "/v2", "/inference"}
+
+func requiresKey(path string) bool {
+	for _, prefix := range keyEnforcedPrefixes {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// newMux builds the stub's HTTP handler. Kept separate from main so unit
+// tests can exercise the routing, key-enforcement, and streaming
+// behavior directly with httptest instead of spawning a real listener.
+func newMux(cfg stubConfig, rec *recorder) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		rec.recordHealth(recordedRequest{
+			Method:  r.Method,
+			Path:    r.URL.Path,
+			Headers: cloneHeader(r.Header),
+			At:      time.Now().UTC(),
+		})
 		_, _ = io.WriteString(w, `{"status":"ok"}`)
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -83,8 +129,15 @@ func main() {
 	mux.HandleFunc("GET /__introspect__", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"label":    *label,
+			"label":    cfg.label,
 			"requests": rec.snapshot(),
+		})
+	})
+	mux.HandleFunc("GET /__introspect__/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"label":    cfg.label,
+			"requests": rec.healthSnapshot(),
 		})
 	})
 	mux.HandleFunc("POST /__introspect__/reset", func(w http.ResponseWriter, _ *http.Request) {
@@ -97,10 +150,16 @@ func main() {
 		_ = r.Body.Close()
 
 		stream := false
+		includeUsage := false
 		var parsed map[string]any
 		if err := json.Unmarshal(body, &parsed); err == nil {
 			if v, ok := parsed["stream"].(bool); ok {
 				stream = v
+			}
+			if so, ok := parsed["stream_options"].(map[string]any); ok {
+				if v, ok := so["include_usage"].(bool); ok {
+					includeUsage = v
+				}
 			}
 		}
 
@@ -113,24 +172,24 @@ func main() {
 			Streamed: stream,
 		})
 
-		if *responseDelay > 0 {
+		if cfg.responseDelay > 0 {
 			// Honor the client's deadline if it surrenders first: a
 			// proxy with a tight context deadline will close the conn,
 			// at which point r.Context() is canceled and we abandon
 			// the sleep. This keeps the test deterministic instead of
 			// waiting the full configured delay.
 			select {
-			case <-time.After(*responseDelay):
+			case <-time.After(cfg.responseDelay):
 			case <-r.Context().Done():
 				return
 			}
 		}
 
 		if stream {
-			writeStreamed(w, *label)
+			writeStreamed(w, r, cfg.label, cfg.chunkDelay, includeUsage)
 			return
 		}
-		writeNonStreamed(w, *label)
+		writeNonStreamed(w, cfg.label)
 	})
 
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
@@ -138,12 +197,61 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"object": "list",
 			"data": []map[string]string{
-				{"id": *label, "object": "model"},
+				{"id": cfg.label, "object": "model"},
 			},
 		})
 	})
 
-	log.Printf("stub-upstream label=%s listen=%s", *label, *listen)
+	var handler http.Handler = mux
+	if cfg.apiKey != "" {
+		handler = enforceKey(cfg.apiKey, mux)
+	}
+	return handler
+}
+
+// enforceKey mirrors vLLM's own API-key middleware: any request whose
+// path starts with /v1, /v2, or /inference must carry
+// "Authorization: Bearer <key>", or it gets vLLM's 401 body. Everything
+// else (health checks, the test-only introspection endpoints) passes
+// through untouched.
+func enforceKey(apiKey string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requiresKey(r.URL.Path) && r.Header.Get("Authorization") != "Bearer "+apiKey {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":"Unauthorized"}`)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func main() {
+	label := flag.String("label", "stub",
+		"identifier returned in chat completion content so tests can tell upstreams apart")
+	listen := flag.String("listen", ":8080", "address to listen on")
+	responseDelay := flag.Duration("response-delay", 0,
+		"artificial delay before writing the chat-completion response. "+
+			"Lets the per-rule / per-backend timeout e2e tests force the "+
+			"proxy's context deadline to fire by simulating a slow upstream.")
+	chunkDelay := flag.Duration("chunk-delay", 0,
+		"artificial delay between streamed chunks. Lets tests that "+
+			"exercise mid-stream behavior (stall detection, client "+
+			"disconnects) observe a response that trickles in over "+
+			"time instead of arriving all at once.")
+	flag.Parse()
+
+	cfg := stubConfig{
+		label:         *label,
+		responseDelay: *responseDelay,
+		chunkDelay:    *chunkDelay,
+		apiKey:        os.Getenv("VLLM_API_KEY"),
+	}
+
+	rec := &recorder{}
+	mux := newMux(cfg, rec)
+
+	log.Printf("stub-upstream label=%s listen=%s", cfg.label, *listen)
 	srv := &http.Server{
 		Addr:              *listen,
 		Handler:           mux,
@@ -181,12 +289,28 @@ func writeNonStreamed(w http.ResponseWriter, label string) {
 				},
 			},
 		},
+		"usage": usage(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func writeStreamed(w http.ResponseWriter, label string) {
+// usage returns the stub's fixed token-usage figures. It is a function
+// (rather than a package-level map literal reused across responses) so
+// every caller gets its own map, safe to marshal concurrently.
+//
+// encoding/json always serializes map[string]T keys in sorted order,
+// so this comes out as completion_tokens, prompt_tokens, total_tokens --
+// alphabetical, and matching vLLM's wire shape byte-for-byte.
+func usage() map[string]int {
+	return map[string]int{
+		"completion_tokens": 3,
+		"prompt_tokens":     7,
+		"total_tokens":      10,
+	}
+}
+
+func writeStreamed(w http.ResponseWriter, r *http.Request, label string, chunkDelay time.Duration, includeUsage bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -221,7 +345,21 @@ func writeStreamed(w http.ResponseWriter, label string) {
 			},
 		},
 	}
-	for _, c := range chunks {
+	if includeUsage {
+		chunks = append(chunks, map[string]any{
+			"choices": []map[string]any{},
+			"usage":   usage(),
+		})
+	}
+
+	for i, c := range chunks {
+		if i > 0 && chunkDelay > 0 {
+			select {
+			case <-time.After(chunkDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		data, _ := json.Marshal(c)
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
 		if flusher != nil {
