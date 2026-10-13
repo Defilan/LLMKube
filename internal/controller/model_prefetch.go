@@ -246,15 +246,6 @@ func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1a
 			r.ModelCacheSize, r.ModelCacheClass, r.ModelCacheAccessMode); err != nil {
 			return ctrl.Result{}, fmt.Errorf("ensuring shared model cache PVC: %w", err)
 		}
-		// The override could not be honoured: keep today's shared-cache
-		// behaviour but surface the condition so the no-op is visible
-		// rather than silent (#1676).
-		if ignoreReason != "" {
-			if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue,
-				"PrefetchCacheIgnored", ignoreReason); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
 	}
 
 	job, err := r.buildPrefetchJob(ctx, model, target)
@@ -283,6 +274,20 @@ func (r *ModelReconciler) startPrefetch(ctx context.Context, model *inferencev1a
 		model.Status.Phase = "Pending"
 		return ctrl.Result{RequeueAfter: caCertConfigMapMissingRequeue}, r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionFalse,
 			ReasonCACertConfigMapMissing, msg)
+	}
+
+	// The override could not be honoured: keep today's shared-cache
+	// behaviour but surface the condition so the no-op is visible rather
+	// than silent (#1676). Written only once the Job is about to be created.
+	// The Model controller has no predicate, so on the CA-hold and
+	// PrefetchInvalid paths above this Progressing=True write would flip the
+	// condition against that path's own Progressing=False write on every
+	// reconcile, and each write re-triggers the reconcile.
+	if target == nil && ignoreReason != "" {
+		if err := r.updateStatus(ctx, model, ConditionProgressing, metav1.ConditionTrue,
+			"PrefetchCacheIgnored", ignoreReason); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	if err := controllerutil.SetControllerReference(model, job, r.Scheme); err != nil {
