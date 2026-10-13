@@ -62,6 +62,11 @@ func main() {
 			"5xx / network error before becoming eligible for a half-open "+
 			"probe. Shorter windows recover faster from transient blips; "+
 			"longer windows reduce probe load on genuinely-down upstreams.")
+	streamIdleTimeout := flag.Duration("stream-idle-timeout", 300*time.Second,
+		"How long a response body may go without a byte from the upstream, "+
+			"after headers, before the proxy aborts the request and "+
+			"quarantines that backend endpoint. Catches a backend that "+
+			"accepted a request and then stopped producing. 0 disables.")
 	responseHeaderTimeout := flag.Duration("response-header-timeout", 120*time.Second,
 		"Upper bound on how long the dispatcher waits for the upstream to "+
 			"begin sending response headers. For non-streaming chat "+
@@ -135,6 +140,7 @@ func main() {
 		router.WithDispatcherOptions(
 			router.WithQuarantineDuration(*quarantineDuration),
 			router.WithResponseHeaderTimeout(*responseHeaderTimeout),
+			router.WithStreamIdleTimeout(*streamIdleTimeout),
 		),
 	}
 	if *enableActivation {

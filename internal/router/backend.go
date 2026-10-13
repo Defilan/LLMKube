@@ -56,6 +56,15 @@ const defaultIdleConnTimeout = 10 * time.Second
 // Tunable via --response-header-timeout (see WithResponseHeaderTimeout).
 const defaultResponseHeaderTimeout = 120 * time.Second
 
+// defaultStreamIdleTimeout caps how long a response body may go without a
+// single byte from the upstream once headers have arrived. A healthy stream
+// emits bytes continuously; the gap that matters is the prefill before the
+// first content token, which can take minutes for a very long prompt on slow
+// hardware, so the default is generous. A body that stays silent this long
+// is treated as a wedged backend: the request is aborted and the endpoint is
+// quarantined. Tunable via --stream-idle-timeout (see WithStreamIdleTimeout).
+const defaultStreamIdleTimeout = 300 * time.Second
+
 // backendHealth is the dispatcher's per-backend state. It implements
 // the half-open part of a circuit breaker: when MarkUnhealthy fires,
 // the backend is skipped until quarantineUntil; the first request
@@ -100,6 +109,11 @@ type Dispatcher struct {
 	// dispatch time. Defaults to defaultResponseHeaderTimeout.
 	responseHeaderTimeout time.Duration
 
+	// streamIdleTimeout is the longest a response body may stay silent
+	// after headers before the dispatcher aborts it and quarantines the
+	// endpoint. 0 disables the guard. Defaults to defaultStreamIdleTimeout.
+	streamIdleTimeout time.Duration
+
 	// nowFn is overridable in tests.
 	nowFn func() time.Time
 }
@@ -131,6 +145,15 @@ func WithResponseHeaderTimeout(d time.Duration) DispatcherOption {
 	return func(disp *Dispatcher) { disp.responseHeaderTimeout = d }
 }
 
+// WithStreamIdleTimeout sets how long a response body may go without a byte
+// from the upstream, after headers, before the dispatcher aborts the request
+// and quarantines that endpoint. 0 disables the guard. Wired from
+// cmd/router-proxy's --stream-idle-timeout flag, which the operator sets from
+// ModelRouter.spec.proxy.streamIdleTimeout.
+func WithStreamIdleTimeout(d time.Duration) DispatcherOption {
+	return func(disp *Dispatcher) { disp.streamIdleTimeout = d }
+}
+
 // ResponseHeaderTimeout returns the dispatcher's proxy-default
 // timeout. Exposed for the proxy handler to use when resolving the
 // effective per-request timeout (rule.timeout || backend.timeout ||
@@ -148,6 +171,7 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 		cfg:                   cfg,
 		quarantineDuration:    defaultQuarantineDuration,
 		responseHeaderTimeout: defaultResponseHeaderTimeout,
+		streamIdleTimeout:     defaultStreamIdleTimeout,
 		nowFn:                 time.Now,
 	}
 	for _, opt := range opts {
@@ -353,13 +377,19 @@ func (d *Dispatcher) Dispatch(
 	// client-facing alias the router matched on.
 	outboundBody := applyModelOverride(requestBody, backend.outboundModel())
 
-	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(outboundBody))
+	// The request runs under its own cancellable context so the stream idle
+	// guard can abort a body that went silent without touching the caller's
+	// context.
+	reqCtx, reqCancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody))
 	if err != nil {
+		reqCancel()
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 
 	d.copyForwardedHeaders(headers, req.Header)
 	if err := d.applyCredentials(backend, req); err != nil {
+		reqCancel()
 		return nil, err
 	}
 
@@ -396,6 +426,7 @@ func (d *Dispatcher) Dispatch(
 			!errors.Is(err, context.Canceled) {
 			d.markUnhealthy(backend.Name, endpoint)
 		}
+		reqCancel()
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	if resp.StatusCode >= 500 {
@@ -405,7 +436,83 @@ func (d *Dispatcher) Dispatch(
 	} else {
 		d.markHealthy(backend.Name, endpoint)
 	}
+	if d.streamIdleTimeout > 0 {
+		name := backend.Name
+		resp.Body = newIdleGuardBody(resp.Body, d.streamIdleTimeout, func() {
+			// The upstream accepted the request and sent headers, then
+			// stopped producing bytes: a wedged backend, not a client
+			// disconnect or a rule deadline, so quarantine the endpoint.
+			d.markUnhealthy(name, endpoint)
+			reqCancel()
+		}, reqCancel)
+	} else {
+		resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: reqCancel}
+	}
 	return resp, nil
+}
+
+// ErrStreamIdle reports a response body aborted by the stream idle guard.
+var ErrStreamIdle = errors.New("upstream stream idle timeout")
+
+// idleGuardBody aborts a response body that produces no bytes for timeout.
+// Every Read that returns data re-arms the timer; Close disarms it.
+type idleGuardBody struct {
+	rc      io.ReadCloser
+	timeout time.Duration
+	timer   *time.Timer
+	fired   atomic.Bool
+	closed  atomic.Bool
+	onIdle  func()
+	onClose func()
+}
+
+func newIdleGuardBody(rc io.ReadCloser, timeout time.Duration, onIdle, onClose func()) *idleGuardBody {
+	g := &idleGuardBody{rc: rc, timeout: timeout, onIdle: onIdle, onClose: onClose}
+	g.timer = time.AfterFunc(timeout, g.fire)
+	return g
+}
+
+func (g *idleGuardBody) fire() {
+	if g.closed.Load() {
+		return
+	}
+	if g.fired.CompareAndSwap(false, true) {
+		g.onIdle()
+	}
+}
+
+func (g *idleGuardBody) Read(p []byte) (int, error) {
+	n, err := g.rc.Read(p)
+	if n > 0 && !g.fired.Load() {
+		g.timer.Reset(g.timeout)
+	}
+	if err != nil && err != io.EOF && g.fired.Load() {
+		return n, fmt.Errorf("%w after %s: %v", ErrStreamIdle, g.timeout, err)
+	}
+	return n, err
+}
+
+func (g *idleGuardBody) Close() error {
+	g.closed.Store(true)
+	g.timer.Stop()
+	err := g.rc.Close()
+	if g.onClose != nil {
+		g.onClose()
+	}
+	return err
+}
+
+// cancelOnCloseBody releases the request context once the caller closes the
+// body, when the idle guard is disabled.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseBody) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // copyForwardedHeaders copies inbound headers to the outbound request,

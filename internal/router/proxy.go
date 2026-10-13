@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -583,10 +584,13 @@ func (p *Proxy) enforceFailClosed(f *RequestFeatures, dec *MatchResult) error {
 // propagates back to the handler as HTTP 502 or 503 (the caller in
 // handleCompletion decides the surface based on dec.FailClosed).
 //
-// Per-attempt deadline: resolveDispatchTimeout produces the cap for
-// each backend attempt, with resolution order rule -> backend ->
-// proxy default. The deadline is applied per attempt, not once for
-// the whole loop, so a slow primary that timed out does NOT eat the
+// Per-attempt header deadline: resolveDispatchTimeout produces the cap for
+// each backend attempt, with resolution order rule -> backend -> proxy
+// default. It bounds only the wait for response headers, as the CRD fields
+// document: once headers arrive the timer is stopped, so a healthy stream may
+// run as long as it keeps producing bytes (the dispatcher's stream idle guard
+// catches one that goes silent). The deadline is applied per attempt, not
+// once for the whole loop, so a slow primary that timed out does NOT eat the
 // fallback's budget.
 func (p *Proxy) dispatchWithFallback(
 	ctx context.Context,
@@ -642,8 +646,12 @@ func (p *Proxy) dispatchWithFallback(
 			poolRelease = rel
 		}
 
-		attemptCtx, cancel := context.WithTimeout(ctx,
-			resolveDispatchTimeout(dec, b, p.disp.ResponseHeaderTimeout()))
+		attemptCtx, cancel := context.WithCancel(ctx)
+		var headerTimedOut atomic.Bool
+		headerTimer := time.AfterFunc(resolveDispatchTimeout(dec, b, p.disp.ResponseHeaderTimeout()), func() {
+			headerTimedOut.Store(true)
+			cancel()
+		})
 		_, span := tracer.Start(attemptCtx, "backend.request",
 			oteltrace.WithAttributes(
 				otelattribute.String("routing.backend.selected", b.Name),
@@ -653,6 +661,16 @@ func (p *Proxy) dispatchWithFallback(
 			),
 		)
 		resp, err := p.disp.Dispatch(attemptCtx, b, http.MethodPost, path, headers, body)
+		// Headers arrived (or the attempt failed): the header deadline no
+		// longer applies. If the timer fired anyway, the attempt context is
+		// already cancelled and the response is unusable.
+		if !headerTimer.Stop() && headerTimedOut.Load() {
+			if err == nil {
+				_ = resp.Body.Close()
+				resp = nil
+			}
+			err = fmt.Errorf("%w: waiting for response headers from %s", context.DeadlineExceeded, name)
+		}
 		if err != nil {
 			if b.Pool != nil && p.activator != nil {
 				// A connection-level failure to a pooled backend almost always
@@ -713,9 +731,8 @@ func (p *Proxy) dispatchWithFallback(
 // cancelOnClose pairs a response body with the cancel func of the
 // per-attempt context. The proxy's caller already does
 // `defer resp.Body.Close()`, so wrapping the body ensures the
-// per-attempt context cancel fires no later than the response is
-// fully consumed (and no sooner — streaming responses need the
-// deadline to outlive the chat completion).
+// per-attempt context is released (and the pool slot freed) no later
+// than the response is fully consumed, and no sooner.
 type cancelOnClose struct {
 	io.ReadCloser
 	cancel context.CancelFunc

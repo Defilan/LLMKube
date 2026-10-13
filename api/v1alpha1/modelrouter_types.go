@@ -706,13 +706,25 @@ type RouterProxySpec struct {
 	// ResponseHeaderTimeout caps how long the proxy waits for the
 	// upstream to begin sending response headers. For non-streaming
 	// chat completions this is effectively a max-generation-time
-	// cap; for streaming dispatches the first SSE chunk arrives well
-	// inside the window so the cap is invisible. Default 120s when
-	// unset. Per-rule and per-backend timeouts (see RouterRule.Timeout
-	// and RouterBackend.Timeout) tighten this on a per-request basis
-	// but cannot extend it beyond this cap.
+	// cap, because their headers arrive when generation completes. It
+	// does not bound a streaming response once its headers arrive;
+	// StreamIdleTimeout guards those. Default 120s when unset.
+	// Per-rule and per-backend timeouts (see RouterRule.Timeout and
+	// RouterBackend.Timeout) tighten this on a per-request basis but
+	// cannot extend it beyond this cap.
 	// +optional
 	ResponseHeaderTimeout *metav1.Duration `json:"responseHeaderTimeout,omitempty"`
+
+	// StreamIdleTimeout caps how long a response body may go without a
+	// single byte from the upstream once its headers have arrived. A
+	// healthy stream emits bytes continuously; the longest gap is the
+	// prefill before the first content token, which can take minutes
+	// for a very long prompt on slow hardware. When the window passes
+	// with no bytes, the proxy aborts the request and quarantines that
+	// backend endpoint, so a wedged replica stops receiving traffic.
+	// Default 300s when unset; "0s" disables the guard.
+	// +optional
+	StreamIdleTimeout *metav1.Duration `json:"streamIdleTimeout,omitempty"`
 
 	// NodeSelector pins the router-proxy pod to nodes matching these labels.
 	// Use it when the proxy image is only present on specific nodes (for
