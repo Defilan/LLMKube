@@ -1483,11 +1483,18 @@ type VLLMConfig struct {
 	// The probe execs a small Python check against the local /metrics
 	// endpoint: while vllm:num_requests_running > 0 and neither
 	// vllm:generation_tokens_total nor vllm:prompt_tokens_total has
-	// increased for the window, the probe fails and kubelet restarts the
-	// container. A restart clears the wedge (only deleting the pod
-	// recovered it in the field). Idle engines (running == 0) never fail
-	// the probe, and a long prefill does not either, because the prompt
-	// counter advances while generation is still flat.
+	// changed and vllm:kv_cache_usage_perc has not moved for the window,
+	// the probe fails and kubelet restarts the container. A restart
+	// clears the wedge (only deleting the pod recovered it in the
+	// field). Idle engines (running == 0) never fail the probe.
+	//
+	// Measured on vLLM v0.31.0 (B200, chunked prefill, 16384 batched
+	// tokens): a ~200K-token prefill kept both token counters flat for
+	// its whole 13.7s while vllm:kv_cache_usage_perc climbed steadily,
+	// so the kv gauge is the mid-prefill heartbeat and a long prefill is
+	// not a stall. A counter that decreases resets the window (the
+	// metrics registry restarted). The kv gauge is optional; without it
+	// the judgment falls back to the token counters alone.
 	//
 	// The check replaces the /health liveness probe only; startup and
 	// readiness stay on /health. spec.probeOverrides.liveness still wins
@@ -1508,13 +1515,14 @@ type VLLMStallDetection struct {
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 
-	// WindowSeconds is how long both token counters must stay flat while
-	// vllm:num_requests_running > 0 before the engine is declared stalled.
-	// Defaults to 120 when unset. Long prefills complete in seconds on
-	// current GPUs, so 120s leaves wide margin; the minimum guards against
-	// restarting pods over ordinary scheduler hiccups between probes.
-	// Restart latency is roughly window + liveness period x failure
-	// threshold (about 165s at the defaults).
+	// WindowSeconds is how long the token counters and
+	// vllm:kv_cache_usage_perc must stay flat while
+	// vllm:num_requests_running > 0 before the engine is declared
+	// stalled. Defaults to 120 when unset. The kv-cache heartbeat keeps
+	// long prefills safe, so the margin guards against restarting pods
+	// over ordinary scheduler hiccups between probes. Restart latency is
+	// roughly window + liveness period x failure threshold (about 165s at
+	// the defaults).
 	// +kubebuilder:validation:Minimum=10
 	// +kubebuilder:validation:Maximum=3600
 	// +optional
