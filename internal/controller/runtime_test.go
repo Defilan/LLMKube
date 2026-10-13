@@ -21,6 +21,17 @@ import (
 // non-empty, it also requires the immediately following entry to equal value
 // (i.e. `--flag value` as separate slice elements, which is how BuildArgs
 // emits everything).
+// flagValue returns the value following the first occurrence of flag, and
+// whether the flag was present (argValue cannot tell absent from "").
+func flagValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
 func containsArg(args []string, flag, value string) bool {
 	for i, a := range args {
 		if a != flag {
@@ -889,7 +900,7 @@ func TestBindAddressAcrossRuntimes(t *testing.T) {
 			runtime:   "sglang",
 			bindAddr:  "",
 			wantFlag:  "--host",
-			wantValue: "::",
+			wantValue: "",
 		},
 		{
 			name:      "tgi default bindAddress",
@@ -1006,8 +1017,10 @@ func TestBindAddressAcrossRuntimes(t *testing.T) {
 				t.Fatalf("unknown runtime %q", tc.runtime)
 			}
 
-			if !containsArg(args, tc.wantFlag, tc.wantValue) {
-				t.Errorf("expected %s %s in args, got %v", tc.wantFlag, tc.wantValue, args)
+			// Exact value: containsArg would accept any value for an empty
+			// wantValue, which hides the sglang default (#2027).
+			if got, ok := flagValue(args, tc.wantFlag); !ok || got != tc.wantValue {
+				t.Errorf("%s = %q (present %v), want %q; args: %v", tc.wantFlag, got, ok, tc.wantValue, args)
 			}
 
 			// When extraArgs sets the flag, the declarative bindAddress value

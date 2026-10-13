@@ -84,9 +84,13 @@ func TestSGLangBuildArgs_NilConfig(t *testing.T) {
 
 	mustContain := []FlagCheck{
 		{"--model-path", "/models/test"},
-		{"--host", "::"},
 		{"--port", "30000"},
 		{"--enable-metrics", ""},
+	}
+	// containsArg treats an empty value as "flag present", so the dual-stack
+	// default (#2027) needs an exact check.
+	if v, ok := flagValue(args, "--host"); !ok || v != "" {
+		t.Errorf("--host = %q (present %v), want \"\" (dual-stack, #2027); args: %v", v, ok, args)
 	}
 	for _, fc := range mustContain {
 		if !containsArg(args, fc.flag, fc.value) {
@@ -117,7 +121,10 @@ func TestSGLangBuildArgs_EmptyConfig(t *testing.T) {
 	}
 	args := backend.BuildArgs(isvc, model, "/models/test", "", 30000)
 
-	for _, fc := range []FlagCheck{{"--model-path", "/models/test"}, {"--host", "::"}, {"--port", "30000"}, {"--enable-metrics", ""}} {
+	if v, ok := flagValue(args, "--host"); !ok || v != "" {
+		t.Errorf("--host = %q (present %v), want \"\" (dual-stack, #2027); args: %v", v, ok, args)
+	}
+	for _, fc := range []FlagCheck{{"--model-path", "/models/test"}, {"--port", "30000"}, {"--enable-metrics", ""}} {
 		if !containsArg(args, fc.flag, fc.value) {
 			t.Errorf("expected %q %q in args, got: %v", fc.flag, fc.value, args)
 		}
