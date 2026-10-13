@@ -59,7 +59,13 @@ var externalPrefixes = []string{
 // but as a prefix it would also allowlist uptime_*, upstream_* and anything
 // else starting with those two letters, which is exactly the typo class this
 // guard exists to catch.
-var externalExact = []string{"up"}
+var externalExact = []string{
+	"up",
+	// dcgm-exporter's own counters (DCGM_EXP_*), opt-in in its counters CSV
+	// since 4.6.0-4.8.3. Exact names, not the prefix, for the reason above.
+	"DCGM_EXP_XID_ERRORS_TOTAL",
+	"DCGM_EXP_GPU_HEALTH_STATUS",
+}
 
 // promqlWords are the identifiers PromQL allows outside a call: operators and
 // modifiers. Function names need no listing, a call is stripped by its "(".
@@ -78,6 +84,9 @@ var (
 		regexp.MustCompile(`"[^"]*"`),     // string literals
 		regexp.MustCompile(`\{[^}]*\}`),   // label matchers
 		regexp.MustCompile(`\[[^\]]*\]`),  // range selectors
+		// offset 15m: the duration is not a selector, but its unit letters
+		// would read as an identifier ("m").
+		regexp.MustCompile(`\boffset\s+-?[0-9][0-9a-z]*`),
 		regexp.MustCompile(`\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)`),
 		// Last: an identifier before "(" is a function, never a metric.
 		regexp.MustCompile(`[a-zA-Z_:][a-zA-Z0-9_:]*\s*\(`),
@@ -683,5 +692,20 @@ func TestInferenceDashboardCoversEveryRuntime(t *testing.T) {
 	// Without this the test passes vacuously once the panels are gone.
 	if checked == 0 {
 		t.Fatalf("%s has no runtime metric queries", dashboard)
+	}
+}
+
+// TestMetricNamesOffsetDuration pins the scanner on the offset modifier: its
+// duration is not a metric, and the metrics on either side still are.
+func TestMetricNamesOffsetDuration(t *testing.T) {
+	cases := map[string][]string{
+		`foo_total unless foo_total offset 15m`:                {"foo_total", "foo_total"},
+		`rate(foo_total[5m] offset 1h30m) > bar_typo`:          {"foo_total", "bar_typo"},
+		`foo_total{xid=~"79|154"} unless foo_total offset -2w`: {"foo_total", "foo_total"},
+	}
+	for expr, want := range cases {
+		if got := metricNames(expr); !slices.Equal(got, want) {
+			t.Errorf("metricNames(%q) = %q, want %q", expr, got, want)
+		}
 	}
 }

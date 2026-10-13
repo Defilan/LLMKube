@@ -123,6 +123,7 @@ spec:
           DCGM_EXP_XID_ERRORS_TOTAL{xid=~"{{ join "|" $xids }}"}
           unless DCGM_EXP_XID_ERRORS_TOTAL{xid=~"{{ join "|" $xids }}"} offset 15m
         )
+      for: 0m
       labels:
         severity: critical
         component: gpu
@@ -144,6 +145,7 @@ spec:
           {{- end }}
         )
         unless on (UUID) DCGM_EXP_XID_ERRORS_TOTAL
+      for: 0m
       labels:
         severity: critical
         component: gpu
@@ -155,6 +157,7 @@ spec:
     # In the default counters.
     - alert: GPURowRemapFailure
       expr: DCGM_FI_DEV_ROW_REMAP_FAILURE > 0
+      for: 0m
       labels:
         severity: critical
         component: gpu
@@ -165,6 +168,7 @@ spec:
     # In the default counters.
     - alert: GPUUncorrectableRowsRemapped
       expr: increase(DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS[1h]) > 0
+      for: 0m
       labels:
         severity: warning
         component: gpu
@@ -176,6 +180,7 @@ spec:
     # DCGM_EXP_GPU_HEALTH_STATUS, dcgm-exporter 4.6.0-4.8.3 or newer.
     - alert: GPUHealthCheckFailed
       expr: DCGM_EXP_GPU_HEALTH_STATUS == 20
+      for: 0m
       labels:
         severity: critical
         component: gpu
