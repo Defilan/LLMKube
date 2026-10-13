@@ -172,5 +172,69 @@ assert_eq "$rc" "0" "dry-run of a deferred row succeeds"
 assert_contains "$run3" "assertions deferred to #1377" "a deferred row announces its deferral"
 assert_eq "$(jq -r '.status' "$tmp/results-deferred/7.json")" "deferred" "a deferred row records the deferred status"
 
+# Overrides (#2018): with none set, every rendered manifest is the tracked
+# file byte for byte, so a stock run applies exactly what is committed.
+for n in 1 2 3 4; do
+  f=$(printf '%s' "$here/manifests/$(printf '%02d' "$n")-"*.yaml)
+  if cmp -s <(b200_render_manifest "$n" "$f") "$f"; then
+    ok "row $n renders unchanged with no overrides"
+  else
+    bad "row $n changed although no override is set"
+  fi
+done
+
+# Overrides: a staged source and an image reach row 2, and a staged source
+# also turns the init container back on and drops the Hugging Face token
+# (skipModelInit true would hand vLLM the pvc:// string itself).
+m2=$(printf '%s' "$here/manifests/02-"*.yaml)
+m3=$(printf '%s' "$here/manifests/03-"*.yaml)
+m1=$(printf '%s' "$here/manifests/01-"*.yaml)
+r2="$(B200_ROW_02_SOURCE='pvc://models/llama-8b-fp8' B200_VLLM_IMAGE='registry.local/vllm:v0.31' b200_render_manifest 2 "$m2")"
+assert_contains "$r2" 'source: "pvc://models/llama-8b-fp8"' "row 2 source override applied"
+assert_contains "$r2" 'image: registry.local/vllm:v0.31' "image override applied"
+assert_contains "$r2" 'skipModelInit: false' "a staged source re-enables the model init container"
+if printf '%s' "$r2" | grep -qF 'hfTokenSecretRef'; then
+  bad "a staged source drops hfTokenSecretRef"
+else
+  ok "a staged source drops hfTokenSecretRef"
+fi
+r3="$(B200_ROW_02_SOURCE='pvc://models/llama-8b-fp8' B200_VLLM_IMAGE='registry.local/vllm:v0.31' b200_render_manifest 3 "$m3")"
+assert_contains "$r3" 'source: "RedHatAI/Llama-3.1-70B-Instruct-FP8"' "a row 2 source override leaves row 3's source alone"
+assert_contains "$r3" 'image: registry.local/vllm:v0.31' "the image override reaches every row"
+
+# Overrides: a Hugging Face repo id is not a staged source, so the runtime
+# still fetches it and keeps its token.
+rhf="$(B200_ROW_02_SOURCE='Qwen/Qwen3-8B-FP8' b200_render_manifest 2 "$m2")"
+assert_contains "$rhf" 'skipModelInit: true' "a repo-id source keeps skipModelInit"
+assert_contains "$rhf" 'hfTokenSecretRef:' "a repo-id source keeps the Hugging Face token"
+
+# Overrides: one that matches no line fails loudly instead of being skipped.
+out="$( B200_ROW_01_QUANTIZATION=fp8 b200_render_manifest 1 "$m1" 2>&1 )"
+rc=$?
+assert_ne_zero "$rc" "an override that matches no line fails"
+assert_contains "$out" "expected exactly one line matching" "the failed override names the missing key"
+
+# Overrides: dry-run prints the effective values and records them.
+run4="$( B200_ROW_02_SOURCE='pvc://models/llama-8b-fp8' B200_VLLM_IMAGE='registry.local/vllm:v0.31' "$here/run-matrix.sh" --rows 2 --dry-run --out "$tmp/results-override" 2>&1 )"
+rc=$?
+assert_eq "$rc" "0" "dry-run with overrides succeeds"
+assert_contains "$run4" "source=pvc://models/llama-8b-fp8 image=registry.local/vllm:v0.31 overrides=true" "dry-run prints the effective source and image"
+assert_eq "$(jq -r '.overrides' "$tmp/results-override/2.json")" "true" "the result records that overrides were used"
+assert_eq "$(jq -r '.model_source' "$tmp/results-override/2.json")" "pvc://models/llama-8b-fp8" "the result records the effective source"
+assert_eq "$(jq -r '.overrides' "$tmp/results/1.json")" "false" "a stock run records no overrides"
+
+# Publish with overrides: the matrix row carries the substitution once, even
+# after a re-run, so a substituted pass is never read as the stock row.
+cp "$B200_DOC" "$tmp/matrix-ov.md"
+# The backticks below are literal Markdown code spans in the matrix note.
+# shellcheck disable=SC2016
+cap_write_row "$tmp/matrix-ov.md" 2 pass 'source `pvc://a`, image `img:1`'
+# shellcheck disable=SC2016
+cap_write_row "$tmp/matrix-ov.md" 2 pass 'source `pvc://b`, image `img:2`'
+row2="$(grep -F '| 2 | ' "$tmp/matrix-ov.md" | head -n1)"
+# shellcheck disable=SC2016
+assert_contains "$row2" '_(run with overrides: source `pvc://b`, image `img:2`)_' "the matrix row records the latest overrides"
+assert_eq "$(printf '%s' "$row2" | grep -o 'run with overrides' | wc -l | tr -d ' ')" "1" "the override note is replaced, not duplicated"
+
 b200_log "self-test: $passes passed, $failures failed"
 [ "$failures" -eq 0 ]

@@ -38,6 +38,87 @@ b200_float_ge() {
   printf '%s\n%s\n' "$b" "$a" | sort -g | tail -n1 | grep -qx -- "$a"
 }
 
+# Air-gapped runs: per-row overrides applied at apply time, so the tracked
+# manifests stay the stock rows (#2018).
+#
+#   B200_ROW_<NN>_SOURCE        replaces the row's Model spec.source
+#   B200_ROW_<NN>_QUANTIZATION  replaces the Model and vllmConfig quantization
+#   B200_VLLM_IMAGE             replaces every row's InferenceService spec.image
+#
+# A staged source (any scheme://, such as pvc:// or s3://) also sets
+# skipModelInit to false and drops vllmConfig.hfTokenSecretRef: with
+# skipModelInit true the operator mounts no model storage and hands vLLM the
+# source string itself, which only works for a Hugging Face repo id.
+
+# b200_override <row> <KEY> prints B200_ROW_<NN>_<KEY>, or nothing.
+b200_override() {
+  local var
+  var="$(printf 'B200_ROW_%02d_%s' "$1" "$2")"
+  printf '%s' "${!var:-}"
+}
+
+# b200_row_has_overrides <row> prints true when any override touches the row.
+b200_row_has_overrides() {
+  if [ -n "$(b200_override "$1" SOURCE)" ] || [ -n "$(b200_override "$1" QUANTIZATION)" ] || [ -n "${B200_VLLM_IMAGE:-}" ]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+# b200_sed_escape <value> escapes a value for the replacement side of a
+# s|...|...| expression.
+b200_sed_escape() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
+
+# b200_require_once <manifest> <regex> <what>: an override must hit exactly
+# one line, so a manifest edit cannot make it silently miss.
+b200_require_once() {
+  local n
+  n="$(grep -cE -- "$2" "$1" || true)"
+  [ "$n" = "1" ] || b200_die "override for $3: expected exactly one line matching '$2' in $1, found $n"
+}
+
+# b200_render_manifest <row> <manifest> prints the manifest with the row's
+# overrides applied. With no overrides it prints the file unchanged.
+b200_render_manifest() {
+  local row="$1" manifest="$2" src quant img
+  src="$(b200_override "$row" SOURCE)"
+  quant="$(b200_override "$row" QUANTIZATION)"
+  img="${B200_VLLM_IMAGE:-}"
+  local -a expr=()
+  if [ -n "$src" ]; then
+    b200_require_once "$manifest" '^  source: ' "B200_ROW_$(printf '%02d' "$row")_SOURCE"
+    expr+=(-e "s|^  source: .*|  source: \"$(b200_sed_escape "$src")\"|")
+    case "$src" in
+      *://*)
+        expr+=(-e 's|^  skipModelInit: true$|  skipModelInit: false|' -e '/^    hfTokenSecretRef:$/,/^      key: /d')
+        ;;
+    esac
+  fi
+  if [ -n "$quant" ]; then
+    b200_require_once "$manifest" '^  quantization: ' "B200_ROW_$(printf '%02d' "$row")_QUANTIZATION"
+    expr+=(-e "s|^  quantization: .*|  quantization: $(b200_sed_escape "$quant")|" \
+      -e "s|^    quantization: .*|    quantization: $(b200_sed_escape "$quant")|")
+  fi
+  if [ -n "$img" ]; then
+    b200_require_once "$manifest" '^  image: ' "B200_VLLM_IMAGE"
+    expr+=(-e "s|^  image: .*|  image: $(b200_sed_escape "$img")|")
+  fi
+  if [ "${#expr[@]}" -eq 0 ]; then
+    cat "$manifest"
+  else
+    sed "${expr[@]}" "$manifest"
+  fi
+}
+
+# b200_manifest_value <yaml> <key> prints the first top-level spec value of
+# key (two-space indent) from a rendered manifest, without quotes.
+b200_manifest_value() {
+  printf '%s\n' "$1" | sed -n "s|^  $2: *\"\{0,1\}\([^\"]*\)\"\{0,1\}\$|\1|p" | head -n1
+}
+
 # b200_standard_row drives the shared row shape for the serving rows:
 # apply the manifest, wait Ready, benchmark to JSON, assert a decode floor,
 # normalize the result. Rows 5-10 carry their own assertions instead.
@@ -47,14 +128,22 @@ b200_standard_row() {
   local row="$1" isvc="$2" manifest="$3" min_decode="$4"
   local out="$B200_OUT/$row"
 
+  local rendered
+  rendered="$(b200_render_manifest "$row" "$manifest")" || return 1
+  export B200_EFFECTIVE_SOURCE B200_EFFECTIVE_IMAGE B200_OVERRIDES
+  B200_EFFECTIVE_SOURCE="$(b200_manifest_value "$rendered" source)"
+  B200_EFFECTIVE_IMAGE="$(b200_manifest_value "$rendered" image)"
+  B200_OVERRIDES="$(b200_row_has_overrides "$row")"
+
   if [ "${B200_DRY_RUN:-0}" = "1" ]; then
     b200_log "row $row: dry-run: apply $manifest, wait Ready, benchmark, assert decode >= $min_decode tok/s"
+    b200_log "row $row: dry-run: source=$B200_EFFECTIVE_SOURCE image=$B200_EFFECTIVE_IMAGE overrides=$B200_OVERRIDES"
     cap_normalize_dry_run "$out.json" "$row"
     return 0
   fi
 
   b200_require_cmd kubectl llmkube jq
-  kubectl apply -f "$manifest"
+  printf '%s\n' "$rendered" | kubectl apply -f -
   kubectl wait --for=jsonpath='{.status.phase}'=Ready "inferenceservice/$isvc" \
     -n "$B200_NS" --timeout=1800s
   llmkube benchmark "$isvc" -n "$B200_NS" -o json > "$out-benchmark.json"
