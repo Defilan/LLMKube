@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -106,6 +107,35 @@ func TestEndpointAPIKeyUserFlagWins(t *testing.T) {
 			if n != 1 {
 				t.Errorf("%s %v: %d --api-key flags in %v, want only the user's", rt, extra, n, c.Args)
 			}
+		}
+	}
+}
+
+// Review Focus 2 (regression): a user's YAML can set apiKeySecretRef.optional:
+// true (SecretKeySelector has the field). apiKeyEnvVar must still force the
+// rendered secretKeyRef to required, and must do so on a copy, not by
+// mutating the InferenceService's own spec value.
+func TestEndpointAPIKeyUserOptionalIsForcedRequired(t *testing.T) {
+	for _, rt := range []string{RuntimeVLLM, RuntimeSGLANG} {
+		isvc := keyedISvc(rt)
+		isvc.Spec.Endpoint.APIKeySecretRef.Optional = ptr.To(true)
+
+		c := renderContainer(t, isvc)
+
+		envName := vllmAPIKeyEnv
+		if rt == RuntimeSGLANG {
+			envName = sglangAPIKeyEnv
+		}
+		got := envNamed(c, envName)
+		if len(got) != 1 || got[0].ValueFrom == nil || got[0].ValueFrom.SecretKeyRef == nil {
+			t.Fatalf("%s: %s = %+v, want one secretKeyRef entry", rt, envName, got)
+		}
+		if opt := got[0].ValueFrom.SecretKeyRef.Optional; opt != nil && *opt {
+			t.Errorf("%s: rendered secretKeyRef.optional = true; a missing Secret would start the server without auth", rt)
+		}
+
+		if opt := isvc.Spec.Endpoint.APIKeySecretRef.Optional; opt == nil || !*opt {
+			t.Errorf("%s: isvc.Spec.Endpoint.APIKeySecretRef.Optional was mutated to %v; apiKeyEnvVar must copy, not mutate, the spec", rt, opt)
 		}
 	}
 }
