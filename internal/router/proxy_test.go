@@ -48,6 +48,10 @@ type fakeBackend struct {
 	// asks for one via stream_options.include_usage. Off by default, so the
 	// streaming backend models an older server that ignores the option.
 	honorUsage atomic.Bool
+	// sseScript, when set, replaces the default delta chunk loop so a test
+	// can replay an endpoint-specific SSE body (legacy completions carry
+	// choices[].text); the usage tail below is still shared.
+	sseScript atomic.Pointer[[]string]
 }
 
 // LastPath returns the request path of the most recent request this backend
@@ -105,12 +109,22 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(status)
 			flusher, _ := w.(http.Flusher)
-			for _, chunk := range []string{"a", "b", "c"} {
-				_, _ = fmt.Fprintf(w, "data: {\"delta\":%q}\n\n", chunk)
-				if flusher != nil {
-					flusher.Flush()
+			if script := fb.sseScript.Load(); script != nil {
+				for _, line := range *script {
+					_, _ = fmt.Fprintf(w, "%s\n\n", line)
+					if flusher != nil {
+						flusher.Flush()
+					}
+					time.Sleep(2 * time.Millisecond)
 				}
-				time.Sleep(2 * time.Millisecond)
+			} else {
+				for _, chunk := range []string{"a", "b", "c"} {
+					_, _ = fmt.Fprintf(w, "data: {\"delta\":%q}\n\n", chunk)
+					if flusher != nil {
+						flusher.Flush()
+					}
+					time.Sleep(2 * time.Millisecond)
+				}
 			}
 			if fb.honorUsage.Load() && strings.Contains(string(raw), `"include_usage":true`) {
 				_, _ = fmt.Fprintln(w, `data: {"usage":{"prompt_tokens":60,"completion_tokens":40}}`)
@@ -284,6 +298,35 @@ func TestProxyMountsRerank(t *testing.T) {
 	}
 }
 
+// TestProxyMountsCompletions verifies the proxy fronts POST /v1/completions
+// (the legacy completions endpoint IDE autocomplete / FIM clients and
+// benchmark tools send raw prompts to), forwards the body unchanged to the
+// chosen backend at that path, and relays the upstream response (#2017).
+func TestProxyMountsCompletions(t *testing.T) {
+	h := newProxyHarness(t)
+	upstream := `{"id":"cmpl-1","object":"text_completion","choices":[{"text":"hi"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}`
+	h.localBack.body.Store(&upstream)
+	// The harness backend declares no model override, so the request body
+	// must reach it byte-for-byte.
+	sent := `{"model":"qwen3-coder","prompt":"hello","max_tokens":8}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions", strings.NewReader(sent))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v1/completions = %d, want 200", rec.Code)
+	}
+	if got := h.localBack.LastPath(); got != "/v1/completions" {
+		t.Errorf("upstream path = %q, want /v1/completions", got)
+	}
+	if got := h.localBack.LastBody(); got != sent {
+		t.Errorf("upstream body = %q, want it relayed unchanged (%q)", got, sent)
+	}
+	if got := rec.Body.String(); got != upstream {
+		t.Errorf("relayed body = %q, want the upstream response %q", got, upstream)
+	}
+}
+
 func TestProxyModels(t *testing.T) {
 	h := newProxyHarness(t)
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -394,6 +437,74 @@ func TestProxyFallsThroughToDefault(t *testing.T) {
 	}
 	if h.localBack.calls.Load() != 1 {
 		t.Errorf("default should hit local, calls = %d", h.localBack.calls.Load())
+	}
+}
+
+// TestProxyCompletionsModelRuleSelectsBackend verifies rule matching on the
+// request's model field selects the backend for a legacy completions request:
+// the model comes from the same body field regardless of prompt vs messages,
+// so a chat-* rule declared before the code-* rule must not capture a code-*
+// model on /v1/completions (#2017).
+func TestProxyCompletionsModelRuleSelectsBackend(t *testing.T) {
+	chat := newFakeBackend(t)
+	code := newFakeBackend(t)
+	cfg := &Config{
+		Backends: []Backend{
+			{Name: "chat-model", Tier: "local", Address: chat.URL()},
+			{Name: "code-completer", Tier: "local", Address: code.URL()},
+		},
+		Rules: []Rule{
+			{
+				Name:  "chat-rule",
+				Match: RuleMatch{Models: []string{"chat-*"}},
+				Route: RuleRoute{Backends: []string{"chat-model"}},
+			},
+			{
+				Name:  "code-rule",
+				Match: RuleMatch{Models: []string{"code-*"}},
+				Route: RuleRoute{Backends: []string{"code-completer"}},
+			},
+		},
+		DefaultRoute: "chat-model",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	mux := http.NewServeMux()
+	NewProxy(cfg, slog.Default()).Mount(mux)
+
+	post := func(model string) *http.Response {
+		req := httptest.NewRequest(http.MethodPost, "/v1/completions",
+			strings.NewReader(`{"model":"`+model+`","prompt":"hi"}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec.Result()
+	}
+
+	r1 := post("code-completer")
+	_ = r1.Body.Close()
+	if r1.StatusCode != http.StatusOK {
+		t.Fatalf("code-completer status = %d, want 200", r1.StatusCode)
+	}
+	if got := chat.calls.Load(); got != 0 {
+		t.Errorf("chat-model calls = %d, want 0 (a chat-* rule must not capture a code-* model)", got)
+	}
+	if got := code.calls.Load(); got != 1 {
+		t.Errorf("code-completer calls = %d, want 1", got)
+	}
+	if got := code.LastPath(); got != "/v1/completions" {
+		t.Errorf("code-completer path = %q, want /v1/completions", got)
+	}
+
+	r2 := post("chat-something")
+	_ = r2.Body.Close()
+	if r2.StatusCode != http.StatusOK {
+		t.Fatalf("chat-something status = %d, want 200", r2.StatusCode)
+	}
+	if got := chat.calls.Load(); got != 1 {
+		t.Errorf("chat-model calls = %d, want 1 for a chat-* model", got)
 	}
 }
 
@@ -1153,8 +1264,15 @@ func budgetTestProxy(t *testing.T, budgets []Budget) (*Proxy, http.Handler, *fak
 // budgetPost posts a minimal completion request through mux.
 func budgetPost(t *testing.T, mux http.Handler, headers map[string]string) *http.Response {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"any"}`))
+	return budgetPostPath(t, mux, "/v1/chat/completions", `{"model":"any"}`, headers)
+}
+
+// budgetPostPath posts an arbitrary OpenAI-compatible body to an arbitrary
+// mounted path through mux, so budget tests can cover endpoints beyond chat
+// completions.
+func budgetPostPath(t *testing.T, mux http.Handler, path, body string, headers map[string]string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -1175,9 +1293,16 @@ func budgetStreamPost(t *testing.T, mux http.Handler) *http.Response {
 // budgetStreamPostBody is budgetStreamPost with a caller-supplied request body.
 func budgetStreamPostBody(t *testing.T, mux http.Handler, body string) *http.Response {
 	t.Helper()
+	return budgetStreamPostPath(t, mux, "/v1/chat/completions", body)
+}
+
+// budgetStreamPostPath is budgetStreamPostBody pointed at an arbitrary mounted
+// path, so streaming budget tests can cover endpoints beyond chat completions.
+func budgetStreamPostPath(t *testing.T, mux http.Handler, path, body string) *http.Response {
+	t.Helper()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+path,
 		strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -1429,6 +1554,62 @@ func TestProxyStreamingBudgetChargedWhenUpstreamHonorsUsage(t *testing.T) {
 	snap := proxy.budgets.Snapshot()
 	if len(snap) != 1 || snap[0].UsedTokens != 100 {
 		t.Fatalf("snapshot = %+v, want one entry with UsedTokens 100 (a budgeted stream the upstream reports usage for must be charged)", snap)
+	}
+	after := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_usage"))
+	if after != before {
+		t.Errorf("no_usage counter = %v, want unchanged at %v", after, before)
+	}
+}
+
+// TestProxyCompletionsBudgetCharged pins budget charging for a non-streamed
+// legacy completions response: the proxy charges from the upstream's usage
+// object, which legacy completions return in the same shape as chat (#2017).
+func TestProxyCompletionsBudgetCharged(t *testing.T) {
+	proxy, mux, back := budgetTestProxy(t, []Budget{
+		{Name: "router-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 1000000},
+	})
+	body := `{"id":"cmpl-1","object":"text_completion","choices":[{"text":"hi"}],"usage":{"prompt_tokens":60,"completion_tokens":40}}`
+	back.body.Store(&body)
+
+	r := budgetPostPath(t, mux, "/v1/completions", `{"model":"any","prompt":"hello"}`, nil)
+	_ = r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode)
+	}
+
+	snap := proxy.budgets.Snapshot()
+	if len(snap) != 1 || snap[0].UsedTokens != 100 {
+		t.Fatalf("snapshot = %+v, want one entry with UsedTokens 100 (a completions response must be charged from its usage object)", snap)
+	}
+}
+
+// TestProxyCompletionsStreamingBudgetCharged pins the streamed case: the proxy
+// asks a budgeted completions stream for usage (stream_options.include_usage),
+// the upstream reports it in the final SSE chunk, and the budget is charged
+// from that chunk (#2017).
+func TestProxyCompletionsStreamingBudgetCharged(t *testing.T) {
+	proxy, mux, back := budgetTestProxy(t, []Budget{
+		{Name: "router-cap", Scope: BudgetScopeRouter, Window: time.Hour, MaxTokens: 1000000},
+	})
+	back.stream.Store(true)
+	back.sseScript.Store(&[]string{
+		`data: {"id":"cmpl-1","object":"text_completion","choices":[{"text":"def "}]}`,
+		`data: {"id":"cmpl-1","object":"text_completion","choices":[{"text":"main()"}]}`,
+	})
+	back.honorUsage.Store(true)
+
+	before := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_usage"))
+
+	resp := budgetStreamPostPath(t, mux, "/v1/completions", `{"model":"any","prompt":"hello","stream":true}`)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	snap := proxy.budgets.Snapshot()
+	if len(snap) != 1 || snap[0].UsedTokens != 100 {
+		t.Fatalf("snapshot = %+v, want one entry with UsedTokens 100 (a streamed completions response must be charged from the final usage chunk)", snap)
 	}
 	after := testutil.ToFloat64(prommetrics.RouterBudgetUnchargedTotal.WithLabelValues("default", "no_usage"))
 	if after != before {
