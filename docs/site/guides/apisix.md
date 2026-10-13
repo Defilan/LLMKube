@@ -529,8 +529,19 @@ LLMKube:
 - `apiKeySecretRef` is supported for runtime `vllm` and `sglang` only;
   admission rejects it on other runtimes.
 - SGLang with `spec.command` set and a key is rejected, because LLMKube cannot
-  add `--api-key` to a command line it does not build. Pass `--api-key` in
-  `spec.args` instead, or drop `spec.command`.
+  add `--api-key` to a command line it does not build. Drop `spec.command`, or
+  remove `apiKeySecretRef` and pass `--api-key $(VAR)` in `spec.args`, with
+  `VAR` set from the Secret in `spec.env`.
+- `apiKeySecretRef` cannot be combined with `spec.endpoint.gateway.enabled`;
+  admission rejects it. The Envoy AI Gateway resources LLMKube generates do
+  not forward the key, so every request through the gateway would get 401.
+- **LoRAAdapter refuses keyed backends.** SGLang guards its adapter load and
+  unload endpoints with the key, and LLMKube does not send it. A LoRAAdapter
+  that targets a keyed InferenceService reports `Loaded=False` with reason
+  `APIKeyUnsupported` and never calls SGLang. Load adapters at startup instead
+  (SGLang `--lora-paths` in `spec.extraArgs`), or remove the key.
+- **`llmkube benchmark` cannot send an API key yet**, so it gets 401 from a
+  keyed InferenceService.
 - **ModelRouter does not forward the key yet.** A
   [ModelRouter](../concepts/model-router) with a backend whose InferenceService
   sets `apiKeySecretRef` reports reason `BackendAPIKeyUnsupported`, naming the
