@@ -1,7 +1,7 @@
 ---
 title: Model Router
 description: A single OpenAI-compatible endpoint that routes across local InferenceServices and external providers (Anthropic, OpenAI, LiteLLM) with policy-driven handoff, fail-closed semantics for regulated data, and audit log per request.
-updated: 2026-05-12
+updated: 2026-10-12
 ---
 
 # Model Router
@@ -114,7 +114,17 @@ After `kubectl apply`:
 - `kubectl get configmap coding-router-router-proxy` contains the compiled JSON config.
 - The endpoint is `http://coding-router-router-proxy.<namespace>.svc.cluster.local:8080/v1/chat/completions`.
 
-Point any OpenAI-compatible client at that URL and it just works. Headers that change routing:
+Point any OpenAI-compatible client at that URL and it just works. The proxy serves the OpenAI-compatible routes at their standard paths, and every POST route is matched on the request's `model` field against the same rule set:
+
+| Route | Serves |
+|---|---|
+| `POST /v1/chat/completions` | Chat completions |
+| `POST /v1/completions` | Legacy completions: what fill-in-the-middle / IDE autocomplete clients and benchmark tools such as `vllm bench serve --backend openai` send |
+| `POST /v1/embeddings` | Embeddings |
+| `POST /v1/rerank` | Reranking |
+| `GET /v1/models` | Model discovery |
+
+Headers that change routing:
 
 | Header | Effect |
 |---|---|
