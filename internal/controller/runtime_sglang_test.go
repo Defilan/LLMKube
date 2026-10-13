@@ -775,6 +775,44 @@ func TestValidateSGLangConfig(t *testing.T) {
 			wantReason: "",
 		},
 		{
+			name: "a Blackwell attention backend is valid",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{AttentionBackend: "trtllm_mha"},
+				},
+			},
+			wantReason: "",
+		},
+		{
+			name: "flash_attn reports AttentionBackendUnsupported",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime:      "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{AttentionBackend: "flash_attn"},
+				},
+			},
+			wantReason: "AttentionBackendUnsupported",
+		},
+		{
+			// The pod cannot start at all with flash_attn, which outranks a
+			// speculative misconfiguration that only skips flags.
+			name: "flash_attn outranks a speculative misconfiguration",
+			isvc: &inferencev1alpha1.InferenceService{
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					Runtime: "sglang",
+					SGLangConfig: &inferencev1alpha1.SGLangConfig{
+						AttentionBackend: "flash_attn",
+						Speculative: &inferencev1alpha1.SGLangSpeculativeConfig{
+							Enabled:        ptrBool(true),
+							DraftModelPath: "/models/draft",
+						},
+					},
+				},
+			},
+			wantReason: "AttentionBackendUnsupported",
+		},
+		{
 			name: "speculative disabled is valid",
 			isvc: &inferencev1alpha1.InferenceService{
 				Spec: inferencev1alpha1.InferenceServiceSpec{

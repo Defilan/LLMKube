@@ -46,6 +46,11 @@ const RuntimeSGLANG = "sglang"
 // fatal to reconciliation (e.g., speculative enabled without an algorithm).
 const ConditionSGLangSpecValid = "SGLangSpecValid"
 
+// sglangInvalidAttentionBackend is the one value the attentionBackend enum
+// admits that SGLang rejects: it is not among SGLang's --attention-backend
+// choices in any release checked (v0.4.6, v0.5.0, v0.5.12, v0.5.15).
+const sglangInvalidAttentionBackend = "flash_attn"
+
 // sglangCUDAImage is the pinned default CUDA image. Tag verified at PR time
 // against Docker Hub; bump in a follow-up if a newer SGLang release is required.
 // sglangCUDAImage pins the newest stable SGLang CUDA image (verified
@@ -190,6 +195,13 @@ func ValidateSGLangConfig(isvc *inferencev1alpha1.InferenceService) (reason, mes
 		return "", ""
 	}
 	cfg := isvc.Spec.SGLangConfig
+	// First: the only case here where the pod cannot start at all. The CRD
+	// enum still admits flash_attn so objects stored before the enum was
+	// corrected stay valid, but no SGLang release has had that choice.
+	if cfg.AttentionBackend == sglangInvalidAttentionBackend {
+		return "AttentionBackendUnsupported",
+			"spec.sglangConfig.attentionBackend flash_attn is not an SGLang attention backend; SGLang exits at startup with an invalid-choice error. Use fa3 on Hopper, trtllm_mha or flashinfer on Blackwell, or leave it unset to let SGLang choose"
+	}
 	if cfg.Speculative != nil && cfg.Speculative.Enabled != nil && *cfg.Speculative.Enabled {
 		if cfg.Speculative.Algorithm == "" || cfg.Speculative.DraftModelPath == "" {
 			return "SpeculativeMissingConfig",
