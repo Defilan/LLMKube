@@ -44,6 +44,39 @@ Rows are individually runnable and idempotent. A row whose result file already
 exists is skipped, so an interrupted hardware session resumes instead of
 restarting. Pass `--force` to re-run.
 
+## Air-gapped runs
+
+The row manifests name Hugging Face sources and a pinned vLLM image. On a
+node without Hugging Face egress, or with images imported from a local
+registry, override them at run time instead of editing the tracked files:
+
+| Variable | Replaces |
+|---|---|
+| `B200_ROW_<NN>_SOURCE` | the row's `Model` `spec.source` |
+| `B200_ROW_<NN>_QUANTIZATION` | the row's `Model` quantization and `vllmConfig.quantization`, when a substitute checkpoint differs |
+| `B200_VLLM_IMAGE` | every row's `InferenceService` `spec.image` |
+
+`<NN>` is the two-digit row number. A staged source (any `scheme://`, such as
+`pvc://` or `s3://`) also sets `skipModelInit: false` and drops
+`vllmConfig.hfTokenSecretRef`: with `skipModelInit: true` the operator mounts
+no model storage and passes the source string to vLLM, which only works for a
+Hugging Face repository id.
+
+```sh
+# Rows 1 and 2 from a pre-staged PVC, on an image imported to the node.
+B200_ROW_01_SOURCE=pvc://models/TinyLlama-1.1B-Chat-v1.0 \
+B200_ROW_02_SOURCE=pvc://models/Llama-3.1-8B-Instruct-FP8 \
+B200_VLLM_IMAGE=vllm/vllm-openai:v0.31.0 \
+  test/e2e/b200/run-matrix.sh --rows 1,2
+```
+
+Each override must match exactly one line in the row's manifest, or the row
+fails before anything is applied. `--dry-run` prints the effective source and
+image per row. A row run with any override records `overrides: true`, the
+effective `model_source` and `image` in its result file, and a published
+matrix row carries a `(run with overrides: ...)` note, so a substituted run is
+never read as the stock row.
+
 ## Preflight gate
 
 Before any row runs, `lib/preflight.sh` asserts that the node meets the floors

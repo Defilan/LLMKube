@@ -17,9 +17,14 @@ cap_normalize() {
 
   tmp="$(mktemp)"
   jq --arg row "$row" --arg status "$status" \
+    --arg source "${B200_EFFECTIVE_SOURCE:-}" --arg image "${B200_EFFECTIVE_IMAGE:-}" \
+    --argjson overrides "${B200_OVERRIDES:-false}" \
     '{
        row: $row,
        status: $status,
+       model_source: $source,
+       image: $image,
+       overrides: $overrides,
        service_name: .service_name,
        iterations: .iterations,
        successful_runs: .successful_runs,
@@ -41,9 +46,14 @@ cap_normalize_dry_run() {
   b200_require_cmd jq
   tmp="$(mktemp)"
   jq -n --arg row "$row" \
+    --arg source "${B200_EFFECTIVE_SOURCE:-}" --arg image "${B200_EFFECTIVE_IMAGE:-}" \
+    --argjson overrides "${B200_OVERRIDES:-false}" \
     '{
        row: $row,
        status: "dry-run",
+       model_source: $source,
+       image: $image,
+       overrides: $overrides,
        service_name: null,
        iterations: 0,
        successful_runs: 0,
@@ -80,7 +90,7 @@ cap_normalize_deferred() {
 }
 # row. status is one of pass / fail / blocked / inprogress / deferred.
 cap_write_row() {
-  local doc="$1" row="$2" status="$3"
+  local doc="$1" row="$2" status="$3" annotation="${4:-}"
   local label tmp replaced=0 line rest test notes
 
   case "$status" in
@@ -102,6 +112,8 @@ cap_write_row() {
         test="${rest%% | *}"
         notes="${rest#* | }"
         notes="${notes#* | }"
+        notes="${notes%% _(run with overrides:*}"
+        [ -n "$annotation" ] && notes="${notes% |} _(run with overrides: $annotation)_ |"
         printf '| %s | %s | %s | %s\n' "$row" "$test" "$label" "$notes" >> "$tmp"
         replaced=1
         ;;
@@ -121,7 +133,10 @@ cap_write_row() {
 # cap_publish <row> <status> flips the row's status in the matrix doc. Called
 # only for a real pass/fail; a dry-run never touches the published doc.
 cap_publish() {
-  local row="$1" status="$2"
-  cap_write_row "$B200_DOC" "$row" "$status"
+  local row="$1" status="$2" annotation=""
+  if [ "${B200_OVERRIDES:-false}" = "true" ]; then
+    annotation="source \`${B200_EFFECTIVE_SOURCE:-}\`, image \`${B200_EFFECTIVE_IMAGE:-}\`"
+  fi
+  cap_write_row "$B200_DOC" "$row" "$status" "$annotation"
   b200_log "published row $row as $status in $B200_DOC"
 }
