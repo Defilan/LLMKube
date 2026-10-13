@@ -853,6 +853,38 @@ func TestRouterDeploymentBuilderResponseHeaderTimeoutRendered(t *testing.T) {
 	}
 }
 
+// TestRouterDeploymentBuilderStreamIdleTimeout covers the
+// spec.proxy.streamIdleTimeout plumbing (#2024): rendered when set, omitted
+// when unset so existing routers keep their pod template on upgrade.
+func TestRouterDeploymentBuilderStreamIdleTimeout(t *testing.T) {
+	r := &ModelRouterReconciler{RouterProxyImage: "ghcr.io/test/router-proxy:v1"}
+
+	mr := canonicalModelRouter()
+	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{
+		StreamIdleTimeout: &metav1.Duration{Duration: 45 * time.Second},
+	}
+	args := r.newRouterDeployment(mr, "hash", false).Spec.Template.Spec.Containers[0].Args
+	var found bool
+	for i, a := range args {
+		if a == "--stream-idle-timeout" && i+1 < len(args) {
+			found = true
+			if args[i+1] != "45s" {
+				t.Errorf("--stream-idle-timeout value = %q, want 45s", args[i+1])
+			}
+		}
+	}
+	if !found {
+		t.Errorf("--stream-idle-timeout flag not rendered; args = %v", args)
+	}
+
+	unset := canonicalModelRouter()
+	for _, a := range r.newRouterDeployment(unset, "hash", false).Spec.Template.Spec.Containers[0].Args {
+		if a == "--stream-idle-timeout" {
+			t.Errorf("--stream-idle-timeout must be omitted when unset")
+		}
+	}
+}
+
 // TestRouterDeploymentBuilderResponseHeaderTimeoutDefault is the
 // inverse: with spec.proxy.responseHeaderTimeout unset the flag must
 // be omitted so the proxy honors its compiled-in 120s default and

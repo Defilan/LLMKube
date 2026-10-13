@@ -324,6 +324,10 @@ func routerProxyArgs(mr *inferencev1alpha1.ModelRouter, hasPools bool) []string 
 		args = append(args, "--response-header-timeout",
 			mr.Spec.Proxy.ResponseHeaderTimeout.Duration.String())
 	}
+	if mr.Spec.Proxy != nil && mr.Spec.Proxy.StreamIdleTimeout != nil {
+		args = append(args, "--stream-idle-timeout",
+			mr.Spec.Proxy.StreamIdleTimeout.Duration.String())
+	}
 	if hasPools {
 		args = append(args, "--enable-activation")
 	}
