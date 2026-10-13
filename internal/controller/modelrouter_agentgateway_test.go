@@ -652,6 +652,95 @@ func TestModelRouterAgentGateway_UnsupportedMatchFailsLoud(t *testing.T) {
 	}
 }
 
+// TestModelRouterAgentGateway_KeyedBackendFailsLoud covers the API-key
+// boundary: agentgateway does not forward spec.endpoint.apiKeySecretRef
+// today, so routing to a keyed backend would 401 every request. A router
+// that reaches Ready while its backend is open, then has that backend's
+// InferenceService turn keyed, flips to AgentGatewayReady=False/
+// BackendAPIKeyUnsupported naming the backend. Like the unsupported-match
+// early return, the previously compiled resources are left in place (no
+// cleanup); only the condition and PoolReady flip.
+func TestModelRouterAgentGateway_KeyedBackendFailsLoud(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+
+	makeBackendISvcInNamespace(t, c, ns, "key-cuda")
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "key-router", Namespace: ns},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{
+				Name: "ai-gateway", EndpointPicker: "epp", EndpointPickerPort: 9002,
+			},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "key-cuda", InferenceServiceRef: corev1LocalRef("key-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "r",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"key-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	// Sanity: the router reaches Ready while the backend is still open.
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "key-router", Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected AgentGatewayReady=True before the backend turns keyed, got %+v", cond)
+	}
+
+	// Flip the backend InferenceService to require an API key.
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "key-cuda", Namespace: ns}, isvc); err != nil {
+		t.Fatalf("get backend isvc: %v", err)
+	}
+	// apiKeySecretRef is only supported for runtime vllm and sglang (Task 1's
+	// CRD validation); makeBackendISvcInNamespace leaves Runtime unset.
+	isvc.Spec.Runtime = RuntimeVLLM
+	isvc.Spec.Endpoint.APIKeySecretRef = &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
+	}
+	if err := c.Update(context.Background(), isvc); err != nil {
+		t.Fatalf("update backend isvc: %v", err)
+	}
+
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "key-router", Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ModelRouterReasonBackendAPIKeyUnsupported {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", ModelRouterReasonBackendAPIKeyUnsupported, cond)
+	}
+	if cond != nil && !strings.Contains(cond.Message, `"key-cuda"`) {
+		t.Errorf("condition message %q does not name the backend", cond.Message)
+	}
+	if fresh.Status.AgentGateway == nil || fresh.Status.AgentGateway.PoolReady {
+		t.Errorf("status.agentGateway.poolReady should be false once the backend is keyed, got %+v", fresh.Status.AgentGateway)
+	}
+
+	// Matches the unsupported-match early return: previously generated
+	// resources are left in place, not withdrawn.
+	getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, "key-cuda")
+	getUnstructuredInNamespace(t, c, agentGatewayPolicyGVK(), ns, "key-router")
+	getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "key-router")
+}
+
 // TestModelRouterAgentGateway_FailedReconcileEmitsWarningEvent covers issue #3:
 // a failed reconcile must be VISIBLE at the request path. The data plane keeps
 // serving its last-good compilation, so a status condition alone is not enough;

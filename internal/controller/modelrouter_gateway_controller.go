@@ -159,6 +159,14 @@ func (r *ModelRouterGatewayReconciler) Reconcile(ctx context.Context, req ctrl.R
 			"dataPlane is Gateway but spec.gatewayRef is unset; cannot attach a route")
 	}
 
+	// A keyed backend would 401 through the gateway: fail loud before any
+	// generation, like the unsupported-match check.
+	if names, err := keyedBackends(ctx, r.Client, mr); err != nil {
+		return ctrl.Result{}, err
+	} else if len(names) > 0 {
+		return ctrl.Result{}, r.setGatewayNotReady(ctx, mr, ModelRouterReasonBackendAPIKeyUnsupported, keyedBackendsMessage(names))
+	}
+
 	// CRD-presence gate. When the aigw CRDs are absent we never create resources
 	// and never requeue in a hot loop; we set a clear condition so the user sees
 	// why nothing happened. A transient discovery error (not a missing kind) is

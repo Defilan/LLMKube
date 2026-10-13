@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +59,10 @@ type compiledConfig struct {
 	// member. It drives whether the reconciler provisions activation RBAC and
 	// runs the proxy with --enable-activation.
 	HasPools bool
+
+	// KeyedBackends holds the sorted names of backends whose InferenceService
+	// requires an API key the proxy does not forward (see keyedBackends).
+	KeyedBackends []string
 }
 
 // compileRouterConfig resolves every backend in the ModelRouter spec
@@ -83,9 +88,18 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 	statuses := make([]inferencev1alpha1.BackendStatus, 0, len(mr.Spec.Backends))
 	var warnings []string
 
+	keyed, err := keyedBackends(ctx, r.Client, mr)
+	if err != nil {
+		return nil, err
+	}
+
 	for i := range mr.Spec.Backends {
 		b := &mr.Spec.Backends[i]
 		wire, status := r.resolveBackend(ctx, mr, b)
+		if slices.Contains(keyed, b.Name) {
+			status.Healthy = false
+			status.Message = appendMsg(status.Message, keyedBackendsMessage([]string{b.Name}))
+		}
 		if status.Message != "" {
 			warnings = append(warnings, fmt.Sprintf("backend %q: %s", b.Name, status.Message))
 		}
@@ -115,11 +129,12 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 	sum := sha256.Sum256(data)
 
 	return &compiledConfig{
-		JSON:     data,
-		Hash:     hex.EncodeToString(sum[:]),
-		Backends: statuses,
-		Warnings: warnings,
-		HasPools: hasPools,
+		JSON:          data,
+		Hash:          hex.EncodeToString(sum[:]),
+		Backends:      statuses,
+		Warnings:      warnings,
+		HasPools:      hasPools,
+		KeyedBackends: keyed,
 	}, nil
 }
 
@@ -333,13 +348,13 @@ func (r *ModelRouterReconciler) resolveInferenceServiceEndpoints(
 	svcName := sanitizeDNSName(isvc.Name)
 	serviceAddr = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, isvc.Namespace, port)
 
-	slices := &discoveryv1.EndpointSliceList{}
-	if err := r.List(ctx, slices,
+	endpointSlices := &discoveryv1.EndpointSliceList{}
+	if err := r.List(ctx, endpointSlices,
 		client.InNamespace(namespace),
 		client.MatchingLabels{"kubernetes.io/service-name": svcName}); err != nil {
 		return nil, serviceAddr, fmt.Sprintf("list EndpointSlices for %q: %v", svcName, err)
 	}
-	return collectReadyReplicaURLs(slices, port), serviceAddr, ""
+	return collectReadyReplicaURLs(endpointSlices, port), serviceAddr, ""
 }
 
 // resolveBackendPool finds the ModelPool a member InferenceService belongs to
