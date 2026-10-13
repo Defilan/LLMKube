@@ -101,10 +101,15 @@ func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mode
 		"--enable-metrics",
 	}
 
-	// BindAddress: default "::" (dual-stack wildcard, #972/#973). Skip if
-	// user already set --host in extraArgs (extraArgs wins).
+	// BindAddress: SGLang defaults to "" (every interface, both address
+	// families), not the "::" the other runtimes use (#972/#973). SGLang's
+	// server binds "::" IPv6-only, because asyncio sets IPV6_V6ONLY on an IPv6
+	// listener, so an IPv4 pod IP has no listener and every kubelet probe is
+	// refused (#2027). With an empty host asyncio binds 0.0.0.0 and :: on
+	// separate sockets. Skip if user already set --host in extraArgs
+	// (extraArgs wins).
 	if !hasMatchingExtraArg(isvc.Spec.ExtraArgs, "host") {
-		bindAddr := "::"
+		bindAddr := ""
 		if isvc.Spec.BindAddress != "" {
 			bindAddr = isvc.Spec.BindAddress
 		}
