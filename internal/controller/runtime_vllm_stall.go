@@ -57,6 +57,11 @@ const vllmStallDefaultWindowSeconds int32 = 120
 // process, so a per-process monotonic clock cannot carry state between them.
 // /tmp is the container's ephemeral filesystem, so a restarted container
 // starts with no baseline and cannot inherit a stale one.
+//
+// The parser mirrors parsePrometheusGaugeSum exactly, NaN included:
+// float("nan") parses and every comparison against it is false, so a NaN
+// counter reads as flat. The two vLLM counters are plain totals and do not
+// emit NaN; deviating from the Go parser here would split the semantics.
 const vllmStallScript = `import json, os, sys, tempfile, time, urllib.request
 
 METRICS_URL = "http://127.0.0.1:%[1]d/metrics"

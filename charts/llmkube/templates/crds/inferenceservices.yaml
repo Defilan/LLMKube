@@ -6205,7 +6205,10 @@ spec:
                       readiness stay on /health. spec.probeOverrides.liveness still wins
                       when set. In-cluster only: metal-agent services run no Kubernetes
                       probes, and the field is inert unless spec.runtime is "vllm".
-                      Default off; the /health liveness is unchanged when not enabled.
+                      The probe execs python3 and keeps its state under /tmp, so it needs
+                      an image with python3 on PATH and a writable /tmp (not a read-only
+                      root filesystem). Default off; the /health liveness is unchanged
+                      when not enabled.
                     properties:
                       enabled:
                         description: |-
