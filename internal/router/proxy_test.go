@@ -528,6 +528,32 @@ func TestProxyFailClosedOnLocalDown(t *testing.T) {
 	}
 }
 
+// TestProxyFailClosedOnCompletions pins the fail-closed gate on the legacy
+// completions route: a sensitive completions request is refused with 503 and
+// never dispatched when the rule's only backend is unhealthy, exactly as on
+// chat completions. The gate is shared code ahead of any route-specific
+// logic; this test keeps that true visible (#2017).
+func TestProxyFailClosedOnCompletions(t *testing.T) {
+	h := newProxyHarness(t)
+	h.proxy.disp.MarkUnhealthy("local-qwen")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/completions",
+		strings.NewReader(`{"model":"any","prompt":"hello"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-llmkube-classification", "pii")
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 fail-closed runtime", rec.Code)
+	}
+	if h.localBack.calls.Load() != 0 {
+		t.Errorf("local must not receive the refused request; calls = %d", h.localBack.calls.Load())
+	}
+	if h.cloudBack.calls.Load() != 0 {
+		t.Errorf("cloud must not receive pii request; calls = %d", h.cloudBack.calls.Load())
+	}
+}
+
 // TestProxyNonFailClosedReturns502OnAllBackendsDown documents the
 // negative case: a non-fail-closed rule with all backends unreachable
 // returns 502 (BadGateway), not 503. This is what distinguishes a
