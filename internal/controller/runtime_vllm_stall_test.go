@@ -222,14 +222,39 @@ func TestStallProbeUnreachableMetricsFails(t *testing.T) {
 	}
 }
 
-// TestStallProbeMissingMetricsFailsOpen: an engine that does not publish the
-// required metrics must not be restarted for it; missing telemetry fails
-// open, engine death does not.
+// TestStallProbeMissingMetricsFailsOpen: missing telemetry fails open,
+// engine death does not. The second shape is what pins the guard: with the
+// guard dropped, an absent counter reads as a flat 0.0 against its 0.0
+// baseline, so a running engine with a missing counter trips the window and
+// gets restarted over telemetry it never published.
 func TestStallProbeMissingMetricsFailsOpen(t *testing.T) {
-	port, _ := metricsStub(t, "# HELP other_metric Something else.\nother_metric 1.0\n")
-	if code := runStallProbe(t, port, t.TempDir()); code != 0 {
-		t.Fatalf("probe against a body without vllm metrics = exit %d, want 0", code)
-	}
+	t.Run("no vllm metrics at all", func(t *testing.T) {
+		port, _ := metricsStub(t, "# HELP other_metric Something else.\nother_metric 1.0\n")
+		if code := runStallProbe(t, port, t.TempDir()); code != 0 {
+			t.Fatalf("probe against a body without vllm metrics = exit %d, want 0", code)
+		}
+	})
+
+	t.Run("running with one counter absent", func(t *testing.T) {
+		partial := strings.NewReplacer(
+			`vllm:num_requests_running{model_name="q"} 0.0`,
+			`vllm:num_requests_running{model_name="q"} 5.0`,
+			`vllm:generation_tokens_total{model_name="q"} 5.0`,
+			`vllm:generation_tokens_total{model_name="q"} 1000.0`,
+			`vllm:prompt_tokens_total{model_name="q"} 10.0`,
+			"",
+		).Replace(stallProbeIdleBody)
+		port, _ := metricsStub(t, partial)
+		stateDir := t.TempDir()
+
+		if code := runStallProbe(t, port, stateDir); code != 0 {
+			t.Fatalf("partial-metrics baseline probe = exit %d, want 0", code)
+		}
+		time.Sleep(2 * time.Second)
+		if code := runStallProbe(t, port, stateDir); code != 0 {
+			t.Fatalf("probe with a running engine and a missing counter = exit %d, want 0 (fail open)", code)
+		}
+	})
 }
 
 // TestStallProbeSumsLabeledSeries pins the parser semantics: series carry
