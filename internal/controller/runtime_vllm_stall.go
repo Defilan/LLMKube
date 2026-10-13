@@ -25,9 +25,11 @@ import (
 )
 
 // vllmStallDefaultWindowSeconds is the stall window when
-// spec.vllmConfig.stallDetection.windowSeconds is unset. Long prefills
-// complete in seconds on current GPUs, so 120s leaves wide margin before a
-// healthy engine looks stalled.
+// spec.vllmConfig.stallDetection.windowSeconds is unset. The kv-cache
+// heartbeat keeps even multi-minute prefills safe, so the margin exists to
+// keep ordinary scheduler hiccups between probes from looking like stalls;
+// restart latency is roughly window + liveness period x failure threshold
+// (about 165s at the defaults).
 const vllmStallDefaultWindowSeconds int32 = 120
 
 // vllmStallScript is the stall detector the exec liveness probe runs. It is
@@ -46,10 +48,17 @@ const vllmStallDefaultWindowSeconds int32 = 120
 //     the fetch-failure branch above.
 //   - running == 0: record the baseline and exit 0. An idle engine is never
 //     stalled.
-//   - running > 0 with progress (either counter above its last recorded
-//     value): record and exit 0. A long prefill advances the prompt counter
-//     while generation is still flat and must not count as a stall.
-//   - running > 0 with both counters flat for windowSeconds: exit 1. The
+//   - running > 0 with a counter reset (a counter below its last recorded
+//     value): record a fresh baseline and exit 0. Counters are monotonic
+//     within an engine lifetime, so a decrease means the metrics world
+//     restarted, not that the engine unstalled.
+//   - running > 0 with progress (a counter above its last recorded value,
+//     or vllm:kv_cache_usage_perc changed beyond float noise): record and
+//     exit 0. Measured on vLLM v0.31.0, a ~200K-token prefill left BOTH
+//     token counters flat for its whole 13.7s while kv_cache_usage_perc
+//     climbed steadily, so the kv gauge is the mid-prefill heartbeat; it is
+//     optional, and absent keeps the counter-only judgment.
+//   - running > 0 with every signal flat for windowSeconds: exit 1. The
 //     baseline is kept, so later probes keep failing until kubelet restarts
 //     the container; the restart also clears the wedge.
 //
@@ -70,6 +79,8 @@ STATE_PATH = os.environ.get("LLMKUBE_STALL_STATE_FILE", "/tmp/llmkube-vllm-stall
 RUNNING = "vllm:num_requests_running"
 GEN = "vllm:generation_tokens_total"
 PROMPT = "vllm:prompt_tokens_total"
+KV = "vllm:kv_cache_usage_perc"
+EPS = 1e-9
 
 
 def fetch(url):
@@ -113,13 +124,15 @@ def read_state():
     try:
         with open(STATE_PATH) as f:
             state = json.load(f)
-        return float(state["gen"]), float(state["prompt"]), float(state["ts"])
+        kv = state.get("kv")
+        return (float(state["gen"]), float(state["prompt"]),
+                None if kv is None else float(kv), float(state["ts"]))
     except Exception:
         return None
 
 
-def write_state(running, gen, prompt, ts):
-    state = {"running": running, "gen": gen, "prompt": prompt, "ts": ts}
+def write_state(running, gen, prompt, kv, ts):
+    state = {"running": running, "gen": gen, "prompt": prompt, "kv": kv, "ts": ts}
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(STATE_PATH) or ".")
     try:
         with os.fdopen(fd, "w") as f:
@@ -144,23 +157,40 @@ if not running_found or not gen_found or not prompt_found:
     print("stall-probe: required metrics absent; cannot judge", file=sys.stderr)
     sys.exit(0)
 
+kv_val, kv_found = gauge_sum(body, KV)
+kv = kv_val if kv_found else None
+
 now = time.time()
 if running <= 0:
-    write_state(running, gen, prompt, now)
+    write_state(running, gen, prompt, kv, now)
     sys.exit(0)
 
 prev = read_state()
 if prev is None:
-    write_state(running, gen, prompt, now)
+    write_state(running, gen, prompt, kv, now)
     sys.exit(0)
 
-prev_gen, prev_prompt, prev_ts = prev
+prev_gen, prev_prompt, prev_kv, prev_ts = prev
+
+# Counters are monotonic within an engine lifetime; a decrease means the
+# metrics world restarted, so start a fresh window.
+if gen < prev_gen or prompt < prev_prompt:
+    write_state(running, gen, prompt, kv, now)
+    sys.exit(0)
+
 if gen > prev_gen or prompt > prev_prompt:
-    write_state(running, gen, prompt, now)
+    write_state(running, gen, prompt, kv, now)
+    sys.exit(0)
+
+# kv cache usage is the mid-prefill heartbeat: it climbs while a long
+# prefill fills the cache with both token counters flat. Any real change
+# counts, up or down; EPS sits above float-print noise.
+if prev_kv is not None and kv is not None and abs(kv - prev_kv) > EPS:
+    write_state(running, gen, prompt, kv, now)
     sys.exit(0)
 
 if now - prev_ts >= WINDOW:
-    print("stall-probe: running", running, "with both token counters flat for",
+    print("stall-probe: running", running, "with no counter or kv-cache progress for",
           now - prev_ts, "s (window", WINDOW, "s)", file=sys.stderr)
     sys.exit(1)
 

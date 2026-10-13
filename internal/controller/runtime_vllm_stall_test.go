@@ -105,6 +105,20 @@ vllm:generation_tokens_total{model_name="q"} 5.0
 vllm:prompt_tokens_total{model_name="q"} 10.0
 `
 
+// stallProbeKvBody is the measured vLLM exposition shape: one request
+// running with both token counters and the kv-cache gauge present.
+// kv_cache_usage_perc is a gauge and moves independently of the counters.
+const stallProbeKvBody = `# HELP vllm:num_requests_running Number of requests running.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{model_name="q"} 1.0
+# TYPE vllm:generation_tokens_total counter
+vllm:generation_tokens_total{model_name="q"} 100.0
+# TYPE vllm:prompt_tokens_total counter
+vllm:prompt_tokens_total{model_name="q"} 5000.0
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{model_name="q"} 0.013
+`
+
 // TestStallProbeIdleNeverFails: an idle engine is never stalled, however
 // long the counters have been flat.
 func TestStallProbeIdleNeverFails(t *testing.T) {
@@ -173,31 +187,93 @@ func TestStallProbeFrozenRunningFailsAfterWindow(t *testing.T) {
 	}
 }
 
-// TestStallProbeLongPrefillDoesNotFail: the prompt counter advances while
-// generation is still flat, and the flat-generation span outlasts the
-// window, so the prompt check is what keeps the engine alive.
+// TestStallProbeLongPrefillDoesNotFail: the measured prefill shape. On
+// vLLM v0.31.0 a ~200K-token prefill kept both token counters flat for its
+// whole 13.7s while vllm:kv_cache_usage_perc climbed steadily (0.013 to
+// 0.057), so kv usage is the mid-prefill heartbeat and must hold the window
+// open on its own.
 func TestStallProbeLongPrefillDoesNotFail(t *testing.T) {
-	prefill := strings.NewReplacer(
-		`vllm:num_requests_running{model_name="q"} 0.0`,
-		`vllm:num_requests_running{model_name="q"} 4.0`,
-		`vllm:generation_tokens_total{model_name="q"} 5.0`,
-		`vllm:generation_tokens_total{model_name="q"} 100.0`,
-		`vllm:prompt_tokens_total{model_name="q"} 10.0`,
-		`vllm:prompt_tokens_total{model_name="q"} 1000.0`,
-	).Replace(stallProbeIdleBody)
-	port, set := metricsStub(t, prefill)
+	port, set := metricsStub(t, stallProbeKvBody)
 	stateDir := t.TempDir()
 
 	if code := runStallProbe(t, port, stateDir); code != 0 {
 		t.Fatalf("prefill baseline probe = exit %d, want 0", code)
 	}
-	set(strings.Replace(prefill,
-		`vllm:prompt_tokens_total{model_name="q"} 1000.0`,
-		`vllm:prompt_tokens_total{model_name="q"} 9000.0`, 1))
+	set(strings.Replace(stallProbeKvBody,
+		`vllm:kv_cache_usage_perc{model_name="q"} 0.013`,
+		`vllm:kv_cache_usage_perc{model_name="q"} 0.057`, 1))
 
 	time.Sleep(2 * time.Second)
 	if code := runStallProbe(t, port, stateDir); code != 0 {
-		t.Fatalf("probe during a long prefill = exit %d, want 0", code)
+		t.Fatalf("probe during a long prefill (kv climbing, counters flat) = exit %d, want 0", code)
+	}
+}
+
+// TestStallProbeKvDropCountsAsProgress: kv usage is a gauge, so movement in
+// either direction is engine activity; a drop (requests finished, cache
+// freed) must hold the window open exactly like a climb.
+func TestStallProbeKvDropCountsAsProgress(t *testing.T) {
+	dropped := strings.Replace(stallProbeKvBody,
+		`vllm:kv_cache_usage_perc{model_name="q"} 0.013`,
+		`vllm:kv_cache_usage_perc{model_name="q"} 0.057`, 1)
+	port, set := metricsStub(t, dropped)
+	stateDir := t.TempDir()
+
+	if code := runStallProbe(t, port, stateDir); code != 0 {
+		t.Fatalf("baseline probe = exit %d, want 0", code)
+	}
+	set(stallProbeKvBody)
+
+	time.Sleep(2 * time.Second)
+	if code := runStallProbe(t, port, stateDir); code != 0 {
+		t.Fatalf("probe with kv usage dropping = exit %d, want 0", code)
+	}
+}
+
+// TestStallProbeFrozenKvFailsAfterWindow: the measured stall shape, kv
+// gauge present but frozen (the 50-minute stall held it at 0.10657). A
+// present-but-flat kv gauge must fail exactly like an absent one; the
+// optional gauge must not weaken the verdict.
+func TestStallProbeFrozenKvFailsAfterWindow(t *testing.T) {
+	port, _ := metricsStub(t, stallProbeKvBody)
+	stateDir := t.TempDir()
+
+	if code := runStallProbe(t, port, stateDir); code != 0 {
+		t.Fatalf("first frozen probe with kv = exit %d, want 0 (baseline write)", code)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if code := runStallProbe(t, port, stateDir); code != 0 {
+		t.Fatalf("frozen probe with kv inside the window = exit %d, want 0", code)
+	}
+	time.Sleep(2 * time.Second)
+	if code := runStallProbe(t, port, stateDir); code == 0 {
+		t.Fatal("frozen probe with kv after the window = exit 0, want non-zero")
+	}
+}
+
+// TestStallProbeCounterResetRestartsTheWindow: counters are monotonic
+// within an engine lifetime, so a decrease means the metrics registry
+// restarted. The probe must write a fresh baseline instead of reading the
+// drop as a stall, and must stay armed for a stall that persists after the
+// reset.
+func TestStallProbeCounterResetRestartsTheWindow(t *testing.T) {
+	port, set := metricsStub(t, stallProbeKvBody)
+	stateDir := t.TempDir()
+
+	if code := runStallProbe(t, port, stateDir); code != 0 {
+		t.Fatalf("pre-reset baseline probe = exit %d, want 0", code)
+	}
+	set(strings.Replace(stallProbeKvBody,
+		`vllm:generation_tokens_total{model_name="q"} 100.0`,
+		`vllm:generation_tokens_total{model_name="q"} 5.0`, 1))
+
+	time.Sleep(2 * time.Second)
+	if code := runStallProbe(t, port, stateDir); code != 0 {
+		t.Fatalf("probe right after a counter reset = exit %d, want 0 (fresh baseline)", code)
+	}
+	time.Sleep(2 * time.Second)
+	if code := runStallProbe(t, port, stateDir); code == 0 {
+		t.Fatal("probe after the reset with everything flat = exit 0, want non-zero (reset must not disable the detector)")
 	}
 }
 
