@@ -661,7 +661,7 @@ picked, APISIX logged `connect: Connection refused`, counted it as status
 500, and retried on the secondary, so a connection failure matches
 `http_5xx`. A Service with no endpoints refuses the connection at once: on
 the route without checks, where every request went through that retry,
-requests for 8 output tokens still completed in 0.07 to 0.09 seconds.
+short requests still completed in 0.07 to 0.09 seconds.
 
 The lab run also scaled the live InferenceService to 0 in the middle of a
 stream on the route without checks. APISIX logged `upstream closed before
