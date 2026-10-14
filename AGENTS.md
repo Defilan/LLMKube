@@ -32,6 +32,8 @@ contributors share. The human onboarding narrative lives in
 - `make test-e2e-rbac` requires Docker, Kind and `jq`; it creates (or reuses)
   its own Kind cluster and kubeconfig file, and never touches your current
   kubectl context.
+- `make test-e2e-apisix` requires Docker, Kind and `helm`, plus network access
+  to the APISIX chart repository.
 
 ## Commands
 
@@ -47,6 +49,7 @@ contributors share. The human onboarding narrative lives in
 | Alert rule behavior (promtool)      | `make test-chart-rules` |
 | E2E tests (needs Kind)              | `make test-e2e`         |
 | Generated-RBAC e2e (needs Kind)     | `make test-e2e-rbac`   |
+| APISIX e2e (needs Kind and Helm)    | `make test-e2e-apisix` |
 | Format                              | `make fmt`              |
 | Vet                                 | `make vet`              |
 | Lint (golangci-lint)                | `make lint`             |

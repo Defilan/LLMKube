@@ -58,6 +58,7 @@ var gateExemptCIChecks = map[string]string{
 	"cleanup-test-e2e":              "tears down an e2e cluster; lifecycle, not a branch check",
 	"test-e2e":                      "needs a live cluster the gate Job does not own",
 	"test-e2e-rbac":                 "creates a kind cluster (Docker) the gate Job neither has nor owns",
+	"test-e2e-apisix":               "creates a kind cluster (Docker) and installs APISIX; the gate Job has neither",
 	"docker-build":                  "image build, not a branch check",
 	"docker-build-foreman-agent":    "image build, not a branch check",
 	"docker-build-foreman-operator": "image build, not a branch check",

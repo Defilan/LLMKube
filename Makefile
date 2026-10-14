@@ -128,7 +128,7 @@ endif
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test GINKGO_SEED=$(GINKGO_SEED))"
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v '/test/e2e$$') -coverprofile cover.out
 
 # The envtest suites only, so CI can run a second fixed seed over just the
 # specs whose ordering matters (#1693). Not part of the Foreman gate: the
@@ -186,6 +186,16 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+
+# Runs only the "APISIX ai-proxy-multi in front of an InferenceService"
+# Context (test/e2e/apisix_e2e_test.go): it Helm-installs the operator chart
+# and APISIX (chart 2.18.0, standalone mode) and serves the stub upstream as
+# keyed InferenceServices behind ai-proxy-multi.
+.PHONY: test-e2e-apisix
+test-e2e-apisix: setup-test-e2e manifests generate fmt vet ## Run the APISIX ai-proxy-multi e2e in kind (needs helm).
+	LLMKUBE_E2E_APISIX=true KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v \
+		-ginkgo.focus='APISIX ai-proxy-multi'
+	$(MAKE) cleanup-test-e2e
 
 # Runs the manager out of cluster under ONLY the RBAC generated from the
 # +kubebuilder:rbac markers and fails on any forbidden error or reconcile
