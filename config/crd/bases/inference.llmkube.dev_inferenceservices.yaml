@@ -1186,6 +1186,49 @@ spec:
               endpoint:
                 description: Endpoint defines the service endpoint configuration
                 properties:
+                  apiKeySecretRef:
+                    description: |-
+                      APIKeySecretRef names a Secret key holding the API key callers must
+                      present as "Authorization: Bearer <key>". vLLM reads it as VLLM_API_KEY;
+                      SGLang gets it as LLMKUBE_API_KEY plus "--api-key $(LLMKUBE_API_KEY)".
+                      Both runtimes leave /health and /metrics open, so probes keep working.
+                      Supported for runtime vllm and sglang. A key change takes effect when the
+                      pods restart. An --api-key already in extraArgs wins; LLMKube then adds
+                      nothing. Cannot be combined with gateway.enabled: the gateway does not
+                      forward the key. Not supported on ModelRouter.
+                    properties:
+                      key:
+                        description: The key of the secret to select from.  Must be
+                          a valid secret key.
+                        type: string
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                      optional:
+                        description: Specify whether the Secret or its key must be
+                          defined
+                        type: boolean
+                    required:
+                    - key
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  externalTrafficPolicy:
+                    description: |-
+                      ExternalTrafficPolicy sets the Service's externalTrafficPolicy. Local
+                      preserves the client source IP on a NodePort or LoadBalancer, which an IP
+                      allowlist (NetworkPolicy) needs. Unset keeps the Kubernetes default
+                      (Cluster). Requires endpoint.type NodePort or LoadBalancer. Not supported
+                      on ModelRouter.
+                    enum:
+                    - Cluster
+                    - Local
+                    type: string
                   gateway:
                     description: |-
                       Gateway opts this InferenceService into Envoy AI Gateway exposure. When
@@ -1261,6 +1304,19 @@ spec:
                     - LoadBalancer
                     type: string
                 type: object
+                x-kubernetes-validations:
+                - message: externalTrafficPolicy requires endpoint.type NodePort or
+                    LoadBalancer
+                  rule: '!has(self.externalTrafficPolicy) || (has(self.type) && self.type
+                    in [''NodePort'',''LoadBalancer''])'
+                - message: 'endpoint.apiKeySecretRef cannot be combined with endpoint.gateway.enabled:
+                    the gateway does not forward the key, so requests would get 401'
+                  rule: '!has(self.apiKeySecretRef) || !has(self.gateway) || !has(self.gateway.enabled)
+                    || !self.gateway.enabled'
+                - message: endpoint.apiKeySecretRef needs a non-empty Secret name
+                    and a valid Secret key (letters, digits, '-', '_' and '.')
+                  rule: '!has(self.apiKeySecretRef) || (has(self.apiKeySecretRef.name)
+                    && size(self.apiKeySecretRef.name) > 0 && self.apiKeySecretRef.key.matches(''^[-._a-zA-Z0-9]+$''))'
               env:
                 description: |-
                   Env adds environment variables to the inference container.
@@ -6322,6 +6378,16 @@ spec:
                 the operator to stage the Model, the other declines staging'
               rule: '!(has(self.stageModel) && self.stageModel && has(self.skipModelInit)
                 && self.skipModelInit)'
+            - message: endpoint.apiKeySecretRef is supported for runtime vllm and
+                sglang in this release
+              rule: '!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) ||
+                (has(self.runtime) && self.runtime in [''vllm'',''sglang''])'
+            - message: with spec.command set, LLMKube cannot add --api-key to the
+                SGLang command line; drop spec.command, or remove endpoint.apiKeySecretRef
+                and pass --api-key $(VAR) in spec.args with VAR from spec.env
+              rule: '!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef) ||
+                !has(self.runtime) || self.runtime != ''sglang'' || !has(self.command)
+                || self.command.size() == 0'
           status:
             description: status defines the observed state of InferenceService
             properties:

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -1276,4 +1277,156 @@ func TestDefaultLoRAAdapterURLResolver_UsesServicePort(t *testing.T) {
 			t.Fatal("expected error when Service does not exist")
 		}
 	})
+}
+
+// keyedSGLangTargets returns sglang InferenceServices that each require an API
+// key, one per form a user can set it in. SGLang v0.5.15 guards
+// /load_lora_adapter and /unload_lora_adapter with that key, and the
+// LoRAAdapter controller sends none.
+func keyedSGLangTargets() []struct {
+	name string
+	isvc *inferencev1alpha1.InferenceService
+} {
+	base := func() *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "isvc-sglang", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime:  RuntimeSGLANG,
+				ModelRef: "m",
+				Endpoint: &inferencev1alpha1.EndpointSpec{Port: 30000},
+			},
+			Status: inferencev1alpha1.InferenceServiceStatus{Endpoint: "http://placeholder:30000"},
+		}
+	}
+	keyRef := &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
+	}
+	secretRef := base()
+	secretRef.Spec.Endpoint.APIKeySecretRef = keyRef
+	extraArgs := base()
+	extraArgs.Spec.ExtraArgs = []string{"--api-key", "$(MY_KEY)"}
+	// endpointAPIKeyRef returns nil here because the user's flag wins.
+	both := base()
+	both.Spec.Endpoint.APIKeySecretRef = keyRef
+	both.Spec.ExtraArgs = []string{"--api-key=$(MY_KEY)"}
+	commandArgs := base()
+	commandArgs.Spec.Command = []string{"python3", "-m", "sglang.launch_server"}
+	commandArgs.Spec.Args = []string{"--api-key", "$(MY_KEY)"}
+	return []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+	}{
+		{"apiKeySecretRef", secretRef},
+		{"--api-key in extraArgs", extraArgs},
+		{"apiKeySecretRef and --api-key in extraArgs", both},
+		{"--api-key in spec.args with spec.command", commandArgs},
+	}
+}
+
+// TestLoRAAdapterController_RefusesKeyedBackend: a load against a keyed SGLang
+// could only get 401, so the controller reports APIKeyUnsupported, sends
+// nothing, and backs off for 5 minutes instead of retrying every 30 seconds.
+func TestLoRAAdapterController_RefusesKeyedBackend(t *testing.T) {
+	for _, tc := range keyedSGLangTargets() {
+		t.Run(tc.name, func(t *testing.T) {
+			sg := newRecordingSGLang(t, sglangStatuses{})
+			scheme := newLoRARecnScheme(t)
+			adapter := &inferencev1alpha1.LoRAAdapter{
+				ObjectMeta: metav1.ObjectMeta{Name: "adapter-a", Namespace: "default", Generation: 1, Finalizers: []string{loraAdapterFinalizer}},
+				Spec: inferencev1alpha1.LoRAAdapterSpec{
+					InferenceServiceRef: inferencev1alpha1.LocalInferenceServiceReference{Name: "isvc-sglang"},
+					Name:                "loraA",
+					Path:                "/loras/a",
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.isvc, adapter).WithStatusSubresource(&inferencev1alpha1.LoRAAdapter{}).Build()
+			r := &LoRAAdapterReconciler{
+				Client:        cl,
+				Scheme:        scheme,
+				AdapterClient: NewSGLangAdapterClient(sg.Client()),
+				URLResolver: func(_ context.Context, _ client.Client, _ *inferencev1alpha1.InferenceService) (string, error) {
+					return sg.URL, nil
+				},
+				Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			}
+
+			res, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}})
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(sg.loadReqs) != 0 {
+				t.Errorf("expected 0 load requests against SGLang, got %d (%v)", len(sg.loadReqs), sg.loadReqs)
+			}
+			if res.RequeueAfter != 5*time.Minute {
+				t.Errorf("RequeueAfter = %v, want 5m", res.RequeueAfter)
+			}
+
+			var got inferencev1alpha1.LoRAAdapter
+			if err := cl.Get(context.Background(), types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}, &got); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			loaded := findCondition(got.Status.Conditions, LoRAConditionLoaded)
+			if loaded == nil || loaded.Status != metav1.ConditionFalse || loaded.Reason != LoRAReasonAPIKeyUnsupported {
+				t.Fatalf("Loaded = %+v, want False/%s", loaded, LoRAReasonAPIKeyUnsupported)
+			}
+			if !strings.Contains(loaded.Message, "requires an API key") || !strings.Contains(loaded.Message, "401") {
+				t.Errorf("Loaded.Message = %q, want it to name the API key gap", loaded.Message)
+			}
+			errCond := findCondition(got.Status.Conditions, LoRAConditionError)
+			if errCond == nil || errCond.Status != metav1.ConditionTrue || errCond.Reason != LoRAReasonAPIKeyUnsupported {
+				t.Errorf("Error = %+v, want True/%s", errCond, LoRAReasonAPIKeyUnsupported)
+			}
+			if got.Status.LoadedPath != "" {
+				t.Errorf("status.loadedPath = %q, want empty", got.Status.LoadedPath)
+			}
+		})
+	}
+}
+
+// TestLoRAAdapterController_DeleteSkipsUnloadOnKeyedBackend: the unload would
+// 401 too, and the load path never loaded anything there, so deletion sends
+// nothing and still drops the finalizer.
+func TestLoRAAdapterController_DeleteSkipsUnloadOnKeyedBackend(t *testing.T) {
+	for _, tc := range keyedSGLangTargets() {
+		t.Run(tc.name, func(t *testing.T) {
+			sg := newRecordingSGLang(t, sglangStatuses{})
+			scheme := newLoRARecnScheme(t)
+			now := metav1.NewTime(time.Unix(1700000000, 0).UTC())
+			adapter := &inferencev1alpha1.LoRAAdapter{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "adapter-a",
+					Namespace:         "default",
+					Finalizers:        []string{loraAdapterFinalizer},
+					DeletionTimestamp: &now,
+				},
+				Spec: inferencev1alpha1.LoRAAdapterSpec{
+					InferenceServiceRef: inferencev1alpha1.LocalInferenceServiceReference{Name: "isvc-sglang"},
+					Name:                "loraA",
+					Path:                "/loras/a",
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tc.isvc, adapter).WithStatusSubresource(&inferencev1alpha1.LoRAAdapter{}).Build()
+			r := &LoRAAdapterReconciler{
+				Client:        cl,
+				Scheme:        scheme,
+				AdapterClient: NewSGLangAdapterClient(sg.Client()),
+				URLResolver: func(_ context.Context, _ client.Client, _ *inferencev1alpha1.InferenceService) (string, error) {
+					return sg.URL, nil
+				},
+				Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			}
+
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(sg.unloadReqs) != 0 {
+				t.Errorf("expected 0 unload requests against SGLang, got %d (%v)", len(sg.unloadReqs), sg.unloadReqs)
+			}
+			var got inferencev1alpha1.LoRAAdapter
+			err := cl.Get(context.Background(), types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}, &got)
+			if !apierrors.IsNotFound(err) {
+				t.Errorf("expected NotFound once the finalizer drops, got err=%v adapter=%+v", err, got)
+			}
+		})
+	}
 }

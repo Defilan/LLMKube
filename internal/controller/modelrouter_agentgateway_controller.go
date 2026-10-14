@@ -288,6 +288,14 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 			"dataPlane is AgentGateway but spec.agentGatewayRef is unset; cannot attach a pool or route")
 	}
 
+	// A keyed backend would 401 through agentgateway: fail loud before any
+	// generation, like the unsupported-match check.
+	if names, err := keyedBackends(ctx, r.Client, mr); err != nil {
+		return ctrl.Result{}, err
+	} else if len(names) > 0 {
+		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, ModelRouterReasonBackendAPIKeyUnsupported, keyedBackendsMessage(names))
+	}
+
 	// CRD-presence gate. When the required CRDs are absent we never create
 	// resources and never requeue in a hot loop; we set a clear condition
 	// naming the missing kinds so the user sees why nothing happened (and which

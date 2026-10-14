@@ -892,6 +892,9 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 		existingService.Spec.Type = service.Spec.Type
 		existingService.Spec.Ports = service.Spec.Ports
 		existingService.Spec.Selector = service.Spec.Selector
+		// Empty is safe to send: the apiserver re-defaults it to Cluster on
+		// NodePort/LoadBalancer, so removing the field reverts to the default.
+		existingService.Spec.ExternalTrafficPolicy = service.Spec.ExternalTrafficPolicy
 		existingService.Labels = service.Labels
 		if err := r.Update(ctx, existingService); err != nil {
 			log.Error(err, "Failed to update Service")

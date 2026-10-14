@@ -608,6 +608,49 @@ var _ = Describe("metal relay mode", func() {
 			Expect(got.Spec.Ports[0].TargetPort).To(Equal(intstr.FromInt(8080)))
 		})
 
+		It("clears a Local externalTrafficPolicy left over from before the isvc was relayed", func() {
+			isvc := newEndpointISVC("relay-adopt-etp", &inferencev1alpha1.EndpointSpec{
+				Type:                  "NodePort",
+				ExternalTrafficPolicy: "Local",
+			})
+			cleanupRelay(isvc.Name)
+
+			// Builds the Service the way an earlier relay pass would have left
+			// it pre-fix: already on the relay selector, but still carrying the
+			// Local that constructService renders for this spec (what the
+			// pod-backed Service had before the Model moved to Metal).
+			svc := reconciler.constructService(isvc)
+			svc.Spec.Selector = relayPodSelector(isvc.Name)
+			for i := range svc.Spec.Ports {
+				svc.Spec.Ports[i].TargetPort = intstr.FromInt(relayListenPort)
+			}
+			Expect(svc.Spec.ExternalTrafficPolicy).To(Equal(corev1.ServiceExternalTrafficPolicyLocal))
+			Expect(setControllerReferenceUnblocked(isvc, svc, k8sClient.Scheme())).To(Succeed())
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+
+			Expect(reconciler.reconcileRelayService(ctx, isvc)).To(Succeed())
+
+			got := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), got)).To(Succeed())
+			Expect(got.Spec.ExternalTrafficPolicy).To(Equal(corev1.ServiceExternalTrafficPolicyCluster))
+
+			firstResourceVersion := got.ResourceVersion
+			// A no-op Update is dropped by the API server without bumping
+			// resourceVersion (see updateCountingClient's doc comment above),
+			// so resourceVersion alone cannot tell a converged pass apart from
+			// one that redundantly re-submits the same content; count the
+			// Update call too.
+			counting := &updateCountingClient{Client: k8sClient}
+			reconciler.Client = counting
+			Expect(reconciler.reconcileRelayService(ctx, isvc)).To(Succeed())
+			reconciler.Client = k8sClient
+			Expect(counting.services).To(BeZero(), "a converged second pass must not Update the Service")
+
+			second := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), second)).To(Succeed())
+			Expect(second.ResourceVersion).To(Equal(firstResourceVersion), "a converged second pass must not Update the Service")
+		})
+
 		// expectSteadyState runs a second reconcileRelay with nothing changed
 		// and asserts neither relay object was written: an unconditional
 		// Update from a cached copy races the Deployment controller's own

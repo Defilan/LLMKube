@@ -381,6 +381,91 @@ func TestModelRouterGateway_UnsupportedMatchFailsLoud(t *testing.T) {
 	}
 }
 
+// TestModelRouterGateway_KeyedBackendFailsLoud covers the API-key boundary: no
+// gateway data plane forwards spec.endpoint.apiKeySecretRef today, so routing
+// to a keyed backend through the gateway would 401 every request. A router
+// that reaches Ready while its backend is open, then has that backend's
+// InferenceService turn keyed, flips to GatewayReady=False/
+// BackendAPIKeyUnsupported naming the backend. Like the unsupported-match
+// early return, the previously compiled resources are left in place (no
+// cleanup); only the condition and RouteReady flip.
+func TestModelRouterGateway_KeyedBackendFailsLoud(t *testing.T) {
+	c, cfg, stop := startGatewayTestEnv(t, true)
+	defer stop()
+
+	makeBackendISvc(t, c, "key-cuda")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "key-router", Namespace: testNS},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:  inferencev1alpha1.ModelRouterDataPlaneGateway,
+			GatewayRef: &inferencev1alpha1.GatewayReference{Name: "ai-gateway", Namespace: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "key-cuda", InferenceServiceRef: corev1LocalRef("key-cuda")},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{
+					Name:  "qwen",
+					Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen35-27b"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"key-cuda"}},
+				},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := newModelRouterGatewayReconciler(t, cfg)
+	reconcileRouter(t, r, mr)
+
+	// Sanity: the router reaches Ready while the backend is still open.
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "key-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected GatewayReady=True before the backend turns keyed, got %+v", cond)
+	}
+
+	// Flip the backend InferenceService to require an API key.
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "key-cuda", Namespace: testNS}, isvc); err != nil {
+		t.Fatalf("get backend isvc: %v", err)
+	}
+	// apiKeySecretRef is only supported for runtime vllm and sglang (Task 1's
+	// CRD validation); makeBackendISvc leaves Runtime unset.
+	isvc.Spec.Runtime = RuntimeVLLM
+	isvc.Spec.Endpoint.APIKeySecretRef = &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
+	}
+	if err := c.Update(context.Background(), isvc); err != nil {
+		t.Fatalf("update backend isvc: %v", err)
+	}
+
+	reconcileRouter(t, r, mr)
+
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "key-router", Namespace: testNS}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterGatewayConditionReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ModelRouterReasonBackendAPIKeyUnsupported {
+		t.Errorf("expected GatewayReady=False/%s, got %+v", ModelRouterReasonBackendAPIKeyUnsupported, cond)
+	}
+	if cond != nil && !strings.Contains(cond.Message, `"key-cuda"`) {
+		t.Errorf("condition message %q does not name the backend", cond.Message)
+	}
+	if fresh.Status.Gateway == nil || fresh.Status.Gateway.RouteReady {
+		t.Errorf("status.gateway.routeReady should be false once the backend is keyed, got %+v", fresh.Status.Gateway)
+	}
+
+	// Matches the unsupported-match early return: previously generated
+	// resources are left in place, not withdrawn.
+	getUnstructured(t, c, backendGVK(), "key-cuda")
+	getUnstructured(t, c, aiServiceBackendGVK(), "key-cuda")
+	getUnstructured(t, c, aiGatewayRouteGVK(), "key-router")
+}
+
 // TestModelRouterGateway_ProxyModeProducesNothing covers case (c): a
 // dataPlane: Proxy (default) ModelRouter generates no gateway resources (the
 // gateway reconciler no-ops; the proxy path is owned by ModelRouterReconciler

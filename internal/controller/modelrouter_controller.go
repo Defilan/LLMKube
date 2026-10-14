@@ -403,11 +403,11 @@ func (r *ModelRouterReconciler) recordSuccess(
 		Message: "spec passed static validation",
 	})
 
-	backendsReady, backendsMessage := summarizeBackends(compiled.Backends)
+	backendsReady, reason, backendsMessage := backendsReadyCondition(compiled)
 	apimeta.SetStatusCondition(&desired.Status.Conditions, metav1.Condition{
 		Type:    ModelRouterConditionBackendsReady,
 		Status:  conditionBool(backendsReady),
-		Reason:  conditionPick(backendsReady, ModelRouterReasonBackendsResolved, ModelRouterReasonBackendsUnresolved),
+		Reason:  reason,
 		Message: backendsMessage,
 	})
 
@@ -486,6 +486,16 @@ func summarizeBackends(backends []inferencev1alpha1.BackendStatus) (bool, string
 		return true, "all backends resolved"
 	}
 	return false, "some backends unresolved (see status.backends for details)"
+}
+
+// backendsReadyCondition derives the BackendsReady condition from the compile.
+// A keyed backend wins the reason: it names the cause and the fix.
+func backendsReadyCondition(compiled *compiledConfig) (bool, string, string) {
+	if len(compiled.KeyedBackends) > 0 {
+		return false, ModelRouterReasonBackendAPIKeyUnsupported, keyedBackendsMessage(compiled.KeyedBackends)
+	}
+	ready, msg := summarizeBackends(compiled.Backends)
+	return ready, conditionPick(ready, ModelRouterReasonBackendsResolved, ModelRouterReasonBackendsUnresolved), msg
 }
 
 func conditionBool(ok bool) metav1.ConditionStatus {

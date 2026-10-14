@@ -64,6 +64,12 @@ func (r *InferenceServiceReconciler) constructService(isvc *inferencev1alpha1.In
 		servicePort.NodePort = *isvc.Spec.Endpoint.NodePort
 	}
 
+	var etp corev1.ServiceExternalTrafficPolicy
+	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.ExternalTrafficPolicy != "" &&
+		serviceType != corev1.ServiceTypeClusterIP {
+		etp = corev1.ServiceExternalTrafficPolicy(isvc.Spec.Endpoint.ExternalTrafficPolicy)
+	}
+
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      serviceName,
@@ -71,9 +77,10 @@ func (r *InferenceServiceReconciler) constructService(isvc *inferencev1alpha1.In
 			Labels:    labels,
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     serviceType,
-			Selector: labels,
-			Ports:    []corev1.ServicePort{servicePort},
+			Type:                  serviceType,
+			Selector:              labels,
+			Ports:                 []corev1.ServicePort{servicePort},
+			ExternalTrafficPolicy: etp,
 		},
 	}
 }

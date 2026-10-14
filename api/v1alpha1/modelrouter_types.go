@@ -80,6 +80,7 @@ const (
 // required capabilities, request headers, or model name, and the router
 // supports fail-closed semantics for sensitive-data routes so PII never
 // escapes the cluster boundary.
+// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || (!has(self.endpoint.apiKeySecretRef) && !has(self.endpoint.externalTrafficPolicy))",message="endpoint.apiKeySecretRef and endpoint.externalTrafficPolicy are InferenceService fields; ModelRouter does not support them"
 type ModelRouterSpec struct {
 	// DataPlane selects how this ModelRouter serves traffic.
 	//
