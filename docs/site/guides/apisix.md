@@ -15,9 +15,16 @@ forwards.
 
 > **Status.** LLMKube's end-to-end suite runs this setup on kind against
 > APISIX 3.19.0 (Helm chart `apisix` 2.18.0), with a stub OpenAI-compatible
-> backend in place of a GPU model (`test/e2e/apisix_e2e_test.go`). Behavior
-> described below as verified comes from that suite. The two endpoint fields
-> this page uses, `spec.endpoint.apiKeySecretRef` and
+> backend in place of a GPU model (`test/e2e/apisix_e2e_test.go`). A lab run
+> then exercised it on real hardware: vLLM serving Qwen3-0.6B on one NVIDIA
+> GB10, with APISIX 3.19.0 on another node of the same cluster, and then
+> SGLang with a key on the same GPU. The lab run used every snippet on this
+> page except the two `rollout restart` commands, adapted only for names,
+> route paths, namespace, node placement and resource limits; with one GPU,
+> the second backend on each route was a second Service in front of the same
+> vLLM pod rather than a second InferenceService. Behavior described below
+> as verified comes from the suite or the lab run. The two endpoint fields this
+> page uses, `spec.endpoint.apiKeySecretRef` and
 > `spec.endpoint.externalTrafficPolicy`, were added after LLMKube 0.10.3.
 
 ## What you get
@@ -27,7 +34,9 @@ forwards.
 - **APISIX adds the key.** The key is configured once per backend in APISIX's
   `ai-proxy-multi` plugin, and clients never see it.
 - **Streaming passes through as it is generated.** In the e2e suite, chunks the
-  backend sent one second apart arrived at the client one second apart.
+  backend sent one second apart arrived at the client one second apart. In
+  the lab run, a 400-token answer from vLLM arrived through APISIX token by
+  token, about 10 ms apart, as vLLM generated it.
 - **Token counts at the gateway.** APISIX asks the backend for a usage report
   on every streamed chat request and exports prompt and completion token
   counters, which its `ai-rate-limiting` plugin can also enforce limits on.
@@ -101,9 +110,15 @@ How LLMKube wires the key:
 - vLLM reads it from the `VLLM_API_KEY` environment variable. SGLang gets it as
   `LLMKUBE_API_KEY` plus the arguments `--api-key $(LLMKUBE_API_KEY)`, which
   Kubernetes expands at container start. The key itself never appears in the
-  pod spec.
+  pod spec. Once SGLang is running, though, the expanded key is on its
+  command line, so it shows in the node's process list, and SGLang 0.5.19
+  prints it among its server arguments in the startup log. Restrict who can
+  read the pod's logs as you would the Secret.
 - Both runtimes leave `/health` and `/metrics` open, so the pod's probes and
-  Prometheus scraping keep working without the key.
+  Prometheus scraping keep working without the key. The lab run checked this
+  on vLLM and on SGLang 0.5.19 (`lmsysorg/sglang:v0.5.19-cu130-runtime`,
+  arm64): 401 without the key, 200 with it, `/health` and `/metrics` 200
+  without it, and `/v1/models` 401 without it on both.
 - The Secret reference is always required, even if you set `optional: true`.
   A missing Secret or key keeps the container from starting rather than
   starting it without a key.
@@ -141,6 +156,14 @@ that runs the pod, or use `type: LoadBalancer`, whose load balancer sends
 traffic only to such nodes. In APISIX, the instance's `override.endpoint` then
 names the node or load balancer address and port instead of the cluster DNS
 name.
+
+In the lab run, with this fragment applied, a client outside the cluster
+called the NodePort on the node running the pod, and vLLM's access log showed
+the client's own address. The NodePort on the other nodes did not answer.
+With `externalTrafficPolicy` unset, the other nodes answered too, and the pod
+saw the address of whichever node forwarded the request instead of the
+client's.
+Changing the field updates only the Service; the pods keep running.
 
 ## Install APISIX and route to the InferenceService
 
@@ -237,7 +260,8 @@ the model with the key APISIX adds. Add one of APISIX's authentication plugins
 `service.type` to `ClusterIP`, before anything untrusted can reach a node.
 APISIX forwards client headers to the backend, but an instance's `auth.header`
 replaces a client header of the same name, so a client's own `Authorization`
-header does not reach the InferenceService.
+header does not reach the InferenceService (in the lab run, a request through
+APISIX carrying a wrong key still got 200).
 
 The ConfigMap holds the upstream key, so restrict who can read it as you would
 a Secret. To change the routes later, recreate the ConfigMap and restart
@@ -352,6 +376,159 @@ curl "http://127.0.0.1:9180/apisix/admin/routes" -X PUT \
   -d @route.json
 ```
 
+The lab run applied this JSON with this command to APISIX 3.19.0 in
+traditional mode (Admin API answered 201) and sent requests through the
+resulting route. Two chart defaults to know about:
+
+- `admin_key` is the chart value `apisix.admin.credentials.admin`, whose
+  default is a published value. Set your own, or keep it in a Secret named by
+  `apisix.admin.credentials.secretName` (keys `admin` and `viewer`).
+- The Admin API accepts connections only from `127.0.0.1/24` (chart value
+  `apisix.admin.allow.ipList`). `kubectl port-forward` arrives from
+  localhost, so the command above works; a client in another pod, such as the
+  ingress controller below, needs its address range added.
+
+### The same route as an ApisixRoute
+
+The APISIX Ingress Controller turns `ApisixRoute` resources
+(`apisix.apache.org/v2`) into APISIX routes. The lab run used controller
+2.2.0, from Helm chart `apisix-ingress-controller` 1.3.0 (the chart that
+`apisix` 2.18.0 bundles as its `ingress-controller` subchart), with provider
+type `apisix`: the controller writes routes through the Admin API of an
+APISIX in traditional mode, like the one in the previous section. It reads
+the Admin API address and key from a GatewayProxy resource that the chart
+creates.
+
+Keep the admin key in a Secret that both releases read, and let the
+controller's pod reach the Admin API. On the APISIX release:
+
+```bash
+kubectl -n llm create secret generic apisix-admin-key \
+  --from-literal=admin="$(openssl rand -hex 16)" \
+  --from-literal=viewer="$(openssl rand -hex 16)"
+
+# add to the APISIX helm install (traditional mode):
+#   --set apisix.admin.credentials.secretName=apisix-admin-key
+#   --set 'apisix.admin.allow.ipList={127.0.0.1/24,<pod CIDR>}'
+```
+
+The controller chart's `crds/` directory holds the APISIX CRDs and a copy of
+the Gateway API CRDs, and `helm install` installs both unless you pass
+`--skip-crds`. On a cluster whose Gateway API CRDs belong to another
+controller, the lab run skipped them and created only the APISIX CRDs:
+
+```bash
+helm pull apisix-ingress-controller --repo https://apache.github.io/apisix-helm-chart \
+  --version 1.3.0 --untar
+kubectl create -f apisix-ingress-controller/crds/apisixic-crds.yaml
+```
+
+Save as `ingress-values.yaml`:
+
+```yaml
+config:
+  provider:
+    type: apisix
+  kubernetes:
+    ingressClass: apisix
+gatewayProxy:
+  createDefault: true
+  provider:
+    type: ControlPlane
+    controlPlane:
+      service:
+        name: apisix-admin
+        port: 9180
+      auth:
+        type: AdminKey
+        adminKey:
+          valueFrom:
+            secretKeyRef:
+              name: apisix-admin-key
+              key: admin
+```
+
+The lab run also set `config.disableGatewayAPI: true` and
+`webhook.enabled: false`, since it used only `ApisixRoute`. Install:
+
+```bash
+helm install apisix-ingress apisix-ingress-controller \
+  --repo https://apache.github.io/apisix-helm-chart --version 1.3.0 \
+  -n llm --skip-crds -f ingress-values.yaml --wait
+```
+
+Then the route, with `<upstream-key>` replaced as before:
+
+```yaml
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: qwen38
+  namespace: llm
+spec:
+  ingressClassName: apisix
+  http:
+    - name: chat
+      match:
+        paths:
+          - /v1/chat/completions
+      plugins:
+        - name: prometheus
+          enable: true
+        - name: ai-proxy-multi
+          enable: true
+          config:
+            timeout: 60000
+            instances:
+              - name: qwen38-a
+                provider: openai-compatible
+                weight: 1
+                auth:
+                  header:
+                    Authorization: "Bearer <upstream-key>"
+                options:
+                  model: qwen38-27b
+                override:
+                  endpoint: "http://qwen38.llm.svc.cluster.local:8000/v1/chat/completions"
+                checks:
+                  active:
+                    type: http
+                    http_path: /health
+                    healthy: {interval: 1, successes: 1}
+                    unhealthy: {interval: 1, http_failures: 2}
+              - name: qwen38-b
+                provider: openai-compatible
+                weight: 1
+                auth:
+                  header:
+                    Authorization: "Bearer <upstream-key>"
+                options:
+                  model: qwen38-27b
+                override:
+                  endpoint: "http://qwen38-b.llm.svc.cluster.local:8000/v1/chat/completions"
+                checks:
+                  active:
+                    type: http
+                    http_path: /health
+                    healthy: {interval: 1, successes: 1}
+                    unhealthy: {interval: 1, http_failures: 2}
+```
+
+In the lab run the controller reported the ApisixRoute `Accepted`, created
+the APISIX route with both instances and their health checks, and streamed
+and plain requests through APISIX's gateway answered 200. Notes:
+
+- `ingressClassName` names the IngressClass the chart creates
+  (`config.kubernetes.ingressClass`).
+- The rule has no `backends`: `ai-proxy-multi` sends the request itself.
+- The key sits in the ApisixRoute, as it sits in the standalone ConfigMap.
+  The plugin's `secretRef` field cannot hold it: controller 2.2.0 merges each
+  key of that Secret into the plugin configuration by dot-separated path,
+  which reaches nested objects but not an entry of the `instances` list.
+  Restrict who can read ApisixRoutes as you would a Secret.
+- The chart creates cluster-scoped objects: ClusterRoles, ClusterRoleBindings
+  and the IngressClass.
+
 ## `options.model`: send the name the runtime serves
 
 `ai-proxy-multi` writes the instance's `options.model` into every request it
@@ -384,7 +561,10 @@ When the timeout elapses, APISIX returns HTTP 504.
 
 The e2e suite verifies this with a backend that takes 40 seconds to answer: a
 route with `timeout: 60000` returns its answer, and a route left at the default
-returns 504 after 30.0 seconds.
+returns 504 after 30.0 seconds. The lab run showed the same on vLLM with a
+route set to `timeout: 200`: a 256-token request that was not streamed got 504
+after 0.2 seconds, while the same request streamed completed in 1.95 seconds,
+because each chunk arrived well inside 200 ms.
 
 For a request that is not streamed, the backend sends nothing until
 generation ends, so the whole generation has to fit inside `timeout`, and one
@@ -417,9 +597,25 @@ passes `successes` checks again. Verified on APISIX 3.19.0:
   until you add a second instance.
 - **The checks carry the instance's `auth.header`**, so they send the key.
   vLLM and SGLang leave `/health` open, so it answers 200 with or without it.
+  The lab run confirmed this on vLLM by pointing `http_path` at `/v1/models`,
+  which vLLM answers only with the key: the instance stayed healthy, and
+  vLLM logged the checks as 200.
+- **Health status takes effect gradually after APISIX loads a route.** In
+  the lab run, the checks marked an instance whose Service had no endpoints
+  unhealthy, yet 9 of the first 14 requests, spread over about a minute, were
+  still sent to it first and succeeded only because `fallback_strategy`
+  retried them on the other instance. The 80 requests after that never
+  touched it. The late ones all came from the same nginx worker, so the
+  status appears to take effect per worker as each one handles its first
+  requests for the route. Set `fallback_strategy` (next section) along with
+  `checks`.
 
 The example checks every second (`interval: 1`), which keeps the e2e suite
-fast. Choose intervals that suit your backends.
+fast. Choose intervals that suit your backends. APISIX's control API reports
+each checker's view (`GET /v1/healthcheck` on port 9090, which listens on
+the pod's loopback address, so reach it with `kubectl port-forward` to the
+pod), and the `apisix_upstream_status` metric is 1 for each healthy checked
+instance.
 
 ## Fallback and retries
 
@@ -430,9 +626,39 @@ another instance, set `fallback_strategy` (`http_5xx`, `http_429`,
 `instance_health_and_rate_limiting`, or a list of `rate_limiting`, `http_429`
 and `http_5xx`), and bound the retries with `max_retries` and
 `retry_on_failure_within_ms`. A stream that has already sent bytes to the
-client is never retried. The e2e suite does not exercise fallback; the fields
-are described in the
+client is never retried. The fields are described in the
 [ai-proxy-multi documentation](https://apisix.apache.org/docs/apisix/plugins/ai-proxy-multi/).
+
+The e2e suite does not exercise fallback; the lab run did, with this route:
+
+```yaml
+      ai-proxy-multi:
+        timeout: 60000
+        fallback_strategy: ["http_5xx"]
+        max_retries: 1
+        instances:
+          - name: primary
+            priority: 1
+            # ... provider, weight, auth, options, override, checks as above,
+            # endpoint on a Service with no ready pods
+          - name: secondary
+            priority: 0
+            # ... endpoint on the live InferenceService
+```
+
+Every request succeeded. When the primary was picked, APISIX logged
+`connect: Connection refused`, counted it as status 500, and retried on the
+secondary, so a connection failure matches `http_5xx`. The retry added no
+measurable time (about 0.07 seconds per request either way).
+
+The lab run also scaled the live InferenceService to 0 in the middle of a
+stream through a route of this shape. APISIX logged `upstream closed before
+complete response` and did not retry. The client had already received
+status 200 and 381 chunks; the stream stopped shortly after the scale-down,
+stayed silent until the pod's 30-second termination grace period ended, and
+then closed without the final `data: [DONE]` line.
+Clients should treat a stream that ends without `[DONE]` as failed, and set
+a read timeout so a silent stream does not hang them.
 
 ## Serving more than one model
 
@@ -454,6 +680,45 @@ header itself, for example with APISIX's `proxy-rewrite` plugin. The list it
 returns names the served model, so setting `--served-model-name` to the name
 your clients send keeps the two consistent.
 
+The lab run verified both, with routes like these in the standalone file
+(the `ai-proxy-multi` blocks are the same shape as above, one per model):
+
+```yaml
+  - id: qwen38
+    uri: /v1/chat/completions
+    vars: [["post_arg.model", "==", "qwen38-27b"]]
+    plugins:
+      ai-proxy-multi:
+        # ... instances for the qwen38 InferenceServices
+  - id: other-model
+    uri: /v1/chat/completions
+    vars: [["post_arg.model", "==", "other-model"]]
+    plugins:
+      ai-proxy-multi:
+        # ... instances for that model's InferenceServices
+  - id: models
+    uri: /v1/models
+    methods: ["GET"]
+    plugins:
+      proxy-rewrite:
+        headers:
+          set:
+            Authorization: "Bearer <upstream-key>"
+    upstream:
+      type: roundrobin
+      nodes:
+        "qwen38.llm.svc.cluster.local:8000": 1
+```
+
+A request naming the first model reached its route and answered 200. A
+request naming `other-model`, on a route left without `options.model`,
+reached vLLM unchanged and got vLLM's 404 ("The model `other-model` does not
+exist"). A name that matches no route got APISIX's own 404
+(`{"error_msg":"404 Route Not Found"}`). `GET /v1/models` answered 200 with
+the served model. Clients must send `Content-Type: application/json`: without
+it the `post_arg` routes did not match (404), and `ai-proxy-multi` itself
+answers 400 ("only application/json is supported").
+
 ## Observability
 
 APISIX's metrics need two settings, both in the steps above:
@@ -467,22 +732,28 @@ lists every metric. The ones for model traffic:
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `apisix_llm_latency` | histogram | Label `type`: `ttft` (streamed requests: first chunk from the backend, measured from the start of the request) or `total` |
+| `apisix_llm_latency` | histogram | Milliseconds. Label `type`: `ttft` (streamed requests: first chunk from the backend, measured from the start of the request) or `total` |
 | `apisix_llm_prompt_tokens` | counter | Prompt tokens the backend reported |
 | `apisix_llm_completion_tokens` | counter | Completion tokens the backend reported |
 
 They are labeled with `route_id`, `request_type` (`ai_chat` or `ai_stream`),
-`node` (the instance name), `request_llm_model` and `llm_model`. The counters
+`node` (the instance name), `request_llm_model` (the name the client sent)
+and `llm_model` (the name forwarded, from `options.model`). The counters
 have no `_total` suffix. In the e2e suite,
 `apisix_llm_completion_tokens{route_id="fast",request_type="ai_stream"}`
 counted the tokens of a streamed request; for the route above, `route_id` is
-`qwen38`.
+`qwen38`. In the lab run, a streamed 400-token answer from vLLM added 400 to
+that counter. APISIX 3.19.0 also exports `apisix_llm_active_connections` and
+per-request histograms `apisix_llm_prompt_tokens_dist` and
+`apisix_llm_completion_tokens_dist`.
 
 Token counts on streams depend on the backend reporting usage.
 `ai-proxy-multi` sets `stream_options.include_usage: true` on every streamed
 chat request, so an OpenAI-compatible backend sends usage in its final chunk.
 The e2e suite verifies that the field reaches the backend and that the counts
-reach the metrics. The
+reach the metrics. With vLLM in the lab run, a streamed request that did not
+ask for usage still ended with vLLM's usage chunk, which the client receives
+too. The
 [ai-rate-limiting plugin](https://apisix.apache.org/docs/apisix/plugins/ai-rate-limiting/)
 limits on the same reported usage, counted after each response: the request
 that crosses a limit completes, and the next one is rejected. A backend that
@@ -496,6 +767,35 @@ and its PrometheusRule (`prometheus.prometheusRule.enabled`) records
 from them. APISIX's `apisix_llm_latency{type="ttft"}` measures the same wait
 from the gateway, so it also includes the time spent in APISIX and on the
 network.
+
+## Gateway overhead, measured
+
+The lab run measured what APISIX adds to time to first token. Setup: vLLM
+serving Qwen3-0.6B on one NVIDIA GB10 (`--gpu-memory-utilization=0.25`),
+APISIX 3.19.0 in standalone mode on another node (4 nginx workers, 4-CPU
+limit), and the client in the cluster on the APISIX node. Every request was
+streamed and used a fresh prompt (a unique prefix, so vLLM's prefix cache
+could not reuse it), and TTFT was measured at the client up to the first
+chunk with content. Direct requests went to the InferenceService's Service,
+the others through APISIX's gateway Service. Medians of 5 runs each:
+
+| Prompt | Direct | Through APISIX | Difference |
+|---|---|---|---|
+| About 1K tokens | 33.6 ms | 38.6 ms | +5.0 ms |
+| About 16K tokens | 738.4 ms | 750.7 ms | +12.3 ms |
+
+A repeat with 20 runs each gave +3.6 ms and +6.3 ms.
+
+A 30-minute soak through APISIX at 32 concurrent streams (prompts of about
+500 to 1,100 tokens, answers of 128 to 384 tokens) completed 9,612 requests
+with no errors and no truncated streams. TTFT at the client was 90 ms at the
+median and 117 ms at p95; APISIX's own `apisix_llm_latency{type="ttft"}`
+averaged 82.8 ms and vLLM's `vllm:time_to_first_token_seconds` 77.4 ms over
+the soak. APISIX used 0.07 of a CPU core on average (0.08 at the
+busiest 30 seconds) and under 190 MiB of memory, and its two instances each
+took 4,806 requests. These figures come from a small model on one GPU, so
+measure with your own model, prompt sizes and concurrency before relying on
+them.
 
 ## Requirements and gaps
 
@@ -517,10 +817,12 @@ APISIX:
 - **Open issue
   [apache/apisix#13256](https://github.com/apache/apisix/issues/13256):** the
   `ai-proxy` streaming loop can starve a worker's CPU when the backend sends in
-  bursts. Soak-test streaming on your own hardware before production.
-- This page configures APISIX directly, through its standalone file or the
-  Admin API. Configuring the route through the APISIX Ingress Controller's
-  resources is not covered here.
+  bursts. The lab soak (see "Gateway overhead, measured") did not show it
+  with vLLM streaming token by token, but soak-test streaming on your own
+  hardware and backends before production.
+- **The ApisixRoute form holds the key in the resource.** With the APISIX
+  Ingress Controller 2.2.0, the plugin's `secretRef` cannot set a value
+  inside `ai-proxy-multi`'s `instances` list (see the ApisixRoute section).
 
 LLMKube:
 
