@@ -189,7 +189,7 @@ need every GPU, you may prefer to keep this off and act on the alerts instead.
 
 ## Related
 
-- [Metrics-driven autoscaling](metrics-driven-autoscaling.md): the GPU
+- [Metrics-driven autoscaling](./metrics-driven-autoscaling): the GPU
   utilization and serving metrics the chart scrapes.
 - [NVIDIA Xid catalog](https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html):
   the resolution for each Xid.
