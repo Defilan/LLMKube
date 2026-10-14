@@ -90,6 +90,9 @@ sections:
       - label: SGLang on Blackwell
         slug: guides/sglang-blackwell
         file: guides/sglang-blackwell.md
+      - label: APISIX in front of LLMKube
+        slug: guides/apisix
+        file: guides/apisix.md
 
   - title: Lab builds
     items:
