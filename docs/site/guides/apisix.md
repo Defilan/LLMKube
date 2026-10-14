@@ -1,6 +1,6 @@
 ---
 title: APISIX in front of LLMKube
-description: Put Apache APISIX's ai-proxy-multi plugin in front of an LLMKube InferenceService that requires an API key. Covers the key Secret, the APISIX route, timeouts sized from measured time to first token, health checks, fallback, metrics, and the known gaps.
+description: Put Apache APISIX's ai-proxy-multi plugin in front of an LLMKube InferenceService that requires an API key. Covers the key Secret, the APISIX route, timeouts sized from measured time to first token, health checks, fallback, client keys, one gateway for several InferenceServices, metrics, and the known gaps.
 ---
 
 # APISIX in front of LLMKube
@@ -19,12 +19,26 @@ forwards.
 > then exercised it on real hardware: vLLM serving Qwen3-0.6B on one NVIDIA
 > GB10, with APISIX 3.19.0 on another node of the same cluster, and then
 > SGLang with a key on the same GPU. The lab run used every snippet on this
-> page except the two `rollout restart` commands, adapted only for names,
-> route paths, namespace, node placement and resource limits; with one GPU,
-> the second backend on each route was a second Service in front of the same
-> vLLM pod rather than a second InferenceService. Behavior described below
-> as verified comes from the suite or the lab run. The two endpoint fields this
-> page uses, `spec.endpoint.apiKeySecretRef` and
+> page except the two `rollout restart` commands and the snippets taken from
+> the daily gateway described next, adapted only for names, route paths,
+> namespace, node placement and resource limits; with one GPU, the second
+> backend on each route was a second Service in front of the same vLLM pod
+> rather than a second InferenceService.
+>
+> The ApisixRoute patterns in "The upstream key from a Secret", "One gateway
+> for many InferenceServices" and "Client authentication", and the
+> "Operating notes", come from a lab's daily inference gateway (APISIX
+> 3.19.0, ingress controller 2.2.0), which serves a coding agent and a
+> LiteLLM proxy. Those snippets are adapted from its configuration only for
+> names, route paths, namespace and port. Its verification matrix checks
+> each live route for 401 on a request without a client key, for chat with
+> the key, and for a streamed chat that ends with `data: [DONE]`; it checks
+> `/v1/models` through the passthrough rule, and, on one route, streamed tool
+> calls, streamed reasoning deltas, and a cold prompt of about 100K tokens.
+> Run with a wrong client key, every check that needs the key fails.
+> Behavior described below as verified comes from the suite, the lab run or
+> the daily gateway. The two endpoint fields this page uses,
+> `spec.endpoint.apiKeySecretRef` and
 > `spec.endpoint.externalTrafficPolicy`, were added after LLMKube 0.10.3.
 
 ## What you get
@@ -257,7 +271,8 @@ value `service.type`), so it is reachable on every node's address. The route
 above does no client authentication: anyone who reaches the gateway can use
 the model with the key APISIX adds. Add one of APISIX's authentication plugins
 (such as `key-auth`, `jwt-auth` or `openid-connect`) to the route, or set
-`service.type` to `ClusterIP`, before anything untrusted can reach a node.
+`service.type` to `ClusterIP`, before anything untrusted can reach a node
+("Client authentication" below shows `key-auth` on ApisixRoutes).
 APISIX forwards client headers to the backend, but an instance's `auth.header`
 replaces a client header of the same name, so a client's own `Authorization`
 header does not reach the InferenceService (in the lab run, a request through
@@ -525,13 +540,66 @@ and plain requests through APISIX's gateway answered 200. Notes:
 - `ingressClassName` names the IngressClass the chart creates
   (`config.kubernetes.ingressClass`).
 - The rule has no `backends`: `ai-proxy-multi` sends the request itself.
-- The key sits in the ApisixRoute, as it sits in the standalone ConfigMap.
-  The plugin's `secretRef` field cannot hold it: controller 2.2.0 merges each
-  key of that Secret into the plugin configuration by dot-separated path,
-  which reaches nested objects but not an entry of the `instances` list.
-  Restrict who can read ApisixRoutes as you would a Secret.
+- In this example the key sits in the ApisixRoute, as it sits in the
+  standalone ConfigMap. The plugin's `secretRef` field cannot hold it:
+  controller 2.2.0 merges each key of that Secret into the plugin
+  configuration by dot-separated path, which reaches nested objects but not
+  an entry of the `instances` list. APISIX can still read the key from a
+  Secret through an environment variable; see the next section.
 - The chart creates cluster-scoped objects: ClusterRoles, ClusterRoleBindings
   and the IngressClass.
+
+### The upstream key from a Secret
+
+APISIX 3.19.0 resolves `$env://VAR` references in plugin configuration,
+including inside an `ai-proxy-multi` instance and in `proxy-rewrite` header
+values, so an ApisixRoute can name an environment variable of the APISIX pod
+instead of holding the key. The lab's daily gateway keeps its upstream key
+in a Secret this way, with no key in any ApisixRoute or values file. Two
+rules shape the setup:
+
+- APISIX's Lua code can read only the environment variables declared in its
+  nginx configuration, chart value `apisix.nginx.envs`.
+- `$env://` replaces a whole value; it does not interpolate inside a string.
+  The variable therefore holds the whole header value, `Bearer <key>`, which
+  Kubernetes builds from the Secret's raw key with `$(VAR)` expansion.
+
+Add to the APISIX release's values (traditional mode, as above). The Secret
+has to be in APISIX's namespace; here that is `llm`, so it is the
+`upstream-key` Secret from "The LLMKube side":
+
+```yaml
+apisix:
+  nginx:
+    # Lua can read only env vars declared here; $env:// references need them.
+    envs:
+      - QWEN38_UPSTREAM_AUTH
+extraEnvVars:
+  - name: QWEN38_UPSTREAM_KEY
+    valueFrom:
+      secretKeyRef: {name: upstream-key, key: key}
+  - name: QWEN38_UPSTREAM_AUTH
+    value: "Bearer $(QWEN38_UPSTREAM_KEY)"
+```
+
+Then give each instance the variable instead of the key:
+
+```yaml
+                auth:
+                  header:
+                    Authorization: "$env://QWEN38_UPSTREAM_AUTH"
+```
+
+The same value works in `proxy-rewrite`'s `headers.set` (see "One gateway
+for many InferenceServices" below). In the lab, a backend that echoed the
+header it received got `Bearer ` followed by a value of the key's length, on
+an `ai-proxy-multi` rule and on a `proxy-rewrite` rule alike. The variables
+are set when the APISIX container starts, so after changing the Secret,
+restart the APISIX Deployment along with the InferenceService.
+
+If `$env://` is not available to you, a literal key in the ApisixRoute, as
+in the example above, is the fallback. Restrict who can read ApisixRoutes as
+you would a Secret.
 
 ## `options.model`: send the name the runtime serves
 
@@ -682,7 +750,8 @@ and match on the request body with the route's `vars`, using the
 [ai-proxy documentation](https://apisix.apache.org/docs/apisix/plugins/ai-proxy/)
 shows this in its "Proxy to Selected Model using Request Body Parameter"
 example. Each route then carries its own `ai-proxy-multi` with that model's
-InferenceServices.
+InferenceServices. The other way, a path prefix per model, is in "One
+gateway for many InferenceServices" below.
 
 `GET /v1/models` cannot go through `ai-proxy-multi`, which accepts only
 requests with an `application/json` body. Serve it with a plain APISIX route
@@ -730,6 +799,207 @@ exist"). A name that matches no route got APISIX's own 404
 the served model. Clients must send `Content-Type: application/json`: without
 it the `post_arg` routes did not match (404), and `ai-proxy-multi` itself
 answers 400 ("only application/json is supported").
+
+## One gateway for many InferenceServices
+
+The lab's daily gateway puts several InferenceServices, each serving its own
+model, behind one APISIX, with a path prefix per model: a client sets its
+base URL to `http://<gateway>/qwen38/v1` for one model and to another prefix
+for the next. Each InferenceService gets one ApisixRoute:
+
+- **The ApisixRoute lives in the backend Service's namespace.** A rule's
+  `backends` name a Service in the ApisixRoute's own namespace and cannot
+  reach another, so InferenceServices in different namespaces get their
+  ApisixRoutes in those namespaces. APISIX and its consumers can stay in a
+  namespace of their own; the lab's routes span two namespaces besides
+  APISIX's.
+- **A chat rule.** `POST <prefix>/v1/chat/completions` goes through
+  `ai-proxy-multi`, as in the routes above, for streaming, token metrics and
+  a long `timeout`.
+- **A passthrough rule.** Every other path under the prefix, such as
+  `<prefix>/v1/models`, which `ai-proxy-multi` cannot serve (see "Serving
+  more than one model"), goes straight to the Service. `proxy-rewrite`
+  strips the prefix, so `/qwen38/v1/models` reaches the runtime as
+  `/v1/models`.
+- **`priority` picks the chat rule.** A chat request matches both rules, and
+  the rule with the higher `priority` wins: 10 for the chat rule, 1 for the
+  passthrough rule.
+
+The route for the InferenceService from "The LLMKube side", adapted from the
+lab's (one instance, the upstream key from a Secret as in "The upstream key
+from a Secret", client keys as in "Client authentication" below):
+
+```yaml
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: qwen38
+  namespace: llm
+spec:
+  ingressClassName: apisix
+  http:
+    - name: chat
+      priority: 10
+      match:
+        paths: [/qwen38/v1/chat/completions]
+        methods: [POST]
+      plugins:
+        - name: key-auth
+          enable: true
+          config: {header: apikey, hide_credentials: true}
+        - name: prometheus
+          enable: true
+        - name: ai-proxy-multi
+          enable: true
+          config:
+            timeout: 600000
+            instances:
+              - name: qwen38
+                provider: openai-compatible
+                weight: 1
+                auth:
+                  header:
+                    Authorization: "$env://QWEN38_UPSTREAM_AUTH"
+                override:
+                  endpoint: "http://qwen38.llm.svc.cluster.local:8000/v1/chat/completions"
+    - name: passthrough
+      priority: 1
+      # Same upstream budget as the chat rule (APISIX default is 60s).
+      timeout:
+        connect: 10s
+        send: 600s
+        read: 600s
+      match:
+        paths: [/qwen38/*]
+      backends:
+        - serviceName: qwen38
+          servicePort: 8000
+      plugins:
+        - name: key-auth
+          enable: true
+          config: {header: apikey, hide_credentials: true}
+        - name: prometheus
+          enable: true
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri: ["^/qwen38/(.*)", "/$1"]
+            headers:
+              set:
+                Authorization: "$env://QWEN38_UPSTREAM_AUTH"
+```
+
+Notes:
+
+- The passthrough rule's `timeout` matches the chat rule's 600000 ms. Without
+  it, the passthrough rule uses APISIX's default upstream timeout of 60
+  seconds. The lab's model routes use the plugin's maximum, 600000; size
+  yours as in the `timeout` section.
+- The upstream key goes on both rules: in the instance's `auth.header` and
+  in `proxy-rewrite`'s `headers.set`. For an InferenceService without a key,
+  drop the `headers` block and give the instance `auth: {}` (see "Operating
+  notes" below).
+- The route has no `options.model`, so the client's `model` passes through
+  and has to be the served name (`qwen38-27b` here). Clients can read it
+  from `<prefix>/v1/models`. Add `options.model` to the instance to
+  overwrite it instead, as in the earlier routes.
+- In the lab, `<prefix>/v1/models` answered 200 through the passthrough rule,
+  and chat and streamed chat through the chat rule, with a client key.
+
+## Client authentication
+
+The lab's daily gateway puts APISIX's `key-auth` plugin on every rule of
+every route, as in the ApisixRoute above:
+
+```yaml
+        - name: key-auth
+          enable: true
+          config: {header: apikey, hide_credentials: true}
+```
+
+- **Clients send their key in an `apikey` header, not in `Authorization`.**
+  OpenAI-compatible clients put `Authorization: Bearer <their key>` on every
+  request. On a route with an upstream key, `ai-proxy-multi` and
+  `proxy-rewrite` overwrite `Authorization` with it, and `key-auth`
+  compares the header's whole value with a consumer's key, `Bearer `
+  included. A header of its own keeps the client key and the upstream key
+  apart.
+- **`hide_credentials: true`** removes the `apikey` header before the
+  request is forwarded, so the InferenceService never sees the client key.
+- **Every rule needs it.** Each rule of an ApisixRoute becomes a separate
+  APISIX route (the lab's six ApisixRoutes of two rules each became 12), so
+  a rule without `key-auth` is open even when the other rule has it.
+
+Create one consumer per client, each with its own Secret, so you can revoke
+one key alone and tell clients apart in the metrics:
+
+```bash
+kubectl -n llm create secret generic client-key-opencode \
+  --from-literal=key="$(openssl rand -hex 24)"
+```
+
+```yaml
+apiVersion: apisix.apache.org/v2
+kind: ApisixConsumer
+metadata:
+  name: opencode
+  namespace: llm
+spec:
+  ingressClassName: apisix
+  authParameter:
+    keyAuth:
+      secretRef:
+        name: client-key-opencode
+```
+
+Consumers do not have to share the routes' namespace: the lab keeps its
+consumers in APISIX's namespace, and they authenticate requests on routes in
+two other namespaces. APISIX labels consumers `<namespace>_<name>` in its
+metrics (the `consumer` label on `apisix_http_status` and the
+`apisix_llm_*` series), not by the bare name, so filter on the prefixed
+form. The default access log does not show the consumer at all.
+
+In the lab, a request without a key got 401 from `key-auth` in 11 to 25 ms,
+before its body reached the backend, and a run of the verification matrix
+with a wrong key failed every check that needs the key. Two clients run
+against the gateway, each verified through the consumer label:
+
+- **opencode** (2.0.28): add the key under `options.headers` in the provider
+  that points at the gateway. The provider's other fields stay as they are.
+
+  ```json
+  {
+    "provider": {
+      "qwen38": {
+        "options": {
+          "baseURL": "http://<gateway>/qwen38/v1",
+          "headers": {
+            "apikey": "<client key>"
+          }
+        }
+      }
+    }
+  }
+  ```
+
+- **LiteLLM** (1.104.2): add `extra_headers` to the model entry. LiteLLM
+  resolves `os.environ/` inside `extra_headers`, so the key stays in an
+  environment variable:
+
+  ```yaml
+  model_list:
+    - model_name: qwen38
+      litellm_params:
+        # model and the entry's other fields stay as they are
+        api_base: http://apisix-gateway.llm.svc.cluster.local/qwen38/v1
+        extra_headers:
+          apikey: os.environ/APISIX_CLIENT_KEY
+  ```
+
+  Fill the variable from a copy of the client's Secret in LiteLLM's
+  namespace, for example with
+  `kubectl -n <litellm-namespace> set env deploy/litellm --from=secret/client-key-litellm --prefix=APISIX_CLIENT_`,
+  which turns the Secret's `key` into `APISIX_CLIENT_KEY`.
 
 ## Observability
 
@@ -809,6 +1079,32 @@ took 4,806 requests. These figures come from a small model on one GPU, so
 measure with your own model, prompt sizes and concurrency before relying on
 them.
 
+## Operating notes
+
+From running the ApisixRoute setup as the lab's daily gateway, on APISIX
+3.19.0 and ingress controller 2.2.0:
+
+- **Every `ai-proxy-multi` instance needs an `auth` block.** APISIX 3.19.0's
+  Admin API answers 400 to a route with an instance that has none. For an
+  InferenceService without a key, write `auth: {}`.
+- **A route whose Service has no endpoints fails cleanly.** With the
+  InferenceService scaled to zero, the chat rule answers 500 and the
+  passthrough rule 503; neither hangs.
+- **The APISIX image has no `curl`**, so `kubectl exec` cannot call the
+  Admin API from inside the pod. Reach it with
+  `kubectl -n llm port-forward svc/apisix-admin 9180:9180`, as in "The same
+  route through the Admin API".
+- **An etcd restart without persistence leaves the controller unable to
+  sync.** In traditional mode with the chart's etcd persistence off
+  (`etcd.persistence.enabled: false`), a `helm upgrade` of the APISIX
+  release that changed only the gateway's NodePort also restarted etcd, and
+  etcd came back empty. APISIX kept serving its
+  last configuration from memory, but the ingress controller's sync failed on
+  every cycle, so no ApisixRoute or ApisixConsumer change reached APISIX. It
+  recovered when the APISIX Deployment was restarted: APISIX initializes
+  etcd when it starts, and the controller's next sync succeeded. Turn on etcd
+  persistence, or restart the APISIX Deployment after any etcd restart.
+
 ## Requirements and gaps
 
 APISIX:
@@ -832,9 +1128,10 @@ APISIX:
   bursts. The lab soak (see "Gateway overhead, measured") did not show it
   with vLLM streaming token by token, but soak-test streaming on your own
   hardware and backends before production.
-- **The ApisixRoute form holds the key in the resource.** With the APISIX
-  Ingress Controller 2.2.0, the plugin's `secretRef` cannot set a value
-  inside `ai-proxy-multi`'s `instances` list (see the ApisixRoute section).
+- **The plugin's `secretRef` cannot set the upstream key.** With the APISIX
+  Ingress Controller 2.2.0, it cannot set a value inside `ai-proxy-multi`'s
+  `instances` list. Keep the key in a Secret through an `$env://` variable
+  instead (see "The upstream key from a Secret").
 
 LLMKube:
 
