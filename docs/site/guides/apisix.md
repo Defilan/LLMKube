@@ -431,6 +431,9 @@ config:
     type: apisix
   kubernetes:
     ingressClass: apisix
+  disableGatewayAPI: true
+webhook:
+  enabled: false
 gatewayProxy:
   createDefault: true
   provider:
@@ -448,8 +451,9 @@ gatewayProxy:
               key: admin
 ```
 
-The lab run also set `config.disableGatewayAPI: true` and
-`webhook.enabled: false`, since it used only `ApisixRoute`. Install:
+`disableGatewayAPI` and `webhook.enabled: false` turn off the controller's
+Gateway API support and its admission webhook, which this route does not
+need; leave them out if you use either. Install:
 
 ```bash
 helm install apisix-ingress apisix-ingress-controller \
@@ -605,10 +609,11 @@ passes `successes` checks again. Verified on APISIX 3.19.0:
   unhealthy, yet 9 of the first 14 requests, spread over about a minute, were
   still sent to it first and succeeded only because `fallback_strategy`
   retried them on the other instance. The 80 requests after that never
-  touched it. The late ones all came from the same nginx worker, so the
-  status appears to take effect per worker as each one handles its first
-  requests for the route. Set `fallback_strategy` (next section) along with
-  `checks`.
+  touched it. The requests came in two batches about 50 seconds apart, and
+  the 4 such requests in the second batch all came from the same nginx
+  worker, so the status appears to take effect per worker as each one
+  handles its first requests for the route. Set `fallback_strategy` (next
+  section) along with `checks`.
 
 The example checks every second (`interval: 1`), which keeps the e2e suite
 fast. Choose intervals that suit your backends. APISIX's control API reports
@@ -629,30 +634,37 @@ and `http_5xx`), and bound the retries with `max_retries` and
 client is never retried. The fields are described in the
 [ai-proxy-multi documentation](https://apisix.apache.org/docs/apisix/plugins/ai-proxy-multi/).
 
-The e2e suite does not exercise fallback; the lab run did, with this route:
+The e2e suite does not exercise fallback; the lab run did, with two routes
+of this shape:
 
 ```yaml
       ai-proxy-multi:
         timeout: 60000
         fallback_strategy: ["http_5xx"]
-        max_retries: 1
+        max_retries: 1        # first route only
         instances:
           - name: primary
             priority: 1
-            # ... provider, weight, auth, options, override, checks as above,
+            # ... provider, weight, auth, options, override,
             # endpoint on a Service with no ready pods
           - name: secondary
             priority: 0
             # ... endpoint on the live InferenceService
 ```
 
-Every request succeeded. When the primary was picked, APISIX logged
-`connect: Connection refused`, counted it as status 500, and retried on the
-secondary, so a connection failure matches `http_5xx`. The retry added no
-measurable time (about 0.07 seconds per request either way).
+On the first route both instances also had a `checks` block (as above, but
+with `http_path: /v1/models`, as described under health checks). The second
+route had no `checks` at all, so every request on it picked the primary
+first. While the secondary was up, every request on both routes succeeded
+(94 on the first, 4 on the second). Whenever the primary was
+picked, APISIX logged `connect: Connection refused`, counted it as status
+500, and retried on the secondary, so a connection failure matches
+`http_5xx`. A Service with no endpoints refuses the connection at once: on
+the route without checks, where every request went through that retry,
+requests for 8 output tokens still completed in 0.07 to 0.09 seconds.
 
 The lab run also scaled the live InferenceService to 0 in the middle of a
-stream through a route of this shape. APISIX logged `upstream closed before
+stream on the route without checks. APISIX logged `upstream closed before
 complete response` and did not retry. The client had already received
 status 200 and 381 chunks; the stream stopped shortly after the scale-down,
 stayed silent until the pod's 30-second termination grace period ended, and
