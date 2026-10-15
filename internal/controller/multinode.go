@@ -165,6 +165,25 @@ func validateMultiNode(isvc *inferencev1alpha1.InferenceService) error {
 	return nil
 }
 
+// multiNodeResourceClaimsConflict rejects spec.multiNode on a Model that
+// allocates GPUs through DRA resourceClaims. Member pods pin spec.nodeName,
+// which bypasses the scheduler, and DRA claims are allocated by the scheduler
+// (KEP-4381: a custom scheduler must allocate and reserve before setting
+// nodeName), so the members' claims would never be allocated and the pods
+// would never start. CEL on the InferenceService cannot see the referenced
+// Model, so this runs in the validating webhook and again at reconcile, the
+// same split as validateRuntimePlacement. A nil Model (not created yet at
+// admission) is undecidable and passes.
+func multiNodeResourceClaimsConflict(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) error {
+	if isvc.Spec.MultiNode == nil || model == nil {
+		return nil
+	}
+	if len(modelResourceClaims(model)) == 0 {
+		return nil
+	}
+	return fmt.Errorf("spec.multiNode pins member pods to nodes with spec.nodeName, which bypasses the scheduler; DRA resourceClaims are allocated by the scheduler, so the members' claims would never be allocated: remove spec.multiNode or the Model's hardware.gpu.resourceClaims")
+}
+
 // constructMemberPods derives one pod per member from the single-node pod
 // template. Returns the pods in rank order and the group hash shared by all
 // of them. The hash covers every member's spec so that a change to any rank
@@ -180,6 +199,9 @@ func (r *InferenceServiceReconciler) constructMemberPods(
 	draftHFEndpoint string,
 ) ([]*corev1.Pod, string, error) {
 	if err := validateMultiNode(isvc); err != nil {
+		return nil, "", err
+	}
+	if err := multiNodeResourceClaimsConflict(isvc, model); err != nil {
 		return nil, "", err
 	}
 	mn := isvc.Spec.MultiNode

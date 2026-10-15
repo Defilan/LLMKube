@@ -274,6 +274,49 @@ func TestValidateMultiNode(t *testing.T) {
 	}
 }
 
+func TestMultiNodeResourceClaimsConflict(t *testing.T) {
+	claimName := "gpu-claim"
+	claimsModel := func() *inferencev1alpha1.Model {
+		_, m := multiNodeFixture()
+		m.Spec.Hardware.GPU.ResourceClaims = []corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: &claimName},
+		}
+		return m
+	}
+
+	isvc, plainModel := multiNodeFixture()
+
+	// multiNode on a claims Model cannot work: members pin spec.nodeName,
+	// which bypasses the scheduler that would allocate the claims (#2061).
+	err := multiNodeResourceClaimsConflict(isvc, claimsModel())
+	if err == nil {
+		t.Fatal("multiNode with resourceClaims must be rejected")
+	}
+	if !strings.Contains(err.Error(), "resourceClaims") || !strings.Contains(err.Error(), "bypasses the scheduler") {
+		t.Fatalf("error must name the conflict, got %q", err.Error())
+	}
+
+	// The reconciler path rejects through constructMemberPods before any
+	// member pod is rendered.
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	if _, _, err := r.constructMemberPods(isvc, claimsModel(), nil, "", ""); err == nil {
+		t.Fatal("constructMemberPods must reject multiNode with resourceClaims")
+	}
+
+	// A claims-free Model, a nil Model, and no multiNode block all pass.
+	if err := multiNodeResourceClaimsConflict(isvc, plainModel); err != nil {
+		t.Errorf("multiNode on a device-plugin Model must pass: %v", err)
+	}
+	if err := multiNodeResourceClaimsConflict(isvc, nil); err != nil {
+		t.Errorf("nil Model (not created yet at admission) must pass: %v", err)
+	}
+	noMN := *isvc
+	noMN.Spec.MultiNode = nil
+	if err := multiNodeResourceClaimsConflict(&noMN, claimsModel()); err != nil {
+		t.Errorf("no multiNode block must pass: %v", err)
+	}
+}
+
 func TestGroupReadinessAndRecreate(t *testing.T) {
 	mk := func(name string, phase corev1.PodPhase, ready bool, restarts int32, hash string) *corev1.Pod {
 		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{AnnotationMultiNodeGroupHash: hash}}}

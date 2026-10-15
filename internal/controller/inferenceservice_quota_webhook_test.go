@@ -513,6 +513,114 @@ func TestInferenceServiceQuotaValidator(t *testing.T) {
 			t.Fatalf("expected sharing-pool rejection reason, got: %v", err)
 		}
 	})
+
+	t.Run("rejects multiNode on a Model using DRA resourceClaims", func(t *testing.T) {
+		// CEL on the InferenceService cannot see the referenced Model, so the
+		// conflict is only knowable here (#2061).
+		model := inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+				Format: "gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cuda",
+					GPU: &inferencev1alpha1.GPUSpec{
+						Enabled:        true,
+						ResourceClaims: []corev1.PodResourceClaim{{Name: "gpu"}},
+					},
+				},
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-ring", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				MultiNode: &inferencev1alpha1.MultiNodeSpec{
+					Members: []inferencev1alpha1.MultiNodeMember{
+						{Node: "a", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.1"}},
+						{Node: "b", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.2"}},
+					},
+				},
+			},
+		}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&model).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		_, err := v.ValidateCreate(ctx, &isvc)
+		if err == nil {
+			t.Fatal("expected rejection of multiNode with DRA resourceClaims, got nil")
+		}
+		if !strContains(err.Error(), "invalid multiNode spec") || !strContains(err.Error(), "resourceClaims") {
+			t.Fatalf("expected the multiNode/claims conflict, got: %v", err)
+		}
+	})
+
+	t.Run("admits multiNode when the Model is absent (reconciler backstops)", func(t *testing.T) {
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-ring", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				MultiNode: &inferencev1alpha1.MultiNodeSpec{
+					Members: []inferencev1alpha1.MultiNodeMember{
+						{Node: "a", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.1"}},
+						{Node: "b", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.2"}},
+					},
+				},
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		if _, err := v.ValidateCreate(ctx, &isvc); err != nil {
+			t.Fatalf("an absent Model is undecidable at admission and must not reject: %v", err)
+		}
+	})
+
+	t.Run("admits multiNode on a device-plugin Model", func(t *testing.T) {
+		model := inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "dp-model", Namespace: "default"},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "https://example.com/model.gguf",
+				Format: "gguf",
+				Hardware: &inferencev1alpha1.HardwareSpec{
+					Accelerator: "cuda",
+					GPU:         &inferencev1alpha1.GPUSpec{Enabled: true, Count: 1, Vendor: "nvidia"},
+				},
+			},
+		}
+		isvc := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dp-ring", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dp-model",
+				MultiNode: &inferencev1alpha1.MultiNodeSpec{
+					Members: []inferencev1alpha1.MultiNodeMember{
+						{Node: "a", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.1"}},
+						{Node: "b", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.2"}},
+					},
+				},
+			},
+		}
+		ns := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(&model, &ns).
+			Build()
+
+		v := &InferenceServiceQuotaValidator{Client: fakeClient}
+		if _, err := v.ValidateCreate(ctx, &isvc); err != nil {
+			t.Fatalf("multiNode on a device-plugin Model must be admitted: %v", err)
+		}
+	})
 }
 
 func ptrInt32Val(i int32) *int32 {

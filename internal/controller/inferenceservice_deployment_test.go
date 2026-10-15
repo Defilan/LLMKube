@@ -5505,6 +5505,44 @@ var _ = Describe("DRA Passthrough (resource.k8s.io/v1)", func() {
 		Expect(deployment.Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
 	})
 
+	// The DRA path must merge scheduling fields the way the device-plugin
+	// path does: GPU entries first, user entries appended, so the DRA path
+	// must not replace them with the user's own (#2061). At count=0 no GPU
+	// entry exists, so the user's fields must render exactly as given.
+	DescribeTable("merges DRA pod scheduling fields per gpuCount",
+		func(count int32, wantTolerations []corev1.Toleration) {
+			claimName := ptr.To("gpu-claim")
+			model := makeDRAModel([]corev1.PodResourceClaim{
+				{Name: "gpu", ResourceClaimName: claimName},
+			})
+			model.Spec.Hardware.GPU.Count = count
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:     "dra-model",
+					Replicas:     ptr.To(int32(1)),
+					Image:        "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+					NodeSelector: map[string]string{"pool": "gpu"},
+					Tolerations: []corev1.Toleration{
+						{Key: "custom-taint", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+					},
+				},
+			}
+
+			deployment := reconciler.constructDeployment(isvc, model, nil, 1, "", "")
+			Expect(deployment.Spec.Template.Spec.Tolerations).To(Equal(wantTolerations))
+			Expect(deployment.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue("pool", "gpu"))
+			Expect(deployment.Spec.Strategy.Type).To(Equal(appsv1.RecreateDeploymentStrategyType))
+		},
+		Entry("count=1 keeps the GPU toleration and appends the user's", int32(1), []corev1.Toleration{
+			{Key: "nvidia.com/gpu", Operator: corev1.TolerationOpEqual, Value: "present", Effect: corev1.TaintEffectNoSchedule},
+			{Key: "custom-taint", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+		}),
+		Entry("count=0 renders the user's fields unchanged", int32(0), []corev1.Toleration{
+			{Key: "custom-taint", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+		}),
+	)
+
 	It("emits GPU args when DRA claims are set (gpuPresent gate)", func() {
 		claimName := ptr.To("gpu-claim")
 		model := makeDRAModel([]corev1.PodResourceClaim{
