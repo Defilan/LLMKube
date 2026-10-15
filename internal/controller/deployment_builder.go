@@ -641,9 +641,12 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		deployment.Spec.Template.Spec.NodeSelector = nodeSelector
 	}
 
-	// DRA: apply nodeSelector and tolerations (no auto GPU taint for DRA)
+	// DRA pods get their scheduling fields from the unconditional merge above
+	// (GPU toleration when count > 0, shared-pool selector, user entries last):
+	// the claim drives placement, not the pod spec, but a GPU-tainted node
+	// still needs the toleration (#2061).
 	if len(modelResourceClaims(model)) > 0 {
-		applyDRAPodScheduling(deployment, isvc)
+		applyDRAPodScheduling(deployment)
 	}
 
 	// TopologySpreadConstraints and Affinity are general pod-scheduling
@@ -732,20 +735,16 @@ func applyArchNodeAffinity(deployment *appsv1.Deployment, archs []string) {
 	deployment.Spec.Template.Spec.Affinity = affinity
 }
 
-// applyDRAPodScheduling configures pod-level scheduling for a DRA workload.
-// The DRA claim itself drives placement, but an explicit nodeSelector and any
-// user tolerations are still honored. Recreate strategy is used to avoid the
-// same scheduling deadlock as device-plugin GPU pods (a new pod can't get the
-// claim while the old one holds it).
-func applyDRAPodScheduling(deployment *appsv1.Deployment, isvc *inferencev1alpha1.InferenceService) {
+// applyDRAPodScheduling sets the DRA-specific Recreate strategy (a new pod
+// cannot get the claim while the old one holds it). NodeSelector and
+// tolerations are deliberately NOT set here: constructDeployment's
+// unconditional merge already applied the GPU taint toleration
+// (gpuCount > 0), the shared-pool selector, and the user's entries, in the
+// device-plugin path's order. Overwriting them here dropped the GPU
+// toleration from any DRA Model that declares count (#2061).
+func applyDRAPodScheduling(deployment *appsv1.Deployment) {
 	deployment.Spec.Strategy = appsv1.DeploymentStrategy{
 		Type: appsv1.RecreateDeploymentStrategyType,
-	}
-	if len(isvc.Spec.NodeSelector) > 0 {
-		deployment.Spec.Template.Spec.NodeSelector = isvc.Spec.NodeSelector
-	}
-	if len(isvc.Spec.Tolerations) > 0 {
-		deployment.Spec.Template.Spec.Tolerations = isvc.Spec.Tolerations
 	}
 }
 
