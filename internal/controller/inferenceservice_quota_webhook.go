@@ -357,10 +357,11 @@ func (v *InferenceServiceQuotaValidator) currentUsage(ctx context.Context, q inf
 // allocate the devices, #2059) and the quota still charges count, so a DRA
 // workload costs the same against the cap as the equivalent device-plugin
 // one. Charging the declared count rather than the rendered pod requests is
-// deliberate (#2061). A Model with claims but no count is charged zero; its
-// device usage is not yet declarable (see the DRA guide's GPU-quota note).
-// The Model argument is nil-safe; when nil the count falls back to
-// isvc.Spec.Resources.GPU.
+// deliberate (#2061). A Model with claims but no count is charged only the
+// isvc.spec.resources.gpu fallback in apiutil.GPUCount, and nothing when
+// that is also unset; the claimed devices themselves are not yet declarable
+// (see the DRA guide's GPU-quota note). The Model argument is nil-safe; when
+// nil the count falls back to isvc.Spec.Resources.GPU.
 //
 // When autoscaling is configured, the replica count used for quota
 // accounting is the autoscaling maxReplicas (the worst-case headroom the

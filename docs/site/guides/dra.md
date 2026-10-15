@@ -129,7 +129,8 @@ With `runtime: vllm` on the InferenceService, the server starts with
   combined with `resourceClaims`: the claim owns device placement.
 - **multiNode:** `spec.multiNode` pins member pods to nodes with `nodeName`,
   which bypasses the scheduler that allocates DRA claims. The combination is
-  rejected at admission; run DRA models single-node.
+  rejected at admission when the validating webhook is installed, and by the
+  operator at reconcile time otherwise. Run DRA models single-node.
 - For a GPU accelerator (`cuda`, `rocm`, and so on), the Model's
   `AcceleratorReady` condition checks that each named claim or template exists
   in the Model's namespace.
@@ -139,4 +140,5 @@ With `runtime: vllm` on the InferenceService, the server starts with
   integration skips the request for claims, leave `count` out for Kueue-managed
   services.
 - **GPU quota:** a GPUQuota charges `count` per replica. A Model with claims but
-  no `count` is not charged.
+  no `count` is charged only if the InferenceService also sets
+  `spec.resources.gpu`; otherwise it is not charged.
