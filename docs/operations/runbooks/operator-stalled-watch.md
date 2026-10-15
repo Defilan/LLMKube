@@ -8,8 +8,8 @@ workload keeps running the old one. `metadata.generation` runs ahead of
 in the operator log.
 
 This is the #2069 failure class: the operator's informers have silently
-stopped receiving events. Since v0.11.0 the operator detects this itself with
-a watch canary and restarts on its own; this runbook covers the alert, the
+stopped receiving events. The operator detects this itself with a watch
+canary and restarts on its own; this runbook covers the alert, the
 manual detection, and what to do when the automatic recovery has not cleared
 it.
 
@@ -20,12 +20,21 @@ One or more of:
 - Alert: `LLMKubeControllerWatchStalled` (critical) or
   `LLMKubeControllerWatchCanaryDown` (warning), shipped by the chart's
   PrometheusRule when the watch canary is enabled.
-- Kubelet restart events on the controller-manager pod with the canary's
-  liveness failure message:
+- Kubelet restart events on the controller-manager pod. The probe response
+  withholds the reason by design (the healthz endpoint is public), so the
+  kubelet event reads:
 
   ```
-  Liveness probe failed: watch canary write not observed for 5m0s
-    (fail-after 5m0s): the manager's watch pipeline is stalled
+  Liveness probe failed: [-]watch-canary failed: reason withheld
+  ```
+
+  The real reason is in the operator's own log, both as the healthz handler's
+  failure line and as the canary's own transition log:
+
+  ```
+  watch canary failed the liveness check; the kubelet restarts this pod once
+    the probe starts failing  {"error": "watch canary write not observed for
+    5m0s (fail-after 5m0s): the manager's watch pipeline is stalled"}
   ```
 
 - Operator notices: an InferenceService whose `status.observedGeneration`
@@ -160,7 +169,7 @@ kubectl --context <ctx> -n llmkube-system port-forward deploy/llmkube-controller
 curl -s localhost:8081/healthz?verbose
 ```
 
-`watch-canary: ok` must appear in the output.
+`[+]watch-canary ok` must appear in the output.
 
 ## Related
 
