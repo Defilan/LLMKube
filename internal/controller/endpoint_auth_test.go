@@ -166,6 +166,12 @@ func TestInferenceServiceRequiresAPIKey(t *testing.T) {
 	unkeyed.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: 30000}
 	flagOnly := keyedISvc(RuntimeSGLANG, "--api-key", "$(MY_KEY)")
 	flagOnly.Spec.Endpoint = nil
+	withEnv := func(runtime string, env ...corev1.EnvVar) *inferencev1alpha1.InferenceService {
+		isvc := keyedISvc(runtime)
+		isvc.Spec.Endpoint = nil
+		isvc.Spec.Env = env
+		return isvc
+	}
 	for _, tc := range []struct {
 		name string
 		isvc *inferencev1alpha1.InferenceService
@@ -178,6 +184,16 @@ func TestInferenceServiceRequiresAPIKey(t *testing.T) {
 		{"user flag only", flagOnly, true},
 		{"spec.args flag with spec.command", withCommandArgs([]string{"python3", "-m", "sglang.launch_server"}), true},
 		{"spec.args flag without spec.command", withCommandArgs(nil), false},
+		{"vLLM env var literal", withEnv(RuntimeVLLM, corev1.EnvVar{Name: vllmAPIKeyEnv, Value: "sk"}), true},
+		{"vLLM env var from a Secret", withEnv(RuntimeVLLM, corev1.EnvVar{Name: vllmAPIKeyEnv,
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "k"}, Key: "key",
+			}}}), true},
+		// Presence is the verdict: the vLLM docs do not pin empty-value behavior.
+		{"vLLM env var present but empty", withEnv(RuntimeVLLM, corev1.EnvVar{Name: vllmAPIKeyEnv}), true},
+		{"SGLang ignores the vLLM env var", withEnv(RuntimeSGLANG, corev1.EnvVar{Name: vllmAPIKeyEnv, Value: "sk"}), false},
+		{"llama.cpp (empty runtime) ignores the vLLM env var", withEnv("", corev1.EnvVar{Name: vllmAPIKeyEnv, Value: "sk"}), false},
+		{"vLLM with an unrelated env var", withEnv(RuntimeVLLM, corev1.EnvVar{Name: "FOO", Value: "bar"}), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := inferenceServiceRequiresAPIKey(tc.isvc); got != tc.want {

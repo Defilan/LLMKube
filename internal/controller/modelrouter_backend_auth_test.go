@@ -131,6 +131,22 @@ func TestKeyedBackendsCommandLineKey(t *testing.T) {
 	}
 }
 
+// TestKeyedBackendsEnvKey pins the router-side path for the vLLM env-var
+// keying form: keyedBackends must inherit the widened helper verdict.
+func TestKeyedBackendsEnvKey(t *testing.T) {
+	isvc := keyedISvc(RuntimeVLLM)
+	isvc.Spec.Endpoint = nil
+	isvc.Spec.Env = []corev1.EnvVar{{Name: vllmAPIKeyEnv, Value: "sk"}}
+	c := fake.NewClientBuilder().WithScheme(routerScheme(t)).WithObjects(isvc).Build()
+	got, err := keyedBackends(context.Background(), c, routerWithLocal("b", "svc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"b"}) {
+		t.Errorf("keyedBackends = %v, want [b]", got)
+	}
+}
+
 func TestBackendsReadyConditionKeyed(t *testing.T) {
 	cc := &compiledConfig{
 		Backends:      []inferencev1alpha1.BackendStatus{{Name: "a", Healthy: false}},

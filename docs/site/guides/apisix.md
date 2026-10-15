@@ -1158,8 +1158,9 @@ LLMKube:
   requires an API key reports reason `BackendAPIKeyUnsupported`, naming the
   backends, on `BackendsReady` (Proxy data plane), `GatewayReady` (Gateway) or
   `AgentGatewayReady` (AgentGateway). An InferenceService requires a key when
-  it sets `apiKeySecretRef`, passes `--api-key` in `spec.extraArgs`, or passes
-  `--api-key` in `spec.args` with `spec.command` set. Route to keyed
+  it sets `apiKeySecretRef`, passes `--api-key` in `spec.extraArgs`, passes
+  `--api-key` in `spec.args` with `spec.command` set, or sets `VLLM_API_KEY`
+  in `spec.env` (vLLM reads the variable directly). Route to keyed
   InferenceServices from APISIX directly.
 - `externalTrafficPolicy` is not applied to Services relayed to the macOS
   Metal agent.
