@@ -408,4 +408,42 @@ spec:
       labels:
         latency_kind: queue_wait
   {{- end }}
+
+  {{- $watchCanary := .Values.controllerManager.watchCanary | default dict }}
+  {{- /* The alerts read the canary's gauges, which only the canary updates,
+         so render the group only when the canary itself is on (interval set
+         and not "0s"), matching the deployment args and the Role condition. */}}
+  {{- if and .Values.prometheus.prometheusRule.rules.watchCanary.enabled $watchCanary.interval (ne (toString $watchCanary.interval) "0s") }}
+  - name: llmkube-controller-watch
+    interval: 30s
+    rules:
+    # The operator's watch pipeline stopped delivering events (#2069): the pod
+    # stays Running, its probes pass and its webhooks answer while every
+    # controller goes silent, so spec changes are silently ignored. The
+    # canary's liveness probe restarts the pod once
+    # --watch-canary-fail-after elapses; this alert pages when the stall
+    # outlasts that (restart loops, or a canary that cannot write at all).
+    - alert: LLMKubeControllerWatchStalled
+      expr: llmkube_watch_canary_up == 1 and (time() - llmkube_watch_canary_last_observed_timestamp_seconds) > {{ .Values.prometheus.prometheusRule.rules.watchCanary.stalledSeconds }}
+      for: 2m
+      labels:
+        severity: critical
+        component: controller
+      annotations:
+        summary: "LLMKube operator watch pipeline is stalled"
+        description: "The watch canary's writes have gone unobserved by the operator's own informer for over {{ .Values.prometheus.prometheusRule.rules.watchCanary.stalledSeconds }}s on {{`{{ $labels.pod }}`}}. Spec changes are not being reconciled. Check the operator's liveness probe events and docs/operations/runbooks/operator-stalled-watch.md."
+
+    # The canary never completed a full write-then-observe cycle: disabled by
+    # a misconfigured namespace, missing lease RBAC (the operator then
+    # restart-loops on its own liveness check), or a watch that never synced.
+    - alert: LLMKubeControllerWatchCanaryDown
+      expr: llmkube_watch_canary_up == 0
+      for: {{ .Values.prometheus.prometheusRule.rules.watchCanary.downFor }}
+      labels:
+        severity: warning
+        component: controller
+      annotations:
+        summary: "LLMKube operator watch canary is not coming up"
+        description: "The watch canary on {{`{{ $labels.pod }}`}} has not completed a single write-observe cycle for {{ .Values.prometheus.prometheusRule.rules.watchCanary.downFor }}. Check the operator logs for watch-canary write errors (RBAC or namespace misconfiguration)."
+  {{- end }}
 {{- end }}

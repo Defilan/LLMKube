@@ -1,0 +1,88 @@
+suite: watch-canary stall detection (#2069)
+templates:
+  - deployment.yaml
+  - role.yaml
+  - prometheusrule.yaml
+
+tests:
+  - it: renders the canary args and the deadline by default
+    template: deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-interval=60s
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-fail-after=5m
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-namespace=NAMESPACE
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --reconcile-timeout=15m
+
+  - it: honours a custom canary namespace over the release namespace
+    template: deployment.yaml
+    set:
+      controllerManager.watchCanary.namespace: ops-namespace
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-namespace=ops-namespace
+
+  - it: omits the canary args and the deadline when disabled
+    template: deployment.yaml
+    set:
+      controllerManager.watchCanary.interval: 0s
+      controllerManager.reconcileTimeout: 0s
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-interval=
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-fail-after=
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --watch-canary-namespace=
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --reconcile-timeout=
+
+  - it: renders the leader-election Role when the canary is on but leader election is off
+    template: role.yaml
+    set:
+      controllerManager.leaderElection.enabled: false
+    asserts:
+      - exists:
+          path: rules
+
+  - it: omits the leader-election Role when both the canary and leader election are off
+    template: role.yaml
+    set:
+      controllerManager.leaderElection.enabled: false
+      controllerManager.watchCanary.interval: 0s
+    asserts:
+      - notExists:
+          path: rules
+
+  - it: renders the stall alerts when the canary and prometheusRule are on
+    template: prometheusrule.yaml
+    set:
+      prometheus.prometheusRule.enabled: true
+    asserts:
+      - equal:
+          path: spec.groups[?(@.name=="llmkube-controller-watch")].rules[?(@.alert=="LLMKubeControllerWatchStalled")].expr
+          value: llmkube_watch_canary_up == 1 and (time() - llmkube_watch_canary_last_observed_timestamp_seconds) > 900
+      - equal:
+          path: spec.groups[?(@.name=="llmkube-controller-watch")].rules[?(@.alert=="LLMKubeControllerWatchCanaryDown")].expr
+          value: llmkube_watch_canary_up == 0
+
+  - it: drops the stall alerts when the canary is off, even with the rules enabled
+    template: prometheusrule.yaml
+    set:
+      prometheus.prometheusRule.enabled: true
+      controllerManager.watchCanary.interval: 0s
+    asserts:
+      - notExists:
+          path: spec.groups[?(@.name=="llmkube-controller-watch")]

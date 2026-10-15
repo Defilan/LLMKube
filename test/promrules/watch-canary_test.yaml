@@ -1,0 +1,87 @@
+# promtool unit tests for the chart's llmkube-controller-watch group (#2069).
+# Run with `make test-chart-rules`, which renders the chart's PrometheusRule
+# into rules.yaml next to a copy of this file.
+#
+# The failure replayed here is the #2069 signature: the operator keeps
+# running with green probes while its controllers silently stop reconciling.
+# The stalled alert must page once the last observed canary write ages past
+# the threshold, stay quiet while the pipeline is fresh, and stay quiet while
+# the canary itself is down (that is the other alert's job). The down alert
+# must page only after its long for, so a pod still starting does not page.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 30s
+
+tests:
+  # Healthy operator: the canary's observed timestamp tracks the scrape clock,
+  # so time() - ts stays near zero and nothing pages.
+  - interval: 30s
+    input_series:
+      - series: 'llmkube_watch_canary_up{pod="llmkube-controller-manager-0"}'
+        values: '1x60'
+      - series: 'llmkube_watch_canary_last_observed_timestamp_seconds{pod="llmkube-controller-manager-0"}'
+        values: '0+30x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchStalled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchCanaryDown
+        exp_alerts: []
+
+  # Stalled watch: the informer stopped delivering, so the last-observed
+  # timestamp freezes at 0 while time() keeps advancing (promtool clock starts
+  # at 0; in production both sides are unix epoch). Past the
+  # 900s threshold plus the 2m for, the stalled alert must page; before the
+  # threshold it must not.
+  - interval: 30s
+    input_series:
+      - series: 'llmkube_watch_canary_up{pod="llmkube-controller-manager-0"}'
+        values: '1x60'
+      - series: 'llmkube_watch_canary_last_observed_timestamp_seconds{pod="llmkube-controller-manager-0"}'
+        values: '0+0x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: LLMKubeControllerWatchStalled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: controller
+              pod: llmkube-controller-manager-0
+            exp_annotations:
+              summary: "LLMKube operator watch pipeline is stalled"
+              description: "The watch canary's writes have gone unobserved by the operator's own informer for over 900s on llmkube-controller-manager-0. Spec changes are not being reconciled. Check the operator's liveness probe events and docs/operations/runbooks/operator-stalled-watch.md."
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchCanaryDown
+        exp_alerts: []
+
+  # Canary never came up: up stays 0 (no restart ever recovered it, or the
+  # canary cannot write at all). The stalled alert must stay quiet, the down
+  # alert must page only after its 15m for, not during startup.
+  - interval: 30s
+    input_series:
+      - series: 'llmkube_watch_canary_up{pod="llmkube-controller-manager-0"}'
+        values: '0x60'
+      - series: 'llmkube_watch_canary_last_observed_timestamp_seconds{pod="llmkube-controller-manager-0"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchStalled
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: LLMKubeControllerWatchCanaryDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchCanaryDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: controller
+              pod: llmkube-controller-manager-0
+            exp_annotations:
+              summary: "LLMKube operator watch canary is not coming up"
+              description: "The watch canary on llmkube-controller-manager-0 has not completed a single write-observe cycle for 15m. Check the operator logs for watch-canary write errors (RBAC or namespace misconfiguration)."

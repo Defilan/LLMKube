@@ -62,6 +62,7 @@ spec:
         - /manager
         args:
           - --leader-elect
+          - --watch-canary-interval=60s
           - --health-probe-bind-address=:8081
           - --metrics-bind-address=:8443
           - --metrics-secure=true
