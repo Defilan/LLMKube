@@ -48,6 +48,18 @@ func TestVLLMBuildArgs(t *testing.T) {
 		},
 		ObjectMeta: metav1.ObjectMeta{Name: "test-model-gpu", Namespace: "default"},
 	}
+	// A DRA-only model: the claim provides the GPU and count is unset (#2059).
+	modelWithDRA := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{
+			Hardware: &inferencev1alpha1.HardwareSpec{
+				GPU: &inferencev1alpha1.GPUSpec{
+					Enabled:        true,
+					ResourceClaims: []corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptrString("gpu-claim")}},
+				},
+			},
+		},
+		ObjectMeta: metav1.ObjectMeta{Name: "test-model-dra", Namespace: "default"},
+	}
 	const modelPath = "/models/test"
 	const port = int32(8000)
 
@@ -115,6 +127,16 @@ func TestVLLMBuildArgs(t *testing.T) {
 			contains: []FlagCheck{{"--cpu-offload-gb", "4"}},
 		},
 		{
+			model: modelWithDRA,
+			name:  "cpuOffloadGB set emits flag for a DRA-only model",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model-dra",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{CPUOffloadGB: ptrInt32(4)},
+			},
+			contains: []FlagCheck{{"--cpu-offload-gb", "4"}},
+		},
+		{
 			model: model,
 			name:  "cpuOffloadGB set does not emit flag if gpu is not enabled",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
@@ -140,6 +162,16 @@ func TestVLLMBuildArgs(t *testing.T) {
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:    "vllm",
 				ModelRef:   "test-model-gpu",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{GPUMemoryUtilization: ptrFloat64(0.80)},
+			},
+			contains: []FlagCheck{{"--gpu-memory-utilization", "0.8"}},
+		},
+		{
+			model: modelWithDRA,
+			name:  "gpuMemoryUtilization set emits flag for a DRA-only model",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model-dra",
 				VLLMConfig: &inferencev1alpha1.VLLMConfig{GPUMemoryUtilization: ptrFloat64(0.80)},
 			},
 			contains: []FlagCheck{{"--gpu-memory-utilization", "0.8"}},

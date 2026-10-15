@@ -37,11 +37,11 @@ func appendAttentionBackend(args []string, attentionBackend string) []string {
 	return args
 }
 
-func appendCPUOffloadGB(args []string, cpuOffloadGB *int32, gpuCount int32) ([]string, error) {
+func appendCPUOffloadGB(args []string, cpuOffloadGB *int32, gpuPresent bool) ([]string, error) {
 	if cpuOffloadGB != nil {
 		// NOTE(fvoituret): --cpu-offload-gb CLI args is only GPU related so we prevent
 		// adding it in a non GPU context.
-		if gpuCount == 0 {
+		if !gpuPresent {
 			return args, errors.New(
 				"spec.vllmConfig.cpuOffloadGB is defined with no GPU hardware; skipping --cpu-offload-gb flags",
 			)
@@ -83,11 +83,11 @@ func appendEnablePrefixCaching(args []string, enablePrefixCaching *bool) []strin
 	return args
 }
 
-func appendGPUMemoryUtilization(args []string, gpuMemoryUtilization *float64, gpuCount int32) ([]string, error) {
+func appendGPUMemoryUtilization(args []string, gpuMemoryUtilization *float64, gpuPresent bool) ([]string, error) {
 	if gpuMemoryUtilization != nil {
 		// NOTE(fvoituret): --gpu-memory-utilization CLI args is only GPU related so we prevent
 		// adding it in a non GPU context.
-		if gpuCount == 0 {
+		if !gpuPresent {
 			return args, errors.New(
 				"spec.vllmConfig.gpuMemoryUtilization is defined with no GPU hardware; skipping --gpu-memory-utilization flags",
 			)

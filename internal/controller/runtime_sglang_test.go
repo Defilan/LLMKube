@@ -290,6 +290,21 @@ func TestSGLangBuildArgs(t *testing.T) {
 			contains: []FlagCheck{{"--mem-fraction-static", "0.85"}},
 		},
 		{
+			model: &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "dra-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{Hardware: &inferencev1alpha1.HardwareSpec{GPU: &inferencev1alpha1.GPUSpec{
+					Enabled:        true,
+					ResourceClaims: []corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: ptrString("gpu-claim")}},
+				}}},
+			},
+			name: "memFractionStatic emits --mem-fraction-static on a DRA-only model (#2059)",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:      "sglang",
+				SGLangConfig: &inferencev1alpha1.SGLangConfig{MemFractionStatic: ptrFloat64(0.85)},
+			},
+			contains: []FlagCheck{{"--mem-fraction-static", "0.85"}},
+		},
+		{
 			model: &inferencev1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "m"}},
 			name:  "memFractionStatic on CPU model logs warning, no flag",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
