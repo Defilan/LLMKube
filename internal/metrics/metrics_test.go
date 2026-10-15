@@ -18,6 +18,7 @@ package metrics
 
 import (
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -410,5 +411,27 @@ func TestPublishModelPhase(t *testing.T) {
 	}
 	if got := ModelStatus.DeletePartialMatch(labels); got != 1 {
 		t.Errorf("expected exactly 1 series after a phase change, got %d", got)
+	}
+}
+
+func TestWatchCanaryMetrics(t *testing.T) {
+	at := time.Unix(1750000000, 0)
+	RecordWatchCanaryObservation(at)
+	if got := testutil.ToFloat64(WatchCanaryLastObservedTimestamp); got != float64(at.Unix()) {
+		t.Errorf("expected last-observed timestamp %d, got %f", at.Unix(), got)
+	}
+
+	SetWatchCanaryUp()
+	if got := testutil.ToFloat64(WatchCanaryUp); got != 1 {
+		t.Errorf("expected watch-canary up = 1, got %f", got)
+	}
+
+	RecordWatchCanaryWrite("ok")
+	RecordWatchCanaryWrite("error")
+	if got := testutil.ToFloat64(WatchCanaryWritesTotal.WithLabelValues("ok")); got < 1 {
+		t.Errorf("expected ok write counter >= 1, got %f", got)
+	}
+	if got := testutil.ToFloat64(WatchCanaryWritesTotal.WithLabelValues("error")); got < 1 {
+		t.Errorf("expected error write counter >= 1, got %f", got)
 	}
 }

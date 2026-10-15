@@ -17,6 +17,8 @@ limitations under the License.
 package metrics
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -407,6 +409,37 @@ var (
 		},
 		[]string{"reason"},
 	)
+
+	// WatchCanaryLastObservedTimestamp is the unix time of the last
+	// watch-canary write the manager's own informer delivered (#2069). An
+	// absolute timestamp, not an age, so the value freezes rather than lies
+	// when the write loop stalls: alerts and humans compute
+	// time() - this to get the real age.
+	WatchCanaryLastObservedTimestamp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "llmkube_watch_canary_last_observed_timestamp_seconds",
+		Help: "Unix time of the last watch-canary write observed through the manager's informer. 0 until the first observation.",
+	})
+
+	// WatchCanaryUp is 1 once a full canary cycle has completed: the canary
+	// wrote its Lease and the manager's informer delivered the event back. 0
+	// before the first cycle. When the canary is disabled the gauge simply
+	// stays 0 and never matters: the chart renders the canary alerts only
+	// when the canary itself is enabled.
+	WatchCanaryUp = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "llmkube_watch_canary_up",
+		Help: "1 once a watch-canary write has been observed through the manager's informer; 0 before the first full cycle.",
+	})
+
+	// WatchCanaryWritesTotal counts canary Lease writes by result ("ok" or
+	// "error"). Persistent errors are a dead API-server path or missing RBAC
+	// on the canary lease, both of which also age out the liveness check.
+	WatchCanaryWritesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_watch_canary_writes_total",
+			Help: "Total watch-canary Lease writes, by result.",
+		},
+		[]string{"result"},
+	)
 )
 
 // AllCollectors is every metric this operator registers. init() registers
@@ -450,6 +483,9 @@ var AllCollectors = []prometheus.Collector{
 	ForemanTaskTurns,
 	ForemanWorkloadCompletedTotal,
 	ForemanArchiveFailuresTotal,
+	WatchCanaryLastObservedTimestamp,
+	WatchCanaryUp,
+	WatchCanaryWritesTotal,
 }
 
 func init() {
@@ -579,4 +615,24 @@ func RecordWorkloadOutcome(outcome string) {
 // string: error text is unbounded and would break cardinality.
 func RecordArchiveFailure(reason string) {
 	ForemanArchiveFailuresTotal.WithLabelValues(reason).Inc()
+}
+
+// RecordWatchCanaryObservation records that the manager's informer delivered
+// an event for the watch-canary Lease at time t. The gauges are package
+// globals because one operator process runs exactly one canary.
+func RecordWatchCanaryObservation(t time.Time) {
+	WatchCanaryLastObservedTimestamp.Set(float64(t.Unix()))
+}
+
+// SetWatchCanaryUp flips the up gauge after the first full write-then-observe
+// cycle. Never called with the canary disabled, so a disabled install keeps
+// the zero value.
+func SetWatchCanaryUp() {
+	WatchCanaryUp.Set(1)
+}
+
+// RecordWatchCanaryWrite counts one canary write attempt. Result is a bounded
+// classification ("ok" or "error"), never an error string.
+func RecordWatchCanaryWrite(result string) {
+	WatchCanaryWritesTotal.WithLabelValues(result).Inc()
 }
