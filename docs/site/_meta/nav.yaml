@@ -78,6 +78,9 @@ sections:
       - label: Model cache
         slug: guides/model-cache
         file: guides/model-cache.md
+      - label: GPUs through DRA
+        slug: guides/dra
+        file: guides/dra.md
       - label: Metrics-driven autoscaling
         slug: guides/metrics-driven-autoscaling
         file: guides/metrics-driven-autoscaling.md
