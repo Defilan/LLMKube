@@ -1160,7 +1160,10 @@ LLMKube:
   `AgentGatewayReady` (AgentGateway). An InferenceService requires a key when
   it sets `apiKeySecretRef`, passes `--api-key` in `spec.extraArgs`, passes
   `--api-key` in `spec.args` with `spec.command` set, or sets `VLLM_API_KEY`
-  in `spec.env` (vLLM reads the variable directly). Route to keyed
-  InferenceServices from APISIX directly.
+  in `spec.env` (vLLM reads the variable directly). A backend whose own
+  InferenceService is open but whose ModelPool has a keyed member is reported
+  the same way on `BackendsReady` (pool siblings are reachable only through
+  the Proxy data plane). Route to keyed InferenceServices from APISIX
+  directly.
 - `externalTrafficPolicy` is not applied to Services relayed to the macOS
   Metal agent.

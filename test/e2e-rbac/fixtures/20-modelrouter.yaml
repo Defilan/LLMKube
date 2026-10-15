@@ -2,7 +2,9 @@
 # a Service, a ServiceAccount and an activation Role/RoleBinding, and reads the
 # external backend's credentials Secret. Creating the Role also requires the
 # operator to hold every permission the Role grants (the RBAC escalation
-# check), so a gap there shows up too.
+# check), so a gap there shows up too. The pooled backend makes the router
+# resolve a ModelPool, so the keyed-sibling scan Lists ModelPools and Gets the
+# sibling member InferenceService under the generated RBAC.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -22,6 +24,10 @@ spec:
     tier: local
     inferenceServiceRef:
       name: rbac-cpu
+  - name: pooled
+    tier: local
+    inferenceServiceRef:
+      name: rbac-pool-a
   - name: external
     tier: cloud
     external:

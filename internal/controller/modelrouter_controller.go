@@ -491,8 +491,8 @@ func summarizeBackends(backends []inferencev1alpha1.BackendStatus) (bool, string
 // backendsReadyCondition derives the BackendsReady condition from the compile.
 // A keyed backend wins the reason: it names the cause and the fix.
 func backendsReadyCondition(compiled *compiledConfig) (bool, string, string) {
-	if len(compiled.KeyedBackends) > 0 {
-		return false, ModelRouterReasonBackendAPIKeyUnsupported, keyedBackendsMessage(compiled.KeyedBackends)
+	if len(compiled.KeyedBackends) > 0 || len(compiled.KeyedPoolBackends) > 0 {
+		return false, ModelRouterReasonBackendAPIKeyUnsupported, keyedVerdictMessage(compiled.KeyedBackends, compiled.KeyedPoolBackends)
 	}
 	ready, msg := summarizeBackends(compiled.Backends)
 	return ready, conditionPick(ready, ModelRouterReasonBackendsResolved, ModelRouterReasonBackendsUnresolved), msg
