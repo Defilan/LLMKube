@@ -322,6 +322,55 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(degraded.Message).To(ContainSubstring("multiNode group provides 2 GPUs"))
 	})
 
+	// #2061: member pods pin spec.nodeName, which bypasses the scheduler that
+	// allocates DRA claims, so the combination can never run.
+	It("parks a multiNode service whose Model uses DRA resourceClaims", func() {
+		claimName := "mn-dra-claim"
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: "mn-dra-model", Namespace: ns},
+			Spec: inferencev1alpha1.ModelSpec{
+				Source: "s3://models/org/dra", Format: "safetensors",
+				Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cuda", GPU: &inferencev1alpha1.GPUSpec{
+					Enabled:        true,
+					ResourceClaims: []corev1.PodResourceClaim{{Name: "gpu", ResourceClaimName: &claimName}},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		model.Status.Phase = PhaseReady
+		model.Status.CacheKey = "org-dra"
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, model) })
+
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "mn-dra", Namespace: ns},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				Runtime: "vllm", ModelRef: "mn-dra-model",
+				Resources: &inferencev1alpha1.InferenceResourceRequirements{GPU: 1},
+				MultiNode: &inferencev1alpha1.MultiNodeSpec{Members: []inferencev1alpha1.MultiNodeMember{
+					{Node: "node-a", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.1"}},
+					{Node: "node-b", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.2"}},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, isvc) })
+
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "mn-dra", Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+
+		var list corev1.PodList
+		Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.MatchingLabels{LabelMultiNodeGroup: "mn-dra"})).To(Succeed())
+		Expect(list.Items).To(BeEmpty(), "no member pod may be created for a multiNode DRA service")
+
+		var got inferencev1alpha1.InferenceService
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "mn-dra", Namespace: ns}, &got)).To(Succeed())
+		Expect(got.Status.Phase).To(Equal(PhaseFailed))
+		degraded := meta.FindStatusCondition(got.Status.Conditions, ConditionDegraded)
+		Expect(degraded).NotTo(BeNil())
+		Expect(degraded.Message).To(ContainSubstring("resourceClaims"))
+	})
+
 	It("holds the group while a member stages, then polices post-formation restarts", func() {
 		// #1757: one member's claim starts empty, so its init container is
 		// still downloading while the other member's runtime waits for the

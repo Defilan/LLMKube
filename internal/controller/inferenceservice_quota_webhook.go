@@ -128,6 +128,13 @@ func (v *InferenceServiceQuotaValidator) ValidateDelete(_ context.Context, _ *in
 // validate checks the InferenceService against all applicable GPUQuotas and
 // returns an error if any quota denies the admission.
 func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
+	// Fetch the referenced Model once, best-effort: the spec validations
+	// below and the quota accounting all read it. At admission time the
+	// Model may not exist yet; a nil Model is undecidable for cross-Model
+	// checks and falls through to resources.gpu in apiutil.GPUCount, exactly
+	// as the reconciler would on first sight.
+	model := v.fetchModel(ctx, isvc)
+
 	// gpuSharing spec validation first (#1196 story 5): an invalid or
 	// unsatisfiable sharing spec is rejected at admission with the same
 	// rules the reconciler applies, instead of being accepted and then
@@ -135,7 +142,7 @@ func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inf
 	// they do not touch the denial counter. The reconcile-time gate stays
 	// as the backstop for installs that run without this webhook
 	// (multitenancy disabled).
-	if err := v.validateGPUSharing(ctx, isvc); err != nil {
+	if err := v.validateGPUSharing(isvc, model); err != nil {
 		return fmt.Errorf("invalid gpuSharing spec: %w", err)
 	}
 
@@ -143,8 +150,16 @@ func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inf
 	// (#525): reject it here instead of letting the reconciler park it at
 	// Phase=Failed. The Model is best-effort; an absent one is re-checked at
 	// reconcile.
-	if err := validateRuntimePlacement(isvc, v.fetchModel(ctx, isvc)); err != nil {
+	if err := validateRuntimePlacement(isvc, model); err != nil {
 		return fmt.Errorf("invalid runtime: %w", err)
+	}
+
+	// spec.multiNode cannot run on a Model that allocates GPUs through DRA
+	// resourceClaims (#2061): CEL on the InferenceService cannot see the
+	// Model, so reject it here like the spec errors above and let the
+	// reconciler backstop installs that run without this webhook.
+	if err := multiNodeResourceClaimsConflict(isvc, model); err != nil {
+		return fmt.Errorf("invalid multiNode spec: %w", err)
 	}
 
 	// Kueue-managed services defer quota gating to Kueue. Spec validation
@@ -161,12 +176,6 @@ func (v *InferenceServiceQuotaValidator) validate(ctx context.Context, isvc *inf
 	if err != nil {
 		return fmt.Errorf("listing applicable GPUQuotas: %w", err)
 	}
-
-	// Fetch the referenced Model best-effort so GPU-count accounting matches
-	// the pod spec (which prefers hardware.gpu.count). At admission time the
-	// Model may not exist yet; a nil Model falls through to resources.gpu in
-	// apiutil.GPUCount, exactly as the reconciler would on first sight.
-	model := v.fetchModel(ctx, isvc)
 
 	for _, q := range quotas {
 		allow, reason := v.decide(ctx, q, isvc, model)
@@ -200,11 +209,10 @@ func (v *InferenceServiceQuotaValidator) fetchModel(ctx context.Context, isvc *i
 
 // validateGPUSharing runs the resolver's sharing rules plus the explicit
 // parallelism cross-checks against the incoming InferenceService. The Model
-// is fetched best-effort: at admission time it may not exist yet, and a nil
-// Model resolves with the NVIDIA-default vendor exactly as the reconciler
-// would on first sight.
-func (v *InferenceServiceQuotaValidator) validateGPUSharing(ctx context.Context, isvc *inferencev1alpha1.InferenceService) error {
-	model := v.fetchModel(ctx, isvc)
+// is fetched once by validate, best-effort: at admission time it may not
+// exist yet, and a nil Model resolves with the NVIDIA-default vendor exactly
+// as the reconciler would on first sight.
+func (v *InferenceServiceQuotaValidator) validateGPUSharing(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) error {
 	if _, err := resolveGPUSharing(isvc, model, v.GPUSharingSharedPool); err != nil {
 		return err
 	}

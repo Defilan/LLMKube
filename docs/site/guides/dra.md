@@ -127,6 +127,9 @@ With `runtime: vllm` on the InferenceService, the server starts with
 - `resourceClaims` and `resourceName` are mutually exclusive.
 - `gpuSharing` modes other than `exclusive` (`partitioned`, `shared`) cannot be
   combined with `resourceClaims`: the claim owns device placement.
+- **multiNode:** `spec.multiNode` pins member pods to nodes with `nodeName`,
+  which bypasses the scheduler that allocates DRA claims. The combination is
+  rejected at admission; run DRA models single-node.
 - For a GPU accelerator (`cuda`, `rocm`, and so on), the Model's
   `AcceleratorReady` condition checks that each named claim or template exists
   in the Model's namespace.
