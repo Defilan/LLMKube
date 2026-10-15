@@ -156,6 +156,11 @@ func TestBackendsReadyConditionKeyed(t *testing.T) {
 	if ready || reason != ModelRouterReasonBackendAPIKeyUnsupported || !strings.Contains(msg, `"a"`) {
 		t.Errorf("got (%v, %q, %q), want not ready, BackendAPIKeyUnsupported, naming a", ready, reason, msg)
 	}
+	// The condition and the gateway controllers hand-maintain one sentence:
+	// the reference-only case must stay byte-identical to keyedBackendsMessage.
+	if keyedVerdictMessage([]string{"a"}, nil) != keyedBackendsMessage([]string{"a"}) {
+		t.Error("keyedVerdictMessage reference-only case drifted from keyedBackendsMessage")
+	}
 	ready, reason, _ = backendsReadyCondition(&compiledConfig{
 		Backends: []inferencev1alpha1.BackendStatus{{Name: "a", Healthy: true}},
 	})
