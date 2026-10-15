@@ -68,3 +68,22 @@ func TestGPUCount(t *testing.T) {
 		})
 	}
 }
+
+func TestUsesDRAClaims(t *testing.T) {
+	claim := []corev1.PodResourceClaim{{Name: "gpu"}}
+	cases := []struct {
+		name  string
+		model *inferencev1alpha1.Model
+		want  bool
+	}{
+		{"nil model", nil, false},
+		{"no hardware", &inferencev1alpha1.Model{}, false},
+		{"gpu without claims", &inferencev1alpha1.Model{Spec: inferencev1alpha1.ModelSpec{Hardware: &inferencev1alpha1.HardwareSpec{GPU: &inferencev1alpha1.GPUSpec{Count: 2}}}}, false},
+		{"gpu with claims", &inferencev1alpha1.Model{Spec: inferencev1alpha1.ModelSpec{Hardware: &inferencev1alpha1.HardwareSpec{GPU: &inferencev1alpha1.GPUSpec{Count: 2, ResourceClaims: claim}}}}, true},
+	}
+	for _, tc := range cases {
+		if got := UsesDRAClaims(tc.model); got != tc.want {
+			t.Errorf("%s: UsesDRAClaims() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

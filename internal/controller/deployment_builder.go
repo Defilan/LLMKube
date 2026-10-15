@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/apiutil"
 )
 
 // Deployment construction. Turns an InferenceService + Model pair into the
@@ -763,19 +764,18 @@ func modelResourceClaims(model *inferencev1alpha1.Model) []corev1.PodResourceCla
 func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, gpuCount int32, gpuResourceName corev1.ResourceName) corev1.ResourceRequirements {
 	var res corev1.ResourceRequirements
 
-	claims := modelResourceClaims(model)
-
 	// With DRA claims the claims allocate the GPUs, so no device-plugin limit:
-	// on a DRA-only cluster nodes advertise nvidia.com/gpu: 0 and the limit
-	// alone made the pod unschedulable (#2059). gpuCount still sizes the
-	// runtime (tensor parallelism, memory flags) on that path.
-	if gpuCount > 0 && len(claims) == 0 {
+	// on a DRA-only cluster nodes advertise no nvidia.com/gpu capacity and the
+	// limit alone made the pod unschedulable (#2059). gpuCount still sizes the
+	// runtime (tensor parallelism, memory flags) on that path. External
+	// consumers (llmkube-kueue) make the same call through apiutil.UsesDRAClaims.
+	if gpuCount > 0 && !apiutil.UsesDRAClaims(model) {
 		res.Limits = corev1.ResourceList{
 			gpuResourceName: resource.MustParse(fmt.Sprintf("%d", gpuCount)),
 		}
 	}
 
-	for _, claim := range claims {
+	for _, claim := range modelResourceClaims(model) {
 		res.Claims = append(res.Claims, corev1.ResourceClaim{Name: claim.Name})
 	}
 
