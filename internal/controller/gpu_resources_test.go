@@ -1,7 +1,14 @@
 package controller
 
 import (
+	"context"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -172,4 +179,63 @@ func TestDetectInsufficientGPUResource(t *testing.T) {
 			t.Fatalf("detectInsufficientGPUResource() = %q, want %q", got, vulkanDRIResourceName)
 		}
 	})
+}
+
+// #2059: the GPU count can come from the Model (hardware.gpu.count) rather than
+// spec.resources.gpu. WaitingFor used to read only the latter and told the user
+// "nvidia.com/gpu: 0" while the pod was waiting for 1.
+func TestGetPodSchedulingInfoReportsThePodsGPULimit(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme: %v", err)
+	}
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("inferencev1alpha1.AddToScheme: %v", err)
+	}
+
+	// No spec.resources: the count came from the Model.
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "embed", Namespace: "default"},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "embed-abc",
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":                           "embed",
+				"inference.llmkube.dev/service": "embed",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name: "llama-server",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{nvidiaGPUResourceName: resource.MustParse("1")},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			Conditions: []corev1.PodCondition{{
+				Type:    corev1.PodScheduled,
+				Status:  corev1.ConditionFalse,
+				Reason:  "Unschedulable",
+				Message: "0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient nvidia.com/gpu.",
+			}},
+		},
+	}
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc, pod).Build()
+	r := &InferenceServiceReconciler{Client: c, Scheme: scheme}
+
+	info, err := r.getPodSchedulingInfo(context.Background(), isvc)
+	if err != nil {
+		t.Fatalf("getPodSchedulingInfo() error = %v", err)
+	}
+	if info == nil || info.Status != "InsufficientGPU" {
+		t.Fatalf("getPodSchedulingInfo() = %+v, want Status InsufficientGPU", info)
+	}
+	if info.WaitingFor != "nvidia.com/gpu: 1" {
+		t.Fatalf("WaitingFor = %q, want %q", info.WaitingFor, "nvidia.com/gpu: 1")
+	}
 }

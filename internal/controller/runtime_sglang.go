@@ -137,11 +137,9 @@ func (b *SGLangBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, mode
 		args = sglangAppendExpertParallelSize(args, cfg.ExpertParallelSize)
 		args = sglangAppendDataParallelSize(args, cfg.DataParallelSize)
 		args = sglangAppendContextLength(args, cfg.ContextLength)
-		if cfg.MemFractionStatic != nil && gpuCount == 0 {
-			// TODO: This guard uses resolveGPUCount (device-plugin only). DRA-only
-			// models (resourceClaims > 0, gpuCount == 0) will spuriously skip
-			// --mem-fraction-static here. Switch to hasGPUPresent(isvc, model) when
-			// the shared vLLM guard is also updated. See #1060.
+		// hasGPUPresent, not gpuCount: a DRA-only model (resourceClaims, no
+		// count) has a GPU and needs the flag (#2059).
+		if cfg.MemFractionStatic != nil && !hasGPUPresent(isvc, model) {
 			sglangLog.Info(
 				"spec.sglangConfig.memFractionStatic is defined with no GPU hardware; skipping --mem-fraction-static",
 				"inferenceService", isvc.Name,

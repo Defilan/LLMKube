@@ -59,6 +59,12 @@ func GPUResourceName(model *inferencev1alpha1.Model) corev1.ResourceName {
 // GPUCount determines the desired GPU count per replica: the Model's
 // hardware count wins, else the InferenceService resources.gpu, else 0.
 // Both arguments are nil-safe.
+//
+// GPUCount sizes the runtime on every path. It is the device-plugin request
+// (GPUResourceName: GPUCount) only when UsesDRAClaims is false: with DRA
+// resourceClaims the claims allocate the devices and the operator adds no
+// extended-resource limit, so a component building an extended-resource
+// request for the pod (a Kueue pod set, a quota estimate) must skip it (#2059).
 func GPUCount(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) int32 {
 	if model != nil && model.Spec.Hardware != nil && model.Spec.Hardware.GPU != nil && model.Spec.Hardware.GPU.Count > 0 {
 		return model.Spec.Hardware.GPU.Count
@@ -67,4 +73,12 @@ func GPUCount(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1
 		return isvc.Spec.Resources.GPU
 	}
 	return 0
+}
+
+// UsesDRAClaims reports whether the Model allocates its GPUs through DRA
+// resourceClaims. When true the operator attaches the claims to the pod and
+// adds no device-plugin GPU limit. Nil-safe.
+func UsesDRAClaims(model *inferencev1alpha1.Model) bool {
+	return model != nil && model.Spec.Hardware != nil && model.Spec.Hardware.GPU != nil &&
+		len(model.Spec.Hardware.GPU.ResourceClaims) > 0
 }

@@ -259,8 +259,12 @@ type GPUSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Count specifies the number of GPUs required
-	// Supports multi-GPU for model sharding (future feature)
+	// Count is the number of GPUs the model uses. It sizes the runtime (for
+	// example vLLM's --tensor-parallel-size when above 1) and, without
+	// resourceClaims, requests that many devices through the device plugin as a
+	// container limit (nvidia.com/gpu by default). With resourceClaims set the
+	// claims allocate the devices and no device-plugin limit is added; set Count
+	// to the number of devices the claims provide so the runtime is sized to match.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=8
 	// +optional
@@ -339,7 +343,8 @@ type GPUSpec struct {
 	// ResourceClaims defines DRA (Dynamic Resource Allocation) claims for GPU devices.
 	// Uses resource.k8s.io/v1 PodResourceClaim format. Each claim must have exactly
 	// one of resourceClaimName or resourceClaimTemplateName set.
-	// Mutually exclusive with resourceName.
+	// Mutually exclusive with resourceName. When set, the operator does not add a
+	// device-plugin GPU limit; Count still sizes the runtime.
 	// +kubebuilder:validation:MaxItems=16
 	// +kubebuilder:validation:XValidation:rule="self.size() == 0 || self.all(c, (has(c.resourceClaimName) && !has(c.resourceClaimTemplateName)) || (!has(c.resourceClaimName) && has(c.resourceClaimTemplateName)))",message="each claim must have exactly one of resourceClaimName or resourceClaimTemplateName"
 	ResourceClaims []corev1.PodResourceClaim `json:"resourceClaims,omitempty"`
