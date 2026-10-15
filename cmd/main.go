@@ -556,10 +556,12 @@ func main() {
 	// and require the manager's own informer to deliver the write back. The
 	// event handler must be attached before the manager starts, so New runs
 	// here rather than inside a runnable; the write loop is the runnable and
-	// starts with leadership.
+	// starts with leadership. The signal context is captured here so that
+	// registration honors shutdown too.
+	ctx := ctrl.SetupSignalHandler()
 	var canary *watchcanary.Canary
 	if watchCanaryInterval > 0 && canaryNamespace != "" {
-		canary, err = watchcanary.New(watchcanary.Options{
+		canary, err = watchcanary.New(ctx, watchcanary.Options{
 			Namespace: canaryNamespace,
 			Interval:  watchCanaryInterval,
 			FailAfter: watchCanaryFailAfter,
@@ -864,7 +866,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

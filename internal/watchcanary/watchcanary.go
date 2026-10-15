@@ -154,8 +154,10 @@ func ResolveNamespace(flagNamespace, leaderElectionNamespace string) string {
 // New validates the options and registers the informer event handler on the
 // manager's cache. Call it before the manager starts: GetInformer on a
 // not-yet-started cache registers the informer without waiting for sync, and
-// the manager starts and syncs it as part of Start.
-func New(o Options) (*Canary, error) {
+// the manager starts and syncs it as part of Start. The context governs that
+// registration; the write loop's lifetime is the runnable context Start
+// receives.
+func New(ctx context.Context, o Options) (*Canary, error) {
 	if o.Interval <= 0 {
 		return nil, fmt.Errorf("watch canary interval must be positive, got %s", o.Interval)
 	}
@@ -178,8 +180,8 @@ func New(o Options) (*Canary, error) {
 	if log.GetSink() == nil {
 		log = logf.Log.WithName("watch-canary")
 	}
-	c := &Canary{opts: o, log: log}
-	if err := c.watchInformer(); err != nil {
+	c := &Canary{opts: o, log: log, healthy: true}
+	if err := c.watchInformer(ctx); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -189,8 +191,8 @@ func New(o Options) (*Canary, error) {
 // lastObserved is advanced only by events for the canary lease itself, which
 // is what makes the liveness check measure the same write -> watch -> cache
 // pipeline the controllers depend on rather than the process being alive.
-func (c *Canary) watchInformer() error {
-	informer, err := c.opts.Cache.GetInformer(context.Background(), &coordinationv1.Lease{})
+func (c *Canary) watchInformer(ctx context.Context) error {
+	informer, err := c.opts.Cache.GetInformer(ctx, &coordinationv1.Lease{})
 	if err != nil {
 		return fmt.Errorf("get lease informer for the watch canary: %w", err)
 	}
@@ -249,8 +251,13 @@ func (c *Canary) LivenessCheck() healthz.Checker {
 		wasHealthy := c.healthy
 		c.healthy = err == nil
 		c.mu.Unlock()
-		if err != nil && wasHealthy {
+		// healthy starts true in New, so the first failure is always a
+		// logged transition and a recovery after one is logged symmetrically.
+		switch {
+		case err != nil && wasHealthy:
 			c.log.Error(err, "watch canary failed the liveness check; the kubelet restarts this pod once the probe starts failing")
+		case err == nil && !wasHealthy:
+			c.log.Info("watch canary liveness check recovered")
 		}
 		return err
 	}
@@ -355,10 +362,11 @@ func (c *Canary) observed(obj interface{}) {
 	c.lastObserved = now
 	wasUp := c.up
 	c.up = c.up || c.sawWrite
+	flip := !wasUp && c.up
 	c.mu.Unlock()
 
 	metrics.RecordWatchCanaryObservation(now)
-	if c.up && !wasUp {
+	if flip {
 		metrics.SetWatchCanaryUp()
 	}
 }

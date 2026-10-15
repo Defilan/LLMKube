@@ -17,6 +17,7 @@ limitations under the License.
 package watchcanary
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -176,16 +177,16 @@ func TestNewValidation(t *testing.T) {
 		FailAfter: 5 * time.Second,
 	}
 
-	if _, err := New(Options{}); err == nil {
+	if _, err := New(context.Background(), Options{}); err == nil {
 		t.Fatal("expected an error for a zero interval")
 	}
-	if _, err := New(Options{Interval: time.Second}); err == nil {
+	if _, err := New(context.Background(), Options{Interval: time.Second}); err == nil {
 		t.Fatal("expected an error for an empty namespace")
 	}
-	if _, err := New(valid); err == nil {
+	if _, err := New(context.Background(), valid); err == nil {
 		t.Fatal("expected an error without a reader, writer and cache")
 	}
-	if _, err := New(Options{Namespace: "ns", Interval: time.Second, FailAfter: time.Second}); err == nil {
+	if _, err := New(context.Background(), Options{Namespace: "ns", Interval: time.Second, FailAfter: time.Second}); err == nil {
 		t.Fatal("expected an error when fail-after does not exceed the interval")
 	}
 	_ = valid

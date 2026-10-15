@@ -72,7 +72,7 @@ func TestCanaryObservesOwnWrites(t *testing.T) {
 		t.Fatalf("new manager: %v", err)
 	}
 
-	c, err := New(Options{
+	c, err := New(context.Background(), Options{
 		Namespace: "default",
 		Interval:  200 * time.Millisecond,
 		FailAfter: 5 * time.Second,
@@ -185,7 +185,7 @@ func TestCanaryRecoversFromExternalLeaseDeletion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	c, err := New(Options{
+	c, err := New(context.Background(), Options{
 		Namespace: "default",
 		Interval:  200 * time.Millisecond,
 		FailAfter: 5 * time.Second,
