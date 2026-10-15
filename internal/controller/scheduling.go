@@ -196,11 +196,7 @@ func (r *InferenceServiceReconciler) getPodSchedulingInfo(ctx context.Context, i
 
 				if gpuResourceName, ok := detectInsufficientGPUResource(condition.Message); ok {
 					info.Status = "InsufficientGPU"
-					gpuCount := int32(0)
-					if isvc.Spec.Resources != nil && isvc.Spec.Resources.GPU > 0 {
-						gpuCount = isvc.Spec.Resources.GPU
-					}
-					info.WaitingFor = fmt.Sprintf("%s: %d", gpuResourceName, gpuCount)
+					info.WaitingFor = fmt.Sprintf("%s: %d", gpuResourceName, podGPULimit(&pod, gpuResourceName))
 				} else if pvName, nodeName, ok := r.classifyUnbindableVolume(ctx, &pod, condition.Message); ok {
 					// Checked before the generic "Insufficient" branch: this
 					// message contains neither that word nor anything else that

@@ -129,6 +129,20 @@ func resolveIntelGPUResourceName() corev1.ResourceName {
 	return corev1.ResourceName(configured)
 }
 
+// podGPULimit sums the pod's container limits for the GPU resource the
+// scheduler reported short, so WaitingFor names what the pod asked for. It
+// used to read only spec.resources.gpu and reported 0 when the count came from
+// the Model's hardware.gpu.count (#2059).
+func podGPULimit(pod *corev1.Pod, name corev1.ResourceName) int64 {
+	var total int64
+	for _, c := range pod.Spec.Containers {
+		if q, ok := c.Resources.Limits[name]; ok {
+			total += q.Value()
+		}
+	}
+	return total
+}
+
 func detectInsufficientGPUResource(message string) (corev1.ResourceName, bool) {
 	candidates := []corev1.ResourceName{
 		nvidiaGPUResourceName,
