@@ -321,15 +321,24 @@ func TestCompileRouterConfigMarksKeyedPoolSibling(t *testing.T) {
 	}
 	c := fake.NewClientBuilder().WithScheme(routerScheme(t)).WithObjects(open, keyed, pool).Build()
 	r := &ModelRouterReconciler{Client: c}
-	cc, err := r.compileRouterConfig(context.Background(), routerWithLocal("a", "open"))
+	// Spec order z-pooled then a-pooled: the compile must report the pair in
+	// sorted order, matching the KeyedPoolBackends contract.
+	mr := routerWithLocal("z-pooled", "open")
+	mr.Spec.Backends = append(mr.Spec.Backends,
+		inferencev1alpha1.RouterBackend{Name: "a-pooled", InferenceServiceRef: &corev1.LocalObjectReference{Name: "open"}})
+	cc, err := r.compileRouterConfig(context.Background(), mr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(cc.KeyedPoolBackends, []string{"a"}) || slices.Contains(cc.KeyedBackends, "a") ||
-		cc.Backends[0].Healthy || !strings.Contains(cc.Backends[0].Message, `"pool"`) ||
-		!strings.Contains(cc.Backends[0].Message, `"keyed"`) {
-		t.Errorf("compiled = keyed %v pool %v, status %+v; want backend a keyed via pool only, unhealthy, naming pool and member",
-			cc.KeyedBackends, cc.KeyedPoolBackends, cc.Backends[0])
+	if !slices.Equal(cc.KeyedPoolBackends, []string{"a-pooled", "z-pooled"}) ||
+		slices.Contains(cc.KeyedBackends, "a-pooled") || slices.Contains(cc.KeyedBackends, "z-pooled") {
+		t.Errorf("compiled = keyed %v pool %v; want both backends keyed via pool only, in sorted order",
+			cc.KeyedBackends, cc.KeyedPoolBackends)
+	}
+	for _, status := range cc.Backends {
+		if status.Healthy || !strings.Contains(status.Message, `"pool"`) || !strings.Contains(status.Message, `"keyed"`) {
+			t.Errorf("backend %q status %+v; want unhealthy, naming pool and keyed member", status.Name, status)
+		}
 	}
 }
 

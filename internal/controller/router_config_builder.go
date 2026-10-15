@@ -124,6 +124,7 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 		out.Backends = append(out.Backends, wire)
 		statuses = append(statuses, status)
 	}
+	slices.Sort(keyedPool)
 	hasPools := false
 	for i := range out.Backends {
 		if out.Backends[i].Pool != nil {
