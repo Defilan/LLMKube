@@ -351,7 +351,14 @@ func (v *InferenceServiceQuotaValidator) currentUsage(ctx context.Context, q inf
 
 // gpuCount returns the total GPU count for an InferenceService across all
 // replicas, routing through apiutil.GPUCount so a Model-declared
-// hardware.gpu.count is charged the same way the pod spec requests it.
+// hardware.gpu.count is charged per replica however the GPUs are allocated:
+// on the device-plugin path count is also the pod's resource limit, while on
+// the DRA path the pod requests no device-plugin GPU (resourceClaims
+// allocate the devices, #2059) and the quota still charges count, so a DRA
+// workload costs the same against the cap as the equivalent device-plugin
+// one. Charging the declared count rather than the rendered pod requests is
+// deliberate (#2061). A Model with claims but no count is charged zero; its
+// device usage is not yet declarable (see the DRA guide's GPU-quota note).
 // The Model argument is nil-safe; when nil the count falls back to
 // isvc.Spec.Resources.GPU.
 //
