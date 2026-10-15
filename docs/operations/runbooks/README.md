@@ -19,6 +19,7 @@ Every runbook should be testable: an on-call engineer who has never seen the fai
 ### Reliability
 
 - [`controller-hot-spin-on-file-source.md`](./controller-hot-spin-on-file-source.md): controller-manager pod pegging CPU because a `Model` references a path the controller pod cannot read.
+- [`operator-stalled-watch.md`](./operator-stalled-watch.md): the operator looks healthy (probes pass, webhooks answer) but its controllers have silently stopped reconciling, so spec changes never take effect (#2069).
 
 ### Memory and resource pressure (Apple Silicon / metal-agent)
 
