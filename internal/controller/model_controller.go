@@ -44,6 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	llmkubemetrics "github.com/defilantech/llmkube/internal/metrics"
@@ -168,6 +169,12 @@ type ModelReconciler struct {
 	// http.DefaultClient for source-derived URLs.
 	metadataHTTPClient     *http.Client
 	metadataHTTPClientOnce sync.Once
+
+	// ReconcileDecorator wraps the reconciler at the point SetupWithManager
+	// hands it to the controller builder, so the wrapper is what the
+	// controller calls. cmd/main.go sets it to the reconcile deadline; nil
+	// leaves the reconcile path untouched.
+	ReconcileDecorator func(reconcile.Reconciler) reconcile.Reconciler
 }
 
 // metadataClient returns the SSRF-guarded HTTP client for source-derived
@@ -1663,9 +1670,13 @@ func computeFileSHA256(path string) (string, error) {
 const ModelReconcileConcurrency = 4
 
 func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	rec := reconcile.Reconciler(r)
+	if r.ReconcileDecorator != nil {
+		rec = r.ReconcileDecorator(rec)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.Model{}).
 		Named("model").
 		WithOptions(controller.Options{MaxConcurrentReconciles: ModelReconcileConcurrency}).
-		Complete(r)
+		Complete(rec)
 }

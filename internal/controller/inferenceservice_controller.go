@@ -129,6 +129,12 @@ type InferenceServiceReconciler struct {
 	// RelayImage is the image for Metal relay pods (router-proxy in --relay
 	// mode). Wired from --router-proxy-image; empty uses the router-proxy default.
 	RelayImage string
+
+	// ReconcileDecorator wraps the reconciler at the point SetupWithManager
+	// hands it to the controller builder, so the wrapper is what the
+	// controller calls. cmd/main.go sets it to the reconcile deadline; nil
+	// leaves the reconcile path untouched.
+	ReconcileDecorator func(reconcile.Reconciler) reconcile.Reconciler
 }
 
 func sanitizeDNSName(name string) string {
@@ -1216,7 +1222,11 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findInferenceServicesForCACertConfigMap),
 		)
 	}
-	return b.Named("inferenceservice").Complete(r)
+	rec := reconcile.Reconciler(r)
+	if r.ReconcileDecorator != nil {
+		rec = r.ReconcileDecorator(rec)
+	}
+	return b.Named("inferenceservice").Complete(rec)
 }
 
 // findInferenceServiceForEndpoints enqueues the InferenceService that an

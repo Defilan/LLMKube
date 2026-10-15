@@ -119,16 +119,6 @@ func TestDeadlineReconcilerKeepsParentCancellationUntouched(t *testing.T) {
 	}
 }
 
-// TestDeadlineReconcilerSetupWithManagerRequiresDelegatableInner pins the
-// registration path cmd/main.go relies on: the wrapper must be able to
-// complete the inner reconciler's controller.
-func TestDeadlineReconcilerSetupWithManagerRequiresDelegatableInner(t *testing.T) {
-	d := &DeadlineReconciler{Inner: &deadlineTestReconciler{}}
-	if err := d.SetupWithManager(nil); err == nil {
-		t.Fatal("expected an error for an inner without SetupWithManager")
-	}
-}
-
 // deadlineTestReconciler blocks for wait (or until its context is done) and
 // records which error, if any, its context ended with.
 type deadlineTestReconciler struct {

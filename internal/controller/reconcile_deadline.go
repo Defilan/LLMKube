@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -59,15 +58,13 @@ func (d *DeadlineReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 	return res, err
 }
 
-// SetupWithManager completes the inner reconciler's controller registration
-// with the wrapper in the reconcile path: the builder completes the wrapper,
-// whose Reconcile applies the deadline before delegating. The reconcilers
-// wrapped in cmd/main.go set their fields explicitly at construction, so
-// nothing depends on the manager injecting through the wrapper.
-func (d *DeadlineReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	setup, ok := d.Inner.(interface{ SetupWithManager(ctrl.Manager) error })
-	if !ok {
-		return fmt.Errorf("inner reconciler %T does not implement SetupWithManager", d.Inner)
+// WithReconcileDeadline returns the decorator a reconciler applies to itself
+// inside its own SetupWithManager: the wrapper has to be the argument the
+// reconciler passes to its builder's Complete, because that argument is what
+// the controller stores as its Reconciler. cmd/main.go sets the field only
+// when --reconcile-timeout is positive.
+func WithReconcileDeadline(timeout time.Duration, log logr.Logger) func(reconcile.Reconciler) reconcile.Reconciler {
+	return func(inner reconcile.Reconciler) reconcile.Reconciler {
+		return &DeadlineReconciler{Inner: inner, Timeout: timeout, Log: log}
 	}
-	return setup.SetupWithManager(mgr)
 }

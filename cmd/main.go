@@ -622,55 +622,56 @@ func main() {
 			"allowConditions", modelAttestationAllowConditions, "maxAge", modelAttestationMaxAge)
 	}
 
-	if err := (&controller.DeadlineReconciler{
-		Timeout: reconcileTimeout,
-		Log:     ctrl.Log.WithName("model"),
-		Inner: &controller.ModelReconciler{
-			Client:               mgr.GetClient(),
-			APIReader:            mgr.GetAPIReader(),
-			Attestation:          attestationPolicy,
-			Scheme:               mgr.GetScheme(),
-			StoragePath:          modelCachePath,
-			RevalidateInterval:   modelRevalidateInterval,
-			ServerVersion:        serverVersion,
-			AllowedHostPathRoots: allowedHostPathRootList,
-			AllowedRemoteHosts:   allowedRemoteHostList,
-			InitContainerImage:   initContainerImage,
-			CACertConfigMap:      caCertConfigMap,
-			Recorder:             mgr.GetEventRecorder("model-controller"),
-			DefaultFSGroup:       defaultFSGroup,
-			ModelCacheSize:       modelCacheSize,
-			ModelCacheClass:      modelCacheClass,
-			ModelCacheAccessMode: modelCacheAccessMode,
-		},
-	}).SetupWithManager(mgr); err != nil {
+	modelReconciler := &controller.ModelReconciler{
+		Client:               mgr.GetClient(),
+		APIReader:            mgr.GetAPIReader(),
+		Attestation:          attestationPolicy,
+		Scheme:               mgr.GetScheme(),
+		StoragePath:          modelCachePath,
+		RevalidateInterval:   modelRevalidateInterval,
+		ServerVersion:        serverVersion,
+		AllowedHostPathRoots: allowedHostPathRootList,
+		AllowedRemoteHosts:   allowedRemoteHostList,
+		InitContainerImage:   initContainerImage,
+		CACertConfigMap:      caCertConfigMap,
+		Recorder:             mgr.GetEventRecorder("model-controller"),
+		DefaultFSGroup:       defaultFSGroup,
+		ModelCacheSize:       modelCacheSize,
+		ModelCacheClass:      modelCacheClass,
+		ModelCacheAccessMode: modelCacheAccessMode,
+	}
+	if reconcileTimeout > 0 {
+		modelReconciler.ReconcileDecorator = controller.WithReconcileDeadline(reconcileTimeout, ctrl.Log.WithName("model"))
+	}
+	if err := modelReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Model")
 		os.Exit(1)
 	}
-	if err := (&controller.DeadlineReconciler{
-		Timeout: reconcileTimeout,
-		Log:     ctrl.Log.WithName("inferenceservice"),
-		Inner: &controller.InferenceServiceReconciler{
-			Client:                mgr.GetClient(),
-			Scheme:                mgr.GetScheme(),
-			Recorder:              mgr.GetEventRecorder("inferenceservice-controller"),
-			ModelCachePath:        modelCachePath,
-			ModelCacheSize:        modelCacheSize,
-			ModelCacheClass:       modelCacheClass,
-			ModelCacheAccessMode:  modelCacheAccessMode,
-			ModelCacheMode:        modelCacheMode,
-			CACertConfigMap:       caCertConfigMap,
-			InitContainerImage:    initContainerImage,
-			DefaultFSGroup:        defaultFSGroup,
-			DRIRenderGID:          driRenderGID,
-			EmitScrapeAnnotations: emitScrapeAnnotations,
-			AllowedHostPathRoots:  allowedHostPathRootList,
-			GPUSharingSharedPool:  gpuSharingSharedPool,
-			RuntimeImageOverrides: runtimeImageOverrides,
-			PodLogReader:          podLogReader,
-			RelayImage:            routerProxyImage,
-		},
-	}).SetupWithManager(mgr); err != nil {
+	isvcReconciler := &controller.InferenceServiceReconciler{
+		Client:                mgr.GetClient(),
+		Scheme:                mgr.GetScheme(),
+		Recorder:              mgr.GetEventRecorder("inferenceservice-controller"),
+		ModelCachePath:        modelCachePath,
+		ModelCacheSize:        modelCacheSize,
+		ModelCacheClass:       modelCacheClass,
+		ModelCacheAccessMode:  modelCacheAccessMode,
+		ModelCacheMode:        modelCacheMode,
+		CACertConfigMap:       caCertConfigMap,
+		InitContainerImage:    initContainerImage,
+		DefaultFSGroup:        defaultFSGroup,
+		DRIRenderGID:          driRenderGID,
+		EmitScrapeAnnotations: emitScrapeAnnotations,
+		AllowedHostPathRoots:  allowedHostPathRootList,
+		GPUSharingSharedPool:  gpuSharingSharedPool,
+		RuntimeImageOverrides: runtimeImageOverrides,
+		PodLogReader:          podLogReader,
+		RelayImage:            routerProxyImage,
+	}
+	if reconcileTimeout > 0 {
+		isvcReconciler.ReconcileDecorator = controller.WithReconcileDeadline(
+			reconcileTimeout, ctrl.Log.WithName("inferenceservice"))
+	}
+	if err := isvcReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
 		os.Exit(1)
 	}
