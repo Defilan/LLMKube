@@ -77,8 +77,8 @@ func TestKeyedBackends(t *testing.T) {
 		t.Errorf("keyedBackends = %v, want [a]", got)
 	}
 	if msg := keyedBackendsMessage(got); !strings.Contains(msg, `"a"`) || !strings.Contains(msg, "apiKeySecretRef") ||
-		!strings.Contains(msg, "--api-key") {
-		t.Errorf("message %q does not name the backend and both keying forms", msg)
+		!strings.Contains(msg, "--api-key") || !strings.Contains(msg, "VLLM_API_KEY") {
+		t.Errorf("message %q does not name the backend and all keying forms", msg)
 	}
 }
 
@@ -355,7 +355,8 @@ func TestBackendsReadyConditionKeyedPool(t *testing.T) {
 		KeyedPoolBackends: []string{"a"},
 	})
 	if ready || reason != ModelRouterReasonBackendAPIKeyUnsupported ||
-		!strings.Contains(msg, `"a"`) || !strings.Contains(msg, "ModelPool") {
+		!strings.Contains(msg, `"a"`) || !strings.Contains(msg, "ModelPool") ||
+		!strings.Contains(msg, "VLLM_API_KEY") {
 		t.Errorf("pool-only case = (%v, %q, %q), want not ready, BackendAPIKeyUnsupported, naming a and the pool", ready, reason, msg)
 	}
 	ready, reason, msg = backendsReadyCondition(&compiledConfig{
@@ -364,7 +365,8 @@ func TestBackendsReadyConditionKeyedPool(t *testing.T) {
 		KeyedPoolBackends: []string{"b"},
 	})
 	if ready || reason != ModelRouterReasonBackendAPIKeyUnsupported ||
-		!strings.Contains(msg, `"a"`) || !strings.Contains(msg, `"b"`) {
+		!strings.Contains(msg, `"a"`) || !strings.Contains(msg, `"b"`) ||
+		!strings.Contains(msg, "VLLM_API_KEY") {
 		t.Errorf("combined case = (%v, %q, %q), want not ready, BackendAPIKeyUnsupported, naming a and b", ready, reason, msg)
 	}
 }

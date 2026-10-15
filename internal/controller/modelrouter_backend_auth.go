@@ -31,9 +31,9 @@ import (
 
 // ModelRouterReasonBackendAPIKeyUnsupported marks a router with a backend
 // InferenceService that requires an API key: spec.endpoint.apiKeySecretRef,
-// --api-key in spec.extraArgs, or --api-key in spec.args with spec.command
-// set. No data plane forwards that key yet, so every request to it would get
-// 401.
+// --api-key in spec.extraArgs, --api-key in spec.args with spec.command set,
+// or VLLM_API_KEY in spec.env (vLLM). No data plane forwards that key yet, so
+// every request to it would get 401.
 //
 //nolint:gosec // G101: condition reason string, not a credential value
 const ModelRouterReasonBackendAPIKeyUnsupported = "BackendAPIKeyUnsupported"
@@ -41,7 +41,7 @@ const ModelRouterReasonBackendAPIKeyUnsupported = "BackendAPIKeyUnsupported"
 // keyedBackends returns the sorted names of InferenceServiceRef backends whose
 // InferenceService requires an API key in any form a user can set it. The
 // verdict must come from inferenceServiceRequiresAPIKey, the same helper the
-// LoRAAdapter refusal and the endpoint wiring use, so all consumers agree on
+// LoRAAdapter load refusal and unload gate use, so all consumers agree on
 // what keyed means. A backend whose InferenceService does not exist is not
 // keyed; the resolver reports it.
 func keyedBackends(ctx context.Context, c client.Reader, mr *inferencev1alpha1.ModelRouter) ([]string, error) {
@@ -67,15 +67,15 @@ func keyedBackends(ctx context.Context, c client.Reader, mr *inferencev1alpha1.M
 	return names, nil
 }
 
-// keyedBackendsMessage names the backends and both ways an InferenceService
-// can require a key; tests pin the apiKeySecretRef substring.
+// keyedBackendsMessage names the backends and all three keying forms; tests
+// pin the apiKeySecretRef and VLLM_API_KEY substrings.
 func keyedBackendsMessage(names []string) string {
 	quoted := make([]string, len(names))
 	for i, n := range names {
 		quoted[i] = fmt.Sprintf("%q", n)
 	}
 	return fmt.Sprintf("backend(s) %s point at an InferenceService that requires an API key "+
-		"(spec.endpoint.apiKeySecretRef or --api-key); ModelRouter does not forward that key yet, "+
+		"(spec.endpoint.apiKeySecretRef, --api-key, or VLLM_API_KEY in spec.env (vLLM)); ModelRouter does not forward that key yet, "+
 		"so requests would get 401. Remove the key "+
 		"from the InferenceService or route to it directly", strings.Join(quoted, ", "))
 }
@@ -134,14 +134,14 @@ func keyedVerdictMessage(names, poolNames []string) string {
 	switch {
 	case len(names) > 0 && len(poolNames) > 0:
 		cause = fmt.Sprintf("backend(s) %s point at an InferenceService that requires an API key "+
-			"(spec.endpoint.apiKeySecretRef or --api-key), and backend(s) %s front a pool containing one",
+			"(spec.endpoint.apiKeySecretRef, --api-key, or VLLM_API_KEY in spec.env (vLLM)), and backend(s) %s front a pool containing one",
 			quoted(names), quoted(poolNames))
 	case len(poolNames) > 0:
 		cause = fmt.Sprintf("backend(s) %s front a ModelPool containing a member whose InferenceService "+
-			"requires an API key (spec.endpoint.apiKeySecretRef or --api-key)", quoted(poolNames))
+			"requires an API key (spec.endpoint.apiKeySecretRef, --api-key, or VLLM_API_KEY in spec.env (vLLM))", quoted(poolNames))
 	default:
 		cause = fmt.Sprintf("backend(s) %s point at an InferenceService that requires an API key "+
-			"(spec.endpoint.apiKeySecretRef or --api-key)", quoted(names))
+			"(spec.endpoint.apiKeySecretRef, --api-key, or VLLM_API_KEY in spec.env (vLLM))", quoted(names))
 	}
 	return cause + "; ModelRouter does not forward that key yet, so requests would get 401. " +
 		"Remove the key from the InferenceService or route to it directly"
