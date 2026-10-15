@@ -30,15 +30,20 @@ import (
 )
 
 // ModelRouterReasonBackendAPIKeyUnsupported marks a router with a backend
-// InferenceService that requires an API key (spec.endpoint.apiKeySecretRef).
-// No data plane forwards that key yet, so every request to it would get 401.
+// InferenceService that requires an API key: spec.endpoint.apiKeySecretRef,
+// --api-key in spec.extraArgs, or --api-key in spec.args with spec.command
+// set. No data plane forwards that key yet, so every request to it would get
+// 401.
 //
 //nolint:gosec // G101: condition reason string, not a credential value
 const ModelRouterReasonBackendAPIKeyUnsupported = "BackendAPIKeyUnsupported"
 
 // keyedBackends returns the sorted names of InferenceServiceRef backends whose
-// InferenceService sets spec.endpoint.apiKeySecretRef. A backend whose
-// InferenceService does not exist is not keyed; the resolver reports it.
+// InferenceService requires an API key in any form a user can set it. The
+// verdict must come from inferenceServiceRequiresAPIKey, the same helper the
+// LoRAAdapter refusal and the endpoint wiring use, so all consumers agree on
+// what keyed means. A backend whose InferenceService does not exist is not
+// keyed; the resolver reports it.
 func keyedBackends(ctx context.Context, c client.Reader, mr *inferencev1alpha1.ModelRouter) ([]string, error) {
 	var names []string
 	for i := range mr.Spec.Backends {
@@ -54,7 +59,7 @@ func keyedBackends(ctx context.Context, c client.Reader, mr *inferencev1alpha1.M
 		if err != nil {
 			return nil, fmt.Errorf("get InferenceService %s/%s: %w", mr.Namespace, b.InferenceServiceRef.Name, err)
 		}
-		if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.APIKeySecretRef != nil {
+		if inferenceServiceRequiresAPIKey(isvc) {
 			names = append(names, b.Name)
 		}
 	}
@@ -62,12 +67,15 @@ func keyedBackends(ctx context.Context, c client.Reader, mr *inferencev1alpha1.M
 	return names, nil
 }
 
+// keyedBackendsMessage names the backends and both ways an InferenceService
+// can require a key; tests pin the apiKeySecretRef substring.
 func keyedBackendsMessage(names []string) string {
 	quoted := make([]string, len(names))
 	for i, n := range names {
 		quoted[i] = fmt.Sprintf("%q", n)
 	}
-	return fmt.Sprintf("backend(s) %s point at an InferenceService with spec.endpoint.apiKeySecretRef; "+
-		"ModelRouter does not forward that key yet, so requests would get 401. Remove the key "+
+	return fmt.Sprintf("backend(s) %s point at an InferenceService that requires an API key "+
+		"(spec.endpoint.apiKeySecretRef or --api-key); ModelRouter does not forward that key yet, "+
+		"so requests would get 401. Remove the key "+
 		"from the InferenceService or route to it directly", strings.Join(quoted, ", "))
 }

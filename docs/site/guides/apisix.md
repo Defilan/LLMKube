@@ -1155,9 +1155,11 @@ LLMKube:
   keyed InferenceService.
 - **ModelRouter does not forward the key yet.** A
   [ModelRouter](../concepts/model-router) with a backend whose InferenceService
-  sets `apiKeySecretRef` reports reason `BackendAPIKeyUnsupported`, naming the
+  requires an API key reports reason `BackendAPIKeyUnsupported`, naming the
   backends, on `BackendsReady` (Proxy data plane), `GatewayReady` (Gateway) or
-  `AgentGatewayReady` (AgentGateway). Route to keyed InferenceServices from
-  APISIX directly.
+  `AgentGatewayReady` (AgentGateway). An InferenceService requires a key when
+  it sets `apiKeySecretRef`, passes `--api-key` in `spec.extraArgs`, or passes
+  `--api-key` in `spec.args` with `spec.command` set. Route to keyed
+  InferenceServices from APISIX directly.
 - `externalTrafficPolicy` is not applied to Services relayed to the macOS
   Metal agent.
