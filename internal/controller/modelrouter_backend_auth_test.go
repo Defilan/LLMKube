@@ -76,8 +76,58 @@ func TestKeyedBackends(t *testing.T) {
 	if !slices.Equal(got, []string{"a"}) {
 		t.Errorf("keyedBackends = %v, want [a]", got)
 	}
-	if msg := keyedBackendsMessage(got); !strings.Contains(msg, `"a"`) || !strings.Contains(msg, "apiKeySecretRef") {
-		t.Errorf("message %q does not name the backend and the field", msg)
+	if msg := keyedBackendsMessage(got); !strings.Contains(msg, `"a"`) || !strings.Contains(msg, "apiKeySecretRef") ||
+		!strings.Contains(msg, "--api-key") {
+		t.Errorf("message %q does not name the backend and both keying forms", msg)
+	}
+}
+
+// TestKeyedBackendsCommandLineKey pins the command-line keying forms: a
+// backend keyed through --api-key must fail the router the same way
+// apiKeySecretRef does, and spec.args only counts when spec.command is set
+// (the runtimes drop spec.args otherwise).
+func TestKeyedBackendsCommandLineKey(t *testing.T) {
+	withCommandArgs := func(command []string) *inferencev1alpha1.InferenceService {
+		isvc := keyedISvc(RuntimeSGLANG)
+		isvc.Spec.Endpoint = nil
+		isvc.Spec.Command = command
+		isvc.Spec.Args = []string{"--api-key", "$(MY_KEY)"}
+		return isvc
+	}
+	flagOnly := keyedISvc(RuntimeVLLM, "--api-key", "$(MY_KEY)")
+	flagOnly.Spec.Endpoint = nil
+	for _, tc := range []struct {
+		name string
+		isvc *inferencev1alpha1.InferenceService
+		want bool
+	}{
+		{"--api-key in extraArgs, split form", flagOnly, true},
+		{"--api-key= in extraArgs, inline form", func() *inferencev1alpha1.InferenceService {
+			isvc := keyedISvc(RuntimeVLLM, "--api-key=$(MY_KEY)")
+			isvc.Spec.Endpoint = nil
+			return isvc
+		}(), true},
+		{"spec.args flag with spec.command", withCommandArgs([]string{"python3", "-m", "sglang.launch_server"}), true},
+		{"spec.args flag without spec.command", withCommandArgs(nil), false},
+		{"unrelated extraArgs", func() *inferencev1alpha1.InferenceService {
+			isvc := keyedISvc(RuntimeVLLM, "--host", "0.0.0.0")
+			isvc.Spec.Endpoint = nil
+			return isvc
+		}(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(routerScheme(t)).WithObjects(tc.isvc).Build()
+			got, err := keyedBackends(context.Background(), c, routerWithLocal("b", "svc"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want && !slices.Equal(got, []string{"b"}) {
+				t.Errorf("keyedBackends = %v, want [b]", got)
+			}
+			if !tc.want && len(got) != 0 {
+				t.Errorf("keyedBackends = %v, want none", got)
+			}
+		})
 	}
 }
 
@@ -133,6 +183,64 @@ func TestModelRouterReconcileProxyKeyedBackend(t *testing.T) {
 					LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-key"}, Key: "key",
 				},
 			},
+		},
+	}
+	if err := c.Create(context.Background(), isvc); err != nil {
+		t.Fatalf("create keyed backend isvc: %v", err)
+	}
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "keyed-router", Namespace: ns},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneProxy,
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "keyed-vllm", InferenceServiceRef: &corev1.LocalObjectReference{Name: "keyed-vllm"}},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{Name: "all", Route: inferencev1alpha1.RuleRoute{Backends: []string{"keyed-vllm"}}},
+			},
+			DefaultRoute: "keyed-vllm",
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := &ModelRouterReconciler{Client: c, Scheme: clientgoscheme.Scheme, RouterProxyImage: "test-image"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterConditionBackendsReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ModelRouterReasonBackendAPIKeyUnsupported {
+		t.Fatalf("BackendsReady = %+v, want False/%s", cond, ModelRouterReasonBackendAPIKeyUnsupported)
+	}
+	if !strings.Contains(cond.Message, `"keyed-vllm"`) {
+		t.Errorf("BackendsReady message %q does not name the backend", cond.Message)
+	}
+}
+
+// TestModelRouterReconcileProxyKeyedExtraArgsBackend drives the same proxy
+// Reconcile with the key passed on the command line instead of
+// apiKeySecretRef: the verdict must survive the status write and read back
+// from the stored ModelRouter.
+func TestModelRouterReconcileProxyKeyedExtraArgsBackend(t *testing.T) {
+	c, _, stop := startBudgetTestEnv(t)
+	defer stop()
+	ns := newTestNamespace(t, c)
+
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "keyed-vllm", Namespace: ns},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:  "keyed-vllm",
+			Runtime:   RuntimeVLLM,
+			ExtraArgs: []string{"--api-key", "$(MY_KEY)"},
+			Endpoint:  &inferencev1alpha1.EndpointSpec{Port: 8080},
 		},
 	}
 	if err := c.Create(context.Background(), isvc); err != nil {
