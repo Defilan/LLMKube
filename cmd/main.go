@@ -46,6 +46,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -57,6 +58,7 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/controller"
 	_ "github.com/defilantech/llmkube/internal/metrics" // Register custom Prometheus metrics
+	"github.com/defilantech/llmkube/internal/watchcanary"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -282,6 +284,28 @@ func main() {
 			"without repeating the URL on every ModelRouter. Empty means "+
 			"users must specify url explicitly.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	var watchCanaryInterval time.Duration
+	var watchCanaryFailAfter time.Duration
+	var watchCanaryNamespace string
+	flag.DurationVar(&watchCanaryInterval, "watch-canary-interval", 60*time.Second,
+		"How often the watch canary renews its Lease in the operator's own namespace and expects the "+
+			"manager's own informer to deliver the write back (#2069). An operator whose informers stop "+
+			"delivering events keeps serving probes and webhooks while every controller goes silent, so "+
+			"spec changes are silently ignored; the canary fails the liveness check when a write goes "+
+			"unobserved, and the kubelet restarts the pod. 0 disables the canary.")
+	flag.DurationVar(&watchCanaryFailAfter, "watch-canary-fail-after", 5*time.Minute,
+		"How long an unobserved watch-canary write fails the liveness check. Must exceed "+
+			"--watch-canary-interval: one missed event must not restart the pod.")
+	flag.StringVar(&watchCanaryNamespace, "watch-canary-namespace", "",
+		"Namespace for the watch-canary Lease. Empty (the default) resolves to --leader-election-namespace, "+
+			"then POD_NAMESPACE, then the pod's projected serviceaccount namespace; if none resolve, the "+
+			"canary is disabled with a warning.")
+	var reconcileTimeout time.Duration
+	flag.DurationVar(&reconcileTimeout, "reconcile-timeout", 15*time.Minute,
+		"Deadline for a single reconcile of the Model and InferenceService controllers, so a call that "+
+			"never returns (to the API server or to a pod endpoint) cannot hold a worker forever (#2069). "+
+			"On expiry the reconcile is cancelled and returned as an error, so the workqueue requeues the "+
+			"object with backoff and the controller's error metric moves. 0 disables the deadline.")
 	var enablePyrraSLO bool
 	flag.BoolVar(&enablePyrraSLO, "enable-pyrra-slo", false,
 		"Enable rendering Pyrra ServiceLevelObjective resources for InferenceServices with spec.slo. "+
@@ -487,9 +511,25 @@ func main() {
 	}
 
 	mgrCfg := ctrl.GetConfigOrDie()
+
+	// The watch canary (#2069) scopes the manager's Lease informer to exactly
+	// its own lease: ByObject keys by GVK, so this must never cover a GVK
+	// another controller watches (the ModelRouter and the CA-cert path watch
+	// ConfigMaps; nothing else watches Leases). Scope only when enabled.
+	var cacheOpts cache.Options
+	canaryNamespace := watchcanary.ResolveNamespace(watchCanaryNamespace, leaderElectionNamespace)
+	if watchCanaryInterval > 0 {
+		if canaryNamespace == "" {
+			setupLog.Info("watch canary disabled: no namespace could be resolved; set --watch-canary-namespace")
+		} else {
+			cacheOpts = watchcanary.CacheScope(canaryNamespace)
+		}
+	}
+
 	mgr, err := ctrl.NewManager(mgrCfg, ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsServerOptions,
+		Cache:                   cacheOpts,
 		WebhookServer:           webhookServer,
 		HealthProbeBindAddress:  probeAddr,
 		LeaderElection:          enableLeaderElection,
@@ -510,6 +550,32 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	// The watch canary (#2069): renew a Lease in the operator's own namespace
+	// and require the manager's own informer to deliver the write back. The
+	// event handler must be attached before the manager starts, so New runs
+	// here rather than inside a runnable; the write loop is the runnable and
+	// starts with leadership.
+	var canary *watchcanary.Canary
+	if watchCanaryInterval > 0 && canaryNamespace != "" {
+		canary, err = watchcanary.New(watchcanary.Options{
+			Namespace: canaryNamespace,
+			Interval:  watchCanaryInterval,
+			FailAfter: watchCanaryFailAfter,
+			Reader:    mgr.GetAPIReader(),
+			Writer:    mgr.GetClient(),
+			Cache:     mgr.GetCache(),
+			Log:       ctrl.Log.WithName("watch-canary"),
+		})
+		if err != nil {
+			setupLog.Error(err, "unable to create the watch canary")
+			os.Exit(1)
+		}
+		if err := mgr.Add(canary); err != nil {
+			setupLog.Error(err, "unable to add the watch canary")
+			os.Exit(1)
+		}
 	}
 
 	// A clientset for pod-log reads, backing the offload surface on
@@ -556,46 +622,54 @@ func main() {
 			"allowConditions", modelAttestationAllowConditions, "maxAge", modelAttestationMaxAge)
 	}
 
-	if err := (&controller.ModelReconciler{
-		Client:               mgr.GetClient(),
-		APIReader:            mgr.GetAPIReader(),
-		Attestation:          attestationPolicy,
-		Scheme:               mgr.GetScheme(),
-		StoragePath:          modelCachePath,
-		RevalidateInterval:   modelRevalidateInterval,
-		ServerVersion:        serverVersion,
-		AllowedHostPathRoots: allowedHostPathRootList,
-		AllowedRemoteHosts:   allowedRemoteHostList,
-		InitContainerImage:   initContainerImage,
-		CACertConfigMap:      caCertConfigMap,
-		Recorder:             mgr.GetEventRecorder("model-controller"),
-		DefaultFSGroup:       defaultFSGroup,
-		ModelCacheSize:       modelCacheSize,
-		ModelCacheClass:      modelCacheClass,
-		ModelCacheAccessMode: modelCacheAccessMode,
+	if err := (&controller.DeadlineReconciler{
+		Timeout: reconcileTimeout,
+		Log:     ctrl.Log.WithName("model"),
+		Inner: &controller.ModelReconciler{
+			Client:               mgr.GetClient(),
+			APIReader:            mgr.GetAPIReader(),
+			Attestation:          attestationPolicy,
+			Scheme:               mgr.GetScheme(),
+			StoragePath:          modelCachePath,
+			RevalidateInterval:   modelRevalidateInterval,
+			ServerVersion:        serverVersion,
+			AllowedHostPathRoots: allowedHostPathRootList,
+			AllowedRemoteHosts:   allowedRemoteHostList,
+			InitContainerImage:   initContainerImage,
+			CACertConfigMap:      caCertConfigMap,
+			Recorder:             mgr.GetEventRecorder("model-controller"),
+			DefaultFSGroup:       defaultFSGroup,
+			ModelCacheSize:       modelCacheSize,
+			ModelCacheClass:      modelCacheClass,
+			ModelCacheAccessMode: modelCacheAccessMode,
+		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Model")
 		os.Exit(1)
 	}
-	if err := (&controller.InferenceServiceReconciler{
-		Client:                mgr.GetClient(),
-		Scheme:                mgr.GetScheme(),
-		Recorder:              mgr.GetEventRecorder("inferenceservice-controller"),
-		ModelCachePath:        modelCachePath,
-		ModelCacheSize:        modelCacheSize,
-		ModelCacheClass:       modelCacheClass,
-		ModelCacheAccessMode:  modelCacheAccessMode,
-		ModelCacheMode:        modelCacheMode,
-		CACertConfigMap:       caCertConfigMap,
-		InitContainerImage:    initContainerImage,
-		DefaultFSGroup:        defaultFSGroup,
-		DRIRenderGID:          driRenderGID,
-		EmitScrapeAnnotations: emitScrapeAnnotations,
-		AllowedHostPathRoots:  allowedHostPathRootList,
-		GPUSharingSharedPool:  gpuSharingSharedPool,
-		RuntimeImageOverrides: runtimeImageOverrides,
-		PodLogReader:          podLogReader,
-		RelayImage:            routerProxyImage,
+	if err := (&controller.DeadlineReconciler{
+		Timeout: reconcileTimeout,
+		Log:     ctrl.Log.WithName("inferenceservice"),
+		Inner: &controller.InferenceServiceReconciler{
+			Client:                mgr.GetClient(),
+			Scheme:                mgr.GetScheme(),
+			Recorder:              mgr.GetEventRecorder("inferenceservice-controller"),
+			ModelCachePath:        modelCachePath,
+			ModelCacheSize:        modelCacheSize,
+			ModelCacheClass:       modelCacheClass,
+			ModelCacheAccessMode:  modelCacheAccessMode,
+			ModelCacheMode:        modelCacheMode,
+			CACertConfigMap:       caCertConfigMap,
+			InitContainerImage:    initContainerImage,
+			DefaultFSGroup:        defaultFSGroup,
+			DRIRenderGID:          driRenderGID,
+			EmitScrapeAnnotations: emitScrapeAnnotations,
+			AllowedHostPathRoots:  allowedHostPathRootList,
+			GPUSharingSharedPool:  gpuSharingSharedPool,
+			RuntimeImageOverrides: runtimeImageOverrides,
+			PodLogReader:          podLogReader,
+			RelayImage:            routerProxyImage,
+		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
 		os.Exit(1)
@@ -773,6 +847,15 @@ func main() {
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
+	}
+	if canary != nil {
+		// Liveness only: a stalled watch is a restart, not a readiness flap.
+		// Failing readiness would pull the pod out of the webhook Service's
+		// endpoints and turn a recoverable stall into an admission outage.
+		if err := mgr.AddHealthzCheck("watch-canary", canary.LivenessCheck()); err != nil {
+			setupLog.Error(err, "unable to set up the watch canary health check")
+			os.Exit(1)
+		}
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
