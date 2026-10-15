@@ -77,8 +77,8 @@ func TestKeyedBackends(t *testing.T) {
 		t.Errorf("keyedBackends = %v, want [a]", got)
 	}
 	if msg := keyedBackendsMessage(got); !strings.Contains(msg, `"a"`) || !strings.Contains(msg, "apiKeySecretRef") ||
-		!strings.Contains(msg, "--api-key") {
-		t.Errorf("message %q does not name the backend and both keying forms", msg)
+		!strings.Contains(msg, "--api-key") || !strings.Contains(msg, "VLLM_API_KEY") {
+		t.Errorf("message %q does not name the backend and all keying forms", msg)
 	}
 }
 
@@ -131,6 +131,22 @@ func TestKeyedBackendsCommandLineKey(t *testing.T) {
 	}
 }
 
+// TestKeyedBackendsEnvKey pins the router-side path for the vLLM env-var
+// keying form: keyedBackends must inherit the widened helper verdict.
+func TestKeyedBackendsEnvKey(t *testing.T) {
+	isvc := keyedISvc(RuntimeVLLM)
+	isvc.Spec.Endpoint = nil
+	isvc.Spec.Env = []corev1.EnvVar{{Name: vllmAPIKeyEnv, Value: "sk"}}
+	c := fake.NewClientBuilder().WithScheme(routerScheme(t)).WithObjects(isvc).Build()
+	got, err := keyedBackends(context.Background(), c, routerWithLocal("b", "svc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []string{"b"}) {
+		t.Errorf("keyedBackends = %v, want [b]", got)
+	}
+}
+
 func TestBackendsReadyConditionKeyed(t *testing.T) {
 	cc := &compiledConfig{
 		Backends:      []inferencev1alpha1.BackendStatus{{Name: "a", Healthy: false}},
@@ -139,6 +155,11 @@ func TestBackendsReadyConditionKeyed(t *testing.T) {
 	ready, reason, msg := backendsReadyCondition(cc)
 	if ready || reason != ModelRouterReasonBackendAPIKeyUnsupported || !strings.Contains(msg, `"a"`) {
 		t.Errorf("got (%v, %q, %q), want not ready, BackendAPIKeyUnsupported, naming a", ready, reason, msg)
+	}
+	// The condition and the gateway controllers hand-maintain one sentence:
+	// the reference-only case must stay byte-identical to keyedBackendsMessage.
+	if keyedVerdictMessage([]string{"a"}, nil) != keyedBackendsMessage([]string{"a"}) {
+		t.Error("keyedVerdictMessage reference-only case drifted from keyedBackendsMessage")
 	}
 	ready, reason, _ = backendsReadyCondition(&compiledConfig{
 		Backends: []inferencev1alpha1.BackendStatus{{Name: "a", Healthy: true}},
@@ -280,5 +301,157 @@ func TestModelRouterReconcileProxyKeyedExtraArgsBackend(t *testing.T) {
 	}
 	if !strings.Contains(cond.Message, `"keyed-vllm"`) {
 		t.Errorf("BackendsReady message %q does not name the backend", cond.Message)
+	}
+}
+
+// TestCompileRouterConfigMarksKeyedPoolSibling covers the pool-expansion gap:
+// the referenced member is open, but a sibling in its ModelPool requires a key
+// the proxy does not forward, so the backend must fail loud.
+func TestCompileRouterConfigMarksKeyedPoolSibling(t *testing.T) {
+	open := keyedISvc(RuntimeVLLM)
+	open.Name = "open"
+	open.Spec.Endpoint = &inferencev1alpha1.EndpointSpec{Port: 8080}
+	keyed := keyedISvc(RuntimeVLLM, "--api-key", "$(MY_KEY)")
+	keyed.Name = "keyed"
+	keyed.Spec.Endpoint = nil
+	pool := &inferencev1alpha1.ModelPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: "default"},
+		Spec: inferencev1alpha1.ModelPoolSpec{
+			SwapPolicy: inferencev1alpha1.ModelPoolSwapPolicySticky,
+			Members: []inferencev1alpha1.ModelPoolMember{
+				{InferenceServiceRef: corev1.LocalObjectReference{Name: "open"}},
+				{InferenceServiceRef: corev1.LocalObjectReference{Name: "keyed"}},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(routerScheme(t)).WithObjects(open, keyed, pool).Build()
+	r := &ModelRouterReconciler{Client: c}
+	// Spec order z-pooled then a-pooled: the compile must report the pair in
+	// sorted order, matching the KeyedPoolBackends contract.
+	mr := routerWithLocal("z-pooled", "open")
+	mr.Spec.Backends = append(mr.Spec.Backends,
+		inferencev1alpha1.RouterBackend{Name: "a-pooled", InferenceServiceRef: &corev1.LocalObjectReference{Name: "open"}})
+	cc, err := r.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(cc.KeyedPoolBackends, []string{"a-pooled", "z-pooled"}) ||
+		slices.Contains(cc.KeyedBackends, "a-pooled") || slices.Contains(cc.KeyedBackends, "z-pooled") {
+		t.Errorf("compiled = keyed %v pool %v; want both backends keyed via pool only, in sorted order",
+			cc.KeyedBackends, cc.KeyedPoolBackends)
+	}
+	for _, status := range cc.Backends {
+		if status.Healthy || !strings.Contains(status.Message, `"pool"`) || !strings.Contains(status.Message, `"keyed"`) {
+			t.Errorf("backend %q status %+v; want unhealthy, naming pool and keyed member", status.Name, status)
+		}
+	}
+}
+
+// TestBackendsReadyConditionKeyedPool pins the condition message for the
+// pool-sibling path, alone and combined with the reference-keyed case.
+func TestBackendsReadyConditionKeyedPool(t *testing.T) {
+	ready, reason, msg := backendsReadyCondition(&compiledConfig{
+		Backends:          []inferencev1alpha1.BackendStatus{{Name: "a", Healthy: false}},
+		KeyedPoolBackends: []string{"a"},
+	})
+	if ready || reason != ModelRouterReasonBackendAPIKeyUnsupported ||
+		!strings.Contains(msg, `"a"`) || !strings.Contains(msg, "ModelPool") ||
+		!strings.Contains(msg, "VLLM_API_KEY") {
+		t.Errorf("pool-only case = (%v, %q, %q), want not ready, BackendAPIKeyUnsupported, naming a and the pool", ready, reason, msg)
+	}
+	ready, reason, msg = backendsReadyCondition(&compiledConfig{
+		Backends:          []inferencev1alpha1.BackendStatus{{Name: "a", Healthy: false}, {Name: "b", Healthy: false}},
+		KeyedBackends:     []string{"a"},
+		KeyedPoolBackends: []string{"b"},
+	})
+	if ready || reason != ModelRouterReasonBackendAPIKeyUnsupported ||
+		!strings.Contains(msg, `"a"`) || !strings.Contains(msg, `"b"`) ||
+		!strings.Contains(msg, "VLLM_API_KEY") {
+		t.Errorf("combined case = (%v, %q, %q), want not ready, BackendAPIKeyUnsupported, naming a and b", ready, reason, msg)
+	}
+}
+
+// TestModelRouterReconcileProxyKeyedPoolSibling drives the real Proxy-mode
+// Reconcile against an API server with a keyed pool sibling: the verdict must
+// survive the status write and read back from the stored ModelRouter.
+func TestModelRouterReconcileProxyKeyedPoolSibling(t *testing.T) {
+	c, _, stop := startBudgetTestEnv(t)
+	defer stop()
+	ns := newTestNamespace(t, c)
+
+	open := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "open-vllm", Namespace: ns},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "open-vllm",
+			Runtime:  RuntimeVLLM,
+			Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+		},
+	}
+	keyed := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "keyed-vllm", Namespace: ns},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:  "keyed-vllm",
+			Runtime:   RuntimeVLLM,
+			ExtraArgs: []string{"--api-key", "$(MY_KEY)"},
+			Endpoint:  &inferencev1alpha1.EndpointSpec{Port: 8080},
+		},
+	}
+	for _, isvc := range []*inferencev1alpha1.InferenceService{open, keyed} {
+		if err := c.Create(context.Background(), isvc); err != nil {
+			t.Fatalf("create %s: %v", isvc.Name, err)
+		}
+	}
+	pool := &inferencev1alpha1.ModelPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "sibling-pool", Namespace: ns},
+		Spec: inferencev1alpha1.ModelPoolSpec{
+			SwapPolicy: inferencev1alpha1.ModelPoolSwapPolicySticky,
+			Members: []inferencev1alpha1.ModelPoolMember{
+				{InferenceServiceRef: corev1.LocalObjectReference{Name: "open-vllm"}},
+				{InferenceServiceRef: corev1.LocalObjectReference{Name: "keyed-vllm"}},
+			},
+			Default: "open-vllm",
+		},
+	}
+	if err := c.Create(context.Background(), pool); err != nil {
+		t.Fatalf("create modelpool: %v", err)
+	}
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-router", Namespace: ns},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane: inferencev1alpha1.ModelRouterDataPlaneProxy,
+			Backends: []inferencev1alpha1.RouterBackend{
+				{Name: "open-vllm", InferenceServiceRef: &corev1.LocalObjectReference{Name: "open-vllm"}},
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{Name: "all", Route: inferencev1alpha1.RuleRoute{Backends: []string{"open-vllm"}}},
+			},
+			DefaultRoute: "open-vllm",
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+
+	r := &ModelRouterReconciler{Client: c, Scheme: clientgoscheme.Scheme, RouterProxyImage: "test-image"}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Name: mr.Name, Namespace: ns},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterConditionBackendsReady)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ModelRouterReasonBackendAPIKeyUnsupported {
+		t.Fatalf("BackendsReady = %+v, want False/%s", cond, ModelRouterReasonBackendAPIKeyUnsupported)
+	}
+	if !strings.Contains(cond.Message, `"open-vllm"`) || !strings.Contains(cond.Message, "ModelPool") {
+		t.Errorf("BackendsReady message %q does not name the backend and the pool", cond.Message)
+	}
+	if len(fresh.Status.Backends) != 1 || fresh.Status.Backends[0].Healthy ||
+		!strings.Contains(fresh.Status.Backends[0].Message, `"keyed-vllm"`) {
+		t.Errorf("status.backends = %+v, want open-vllm unhealthy with the keyed sibling named", fresh.Status.Backends)
 	}
 }

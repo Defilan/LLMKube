@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
+
 	corev1 "k8s.io/api/core/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -45,9 +47,10 @@ func endpointAPIKeyRef(isvc *inferencev1alpha1.InferenceService) *corev1.SecretK
 
 // inferenceServiceRequiresAPIKey reports whether the server answers 401 to a
 // request without the key, in any form a user can set it: apiKeySecretRef,
-// --api-key in extraArgs, or --api-key in spec.args, which the native runtimes
-// pass through only when spec.command is set. endpointAPIKeyRef is not enough:
-// it returns nil when extraArgs already carries the flag.
+// --api-key in extraArgs, --api-key in spec.args, which the native runtimes
+// pass through only when spec.command is set, or a hand-set VLLM_API_KEY in
+// spec.env. endpointAPIKeyRef is not enough: it returns nil when extraArgs
+// already carries the flag.
 func inferenceServiceRequiresAPIKey(isvc *inferencev1alpha1.InferenceService) bool {
 	if isvc == nil {
 		return false
@@ -58,7 +61,15 @@ func inferenceServiceRequiresAPIKey(isvc *inferencev1alpha1.InferenceService) bo
 	if hasMatchingExtraArg(isvc.Spec.ExtraArgs, "api-key") {
 		return true
 	}
-	return len(isvc.Spec.Command) > 0 && hasMatchingExtraArg(isvc.Spec.Args, "api-key")
+	if len(isvc.Spec.Command) > 0 && hasMatchingExtraArg(isvc.Spec.Args, "api-key") {
+		return true
+	}
+	// The env check is vLLM-only because the default runtime is llama.cpp,
+	// which ignores the variable. Presence is the verdict: the vLLM docs do
+	// not pin what an empty value does, and resolving valueFrom would need
+	// Secret reads the detector must not make.
+	return isvc.Spec.Runtime == RuntimeVLLM &&
+		slices.ContainsFunc(isvc.Spec.Env, func(e corev1.EnvVar) bool { return e.Name == vllmAPIKeyEnv })
 }
 
 // apiKeyEnvVar renders the key as a non-optional secretKeyRef: a missing Secret

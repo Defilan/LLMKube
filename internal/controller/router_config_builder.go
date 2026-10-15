@@ -63,6 +63,13 @@ type compiledConfig struct {
 	// KeyedBackends holds the sorted names of backends whose InferenceService
 	// requires an API key the proxy does not forward (see keyedBackends).
 	KeyedBackends []string
+
+	// KeyedPoolBackends holds the sorted names of backends that are keyed only
+	// because a sibling member of their ModelPool requires an API key. Pool
+	// siblings are reachable only through the Proxy data plane, which is why
+	// this check lives in the compile and not in keyedBackends, which all
+	// three data planes share.
+	KeyedPoolBackends []string
 }
 
 // compileRouterConfig resolves every backend in the ModelRouter spec
@@ -92,6 +99,7 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 	if err != nil {
 		return nil, err
 	}
+	var keyedPool []string
 
 	for i := range mr.Spec.Backends {
 		b := &mr.Spec.Backends[i]
@@ -99,6 +107,16 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 		if slices.Contains(keyed, b.Name) {
 			status.Healthy = false
 			status.Message = appendMsg(status.Message, keyedBackendsMessage([]string{b.Name}))
+		} else if wire.Pool != nil && b.InferenceServiceRef != nil {
+			siblings, serr := keyedPoolMembers(ctx, r.Client, mr.Namespace, b.InferenceServiceRef.Name, wire.Pool.Members)
+			if serr != nil {
+				return nil, serr
+			}
+			if len(siblings) > 0 {
+				keyedPool = append(keyedPool, b.Name)
+				status.Healthy = false
+				status.Message = appendMsg(status.Message, keyedPoolMembersMessage(wire.Pool.Name, siblings))
+			}
 		}
 		if status.Message != "" {
 			warnings = append(warnings, fmt.Sprintf("backend %q: %s", b.Name, status.Message))
@@ -106,6 +124,7 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 		out.Backends = append(out.Backends, wire)
 		statuses = append(statuses, status)
 	}
+	slices.Sort(keyedPool)
 	hasPools := false
 	for i := range out.Backends {
 		if out.Backends[i].Pool != nil {
@@ -129,12 +148,13 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 	sum := sha256.Sum256(data)
 
 	return &compiledConfig{
-		JSON:          data,
-		Hash:          hex.EncodeToString(sum[:]),
-		Backends:      statuses,
-		Warnings:      warnings,
-		HasPools:      hasPools,
-		KeyedBackends: keyed,
+		JSON:              data,
+		Hash:              hex.EncodeToString(sum[:]),
+		Backends:          statuses,
+		Warnings:          warnings,
+		HasPools:          hasPools,
+		KeyedBackends:     keyed,
+		KeyedPoolBackends: keyedPool,
 	}, nil
 }
 

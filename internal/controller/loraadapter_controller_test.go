@@ -289,58 +289,73 @@ func TestLoRAAdapterController_LoadsAgainstSGLang(t *testing.T) {
 
 // TestLoRAAdapterController_RuntimeMismatch verifies that referencing
 // a non-sglang InferenceService sets Available=False with
-// RuntimeMismatch and never tries to talk to any HTTP endpoint.
+// RuntimeMismatch and never tries to talk to any HTTP endpoint. The
+// env-keyed row pins the gate ordering in reconcileLoad: the keyed check
+// behind inferenceServiceRequiresAPIKey is unreachable for non-sglang
+// runtimes, so a vLLM service keyed through VLLM_API_KEY in spec.env must
+// report RuntimeMismatch, not APIKeyUnsupported.
 func TestLoRAAdapterController_RuntimeMismatch(t *testing.T) {
-	sg := newRecordingSGLang(t, sglangStatuses{})
-	scheme := newLoRARecnScheme(t)
-	isvc := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "isvc-vllm", Namespace: "default"},
-		Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: "vllm", ModelRef: "m"},
-	}
-	adapter := &inferencev1alpha1.LoRAAdapter{
-		ObjectMeta: metav1.ObjectMeta{Name: "adapter-a", Namespace: "default", Finalizers: []string{loraAdapterFinalizer}},
-		Spec: inferencev1alpha1.LoRAAdapterSpec{
-			InferenceServiceRef: inferencev1alpha1.LocalInferenceServiceReference{Name: "isvc-vllm"},
-			Name:                "loraA",
-			Path:                "/loras/a",
-		},
-	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc, adapter).WithStatusSubresource(&inferencev1alpha1.LoRAAdapter{}).Build()
-	fakec := &fakeAdapterClient{}
-	r := &LoRAAdapterReconciler{
-		Client:        cl,
-		Scheme:        scheme,
-		AdapterClient: fakec,
-		URLResolver: func(_ context.Context, _ client.Client, _ *inferencev1alpha1.InferenceService) (string, error) {
-			return sg.URL, nil
-		},
-		Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
-	}
+	for _, tc := range []struct {
+		name string
+		env  []corev1.EnvVar
+	}{
+		{"plain vLLM", nil},
+		{"vLLM keyed through VLLM_API_KEY in spec.env",
+			[]corev1.EnvVar{{Name: vllmAPIKeyEnv, Value: "sk"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sg := newRecordingSGLang(t, sglangStatuses{})
+			scheme := newLoRARecnScheme(t)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "isvc-vllm", Namespace: "default"},
+				Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: "vllm", ModelRef: "m", Env: tc.env},
+			}
+			adapter := &inferencev1alpha1.LoRAAdapter{
+				ObjectMeta: metav1.ObjectMeta{Name: "adapter-a", Namespace: "default", Finalizers: []string{loraAdapterFinalizer}},
+				Spec: inferencev1alpha1.LoRAAdapterSpec{
+					InferenceServiceRef: inferencev1alpha1.LocalInferenceServiceReference{Name: "isvc-vllm"},
+					Name:                "loraA",
+					Path:                "/loras/a",
+				},
+			}
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(isvc, adapter).WithStatusSubresource(&inferencev1alpha1.LoRAAdapter{}).Build()
+			fakec := &fakeAdapterClient{}
+			r := &LoRAAdapterReconciler{
+				Client:        cl,
+				Scheme:        scheme,
+				AdapterClient: fakec,
+				URLResolver: func(_ context.Context, _ client.Client, _ *inferencev1alpha1.InferenceService) (string, error) {
+					return sg.URL, nil
+				},
+				Now: func() time.Time { return time.Unix(1700000000, 0).UTC() },
+			}
 
-	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}}); err != nil {
-		t.Fatalf("Reconcile: %v", err)
-	}
+			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}}); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
 
-	var got inferencev1alpha1.LoRAAdapter
-	if err := cl.Get(context.Background(), types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}, &got); err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	available := findCondition(got.Status.Conditions, LoRAConditionAvailable)
-	if available == nil || available.Status != metav1.ConditionFalse {
-		t.Fatalf("Available = %+v, want False", available)
-	}
-	if available.Reason != LoRAReasonRuntimeMismatch {
-		t.Errorf("Available.Reason = %q, want %q", available.Reason, LoRAReasonRuntimeMismatch)
-	}
-	errCond := findCondition(got.Status.Conditions, LoRAConditionError)
-	if errCond == nil || errCond.Status != metav1.ConditionTrue || errCond.Reason != LoRAReasonRuntimeMismatch {
-		t.Fatalf("Error = %+v, want True/%s", errCond, LoRAReasonRuntimeMismatch)
-	}
-	if len(sg.loadReqs) != 0 {
-		t.Errorf("expected 0 load requests against SGLang, got %d", len(sg.loadReqs))
-	}
-	if len(fakec.loadCalls) != 0 {
-		t.Errorf("expected 0 fake load calls, got %d", len(fakec.loadCalls))
+			var got inferencev1alpha1.LoRAAdapter
+			if err := cl.Get(context.Background(), types.NamespacedName{Name: adapter.Name, Namespace: adapter.Namespace}, &got); err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			available := findCondition(got.Status.Conditions, LoRAConditionAvailable)
+			if available == nil || available.Status != metav1.ConditionFalse {
+				t.Fatalf("Available = %+v, want False", available)
+			}
+			if available.Reason != LoRAReasonRuntimeMismatch {
+				t.Errorf("Available.Reason = %q, want %q", available.Reason, LoRAReasonRuntimeMismatch)
+			}
+			errCond := findCondition(got.Status.Conditions, LoRAConditionError)
+			if errCond == nil || errCond.Status != metav1.ConditionTrue || errCond.Reason != LoRAReasonRuntimeMismatch {
+				t.Fatalf("Error = %+v, want True/%s", errCond, LoRAReasonRuntimeMismatch)
+			}
+			if len(sg.loadReqs) != 0 {
+				t.Errorf("expected 0 load requests against SGLang, got %d", len(sg.loadReqs))
+			}
+			if len(fakec.loadCalls) != 0 {
+				t.Errorf("expected 0 fake load calls, got %d", len(fakec.loadCalls))
+			}
+		})
 	}
 }
 
