@@ -5545,6 +5545,49 @@ var _ = Describe("DRA Passthrough (resource.k8s.io/v1)", func() {
 		Expect(container.Resources.Limits).NotTo(HaveKey(corev1.ResourceName("nvidia.com/gpu")))
 	})
 
+	// #2059: count alongside claims used to add nvidia.com/gpu: <count> as well,
+	// so on a DRA-only cluster (nodes advertise nvidia.com/gpu: 0) the pod could
+	// never schedule. The claims own allocation; count still sizes the runtime.
+	It("does not set a device-plugin limit when count is set alongside claims, and count still sizes vLLM", func() {
+		model := makeDRAModel([]corev1.PodResourceClaim{
+			{Name: "gpu", ResourceClaimName: ptr.To("gpu-claim")},
+		})
+		model.Spec.Hardware.GPU.Count = 2
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dra-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Runtime:  "vllm",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1, "", "")
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Resources.Limits).NotTo(HaveKey(corev1.ResourceName("nvidia.com/gpu")))
+		Expect(container.Resources.Claims).To(Equal([]corev1.ResourceClaim{{Name: "gpu"}}))
+		Expect(deployment.Spec.Template.Spec.ResourceClaims).To(HaveLen(1))
+		Expect(container.Args).To(ContainElements("--tensor-parallel-size", "2"))
+	})
+
+	It("keeps the device-plugin limit when count is set without claims", func() {
+		model := makeDRAModel(nil)
+		model.Spec.Hardware.GPU.Count = 2
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "dp-isvc", Namespace: "default"},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "dra-model",
+				Replicas: ptr.To(int32(1)),
+				Runtime:  "vllm",
+			},
+		}
+
+		deployment := reconciler.constructDeployment(isvc, model, nil, 1, "", "")
+		container := deployment.Spec.Template.Spec.Containers[0]
+		Expect(container.Resources.Limits).To(HaveKeyWithValue(corev1.ResourceName("nvidia.com/gpu"), resource.MustParse("2")))
+		Expect(container.Resources.Claims).To(BeEmpty())
+	})
+
 	It("skips DRA wiring when model has no ResourceClaims", func() {
 		model := makeDRAModel(nil)
 		isvc := &inferencev1alpha1.InferenceService{

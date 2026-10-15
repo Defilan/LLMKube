@@ -763,16 +763,20 @@ func modelResourceClaims(model *inferencev1alpha1.Model) []corev1.PodResourceCla
 func buildContainerResources(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, gpuCount int32, gpuResourceName corev1.ResourceName) corev1.ResourceRequirements {
 	var res corev1.ResourceRequirements
 
-	if gpuCount > 0 {
+	claims := modelResourceClaims(model)
+
+	// With DRA claims the claims allocate the GPUs, so no device-plugin limit:
+	// on a DRA-only cluster nodes advertise nvidia.com/gpu: 0 and the limit
+	// alone made the pod unschedulable (#2059). gpuCount still sizes the
+	// runtime (tensor parallelism, memory flags) on that path.
+	if gpuCount > 0 && len(claims) == 0 {
 		res.Limits = corev1.ResourceList{
 			gpuResourceName: resource.MustParse(fmt.Sprintf("%d", gpuCount)),
 		}
 	}
 
-	if model.Spec.Hardware != nil && model.Spec.Hardware.GPU != nil && len(model.Spec.Hardware.GPU.ResourceClaims) > 0 {
-		for _, claim := range model.Spec.Hardware.GPU.ResourceClaims {
-			res.Claims = append(res.Claims, corev1.ResourceClaim{Name: claim.Name})
-		}
+	for _, claim := range claims {
+		res.Claims = append(res.Claims, corev1.ResourceClaim{Name: claim.Name})
 	}
 
 	if isvc.Spec.Resources != nil {
