@@ -18,7 +18,7 @@ One or more of:
   kubectl get inferenceservice <name> -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")]}{"\n"}'
   ```
 
-- Metric: `llmkube_metal_agent_evictions_skipped_total` increments (visible in the metal-agent's `/metrics` endpoint). Its companions are `llmkube_metal_agent_evictions_total` and the `llmkube_metal_agent_memory_pressure_level` gauge (0 Normal, 1 Warning, 2 Critical).
+- Metric: `llmkube_metal_agent_evictions_skipped_total` increments (visible in the metal-agent's `/metrics` endpoint). Its companions are `llmkube_metal_agent_evictions_total` and the `llmkube_metal_agent_memory_pressure_level` gauge (0 Normal, 1 Warning, 2 Critical). The eviction path does not increment `llmkube_metal_agent_evictions_total` yet, so it reads 0; count `Evicted` events instead.
 - Operator notices: free memory on the host drops, or applications connected to the inference endpoint report sudden hangs or 5xx responses.
 
 ## Diagnose
@@ -93,7 +93,7 @@ Pick the path that matches the level.
 
 The watchdog will not evict at Warning. The condition is informational. If the host is meaningfully degrading, manually choose a path:
 
-- **Reduce a service's footprint.** Edit an InferenceService with a smaller `--max-model-len`, lower `parallelSlots`, or lower `cacheTypeK/V` precision (e.g., `q4_0` instead of `f16`). The metal-agent will respawn the process with the new settings.
+- **Reduce a service's footprint.** Edit an InferenceService with a smaller `contextSize` (the agent passes it to llama-server as `--ctx-size` and to vllm-swift as `--max-model-len`), lower `parallelSlots`, or lower `cacheTypeK/V` precision (e.g., `q4_0` instead of `f16`). The metal-agent will respawn the process with the new settings.
 - **Scale a non-essential service down to 0.**
 
   ```bash
@@ -181,10 +181,10 @@ If memory pressure is recurring on this host:
    in-memory so a controller event cannot respawn it mid-teardown, and clears
    every block the moment pressure returns to Normal.
 
-3. **`llmkube_metal_agent_evictions_skipped_total` is not climbing** unless eviction is intentionally disabled:
+3. **`llmkube_metal_agent_evictions_skipped_total` is not climbing** unless eviction is intentionally disabled. The agent serves `/metrics` on `127.0.0.1:9090` only, so run this on the Mac itself (or over `ssh <metal-agent-host>`):
 
    ```bash
-   curl -s http://<metal-agent-host>:9090/metrics \
+   curl -s http://127.0.0.1:9090/metrics \
      | grep -E 'llmkube_metal_agent_(evictions|memory_pressure_level)'
    ```
 

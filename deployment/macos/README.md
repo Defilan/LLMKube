@@ -4,17 +4,20 @@ This directory contains the macOS launchd configuration for the LLMKube Metal Ag
 
 ## Prerequisites
 
-1. **macOS with Apple Silicon** (M1/M2/M3/M4) or Intel Mac with Metal 2+ support
+1. **macOS with Apple Silicon** (M1 to M5). An Intel Mac with Metal 2+ can run the agent, but the bundled plist points `--llama-server` at the Apple Silicon Homebrew path (`/opt/homebrew/bin/llama-server`); change it to `/usr/local/bin/llama-server` there.
 2. **Access to a Kubernetes cluster** — either a remote cluster (recommended) or local minikube
 3. **llama.cpp** with Metal support:
    ```bash
    brew install llama.cpp
    ```
-4. **LLMKube operator** installed in your cluster:
+4. **LLMKube operator** installed in your cluster with Helm:
    ```bash
-   kubectl apply -f https://github.com/defilantech/llmkube/releases/latest/download/install.yaml
+   helm repo add llmkube https://defilantech.github.io/LLMKube
+   helm install llmkube llmkube/llmkube \
+     -n llmkube-system --create-namespace
    ```
-5. **`--host-ip` flag** (required when using a remote cluster): the Metal Agent must be started with `--host-ip <your-mac-ip>` so that the agent's ingress is registered in Kubernetes at the Mac's reachable IP address instead of `localhost`
+5. **To build the agent from source:** the Xcode Command Line Tools (`xcode-select --install`) and Go 1.26.9 or newer, the version `go.mod` pins.
+6. **`--host-ip` flag** (recommended with a remote cluster): without it the agent auto-detects an address (see "`--host-ip` flag (remote cluster)" below), which may not be one your cluster can reach. Start the agent with `--host-ip <your-mac-ip>` so that its ingress is registered in Kubernetes at an address you chose.
 
 ## Installation
 
@@ -47,9 +50,16 @@ mkdir -p -m 0700 ~/Library/Logs/llmkube
 sed 's|__HOME__|'"$HOME"'|g' deployment/macos/com.llmkube.metal-agent.plist \
   > ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 
-# Load the service
-launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+# Load and start the service
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
+
+The `llmkube-metal-agent` binary in a release archive
+(`LLMKube-metal-agent_<version>_darwin_<arch>.tar.gz`) can replace the build
+step: from the directory you extracted the archive into, copy
+`llmkube-metal-agent` instead of `bin/llmkube-metal-agent`. The archive carries
+`deployment/macos/` but not the Makefile. The release binary is not notarized;
+if macOS refuses to run it, build from source.
 
 ## Usage
 
@@ -97,7 +107,9 @@ sudo powermetrics --samplers gpu_power -i 1000
 
 ## Configuration
 
-The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
+The agent is configured through the `ProgramArguments` array of the installed
+plist, `~/Library/LaunchAgents/com.llmkube.metal-agent.plist`. The template in
+this directory starts with:
 
 ```xml
 <key>ProgramArguments</key>
@@ -107,11 +119,35 @@ The launchd plist can be customized by editing `com.llmkube.metal-agent.plist`:
     <string>default</string>              <!-- Kubernetes namespace to watch -->
     <!-- Optional: --model-store <path>; default ~/Library/Application Support/llmkube/models -->
     <string>--llama-server</string>
-    <string>/usr/local/bin/llama-server</string>  <!-- Path to llama-server binary -->
+    <string>/opt/homebrew/bin/llama-server</string>  <!-- Path to llama-server binary -->
     <string>--port</string>
     <string>9090</string>                 <!-- Agent metrics port -->
+    <string>--log-level</string>
+    <string>info</string>
 </array>
 ```
+
+`make install-metal-agent` rewrites the installed plist from this template
+every time it runs (adding only `--kubeconfig` and `--kube-context` when
+`METAL_KUBECONFIG` or `METAL_KUBE_CONTEXT` is set), so flags you added to the
+installed copy are lost on a reinstall. Re-add them afterwards, or keep them in
+your checkout's copy of the template.
+
+### Applying a plist change
+
+launchd keeps running the definition it loaded, so after editing the installed
+plist, unload the job, wait for it to go away, and load it again:
+
+```bash
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+```
+
+`bootout` returns before launchd has finished, and a `bootstrap` that runs too
+soon can fail with `Bootstrap failed: 5: Input/output error`, hence the wait.
+To restart the agent without a plist change, run
+`launchctl kickstart -k gui/$(id -u)/com.llmkube.metal-agent`.
 
 ### Model store
 
@@ -240,17 +276,19 @@ A few behavior notes:
 
 When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source against it before the file is used. A mismatch deletes the file and refuses to start the InferenceService with reason `ModelDigestMismatch` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). A verified file gets a `<file>.sha256` stamp beside it, so a later restart does not re-hash a potentially huge model unless the stamp is missing or stale. The stamp is the same `digest size mtime` triple the cluster-side download init container writes, so a cache populated by either one is legible to the other; a bare-digest stamp from an older agent release is not trusted, and is hashed once and rewritten.
 
-`spec.sha256` is enforced for sources the agent downloads for llama-server (the `llamacpp` runtime): `http`, `https`, `hf` and `s3`. A local-path or `file://` source is loaded in place and is never hashed. The other Metal runtimes (mlx-server, vllm-swift, oMLX, TensorFold and Ollama) do not download through the agent and ignore `spec.sha256` in 0.10.1.
+`spec.sha256` is enforced for sources the agent downloads for llama-server (the `llamacpp` runtime): `http`, `https`, `hf` and `s3`. A local-path or `file://` source is loaded in place and is never hashed. The other Metal runtimes (mlx-server, vllm-swift, oMLX, TensorFold and Ollama) do not download through the agent and ignore `spec.sha256`.
 
 The agent remembers a mismatch so it does not re-download the same bad source on every reconcile. Changing the Model's `source` or `sha256` clears that memo automatically, since it is keyed to the exact source and digest it was recorded against; the next reconcile then retries the download. If the spec is unchanged (for example, the same URL now serves a corrected file), recreate the `Model` or the `InferenceService` instead: deleting either one clears the memo, so the next reconcile downloads and verifies it again.
 
 ### Choosing the cluster (`--kubeconfig`, `--kube-context`)
 
 The agent finds its cluster the same way controller-runtime tools do: the
-`--kubeconfig` flag, then `$KUBECONFIG`, then `~/.kube/config`. By default it
-uses that kubeconfig's **current context**, so if you switch contexts with
-`kubectl config use-context` and the agent restarts, it connects to whatever
-cluster you last selected.
+`--kubeconfig` flag, then `$KUBECONFIG`, then `~/.kube/config`. Under launchd
+the agent does not see your shell's `$KUBECONFIG`: the bundled plist sets only
+`PATH` and `GGML_METAL_ENABLE`, so without `--kubeconfig` it reads
+`~/.kube/config`. By default it uses that kubeconfig's **current context**, so
+if you switch contexts with `kubectl config use-context` and the agent
+restarts, it connects to whatever cluster you last selected.
 
 Pin the agent to its cluster so your kubectl context never moves it:
 
@@ -348,7 +386,19 @@ llmkube-metal-agent --host-ip 192.168.1.50
 llmkube-metal-agent --host-ip 100.64.0.10
 ```
 
-Without `--host-ip`, the agent registers `localhost` as the endpoint — which only works when K8s is on the same machine (e.g. minikube).
+Without `--host-ip`, the agent auto-detects an address from the Mac's network interfaces, in this order:
+
+1. a Tailscale address (100.64.0.0/10), if the Mac has one;
+2. otherwise the first other routable IPv4 address, skipping loopback, link-local, IPv6, and the Docker and VM bridge ranges 192.168.65.0/24, 172.17.0.0/16 and 10.96.0.0/12;
+3. only when neither exists, `host.minikube.internal`, then `host.docker.internal`, then 192.168.65.254, for a cluster on the same Mac.
+
+It never registers `localhost`. The agent logs its pick as `auto-detected host IP` (with the interface and the rejected candidates), and every registration as `registered endpoint` with a `hostIP` field:
+
+```bash
+grep 'auto-detected host IP\|registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
+```
+
+Auto-detection can pick an address the cluster cannot reach, for example a personal tailnet on a work Mac, or the wrong interface on a Mac with several. For a remote cluster, set `--host-ip` explicitly, ideally to an address with a DHCP reservation so it does not change.
 
 The IP must be reachable from the cluster's nodes on `--ingress-port` (below).
 
@@ -359,11 +409,34 @@ To set this in the launchd plist, add these lines to the `ProgramArguments` arra
     <string>192.168.1.50</string>         <!-- Your Mac's reachable IP -->
 ```
 
-After editing, reload the service:
+After editing, reload the service (see "Applying a plist change" above):
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
-launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
+
+### `--inference-service-allowlist` flag (several Macs on one cluster)
+
+By default an agent claims every InferenceService in its `--namespace` whose
+Model sets `hardware.accelerator: metal`. With more than one Mac on a cluster,
+every agent would start every Metal model. Give each agent a comma-separated
+list of the InferenceService names it should serve:
+
+```bash
+llmkube-metal-agent --inference-service-allowlist phi-4-mini,qwen-coder
+```
+
+To set this in the launchd plist:
+
+```xml
+    <string>--inference-service-allowlist</string>
+    <string>phi-4-mini,qwen-coder</string>
+```
+
+Names are matched exactly against `metadata.name`. An agent without the flag
+still claims everything, so set it on every agent; an InferenceService on none
+of the lists is then not served.
 
 ### Ingress and client-proxy flags
 
@@ -453,8 +526,9 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
    Then:
 
    ```bash
-   launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
-   launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+   launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+   while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
    ```
 
 3. Verify the gauges are populated:
@@ -497,12 +571,20 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `llmkube_metal_agent_managed_processes` | Gauge | Number of llama-server processes currently managed |
+| `llmkube_metal_agent_managed_processes` | Gauge | Number of inference processes currently managed, across every runtime (the metric's help text says llama-server) |
 | `llmkube_metal_agent_process_healthy` | Gauge | Whether a process is healthy (1) or not (0). Labels: `name`, `namespace` |
 | `llmkube_metal_agent_process_restarts_total` | Counter | Total process restarts triggered by health monitoring. Labels: `name`, `namespace` |
 | `llmkube_metal_agent_health_check_duration_seconds` | Histogram | Duration of health check probes. Labels: `name`, `namespace` |
 | `llmkube_metal_agent_memory_budget_bytes` | Gauge | Total memory budget for model serving |
 | `llmkube_metal_agent_memory_estimated_bytes` | Gauge | Estimated memory per process. Labels: `name`, `namespace` |
+| `llmkube_metal_agent_system_memory_available_bytes` | Gauge | Available system memory, sampled by the memory watchdog (`--memory-watchdog-interval`, default 10s) |
+| `llmkube_metal_agent_system_memory_wired_bytes` | Gauge | Wired (non-pageable) system memory, sampled by the memory watchdog |
+| `llmkube_metal_agent_process_rss_bytes` | Gauge | Resident set size per managed process. Labels: `name` only (no `namespace`, so same-named InferenceServices in different namespaces share a series) |
+| `llmkube_metal_agent_memory_pressure_level` | Gauge | Memory pressure level: 0 Normal, 1 Warning, 2 Critical (see `--memory-pressure-warning` and `--memory-pressure-critical`) |
+| `llmkube_metal_agent_evictions_total` | Counter | Registered for eviction events, but the eviction path does not increment it yet, so it reads 0. Count `Evicted` events instead |
+| `llmkube_metal_agent_evictions_skipped_total` | Counter | Times the watchdog was at Critical but did not evict. Labels: `reason` (`disabled`, `below_guard`, `empty`, `floor`, `all_protected`, `runtime_ineligible`) |
+| `llmkube_metal_agent_watch_consecutive_failures` | Gauge | Consecutive failed Kubernetes lists by the InferenceService watcher; resets to 0 on success. The agent exits for a launchd restart at `--max-watch-failures` |
+| `llmkube_metal_agent_fatal_exits_total` | Counter | Fatal-exit signals raised before the agent exits. Labels: `subsystem` (`watcher`, `health-server`) |
 | `llmkube_metal_agent_apple_power_combined_watts` | Gauge | Combined CPU + GPU + ANE package power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_gpu_watts` | Gauge | GPU subsystem power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_cpu_watts` | Gauge | CPU subsystem power. Zero unless `--apple-power-enabled`. |
@@ -1035,7 +1117,12 @@ cat ~/Library/Logs/llmkube/metal-agent.log
 # Verify llama-server is installed
 which llama-server
 
-# Verify Metal support
+# Verify Metal support: the agent logs "Metal support detected" at startup,
+# or "Metal support not detected" before it exits
+grep "Metal support" ~/Library/Logs/llmkube/metal-agent.log
+
+# Print the agent version (it exits before the Metal check, so this does
+# not verify Metal)
 llmkube-metal-agent --version
 ```
 
@@ -1080,7 +1167,7 @@ If the source is a LAN mirror you trust (an internal MinIO or registry), add its
 
 ### LAN download fails with `no route to host` after an upgrade
 
-The guard allowed the host, but macOS blocked the connection. macOS Local Network Privacy ties its permission to the agent binary, so a new binary loses access to the local network until it is granted again, and the refusal surfaces as `connect: no route to host` rather than a permission error. Downloads from the internet and the cluster's traffic to the agent's ingress are not affected. Grant the agent access in System Settings, Privacy & Security, Local Network, or reach the mirror over a route macOS does not treat as local (for example a VPN or tailnet address).
+The guard allowed the host, but macOS blocked the connection. macOS Local Network Privacy ties its permission to the agent binary, so a new binary loses access to the local network until it is granted again, and the refusal surfaces as `connect: no route to host` rather than a permission error. It affects every connection the agent opens to a LAN address, including its connection to a Kubernetes API server on the LAN, not only model downloads; downloads from the internet are not affected. Incoming connections to the ingress are governed by the macOS firewall instead, which may ask again to allow them for the new binary. Grant the agent access in System Settings, Privacy & Security, Local Network, or reach the mirror over a route macOS does not treat as local (for example a VPN or tailnet address).
 
 ### `ModelDigestMismatch`
 
@@ -1095,7 +1182,8 @@ kubectl get nodes
 # Check which context is active
 kubectl config current-context
 
-# Check kubeconfig path
+# Check kubeconfig path (the agent under launchd does not see this; it
+# reads --kubeconfig, or ~/.kube/config)
 echo $KUBECONFIG
 
 # See which cluster and context the agent actually connected to
@@ -1135,7 +1223,7 @@ tailscale status   # or wg show
 make uninstall-metal-agent
 
 # Or manually
-launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
 sudo rm /usr/local/bin/llmkube-metal-agent
 rm ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
@@ -1257,8 +1345,9 @@ uv tool install --python 3.12 --with "mlx==0.31.2" \
 
 Pin MLX to 0.31.2. On M5 hardware, MLX 0.32.2 fails the load-time exactness
 self-check for Nemotron, and TensorFold then keeps serving without drafts, so
-the only symptom is lost speed. Confirm the version inside the tool's
-environment after installing:
+the only symptom is lost speed. The install hint the agent logs when it cannot
+find `tensorfold` omits this pin; use the command above. Confirm the version
+inside the tool's environment after installing:
 
 ```bash
 ~/.local/share/uv/tools/tensorfold/bin/python -c "import mlx.core as mx; print(mx.__version__)"
@@ -1285,9 +1374,11 @@ How the agent runs it:
 
 - The Model must have `format: mlx` and `hardware.accelerator: metal`. The
   agent does not download MLX directories; stage the directory first. An
-  absolute `spec.source` is used as-is (the operator must allow its root with
-  `--allowed-host-path-roots`). A Hugging Face style `owner/repo` source is
-  read from `<model-store>/owner/repo`.
+  absolute `spec.source` is used as-is: the controller must allow its root
+  with `--allowed-host-path-roots` (Helm `modelSource.allowedHostPathRoots`),
+  and the agent must have the directory in `--allowed-model-roots` (see
+  "`--allowed-model-roots` flag (local model paths)" above). A Hugging Face
+  style `owner/repo` source is read from `<model-store>/owner/repo`.
 - Each InferenceService gets its own `tensorfold serve` process on an
   ephemeral port, bound to `127.0.0.1`, with `--name` set to `spec.modelRef` (the
   model ID clients send) and `--no-update-check`.
@@ -1495,4 +1586,4 @@ authenticated ingress and an in-cluster relay).
 ## Support
 
 - GitHub Issues: https://github.com/defilantech/llmkube/issues
-- Documentation: https://github.com/defilantech/llmkube#metal-support
+- Documentation: https://github.com/defilantech/LLMKube#the-metal-agent

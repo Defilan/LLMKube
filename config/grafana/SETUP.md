@@ -220,8 +220,9 @@ curl http://<your-server>:9100/metrics | grep node_cpu
 # DCGM exporter metrics
 curl http://<your-server>:9400/metrics | grep DCGM_FI_DEV_GPU
 
-# Metal Agent metrics (if using Apple Silicon)
-curl http://<your-mac-ip>:9090/metrics | grep llmkube_metal_agent
+# Metal Agent metrics (if using Apple Silicon). The agent binds 127.0.0.1,
+# so run this on the Mac, or through the SSH tunnel from step 3
+curl http://127.0.0.1:9090/metrics | grep llmkube_metal_agent
 
 # Prometheus targets (should show UP)
 curl http://prometheus:9090/api/v1/targets
@@ -286,12 +287,16 @@ shape.
 
 | Metric | Description |
 |--------|-------------|
-| `llmkube_metal_agent_managed_processes` | Number of managed llama-server processes |
+| `llmkube_metal_agent_managed_processes` | Number of managed inference processes (every runtime) |
 | `llmkube_metal_agent_process_healthy` | Process health status (1=healthy, 0=unhealthy) |
 | `llmkube_metal_agent_process_restarts_total` | Process restarts from health monitoring |
 | `llmkube_metal_agent_health_check_duration_seconds` | Health check probe duration |
 | `llmkube_metal_agent_memory_budget_bytes` | Total memory budget for model serving |
 | `llmkube_metal_agent_memory_estimated_bytes` | Estimated memory usage per process |
+
+This is a subset. The full list, including the memory-pressure, eviction,
+watcher, power, ingress and client-proxy metrics, is in
+[`deployment/macos/README.md`](../../deployment/macos/README.md#prometheus-metrics).
 
 ## Troubleshooting
 
