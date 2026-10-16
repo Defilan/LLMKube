@@ -540,22 +540,24 @@ uninstall-foreman-agent: ## Uninstall foreman-agent launchd service (leaves inst
 # whole milliseconds, minimum 100. The default matches the agent's 1s default.
 APPLE_POWER_INTERVAL_MS ?= 1000
 POWERMETRICS_SUDOERS_TEMPLATE = deployment/macos/sudoers.d/llmkube-powermetrics
-# The interval must be a plain integer: it is substituted into a sudoers rule
-# that must not contain wildcard or separator characters.
+# Sets the shell variable ms to APPLE_POWER_INTERVAL_MS and exits unless it is
+# a plain integer from 100 to 999999999. The value is pasted into the shell
+# once, single-quoted with any ' escaped, so nothing in it is expanded or run;
+# everything after this uses "$$ms". The rule it is rendered into must not
+# contain wildcard or separator characters.
 CHECK_APPLE_POWER_INTERVAL_MS = \
-	case "$(APPLE_POWER_INTERVAL_MS)" in \
-		''|0*|*[!0-9]*) echo "APPLE_POWER_INTERVAL_MS must be a whole number of milliseconds, got '$(APPLE_POWER_INTERVAL_MS)'" >&2; exit 1 ;; \
+	ms='$(subst ','\'',$(APPLE_POWER_INTERVAL_MS))'; \
+	case "$$ms" in \
+		''|0*|*[!0-9]*|??????????*) echo "APPLE_POWER_INTERVAL_MS must be a whole number of milliseconds, got '$$ms'" >&2; exit 1 ;; \
 	esac; \
-	if [ "$(APPLE_POWER_INTERVAL_MS)" -lt 100 ]; then \
-		echo "APPLE_POWER_INTERVAL_MS must be at least 100: the agent never passes powermetrics a shorter interval" >&2; exit 1; \
-	fi
+	[ "$$ms" -ge 100 ] || { echo "APPLE_POWER_INTERVAL_MS must be at least 100: the agent never passes powermetrics a shorter interval" >&2; exit 1; }
 # Shell commands that print the rendered fragment. Shared by
 # render-powermetrics-sudoers and install-powermetrics-sudo so the file that
 # is installed is the file that can be inspected.
 RENDER_POWERMETRICS_SUDOERS = \
 	$(CHECK_APPLE_POWER_INTERVAL_MS); \
 	sed -e "s/__LLMKUBE_USER__/$(shell whoami)/" \
-		-e "s/__LLMKUBE_POWERMETRICS_INTERVAL_MS__/$(APPLE_POWER_INTERVAL_MS)/" \
+		-e "s/__LLMKUBE_POWERMETRICS_INTERVAL_MS__/$$ms/" \
 		$(POWERMETRICS_SUDOERS_TEMPLATE)
 
 .PHONY: render-powermetrics-sudoers
@@ -564,16 +566,18 @@ render-powermetrics-sudoers: ## Print the powermetrics sudoers fragment rendered
 
 .PHONY: install-powermetrics-sudo
 install-powermetrics-sudo: ## Install NOPASSWD sudoers entry for /usr/bin/powermetrics (required for --apple-power-enabled; set APPLE_POWER_INTERVAL_MS for a non-default --apple-power-interval).
-	@$(CHECK_APPLE_POWER_INTERVAL_MS)
-	@echo "Installing sudoers entry for the Apple power sampler..."
-	@echo "This grants the current user ($(shell whoami)) NOPASSWD access to exactly"
-	@echo "  /usr/bin/powermetrics --samplers cpu_power,gpu_power -i $(APPLE_POWER_INTERVAL_MS)"
-	@echo "which is what the agent runs with --apple-power-interval=$(APPLE_POWER_INTERVAL_MS)ms, and nothing else."
-	@echo ""
-	@TMP=$$(mktemp); \
+	@$(CHECK_APPLE_POWER_INTERVAL_MS); \
+		echo "Installing sudoers entry for the Apple power sampler..."; \
+		echo "This grants the current user ($(shell whoami)) NOPASSWD access to exactly"; \
+		echo "  /usr/bin/powermetrics --samplers cpu_power,gpu_power -i $$ms"; \
+		echo "which is what the agent runs with --apple-power-interval=$${ms}ms, and nothing else."; \
+		echo ""
+	@# Every failure exits the recipe line explicitly: macOS's make (3.81)
+	@# ignores .SHELLFLAGS, so the shell does not stop on errors by itself.
+	@TMP=$$(mktemp) || exit 1; \
 		( $(RENDER_POWERMETRICS_SUDOERS) ) > "$$TMP" || { rm -f "$$TMP"; exit 1; }; \
-		sudo visudo -cf "$$TMP" || (echo "❌ sudoers syntax check failed; aborting"; rm -f "$$TMP"; exit 1); \
-		sudo install -m 0440 -o root -g wheel "$$TMP" /etc/sudoers.d/llmkube-powermetrics; \
+		sudo visudo -cf "$$TMP" || { echo "❌ sudoers syntax check failed; aborting" >&2; rm -f "$$TMP"; exit 1; }; \
+		sudo install -m 0440 -o root -g wheel "$$TMP" /etc/sudoers.d/llmkube-powermetrics || { rm -f "$$TMP"; exit 1; }; \
 		rm -f "$$TMP"
 	@echo ""
 	@echo "✅ Sudoers entry installed. Granted command:"
