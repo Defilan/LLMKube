@@ -1,11 +1,12 @@
 # InferenceService stuck in `Failed` with `DeploymentNameTaken`
 
 An `InferenceService` sits in phase `Failed` with
-`status.schedulingStatus: DeploymentNameTaken`, no Deployment or Service was
-created for it, and the operator log repeats a refusal line on a slow
-two-minute cadence instead of erroring. The controller is not broken: a
-Deployment already holds the name the service generates, and the controller
-refuses to touch an object it did not create (#2011).
+`status.schedulingStatus: DeploymentNameTaken`, the reconcile provisions
+nothing past the refused Deployment step (no Service follows), and the
+operator log repeats a refusal line on a slow two-minute cadence instead of
+erroring. The controller is not broken: a Deployment already holds the name
+the service generates, and the controller refuses to touch an object it did
+not create (#2011).
 
 ## Trigger
 
@@ -51,20 +52,26 @@ One or more of:
    kubectl get deployment <name> -n <namespace> -o jsonpath='{.spec.selector.matchLabels}{"\n"}{.spec.template.spec.containers[*].image}{"\n"}'
    ```
 
-   Three cases:
+   Four cases:
 
    - **No owner references at all**: something other than LLMKube created a
      Deployment with this name (a hand-rolled workload, another operator, a
      leftover). The container image tells you whose it is.
    - **A controller reference to a different `InferenceService` UID**: a
      same-name service was deleted and recreated before garbage collection
-     removed its old Deployment, and the new service now refuses to adopt the
-     stale one. Check whether the referenced service still exists:
+     removed its old Deployment (or the old Deployment was orphaned with
+     `kubectl delete --cascade=orphan`), and the new service now refuses to
+     adopt the stale one. Check whether the referenced service still exists:
      `kubectl get inferenceservice <name> -o jsonpath='{.metadata.uid}'`.
-   - **A controller reference to this service's UID** would mean the operator
-     manages it and no refusal fires; if you see the refusal anyway, the UID
-     in the message differs from `metadata.uid` here, which is the
-     different-owner case above.
+   - **A controller reference to this service's own UID** means the operator
+     manages the Deployment and no refusal fires for it; if you see the
+     refusal anyway, the UID in the message differs from `metadata.uid`
+     here, which is the different-owner case above.
+   - **A reference to this service's UID without `controller: true`** (for
+     example a third-party applier stamping plain owner references): refused
+     all the same, with the generic "is not controlled by this
+     InferenceService" message, because the gate requires the controller
+     role. The reference alone does not hand the object to the operator.
 
 3. **Check whether anything still serves through the name.**
 
@@ -146,7 +153,7 @@ name can.
   HPA ([#2009](https://github.com/defilantech/LLMKube/issues/2009), shipped in
   [#2010](https://github.com/defilantech/LLMKube/pull/2010)); for the HPA case
   see "An HPA with the service's name already exists" in the
-  [autoscaling guide](/docs/guides/metrics-driven-autoscaling)
+  [autoscaling guide](../../site/guides/metrics-driven-autoscaling.md)
 - The refusal is one of the operator's ownership guards: objects LLMKube did
   not create are never adopted, overwritten, or deleted, and a refused
   sequence provisions nothing past the refused step
