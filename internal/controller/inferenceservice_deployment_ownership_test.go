@@ -138,6 +138,9 @@ func expectDeploymentNameTaken(ctx context.Context, name string) {
 	cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionDegraded)
 	Expect(cond).NotTo(BeNil())
 	Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	// The Failed phase drives the Degraded reason; the dedicated
+	// DeploymentNameTaken reason rides SchedulingStatus and the event.
+	Expect(cond.Reason).To(Equal(PhaseFailed))
 }
 
 var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
