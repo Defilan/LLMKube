@@ -157,6 +157,9 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 
 			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
 			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+			seeded := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, seeded)).To(Succeed())
+			foreignRV := seeded.ResourceVersion
 
 			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
 			Expect(err).NotTo(HaveOccurred())
@@ -167,6 +170,7 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			// references, and resourceVersion (no write of any kind).
 			got := &appsv1.Deployment{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			Expect(got.ResourceVersion).To(Equal(foreignRV))
 			Expect(got.Spec.Template.Spec.Containers[0].Image).To(Equal("registry.example.com/someone-else:latest"))
 			Expect(*got.Spec.Replicas).To(Equal(int32(2)))
 			Expect(got.Labels).To(HaveKeyWithValue("foreign", "true"))
@@ -236,6 +240,36 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
 			Expect(got.OwnerReferences).To(HaveLen(1))
 			Expect(got.OwnerReferences[0].Name).To(Equal("other-isvc"))
+		})
+
+		It("keeps reporting the refusal while another fault fails the reconcile", func() {
+			name := "dep-foreign-compound"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			Expect(k8sClient.Create(ctx, foreignISVCDeployment(name, generatedDeploymentSelector(name)))).To(Succeed())
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			expectDeploymentNameTaken(ctx, name)
+
+			// Break the spec in a way that fails reconcileDeployment before
+			// the ownership gate is reached: a metal-only runtime off Metal
+			// is rejected up front and its failure write carries no
+			// SchedulingInfo, so the status writer preserves the in-memory
+			// scheduling fields (#643). The marker must survive that pass:
+			// the foreign Deployment still holds the name, and the runbook
+			// names it as the symptom.
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Spec.Runtime = "mlx-server"
+			Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+			_, err = reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			Expect(isvc.Status.Phase).To(Equal(PhaseFailed))
+			Expect(isvc.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken),
+				"an unrelated spec fault must not erase the name-taken marker")
+			Expect(isvc.Status.SchedulingMessage).To(ContainSubstring(name))
 		})
 	})
 
@@ -317,6 +351,21 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 				}}}}
 			err = ensureDeploymentOwned(isvc, foreign)
 			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).NotTo(ContainSubstring("another InferenceService"))
+
+			// A reference to this very service without the controller role
+			// does not pass the gate either: IsControlledBy requires
+			// Controller: true, and GetControllerOf only returns
+			// controller-role references, so the generic message applies.
+			notController := false
+			selfRef := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d", Namespace: "default",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: inferencev1alpha1.GroupVersion.String(), Kind: "InferenceService",
+					Name:       "s1", UID: "uid-1", Controller: &notController,
+				}}}}
+			err = ensureDeploymentOwned(isvc, selfRef)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("not controlled by this InferenceService"))
 			Expect(err.Error()).NotTo(ContainSubstring("another InferenceService"))
 		})
 	})

@@ -597,11 +597,13 @@ func (e *deploymentNameTakenError) Error() string {
 		e.ns, e.name)
 }
 
-// ensureDeploymentOwned is the ownership gate for every Deployment write and
-// delete: write only what this InferenceService controls. A Deployment with
-// the generated name but no controller reference, a foreign reference, or
-// another InferenceService's reference is refused, never adopted, never
-// overwritten, and never deleted.
+// ensureDeploymentOwned is the ownership gate for the workload Deployment
+// writes in reconcileDeployment: the selector-migration delete-and-recreate
+// and the in-place spec replace. Write only what this InferenceService
+// controls: a Deployment with the generated name but no controller reference,
+// a foreign reference, or another InferenceService's reference is refused,
+// never adopted, never overwritten, and never deleted. The relay Deployment
+// (teardownRelay) and the router-proxy Deployment carry their own gates.
 func ensureDeploymentOwned(isvc *inferencev1alpha1.InferenceService, existing *appsv1.Deployment) error {
 	if metav1.IsControlledBy(existing, isvc) {
 		return nil
@@ -640,16 +642,22 @@ func clearDeploymentNameTaken(isvc *inferencev1alpha1.InferenceService) {
 func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// A previous pass may have reported a Deployment name-taken refusal. The
-	// status writer preserves scheduling fields it is not given (#643), so the
-	// marker must be dropped before any success path persists status; the
-	// guard below re-sets it when the foreign object is still there. Captured
-	// before the clear so the Warning event fires once per episode, not once
-	// per bounded requeue.
+	// A previous pass may have reported a Deployment name-taken refusal.
+	// Captured before anything can change it so the Warning event fires once
+	// per episode, not once per bounded requeue. The marker itself is cleared
+	// only where the name's true state is known: on the metal path (no
+	// Deployment is wanted) and just before the Deployment Get below, whose
+	// guard re-sets it when the object at the name is foreign. Clearing only
+	// at those points keeps the marker visible across the fatal spec-fault
+	// returns between here and the Get, which persist whatever scheduling
+	// fields the in-memory object carries (#643).
 	nameTakenPreviously := isvc.Status.SchedulingStatus == inferencev1alpha1.ReasonDeploymentNameTaken
-	clearDeploymentNameTaken(isvc)
 
 	if isMetal {
+		// A metal service wants no Deployment, so a marker left by a
+		// deployment-path pass is stale; drop it before the metal status
+		// writes persist it.
+		clearDeploymentNameTaken(isvc)
 		ready, snap, result, err := r.reconcileMetal(ctx, isvc)
 		var unmanaged *relaySecretNotManagedError
 		if errors.As(err, &unmanaged) {
@@ -727,6 +735,11 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	if err != nil {
 		return nil, replicaCounts{}, nil, nil, err
 	}
+
+	// The Get below decides the name's state: drop a stale marker here so
+	// the create, migration, and in-place paths all persist it cleared, and
+	// the guard re-sets it when the object at the name is foreign.
+	clearDeploymentNameTaken(isvc)
 
 	existingDeployment := &appsv1.Deployment{}
 	err = r.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, existingDeployment)
