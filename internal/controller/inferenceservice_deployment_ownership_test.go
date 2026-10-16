@@ -304,7 +304,7 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(getDeploymentOwnershipISVC(ctx, name).Status.SchedulingStatus).NotTo(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
 		})
 
-		It("migrates an owned pre-0.8 selector and recovers once the foreign Deployment is gone", func() {
+		It("recovers once the foreign Deployment is gone, clearing the marker", func() {
 			name := "dep-own-recovery"
 			r := setupDeploymentOwnershipFixture(ctx, name)
 			defer cleanupDeploymentOwnershipFixture(ctx, name)
@@ -328,6 +328,59 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(*dep.OwnerReferences[0].Controller).To(BeTrue())
 			Expect(getDeploymentOwnershipISVC(ctx, name).Status.SchedulingStatus).To(BeEmpty())
 			Expect(getDeploymentOwnershipISVC(ctx, name).Status.Phase).NotTo(Equal(PhaseFailed))
+		})
+	})
+
+	Context("a metal transition drops the marker", func() {
+		ctx := context.Background()
+
+		// The metal path persists status with no SchedulingInfo of its own
+		// when the service is suspended (determinePhase returns
+		// PhaseSuspended, nil), so the writer preserves whatever the
+		// in-memory object carries (#643). reconcileDeployment's metal
+		// branch must clear the stale marker before that write, or the
+		// refusal a previous deployment-path pass wrote would freeze.
+		It("clears a stale marker when the service no longer wants a Deployment", func() {
+			name := "dep-metal-marker"
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						Accelerator: "metal",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+			replicas := int32(1)
+			Expect(k8sClient.Create(ctx, &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: model.Name,
+					Replicas: &replicas,
+					Suspend:  true,
+				},
+			})).To(Succeed())
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Status.SchedulingStatus = inferencev1alpha1.ReasonDeploymentNameTaken
+			isvc.Status.SchedulingMessage = "Deployment default/" + name + " already exists and is not controlled by this InferenceService"
+			Expect(k8sClient.Status().Update(ctx, isvc)).To(Succeed())
+
+			r := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(getDeploymentOwnershipISVC(ctx, name).Status.SchedulingStatus).To(BeEmpty(),
+				"a metal service wants no Deployment; the marker must not survive the transition")
+			Expect(getDeploymentOwnershipISVC(ctx, name).Status.Phase).To(Equal(PhaseSuspended))
 		})
 	})
 
