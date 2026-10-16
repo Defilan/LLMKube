@@ -284,10 +284,10 @@ type MetalAgent struct {
 	// evicted under memory pressure. Subsequent ensureProcess calls for these
 	// keys are no-ops while lastPressureLevel != Normal, to prevent a
 	// thrashing respawn loop where the controller's UPDATED event simply
-	// re-spawns the process we just killed for memory. handleMemoryPressure
-	// clears it, and starts those services again, when pressure returns to
-	// Normal.
-	pressureBlocked map[string]bool
+	// re-spawns the process we just killed for memory. Once pressure is
+	// Normal, handleMemoryPressure unblocks and restarts the ones the
+	// available memory has room for.
+	pressureBlocked map[string]evictedService
 	// lastPressureLevel is the most recent pressure level reported by the
 	// watchdog. Used to gate respawn (above) and to detect transitions for
 	// status condition updates.
@@ -301,6 +301,9 @@ type MetalAgent struct {
 	// evictedRestarts tracks the restartEvicted goroutines a return to
 	// Normal launches, so tests can wait for them to finish.
 	evictedRestarts sync.WaitGroup
+	// restartingEvicted is true while a restartEvicted batch runs; no other
+	// batch is picked until it ends.
+	restartingEvicted bool
 
 	// starting records namespacedName keys whose ensureProcess call is
 	// in flight, and keys whose unhealthy engine the health monitor is
@@ -490,7 +493,7 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		memoryFraction:      fraction,
 		memoryCheckWarnOnly: warnOnly,
 		downloadAllow:       safehttp.ParseAllowlist(config.AllowedDownloadHosts),
-		pressureBlocked:     make(map[string]bool),
+		pressureBlocked:     make(map[string]evictedService),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
 		restarts:            make(map[string]*restartBackoff),
@@ -718,6 +721,7 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 			*a.config.WatchdogConfig,
 			a.logger.With("subsystem", "watchdog"),
 		)
+		watchdog.wantNormal = a.hasEvictedWaiting
 		go watchdog.Run(ctx)
 	}
 
@@ -1137,7 +1141,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// Check if process already exists
 	a.mu.RLock()
 	existing, exists := a.processes[key]
-	blocked := a.pressureBlocked[key]
+	_, blocked := a.pressureBlocked[key]
 	pressureLevel := a.lastPressureLevel
 	a.mu.RUnlock()
 
@@ -1145,8 +1149,9 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// still abnormal. Without this guard, the controller's UPDATED event
 	// loop would silently re-spawn the very process we just killed for
 	// memory, defeating eviction. The block clears automatically once the
-	// watchdog reports MemoryPressureNormal, and handleMemoryPressure then
-	// calls ensureProcess for the service again (restartEvicted).
+	// watchdog reports MemoryPressureNormal and there is room for the
+	// service; handleMemoryPressure then calls ensureProcess for it again
+	// (restartEvicted).
 	if blocked && pressureLevel != MemoryPressureNormal {
 		a.logger.Warnw("skipping ensureProcess; eviction-blocked under memory pressure",
 			"namespace", isvc.Namespace, "name", isvc.Name,

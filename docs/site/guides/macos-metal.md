@@ -344,7 +344,8 @@ behavior if you need an escape hatch.
 The agent also implements **memory-pressure protection**: if
 macOS reports critical memory pressure, the agent can evict the
 lowest-priority running InferenceService, keep it stopped until
-pressure returns to normal, and then start it again. See the
+pressure returns to normal, and then start it again once available
+memory has room for it. See the
 [`Memory-pressure protection`](../memory-pressure-protection)
 guide for tuning.
 

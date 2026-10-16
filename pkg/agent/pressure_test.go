@@ -20,7 +20,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +36,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -169,7 +169,8 @@ func (stubExecutor) StopProcess(_ int) error { return nil }
 // end-to-end test for the eviction path: guard satisfied, EvictionEnabled
 // true, multiple priorities — verifies the lowest-priority process is the
 // one removed from the managed map and the key lands in pressureBlocked so
-// a subsequent ensureProcess will not respawn it.
+// a subsequent ensureProcess will not respawn it, with its RSS recorded so a
+// restart can wait for room to take that memory back.
 func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *testing.T) {
 	low := newPressureTestISvc("svc-low", "low")
 	high := newPressureTestISvc("svc-high", "high")
@@ -189,6 +190,7 @@ func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *te
 
 	a.handleMemoryPressure(context.Background(), MemoryPressureCritical, MemoryStats{
 		TotalMemory: 100 << 30, TotalRSS: 80 << 30,
+		ProcessRSS: map[string]uint64{"svc-low": 30 << 30, "svc-high": 50 << 30},
 	})
 
 	a.mu.RLock()
@@ -199,8 +201,12 @@ func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *te
 	if _, stillRunning := a.processes["default/svc-high"]; !stillRunning {
 		t.Error("svc-high should still be running (only one eviction per tick)")
 	}
-	if !a.pressureBlocked["default/svc-low"] {
+	evicted, blocked := a.pressureBlocked["default/svc-low"]
+	if !blocked {
 		t.Error("evicted key must be in pressureBlocked to prevent respawn")
+	}
+	if evicted.rss != 30<<30 {
+		t.Errorf("recorded RSS = %d, want %d (svc-low's RSS at eviction)", evicted.rss, uint64(30<<30))
 	}
 }
 
@@ -229,7 +235,7 @@ func TestHandleMemoryPressure_DisabledHonorsCLIFlag(t *testing.T) {
 	if _, stillRunning := a.processes["default/svc-low"]; !stillRunning {
 		t.Error("EvictionEnabled=false must prevent eviction even at Critical+guard")
 	}
-	if a.pressureBlocked["default/svc-low"] {
+	if _, blocked := a.pressureBlocked["default/svc-low"]; blocked {
 		t.Error("no eviction means no pressureBlocked entry")
 	}
 }
@@ -243,7 +249,7 @@ func TestEnsureProcess_BlockedUnderCriticalSkipsRespawn(t *testing.T) {
 	a := newPressureTestAgent(t, isvc)
 	a.executors["llama-server"] = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
 
-	a.pressureBlocked["default/svc-a"] = true
+	a.pressureBlocked["default/svc-a"] = evictedService{}
 	a.lastPressureLevel = MemoryPressureCritical
 
 	if err := a.ensureProcess(context.Background(), isvc); err != nil {
@@ -529,7 +535,7 @@ func TestHandleMemoryPressure_NormalClearsBlockedSet(t *testing.T) {
 	// needs a registry.
 	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 
-	a.pressureBlocked["default/svc-a"] = true
+	a.pressureBlocked["default/svc-a"] = evictedService{}
 	a.lastPressureLevel = MemoryPressureCritical
 
 	a.handleMemoryPressure(context.Background(), MemoryPressureNormal, MemoryStats{
@@ -550,19 +556,26 @@ func TestHandleMemoryPressure_NormalClearsBlockedSet(t *testing.T) {
 // returnToNormal reports a Warning-or-above to Normal transition to the
 // agent, then waits for the evicted-service restarts it launches.
 func returnToNormal(a *MetalAgent) {
+	normalSample(a, 60)
+}
+
+// normalSample reports a Normal watchdog sample with availGiB of 100 GiB
+// available, then waits for the evicted-service restarts it launches.
+func normalSample(a *MetalAgent, availGiB uint64) {
 	a.handleMemoryPressure(context.Background(), MemoryPressureNormal, MemoryStats{
-		TotalMemory: 100 << 30, TotalRSS: 40 << 30,
+		TotalMemory: 100 << 30, AvailableMemory: availGiB << 30, TotalRSS: 40 << 30,
 	})
 	a.evictedRestarts.Wait()
 }
 
-// blockEvicted marks keys as evicted under Critical pressure, the state
-// handleMemoryPressure's eviction path leaves behind.
-func blockEvicted(a *MetalAgent, keys ...string) {
+// blockEvicted marks keys as evicted under Critical pressure with rssGiB of
+// resident memory each, the state handleMemoryPressure's eviction path
+// leaves behind.
+func blockEvicted(a *MetalAgent, rssGiB uint64, keys ...string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, key := range keys {
-		a.pressureBlocked[key] = true
+		a.pressureBlocked[key] = evictedService{rss: rssGiB << 30}
 	}
 	a.lastPressureLevel = MemoryPressureCritical
 }
@@ -575,7 +588,7 @@ func runningKeys(a *MetalAgent) []string {
 	for key := range a.processes {
 		keys = append(keys, key)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 
@@ -655,7 +668,7 @@ func TestHandleMemoryPressure_NormalLeavesGoneEvictedServicesDown(t *testing.T) 
 	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, live, deleting, zero, moved, refusalModel(), cudaModel)
 	a.watcher = NewInferenceServiceWatcher(a.config.K8sClient, "default", newNopLogger())
 
-	blockEvicted(a, "default/svc-deleting", "default/svc-gone", "default/svc-live",
+	blockEvicted(a, 0, "default/svc-deleting", "default/svc-gone", "default/svc-live",
 		"default/svc-moved", "default/svc-zero")
 	returnToNormal(a)
 
@@ -672,7 +685,7 @@ func TestHandleMemoryPressure_NormalLeavesGoneEvictedServicesDown(t *testing.T) 
 // yet restarted must be blocked again for the next return to Normal, not
 // started under the pressure that evicted them.
 func TestHandleMemoryPressure_RestartStopsWhenPressureReturns(t *testing.T) {
-	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, refusalISVC("svc-a"), refusalISVC("svc-b"), refusalModel())
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, evictedISVC("svc-a"), evictedISVC("svc-b"), refusalModel())
 	// svc-a restarts first (keys run in sorted order), and its model load
 	// drives the host back to Critical.
 	ex.onStart = func() {
@@ -681,7 +694,7 @@ func TestHandleMemoryPressure_RestartStopsWhenPressureReturns(t *testing.T) {
 		a.mu.Unlock()
 	}
 
-	blockEvicted(a, "default/svc-a", "default/svc-b")
+	blockEvicted(a, 0, "default/svc-a", "default/svc-b")
 	returnToNormal(a)
 
 	if ex.starts != 1 || ex.lastCfg.Name != "svc-a" {
@@ -692,6 +705,220 @@ func TestHandleMemoryPressure_RestartStopsWhenPressureReturns(t *testing.T) {
 	}
 	if a.isPressureBlocked("default/svc-a") {
 		t.Error("svc-a was restarted, so it must not be blocked")
+	}
+	if got := memoryPressureCondition(t, a, "svc-b"); got != conditionEvicted {
+		t.Errorf("svc-b MemoryPressure = %q, want %q while it is blocked again", got, conditionEvicted)
+	}
+}
+
+// evictedISVC is a refusal-fixture InferenceService whose MemoryPressure
+// condition reads Evicted, as the eviction path leaves it.
+func evictedISVC(name string) *inferencev1alpha1.InferenceService {
+	isvc := refusalISVC(name)
+	isvc.Status.Conditions = []metav1.Condition{{
+		Type: ConditionMemoryPressure, Status: metav1.ConditionTrue, Reason: ReasonEvicted,
+		Message: "Evicted by memory watchdog", LastTransitionTime: metav1.Now(),
+	}}
+	return isvc
+}
+
+// memoryPressureCondition returns name's MemoryPressure condition as
+// "Status/Reason", or "" when it has none.
+func memoryPressureCondition(t *testing.T, a *MetalAgent, name string) string {
+	t.Helper()
+	got := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: name}, got); err != nil {
+		t.Fatalf("get %s: %v", name, err)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, ConditionMemoryPressure); cond != nil {
+		return string(cond.Status) + "/" + cond.Reason
+	}
+	return ""
+}
+
+// Condition values memoryPressureCondition returns for a blocked service and
+// for one back at Normal.
+const (
+	conditionEvicted = "True/" + ReasonEvicted
+	conditionNormal  = "False/" + ReasonMemoryNormal
+)
+
+// headroomFixture is a refusal fixture whose watchdog Warning threshold is
+// 0.20, so with the 100 GiB normalSample reports a restart must leave 20 GiB
+// available.
+func headroomFixture(
+	t *testing.T, objs ...runtimeObject,
+) (*MetalAgent, *recordingExecutor) {
+	t.Helper()
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{WatchdogConfig: &MemoryWatchdogConfig{
+		Interval: time.Second, WarningThreshold: 0.20, CriticalThreshold: 0.10,
+	}}, objs...)
+	return a, ex
+}
+
+// TestHandleMemoryPressure_RestartWaitsForHeadroom covers the evict and restart
+// loop admission cannot stop: admission compares one model's estimate with a
+// fraction of total memory, never with what is available. A service whose
+// eviction-time RSS would leave less than the Warning floor available stays
+// blocked, and keeps its Evicted condition, until a later Normal sample shows
+// enough room.
+func TestHandleMemoryPressure_RestartWaitsForHeadroom(t *testing.T) {
+	a, ex := headroomFixture(t, evictedISVC("svc-a"), refusalModel())
+	blockEvicted(a, 30, "default/svc-a")
+
+	normalSample(a, 45) // 45 - 30 = 15 GiB left, under the 20 GiB floor
+	if ex.starts != 0 || !a.isPressureBlocked("default/svc-a") {
+		t.Fatalf("with 15 GiB left: starts = %d, blocked = %v; want 0, true",
+			ex.starts, a.isPressureBlocked("default/svc-a"))
+	}
+	if got := memoryPressureCondition(t, a, "svc-a"); got != conditionEvicted {
+		t.Errorf("MemoryPressure = %q, want %q while svc-a waits", got, conditionEvicted)
+	}
+
+	normalSample(a, 55) // 55 - 30 = 25 GiB left
+	if ex.starts != 1 || a.isPressureBlocked("default/svc-a") {
+		t.Errorf("with 25 GiB left: starts = %d, blocked = %v; want 1, false",
+			ex.starts, a.isPressureBlocked("default/svc-a"))
+	}
+	if got := memoryPressureCondition(t, a, "svc-a"); got != conditionNormal {
+		t.Errorf("MemoryPressure = %q, want %q after the restart", got, conditionNormal)
+	}
+}
+
+// TestHandleMemoryPressure_RestartReservesHeadroomAcrossServices covers two
+// evicted services that each fit the headroom alone but not together: only
+// the first is restarted, and the second waits.
+func TestHandleMemoryPressure_RestartReservesHeadroomAcrossServices(t *testing.T) {
+	a, ex := headroomFixture(t, evictedISVC("svc-a"), evictedISVC("svc-b"), refusalModel())
+	blockEvicted(a, 20, "default/svc-a", "default/svc-b")
+
+	normalSample(a, 55) // one leaves 35 GiB, both leave 15 GiB, under the 20 GiB floor
+
+	if got, want := runningKeys(a), []string{"default/svc-a"}; !slices.Equal(got, want) || ex.starts != 1 {
+		t.Errorf("running = %v after %d start(s), want %v after 1", got, ex.starts, want)
+	}
+	if !a.isPressureBlocked("default/svc-b") {
+		t.Error("svc-b must stay blocked: with svc-a back there is no room for it")
+	}
+}
+
+// TestPickRestartable pins the headroom arithmetic: services are taken in key
+// order while their summed RSS leaves at least floor bytes available, one
+// that does not fit is skipped, and a smaller one after it may still fit.
+func TestPickRestartable(t *testing.T) {
+	const gib = 1 << 30
+	tests := []struct {
+		name      string
+		blocked   map[string]uint64 // key -> RSS in GiB
+		available uint64            // GiB
+		want      []string
+	}{
+		{"fits", map[string]uint64{"a": 30}, 55, []string{"a"}},
+		{"under the floor", map[string]uint64{"a": 30}, 45, nil},
+		{"exactly the floor", map[string]uint64{"a": 30}, 50, []string{"a"}},
+		{"second does not fit with the first", map[string]uint64{"a": 20, "b": 20}, 55, []string{"a"}},
+		{"smaller later one fits", map[string]uint64{"a": 40, "b": 10}, 45, []string{"b"}},
+		{"unknown RSS reserves nothing", map[string]uint64{"a": 0}, 20, []string{"a"}},
+		{"more than available", map[string]uint64{"a": 90}, 60, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			blocked := make(map[string]evictedService, len(tt.blocked))
+			for key, rss := range tt.blocked {
+				blocked[key] = evictedService{rss: rss * gib}
+			}
+			if got := pickRestartable(blocked, tt.available*gib, 20*gib); !slices.Equal(got, tt.want) {
+				t.Errorf("pickRestartable = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWatchdogRestart_DebouncedAndRetried wires a real watchdog to the agent:
+// a Warning sample inside the Normal debounce window starts nothing, the
+// debounced return to Normal does not restart a service the headroom cannot
+// take, and a later steady Normal sample (delivered because the service is
+// still waiting) restarts it once there is room.
+func TestWatchdogRestart_DebouncedAndRetried(t *testing.T) {
+	a, ex := headroomFixture(t, evictedISVC("svc-a"), refusalModel())
+	blockEvicted(a, 30, "default/svc-a")
+	total := uint64(100 << 30)
+	provider := &mockMemoryProvider{totalBytes: total}
+	w := NewMemoryWatchdog(provider, a.processMemInfoSnapshot,
+		func(level MemoryPressureLevel, stats MemoryStats) {
+			a.handleMemoryPressure(context.Background(), level, stats)
+		}, *a.config.WatchdogConfig, newNopLogger())
+	w.wantNormal = a.hasEvictedWaiting
+
+	sample := func(availGiB uint64) {
+		t.Helper()
+		provider.availableBytes = availGiB << 30
+		w.sample()
+		a.evictedRestarts.Wait()
+	}
+	for _, avail := range []uint64{5, 60, 60, 15, 60, 60} { // Critical, then Normal broken by Warning
+		sample(avail)
+	}
+	if ex.starts != 0 {
+		t.Fatalf("started %d time(s) before three consecutive Normal samples, want 0", ex.starts)
+	}
+	sample(45) // third Normal in a row: return delivered, but 45 - 30 leaves 15 GiB
+	if ex.starts != 0 || !a.isPressureBlocked("default/svc-a") {
+		t.Fatalf("after the return with 15 GiB left: starts = %d, blocked = %v; want 0, true",
+			ex.starts, a.isPressureBlocked("default/svc-a"))
+	}
+	sample(60) // steady Normal, retried because svc-a waits: 30 GiB left
+	if ex.starts != 1 || a.isPressureBlocked("default/svc-a") {
+		t.Errorf("after the retry with 30 GiB left: starts = %d, blocked = %v; want 1, false",
+			ex.starts, a.isPressureBlocked("default/svc-a"))
+	}
+}
+
+// TestHandleMemoryPressure_ReblockSkipsRunningServices covers pressure rising
+// mid-batch after a watch event already started (or is starting) a service
+// whose block was cleared: blocking a live process again would mark it
+// Evicted and stop a later restart from replacing it.
+func TestHandleMemoryPressure_ReblockSkipsRunningServices(t *testing.T) {
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{},
+		refusalISVC("svc-a"), refusalISVC("svc-b"), refusalISVC("svc-c"), refusalModel())
+	ex.onStart = func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.lastPressureLevel = MemoryPressureCritical
+		a.processes["default/svc-b"] = &ManagedProcess{Name: "svc-b", Namespace: "default", PID: 4343}
+		a.starting["default/svc-c"] = true
+	}
+
+	blockEvicted(a, 0, "default/svc-a", "default/svc-b", "default/svc-c")
+	returnToNormal(a)
+
+	for _, key := range []string{"default/svc-b", "default/svc-c"} {
+		if a.isPressureBlocked(key) {
+			t.Errorf("%s is running or starting, so it must not be blocked again", key)
+		}
+	}
+}
+
+// TestHandleMemoryPressure_RestartKeepsBlockOnReadError covers a failed read of
+// an evicted InferenceService during its restart: the service stays blocked,
+// so a later Normal sample retries it, instead of being dropped and left down.
+func TestHandleMemoryPressure_RestartKeepsBlockOnReadError(t *testing.T) {
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, &interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object,
+			opts ...client.GetOption) error {
+			if _, ok := obj.(*inferencev1alpha1.InferenceService); ok && key.Name == "svc-a" {
+				return errors.New("apiserver unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}, refusalISVC("svc-a"), refusalModel())
+
+	blockEvicted(a, 0, "default/svc-a")
+	returnToNormal(a)
+
+	if ex.starts != 0 || !a.isPressureBlocked("default/svc-a") {
+		t.Errorf("starts = %d, blocked = %v; want 0, true", ex.starts, a.isPressureBlocked("default/svc-a"))
 	}
 }
 
@@ -901,7 +1128,7 @@ func TestEnsureProcess_EmitsRespawnBlockedEvent(t *testing.T) {
 	rec := record.NewFakeRecorder(32)
 	a.config.EventRecorder = rec
 
-	a.pressureBlocked["default/svc-a"] = true
+	a.pressureBlocked["default/svc-a"] = evictedService{}
 	a.lastPressureLevel = MemoryPressureCritical
 
 	if err := a.ensureProcess(context.Background(), isvc); err != nil {
