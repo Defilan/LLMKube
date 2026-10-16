@@ -352,8 +352,9 @@ func TestDownloadFile_DeclaredContentLengthOverCapRefused(t *testing.T) {
 }
 
 // A partial on disk whose content, with the rest of the body, would exceed
-// the cap is refused even though the partial alone is under it; the partial
-// is removed and no ranged request is sent.
+// the cap is refused even though the partial alone is under it. The probed
+// size is what refuses it, so the partial is removed and no ranged request is
+// sent.
 func TestDownloadFile_ResumeOverCapRefused(t *testing.T) {
 	dir := t.TempDir()
 	md := modelDirPath(t, dir, "resume-over-model")
@@ -373,6 +374,55 @@ func TestDownloadFile_ResumeOverCapRefused(t *testing.T) {
 	if o.rangeRequests.Load() != 0 || o.fullFromZero.Load() != 0 {
 		t.Errorf("body requests sent: range=%d full=%d, want none", o.rangeRequests.Load(), o.fullFromZero.Load())
 	}
+}
+
+// A source whose probe under-declares (a size under the cap) and whose
+// ranged remainder then streams on without a length is still stopped at the
+// cap through downloadFile. A resumed copy itself cannot overrun here: the
+// 206 must imply exactly the probed total or the resume is dropped, and
+// net/http ends a body at its Content-Length, so the only way to stream past
+// the declared size is without a length, which drops the resume. This pins
+// that the fallback removes the partial and the from-zero copy is capped;
+// the resume accounting inside the copy is pinned by
+// TestCopyToFileResume_DownloadCap.
+func TestDownloadFile_UnderDeclaredResumeOverrunIsCapped(t *testing.T) {
+	const size, onDisk, limit = 40 << 10, 20 << 10, 64 << 10
+	rangeBody := &endlessBody{safety: 64 << 20}
+	fullBody := &endlessBody{safety: 64 << 20}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(size))
+		case r.Header.Get("Range") != "":
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", onDisk, size-1, size))
+			w.WriteHeader(http.StatusPartialContent)
+			rangeBody.serve(w)
+		default:
+			fullBody.serve(w)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	md := modelDirPath(t, dir, "underdeclared-model")
+	localPath := filepath.Join(md, "model.gguf")
+	validator := "CL" + strconv.Itoa(size) + `ET"v1"`
+	if err := os.WriteFile(validatorPartialPath(localPath, validator),
+		bytes.Repeat([]byte("A"), onDisk), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := cappedExecutor(dir, limit).downloadFile(t.Context(), srv.URL+"/model.gguf", localPath, "", "")
+
+	assertTooLarge(t, err, 0)
+	assertDirEmpty(t, md)
+	srv.Close()
+	if rangeBody.gets.Load() != 1 || fullBody.gets.Load() != 1 {
+		t.Errorf("ranged GETs = %d, from-zero GETs = %d, want 1 each (the overrunning resume is dropped "+
+			"for a from-zero download)", rangeBody.gets.Load(), fullBody.gets.Load())
+	}
+	fullBody.assertStoppedEarly(t, srv)
+	rangeBody.assertStoppedEarly(t, srv)
 }
 
 // A resume whose total lands exactly on the cap completes unchanged: it
