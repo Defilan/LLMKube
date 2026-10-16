@@ -46,19 +46,39 @@ func TestDeadlineReconcilerCancelsHungReconcile(t *testing.T) {
 	}
 }
 
-// TestDeadlineReconcilerSurfacesDeadlineWhenInnerSwallowsIt covers an inner
-// that returns cleanly (nil error) after the deadline fired: the wrapper must
-// still turn the aborted reconcile into an error, or the object silently
-// stays unreconciled with no retry.
-func TestDeadlineReconcilerSurfacesDeadlineWhenInnerSwallowsIt(t *testing.T) {
+// TestDeadlineReconcilerKeepsLateSuccessAfterCancellation covers an inner
+// that observes the deadline cancellation and still returns cleanly: the
+// wrapper must not relabel that clean return into an error, or finished work
+// gets requeued as if it had failed.
+func TestDeadlineReconcilerKeepsLateSuccessAfterCancellation(t *testing.T) {
 	inner := &deadlineTestReconciler{wait: 5 * time.Second, swallow: true}
 	d := &DeadlineReconciler{Inner: inner, Timeout: 50 * time.Millisecond, Log: logr.Discard()}
 
 	_, err := d.Reconcile(context.Background(), reconcile.Request{
 		NamespacedName: types.NamespacedName{Namespace: "ns", Name: "isvc"},
 	})
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected the wrapper to surface the deadline, got %v", err)
+	if err != nil {
+		t.Fatalf("expected a swallowed deadline to stay a success, got %v", err)
+	}
+}
+
+// TestDeadlineReconcilerKeepsLateSuccess pins the slow-success case: a
+// reconcile that ignores its context (a local file copy cannot be
+// interrupted) and still completes must keep its success. Relabeling it as a
+// deadline failure would requeue finished work and move the error metric for
+// a reconcile that did not fail.
+func TestDeadlineReconcilerKeepsLateSuccess(t *testing.T) {
+	inner := &deadlineTestReconciler{ignoreCtx: true, wait: 150 * time.Millisecond, result: reconcile.Result{RequeueAfter: time.Minute}}
+	d := &DeadlineReconciler{Inner: inner, Timeout: 20 * time.Millisecond, Log: logr.Discard()}
+
+	res, err := d.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "ns", Name: "isvc"},
+	})
+	if err != nil {
+		t.Fatalf("expected a late success to stay a success, got %v", err)
+	}
+	if res.RequeueAfter != time.Minute {
+		t.Fatalf("expected the inner result to pass through, got %+v", res)
 	}
 }
 
@@ -122,13 +142,20 @@ func TestDeadlineReconcilerKeepsParentCancellationUntouched(t *testing.T) {
 // deadlineTestReconciler blocks for wait (or until its context is done) and
 // records which error, if any, its context ended with.
 type deadlineTestReconciler struct {
-	wait    time.Duration
-	swallow bool
-	result  reconcile.Result
-	sawErr  error
+	wait      time.Duration
+	ignoreCtx bool
+	swallow   bool
+	result    reconcile.Result
+	sawErr    error
 }
 
 func (r *deadlineTestReconciler) Reconcile(ctx context.Context, _ reconcile.Request) (reconcile.Result, error) {
+	if r.ignoreCtx {
+		// Simulates work that cannot be interrupted by the context (a local
+		// file copy): it runs to completion and reports its own outcome.
+		time.Sleep(r.wait)
+		return r.result, nil
+	}
 	select {
 	case <-ctx.Done():
 		r.sawErr = ctx.Err()

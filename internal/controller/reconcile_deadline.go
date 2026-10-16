@@ -26,12 +26,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// DeadlineReconciler bounds every wrapped reconcile with a context deadline.
-// A call that never returns (to the API server, or to a pod endpoint on the
-// Metal path) would otherwise hold its worker forever; with the deadline it
-// fails instead, the workqueue requeues the object with backoff, and the
-// controller's error metric moves so the stall is visible (#2069). A timeout
-// of zero or less disables the bound and passes the request through.
+// DeadlineReconciler bounds the context-aware parts of every wrapped
+// reconcile with a context deadline: API requests and HTTP requests built
+// with the reconcile context fail at the deadline, so the workqueue requeues
+// the object with backoff and the controller's error metric moves (#2069).
+// It cannot interrupt code that ignores its context (a local file copy), so
+// such a reconcile still completes; a success that lands after the deadline
+// is kept and logged as an overrun, not relabeled as a failure. A timeout of
+// zero or less disables the bound and passes the request through.
 type DeadlineReconciler struct {
 	Inner   reconcile.Reconciler
 	Timeout time.Duration
@@ -43,19 +45,31 @@ func (d *DeadlineReconciler) Reconcile(ctx context.Context, req reconcile.Reques
 	if d.Timeout <= 0 {
 		return d.Inner.Reconcile(ctx, req)
 	}
+	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, d.Timeout)
 	defer cancel()
 
 	res, err := d.Inner.Reconcile(ctx, req)
-	// Only a deadline counts here. A plain cancellation means the manager is
-	// shutting down, where relabeling the error buys nothing, and an inner
-	// error that already reports the deadline is left alone.
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
-		d.Log.Error(ctx.Err(), "reconcile exceeded its deadline and was cancelled",
-			"timeout", d.Timeout.String(), "namespace", req.Namespace, "name", req.Name)
-		err = fmt.Errorf("reconcile exceeded deadline %s: %w", d.Timeout, ctx.Err())
+	// Only a deadline counts here, and only a failed reconcile is relabeled:
+	// an inner that ignored its context and still succeeded keeps its
+	// success, with the overrun logged. A plain cancellation means the
+	// manager is shutting down, where relabeling the error buys nothing, and
+	// an inner error that already reports the deadline is left alone.
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return res, err
 	}
-	return res, err
+	if err == nil {
+		d.Log.Info("reconcile finished after its deadline",
+			"elapsed", time.Since(start).String(), "timeout", d.Timeout.String(),
+			"namespace", req.Namespace, "name", req.Name)
+		return res, nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return res, err
+	}
+	d.Log.Error(ctx.Err(), "reconcile exceeded its deadline and was cancelled",
+		"timeout", d.Timeout.String(), "namespace", req.Namespace, "name", req.Name)
+	return res, fmt.Errorf("reconcile exceeded deadline %s: %w", d.Timeout, ctx.Err())
 }
 
 // WithReconcileDeadline returns the decorator a reconciler applies to itself
