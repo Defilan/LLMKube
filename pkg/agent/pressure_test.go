@@ -18,12 +18,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -460,6 +462,60 @@ func readSkippedCounter(t *testing.T, reason string) float64 {
 		t.Fatalf("read counter: %v", err)
 	}
 	return m.GetCounter().GetValue()
+}
+
+// failingStopExecutor is a stubExecutor whose StopProcess fails, so the
+// eviction's deleteProcess reports a teardown error.
+type failingStopExecutor struct{ stubExecutor }
+
+func (failingStopExecutor) StopProcess(_ int) error { return errors.New("stop failed") }
+
+// TestHandleMemoryPressure_CountsEvictionsTotal pins evictions_total: it rises
+// by exactly one when the watchdog actually stops a process, and does not move
+// when an eviction is skipped or the picked process's teardown fails.
+func TestHandleMemoryPressure_CountsEvictionsTotal(t *testing.T) {
+	addProcess := func(a *MetalAgent, name, priority string, pid int) {
+		a.processes["default/"+name] = &ManagedProcess{
+			Name: name, Namespace: "default", Priority: priority,
+			ModelPath: "/m.gguf", PID: pid, StartedAt: time.Now(),
+		}
+	}
+	one := func(a *MetalAgent) { addProcess(a, "svc-low", "low", 999990) }
+	two := func(a *MetalAgent) {
+		one(a)
+		addProcess(a, "svc-high", "high", 999991)
+	}
+	tests := []struct {
+		name      string
+		enabled   bool
+		exec      ProcessExecutor
+		processes func(*MetalAgent)
+		rssGiB    uint64
+		want      float64
+	}{
+		{"eviction", true, stubExecutor{}, two, 80, 1},
+		{"skipped: disabled", false, stubExecutor{}, two, 80, 0},
+		{"skipped: below guard", true, stubExecutor{}, two, 30, 0},
+		{"skipped: floor", true, stubExecutor{}, one, 80, 0},
+		{"teardown failed", true, failingStopExecutor{}, two, 80, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newPressureTestAgent(t)
+			a.config.EvictionEnabled = tc.enabled
+			a.executors["llama-server"] = tc.exec
+			a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
+			tc.processes(a)
+
+			before := testutil.ToFloat64(evictionsTotal)
+			a.handleMemoryPressure(context.Background(), MemoryPressureCritical, MemoryStats{
+				TotalMemory: 100 << 30, TotalRSS: tc.rssGiB << 30,
+			})
+			if got := testutil.ToFloat64(evictionsTotal) - before; got != tc.want {
+				t.Errorf("evictions_total delta = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // TestHandleMemoryPressure_NormalClearsBlockedSet verifies that when pressure

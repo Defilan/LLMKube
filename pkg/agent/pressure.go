@@ -264,6 +264,9 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		a.logger.Errorw("eviction failed; cleared pressure block", "key", key, "error", err)
 		return
 	}
+	// Counted only here, once the process is actually stopped: a picked
+	// candidate whose teardown failed was not evicted.
+	evictionsTotal.Inc()
 
 	a.emitInferenceEvent(ctx, target, corev1.EventTypeWarning, EventReasonEvicted,
 		"Process evicted to relieve memory pressure (priority=%s, totalRSS=%s of %s)",
