@@ -35,15 +35,21 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
-// mockHealthChecker is a test double for ProcessHealthChecker.
+// mockHealthChecker is a test double for ProcessHealthChecker. probed
+// records the path requested on each port.
 type mockHealthChecker struct {
 	result bool
 	err    error
 	calls  int
+	probed map[int]string
 }
 
-func (m *mockHealthChecker) Check(_ context.Context, _ int) (bool, error) {
+func (m *mockHealthChecker) Check(_ context.Context, port int, path string) (bool, error) {
 	m.calls++
+	if m.probed == nil {
+		m.probed = map[int]string{}
+	}
+	m.probed[port] = path
 	return m.result, m.err
 }
 
@@ -208,7 +214,11 @@ func TestHealthMonitor_MarksHealthy(t *testing.T) {
 	}
 }
 
-func TestHealthMonitor_RecordsRestartCount(t *testing.T) {
+// TestHealthMonitor_OneFailureDoesNotRestart checks that a single failed
+// probe marks the process unhealthy but leaves it running and tracked: the
+// restart waits for DefaultHealthFailureThreshold consecutive failures
+// (#2077). Restarts and their counter are covered in health_restart_test.go.
+func TestHealthMonitor_OneFailureDoesNotRestart(t *testing.T) {
 	agent := newTestAgent()
 	agent.processes["default/model-a"] = &ManagedProcess{
 		Name: "model-a", Namespace: "default", Port: 8080, Healthy: true,
@@ -220,17 +230,17 @@ func TestHealthMonitor_RecordsRestartCount(t *testing.T) {
 
 	monitor.checkAll(context.Background())
 
-	// Verify restart counter was incremented (scheduleRestart calls processRestarts.Inc)
-	// We can't easily check the counter value directly without reading the metric,
-	// but we can verify the checker was called and the process was marked unhealthy.
 	if checker.calls != 1 {
 		t.Errorf("expected 1 health check call, got %d", checker.calls)
 	}
 
 	agent.mu.RLock()
-	healthy := agent.processes["default/model-a"].Healthy
+	p := agent.processes["default/model-a"]
 	agent.mu.RUnlock()
-	if healthy {
+	if p == nil {
+		t.Fatal("process was stopped after one failed check")
+	}
+	if p.Healthy {
 		t.Error("process should be unhealthy after failed check")
 	}
 }
@@ -361,6 +371,32 @@ func TestHealthMonitor_RegistersOnRecovery(t *testing.T) {
 	}
 }
 
+// TestHealthMonitor_ProbesOllamaAtRoot pins the probe path per runtime.
+// Ollama has no /health route (it answers 404), so probing it there marked
+// every Ollama service unhealthy on every cycle.
+func TestHealthMonitor_ProbesOllamaAtRoot(t *testing.T) {
+	agent := newTestAgent()
+	agent.processes["default/ollama"] = &ManagedProcess{
+		Name: "ollama", Namespace: "default", Port: 11434, Healthy: true, Runtime: runtimeOllama,
+	}
+	agent.processes["default/llama"] = &ManagedProcess{
+		Name: "llama", Namespace: "default", Port: 18080, Healthy: true, Runtime: runtimeLlamaServer,
+	}
+	agent.processes["default/legacy"] = &ManagedProcess{
+		Name: "legacy", Namespace: "default", Port: 18081, Healthy: true,
+	}
+
+	checker := &mockHealthChecker{result: true}
+	NewHealthMonitor(agent, checker, time.Second, newNopLogger()).checkAll(context.Background())
+
+	want := map[int]string{11434: "/", 18080: "/health", 18081: "/health"}
+	for port, path := range want {
+		if got := checker.probed[port]; got != path {
+			t.Errorf("port %d probed at %q, want %q", port, got, path)
+		}
+	}
+}
+
 func TestHealthMonitor_ContextCancellation(t *testing.T) {
 	agent := newTestAgent()
 	checker := &mockHealthChecker{result: true}
@@ -400,7 +436,7 @@ func TestDefaultProcessHealthChecker_Success(t *testing.T) {
 	}
 
 	checker := NewDefaultProcessHealthChecker(5 * time.Second)
-	healthy, err := checker.Check(context.Background(), port)
+	healthy, err := checker.Check(context.Background(), port, "/health")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -409,10 +445,36 @@ func TestDefaultProcessHealthChecker_Success(t *testing.T) {
 	}
 }
 
+// TestDefaultProcessHealthChecker_UsesPath checks that the probe requests the
+// path it is given rather than a fixed /health.
+func TestDefaultProcessHealthChecker_UsesPath(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	var port int
+	if _, err := fmt.Sscanf(ts.URL, "http://127.0.0.1:%d", &port); err != nil {
+		t.Fatalf("failed to parse test server port: %v", err)
+	}
+
+	checker := NewDefaultProcessHealthChecker(5 * time.Second)
+	if healthy, err := checker.Check(context.Background(), port, "/"); err != nil || !healthy {
+		t.Errorf("Check(/) = %v, %v; want true, nil", healthy, err)
+	}
+	if healthy, err := checker.Check(context.Background(), port, "/health"); err != nil || healthy {
+		t.Errorf("Check(/health) = %v, %v; want false, nil from a server without that route", healthy, err)
+	}
+}
+
 func TestDefaultProcessHealthChecker_Failure(t *testing.T) {
 	// Use a port that is almost certainly not listening
 	checker := NewDefaultProcessHealthChecker(500 * time.Millisecond)
-	healthy, err := checker.Check(context.Background(), 19999)
+	healthy, err := checker.Check(context.Background(), 19999, "/health")
 	if err == nil {
 		t.Error("expected error for unreachable port")
 	}

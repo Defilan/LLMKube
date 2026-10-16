@@ -604,7 +604,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 |--------|------|-------------|
 | `llmkube_metal_agent_managed_processes` | Gauge | Number of inference processes currently managed, across every runtime (the metric's help text says llama-server) |
 | `llmkube_metal_agent_process_healthy` | Gauge | Whether a process is healthy (1) or not (0). Labels: `name`, `namespace` |
-| `llmkube_metal_agent_process_restarts_total` | Counter | Total process restarts triggered by health monitoring. Labels: `name`, `namespace` |
+| `llmkube_metal_agent_process_restarts_total` | Counter | Engine restart attempts, counted per attempt (a retry after a failed restart counts again). Labels: `name`, `namespace` |
 | `llmkube_metal_agent_health_check_duration_seconds` | Histogram | Duration of health check probes. Labels: `name`, `namespace` |
 | `llmkube_metal_agent_memory_budget_bytes` | Gauge | Total memory budget for model serving |
 | `llmkube_metal_agent_memory_estimated_bytes` | Gauge | Estimated memory per process. Labels: `name`, `namespace` |
@@ -627,14 +627,19 @@ Standard Go runtime and process metrics (`go_*`, `process_*`) are also available
 
 ### Continuous Health Monitoring
 
-The agent polls each managed llama-server process every 30 seconds via its `/health` endpoint. On failure:
+The agent probes each engine every 30 seconds at `GET /health` (Ollama, which has no `/health` route, at `GET /`). It only probes an engine that has finished starting, so a model that is still loading is never counted as failing.
 
-1. The process is marked unhealthy (`Healthy=false`, `process_healthy` gauge set to 0)
-2. The agent re-fetches the InferenceService from Kubernetes
-3. `ensureProcess()` is called to restart the llama-server
-4. The `process_restarts_total` counter is incremented
+On the first failed probe the engine is marked unhealthy (`process_healthy` set to 0) and its endpoint is withdrawn (`Ready=false`), so the cluster stops routing to it. The engine keeps running, so one slow probe does not reload a large model. If a later probe succeeds, the engine is marked healthy and its endpoint re-registered.
 
-When a previously unhealthy process recovers, it is marked healthy again automatically.
+After `--health-failure-threshold` consecutive failed probes (default `3`, about a minute after the first failure), the agent restarts the engine, much like a kubelet liveness probe:
+
+1. It stops the unhealthy engine the way a spec change does (SIGTERM, then SIGKILL after 10 seconds; for oMLX and Ollama it unloads the model instead, since their daemon is shared) and stops tracking it. A `HealthRestart` Warning event records the stop.
+2. It starts a new engine from the current InferenceService and re-registers the endpoint. `process_restarts_total` counts every restart attempt.
+3. A restart that fails is retried on its own, without any change to the InferenceService. Each failure logs the next retry time and emits a `RestartFailed` Warning event.
+
+Restarts back off per InferenceService: the first one runs at once, and each later one waits twice as long as the one before (10s, 20s, 40s, up to 5 minutes), whether the start failed or the new engine failed its health checks again. Other changes to the InferenceService (a status update, for example) do not start the engine early, but a spec change resets the backoff and starts the new spec at once. The backoff also resets once an engine has run for 10 minutes. An engine that did not stop cleanly (for example one that had to be killed) gets at least 10 seconds to release its memory before the new engine loads the weights, spec change or not.
+
+Deleting the InferenceService, scaling it to zero, suspending it, evicting it under memory pressure and shutting down the agent all cancel a pending restart.
 
 ### Scraping with Prometheus
 
@@ -1275,7 +1280,7 @@ rm ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 4. **Validates** that the model fits in the system's memory budget
 5. **Spawns** llama-server processes with Metal acceleration
 6. **Registers** its authenticated TLS ingress back to Kubernetes as `<isvc>-agent` (engines themselves listen on `127.0.0.1` only)
-7. **Monitors** process health every 30s and auto-restarts on failure
+7. **Monitors** engine health every 30s and restarts an engine that keeps failing its health checks, with backoff
 8. **Exposes** health checks and Prometheus metrics on port 9090
 9. **Pods** call the `<isvc>` Service, which the controller points at an in-cluster relay (`<isvc>-relay`) that forwards to the ingress
 

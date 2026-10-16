@@ -27,12 +27,24 @@ import (
 	"go.uber.org/zap"
 )
 
-// ProcessHealthChecker checks whether a llama-server process is healthy.
+// ProcessHealthChecker checks whether an engine is healthy by probing path on
+// its loopback port.
 type ProcessHealthChecker interface {
-	Check(ctx context.Context, port int) (bool, error)
+	Check(ctx context.Context, port int, path string) (bool, error)
 }
 
-// DefaultProcessHealthChecker probes a llama-server's /health endpoint.
+// healthProbePath returns the path the health monitor probes for a runtime.
+// Every engine the agent starts serves /health except Ollama, which has no
+// such route and answers it with 404; OllamaExecutor.isHealthy checks GET /
+// for the same reason.
+func healthProbePath(runtime string) string {
+	if runtime == runtimeOllama {
+		return "/"
+	}
+	return "/health"
+}
+
+// DefaultProcessHealthChecker probes an engine's health endpoint over HTTP.
 type DefaultProcessHealthChecker struct {
 	client http.Client
 }
@@ -44,9 +56,10 @@ func NewDefaultProcessHealthChecker(timeout time.Duration) *DefaultProcessHealth
 	}
 }
 
-// Check sends a GET request to the llama-server /health endpoint.
-func (c *DefaultProcessHealthChecker) Check(ctx context.Context, port int) (bool, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+// Check sends a GET request to path on 127.0.0.1:port and reports whether it
+// answered 200.
+func (c *DefaultProcessHealthChecker) Check(ctx context.Context, port int, path string) (bool, error) {
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, err
@@ -92,7 +105,11 @@ type processSnapshot struct {
 	Name      string
 	Namespace string
 	Port      int
-	Healthy   bool
+	Runtime   string
+	// proc is the probed process itself, so a result that arrives after it
+	// was replaced or stopped is not applied to whatever is tracked under
+	// Key by then.
+	proc *ManagedProcess
 }
 
 // Run starts the health monitor loop. It blocks until ctx is cancelled.
@@ -121,7 +138,8 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 			Name:      p.Name,
 			Namespace: p.Namespace,
 			Port:      p.Port,
-			Healthy:   p.Healthy,
+			Runtime:   p.Runtime,
+			proc:      p,
 		})
 	}
 	m.agent.mu.RUnlock()
@@ -129,53 +147,75 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 	// Update managed process count
 	managedProcesses.Set(float64(len(snapshots)))
 
+	threshold := m.agent.healthFailureThreshold()
 	for _, snap := range snapshots {
 		if ctx.Err() != nil {
 			return
 		}
 
 		start := time.Now()
-		healthy, err := m.checker.Check(ctx, snap.Port)
+		healthy, err := m.checker.Check(ctx, snap.Port, healthProbePath(snap.Runtime))
 		duration := time.Since(start).Seconds()
 		healthCheckDuration.WithLabelValues(snap.Name, snap.Namespace).Observe(duration)
+		if ctx.Err() != nil {
+			// Cut short by shutdown: says nothing about the engine.
+			return
+		}
 
 		if err != nil {
 			healthy = false
 			m.logger.Warnw("health check error", "name", snap.Name, "namespace", snap.Namespace, "error", err)
 		}
 
-		if snap.Healthy && !healthy {
-			// healthy → unhealthy transition
-			m.logger.Warnw("process became unhealthy",
-				"name", snap.Name, "namespace", snap.Namespace)
+		m.applyResult(ctx, snap, healthy, threshold)
+	}
+}
 
-			m.agent.mu.Lock()
-			if p, ok := m.agent.processes[snap.Key]; ok {
-				p.Healthy = false
-			}
-			m.agent.mu.Unlock()
+// applyResult records one probe result on the process it was taken from and
+// acts on it: the first failure withdraws the endpoint, threshold consecutive
+// failures stop the engine for a restart, and a success after failures
+// re-registers the endpoint. An engine that is still loading is never probed:
+// the agent tracks a process only after its executor's StartProcess returns,
+// and every executor waits there until the engine is ready to serve.
+func (m *HealthMonitor) applyResult(ctx context.Context, snap processSnapshot, healthy bool, threshold int) {
+	a := m.agent
+	a.mu.Lock()
+	if a.processes[snap.Key] != snap.proc {
+		// Replaced or stopped while the probe ran; the result says nothing
+		// about the process tracked now.
+		a.mu.Unlock()
+		return
+	}
+	wasHealthy := snap.proc.Healthy
+	snap.proc.Healthy = healthy
+	if healthy {
+		snap.proc.healthFailures = 0
+		a.resetRestartBackoffLocked(snap.Key, snap.proc)
+	} else {
+		snap.proc.healthFailures++
+	}
+	failures := snap.proc.healthFailures
+	a.mu.Unlock()
 
-			processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(0)
-			// Immediately withdraw the endpoint so kube-proxy stops DNATing
-			// to the dead backend (#662).
-			m.agent.withdrawEndpoint(ctx, snap.Name, snap.Namespace)
-			m.agent.scheduleRestart(ctx, snap.Name, snap.Namespace)
-		} else if !snap.Healthy && healthy {
-			// unhealthy → healthy transition
-			m.logger.Infow("process recovered",
-				"name", snap.Name, "namespace", snap.Namespace)
+	switch {
+	case wasHealthy && !healthy:
+		m.logger.Warnw("process became unhealthy",
+			"name", snap.Name, "namespace", snap.Namespace, "restartAfterFailures", threshold)
+		processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(0)
+		// Immediately withdraw the endpoint so kube-proxy stops DNATing
+		// to the dead backend (#662).
+		a.withdrawEndpoint(ctx, snap.Name, snap.Namespace)
+	case !wasHealthy && healthy:
+		m.logger.Infow("process recovered",
+			"name", snap.Name, "namespace", snap.Namespace)
+		processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(1)
+		// Immediately re-register the endpoint so kube-proxy resumes
+		// routing to the recovered backend (#662).
+		a.registerEndpoint(ctx, snap.Key, snap.proc)
+	}
 
-			m.agent.mu.Lock()
-			if p, ok := m.agent.processes[snap.Key]; ok {
-				p.Healthy = true
-			}
-			m.agent.mu.Unlock()
-
-			processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(1)
-			// Immediately re-register the endpoint so kube-proxy resumes
-			// routing to the recovered backend (#662).
-			m.agent.registerEndpoint(ctx, snap.Name, snap.Namespace)
-		}
+	if !healthy && failures >= threshold {
+		a.restartUnhealthy(ctx, snap.Key, snap.proc, failures)
 	}
 }
 

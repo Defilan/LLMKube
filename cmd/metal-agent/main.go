@@ -77,6 +77,7 @@ type AgentConfig struct {
 	MemoryPressureCritical    float64
 	EvictionEnabled           bool
 	MaxWatchFailures          int
+	HealthFailureThreshold    int
 	InferenceServiceAllowlist string
 	LlamaServerStartupTimeout time.Duration
 	OMLXStartupTimeout        time.Duration
@@ -521,6 +522,10 @@ func main() {
 	flag.IntVar(&cfg.MaxWatchFailures, "max-watch-failures", agent.DefaultMaxConsecutiveFailures,
 		"Consecutive Kubernetes list failures from the InferenceService watcher before the agent "+
 			"gives up and exits for supervisor restart. Set to 0 to use the agent default.")
+	flag.IntVar(&cfg.HealthFailureThreshold, "health-failure-threshold", agent.DefaultHealthFailureThreshold,
+		"Consecutive failed health probes (one every 30s) before the agent stops an engine and starts "+
+			"a new one; restarts that keep failing back off from 10s to 5m. The first failed probe already "+
+			"withdraws the engine's endpoint. Set to 0 to use the agent default.")
 	flag.StringVar(&cfg.InferenceServiceAllowlist, "inference-service-allowlist", "",
 		"Comma-separated list of InferenceService names this agent is permitted to claim. "+
 			"Empty (default) claims every metal-accelerator InferenceService in --namespace "+
@@ -766,6 +771,7 @@ func main() {
 		MemoryFraction:            cfg.MemoryFraction,
 		MemoryCheckMode:           cfg.MemoryCheckMode,
 		MaxWatchFailures:          cfg.MaxWatchFailures,
+		HealthFailureThreshold:    cfg.HealthFailureThreshold,
 		InferenceServiceAllowlist: splitCSV(cfg.InferenceServiceAllowlist),
 		LlamaServerStartupTimeout: cfg.LlamaServerStartupTimeout,
 		OMLXStartupTimeout:        cfg.OMLXStartupTimeout,
