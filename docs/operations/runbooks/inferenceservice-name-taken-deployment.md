@@ -1,13 +1,15 @@
 # InferenceService stuck in `Failed` with `DeploymentNameTaken`
 
-An `InferenceService` sits in phase `Failed` with
-`status.schedulingStatus: DeploymentNameTaken`, the reconcile creates or
-updates nothing past the refused Deployment step, and the operator log
-repeats a refusal line on a slow two-minute cadence instead of erroring.
-Objects an earlier pass provisioned are left in place: the refusal stops the
-sequence, it does not tear anything down. The controller is not broken: a
-Deployment already holds the name the service generates, and the controller
-refuses to touch an object it did not create (#2011).
+An `InferenceService` sits with `status.schedulingStatus: DeploymentNameTaken`
+and a phase of `Failed` while it should be serving, or `Suspended`/`Stopped`
+when it is deliberately off (the refusal respects the user's intent and rides
+the marker instead), the reconcile creates or updates nothing past the refused
+Deployment step, and the operator log repeats a refusal line on a slow
+two-minute cadence instead of erroring. Objects an earlier pass provisioned
+are left in place: the refusal stops the sequence, it does not tear anything
+down. The controller is not broken: a Deployment already holds the name the
+service generates, and the controller refuses to touch an object it did not
+create (#2011).
 
 ## Trigger
 
@@ -41,8 +43,11 @@ One or more of:
    kubectl get inferenceservice <name> -o jsonpath='{.status.conditions[?(@.type=="Degraded")]}' | jq
    ```
 
-   Expect `Failed` and `DeploymentNameTaken`; the message names the blocking
-   Deployment and the remedy. The `Degraded` condition carries the generic
+   Expect `Failed` and `DeploymentNameTaken` for a service that should be
+   serving; a suspended or zero-replica service reports `Suspended` or
+   `Stopped` with the same marker, and the conflict bites when it is
+   unsuspended or scaled back up. The message names the blocking Deployment
+   and the remedy. The `Degraded` condition carries the generic
    `Failed` reason; the specific `DeploymentNameTaken` reason appears only in
    `status.schedulingStatus` and the Warning event.
 
