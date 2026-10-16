@@ -499,7 +499,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 |--------|------|-------------|
 | `llmkube_metal_agent_managed_processes` | Gauge | Number of llama-server processes currently managed |
 | `llmkube_metal_agent_process_healthy` | Gauge | Whether a process is healthy (1) or not (0). Labels: `name`, `namespace` |
-| `llmkube_metal_agent_process_restarts_total` | Counter | Total process restarts triggered by health monitoring. Labels: `name`, `namespace` |
+| `llmkube_metal_agent_process_restarts_total` | Counter | Engine restart attempts, counted per attempt (a retry after a failed restart counts again). Labels: `name`, `namespace` |
 | `llmkube_metal_agent_health_check_duration_seconds` | Histogram | Duration of health check probes. Labels: `name`, `namespace` |
 | `llmkube_metal_agent_memory_budget_bytes` | Gauge | Total memory budget for model serving |
 | `llmkube_metal_agent_memory_estimated_bytes` | Gauge | Estimated memory per process. Labels: `name`, `namespace` |
@@ -524,7 +524,7 @@ After `--health-failure-threshold` consecutive failed probes (default `3`, about
 2. It starts a new engine from the current InferenceService and re-registers the endpoint. `process_restarts_total` counts every restart attempt.
 3. A restart that fails is retried on its own, without any change to the InferenceService. Each failure logs the next retry time and emits a `RestartFailed` Warning event.
 
-Restarts back off per InferenceService: the first one runs at once, and each later one waits twice as long as the one before (10s, 20s, 40s, up to 5 minutes), whether the start failed or the new engine failed its health checks again. The backoff resets once an engine has run for 10 minutes. An engine that did not stop cleanly (for example one that had to be killed) gets at least 10 seconds to release its memory before the new engine loads the weights.
+Restarts back off per InferenceService: the first one runs at once, and each later one waits twice as long as the one before (10s, 20s, 40s, up to 5 minutes), whether the start failed or the new engine failed its health checks again. Other changes to the InferenceService (a status update, for example) do not start the engine early, but a spec change resets the backoff and starts the new spec at once. The backoff also resets once an engine has run for 10 minutes. An engine that did not stop cleanly (for example one that had to be killed) gets at least 10 seconds to release its memory before the new engine loads the weights.
 
 Deleting the InferenceService, scaling it to zero, suspending it, evicting it under memory pressure and shutting down the agent all cancel a pending restart.
 

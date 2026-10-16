@@ -48,6 +48,10 @@ const (
 	healthRestartBackoffReset   = 10 * time.Minute
 )
 
+// restartGuardRetry is how soon a due restart looks again when another start
+// (or the health monitor's stop) holds its key.
+const restartGuardRetry = time.Second
+
 // Kubernetes event reasons for health restarts.
 const (
 	EventReasonHealthRestart = "HealthRestart"
@@ -66,6 +70,10 @@ type restartBackoff struct {
 	pending bool
 	// nextAt is the earliest time the pending restart may run.
 	nextAt time.Time
+	// specHash is the spec of the engine that last failed. A watch event with
+	// a different spec resets the backoff (see deferToPendingRestart). Empty
+	// when unknown (a queued restart), which never resets it.
+	specHash string
 	// timer wakes the event loop at nextAt.
 	timer *time.Timer
 }
@@ -107,23 +115,103 @@ func (a *MetalAgent) restartStateLocked(key string) *restartBackoff {
 // restart may run. Must be called with a.mu held.
 func (a *MetalAgent) scheduleRestartLocked(key string, notBefore time.Time) time.Time {
 	st := a.restartStateLocked(key)
-	now := a.now()
 	st.pending = true
-	st.nextAt = now.Add(st.delay)
+	st.nextAt = a.now().Add(st.delay)
 	if st.nextAt.Before(notBefore) {
 		st.nextAt = notBefore
 	}
 	st.delay = nextRestartDelay(st.delay)
+	a.armRestartLocked(st, st.nextAt)
+	return st.nextAt
+}
+
+// queueRestart asks the event loop to start key's engine once notBefore has
+// passed (at once for the zero time). It is the entry point for starts other
+// than a health restart: it records no health failure, does not grow the
+// backoff, and never brings forward a restart the backoff already delays.
+// If the queued start fails, the retry waits the initial backoff and grows
+// from there. A delete, scale-to-zero, eviction or shutdown cancels it like
+// any pending restart. reason is logged.
+func (a *MetalAgent) queueRestart(key string, notBefore time.Time, reason string) {
+	a.mu.Lock()
+	st := a.restartStateLocked(key)
+	if st.pending && st.nextAt.After(notBefore) {
+		notBefore = st.nextAt
+	}
+	st.pending = true
+	st.nextAt = notBefore
+	if st.delay == 0 {
+		st.delay = healthRestartInitialBackoff
+	}
+	a.armRestartLocked(st, st.nextAt)
+	a.mu.Unlock()
+
+	a.logger.Infow("restart queued", "key", key, "reason", reason, "notBefore", notBefore)
+}
+
+// armRestartLocked replaces st's wake-up with one at at, or wakes the event
+// loop now when at has passed. Must be called with a.mu held.
+func (a *MetalAgent) armRestartLocked(st *restartBackoff, at time.Time) {
 	if st.timer != nil {
 		st.timer.Stop()
 		st.timer = nil
 	}
-	if wait := st.nextAt.Sub(now); wait > 0 {
+	if wait := at.Sub(a.now()); wait > 0 {
 		st.timer = time.AfterFunc(wait, a.wakeRestarts)
 	} else {
 		a.wakeRestarts()
 	}
-	return st.nextAt
+}
+
+// deferToPendingRestart reports whether a start of key must be left to its
+// pending restart, which owns the start until it runs while no engine is
+// tracked. Without this, any write to the InferenceService (status included)
+// emits a watch event whose reconcile would start the engine at once and skip
+// the backoff. A spec that differs from the one whose engine failed resets
+// the backoff instead: the restart is queued to run on the next loop turn
+// with the new spec. Only called on the event loop.
+func (a *MetalAgent) deferToPendingRestart(key, specHash string) bool {
+	a.mu.Lock()
+	st := a.restarts[key]
+	if st == nil || !st.pending || a.processes[key] != nil {
+		a.mu.Unlock()
+		return false
+	}
+	if st.specHash == "" || st.specHash == specHash {
+		nextAt := st.nextAt
+		a.mu.Unlock()
+		a.logger.Debugw("start left to the pending restart", "key", key, "restartAt", nextAt)
+		return true
+	}
+	a.cancelRestartLocked(key)
+	a.mu.Unlock()
+	a.queueRestart(key, time.Time{}, "spec changed while a health restart was backing off")
+	return true
+}
+
+// dropRestart cancels key's restart. When no engine is tracked for key it
+// also removes the endpoint, which the health monitor's stop left withdrawn:
+// nothing else removes it once nothing is tracked. A key with no restart
+// state is left alone.
+func (a *MetalAgent) dropRestart(ctx context.Context, key string) error {
+	a.mu.Lock()
+	_, had := a.restarts[key]
+	a.cancelRestartLocked(key)
+	_, tracked := a.processes[key]
+	a.mu.Unlock()
+	if !had || tracked {
+		return nil
+	}
+	return a.unregisterKey(ctx, key)
+}
+
+// unregisterKey removes the endpoint of the InferenceService key names.
+func (a *MetalAgent) unregisterKey(ctx context.Context, key string) error {
+	namespace, name := parseKey(key)
+	if err := a.registry.UnregisterEndpoint(ctx, namespace, name); err != nil {
+		return fmt.Errorf("failed to unregister endpoint for %s: %w", key, err)
+	}
+	return nil
 }
 
 // cancelRestartLocked forgets key's restart state, a pending restart
@@ -137,12 +225,6 @@ func (a *MetalAgent) cancelRestartLocked(key string) {
 		st.timer.Stop()
 	}
 	delete(a.restarts, key)
-}
-
-func (a *MetalAgent) cancelRestart(key string) {
-	a.mu.Lock()
-	a.cancelRestartLocked(key)
-	a.mu.Unlock()
 }
 
 // resetRestartBackoffLocked forgets key's restart backoff once its engine has
@@ -188,6 +270,7 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 	// Held from before the stop: a delete handled while the engine stops
 	// cancels it, and that is how the check below sees the delete.
 	st := a.restartStateLocked(key)
+	st.specHash = proc.SpecHash
 	a.mu.Unlock()
 
 	a.logger.Warnw("stopping unhealthy process to restart it",
@@ -204,9 +287,9 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 
 	a.mu.Lock()
 	delete(a.starting, key)
-	if a.restarts[key] != st {
+	if a.restarts[key] != st || ctx.Err() != nil {
 		a.mu.Unlock()
-		a.logger.Infow("service was torn down while its unhealthy process stopped; not restarting it",
+		a.logger.Infow("service torn down or agent stopping while its unhealthy process stopped; not restarting it",
 			"namespace", proc.Namespace, "name", proc.Name)
 		return
 	}
@@ -244,17 +327,23 @@ func (a *MetalAgent) runDueRestarts(ctx context.Context) {
 	}
 }
 
-// runRestart starts the engine of a service owed a health restart, unless
-// the restart was cancelled or another start already brought an engine up.
-// A service that is gone, being deleted or stopped drops the restart; an
-// attempt that leaves no engine running is retried on the backoff schedule.
+// runRestart starts the engine of a service owed a restart, unless the
+// restart was cancelled or another start already brought an engine up. A
+// service that is gone or being deleted drops the restart, a stopped one has
+// its stop applied; an attempt that leaves no engine running is retried on
+// the backoff schedule.
 func (a *MetalAgent) runRestart(ctx context.Context, key string) {
 	a.mu.Lock()
 	st := a.restarts[key]
 	switch {
-	case st == nil || !st.pending || a.starting[key] || a.now().Before(st.nextAt):
-		// Cancelled or rescheduled, or the health monitor is still stopping
-		// the old engine and reschedules once it has.
+	case st == nil || !st.pending || a.now().Before(st.nextAt):
+		// Cancelled or rescheduled.
+		a.mu.Unlock()
+		return
+	case a.starting[key]:
+		// Another start, or the health monitor's stop, holds the key. Look
+		// again shortly rather than rely on the holder to reschedule.
+		a.armRestartLocked(st, a.now().Add(restartGuardRetry))
 		a.mu.Unlock()
 		return
 	case a.processes[key] != nil:
@@ -263,23 +352,35 @@ func (a *MetalAgent) runRestart(ctx context.Context, key string) {
 		a.mu.Unlock()
 		return
 	}
+	// This attempt is the start deferToPendingRestart leaves to the restart,
+	// so the reconcile below must not defer it again.
+	st.pending = false
 	a.mu.Unlock()
 
 	namespace, name := parseKey(key)
 	isvc := &inferencev1alpha1.InferenceService{}
 	err := a.config.K8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, isvc)
+	var specHash string
 	switch {
-	case apierrors.IsNotFound(err):
-		a.cancelRestart(key)
+	case apierrors.IsNotFound(err), err == nil && isvc.DeletionTimestamp != nil:
+		if dropErr := a.dropRestart(ctx, key); dropErr != nil {
+			a.logger.Warnw("failed to clean up after a cancelled restart", "key", key, "error", dropErr)
+		}
 		return
 	case err != nil:
 		err = fmt.Errorf("failed to fetch InferenceService: %w", err)
-	case isvc.DeletionTimestamp != nil || isvcStopped(isvc):
-		a.cancelRestart(key)
+	case isvcStopped(isvc):
+		// A scale-to-zero or suspend whose watch event found the key held
+		// by the health monitor's stop and was dropped. Apply it now: this
+		// cancels the restart and records the stopped status.
+		if stopErr := a.handleScaleToZero(ctx, isvc, key, false); stopErr != nil {
+			a.logger.Warnw("failed to apply stop to a restarting service", "key", key, "error", stopErr)
+		}
 		return
 	default:
+		specHash = computeSpecHash(isvc)
 		processRestarts.WithLabelValues(name, namespace).Inc()
-		a.logger.Infow("restarting inference service after failed health checks",
+		a.logger.Infow("restarting inference service",
 			"namespace", namespace, "name", name)
 		err = a.ensureProcess(ctx, isvc)
 	}
@@ -288,11 +389,11 @@ func (a *MetalAgent) runRestart(ctx context.Context, key string) {
 	st = a.restarts[key]
 	if st == nil || a.processes[key] != nil {
 		// Cancelled during the attempt, or the attempt brought an engine up.
-		if st != nil {
-			st.pending = false
-		}
 		a.mu.Unlock()
 		return
+	}
+	if specHash != "" {
+		st.specHash = specHash
 	}
 	retryAt := a.scheduleRestartLocked(key, time.Time{})
 	retryIn := retryAt.Sub(a.now())
@@ -301,12 +402,12 @@ func (a *MetalAgent) runRestart(ctx context.Context, key string) {
 	if err == nil {
 		err = errors.New("no engine is running after the restart")
 	}
-	a.logger.Warnw("health restart failed; retrying",
+	a.logger.Warnw("restart failed; retrying",
 		"namespace", namespace, "name", name, "retryAt", retryAt, "retryIn", retryIn, "error", err)
 	// Only the first line: a start error can carry the tail of the engine
 	// log, which belongs in the agent log, not in an Event.
 	reason, _, _ := strings.Cut(err.Error(), "\n")
 	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: namespace, Name: name}, corev1.EventTypeWarning,
-		EventReasonRestartFailed, "Restart after failed health checks did not bring the engine back: %s; retrying in %s",
+		EventReasonRestartFailed, "Restart did not bring the engine back: %s; retrying in %s",
 		reason, retryIn)
 }

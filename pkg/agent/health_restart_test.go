@@ -30,10 +30,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -101,6 +105,7 @@ func (e *restartExecutor) starts() int {
 // restartExecutor.
 type restartFixture struct {
 	agent   *MetalAgent
+	client  client.Client
 	exec    *restartExecutor
 	checker *mockHealthChecker
 	monitor *HealthMonitor
@@ -112,6 +117,13 @@ type restartFixture struct {
 
 func newRestartFixture(t *testing.T, name string) *restartFixture {
 	t.Helper()
+	return newRestartFixtureWith(t, name, nil)
+}
+
+// newRestartFixtureWith is newRestartFixture with interceptor funcs, when
+// non-nil, installed on the fake client.
+func newRestartFixtureWith(t *testing.T, name string, funcs *interceptor.Funcs) *restartFixture {
+	t.Helper()
 	model := ggufModel(t, name)
 	isvc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
@@ -120,11 +132,14 @@ func newRestartFixture(t *testing.T, name string) *restartFixture {
 	scheme := newTestScheme()
 	_ = corev1.AddToScheme(scheme)
 	_ = discoveryv1.AddToScheme(scheme)
-	c := fake.NewClientBuilder().
+	b := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(&inferencev1alpha1.InferenceService{}).
-		WithObjects(model, isvc).
-		Build()
+		WithObjects(model, isvc)
+	if funcs != nil {
+		b = b.WithInterceptorFuncs(*funcs)
+	}
+	c := b.Build()
 	rec := record.NewFakeRecorder(256)
 	a := NewMetalAgent(MetalAgentConfig{
 		K8sClient:         c,
@@ -136,11 +151,12 @@ func newRestartFixture(t *testing.T, name string) *restartFixture {
 	a.registry = NewServiceRegistry(c, "10.0.0.1", newNopLogger(), "")
 
 	f := &restartFixture{
-		agent: a,
-		rec:   rec,
-		isvc:  isvc,
-		key:   "default/" + name,
-		clock: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
+		agent:  a,
+		client: c,
+		rec:    rec,
+		isvc:   isvc,
+		key:    "default/" + name,
+		clock:  time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC),
 	}
 	a.now = func() time.Time { return f.clock }
 	f.exec = &restartExecutor{now: a.now}
@@ -164,6 +180,50 @@ func (f *restartFixture) probe(n int) {
 
 func (f *restartFixture) advance(d time.Duration) {
 	f.clock = f.clock.Add(d)
+}
+
+// endpointExists reports whether the agent's Service for the fixture's
+// InferenceService exists.
+func (f *restartFixture) endpointExists(t *testing.T) bool {
+	t.Helper()
+	key := types.NamespacedName{Namespace: "default", Name: f.agent.registry.serviceNameFor(f.isvc.Name)}
+	err := f.client.Get(context.Background(), key, &corev1.Service{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		t.Fatalf("get Service %s: %v", key, err)
+	}
+	return err == nil
+}
+
+// updateISVC applies mutate to the stored InferenceService and returns the
+// updated object, as a watch event would deliver it.
+func (f *restartFixture) updateISVC(
+	t *testing.T, mutate func(*inferencev1alpha1.InferenceService),
+) *inferencev1alpha1.InferenceService {
+	t.Helper()
+	cur := &inferencev1alpha1.InferenceService{}
+	key := types.NamespacedName{Namespace: "default", Name: f.isvc.Name}
+	if err := f.client.Get(context.Background(), key, cur); err != nil {
+		t.Fatalf("get InferenceService: %v", err)
+	}
+	mutate(cur)
+	if err := f.client.Update(context.Background(), cur); err != nil {
+		t.Fatalf("update InferenceService: %v", err)
+	}
+	return cur
+}
+
+// failFirstRestart drives the fixture to a pending retry: the engine fails
+// its health checks, is stopped, and the restart's start fails, so the next
+// attempt is due healthRestartInitialBackoff from now.
+func (f *restartFixture) failFirstRestart(t *testing.T) {
+	t.Helper()
+	f.exec.startErr = errors.New("llama-server exited during startup")
+	f.probe(DefaultHealthFailureThreshold)
+	f.agent.runDueRestarts(context.Background())
+	if got := f.exec.starts(); got != 1 {
+		t.Fatalf("starts = %d after the first restart, want 1", got)
+	}
+	f.exec.startErr = nil
 }
 
 // tracked returns the process the agent tracks for the fixture's service.
@@ -325,6 +385,10 @@ func TestHealthRestart_DeleteCancelsPendingRetry(t *testing.T) {
 		t.Fatalf("handleEvent(DELETED): %v", err)
 	}
 
+	if f.endpointExists(t) {
+		t.Errorf("the withdrawn endpoint of the stopped engine survived the delete")
+	}
+
 	f.exec.startErr = nil
 	f.advance(time.Hour)
 	f.agent.runDueRestarts(ctx)
@@ -358,6 +422,9 @@ func TestHealthRestart_DeleteWhileStoppingSchedulesNoRestart(t *testing.T) {
 	}
 	if p := f.tracked(); p != nil {
 		t.Errorf("deleted service started again: PID %d", p.PID)
+	}
+	if f.endpointExists(t) {
+		t.Errorf("the withdrawn endpoint of the stopped engine survived the delete")
 	}
 }
 
@@ -471,6 +538,7 @@ func (c *replacingChecker) Check(_ context.Context, port int, _ string) (bool, e
 func TestHealthMonitor_IgnoresResultForReplacedProcess(t *testing.T) {
 	f := newRestartFixture(t, "restart-replaced")
 	f.agent.config.HealthFailureThreshold = 1
+	old := f.tracked()
 	replacement := &ManagedProcess{
 		Name: f.isvc.Name, Namespace: "default", PID: 2222, Port: 18081, Healthy: true,
 		StartedAt: f.clock, Runtime: runtimeLlamaServer, SpecHash: computeSpecHash(f.isvc),
@@ -491,6 +559,12 @@ func TestHealthMonitor_IgnoresResultForReplacedProcess(t *testing.T) {
 	if p := f.tracked(); p != replacement || !healthy || failures != 0 {
 		t.Errorf("replacement tracked=%v healthy=%v failures=%d, want tracked, healthy, 0",
 			p == replacement, healthy, failures)
+	}
+	f.agent.mu.RLock()
+	oldHealthy, oldFailures := old.Healthy, old.healthFailures
+	f.agent.mu.RUnlock()
+	if !oldHealthy || oldFailures != 0 {
+		t.Errorf("replaced process healthy=%v failures=%d, want untouched (true, 0)", oldHealthy, oldFailures)
 	}
 }
 
@@ -528,5 +602,310 @@ func TestEnsureProcess_LeavesUnhealthyProcessToHealthMonitor(t *testing.T) {
 				t.Errorf("tracked process = %+v, want PID %d", p, tc.wantPID)
 			}
 		})
+	}
+}
+
+// TestHealthMonitor_RecoveryOfRemovedProcessRegistersNothing covers a
+// recovery whose process is removed (by a delete on the event loop) while the
+// monitor fetches the InferenceService to re-register it. It used to read the
+// port through the missing map entry and panic, taking the agent down; it
+// must also not bring back an endpoint the delete removed.
+func TestHealthMonitor_RecoveryOfRemovedProcessRegistersNothing(t *testing.T) {
+	var f *restartFixture
+	armed := false
+	funcs := &interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object,
+			opts ...client.GetOption) error {
+			if _, ok := obj.(*inferencev1alpha1.InferenceService); ok && armed {
+				armed = false
+				f.agent.mu.Lock()
+				delete(f.agent.processes, f.key)
+				f.agent.mu.Unlock()
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	f = newRestartFixtureWith(t, "recover-removed", funcs)
+	f.agent.processes[f.key].Healthy = false
+	f.checker.result = true
+	armed = true
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("recovery of a removed process panicked: %v", r)
+			}
+		}()
+		f.probe(1)
+	}()
+	if armed {
+		t.Fatal("the recovery never fetched the InferenceService; the test did not exercise the window")
+	}
+	if f.endpointExists(t) {
+		t.Errorf("recovery registered an endpoint for a process that is no longer tracked")
+	}
+}
+
+// cancellingChecker cancels the probe's context during the check, as agent
+// shutdown does, and fails the probe the way a cancelled request fails.
+type cancellingChecker struct {
+	cancel context.CancelFunc
+}
+
+func (c *cancellingChecker) Check(ctx context.Context, _ int, _ string) (bool, error) {
+	c.cancel()
+	return false, ctx.Err()
+}
+
+// TestHealthMonitor_ProbeCutShortByShutdownIsNotAFailure checks that a probe
+// that fails because the agent is shutting down is not counted: with a
+// threshold of 1 it would stop the engine with a cancelled context, which
+// leaves an oMLX or Ollama model loaded.
+func TestHealthMonitor_ProbeCutShortByShutdownIsNotAFailure(t *testing.T) {
+	f := newRestartFixture(t, "probe-shutdown")
+	f.agent.config.HealthFailureThreshold = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	monitor := NewHealthMonitor(f.agent, &cancellingChecker{cancel: cancel}, time.Second, newNopLogger())
+
+	monitor.checkAll(ctx)
+
+	if got := f.exec.recorded(); len(got) != 0 {
+		t.Errorf("executor calls = %v after a probe cut short by shutdown, want none", got)
+	}
+	f.agent.mu.RLock()
+	p := f.agent.processes[f.key]
+	healthy := p != nil && p.Healthy
+	f.agent.mu.RUnlock()
+	if !healthy {
+		t.Errorf("engine tracked=%v healthy=%v after a cancelled probe, want tracked and healthy", p != nil, healthy)
+	}
+}
+
+// TestHealthRestart_WatchEventDuringBackoffDoesNotStart checks that a watch
+// event (any write to the InferenceService, status included, emits one) does
+// not start the engine while its restart is backing off.
+func TestHealthRestart_WatchEventDuringBackoffDoesNotStart(t *testing.T) {
+	f := newRestartFixture(t, "restart-watch-backoff")
+	ctx := context.Background()
+	f.failFirstRestart(t)
+
+	f.advance(5 * time.Second)
+	if err := f.agent.ensureProcess(ctx, f.isvc); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	if got := f.exec.starts(); got != 1 {
+		t.Fatalf("starts = %d after a watch event 5s into a 10s backoff, want 1", got)
+	}
+
+	f.advance(5 * time.Second)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 2 {
+		t.Errorf("starts = %d when the backoff expired, want 2", got)
+	}
+}
+
+// TestHealthRestart_SpecChangeResetsBackoff checks that a new spec does not
+// wait out the backoff earned by the old one: it starts on the next loop turn.
+func TestHealthRestart_SpecChangeResetsBackoff(t *testing.T) {
+	f := newRestartFixture(t, "restart-spec-reset")
+	ctx := context.Background()
+	f.failFirstRestart(t)
+
+	changed := f.updateISVC(t, func(isvc *inferencev1alpha1.InferenceService) {
+		isvc.Spec.ContextSize = ptr.To(int32(8192))
+	})
+	if err := f.agent.ensureProcess(ctx, changed); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	f.agent.runDueRestarts(ctx)
+
+	if got := f.exec.starts(); got != 2 {
+		t.Fatalf("starts = %d right after a spec change during the backoff, want 2", got)
+	}
+	if p := f.tracked(); p == nil || p.SpecHash != computeSpecHash(changed) {
+		t.Errorf("tracked process = %+v, want one started with the new spec", p)
+	}
+}
+
+// TestHealthRestart_ScaleToZeroDuringBackoff checks that replicas=0 during the
+// backoff cancels the restart and removes the endpoint the stopped engine
+// left withdrawn.
+func TestHealthRestart_ScaleToZeroDuringBackoff(t *testing.T) {
+	f := newRestartFixture(t, "restart-scale-backoff")
+	ctx := context.Background()
+	f.failFirstRestart(t)
+
+	stopped := f.updateISVC(t, func(isvc *inferencev1alpha1.InferenceService) {
+		isvc.Spec.Replicas = ptr.To(int32(0))
+	})
+	updated := InferenceServiceEvent{Type: EventTypeUpdated, InferenceService: stopped}
+	if err := f.agent.handleEvent(ctx, updated); err != nil {
+		t.Fatalf("handleEvent(UPDATED): %v", err)
+	}
+	if f.endpointExists(t) {
+		t.Errorf("endpoint of the stopped engine survived scale-to-zero")
+	}
+
+	f.advance(time.Hour)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Errorf("starts = %d after scale-to-zero, want 1 (only the restart before it)", got)
+	}
+}
+
+// TestHealthRestart_ScaleToZeroDuringStopIsApplied covers replicas=0 landing
+// while the health monitor stops the engine: its watch event finds the key
+// held and is dropped, so the restart must apply the stop itself (no start,
+// Stopped status, endpoint removed).
+func TestHealthRestart_ScaleToZeroDuringStopIsApplied(t *testing.T) {
+	f := newRestartFixture(t, "restart-scale-stopping")
+	ctx := context.Background()
+	f.exec.onStop = func() {
+		stopped := f.updateISVC(t, func(isvc *inferencev1alpha1.InferenceService) {
+			isvc.Spec.Replicas = ptr.To(int32(0))
+		})
+		updated := InferenceServiceEvent{Type: EventTypeUpdated, InferenceService: stopped}
+		if err := f.agent.handleEvent(ctx, updated); err != nil {
+			t.Errorf("handleEvent(UPDATED): %v", err)
+		}
+	}
+
+	f.probe(DefaultHealthFailureThreshold)
+	f.agent.runDueRestarts(ctx)
+
+	if got := f.exec.starts(); got != 0 {
+		t.Errorf("starts = %d for a service scaled to zero during the stop, want 0", got)
+	}
+	cur := &inferencev1alpha1.InferenceService{}
+	if err := f.client.Get(ctx, types.NamespacedName{Namespace: "default", Name: f.isvc.Name}, cur); err != nil {
+		t.Fatalf("get InferenceService: %v", err)
+	}
+	if cur.Status.Phase != inferencev1alpha1.PhaseStopped {
+		t.Errorf("status phase = %q, want %q", cur.Status.Phase, inferencev1alpha1.PhaseStopped)
+	}
+	if f.endpointExists(t) {
+		t.Errorf("endpoint of the stopped engine survived scale-to-zero")
+	}
+}
+
+// TestHealthRestart_WaitsForInFlightStart checks that the health monitor does
+// not stop an engine while a start holds its key (a spec change being applied
+// on the event loop), and stops it on a later probe once the key is free.
+func TestHealthRestart_WaitsForInFlightStart(t *testing.T) {
+	f := newRestartFixture(t, "restart-guard-monitor")
+	f.agent.mu.Lock()
+	f.agent.starting[f.key] = true
+	f.agent.mu.Unlock()
+
+	f.probe(DefaultHealthFailureThreshold)
+	if got := f.exec.recorded(); len(got) != 0 {
+		t.Fatalf("executor calls = %v while a start held the key, want none", got)
+	}
+
+	f.agent.mu.Lock()
+	delete(f.agent.starting, f.key)
+	f.agent.mu.Unlock()
+	f.probe(1)
+	f.agent.runDueRestarts(context.Background())
+	if got, want := f.exec.recorded(), []string{"stop 1111", "start"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("executor calls = %v once the key was free, want %v", got, want)
+	}
+}
+
+// TestHealthRestart_RearmsWhenKeyHeld checks that a due restart whose key is
+// held by another start is not stranded: it wakes the event loop again
+// shortly and starts once the key is free.
+func TestHealthRestart_RearmsWhenKeyHeld(t *testing.T) {
+	f := newRestartFixture(t, "restart-guard-rearm")
+	ctx := context.Background()
+	f.probe(DefaultHealthFailureThreshold)
+	select {
+	case <-f.agent.restartWake:
+	default:
+	}
+
+	f.agent.mu.Lock()
+	f.agent.starting[f.key] = true
+	f.agent.mu.Unlock()
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 0 {
+		t.Fatalf("starts = %d while another start held the key, want 0", got)
+	}
+	f.agent.mu.Lock()
+	delete(f.agent.starting, f.key)
+	f.agent.mu.Unlock()
+
+	select {
+	case <-f.agent.restartWake:
+	case <-time.After(restartGuardRetry + 2*time.Second):
+		t.Fatal("no wake-up after the key was held; the restart is stranded")
+	}
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Errorf("starts = %d after the re-armed wake-up, want 1", got)
+	}
+}
+
+// TestQueueRestart_StartsOnNextWake checks the entry point for other callers
+// (the memory-pressure recovery path): a queued key starts on the next event
+// loop wake-up after notBefore, and queueing does not bring forward a restart
+// the health backoff delays.
+func TestQueueRestart_StartsOnNextWake(t *testing.T) {
+	f := newRestartFixture(t, "queue-start")
+	ctx := context.Background()
+	f.agent.mu.Lock()
+	delete(f.agent.processes, f.key) // evicted, say
+	f.agent.mu.Unlock()
+
+	f.agent.queueRestart(f.key, f.clock.Add(30*time.Second), "test")
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 0 {
+		t.Fatalf("starts = %d before notBefore, want 0", got)
+	}
+	f.advance(30 * time.Second)
+	f.agent.runDueRestarts(ctx)
+	if p := f.tracked(); p == nil || f.exec.starts() != 1 {
+		t.Fatalf("queued key not started after notBefore: starts=%d tracked=%v", f.exec.starts(), p != nil)
+	}
+}
+
+// TestQueueRestart_DoesNotShortenBackoff checks that queueing a key whose
+// restart is backing off keeps the backoff.
+func TestQueueRestart_DoesNotShortenBackoff(t *testing.T) {
+	f := newRestartFixture(t, "queue-backoff")
+	ctx := context.Background()
+	f.failFirstRestart(t)
+
+	f.agent.queueRestart(f.key, time.Time{}, "test")
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Fatalf("starts = %d after queueing during a 10s backoff, want 1", got)
+	}
+	f.advance(healthRestartInitialBackoff)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 2 {
+		t.Errorf("starts = %d when the backoff expired, want 2", got)
+	}
+}
+
+// TestQueueRestart_DeletedBeforeRunNeverStarts checks that a delete cancels a
+// queued restart.
+func TestQueueRestart_DeletedBeforeRunNeverStarts(t *testing.T) {
+	f := newRestartFixture(t, "queue-delete")
+	ctx := context.Background()
+	f.agent.mu.Lock()
+	delete(f.agent.processes, f.key)
+	f.agent.mu.Unlock()
+
+	f.agent.queueRestart(f.key, f.clock.Add(time.Minute), "test")
+	deleted := InferenceServiceEvent{Type: EventTypeDeleted, InferenceService: f.isvc}
+	if err := f.agent.handleEvent(ctx, deleted); err != nil {
+		t.Fatalf("handleEvent(DELETED): %v", err)
+	}
+	f.advance(time.Hour)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 0 {
+		t.Errorf("starts = %d for a queued key deleted before it ran, want 0", got)
 	}
 }

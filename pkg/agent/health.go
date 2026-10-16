@@ -157,6 +157,10 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 		healthy, err := m.checker.Check(ctx, snap.Port, healthProbePath(snap.Runtime))
 		duration := time.Since(start).Seconds()
 		healthCheckDuration.WithLabelValues(snap.Name, snap.Namespace).Observe(duration)
+		if ctx.Err() != nil {
+			// Cut short by shutdown: says nothing about the engine.
+			return
+		}
 
 		if err != nil {
 			healthy = false
@@ -207,7 +211,7 @@ func (m *HealthMonitor) applyResult(ctx context.Context, snap processSnapshot, h
 		processHealthy.WithLabelValues(snap.Name, snap.Namespace).Set(1)
 		// Immediately re-register the endpoint so kube-proxy resumes
 		// routing to the recovered backend (#662).
-		a.registerEndpoint(ctx, snap.Name, snap.Namespace)
+		a.registerEndpoint(ctx, snap.Key, snap.proc)
 	}
 
 	if !healthy && failures >= threshold {

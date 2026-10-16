@@ -1123,6 +1123,12 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return a.handleScaleToZero(ctx, isvc, key, exists)
 	}
 
+	// With no engine running, a pending restart owns the start and its
+	// backoff; see deferToPendingRestart.
+	if a.deferToPendingRestart(key, desiredHash) {
+		return nil
+	}
+
 	if exists {
 		if existing.SpecHash == desiredHash {
 			// An unhealthy process is left to the health monitor, which stops
@@ -1334,13 +1340,20 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 
 	a.mu.Lock()
 	// Whatever tears the service down (a delete, eviction, a spec change)
-	// supersedes a pending health restart, so a backed-off retry cannot
-	// start it again later. Also before the early return: a service whose
-	// restart failed has no process.
+	// supersedes a pending restart, so a backed-off retry cannot start it
+	// again later. Cancelled under the same lock as the process lookup: the
+	// health monitor removes the process and registers its restart in one
+	// critical section, so one of the two always sees the other.
+	_, hadRestart := a.restarts[key]
 	a.cancelRestartLocked(key)
 	process, exists := a.processes[key]
 	if !exists {
 		a.mu.Unlock()
+		if hadRestart {
+			// The health monitor stopped the engine and left its endpoint
+			// withdrawn for the restart; nothing else removes it now.
+			return a.unregisterKey(ctx, key)
+		}
 		return nil
 	}
 	delete(a.processes, key)
@@ -1435,10 +1448,14 @@ func (a *MetalAgent) handleScaleToZero(
 	key string,
 	exists bool,
 ) error {
-	// A pending health restart must not bring a stopped service back. The
-	// process may already be gone (a restart that failed), so this does not
-	// rely on deleteProcess below.
-	a.cancelRestart(key)
+	// A pending restart must not bring a stopped service back. The process
+	// may already be gone (stopped by the health monitor), so this does not
+	// rely on deleteProcess below; it also removes the endpoint such a stop
+	// left withdrawn.
+	if err := a.dropRestart(ctx, key); err != nil {
+		a.logger.Warnw("failed to cancel the pending restart of a stopped service",
+			"namespace", isvc.Namespace, "name", isvc.Name, "error", err)
+	}
 	if exists {
 		a.logger.Infow("scaled to zero or suspended; stopping process",
 			"namespace", isvc.Namespace, "name", isvc.Name,
@@ -1685,12 +1702,13 @@ func (a *MetalAgent) withdrawEndpointFor(ctx context.Context, isvc *inferencev1a
 	}
 }
 
-// registerEndpoint fetches the InferenceService for the given name/namespace
+// registerEndpoint fetches the InferenceService of proc, tracked under key,
 // and calls registry.RegisterEndpoint to flip the endpoint's Ready condition
 // back to true. This is the event-driven recovery path (#662): the health
 // monitor calls this immediately when it detects an unhealthy→healthy
 // transition, rather than waiting for the next heartbeat tick.
-func (a *MetalAgent) registerEndpoint(ctx context.Context, name, namespace string) {
+func (a *MetalAgent) registerEndpoint(ctx context.Context, key string, proc *ManagedProcess) {
+	name, namespace := proc.Name, proc.Namespace
 	isvc := &inferencev1alpha1.InferenceService{}
 	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
 		Namespace: namespace,
@@ -1701,17 +1719,24 @@ func (a *MetalAgent) registerEndpoint(ctx context.Context, name, namespace strin
 		return
 	}
 
-	// Read the port from the managed process snapshot.
+	// Register only while proc is still the tracked process. A delete,
+	// scale-to-zero or spec change handled on the event loop since the probe
+	// removed or replaced it, and may have removed the endpoint; registering
+	// now would bring that endpoint back.
 	a.mu.RLock()
-	port := a.processes[types.NamespacedName{Namespace: namespace, Name: name}.String()].Port
+	current := a.processes[key] == proc
+	port := proc.Port
 	a.mu.RUnlock()
+	if !current {
+		return
+	}
 
 	if err := a.registry.RegisterEndpoint(ctx, isvc, port); err != nil {
 		a.logger.Warnw("failed to register endpoint",
 			"name", name, "namespace", namespace, "error", err)
 		return
 	}
-	a.noteRelayRegistered(types.NamespacedName{Namespace: namespace, Name: name}.String())
+	a.noteRelayRegistered(key)
 }
 
 // heartbeatOnce re-registers the endpoint for every currently-running managed
