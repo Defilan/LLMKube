@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -85,9 +86,11 @@ type InferenceServiceWatcher struct {
 	// lookupFailing maps the key of each InferenceService whose latest
 	// Model lookup failed (other than NotFound) to when it started failing,
 	// so the failure is logged at Warn once and at Info when it clears
-	// rather than on every poll (#2076). Not locked: shouldWatch runs on
-	// one goroutine at a time (prepareRegistry's startup passes run in
-	// Start before the watcher goroutine exists, then only Watch calls it).
+	// rather than on every poll (#2076). lookupMu guards it and the gauge
+	// updates derived from it: shouldWatch may run on more than one
+	// goroutine (the poll loop, and callers outside the watcher that use it
+	// as a claim guard).
+	lookupMu      sync.Mutex
 	lookupFailing map[string]time.Time
 }
 
@@ -402,7 +405,18 @@ func (w *InferenceServiceWatcher) decideWatch(
 // starts a failure, a Debug line while it continues.
 func (w *InferenceServiceWatcher) noteLookupFailed(isvc *inferencev1alpha1.InferenceService, err error) {
 	key := watchKey(isvc)
-	if since, failing := w.lookupFailing[key]; failing {
+	w.lookupMu.Lock()
+	since, failing := w.lookupFailing[key]
+	if !failing {
+		if w.lookupFailing == nil {
+			w.lookupFailing = make(map[string]time.Time)
+		}
+		w.lookupFailing[key] = time.Now()
+		watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
+	}
+	w.lookupMu.Unlock()
+
+	if failing {
 		w.logger.Debugw("referenced model lookup still failing; keeping the inference service's previous state",
 			"namespace", isvc.Namespace,
 			"inferenceService", isvc.Name,
@@ -412,11 +426,6 @@ func (w *InferenceServiceWatcher) noteLookupFailed(isvc *inferencev1alpha1.Infer
 		)
 		return
 	}
-	if w.lookupFailing == nil {
-		w.lookupFailing = make(map[string]time.Time)
-	}
-	w.lookupFailing[key] = time.Now()
-	watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
 	w.logger.Warnw("referenced model lookup failed; keeping the inference service's previous state",
 		"namespace", isvc.Namespace,
 		"inferenceService", isvc.Name,
@@ -429,12 +438,17 @@ func (w *InferenceServiceWatcher) noteLookupFailed(isvc *inferencev1alpha1.Infer
 // reaches an answer for it again, logging the recovery at Info.
 func (w *InferenceServiceWatcher) noteLookupDecided(isvc *inferencev1alpha1.InferenceService) {
 	key := watchKey(isvc)
+	w.lookupMu.Lock()
 	since, failing := w.lookupFailing[key]
+	if failing {
+		delete(w.lookupFailing, key)
+		watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
+	}
+	w.lookupMu.Unlock()
+
 	if !failing {
 		return
 	}
-	delete(w.lookupFailing, key)
-	watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
 	w.logger.Infow("referenced model lookup recovered",
 		"namespace", isvc.Namespace,
 		"inferenceService", isvc.Name,
@@ -447,8 +461,12 @@ func (w *InferenceServiceWatcher) noteLookupDecided(isvc *inferencev1alpha1.Infe
 // service the latest poll did not list, so a service deleted while its lookup
 // failed does not hold the gauge up forever. A listed service whose lookup is
 // still failing is in current (poll counts it there), and one whose lookup
-// succeeded was already cleared by noteLookupDecided.
+// succeeded was already cleared by noteLookupDecided. A failure another
+// goroutine records meanwhile for a listed service this poll found not ours
+// is dropped as well, which only means its next failure warns again.
 func (w *InferenceServiceWatcher) forgetVanishedLookupFailures(current map[string]bool) {
+	w.lookupMu.Lock()
+	defer w.lookupMu.Unlock()
 	pruned := false
 	for key := range w.lookupFailing {
 		if !current[key] {

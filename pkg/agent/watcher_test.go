@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"maps"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -750,6 +751,59 @@ func TestPoll_ModelLookupFailureLogsTransitions(t *testing.T) {
 	}
 	if g := gauge(); g != 0 {
 		t.Errorf("poll 6 gauge = %v, want 0 once the failing service is gone", g)
+	}
+}
+
+// TestShouldWatch_ConcurrentLookupFailuresTrackedOnce: shouldWatch may run on
+// more than one goroutine (the poll loop, and callers outside the watcher that
+// use it as a claim guard). Concurrent failures of one service must still log
+// a single Warn and count once in the gauge, and concurrent recoveries a
+// single Info. Run with -race, which reports unguarded tracking state.
+func TestShouldWatch_ConcurrentLookupFailuresTrackedOnce(t *testing.T) {
+	f := newModelLookupFixture(t)
+	core, logs := observer.New(zap.DebugLevel)
+	f.watcher.logger = zap.New(core).Sugar()
+	watchModelLookupFailingServices.Set(0)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: lookupISVCName, Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: lookupModelName},
+	}
+
+	const callers = 8
+	callConcurrently := func() (errs int32) {
+		var n atomic.Int32
+		var wg sync.WaitGroup
+		for range callers {
+			wg.Go(func() {
+				if _, err := f.watcher.shouldWatch(context.Background(), isvc); err != nil {
+					n.Add(1)
+				}
+			})
+		}
+		wg.Wait()
+		return n.Load()
+	}
+
+	f.failModelGet = apierrors.NewServiceUnavailable("apiserver restarting")
+	if errs := callConcurrently(); errs != callers {
+		t.Errorf("failing lookup: %d of %d calls returned an error, want all", errs, callers)
+	}
+	if got := lookupLogCounts(logs); got[zap.WarnLevel] != 1 || got[zap.DebugLevel] != callers-1 {
+		t.Errorf("failing lookup: log lines by level = %v, want one Warn and %d Debug", got, callers-1)
+	}
+	if g := testutil.ToFloat64(watchModelLookupFailingServices); g != 1 {
+		t.Errorf("failing lookup: gauge = %v, want 1", g)
+	}
+
+	f.failModelGet = nil
+	if errs := callConcurrently(); errs != 0 {
+		t.Errorf("recovered lookup: %d of %d calls returned an error, want none", errs, callers)
+	}
+	if got := lookupLogCounts(logs); got[zap.InfoLevel] != 1 || got[zap.WarnLevel] != 0 {
+		t.Errorf("recovered lookup: log lines by level = %v, want exactly one Info", got)
+	}
+	if g := testutil.ToFloat64(watchModelLookupFailingServices); g != 0 {
+		t.Errorf("recovered lookup: gauge = %v, want 0", g)
 	}
 }
 
