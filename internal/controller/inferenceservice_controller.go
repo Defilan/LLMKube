@@ -571,6 +571,66 @@ type replicaCounts struct {
 	Observed int32
 }
 
+// deploymentNameTakenRequeueAfter is the bounded requeue for a name-taken
+// refusal. The refusal depends on cluster state outside the service's spec and
+// nothing watches the foreign Deployment, so the requeue is the only way
+// deleting or renaming it takes effect without an unrelated event. Same
+// cadence as the router-proxy and HPA refusals
+// (routerProxyNameTakenRequeueAfter, hpaNameTakenRequeueAfter).
+const deploymentNameTakenRequeueAfter = 2 * time.Minute
+
+// deploymentNameTakenError reports a Deployment whose generated name is held
+// by an existing object this InferenceService does not control.
+// reconcileDeployment turns it into the DeploymentNameTaken scheduling status
+// and a bounded requeue instead of a reconcile error.
+type deploymentNameTakenError struct {
+	ns, name, owner string
+}
+
+func (e *deploymentNameTakenError) Error() string {
+	if e.owner != "" {
+		return fmt.Sprintf("Deployment %s/%s is already controlled by another InferenceService (uid %s); "+
+			"refusing to overwrite or recreate it; rename one of the services", e.ns, e.name, e.owner)
+	}
+	return fmt.Sprintf("Deployment %s/%s already exists and is not controlled by this InferenceService; "+
+		"refusing to overwrite or recreate it (LLMKube did not create it); delete or rename the object, or the service",
+		e.ns, e.name)
+}
+
+// ensureDeploymentOwned is the ownership gate for every Deployment write and
+// delete: write only what this InferenceService controls. A Deployment with
+// the generated name but no controller reference, a foreign reference, or
+// another InferenceService's reference is refused, never adopted, never
+// overwritten, and never deleted.
+func ensureDeploymentOwned(isvc *inferencev1alpha1.InferenceService, existing *appsv1.Deployment) error {
+	if metav1.IsControlledBy(existing, isvc) {
+		return nil
+	}
+	taken := &deploymentNameTakenError{ns: existing.GetNamespace(), name: existing.GetName()}
+	if ref := metav1.GetControllerOf(existing); ref != nil && ref.Kind == "InferenceService" {
+		// The owner ref's APIVersion is "<group>/<version>" (or bare version
+		// for the core group); match the group so a same-Kind controller in
+		// another API group is not misreported as another InferenceService.
+		if strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
+			taken.owner = string(ref.UID)
+		}
+	}
+	return taken
+}
+
+// clearDeploymentNameTaken drops the DeploymentNameTaken diagnosis this
+// controller wrote once the name is usable again. The status writer preserves
+// scheduling fields when a pass returns no SchedulingInfo, so without this a
+// recovered service would keep advertising the refusal.
+func clearDeploymentNameTaken(isvc *inferencev1alpha1.InferenceService) {
+	if isvc.Status.SchedulingStatus != inferencev1alpha1.ReasonDeploymentNameTaken {
+		return
+	}
+	isvc.Status.SchedulingStatus = ""
+	isvc.Status.SchedulingMessage = ""
+	isvc.Status.WaitingFor = ""
+}
+
 // reconcileDeployment coordinates several independent concerns (metal snapshot,
 // rollout-policy idle gating, HPA replica ownership, and retry-on-conflict update
 // for concurrent ModelPool replica scaling), which keeps it over the gocyclo
@@ -579,6 +639,15 @@ type replicaCounts struct {
 //nolint:gocyclo
 func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, draftModel *inferencev1alpha1.Model, desiredReplicas int32, modelReady bool, isMetal bool) (*appsv1.Deployment, replicaCounts, *metalSnapshot, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+
+	// A previous pass may have reported a Deployment name-taken refusal. The
+	// status writer preserves scheduling fields it is not given (#643), so the
+	// marker must be dropped before any success path persists status; the
+	// guard below re-sets it when the foreign object is still there. Captured
+	// before the clear so the Warning event fires once per episode, not once
+	// per bounded requeue.
+	nameTakenPreviously := isvc.Status.SchedulingStatus == inferencev1alpha1.ReasonDeploymentNameTaken
+	clearDeploymentNameTaken(isvc)
 
 	if isMetal {
 		ready, snap, result, err := r.reconcileMetal(ctx, isvc)
@@ -689,6 +758,22 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	} else if err != nil {
 		log.Error(err, "Failed to get Deployment")
 		return nil, replicaCounts{}, nil, nil, err
+	}
+
+	// The gate sits above the selector-migration branch so one check covers
+	// both writes: the in-place spec replace below and the delete-and-recreate
+	// migrate path. A refusal must precede every write to the existing object.
+	if err := ensureDeploymentOwned(isvc, existingDeployment); err != nil {
+		log.Info("Refusing to overwrite or recreate a Deployment this InferenceService does not control", "error", err)
+		if !nameTakenPreviously && r.Recorder != nil {
+			r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning,
+				inferencev1alpha1.ReasonDeploymentNameTaken, "Reconcile", "%s", err.Error())
+		}
+		res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady,
+			0, isvc.Status.Replicas, desiredReplicas, "", err.Error(),
+			&SchedulingInfo{Status: inferencev1alpha1.ReasonDeploymentNameTaken, Message: err.Error()})
+		res.RequeueAfter = earliestPositive(res.RequeueAfter, deploymentNameTakenRequeueAfter)
+		return nil, replicaCounts{}, nil, &res, updateErr
 	}
 
 	// Deployment.spec.selector is immutable. A Deployment created by an older
