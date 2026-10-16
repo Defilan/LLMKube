@@ -434,6 +434,72 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 		})
 	})
 
+	Context("states that want no Deployment write", func() {
+		ctx := context.Background()
+
+		// A multiNode group runs no Deployment either; its dispatch branch
+		// must clear a stale marker the same way the metal branch does, or
+		// the #643 preserve freezes it (the group's own status writes carry
+		// no SchedulingInfo). The member claim referencing a missing PVC
+		// keeps the spec admission-valid while giving the group a
+		// deterministic controller-side fatal write that persists status.
+		It("drops the marker when the service switches to multiNode", func() {
+			name := "dep-multinode-marker"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Spec.Runtime = "vllm"
+			isvc.Spec.MultiNode = &inferencev1alpha1.MultiNodeSpec{
+				Members: []inferencev1alpha1.MultiNodeMember{
+					{Node: "node-a", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.1"},
+						ModelCache: &inferencev1alpha1.MultiNodeMemberCache{ClaimName: "missing-claim"}},
+					{Node: "node-b", Fabric: &inferencev1alpha1.MultiNodeMemberFabric{Address: "10.0.0.2"}},
+				},
+			}
+			Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			isvc.Status.SchedulingStatus = inferencev1alpha1.ReasonDeploymentNameTaken
+			isvc.Status.SchedulingMessage = "Deployment default/" + name + " already exists and is not controlled by this InferenceService"
+			Expect(k8sClient.Status().Update(ctx, isvc)).To(Succeed())
+
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			Expect(isvc.Status.SchedulingStatus).To(BeEmpty(),
+				"a multiNode service wants no Deployment; the marker must not survive the switch")
+		})
+
+		// A suspended service with a foreign Deployment at the generated name
+		// is deliberately off: the refusal must report Suspended with the
+		// marker, not Failed. The running counterpart reporting Failed is
+		// pinned by the overwrite spec above.
+		It("reports Suspended, not Failed, while the foreign object holds the name", func() {
+			name := "dep-foreign-suspended"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Spec.Suspend = true
+			Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+			Expect(k8sClient.Create(ctx, foreignISVCDeployment(name, generatedDeploymentSelector(name)))).To(Succeed())
+
+			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			Expect(isvc.Status.Phase).To(Equal(PhaseSuspended),
+				"suspending is the user's intent; the refusal must not turn it into Failed")
+			Expect(isvc.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken),
+				"the diagnosis rides the marker even while suspended")
+			cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionDegraded)
+			Expect(cond).To(BeNil(), "Suspended removes Degraded; the refusal must not re-set it")
+		})
+	})
+
 	Context("the refusal message branches", func() {
 		It("names a foreign InferenceService owner and not a foreign-group impostor", func() {
 			isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "s1", Namespace: "default", UID: "uid-1"}}

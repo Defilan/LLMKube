@@ -573,7 +573,8 @@ type replicaCounts struct {
 
 // deploymentNameTakenRequeueAfter is the bounded requeue for a name-taken
 // refusal. The refusal depends on cluster state outside the service's spec and
-// nothing watches the foreign Deployment, so the requeue is the only way
+// nothing maps a foreign Deployment's events to this reconcile (Owns maps
+// only owned objects), so the requeue is the only way
 // deleting or renaming it takes effect without an unrelated event. Same
 // cadence as the router-proxy and HPA refusals
 // (routerProxyNameTakenRequeueAfter, hpaNameTakenRequeueAfter).
@@ -602,7 +603,10 @@ func (e *deploymentNameTakenError) Error() string {
 // and the in-place spec replace. Write only what this InferenceService
 // controls: a Deployment with the generated name but no controller reference,
 // a foreign reference, or another InferenceService's reference is refused,
-// never adopted, never overwritten, and never deleted. The relay Deployment
+// never adopted, never overwritten, and never deleted. A refused service
+// reports Failed, or Suspended/Stopped when the service is deliberately off,
+// with the DeploymentNameTaken marker; the multiNode and metal paths run no
+// Deployment and clear a stale marker instead. The relay Deployment
 // (teardownRelay) and the router-proxy Deployment carry their own gates; the
 // Service upsert in reconcileService is not gated yet (#2086).
 func ensureDeploymentOwned(isvc *inferencev1alpha1.InferenceService, existing *appsv1.Deployment) error {
@@ -783,7 +787,18 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning,
 				inferencev1alpha1.ReasonDeploymentNameTaken, "Reconcile", "%s", err.Error())
 		}
-		res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady,
+		// Report the refusal through the phase the service would otherwise
+		// have: a suspended or scaled-to-zero service is deliberately off,
+		// so the refusal must not override that intent with Failed. The
+		// marker carries the diagnosis in all three cases and bites on
+		// unsuspend or scale-up. Same precedence determinePhase applies.
+		phase := PhaseFailed
+		if isvc.Spec.Suspend {
+			phase = PhaseSuspended
+		} else if desiredReplicas == 0 {
+			phase = PhaseStopped
+		}
+		res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady,
 			0, isvc.Status.Replicas, desiredReplicas, "", err.Error(),
 			&SchedulingInfo{Status: inferencev1alpha1.ReasonDeploymentNameTaken, Message: err.Error()})
 		res.RequeueAfter = earliestPositive(res.RequeueAfter, deploymentNameTakenRequeueAfter)
@@ -1388,6 +1403,10 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 		}
 	}
 	if isvc.Spec.MultiNode != nil {
+		// A multiNode group runs no Deployment, so a marker left by a
+		// deployment-path pass is stale; drop it before the group's status
+		// writes persist it.
+		clearDeploymentNameTaken(isvc)
 		readyReplicas, result, err := r.reconcileMultiNodeGroup(ctx, isvc, model, draftModel, desiredReplicas, modelReady)
 		// A multiNode group has no Deployment to read an observed total from,
 		// so the ready member count stands in for both.
