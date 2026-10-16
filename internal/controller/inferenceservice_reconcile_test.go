@@ -377,6 +377,7 @@ var _ = Describe("determinePhase", func() {
 		Entry("rejected extraArgs", inferencev1alpha1.ReasonExtraArgsRejected),
 		Entry("relay service name too long", inferencev1alpha1.ReasonServiceNameTooLong),
 		Entry("model digest mismatch", inferencev1alpha1.ReasonModelDigestMismatch),
+		Entry("model download over the agent's cap", inferencev1alpha1.ReasonModelDownloadTooLarge),
 	)
 
 	It("should replace a controller-written status with WaitingForMetalAgent on a not-ready metal service", func() {

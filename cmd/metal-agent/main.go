@@ -20,6 +20,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,6 +31,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -86,6 +88,7 @@ type AgentConfig struct {
 	PowermetricsBin           string
 	AllowedModelRoots         string
 	AllowedDownloadHosts      string
+	MaxDownloadSize           string
 	AllowUnsafeExtraArgs      bool
 	IngressPort               int
 	StateDir                  string
@@ -321,6 +324,39 @@ func configureModelStore(cfg *AgentConfig) error {
 	return nil
 }
 
+// resolveMaxDownloadBytes turns --max-download-size into the byte cap the
+// agent enforces on each Model download. Empty means the host's total
+// physical memory, read through totalMemory: the agent wires model weights
+// into memory and memory admission requires the model to fit, so a single
+// file larger than RAM is never one it could serve. "0" disables the cap.
+// Anything else is a Kubernetes quantity or a plain byte count (128Gi, 200G,
+// 137438953472). An unknown or zero total memory is an error rather than a
+// silent fallback to no cap.
+func resolveMaxDownloadBytes(flagValue string, totalMemory func() (uint64, error)) (int64, error) {
+	if flagValue == "" {
+		total, err := totalMemory()
+		if err != nil {
+			return 0, fmt.Errorf("--max-download-size is not set and its default, "+
+				"the host's total memory, is unknown (set it explicitly): %w", err)
+		}
+		if total == 0 {
+			return 0, fmt.Errorf("--max-download-size is not set and its default, " +
+				"the host's total memory, reads as 0 (set it explicitly)")
+		}
+		return int64(min(total, math.MaxInt64)), nil //nolint:gosec // G115: clamped to MaxInt64
+	}
+	qty, err := resource.ParseQuantity(flagValue)
+	if err != nil {
+		return 0, fmt.Errorf("--max-download-size %q is not a byte count or a quantity such as 128Gi: %w",
+			flagValue, err)
+	}
+	n, ok := qty.AsInt64()
+	if !ok || n < 0 {
+		return 0, fmt.Errorf("--max-download-size %q must be a whole, non-negative number of bytes", flagValue)
+	}
+	return n, nil
+}
+
 // resolveTensorFoldBin returns the tensorfold binary path. If override is
 // non-empty it is returned as-is. Otherwise the function searches
 // defaultTensorFoldPaths.
@@ -528,6 +564,11 @@ func main() {
 	flag.StringVar(&cfg.AllowedDownloadHosts, "allowed-download-hosts", "",
 		"Comma-separated hostnames or CIDRs the agent may download models from even though they "+
 			"resolve to a private, loopback or link-local address, e.g. a LAN MinIO. Default: none.")
+	flag.StringVar(&cfg.MaxDownloadSize, "max-download-size", "",
+		"Cap on the bytes one Model download may write, resumed bytes included, as a byte count or a quantity "+
+			"such as 128Gi. A download over it is stopped, its partial removed, and the start refused with "+
+			"ModelDownloadTooLarge. Default: the host's total memory (a model file larger than RAM cannot be "+
+			"wired). 0 disables the cap.")
 	flag.BoolVar(&cfg.AllowUnsafeExtraArgs, "allow-unsafe-extra-args", false,
 		"Relax the extraArgs policy (unknown flags, stray tokens, refused non-listener flags, path checks, "+
 			"vllm-swift code-loading) for Macs whose InferenceService authors are fully trusted; flags that "+
@@ -575,6 +616,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, (&agent.DarwinMemoryProvider{}).TotalMemory)
+	if err != nil {
+		logger.Errorw("invalid --max-download-size", "error", err)
+		os.Exit(1)
+	}
+
 	// TODO: Wire this logger into controller-runtime via ctrl.SetLogger(...) so
 	// Kubernetes client/controller-runtime logs share the same configuration.
 
@@ -614,6 +661,7 @@ func main() {
 		"legacyDirectEndpoints", cfg.LegacyDirectEndpoints,
 		"hostIP", hostIP,
 		"logLevel", cfg.LogLevel,
+		"maxDownloadBytes", maxDownloadBytes,
 	)
 
 	// Verify Metal support
@@ -727,6 +775,7 @@ func main() {
 		EvictionEnabled:           cfg.EvictionEnabled,
 		AllowedModelRoots:         allowedModelRoots,
 		AllowedDownloadHosts:      splitCSV(cfg.AllowedDownloadHosts),
+		MaxDownloadBytes:          maxDownloadBytes,
 		AllowUnsafeExtraArgs:      cfg.AllowUnsafeExtraArgs,
 		IngressPort:               cfg.IngressPort,
 		StateDir:                  cfg.StateDir,

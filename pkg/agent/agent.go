@@ -220,6 +220,14 @@ type MetalAgentConfig struct {
 	// nothing.
 	AllowedDownloadHosts []string
 
+	// MaxDownloadBytes caps the bytes a single Model download may write,
+	// counting bytes a resumed download already has on disk
+	// (--max-download-size, whose default cmd/metal-agent resolves to the
+	// host's total memory). A download over it is stopped, its partial
+	// removed, and the start refused with ModelDownloadTooLarge. Zero means
+	// no cap.
+	MaxDownloadBytes int64
+
 	// AllowUnsafeExtraArgs relaxes the extraArgs policy on a Mac whose
 	// InferenceService authors are fully trusted: unknown flags, stray
 	// tokens, refused non-listener flags, path checks and vllm-swift
@@ -313,8 +321,8 @@ type MetalAgent struct {
 	// RelayNotAdopted Event in this agent process.
 	relayNotAdoptedSent map[string]bool
 
-	// digestMismatches remembers a Model's most recent SHA256 mismatch, so
-	// reconcileProcess can refuse a persistently-mismatching Model without
+	// digestMismatches remembers a Model's most recent SHA256 mismatch or
+	// over-cap download, so reconcileProcess can refuse such a Model without
 	// re-downloading the whole file (tens of GB) every reconcile.
 	digestMismatches *digestMismatchMemo
 }
@@ -485,6 +493,7 @@ func (a *MetalAgent) buildExecutors() {
 		a.logger.With("subsystem", "executor"),
 		WithKubeClient(a.config.Namespace, a.config.K8sClient, nil),
 		WithAllowedDownloadHosts(a.config.AllowedDownloadHosts),
+		WithMaxDownloadBytes(a.config.MaxDownloadBytes),
 	)
 	if a.config.LlamaServerStartupTimeout > 0 {
 		metalExec.SetStartupTimeout(a.config.LlamaServerStartupTimeout)
@@ -1008,15 +1017,15 @@ func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
 }
 
 // fetchModelForReconcile gets the Model isvc.Spec.ModelRef names. A NotFound
-// result clears any remembered digest mismatch for it (nothing else revisits
-// a NamespacedName once its Get starts 404ing, so this is the only place that
-// notices the Model is gone); a successful Get records which Model isvcKey
-// currently resolves to, so deleteProcess can clear that entry when the
-// InferenceService itself is deleted (digestMismatchMemo.forgetISVC: a
-// persistently-refused InferenceService never reaches a.processes, so that is
-// the only place this association is available). Split out of
-// reconcileProcess, rather than inlined there, to keep its cyclomatic
-// complexity from crossing the linter's threshold.
+// result clears any remembered digest mismatch or over-cap download for it
+// (nothing else revisits a NamespacedName once its Get starts 404ing, so this
+// is the only place that notices the Model is gone); a successful Get records
+// which Model isvcKey currently resolves to, so deleteProcess can clear that
+// entry when the InferenceService itself is deleted
+// (digestMismatchMemo.forgetISVC: a persistently-refused InferenceService
+// never reaches a.processes, so that is the only place this association is
+// available). Split out of reconcileProcess, rather than inlined there, to
+// keep its cyclomatic complexity from crossing the linter's threshold.
 func (a *MetalAgent) fetchModelForReconcile(
 	ctx context.Context, isvc *inferencev1alpha1.InferenceService, isvcKey string,
 ) (*inferencev1alpha1.Model, error) {

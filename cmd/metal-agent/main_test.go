@@ -382,3 +382,52 @@ func TestConfigureModelStore_RefusesRelative(t *testing.T) {
 		t.Fatal("configureModelStore(relative) = nil, want an error")
 	}
 }
+
+func TestResolveMaxDownloadBytes(t *testing.T) {
+	const total = 128 << 30
+	memory := func(n uint64, err error) func() (uint64, error) {
+		return func() (uint64, error) { return n, err }
+	}
+	for _, tc := range []struct {
+		name    string
+		flag    string
+		total   func() (uint64, error)
+		want    int64
+		wantErr string
+	}{
+		{name: "unset defaults to total memory", flag: "", total: memory(total, nil), want: total},
+		{name: "unset with unknown memory is an error", flag: "", total: memory(0, errors.New("no sysctl")),
+			wantErr: "set it explicitly"},
+		{name: "unset with zero memory is an error, not an uncapped agent", flag: "", total: memory(0, nil),
+			wantErr: "set it explicitly"},
+		{name: "0 disables the cap", flag: "0", want: 0},
+		{name: "binary quantity", flag: "64Gi", want: 64 << 30},
+		{name: "decimal quantity", flag: "200G", want: 200_000_000_000},
+		{name: "plain byte count", flag: "137438953472", want: 137438953472},
+		{name: "negative is refused", flag: "-1Gi", wantErr: "non-negative"},
+		{name: "fractional bytes are refused", flag: "0.5", wantErr: "whole"},
+		{name: "beyond int64 is refused", flag: "100Ei", wantErr: "whole"},
+		{name: "garbage is refused", flag: "lots", wantErr: "quantity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			totalMemory := tc.total
+			if totalMemory == nil {
+				totalMemory = func() (uint64, error) {
+					t.Fatal("total memory consulted although the flag was set")
+					return 0, nil
+				}
+			}
+			got, err := resolveMaxDownloadBytes(tc.flag, totalMemory)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("resolveMaxDownloadBytes(%q) = %d, %v; want an error containing %q",
+						tc.flag, got, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("resolveMaxDownloadBytes(%q) = %d, %v; want %d", tc.flag, got, err, tc.want)
+			}
+		})
+	}
+}
