@@ -214,7 +214,11 @@ func TestHealthMonitor_MarksHealthy(t *testing.T) {
 	}
 }
 
-func TestHealthMonitor_RecordsRestartCount(t *testing.T) {
+// TestHealthMonitor_OneFailureDoesNotRestart checks that a single failed
+// probe marks the process unhealthy but leaves it running and tracked: the
+// restart waits for DefaultHealthFailureThreshold consecutive failures
+// (#2077). Restarts and their counter are covered in health_restart_test.go.
+func TestHealthMonitor_OneFailureDoesNotRestart(t *testing.T) {
 	agent := newTestAgent()
 	agent.processes["default/model-a"] = &ManagedProcess{
 		Name: "model-a", Namespace: "default", Port: 8080, Healthy: true,
@@ -226,17 +230,17 @@ func TestHealthMonitor_RecordsRestartCount(t *testing.T) {
 
 	monitor.checkAll(context.Background())
 
-	// Verify restart counter was incremented (scheduleRestart calls processRestarts.Inc)
-	// We can't easily check the counter value directly without reading the metric,
-	// but we can verify the checker was called and the process was marked unhealthy.
 	if checker.calls != 1 {
 		t.Errorf("expected 1 health check call, got %d", checker.calls)
 	}
 
 	agent.mu.RLock()
-	healthy := agent.processes["default/model-a"].Healthy
+	p := agent.processes["default/model-a"]
 	agent.mu.RUnlock()
-	if healthy {
+	if p == nil {
+		t.Fatal("process was stopped after one failed check")
+	}
+	if p.Healthy {
 		t.Error("process should be unhealthy after failed check")
 	}
 }

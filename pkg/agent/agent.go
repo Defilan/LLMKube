@@ -151,6 +151,12 @@ type MetalAgentConfig struct {
 	// (DefaultMaxConsecutiveFailures).
 	MaxWatchFailures int
 
+	// HealthFailureThreshold is how many consecutive failed health probes
+	// make the agent stop an engine and start a new one. The first failure
+	// already withdraws the engine's endpoint. Zero means
+	// DefaultHealthFailureThreshold.
+	HealthFailureThreshold int
+
 	// InferenceServiceAllowlist optionally restricts which
 	// InferenceServices this agent claims by name. Empty / nil claims
 	// every metal-accelerator InferenceService in the namespace (v0.1
@@ -284,13 +290,20 @@ type MetalAgent struct {
 	pressureObserved map[string]MemoryPressureLevel
 
 	// starting records namespacedName keys whose ensureProcess call is
-	// in flight. The K8s watcher (handleEvent) and the health monitor
-	// (scheduleRestart) can both call ensureProcess for the same key at the
-	// same time; the model load between the processes[] check and the store
-	// is long and unlocked, so without this guard both callers pass the
-	// stale check and each spawns a runtime process — loading the model
+	// in flight, and keys whose unhealthy engine the health monitor is
+	// stopping before a restart (restartUnhealthy). The model load between
+	// the processes[] check and the store is long and unlocked, so without
+	// this guard a second start for the key would pass the stale check and
+	// spawn another runtime process next to the first: loading the model
 	// twice, enough to exhaust host memory.
 	starting map[string]bool
+
+	// restarts holds the health-restart backoff of each service whose engine
+	// the health monitor has restarted (see health_restart.go).
+	restarts map[string]*restartBackoff
+	// restartWake asks the event loop to run due health restarts. Buffered
+	// (capacity 1) so a wake-up never blocks its sender.
+	restartWake chan struct{}
 
 	// roots is the set of directories local model sources and the oMLX
 	// pagedSSDCacheDir must resolve into. Derived from
@@ -353,6 +366,10 @@ type ManagedProcess struct {
 	// so deleteProcess and Shutdown can pick the correct executor even
 	// when the agent hosts multiple runtimes concurrently (#525).
 	Runtime string
+
+	// healthFailures counts this process's consecutive failed health probes.
+	// Guarded by MetalAgent.mu; a replacement process starts again at zero.
+	healthFailures int
 }
 
 // EffectiveModelRoots returns the root paths NewMetalAgent resolves into
@@ -463,6 +480,8 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		pressureBlocked:     make(map[string]bool),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
+		restarts:            make(map[string]*restartBackoff),
+		restartWake:         make(chan struct{}, 1),
 		now:                 time.Now,
 		relayRegisteredAt:   make(map[string]time.Time),
 		relayNotAdoptedSent: make(map[string]bool),
@@ -708,6 +727,10 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 			if err := a.handleEvent(ctx, event); err != nil {
 				a.logger.Warnw("failed to handle event", "eventType", event.Type, "error", err)
 			}
+		case <-a.restartWake:
+			// Health restarts start here, serialized with watch events, so
+			// a delete or scale-to-zero cannot race a restart's start.
+			a.runDueRestarts(ctx)
 		}
 	}
 }
@@ -1042,11 +1065,11 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 
 	desiredHash := computeSpecHash(isvc)
 
-	// Serialize ensureProcess per service. The K8s watcher and the health
-	// monitor's scheduleRestart can both reach ensureProcess for this key
-	// concurrently; the spawn path between the processes[] check and the
-	// store is long and unlocked, so without this guard both callers would
-	// spawn a runtime process and load the model twice. A spec change that
+	// Serialize starts per service. The health monitor holds this guard
+	// while it stops an unhealthy engine before a restart, and the spawn
+	// path between the processes[] check and the store is long and
+	// unlocked, so without it a second caller would spawn a runtime process
+	// next to the first and load the model twice. A spec change that
 	// arrives mid-spawn is dropped here and reconciled by the next watch
 	// event — acceptable, where a double model load is not.
 	a.mu.Lock()
@@ -1100,9 +1123,14 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return a.handleScaleToZero(ctx, isvc, key, exists)
 	}
 
-	if exists && existing.Healthy {
+	if exists {
 		if existing.SpecHash == desiredHash {
-			a.logger.Debugw("inference service already has a healthy process with matching spec", "key", key)
+			// An unhealthy process is left to the health monitor, which stops
+			// it and restarts it after healthFailureThreshold consecutive
+			// failed probes. Starting a new engine here would leave this one
+			// running untracked, with its weights still wired (#2077).
+			a.logger.Debugw("inference service already has a process with matching spec",
+				"key", key, "healthy", existing.Healthy)
 			return nil
 		}
 		a.logger.Infow("spec changed; restarting process to pick up new flags",
@@ -1305,6 +1333,11 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	a.digestMismatches.forgetISVC(key)
 
 	a.mu.Lock()
+	// Whatever tears the service down (a delete, eviction, a spec change)
+	// supersedes a pending health restart, so a backed-off retry cannot
+	// start it again later. Also before the early return: a service whose
+	// restart failed has no process.
+	a.cancelRestartLocked(key)
 	process, exists := a.processes[key]
 	if !exists {
 		a.mu.Unlock()
@@ -1324,29 +1357,8 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	processRestarts.DeleteLabelValues(name, namespace)
 
 	var deleteErrors []error
-
-	// Pick the executor that matches the process's runtime.
-	exec := a.executors[process.Runtime]
-	if exec == nil {
-		// Fallback to the default executor if the runtime is unknown
-		// (e.g. a process spawned before the multi-runtime refactor).
-		exec = a.executors[runtimeLlamaServer]
-	}
-
-	// For shared-daemon runtimes (oMLX, Ollama), unload the specific model
-	// instead of killing the shared daemon.
-	if ollama, ok := exec.(*OllamaExecutor); ok && process.ModelID != "" {
-		if err := ollama.UnloadModel(ctx, process.ModelID); err != nil {
-			deleteErrors = append(deleteErrors,
-				fmt.Errorf("failed to unload Ollama model %s: %w", process.ModelID, err))
-		}
-	} else if omlx, ok := exec.(*OMLXExecutor); ok && process.ModelID != "" {
-		if err := omlx.UnloadModel(ctx, process.ModelID); err != nil {
-			deleteErrors = append(deleteErrors,
-				fmt.Errorf("failed to unload oMLX model %s: %w", process.ModelID, err))
-		}
-	} else if err := exec.StopProcess(process.PID); err != nil {
-		deleteErrors = append(deleteErrors, fmt.Errorf("failed to stop process: %w", err))
+	if err := a.stopManagedProcess(ctx, process); err != nil {
+		deleteErrors = append(deleteErrors, err)
 	}
 
 	// Unregister after the process has stopped. UnregisterEndpoint is idempotent
@@ -1361,6 +1373,38 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	}
 
 	a.logger.Infow("stopped inference service", "key", key)
+	return nil
+}
+
+// stopManagedProcess stops a process the caller has already removed from
+// a.processes, with the executor that matches its runtime. For shared-daemon
+// runtimes (oMLX, Ollama) it unloads the model instead of killing the shared
+// daemon; for the others StopProcess sends SIGTERM and, after a grace period,
+// SIGKILL.
+func (a *MetalAgent) stopManagedProcess(ctx context.Context, process *ManagedProcess) error {
+	// Pick the executor that matches the process's runtime.
+	exec := a.executors[process.Runtime]
+	if exec == nil {
+		// Fallback to the default executor if the runtime is unknown
+		// (e.g. a process spawned before the multi-runtime refactor).
+		exec = a.executors[runtimeLlamaServer]
+	}
+
+	if ollama, ok := exec.(*OllamaExecutor); ok && process.ModelID != "" {
+		if err := ollama.UnloadModel(ctx, process.ModelID); err != nil {
+			return fmt.Errorf("failed to unload Ollama model %s: %w", process.ModelID, err)
+		}
+		return nil
+	}
+	if omlx, ok := exec.(*OMLXExecutor); ok && process.ModelID != "" {
+		if err := omlx.UnloadModel(ctx, process.ModelID); err != nil {
+			return fmt.Errorf("failed to unload oMLX model %s: %w", process.ModelID, err)
+		}
+		return nil
+	}
+	if err := exec.StopProcess(process.PID); err != nil {
+		return fmt.Errorf("failed to stop process: %w", err)
+	}
 	return nil
 }
 
@@ -1391,6 +1435,10 @@ func (a *MetalAgent) handleScaleToZero(
 	key string,
 	exists bool,
 ) error {
+	// A pending health restart must not bring a stopped service back. The
+	// process may already be gone (a restart that failed), so this does not
+	// rely on deleteProcess below.
+	a.cancelRestart(key)
 	if exists {
 		a.logger.Infow("scaled to zero or suspended; stopping process",
 			"namespace", isvc.Namespace, "name", isvc.Name,
@@ -1481,9 +1529,6 @@ func (a *MetalAgent) markStopped(ctx context.Context, isvc *inferencev1alpha1.In
 	return a.config.K8sClient.Status().Update(ctx, fresh)
 }
 
-// scheduleRestart increments the restart counter and re-runs ensureProcess
-// for the named InferenceService. It is called by HealthMonitor when a process
-// becomes unhealthy.
 // runWatcherLoop drives a.watcher.Watch in a loop, retrying transient errors
 // with exponential backoff (handles the "CRDs not installed yet" startup
 // race) but bubbling ErrWatchStalled up via fatalErrChan immediately.
@@ -1596,23 +1641,6 @@ var applePowerSamplerFactory func(string, time.Duration, *zap.SugaredLogger) app
 	bin string, interval time.Duration, logger *zap.SugaredLogger,
 ) applePowerRunner {
 	return NewApplePowerSampler(bin, interval, logger)
-}
-
-func (a *MetalAgent) scheduleRestart(ctx context.Context, name, namespace string) {
-	processRestarts.WithLabelValues(name, namespace).Inc()
-
-	isvc := &inferencev1alpha1.InferenceService{}
-	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{
-		Namespace: namespace,
-		Name:      name,
-	}, isvc); err != nil {
-		a.logger.Warnw("failed to fetch InferenceService for restart", "name", name, "namespace", namespace, "error", err)
-		return
-	}
-
-	if err := a.ensureProcess(ctx, isvc); err != nil {
-		a.logger.Warnw("failed to restart process", "name", name, "namespace", namespace, "error", err)
-	}
 }
 
 // withdrawEndpoint fetches the InferenceService for the given name/namespace
@@ -1803,6 +1831,11 @@ func (a *MetalAgent) runHeartbeatLoop(ctx context.Context) {
 func (a *MetalAgent) Shutdown(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// No health restart may start an engine after shutdown.
+	for key := range a.restarts {
+		a.cancelRestartLocked(key)
+	}
 
 	a.logger.Infow("cleaning up running processes", "count", len(a.processes))
 
