@@ -238,12 +238,11 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 
 	// Mark blocked BEFORE deleteProcess so a controller event arriving
 	// during the (potentially slow) process teardown does not race ahead
-	// and respawn it. The watchdog keys RSS by process name; record it so
-	// a restart can wait for room to take that memory back, and when the
-	// restart backoff allows the next one.
+	// and respawn it. Record its RSS so a restart can wait for room to take
+	// that memory back, and when the restart backoff allows the next one.
 	a.mu.Lock()
 	a.pressureBlocked[key] = evictedService{
-		rss:       stats.ProcessRSS[target.Name],
+		rss:       stats.ProcessRSS[managedProcessRSSKey(target)],
 		notBefore: a.nextEvictedRestartLocked(key),
 	}
 	delete(a.pressureRestarting, key)
