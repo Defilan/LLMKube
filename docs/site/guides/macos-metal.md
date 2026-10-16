@@ -527,6 +527,16 @@ health/metrics and serves its TLS ingress on `--ingress-port`
 `127.0.0.1` only. macOS will prompt to allow incoming connections
 on first run. Allow them for the ingress port.
 
+**Agent log shows `referenced model lookup failed; keeping the inference service's previous state`**
+The agent could not read the Model an `InferenceService` references
+(an API server timeout, throttling, a control-plane restart, or a
+lost `get` permission on `models`). It leaves the service as it
+was, so a running model keeps serving, and retries on the next poll
+(every 5 seconds). A few lines during a control-plane restart are
+normal; if the warning keeps repeating, check the agent's RBAC and
+its connection to the API server. Only a deleted Model, or one whose
+`hardware.accelerator` is no longer `metal`, stops the service.
+
 **Agent log shows `replicas=0; stopping process` unexpectedly**
 A controller-side reconcile saw `spec.replicas=0` on the
 `InferenceService`. Check whether something scaled it down
