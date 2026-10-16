@@ -189,7 +189,6 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(context.Background(), Options{Namespace: "ns", Interval: time.Second, FailAfter: time.Second}); err == nil {
 		t.Fatal("expected an error when fail-after does not exceed the interval")
 	}
-	_ = valid
 }
 
 func TestResolveNamespace(t *testing.T) {
