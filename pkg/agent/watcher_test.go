@@ -840,6 +840,34 @@ func TestPoll_ShutdownLookupFailureKeepsStateSilently(t *testing.T) {
 	}
 }
 
+// TestShouldWatch_DeadlineExceededLookupIsLoggedAndCounted: only cancellation
+// (shutdown) silences a failed lookup. A caller's context whose deadline
+// expired while the Get was outstanding points at a slow API server, so the
+// failure is logged and counted like any other.
+func TestShouldWatch_DeadlineExceededLookupIsLoggedAndCounted(t *testing.T) {
+	f := newModelLookupFixture(t)
+	core, logs := observer.New(zap.DebugLevel)
+	f.watcher.logger = zap.New(core).Sugar()
+	watchModelLookupFailingServices.Set(0)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: lookupISVCName, Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: lookupModelName},
+	}
+
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	f.failModelGet = context.DeadlineExceeded
+	if _, err := f.watcher.shouldWatch(ctx, isvc); err == nil {
+		t.Fatal("shouldWatch returned no error for a failed lookup, want the lookup error")
+	}
+	if got := lookupLogCounts(logs); got[zap.WarnLevel] != 1 {
+		t.Errorf("deadline-exceeded lookup: log lines by level = %v, want one Warn", got)
+	}
+	if g := testutil.ToFloat64(watchModelLookupFailingServices); g != 1 {
+		t.Errorf("deadline-exceeded lookup: gauge = %v, want 1", g)
+	}
+}
+
 // TestWatcher_ModelLookupErrorDoesNotAddUnseenService covers the other half of
 // keeping the previous state (#2076): a service the watcher has not seen yet
 // is not started while its Model lookup fails, by either the startup list or a

@@ -352,10 +352,12 @@ func (w *InferenceServiceWatcher) shouldWatch(
 	switch {
 	case err == nil:
 		w.noteLookupDecided(isvc)
-	case ctx.Err() != nil:
+	case errors.Is(ctx.Err(), context.Canceled):
 		// The agent is shutting down and the Get failed because of it, not
 		// because the API server is unhealthy: still unknown, but not worth
-		// a log line or a change to the failure tracking.
+		// a log line or a change to the failure tracking. A caller's expired
+		// deadline is not this case: a Get that outlived it points at a slow
+		// API server, so it is logged and counted like any other failure.
 	default:
 		w.noteLookupFailed(isvc, err)
 	}
