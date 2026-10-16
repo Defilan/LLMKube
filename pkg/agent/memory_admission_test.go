@@ -237,6 +237,56 @@ func TestCheckMemoryAdmission_WarnModeProceeds(t *testing.T) {
 	}
 }
 
+// TestCheckMemoryAdmission_GQAShapeAdmits pins the end-to-end admission effect
+// of the grouped-query-attention KV estimate (#2085): a Model whose GGUF status
+// carries the attention shape fits a budget that the embedding-width estimate
+// refuses, and loses that margin the moment the fields are absent from status.
+func TestCheckMemoryAdmission_GQAShapeAdmits(t *testing.T) {
+	// 15 GiB of weights: with GQA accounting the 131072-context KV is 16 GiB
+	// (total 31.5 GiB, under the 36 GiB budget); the embedding-width KV is
+	// 64 GiB (total 79.5 GiB, over it).
+	isvc := newAdmissionTestISVC()
+	agent := newAdmissionTestAgent(t, isvc, MetalAgentConfig{
+		MemoryProvider: &mockMemoryProvider{totalBytes: 48 * 1024 * 1024 * 1024},
+		MemoryFraction: 0.75,
+	})
+	model := newAdmissionTestModel("https://model-host.invalid/model.gguf", "15.0 GiB")
+	model.Status.GGUF = &inferencev1alpha1.GGUFMetadata{
+		LayerCount:    32,
+		EmbeddingSize: 4096,
+		HeadCount:     32,
+		HeadCountKV:   8,
+		KeyLength:     128,
+		ValueLength:   128,
+	}
+
+	if err := agent.checkMemoryAdmission(context.Background(), isvc, model, 131072, "", ""); err != nil {
+		t.Fatalf("a GQA-shaped model must be admitted at 131072 context, got: %v", err)
+	}
+
+	// The same weights and context without the attention shape in status:
+	// the embedding-width estimate refuses.
+	isvcRefused := newAdmissionTestISVC()
+	agentRefused := newAdmissionTestAgent(t, isvcRefused, MetalAgentConfig{
+		MemoryProvider: &mockMemoryProvider{totalBytes: 48 * 1024 * 1024 * 1024},
+		MemoryFraction: 0.75,
+	})
+	modelRefused := newAdmissionTestModel("https://model-host.invalid/model.gguf", "15.0 GiB")
+	modelRefused.Status.GGUF = &inferencev1alpha1.GGUFMetadata{
+		LayerCount:    32,
+		EmbeddingSize: 4096,
+		HeadCount:     32,
+	}
+
+	err := agentRefused.checkMemoryAdmission(context.Background(), isvcRefused, modelRefused, 131072, "", "")
+	if err == nil {
+		t.Fatal("the same model without GQA metadata must still be refused, got nil error")
+	}
+	if !strings.Contains(err.Error(), "insufficient memory") {
+		t.Errorf("error %q should mention insufficient memory", err)
+	}
+}
+
 func TestCheckMemoryAdmission_RejectsOverBudget(t *testing.T) {
 	isvc := newAdmissionTestISVC()
 	agent := newAdmissionTestAgent(t, isvc, MetalAgentConfig{

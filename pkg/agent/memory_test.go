@@ -209,6 +209,113 @@ func TestEstimateModelMemory_UnknownCacheTypeFallsBackToF16(t *testing.T) {
 	}
 }
 
+// TestEstimateModelMemoryWithOptions_GQAShape covers the grouped-query-attention
+// KV estimate (#2085): the GQA formula when the GGUF attention shape is known,
+// byte-identical legacy behavior when it is not, per-side cache-type bytes,
+// and the fallback and overflow guards.
+func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
+	const fileSize = uint64(4 * 1024 * 1024 * 1024) // 4 GiB
+	const kvGQA = uint64(17179869184)               // 32 layers * 131072 ctx * 8 kv heads * 128 dims * 4 bytes = 16 GiB
+	const kvLegacy = uint64(68719476736)            // 32 * 4096 * 131072 * 4 bytes = 64 GiB
+	const overhead = uint64(512 * 1024 * 1024)
+
+	tests := []struct {
+		name       string
+		layerCount uint64
+		embedSize  uint64
+		opts       EstimateOptions
+		wantKV     uint64
+		fallback   bool // expect the fileSize*1.2 heuristic instead of a KV term
+	}{
+		{
+			name:       "llama-3.1-8B shape with full GQA metadata",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128},
+			wantKV: kvGQA,
+		},
+		{
+			name:       "no GQA metadata matches the legacy formula exactly",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "key and value lengths absent are derived from embedding/headCount",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8},
+			wantKV: kvGQA,
+		},
+		{
+			name:       "key length absent only, value length present",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, ValueLength: 128},
+			wantKV: kvGQA,
+		},
+		{
+			name:       "asymmetric cache types apply per-side bytes",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128, CacheTypeK: "q8_0"},
+			wantKV: 13153337344, // 4294967296 elems * (1.0625 + 2.0)
+		},
+		{
+			name:       "missing headCount falls back even with kv heads and lengths",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCountKV: 8, KeyLength: 128, ValueLength: 128},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "zero headCountKV falls back, no MHA substitution",
+			layerCount: 32, embedSize: 4096,
+			// keyLength 64 differs from the derivable 4096/32 = 128 so the
+			// row distinguishes the fallback from a headCount substitution:
+			// substituting would halve the KV term.
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 0, KeyLength: 64, ValueLength: 64},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "embedding not divisible by headCount cannot derive head dims",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 48, HeadCountKV: 8},
+			wantKV: kvLegacy,
+		},
+		{
+			// layerCount*kvHeads*ctx stays below 2^64 (2^45) while
+			// base*keyLen overflows, so the row fires at the kElems guard
+			// specifically.
+			name:       "absurd shapes hit the overflow guard and fall back",
+			layerCount: 1 << 20, embedSize: 1,
+			opts:     EstimateOptions{HeadCount: 1, HeadCountKV: 256, KeyLength: 1048576, ValueLength: 1048576},
+			fallback: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			est := EstimateModelMemoryWithOptions(fileSize, tt.layerCount, tt.embedSize, 131072, tt.opts)
+			if tt.fallback {
+				want := fallbackEstimate(fileSize)
+				if est.KVCacheBytes != 0 || est.TotalBytes != want.TotalBytes {
+					t.Errorf("expected fallback estimate, got KV=%d total=%d, want KV=%d total=%d",
+						est.KVCacheBytes, est.TotalBytes, want.KVCacheBytes, want.TotalBytes)
+				}
+				return
+			}
+			if est.KVCacheBytes != tt.wantKV {
+				t.Errorf("KV = %d, want %d", est.KVCacheBytes, tt.wantKV)
+			}
+			if want := fileSize + tt.wantKV + overhead; est.TotalBytes != want {
+				t.Errorf("total = %d, want %d", est.TotalBytes, want)
+			}
+		})
+	}
+
+	// The legacy 4-arg entry point must keep producing the no-metadata number.
+	legacy := EstimateModelMemory(fileSize, 32, 4096, 131072)
+	if legacy.KVCacheBytes != kvLegacy {
+		t.Errorf("legacy estimate = %d, want %d", legacy.KVCacheBytes, kvLegacy)
+	}
+}
+
 func TestDefaultMemoryFraction_Small(t *testing.T) {
 	total := uint64(16 * 1024 * 1024 * 1024) // 16 GiB
 	f := DefaultMemoryFraction(total)

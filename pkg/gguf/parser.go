@@ -649,6 +649,60 @@ func (f *GGUFFile) HeadCount() uint64 {
 	return n
 }
 
+// HeadCountKV returns the number of key/value attention heads (grouped-query
+// attention). Returns 0 when the key is absent or not a scalar unsigned
+// integer: some hybrid architectures (Jamba, Nemotron-H) store per-layer
+// arrays, and callers must treat 0 as unknown rather than guessing.
+func (f *GGUFFile) HeadCountKV() uint64 {
+	arch := f.Architecture()
+	if arch == "" {
+		return 0
+	}
+	v, ok := f.GetMetadata(arch + ".attention.head_count_kv")
+	if !ok {
+		return 0
+	}
+	n, ok := AsU64(v)
+	if !ok {
+		return 0
+	}
+	return n
+}
+
+// KeyLength returns the per-head key dimension.
+func (f *GGUFFile) KeyLength() uint64 {
+	arch := f.Architecture()
+	if arch == "" {
+		return 0
+	}
+	v, ok := f.GetMetadata(arch + ".attention.key_length")
+	if !ok {
+		return 0
+	}
+	n, ok := AsU64(v)
+	if !ok {
+		return 0
+	}
+	return n
+}
+
+// ValueLength returns the per-head value dimension.
+func (f *GGUFFile) ValueLength() uint64 {
+	arch := f.Architecture()
+	if arch == "" {
+		return 0
+	}
+	v, ok := f.GetMetadata(arch + ".attention.value_length")
+	if !ok {
+		return 0
+	}
+	n, ok := AsU64(v)
+	if !ok {
+		return 0
+	}
+	return n
+}
+
 // License returns the license identifier from the GGUF metadata.
 func (f *GGUFFile) License() string {
 	v, ok := f.GetMetadata("general.license")

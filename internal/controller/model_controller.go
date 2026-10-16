@@ -1298,6 +1298,27 @@ func computeCacheKey(source string) string {
 	return cachekey.Compute(source)
 }
 
+// ggufMetadataFromParsed maps a parsed GGUF header into the status type. All
+// three parse paths (local file, remote http(s), s3) share it so a new field
+// is populated at every site by construction.
+func ggufMetadataFromParsed(parsed *gguf.GGUFFile) *inferencev1alpha1.GGUFMetadata {
+	return &inferencev1alpha1.GGUFMetadata{
+		Architecture:  parsed.Architecture(),
+		ModelName:     parsed.Name(),
+		Quantization:  parsed.Quantization(),
+		ContextLength: parsed.ContextLength(),
+		EmbeddingSize: parsed.EmbeddingLength(),
+		LayerCount:    parsed.BlockCount(),
+		HeadCount:     parsed.HeadCount(),
+		HeadCountKV:   parsed.HeadCountKV(),
+		KeyLength:     parsed.KeyLength(),
+		ValueLength:   parsed.ValueLength(),
+		TensorCount:   parsed.Header.TensorCount,
+		FileVersion:   parsed.Header.Version,
+		License:       license.Normalize(parsed.License()),
+	}
+}
+
 func (r *ModelReconciler) parseGGUFMetadata(path string) (*inferencev1alpha1.GGUFMetadata, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1310,18 +1331,7 @@ func (r *ModelReconciler) parseGGUFMetadata(path string) (*inferencev1alpha1.GGU
 		return nil, fmt.Errorf("failed to parse GGUF: %w", err)
 	}
 
-	return &inferencev1alpha1.GGUFMetadata{
-		Architecture:  parsed.Architecture(),
-		ModelName:     parsed.Name(),
-		Quantization:  parsed.Quantization(),
-		ContextLength: parsed.ContextLength(),
-		EmbeddingSize: parsed.EmbeddingLength(),
-		LayerCount:    parsed.BlockCount(),
-		HeadCount:     parsed.HeadCount(),
-		TensorCount:   parsed.Header.TensorCount,
-		FileVersion:   parsed.Header.Version,
-		License:       license.Normalize(parsed.License()),
-	}, nil
+	return ggufMetadataFromParsed(parsed), nil
 }
 
 // parseRemoteGGUFMetadata reads GGUF metadata from a remote http(s) URL using a
@@ -1364,18 +1374,7 @@ func (r *ModelReconciler) parseRemoteGGUFMetadata(ctx context.Context, model *in
 		return nil, 0, fmt.Errorf("failed to parse remote GGUF: %w", err)
 	}
 
-	meta := &inferencev1alpha1.GGUFMetadata{
-		Architecture:  parsed.Architecture(),
-		ModelName:     parsed.Name(),
-		Quantization:  parsed.Quantization(),
-		ContextLength: parsed.ContextLength(),
-		EmbeddingSize: parsed.EmbeddingLength(),
-		LayerCount:    parsed.BlockCount(),
-		HeadCount:     parsed.HeadCount(),
-		TensorCount:   parsed.Header.TensorCount,
-		FileVersion:   parsed.Header.Version,
-		License:       license.Normalize(parsed.License()),
-	}
+	meta := ggufMetadataFromParsed(parsed)
 
 	size = r.remoteContentLength(ctx, source)
 	return meta, size, nil
@@ -1415,18 +1414,7 @@ func (r *ModelReconciler) parseS3GGUFMetadata(ctx context.Context, model *infere
 		return nil, 0, fmt.Errorf("failed to parse s3 GGUF: %w", err)
 	}
 
-	meta := &inferencev1alpha1.GGUFMetadata{
-		Architecture:  parsed.Architecture(),
-		ModelName:     parsed.Name(),
-		Quantization:  parsed.Quantization(),
-		ContextLength: parsed.ContextLength(),
-		EmbeddingSize: parsed.EmbeddingLength(),
-		LayerCount:    parsed.BlockCount(),
-		HeadCount:     parsed.HeadCount(),
-		TensorCount:   parsed.Header.TensorCount,
-		FileVersion:   parsed.Header.Version,
-		License:       license.Normalize(parsed.License()),
-	}
+	meta := ggufMetadataFromParsed(parsed)
 
 	return meta, r.s3ContentLength(ctx, s3Client, objectURL), nil
 }

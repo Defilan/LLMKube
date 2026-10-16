@@ -90,7 +90,8 @@ type MemoryBudget struct {
 const overheadBytes = 512 * 1024 * 1024 // 512 MiB constant overhead
 
 // EstimateOptions tweaks EstimateModelMemoryWithOptions's KV-cache calculation.
-// Empty values reproduce the historical defaults (f16 K and V).
+// Empty values reproduce the historical defaults (f16 K and V) and the
+// historical embedding-width KV formula.
 type EstimateOptions struct {
 	// CacheTypeK is the llama.cpp --cache-type-k value (e.g. "q8_0", "turbo3").
 	// Empty means f16. Unknown values fall back to f16 so the estimate
@@ -100,6 +101,23 @@ type EstimateOptions struct {
 
 	// CacheTypeV mirrors CacheTypeK for --cache-type-v.
 	CacheTypeV string
+
+	// HeadCount is the number of attention heads from the GGUF metadata.
+	// 0 means unknown.
+	HeadCount uint64
+
+	// HeadCountKV is the number of key/value attention heads (grouped-query
+	// attention). 0 means unknown: the GGUF did not provide a usable scalar
+	// value, and the historical embedding-width formula is used instead.
+	HeadCountKV uint64
+
+	// KeyLength is the per-head key dimension. 0 means unknown; the estimator
+	// derives embeddingSize / HeadCount when that divides evenly.
+	KeyLength uint64
+
+	// ValueLength is the per-head value dimension. 0 means unknown; derived
+	// like KeyLength.
+	ValueLength uint64
 }
 
 // cacheTypeBytesPerElement returns the per-element byte cost of a llama.cpp
@@ -154,11 +172,45 @@ func EstimateModelMemory(fileSizeBytes uint64, layerCount, embeddingSize uint64,
 	return EstimateModelMemoryWithOptions(fileSizeBytes, layerCount, embeddingSize, contextSize, EstimateOptions{})
 }
 
+// resolveKVShape resolves the per-layer KV geometry for the GQA-aware
+// estimate. ok is false whenever the GGUF did not provide a usable scalar
+// attention shape, in which case the caller must use the historical
+// embedding-width formula: for any plain multi-head-attention model that
+// formula is exact (head_count x embedding/head_count = embedding), and for
+// array-valued head_count_kv (Jamba, Nemotron-H) guessing head_count would
+// under-estimate.
+func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen, valLen uint64, ok bool) {
+	if layerCount == 0 || opts.HeadCount == 0 || opts.HeadCountKV == 0 {
+		return 0, 0, 0, false
+	}
+	if embeddingSize%opts.HeadCount != 0 {
+		return 0, 0, 0, false
+	}
+	derived := embeddingSize / opts.HeadCount
+	keyLen = derived
+	if opts.KeyLength > 0 {
+		keyLen = opts.KeyLength
+	}
+	valLen = derived
+	if opts.ValueLength > 0 {
+		valLen = opts.ValueLength
+	}
+	if keyLen == 0 || valLen == 0 {
+		return 0, 0, 0, false
+	}
+	return opts.HeadCountKV, keyLen, valLen, true
+}
+
 // EstimateModelMemoryWithOptions is EstimateModelMemory parameterized on the
 // configured KV cache types. The KV-cache term becomes
 // layers * embedding * context * (bytesPerK + bytesPerV) where bytesPerK / V
 // come from cacheTypeBytesPerElement. With f16/f16 (the empty-string default)
-// it produces the same result as EstimateModelMemory.
+// it produces the same result as EstimateModelMemory. When the GGUF attention
+// shape is known (HeadCountKV > 0 and both head dims resolvable), the KV term
+// uses the grouped-query-attention shape
+// layers * headCountKV * context * (keyLength * bytesPerK + valueLength * bytesPerV)
+// instead; that is several times smaller for GQA models and identical to the
+// embedding-width formula for models without GQA metadata.
 func EstimateModelMemoryWithOptions(
 	fileSizeBytes uint64,
 	layerCount, embeddingSize uint64,
@@ -167,6 +219,41 @@ func EstimateModelMemoryWithOptions(
 ) MemoryEstimate {
 	if layerCount == 0 || embeddingSize == 0 {
 		return fallbackEstimate(fileSizeBytes)
+	}
+
+	if kvHeads, keyLen, valLen, ok := resolveKVShape(layerCount, embeddingSize, opts); ok {
+		ctx := uint64(contextSize) //nolint:gosec // G115: contextSize is CRD-validated ≥128 upstream
+		base := layerCount * kvHeads
+		if base/layerCount != kvHeads {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		base *= ctx
+		if ctx != 0 && base/ctx != layerCount*kvHeads {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		kElems := base * keyLen
+		if kElems/base != keyLen {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		vElems := base * valLen
+		if vElems/base != valLen {
+			return fallbackEstimate(fileSizeBytes)
+		}
+
+		bytesK := cacheTypeBytesPerElement(opts.CacheTypeK)
+		bytesV := cacheTypeBytesPerElement(opts.CacheTypeV)
+		kvCache := uint64(math.Ceil(float64(kElems)*bytesK + float64(vElems)*bytesV))
+
+		total := fileSizeBytes + kvCache + uint64(overheadBytes)
+		if total < fileSizeBytes { // addition overflow
+			return fallbackEstimate(fileSizeBytes)
+		}
+		return MemoryEstimate{
+			WeightsBytes:  fileSizeBytes,
+			KVCacheBytes:  kvCache,
+			OverheadBytes: uint64(overheadBytes),
+			TotalBytes:    total,
+		}
 	}
 
 	// Guard against overflow in the multiplication chain. The integer math

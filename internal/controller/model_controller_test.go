@@ -2065,6 +2065,139 @@ func buildTestGGUF(arch, name string, blockCount uint64, padBytes int) []byte {
 	return buf.Bytes()
 }
 
+// buildTestGQAGGUF is buildTestGGUF plus the grouped-query-attention metadata
+// keys (#2085). A zero headCountKV omits the GQA keys entirely, producing the
+// no-metadata shape the estimator must treat exactly like the old formula.
+func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, keyLength, valueLength uint64, padBytes int) []byte {
+	buf := &bytes.Buffer{}
+	wLE := func(v interface{}) { _ = binary.Write(buf, binary.LittleEndian, v) }
+	wStr := func(s string) {
+		wLE(uint64(len(s)))
+		buf.WriteString(s)
+	}
+	wKVString := func(k, v string) {
+		wStr(k)
+		wLE(uint32(8)) // string type tag
+		wStr(v)
+	}
+	wKVU64 := func(k string, v uint64) {
+		wStr(k)
+		wLE(uint32(10)) // uint64 type tag
+		wLE(v)
+	}
+
+	metaCount := uint64(4)
+	if headCountKV > 0 {
+		metaCount = 7
+	}
+	wLE(uint32(0x46554747)) // magic GGUF
+	wLE(uint32(3))          // version
+	wLE(uint64(0))          // tensor count (none, keeps the prefix small)
+	wLE(metaCount)          // metadata kv count
+
+	wKVString("general.architecture", arch)
+	wKVString("general.name", name)
+	wKVU64(arch+".block_count", blockCount)
+	wKVU64(arch+".attention.head_count", headCount)
+	if headCountKV > 0 {
+		wKVU64(arch+".attention.head_count_kv", headCountKV)
+		wKVU64(arch+".attention.key_length", keyLength)
+		wKVU64(arch+".attention.value_length", valueLength)
+	}
+
+	if padBytes > 0 {
+		buf.Write(make([]byte, padBytes))
+	}
+	return buf.Bytes()
+}
+
+// TestParseGGUFMetadataGQAFields pins the local-file parse path filling the
+// grouped-query-attention status fields (#2085). Dropping them from
+// ggufMetadataFromParsed fails this test at every fill site, since all three
+// parse paths share the helper.
+func TestParseGGUFMetadataGQAFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	ggufBytes := buildTestGQAGGUF("llama", "gqa-test-model", 32, 32, 8, 128, 128, 0)
+	if err := os.WriteFile(path, ggufBytes, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	r := &ModelReconciler{}
+	ggufMeta, err := r.parseGGUFMetadata(path)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata: %v", err)
+	}
+	if ggufMeta.HeadCountKV != 8 {
+		t.Errorf("HeadCountKV = %d, want 8", ggufMeta.HeadCountKV)
+	}
+	if ggufMeta.KeyLength != 128 {
+		t.Errorf("KeyLength = %d, want 128", ggufMeta.KeyLength)
+	}
+	if ggufMeta.ValueLength != 128 {
+		t.Errorf("ValueLength = %d, want 128", ggufMeta.ValueLength)
+	}
+
+	// A GGUF without the GQA keys must leave the fields zero, not guessed.
+	plainPath := filepath.Join(t.TempDir(), "plain.gguf")
+	if err := os.WriteFile(plainPath, buildTestGQAGGUF("llama", "plain-model", 32, 32, 0, 0, 0, 0), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ggufMeta, err = r.parseGGUFMetadata(plainPath)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata(plain): %v", err)
+	}
+	if ggufMeta.HeadCountKV != 0 || ggufMeta.KeyLength != 0 || ggufMeta.ValueLength != 0 {
+		t.Errorf("plain GGUF GQA fields = (%d, %d, %d), want (0, 0, 0)",
+			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
+	}
+}
+
+// TestParseRemoteGGUFMetadataGQAFields pins the remote http(s) header-read
+// path filling the grouped-query-attention status fields (#2085).
+func TestParseRemoteGGUFMetadataGQAFields(t *testing.T) {
+	ggufBytes := buildTestGQAGGUF("llama", "remote-gqa-model", 32, 32, 8, 128, 128, 4<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(ggufBytes)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if rng := r.Header.Get("Range"); rng != "" && strings.HasPrefix(rng, "bytes=") {
+			var start, end int
+			if _, perr := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); perr == nil {
+				if end >= len(ggufBytes) {
+					end = len(ggufBytes) - 1
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(ggufBytes)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(ggufBytes[start : end+1])
+				return
+			}
+		}
+		_, _ = w.Write(ggufBytes)
+	}))
+	defer srv.Close()
+
+	model := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{Source: srv.URL + "/model.gguf"},
+	}
+	r := &ModelReconciler{AllowedRemoteHosts: testRemoteHosts}
+	ggufMeta, _, err := r.parseRemoteGGUFMetadata(context.Background(), model)
+	if err != nil {
+		t.Fatalf("parseRemoteGGUFMetadata: %v", err)
+	}
+	if ggufMeta.HeadCountKV != 8 {
+		t.Errorf("HeadCountKV = %d, want 8", ggufMeta.HeadCountKV)
+	}
+	if ggufMeta.KeyLength != 128 {
+		t.Errorf("KeyLength = %d, want 128", ggufMeta.KeyLength)
+	}
+	if ggufMeta.ValueLength != 128 {
+		t.Errorf("ValueLength = %d, want 128", ggufMeta.ValueLength)
+	}
+}
+
 // The metadata-read gate in reconcileRuntimeResolvedSource must admit s3://
 // sources (#1453). Before the gate was widened, an s3:// source was not an
 // http(s) source, so the read was skipped and status.size stayed "0" with
