@@ -7,6 +7,10 @@
 
   **Run models across NVIDIA, Apple Silicon, and AMD from one spec. Your models. Your hardware. Your rules.**
 
+  Three things no other Kubernetes LLM operator combines: Apple Silicon inference as **native macOS processes, not containers** (the [Metal Agent](#the-metal-agent) runs `llama-server`, `mlx-server`, and `vllm-swift` with full Metal GPU access); **heterogeneous fleets** of NVIDIA, AMD (Vulkan), Intel, and Apple Silicon hosts under one operator and one set of CRDs; and **fail-closed policy routing** between local and external models via [ModelRouter](#composition-modelrouter).
+
+  **Who it's for:** platform and AI-ops teams running on-prem, mixed-hardware, or air-gapped inference. If you want one model on one laptop, Ollama is simpler.
+
   *Plus [Foreman](#foreman): an agentic harness that runs coding agents on your own fleet. It has shipped real fixes to this repo.*
 
   <p>
@@ -36,6 +40,7 @@
 
   <p>
     <a href="#quick-start">Quick Start</a> &bull;
+    <a href="#project-status">Status</a> &bull;
     <a href="#composition-modelrouter">ModelRouter</a> &bull;
     <a href="#foreman">Foreman</a> &bull;
     <a href="#the-metal-agent">Metal Agent</a> &bull;
@@ -58,10 +63,6 @@ So you set up llama.cpp. It works great on one machine. Then you need to scale i
 Suddenly you're building an entire platform instead of shipping your product.
 
 **LLMKube is a Kubernetes operator that turns LLM deployment into a two-line YAML problem.** Define a `Model` and an `InferenceService`, and the operator handles downloading, caching, GPU scheduling, health checks, scaling, and exposing an OpenAI-compatible API. Add a `ModelRouter` on top and the same cluster does policy-aware routing between your local models and external providers (Anthropic / OpenAI / LiteLLM) with fail-closed semantics for regulated data.
-
-> **0.8.0 (2026-05-28)**: Foreman ships as an opt-in add-on. A Kubernetes-native control plane that dispatches coder, verifier, and reviewer agents across a heterogeneous fleet of locally-hosted LLM nodes. Foreman authored its own debut PRs against this repository ([#508](https://github.com/defilantech/LLMKube/pull/508), [#588](https://github.com/defilantech/LLMKube/pull/588)). Plus Intel oneAPI / SYCL GPU support from a first-time contributor. See [Foreman](#foreman) below or the [live Foreman docs](https://llmkube.com/docs/foreman) for the full reference.
->
-> **0.7.8 (2026-05-13)**: `ModelRouter` CRD ships: cross-engine routing with per-rule and per-backend timeout budgets, half-open circuit breaker, runtime fail-closed for PII/PHI rules, configurable response-header timeout, cloud-tier connection hygiene. See [Composition: ModelRouter](#composition-modelrouter) below.
 
 ---
 
@@ -166,6 +167,15 @@ kubectl apply -f model.yaml
 </details>
 
 **Full setup guides:** [Minikube Quickstart](docs/minikube-quickstart.md) | [GKE with GPUs](docs/gpu-setup-guide.md) | [Intel GPU Quickstart](docs/intel-gpu-quickstart.md) | [DGX Spark (MicroK8s)](docs/dgx-spark-microk8s.md) | [Air-Gapped Deployment](docs/air-gapped-quickstart.md) | [OpenShift](#troubleshooting)
+
+---
+
+## Project status
+
+- **Actively maintained:** frequent point releases, three in October 2026 alone as of 2026-10-16 (v0.10.2 through [v0.10.4](https://github.com/defilantech/LLMKube/releases/tag/v0.10.4)). See the [latest release](https://github.com/defilantech/LLMKube/releases/latest) and the [CHANGELOG](CHANGELOG.md) for what's current.
+- **First-time contributors have landed real features:** Intel oneAPI / SYCL GPU support arrived as PR [#557](https://github.com/defilantech/LLMKube/pull/557) from a first-time contributor, and configurable GPU resource names for AMD/Vulkan/Intel scheduling as [#709](https://github.com/defilantech/LLMKube/pull/709) from a contributor new to the repo, who followed with vendor-neutral DRA scheduling in [#750](https://github.com/defilantech/LLMKube/pull/750).
+- **Foreman, the agentic harness, contributes code to this repository:** its first two merged PRs landed in May 2026 ([#508](https://github.com/defilantech/LLMKube/pull/508), [#588](https://github.com/defilantech/LLMKube/pull/588)), with more Foreman-authored PRs merging since.
+- **Running LLMKube in production, a lab, or a homelab?** [Add yourself to ADOPTERS.md](ADOPTERS.md).
 
 ---
 
@@ -289,7 +299,7 @@ spec:
     - { name: devstral-24b-reviewer }
 ```
 
-`kubectl apply` and watch the fleet land DCO-signed branches on a fork. Two such branches reached this repository as upstream PRs: [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588).
+`kubectl apply` and watch the fleet land DCO-signed branches on a fork. Foreman's debut branches landed as upstream PRs [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588) in May 2026, and the pipeline has merged Foreman-authored PRs ever since.
 
 Foreman is meant for shops where on-prem hardware, sovereignty constraints, or sheer batch scale make the agentic-coding cloud-API model a poor fit. It is not a replacement for individual-developer tools like Cursor or aider; it is the control plane *below* those tools, for when you want a fleet doing the work instead of one developer.
 
@@ -305,7 +315,7 @@ Foreman is meant for shops where on-prem hardware, sovereignty constraints, or s
 | **Apple Silicon Metal GPU** | Native (Metal Agent) | No | Local only | No | CPU only |
 | **NVIDIA GPU** | Yes | Yes | Limited | Yes | Yes |
 | **AMD GPU** (Vulkan, incl. Strix Halo) | Yes | No | Limited | No | Limited |
-| **Heterogeneous clusters** (NVIDIA + Apple Silicon + AMD) | Yes | No | No | No | No |
+| **Heterogeneous clusters** (NVIDIA + Apple Silicon + AMD + Intel) | Yes | No | No | No | No |
 | **Hybrid local + cloud routing with policy** | `ModelRouter` CRD | No | No | No | No |
 | **Fail-closed for regulated data (PII/PHI)** | Static + runtime, K8s-enforced | No | No | No | No |
 | **Per-rule / per-backend timeout budgets** | Yes (`spec.rules[].timeout`) | No | No | No | No |
