@@ -44,10 +44,10 @@ func TestAvailableBytesFromVMStat_IncludesPurgeableAndSpeculative(t *testing.T) 
 	// free + inactive + speculative + purgeable
 	want := uint64(58000+440000+20000+30000) * pageSize
 
-	got := availableBytesFromVMStat(sampleVMStat)
+	got, err := availableBytesFromVMStat(sampleVMStat)
 
-	if got != want {
-		t.Fatalf("availableBytesFromVMStat = %d, want %d (free+inactive+speculative+purgeable)", got, want)
+	if err != nil || got != want {
+		t.Fatalf("availableBytesFromVMStat = %d, %v; want %d (free+inactive+speculative+purgeable), nil", got, err, want)
 	}
 }
 
@@ -62,9 +62,33 @@ Pages wired down:                  1250000.
 	const pageSize uint64 = 16384
 	want := uint64(58000+440000) * pageSize
 
-	got := availableBytesFromVMStat(out)
+	got, err := availableBytesFromVMStat(out)
 
-	if got != want {
-		t.Fatalf("availableBytesFromVMStat = %d, want %d (free+inactive only)", got, want)
+	if err != nil || got != want {
+		t.Fatalf("availableBytesFromVMStat = %d, %v; want %d (free+inactive only), nil", got, err, want)
+	}
+}
+
+// Output the parser cannot read must be an error, not zero bytes available:
+// the watchdog reads zero as Critical memory pressure and, with eviction
+// enabled, would evict on it (#2078). The watchdog skips a sample whose
+// available memory read fails.
+func TestAvailableBytesFromVMStat_RejectsUnparsableOutput(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+	}{
+		{"empty output", ""},
+		{"header only", "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"},
+		{"header without a page size", "Mach Virtual Memory Statistics:\n" +
+			"Pages free:                          58000.\nPages inactive:                     440000.\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := availableBytesFromVMStat(tt.out)
+			if err == nil {
+				t.Errorf("availableBytesFromVMStat = %d, nil; want an error", got)
+			}
+		})
 	}
 }
