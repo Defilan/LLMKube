@@ -29,6 +29,24 @@ controllerManager:
   leaderElection:
     enabled: true
 
+  # Watch-canary stall detection (#2069). The operator renews a Lease in its
+  # own namespace every interval and requires its own informer to deliver the
+  # write back; when a write goes unobserved for failAfter the liveness probe
+  # fails and the kubelet restarts the pod. This catches the silent-stall
+  # failure mode where the operator keeps serving probes and webhooks while
+  # its controllers stop reconciling. Set interval to "0s" to disable.
+  watchCanary:
+    interval: "60s"
+    failAfter: "5m"
+    # Namespace for the canary Lease. Empty uses the chart's namespace.
+    namespace: ""
+
+  # Deadline for a single Model or InferenceService reconcile, so a call that
+  # never returns cannot hold a controller worker forever (#2069). On expiry
+  # the reconcile is cancelled and requeued with backoff. Set to "0s" to
+  # disable.
+  reconcileTimeout: "15m"
+
   # Resource limits and requests
   resources:
     limits:
@@ -331,6 +349,22 @@ prometheus:
         kvOffload:
           enabled: false
           loadSecondsThreshold: 10
+      # Watch-canary alerts (#2069): the operator's own watch pipeline has
+      # stopped delivering events, so spec changes are silently ignored while
+      # the pod looks healthy. Rendered only when
+      # controllerManager.watchCanary.interval is not "0s": the alert reads the
+      # canary's gauges, which only the canary updates.
+      watchCanary:
+        enabled: true
+        # Fire when the last observed canary write is older than this. Should
+        # sit above --watch-canary-fail-after (5m default) so the alert is a
+        # backstop for a canary that keeps restarting rather than its only
+        # signal.
+        stalledSeconds: 900
+        # Fire when the canary has never completed a full write-observe cycle
+        # for this long: covers a canary that is disabled-by-misconfiguration
+        # or stuck in a restart loop.
+        downFor: 15m
 
 # Grafana dashboards shipped in charts/llmkube/dashboards/. One ConfigMap holds
 # every dashboard, one key per file; the sidecar label and the grafana-operator

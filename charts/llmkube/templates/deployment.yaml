@@ -40,6 +40,23 @@ spec:
         {{- if .Values.controllerManager.leaderElection.enabled }}
         - --leader-elect
         {{- end }}
+        {{- $wc := .Values.controllerManager.watchCanary | default dict }}
+        {{- if and $wc.interval (ne (toString $wc.interval) "0s") }}
+        # Watch-canary stall detection (#2069): the operator renews a lease
+        # and requires its own informer to observe the write; an unobserved
+        # write fails the liveness probe so the kubelet restarts an operator
+        # whose controllers have gone silent.
+        - --watch-canary-interval={{ $wc.interval }}
+        {{- if $wc.failAfter }}
+        - --watch-canary-fail-after={{ $wc.failAfter }}
+        {{- end }}
+        - --watch-canary-namespace={{ default (include "llmkube.namespace" .) $wc.namespace }}
+        {{- end }}
+        {{- if and .Values.controllerManager.reconcileTimeout (ne (toString .Values.controllerManager.reconcileTimeout) "0s") }}
+        # Bound every Model / InferenceService reconcile so a call that never
+        # returns cannot hold a controller worker forever (#2069).
+        - --reconcile-timeout={{ .Values.controllerManager.reconcileTimeout }}
+        {{- end }}
         - --health-probe-bind-address=:8081
         {{- if .Values.metrics.enabled }}
         - --metrics-bind-address=:{{ .Values.metrics.service.port }}

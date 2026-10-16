@@ -1,4 +1,10 @@
-{{- if and .Values.rbac.create .Values.controllerManager.leaderElection.enabled }}
+{{- /* Rendered for leader election (leases, configmaps, events) and for the
+watch-canary lease writes (#2069), which use the same lease verbs whether or
+not leader election is on. The canary is on when its interval is set and not
+"0s", matching the deployment args. */ -}}
+{{- $watchCanary := .Values.controllerManager.watchCanary | default dict }}
+{{- $watchCanaryOn := and $watchCanary.interval (ne (toString $watchCanary.interval) "0s") }}
+{{- if and .Values.rbac.create (or .Values.controllerManager.leaderElection.enabled $watchCanaryOn) }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

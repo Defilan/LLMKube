@@ -42,6 +42,16 @@
             "enabled": { "type": "boolean" }
           }
         },
+        "watchCanary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "interval": { "type": "string" },
+            "failAfter": { "type": "string" },
+            "namespace": { "type": "string" }
+          }
+        },
+        "reconcileTimeout": { "type": "string" },
         "resources": {
           "type": "object",
           "additionalProperties": false,
@@ -294,6 +304,15 @@
                         "loadSecondsThreshold": { "type": "number", "minimum": 0 }
                       }
                     }
+                  }
+                },
+                "watchCanary": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": { "type": "boolean" },
+                    "stalledSeconds": { "type": "number", "minimum": 0 },
+                    "downFor": { "type": "string" }
                   }
                 }
               }

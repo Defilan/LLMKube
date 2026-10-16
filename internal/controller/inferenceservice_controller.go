@@ -39,6 +39,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -128,6 +129,12 @@ type InferenceServiceReconciler struct {
 	// RelayImage is the image for Metal relay pods (router-proxy in --relay
 	// mode). Wired from --router-proxy-image; empty uses the router-proxy default.
 	RelayImage string
+
+	// ReconcileDecorator wraps the reconciler at the point SetupWithManager
+	// hands it to the controller builder, so the wrapper is what the
+	// controller calls. cmd/main.go sets it to the reconcile deadline; nil
+	// leaves the reconcile path untouched.
+	ReconcileDecorator func(reconcile.Reconciler) reconcile.Reconciler
 }
 
 func sanitizeDNSName(name string) string {
@@ -1175,9 +1182,22 @@ func (r *InferenceServiceReconciler) emitSpecAdvisoryEvents(isvc *inferencev1alp
 	}
 }
 
+// InferenceServiceReconcileConcurrency is how many InferenceServices
+// reconcile at once. The controller-runtime default is 1, which makes a
+// single stuck reconcile a head-of-line block for every InferenceService in
+// the cluster: in the #2069 stall, one wedged reconcile froze all of them
+// behind the single worker while the pod stayed healthy.
+//
+// Safe to raise here: controller-runtime never reconciles the same object
+// concurrently, and InferenceServiceReconciler carries no mutable shared
+// state (its fields are configuration set once at startup; a package-wide
+// audit of its reconcile-path methods found no receiver-field writes).
+const InferenceServiceReconcileConcurrency = 4
+
 func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.InferenceService{}).
+		WithOptions(controller.Options{MaxConcurrentReconciles: InferenceServiceReconcileConcurrency}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&autoscalingv2.HorizontalPodAutoscaler{}).
@@ -1202,7 +1222,11 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.findInferenceServicesForCACertConfigMap),
 		)
 	}
-	return b.Named("inferenceservice").Complete(r)
+	rec := reconcile.Reconciler(r)
+	if r.ReconcileDecorator != nil {
+		rec = r.ReconcileDecorator(rec)
+	}
+	return b.Named("inferenceservice").Complete(rec)
 }
 
 // findInferenceServiceForEndpoints enqueues the InferenceService that an
