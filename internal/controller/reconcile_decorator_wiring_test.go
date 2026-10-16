@@ -33,14 +33,21 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
-// TestReconcileDecoratorReachesTheController pins where the deadline is
-// applied (#2069): a reconciler's ReconcileDecorator has to be applied inside
+// The decorator wiring tests pin where the deadline is applied (#2069): a
+// reconciler's ReconcileDecorator has to be applied inside its own
 // SetupWithManager, at the builder's Complete site, because that argument is
 // what the controller stores as its Reconciler. If the application is
 // dropped, the controller calls the bare reconciler and the decorator is
 // never invoked; every unit test of the decorator itself stays green, so
-// this test is the only guard on the wiring.
-func TestReconcileDecoratorReachesTheController(t *testing.T) {
+// these tests are the only guard on the wiring. Both wrapped controllers are
+// pinned because the InferenceService controller is the one #2069 actually
+// froze.
+
+// startWiringManager boots an envtest environment and a started manager for
+// the decorator wiring tests. The returned stop function cancels the manager
+// and waits for it to exit.
+func startWiringManager(t *testing.T) (ctrl.Manager, func()) {
+	t.Helper()
 	testEnv := &envtest.Environment{
 		BinaryAssetsDirectory: getFirstFoundEnvTestBinaryDir(),
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
@@ -65,31 +72,7 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 		t.Fatalf("new manager: %v", err)
 	}
 
-	hits := make(chan struct{}, 8)
-	rec := &ModelReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		APIReader: mgr.GetAPIReader(),
-		Recorder:  mgr.GetEventRecorder("decorator-wiring-test"),
-	}
-	rec.ReconcileDecorator = func(inner reconcile.Reconciler) reconcile.Reconciler {
-		return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-			select {
-			case hits <- struct{}{}:
-			default:
-			}
-			// The inner reconciler's behavior is not this test's subject
-			// (it needs no fields beyond the client to have run), so the
-			// wrapper short-circuits to keep the test hermetic.
-			return reconcile.Result{}, nil
-		})
-	}
-	if err := rec.SetupWithManager(mgr); err != nil {
-		t.Fatalf("setup model controller: %v", err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- mgr.Start(ctx) }()
 	select {
@@ -97,7 +80,58 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("manager exited during startup: %v", err)
 	case <-time.After(30 * time.Second):
+		cancel()
 		t.Fatal("manager did not start")
+	}
+	return mgr, func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("manager exited with an error: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Errorf("manager did not stop")
+		}
+	}
+}
+
+// recordingDecorator returns a ReconcileDecorator that signals hits and
+// short-circuits the inner reconciler: the inner's behavior is not the wiring
+// test's subject, and short-circuiting keeps the test hermetic.
+func recordingDecorator(hits chan struct{}) func(reconcile.Reconciler) reconcile.Reconciler {
+	return func(_ reconcile.Reconciler) reconcile.Reconciler {
+		return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+			select {
+			case hits <- struct{}{}:
+			default:
+			}
+			return reconcile.Result{}, nil
+		})
+	}
+}
+
+func expectDecoratorHit(t *testing.T, hits chan struct{}) {
+	t.Helper()
+	select {
+	case <-hits:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the decorator was never invoked: SetupWithManager did not apply it at the Complete site")
+	}
+}
+
+func TestReconcileDecoratorReachesTheController(t *testing.T) {
+	mgr, stop := startWiringManager(t)
+	hits := make(chan struct{}, 8)
+	rec := &ModelReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		APIReader: mgr.GetAPIReader(),
+		Recorder:  mgr.GetEventRecorder("decorator-wiring-test"),
+	}
+	rec.ReconcileDecorator = recordingDecorator(hits)
+	if err := rec.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup model controller: %v", err)
 	}
 
 	model := &inferencev1alpha1.Model{
@@ -110,19 +144,31 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 		t.Fatalf("create model: %v", err)
 	}
 
-	select {
-	case <-hits:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the decorator was never invoked: SetupWithManager did not apply it at the Complete site")
+	expectDecoratorHit(t, hits)
+	stop()
+}
+
+func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
+	mgr, stop := startWiringManager(t)
+	hits := make(chan struct{}, 8)
+	rec := &InferenceServiceReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("decorator-wiring-test"),
+	}
+	rec.ReconcileDecorator = recordingDecorator(hits)
+	if err := rec.SetupWithManager(mgr); err != nil {
+		t.Fatalf("setup inferenceservice controller: %v", err)
 	}
 
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("manager exited with an error: %v", err)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("manager did not stop")
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "decorator-wiring-model"},
 	}
+	if err := mgr.GetClient().Create(context.Background(), isvc); err != nil {
+		t.Fatalf("create inferenceservice: %v", err)
+	}
+
+	expectDecoratorHit(t, hits)
+	stop()
 }
