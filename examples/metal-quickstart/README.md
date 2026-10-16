@@ -1,61 +1,113 @@
 # Metal Quickstart - Local LLM Inference on Apple Silicon
 
-This guide shows you how to deploy GPU-accelerated LLM inference on your Mac using **Metal** (Apple's GPU framework) with Kubernetes orchestration.
+This quickstart runs Kubernetes (minikube) and the LLMKube Metal Agent on the
+same Mac. The agent watches the cluster for `InferenceService` resources whose
+Model sets `accelerator: metal` and runs `llama-server` natively with full
+Metal GPU access. Engines listen on `127.0.0.1` only: the cluster reaches them
+through the agent's authenticated TLS ingress and an in-cluster relay, and
+clients on the Mac use the agent's client proxy on `127.0.0.1:9999`.
 
-**Performance:** Get Ollama-level speeds (60-120 tok/s) with Kubernetes-native deployment! 🚀
+For a remote cluster (the recommended production shape), memory budgets and
+the full walkthrough, see the
+[macOS Metal Agent guide](https://llmkube.com/docs/guides/macos-metal). The
+complete agent reference is [`deployment/macos/README.md`](../../deployment/macos/README.md).
+The release archive carries it, the plist template and the RBAC manifest under
+`deployment/macos/`.
 
 ## Prerequisites
 
 ### Hardware
-- **macOS** with Apple Silicon (M1/M2/M3/M4) or Intel Mac with Metal 2+
-- Recommended: M-series Mac with 16GB+ RAM
+- **Apple Silicon Mac** (M1 to M5). Recommended: 16GB+ unified memory.
 
 ### Software
-1. **Minikube** with Docker driver
+1. **Homebrew**, a running Docker runtime for minikube's Docker driver (Docker
+   Desktop, or another such as Colima), plus **minikube**, **kubectl** and **Helm**:
    ```bash
-   brew install minikube
+   brew install minikube kubectl helm
    minikube start --driver=docker
    ```
 
-2. **llama.cpp** with Metal support
+2. **llama.cpp** with Metal support (installs `/opt/homebrew/bin/llama-server`):
    ```bash
    brew install llama.cpp
    ```
 
 3. **LLMKube CLI**
    ```bash
-   # Install via Homebrew (Recommended for macOS)
    brew install defilantech/tap/llmkube
    ```
 
-4. **LLMKube Operator**
-   ```bash
-   # Option 1: Install from GitHub (Recommended)
-   kubectl apply -k https://github.com/defilantech/LLMKube/config/default
+4. **To build the agent from source:** the Xcode Command Line Tools
+   (`xcode-select --install`) and Go 1.26.9 or newer (`brew install go`).
 
-   # Wait for the operator to be ready:
-   kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n llmkube-system --timeout=60s
-   ```
+## Step 1: Install the LLMKube operator
 
-   For development/testing from branch:
-   ```bash
-   # From the llmkube repository root
-   make deploy
+Install the operator with Helm, the same way the
+[macOS Metal Agent guide](https://llmkube.com/docs/guides/macos-metal) does:
 
-   # Wait for the operator to be ready:
-   kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n llmkube-system --timeout=60s
-   ```
+```bash
+helm repo add llmkube https://defilantech.github.io/LLMKube
+helm install llmkube llmkube/llmkube \
+  -n llmkube-system --create-namespace
 
-5. **Metal Agent**
-   ```bash
-   # Build and install from source (Recommended)
-   # From llmkube repository
-   make install-metal-agent
+# Wait for the operator to be ready:
+kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n llmkube-system --timeout=120s
+```
 
-   # Or download pre-built binary from releases page:
-   # https://github.com/defilantech/LLMKube/releases/latest
-   # Look for: llmkube-metal-agent_*_darwin_*.tar.gz
-   ```
+## Step 2: Install the Metal Agent
+
+### From source (recommended)
+
+The agent connects with the current context of `~/.kube/config`, which
+`minikube start` sets. If your shell sets `$KUBECONFIG`, minikube writes that
+file instead, and the agent under launchd does not see your shell's
+environment: replace the last line below with
+`make install-metal-agent METAL_KUBECONFIG=<that file>`.
+
+```bash
+git clone https://github.com/defilantech/LLMKube.git
+cd LLMKube
+# Build the release that matches the operator Helm installed in Step 1
+git checkout v$(helm show chart llmkube/llmkube | awk '/^appVersion:/{print $2}')
+make install-metal-agent
+```
+
+`helm show chart` reads the same local chart index `helm install` used, so the
+checkout matches the controller's release tag instead of `main`.
+
+`make install-metal-agent` builds the agent, copies it to
+`/usr/local/bin/llmkube-metal-agent` (sudo asks for your password), renders the
+launchd plist into `~/Library/LaunchAgents/com.llmkube.metal-agent.plist` and
+starts the service. To run the agent with a least-privilege identity instead
+of your minikube admin context, see "Dedicated kubeconfig with least-privilege
+RBAC" in
+[`deployment/macos/README.md`](../../deployment/macos/README.md#dedicated-kubeconfig-with-least-privilege-rbac).
+
+### From a release archive
+
+Each release publishes `LLMKube-metal-agent_<version>_darwin_arm64.tar.gz` on
+the [releases page](https://github.com/defilantech/LLMKube/releases/latest). The
+archive holds the `llmkube-metal-agent` binary, this quickstart and
+`deployment/macos/` (plist template, RBAC manifest, agent README), but not the
+Makefile. From the directory you extracted it into:
+
+```bash
+sudo cp llmkube-metal-agent /usr/local/bin/
+mkdir -p ~/Library/LaunchAgents
+mkdir -p -m 0700 ~/Library/Logs/llmkube
+sed 's|__HOME__|'"$HOME"'|g' deployment/macos/com.llmkube.metal-agent.plist \
+  > ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+```
+
+The release binary is not notarized. If macOS refuses to run it, install from
+source instead. For an archive install, a kubeconfig other than
+`~/.kube/config` goes in the plist's `ProgramArguments` as
+`--kubeconfig <file>`.
+
+Whichever way you installed it, if macOS asks whether `llmkube-metal-agent` may
+accept incoming connections, allow it: the in-cluster relay connects to the
+agent's TLS ingress on port 9443 (`--ingress-port`).
 
 ## Verify Setup
 
@@ -66,7 +118,7 @@ system_profiler SPDisplaysDataType | grep "Metal"
 
 # 2. Check llama-server is installed
 which llama-server
-# Should show: /usr/local/bin/llama-server
+# Should show: /opt/homebrew/bin/llama-server
 
 # 3. Check Metal agent is running
 launchctl list | grep llmkube
@@ -85,48 +137,47 @@ kubectl get nodes
 # Should show your minikube node
 ```
 
-## Quick Start
-
-### Option 1: Deploy from Catalog (Recommended)
+## Step 3: Deploy a model
 
 ```bash
-# Build the CLI from the repository (if testing from branch)
-make build
-
-# Deploy Llama 3.1 8B with Metal acceleration
-./bin/llmkube deploy llama-3.1-8b --accelerator metal
-
-# Output:
-# 📚 Using catalog model: Llama 3.1 8B Instruct
-# ℹ️  Metal acceleration: Using native llama-server (not containerized)
-# 🚀 Deploying LLM inference service
-# ...
+llmkube deploy llama-3.1-8b --accelerator metal --context 8192
 ```
 
-**Note**: Use `--accelerator metal` explicitly to ensure Metal acceleration is used.
+`--accelerator metal` sends the model to the Metal Agent. `--context` caps the
+context window: the catalog default for this model is 131072 tokens, and the
+agent's pre-flight memory check counts the KV cache for the whole window, so a
+smaller value keeps the model inside the memory budget of most Macs.
 
-### Option 2: With Custom GPU Settings
+Once the model is up, check which address the agent registered for the cluster
+to reach it (the `hostIP` field):
 
 ```bash
-# Specify custom GPU layer offloading
-./bin/llmkube deploy llama-3.1-8b --accelerator metal --gpu-layers 33
-
-# Or with custom settings
-llmkube deploy qwen-2.5-coder-7b \
-  --accelerator metal \
-  --gpu-layers 33 \
-  --memory 8Gi
+grep 'registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
 ```
 
-### Option 3: Custom Model
+Without `--host-ip`, the agent picks a Tailscale address (100.64.0.0/10) if
+the Mac has one, otherwise the first other routable IPv4 address, skipping
+loopback, link-local and Docker or VM bridge ranges. Only when there is none
+does it fall back to the IP address `host.minikube.internal` resolves to on the
+Mac, else the one `host.docker.internal` resolves to, else 192.168.65.254. It
+registers the address, never the hostname, and logs
+`no routable interface for host-IP auto-detect; using co-located DNS fallback`.
+If the cluster cannot reach the address it picked (see "Service not
+accessible" below), set `--host-ip` as described in
+[`deployment/macos/README.md`](../../deployment/macos/README.md#--host-ip-flag-remote-cluster).
+
+A model that is not in the catalog:
 
 ```bash
 llmkube deploy my-custom-model \
   --accelerator metal \
   --source https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf \
-  --quantization Q8_0 \
-  --gpu-layers 28
+  --quantization Q8_0
 ```
+
+The agent runs one engine process per InferenceService on the Mac. To serve
+more models, create more InferenceServices (within the memory budget); a
+`replicas` value above 1 does not start extra copies.
 
 ## Monitor the Deployment
 
@@ -144,104 +195,83 @@ curl -s http://localhost:9090/metrics | grep llmkube_metal_agent
 # Check Metal agent logs
 tail -f ~/Library/Logs/llmkube/metal-agent.log
 
+# Check the engine's own output (<model-store>/llama-server-<namespace>-<name>.log)
+tail -f ~/Library/Application\ Support/llmkube/models/llama-server-default-llama-3.1-8b.log
+
 # Monitor GPU usage
 sudo powermetrics --samplers gpu_power -i 1000
 ```
 
+The agent serves `/healthz`, `/readyz` and `/metrics` on `127.0.0.1:9090`
+only, so run these on the Mac itself.
+
 ## Test the Endpoint
 
-Once deployed, test your inference service:
+The served model name, the `model` field below, is the InferenceService's
+`spec.modelRef` (`llama-3.1-8b` here). The Kubernetes Service name is
+sanitized, with dots replaced by dashes: `llama-3.1-8b` becomes
+`llama-3-1-8b`.
 
-### Option 1: Direct Access (Fastest)
+### Option 1: On the Mac, through the client proxy
 
-```bash
-# The Metal agent runs llama-server on your Mac (port 8080)
-# You can access it directly without Kubernetes
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":20}'
-```
-
-### Option 2: Via Kubernetes Service (In-Cluster)
-
-Metal services are **selectorless** (no pods), so `kubectl port-forward` will not work.
-To access the service from within the cluster, use Kubernetes DNS:
+The agent's client proxy on `127.0.0.1:9999` (`--client-port`) forwards to the
+running engine. With several engines running on one Mac it picks one for each
+request, and consecutive requests can land on different engines, so use Option
+2 to reach a specific model.
 
 ```bash
-# From a pod inside the cluster (note the sanitized name: llama-3-1-8b)
-curl http://llama-3-1-8b.default.svc.cluster.local:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What is 2+2?"}]}'
+curl -sS http://127.0.0.1:9999/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":20}'
 ```
 
-You can also test from a temporary pod:
+### Option 2: Through the Kubernetes Service
+
+The `llama-3-1-8b` Service selects the in-cluster relay pod, so
+`kubectl port-forward` works:
 
 ```bash
-kubectl run curl-test --rm -it --image=curlimages/curl -- \
-  curl -s http://llama-3-1-8b.default.svc.cluster.local:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What is 2+2?"}]}'
+kubectl port-forward svc/llama-3-1-8b 8080:8080
+
+# In a second terminal:
+curl -sS http://localhost:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"What is 2+2?"}]}'
 ```
 
-**Note**: The Kubernetes Service name is sanitized (dots replaced with dashes): `llama-3.1-8b` → `llama-3-1-8b`
+From a pod inside the cluster, use the Service DNS name:
 
-## Performance Expectations
+```bash
+kubectl run curl-test --rm -it --restart=Never --image=curlimages/curl -- \
+  curl -sS http://llama-3-1-8b.default.svc.cluster.local:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"llama-3.1-8b","messages":[{"role":"user","content":"What is 2+2?"}]}'
+```
 
-On M4 Max (32 GPU cores):
-
-| Model | Generation Speed | Prompt Processing | VRAM Usage |
-|-------|-----------------|-------------------|------------|
-| **Llama 3.2 3B** | 80-120 tok/s | 1000+ tok/s | 2-3 GB |
-| **Llama 3.1 8B** | 40-60 tok/s | 500-800 tok/s | 5-8 GB |
-| **Mistral 7B** | 45-65 tok/s | 600-900 tok/s | 5-7 GB |
-| **Qwen Coder 7B** | 40-55 tok/s | 500-750 tok/s | 5-8 GB |
+The engine port on the Mac is not reachable from the network by design.
 
 ## How It Works
 
 ```
-┌─────────────────────────────────────────────────┐
-│              Your Mac (macOS)                    │
-│                                                  │
-│  ┌──────────────────────────────────────────┐   │
-│  │   Minikube (Kubernetes in VM)            │   │
-│  │   ✅ Creates InferenceService CRD        │   │
-│  │   ✅ Service points to host              │   │
-│  └──────────────────────────────────────────┘   │
-│                     ↕                            │
-│  ┌──────────────────────────────────────────┐   │
-│  │   Metal Agent (Native Process)           │   │
-│  │   ✅ Watches K8s for InferenceService    │   │
-│  │   ✅ Downloads model from HuggingFace    │   │
-│  │   ✅ Spawns llama-server with Metal      │   │
-│  └──────────────────────────────────────────┘   │
-│                     ↕                            │
-│  ┌──────────────────────────────────────────┐   │
-│  │   llama-server (Metal Accelerated) 🚀   │   │
-│  │   ✅ Runs on localhost:8080+             │   │
-│  │   ✅ Direct Metal GPU access             │   │
-│  │   ✅ OpenAI-compatible API               │   │
-│  └──────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────┘
+client pod ──▶ llama-3-1-8b Service ──▶ llama-3-1-8b-relay pod ──TLS──▶ agent ingress :9443 ──▶ llama-server on 127.0.0.1
+               (in minikube)            (in minikube)                    (on the Mac)
+
+curl on the Mac ──▶ agent client proxy 127.0.0.1:9999 ──▶ llama-server on 127.0.0.1
 ```
+
+1. The agent checks that the model fits the memory budget, downloads it, and
+   starts `llama-server` on `127.0.0.1` with an ephemeral port.
+2. It registers its TLS ingress (port 9443, `--ingress-port`) as the Service
+   and EndpointSlice `llama-3-1-8b-agent`.
+3. The controller creates the relay Deployment `llama-3-1-8b-relay` and points
+   the `llama-3-1-8b` Service at it. The relay pins the agent's certificate
+   and authenticates with a per-namespace token.
+
+See "Network exposure" in
+[`deployment/macos/README.md`](../../deployment/macos/README.md#network-exposure)
+for the details.
 
 ## Troubleshooting
-
-### Operator pod ImagePullBackOff (when deploying from branch)
-
-If you see ImagePullBackOff when running `make deploy`:
-
-```bash
-# Build the controller image in minikube's Docker environment
-eval $(minikube docker-env)
-make docker-build
-
-# Delete the failing pod to recreate it
-kubectl delete pod -n llmkube-system -l control-plane=controller-manager
-
-# Patch the deployment to use local images
-kubectl patch deployment -n llmkube-system llmkube-controller-manager \
-  -p '{"spec":{"template":{"spec":{"containers":[{"name":"manager","imagePullPolicy":"IfNotPresent"}]}}}}'
-```
 
 ### Metal agent not starting
 
@@ -253,8 +283,7 @@ cat ~/Library/Logs/llmkube/metal-agent.log
 llama-server --version
 
 # Restart the agent
-launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
-launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+launchctl kickstart -k gui/$(id -u)/com.llmkube.metal-agent
 ```
 
 ### Model rejected (InsufficientMemory)
@@ -271,8 +300,10 @@ kubectl get isvc <name> -o jsonpath='{.status.schedulingMessage}'
 
 Fix options:
 - Use a smaller quantization (Q4_K_M instead of Q8_0)
-- Reduce `contextSize` in the InferenceService spec
-- Increase the budget: restart the agent with `--memory-fraction 0.9`
+- Reduce `contextSize` in the InferenceService spec (`--context` on `llmkube deploy`)
+- Increase the budget: add `--memory-fraction 0.9` to the agent's launchd
+  plist (see "`--memory-fraction` flag" in
+  [`deployment/macos/README.md`](../../deployment/macos/README.md#--memory-fraction-flag-memory-budget))
 
 ### Model download slow/failing
 
@@ -282,42 +313,60 @@ df -h
 
 # Check model store
 ls -lh ~/Library/Application\ Support/llmkube/models/
-
-# Manually download model
-curl -L https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf \
-  -o ~/Library/Application\ Support/llmkube/models/llama-3.1-8b/model.gguf
 ```
+
+The agent caches a downloaded model at
+`<model-store>/<Model name>/<file name from the source URL>` and uses a
+non-empty regular file already there instead of downloading it again. To
+download it yourself, write to a temporary name and move it into place:
+
+```bash
+SLOT="$HOME/Library/Application Support/llmkube/models/llama-3.1-8b"
+mkdir -p -m 0700 "$SLOT"
+curl -fL -o "$SLOT/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf.part" \
+  https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf
+mv "$SLOT/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf.part" \
+  "$SLOT/Meta-Llama-3.1-8B-Instruct-Q5_K_M.gguf"
+```
+
+Do not put a symlink in that slot: the agent refuses it with
+`ModelSourceNotAllowed`. To serve a GGUF that already lives elsewhere on the
+Mac, set the Model's `spec.source` to its absolute path, add its directory to
+the agent's `--allowed-model-roots`, and allow the same directory on the
+controller with the Helm value `modelSource.allowedHostPathRoots` (see
+[`deployment/macos/README.md`](../../deployment/macos/README.md#--allowed-model-roots-flag-local-model-paths)).
 
 ### Service not accessible
 
-**Note**: Service names are sanitized - dots are replaced with dashes!
-
 ```bash
-# Check service exists (note the sanitized name: llama-3-1-8b)
+# The Service clients call (note the sanitized name: llama-3-1-8b)
 kubectl get svc llama-3-1-8b
 
-# Check endpoints
-kubectl get endpoints llama-3-1-8b
+# The agent's registration: your Mac's address, port 9443, and the
+# llmkube.ai/agent-ingress-spki annotation
+kubectl get endpointslice llama-3-1-8b-agent -o yaml
+
+# The relay pod and its logs
+kubectl get pods -l inference.llmkube.dev/service=llama-3.1-8b
+kubectl logs deploy/llama-3-1-8b-relay
+
+# Events: RelayNotAdopted, InvalidAgentIngressPin, RelayReconcileFailed, RelaySecretNotManaged
+kubectl describe inferenceservice llama-3.1-8b
 
 # Check if llama-server is running
-ps aux | grep llama-server
-
-# Check Metal agent can reach K8s
-kubectl get inferenceservices
+ps aux | grep '[l]lama-server'
 ```
 
 ### Poor performance
 
 ```bash
-# Verify Metal is being used
-llama-server --version  # Should show Metal support
-
 # Check GPU utilization
 sudo powermetrics --samplers gpu_power -i 1000
 
-# Verify all layers offloaded to GPU
-# Check Metal agent logs for "n-gpu-layers"
-grep "n-gpu-layers" ~/Library/Logs/llmkube/metal-agent.log
+# Verify all layers are offloaded to the GPU: the command line shows
+# --n-gpu-layers, and llama-server logs "offloaded N/N layers to GPU"
+ps aux | grep '[l]lama-server'
+grep offloaded ~/Library/Application\ Support/llmkube/models/llama-server-default-llama-3.1-8b.log
 ```
 
 ## Cleanup
@@ -327,18 +376,24 @@ grep "n-gpu-layers" ~/Library/Logs/llmkube/metal-agent.log
 llmkube delete llama-3.1-8b
 
 # Stop Metal agent
-launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
 
-# Or completely uninstall
+# Or completely uninstall (from the LLMKube checkout)
 make uninstall-metal-agent
+
+# Archive install (no Makefile): after the bootout above
+sudo rm /usr/local/bin/llmkube-metal-agent
+rm ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
 
 ## Next Steps
 
-- **Scale up**: Try larger models (Mixtral 8x7B, Llama 70B)
-- **Production**: Deploy multiple replicas for high availability
-- **Integration**: Connect to your applications using OpenAI SDK
-- **Monitoring**: Scrape `localhost:9090/metrics` with Prometheus for agent health and process metrics
+- **Remote cluster**: put the Mac on the same LAN or tailnet as the cluster
+  and follow the [macOS Metal Agent guide](https://llmkube.com/docs/guides/macos-metal)
+- **Integration**: connect your applications with the OpenAI SDK (below)
+- **Monitoring**: scrape `127.0.0.1:9090/metrics` with a Prometheus on the
+  Mac, or through an SSH tunnel; see "Health Checks & Monitoring" in
+  [`deployment/macos/README.md`](../../deployment/macos/README.md#health-checks--monitoring)
 
 ## Example Applications
 
@@ -348,7 +403,7 @@ make uninstall-metal-agent
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8080/v1",
+    base_url="http://127.0.0.1:9999/v1",
     api_key="not-needed"
 )
 
@@ -365,7 +420,7 @@ print(response.choices[0].message.content)
 ### cURL Example
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://127.0.0.1:9999/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "llama-3.1-8b",
@@ -378,21 +433,11 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+Both examples use the client proxy on the Mac. From elsewhere, point them at
+the Service through `kubectl port-forward` (Option 2 above).
+
 ## Support
 
-- **Documentation**: https://github.com/defilantech/llmkube#metal-support
+- **Documentation**: https://github.com/defilantech/LLMKube#the-metal-agent
 - **Issues**: https://github.com/defilantech/llmkube/issues
 - **Discussions**: https://github.com/defilantech/llmkube/discussions
-
-## Performance Tips
-
-1. **Use Q5_K_M quantization** - Best balance of quality and speed
-2. **Offload all layers** - Set `--gpu-layers 99` for maximum Metal usage
-3. **Close other apps** - Free up unified memory and GPU resources
-4. **Monitor temperature** - Keep your Mac cool for sustained performance
-5. **Use catalog models** - Pre-optimized settings for your hardware
-6. **Tune memory fraction** - On a dedicated inference Mac, use `--memory-fraction 0.9` to allow larger models
-
----
-
-**Congratulations!** 🎉 You're now running Kubernetes-native LLM inference with Metal acceleration on your Mac!

@@ -26,13 +26,19 @@ running Metal-accelerated InferenceService in about ten minutes.
 ## Prerequisites
 
 - **Apple Silicon Mac** (M1 / M2 / M3 / M4 / M5). Intel Macs with
-  Metal 2+ work but performance is materially worse.
+  Metal 2+ work but performance is materially worse, and the bundled
+  launchd plist points `--llama-server` at the Apple Silicon Homebrew
+  path (`/opt/homebrew/bin/llama-server`), so change it to
+  `/usr/local/bin/llama-server` there.
 - **Access to a Kubernetes cluster** — either remote (recommended;
   most production patterns put the Mac on the LAN as an inference
   node) or local (minikube / kind on Docker Desktop).
-- **kubectl** configured against your cluster.
+- **kubectl** and **Helm** configured against your cluster.
 - **Homebrew** (or any equivalent way to install `llama.cpp` with
   Metal support).
+- **Xcode Command Line Tools** (`xcode-select --install`, for `git`
+  and `make`) and **Go 1.26.9 or newer** (the version `go.mod` pins),
+  to build the agent in Step 3.
 
 ## Step 1: Install llama.cpp with Metal
 
@@ -64,18 +70,41 @@ For OpenShift clusters, add `-f values-openshift.yaml`
 
 ## Step 3: Install and start the Metal Agent
 
-Clone the operator repo on your Mac and run the bundled installer:
+Clone the operator repo on your Mac and check out the release that
+matches the operator Helm installed:
 
 ```bash
 git clone https://github.com/defilantech/LLMKube.git
 cd LLMKube
-make install-metal-agent
+git checkout v$(helm show chart llmkube/llmkube | awk '/^appVersion:/{print $2}')
 ```
 
+`helm show chart` reads the same local chart index `helm install`
+used, so this builds the agent from the controller's release tag
+instead of from `main`.
+
+The agent does not need your admin credentials. From the checkout,
+run the recipe in
+["Dedicated kubeconfig with least-privilege RBAC"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#dedicated-kubeconfig-with-least-privilege-rbac).
+It creates a least-privilege ServiceAccount, writes a kubeconfig for
+it to `~/.kube/llmkube-metal-agent.yaml`, and ends by running the
+bundled installer with that kubeconfig:
+
+```bash
+make install-metal-agent METAL_KUBECONFIG="$KC"   # KC=$HOME/.kube/llmkube-metal-agent.yaml
+```
+
+Without `METAL_KUBECONFIG` the agent connects with the current context
+of `~/.kube/config`, usually an admin identity. Under launchd it does
+not see your shell's `$KUBECONFIG`.
+
 This builds the agent binary, installs to
-`/usr/local/bin/llmkube-metal-agent`, drops a launchd plist into
-`~/Library/LaunchAgents/`, and starts the service. On a fresh Mac
-the whole thing takes about twenty seconds.
+`/usr/local/bin/llmkube-metal-agent` (`sudo` asks for your password),
+drops a launchd plist into `~/Library/LaunchAgents/`, and starts the
+service. The build also runs `go fmt ./...` and `go vet ./...` over
+the whole repository, and the first build downloads every Go module
+dependency, so a first install takes noticeably longer than later
+ones.
 
 If you need to install manually (different binary path, different
 launch system), see the
@@ -89,7 +118,7 @@ launchctl list | grep llmkube
 # expected: <PID>   0   com.llmkube.metal-agent
 
 curl -s http://localhost:9090/healthz
-# expected: {"status":"ok"}
+# expected: ok
 
 tail -f ~/Library/Logs/llmkube/metal-agent.log
 # leave this tab open; we'll watch it pick up the first InferenceService
@@ -119,16 +148,37 @@ add to the `ProgramArguments` array:
 <string>192.168.1.50</string>
 ```
 
-Reload:
+Reload. launchd keeps the definition it loaded, so unload the job,
+wait for it to go away, and load the edited plist:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
-launchctl load ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
 
-Without `--host-ip` the agent registers `localhost` as the
-endpoint, which only works when Kubernetes lives on the same Mac
-(local minikube or Docker Desktop kind).
+`make install-metal-agent` rewrites this plist from the repo's
+template, so re-add your flags after a reinstall.
+
+Without `--host-ip` the agent auto-detects an address: a Tailscale
+address (100.64.0.0/10) if the Mac has one, otherwise the first other
+routable IPv4 address (skipping loopback, link-local, and Docker or VM
+bridge ranges). Only when there is none does it fall back, for a
+cluster on the same Mac, to the IP address `host.minikube.internal`
+resolves to on the Mac, else the one `host.docker.internal` resolves
+to, else 192.168.65.254. It registers the address, never the
+hostname, and logs
+`no routable interface for host-IP auto-detect; using co-located DNS fallback`.
+It logs the address it registered:
+
+```bash
+grep 'auto-detected host IP\|co-located DNS fallback\|registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
+```
+
+The detected address can be one your cluster cannot reach (a personal
+tailnet on a work Mac, or the wrong interface on a Mac with several),
+so set `--host-ip` explicitly for a remote cluster, ideally to an
+address with a DHCP reservation.
 
 Engines on the Mac listen on `127.0.0.1` only. The cluster reaches
 them through the agent's TLS ingress on `--ingress-port` (default
@@ -354,8 +404,16 @@ Operationally:
 - Put the Mac on the same VPN / Tailscale tailnet as your
   cluster's worker nodes.
 - Set `--host-ip` to the Mac's address on that network.
-- The controller routes all `accelerator: metal` InferenceServices
-  to whatever agent is registered for that endpoint.
+- Each agent claims every `accelerator: metal` InferenceService in
+  its `--namespace`. With more than one Mac on a cluster, give each
+  agent `--inference-service-allowlist`, a comma-separated list of the
+  InferenceService names it should serve, so two Macs do not both
+  start the same model:
+
+  ```xml
+  <string>--inference-service-allowlist</string>
+  <string>phi-4-mini,qwen-coder</string>
+  ```
 
 ## Optional: Apple Silicon power metrics
 
@@ -463,6 +521,44 @@ A controller-side reconcile saw `spec.replicas=0` on the
 `InferenceService`. Check whether something scaled it down
 (another operator, a Helm upgrade reverting your spec, an
 operator-managed argocd app pulling a stale value).
+
+## Upgrading
+
+Upgrade the operator first, then the agent on each Mac:
+
+```bash
+helm repo update
+helm upgrade llmkube llmkube/llmkube -n llmkube-system
+```
+
+On each Mac, check out the matching release in your checkout, unload
+the agent, and reinstall it (`make install-metal-agent` alone keeps
+running the plist launchd already loaded):
+
+```bash
+cd /path/to/LLMKube-checkout
+git fetch --tags
+git checkout v$(helm show chart llmkube/llmkube | awk '/^appVersion:/{print $2}')
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+make install-metal-agent METAL_KUBECONFIG=$HOME/.kube/llmkube-metal-agent.yaml
+launchctl print gui/$(id -u)/com.llmkube.metal-agent | grep 'state = running'
+```
+
+If you installed the agent without a dedicated kubeconfig, drop the
+`METAL_KUBECONFIG=...` argument.
+
+The reinstall rewrites the launchd plist from the template, so re-add
+any flags you set by hand (`--host-ip`, `--memory-fraction` and so
+on). Before upgrading across releases, read "Upgrading" and
+"Upgrading to 0.10.1" in
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#upgrading)
+and the
+[upgrade and rollback runbook](https://github.com/defilantech/LLMKube/blob/main/docs/operations/runbooks/upgrade-rollback.md):
+some releases change the plist or refuse an old configuration until
+it is fixed. A new agent binary can also lose macOS Local Network
+access; see
+["LAN download fails with `no route to host` after an upgrade"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#lan-download-fails-with-no-route-to-host-after-an-upgrade).
 
 ## Uninstall
 
