@@ -172,9 +172,9 @@ kubectl apply -f model.yaml
 
 ## Project status
 
-- **Actively maintained:** latest release [v0.10.4](https://github.com/defilantech/LLMKube/releases/tag/v0.10.4) (2026-10-16), with frequent point releases. Full history in the [CHANGELOG](CHANGELOG.md) and on the [releases page](https://github.com/defilantech/LLMKube/releases).
-- **First-time contributors have landed real features:** Intel oneAPI / SYCL GPU support arrived as PR [#557](https://github.com/defilantech/LLMKube/pull/557); vendor-neutral DRA scheduling and configurable GPU resource names for AMD/Vulkan/Intel landed via [#709](https://github.com/defilantech/LLMKube/pull/709) and [#750](https://github.com/defilantech/LLMKube/pull/750).
-- **Foreman, the agentic harness, has opened and landed real PRs against this repository:** [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588).
+- **Actively maintained:** frequent point releases, three in October 2026 alone (v0.10.2 through [v0.10.4](https://github.com/defilantech/LLMKube/releases/tag/v0.10.4)). See the [latest release](https://github.com/defilantech/LLMKube/releases/latest) and the [CHANGELOG](CHANGELOG.md) for what's current.
+- **First-time contributors have landed real features:** Intel oneAPI / SYCL GPU support arrived as PR [#557](https://github.com/defilantech/LLMKube/pull/557) from a first-time contributor, and configurable GPU resource names for AMD/Vulkan/Intel scheduling as [#709](https://github.com/defilantech/LLMKube/pull/709) from a contributor new to the repo, who followed with vendor-neutral DRA scheduling in [#750](https://github.com/defilantech/LLMKube/pull/750).
+- **Two Foreman-authored branches have reached this repository as upstream PRs:** [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588).
 - **Running LLMKube in production, a lab, or a homelab?** [Add yourself to ADOPTERS.md](ADOPTERS.md).
 
 ---
