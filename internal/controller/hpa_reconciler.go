@@ -47,7 +47,9 @@ const (
 	// named after the service. Diagnostic only: it never feeds phase or the
 	// Available condition. The reason enumeration lives in the autoscaling
 	// guide's table (docs/site/guides/metrics-driven-autoscaling.md):
-	// True/HPAManaged, False/HPANameTaken (foreign same-name HPA),
+	// True/HPAManaged, False/HPANameTaken (a foreign same-name HPA holds the
+	// name, reported by reconcileHPA or by the Deployment-name refusal when
+	// it stops the sequence before reconcileHPA runs),
 	// False/DeploymentNameTaken (the Deployment-name refusal removed or
 	// cannot provision the HPA), False/HPAStateUnknown (the HPA could not be
 	// read), and absent when there is no HPA to report on (autoscaling not

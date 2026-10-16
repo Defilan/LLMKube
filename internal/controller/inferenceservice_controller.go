@@ -650,11 +650,15 @@ func clearDeploymentNameTaken(isvc *inferencev1alpha1.InferenceService) {
 // service owns would keep scaling whatever holds the generated name, which
 // after the refusal is the foreign object. Delete it (the #2010 gate keeps
 // HPAs at this name operator-owned or refused, never adopted) and report the
-// removal on AutoscalingReady=False; a foreign HPA is left alone with its
-// condition as-is. The multiNode path never reaches this helper (it runs no
-// Deployment); its own HPA-target gap is tracked in #2094.
+// removal on AutoscalingReady=False; a foreign HPA is left alone and reported
+// as HPANameTaken, since reconcileHPA cannot report it itself. The multiNode
+// path never reaches this helper (it runs no Deployment); its own HPA-target
+// gap is tracked in #2094.
 func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Context, isvc *inferencev1alpha1.InferenceService, nameTakenPreviously bool, modelReady bool, desiredReplicas int32, taken error) (*ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	// The event fires before the status write, so "once per episode" assumes
+	// that write persisted; a write conflict re-fires the event on the next
+	// bounded requeue for the same episode.
 	log.Info("Refusing to overwrite or recreate a Deployment this InferenceService does not control", "error", taken)
 	if !nameTakenPreviously && r.Recorder != nil {
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning,
@@ -673,6 +677,15 @@ func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Conte
 				log.Error(delErr, "Failed to delete the operator-owned HPA scaling a refused name", "hpa", isvc.Name)
 			} else {
 				setHPARemovedForNameTaken(isvc)
+			}
+		case getErr == nil:
+			// A foreign HPA holds the generated name. Report it the way
+			// reconcileHPA would have (#2010): this refusal stops the
+			// sequence before reconcileHPA runs, so the condition would
+			// otherwise stay stale or absent for the whole episode. The HPA
+			// object itself is left alone.
+			if takenHPA := ensureHPAOwned(isvc, hpa); takenHPA != nil {
+				setHPANameTakenCondition(isvc, takenHPA)
 			}
 		case apierrors.IsNotFound(getErr):
 			setHPARemovedForNameTaken(isvc)

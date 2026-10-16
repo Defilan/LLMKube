@@ -476,6 +476,80 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 				"a prior True/HPAManaged must not stand when the HPA cannot be read")
 		})
 
+		It("corrects HPAStateUnknown to HPANameTaken once the HPA reads as foreign", func() {
+			name := "dep-hpa-unknown-then-foreign"
+			scheme := k8sClient.Scheme()
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: PhaseReady},
+			}
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:    model.Name,
+					Replicas:    &replicas,
+					Image:       "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(1), MaxReplicas: 4},
+				},
+			}
+			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
+			foreignHPAObj := foreignHPA(name)
+
+			// Pass 1: the HPA Get fails, so the state can only be reported as
+			// unknown. Pass 2: the read succeeds and the HPA is foreign, so
+			// the unknown reason must be corrected to HPANameTaken.
+			hpaGets := 0
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(model, isvc, foreign, foreignHPAObj).
+				WithStatusSubresource(&inferencev1alpha1.InferenceService{}, &inferencev1alpha1.Model{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ictx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); ok {
+							hpaGets++
+							if hpaGets == 1 {
+								return fmt.Errorf("injected HPA get failure")
+							}
+						}
+						return cl.Get(ictx, key, obj, opts...)
+					},
+				}).
+				Build()
+			r := &InferenceServiceReconciler{
+				Client:             c,
+				Scheme:             scheme,
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			_, _, _, result, err := r.reconcileDeployment(context.Background(), isvc, model, nil, 1, true, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(ReasonHPAStateUnknown))
+
+			_, _, _, result, err = r.reconcileDeployment(context.Background(), isvc, model, nil, 1, true, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			cond = meta.FindStatusCondition(got.Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(ReasonHPANameTaken),
+				"a known-foreign HPA must replace the unknown state")
+
+			survivor := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, survivor)).To(Succeed())
+			Expect(survivor.OwnerReferences).To(BeEmpty())
+		})
+
 		It("still refuses when the owned HPA's delete is rejected", func() {
 			name := "dep-hpa-delete-fails"
 			scheme := k8sClient.Scheme()
@@ -601,10 +675,12 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(got.ResourceVersion).To(Equal(foreignHpaRV))
 			Expect(got.Spec.MaxReplicas).To(Equal(int32(3)))
 			Expect(got.OwnerReferences).To(BeEmpty())
+			// The refusal reports the foreign HPA the way reconcileHPA would
+			// have (#2010), since the stopped sequence cannot reach it.
 			cond = meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
 			Expect(cond).NotTo(BeNil())
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
+			Expect(cond.Reason).To(Equal(ReasonHPANameTaken))
 			expectDeploymentNameTaken(ctx, name)
 		})
 
