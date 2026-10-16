@@ -92,11 +92,19 @@ One or more of:
    refusal leaves it running, and its selector still matches any pod carrying
    the service's labels, including a foreign Deployment's pods when the
    foreign object copied the same selector. The cluster name can therefore
-   route to pods the operator does not own while the phase reads `Failed`.
+   route to pods the operator does not own while the phase reads `Failed`,
+   and `status.endpoint` is emptied by the refusal even though that Service
+   may still route.
 
    ```bash
    kubectl get service <name> -n <namespace> -o jsonpath='{.spec.selector}{"\n"}{.metadata.ownerReferences}' | jq
    ```
+
+   The same applies to the operator-owned HPA when `spec.autoscaling` is set:
+   an HPA left scaling the generated name would scale the foreign
+   Deployment's replicas, so the refusal removes the operator-owned HPA (and
+   its `AutoscalingReady` condition) while the name is not the service's. A
+   foreign HPA is left alone.
 
 ## Mitigate (immediate)
 
@@ -107,7 +115,9 @@ Pick based on the Diagnose decision:
    now selects whatever pods match its labels, which may be the foreign
    Deployment's. Delete the Service, or fix the foreign workload's labels, or
    rename a claimant; the refusal neither drains nor deletes the Service, so
-   this decision is yours.
+   this decision is yours. The operator-owned HPA needs no such decision:
+   the refusal removes it while the name is not the service's, so it cannot
+   keep scaling the foreign object.
 
 2. **The foreign Deployment is not needed** (nobody's workload, or a stale
    leftover from a deleted service): delete it. The controller provisions the

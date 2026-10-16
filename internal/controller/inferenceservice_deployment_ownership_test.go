@@ -22,12 +22,16 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -241,6 +245,145 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
 			Expect(got.OwnerReferences).To(HaveLen(1))
 			Expect(got.OwnerReferences[0].Name).To(Equal("other-isvc"))
+		})
+
+		It("routes a create-time name race into the refusal", func() {
+			name := "dep-create-race"
+			scheme := k8sClient.Scheme()
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: PhaseReady},
+			}
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: model.Name,
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				},
+			}
+			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
+
+			// The race: the gate's Get runs before the foreign object exists
+			// (hidden by the interceptor), the Create loses to it, and the
+			// re-Get finds it. Without the race branch the reconcile wedges
+			// on a generic create error that no requeue clears.
+			deploymentGets := 0
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(model, isvc, foreign).
+				WithStatusSubresource(&inferencev1alpha1.InferenceService{}, &inferencev1alpha1.Model{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ictx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*appsv1.Deployment); ok {
+							deploymentGets++
+							if deploymentGets == 1 {
+								return apierrors.NewNotFound(appsv1.Resource("deployments"), key.Name)
+							}
+						}
+						return cl.Get(ictx, key, obj, opts...)
+					},
+					Create: func(ictx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if _, ok := obj.(*appsv1.Deployment); ok {
+							return apierrors.NewAlreadyExists(appsv1.Resource("deployments"), obj.GetName())
+						}
+						return cl.Create(ictx, obj, opts...)
+					},
+				}).
+				Build()
+			r := &InferenceServiceReconciler{
+				Client:             c,
+				Scheme:             scheme,
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			dep, _, _, result, err := r.reconcileDeployment(context.Background(), isvc, model, nil, 1, true, false)
+			Expect(err).NotTo(HaveOccurred(), "the refusal is not a reconcile error")
+			Expect(dep).To(BeNil())
+			Expect(result).NotTo(BeNil())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			Expect(got.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
+			Expect(got.Status.Phase).To(Equal(PhaseFailed))
+
+			survivor := &appsv1.Deployment{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, survivor)).To(Succeed())
+			Expect(survivor.OwnerReferences).To(BeEmpty())
+			Expect(survivor.Spec.Template.Spec.Containers[0].Image).To(Equal("registry.example.com/someone-else:latest"))
+		})
+
+		It("removes the operator-owned HPA scaling a refused name", func() {
+			name := "dep-foreign-hpa"
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						Accelerator: "cpu",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+			replicas := int32(1)
+			Expect(k8sClient.Create(ctx, &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:    model.Name,
+					Replicas:    &replicas,
+					Image:       "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(1), MaxReplicas: 4},
+				},
+			})).To(Succeed())
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+			r := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			// The first pass provisions the Deployment, the Service, and the
+			// operator-owned HPA.
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			hpaNN := types.NamespacedName{Name: name, Namespace: "default"}
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(k8sClient.Get(ctx, hpaNN, hpa)).To(Succeed())
+			Expect(hpa.OwnerReferences).To(HaveLen(1))
+			cond := meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(ReasonHPAManaged))
+
+			// The name changes hands under a serving, autoscaled service.
+			owned := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, hpaNN, owned)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, owned)).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, hpaNN, &appsv1.Deployment{}))
+			}, "10s", "100ms").Should(BeTrue())
+			Expect(k8sClient.Create(ctx, foreignISVCDeployment(name, generatedDeploymentSelector(name)))).To(Succeed())
+
+			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			// The HPA must not keep scaling the foreign object the operator
+			// just refused to touch: the refusal removes the operator-owned
+			// HPA and its condition with it.
+			err = k8sClient.Get(ctx, hpaNN, &autoscalingv2.HorizontalPodAutoscaler{})
+			Expect(err).To(HaveOccurred())
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			Expect(meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)).To(BeNil())
+			expectDeploymentNameTaken(ctx, name)
 		})
 
 		It("keeps reporting the refusal while another fault fails the reconcile", func() {

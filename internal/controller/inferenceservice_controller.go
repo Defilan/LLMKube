@@ -572,11 +572,11 @@ type replicaCounts struct {
 }
 
 // deploymentNameTakenRequeueAfter is the bounded requeue for a name-taken
-// refusal. The refusal depends on cluster state outside the service's spec and
+// refusal. The refusal depends on cluster state outside the service's spec:
 // nothing maps a foreign Deployment's events to this reconcile (Owns maps
-// only owned objects), so the requeue is the only way
-// deleting or renaming it takes effect without an unrelated event. Same
-// cadence as the router-proxy and HPA refusals
+// only owned objects), so deleting or renaming the foreign object takes
+// effect only on this timer, without an unrelated event. Same cadence as the
+// router-proxy and HPA refusals
 // (routerProxyNameTakenRequeueAfter, hpaNameTakenRequeueAfter).
 const deploymentNameTakenRequeueAfter = 2 * time.Minute
 
@@ -636,6 +636,60 @@ func clearDeploymentNameTaken(isvc *inferencev1alpha1.InferenceService) {
 	isvc.Status.SchedulingStatus = ""
 	isvc.Status.SchedulingMessage = ""
 	isvc.Status.WaitingFor = ""
+}
+
+// refuseDeploymentNameTaken records a name-taken refusal and returns the stop
+// result every refusal path returns: a Warning event once per episode, the
+// marker on the scheduling status, and the bounded requeue. The reported phase
+// follows the precedence determinePhase uses: a suspended or scaled-to-zero
+// service is deliberately off, so the refusal reports Suspended or Stopped
+// rather than overriding that intent with Failed; the marker bites on
+// unsuspend or scale-up.
+//
+// The sequence stops here, so reconcileHPA would never run: an HPA this
+// service owns would keep scaling whatever holds the generated name, which
+// after the refusal is the foreign object. Delete it (the #2010 gate keeps
+// HPAs at this name operator-owned or refused, never adopted) and drop the
+// AutoscalingReady condition; a foreign HPA is left alone with its condition
+// as-is.
+func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Context, isvc *inferencev1alpha1.InferenceService, nameTakenPreviously bool, modelReady bool, desiredReplicas int32, taken error) (*ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	log.Info("Refusing to overwrite or recreate a Deployment this InferenceService does not control", "error", taken)
+	if !nameTakenPreviously && r.Recorder != nil {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning,
+			inferencev1alpha1.ReasonDeploymentNameTaken, "Reconcile", "%s", taken.Error())
+	}
+
+	if isvc.Spec.Autoscaling != nil {
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{}
+		getErr := r.Get(ctx, types.NamespacedName{Name: isvc.Name, Namespace: isvc.Namespace}, hpa)
+		switch {
+		case getErr == nil && metav1.IsControlledBy(hpa, isvc):
+			if delErr := r.Delete(ctx, hpa); delErr != nil && !apierrors.IsNotFound(delErr) {
+				// Transient: the bounded requeue brings the next pass, which
+				// retries the delete. The refusal below still lands.
+				log.Error(delErr, "Failed to delete the operator-owned HPA scaling a refused name", "hpa", isvc.Name)
+			} else {
+				meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionAutoscalingReady)
+			}
+		case apierrors.IsNotFound(getErr):
+			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionAutoscalingReady)
+		case getErr != nil:
+			log.Error(getErr, "Failed to get the HPA while refusing a name-taken Deployment", "hpa", isvc.Name)
+		}
+	}
+
+	phase := PhaseFailed
+	if isvc.Spec.Suspend {
+		phase = PhaseSuspended
+	} else if desiredReplicas == 0 {
+		phase = PhaseStopped
+	}
+	res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady,
+		0, isvc.Status.Replicas, desiredReplicas, "", taken.Error(),
+		&SchedulingInfo{Status: inferencev1alpha1.ReasonDeploymentNameTaken, Message: taken.Error()})
+	res.RequeueAfter = earliestPositive(res.RequeueAfter, deploymentNameTakenRequeueAfter)
+	return &res, updateErr
 }
 
 // reconcileDeployment coordinates several independent concerns (metal snapshot,
@@ -768,6 +822,24 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 		tmplHash := desiredTemplateHash(deployment.Spec.Template)
 		deployment.Annotations[AnnotationDesiredTemplateHash] = tmplHash
 		if err := r.Create(ctx, deployment); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// A foreign object took the name between the Get above and
+				// this Create: the same race the gate closes, reached from
+				// the other side. Route it through the refusal instead of
+				// wedging on an error no requeue would clear (nothing maps
+				// the foreign object's events here). If the object at the
+				// name is this service's own (a concurrent reconcile created
+				// it), return it and let the next pass take the update path.
+				raced := &appsv1.Deployment{}
+				if getErr := r.Get(ctx, types.NamespacedName{Name: deployment.Name, Namespace: deployment.Namespace}, raced); getErr != nil {
+					return nil, replicaCounts{}, nil, nil, getErr
+				}
+				if guardErr := ensureDeploymentOwned(isvc, raced); guardErr != nil {
+					res, updateErr := r.refuseDeploymentNameTaken(ctx, isvc, nameTakenPreviously, modelReady, desiredReplicas, guardErr)
+					return nil, replicaCounts{}, nil, res, updateErr
+				}
+				return deployment, replicaCounts{}, nil, nil, nil
+			}
 			log.Error(err, "Failed to create Deployment")
 			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Deployment", nil)
 			return nil, replicaCounts{}, nil, &result, updateErr
@@ -782,27 +854,8 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// both writes: the in-place spec replace below and the delete-and-recreate
 	// migrate path. A refusal must precede every write to the existing object.
 	if err := ensureDeploymentOwned(isvc, existingDeployment); err != nil {
-		log.Info("Refusing to overwrite or recreate a Deployment this InferenceService does not control", "error", err)
-		if !nameTakenPreviously && r.Recorder != nil {
-			r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning,
-				inferencev1alpha1.ReasonDeploymentNameTaken, "Reconcile", "%s", err.Error())
-		}
-		// Report the refusal through the phase the service would otherwise
-		// have: a suspended or scaled-to-zero service is deliberately off,
-		// so the refusal must not override that intent with Failed. The
-		// marker carries the diagnosis in all three cases and bites on
-		// unsuspend or scale-up. Same precedence determinePhase applies.
-		phase := PhaseFailed
-		if isvc.Spec.Suspend {
-			phase = PhaseSuspended
-		} else if desiredReplicas == 0 {
-			phase = PhaseStopped
-		}
-		res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady,
-			0, isvc.Status.Replicas, desiredReplicas, "", err.Error(),
-			&SchedulingInfo{Status: inferencev1alpha1.ReasonDeploymentNameTaken, Message: err.Error()})
-		res.RequeueAfter = earliestPositive(res.RequeueAfter, deploymentNameTakenRequeueAfter)
-		return nil, replicaCounts{}, nil, &res, updateErr
+		res, updateErr := r.refuseDeploymentNameTaken(ctx, isvc, nameTakenPreviously, modelReady, desiredReplicas, err)
+		return nil, replicaCounts{}, nil, res, updateErr
 	}
 
 	// Deployment.spec.selector is immutable. A Deployment created by an older
