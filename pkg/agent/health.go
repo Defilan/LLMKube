@@ -27,12 +27,24 @@ import (
 	"go.uber.org/zap"
 )
 
-// ProcessHealthChecker checks whether a llama-server process is healthy.
+// ProcessHealthChecker checks whether an engine is healthy by probing path on
+// its loopback port.
 type ProcessHealthChecker interface {
-	Check(ctx context.Context, port int) (bool, error)
+	Check(ctx context.Context, port int, path string) (bool, error)
 }
 
-// DefaultProcessHealthChecker probes a llama-server's /health endpoint.
+// healthProbePath returns the path the health monitor probes for a runtime.
+// Every engine the agent starts serves /health except Ollama, which has no
+// such route and answers it with 404; OllamaExecutor.isHealthy checks GET /
+// for the same reason.
+func healthProbePath(runtime string) string {
+	if runtime == runtimeOllama {
+		return "/"
+	}
+	return "/health"
+}
+
+// DefaultProcessHealthChecker probes an engine's health endpoint over HTTP.
 type DefaultProcessHealthChecker struct {
 	client http.Client
 }
@@ -44,9 +56,10 @@ func NewDefaultProcessHealthChecker(timeout time.Duration) *DefaultProcessHealth
 	}
 }
 
-// Check sends a GET request to the llama-server /health endpoint.
-func (c *DefaultProcessHealthChecker) Check(ctx context.Context, port int) (bool, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+// Check sends a GET request to path on 127.0.0.1:port and reports whether it
+// answered 200.
+func (c *DefaultProcessHealthChecker) Check(ctx context.Context, port int, path string) (bool, error) {
+	url := fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return false, err
@@ -92,6 +105,7 @@ type processSnapshot struct {
 	Name      string
 	Namespace string
 	Port      int
+	Runtime   string
 	Healthy   bool
 }
 
@@ -121,6 +135,7 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 			Name:      p.Name,
 			Namespace: p.Namespace,
 			Port:      p.Port,
+			Runtime:   p.Runtime,
 			Healthy:   p.Healthy,
 		})
 	}
@@ -135,7 +150,7 @@ func (m *HealthMonitor) checkAll(ctx context.Context) {
 		}
 
 		start := time.Now()
-		healthy, err := m.checker.Check(ctx, snap.Port)
+		healthy, err := m.checker.Check(ctx, snap.Port, healthProbePath(snap.Runtime))
 		duration := time.Since(start).Seconds()
 		healthCheckDuration.WithLabelValues(snap.Name, snap.Namespace).Observe(duration)
 
