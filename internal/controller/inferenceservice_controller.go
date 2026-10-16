@@ -603,7 +603,8 @@ func (e *deploymentNameTakenError) Error() string {
 // controls: a Deployment with the generated name but no controller reference,
 // a foreign reference, or another InferenceService's reference is refused,
 // never adopted, never overwritten, and never deleted. The relay Deployment
-// (teardownRelay) and the router-proxy Deployment carry their own gates.
+// (teardownRelay) and the router-proxy Deployment carry their own gates; the
+// Service upsert in reconcileService is not gated yet (#2086).
 func ensureDeploymentOwned(isvc *inferencev1alpha1.InferenceService, existing *appsv1.Deployment) error {
 	if metav1.IsControlledBy(existing, isvc) {
 		return nil
