@@ -74,6 +74,10 @@ type restartBackoff struct {
 	// a different spec resets the backoff (see deferToPendingRestart). Empty
 	// when unknown (a queued restart), which never resets it.
 	specHash string
+	// releaseAt is the earliest time a new engine may start after a stop
+	// that failed or had to SIGKILL, so the old engine can release its wired
+	// memory first. Unlike the backoff, nothing resets it.
+	releaseAt time.Time
 	// timer wakes the event loop at nextAt.
 	timer *time.Timer
 }
@@ -128,7 +132,8 @@ func (a *MetalAgent) scheduleRestartLocked(key string, notBefore time.Time) time
 // queueRestart asks the event loop to start key's engine once notBefore has
 // passed (at once for the zero time). It is the entry point for starts other
 // than a health restart: it records no health failure, does not grow the
-// backoff, and never brings forward a restart the backoff already delays.
+// backoff, and never brings forward a restart the backoff already delays or
+// starts an engine before an unclean stop's release floor (releaseAt).
 // If the queued start fails, the retry waits the initial backoff and grows
 // from there. A delete, scale-to-zero, eviction or shutdown cancels it like
 // any pending restart. reason is logged.
@@ -137,6 +142,9 @@ func (a *MetalAgent) queueRestart(key string, notBefore time.Time, reason string
 	st := a.restartStateLocked(key)
 	if st.pending && st.nextAt.After(notBefore) {
 		notBefore = st.nextAt
+	}
+	if st.releaseAt.After(notBefore) {
+		notBefore = st.releaseAt
 	}
 	st.pending = true
 	st.nextAt = notBefore
@@ -169,7 +177,8 @@ func (a *MetalAgent) armRestartLocked(st *restartBackoff, at time.Time) {
 // emits a watch event whose reconcile would start the engine at once and skip
 // the backoff. A spec that differs from the one whose engine failed resets
 // the backoff instead: the restart is queued to run on the next loop turn
-// with the new spec. Only called on the event loop.
+// with the new spec, or once the release floor passes if the old engine's
+// stop was unclean. Only called on the event loop.
 func (a *MetalAgent) deferToPendingRestart(key, specHash string) bool {
 	a.mu.Lock()
 	st := a.restarts[key]
@@ -183,9 +192,10 @@ func (a *MetalAgent) deferToPendingRestart(key, specHash string) bool {
 		a.logger.Debugw("start left to the pending restart", "key", key, "restartAt", nextAt)
 		return true
 	}
+	releaseAt := st.releaseAt
 	a.cancelRestartLocked(key)
 	a.mu.Unlock()
-	a.queueRestart(key, time.Time{}, "spec changed while a health restart was backing off")
+	a.queueRestart(key, releaseAt, "spec changed while a health restart was backing off")
 	return true
 }
 
@@ -292,6 +302,9 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 		a.logger.Infow("service torn down or agent stopping while its unhealthy process stopped; not restarting it",
 			"namespace", proc.Namespace, "name", proc.Name)
 		return
+	}
+	if !notBefore.IsZero() {
+		st.releaseAt = notBefore
 	}
 	restartAt := a.scheduleRestartLocked(key, notBefore)
 	restartIn := max(restartAt.Sub(a.now()), 0)

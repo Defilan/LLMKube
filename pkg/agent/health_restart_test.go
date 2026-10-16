@@ -909,3 +909,103 @@ func TestQueueRestart_DeletedBeforeRunNeverStarts(t *testing.T) {
 		t.Errorf("starts = %d for a queued key deleted before it ran, want 0", got)
 	}
 }
+
+// TestHealthRestart_SpecChangeKeepsReleaseFloor checks that a spec change
+// after an unclean stop (one that had to kill the engine) resets the backoff
+// but still waits the release floor, so the new engine does not wire its
+// weights while the killed one may still hold them.
+func TestHealthRestart_SpecChangeKeepsReleaseFloor(t *testing.T) {
+	f := newRestartFixture(t, "restart-release-floor")
+	f.exec.stopErr = errors.New("process 1111 did not exit gracefully, killed")
+	ctx := context.Background()
+
+	f.probe(DefaultHealthFailureThreshold)
+	changed := f.updateISVC(t, func(isvc *inferencev1alpha1.InferenceService) {
+		isvc.Spec.ContextSize = ptr.To(int32(8192))
+	})
+	if err := f.agent.ensureProcess(ctx, changed); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 0 {
+		t.Fatalf("starts = %d right after a spec change that followed an unclean stop, want 0", got)
+	}
+
+	f.advance(healthRestartInitialBackoff)
+	f.agent.runDueRestarts(ctx)
+	if p := f.tracked(); p == nil || f.exec.starts() != 1 || p.SpecHash != computeSpecHash(changed) {
+		t.Errorf("after the release floor: starts=%d tracked=%+v, want one engine with the new spec", f.exec.starts(), p)
+	}
+}
+
+// TestHealthRestart_SpecChangeDuringLivenessBackoffResets covers a spec
+// change after the health monitor stopped a repeatedly failing engine and
+// before its backed-off restart ran: the new spec starts at once instead of
+// waiting out the old spec's backoff.
+func TestHealthRestart_SpecChangeDuringLivenessBackoffResets(t *testing.T) {
+	f := newRestartFixture(t, "restart-spec-liveness")
+	ctx := context.Background()
+
+	f.probe(DefaultHealthFailureThreshold)
+	f.agent.runDueRestarts(ctx)
+	f.advance(time.Minute)
+	f.probe(DefaultHealthFailureThreshold) // the replacement fails too: next restart in 10s
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Fatalf("starts = %d during the 10s backoff, want 1", got)
+	}
+
+	changed := f.updateISVC(t, func(isvc *inferencev1alpha1.InferenceService) {
+		isvc.Spec.ContextSize = ptr.To(int32(8192))
+	})
+	if err := f.agent.ensureProcess(ctx, changed); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	f.agent.runDueRestarts(ctx)
+	if p := f.tracked(); p == nil || f.exec.starts() != 2 || p.SpecHash != computeSpecHash(changed) {
+		t.Errorf("after a spec change in the backoff: starts=%d tracked=%+v, want the new spec started at once",
+			f.exec.starts(), p)
+	}
+}
+
+// TestQueueRestart_FailedStartWaitsInitialBackoff checks that a queued start
+// that fails is retried after the initial backoff, not at once.
+func TestQueueRestart_FailedStartWaitsInitialBackoff(t *testing.T) {
+	f := newRestartFixture(t, "queue-retry")
+	ctx := context.Background()
+	f.agent.mu.Lock()
+	delete(f.agent.processes, f.key)
+	f.agent.mu.Unlock()
+	f.exec.startErr = errors.New("llama-server exited during startup")
+
+	f.agent.queueRestart(f.key, time.Time{}, "test")
+	f.agent.runDueRestarts(ctx)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Fatalf("starts = %d right after a failed queued start, want 1", got)
+	}
+	f.advance(healthRestartInitialBackoff)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 2 {
+		t.Errorf("starts = %d after the initial backoff, want 2", got)
+	}
+}
+
+// TestHealthRestart_ShutdownDuringStopSchedulesNothing checks that the
+// health monitor schedules no restart when the agent shuts down while it is
+// stopping the unhealthy engine.
+func TestHealthRestart_ShutdownDuringStopSchedulesNothing(t *testing.T) {
+	f := newRestartFixture(t, "restart-shutdown-stopping")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.exec.onStop = cancel
+
+	for range DefaultHealthFailureThreshold {
+		f.monitor.checkAll(ctx)
+	}
+	f.advance(time.Hour)
+	f.agent.runDueRestarts(context.Background())
+	if got := f.exec.starts(); got != 0 {
+		t.Errorf("starts = %d after a shutdown during the stop, want 0", got)
+	}
+}
