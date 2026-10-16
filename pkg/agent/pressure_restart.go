@@ -266,15 +266,14 @@ func (a *MetalAgent) evictedRestartVerdict(ctx context.Context, key string) evic
 // claimsForRestart reports whether this agent still claims isvc (the watcher's
 // shouldWatch: allowlist, a Metal Model). An evicted service it no longer
 // claims must not be started here, whether or not the watcher has reported
-// it gone yet. The error is for a claim check that can fail; the caller keeps
-// the service blocked on one.
-//
-//nolint:unparam // the error result is for a shouldWatch that returns (bool, error)
+// it gone yet. shouldWatch reports a Model lookup that failed for any reason
+// other than NotFound as an error; the caller keeps the service blocked on
+// one rather than dropping a service this agent may still own.
 func (a *MetalAgent) claimsForRestart(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (bool, error) {
 	if a.watcher == nil {
 		return true, nil
 	}
-	return a.watcher.shouldWatch(ctx, isvc), nil
+	return a.watcher.shouldWatch(ctx, isvc)
 }
 
 // holdQueuedEvictedLocked runs when key is about to start. If key is the

@@ -668,6 +668,32 @@ func TestHandleMemoryPressure_RestartKeepsBlockOnReadError(t *testing.T) {
 	}
 }
 
+// TestHandleMemoryPressure_RestartKeepsBlockOnClaimCheckError covers a Model
+// lookup that fails for a reason other than NotFound while an evicted service
+// waits: whether this agent still claims the service is unknown, so the
+// service stays blocked for a later retry instead of being dropped as
+// unclaimed.
+func TestHandleMemoryPressure_RestartKeepsBlockOnClaimCheckError(t *testing.T) {
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, &interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object,
+			opts ...client.GetOption) error {
+			if _, ok := obj.(*inferencev1alpha1.Model); ok && key.Name == refusalModelName {
+				return errors.New("apiserver unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}, refusalISVC("svc-a"), refusalModel())
+	a.watcher = NewInferenceServiceWatcher(a.config.K8sClient, "default", newNopLogger())
+
+	blockEvicted(a, 0, "default/svc-a")
+	returnToNormal(a)
+
+	if ex.starts != 0 || !a.isPressureBlocked("default/svc-a") || restartPending(a, "default/svc-a") {
+		t.Errorf("starts = %d, blocked = %v, restart pending = %v; want 0, true, false",
+			ex.starts, a.isPressureBlocked("default/svc-a"), restartPending(a, "default/svc-a"))
+	}
+}
+
 // TestEnsureProcess_BlockedServiceWaitsAtNormal covers a watch event (any write
 // to the InferenceService, status included) for a service still waiting for
 // room at Normal pressure: the block holds, or the event would start the
