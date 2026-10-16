@@ -1240,14 +1240,17 @@ minikube status
 
 ### Agent logs `referenced model lookup failed; keeping the inference service's previous state`
 
-On every poll (every 5 seconds) the agent looks up the Model each InferenceService references, to decide whether it is a Metal service this agent runs. When that lookup fails with anything other than NotFound (an API server timeout, throttling, a 5xx while the control plane restarts, `Forbidden`), the agent cannot tell, so it leaves the service as it was: a running engine keeps serving and keeps its Service and EndpointSlice, and a service it was not running yet is not started. It retries on the next poll and logs this warning once per affected service per poll, so a few lines during a control-plane restart are expected. If the warning keeps repeating, check that the agent's credentials can still read Models in its namespace:
+On every poll (every 5 seconds) the agent looks up the Model each InferenceService references, to decide whether it is a Metal service this agent runs. When that lookup fails with anything other than NotFound (an API server timeout, throttling, a 5xx while the control plane restarts, `Forbidden`), the agent cannot tell, so it leaves the service as it was: a running engine keeps serving and keeps its Service and EndpointSlice, and a service it was not running yet is not started. While the lookup fails, changes to the InferenceService (`replicas: 0`, `suspend`, flag changes) do not take effect; deleting the InferenceService, or restoring the agent's access, does.
+
+The agent retries on every poll. It logs this warning once when a service's lookup starts failing, Debug lines while it keeps failing, and `referenced model lookup recovered` at Info when it succeeds again, and the `llmkube_metal_agent_watch_model_lookup_failing_services` gauge counts the services currently in this state. A warning followed by a recovery line around a control-plane restart is expected. If the gauge stays above zero, check that the agent's credentials can still read Models in its namespace:
 
 ```bash
-grep "referenced model lookup failed" ~/Library/Logs/llmkube/metal-agent.log | tail -5
+grep "referenced model lookup" ~/Library/Logs/llmkube/metal-agent.log | tail -5
+curl -s http://localhost:9090/metrics | grep llmkube_metal_agent_watch_model_lookup_failing_services
 kubectl --kubeconfig <agent-kubeconfig> auth can-i get models.inference.llmkube.dev -n <namespace>
 ```
 
-Only a Model that no longer exists, or whose `hardware.accelerator` is no longer `metal`, makes the agent stop the service.
+Of the possible lookup results, only a Model that no longer exists, or one that is no longer `accelerator: metal`, makes the agent stop the service.
 
 ### Remote cluster: pods can't reach the model
 

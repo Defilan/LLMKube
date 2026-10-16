@@ -531,11 +531,18 @@ on first run. Allow them for the ingress port.
 The agent could not read the Model an `InferenceService` references
 (an API server timeout, throttling, a control-plane restart, or a
 lost `get` permission on `models`). It leaves the service as it
-was, so a running model keeps serving, and retries on the next poll
-(every 5 seconds). A few lines during a control-plane restart are
-normal; if the warning keeps repeating, check the agent's RBAC and
-its connection to the API server. Only a deleted Model, or one whose
-`hardware.accelerator` is no longer `metal`, stops the service.
+was, so a running model keeps serving, and retries on every poll
+(every 5 seconds). While the lookup fails, changes to the
+`InferenceService` (`replicas: 0`, `suspend`, flag changes) do not
+take effect; deleting the `InferenceService`, or restoring the
+agent's access, does. The warning is logged once when the lookup
+starts failing, and `referenced model lookup recovered` follows when
+it succeeds again; the
+`llmkube_metal_agent_watch_model_lookup_failing_services` gauge
+counts the services in this state. If it stays above zero, check the
+agent's RBAC and its connection to the API server. Of the possible
+lookup results, only a deleted Model, or one that is no longer
+`accelerator: metal`, stops the service.
 
 **Agent log shows `replicas=0; stopping process` unexpectedly**
 A controller-side reconcile saw `spec.replicas=0` on the
