@@ -46,9 +46,12 @@ const (
 	// ConditionAutoscalingReady reports whether the reconciler manages the HPA
 	// named after the service. Diagnostic only: it never feeds phase or the
 	// Available condition. True while the service's own HPA is in place,
-	// False while a foreign same-name HPA blocks the reconciler, and absent
-	// when there is no HPA to report on (autoscaling not configured, the
-	// service suspended, or a Metal workload).
+	// False with HPANameTaken while a foreign same-name HPA blocks the
+	// reconciler, False with DeploymentNameTaken while the Deployment-name
+	// refusal has removed (or cannot provision) the service's HPA because a
+	// foreign Deployment holds the generated name, and absent when there is
+	// no HPA to report on (autoscaling not configured, the service
+	// suspended, or a Metal workload).
 	ConditionAutoscalingReady = "AutoscalingReady"
 
 	// ReasonHPAManaged is set when AutoscalingReady=True: the HPA was created
@@ -146,7 +149,7 @@ func setHPARemovedForNameTaken(isvc *inferencev1alpha1.InferenceService) {
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: isvc.Generation,
 		Reason:             inferencev1alpha1.ReasonDeploymentNameTaken,
-		Message:            "the HPA this service owns is not in place while a foreign Deployment holds the generated name; it returns when the name is free",
+		Message:            "the service's HPA is not in place while a foreign Deployment holds the generated name; it returns when the name is free",
 	})
 }
 

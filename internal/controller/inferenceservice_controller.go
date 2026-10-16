@@ -679,11 +679,17 @@ func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Conte
 		case getErr != nil:
 			log.Error(getErr, "Failed to get the HPA while refusing a name-taken Deployment", "hpa", isvc.Name)
 		}
+	} else {
+		// The refusal stops the sequence before reconcileHPA, which owns the
+		// condition's removal when autoscaling is not configured; do it here
+		// so a mode switch while the name is taken cannot strand a stale
+		// AutoscalingReady.
+		removeAutoscalingReadyCondition(isvc)
 	}
 
 	// Ready is forced to zero (this service has no workload of its own to
-	// count) while Observed preserves the last persisted value so /scale
-	// keeps reading a truthful count; see updateStatusWithSchedulingInfo.
+	// count) while Observed preserves the last persisted count rather than
+	// reading the foreign object's status; see updateStatusWithSchedulingInfo.
 	phase := PhaseFailed
 	if isvc.Spec.Suspend {
 		phase = PhaseSuspended

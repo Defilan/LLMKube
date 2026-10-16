@@ -371,7 +371,8 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Eventually(func() bool {
 				return apierrors.IsNotFound(k8sClient.Get(ctx, hpaNN, &appsv1.Deployment{}))
 			}, "10s", "100ms").Should(BeTrue())
-			Expect(k8sClient.Create(ctx, foreignISVCDeployment(name, generatedDeploymentSelector(name)))).To(Succeed())
+			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 
 			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
 			Expect(err).NotTo(HaveOccurred())
@@ -388,6 +389,24 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
 			expectDeploymentNameTaken(ctx, name)
+
+			// Recovery: the name frees, the refusal lifts, and the HPA comes
+			// back with the condition returning to managed.
+			Expect(k8sClient.Delete(ctx, foreign)).To(Succeed())
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, hpaNN, &appsv1.Deployment{}))
+			}, "10s", "100ms").Should(BeTrue())
+			_, err = reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			returned := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(k8sClient.Get(ctx, hpaNN, returned)).To(Succeed())
+			Expect(returned.OwnerReferences).To(HaveLen(1))
+			Expect(*returned.OwnerReferences[0].Controller).To(BeTrue())
+			cond = meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			Expect(cond.Reason).To(Equal(ReasonHPAManaged))
 		})
 
 		It("still refuses when the owned HPA's delete is rejected", func() {
@@ -520,6 +539,59 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
 			expectDeploymentNameTaken(ctx, name)
+		})
+
+		It("drops AutoscalingReady when autoscaling is cleared during a refusal", func() {
+			name := "dep-foreign-autoscale-off"
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						Accelerator: "cpu",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+			replicas := int32(1)
+			Expect(k8sClient.Create(ctx, &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:    model.Name,
+					Replicas:    &replicas,
+					Image:       "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(1), MaxReplicas: 4},
+				},
+			})).To(Succeed())
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+			r := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			Expect(k8sClient.Create(ctx, foreignISVCDeployment(name, generatedDeploymentSelector(name)))).To(Succeed())
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			cond := meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
+
+			// The refusal stops the sequence before reconcileHPA, which owns
+			// the condition's removal when autoscaling is not configured; a
+			// mode switch during the refusal must not strand a stale False.
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Spec.Autoscaling = nil
+			Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+			_, err = reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			Expect(meta.FindStatusCondition(isvc.Status.Conditions, ConditionAutoscalingReady)).To(BeNil())
+			Expect(isvc.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken),
+				"clearing autoscaling must not clear the name-taken diagnosis")
 		})
 
 		It("keeps reporting the refusal while another fault fails the reconcile", func() {
