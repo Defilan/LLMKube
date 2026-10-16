@@ -19,8 +19,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"maps"
-	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -104,15 +102,16 @@ func (a *MetalAgent) emitInferenceEvent(
 // Behavior, in order:
 //
 //  1. Capture the new pressure level under the agent's mutex.
-//  2. If pressure is Normal, unblock the evicted services that fit the
-//     available memory (takeRestartableLocked). The rest stay blocked; the
-//     watchdog keeps delivering Normal samples while any are waiting.
+//  2. If pressure is Normal, pick the evicted services that fit the
+//     available memory (restartCandidatesLocked). The rest stay blocked;
+//     the watchdog keeps delivering Normal samples while any are waiting.
 //  3. Update the MemoryPressure condition on every managed
 //     InferenceService that has not already been observed at this level
 //     (covers level transitions and late-spawned processes during
 //     sustained pressure).
-//  4. Start the services step 2 unblocked again, on their own goroutine
-//     (restartEvicted), which also takes their condition off Evicted.
+//  4. Queue the restart of the services step 2 picked
+//     (queueEvictedRestarts). The event loop starts them later; their
+//     condition leaves Evicted once their engine runs.
 //  5. If the level is Critical AND the friendly-fire guard says we're
 //     responsible for the pressure (shouldEvict), pick one process to
 //     evict, mark it blocked, and stop it. Only one eviction per watchdog
@@ -127,7 +126,7 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	a.lastPressureLevel = level
 	var restart []evictedRestart
 	if level == MemoryPressureNormal {
-		restart = a.takeRestartableLocked(stats, level != previous)
+		restart = a.restartCandidatesLocked(stats, level != previous)
 	}
 	// Reset observed-at-level when the level changes so each new level
 	// triggers a fresh round of condition patches.
@@ -186,7 +185,8 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		}
 	}
 
-	a.restartEvictedAsync(ctx, restart)
+	// Queued only now, with a.mu released: queueRestart takes it.
+	a.queueEvictedRestarts(ctx, restart)
 
 	// Eviction path. Honored via the --eviction-enabled CLI flag (default
 	// false) so that operators must explicitly opt in to having the
@@ -239,9 +239,14 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	// Mark blocked BEFORE deleteProcess so a controller event arriving
 	// during the (potentially slow) process teardown does not race ahead
 	// and respawn it. The watchdog keys RSS by process name; record it so
-	// a restart can wait for room to take that memory back.
+	// a restart can wait for room to take that memory back, and when the
+	// restart backoff allows the next one.
 	a.mu.Lock()
-	a.pressureBlocked[key] = evictedService{rss: stats.ProcessRSS[target.Name]}
+	a.pressureBlocked[key] = evictedService{
+		rss:       stats.ProcessRSS[target.Name],
+		notBefore: a.nextEvictedRestartLocked(key),
+	}
+	delete(a.pressureRestarting, key)
 	a.mu.Unlock()
 
 	if err := a.updateMemoryPressureCondition(ctx, target, MemoryPressureCritical,
@@ -270,259 +275,6 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		target.Priority,
 		formatMemory(stats.TotalRSS), formatMemory(stats.TotalMemory),
 	)
-}
-
-// evictedService is what the agent remembers about a service it evicted
-// under memory pressure, for as long as the service stays blocked.
-type evictedService struct {
-	// rss is the process's resident memory when it was evicted: about what
-	// restarting it will take back. 0 when the watchdog had no RSS sample
-	// for it, in which case it reserves no headroom.
-	rss uint64
-}
-
-// evictedRestart is one blocked service picked for a restart.
-type evictedRestart struct {
-	key string
-	svc evictedService
-}
-
-// pickRestartable returns, in key order, the blocked services that may restart
-// now: each one's eviction-time RSS, added to that of the services picked
-// before it, must leave at least floor bytes of the available memory. One
-// that does not fit stays blocked, and a smaller one after it may still fit.
-// Admission alone cannot make this call: it compares one model's estimate
-// with a fraction of total memory and never looks at what is available, so a
-// service evicted for pressure that has not gone away would pass it and push
-// the host straight back into pressure.
-func pickRestartable(blocked map[string]evictedService, available, floor uint64) []string {
-	var picked []string
-	var reserved uint64
-	for _, key := range slices.Sorted(maps.Keys(blocked)) {
-		need := reserved + blocked[key].rss
-		if need > available || available-need < floor {
-			continue
-		}
-		reserved = need
-		picked = append(picked, key)
-	}
-	return picked
-}
-
-// restartFloor is the available memory a restart must leave free: the
-// watchdog's Warning threshold of total memory, so taking back the evicted
-// RSS is not expected to put the host back at Warning. Without a watchdog
-// (unit tests) there is no threshold, and the floor is 0.
-func (a *MetalAgent) restartFloor(total uint64) uint64 {
-	if a.config.WatchdogConfig == nil {
-		return 0
-	}
-	return uint64(a.config.WatchdogConfig.WarningThreshold * float64(total))
-}
-
-// takeRestartableLocked removes from pressureBlocked the services that may
-// restart now (pickRestartable) and returns them, marking a restart batch in
-// flight. It picks nothing while an earlier batch runs: available memory does
-// not yet show what that batch is loading. The caller must hold a.mu.
-func (a *MetalAgent) takeRestartableLocked(stats MemoryStats, transition bool) []evictedRestart {
-	if a.restartingEvicted || len(a.pressureBlocked) == 0 {
-		return nil
-	}
-	keys := pickRestartable(a.pressureBlocked, stats.AvailableMemory, a.restartFloor(stats.TotalMemory))
-	waiting := len(a.pressureBlocked) - len(keys)
-	log := a.logger.Debugw
-	if transition {
-		log = a.logger.Infow
-	}
-	log("memory pressure normal; restarting evicted services that fit the headroom",
-		"restarting", len(keys), "stillBlocked", waiting,
-		"available", formatMemory(stats.AvailableMemory),
-		"floor", formatMemory(a.restartFloor(stats.TotalMemory)))
-	if len(keys) == 0 {
-		return nil
-	}
-	items := make([]evictedRestart, 0, len(keys))
-	for _, key := range keys {
-		items = append(items, evictedRestart{key: key, svc: a.pressureBlocked[key]})
-		delete(a.pressureBlocked, key)
-	}
-	a.restartingEvicted = true
-	return items
-}
-
-// hasEvictedWaiting reports whether evicted services are still blocked, so
-// the watchdog keeps delivering steady Normal samples to retry them.
-func (a *MetalAgent) hasEvictedWaiting() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return len(a.pressureBlocked) > 0
-}
-
-// restartEvictedAsync runs restartEvicted on its own goroutine, so the
-// watchdog goroutine never waits on a model load. No-op without items.
-func (a *MetalAgent) restartEvictedAsync(ctx context.Context, items []evictedRestart) {
-	if len(items) == 0 {
-		return
-	}
-	a.evictedRestarts.Go(func() { a.restartEvicted(ctx, items) })
-}
-
-// restartEvicted starts again, one at a time, the services
-// takeRestartableLocked picked. Nothing else would: the watcher emits an
-// event only when an InferenceService's resourceVersion changes, the health
-// monitor only checks processes still in a.processes, and an eviction leaves
-// the spec untouched, so an evicted service would otherwise stay down until
-// the agent restarted.
-//
-// Sequential on purpose, since parallel model loads could together push the
-// host back into pressure. If pressure leaves Normal before a service's turn,
-// it and every service after it are blocked again until pressure is Normal
-// again, rather than started under the pressure that evicted them.
-func (a *MetalAgent) restartEvicted(ctx context.Context, items []evictedRestart) {
-	defer func() {
-		a.mu.Lock()
-		a.restartingEvicted = false
-		a.mu.Unlock()
-	}()
-	for i, item := range items {
-		if ctx.Err() != nil {
-			return
-		}
-		if a.reblockUnlessNormal(items[i:]) {
-			return
-		}
-		a.restartOne(ctx, item)
-	}
-}
-
-// restartOne restarts one evicted service through ensureProcess, the
-// watcher's own path: every pre-start refusal applies, a service scaled to
-// zero or suspended takes the stop path, and the in-flight guard dedupes
-// against a watch event for the same key. Its MemoryPressure condition stops
-// reading Evicted only once that is done.
-func (a *MetalAgent) restartOne(ctx context.Context, item evictedRestart) {
-	isvc, reblock := a.fetchEvictedForRestart(ctx, item.key)
-	if reblock {
-		a.reblock([]evictedRestart{item})
-		return
-	}
-	if isvc == nil {
-		return
-	}
-	claimed, err := a.claimsForRestart(ctx, isvc)
-	if err != nil {
-		a.logger.Warnw("could not tell whether this agent still claims an evicted service; keeping it blocked",
-			"key", item.key, "error", err)
-		a.reblock([]evictedRestart{item})
-		return
-	}
-	if !claimed {
-		// The watcher stops surfacing a service it no longer claims, so
-		// nothing else would ever clear this block; drop it here.
-		a.logger.Infow("evicted service is no longer claimed by this agent; not restarting it", "key", item.key)
-		return
-	}
-	if !isvcStopped(isvc) {
-		a.logger.Infow("restarting service evicted under memory pressure", "key", item.key)
-	}
-	if err := a.ensureProcess(ctx, isvc); err != nil {
-		a.logger.Warnw("failed to restart evicted service", "key", item.key, "error", err)
-	}
-	a.markUnblockedCondition(ctx, item.key)
-}
-
-// reblockUnlessNormal blocks items again and returns true when memory
-// pressure is no longer Normal; otherwise it changes nothing and returns
-// false.
-func (a *MetalAgent) reblockUnlessNormal(items []evictedRestart) bool {
-	a.mu.RLock()
-	level := a.lastPressureLevel
-	a.mu.RUnlock()
-	if level == MemoryPressureNormal {
-		return false
-	}
-	n := a.reblock(items)
-	a.logger.Infow("memory pressure rose again; keeping the remaining evicted services blocked",
-		"level", level.String(), "blocked", n)
-	return true
-}
-
-// reblock puts items back in pressureBlocked with what was recorded at
-// eviction, and returns how many it put back. It skips a key that is running
-// or starting again (a watch event can start it once its block is gone):
-// blocking a live process would mark it Evicted and keep a later restart
-// from replacing it.
-func (a *MetalAgent) reblock(items []evictedRestart) int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	n := 0
-	for _, item := range items {
-		if _, running := a.processes[item.key]; running || a.starting[item.key] {
-			continue
-		}
-		a.pressureBlocked[item.key] = item.svc
-		n++
-	}
-	return n
-}
-
-// fetchEvictedForRestart returns the current InferenceService for an evicted
-// key. It returns nil when the service must not be restarted (deleted, or
-// being deleted, while blocked), and reblock=true when it could not be read
-// (a later Normal sample retries it).
-func (a *MetalAgent) fetchEvictedForRestart(
-	ctx context.Context, key string,
-) (isvc *inferencev1alpha1.InferenceService, reblock bool) {
-	if a.config.K8sClient == nil {
-		return nil, false
-	}
-	namespace, name := parseKey(key)
-	isvc = &inferencev1alpha1.InferenceService{}
-	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, isvc); err != nil {
-		if apierrors.IsNotFound(err) {
-			a.logger.Infow("evicted service was deleted while blocked; not restarting it", "key", key)
-			return nil, false
-		}
-		a.logger.Warnw("failed to fetch evicted service for restart; keeping it blocked", "key", key, "error", err)
-		return nil, true
-	}
-	if isvc.DeletionTimestamp != nil {
-		a.logger.Infow("evicted service is being deleted; not restarting it", "key", key)
-		return nil, false
-	}
-	return isvc, false
-}
-
-// claimsForRestart reports whether this agent still claims isvc (the watcher's
-// shouldWatch: allowlist, a Metal Model). An evicted service it no longer
-// claims must not be started here, whether or not the watcher ever reported
-// it gone. The error is for a claim check that can fail; restartOne keeps the
-// key blocked on one.
-//
-//nolint:unparam // the error result is for a shouldWatch that returns (bool, error)
-func (a *MetalAgent) claimsForRestart(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (bool, error) {
-	if a.watcher == nil {
-		return true, nil
-	}
-	return a.watcher.shouldWatch(ctx, isvc), nil
-}
-
-// markUnblockedCondition sets a restarted (or deliberately not restarted)
-// service's MemoryPressure condition to the current level, no longer
-// Evicted, and records the key as observed at that level.
-func (a *MetalAgent) markUnblockedCondition(ctx context.Context, key string) {
-	a.mu.RLock()
-	level := a.lastPressureLevel
-	a.mu.RUnlock()
-	namespace, name := parseKey(key)
-	if err := a.updateMemoryPressureCondition(ctx, &ManagedProcess{Namespace: namespace, Name: name}, level,
-		"watchdog reported "+level.String()+" memory pressure"); err != nil {
-		a.logger.Warnw("failed to update MemoryPressure condition", "key", key, "level", level.String(), "error", err)
-		return
-	}
-	a.mu.Lock()
-	a.pressureObserved[key] = level
-	a.mu.Unlock()
 }
 
 // emitEvictionSkippedAcrossManaged broadcasts an EvictionSkipped event to

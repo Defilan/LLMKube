@@ -282,12 +282,19 @@ type MetalAgent struct {
 
 	// pressureBlocked records namespacedName keys of processes the agent
 	// evicted under memory pressure. Subsequent ensureProcess calls for these
-	// keys are no-ops while lastPressureLevel != Normal, to prevent a
-	// thrashing respawn loop where the controller's UPDATED event simply
-	// re-spawns the process we just killed for memory. Once pressure is
-	// Normal, handleMemoryPressure unblocks and restarts the ones the
-	// available memory has room for.
+	// keys are no-ops, to prevent a thrashing respawn loop where the
+	// controller's UPDATED event simply re-spawns the process we just killed
+	// for memory. Once pressure is Normal, handleMemoryPressure moves the
+	// ones the available memory has room for to pressureRestarting and
+	// queues their restart.
 	pressureBlocked map[string]evictedService
+	// pressureRestarting holds evicted services whose restart is queued
+	// (queueRestart), until their engine is running or the restart is
+	// cancelled. Their RSS stays reserved against the headroom meanwhile.
+	pressureRestarting map[string]evictedService
+	// evictionBackoff is the restart backoff of services restarted after an
+	// eviction (see nextEvictedRestartLocked).
+	evictionBackoff map[string]*evictionBackoff
 	// lastPressureLevel is the most recent pressure level reported by the
 	// watchdog. Used to gate respawn (above) and to detect transitions for
 	// status condition updates.
@@ -298,12 +305,6 @@ type MetalAgent struct {
 	// current level without re-patching ones already observed at it.
 	// Reset on every level transition.
 	pressureObserved map[string]MemoryPressureLevel
-	// evictedRestarts tracks the restartEvicted goroutines a return to
-	// Normal launches, so tests can wait for them to finish.
-	evictedRestarts sync.WaitGroup
-	// restartingEvicted is true while a restartEvicted batch runs; no other
-	// batch is picked until it ends.
-	restartingEvicted bool
 
 	// starting records namespacedName keys whose ensureProcess call is
 	// in flight, and keys whose unhealthy engine the health monitor is
@@ -494,6 +495,8 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		memoryCheckWarnOnly: warnOnly,
 		downloadAllow:       safehttp.ParseAllowlist(config.AllowedDownloadHosts),
 		pressureBlocked:     make(map[string]evictedService),
+		pressureRestarting:  make(map[string]evictedService),
+		evictionBackoff:     make(map[string]*evictionBackoff),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
 		restarts:            make(map[string]*restartBackoff),
@@ -764,6 +767,9 @@ func (a *MetalAgent) handleEvent(ctx context.Context, event InferenceServiceEven
 	case EventTypeCreated, EventTypeUpdated:
 		return a.ensureProcess(ctx, event.InferenceService)
 	case EventTypeDeleted:
+		// Deleted, or no longer claimed by this agent: an eviction block or
+		// queued eviction restart for it has nothing left to wait for.
+		a.forgetEvicted(key)
 		return a.deleteProcess(ctx, key)
 	}
 
@@ -1139,21 +1145,20 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	}()
 
 	// Check if process already exists
-	a.mu.RLock()
+	a.mu.Lock()
 	existing, exists := a.processes[key]
+	a.holdQueuedEvictedLocked(key)
 	_, blocked := a.pressureBlocked[key]
 	pressureLevel := a.lastPressureLevel
-	a.mu.RUnlock()
+	a.mu.Unlock()
 
-	// Refuse to respawn a service the watchdog evicted while pressure is
-	// still abnormal. Without this guard, the controller's UPDATED event
-	// loop would silently re-spawn the very process we just killed for
-	// memory, defeating eviction. The block clears automatically once the
-	// watchdog reports MemoryPressureNormal and there is room for the
-	// service; handleMemoryPressure then calls ensureProcess for it again
-	// (restartEvicted).
-	if blocked && pressureLevel != MemoryPressureNormal {
-		a.logger.Warnw("skipping ensureProcess; eviction-blocked under memory pressure",
+	// Refuse to respawn a service the watchdog evicted. Without this guard,
+	// the controller's UPDATED event loop would silently re-spawn the very
+	// process we just killed for memory, defeating eviction. The block holds
+	// at Normal too, until the available memory has room for the service:
+	// handleMemoryPressure then lifts it and queues the restart.
+	if blocked {
+		a.logger.Warnw("skipping ensureProcess; eviction-blocked until memory has room",
 			"namespace", isvc.Namespace, "name", isvc.Name,
 			"pressureLevel", pressureLevel.String())
 		// Surface the block as a Kubernetes event so an operator who
@@ -1162,7 +1167,8 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		// emitInferenceEvent re-fetches the live IS for the event target.
 		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
 			corev1.EventTypeWarning, EventReasonRespawnBlocked,
-			"Respawn blocked: previous process was evicted and host memory pressure is %s",
+			"Respawn blocked: previous process was evicted under memory pressure and restarts once "+
+				"available memory has room for it (pressure is %s)",
 			pressureLevel.String(),
 		)
 		return nil
@@ -1367,6 +1373,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		"port", process.Port,
 		"pid", process.PID,
 	)
+	a.noteEvictedRestarted(ctx, key)
 
 	return nil
 }
