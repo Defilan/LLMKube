@@ -40,7 +40,9 @@ One or more of:
    ```
 
    Expect `Failed` and `DeploymentNameTaken`; the message names the blocking
-   Deployment and the remedy.
+   Deployment and the remedy. The `Degraded` condition carries the generic
+   `Failed` reason; the specific `DeploymentNameTaken` reason appears only in
+   `status.schedulingStatus` and the Warning event.
 
 2. **Inspect whatever holds the name.** This is the decision point.
 

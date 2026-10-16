@@ -361,7 +361,7 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			selfRef := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "d", Namespace: "default",
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: inferencev1alpha1.GroupVersion.String(), Kind: "InferenceService",
-					Name:       "s1", UID: "uid-1", Controller: &notController,
+					Name: "s1", UID: "uid-1", Controller: &notController,
 				}}}}
 			err = ensureDeploymentOwned(isvc, selfRef)
 			Expect(err).To(HaveOccurred())

@@ -220,6 +220,20 @@ the new default store is a directory the agent has never populated.
   (`http`, `https`, `hf`, `s3`). Local sources are not hashed, and the other
   Metal runtimes ignore it in 0.10.1.
 
+#### Behavior changes in 0.10.4
+
+- An `InferenceService` whose generated Deployment name is held by a
+  Deployment the controller did not create is no longer overwritten or
+  recreated by the controller: the reconcile refuses with phase `Failed` and
+  `status.schedulingStatus: DeploymentNameTaken` (#2011). This only bites an
+  install where a foreign object already holds the name; every Deployment the
+  operator itself created carries the service's controller reference (the
+  create path has stamped one since the first release), so upgrade in place
+  is unaffected. See
+  [`inferenceservice-name-taken-deployment.md`](./inferenceservice-name-taken-deployment.md)
+  for diagnosis and recovery. The same guard has covered the router-proxy
+  objects and the managed HPA since 0.10.3.
+
 ## Verify the upgrade
 
 1. **Controller pod replaced and Ready.**
