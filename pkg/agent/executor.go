@@ -979,7 +979,8 @@ func hfRedirectStripper(base *http.Client) *http.Client {
 // model that the stat check in ensureModel would treat as cached. When
 // contentLength > 0 it verifies the byte count matches, so a mid-stream
 // connection drop does not leave a truncated model. This is the non-resuming
-// path (S3), byte-for-byte the behaviour it had before resume was added.
+// path (S3): it always starts from zero and shares copyToFileResume's size,
+// digest and download-cap checks.
 func (e *MetalExecutor) copyToFileNoResume(
 	filePath string, r io.Reader, contentLength int64, expectedSHA256 string,
 ) error {

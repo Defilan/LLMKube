@@ -616,12 +616,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, (&agent.DarwinMemoryProvider{}).TotalMemory)
-	if err != nil {
-		logger.Errorw("invalid --max-download-size", "error", err)
-		os.Exit(1)
-	}
-
 	// TODO: Wire this logger into controller-runtime via ctrl.SetLogger(...) so
 	// Kubernetes client/controller-runtime logs share the same configuration.
 
@@ -661,7 +655,6 @@ func main() {
 		"legacyDirectEndpoints", cfg.LegacyDirectEndpoints,
 		"hostIP", hostIP,
 		"logLevel", cfg.LogLevel,
-		"maxDownloadBytes", maxDownloadBytes,
 	)
 
 	// Verify Metal support
@@ -678,6 +671,16 @@ func main() {
 		"gpuCores", caps.GPUCores,
 		"metalVersion", caps.MetalVersion,
 	)
+
+	// Resolved after the Metal check: its default reads the host's memory
+	// through the darwin provider, which is a stub elsewhere, so a non-Mac
+	// host should fail on Metal first.
+	maxDownloadBytes, err := resolveMaxDownloadBytes(cfg.MaxDownloadSize, (&agent.DarwinMemoryProvider{}).TotalMemory)
+	if err != nil {
+		logger.Errorw("invalid --max-download-size", "error", err)
+		os.Exit(1)
+	}
+	logger.Infow("model download cap", "maxDownloadBytes", maxDownloadBytes)
 
 	// Log which runtimes are available. llama-server is always available
 	// (resolved above). Other runtimes are available when their binary
