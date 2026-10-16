@@ -76,7 +76,7 @@ tests:
           value: llmkube_watch_canary_up == 1 and (time() - llmkube_watch_canary_last_observed_timestamp_seconds) > 900
       - equal:
           path: spec.groups[?(@.name=="llmkube-controller-watch")].rules[?(@.alert=="LLMKubeControllerWatchCanaryDown")].expr
-          value: llmkube_watch_canary_up == 0
+          value: llmkube_watch_canary_up == 0 and on(namespace) (max by (namespace) (llmkube_watch_canary_up) == 0)
 
   - it: drops the stall alerts when the canary is off, even with the rules enabled
     template: prometheusrule.yaml

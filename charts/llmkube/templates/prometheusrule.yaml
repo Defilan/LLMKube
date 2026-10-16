@@ -436,8 +436,10 @@ spec:
     # The canary never completed a full write-then-observe cycle: disabled by
     # a misconfigured namespace, missing lease RBAC (the operator then
     # restart-loops on its own liveness check), or a watch that never synced.
+    # Standbys never write, so a lone 0 series is expected in HA: fire only
+    # when no scraped pod in the namespace has completed a cycle.
     - alert: LLMKubeControllerWatchCanaryDown
-      expr: llmkube_watch_canary_up == 0
+      expr: llmkube_watch_canary_up == 0 and on(namespace) (max by (namespace) (llmkube_watch_canary_up) == 0)
       for: {{ .Values.prometheus.prometheusRule.rules.watchCanary.downFor }}
       labels:
         severity: warning

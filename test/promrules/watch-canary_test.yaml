@@ -59,6 +59,28 @@ tests:
         alertname: LLMKubeControllerWatchCanaryDown
         exp_alerts: []
 
+  # HA install: the leader is healthy (up=1, fresh timestamp) while the
+  # standby never writes, so its gauge is permanently 0. A standby's lone 0
+  # series is expected and must not page; only a namespace where no scraped
+  # pod has completed a cycle may.
+  - interval: 30s
+    input_series:
+      - series: 'llmkube_watch_canary_up{namespace="llmkube-system",pod="llmkube-controller-manager-0"}'
+        values: '1x60'
+      - series: 'llmkube_watch_canary_last_observed_timestamp_seconds{namespace="llmkube-system",pod="llmkube-controller-manager-0"}'
+        values: '0+30x60'
+      - series: 'llmkube_watch_canary_up{namespace="llmkube-system",pod="llmkube-controller-manager-1"}'
+        values: '0x60'
+      - series: 'llmkube_watch_canary_last_observed_timestamp_seconds{namespace="llmkube-system",pod="llmkube-controller-manager-1"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchStalled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: LLMKubeControllerWatchCanaryDown
+        exp_alerts: []
+
   # Canary never came up: up stays 0 (no restart ever recovered it, or the
   # canary cannot write at all). The stalled alert must stay quiet, the down
   # alert must page only after its 15m for, not during startup.
