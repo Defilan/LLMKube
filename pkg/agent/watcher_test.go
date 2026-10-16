@@ -19,11 +19,17 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"maps"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -565,8 +571,16 @@ func newModelLookupFixture(t *testing.T) *modelLookupFixture {
 // pollOnce runs one poll against seen and returns the events it emitted.
 func (f *modelLookupFixture) pollOnce(t *testing.T, seen map[string]string) []InferenceServiceEvent {
 	t.Helper()
+	return f.pollWithContext(context.Background(), t, seen)
+}
+
+// pollWithContext is pollOnce with a caller-supplied context.
+func (f *modelLookupFixture) pollWithContext(
+	ctx context.Context, t *testing.T, seen map[string]string,
+) []InferenceServiceEvent {
+	t.Helper()
 	eventChan := make(chan InferenceServiceEvent, 10)
-	if err := f.watcher.poll(context.Background(), eventChan, seen); err != nil {
+	if err := f.watcher.poll(ctx, eventChan, seen); err != nil {
 		t.Fatalf("poll returned error: %v", err)
 	}
 	events := make([]InferenceServiceEvent, 0, len(eventChan))
@@ -587,9 +601,11 @@ func eventSummary(events []InferenceServiceEvent) []string {
 
 // TestPoll_ModelLookupErrorKeepsService pins #2076: a Model Get that fails
 // with anything but NotFound must not emit Deleted for a running service
-// (that stops its engine and deletes its Service and EndpointSlice) or touch
-// its seen entry, and the next successful poll, with the resourceVersion
-// unchanged, emits nothing.
+// (that stops its engine and deletes its Service and EndpointSlice), must not
+// emit Updated for a change made meanwhile, and must not touch its seen entry.
+// The next successful poll then compares against the recorded resourceVersion
+// as usual: nothing when the service is unchanged, one Updated when it changed
+// while the lookup failed.
 func TestPoll_ModelLookupErrorKeepsService(t *testing.T) {
 	cases := []struct {
 		name string
@@ -600,30 +616,173 @@ func TestPoll_ModelLookupErrorKeepsService(t *testing.T) {
 		{"429 Too Many Requests", apierrors.NewTooManyRequests("slow down", 1)},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newModelLookupFixture(t)
-			seen := map[string]string{}
+		for _, changed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/changed during failure=%t", tc.name, changed), func(t *testing.T) {
+				f := newModelLookupFixture(t)
+				seen := map[string]string{}
 
-			events := f.pollOnce(t, seen)
-			if len(events) != 1 || events[0].Type != EventTypeCreated {
-				t.Fatalf("poll 1 events = %v, want one CREATED", eventSummary(events))
-			}
-			before := maps.Clone(seen)
+				events := f.pollOnce(t, seen)
+				if len(events) != 1 || events[0].Type != EventTypeCreated {
+					t.Fatalf("poll 1 events = %v, want one CREATED", eventSummary(events))
+				}
+				before := maps.Clone(seen)
 
-			f.failModelGet = tc.err
-			if events := f.pollOnce(t, seen); len(events) != 0 {
-				t.Errorf("poll 2 (model lookup failing) events = %v, want none", eventSummary(events))
-			}
-			if !maps.Equal(seen, before) {
-				t.Errorf("poll 2 (model lookup failing) changed seen to %v, want %v", seen, before)
-			}
+				if changed {
+					f.annotateISVC(t)
+				}
+				f.failModelGet = tc.err
+				if events := f.pollOnce(t, seen); len(events) != 0 {
+					t.Errorf("poll 2 (model lookup failing) events = %v, want none", eventSummary(events))
+				}
+				if !maps.Equal(seen, before) {
+					t.Errorf("poll 2 (model lookup failing) changed seen to %v, want %v", seen, before)
+				}
 
-			f.failModelGet = nil
-			if events := f.pollOnce(t, seen); len(events) != 0 {
-				t.Errorf("poll 3 (lookup recovered, resourceVersion unchanged) events = %v, want none",
-					eventSummary(events))
-			}
-		})
+				f.failModelGet = nil
+				events = f.pollOnce(t, seen)
+				switch {
+				case !changed && len(events) != 0:
+					t.Errorf("poll 3 (lookup recovered, resourceVersion unchanged) events = %v, want none",
+						eventSummary(events))
+				case changed && (len(events) != 1 || events[0].Type != EventTypeUpdated):
+					t.Errorf("poll 3 (lookup recovered, service changed during the failure) events = %v, "+
+						"want one UPDATED", eventSummary(events))
+				}
+			})
+		}
+	}
+}
+
+// annotateISVC changes the fixture's InferenceService through the base
+// client, bumping its resourceVersion the way any spec or metadata edit does.
+func (f *modelLookupFixture) annotateISVC(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := f.base.Get(ctx, client.ObjectKey{Namespace: "default", Name: lookupISVCName}, isvc); err != nil {
+		t.Fatalf("get isvc: %v", err)
+	}
+	isvc.Annotations = map[string]string{"example.com/touched": "true"}
+	if err := f.base.Update(ctx, isvc); err != nil {
+		t.Fatalf("update isvc: %v", err)
+	}
+}
+
+// lookupLogCounts returns how many "referenced model lookup" log lines were
+// written at each level since the last call, and clears them.
+func lookupLogCounts(logs *observer.ObservedLogs) map[zapcore.Level]int {
+	counts := map[zapcore.Level]int{}
+	for _, e := range logs.FilterMessageSnippet("referenced model lookup").All() {
+		counts[e.Level]++
+	}
+	logs.TakeAll()
+	return counts
+}
+
+// TestPoll_ModelLookupFailureLogsTransitions pins the log volume side of
+// #2076: a failing Model lookup logs one Warn (with the error) when it starts,
+// Debug while it continues and one Info when it clears, and the
+// watch_model_lookup_failing_services gauge counts the service only while it
+// fails, including dropping it when the service is deleted mid-failure (which
+// still emits Deleted).
+func TestPoll_ModelLookupFailureLogsTransitions(t *testing.T) {
+	f := newModelLookupFixture(t)
+	core, logs := observer.New(zap.DebugLevel)
+	f.watcher.logger = zap.New(core).Sugar()
+	seen := map[string]string{}
+	lookupErr := apierrors.NewServiceUnavailable("apiserver restarting")
+	// The gauge is process-wide and other tests leave it set: start from a
+	// known value so every reading below comes from this watcher.
+	watchModelLookupFailingServices.Set(0)
+	gauge := func() float64 { return testutil.ToFloat64(watchModelLookupFailingServices) }
+
+	f.pollOnce(t, seen)
+	if got := lookupLogCounts(logs); len(got) != 0 {
+		t.Fatalf("poll 1 (lookup ok) lookup log lines = %v, want none", got)
+	}
+
+	f.failModelGet = lookupErr
+	f.pollOnce(t, seen)
+	warns := logs.FilterMessageSnippet("referenced model lookup failed").FilterLevelExact(zap.WarnLevel).All()
+	if len(warns) != 1 {
+		t.Fatalf("poll 2 (lookup starts failing) Warn lines = %d, want 1 (all: %v)", len(warns), logs.All())
+	}
+	if got, _ := warns[0].ContextMap()["error"].(string); !strings.Contains(got, "apiserver restarting") {
+		t.Errorf("poll 2 Warn error field = %q, want the lookup error", got)
+	}
+	if got := lookupLogCounts(logs); got[zap.WarnLevel] != 1 || got[zap.InfoLevel] != 0 {
+		t.Errorf("poll 2 lookup log lines by level = %v, want exactly one Warn", got)
+	}
+	if g := gauge(); g != 1 {
+		t.Errorf("poll 2 gauge = %v, want 1", g)
+	}
+
+	f.pollOnce(t, seen)
+	if got := lookupLogCounts(logs); got[zap.WarnLevel] != 0 || got[zap.InfoLevel] != 0 || got[zap.DebugLevel] != 1 {
+		t.Errorf("poll 3 (still failing) lookup log lines by level = %v, want exactly one Debug", got)
+	}
+	if g := gauge(); g != 1 {
+		t.Errorf("poll 3 gauge = %v, want 1", g)
+	}
+
+	f.failModelGet = nil
+	f.pollOnce(t, seen)
+	if got := lookupLogCounts(logs); got[zap.InfoLevel] != 1 || got[zap.WarnLevel] != 0 {
+		t.Errorf("poll 4 (recovered) lookup log lines by level = %v, want exactly one Info", got)
+	}
+	if g := gauge(); g != 0 {
+		t.Errorf("poll 4 gauge = %v, want 0", g)
+	}
+
+	f.failModelGet = lookupErr
+	f.pollOnce(t, seen)
+	if got := lookupLogCounts(logs); got[zap.WarnLevel] != 1 {
+		t.Errorf("poll 5 (fails again) lookup log lines by level = %v, want a new Warn", got)
+	}
+	if err := f.base.Delete(context.Background(), &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: lookupISVCName, Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("delete isvc: %v", err)
+	}
+	events := f.pollOnce(t, seen)
+	if len(events) != 1 || events[0].Type != EventTypeDeleted {
+		t.Errorf("poll 6 (deleted while failing) events = %v, want one DELETED", eventSummary(events))
+	}
+	if g := gauge(); g != 0 {
+		t.Errorf("poll 6 gauge = %v, want 0 once the failing service is gone", g)
+	}
+}
+
+// TestPoll_ShutdownLookupFailureKeepsStateSilently covers a lookup that fails
+// because the poll's context ended (agent shutdown): the service keeps its
+// state like any other unknown answer, nothing is logged, and the failure is
+// not recorded, so a later real failure still starts with a Warn.
+func TestPoll_ShutdownLookupFailureKeepsStateSilently(t *testing.T) {
+	f := newModelLookupFixture(t)
+	core, logs := observer.New(zap.DebugLevel)
+	f.watcher.logger = zap.New(core).Sugar()
+	seen := map[string]string{}
+	f.pollOnce(t, seen)
+	before := maps.Clone(seen)
+	logs.TakeAll()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.failModelGet = context.Canceled
+	if events := f.pollWithContext(ctx, t, seen); len(events) != 0 {
+		t.Errorf("canceled poll events = %v, want none", eventSummary(events))
+	}
+	if !maps.Equal(seen, before) {
+		t.Errorf("canceled poll changed seen to %v, want %v", seen, before)
+	}
+	if got := lookupLogCounts(logs); len(got) != 0 {
+		t.Errorf("canceled poll lookup log lines by level = %v, want none", got)
+	}
+
+	f.failModelGet = apierrors.NewServiceUnavailable("apiserver restarting")
+	f.pollOnce(t, seen)
+	if got := lookupLogCounts(logs); got[zap.WarnLevel] != 1 {
+		t.Errorf("first real failure after a canceled poll: lookup log lines by level = %v, want one Warn", got)
 	}
 }
 

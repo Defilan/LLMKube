@@ -133,6 +133,15 @@ var (
 		},
 	)
 
+	watchModelLookupFailingServices = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "llmkube_metal_agent_watch_model_lookup_failing_services",
+			Help: "Number of InferenceServices whose referenced Model lookup is " +
+				"currently failing with an error other than NotFound. The agent " +
+				"keeps each such service in its previous state until a lookup succeeds.",
+		},
+	)
+
 	fatalExitsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "llmkube_metal_agent_fatal_exits_total",
@@ -210,6 +219,7 @@ func init() {
 		evictionsTotal,
 		evictionsSkippedTotal,
 		watchConsecutiveFailures,
+		watchModelLookupFailingServices,
 		fatalExitsTotal,
 		applePowerCombinedWatts,
 		applePowerGPUWatts,

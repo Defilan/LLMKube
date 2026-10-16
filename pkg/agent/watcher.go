@@ -82,6 +82,13 @@ type InferenceServiceWatcher struct {
 	// SetNameAllowlist; v0.2 #524 (per-node partition for multi-Mac
 	// fleets sharing one cluster).
 	nameAllowlist map[string]struct{}
+	// lookupFailing maps the key of each InferenceService whose latest
+	// Model lookup failed (other than NotFound) to when it started failing,
+	// so the failure is logged at Warn once and at Info when it clears
+	// rather than on every poll (#2076). Not locked: shouldWatch runs on
+	// one goroutine at a time (prepareRegistry's startup passes run in
+	// Start before the watcher goroutine exists, then only Watch calls it).
+	lookupFailing map[string]time.Time
 }
 
 // NewInferenceServiceWatcher creates a new watcher with the default failure
@@ -262,7 +269,7 @@ func (w *InferenceServiceWatcher) poll(
 
 	for i := range list.Items {
 		isvc := &list.Items[i]
-		key := fmt.Sprintf("%s/%s", isvc.Namespace, isvc.Name)
+		key := watchKey(isvc)
 
 		watch, err := w.shouldWatch(ctx, isvc)
 		if err != nil {
@@ -297,6 +304,8 @@ func (w *InferenceServiceWatcher) poll(
 			seen[key] = currentVersion
 		}
 	}
+
+	w.forgetVanishedLookupFailures(current)
 
 	// Check for deleted services
 	for key := range seen {
@@ -336,6 +345,24 @@ func (w *InferenceServiceWatcher) poll(
 func (w *InferenceServiceWatcher) shouldWatch(
 	ctx context.Context, isvc *inferencev1alpha1.InferenceService,
 ) (bool, error) {
+	watch, err := w.decideWatch(ctx, isvc)
+	switch {
+	case err == nil:
+		w.noteLookupDecided(isvc)
+	case ctx.Err() != nil:
+		// The agent is shutting down and the Get failed because of it, not
+		// because the API server is unhealthy: still unknown, but not worth
+		// a log line or a change to the failure tracking.
+	default:
+		w.noteLookupFailed(isvc, err)
+	}
+	return watch, err
+}
+
+// decideWatch is shouldWatch's decision without the failure tracking.
+func (w *InferenceServiceWatcher) decideWatch(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService,
+) (bool, error) {
 	if isvc.Spec.ModelRef == "" {
 		return false, nil
 	}
@@ -365,17 +392,73 @@ func (w *InferenceServiceWatcher) shouldWatch(
 			)
 			return false, nil
 		}
-		w.logger.Warnw(
-			"referenced model lookup failed; keeping the inference service's previous state",
-			"namespace", isvc.Namespace,
-			"inferenceService", isvc.Name,
-			"modelRef", isvc.Spec.ModelRef,
-			"error", err,
-		)
 		return false, fmt.Errorf("get model %s/%s: %w", isvc.Namespace, isvc.Spec.ModelRef, err)
 	}
 
 	return model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == "metal", nil
+}
+
+// noteLookupFailed records a failed Model lookup for isvc: a Warn when this
+// starts a failure, a Debug line while it continues.
+func (w *InferenceServiceWatcher) noteLookupFailed(isvc *inferencev1alpha1.InferenceService, err error) {
+	key := watchKey(isvc)
+	if since, failing := w.lookupFailing[key]; failing {
+		w.logger.Debugw("referenced model lookup still failing; keeping the inference service's previous state",
+			"namespace", isvc.Namespace,
+			"inferenceService", isvc.Name,
+			"modelRef", isvc.Spec.ModelRef,
+			"failingFor", time.Since(since).Round(time.Second),
+			"error", err,
+		)
+		return
+	}
+	if w.lookupFailing == nil {
+		w.lookupFailing = make(map[string]time.Time)
+	}
+	w.lookupFailing[key] = time.Now()
+	watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
+	w.logger.Warnw("referenced model lookup failed; keeping the inference service's previous state",
+		"namespace", isvc.Namespace,
+		"inferenceService", isvc.Name,
+		"modelRef", isvc.Spec.ModelRef,
+		"error", err,
+	)
+}
+
+// noteLookupDecided clears a recorded lookup failure for isvc once shouldWatch
+// reaches an answer for it again, logging the recovery at Info.
+func (w *InferenceServiceWatcher) noteLookupDecided(isvc *inferencev1alpha1.InferenceService) {
+	key := watchKey(isvc)
+	since, failing := w.lookupFailing[key]
+	if !failing {
+		return
+	}
+	delete(w.lookupFailing, key)
+	watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
+	w.logger.Infow("referenced model lookup recovered",
+		"namespace", isvc.Namespace,
+		"inferenceService", isvc.Name,
+		"modelRef", isvc.Spec.ModelRef,
+		"failedFor", time.Since(since).Round(time.Second),
+	)
+}
+
+// forgetVanishedLookupFailures drops the recorded lookup failure of every
+// service the latest poll did not list, so a service deleted while its lookup
+// failed does not hold the gauge up forever. A listed service whose lookup is
+// still failing is in current (poll counts it there), and one whose lookup
+// succeeded was already cleared by noteLookupDecided.
+func (w *InferenceServiceWatcher) forgetVanishedLookupFailures(current map[string]bool) {
+	pruned := false
+	for key := range w.lookupFailing {
+		if !current[key] {
+			delete(w.lookupFailing, key)
+			pruned = true
+		}
+	}
+	if pruned {
+		watchModelLookupFailingServices.Set(float64(len(w.lookupFailing)))
+	}
 }
 
 // owns adapts shouldWatch to the ownership predicate the startup cleanup
@@ -386,6 +469,11 @@ func (w *InferenceServiceWatcher) shouldWatch(
 func (w *InferenceServiceWatcher) owns(ctx context.Context, isvc *inferencev1alpha1.InferenceService) bool {
 	watch, err := w.shouldWatch(ctx, isvc)
 	return err == nil && watch
+}
+
+// watchKey is the "namespace/name" key poll tracks isvc under.
+func watchKey(isvc *inferencev1alpha1.InferenceService) string {
+	return isvc.Namespace + "/" + isvc.Name
 }
 
 // parseKey splits "namespace/name" into components
