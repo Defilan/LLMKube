@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -68,6 +69,53 @@ func TestWatchdog_NormalPressure(t *testing.T) {
 	defer mu.Unlock()
 	if callCount != 0 {
 		t.Errorf("onPressure called %d times, want 0 (normal pressure)", callCount)
+	}
+}
+
+// TestWatchdog_DeliversReturnToNormalOnce pins when the watchdog calls
+// onPressure across a sequence of samples: every sample at Warning or above,
+// plus the one sample that drops back to Normal from a higher level, and no
+// steady Normal sample. handleMemoryPressure clears eviction blocks and
+// MemoryPressure conditions only when it is handed Normal (#2078).
+func TestWatchdog_DeliversReturnToNormalOnce(t *testing.T) {
+	const normal, warning, critical = 0.50, 0.15, 0.05
+	tests := []struct {
+		name    string
+		samples []float64 // available fraction per sample
+		want    []MemoryPressureLevel
+	}{
+		{"normal then normal", []float64{normal, normal}, nil},
+		{"warning then normal", []float64{warning, normal},
+			[]MemoryPressureLevel{MemoryPressureWarning, MemoryPressureNormal}},
+		{"steady normal after a return is silent", []float64{critical, normal, normal, normal},
+			[]MemoryPressureLevel{MemoryPressureCritical, MemoryPressureNormal}},
+		{"every return is delivered", []float64{warning, normal, critical, warning, normal},
+			[]MemoryPressureLevel{
+				MemoryPressureWarning, MemoryPressureNormal,
+				MemoryPressureCritical, MemoryPressureWarning, MemoryPressureNormal,
+			}},
+	}
+
+	total := uint64(64 * 1024 * 1024 * 1024)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &mockMemoryProvider{totalBytes: total}
+			var got []MemoryPressureLevel
+			onPressure := func(level MemoryPressureLevel, _ MemoryStats) {
+				got = append(got, level)
+			}
+			w := NewMemoryWatchdog(provider, func() []processMemInfo { return nil },
+				onPressure, defaultTestConfig(), testLogger())
+
+			for _, avail := range tt.samples {
+				provider.availableBytes = uint64(float64(total) * avail)
+				w.sample()
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("onPressure levels = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

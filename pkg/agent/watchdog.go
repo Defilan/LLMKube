@@ -41,13 +41,20 @@ type MemoryStats struct {
 }
 
 // MemoryWatchdog periodically samples system memory and per-process RSS,
-// computes a pressure level, and updates Prometheus metrics.
+// computes a pressure level, and updates Prometheus metrics. It calls
+// onPressure on every sample at Warning or above, and once on the sample
+// that returns to Normal from a higher level; steady Normal samples do not
+// call it.
 type MemoryWatchdog struct {
 	provider   MemoryProvider
 	processes  func() []processMemInfo
 	onPressure func(level MemoryPressureLevel, stats MemoryStats)
 	config     MemoryWatchdogConfig
 	logger     *zap.SugaredLogger
+	// lastLevel is the level the previous sample computed, so sample can
+	// tell a return to Normal from a steady Normal. Only the goroutine
+	// running sample touches it.
+	lastLevel MemoryPressureLevel
 }
 
 // processMemInfo is the minimal info needed to sample a process's RSS.
@@ -133,6 +140,8 @@ func (w *MemoryWatchdog) sample() {
 	// Compute pressure level
 	stats.PressureLevel = w.computePressure(stats)
 	memoryPressureLevelGauge.Set(float64(stats.PressureLevel))
+	previous := w.lastLevel
+	w.lastLevel = stats.PressureLevel
 
 	if stats.PressureLevel >= MemoryPressureWarning {
 		w.logger.Warnw("memory pressure detected",
@@ -141,6 +150,22 @@ func (w *MemoryWatchdog) sample() {
 			"total", formatMemory(stats.TotalMemory),
 			"wired", formatMemory(stats.WiredMemory),
 			"totalRSS", formatMemory(stats.TotalRSS),
+		)
+		if w.onPressure != nil {
+			w.onPressure(stats.PressureLevel, stats)
+		}
+		return
+	}
+
+	// Deliver the return to Normal exactly once: the callback needs it to
+	// undo what it did under pressure, clearing eviction blocks (otherwise
+	// held until the agent restarts) and setting MemoryPressure conditions
+	// back to Normal.
+	if previous >= MemoryPressureWarning {
+		w.logger.Infow("memory pressure returned to normal",
+			"previous", previous.String(),
+			"available", formatMemory(stats.AvailableMemory),
+			"total", formatMemory(stats.TotalMemory),
 		)
 		if w.onPressure != nil {
 			w.onPressure(stats.PressureLevel, stats)

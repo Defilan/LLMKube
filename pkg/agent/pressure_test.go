@@ -18,6 +18,8 @@ package agent
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -465,6 +468,10 @@ func readSkippedCounter(t *testing.T, reason string) float64 {
 func TestHandleMemoryPressure_NormalClearsBlockedSet(t *testing.T) {
 	isvc := newPressureTestISvc("svc-a", "low")
 	a := newPressureTestAgent(t, isvc)
+	// The return to Normal also tries to restart svc-a. Its Model does not
+	// exist here, so that start fails and withdraws svc-a's endpoint, which
+	// needs a registry.
+	a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
 
 	a.pressureBlocked["default/svc-a"] = true
 	a.lastPressureLevel = MemoryPressureCritical
@@ -472,6 +479,7 @@ func TestHandleMemoryPressure_NormalClearsBlockedSet(t *testing.T) {
 	a.handleMemoryPressure(context.Background(), MemoryPressureNormal, MemoryStats{
 		TotalMemory: 100 << 30, TotalRSS: 10 << 30,
 	})
+	a.evictedRestarts.Wait()
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -480,6 +488,206 @@ func TestHandleMemoryPressure_NormalClearsBlockedSet(t *testing.T) {
 	}
 	if a.lastPressureLevel != MemoryPressureNormal {
 		t.Errorf("lastPressureLevel = %v, want Normal", a.lastPressureLevel)
+	}
+}
+
+// returnToNormal reports a Warning-or-above to Normal transition to the
+// agent, then waits for the evicted-service restarts it launches.
+func returnToNormal(a *MetalAgent) {
+	a.handleMemoryPressure(context.Background(), MemoryPressureNormal, MemoryStats{
+		TotalMemory: 100 << 30, TotalRSS: 40 << 30,
+	})
+	a.evictedRestarts.Wait()
+}
+
+// blockEvicted marks keys as evicted under Critical pressure, the state
+// handleMemoryPressure's eviction path leaves behind.
+func blockEvicted(a *MetalAgent, keys ...string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, key := range keys {
+		a.pressureBlocked[key] = true
+	}
+	a.lastPressureLevel = MemoryPressureCritical
+}
+
+// runningKeys returns the sorted keys of the agent's managed processes.
+func runningKeys(a *MetalAgent) []string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	keys := make([]string, 0, len(a.processes))
+	for key := range a.processes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// TestHandleMemoryPressure_NormalRestartsEvictedService is the regression test
+// for #2078: a service evicted under Critical pressure must start again once
+// pressure returns to Normal. No watcher runs here, so the restart has to come
+// from handleMemoryPressure itself: the watcher emits an event only when an
+// InferenceService's resourceVersion changes, so clearing the block alone left
+// the service down until the agent restarted. Its MemoryPressure condition
+// must also stop claiming Evicted.
+func TestHandleMemoryPressure_NormalRestartsEvictedService(t *testing.T) {
+	low := refusalISVC("svc-low")
+	low.Spec.Priority = "low"
+	high := refusalISVC("svc-high")
+	high.Spec.Priority = "high"
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{EvictionEnabled: true}, low, high, refusalModel())
+	ctx := context.Background()
+	for _, isvc := range []*inferencev1alpha1.InferenceService{low, high} {
+		if err := a.ensureProcess(ctx, isvc); err != nil {
+			t.Fatalf("start %s: %v", isvc.Name, err)
+		}
+	}
+
+	a.handleMemoryPressure(ctx, MemoryPressureCritical, MemoryStats{
+		TotalMemory: 100 << 30, TotalRSS: 80 << 30,
+	})
+	if !a.isPressureBlocked("default/svc-low") || ex.starts != 2 {
+		t.Fatalf("setup: svc-low not evicted (blocked=%v, starts=%d)",
+			a.isPressureBlocked("default/svc-low"), ex.starts)
+	}
+	if got := runningKeys(a); !slices.Equal(got, []string{"default/svc-high"}) {
+		t.Fatalf("setup: running after eviction = %v, want only svc-high", got)
+	}
+
+	returnToNormal(a)
+
+	if ex.starts != 3 || ex.lastCfg.Name != "svc-low" {
+		t.Errorf("starts = %d (last %q), want 3 with svc-low restarted last", ex.starts, ex.lastCfg.Name)
+	}
+	if got, want := runningKeys(a), []string{"default/svc-high", "default/svc-low"}; !slices.Equal(got, want) {
+		t.Errorf("running after the return to Normal = %v, want %v", got, want)
+	}
+	if a.isPressureBlocked("default/svc-low") {
+		t.Error("svc-low is still blocked after the return to Normal")
+	}
+
+	got := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "svc-low"}, got); err != nil {
+		t.Fatalf("get svc-low: %v", err)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, ConditionMemoryPressure)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonMemoryNormal {
+		t.Errorf("svc-low MemoryPressure condition = %+v, want status False reason %s", cond, ReasonMemoryNormal)
+	}
+}
+
+// TestHandleMemoryPressure_NormalLeavesGoneEvictedServicesDown covers the
+// services a return to Normal must not start even though it clears their
+// block: one deleted while blocked, one being deleted (held by a finalizer),
+// one scaled to zero, and one whose Model is no longer a Metal one (the
+// watcher stopped claiming it, which never cleared its block). svc-live is
+// the control: it proves the restart ran at all.
+func TestHandleMemoryPressure_NormalLeavesGoneEvictedServicesDown(t *testing.T) {
+	live := refusalISVC("svc-live")
+	deleting := refusalISVC("svc-deleting")
+	deleting.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	deleting.Finalizers = []string{"example.com/hold"}
+	zero := refusalISVC("svc-zero")
+	zero.Spec.Replicas = ptr.To(int32(0))
+	moved := refusalISVC("svc-moved")
+	moved.Spec.ModelRef = "cuda-model"
+	cudaModel := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "cuda-model", Namespace: "default"},
+		Spec: inferencev1alpha1.ModelSpec{Source: "https://example.invalid/c.gguf", Format: "gguf",
+			Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cuda"}},
+	}
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, live, deleting, zero, moved, refusalModel(), cudaModel)
+	a.watcher = NewInferenceServiceWatcher(a.config.K8sClient, "default", newNopLogger())
+
+	blockEvicted(a, "default/svc-deleting", "default/svc-gone", "default/svc-live",
+		"default/svc-moved", "default/svc-zero")
+	returnToNormal(a)
+
+	if got, want := runningKeys(a), []string{"default/svc-live"}; !slices.Equal(got, want) {
+		t.Errorf("running after the return to Normal = %v, want %v", got, want)
+	}
+	if ex.starts != 1 {
+		t.Errorf("engine started %d time(s), want 1 (svc-live only)", ex.starts)
+	}
+}
+
+// TestHandleMemoryPressure_RestartStopsWhenPressureReturns covers pressure
+// rising again while evicted services are being restarted: the services not
+// yet restarted must be blocked again for the next return to Normal, not
+// started under the pressure that evicted them.
+func TestHandleMemoryPressure_RestartStopsWhenPressureReturns(t *testing.T) {
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, refusalISVC("svc-a"), refusalISVC("svc-b"), refusalModel())
+	// svc-a restarts first (keys run in sorted order), and its model load
+	// drives the host back to Critical.
+	ex.onStart = func() {
+		a.mu.Lock()
+		a.lastPressureLevel = MemoryPressureCritical
+		a.mu.Unlock()
+	}
+
+	blockEvicted(a, "default/svc-a", "default/svc-b")
+	returnToNormal(a)
+
+	if ex.starts != 1 || ex.lastCfg.Name != "svc-a" {
+		t.Errorf("starts = %d (last %q), want only svc-a started", ex.starts, ex.lastCfg.Name)
+	}
+	if !a.isPressureBlocked("default/svc-b") {
+		t.Error("svc-b must be blocked again: pressure left Normal before its turn")
+	}
+	if a.isPressureBlocked("default/svc-a") {
+		t.Error("svc-a was restarted, so it must not be blocked")
+	}
+}
+
+// TestHandleMemoryPressure_ReturnToNormalSideEffects pins what a return to
+// Normal does to a running, never-evicted service now that the watchdog
+// delivers it: one Normal-type MemoryPressureLevelChanged event, the
+// condition back to False/Normal, and no EvictionSkipped event or skipped
+// counter.
+func TestHandleMemoryPressure_ReturnToNormalSideEffects(t *testing.T) {
+	isvc := newPressureTestISvc("svc-a", "normal")
+	a := newPressureTestAgent(t, isvc)
+	a.config.EvictionEnabled = true
+	rec := record.NewFakeRecorder(32)
+	a.config.EventRecorder = rec
+	a.processes["default/svc-a"] = &ManagedProcess{
+		Name: "svc-a", Namespace: "default", ModelPath: "/m.gguf",
+		Priority: "normal", StartedAt: time.Now(),
+	}
+	a.handleMemoryPressure(context.Background(), MemoryPressureWarning, MemoryStats{
+		TotalMemory: 100 << 30, TotalRSS: 25 << 30,
+	})
+	_ = drainEvents(rec)
+
+	reasons := []string{"disabled", "below_guard", SkipReasonEmpty, SkipReasonFloor,
+		SkipReasonAllProtected, SkipReasonRuntimeIneligible}
+	before := make(map[string]float64, len(reasons))
+	for _, r := range reasons {
+		before[r] = readSkippedCounter(t, r)
+	}
+
+	returnToNormal(a)
+
+	events := drainEvents(rec)
+	wantPrefix := corev1.EventTypeNormal + " " + EventReasonMemoryPressureLevelChanged
+	if len(events) != 1 || !strings.HasPrefix(events[0], wantPrefix) ||
+		!strings.Contains(events[0], "warning to normal") {
+		t.Errorf("events = %v, want exactly one Normal %s for warning to normal",
+			events, EventReasonMemoryPressureLevelChanged)
+	}
+	for _, r := range reasons {
+		if d := readSkippedCounter(t, r) - before[r]; d != 0 {
+			t.Errorf("evictions_skipped_total{reason=%q} moved by %v on a return to Normal", r, d)
+		}
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: "svc-a"}, got); err != nil {
+		t.Fatalf("get isvc: %v", err)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, ConditionMemoryPressure)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonMemoryNormal {
+		t.Errorf("MemoryPressure condition = %+v, want status False reason %s", cond, ReasonMemoryNormal)
 	}
 }
 

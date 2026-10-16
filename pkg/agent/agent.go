@@ -284,7 +284,9 @@ type MetalAgent struct {
 	// evicted under memory pressure. Subsequent ensureProcess calls for these
 	// keys are no-ops while lastPressureLevel != Normal, to prevent a
 	// thrashing respawn loop where the controller's UPDATED event simply
-	// re-spawns the process we just killed for memory.
+	// re-spawns the process we just killed for memory. handleMemoryPressure
+	// clears it, and starts those services again, when pressure returns to
+	// Normal.
 	pressureBlocked map[string]bool
 	// lastPressureLevel is the most recent pressure level reported by the
 	// watchdog. Used to gate respawn (above) and to detect transitions for
@@ -296,6 +298,9 @@ type MetalAgent struct {
 	// current level without re-patching ones already observed at it.
 	// Reset on every level transition.
 	pressureObserved map[string]MemoryPressureLevel
+	// evictedRestarts tracks the restartEvicted goroutines a return to
+	// Normal launches, so tests can wait for them to finish.
+	evictedRestarts sync.WaitGroup
 
 	// starting records namespacedName keys whose ensureProcess call is
 	// in flight, and keys whose unhealthy engine the health monitor is
@@ -1140,7 +1145,8 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// still abnormal. Without this guard, the controller's UPDATED event
 	// loop would silently re-spawn the very process we just killed for
 	// memory, defeating eviction. The block clears automatically once the
-	// watchdog reports MemoryPressureNormal.
+	// watchdog reports MemoryPressureNormal, and handleMemoryPressure then
+	// calls ensureProcess for the service again (restartEvicted).
 	if blocked && pressureLevel != MemoryPressureNormal {
 		a.logger.Warnw("skipping ensureProcess; eviction-blocked under memory pressure",
 			"namespace", isvc.Namespace, "name", isvc.Name,

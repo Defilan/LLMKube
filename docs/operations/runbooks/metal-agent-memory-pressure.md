@@ -167,6 +167,10 @@ If memory pressure is recurring on this host:
      --output=custom-columns='TIME:.lastTimestamp,REASON:.reason,MSG:.message' | tail -5
    ```
 
+   The recovery itself shows up as one type `Normal` event per managed
+   service, with a message containing `to normal`, and the agent logs
+   `memory pressure returned to normal`.
+
 2. **The managed services that should be running, are running.**
 
    ```bash
@@ -175,11 +179,22 @@ If memory pressure is recurring on this host:
 
    An eviction does **not** change the InferenceService spec. The agent kills
    the local process and sets the `MemoryPressure` condition with reason
-   `Evicted`; `spec.replicas` is left exactly as you set it, so a service
-   showing `replicas: 1` with no running process is the expected shape after
-   an eviction, not a stuck reconcile. The agent keeps that key blocked
-   in-memory so a controller event cannot respawn it mid-teardown, and clears
-   every block the moment pressure returns to Normal.
+   `Evicted`; `spec.replicas` is left exactly as you set it, so while
+   pressure is above Normal a service showing `replicas: 1` with no running
+   process is the expected shape after an eviction, not a stuck reconcile.
+   The agent keeps that key blocked in-memory so a controller event cannot
+   respawn it while pressure stays high.
+
+   The moment pressure returns to Normal, the agent clears every block, sets
+   each evicted service's `MemoryPressure` condition back to `False` with
+   reason `Normal`, and starts the evicted services again, one at a time,
+   through the same memory admission check as any other start. A service
+   deleted or scaled to zero in the meantime stays down. If pressure rises
+   again before every evicted service is back, the rest stay blocked until
+   the next return to Normal. A service still down after pressure has been
+   Normal for a while most likely failed its start: check its
+   `status.schedulingStatus`, its events, and the agent log for
+   `failed to restart evicted service`.
 
 3. **`llmkube_metal_agent_evictions_skipped_total` is not climbing** unless eviction is intentionally disabled. The agent serves `/metrics` on `127.0.0.1:9090` only, so run this on the Mac itself (or over `ssh <metal-agent-host>`):
 

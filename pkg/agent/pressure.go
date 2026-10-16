@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -102,13 +103,15 @@ func (a *MetalAgent) emitInferenceEvent(
 // Behavior, in order:
 //
 //  1. Capture the new pressure level under the agent's mutex.
-//  2. If pressure dropped to Normal, clear pressureBlocked so the next
-//     ensureProcess can respawn previously evicted services.
+//  2. If pressure dropped to Normal, clear pressureBlocked so previously
+//     evicted services may run again.
 //  3. Update the MemoryPressure condition on every managed
 //     InferenceService that has not already been observed at this level
 //     (covers level transitions and late-spawned processes during
-//     sustained pressure).
-//  4. If the level is Critical AND the friendly-fire guard says we're
+//     sustained pressure), and on every service step 2 unblocked.
+//  4. Start the services step 2 unblocked again, on their own goroutine
+//     (restartEvicted).
+//  5. If the level is Critical AND the friendly-fire guard says we're
 //     responsible for the pressure (shouldEvict), pick one process to
 //     evict, mark it blocked, and stop it. Only one eviction per watchdog
 //     tick to avoid stampedes. Skip-without-evict outcomes are recorded
@@ -120,10 +123,9 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	a.mu.Lock()
 	previous := a.lastPressureLevel
 	a.lastPressureLevel = level
-	if level == MemoryPressureNormal && len(a.pressureBlocked) > 0 {
-		a.logger.Infow("memory pressure cleared; unblocking previously evicted services",
-			"unblocked", len(a.pressureBlocked))
-		a.pressureBlocked = make(map[string]bool)
+	var unblocked []string
+	if level == MemoryPressureNormal {
+		unblocked = a.unblockAllLocked()
 	}
 	// Reset observed-at-level when the level changes so each new level
 	// triggers a fresh round of condition patches.
@@ -137,12 +139,21 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	// Determine which keys still need a condition patch at this level.
 	// New keys (added since the last tick) and unchanged keys at a new
 	// level both fall through; already-observed keys are skipped to keep
-	// the status churn quiet under sustained pressure.
+	// the status churn quiet under sustained pressure. The comma-ok matters
+	// at Normal: it is the map's zero value, so a plain lookup would read a
+	// key never patched at Normal as already observed there and leave its
+	// condition at Warning or Critical.
 	needsPatch := make(map[string]*ManagedProcess, len(snapshot))
 	for k, p := range snapshot {
-		if a.pressureObserved[k] != level {
+		if observed, ok := a.pressureObserved[k]; !ok || observed != level {
 			needsPatch[k] = p
 		}
+	}
+	// An evicted service is no longer in a.processes, but its condition
+	// still reads Evicted; bring it back to Normal with the rest.
+	for _, key := range unblocked {
+		namespace, name := parseKey(key)
+		needsPatch[key] = &ManagedProcess{Namespace: namespace, Name: name}
 	}
 	a.mu.Unlock()
 
@@ -178,6 +189,8 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 				EventReasonMemoryPressureLevelChanged, "%s", eventMsg)
 		}
 	}
+
+	a.restartEvictedAsync(ctx, unblocked)
 
 	// Eviction path. Honored via the --eviction-enabled CLI flag (default
 	// false) so that operators must explicitly opt in to having the
@@ -257,6 +270,115 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		target.Priority,
 		formatMemory(stats.TotalRSS), formatMemory(stats.TotalMemory),
 	)
+}
+
+// unblockAllLocked clears pressureBlocked and returns the keys it held,
+// sorted so restarts run in a stable order. The caller must hold a.mu.
+func (a *MetalAgent) unblockAllLocked() []string {
+	if len(a.pressureBlocked) == 0 {
+		return nil
+	}
+	a.logger.Infow("memory pressure cleared; unblocking previously evicted services",
+		"unblocked", len(a.pressureBlocked))
+	keys := make([]string, 0, len(a.pressureBlocked))
+	for key := range a.pressureBlocked {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	a.pressureBlocked = make(map[string]bool)
+	return keys
+}
+
+// restartEvictedAsync runs restartEvicted on its own goroutine, so the
+// watchdog goroutine never waits on a model load. No-op without keys.
+func (a *MetalAgent) restartEvictedAsync(ctx context.Context, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	a.evictedRestarts.Go(func() { a.restartEvicted(ctx, keys) })
+}
+
+// restartEvicted starts again, one at a time, the services whose eviction
+// block a return to Normal just cleared. Nothing else would: the watcher
+// emits an event only when an InferenceService's resourceVersion changes,
+// the health monitor only checks processes still in a.processes, and an
+// eviction leaves the spec untouched, so an evicted service would otherwise
+// stay down until the agent restarted.
+//
+// Each service is fetched fresh right before its turn and goes through
+// ensureProcess, the watcher's own path: memory admission and every
+// pre-start refusal apply, a service scaled to zero or suspended takes the
+// stop path, and the in-flight guard dedupes against a watch event for the
+// same key. Sequential on purpose, since parallel model loads could each
+// pass admission and together push the host back into pressure. If pressure
+// leaves Normal before a service's turn, it and every service after it are
+// blocked again until the next return to Normal, rather than started under
+// the pressure that evicted them.
+func (a *MetalAgent) restartEvicted(ctx context.Context, keys []string) {
+	for i, key := range keys {
+		if ctx.Err() != nil {
+			return
+		}
+		if a.reblockUnlessNormal(keys[i:]) {
+			return
+		}
+		isvc := a.fetchEvictedForRestart(ctx, key)
+		if isvc == nil {
+			continue
+		}
+		a.logger.Infow("restarting service evicted under memory pressure", "key", key)
+		if err := a.ensureProcess(ctx, isvc); err != nil {
+			a.logger.Warnw("failed to restart evicted service", "key", key, "error", err)
+		}
+	}
+}
+
+// reblockUnlessNormal blocks keys again and returns true when memory pressure
+// is no longer Normal; otherwise it changes nothing and returns false.
+func (a *MetalAgent) reblockUnlessNormal(keys []string) bool {
+	a.mu.Lock()
+	level := a.lastPressureLevel
+	if level != MemoryPressureNormal {
+		for _, key := range keys {
+			a.pressureBlocked[key] = true
+		}
+	}
+	a.mu.Unlock()
+	if level == MemoryPressureNormal {
+		return false
+	}
+	a.logger.Infow("memory pressure rose again; keeping the remaining evicted services blocked",
+		"level", level.String(), "blocked", len(keys))
+	return true
+}
+
+// fetchEvictedForRestart returns the current InferenceService for an evicted
+// key, or nil when it must not be restarted: deleted or being deleted while
+// blocked, or no longer one this agent claims (shouldWatch, e.g. its Model is
+// no longer a Metal one). The watcher reports a service it stops claiming as
+// deleted, which clears a.processes but never the block, so that check
+// cannot be left to ensureProcess.
+func (a *MetalAgent) fetchEvictedForRestart(ctx context.Context, key string) *inferencev1alpha1.InferenceService {
+	namespace, name := parseKey(key)
+	isvc := &inferencev1alpha1.InferenceService{}
+	nn := types.NamespacedName{Namespace: namespace, Name: name}
+	if err := a.config.K8sClient.Get(ctx, nn, isvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			a.logger.Infow("evicted service was deleted while blocked; not restarting it", "key", key)
+		} else {
+			a.logger.Warnw("failed to fetch evicted service for restart", "key", key, "error", err)
+		}
+		return nil
+	}
+	if isvc.DeletionTimestamp != nil {
+		a.logger.Infow("evicted service is being deleted; not restarting it", "key", key)
+		return nil
+	}
+	if a.watcher != nil && !a.watcher.shouldWatch(ctx, isvc) {
+		a.logger.Infow("evicted service is no longer claimed by this agent; not restarting it", "key", key)
+		return nil
+	}
+	return isvc
 }
 
 // emitEvictionSkippedAcrossManaged broadcasts an EvictionSkipped event to
