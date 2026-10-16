@@ -172,9 +172,9 @@ kubectl apply -f model.yaml
 
 ## Project status
 
-- **Actively maintained:** frequent point releases, three in October 2026 alone (v0.10.2 through [v0.10.4](https://github.com/defilantech/LLMKube/releases/tag/v0.10.4)). See the [latest release](https://github.com/defilantech/LLMKube/releases/latest) and the [CHANGELOG](CHANGELOG.md) for what's current.
+- **Actively maintained:** frequent point releases, three in October 2026 alone as of 2026-10-16 (v0.10.2 through [v0.10.4](https://github.com/defilantech/LLMKube/releases/tag/v0.10.4)). See the [latest release](https://github.com/defilantech/LLMKube/releases/latest) and the [CHANGELOG](CHANGELOG.md) for what's current.
 - **First-time contributors have landed real features:** Intel oneAPI / SYCL GPU support arrived as PR [#557](https://github.com/defilantech/LLMKube/pull/557) from a first-time contributor, and configurable GPU resource names for AMD/Vulkan/Intel scheduling as [#709](https://github.com/defilantech/LLMKube/pull/709) from a contributor new to the repo, who followed with vendor-neutral DRA scheduling in [#750](https://github.com/defilantech/LLMKube/pull/750).
-- **Two Foreman-authored branches have reached this repository as upstream PRs:** [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588).
+- **Foreman, the agentic harness, contributes code to this repository:** its first two merged PRs landed in May 2026 ([#508](https://github.com/defilantech/LLMKube/pull/508), [#588](https://github.com/defilantech/LLMKube/pull/588)), with more Foreman-authored PRs merging since.
 - **Running LLMKube in production, a lab, or a homelab?** [Add yourself to ADOPTERS.md](ADOPTERS.md).
 
 ---
@@ -315,7 +315,7 @@ Foreman is meant for shops where on-prem hardware, sovereignty constraints, or s
 | **Apple Silicon Metal GPU** | Native (Metal Agent) | No | Local only | No | CPU only |
 | **NVIDIA GPU** | Yes | Yes | Limited | Yes | Yes |
 | **AMD GPU** (Vulkan, incl. Strix Halo) | Yes | No | Limited | No | Limited |
-| **Heterogeneous clusters** (NVIDIA + Apple Silicon + AMD) | Yes | No | No | No | No |
+| **Heterogeneous clusters** (NVIDIA + Apple Silicon + AMD + Intel) | Yes | No | No | No | No |
 | **Hybrid local + cloud routing with policy** | `ModelRouter` CRD | No | No | No | No |
 | **Fail-closed for regulated data (PII/PHI)** | Static + runtime, K8s-enforced | No | No | No | No |
 | **Per-rule / per-backend timeout budgets** | Yes (`spec.rules[].timeout`) | No | No | No | No |
