@@ -820,7 +820,7 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
 
 ### Enable
 
-1. Install the NOPASSWD sudoers fragment so the agent can call `powermetrics` without a password. **The shipped fragment pins both the binary path and its exact argument vector.** The rule contains no wildcard characters; the sampling interval is rendered into it at install time, so with the default 1s interval the grant is `powermetrics --samplers cpu_power,gpu_power -i 1000` and nothing else, not `powermetrics --output-file=/wherever`.
+1. Install the NOPASSWD sudoers fragment so the agent can call `powermetrics` without a password. **The shipped fragment pins both the binary path and its arguments.** The rule contains no wildcard characters and the sampling interval is rendered into it at install time, so it matches only this one command line (sudo compares the space-joined arguments): with the default 1s interval the grant is `powermetrics --samplers cpu_power,gpu_power -i 1000` and nothing else, not `powermetrics --output-file=/wherever`.
 
    The easy way (one command, sudo prompts you):
 
@@ -836,7 +836,7 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
    make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000
    ```
 
-   Before it starts sampling, the agent asks sudo whether that exact argument vector is permitted (`sudo -n -l /usr/bin/powermetrics --samplers cpu_power,gpu_power -i <ms>`). If it is not, because the fragment is missing or was rendered for a different interval, the agent does not start `powermetrics`; it logs `apple-power: refusing to start powermetrics` with a `remedy` field holding the `make` command to run. The check relies on sudo's default of allowing `sudo -l` without a password when any of the user's rules is `NOPASSWD`; if your sudoers sets `listpw` to `all` or `always`, the check cannot pass and the sampler stays off.
+   If the installed rule does not match the agent's command (the fragment is missing, or was rendered for a different interval), sudo refuses it and the agent logs `apple-power: powermetrics exited unexpectedly` with sudo's message, the command it ran (`argv`) and a `remedy` field naming the `make` command to run.
 
    To **uninstall**:
 
@@ -851,7 +851,7 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
    sed -e "s/__LLMKUBE_USER__/$(whoami)/" \
        -e "s/__LLMKUBE_POWERMETRICS_INTERVAL_MS__/1000/" \
        deployment/macos/sudoers.d/llmkube-powermetrics > "$TMP"
-   sudo visudo -cf "$TMP"
+   visudo -cf "$TMP"   # syntax check; needs no root
    sudo install -m 0440 -o root -g wheel "$TMP" /etc/sudoers.d/llmkube-powermetrics
    rm "$TMP"
    ```
@@ -1370,6 +1370,12 @@ controller predates relay support.
   design. Call the Service instead, or, on the Mac itself, the agent's client
   proxy on `127.0.0.1:<client-port>` (see "Ingress and client-proxy flags"
   above).
+- Upgrading the agent does not change `/etc/sudoers.d/llmkube-powermetrics`.
+  On a host where you installed the powermetrics rule, re-run
+  `make install-powermetrics-sudo` (with `APPLE_POWER_INTERVAL_MS=<ms>` if
+  the agent uses a non-default `--apple-power-interval`), then confirm with
+  `sudo -ln | grep powermetrics` that the rule ends in `-i` followed by a
+  number.
 
 #### Upgrading to 0.10.1
 

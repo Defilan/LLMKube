@@ -947,8 +947,8 @@ because `powermetrics` requires root.
 Enable in three steps:
 
 1. Install the bundled NOPASSWD sudoers fragment, which pins both
-   the binary path and the exact argument vector (no wildcards) so
-   the grant is the narrowest possible:
+   the binary path and the arguments (no wildcards), so it matches
+   only the one command line the agent runs:
 
    ```bash
    make install-powermetrics-sudo
@@ -958,9 +958,11 @@ Enable in three steps:
    run the agent with a non-default `--apple-power-interval`, pass
    the same value in whole milliseconds (minimum 100), for example
    `make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000`
-   for `--apple-power-interval=2s`. The agent checks the installed
-   rule before sampling and logs `apple-power: refusing to start
-   powermetrics` with the command to run when it does not match.
+   for `--apple-power-interval=2s`. When the installed rule does
+   not match, sudo refuses the agent's command and the agent logs
+   `apple-power: powermetrics exited unexpectedly` with a `remedy`
+   field naming the command to run. Upgrading the agent does not
+   change an installed rule; re-run the install after upgrading.
 
 2. Add `--apple-power-enabled` to the launchd plist's
    `ProgramArguments` array.

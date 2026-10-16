@@ -20,11 +20,9 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -263,126 +261,41 @@ func TestPowermetricsIntervalMS(t *testing.T) {
 	}
 }
 
-// fakeSudo writes a stand-in for /usr/bin/sudo whose policy permits only the
-// argv the fragment rendered with the default interval grants, the way the
-// real sudo answers `sudo -n -l <argv>`: print the command and exit 0 when
-// permitted, exit 1 otherwise.
-func fakeSudo(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "sudo")
-	body := `if [ "$#" -eq 7 ] && [ "$1" = -n ] && [ "$2" = -l ] && [ "$3" = /usr/bin/powermetrics ] &&
-   [ "$4" = --samplers ] && [ "$5" = cpu_power,gpu_power ] && [ "$6" = -i ] && [ "$7" = 1000 ]; then
-	echo "$3 $4 $5 $6 $7"
-	exit 0
-fi
-echo "sudo: a password is required" >&2
-exit 1
-`
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
-		t.Fatalf("write fake sudo: %v", err)
-	}
-	return path
-}
-
-func TestSudoPermits_OnlyTheExactArgv(t *testing.T) {
-	sudo := fakeSudo(t)
-	ctx := context.Background()
-
-	if err := sudoPermits(ctx, sudo, powermetricsArgv(DefaultPowermetricsBin, time.Second)); err != nil {
-		t.Errorf("sudoPermits refused the argv the policy permits: %v", err)
-	}
-
-	err := sudoPermits(ctx, sudo, powermetricsArgv(DefaultPowermetricsBin, 2*time.Second))
-	if err == nil {
-		t.Fatal("sudoPermits accepted an argv the policy does not permit")
-	}
-	if !strings.Contains(err.Error(), "a password is required") {
-		t.Errorf("refusal error %q does not carry sudo's reason", err)
-	}
-
-	missing := filepath.Join(t.TempDir(), "missing-sudo")
-	if err := sudoPermits(ctx, missing, powermetricsArgv(DefaultPowermetricsBin, time.Second)); err == nil {
-		t.Error("sudoPermits accepted when sudo could not be run")
-	}
-}
-
-// TestApplePowerSamplerRun_RefusesWhenSudoersDoesNotPermit requires Run to
-// check the exact argv against sudo's policy first and, when the policy does
-// not permit it, to log the refusal with the install command for this
-// interval and never launch powermetrics.
-func TestApplePowerSamplerRun_RefusesWhenSudoersDoesNotPermit(t *testing.T) {
+// TestApplePowerSamplerRun_ExitWarningCarriesArgvAndRemedy covers the common
+// failure after an interval change or a missing rule: sudo refuses the
+// command and the child exits. The warning must name the command sudo was
+// asked to run and the install command for this interval, next to sudo's
+// own message.
+func TestApplePowerSamplerRun_ExitWarningCarriesArgvAndRemedy(t *testing.T) {
 	core, logs := observer.New(zap.WarnLevel)
 	s := NewApplePowerSampler(DefaultPowermetricsBin, 2*time.Second, zap.New(core).Sugar())
-	var checked []string
-	s.permitCheck = func(_ context.Context, argv []string) error {
-		checked = argv
-		return errors.New("sudo: a password is required")
-	}
-	launched := false
 	s.commandFactory = func(ctx context.Context, _ string, _ time.Duration) *exec.Cmd {
-		launched = true
-		return exec.CommandContext(ctx, "/usr/bin/true")
+		return exec.CommandContext(ctx, "/bin/sh", "-c", `echo "sudo: a password is required" >&2; exit 1`)
 	}
 
 	s.Run(context.Background())
 
-	if launched {
-		t.Fatal("Run launched powermetrics although sudo does not permit its argv")
-	}
-	if want := powermetricsArgv(DefaultPowermetricsBin, 2*time.Second); !slices.Equal(checked, want) {
-		t.Errorf("permit check got argv %q, want %q", checked, want)
-	}
-	entries := logs.FilterMessageSnippet("refusing to start powermetrics").All()
+	entries := logs.FilterMessageSnippet("powermetrics exited unexpectedly").All()
 	if len(entries) != 1 {
-		t.Fatalf("want 1 refusal log line, got %d (all warnings: %v)", len(entries), logs.All())
+		t.Fatalf("want 1 exit warning, got %d (all warnings: %v)", len(entries), logs.All())
 	}
-	want := "make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000"
-	if got := entries[0].ContextMap()["remedy"]; got != want {
-		t.Errorf("refusal remedy = %v, want %q", got, want)
+	fields := entries[0].ContextMap()
+	if got := fields["stderr"]; got != "sudo: a password is required" {
+		t.Errorf("stderr = %v, want sudo's message", got)
 	}
-}
-
-// TestApplePowerSamplerRun_QuietWhenCancelledDuringCheck covers shutdown: a
-// permit check that fails because ctx was cancelled is not a policy refusal
-// and must not be logged as one.
-func TestApplePowerSamplerRun_QuietWhenCancelledDuringCheck(t *testing.T) {
-	core, logs := observer.New(zap.WarnLevel)
-	s := NewApplePowerSampler(DefaultPowermetricsBin, time.Second, zap.New(core).Sugar())
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	s.permitCheck = func(ctx context.Context, _ []string) error {
-		cancel()
-		return ctx.Err()
+	wantArgv := powermetricsArgv(DefaultPowermetricsBin, 2*time.Second)
+	gotArgv, ok := fields["argv"].([]any)
+	if !ok || len(gotArgv) != len(wantArgv) {
+		t.Fatalf("argv = %#v, want %q", fields["argv"], wantArgv)
 	}
-	launched := false
-	s.commandFactory = func(ctx context.Context, _ string, _ time.Duration) *exec.Cmd {
-		launched = true
-		return exec.CommandContext(ctx, "/usr/bin/true")
+	for i, want := range wantArgv {
+		if gotArgv[i] != want {
+			t.Errorf("argv[%d] = %v, want %q", i, gotArgv[i], want)
+		}
 	}
-
-	s.Run(ctx)
-
-	if launched {
-		t.Error("Run launched powermetrics after its context was cancelled")
-	}
-	if n := logs.Len(); n != 0 {
-		t.Errorf("want no warnings on shutdown, got %d: %v", n, logs.All())
-	}
-}
-
-func TestApplePowerSamplerRun_LaunchesWhenSudoersPermits(t *testing.T) {
-	s := NewApplePowerSampler(DefaultPowermetricsBin, time.Second, zap.NewNop().Sugar())
-	s.permitCheck = func(context.Context, []string) error { return nil }
-	launched := false
-	s.commandFactory = func(ctx context.Context, _ string, _ time.Duration) *exec.Cmd {
-		launched = true
-		return exec.CommandContext(ctx, "/usr/bin/true")
-	}
-
-	s.Run(context.Background())
-
-	if !launched {
-		t.Error("Run did not launch powermetrics although sudo permits its argv")
+	wantRemedy := "if sudo refused the command, run make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000"
+	if got := fields["remedy"]; got != wantRemedy {
+		t.Errorf("remedy = %v, want %q", got, wantRemedy)
 	}
 }
 

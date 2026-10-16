@@ -12,8 +12,8 @@
 # flags that, combined with root, give an attacker a write-anywhere primitive
 # (`sudo powermetrics --output-file=/etc/passwd …`). The rule below names the
 # one invocation the agent runs, the cpu_power+gpu_power sampler at a fixed
-# sampling interval, and contains no wildcard characters, so it matches
-# exactly one argument vector.
+# sampling interval, and contains no wildcard characters, so it matches only
+# this one command line (sudo compares the space-joined arguments).
 #
 # This file is a template. Two placeholders are rendered at install time:
 #
@@ -25,11 +25,11 @@
 #       milliseconds, minimum 100. The agent default (1s) renders as 1000.
 #
 # A placeholder left in place, or an interval that differs from the agent's
-# --apple-power-interval, means the rule does not match. The agent checks the
-# rule with `sudo -n -l` before it starts sampling, logs "apple-power:
-# refusing to start powermetrics" with the command to fix it, and the gauges
-# read zero. Re-install with the matching interval whenever you change
-# --apple-power-interval.
+# --apple-power-interval, means the rule does not match: sudo refuses the
+# agent's command, the agent logs "apple-power: powermetrics exited
+# unexpectedly" with sudo's message and a remedy field naming the make command
+# to run, and the gauges read zero. Re-install with the matching interval
+# whenever you change --apple-power-interval.
 #
 # If you upgrade the agent and powermetrics stops returning data, it likely
 # means the agent's argv changed and this file is now a no-match. Re-install
