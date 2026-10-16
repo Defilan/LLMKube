@@ -47,7 +47,8 @@ var (
 	processRestarts = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "llmkube_metal_agent_process_restarts_total",
-			Help: "Total number of process restarts triggered by health monitoring.",
+			Help: "Total number of engine restart attempts by the agent: health restarts " +
+				"and restarts after a memory-pressure eviction.",
 		},
 		[]string{"name", "namespace"},
 	)
