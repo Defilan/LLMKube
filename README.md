@@ -299,7 +299,7 @@ spec:
     - { name: devstral-24b-reviewer }
 ```
 
-`kubectl apply` and watch the fleet land DCO-signed branches on a fork. Two such branches reached this repository as upstream PRs: [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588).
+`kubectl apply` and watch the fleet land DCO-signed branches on a fork. Foreman's debut branches landed as upstream PRs [#508](https://github.com/defilantech/LLMKube/pull/508) and [#588](https://github.com/defilantech/LLMKube/pull/588) in May 2026, and the pipeline has merged Foreman-authored PRs ever since.
 
 Foreman is meant for shops where on-prem hardware, sovereignty constraints, or sheer batch scale make the agentic-coding cloud-API model a poor fit. It is not a replacement for individual-developer tools like Cursor or aider; it is the control plane *below* those tools, for when you want a fleet doing the work instead of one developer.
 
