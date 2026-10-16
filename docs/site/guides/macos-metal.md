@@ -70,21 +70,28 @@ For OpenShift clusters, add `-f values-openshift.yaml`
 
 ## Step 3: Install and start the Metal Agent
 
-Clone the operator repo on your Mac:
+Clone the operator repo on your Mac and check out the release that
+matches the operator Helm installed:
 
 ```bash
 git clone https://github.com/defilantech/LLMKube.git
 cd LLMKube
+git checkout v$(helm show chart llmkube/llmkube | awk '/^appVersion:/{print $2}')
 ```
 
-The agent does not need your admin credentials. Mint a kubeconfig for
-a least-privilege ServiceAccount with the recipe in
-["Dedicated kubeconfig with least-privilege RBAC"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#dedicated-kubeconfig-with-least-privilege-rbac),
-which writes `~/.kube/llmkube-metal-agent.yaml`, then run the bundled
-installer with it:
+`helm show chart` reads the same local chart index `helm install`
+used, so this builds the agent from the controller's release tag
+instead of from `main`.
+
+The agent does not need your admin credentials. From the checkout,
+run the recipe in
+["Dedicated kubeconfig with least-privilege RBAC"](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#dedicated-kubeconfig-with-least-privilege-rbac).
+It creates a least-privilege ServiceAccount, writes a kubeconfig for
+it to `~/.kube/llmkube-metal-agent.yaml`, and ends by running the
+bundled installer with that kubeconfig:
 
 ```bash
-make install-metal-agent METAL_KUBECONFIG=$HOME/.kube/llmkube-metal-agent.yaml
+make install-metal-agent METAL_KUBECONFIG="$KC"   # KC=$HOME/.kube/llmkube-metal-agent.yaml
 ```
 
 Without `METAL_KUBECONFIG` the agent connects with the current context
@@ -156,12 +163,16 @@ template, so re-add your flags after a reinstall.
 Without `--host-ip` the agent auto-detects an address: a Tailscale
 address (100.64.0.0/10) if the Mac has one, otherwise the first other
 routable IPv4 address (skipping loopback, link-local, and Docker or VM
-bridge ranges). Only when there is none does it fall back to
-`host.minikube.internal`, `host.docker.internal` or 192.168.65.254,
-for a cluster on the same Mac. It logs the address it registered:
+bridge ranges). Only when there is none does it fall back, for a
+cluster on the same Mac, to the IP address `host.minikube.internal`
+resolves to on the Mac, else the one `host.docker.internal` resolves
+to, else 192.168.65.254. It registers the address, never the
+hostname, and logs
+`no routable interface for host-IP auto-detect; using co-located DNS fallback`.
+It logs the address it registered:
 
 ```bash
-grep 'auto-detected host IP\|registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
+grep 'auto-detected host IP\|co-located DNS fallback\|registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
 ```
 
 The detected address can be one your cluster cannot reach (a personal
@@ -526,12 +537,16 @@ running the plist launchd already loaded):
 
 ```bash
 cd /path/to/LLMKube-checkout
-git fetch --tags && git checkout v<version>
+git fetch --tags
+git checkout v$(helm show chart llmkube/llmkube | awk '/^appVersion:/{print $2}')
 launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
 while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
 make install-metal-agent METAL_KUBECONFIG=$HOME/.kube/llmkube-metal-agent.yaml
 launchctl print gui/$(id -u)/com.llmkube.metal-agent | grep 'state = running'
 ```
+
+If you installed the agent without a dedicated kubeconfig, drop the
+`METAL_KUBECONFIG=...` argument.
 
 The reinstall rewrites the launchd plist from the template, so re-add
 any flags you set by hand (`--host-ip`, `--memory-fraction` and so

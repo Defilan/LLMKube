@@ -18,7 +18,7 @@ One or more of:
   kubectl get inferenceservice <name> -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")]}{"\n"}'
   ```
 
-- Metric: `llmkube_metal_agent_evictions_skipped_total` increments (visible in the metal-agent's `/metrics` endpoint). Its companions are `llmkube_metal_agent_evictions_total` and the `llmkube_metal_agent_memory_pressure_level` gauge (0 Normal, 1 Warning, 2 Critical). The eviction path does not increment `llmkube_metal_agent_evictions_total` yet, so it reads 0; count `Evicted` events instead.
+- Metric: `llmkube_metal_agent_evictions_skipped_total` increments (visible in the metal-agent's `/metrics` endpoint). Its companions are `llmkube_metal_agent_evictions_total` and the `llmkube_metal_agent_memory_pressure_level` gauge (0 Normal, 1 Warning, 2 Critical).
 - Operator notices: free memory on the host drops, or applications connected to the inference endpoint report sudden hangs or 5xx responses.
 
 ## Diagnose

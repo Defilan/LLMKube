@@ -10,8 +10,9 @@ clients on the Mac use the agent's client proxy on `127.0.0.1:9999`.
 For a remote cluster (the recommended production shape), memory budgets and
 the full walkthrough, see the
 [macOS Metal Agent guide](https://llmkube.com/docs/guides/macos-metal). The
-complete agent reference is [`deployment/macos/README.md`](../../deployment/macos/README.md),
-which also ships in the release archive next to this file.
+complete agent reference is [`deployment/macos/README.md`](../../deployment/macos/README.md).
+The release archive carries it, the plist template and the RBAC manifest under
+`deployment/macos/`.
 
 ## Prerequisites
 
@@ -19,7 +20,8 @@ which also ships in the release archive next to this file.
 - **Apple Silicon Mac** (M1 to M5). Recommended: 16GB+ unified memory.
 
 ### Software
-1. **Homebrew**, plus **minikube** with the Docker driver, **kubectl** and **Helm**:
+1. **Homebrew**, a running Docker runtime for minikube's Docker driver (Docker
+   Desktop, or another such as Colima), plus **minikube**, **kubectl** and **Helm**:
    ```bash
    brew install minikube kubectl helm
    minikube start --driver=docker
@@ -56,18 +58,29 @@ kubectl wait --for=condition=ready pod -l control-plane=controller-manager -n ll
 
 ### From source (recommended)
 
+The agent connects with the current context of `~/.kube/config`, which
+`minikube start` sets. If your shell sets `$KUBECONFIG`, minikube writes that
+file instead, and the agent under launchd does not see your shell's
+environment: replace the last line below with
+`make install-metal-agent METAL_KUBECONFIG=<that file>`.
+
 ```bash
 git clone https://github.com/defilantech/LLMKube.git
 cd LLMKube
+# Build the release that matches the operator Helm installed in Step 1
+git checkout v$(helm show chart llmkube/llmkube | awk '/^appVersion:/{print $2}')
 make install-metal-agent
 ```
 
-This builds the agent, copies it to `/usr/local/bin/llmkube-metal-agent` (sudo
-asks for your password), renders the launchd plist into
-`~/Library/LaunchAgents/com.llmkube.metal-agent.plist` and starts the service.
-The agent connects with the current context of `~/.kube/config`, which
-`minikube start` sets. To run it with a least-privilege identity instead, see
-"Dedicated kubeconfig with least-privilege RBAC" in
+`helm show chart` reads the same local chart index `helm install` used, so the
+checkout matches the controller's release tag instead of `main`.
+
+`make install-metal-agent` builds the agent, copies it to
+`/usr/local/bin/llmkube-metal-agent` (sudo asks for your password), renders the
+launchd plist into `~/Library/LaunchAgents/com.llmkube.metal-agent.plist` and
+starts the service. To run the agent with a least-privilege identity instead
+of your minikube admin context, see "Dedicated kubeconfig with least-privilege
+RBAC" in
 [`deployment/macos/README.md`](../../deployment/macos/README.md#dedicated-kubeconfig-with-least-privilege-rbac).
 
 ### From a release archive
@@ -88,7 +101,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.
 ```
 
 The release binary is not notarized. If macOS refuses to run it, install from
-source instead.
+source instead. For an archive install, a kubeconfig other than
+`~/.kube/config` goes in the plist's `ProgramArguments` as
+`--kubeconfig <file>`.
+
+Whichever way you installed it, if macOS asks whether `llmkube-metal-agent` may
+accept incoming connections, allow it: the in-cluster relay connects to the
+agent's TLS ingress on port 9443 (`--ingress-port`).
 
 ## Verify Setup
 
@@ -139,9 +158,12 @@ grep 'registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
 Without `--host-ip`, the agent picks a Tailscale address (100.64.0.0/10) if
 the Mac has one, otherwise the first other routable IPv4 address, skipping
 loopback, link-local and Docker or VM bridge ranges. Only when there is none
-does it fall back to `host.minikube.internal`, `host.docker.internal` or
-192.168.65.254. If the cluster cannot reach the address it picked (see "Service
-not accessible" below), set `--host-ip` as described in
+does it fall back to the IP address `host.minikube.internal` resolves to on the
+Mac, else the one `host.docker.internal` resolves to, else 192.168.65.254. It
+registers the address, never the hostname, and logs
+`no routable interface for host-IP auto-detect; using co-located DNS fallback`.
+If the cluster cannot reach the address it picked (see "Service not
+accessible" below), set `--host-ip` as described in
 [`deployment/macos/README.md`](../../deployment/macos/README.md#--host-ip-flag-remote-cluster).
 
 A model that is not in the catalog:
@@ -150,8 +172,7 @@ A model that is not in the catalog:
 llmkube deploy my-custom-model \
   --accelerator metal \
   --source https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf \
-  --quantization Q8_0 \
-  --gpu-layers 28
+  --quantization Q8_0
 ```
 
 The agent runs one engine process per InferenceService on the Mac. To serve
@@ -194,8 +215,9 @@ sanitized, with dots replaced by dashes: `llama-3.1-8b` becomes
 ### Option 1: On the Mac, through the client proxy
 
 The agent's client proxy on `127.0.0.1:9999` (`--client-port`) forwards to the
-running engine. With several InferenceServices on one Mac it forwards to one
-of them, so use Option 2 to pick a specific model.
+running engine. With several engines running on one Mac it picks one for each
+request, and consecutive requests can land on different engines, so use Option
+2 to reach a specific model.
 
 ```bash
 curl -sS http://127.0.0.1:9999/v1/chat/completions \
@@ -358,6 +380,10 @@ launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
 
 # Or completely uninstall (from the LLMKube checkout)
 make uninstall-metal-agent
+
+# Archive install (no Makefile): after the bootout above
+sudo rm /usr/local/bin/llmkube-metal-agent
+rm ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
 
 ## Next Steps

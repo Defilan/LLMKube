@@ -68,8 +68,9 @@ Once installed, the Metal agent runs automatically in the background and watches
 ### Deploy a Model with Metal Acceleration
 
 ```bash
-# Deploy from catalog
-llmkube deploy llama-3.1-8b --accelerator metal
+# Deploy from catalog (--context caps the 131072-token catalog default so the
+# model fits the agent's memory budget on most Macs)
+llmkube deploy llama-3.1-8b --accelerator metal --context 8192
 
 # Or deploy custom model
 llmkube deploy my-model --accelerator metal \
@@ -390,12 +391,12 @@ Without `--host-ip`, the agent auto-detects an address from the Mac's network in
 
 1. a Tailscale address (100.64.0.0/10), if the Mac has one;
 2. otherwise the first other routable IPv4 address, skipping loopback, link-local, IPv6, and the Docker and VM bridge ranges 192.168.65.0/24, 172.17.0.0/16 and 10.96.0.0/12;
-3. only when neither exists, `host.minikube.internal`, then `host.docker.internal`, then 192.168.65.254, for a cluster on the same Mac.
+3. only when neither exists, a co-located DNS fallback for a cluster on the same Mac: the IP address `host.minikube.internal` resolves to on the Mac, else the one `host.docker.internal` resolves to, else 192.168.65.254. It registers the address, never the hostname, and logs `no routable interface for host-IP auto-detect; using co-located DNS fallback`.
 
-It never registers `localhost`. The agent logs its pick as `auto-detected host IP` (with the interface and the rejected candidates), and every registration as `registered endpoint` with a `hostIP` field:
+It does not register `localhost`: the interface pick skips loopback addresses, and the fallback registers whatever those names resolve to on the Mac. The agent logs an interface pick as `auto-detected host IP` (with the interface and the rejected candidates), and every registration as `registered endpoint` with a `hostIP` field:
 
 ```bash
-grep 'auto-detected host IP\|registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
+grep 'auto-detected host IP\|co-located DNS fallback\|registered endpoint' ~/Library/Logs/llmkube/metal-agent.log
 ```
 
 Auto-detection can pick an address the cluster cannot reach, for example a personal tailnet on a work Mac, or the wrong interface on a Mac with several. For a remote cluster, set `--host-ip` explicitly, ideally to an address with a DHCP reservation so it does not change.
@@ -581,7 +582,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_system_memory_wired_bytes` | Gauge | Wired (non-pageable) system memory, sampled by the memory watchdog |
 | `llmkube_metal_agent_process_rss_bytes` | Gauge | Resident set size per managed process. Labels: `name` only (no `namespace`, so same-named InferenceServices in different namespaces share a series) |
 | `llmkube_metal_agent_memory_pressure_level` | Gauge | Memory pressure level: 0 Normal, 1 Warning, 2 Critical (see `--memory-pressure-warning` and `--memory-pressure-critical`) |
-| `llmkube_metal_agent_evictions_total` | Counter | Registered for eviction events, but the eviction path does not increment it yet, so it reads 0. Count `Evicted` events instead |
+| `llmkube_metal_agent_evictions_total` | Counter | Processes the memory watchdog evicted under Critical pressure (only with `--eviction-enabled`). Each eviction also emits an `Evicted` Warning event |
 | `llmkube_metal_agent_evictions_skipped_total` | Counter | Times the watchdog was at Critical but did not evict. Labels: `reason` (`disabled`, `below_guard`, `empty`, `floor`, `all_protected`, `runtime_ineligible`) |
 | `llmkube_metal_agent_watch_consecutive_failures` | Gauge | Consecutive failed Kubernetes lists by the InferenceService watcher; resets to 0 on success. The agent exits for a launchd restart at `--max-watch-failures` |
 | `llmkube_metal_agent_fatal_exits_total` | Counter | Fatal-exit signals raised before the agent exits. Labels: `subsystem` (`watcher`, `health-server`) |
