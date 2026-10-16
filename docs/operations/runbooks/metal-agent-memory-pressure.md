@@ -6,7 +6,7 @@ The LLMKube metal-agent watchdog is reporting Warning or Critical memory pressur
 
 One or more of:
 
-- Kubernetes event on a managed `InferenceService` with reason `MemoryPressureLevelChanged`, type `Warning`, message containing `transitioned from Normal to Warning` or `transitioned from Normal to Critical`.
+- Kubernetes event on a managed `InferenceService` with reason `MemoryPressureLevelChanged`, type `Warning`, message containing `transitioned from normal to warning` or `transitioned from normal to critical`.
 
   ```bash
   kubectl get events -A --field-selector reason=MemoryPressureLevelChanged
