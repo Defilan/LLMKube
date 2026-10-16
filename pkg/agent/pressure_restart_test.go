@@ -691,3 +691,93 @@ func TestEnsureProcess_BlockedServiceWaitsAtNormal(t *testing.T) {
 		t.Errorf("events = %q, want a %s event", events, EventReasonRespawnBlocked)
 	}
 }
+
+// TestEnsureProcess_StoppedBlockedServiceIsReleased covers a blocked service
+// scaled to zero: it takes the stop path (status Stopped, not the stale Ready
+// it had), its block is forgotten so the watchdog stops retrying it, its
+// MemoryPressure condition leaves Evicted, and a later scale-up starts it as
+// usual.
+func TestEnsureProcess_StoppedBlockedServiceIsReleased(t *testing.T) {
+	isvc := evictedISVC("svc-a")
+	isvc.Status.Phase = "Ready"
+	isvc.Status.ReadyReplicas = 1
+	isvc.Status.DesiredReplicas = 1
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ctx := context.Background()
+	blockEvicted(a, 30, "default/svc-a")
+	a.mu.Lock()
+	a.lastPressureLevel = MemoryPressureNormal
+	a.mu.Unlock()
+	nn := types.NamespacedName{Namespace: "default", Name: "svc-a"}
+
+	stopped := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(ctx, nn, stopped); err != nil {
+		t.Fatal(err)
+	}
+	stopped.Spec.Replicas = ptr.To(int32(0))
+	if err := a.config.K8sClient.Update(ctx, stopped); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureProcess(ctx, stopped); err != nil {
+		t.Fatalf("ensureProcess (scaled to zero): %v", err)
+	}
+
+	got := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(ctx, nn, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != inferencev1alpha1.PhaseStopped || got.Status.ReadyReplicas != 0 {
+		t.Errorf("status = %q with %d ready, want %q with 0", got.Status.Phase, got.Status.ReadyReplicas,
+			inferencev1alpha1.PhaseStopped)
+	}
+	if a.isPressureBlocked("default/svc-a") || a.hasEvictedWaiting() {
+		t.Errorf("blocked = %v, waiting = %v; want false, false", a.isPressureBlocked("default/svc-a"), a.hasEvictedWaiting())
+	}
+	if c := memoryPressureCondition(t, a, "svc-a"); c != conditionNormal {
+		t.Errorf("MemoryPressure = %q, want %q", c, conditionNormal)
+	}
+
+	got.Spec.Replicas = ptr.To(int32(1))
+	if err := a.config.K8sClient.Update(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.ensureProcess(ctx, got); err != nil {
+		t.Fatalf("ensureProcess (scaled up): %v", err)
+	}
+	if ex.starts != 1 {
+		t.Errorf("engine started %d time(s) after the scale-up, want 1", ex.starts)
+	}
+}
+
+// TestHandleMemoryPressure_EvictedRestartLeavesNoRestartDelay covers the
+// restart state queueRestart creates for an evicted service's restart: once
+// the engine runs it is dropped, so the new engine's first health restart
+// runs at once, as for any engine, instead of waiting out a leftover delay.
+func TestHandleMemoryPressure_EvictedRestartLeavesNoRestartDelay(t *testing.T) {
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, refusalISVC("svc-a"), refusalModel())
+	clock := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	a.now = func() time.Time { return clock }
+	ctx := context.Background()
+	const key = "default/svc-a"
+	blockEvicted(a, 0, key)
+	returnToNormal(a)
+	if ex.starts != 1 {
+		t.Fatalf("setup: svc-a not restarted (starts = %d)", ex.starts)
+	}
+
+	a.mu.Lock()
+	proc := a.processes[key]
+	proc.Healthy = false
+	a.mu.Unlock()
+	a.restartUnhealthy(ctx, key, proc, a.healthFailureThreshold())
+
+	a.mu.RLock()
+	st := a.restarts[key]
+	a.mu.RUnlock()
+	if st == nil || !st.pending {
+		t.Fatal("no health restart scheduled")
+	}
+	if !st.nextAt.Equal(clock) {
+		t.Errorf("first health restart after the eviction restart runs at %v, want at once (%v)", st.nextAt, clock)
+	}
+}

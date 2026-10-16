@@ -1158,20 +1158,7 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// at Normal too, until the available memory has room for the service:
 	// handleMemoryPressure then lifts it and queues the restart.
 	if blocked {
-		a.logger.Warnw("skipping ensureProcess; eviction-blocked until memory has room",
-			"namespace", isvc.Namespace, "name", isvc.Name,
-			"pressureLevel", pressureLevel.String())
-		// Surface the block as a Kubernetes event so an operator who
-		// `kubectl describe`s a service that "won't start" can see why.
-		// Synthesize a ManagedProcess shell with just the IS coordinates;
-		// emitInferenceEvent re-fetches the live IS for the event target.
-		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
-			corev1.EventTypeWarning, EventReasonRespawnBlocked,
-			"Respawn blocked: previous process was evicted under memory pressure and restarts once "+
-				"available memory has room for it (pressure is %s)",
-			pressureLevel.String(),
-		)
-		return nil
+		return a.refuseBlockedStart(ctx, isvc, key, exists, pressureLevel)
 	}
 
 	// Honor spec.replicas=0 or spec.suspend by stopping a running process and

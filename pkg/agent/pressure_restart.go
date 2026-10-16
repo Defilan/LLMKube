@@ -22,6 +22,7 @@ import (
 	"slices"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -329,11 +330,52 @@ func (a *MetalAgent) noteEvictedRestarted(ctx context.Context, key string) {
 			a.evictionBackoff[key] = rec
 		}
 		rec.restartedAt = a.now()
+		// The restart state was created by queueRestart for this start, not
+		// by a health failure; leaving it would hold its initial delay over
+		// the first health restart of the new engine.
+		a.cancelRestartLocked(key)
 	}
 	a.mu.Unlock()
 	if restarting {
 		a.markUnblockedCondition(ctx, key)
 	}
+}
+
+// refuseBlockedStart handles a start of a blocked service (see the block guard
+// in reconcileProcess). A blocked service that is now stopped has nothing
+// left to wait for: it is released and takes the stop path. Any other start
+// is refused, with a RespawnBlocked event so an operator who `kubectl
+// describe`s a service that "won't start" can see why.
+func (a *MetalAgent) refuseBlockedStart(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, key string, exists bool,
+	level MemoryPressureLevel,
+) error {
+	if isvcStopped(isvc) {
+		return a.releaseStoppedEvicted(ctx, isvc, key, exists)
+	}
+	a.logger.Warnw("skipping ensureProcess; eviction-blocked until memory has room",
+		"namespace", isvc.Namespace, "name", isvc.Name, "pressureLevel", level.String())
+	// A ManagedProcess shell with just the IS coordinates: emitInferenceEvent
+	// re-fetches the live IS for the event target.
+	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+		corev1.EventTypeWarning, EventReasonRespawnBlocked,
+		"Respawn blocked: previous process was evicted under memory pressure and restarts once "+
+			"available memory has room for it (pressure is %s)",
+		level.String(),
+	)
+	return nil
+}
+
+// releaseStoppedEvicted handles a blocked service that was scaled to zero or
+// suspended. Its block is forgotten, so the watchdog stops retrying it and a
+// later scale-up starts it as usual, its MemoryPressure condition goes back
+// to the current level, and the stop path records the stopped status.
+func (a *MetalAgent) releaseStoppedEvicted(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, key string, exists bool,
+) error {
+	a.forgetEvicted(key)
+	a.markUnblockedCondition(ctx, key)
+	return a.handleScaleToZero(ctx, isvc, key, exists)
 }
 
 // forgetEvicted drops everything the agent remembers about key's eviction:
