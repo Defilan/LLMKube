@@ -261,6 +261,11 @@ const (
 	// ReasonModelDigestMismatch is set when a downloaded model's SHA256 does
 	// not match Model.spec.sha256.
 	ReasonModelDigestMismatch string = "ModelDigestMismatch"
+
+	// ReasonModelDownloadTooLarge is set when a model download exceeds the
+	// agent's --max-download-size cap, by its declared size or by the bytes
+	// it streamed.
+	ReasonModelDownloadTooLarge string = "ModelDownloadTooLarge"
 )
 
 // ReasonModelAttestationRejected is set on a Model the attestation policy
@@ -283,6 +288,7 @@ var MetalAgentRefusalReasons = []string{
 	ReasonExtraArgsRejected,
 	ReasonServiceNameTooLong,
 	ReasonModelDigestMismatch,
+	ReasonModelDownloadTooLarge,
 }
 
 // ReasonRelaySecretNotManaged is the Status.SchedulingStatus (and Warning

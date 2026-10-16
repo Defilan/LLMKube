@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -227,6 +228,10 @@ type MetalExecutor struct {
 	// production value) keeps the system resolver; tests pin a hostname to a
 	// local server through it.
 	lookupNetIP safehttp.LookupFunc
+	// maxDownloadBytes caps the bytes a single model download may write,
+	// counting bytes a resume already has on disk (the --max-download-size
+	// flag, set by WithMaxDownloadBytes). Zero, the default, is no cap.
+	maxDownloadBytes int64
 
 	// helpProbe returns llama-server's --help output; a seam so tests can fake
 	// the binary. loadMode caches the result of probing it (see
@@ -261,6 +266,15 @@ func WithKubeClient(namespace string, c client.Client, caCerts [][]byte) Option 
 func WithAllowedDownloadHosts(entries []string) Option {
 	return func(e *MetalExecutor) {
 		e.downloadAllow = safehttp.ParseAllowlist(entries)
+	}
+}
+
+// WithMaxDownloadBytes caps the bytes one model download may write (the
+// --max-download-size flag). Zero or a negative value leaves downloads
+// uncapped.
+func WithMaxDownloadBytes(n int64) Option {
+	return func(e *MetalExecutor) {
+		e.maxDownloadBytes = max(n, 0)
 	}
 }
 
@@ -710,6 +724,14 @@ func (e *MetalExecutor) downloadFile(ctx context.Context, url, filePath, token, 
 	// resumable partial.
 	sweepStalePartials(filePath, partPath)
 
+	// A probed size over the cap is refused before any GET. Its partial goes
+	// too: it can never complete under this cap, and an already-complete one
+	// (left under a larger cap) must not be published by the shortcut below.
+	if err := e.checkDeclaredSize(filePath, size); err != nil {
+		_ = os.Remove(partPath)
+		return err
+	}
+
 	var resumeFrom int64
 	// Lstat so a symlink planted at partPath is never resumed into or
 	// published by rename; the fresh-download create then refuses it.
@@ -957,7 +979,8 @@ func hfRedirectStripper(base *http.Client) *http.Client {
 // model that the stat check in ensureModel would treat as cached. When
 // contentLength > 0 it verifies the byte count matches, so a mid-stream
 // connection drop does not leave a truncated model. This is the non-resuming
-// path (S3), byte-for-byte the behaviour it had before resume was added.
+// path (S3): it always starts from zero and shares copyToFileResume's size,
+// digest and download-cap checks.
 func (e *MetalExecutor) copyToFileNoResume(
 	filePath string, r io.Reader, contentLength int64, expectedSHA256 string,
 ) error {
@@ -974,12 +997,23 @@ func (e *MetalExecutor) copyToFileNoResume(
 // size mismatch or a rename failure: a resumable error leaves the partial in
 // place so a later attempt resumes, while a size mismatch means the partial is
 // untrustworthy.
+//
+// The download cap (maxDownloadBytes) is enforced here, the one copy every
+// download path goes through: a contentLength over the cap is refused before
+// partPath is opened, and the copy reads at most one byte past the cap,
+// counting the resumeFrom bytes already on disk, so a body that omits or
+// outruns its Content-Length is stopped there. Either way the partial is
+// removed, since it can never complete under the cap.
 func (e *MetalExecutor) copyToFileResume(
 	partPath, filePath string,
 	r io.Reader,
 	contentLength, resumeFrom int64,
 	expectedSHA256 string,
 ) error {
+	if err := e.checkDeclaredSize(filePath, contentLength); err != nil {
+		_ = os.Remove(partPath)
+		return err
+	}
 	var out *os.File
 	var err error
 	// Both branches refuse to follow a symlink planted at partPath inside the
@@ -992,7 +1026,12 @@ func (e *MetalExecutor) copyToFileResume(
 	if err != nil {
 		return err
 	}
-	written, cerr := io.Copy(out, r)
+	written, cerr := io.Copy(out, e.capReader(r, resumeFrom))
+	if e.overCap(resumeFrom + written) {
+		_ = out.Close()
+		_ = os.Remove(partPath)
+		return &ModelDownloadTooLargeError{Path: filePath, Limit: e.maxDownloadBytes}
+	}
 	if cerr != nil {
 		_ = out.Close()
 		return cerr
@@ -1008,6 +1047,64 @@ func (e *MetalExecutor) copyToFileResume(
 	}
 
 	return e.verifyAndPublish(partPath, filePath, expectedSHA256)
+}
+
+// checkDeclaredSize refuses a download whose size the source announced up
+// front (the HEAD probe, a response's Content-Length, or an S3 object's
+// size) when it already exceeds the cap. An unknown size (<= 0) passes: the
+// copy itself enforces the cap.
+func (e *MetalExecutor) checkDeclaredSize(filePath string, size int64) error {
+	if e.overCap(size) {
+		return &ModelDownloadTooLargeError{Path: filePath, Limit: e.maxDownloadBytes, Size: size}
+	}
+	return nil
+}
+
+// overCap reports whether total bytes exceed the download cap.
+func (e *MetalExecutor) overCap(total int64) bool {
+	return e.maxDownloadBytes > 0 && total > e.maxDownloadBytes
+}
+
+// capReader limits r to one byte past what the cap leaves after the
+// resumeFrom bytes already on disk. Reading that one extra byte is how the
+// copy tells a body that ends exactly at the cap from one that runs past it.
+// A partial already past the cap leaves no room at all, so the copy reads
+// nothing and overCap refuses it.
+func (e *MetalExecutor) capReader(r io.Reader, resumeFrom int64) io.Reader {
+	if e.maxDownloadBytes <= 0 {
+		return r
+	}
+	remaining := e.maxDownloadBytes - resumeFrom
+	if remaining == math.MaxInt64 {
+		return r // remaining+1 would overflow; no body can be that long anyway
+	}
+	return io.LimitReader(r, remaining+1)
+}
+
+// ModelDownloadTooLargeError reports that a model download exceeded the
+// agent's --max-download-size cap. Size is the size the source declared when
+// that alone was over the cap (nothing was written), or 0 when the body ran
+// past the cap during the copy (the partial was removed). It is a distinct
+// type so handleStartProcessError can refuse the start with
+// EventReasonModelDownloadTooLarge and memoize it like a digest mismatch:
+// re-downloading up to the cap on every reconcile is the storm that memo
+// exists to stop.
+type ModelDownloadTooLargeError struct {
+	Path  string
+	Limit int64
+	Size  int64
+}
+
+func (e *ModelDownloadTooLargeError) Error() string {
+	limit := fmt.Sprintf("%d bytes (%s)", e.Limit, formatMemory(uint64(e.Limit))) //nolint:gosec // G115: Limit is positive
+	what := fmt.Sprintf("the download ran past the agent's --max-download-size cap of %s and was stopped; "+
+		"the partial file was removed", limit)
+	if e.Size > 0 {
+		what = fmt.Sprintf("the source declares %d bytes (%s), over the agent's --max-download-size cap of %s; "+
+			"nothing was written", e.Size, formatMemory(uint64(e.Size)), limit) //nolint:gosec // G115: Size > 0
+	}
+	return fmt.Sprintf("refusing model download for %s: %s. If the model really is this large, raise "+
+		"--max-download-size (0 disables the cap) and restart the agent", e.Path, what)
 }
 
 // ModelDigestMismatchError reports that a downloaded model's SHA256 does not

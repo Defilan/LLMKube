@@ -22,19 +22,21 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// digestMismatchEntry is one Model's remembered SHA256 mismatch, keyed (by
+// digestMismatchEntry is one Model's remembered download refusal, keyed (by
 // the map holding it) on the Model's namespace/name, and self-describing the
-// source+sha256 it was observed against so a spec edit invalidates it.
+// source+sha256 it was observed against so a spec edit invalidates it. err is
+// a *ModelDigestMismatchError or a *ModelDownloadTooLargeError.
 type digestMismatchEntry struct {
 	source string
 	sha256 string
-	err    *ModelDigestMismatchError
+	err    error
 }
 
-// digestMismatchMemo remembers, per Model, the most recent SHA256 mismatch
-// this agent observed for it, so reconcileProcess's pre-flight check
-// (checkModelDigestMemo) can refuse a persistently-mismatching Model without
-// re-downloading it every reconcile. Without this, the mismatch is only
+// digestMismatchMemo remembers, per Model, the most recent download refusal
+// this agent observed for it: a SHA256 mismatch (what it was built for, hence
+// the name) or a download over --max-download-size. reconcileProcess's
+// pre-flight check (checkModelDigestMemo) can then refuse such a Model without
+// re-downloading it every reconcile. Without this, the refusal is only
 // discovered inside StartProcess, which runs after checkMemoryAdmission:
 // admission's success path clears Status.SchedulingStatus (a Status().Update)
 // and the subsequent refusal writes it back (another Status().Update); each
@@ -99,9 +101,9 @@ func (m *digestMismatchMemo) forgetISVC(isvcKey string) {
 	delete(m.entries, model)
 }
 
-// record stores a digest mismatch for model, keyed by the source+sha256 it
+// record stores a download refusal for model, keyed by the source+sha256 it
 // was observed against. A nil receiver is a silent no-op (see noteRef).
-func (m *digestMismatchMemo) record(model types.NamespacedName, source, sha256 string, err *ModelDigestMismatchError) {
+func (m *digestMismatchMemo) record(model types.NamespacedName, source, sha256 string, err error) {
 	if m == nil {
 		return
 	}
@@ -110,13 +112,13 @@ func (m *digestMismatchMemo) record(model types.NamespacedName, source, sha256 s
 	m.entries[model] = digestMismatchEntry{source: source, sha256: sha256, err: err}
 }
 
-// check returns the remembered mismatch for model if one is on file and it
+// check returns the remembered refusal for model if one is on file and it
 // still matches the model's current source+sha256. A stale entry (the source
 // or sha256 changed since it was recorded) is dropped and nil is returned, so
 // a spec edit retries the download normally instead of being blocked by a
 // memo of a different, already-fixed problem. A nil receiver reports no
 // memo, exactly like an empty one (see noteRef).
-func (m *digestMismatchMemo) check(model types.NamespacedName, source, sha256 string) *ModelDigestMismatchError {
+func (m *digestMismatchMemo) check(model types.NamespacedName, source, sha256 string) error {
 	if m == nil {
 		return nil
 	}
@@ -133,7 +135,7 @@ func (m *digestMismatchMemo) check(model types.NamespacedName, source, sha256 st
 	return entry.err
 }
 
-// clear drops any remembered mismatch for model directly. Called when the
+// clear drops any remembered refusal for model directly. Called when the
 // Model itself is deleted (detected at the Get call site in
 // reconcileProcess, which already knows the Model's namespace/name even when
 // the Get fails). A nil receiver is a silent no-op (see noteRef).

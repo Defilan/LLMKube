@@ -44,6 +44,7 @@ const (
 	EventReasonExtraArgsRejected     = inferencev1alpha1.ReasonExtraArgsRejected
 	EventReasonServiceNameTooLong    = inferencev1alpha1.ReasonServiceNameTooLong
 	EventReasonModelDigestMismatch   = inferencev1alpha1.ReasonModelDigestMismatch
+	EventReasonModelDownloadTooLarge = inferencev1alpha1.ReasonModelDownloadTooLarge
 )
 
 // refuseStart records why the agent will not serve an InferenceService: it
@@ -74,6 +75,9 @@ func (a *MetalAgent) refuseStart(
 // without downloading again) and refused through refuseStart, the same way
 // an endpoint-name conflict or a bad model path is refused, so it is visible
 // as a status field and a Warning Event instead of only a log line. A
+// *ModelDownloadTooLargeError (a download over --max-download-size) is
+// remembered and refused the same way, as ModelDownloadTooLarge: without the
+// memo every reconcile would download up to the cap again. A
 // *ModelCacheEntryNotRegularError (a symlink in a downloaded source's cache
 // slot that appeared after checkModelCacheSlot ran) is refused the same way
 // as ModelSourceNotAllowed. Every other StartProcess failure
@@ -91,6 +95,14 @@ func (a *MetalAgent) handleStartProcessError(
 			model.Spec.Source, model.Spec.SHA256, digestErr,
 		)
 		return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
+	}
+	var tooLargeErr *ModelDownloadTooLargeError
+	if errors.As(startErr, &tooLargeErr) {
+		a.digestMismatches.record(
+			types.NamespacedName{Namespace: model.Namespace, Name: model.Name},
+			model.Spec.Source, model.Spec.SHA256, tooLargeErr,
+		)
+		return a.refuseStart(ctx, isvc, EventReasonModelDownloadTooLarge, tooLargeErr.Error())
 	}
 	var slotErr *ModelCacheEntryNotRegularError
 	if errors.As(startErr, &slotErr) {
@@ -144,25 +156,28 @@ func (a *MetalAgent) checkModelCacheSlot(
 }
 
 // checkModelDigestMemo refuses a Model this agent already found to have a
-// mismatching SHA256 for its CURRENT spec.source and spec.sha256, without
-// letting StartProcess download it again: the memo (a.digestMismatches) was
-// populated by handleStartProcessError on a prior reconcile and
-// self-invalidates the moment source or sha256 changes (digestMismatchMemo.check),
-// so an edited Model always gets a fresh download attempt. A no-op when the
-// Model has no recorded mismatch, or no spec.sha256 at all (nothing to
-// memoize).
+// mismatching SHA256, or a download over --max-download-size, for its CURRENT
+// spec.source and spec.sha256, without letting StartProcess download it
+// again: the memo (a.digestMismatches) was populated by
+// handleStartProcessError on a prior reconcile and self-invalidates the
+// moment source or sha256 changes (digestMismatchMemo.check), so an edited
+// Model always gets a fresh download attempt. A no-op when the Model has no
+// recorded refusal. A Model without spec.sha256 is checked too, since an
+// over-cap download can be recorded for one (a digest mismatch cannot).
 func (a *MetalAgent) checkModelDigestMemo(
 	ctx context.Context, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model,
 ) error {
-	if model.Spec.SHA256 == "" {
-		return nil
-	}
 	modelKey := types.NamespacedName{Namespace: model.Namespace, Name: model.Name}
-	digestErr := a.digestMismatches.check(modelKey, model.Spec.Source, model.Spec.SHA256)
-	if digestErr == nil {
+	memoErr := a.digestMismatches.check(modelKey, model.Spec.Source, model.Spec.SHA256)
+	var tooLargeErr *ModelDownloadTooLargeError
+	switch {
+	case memoErr == nil:
 		return nil
+	case errors.As(memoErr, &tooLargeErr):
+		return a.refuseStart(ctx, isvc, EventReasonModelDownloadTooLarge, memoErr.Error())
+	default:
+		return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, memoErr.Error())
 	}
-	return a.refuseStart(ctx, isvc, EventReasonModelDigestMismatch, digestErr.Error())
 }
 
 // checkModelPaths refuses a Model the controller marked Failed and any local

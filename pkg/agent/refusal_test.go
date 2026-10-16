@@ -1019,6 +1019,105 @@ func TestEnsureProcess_DigestMismatchMemo_ClearsOnSHA256Change(t *testing.T) {
 	}
 }
 
+// A download over --max-download-size surfaces from the real executor as a
+// wrapped *ModelDownloadTooLargeError. It must be refused through refuseStart
+// with ModelDownloadTooLarge (status field plus Warning Event) and memoized,
+// so later reconciles of the unchanged spec refuse in the pre-flight check
+// instead of downloading up to the cap again. The Model has no spec.sha256:
+// the memo must not be skipped for it, since an over-cap download needs no
+// digest to be refused.
+func TestEnsureProcess_DownloadTooLargeRefusedAndMemoized(t *testing.T) {
+	var written []string
+	funcs := &interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, sub string,
+			obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			if is, ok := obj.(*inferencev1alpha1.InferenceService); ok && sub == "status" {
+				written = append(written, is.Status.SchedulingStatus)
+			}
+			return c.SubResource(sub).Update(ctx, obj, opts...)
+		},
+	}
+	isvc := refusalISVC("svc")
+	a, ex, rec := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, funcs, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: failed to download model: %w",
+		&ModelDownloadTooLargeError{Path: "/models/m/m.gguf", Limit: 1 << 30})
+
+	for i := range 3 {
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		err := a.ensureProcess(context.Background(), cur)
+		if err == nil || !strings.Contains(err.Error(), EventReasonModelDownloadTooLarge) {
+			t.Fatalf("call %d: ensureProcess error = %v, want it to name %s", i+1, err, EventReasonModelDownloadTooLarge)
+		}
+	}
+
+	if ex.starts != 1 {
+		t.Errorf("StartProcess invoked %d time(s) over 3 reconciles of an unchanged over-cap spec, want exactly 1 "+
+			"(the memo should have refused the other 2 without downloading)", ex.starts)
+	}
+	if len(written) == 0 {
+		t.Fatal("no status writes recorded; the refusal must be reported on the status")
+	}
+	for i, s := range written {
+		if s != EventReasonModelDownloadTooLarge {
+			t.Errorf("status write %d = %q, want %q (writes: %q)", i, s, EventReasonModelDownloadTooLarge, written)
+		}
+	}
+	events := strings.Join(drainEvents(rec), "\n")
+	if !strings.Contains(events, "Warning "+EventReasonModelDownloadTooLarge) ||
+		!strings.Contains(events, "--max-download-size") {
+		t.Errorf("events = %q, want a Warning %s naming --max-download-size", events, EventReasonModelDownloadTooLarge)
+	}
+}
+
+// Editing the Model's source clears the over-cap memo, so a corrected source
+// is downloaded again rather than refused for the old one.
+func TestEnsureProcess_DownloadTooLargeMemo_ClearsOnSourceChange(t *testing.T) {
+	isvc := refusalISVC("svc")
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel())
+	ex.startErr = fmt.Errorf("failed to ensure model: %w",
+		&ModelDownloadTooLargeError{Path: "/models/m/m.gguf", Limit: 1 << 30})
+	get := func() *inferencev1alpha1.InferenceService {
+		t.Helper()
+		cur := &inferencev1alpha1.InferenceService{}
+		if err := a.config.K8sClient.Get(context.Background(),
+			types.NamespacedName{Name: "svc", Namespace: "default"}, cur); err != nil {
+			t.Fatal(err)
+		}
+		return cur
+	}
+
+	for range 2 {
+		if err := a.ensureProcess(context.Background(), get()); err == nil {
+			t.Fatal("ensureProcess succeeded, want an over-cap refusal")
+		}
+	}
+	if ex.starts != 1 {
+		t.Fatalf("starts after two reconciles of an unchanged over-cap spec = %d, want 1", ex.starts)
+	}
+
+	model := &inferencev1alpha1.Model{}
+	if err := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Name: refusalModelName, Namespace: "default"}, model); err != nil {
+		t.Fatal(err)
+	}
+	model.Spec.Source = "https://example.invalid/m-smaller.gguf"
+	if err := a.config.K8sClient.Update(context.Background(), model); err != nil {
+		t.Fatal(err)
+	}
+	ex.startErr = nil
+
+	if err := a.ensureProcess(context.Background(), get()); err != nil {
+		t.Fatalf("ensureProcess after changing the source: %v", err)
+	}
+	if ex.starts != 2 {
+		t.Errorf("starts after changing the source = %d, want 2", ex.starts)
+	}
+}
+
 // TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason (a structural
 // AST scan, not a hand-maintained table) lives in
 // refusal_reasons_scan_test.go.
