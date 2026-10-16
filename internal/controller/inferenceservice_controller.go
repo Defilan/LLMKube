@@ -586,9 +586,17 @@ const deploymentNameTakenRequeueAfter = 2 * time.Minute
 // and a bounded requeue instead of a reconcile error.
 type deploymentNameTakenError struct {
 	ns, name, owner string
+	// previous is set when the controller is an InferenceService with this
+	// service's name but another UID: a deleted predecessor whose Deployment
+	// garbage collection has not removed yet (a GitOps delete-and-recreate).
+	previous bool
 }
 
 func (e *deploymentNameTakenError) Error() string {
+	if e.previous {
+		return fmt.Sprintf("Deployment %s/%s is still controlled by a previous InferenceService named %s (uid %s) that was deleted; "+
+			"it is removed when garbage collection finishes, and this service is reconciled again then", e.ns, e.name, e.name, e.owner)
+	}
 	if e.owner != "" {
 		return fmt.Sprintf("Deployment %s/%s is already controlled by another InferenceService (uid %s); "+
 			"refusing to overwrite or recreate it; rename one of the services", e.ns, e.name, e.owner)
@@ -620,6 +628,7 @@ func ensureDeploymentOwned(isvc *inferencev1alpha1.InferenceService, existing *a
 		// another API group is not misreported as another InferenceService.
 		if strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
 			taken.owner = string(ref.UID)
+			taken.previous = ref.Name == isvc.Name
 		}
 	}
 	return taken

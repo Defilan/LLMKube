@@ -33,6 +33,12 @@ One or more of:
 - The message variant `is already controlled by another InferenceService
   (uid <uid>)` instead: the object at that name carries a controller
   reference to a different `InferenceService` UID.
+- The message variant `is still controlled by a previous InferenceService
+  named <name> (uid <uid>) that was deleted`: the InferenceService was deleted
+  and recreated under the same name (for example a GitOps replace) before
+  garbage collection removed the old Deployment. No action is needed; the
+  refusal clears on its own once the old Deployment is gone, because its
+  deletion triggers a reconcile of the new service.
 
 ## Diagnose
 

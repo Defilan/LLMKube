@@ -995,6 +995,20 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 	})
 
 	Context("the refusal message branches", func() {
+		It("reports a deleted same-name predecessor as awaiting garbage collection", func() {
+			isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "s1", Namespace: "default", UID: "uid-new"}}
+			predecessor := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "s1", UID: "uid-old"}}
+			dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "s1", Namespace: "default"}}
+			Expect(setControllerReferenceUnblocked(predecessor, dep, k8sClient.Scheme())).To(Succeed())
+
+			err := ensureDeploymentOwned(isvc, dep)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("previous InferenceService named s1"))
+			Expect(err.Error()).To(ContainSubstring("uid-old"))
+			Expect(err.Error()).To(ContainSubstring("garbage collection"))
+			Expect(err.Error()).NotTo(ContainSubstring("rename one of the services"))
+		})
+
 		It("names a foreign InferenceService owner and not a foreign-group impostor", func() {
 			isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "s1", Namespace: "default", UID: "uid-1"}}
 			other := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: "s2", UID: "uid-2"}}
