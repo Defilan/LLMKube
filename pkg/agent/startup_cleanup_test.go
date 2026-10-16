@@ -197,6 +197,31 @@ func TestPrepareRegistry_LegacyRemovesOwnRelayObjects(t *testing.T) {
 	assertPresent(t, a.config.K8sClient, "other-agent", &discoveryv1.EndpointSlice{})
 }
 
+// Legacy mode deletes the agent's own relay pair only for an InferenceService
+// it owns. When the Model lookup fails with anything but NotFound, ownership
+// is unknown, so the relay Service and EndpointSlice are left in place for
+// the next start to retry (#2076).
+func TestPrepareRegistry_LegacyKeepsRelayObjectsWhenModelLookupFails(t *testing.T) {
+	funcs := &interceptor.Funcs{
+		Get: func(
+			ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+		) error {
+			if _, isModel := obj.(*inferencev1alpha1.Model); isModel {
+				return apierrors.NewServiceUnavailable("apiserver restarting")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	objs := append([]runtimeObject{refusalISVC("llm"), refusalModel()}, agentObjects("llm-agent", "llm")...)
+	a := startupFixture(t, MetalAgentConfig{LegacyDirectEndpoints: true}, funcs, objs...)
+
+	if srv, err := a.prepareRegistry(context.Background()); err != nil || srv != nil {
+		t.Fatalf("prepareRegistry = %v, %v; want nil, nil in legacy mode", srv, err)
+	}
+	assertPresent(t, a.config.K8sClient, "llm-agent", &corev1.Service{})
+	assertPresent(t, a.config.K8sClient, "llm-agent", &discoveryv1.EndpointSlice{})
+}
+
 // Relay mode keeps the agent's own "<isvc>-agent" pair at startup (it is
 // withdrawn, not deleted).
 func TestPrepareRegistry_RelayKeepsOwnRelayObjects(t *testing.T) {
