@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"maps"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -270,6 +271,55 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(isvc.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken),
 				"an unrelated spec fault must not erase the name-taken marker")
 			Expect(isvc.Status.SchedulingMessage).To(ContainSubstring(name))
+		})
+
+		It("refuses when the name changes hands after provisioning", func() {
+			name := "dep-foreign-handover"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			// The first pass provisions the operator's own Deployment and
+			// Service; the service was working before the name changed hands.
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			owned := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: "default"}, owned)).To(Succeed())
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sanitizeDNSName(name), Namespace: "default"}, svc)).To(Succeed())
+			svcRV := svc.ResourceVersion
+			svcSelector := maps.Clone(svc.Spec.Selector)
+
+			// The name changes hands: the operator's Deployment is gone and a
+			// foreign one takes the generated name.
+			Expect(k8sClient.Delete(ctx, owned)).To(Succeed())
+			nn := types.NamespacedName{Name: name, Namespace: "default"}
+			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, nn, &appsv1.Deployment{}))
+			}, "10s", "100ms").Should(BeTrue())
+			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+			seeded := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, nn, seeded)).To(Succeed())
+			foreignRV := seeded.ResourceVersion
+
+			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			got := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, nn, got)).To(Succeed())
+			Expect(got.ResourceVersion).To(Equal(foreignRV))
+			Expect(got.OwnerReferences).To(BeEmpty())
+			expectDeploymentNameTaken(ctx, name)
+
+			// The refusal's early return stops the sequence before the
+			// Service step, so the Service provisioned by the earlier pass
+			// survives untouched: no rewrite, no delete, no adoption of the
+			// foreign workload behind it.
+			svcNow := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sanitizeDNSName(name), Namespace: "default"}, svcNow)).To(Succeed())
+			Expect(svcNow.ResourceVersion).To(Equal(svcRV))
+			Expect(svcNow.Spec.Selector).To(Equal(svcSelector))
 		})
 	})
 

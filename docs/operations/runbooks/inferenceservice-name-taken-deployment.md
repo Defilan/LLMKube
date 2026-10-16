@@ -1,12 +1,13 @@
 # InferenceService stuck in `Failed` with `DeploymentNameTaken`
 
 An `InferenceService` sits in phase `Failed` with
-`status.schedulingStatus: DeploymentNameTaken`, the reconcile provisions
-nothing past the refused Deployment step (no Service follows), and the
-operator log repeats a refusal line on a slow two-minute cadence instead of
-erroring. The controller is not broken: a Deployment already holds the name
-the service generates, and the controller refuses to touch an object it did
-not create (#2011).
+`status.schedulingStatus: DeploymentNameTaken`, the reconcile creates or
+updates nothing past the refused Deployment step, and the operator log
+repeats a refusal line on a slow two-minute cadence instead of erroring.
+Objects an earlier pass provisioned are left in place: the refusal stops the
+sequence, it does not tear anything down. The controller is not broken: a
+Deployment already holds the name the service generates, and the controller
+refuses to touch an object it did not create (#2011).
 
 ## Trigger
 
@@ -73,7 +74,7 @@ One or more of:
      InferenceService" message, because the gate requires the controller
      role. The reference alone does not hand the object to the operator.
 
-3. **Check whether anything still serves through the name.**
+3. **Check what still serves through the name.**
 
    ```bash
    kubectl get endpointslices -l kubernetes.io/service-name=<name> -n <namespace>
@@ -82,11 +83,28 @@ One or more of:
    A foreign Deployment may still be running pods under the same name. Do not
    assume the name is free just because the InferenceService is new.
 
+   Also check for a Service the operator provisioned on an earlier pass: the
+   refusal leaves it running, and its selector still matches any pod carrying
+   the service's labels, including a foreign Deployment's pods when the
+   foreign object copied the same selector. The cluster name can therefore
+   route to pods the operator does not own while the phase reads `Failed`.
+
+   ```bash
+   kubectl get service <name> -n <namespace> -o jsonpath='{.spec.selector}{"\n"}{.metadata.ownerReferences}' | jq
+   ```
+
 ## Mitigate (immediate)
 
 Pick based on the Diagnose decision:
 
-1. **The foreign Deployment is not needed** (nobody's workload, or a stale
+1. **If the operator's own Service is still up** (the service was serving
+   before the name changed hands): decide whether it should keep routing. It
+   now selects whatever pods match its labels, which may be the foreign
+   Deployment's. Delete the Service, or fix the foreign workload's labels, or
+   rename a claimant; the refusal neither drains nor deletes the Service, so
+   this decision is yours.
+
+2. **The foreign Deployment is not needed** (nobody's workload, or a stale
    leftover from a deleted service): delete it. The controller provisions the
    owned Deployment on its next pass; the refusal is rechecked about every
    2 minutes, so recovery needs no manual poke.
@@ -95,7 +113,7 @@ Pick based on the Diagnose decision:
    kubectl delete deployment <name> -n <namespace>
    ```
 
-2. **The foreign Deployment is someone's real workload**: rename one of the
+3. **The foreign Deployment is someone's real workload**: rename one of the
    two claimants. Either rename the workload (and whatever selects it), or
    rename the `InferenceService` (`metadata.name` is immutable, so this means
    create a new one and delete the old). The refusal never resolves on its
@@ -156,4 +174,6 @@ name can.
   [autoscaling guide](../../site/guides/metrics-driven-autoscaling.md)
 - The refusal is one of the operator's ownership guards: objects LLMKube did
   not create are never adopted, overwritten, or deleted, and a refused
-  sequence provisions nothing past the refused step
+  sequence creates or updates nothing past the refused step
+- Same defect class, still unguarded: the Service upsert in
+  `reconcileService` (#2086)
