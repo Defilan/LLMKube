@@ -494,9 +494,14 @@ func (r *ModelReconciler) validateMultiFileStagingSource(ctx context.Context, mo
 	// mmproj set failed here and the download code was never reached. Verified
 	// on the fleet against a real MinIO, where the Model went straight to
 	// Failed/InvalidFileSet while both objects were fetchable by hand.
-	if !isHFRepoSource(model.Spec.Source) && !isS3Source(model.Spec.Source) && !isOCISource(model.Spec.Source) {
+	//
+	// A repo base on the origin HF_ENDPOINT names is a Hugging Face repo behind
+	// a mirror: the init container fetches "$SOURCE/$rel" with the token for
+	// that origin, so it is admitted like the HF repo path.
+	if !isHFRepoSource(model.Spec.Source) && !isS3Source(model.Spec.Source) && !isOCISource(model.Spec.Source) &&
+		!isOnHFEndpoint(model.Spec.Source, hfEndpointFromSecret(ctx, r.Client, model)) {
 		msg := fmt.Sprintf(
-			"multi-file staging requires a HuggingFace repo, s3://, or oci:// source, but got: %s",
+			"multi-file staging requires a HuggingFace repo, s3://, or oci:// source, or a repo base on the sourceSecretRef's HF_ENDPOINT origin, but got: %s",
 			model.Spec.Source)
 		return true, r.failInvalidFileSet(ctx, model, msg)
 	}
@@ -911,7 +916,18 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 
 	// Validate multi-file staging before marking Ready.
 	if hasMultiFileStaging(model) {
-		plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil)
+		repoFiles, listErr := r.repoFileListing(ctx, model)
+		if listErr != nil {
+			model.Status.Phase = PhaseFailed
+			model.Status.StagedFiles = nil
+			if updateErr := r.updateStatus(ctx, model, ConditionDegraded, metav1.ConditionTrue, "RepoListingFailed",
+				"spec.files has a glob and listing the source repository failed: "+listErr.Error()); updateErr != nil {
+				logger.Error(updateErr, "Failed to update status after repository listing failure")
+			}
+			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "error").Inc()
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+		plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, repoFiles)
 		if err != nil {
 			model.Status.Phase = PhaseFailed
 			if updateErr := r.updateStatus(ctx, model, ConditionDegraded, metav1.ConditionTrue, "InvalidFileSet", err.Error()); updateErr != nil {

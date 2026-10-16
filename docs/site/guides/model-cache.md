@@ -282,6 +282,65 @@ A Model can name one mirror origin. A speculative-decoding draft Model that
 the runtime downloads itself uses the target Model's mirror, because both run
 in the same container.
 
+#### Staging a multi-file checkpoint through the mirror
+
+Some mirrors break runtime downloads of large files. Artifactory's
+`huggingfaceml` remotes answer a `HEAD` on an LFS file with a `302` to its own
+URL; `huggingface_hub` follows same-host redirects, so the runtime fails with
+`TooManyRedirects` (vLLM reports it as `Can't load tokenizer`). The operator's
+downloader is unaffected, so let it stage the checkpoint instead: give the repo
+ID as `spec.source` and select the files with `spec.files`. The runtime then
+loads a local directory and never calls the Hub.
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: glm-5-3-flash
+spec:
+  source: nvidia/GLM-5.3-Flash-NVFP4
+  format: safetensors
+  sourceSecretRef:
+    name: huggingface        # holds HF_ENDPOINT and HF_TOKEN
+  files:
+    - config.json            # the primary: must match exactly one file
+    - "*.json"
+    - "*.jinja"
+    - "*.safetensors"
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: glm
+spec:
+  modelRef: glm-5-3-flash
+  runtime: vllm
+```
+
+With `spec.files`, a repo source (a bare repo ID, `hf://org/repo[@revision]`,
+or a `huggingface.co` repo URL) is staged from `HF_ENDPOINT` when the
+`sourceSecretRef` names one, and from `huggingface.co` otherwise, as
+`huggingface_hub` treats `HF_ENDPOINT`. A bare repo ID **without**
+`spec.files` is unchanged: the runtime downloads it. The mirror's own repo
+base, `<HF_ENDPOINT>/<org>/<repo>/resolve/<revision>/`, also works as the
+source; any other plain `https://` base is rejected for `spec.files`.
+
+Globs in `spec.files` are expanded against the repository's file listing,
+which the Model controller reads from the Hub API of the same host the files
+are downloaded from. Other sources need explicit paths.
+
+- The expansion is recorded in `status.stagedFiles` when the Model reconciles
+  a new generation. Files added upstream later are not picked up until the
+  spec changes.
+- A pattern matches within one directory (`*.safetensors` does not match
+  `sub/x.safetensors`; write `sub/*.safetensors`).
+- A failed listing fails the Model with reason `RepoListingFailed` and the
+  cause, and is retried every minute.
+- A glob turns off `spec.prefetch`: the expansion is written when the Model
+  reconciles, after prefetch would run, so the files stage when the serving
+  pod starts instead.
+- `spec.fileSha256` still needs explicit paths.
+
 Properties worth knowing:
 
 - **The token is only ever sent to `huggingface.co`, or to the origin named by
@@ -301,13 +360,21 @@ Properties worth knowing:
   request with the whole file and advertise no `Accept-Ranges`. The downloader
   then discards its partial rather than failing to resume it, so a restart is a
   full re-download instead of a pod that will not start.
-- **A mirror that redirects a file to its own URL fails the download.** This
-  has been seen with an Artifactory `huggingfaceml` remote for some files of a
-  repository while other files of the same repository downloaded fine. The
-  operator's downloader fails with `curl: (47) Maximum (50) redirects
-  followed` and `huggingface_hub` with `TooManyRedirects`. It is a mirror-side
-  problem: `curl -sI <file URL>` against the mirror shows a `Location` equal to
-  the requested URL. Take that output to the mirror's administrators.
+- **A mirror that redirects a file to its own URL breaks runtime downloads.**
+  An Artifactory `huggingfaceml` remote answers a `HEAD` on an LFS file with a
+  `302` whose `Location` equals the requested URL, while small files answer
+  `200`; `curl -sI <file URL>` shows it. `huggingface_hub` resolves file
+  metadata with `HEAD` and follows same-host redirects, so a runtime fails
+  with `TooManyRedirects`. On the remote this was verified against, `GET`
+  returns `200`, and the operator's downloader stages those files: it tolerates
+  the failed `HEAD` and downloads with `GET`. Stage such a model with
+  `spec.files` (see above). If `GET` loops too, the downloader fails with
+  `curl: (47) Maximum (50) redirects followed`. Either way it is mirror-side:
+  take the `curl -sI` output to the mirror's administrators.
+- **`refreshPolicy: OnChange` re-downloads on every start behind such a
+  mirror.** Revalidation reads the size from that same `HEAD`; when it fails,
+  the size is unknown and every file is downloaded again on each pod start.
+  Keep the default `IfNotPresent`.
 
 Rotating the token is a Secret edit; the new value is picked up the next time a
 pod starts, the same as the S3 credentials. An `HF_ENDPOINT` change is also

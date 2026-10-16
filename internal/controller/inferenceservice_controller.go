@@ -1153,7 +1153,7 @@ func shouldWarnMissingSkipModelInit(model *inferencev1alpha1.Model, isvc *infere
 	if model.Status.Phase != PhaseReady {
 		return false
 	}
-	if !isHFRepoSource(model.Spec.Source) {
+	if !isHFRepoSource(model.Spec.Source) || hasMultiFileStaging(model) {
 		return false
 	}
 	return !needsSkipModelInit(isvc)

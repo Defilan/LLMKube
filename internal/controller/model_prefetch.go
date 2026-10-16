@@ -76,6 +76,11 @@ func prefetchEligible(model *inferencev1alpha1.Model) bool {
 	if model == nil || !model.Spec.Prefetch {
 		return false
 	}
+	// A glob's expansion is written only by the runtime-resolved reconcile,
+	// which runs after prefetch; a Job built before it cannot stage the files.
+	if filesHaveGlob(model.Spec.Files) {
+		return false
+	}
 	// A source is prefetchable when it normalizes to a fetchable http(s) URL:
 	// hf:// and huggingface.co repo URLs become resolve URLs, direct file URLs
 	// stay as-is, while bare org/name (runtime-resolved), local paths, pvc://
@@ -83,7 +88,11 @@ func prefetchEligible(model *inferencev1alpha1.Model) bool {
 	// original semantics without depending on isRemoteHTTPSource's repo-vs-file
 	// classification.
 	normalized := normalizeHFSource(model.Spec.Source)
-	return hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://")
+	if hasSchemeFold(normalized, "https://") || hasSchemeFold(normalized, "http://") {
+		return true
+	}
+	// A bare repo ID with spec.files is staged by the operator (stagingRepoBase).
+	return hasMultiFileStaging(model) && isHFRepoSource(model.Spec.Source)
 }
 
 // DefaultPrefetchJobReadTimeout bounds the read of the prefetch Job. Generous

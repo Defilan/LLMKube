@@ -817,7 +817,11 @@ func modelStagingPlan(model *inferencev1alpha1.Model) (*StagingPlan, error) {
 	if !hasMultiFileStaging(model) {
 		return nil, nil
 	}
-	plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, nil)
+	files, err := stagedFileEntries(model)
+	if err != nil {
+		return nil, fmt.Errorf("invalid fileset: %w", err)
+	}
+	plan, err := ResolveFileSet(files, model.Spec.Mmproj, nil)
 	if err != nil {
 		return nil, fmt.Errorf("invalid fileset: %w", err)
 	}
@@ -825,6 +829,21 @@ func modelStagingPlan(model *inferencev1alpha1.Model) (*StagingPlan, error) {
 		return nil, nil
 	}
 	return plan, nil
+}
+
+// stagedFileEntries returns the file entries to stage: spec.files as written,
+// or, when it holds a glob, the expansion the Model controller recorded in
+// status.stagedFiles. The expansion is trusted only for the current generation;
+// one written for an older spec would stage the wrong set.
+func stagedFileEntries(model *inferencev1alpha1.Model) ([]string, error) {
+	if !filesHaveGlob(model.Spec.Files) {
+		return model.Spec.Files, nil
+	}
+	gen, ok := availableObservedGeneration(model)
+	if len(model.Status.StagedFiles) == 0 || !ok || gen != model.Generation {
+		return nil, fmt.Errorf("spec.files has a glob and the Model has not recorded its expansion for generation %d", model.Generation)
+	}
+	return model.Status.StagedFiles, nil
 }
 
 // invalidFileSetInitContainer returns an init container that immediately exits
@@ -1396,8 +1415,9 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 	}
 	if plan != nil {
 		modelPath := stagedCachePath(cacheDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
-		env := multiFileInitEnvVars(model.Spec.Source, cacheDir, plan.Files, model.Spec.FileSHA256)
+		base := stagingRepoBase(model.Spec.Source, hfEndpoint)
+		cmd := buildMultiFileInitCommand(true, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(base, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
+		env := multiFileInitEnvVars(base, cacheDir, plan.Files, model.Spec.FileSHA256)
 
 		initVolumeMounts := []corev1.VolumeMount{
 			{Name: "model-cache", MountPath: "/models"},
@@ -1527,8 +1547,9 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 	if plan != nil {
 		stagedDir := fmt.Sprintf("/models/%s-%s", namespace, model.Name)
 		modelPath := fmt.Sprintf("%s/%s", stagedDir, plan.Primary)
-		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(model.Spec.Source, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
-		env := multiFileInitEnvVars(model.Spec.Source, stagedDir, plan.Files, model.Spec.FileSHA256)
+		base := stagingRepoBase(model.Spec.Source, hfEndpoint)
+		cmd := buildMultiFileInitCommand(false, isS3Source(model.Spec.Source), isHFAuthSourceForEndpoint(base, hfEndpoint), len(model.Spec.FileSHA256) > 0, model.Spec.RefreshPolicy)
+		env := multiFileInitEnvVars(base, stagedDir, plan.Files, model.Spec.FileSHA256)
 
 		initVolumeMounts := []corev1.VolumeMount{{Name: "model-storage", MountPath: "/models"}}
 		volumes := []corev1.Volume{
