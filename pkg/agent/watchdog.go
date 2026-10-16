@@ -44,7 +44,8 @@ type MemoryStats struct {
 // computes a pressure level, and updates Prometheus metrics. It calls
 // onPressure on every sample at Warning or above, and once on the sample
 // that returns to Normal from a higher level; steady Normal samples do not
-// call it.
+// call it. A sample whose available memory cannot be read has no level and
+// is skipped.
 type MemoryWatchdog struct {
 	provider   MemoryProvider
 	processes  func() []processMemInfo
@@ -109,6 +110,7 @@ func (w *MemoryWatchdog) sample() {
 	stats.TotalMemory = total
 
 	avail, err := w.provider.AvailableMemory()
+	availKnown := err == nil
 	if err != nil {
 		w.logger.Warnw("watchdog: failed to get available memory", "error", err)
 	} else {
@@ -135,6 +137,15 @@ func (w *MemoryWatchdog) sample() {
 		stats.ProcessRSS[p.Name] = rss
 		stats.TotalRSS += rss
 		processRSSBytes.WithLabelValues(p.Name).Set(float64(rss))
+	}
+
+	// Without available memory the level is unknown: computing it from a
+	// zero reads as Critical, which could evict a process on a sensor
+	// error. Skip pressure evaluation for this sample, leaving the level
+	// gauge, lastLevel and the callback untouched, so the next good sample
+	// still compares against the last real level.
+	if !availKnown {
+		return
 	}
 
 	// Compute pressure level

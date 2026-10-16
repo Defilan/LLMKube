@@ -18,11 +18,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/zap"
 )
@@ -110,6 +112,56 @@ func TestWatchdog_DeliversReturnToNormalOnce(t *testing.T) {
 			for _, avail := range tt.samples {
 				provider.availableBytes = uint64(float64(total) * avail)
 				w.sample()
+			}
+
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("onPressure levels = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWatchdog_SkipsSampleWhenAvailableMemoryFails covers a failed available
+// memory read. It used to count as zero bytes available, so the sample
+// computed Critical and, with eviction enabled, could evict on a sensor error.
+// Now the sample is skipped: no callback, no level gauge change, and the
+// previous level is kept, so the next good sample still sees the right
+// transition.
+func TestWatchdog_SkipsSampleWhenAvailableMemoryFails(t *testing.T) {
+	const normal, warning, readFails = 0.50, 0.15, -1.0
+	tests := []struct {
+		name    string
+		samples []float64 // available fraction per sample; readFails makes the read error
+		want    []MemoryPressureLevel
+	}{
+		{"failed read after normal", []float64{normal, readFails}, nil},
+		{"return to normal after a failed read is delivered", []float64{warning, readFails, normal},
+			[]MemoryPressureLevel{MemoryPressureWarning, MemoryPressureNormal}},
+	}
+
+	total := uint64(64 * 1024 * 1024 * 1024)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := &mockMemoryProvider{totalBytes: total}
+			var got []MemoryPressureLevel
+			onPressure := func(level MemoryPressureLevel, _ MemoryStats) {
+				got = append(got, level)
+			}
+			w := NewMemoryWatchdog(provider, func() []processMemInfo { return nil },
+				onPressure, defaultTestConfig(), testLogger())
+
+			for _, avail := range tt.samples {
+				provider.availableErr = nil
+				if avail == readFails {
+					provider.availableErr = errors.New("vm_stat failed")
+				} else {
+					provider.availableBytes = uint64(float64(total) * avail)
+				}
+				gaugeBefore := testutil.ToFloat64(memoryPressureLevelGauge)
+				w.sample()
+				if gaugeAfter := testutil.ToFloat64(memoryPressureLevelGauge); avail == readFails && gaugeAfter != gaugeBefore {
+					t.Errorf("a failed read moved the pressure level gauge from %v to %v", gaugeBefore, gaugeAfter)
+				}
 			}
 
 			if !slices.Equal(got, tt.want) {
