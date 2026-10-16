@@ -836,7 +836,9 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
    make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000
    ```
 
-   If the installed rule does not match the agent's command (the fragment is missing, or was rendered for a different interval), sudo refuses it and the agent logs `apple-power: powermetrics exited unexpectedly` with sudo's message, the command it ran (`argv`) and a `remedy` field naming the `make` command to run.
+   If the installed rule does not match the agent's command (the fragment is missing, or was rendered for a different interval), sudo refuses it and the agent logs `apple-power: powermetrics exited unexpectedly` with sudo's message, the command it asked sudo to run (`argv`, without the leading `/usr/bin/sudo -n`) and a `remedy` field naming the `make` command to run.
+
+   Upgrading the agent does not change an installed `/etc/sudoers.d/llmkube-powermetrics`; after an upgrade, re-run `make install-powermetrics-sudo` (with `APPLE_POWER_INTERVAL_MS` if you use a non-default interval).
 
    To **uninstall**:
 
