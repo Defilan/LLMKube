@@ -62,7 +62,10 @@ One or more of:
 
    - **No owner references at all**: something other than LLMKube created a
      Deployment with this name (a hand-rolled workload, another operator, a
-     leftover). The container image tells you whose it is.
+     leftover). The container image tells you whose it is. This includes a
+     legacy object from before the controller stamped owner references: such
+     an object is refused, not migrated, even when its selector predates the
+     current one.
    - **A controller reference to a different `InferenceService` UID**: a
      same-name service was deleted and recreated before garbage collection
      removed its old Deployment (or the old Deployment was orphaned with

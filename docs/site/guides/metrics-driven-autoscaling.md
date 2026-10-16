@@ -83,6 +83,7 @@ The managed HPA has the same name as the `InferenceService`
 | `True` | `HPAManaged` | The controller created or updated the HPA. |
 | `False` | `HPANameTaken` | An HPA the controller did not create already has that name. The controller leaves it alone (no overwrite, no delete), keeps reconciling the rest of the service, emits a Warning event once, and rechecks about every 2 minutes. See [the pitfall below](#an-hpa-with-the-services-name-already-exists). |
 | `False` | `DeploymentNameTaken` | A foreign Deployment holds the generated name, so the controller refused to provision the service's workload and removed the HPA it owns so the HPA cannot scale the foreign object. The HPA (and this condition back to `True`) return when the name is free. See [the name-taken runbook](../../operations/runbooks/inferenceservice-name-taken-deployment.md). |
+| `False` | `HPAStateUnknown` | The controller could not read the HPA while refusing a foreign Deployment at the generated name; the reconcile retries in about 2 minutes. |
 | absent | | Nothing to report: `spec.autoscaling` is not set, the service is suspended, or it is a Metal workload, and no Deployment-name refusal is in flight. |
 
 ```bash

@@ -677,7 +677,17 @@ func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Conte
 		case apierrors.IsNotFound(getErr):
 			setHPARemovedForNameTaken(isvc)
 		case getErr != nil:
+			// The HPA's state cannot be verified or corrected this pass, so
+			// a prior True/HPAManaged must not stand: report the unknown
+			// state and let the bounded requeue retry the read.
 			log.Error(getErr, "Failed to get the HPA while refusing a name-taken Deployment", "hpa", isvc.Name)
+			meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
+				Type:               ConditionAutoscalingReady,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: isvc.Generation,
+				Reason:             ReasonHPAStateUnknown,
+				Message:            fmt.Sprintf("could not read HorizontalPodAutoscaler %s/%s while a foreign Deployment holds the generated name; its state is unknown and the reconcile will retry", isvc.Namespace, isvc.Name),
+			})
 		}
 	} else {
 		// The refusal stops the sequence before reconcileHPA, which owns the

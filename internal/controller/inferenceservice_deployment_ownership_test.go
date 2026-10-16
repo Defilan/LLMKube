@@ -409,6 +409,73 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 			Expect(cond.Reason).To(Equal(ReasonHPAManaged))
 		})
 
+		It("reports an unreadable HPA as HPAStateUnknown while refusing", func() {
+			name := "dep-hpa-get-fails"
+			scheme := k8sClient.Scheme()
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: PhaseReady},
+			}
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:    model.Name,
+					Replicas:    &replicas,
+					Image:       "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(1), MaxReplicas: 4},
+				},
+				Status: inferencev1alpha1.InferenceServiceStatus{
+					Conditions: []metav1.Condition{{
+						Type:               ConditionAutoscalingReady,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 1,
+						Reason:             ReasonHPAManaged,
+						Message:            "from a previous pass",
+					}},
+				},
+			}
+			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
+
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(model, isvc, foreign).
+				WithStatusSubresource(&inferencev1alpha1.InferenceService{}, &inferencev1alpha1.Model{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ictx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if _, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); ok {
+							return fmt.Errorf("injected HPA get failure")
+						}
+						return cl.Get(ictx, key, obj, opts...)
+					},
+				}).
+				Build()
+			r := &InferenceServiceReconciler{
+				Client:             c,
+				Scheme:             scheme,
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			_, _, _, result, err := r.reconcileDeployment(context.Background(), isvc, model, nil, 1, true, false)
+			Expect(err).NotTo(HaveOccurred(), "the refusal is not a reconcile error")
+			Expect(result).NotTo(BeNil())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			Expect(got.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
+			cond := meta.FindStatusCondition(got.Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(ReasonHPAStateUnknown),
+				"a prior True/HPAManaged must not stand when the HPA cannot be read")
+		})
+
 		It("still refuses when the owned HPA's delete is rejected", func() {
 			name := "dep-hpa-delete-fails"
 			scheme := k8sClient.Scheme()

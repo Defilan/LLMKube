@@ -45,13 +45,13 @@ const hpaNameTakenRequeueAfter = 2 * time.Minute
 const (
 	// ConditionAutoscalingReady reports whether the reconciler manages the HPA
 	// named after the service. Diagnostic only: it never feeds phase or the
-	// Available condition. True while the service's own HPA is in place,
-	// False with HPANameTaken while a foreign same-name HPA blocks the
-	// reconciler, False with DeploymentNameTaken while the Deployment-name
-	// refusal has removed (or cannot provision) the service's HPA because a
-	// foreign Deployment holds the generated name, and absent when there is
-	// no HPA to report on (autoscaling not configured, the service
-	// suspended, or a Metal workload).
+	// Available condition. The reason enumeration lives in the autoscaling
+	// guide's table (docs/site/guides/metrics-driven-autoscaling.md):
+	// True/HPAManaged, False/HPANameTaken (foreign same-name HPA),
+	// False/DeploymentNameTaken (the Deployment-name refusal removed or
+	// cannot provision the HPA), False/HPAStateUnknown (the HPA could not be
+	// read), and absent when there is no HPA to report on (autoscaling not
+	// configured, the service suspended, or a Metal workload).
 	ConditionAutoscalingReady = "AutoscalingReady"
 
 	// ReasonHPAManaged is set when AutoscalingReady=True: the HPA was created
@@ -62,6 +62,12 @@ const (
 	// this InferenceService did not create already holds the generated name,
 	// so the reconciler refuses to overwrite or delete it.
 	ReasonHPANameTaken = "HPANameTaken"
+
+	// ReasonHPAStateUnknown is set when AutoscalingReady=False because the
+	// HPA could not be read (a non-NotFound Get failure while refusing a
+	// name-taken Deployment), so the previous state cannot be verified or
+	// corrected on this pass. The bounded requeue retries the read.
+	ReasonHPAStateUnknown = "HPAStateUnknown"
 )
 
 // hpaNameTakenError reports an HPA whose generated name is held by an
@@ -142,7 +148,10 @@ func removeAutoscalingReadyCondition(isvc *inferencev1alpha1.InferenceService) {
 // the refusal removed the operator-owned HPA so it cannot scale that object,
 // or there was none left to remove. A destructive action must leave a status
 // record, not only a transient event; reconcileHPA recreates the HPA and the
-// condition returns to True when the name is free again.
+// condition returns to True when the name is free again. The removal lands
+// before the refusal's status write, so a write conflict can leave the HPA
+// deleted while the persisted condition still reads the previous state until
+// the bounded requeue's next pass.
 func setHPARemovedForNameTaken(isvc *inferencev1alpha1.InferenceService) {
 	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
 		Type:               ConditionAutoscalingReady,

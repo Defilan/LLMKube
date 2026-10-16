@@ -104,7 +104,10 @@ var _ = Describe("InferenceService Deployment selector migration (#606)", func()
 		}
 		// The old operator stamped this service's controller reference on
 		// every Deployment it created, so the migration target carries one;
-		// an unowned Deployment is refused per #2011 rather than migrated.
+		// an unowned Deployment is refused per #2011 rather than migrated
+		// (that contract is pinned by the Deployment ownership suite's
+		// selector-differs spec, which seeds the old selector with no
+		// owner references).
 		owned := &inferencev1alpha1.InferenceService{}
 		Expect(k8sClient.Get(ctx, nn, owned)).To(Succeed())
 		Expect(setControllerReferenceUnblocked(owned, dep, k8sClient.Scheme())).To(Succeed())

@@ -226,13 +226,17 @@ the new default store is a directory the agent has never populated.
   Deployment the controller did not create is no longer overwritten or
   recreated by the controller: the reconcile refuses with phase `Failed` and
   `status.schedulingStatus: DeploymentNameTaken` (#2011). This only bites an
-  install where a foreign object already holds the name; every Deployment the
-  operator itself created carries the service's controller reference (the
-  create path has stamped one since the first release), so upgrade in place
-  is unaffected. See
-  [`inferenceservice-name-taken-deployment.md`](./inferenceservice-name-taken-deployment.md)
-  for diagnosis and recovery. The same guard has covered the router-proxy
-  objects and the managed HPA since 0.10.3.
+  install where a foreign object already holds the name: the Deployment
+  create path has stamped the service's controller reference on every
+  Deployment it created
+  (`setControllerReferenceUnblocked(isvc, deployment, ...)` immediately
+  before `r.Create` in `internal/controller/inferenceservice_controller.go`),
+  verified in every tagged release from v0.2.0 through v0.10.3, so upgrade in
+  place is unaffected. A service whose name is taken recovers by deleting or
+  renaming the foreign object; see
+  [`inferenceservice-name-taken-deployment.md`](./inferenceservice-name-taken-deployment.md).
+  The same guard has covered the router-proxy objects and the managed HPA
+  since 0.10.3.
 
 ## Verify the upgrade
 
