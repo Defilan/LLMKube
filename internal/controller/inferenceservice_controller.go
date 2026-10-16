@@ -649,9 +649,10 @@ func clearDeploymentNameTaken(isvc *inferencev1alpha1.InferenceService) {
 // The sequence stops here, so reconcileHPA would never run: an HPA this
 // service owns would keep scaling whatever holds the generated name, which
 // after the refusal is the foreign object. Delete it (the #2010 gate keeps
-// HPAs at this name operator-owned or refused, never adopted) and drop the
-// AutoscalingReady condition; a foreign HPA is left alone with its condition
-// as-is.
+// HPAs at this name operator-owned or refused, never adopted) and report the
+// removal on AutoscalingReady=False; a foreign HPA is left alone with its
+// condition as-is. The multiNode path never reaches this helper (it runs no
+// Deployment); its own HPA-target gap is tracked in #2094.
 func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Context, isvc *inferencev1alpha1.InferenceService, nameTakenPreviously bool, modelReady bool, desiredReplicas int32, taken error) (*ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	log.Info("Refusing to overwrite or recreate a Deployment this InferenceService does not control", "error", taken)
@@ -667,18 +668,22 @@ func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Conte
 		case getErr == nil && metav1.IsControlledBy(hpa, isvc):
 			if delErr := r.Delete(ctx, hpa); delErr != nil && !apierrors.IsNotFound(delErr) {
 				// Transient: the bounded requeue brings the next pass, which
-				// retries the delete. The refusal below still lands.
+				// retries the delete. The refusal below still lands, and the
+				// HPA's own condition stays until the delete lands.
 				log.Error(delErr, "Failed to delete the operator-owned HPA scaling a refused name", "hpa", isvc.Name)
 			} else {
-				meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionAutoscalingReady)
+				setHPARemovedForNameTaken(isvc)
 			}
 		case apierrors.IsNotFound(getErr):
-			meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionAutoscalingReady)
+			setHPARemovedForNameTaken(isvc)
 		case getErr != nil:
 			log.Error(getErr, "Failed to get the HPA while refusing a name-taken Deployment", "hpa", isvc.Name)
 		}
 	}
 
+	// Ready is forced to zero (this service has no workload of its own to
+	// count) while Observed preserves the last persisted value so /scale
+	// keeps reading a truthful count; see updateStatusWithSchedulingInfo.
 	phase := PhaseFailed
 	if isvc.Spec.Suspend {
 		phase = PhaseSuspended
@@ -838,7 +843,9 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 					res, updateErr := r.refuseDeploymentNameTaken(ctx, isvc, nameTakenPreviously, modelReady, desiredReplicas, guardErr)
 					return nil, replicaCounts{}, nil, res, updateErr
 				}
-				return deployment, replicaCounts{}, nil, nil, nil
+				// Ours: a concurrent reconcile created it; return the object
+				// that actually exists so the next pass takes the update path.
+				return raced, replicaCounts{}, nil, nil, nil
 			}
 			log.Error(err, "Failed to create Deployment")
 			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Deployment", nil)

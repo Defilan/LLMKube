@@ -3,13 +3,13 @@
 An `InferenceService` sits with `status.schedulingStatus: DeploymentNameTaken`
 and a phase of `Failed` while it should be serving, or `Suspended`/`Stopped`
 when it is deliberately off (the refusal respects the user's intent and rides
-the marker instead), the reconcile creates or updates nothing past the refused
-Deployment step, and the operator log repeats a refusal line on a slow
-two-minute cadence instead of erroring. Objects an earlier pass provisioned
-are left in place: the refusal stops the sequence, it does not tear anything
-down. The controller is not broken: a Deployment already holds the name the
-service generates, and the controller refuses to touch an object it did not
-create (#2011).
+the marker instead). The reconcile creates or updates nothing past the refused
+Deployment step, and it removes the operator-owned HPA so the HPA cannot keep
+scaling the foreign object; everything else an earlier pass provisioned is
+left in place. The operator log repeats a refusal line on a slow two-minute
+cadence instead of erroring. The controller is not broken: a Deployment
+already holds the name the service generates, and the controller refuses to
+touch an object it did not create (#2011).
 
 ## Trigger
 
@@ -174,7 +174,10 @@ name can.
    ```
 
    The last event should predate your fix; a fresh one means the name is
-   occupied again.
+   occupied again. One caveat: the event is emitted before the status write
+   persists the marker, so a status write that conflicts re-fires the Warning
+   on the next pass for the same episode. A fresh event alone is not proof
+   the name was re-taken; check `schedulingStatus` too.
 
 ## Related
 

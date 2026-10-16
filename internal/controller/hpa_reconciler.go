@@ -134,6 +134,22 @@ func removeAutoscalingReadyCondition(isvc *inferencev1alpha1.InferenceService) {
 	meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionAutoscalingReady)
 }
 
+// setHPARemovedForNameTaken records on AutoscalingReady that the service's
+// HPA is not in place because a foreign Deployment holds the generated name:
+// the refusal removed the operator-owned HPA so it cannot scale that object,
+// or there was none left to remove. A destructive action must leave a status
+// record, not only a transient event; reconcileHPA recreates the HPA and the
+// condition returns to True when the name is free again.
+func setHPARemovedForNameTaken(isvc *inferencev1alpha1.InferenceService) {
+	meta.SetStatusCondition(&isvc.Status.Conditions, metav1.Condition{
+		Type:               ConditionAutoscalingReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: isvc.Generation,
+		Reason:             inferencev1alpha1.ReasonDeploymentNameTaken,
+		Message:            "the HPA this service owns is not in place while a foreign Deployment holds the generated name; it returns when the name is free",
+	})
+}
+
 // reportHPANameTaken records a refusal on the condition and, on the
 // transition into it, as a Warning event.
 func (r *InferenceServiceReconciler) reportHPANameTaken(isvc *inferencev1alpha1.InferenceService, err error) {

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"time"
 
@@ -378,11 +379,146 @@ var _ = Describe("InferenceService Deployment ownership (#2011)", func() {
 
 			// The HPA must not keep scaling the foreign object the operator
 			// just refused to touch: the refusal removes the operator-owned
-			// HPA and its condition with it.
+			// HPA and reports the removal on AutoscalingReady=False.
 			err = k8sClient.Get(ctx, hpaNN, &autoscalingv2.HorizontalPodAutoscaler{})
 			Expect(err).To(HaveOccurred())
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
-			Expect(meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)).To(BeNil())
+			cond = meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
+			expectDeploymentNameTaken(ctx, name)
+		})
+
+		It("still refuses when the owned HPA's delete is rejected", func() {
+			name := "dep-hpa-delete-fails"
+			scheme := k8sClient.Scheme()
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: PhaseReady},
+			}
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: "uid-hpa-fails"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:    model.Name,
+					Replicas:    &replicas,
+					Image:       "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(1), MaxReplicas: 4},
+				},
+			}
+			foreign := foreignISVCDeployment(name, generatedDeploymentSelector(name))
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{APIVersion: "apps/v1", Kind: "Deployment", Name: name},
+					MaxReplicas:    4,
+				},
+			}
+			Expect(setControllerReferenceUnblocked(isvc, hpa, scheme)).To(Succeed())
+
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(model, isvc, foreign, hpa).
+				WithStatusSubresource(&inferencev1alpha1.InferenceService{}, &inferencev1alpha1.Model{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Delete: func(ictx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if _, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); ok {
+							return fmt.Errorf("injected HPA delete failure")
+						}
+						return cl.Delete(ictx, obj, opts...)
+					},
+				}).
+				Build()
+			r := &InferenceServiceReconciler{
+				Client:             c,
+				Scheme:             scheme,
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			dep, _, _, result, err := r.reconcileDeployment(context.Background(), isvc, model, nil, 1, true, false)
+			Expect(err).NotTo(HaveOccurred(), "a failed HPA delete must not abort the refusal")
+			Expect(dep).To(BeNil())
+			Expect(result).NotTo(BeNil())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			Expect(got.Status.SchedulingStatus).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
+			Expect(got.Status.Phase).To(Equal(PhaseFailed))
+
+			// The delete failed, so the HPA is still there and its condition
+			// is left for the next pass, which retries the delete.
+			survivor := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, survivor)).To(Succeed())
+		})
+
+		It("leaves a foreign same-name HPA alone while refusing the Deployment", func() {
+			name := "dep-foreign-hpa-untouched"
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						Accelerator: "cpu",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+			replicas := int32(1)
+			Expect(k8sClient.Create(ctx, &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef:    model.Name,
+					Replicas:    &replicas,
+					Image:       "ghcr.io/ggml-org/llama.cpp:server",
+					Autoscaling: &inferencev1alpha1.AutoscalingSpec{MinReplicas: int32Ptr(1), MaxReplicas: 4},
+				},
+			})).To(Succeed())
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+			r := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			// First refusal with no HPA at the name: AutoscalingReady reports
+			// the removed HPA.
+			Expect(k8sClient.Create(ctx, foreignISVCDeployment(name, generatedDeploymentSelector(name)))).To(Succeed())
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			cond := meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+
+			// A foreign HPA takes the generated name; the next pass must
+			// refuse the Deployment and leave the foreign HPA untouched.
+			foreignHPA := foreignHPA(name)
+			Expect(k8sClient.Create(ctx, foreignHPA)).To(Succeed())
+			hpaNN := types.NamespacedName{Name: name, Namespace: "default"}
+			seeded := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(k8sClient.Get(ctx, hpaNN, seeded)).To(Succeed())
+			foreignHpaRV := seeded.ResourceVersion
+
+			_, err = reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &autoscalingv2.HorizontalPodAutoscaler{}
+			Expect(k8sClient.Get(ctx, hpaNN, got)).To(Succeed())
+			Expect(got.ResourceVersion).To(Equal(foreignHpaRV))
+			Expect(got.Spec.MaxReplicas).To(Equal(int32(3)))
+			Expect(got.OwnerReferences).To(BeEmpty())
+			cond = meta.FindStatusCondition(getDeploymentOwnershipISVC(ctx, name).Status.Conditions, ConditionAutoscalingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonDeploymentNameTaken))
 			expectDeploymentNameTaken(ctx, name)
 		})
 
