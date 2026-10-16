@@ -1041,16 +1041,12 @@ func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
 
 // fetchModelForReconcile gets the Model isvc.Spec.ModelRef names. A NotFound
 // result clears any remembered digest mismatch or over-cap download for it
-// (nothing else revisits a NamespacedName once its Get starts 404ing, so this
-// is the only place that notices the Model is gone); a successful Get records
-// which Model isvcKey currently resolves to, so deleteProcess can clear that
-// entry when the InferenceService itself is deleted
-// (digestMismatchMemo.forgetISVC: a persistently-refused InferenceService
-// never reaches a.processes, so that is the only place this association is
-// available). Split out of reconcileProcess, rather than inlined there, to
-// keep its cyclomatic complexity from crossing the linter's threshold.
+// (nothing else revisits a NamespacedName once its Get starts 404ing, so this is the only place that
+// notices the Model is gone). Split out of reconcileProcess, rather than
+// inlined there, to keep its cyclomatic complexity from crossing the linter's
+// threshold.
 func (a *MetalAgent) fetchModelForReconcile(
-	ctx context.Context, isvc *inferencev1alpha1.InferenceService, isvcKey string,
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService,
 ) (*inferencev1alpha1.Model, error) {
 	model := &inferencev1alpha1.Model{}
 	modelKey := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Spec.ModelRef}
@@ -1060,7 +1056,45 @@ func (a *MetalAgent) fetchModelForReconcile(
 		}
 		return nil, fmt.Errorf("failed to get model %s: %w", isvc.Spec.ModelRef, err)
 	}
-	a.digestMismatches.noteRef(isvcKey, modelKey)
+	return model, nil
+}
+
+// fetchModelThenStopStale gets the Model for isvc and only then stops
+// existing, when it is a healthy process running an older spec (existing is
+// nil when nothing runs for key). A lookup that fails with anything but
+// NotFound (a timeout, throttling, a 5xx while the API server restarts)
+// returns with the old process still serving: stopping it first would leave
+// the service down until the InferenceService changes again, because nothing
+// else retries (#2076). A NotFound Model can never be started, so the old
+// process is stopped as before. Split out of reconcileProcess to keep its
+// cyclomatic complexity under the linter's threshold.
+//
+// The Model reference is recorded (digestMismatchMemo.noteRef, so deleting
+// the InferenceService later clears its Model's memo entry; a
+// persistently-refused one never reaches a.processes, so this is the only
+// place the association is available) only after the stop: deleteProcess
+// forgets the previous reference with forgetISVC, and noting the new one
+// first would have it forgotten, along with that Model's memo entry, at once.
+func (a *MetalAgent) fetchModelThenStopStale(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService, key string,
+	existing *ManagedProcess, desiredHash string,
+) (*inferencev1alpha1.Model, error) {
+	model, modelErr := a.fetchModelForReconcile(ctx, isvc)
+	if modelErr != nil && !apierrors.IsNotFound(modelErr) {
+		return nil, modelErr
+	}
+	if existing != nil {
+		a.logger.Infow("spec changed; restarting process to pick up new flags",
+			"namespace", isvc.Namespace, "name", isvc.Name,
+			"oldSpecHash", existing.SpecHash, "newSpecHash", desiredHash)
+		if err := a.deleteProcess(ctx, key); err != nil {
+			return nil, fmt.Errorf("failed to stop process before respawn: %w", err)
+		}
+	}
+	if modelErr != nil {
+		return nil, modelErr
+	}
+	a.digestMismatches.noteRef(key, types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Spec.ModelRef})
 	return model, nil
 }
 
@@ -1138,22 +1172,19 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		return nil
 	}
 
-	if exists {
-		if existing.SpecHash == desiredHash {
-			// An unhealthy process is left to the health monitor, which stops
-			// it and restarts it after healthFailureThreshold consecutive
-			// failed probes. Starting a new engine here would leave this one
-			// running untracked, with its weights still wired (#2077).
-			a.logger.Debugw("inference service already has a process with matching spec",
-				"key", key, "healthy", existing.Healthy)
-			return nil
-		}
-		a.logger.Infow("spec changed; restarting process to pick up new flags",
-			"namespace", isvc.Namespace, "name", isvc.Name,
-			"oldSpecHash", existing.SpecHash, "newSpecHash", desiredHash)
-		if err := a.deleteProcess(ctx, key); err != nil {
-			return fmt.Errorf("failed to stop process before respawn: %w", err)
-		}
+	if exists && existing.SpecHash == desiredHash {
+		// An unhealthy process is left to the health monitor, which stops
+		// it and restarts it after healthFailureThreshold consecutive
+		// failed probes. Starting a new engine here would leave this one
+		// running untracked, with its weights still wired (#2077).
+		a.logger.Debugw("inference service already has a process with matching spec",
+			"key", key, "healthy", existing.Healthy)
+		return nil
+	}
+
+	model, err := a.fetchModelThenStopStale(ctx, isvc, key, existing, desiredHash)
+	if err != nil {
+		return err
 	}
 
 	a.logger.Infow("starting inference service", "namespace", isvc.Namespace, "name", isvc.Name)
@@ -1161,12 +1192,6 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// Resolve the effective runtime for this InferenceService.
 	// spec.runtime wins; the agent's --runtime flag is the fallback.
 	runtime := a.resolveRuntime(isvc)
-
-	// Get the Model resource
-	model, err := a.fetchModelForReconcile(ctx, isvc, key)
-	if err != nil {
-		return err
-	}
 
 	// Relay mode appends "-agent" to the Service name; refuse a name that no
 	// longer fits a DNS label before starting anything.

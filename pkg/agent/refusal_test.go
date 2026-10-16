@@ -1118,6 +1118,87 @@ func TestEnsureProcess_DownloadTooLargeMemo_ClearsOnSourceChange(t *testing.T) {
 	}
 }
 
+// respawnFixtureProcess seeds a healthy process for default/svc whose spec hash
+// no longer matches, so the next ensureProcess takes the spec-change respawn.
+func respawnFixtureProcess(a *MetalAgent) {
+	a.processes["default/svc"] = &ManagedProcess{
+		Name: "svc", Namespace: "default", PID: 1111, Port: 18080,
+		Healthy: true, SpecHash: "old-hash", Runtime: runtimeLlamaServer,
+	}
+}
+
+// TestEnsureProcess_SpecChangeKeepsProcessWhenModelLookupFails is the respawn
+// side of #2076: a spec change stops the healthy process only once the Model
+// lookup has succeeded, so a transient lookup failure leaves the old process
+// serving (nothing else retries until the InferenceService changes again),
+// and the next reconcile respawns it as usual.
+func TestEnsureProcess_SpecChangeKeepsProcessWhenModelLookupFails(t *testing.T) {
+	failModelGet := false
+	funcs := &interceptor.Funcs{
+		Get: func(
+			ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+		) error {
+			if _, isModel := obj.(*inferencev1alpha1.Model); isModel && failModelGet {
+				failModelGet = false
+				return apierrors.NewServiceUnavailable("apiserver restarting")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+	isvc := refusalISVC("svc")
+	a, ex, _ := refusalFixtureWithInterceptor(t, MetalAgentConfig{}, funcs, isvc, refusalModel())
+	respawnFixtureProcess(a)
+
+	failModelGet = true
+	if err := a.ensureProcess(context.Background(), isvc); err == nil {
+		t.Fatal("ensureProcess with the Model lookup failing returned nil, want the lookup error")
+	}
+	if len(ex.stopped) != 0 {
+		t.Errorf("old process stopped (pids %v) on a failed Model lookup, want it left serving", ex.stopped)
+	}
+	if p := a.processes["default/svc"]; p == nil || p.PID != 1111 {
+		t.Errorf("processes[default/svc] = %+v, want the old process (pid 1111) still tracked", p)
+	}
+
+	if err := a.ensureProcess(context.Background(), isvc); err != nil {
+		t.Fatalf("ensureProcess after the lookup recovered: %v", err)
+	}
+	if len(ex.stopped) != 1 || ex.stopped[0] != 1111 || ex.starts != 1 {
+		t.Errorf("after the lookup recovered stopped = %v, starts = %d; want pid 1111 stopped once and one start",
+			ex.stopped, ex.starts)
+	}
+}
+
+// TestEnsureProcess_SpecChangeToMemoizedMismatchRefusedWithoutDownload pins
+// the order inside a spec-change respawn: the new Model reference is noted
+// only after deleteProcess forgets the old one. Noting it first would let
+// forgetISVC drop the new Model's digest-mismatch memo entry, and the respawn
+// would download a file already known to be bad.
+func TestEnsureProcess_SpecChangeToMemoizedMismatchRefusedWithoutDownload(t *testing.T) {
+	bad := refusalModel()
+	bad.Name = "bad"
+	bad.Spec.SHA256 = "aaaa"
+	isvc := refusalISVC("svc")
+	isvc.Spec.ModelRef = bad.Name
+	a, ex, _ := refusalFixture(t, MetalAgentConfig{}, isvc, refusalModel(), bad)
+	respawnFixtureProcess(a)
+	a.digestMismatches.noteRef("default/svc", types.NamespacedName{Namespace: "default", Name: refusalModelName})
+	a.digestMismatches.record(types.NamespacedName{Namespace: "default", Name: bad.Name}, bad.Spec.Source, "aaaa",
+		&ModelDigestMismatchError{Path: "/models/bad/m.gguf", Expected: "aaaa", Computed: "bbbb"})
+
+	err := a.ensureProcess(context.Background(), isvc)
+
+	if err == nil || !strings.Contains(err.Error(), EventReasonModelDigestMismatch) {
+		t.Fatalf("ensureProcess error = %v, want the memoized %s refusal", err, EventReasonModelDigestMismatch)
+	}
+	if ex.starts != 0 {
+		t.Errorf("starts = %d, want 0 (the memo should refuse the bad Model without downloading it)", ex.starts)
+	}
+	if len(ex.stopped) != 1 {
+		t.Errorf("stopped = %v, want the old process stopped for the spec change", ex.stopped)
+	}
+}
+
 // TestMetalAgentRefusalReasons_CoversEveryAgentRefusalReason (a structural
 // AST scan, not a hand-maintained table) lives in
 // refusal_reasons_scan_test.go.
