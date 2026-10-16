@@ -251,6 +251,8 @@ The agent caps the bytes a single Model download may write, so a broken or hosti
 - A source whose declared size (the HEAD probe, the response's `Content-Length`, or the s3 object size) is over the cap is refused before anything is written, and a partial left for it by an earlier attempt is removed.
 - A body that omits its `Content-Length` or keeps streaming is stopped one byte past the cap, and its partial file is removed.
 
+The cap does not cover downloads the agent does not make itself: Ollama pulls, which the Ollama daemon writes into its own store, and llama-server's own download flags (`-hf`, `--model-url` and similar), which are only allowed with `--allow-unsafe-extra-args`.
+
 Either way the start is refused with reason `ModelDownloadTooLarge` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). Downloads within the cap, resumed ones included, behave exactly as before.
 
 The default is the Mac's total physical memory. The agent wires model weights into memory (mlock), and memory admission only starts a model that fits the memory budget, so a single model file larger than RAM is not one the agent can serve. Set the cap explicitly as a byte count or a Kubernetes quantity, or `0` to disable it:
@@ -268,7 +270,7 @@ To set this in the launchd plist:
 
 The agent logs the effective cap as `maxDownloadBytes` at startup. It refuses to start if the flag does not parse, or if the flag is unset and the total memory cannot be read.
 
-Like a digest mismatch, the refusal is remembered, so the agent does not download the same source up to the cap on every reconcile. Changing the Model's `source` (or `sha256`) retries, and so does restarting the agent, which is also how a raised cap takes effect.
+Like a digest mismatch, the refusal is remembered, so the agent does not download the same source up to the cap on every reconcile. Changing the Model's `source` (or `sha256`) retries, and so does restarting the agent, which is also how a raised cap takes effect. Deleting the `Model` or the `InferenceService` clears the memo too, once the agent's next poll (every 5 seconds) sees it gone, so recreate it after that. A file placed in the cache slot (`<model-store>/<model>/<file>`) by hand does not lift the refusal: the memo is checked before the agent looks for a cached file, so the start stays refused until one of those resets or an agent restart.
 
 Upgrade note: if you deliberately serve a model file larger than the Mac's physical memory (for example with a Model `spec.hardware.memoryBudget` above the Mac's RAM), raise `--max-download-size` or set it to `0` before upgrading, or the agent will refuse that download.
 
@@ -1120,7 +1122,7 @@ The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad
 
 ### `ModelDownloadTooLarge`
 
-The Model's download went over `--max-download-size`: either the source declared a size over the cap (nothing was written) or the body ran past it (the partial was removed). The message says which, and names the cap in bytes. If the source is wrong, fix `spec.source`; the next reconcile retries. If the model really is that large, raise `--max-download-size` (or set it to `0`) and restart the agent. See "`--max-download-size` flag (download cap)" above.
+The Model's download went over `--max-download-size`: either the source declared a size over the cap (nothing was written) or the body ran past it (the partial was removed). The message says which, and names the cap in bytes. If the source is wrong, fix `spec.source`; the next reconcile retries. If the model really is that large, raise `--max-download-size` (or set it to `0`) and restart the agent. If the spec was already right and the source was fixed upstream, delete and recreate the Model (or the InferenceService), or restart the agent. Placing the file in the cache slot by hand is not enough: the remembered refusal is checked first, so it only lifts after one of those. See "`--max-download-size` flag (download cap)" above.
 
 ### Can't connect to Kubernetes
 
