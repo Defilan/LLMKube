@@ -41,6 +41,7 @@ func TestAgentMetricsRegistered(t *testing.T) {
 		{"llmkube_metal_agent_process_rss_bytes", processRSSBytes},
 		{"llmkube_metal_agent_memory_pressure_level", memoryPressureLevelGauge},
 		{"llmkube_metal_agent_evictions_total", evictionsTotal},
+		{"llmkube_metal_agent_watch_model_lookup_failing_services", watchModelLookupFailingServices},
 		{"llmkube_metal_agent_apple_power_combined_watts", applePowerCombinedWatts},
 		{"llmkube_metal_agent_apple_power_gpu_watts", applePowerGPUWatts},
 		{"llmkube_metal_agent_apple_power_cpu_watts", applePowerCPUWatts},

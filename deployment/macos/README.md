@@ -615,6 +615,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_evictions_total` | Counter | Processes the memory watchdog evicted under Critical pressure (only with `--eviction-enabled`). Each eviction also emits an `Evicted` Warning event |
 | `llmkube_metal_agent_evictions_skipped_total` | Counter | Times the watchdog was at Critical but did not evict. Labels: `reason` (`disabled`, `below_guard`, `empty`, `floor`, `all_protected`, `runtime_ineligible`) |
 | `llmkube_metal_agent_watch_consecutive_failures` | Gauge | Consecutive failed Kubernetes lists by the InferenceService watcher; resets to 0 on success. The agent exits for a launchd restart at `--max-watch-failures` |
+| `llmkube_metal_agent_watch_model_lookup_failing_services` | Gauge | InferenceServices whose referenced Model lookup is currently failing with an error other than NotFound; each is kept in its previous state until a lookup succeeds |
 | `llmkube_metal_agent_fatal_exits_total` | Counter | Fatal-exit signals raised before the agent exits. Labels: `subsystem` (`watcher`, `health-server`) |
 | `llmkube_metal_agent_apple_power_combined_watts` | Gauge | Combined CPU + GPU + ANE package power. Zero unless `--apple-power-enabled`. |
 | `llmkube_metal_agent_apple_power_gpu_watts` | Gauge | GPU subsystem power. Zero unless `--apple-power-enabled`. |
@@ -1236,6 +1237,20 @@ grep "connecting to Kubernetes\|connected to Kubernetes" ~/Library/Logs/llmkube/
 # If using minikube locally
 minikube status
 ```
+
+### Agent logs `referenced model lookup failed; keeping the inference service's previous state`
+
+On every poll (every 5 seconds) the agent looks up the Model each InferenceService references, to decide whether it is a Metal service this agent runs. When that lookup fails with anything other than NotFound (an API server timeout, throttling, a 5xx while the control plane restarts, `Forbidden`), the agent cannot tell, so it leaves the service as it was: a running engine keeps serving and keeps its Service and EndpointSlice, and a service it was not running yet is not started. While the lookup fails, changes to the InferenceService (`replicas: 0`, `suspend`, flag changes) do not take effect; deleting the InferenceService, or restoring the agent's access, does.
+
+The agent retries on every poll. It logs this warning once when a service's lookup starts failing, Debug lines while it keeps failing, and `referenced model lookup recovered` at Info when it succeeds again, and the `llmkube_metal_agent_watch_model_lookup_failing_services` gauge counts the services currently in this state. A warning followed by a recovery line around a control-plane restart is expected. If the gauge stays above zero, check that the agent's credentials can still read Models in its namespace:
+
+```bash
+grep "referenced model lookup" ~/Library/Logs/llmkube/metal-agent.log | tail -5
+curl -s http://localhost:9090/metrics | grep llmkube_metal_agent_watch_model_lookup_failing_services
+kubectl --kubeconfig <agent-kubeconfig> auth can-i get models.inference.llmkube.dev -n <namespace>
+```
+
+Of the possible lookup results, only a Model that no longer exists, or one that is no longer `accelerator: metal`, makes the agent stop the service.
 
 ### Remote cluster: pods can't reach the model
 

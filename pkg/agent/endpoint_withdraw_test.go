@@ -32,6 +32,7 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -287,6 +288,38 @@ func TestWithdrawInheritedEndpoints_RespectsAllowlist(t *testing.T) {
 	}
 	if ready, _ := endpointReady(t, c, foreign); !ready {
 		t.Errorf("startup withdrawal touched a slice outside this agent's allowlist")
+	}
+}
+
+// TestWithdrawInheritedEndpoints_ModelLookupErrorLeavesEndpoint pins the
+// startup cleanup side of #2076: when the Model lookup fails with anything but
+// NotFound, ownership is unknown, so the pass leaves that service's slice as it
+// found it, the same "keep the previous state" the poll loop applies.
+func TestWithdrawInheritedEndpoints_ModelLookupErrorLeavesEndpoint(t *testing.T) {
+	const name = "model-lookup-fails"
+	model := ggufModel(t, name)
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: name},
+	}
+	svc, slice := inheritedEndpoint(name)
+	agent, c := newWithdrawTestAgent(t, nil, model, isvc, svc, slice)
+	failing := interceptor.NewClient(c.(client.WithWatch), interceptor.Funcs{
+		Get: func(
+			ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+		) error {
+			if _, isModel := obj.(*inferencev1alpha1.Model); isModel {
+				return apierrors.NewServiceUnavailable("apiserver restarting")
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+	})
+	agent.watcher = NewInferenceServiceWatcher(failing, "default", newNopLogger())
+
+	agent.withdrawInheritedEndpoints(context.Background())
+
+	if ready, _ := endpointReady(t, c, name); !ready {
+		t.Errorf("startup withdrawal acted on a service whose Model lookup failed; want its slice left Ready")
 	}
 }
 
