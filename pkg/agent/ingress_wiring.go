@@ -312,7 +312,7 @@ func (a *MetalAgent) prepareRegistry(ctx context.Context) (*ingress.Server, erro
 		return nil, err
 	}
 	if a.config.LegacyDirectEndpoints && a.watcher != nil {
-		n, err := a.registry.RemoveRelayRegistrations(ctx, a.config.Namespace, a.watcher.shouldWatch)
+		n, err := a.registry.RemoveRelayRegistrations(ctx, a.config.Namespace, a.watcher.owns)
 		if err != nil {
 			a.logger.Warnw("legacy mode: relay registration cleanup failed", "error", err)
 		} else if n > 0 {

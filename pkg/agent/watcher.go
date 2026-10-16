@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -224,8 +225,10 @@ func (w *InferenceServiceWatcher) listExisting(ctx context.Context, eventChan ch
 	}
 
 	for i := range list.Items {
-		// Only watch services with Metal accelerator
-		if !w.shouldWatch(ctx, &list.Items[i]) {
+		// Only watch services with Metal accelerator. A service whose Model
+		// lookup failed is not started yet: the first poll finds it unseen
+		// and emits Created once a lookup succeeds.
+		if watch, err := w.shouldWatch(ctx, &list.Items[i]); err != nil || !watch {
 			continue
 		}
 
@@ -258,12 +261,21 @@ func (w *InferenceServiceWatcher) poll(
 	current := make(map[string]bool)
 
 	for i := range list.Items {
-		if !w.shouldWatch(ctx, &list.Items[i]) {
-			continue
-		}
-
 		isvc := &list.Items[i]
 		key := fmt.Sprintf("%s/%s", isvc.Namespace, isvc.Name)
+
+		watch, err := w.shouldWatch(ctx, isvc)
+		if err != nil {
+			// Ownership is unknown this round (#2076). Counting the service
+			// as current keeps a seen one out of the deletion pass below,
+			// with its recorded version, so the next successful poll
+			// compares against that as usual; an unseen one is not added.
+			current[key] = true
+			continue
+		}
+		if !watch {
+			continue
+		}
 		current[key] = true
 
 		lastVersion, exists := seen[key]
@@ -315,9 +327,17 @@ func (w *InferenceServiceWatcher) poll(
 //     multi-Mac fleets partition without colliding.
 //  2. Model.spec.hardware.accelerator check -- looks up the referenced
 //     Model and returns true only when its accelerator is "metal".
-func (w *InferenceServiceWatcher) shouldWatch(ctx context.Context, isvc *inferencev1alpha1.InferenceService) bool {
+//
+// A NotFound Model means the service is not ours. Any other lookup error (a
+// timeout, client-side throttling, a 5xx while the API server restarts) is
+// returned instead, because the answer is unknown: callers must leave the
+// service as it was rather than treat it as not ours, or one transient error
+// stops a healthy engine and deletes its endpoint (#2076).
+func (w *InferenceServiceWatcher) shouldWatch(
+	ctx context.Context, isvc *inferencev1alpha1.InferenceService,
+) (bool, error) {
 	if isvc.Spec.ModelRef == "" {
-		return false
+		return false, nil
 	}
 
 	if w.nameAllowlist != nil {
@@ -327,7 +347,7 @@ func (w *InferenceServiceWatcher) shouldWatch(ctx context.Context, isvc *inferen
 				"namespace", isvc.Namespace,
 				"inferenceService", isvc.Name,
 			)
-			return false
+			return false, nil
 		}
 	}
 
@@ -336,17 +356,36 @@ func (w *InferenceServiceWatcher) shouldWatch(ctx context.Context, isvc *inferen
 		Namespace: isvc.Namespace,
 		Name:      isvc.Spec.ModelRef,
 	}, model); err != nil {
-		w.logger.Debugw(
-			"skipping inference service because referenced model cannot be fetched",
+		if apierrors.IsNotFound(err) {
+			w.logger.Debugw(
+				"skipping inference service because referenced model does not exist",
+				"namespace", isvc.Namespace,
+				"inferenceService", isvc.Name,
+				"modelRef", isvc.Spec.ModelRef,
+			)
+			return false, nil
+		}
+		w.logger.Warnw(
+			"referenced model lookup failed; keeping the inference service's previous state",
 			"namespace", isvc.Namespace,
 			"inferenceService", isvc.Name,
 			"modelRef", isvc.Spec.ModelRef,
 			"error", err,
 		)
-		return false
+		return false, fmt.Errorf("get model %s/%s: %w", isvc.Namespace, isvc.Spec.ModelRef, err)
 	}
 
-	return model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == "metal"
+	return model.Spec.Hardware != nil && model.Spec.Hardware.Accelerator == "metal", nil
+}
+
+// owns adapts shouldWatch to the ownership predicate the startup cleanup
+// passes take (ServiceRegistry.WithdrawOwnedEndpoints and
+// RemoveRelayRegistrations). They act only on services the predicate claims,
+// so reporting an unknown answer as false leaves that service's objects as
+// they are: the same "keep the previous state" the poll loop applies.
+func (w *InferenceServiceWatcher) owns(ctx context.Context, isvc *inferencev1alpha1.InferenceService) bool {
+	watch, err := w.shouldWatch(ctx, isvc)
+	return err == nil && watch
 }
 
 // parseKey splits "namespace/name" into components

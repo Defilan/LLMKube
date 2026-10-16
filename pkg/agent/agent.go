@@ -1029,7 +1029,7 @@ func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
 	if a.watcher == nil {
 		return
 	}
-	n, err := a.registry.WithdrawOwnedEndpoints(ctx, a.config.Namespace, a.watcher.shouldWatch)
+	n, err := a.registry.WithdrawOwnedEndpoints(ctx, a.config.Namespace, a.watcher.owns)
 	if err != nil {
 		a.logger.Warnw("startup endpoint withdrawal failed", "error", err)
 		return

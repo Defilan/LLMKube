@@ -19,10 +19,12 @@ package agent
 import (
 	"context"
 	"errors"
+	"maps"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -169,7 +171,7 @@ func TestShouldWatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := watcher.shouldWatch(context.Background(), tt.isvc)
+			got := watchDecision(t, watcher, tt.isvc)
 			if got != tt.want {
 				t.Errorf("shouldWatch() = %v, want %v", got, tt.want)
 			}
@@ -207,7 +209,7 @@ func TestSetNameAllowlist_FiltersInShouldWatch(t *testing.T) {
 	t.Run("no allowlist: every metal ISvc passes (v0.1 behavior)", func(t *testing.T) {
 		w := NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
 		for _, name := range []string{"qwen36-35b-a3b", "devstral-24b", "anything-else"} {
-			if !w.shouldWatch(context.Background(), mkISvc(name)) {
+			if !watchDecision(t, w, mkISvc(name)) {
 				t.Errorf("%q: want true, got false", name)
 			}
 		}
@@ -216,10 +218,10 @@ func TestSetNameAllowlist_FiltersInShouldWatch(t *testing.T) {
 	t.Run("allowlist set: only listed names pass", func(t *testing.T) {
 		w := NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
 		w.SetNameAllowlist([]string{"qwen36-35b-a3b"})
-		if !w.shouldWatch(context.Background(), mkISvc("qwen36-35b-a3b")) {
+		if !watchDecision(t, w, mkISvc("qwen36-35b-a3b")) {
 			t.Error("qwen36-35b-a3b: want true (on allowlist), got false")
 		}
-		if w.shouldWatch(context.Background(), mkISvc("devstral-24b")) {
+		if watchDecision(t, w, mkISvc("devstral-24b")) {
 			t.Error("devstral-24b: want false (not on allowlist), got true")
 		}
 	})
@@ -228,11 +230,11 @@ func TestSetNameAllowlist_FiltersInShouldWatch(t *testing.T) {
 		w := NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
 		w.SetNameAllowlist([]string{"qwen36-35b-a3b", "devstral-24b"})
 		for _, name := range []string{"qwen36-35b-a3b", "devstral-24b"} {
-			if !w.shouldWatch(context.Background(), mkISvc(name)) {
+			if !watchDecision(t, w, mkISvc(name)) {
 				t.Errorf("%q: want true (on allowlist), got false", name)
 			}
 		}
-		if w.shouldWatch(context.Background(), mkISvc("third-model")) {
+		if watchDecision(t, w, mkISvc("third-model")) {
 			t.Error("third-model: want false (not on allowlist), got true")
 		}
 	})
@@ -240,10 +242,10 @@ func TestSetNameAllowlist_FiltersInShouldWatch(t *testing.T) {
 	t.Run("allowlist with empty/whitespace entries gets normalized", func(t *testing.T) {
 		w := NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
 		w.SetNameAllowlist([]string{"", "  qwen36-35b-a3b  ", ""})
-		if !w.shouldWatch(context.Background(), mkISvc("qwen36-35b-a3b")) {
+		if !watchDecision(t, w, mkISvc("qwen36-35b-a3b")) {
 			t.Error("qwen36-35b-a3b: want true after whitespace trim, got false")
 		}
-		if w.shouldWatch(context.Background(), mkISvc("other")) {
+		if watchDecision(t, w, mkISvc("other")) {
 			t.Error("other: want false (not on allowlist), got true")
 		}
 	})
@@ -252,7 +254,7 @@ func TestSetNameAllowlist_FiltersInShouldWatch(t *testing.T) {
 		w := NewInferenceServiceWatcher(k8sClient, "default", newNopLogger())
 		w.SetNameAllowlist([]string{"qwen36-35b-a3b"})
 		w.SetNameAllowlist(nil)
-		if !w.shouldWatch(context.Background(), mkISvc("devstral-24b")) {
+		if !watchDecision(t, w, mkISvc("devstral-24b")) {
 			t.Error("devstral-24b: want true after allowlist cleared, got false")
 		}
 	})
@@ -265,10 +267,21 @@ func TestSetNameAllowlist_FiltersInShouldWatch(t *testing.T) {
 		emptyClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 		w := NewInferenceServiceWatcher(emptyClient, "default", newNopLogger())
 		w.SetNameAllowlist([]string{"yes"})
-		if w.shouldWatch(context.Background(), mkISvc("no")) {
+		if watchDecision(t, w, mkISvc("no")) {
 			t.Error("non-allowlisted name should return false without hitting the API")
 		}
 	})
+}
+
+// watchDecision calls shouldWatch and fails the test on a lookup error, for
+// cases whose fake client answers every Model lookup (found or NotFound).
+func watchDecision(t *testing.T, w *InferenceServiceWatcher, isvc *inferencev1alpha1.InferenceService) bool {
+	t.Helper()
+	watch, err := w.shouldWatch(context.Background(), isvc)
+	if err != nil {
+		t.Fatalf("shouldWatch(%s/%s) returned error: %v", isvc.Namespace, isvc.Name, err)
+	}
+	return watch
 }
 
 func TestParseKey(t *testing.T) {
@@ -498,6 +511,196 @@ func TestPoll_DetectsDeletedService(t *testing.T) {
 	}
 	if event.InferenceService.Name != "old-model" {
 		t.Errorf("event service name = %q, want %q", event.InferenceService.Name, "old-model")
+	}
+}
+
+const (
+	lookupModelName = "lookup-model"
+	lookupISVCName  = "lookup-svc"
+)
+
+// modelLookupFixture is a watcher over one metal Model and one
+// InferenceService that references it. While failModelGet is set, every Model
+// Get through the watcher's client returns it; InferenceService lists and
+// writes through base are untouched.
+type modelLookupFixture struct {
+	base         client.WithWatch
+	watcher      *InferenceServiceWatcher
+	failModelGet error
+}
+
+func newModelLookupFixture(t *testing.T) *modelLookupFixture {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := inferencev1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme: %v", err)
+	}
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: lookupModelName, Namespace: "default"},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source: "https://example.com/lookup.gguf", Format: "gguf",
+			Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "metal"},
+		},
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: lookupISVCName, Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: lookupModelName},
+	}
+	f := &modelLookupFixture{}
+	f.base = fake.NewClientBuilder().WithScheme(scheme).WithObjects(model, isvc).Build()
+	c := interceptor.NewClient(f.base, interceptor.Funcs{
+		Get: func(
+			ctx context.Context, w client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+		) error {
+			if _, isModel := obj.(*inferencev1alpha1.Model); isModel && f.failModelGet != nil {
+				return f.failModelGet
+			}
+			return w.Get(ctx, key, obj, opts...)
+		},
+	})
+	f.watcher = NewInferenceServiceWatcher(c, "default", newNopLogger())
+	return f
+}
+
+// pollOnce runs one poll against seen and returns the events it emitted.
+func (f *modelLookupFixture) pollOnce(t *testing.T, seen map[string]string) []InferenceServiceEvent {
+	t.Helper()
+	eventChan := make(chan InferenceServiceEvent, 10)
+	if err := f.watcher.poll(context.Background(), eventChan, seen); err != nil {
+		t.Fatalf("poll returned error: %v", err)
+	}
+	events := make([]InferenceServiceEvent, 0, len(eventChan))
+	for len(eventChan) > 0 {
+		events = append(events, <-eventChan)
+	}
+	return events
+}
+
+// eventSummary renders events as "TYPE ns/name" for failure messages.
+func eventSummary(events []InferenceServiceEvent) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		out = append(out, string(e.Type)+" "+e.InferenceService.Namespace+"/"+e.InferenceService.Name)
+	}
+	return out
+}
+
+// TestPoll_ModelLookupErrorKeepsService pins #2076: a Model Get that fails
+// with anything but NotFound must not emit Deleted for a running service
+// (that stops its engine and deletes its Service and EndpointSlice) or touch
+// its seen entry, and the next successful poll, with the resourceVersion
+// unchanged, emits nothing.
+func TestPoll_ModelLookupErrorKeepsService(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"transport error", errors.New("dial tcp 10.0.0.1:6443: i/o timeout")},
+		{"API server unavailable", apierrors.NewServiceUnavailable("apiserver restarting")},
+		{"429 Too Many Requests", apierrors.NewTooManyRequests("slow down", 1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newModelLookupFixture(t)
+			seen := map[string]string{}
+
+			events := f.pollOnce(t, seen)
+			if len(events) != 1 || events[0].Type != EventTypeCreated {
+				t.Fatalf("poll 1 events = %v, want one CREATED", eventSummary(events))
+			}
+			before := maps.Clone(seen)
+
+			f.failModelGet = tc.err
+			if events := f.pollOnce(t, seen); len(events) != 0 {
+				t.Errorf("poll 2 (model lookup failing) events = %v, want none", eventSummary(events))
+			}
+			if !maps.Equal(seen, before) {
+				t.Errorf("poll 2 (model lookup failing) changed seen to %v, want %v", seen, before)
+			}
+
+			f.failModelGet = nil
+			if events := f.pollOnce(t, seen); len(events) != 0 {
+				t.Errorf("poll 3 (lookup recovered, resourceVersion unchanged) events = %v, want none",
+					eventSummary(events))
+			}
+		})
+	}
+}
+
+// TestWatcher_ModelLookupErrorDoesNotAddUnseenService covers the other half of
+// keeping the previous state (#2076): a service the watcher has not seen yet
+// is not started while its Model lookup fails, by either the startup list or a
+// poll, and the first poll whose lookup succeeds emits Created for it.
+func TestWatcher_ModelLookupErrorDoesNotAddUnseenService(t *testing.T) {
+	f := newModelLookupFixture(t)
+	f.failModelGet = apierrors.NewServiceUnavailable("apiserver restarting")
+
+	eventChan := make(chan InferenceServiceEvent, 10)
+	if err := f.watcher.listExisting(context.Background(), eventChan); err != nil {
+		t.Fatalf("listExisting returned error: %v", err)
+	}
+	if len(eventChan) != 0 {
+		t.Errorf("listExisting emitted %d events while the model lookup fails, want 0", len(eventChan))
+	}
+
+	seen := map[string]string{}
+	if events := f.pollOnce(t, seen); len(events) != 0 {
+		t.Errorf("poll (model lookup failing) events = %v, want none", eventSummary(events))
+	}
+	if len(seen) != 0 {
+		t.Errorf("poll (model lookup failing) recorded seen = %v, want empty", seen)
+	}
+
+	f.failModelGet = nil
+	if events := f.pollOnce(t, seen); len(events) != 1 || events[0].Type != EventTypeCreated {
+		t.Errorf("poll after recovery events = %v, want one CREATED", eventSummary(events))
+	}
+}
+
+// TestPoll_ModelGoneOrNotMetalStillDeletes keeps the #2076 fix from
+// overreaching: a Model that is deleted (NotFound), or that stops being a
+// metal Model, still removes the service from this agent.
+func TestPoll_ModelGoneOrNotMetalStillDeletes(t *testing.T) {
+	modelKey := client.ObjectKey{Namespace: "default", Name: lookupModelName}
+	cases := []struct {
+		name   string
+		change func(ctx context.Context, c client.Client) error
+	}{
+		{"model deleted", func(ctx context.Context, c client.Client) error {
+			return c.Delete(ctx, &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelKey.Name, Namespace: modelKey.Namespace},
+			})
+		}},
+		{"accelerator switched to cuda", func(ctx context.Context, c client.Client) error {
+			model := &inferencev1alpha1.Model{}
+			if err := c.Get(ctx, modelKey, model); err != nil {
+				return err
+			}
+			model.Spec.Hardware.Accelerator = "cuda"
+			return c.Update(ctx, model)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newModelLookupFixture(t)
+			seen := map[string]string{}
+			if events := f.pollOnce(t, seen); len(events) != 1 || events[0].Type != EventTypeCreated {
+				t.Fatalf("poll 1 events = %v, want one CREATED", eventSummary(events))
+			}
+
+			if err := tc.change(context.Background(), f.base); err != nil {
+				t.Fatalf("change model: %v", err)
+			}
+
+			events := f.pollOnce(t, seen)
+			if len(events) != 1 || events[0].Type != EventTypeDeleted ||
+				events[0].InferenceService.Name != lookupISVCName {
+				t.Errorf("poll 2 events = %v, want one DELETED default/%s", eventSummary(events), lookupISVCName)
+			}
+			if len(seen) != 0 {
+				t.Errorf("poll 2 left seen = %v, want empty", seen)
+			}
+		})
 	}
 }
 
