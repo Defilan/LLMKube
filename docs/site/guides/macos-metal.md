@@ -947,12 +947,20 @@ because `powermetrics` requires root.
 Enable in three steps:
 
 1. Install the bundled NOPASSWD sudoers fragment, which pins both
-   the binary path and the argument vector so the grant is the
-   narrowest possible:
+   the binary path and the exact argument vector (no wildcards) so
+   the grant is the narrowest possible:
 
    ```bash
    make install-powermetrics-sudo
    ```
+
+   The sampling interval is part of the pinned arguments. If you
+   run the agent with a non-default `--apple-power-interval`, pass
+   the same value in whole milliseconds (minimum 100), for example
+   `make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000`
+   for `--apple-power-interval=2s`. The agent checks the installed
+   rule before sampling and logs `apple-power: refusing to start
+   powermetrics` with the command to run when it does not match.
 
 2. Add `--apple-power-enabled` to the launchd plist's
    `ProgramArguments` array.

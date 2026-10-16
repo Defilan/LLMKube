@@ -1,18 +1,35 @@
-# LLMKube Metal Agent — NOPASSWD sudoers entry for /usr/bin/powermetrics.
+# LLMKube Metal Agent: NOPASSWD sudoers entry for /usr/bin/powermetrics.
 #
 # powermetrics requires root, but the Metal Agent runs as a regular user
 # under launchd. This fragment grants the *minimum* privilege needed: the
 # named user can run /usr/bin/powermetrics with EXACTLY the argument vector
 # the agent uses, and nothing else.
 #
-# SECURITY — argv is pinned, not just the binary
-# ===============================================
+# SECURITY: argv is pinned, not just the binary
+# =============================================
 # A common mistake is to grant `NOPASSWD: /usr/bin/powermetrics` (any args).
 # That's a one-line root escalation: powermetrics has --output-file and other
 # flags that, combined with root, give an attacker a write-anywhere primitive
-# (`sudo powermetrics --output-file=/etc/passwd …`). The pinned-argv form
-# below restricts the user to *only* the cpu_power+gpu_power sampler invocation
-# the agent actually needs, with a numeric sampling interval.
+# (`sudo powermetrics --output-file=/etc/passwd …`). The rule below names the
+# one invocation the agent runs, the cpu_power+gpu_power sampler at a fixed
+# sampling interval, and contains no wildcard characters, so it matches
+# exactly one argument vector.
+#
+# This file is a template. Two placeholders are rendered at install time:
+#
+#   __LLMKUBE_USER__
+#       The user the metal-agent runs as (typically the result of `whoami`
+#       from the user's shell, NOT from a sudo session).
+#   __LLMKUBE_POWERMETRICS_INTERVAL_MS__
+#       The -i value the agent passes: its --apple-power-interval in whole
+#       milliseconds, minimum 100. The agent default (1s) renders as 1000.
+#
+# A placeholder left in place, or an interval that differs from the agent's
+# --apple-power-interval, means the rule does not match. The agent checks the
+# rule with `sudo -n -l` before it starts sampling, logs "apple-power:
+# refusing to start powermetrics" with the command to fix it, and the gauges
+# read zero. Re-install with the matching interval whenever you change
+# --apple-power-interval.
 #
 # If you upgrade the agent and powermetrics stops returning data, it likely
 # means the agent's argv changed and this file is now a no-match. Re-install
@@ -20,15 +37,19 @@
 #
 # Install
 # -------
-#   sudo install -m 0440 -o root -g wheel \
-#     llmkube-powermetrics /etc/sudoers.d/llmkube-powermetrics
-#   sudo visudo -c -f /etc/sudoers.d/llmkube-powermetrics   # syntax check
+#   make install-powermetrics-sudo                               # 1s default
+#   make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000  # for 2s
 #
-# Replace __LLMKUBE_USER__ below with the user the metal-agent runs as
-# (typically the result of `whoami` from the user's shell, NOT from a sudo
-# session). Leaving the placeholder will make sudo refuse the agent's
-# powermetrics calls — the gauges will read zero and the agent will log
-# "powermetrics: failed to start ..." on startup.
+# or by hand, from the repository root:
+#
+#   TMP=$(mktemp)
+#   sed -e "s/__LLMKUBE_USER__/$(whoami)/" \
+#       -e "s/__LLMKUBE_POWERMETRICS_INTERVAL_MS__/1000/" \
+#       deployment/macos/sudoers.d/llmkube-powermetrics > "$TMP"
+#   visudo -cf "$TMP"   # syntax check
+#   sudo install -m 0440 -o root -g wheel \
+#     "$TMP" /etc/sudoers.d/llmkube-powermetrics
+#   rm "$TMP"
 #
 # Uninstall
 # ---------
@@ -39,4 +60,4 @@
 # Keeps the grant out of the main /etc/sudoers and makes uninstall a single
 # `rm`. Owner must be root:wheel and mode 0440 or sudo will refuse the file.
 
-__LLMKUBE_USER__ ALL = (root) NOPASSWD: /usr/bin/powermetrics --samplers cpu_power\,gpu_power -i [0-9]*
+__LLMKUBE_USER__ ALL = (root) NOPASSWD: /usr/bin/powermetrics --samplers cpu_power\,gpu_power -i __LLMKUBE_POWERMETRICS_INTERVAL_MS__

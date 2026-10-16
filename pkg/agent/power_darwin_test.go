@@ -19,15 +19,18 @@ limitations under the License.
 package agent
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"os"
-	"regexp"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestParsePowermetricsStream_Fixture(t *testing.T) {
@@ -134,9 +137,9 @@ func TestParsePowermetricsStream_PartialSampleNotEmitted(t *testing.T) {
 // TestDefaultPowermetricsCommand_MatchesSudoersSpec is the regression guard
 // that keeps the agent's argv aligned with the shipped sudoers fragment.
 // If you change defaultPowermetricsCommand without updating
-// deployment/macos/sudoers.d/llmkube-powermetrics, this test will fail —
-// preventing a release where the gauges silently stop publishing because
-// sudo refuses the new argv.
+// deployment/macos/sudoers.d/llmkube-powermetrics, this test will fail,
+// preventing a release where the gauges stop publishing because sudo refuses
+// the new argv.
 func TestDefaultPowermetricsCommand_MatchesSudoersSpec(t *testing.T) {
 	cmd := defaultPowermetricsCommand(context.Background(), DefaultPowermetricsBin, time.Second)
 
@@ -161,19 +164,225 @@ func TestDefaultPowermetricsCommand_MatchesSudoersSpec(t *testing.T) {
 		}
 	}
 
-	// Cross-check against the actual sudoers fragment we ship. Strip the
-	// `User Host = (root) NOPASSWD:` prefix and what's left must match the
-	// post-binary portion of our argv with the dynamic interval rendered.
-	specPattern := readShippedSudoersSpec(t)
-	postBinary := strings.Join(cmd.Args[3:], " ") // drop sudo, -n, /usr/bin/powermetrics
-	// sudoers escapes the comma in cpu_power\,gpu_power; strip the backslash
-	// before matching against the rendered argv.
-	specPattern = strings.ReplaceAll(specPattern, `\,`, ",")
-	// "[0-9]*" in the sudoers spec is shell-glob, not regex. Translate.
-	regexPattern := "^" + strings.ReplaceAll(regexp.QuoteMeta(specPattern), `\[0-9\]\*`, `[0-9]+`) + "$"
-	if !regexp.MustCompile(regexPattern).MatchString(postBinary) {
-		t.Errorf("agent argv %q does not satisfy shipped sudoers spec %q (regex %q)",
-			postBinary, specPattern, regexPattern)
+	// Cross-check against the rule `make install-powermetrics-sudo` installs
+	// with its default interval: the granted command must be exactly the
+	// agent's argv after `sudo -n`.
+	rendered, err := renderPowermetricsSudoers(t)
+	if err != nil {
+		t.Fatalf("render sudoers fragment: %v", err)
+	}
+	assertSudoersGrantsExactly(t, rendered, cmd.Args[2:])
+}
+
+// TestPowermetricsArgv_MatchesSudoersRenderedForInterval covers non-default
+// --apple-power-interval values: rendering the fragment with the documented
+// APPLE_POWER_INTERVAL_MS for an interval must grant exactly the argv the
+// agent runs for it, including when the agent raises a short interval to
+// the 100ms floor.
+func TestPowermetricsArgv_MatchesSudoersRenderedForInterval(t *testing.T) {
+	cases := []struct {
+		interval time.Duration
+		makeVar  string
+	}{
+		{interval: 2500 * time.Millisecond, makeVar: "APPLE_POWER_INTERVAL_MS=2500"},
+		{interval: 5 * time.Second, makeVar: "APPLE_POWER_INTERVAL_MS=5000"},
+		{interval: 50 * time.Millisecond, makeVar: "APPLE_POWER_INTERVAL_MS=100"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.interval.String(), func(t *testing.T) {
+			t.Parallel()
+			cmd := defaultPowermetricsCommand(context.Background(), DefaultPowermetricsBin, tc.interval)
+			if len(cmd.Args) < 2 || cmd.Args[0] != defaultSudoBin || cmd.Args[1] != "-n" {
+				t.Fatalf("argv = %v, want it to start with %s -n", cmd.Args, defaultSudoBin)
+			}
+			rendered, err := renderPowermetricsSudoers(t, tc.makeVar)
+			if err != nil {
+				t.Fatalf("render sudoers fragment: %v", err)
+			}
+			assertSudoersGrantsExactly(t, rendered, cmd.Args[2:])
+			assertSudoersGrantsExactly(t, rendered, powermetricsArgv(DefaultPowermetricsBin, tc.interval))
+		})
+	}
+}
+
+// assertSudoersGrantsExactly requires the single rule in a rendered sudoers
+// fragment to grant argv and nothing else. sudoers escapes the comma in
+// cpu_power\,gpu_power; the backslash is not part of the argument sudo
+// matches.
+func assertSudoersGrantsExactly(t *testing.T, rendered string, argv []string) {
+	t.Helper()
+	spec := sudoersCommandSpec(t, singleSudoersRule(t, rendered))
+	if got, want := strings.ReplaceAll(spec, `\,`, ","), strings.Join(argv, " "); got != want {
+		t.Errorf("sudoers rule grants %q, agent runs %q", got, want)
+	}
+}
+
+// TestRenderedPowermetricsSudoers_PassesVisudo syntax-checks the fragment
+// exactly as `make install-powermetrics-sudo` renders it, with the same
+// `visudo -cf` the install target runs. visudo -cf on a file does not need
+// root.
+func TestRenderedPowermetricsSudoers_PassesVisudo(t *testing.T) {
+	visudo, err := exec.LookPath("visudo")
+	if err != nil {
+		visudo = "/usr/sbin/visudo"
+		if _, statErr := os.Stat(visudo); statErr != nil {
+			t.Skipf("visudo not found: %v", err)
+		}
+	}
+	for _, makeVars := range [][]string{nil, {"APPLE_POWER_INTERVAL_MS=2500"}} {
+		rendered, err := renderPowermetricsSudoers(t, makeVars...)
+		if err != nil {
+			t.Fatalf("render %v: %v", makeVars, err)
+		}
+		path := filepath.Join(t.TempDir(), "llmkube-powermetrics")
+		if err := os.WriteFile(path, []byte(rendered), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if out, err := exec.Command(visudo, "-cf", path).CombinedOutput(); err != nil {
+			t.Errorf("visudo -cf rejected the fragment rendered with %v: %v\n%s", makeVars, err, out)
+		}
+	}
+}
+
+func TestPowermetricsIntervalMS(t *testing.T) {
+	cases := []struct {
+		interval time.Duration
+		want     int
+	}{
+		{interval: time.Second, want: 1000},
+		{interval: 2500 * time.Millisecond, want: 2500},
+		{interval: 1234567 * time.Microsecond, want: 1234}, // truncated, not rounded
+		{interval: 100 * time.Millisecond, want: 100},
+		{interval: 99 * time.Millisecond, want: 100},
+		{interval: 0, want: 100},
+	}
+	for _, tc := range cases {
+		if got := powermetricsIntervalMS(tc.interval); got != tc.want {
+			t.Errorf("powermetricsIntervalMS(%v) = %d, want %d", tc.interval, got, tc.want)
+		}
+	}
+}
+
+// fakeSudo writes a stand-in for /usr/bin/sudo whose policy permits only the
+// argv the fragment rendered with the default interval grants, the way the
+// real sudo answers `sudo -n -l <argv>`: print the command and exit 0 when
+// permitted, exit 1 otherwise.
+func fakeSudo(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "sudo")
+	body := `if [ "$#" -eq 7 ] && [ "$1" = -n ] && [ "$2" = -l ] && [ "$3" = /usr/bin/powermetrics ] &&
+   [ "$4" = --samplers ] && [ "$5" = cpu_power,gpu_power ] && [ "$6" = -i ] && [ "$7" = 1000 ]; then
+	echo "$3 $4 $5 $6 $7"
+	exit 0
+fi
+echo "sudo: a password is required" >&2
+exit 1
+`
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+		t.Fatalf("write fake sudo: %v", err)
+	}
+	return path
+}
+
+func TestSudoPermits_OnlyTheExactArgv(t *testing.T) {
+	sudo := fakeSudo(t)
+	ctx := context.Background()
+
+	if err := sudoPermits(ctx, sudo, powermetricsArgv(DefaultPowermetricsBin, time.Second)); err != nil {
+		t.Errorf("sudoPermits refused the argv the policy permits: %v", err)
+	}
+
+	err := sudoPermits(ctx, sudo, powermetricsArgv(DefaultPowermetricsBin, 2*time.Second))
+	if err == nil {
+		t.Fatal("sudoPermits accepted an argv the policy does not permit")
+	}
+	if !strings.Contains(err.Error(), "a password is required") {
+		t.Errorf("refusal error %q does not carry sudo's reason", err)
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing-sudo")
+	if err := sudoPermits(ctx, missing, powermetricsArgv(DefaultPowermetricsBin, time.Second)); err == nil {
+		t.Error("sudoPermits accepted when sudo could not be run")
+	}
+}
+
+// TestApplePowerSamplerRun_RefusesWhenSudoersDoesNotPermit requires Run to
+// check the exact argv against sudo's policy first and, when the policy does
+// not permit it, to log the refusal with the install command for this
+// interval and never launch powermetrics.
+func TestApplePowerSamplerRun_RefusesWhenSudoersDoesNotPermit(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	s := NewApplePowerSampler(DefaultPowermetricsBin, 2*time.Second, zap.New(core).Sugar())
+	var checked []string
+	s.permitCheck = func(_ context.Context, argv []string) error {
+		checked = argv
+		return errors.New("sudo: a password is required")
+	}
+	launched := false
+	s.commandFactory = func(ctx context.Context, _ string, _ time.Duration) *exec.Cmd {
+		launched = true
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	}
+
+	s.Run(context.Background())
+
+	if launched {
+		t.Fatal("Run launched powermetrics although sudo does not permit its argv")
+	}
+	if want := powermetricsArgv(DefaultPowermetricsBin, 2*time.Second); !slices.Equal(checked, want) {
+		t.Errorf("permit check got argv %q, want %q", checked, want)
+	}
+	entries := logs.FilterMessageSnippet("refusing to start powermetrics").All()
+	if len(entries) != 1 {
+		t.Fatalf("want 1 refusal log line, got %d (all warnings: %v)", len(entries), logs.All())
+	}
+	want := "make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000"
+	if got := entries[0].ContextMap()["remedy"]; got != want {
+		t.Errorf("refusal remedy = %v, want %q", got, want)
+	}
+}
+
+// TestApplePowerSamplerRun_QuietWhenCancelledDuringCheck covers shutdown: a
+// permit check that fails because ctx was cancelled is not a policy refusal
+// and must not be logged as one.
+func TestApplePowerSamplerRun_QuietWhenCancelledDuringCheck(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	s := NewApplePowerSampler(DefaultPowermetricsBin, time.Second, zap.New(core).Sugar())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.permitCheck = func(ctx context.Context, _ []string) error {
+		cancel()
+		return ctx.Err()
+	}
+	launched := false
+	s.commandFactory = func(ctx context.Context, _ string, _ time.Duration) *exec.Cmd {
+		launched = true
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	}
+
+	s.Run(ctx)
+
+	if launched {
+		t.Error("Run launched powermetrics after its context was cancelled")
+	}
+	if n := logs.Len(); n != 0 {
+		t.Errorf("want no warnings on shutdown, got %d: %v", n, logs.All())
+	}
+}
+
+func TestApplePowerSamplerRun_LaunchesWhenSudoersPermits(t *testing.T) {
+	s := NewApplePowerSampler(DefaultPowermetricsBin, time.Second, zap.NewNop().Sugar())
+	s.permitCheck = func(context.Context, []string) error { return nil }
+	launched := false
+	s.commandFactory = func(ctx context.Context, _ string, _ time.Duration) *exec.Cmd {
+		launched = true
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	}
+
+	s.Run(context.Background())
+
+	if !launched {
+		t.Error("Run did not launch powermetrics although sudo permits its argv")
 	}
 }
 
@@ -198,37 +407,6 @@ func TestNewApplePowerSampler_RejectsNonDefaultBin(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("disabled sampler Run did not return promptly")
 	}
-}
-
-// readShippedSudoersSpec extracts the actual command-spec from the file we
-// ship at deployment/macos/sudoers.d/llmkube-powermetrics. Skipping comments
-// and the user/host preamble, we keep just what comes after `NOPASSWD:`.
-func readShippedSudoersSpec(t *testing.T) string {
-	t.Helper()
-	const path = "../../deployment/macos/sudoers.d/llmkube-powermetrics"
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatalf("open shipped sudoers fragment %s: %v", path, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		idx := strings.Index(line, "NOPASSWD:")
-		if idx < 0 {
-			continue
-		}
-		spec := strings.TrimSpace(line[idx+len("NOPASSWD:"):])
-		// Drop the binary path itself; we only need the arg portion.
-		spec = strings.TrimPrefix(spec, DefaultPowermetricsBin+" ")
-		return spec
-	}
-	t.Fatalf("no NOPASSWD line found in %s", path)
-	return ""
 }
 
 func TestStderrCapture_TruncatesAtMax(t *testing.T) {

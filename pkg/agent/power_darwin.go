@@ -82,6 +82,11 @@ type ApplePowerSampler struct {
 	// commandFactory builds the exec.Cmd. Overridden in tests so the parser
 	// can be exercised without spawning powermetrics.
 	commandFactory func(ctx context.Context, bin string, interval time.Duration) *exec.Cmd
+
+	// permitCheck reports whether sudo will run argv without a password. Run
+	// refuses to launch powermetrics when it returns an error. Overridden in
+	// tests so Run can be exercised without invoking the real sudo.
+	permitCheck func(ctx context.Context, argv []string) error
 }
 
 // NewApplePowerSampler constructs a sampler. Empty bin or zero interval fall
@@ -116,6 +121,9 @@ func NewApplePowerSampler(bin string, interval time.Duration, logger *zap.Sugare
 		interval:       interval,
 		logger:         logger,
 		commandFactory: defaultPowermetricsCommand,
+		permitCheck: func(ctx context.Context, argv []string) error {
+			return sudoPermits(ctx, defaultSudoBin, argv)
+		},
 	}
 }
 
@@ -125,6 +133,19 @@ func NewApplePowerSampler(bin string, interval time.Duration, logger *zap.Sugare
 func (s *ApplePowerSampler) Run(ctx context.Context) {
 	if s.disabled {
 		s.logger.Infow("apple-power: sampler disabled (see prior warning); skipping")
+		return
+	}
+	argv := powermetricsArgv(s.bin, s.interval)
+	if err := s.permitCheck(ctx, argv); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		intervalMS := powermetricsIntervalMS(s.interval)
+		s.logger.Warnw("apple-power: refusing to start powermetrics: sudo does not permit this exact "+
+			"argument vector without a password (sudoers rule missing, or rendered for a different interval)",
+			"argv", argv, "intervalMS", intervalMS,
+			"remedy", fmt.Sprintf("make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=%d", intervalMS),
+			"error", err)
 		return
 	}
 	cmd := s.commandFactory(ctx, s.bin, s.interval)
@@ -273,24 +294,66 @@ func parsePowermetricsStream(r io.Reader, emit func(applePowerSample)) error {
 // invocation. macOS ships sudo at /usr/bin/sudo and SIP keeps it there.
 const defaultSudoBin = "/usr/bin/sudo"
 
+// minPowermetricsIntervalMS is the smallest -i value the agent passes;
+// shorter configured intervals are raised to it.
+const minPowermetricsIntervalMS = 100
+
+// sudoPolicyCheckTimeout bounds the pre-launch `sudo -n -l` check. With -n
+// sudo never prompts, so this only guards against a wedged sudo.
+const sudoPolicyCheckTimeout = 10 * time.Second
+
+// powermetricsIntervalMS is the -i value the agent passes for a configured
+// interval: whole milliseconds (truncated), never below
+// minPowermetricsIntervalMS. The sudoers rule pins this exact number, which
+// `make install-powermetrics-sudo` renders from APPLE_POWER_INTERVAL_MS.
+func powermetricsIntervalMS(interval time.Duration) int {
+	ms := int(interval / time.Millisecond)
+	if ms < minPowermetricsIntervalMS {
+		return minPowermetricsIntervalMS
+	}
+	return ms
+}
+
+// powermetricsArgv is the command sudo runs as root: the binary followed by
+// its arguments. The launch and the pre-launch policy check both build it
+// here so they cannot disagree.
+//
+// SECURITY: this is the one argument vector the shipped sudoers fragment
+// permits. If you change flags, update deployment/macos/sudoers.d/llmkube-powermetrics
+// in lockstep, along with the tests in power_darwin_test.go and
+// powermetrics_sudoers_test.go that assert the two stay in sync, or the agent
+// will refuse to sample after upgrade because sudoers no longer matches.
+func powermetricsArgv(bin string, interval time.Duration) []string {
+	return []string{
+		bin,
+		"--samplers", "cpu_power,gpu_power",
+		"-i", strconv.Itoa(powermetricsIntervalMS(interval)),
+	}
+}
+
 // defaultPowermetricsCommand builds the actual sudo invocation. Split out so
 // tests can swap in a fixture-replay command.
-//
-// SECURITY: the argv emitted here is what the shipped sudoers fragment is
-// pinned to. If you change flags, update deployment/macos/sudoers.d/llmkube-powermetrics
-// in lockstep — and the regression test in power_darwin_test.go that asserts
-// the two stay in sync — or the agent will silently lose power data after
-// upgrade because sudoers will no longer match the new argv.
 func defaultPowermetricsCommand(ctx context.Context, bin string, interval time.Duration) *exec.Cmd {
-	intervalMS := int(interval / time.Millisecond)
-	if intervalMS < 100 {
-		intervalMS = 100
+	args := append([]string{"-n"}, powermetricsArgv(bin, interval)...)
+	return exec.CommandContext(ctx, defaultSudoBin, args...)
+}
+
+// sudoPermits asks sudo's own policy whether the invoking user may run argv
+// as root without a password, via `sudo -n -l <argv>`. sudo exits 0 only when
+// the policy permits that exact argument vector, and 1 when it does not or
+// when a password would be required. sudo -l only lists; argv is not run.
+func sudoPermits(ctx context.Context, sudoBin string, argv []string) error {
+	ctx, cancel := context.WithTimeout(ctx, sudoPolicyCheckTimeout)
+	defer cancel()
+	out := &strings.Builder{}
+	capture := stderrCapture{w: out, max: 4096}
+	cmd := exec.CommandContext(ctx, sudoBin, append([]string{"-n", "-l"}, argv...)...)
+	cmd.Stdout = capture
+	cmd.Stderr = capture
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s -n -l: %w: %s", sudoBin, err, strings.TrimSpace(out.String()))
 	}
-	return exec.CommandContext(ctx,
-		defaultSudoBin, "-n", bin,
-		"--samplers", "cpu_power,gpu_power",
-		"-i", strconv.Itoa(intervalMS),
-	)
+	return nil
 }
 
 // stderrCapture is an io.Writer that retains at most max bytes of stderr,

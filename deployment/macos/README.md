@@ -820,7 +820,7 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
 
 ### Enable
 
-1. Install the NOPASSWD sudoers fragment so the agent can call `powermetrics` without a password. **The shipped fragment pins both the binary path and its argument vector** so the grant is `powermetrics --samplers cpu_power,gpu_power -i <numeric-interval>` only, not `powermetrics --output-file=/wherever`.
+1. Install the NOPASSWD sudoers fragment so the agent can call `powermetrics` without a password. **The shipped fragment pins both the binary path and its exact argument vector.** The rule contains no wildcard characters; the sampling interval is rendered into it at install time, so with the default 1s interval the grant is `powermetrics --samplers cpu_power,gpu_power -i 1000` and nothing else, not `powermetrics --output-file=/wherever`.
 
    The easy way (one command, sudo prompts you):
 
@@ -828,7 +828,15 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
    make install-powermetrics-sudo
    ```
 
-   This renders the placeholder for the current user, syntax-checks with `visudo -cf`, and atomically installs to `/etc/sudoers.d/llmkube-powermetrics` with `0440 root:wheel` ownership. The grant is read back to your terminal so you can see exactly what was just authorized.
+   This renders the template's two placeholders (the current user and the interval), syntax-checks with `visudo -cf`, and atomically installs to `/etc/sudoers.d/llmkube-powermetrics` with `0440 root:wheel` ownership. The grant is read back to your terminal so you can see exactly what was just authorized. To see the rendered file without installing anything, run `make render-powermetrics-sudoers`.
+
+   If you run the agent with a non-default `--apple-power-interval`, pass the same interval in whole milliseconds (minimum 100, the floor the agent applies), for example for `--apple-power-interval=2s`:
+
+   ```bash
+   make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=2000
+   ```
+
+   Before it starts sampling, the agent asks sudo whether that exact argument vector is permitted (`sudo -n -l /usr/bin/powermetrics --samplers cpu_power,gpu_power -i <ms>`). If it is not, because the fragment is missing or was rendered for a different interval, the agent does not start `powermetrics`; it logs `apple-power: refusing to start powermetrics` with a `remedy` field holding the `make` command to run. The check relies on sudo's default of allowing `sudo -l` without a password when any of the user's rules is `NOPASSWD`; if your sudoers sets `listpw` to `all` or `always`, the check cannot pass and the sampler stays off.
 
    To **uninstall**:
 
@@ -840,7 +848,9 @@ The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges so
 
    ```bash
    TMP=$(mktemp)
-   sed "s/__LLMKUBE_USER__/$(whoami)/" deployment/macos/sudoers.d/llmkube-powermetrics > "$TMP"
+   sed -e "s/__LLMKUBE_USER__/$(whoami)/" \
+       -e "s/__LLMKUBE_POWERMETRICS_INTERVAL_MS__/1000/" \
+       deployment/macos/sudoers.d/llmkube-powermetrics > "$TMP"
    sudo visudo -cf "$TMP"
    sudo install -m 0440 -o root -g wheel "$TMP" /etc/sudoers.d/llmkube-powermetrics
    rm "$TMP"
@@ -881,7 +891,7 @@ All four gauges read 0 unless `--apple-power-enabled` is set.
 
 ### Tuning
 
-- `--apple-power-interval=1s` — sampling cadence; tighter values don't add fidelity because `powermetrics` rounds to whole milliseconds.
+- `--apple-power-interval=1s`: sampling cadence; tighter values don't add fidelity because `powermetrics` rounds to whole milliseconds. The sudoers rule pins the interval, so after changing it re-run `make install-powermetrics-sudo APPLE_POWER_INTERVAL_MS=<ms>` with the new value in whole milliseconds (minimum 100).
 - `--powermetrics-bin=/usr/bin/powermetrics` — override only if you've installed `powermetrics` somewhere non-standard.
 
 ## Health Checks & Monitoring
