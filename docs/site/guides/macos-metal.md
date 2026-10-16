@@ -451,6 +451,17 @@ refused with reason `ModelDigestMismatch`. Both are covered in
 "Security model" in
 [`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#security-model).
 
+**InferenceService refused with `ModelDownloadTooLarge`**
+The Model's download went over the agent's `--max-download-size` cap
+(default: the Mac's total memory, since a model file larger than RAM
+cannot be wired into memory). A source that declared a larger size was
+refused before anything was written; a body that streamed past the cap
+was stopped and its partial file removed. Fix `spec.source` if it is
+wrong, or, if the model really is that large, raise
+`--max-download-size` (`0` disables the cap) and restart the agent. See
+"`--max-download-size` flag (download cap)" in
+[`deployment/macos/README.md`](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#--max-download-size-flag-download-cap).
+
 **macOS firewall prompt on first run**
 The Metal Agent listens on `127.0.0.1:9090` for its own
 health/metrics and serves its TLS ingress on `--ingress-port`

@@ -233,7 +233,7 @@ A few behavior notes:
 - HTTP proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and their lowercase forms) are honored. The target host is still checked against the allowlist even when the request goes through a proxy; the proxy's own address is trusted as configured.
 - Redirects are capped at 5 hops, and each hop's target is checked again before it is dialed.
 - For `s3` sources, only requests to the host in `AWS_ENDPOINT_URL` (same scheme, host and port) are SigV4-signed. A redirect to another host is followed unsigned, so the store's credentials never reach it; a presigned-URL redirect still works because it carries its own signature. An AWS path-style endpoint that answers 307 toward `<bucket>.s3.<region>.amazonaws.com` therefore now fails with 403 instead of being re-signed: set `AWS_ENDPOINT_URL` to the bucket's regional endpoint (for example `https://s3.<region>.amazonaws.com`). The controller's own s3 reads behave the same way.
-- The dial timeout is 10 seconds; there is no overall download timeout, so a slow but healthy transfer of a large model is not cut short.
+- The dial timeout is 10 seconds; there is no overall download timeout, so a slow but healthy transfer of a large model is not cut short. What bounds a download is its size: see "`--max-download-size` flag (download cap)" below.
 - A DNS64 address is judged by its embedded IPv4 address, so a public IPv4-only host stays reachable on a DNS64 network while the loopback and private ranges stay blocked.
 
 ### `spec.sha256` digest verification
@@ -243,6 +243,34 @@ When a `Model`'s `spec.sha256` is set, the agent verifies a downloaded source ag
 `spec.sha256` is enforced for sources the agent downloads for llama-server (the `llamacpp` runtime): `http`, `https`, `hf` and `s3`. A local-path or `file://` source is loaded in place and is never hashed. The other Metal runtimes (mlx-server, vllm-swift, oMLX, TensorFold and Ollama) do not download through the agent and ignore `spec.sha256` in 0.10.1.
 
 The agent remembers a mismatch so it does not re-download the same bad source on every reconcile. Changing the Model's `source` or `sha256` clears that memo automatically, since it is keyed to the exact source and digest it was recorded against; the next reconcile then retries the download. If the spec is unchanged (for example, the same URL now serves a corrected file), recreate the `Model` or the `InferenceService` instead: deleting either one clears the memo, so the next reconcile downloads and verifies it again.
+
+### `--max-download-size` flag (download cap)
+
+The agent caps the bytes a single Model download may write, so a broken or hostile source cannot fill the Mac's disk. The cap counts bytes a resumed download already has on disk, and it covers every download the agent makes for llama-server (`http`, `https`, `hf` and `s3`, including the from-zero restart when a resume is not possible):
+
+- A source whose declared size (the HEAD probe, the response's `Content-Length`, or the s3 object size) is over the cap is refused before anything is written, and a partial left for it by an earlier attempt is removed.
+- A body that omits its `Content-Length` or keeps streaming is stopped one byte past the cap, and its partial file is removed.
+
+Either way the start is refused with reason `ModelDownloadTooLarge` (a Warning Event, plus `status.schedulingStatus`/`status.schedulingMessage`). Downloads within the cap, resumed ones included, behave exactly as before.
+
+The default is the Mac's total physical memory. The agent wires model weights into memory (mlock), and memory admission only starts a model that fits the memory budget, so a single model file larger than RAM is not one the agent can serve. Set the cap explicitly as a byte count or a Kubernetes quantity, or `0` to disable it:
+
+```bash
+llmkube-metal-agent --max-download-size=200Gi
+```
+
+To set this in the launchd plist:
+
+```xml
+    <string>--max-download-size</string>
+    <string>200Gi</string>
+```
+
+The agent logs the effective cap as `maxDownloadBytes` at startup. It refuses to start if the flag does not parse, or if the flag is unset and the total memory cannot be read.
+
+Like a digest mismatch, the refusal is remembered, so the agent does not download the same source up to the cap on every reconcile. Changing the Model's `source` (or `sha256`) retries, and so does restarting the agent, which is also how a raised cap takes effect.
+
+Upgrade note: if you deliberately serve a model file larger than the Mac's physical memory (for example with a Model `spec.hardware.memoryBudget` above the Mac's RAM), raise `--max-download-size` or set it to `0` before upgrading, or the agent will refuse that download.
 
 ### Choosing the cluster (`--kubeconfig`, `--kube-context`)
 
@@ -589,6 +617,10 @@ kubectl describe inferenceservice <name>
 - **Digest mismatch** (`ModelDigestMismatch`): when `spec.sha256` is set, a
   downloaded source that does not match it is deleted and refused. See
   "`spec.sha256` digest verification" above.
+- **Download size** (`ModelDownloadTooLarge`): a download over
+  `--max-download-size` (default: the Mac's total memory) is stopped, its
+  partial removed, and refused. See "`--max-download-size` flag (download
+  cap)" above.
 - **Cache slot** (`ModelSourceNotAllowed`): for a downloaded source, the
   file at `<model-store>/<model>/<file>` must be a regular file the agent
   wrote. A symlink there is refused, not followed.
@@ -906,7 +938,7 @@ On a Metal InferenceService (`kubectl describe inferenceservice <name>`):
   `RelaySecretNotManaged` (Warning).
 - From the agent: `RelayNotAdopted`, `ExtraArgsRejected`,
   `EndpointNameConflict`, `ModelSourceNotAllowed`, `ServiceNameTooLong`,
-  `ModelDigestMismatch` (Warning).
+  `ModelDigestMismatch`, `ModelDownloadTooLarge` (Warning).
 
 `ServiceNameTooLong` means the InferenceService name is too long for the
 `<isvc>-agent` Service (at most 57 characters, since the name plus `-agent`
@@ -1085,6 +1117,10 @@ The guard allowed the host, but macOS blocked the connection. macOS Local Networ
 ### `ModelDigestMismatch`
 
 The downloaded source's SHA256 does not match the Model's `spec.sha256`. The bad file was already deleted. Fixing `spec.sha256` or `spec.source` retries on the next reconcile; if the spec was already right and the source was fixed upstream, recreate the Model (or the InferenceService) to retry. See "`spec.sha256` digest verification" above.
+
+### `ModelDownloadTooLarge`
+
+The Model's download went over `--max-download-size`: either the source declared a size over the cap (nothing was written) or the body ran past it (the partial was removed). The message says which, and names the cap in bytes. If the source is wrong, fix `spec.source`; the next reconcile retries. If the model really is that large, raise `--max-download-size` (or set it to `0`) and restart the agent. See "`--max-download-size` flag (download cap)" above.
 
 ### Can't connect to Kubernetes
 
