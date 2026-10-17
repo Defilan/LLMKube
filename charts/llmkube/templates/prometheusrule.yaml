@@ -219,16 +219,17 @@ spec:
     # at severity critical. A ceiling is also unstable around its own boundary --
     # with running oscillating 0/1/2 the 10m average lands either side of 1 on
     # consecutive evaluations, so `for: 10m` is never satisfied and a REAL stall
-    # hovering there never fires either. Zero predicted tokens while a queue
+    # hovering there never fires either. Zero decode calls while a queue
     # persists is the honest definition of "not admitting work", and it holds
-    # for one slot and for many.
+    # for one slot and for many. n_decode_total, not tokens_predicted_total:
+    # --embedding and --reranking servers decode but never predict a token.
     - alert: InferenceAdmissionStalled
       expr: |
         (avg_over_time(vllm:num_requests_waiting[10m]) > 0 and avg_over_time(vllm:num_requests_running[10m]) <= 1)
         or
         (avg_over_time(sglang:num_queue_reqs[10m]) > 0 and avg_over_time(sglang:num_running_reqs[10m]) <= 1)
         or
-        (avg_over_time(llamacpp:requests_deferred[10m]) > 0 and rate(llamacpp:tokens_predicted_total[10m]) == 0)
+        (avg_over_time(llamacpp:requests_deferred[10m]) > 0 and rate(llamacpp:n_decode_total[10m]) == 0)
       for: 10m
       labels:
         severity: critical

@@ -258,6 +258,9 @@ tests:
           pattern: llamacpp:requests_deferred
       - matchRegex:
           path: spec.groups[?(@.name=="llmkube-serving")].rules[?(@.alert=="InferenceAdmissionStalled")].expr
+          pattern: 'rate\(llamacpp:n_decode_total\[10m\]\) == 0'
+      - matchRegex:
+          path: spec.groups[?(@.name=="llmkube-serving")].rules[?(@.alert=="InferenceAdmissionStalled")].expr
           pattern: 'avg_over_time\(vllm:num_requests_running\[10m\]\) <= 1'
 
   - it: should AND absence across every runtime's running-count metric in InferenceMetricsMissing

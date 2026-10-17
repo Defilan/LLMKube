@@ -1,0 +1,41 @@
+# promtool unit tests for the chart's llmkube-serving group. Run with
+# `make test-chart-rules`, which renders the chart's PrometheusRule into
+# rules.yaml next to a copy of this file.
+# InferenceMetricsMissing also fires on these inputs because running-count
+# metrics are absent; only InferenceAdmissionStalled is asserted here.
+rule_files:
+  - rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # llama.cpp embedder working off a backlog: queued requests, decode calls
+  # advancing, zero predicted tokens (embedding never generates). Must not
+  # page. A server with the same backlog and no decode progress must.
+  - interval: 1m
+    input_series:
+      - series: 'llamacpp:requests_deferred{namespace="ai",service="embedder"}'
+        values: '50x20'
+      - series: 'llamacpp:n_decode_total{namespace="ai",service="embedder"}'
+        values: '0+100x20'
+      - series: 'llamacpp:tokens_predicted_total{namespace="ai",service="embedder"}'
+        values: '0x20'
+      - series: 'llamacpp:requests_deferred{namespace="ai",service="stuck"}'
+        values: '5x20'
+      - series: 'llamacpp:n_decode_total{namespace="ai",service="stuck"}'
+        values: '1000x20'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: InferenceAdmissionStalled
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: InferenceAdmissionStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: inference
+              namespace: ai
+              service: stuck
+            exp_annotations:
+              summary: "Inference engine is queuing requests but running almost none"
+              description: "stuck in ai has 5 requests queued while running almost none. The process is up; it is not admitting work."

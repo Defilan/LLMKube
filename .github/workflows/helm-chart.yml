@@ -278,10 +278,12 @@ jobs:
             | tar -xz --strip-components=1 --wildcards '*/promtool'
 
           # serviceMonitor on: ControllerMetricsMissing is gated behind it.
+          # inferencePodMonitor on: the llmkube-serving group is gated behind it.
           helm template llmkube charts/llmkube \
             --namespace llmkube-system \
             --set prometheus.prometheusRule.enabled=true \
             --set prometheus.serviceMonitor.enabled=true \
+            --set prometheus.inferencePodMonitor.enabled=true \
             --show-only templates/prometheusrule.yaml \
             | yq '.spec' > /tmp/rules.yaml
 

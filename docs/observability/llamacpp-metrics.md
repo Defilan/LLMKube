@@ -12,7 +12,7 @@ contract — see `amd-gpu-metrics.md`.
 ## Source: llama.cpp `/metrics`
 
 Requires the server to run with `--metrics`. Scraped by the chart's
-`inference-podmonitor.yaml` (`prometheus.inferencePodMonitor.enabled`, on by
+`inference-podmonitor.yaml` (`prometheus.inferencePodMonitor.enabled`, off by
 default), which selects on the operator's `inference.llmkube.dev/service` label
 and relabels every series with `service`, `model`, `runtime` and `namespace`, so
 a panel can break down per model without naming a target.

@@ -19,11 +19,12 @@ esac
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# serviceMonitor on so every gated rule renders, matching the CI check step.
+# Monitors on so every gated rule renders, matching the CI check step.
 helm template llmkube "$repo_root/charts/llmkube" \
   --namespace llmkube-system \
   --set prometheus.prometheusRule.enabled=true \
   --set prometheus.serviceMonitor.enabled=true \
+  --set prometheus.inferencePodMonitor.enabled=true \
   --show-only templates/prometheusrule.yaml \
   | yq '.spec' > "$work/rules.yaml"
 
