@@ -185,7 +185,8 @@ var _ = Describe("Model Controller Reconcile", func() {
 		cacheKey := computeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
-		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"), []byte("fake-model-data"), 0644)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"),
+			buildTestGQAGGUF("llama", "cached-model", 32, 32, 8, 128, 128, 0, 0), 0644)).To(Succeed())
 
 		model := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
@@ -242,7 +243,8 @@ var _ = Describe("Model Controller Reconcile", func() {
 		cacheKey := computeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
-		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"), []byte("fake-model-data"), 0644)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"),
+			buildTestGQAGGUF("llama", "cached-model", 32, 32, 8, 128, 128, 0, 0), 0644)).To(Succeed())
 
 		model := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
