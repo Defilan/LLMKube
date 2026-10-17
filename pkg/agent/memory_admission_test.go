@@ -285,6 +285,49 @@ func TestCheckMemoryAdmission_GQAShapeAdmits(t *testing.T) {
 	if !strings.Contains(err.Error(), "insufficient memory") {
 		t.Errorf("error %q should mention insufficient memory", err)
 	}
+
+	// The tightening direction: a Gemma-shaped model (16 heads x 256 dims
+	// against a 3072 embedding) that the embedding-width estimate admits at
+	// this budget is refused once the attention shape is known, because the
+	// attention-shape charge is the larger, correct one.
+	isvcGemma := newAdmissionTestISVC()
+	agentGemma := newAdmissionTestAgent(t, isvcGemma, MetalAgentConfig{
+		MemoryProvider: &mockMemoryProvider{totalBytes: 48 * 1024 * 1024 * 1024},
+		MemoryFraction: 0.75,
+	})
+	// 8 GiB of weights at 65536 context: legacy KV is 21 GiB (total 29.5 GiB,
+	// admitted); the attention-shape KV is 28 GiB (total 36.5 GiB, refused).
+	gemmaLegacy := newAdmissionTestModel("https://model-host.invalid/model.gguf", "8.0 GiB")
+	gemmaLegacy.Status.GGUF = &inferencev1alpha1.GGUFMetadata{
+		LayerCount:    28,
+		EmbeddingSize: 3072,
+		HeadCount:     16,
+	}
+	if err := agentGemma.checkMemoryAdmission(context.Background(), isvcGemma, gemmaLegacy, 65536, "", ""); err != nil {
+		t.Fatalf("a head-dim model without attention metadata must be admitted on the legacy estimate, got: %v", err)
+	}
+
+	isvcGemmaShaped := newAdmissionTestISVC()
+	agentGemmaShaped := newAdmissionTestAgent(t, isvcGemmaShaped, MetalAgentConfig{
+		MemoryProvider: &mockMemoryProvider{totalBytes: 48 * 1024 * 1024 * 1024},
+		MemoryFraction: 0.75,
+	})
+	gemmaShaped := newAdmissionTestModel("https://model-host.invalid/model.gguf", "8.0 GiB")
+	gemmaShaped.Status.GGUF = &inferencev1alpha1.GGUFMetadata{
+		LayerCount:    28,
+		EmbeddingSize: 3072,
+		HeadCount:     16,
+		HeadCountKV:   16,
+		KeyLength:     256,
+		ValueLength:   256,
+	}
+	err = agentGemmaShaped.checkMemoryAdmission(context.Background(), isvcGemmaShaped, gemmaShaped, 65536, "", "")
+	if err == nil {
+		t.Fatal("the same model with its attention shape must be refused at this budget, got nil error")
+	}
+	if !strings.Contains(err.Error(), "insufficient memory") {
+		t.Errorf("error %q should mention insufficient memory", err)
+	}
 }
 
 func TestCheckMemoryAdmission_RejectsOverBudget(t *testing.T) {

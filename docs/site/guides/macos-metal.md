@@ -318,7 +318,12 @@ the InferenceService with `status.schedulingStatus: InsufficientMemory`.
 
 The KV-cache term is sized from the model's GGUF attention shape
 (KV head count and key/value length, i.e. grouped-query attention)
-when the file provides it. When the GGUF omits the key/value lengths,
+when the file provides it. The charge can be lower or higher than the
+old embedding-width formula: lower for GQA models whose KV head count
+is well below the attention head count (Llama 3.1), higher for
+head-dim models whose heads times head_dim exceeds the embedding
+width (Gemma), so a model admitted under the old estimate can be
+refused after this change. When the GGUF omits the key/value lengths,
 the head dims are derived as the embedding width divided by the
 attention head count, which is what llama-server itself uses for such
 files (Llama 3.1 and Qwen 2.5 GGUFs carry the KV head count but not
@@ -340,9 +345,11 @@ it, so admission does not scale with slot count.
 
 A Model parsed by an older controller keeps the
 embedding-width estimate until its GGUF metadata is re-parsed, which
-happens on the next download or after any change to the Model's spec
-(a spec change advances the generation and the controller re-derives
-the status); editing the source file on disk does nothing.
+happens on the next download, or after any change to the Model's spec
+when the Available condition records an older generation than the
+spec (a Ready status written before that condition existed has no
+such record and needs the Model recreated). Editing the source file
+on disk does nothing.
 
 Defaults are tuned by total system RAM:
 

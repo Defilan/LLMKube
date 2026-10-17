@@ -2130,8 +2130,9 @@ func buildTestGGUF(arch, name string, blockCount uint64, padBytes int) []byte {
 }
 
 // buildTestGQAGGUF is buildTestGGUF plus the grouped-query-attention metadata
-// keys (#2085). A zero headCountKV omits the GQA keys entirely, producing the
-// no-metadata shape the estimator must treat exactly like the old formula. A
+// keys (#2085). Each attention key is emitted independently when its value is
+// nonzero, so the real Llama 3.1 shape (kv head count present, lengths
+// absent) is expressible; a zero headCountKV omits the kv head count, and a
 // nonzero kvLoraRank adds the low-rank (MLA) marker key.
 func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, keyLength, valueLength, kvLoraRank uint64, padBytes int) []byte {
 	buf := &bytes.Buffer{}
@@ -2151,9 +2152,18 @@ func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, key
 		wLE(v)
 	}
 
-	metaCount := uint64(4)
+	metaCount := uint64(3)
+	if headCount > 0 {
+		metaCount++
+	}
 	if headCountKV > 0 {
-		metaCount = 7
+		metaCount++
+	}
+	if keyLength > 0 {
+		metaCount++
+	}
+	if valueLength > 0 {
+		metaCount++
 	}
 	if kvLoraRank > 0 {
 		metaCount++
@@ -2166,10 +2176,16 @@ func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, key
 	wKVString("general.architecture", arch)
 	wKVString("general.name", name)
 	wKVU64(arch+".block_count", blockCount)
-	wKVU64(arch+".attention.head_count", headCount)
+	if headCount > 0 {
+		wKVU64(arch+".attention.head_count", headCount)
+	}
 	if headCountKV > 0 {
 		wKVU64(arch+".attention.head_count_kv", headCountKV)
+	}
+	if keyLength > 0 {
 		wKVU64(arch+".attention.key_length", keyLength)
+	}
+	if valueLength > 0 {
 		wKVU64(arch+".attention.value_length", valueLength)
 	}
 	if kvLoraRank > 0 {
@@ -2228,6 +2244,23 @@ func TestParseGGUFMetadataGQAFields(t *testing.T) {
 	}
 	if ggufMeta.HeadCountKV != 16 || ggufMeta.KeyLength != 192 || ggufMeta.ValueLength != 128 {
 		t.Errorf("MLA dims = (%d, %d, %d), want (16, 192, 128)",
+			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
+	}
+
+	// The real Llama 3.1 producer shape: kv head count present, both lengths
+	// absent. The status must carry exactly that (8, 0, 0), not a filled-in
+	// guess.
+	noLengthsPath := filepath.Join(t.TempDir(), "no-lengths.gguf")
+	noLengthsBytes := buildTestGQAGGUF("llama", "no-lengths-model", 32, 32, 8, 0, 0, 0, 0)
+	if err := os.WriteFile(noLengthsPath, noLengthsBytes, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ggufMeta, err = r.parseGGUFMetadata(noLengthsPath)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata(no-lengths): %v", err)
+	}
+	if ggufMeta.HeadCountKV != 8 || ggufMeta.KeyLength != 0 || ggufMeta.ValueLength != 0 {
+		t.Errorf("no-lengths GGUF fields = (%d, %d, %d), want (8, 0, 0)",
 			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
 	}
 

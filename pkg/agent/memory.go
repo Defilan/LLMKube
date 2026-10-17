@@ -186,9 +186,10 @@ func EstimateModelMemory(fileSizeBytes uint64, layerCount, embeddingSize uint64,
 // attention shape, in which case the caller must use the historical
 // embedding-width formula. A missing key_length or value_length is derived
 // as embeddingSize/HeadCount because that is llama.cpp's own allocation
-// default for an absent length (llama-model.cpp sets n_embd_head_k_full to
-// n_embd/n_head and overrides it only when the GGUF carries the key), so the
-// derived cell is what the server allocates rather than a guess. Real files
+// default for an absent length: llama-model.cpp's generic loader sets
+// n_embd_head_k_full and n_embd_head_v_full to n_embd/n_head independently
+// and overrides each only when the GGUF carries its key, so the derived cell
+// per side is what the server allocates rather than a guess. Real files
 // split both ways: Llama 3.1 and Qwen 2.5 GGUFs carry head_count_kv but no
 // lengths, while Qwen 3 and Gemma 3 carry all three; deepseek2 files carry
 // lengths plus kv_lora_rank, which keeps them on the embedding-width formula.
@@ -228,11 +229,16 @@ func resolveKVShape(embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen
 // llama.cpp's own default for an absent length), the
 // KV term uses the grouped-query-attention shape
 // layers * headCountKV * context * (keyLength * bytesPerK + valueLength * bytesPerV)
-// instead; that is several times smaller for GQA models and identical to the
-// embedding-width formula for models without GQA metadata. Regardless of
-// shape, contextSize is the process-wide --ctx-size pool: llama-server shares
-// it across --parallel slots (total KV cells track the context size, not the
-// context size times the slot count), so the estimate takes no slot factor.
+// instead. The GQA term is smaller than the embedding-width formula when
+// kvHeads*(keyLen+valLen) is below embeddingSize (Llama-class GQA), larger
+// when it exceeds it (head-dim models like Gemma, where heads*head_dim
+// outruns the embedding width, so a model admitted under the old estimate
+// can be refused after this change), and identical for a model with no GQA
+// metadata at all; all three directions are pinned by test.
+// Regardless of shape, contextSize is the process-wide --ctx-size pool:
+// llama-server shares it across --parallel slots (total KV cells track the
+// context size, not the context size times the slot count), so the estimate
+// takes no slot factor.
 func EstimateModelMemoryWithOptions(
 	fileSizeBytes uint64,
 	layerCount, embeddingSize uint64,
@@ -270,7 +276,12 @@ func EstimateModelMemoryWithOptions(
 		bytesV := cacheTypeBytesPerElement(opts.CacheTypeV)
 		// Bound each side's byte total to MaxUint64/4 so the float64 sum
 		// stays below 2^63 and the uint64 conversion is defined; the divisor
-		// is the per-element cost rounded up, not a fixed 8.
+		// is the per-element cost rounded up, not a fixed 8. (f16 keeps the
+		// old 8; q5_0 loosens to 4 and f32 tightens to 16.) The divisor is
+		// never 0: cacheTypeBytesPerElement returns at least 0.40625 for
+		// every case it defines. Above 2^53 elements the float64 products
+		// round, so the converted total is approximate there; the guard
+		// keeps it in range regardless.
 		if kElems > math.MaxUint64/(4*uint64(math.Ceil(bytesK))) ||
 			vElems > math.MaxUint64/(4*uint64(math.Ceil(bytesV))) {
 			return fallbackEstimate(fileSizeBytes)

@@ -17,11 +17,14 @@ limitations under the License.
 package agent
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"testing"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/gguf"
 )
 
 type mockMemoryProvider struct {
@@ -53,6 +56,59 @@ func (m *mockMemoryProvider) ProcessRSS(pid int) (uint64, error) {
 		}
 	}
 	return 0, fmt.Errorf("no RSS for pid %d", pid)
+}
+
+// TestEstimateModelMemory_ProducerBytesDeriveLengths covers the derive path
+// with real producer bytes: a GGUF in the actual Llama 3.1 8B shape (kv head
+// count present, both lengths absent) is parsed with pkg/gguf and estimated
+// from what the parser returns, so the embedding/HeadCount derivation is
+// exercised from the file onward rather than from hand-set options.
+func TestEstimateModelMemory_ProducerBytesDeriveLengths(t *testing.T) {
+	buf := &bytes.Buffer{}
+	wLE := func(v interface{}) { _ = binary.Write(buf, binary.LittleEndian, v) }
+	wStr := func(s string) {
+		wLE(uint64(len(s)))
+		buf.WriteString(s)
+	}
+	wKVString := func(k, v string) {
+		wStr(k)
+		wLE(uint32(8)) // string type tag
+		wStr(v)
+	}
+	wKVU32 := func(k string, v uint32) {
+		wStr(k)
+		wLE(uint32(4)) // uint32 type tag
+		wLE(v)
+	}
+
+	wLE(uint32(0x46554747)) // magic GGUF
+	wLE(uint32(3))          // version
+	wLE(uint64(0))          // tensor count
+	wLE(uint64(6))          // metadata kv count
+	wKVString("general.architecture", "llama")
+	wKVString("general.name", "llama-3.1-8b-producer-shape")
+	wKVU32("llama.block_count", 32)
+	wKVU32("llama.embedding_length", 4096)
+	wKVU32("llama.attention.head_count", 32)
+	wKVU32("llama.attention.head_count_kv", 8)
+
+	parsed, err := gguf.Parse(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse producer bytes: %v", err)
+	}
+	if parsed.HeadCountKV() != 8 || parsed.KeyLength() != 0 || parsed.ValueLength() != 0 {
+		t.Fatalf("parsed attention shape = (%d, %d, %d), want (8, 0, 0)",
+			parsed.HeadCountKV(), parsed.KeyLength(), parsed.ValueLength())
+	}
+
+	est := EstimateModelMemoryWithOptions(4*1024*1024*1024, parsed.BlockCount(), parsed.EmbeddingLength(),
+		131072, EstimateOptions{
+			HeadCount:   parsed.HeadCount(),
+			HeadCountKV: parsed.HeadCountKV(),
+		})
+	if want := uint64(17179869184); est.KVCacheBytes != want {
+		t.Errorf("producer-bytes estimate KV = %d, want %d (16 GiB, derived dims 4096/32)", est.KVCacheBytes, want)
+	}
 }
 
 func TestEstimateModelMemory_WithFullMetadata(t *testing.T) {
@@ -250,12 +306,14 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			wantKV: kvGQA,
 		},
 		{
-			// A missing key length derives while an explicit value length
-			// stands: llama.cpp defaults each side independently.
-			name:       "key length absent derives, value length present",
-			layerCount: 32, embedSize: 4096,
-			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, ValueLength: 128},
-			wantKV: kvGQA,
+			// A missing value length derives independently of an explicit key
+			// length, matching llama.cpp's per-side defaults: embed 2560 with
+			// 32 heads derives 80, not a mirror of the stated 256. A mirror
+			// implementation would charge 34359738240 instead.
+			name:       "value length absent derives independently of the stated key length",
+			layerCount: 32, embedSize: 2560,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 256},
+			wantKV: 22548578304, // 32 * 131072 * 8 * (256*2 + 80*2)
 		},
 		{
 			// Real Qwen 2.5 7B GGUFs: heads 28, kv heads 4, no lengths.
