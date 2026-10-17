@@ -90,7 +90,8 @@ type MemoryBudget struct {
 const overheadBytes = 512 * 1024 * 1024 // 512 MiB constant overhead
 
 // EstimateOptions tweaks EstimateModelMemoryWithOptions's KV-cache calculation.
-// Empty values reproduce the historical defaults (f16 K and V).
+// Empty values reproduce the historical defaults (f16 K and V) and the
+// historical embedding-width KV formula.
 type EstimateOptions struct {
 	// CacheTypeK is the llama.cpp --cache-type-k value (e.g. "q8_0", "turbo3").
 	// Empty means f16. Unknown values fall back to f16 so the estimate
@@ -100,6 +101,29 @@ type EstimateOptions struct {
 
 	// CacheTypeV mirrors CacheTypeK for --cache-type-v.
 	CacheTypeV string
+
+	// HeadCount is the number of attention heads from the GGUF metadata.
+	// 0 means unknown.
+	HeadCount uint64
+
+	// HeadCountKV is the number of key/value attention heads (grouped-query
+	// attention). 0 means unknown: the GGUF did not provide a usable scalar
+	// value, and the historical embedding-width formula is used instead.
+	HeadCountKV uint64
+
+	// KeyLength is the per-head key dimension. 0 means the GGUF did not
+	// provide a usable scalar value; a missing side is then derived as
+	// embeddingSize / HeadCount, which is llama.cpp's own default for an
+	// absent length. The embedding-width formula applies when the GGUF has
+	// no scalar head count, no KV head count, more KV heads than attention
+	// heads, or a missing length while HeadCount does not divide
+	// embeddingSize; with both lengths explicit a non-dividing HeadCount
+	// still charges the head dims.
+	KeyLength uint64
+
+	// ValueLength is the per-head value dimension. 0 means the GGUF did not
+	// provide a usable scalar value; resolved like KeyLength.
+	ValueLength uint64
 }
 
 // cacheTypeBytesPerElement returns the per-element byte cost of a llama.cpp
@@ -154,11 +178,65 @@ func EstimateModelMemory(fileSizeBytes uint64, layerCount, embeddingSize uint64,
 	return EstimateModelMemoryWithOptions(fileSizeBytes, layerCount, embeddingSize, contextSize, EstimateOptions{})
 }
 
+// resolveKVShape resolves the per-layer KV geometry for the GQA-aware
+// estimate. ok is false whenever the GGUF did not provide a usable scalar
+// attention shape, in which case the caller must use the historical
+// embedding-width formula. A missing key_length or value_length is derived
+// as embeddingSize/HeadCount because that is llama.cpp's own allocation
+// default for an absent length: llama-model.cpp's generic loader sets
+// n_embd_head_k_full and n_embd_head_v_full to n_embd/n_head independently
+// and overrides each only when the GGUF carries its key, so the derived cell
+// per side is what the server allocates rather than a guess. Real files
+// split both ways: Llama 3.1 and Qwen 2.5 GGUFs carry head_count_kv but no
+// lengths, while Qwen 3 and Gemma 3 carry all three; older deepseek2
+// conversions carry all three with no *_mla keys, so llama-server runs the
+// non-MLA path and the head-dim charge is exact. Current-converter deepseek2
+// files are MLA layout (one KV head, lengths derived from kv_lora_rank):
+// llama-server stores only the compressed key cache there, so the head-dim
+// charge over-charges those files, which is the safe direction for a
+// pre-flight check. Array-valued head_count_kv (Jamba, Nemotron-H) reads as
+// 0 and takes the same fallback.
+// Models that do fall back are over-charged by HeadCount/HeadCountKV, and
+// the hybrid archs named above are charged further because their layer
+// count includes the non-attention layers.
+func resolveKVShape(embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen, valLen uint64, ok bool) {
+	if opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount {
+		return 0, 0, 0, false
+	}
+	keyLen, valLen = opts.KeyLength, opts.ValueLength
+	if (keyLen == 0 || valLen == 0) && embeddingSize%opts.HeadCount != 0 {
+		return 0, 0, 0, false
+	}
+	derived := embeddingSize / opts.HeadCount
+	if keyLen == 0 {
+		keyLen = derived
+	}
+	if valLen == 0 {
+		valLen = derived
+	}
+	return opts.HeadCountKV, keyLen, valLen, true
+}
+
 // EstimateModelMemoryWithOptions is EstimateModelMemory parameterized on the
 // configured KV cache types. The KV-cache term becomes
 // layers * embedding * context * (bytesPerK + bytesPerV) where bytesPerK / V
 // come from cacheTypeBytesPerElement. With f16/f16 (the empty-string default)
-// it produces the same result as EstimateModelMemory.
+// it produces the same result as EstimateModelMemory. When the GGUF attention
+// shape is known (HeadCountKV between 1 and HeadCount, with both head dims
+// present explicitly or derived as embeddingSize/HeadCount, which is
+// llama.cpp's own default for an absent length), the
+// KV term uses the grouped-query-attention shape
+// layers * headCountKV * context * (keyLength * bytesPerK + valueLength * bytesPerV)
+// instead. The GQA term is smaller than the embedding-width formula when
+// kvHeads*(keyLen+valLen) is below embeddingSize (Llama-class GQA), larger
+// when it exceeds it (head-dim models like Gemma, where heads*head_dim
+// outruns the embedding width, so a model admitted under the old estimate
+// can be refused after this change), and identical for a model with no GQA
+// metadata at all; all three directions are pinned by test.
+// Regardless of shape, contextSize is the process-wide --ctx-size pool:
+// llama-server shares it across --parallel slots (total KV cells track the
+// context size, not the context size times the slot count), so the estimate
+// takes no slot factor.
 func EstimateModelMemoryWithOptions(
 	fileSizeBytes uint64,
 	layerCount, embeddingSize uint64,
@@ -167,6 +245,57 @@ func EstimateModelMemoryWithOptions(
 ) MemoryEstimate {
 	if layerCount == 0 || embeddingSize == 0 {
 		return fallbackEstimate(fileSizeBytes)
+	}
+
+	// contextSize == 0 routes to the legacy branch, which yields a zero KV
+	// term for it; a negative value wraps in the legacy uint64 conversion
+	// and lands in the overflow fallback. Guarding here keeps the divisions
+	// below well-defined for any caller.
+	if kvHeads, keyLen, valLen, ok := resolveKVShape(embeddingSize, opts); ok && contextSize > 0 {
+		ctx := uint64(contextSize) //nolint:gosec // G115: contextSize is CRD-validated ≥128 upstream
+		base := layerCount * kvHeads
+		if base/layerCount != kvHeads {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		base *= ctx
+		if base/ctx != layerCount*kvHeads {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		kElems := base * keyLen
+		if kElems/base != keyLen {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		vElems := base * valLen
+		if vElems/base != valLen {
+			return fallbackEstimate(fileSizeBytes)
+		}
+
+		bytesK := cacheTypeBytesPerElement(opts.CacheTypeK)
+		bytesV := cacheTypeBytesPerElement(opts.CacheTypeV)
+		// Bound each side's byte total to MaxUint64/4 so the float64 sum
+		// stays below 2^63 and the uint64 conversion is defined; the divisor
+		// is the per-element cost rounded up, not a fixed 8. (f16 keeps the
+		// old 8; q5_0 loosens to 4 and f32 tightens to 16.) The divisor is
+		// never 0: cacheTypeBytesPerElement returns at least 0.40625 for
+		// every case it defines. Above 2^53 elements the float64 products
+		// round, so the converted total is approximate there; the guard
+		// keeps it in range regardless.
+		if kElems > math.MaxUint64/(4*uint64(math.Ceil(bytesK))) ||
+			vElems > math.MaxUint64/(4*uint64(math.Ceil(bytesV))) {
+			return fallbackEstimate(fileSizeBytes)
+		}
+		kvCache := uint64(math.Ceil(float64(kElems)*bytesK + float64(vElems)*bytesV))
+
+		total := fileSizeBytes + kvCache + uint64(overheadBytes)
+		if total < fileSizeBytes { // addition overflow
+			return fallbackEstimate(fileSizeBytes)
+		}
+		return MemoryEstimate{
+			WeightsBytes:  fileSizeBytes,
+			KVCacheBytes:  kvCache,
+			OverheadBytes: uint64(overheadBytes),
+			TotalBytes:    total,
+		}
 	}
 
 	// Guard against overflow in the multiplication chain. The integer math
@@ -183,9 +312,14 @@ func EstimateModelMemoryWithOptions(
 	}
 
 	bytesPerKV := cacheTypeBytesPerElement(opts.CacheTypeK) + cacheTypeBytesPerElement(opts.CacheTypeV)
-	// product is at most ~10^15 for absurd configs (1M ctx, 200B model);
-	// float64 represents integers up to 2^53 ≈ 9e15 exactly, so the conversion
-	// is lossless for any realistic input.
+	// Bound the byte total the same way the GQA branch bounds its sides:
+	// product fits uint64, but product times the per-element cost (8.0 at
+	// f32/f32) can leave uint64 range and convert to an
+	// implementation-defined value. Divisor is the cost rounded up, times
+	// four for headroom on both sides of the ceil.
+	if product > math.MaxUint64/(4*uint64(math.Ceil(bytesPerKV))) {
+		return fallbackEstimate(fileSizeBytes)
+	}
 	kvCache := uint64(math.Ceil(float64(product) * bytesPerKV))
 
 	total := fileSizeBytes + kvCache + uint64(overheadBytes)

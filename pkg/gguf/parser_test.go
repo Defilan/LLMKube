@@ -75,6 +75,18 @@ func (t testUint32) writeData(buf *bytes.Buffer) {
 	writeLE(buf, t.v)
 }
 
+type testUint64 struct{ v uint64 }
+
+func (t testUint64) typeTag() uint32 { return 10 }
+
+func (t testUint64) writeWithTag(buf *bytes.Buffer) {
+	writeLE(buf, uint32(10))
+	writeLE(buf, t.v)
+}
+func (t testUint64) writeData(buf *bytes.Buffer) {
+	writeLE(buf, t.v)
+}
+
 func (t testBool) writeWithTag(buf *bytes.Buffer) {
 	writeLE(buf, uint32(7))
 	if t.v {
@@ -373,6 +385,100 @@ func TestParseFullFile(t *testing.T) {
 	}
 	if len(gguf.TensorInfo) != 5 {
 		t.Errorf("tensor count = %d, want 5", len(gguf.TensorInfo))
+	}
+}
+
+// TestGQAAttentionAccessors covers the grouped-query-attention metadata
+// accessors added for the metal-agent KV estimate (#2085): scalar reads for
+// both integer widths, absent keys reading as 0, and an array-valued
+// head_count_kv reading as 0 rather than a guess.
+func TestGQAAttentionAccessors(t *testing.T) {
+	gqaMeta := []metadataEntry{
+		{key: "general.architecture", value: testString{s: "llama"}},
+		{key: "llama.attention.head_count", value: testUint32{v: 32}},
+		{key: "llama.attention.head_count_kv", value: testUint32{v: 8}},
+		{key: "llama.attention.key_length", value: testUint32{v: 128}},
+		{key: "llama.attention.value_length", value: testUint32{v: 128}},
+	}
+	data := buildGGUF(gqaMeta, 0)
+	gguf, err := Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gguf.HeadCountKV() != 8 {
+		t.Errorf("head_count_kv = %d, want 8", gguf.HeadCountKV())
+	}
+	if gguf.KeyLength() != 128 {
+		t.Errorf("key_length = %d, want 128", gguf.KeyLength())
+	}
+	if gguf.ValueLength() != 128 {
+		t.Errorf("value_length = %d, want 128", gguf.ValueLength())
+	}
+
+	// The same keys written as uint64 must read through AsU64 as well.
+	u64Meta := []metadataEntry{
+		{key: "general.architecture", value: testString{s: "llama"}},
+		{key: "llama.attention.head_count", value: testUint64{v: 32}},
+		{key: "llama.attention.head_count_kv", value: testUint64{v: 8}},
+		{key: "llama.attention.key_length", value: testUint64{v: 128}},
+		{key: "llama.attention.value_length", value: testUint64{v: 128}},
+	}
+	data = buildGGUF(u64Meta, 0)
+	gguf, err = Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gguf.HeadCountKV() != 8 || gguf.KeyLength() != 128 || gguf.ValueLength() != 128 {
+		t.Errorf("uint64 attention keys = (%d, %d, %d), want (8, 128, 128)",
+			gguf.HeadCountKV(), gguf.KeyLength(), gguf.ValueLength())
+	}
+
+	// Keys absent entirely: 0, never a substitute value.
+	bareMeta := []metadataEntry{
+		{key: "general.architecture", value: testString{s: "llama"}},
+		{key: "llama.attention.head_count", value: testUint32{v: 32}},
+	}
+	data = buildGGUF(bareMeta, 0)
+	gguf, err = Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gguf.HeadCountKV() != 0 || gguf.KeyLength() != 0 || gguf.ValueLength() != 0 {
+		t.Errorf("absent attention keys = (%d, %d, %d), want (0, 0, 0)",
+			gguf.HeadCountKV(), gguf.KeyLength(), gguf.ValueLength())
+	}
+
+	// No general.architecture at all: every accessor must return 0 rather
+	// than read a ".attention.key" key with an empty prefix.
+	noArchMeta := []metadataEntry{
+		{key: "general.name", value: testString{s: "arch-less"}},
+	}
+	data = buildGGUF(noArchMeta, 0)
+	gguf, err = Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gguf.HeadCountKV() != 0 || gguf.KeyLength() != 0 || gguf.ValueLength() != 0 {
+		t.Errorf("accessors without architecture = (%d, %d, %d), want all 0",
+			gguf.HeadCountKV(), gguf.KeyLength(), gguf.ValueLength())
+	}
+
+	// head_count_kv stored per layer as an array (Jamba, Nemotron-H style):
+	// must read as unknown (0), not as a guess from head_count.
+	arrMeta := []metadataEntry{
+		{key: "general.architecture", value: testString{s: "jamba"}},
+		{key: "jamba.attention.head_count", value: testUint32{v: 32}},
+		{key: "jamba.attention.head_count_kv", value: testArray{elements: []testValue{
+			testUint32{v: 8}, testUint32{v: 8}, testUint32{v: 0},
+		}}},
+	}
+	data = buildGGUF(arrMeta, 0)
+	gguf, err = Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gguf.HeadCountKV() != 0 {
+		t.Errorf("array head_count_kv = %d, want 0 (unknown)", gguf.HeadCountKV())
 	}
 }
 

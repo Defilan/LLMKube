@@ -185,7 +185,8 @@ var _ = Describe("Model Controller Reconcile", func() {
 		cacheKey := computeCacheKey(source)
 		modelDir := filepath.Join(tempDir, cacheKey)
 		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
-		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"), []byte("fake-model-data"), 0644)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"),
+			buildTestGQAGGUF("llama", "cached-model", 32, 32, 8, 128, 128, 0), 0644)).To(Succeed())
 
 		model := &inferencev1alpha1.Model{
 			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
@@ -218,6 +219,70 @@ var _ = Describe("Model Controller Reconcile", func() {
 		Expect(updated.Status.Size).NotTo(BeEmpty())
 		Expect(updated.Status.AcceleratorReady).To(BeTrue())
 		Expect(updated.Status.LastUpdated).NotTo(BeNil())
+	})
+
+	// Accepted staleness for #2085: a Model whose Status.GGUF was written
+	// before the attention-shape fields existed keeps the embedding-width
+	// memory estimate until a re-download or a source change; the cache-hit
+	// path parses only when GGUF is nil, so it must not re-parse a populated
+	// one. A one-time status refresh is deliberately not part of this
+	// change, and no ticket tracks it yet.
+	It("keeps a populated GGUF status instead of re-parsing on the cache-hit path", func() {
+		modelName := "model-cached-legacy-gguf"
+		srcDir, err := os.MkdirTemp("", "llmkube-src-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(srcDir) }()
+		srcFile := filepath.Join(srcDir, "src-model.gguf")
+		Expect(os.WriteFile(srcFile, []byte("fake-model-data"), 0644)).To(Succeed())
+		source := fmt.Sprintf("file://%s", srcFile)
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		cacheKey := computeCacheKey(source)
+		modelDir := filepath.Join(tempDir, cacheKey)
+		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"),
+			buildTestGQAGGUF("llama", "cached-model", 32, 32, 8, 128, 128, 0), 0644)).To(Succeed())
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: source},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		// Pre-upgrade status shape: GGUF populated, no attention-shape fields.
+		model.Status.GGUF = &inferencev1alpha1.GGUFMetadata{
+			Architecture:  "llama",
+			ModelName:     "legacy-parsed-model",
+			LayerCount:    32,
+			EmbeddingSize: 4096,
+			HeadCount:     32,
+		}
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		Expect(updated.Status.GGUF).NotTo(BeNil())
+		Expect(updated.Status.GGUF.LayerCount).To(Equal(uint64(32)))
+		Expect(updated.Status.GGUF.HeadCountKV).To(Equal(uint64(0)))
+		Expect(updated.Status.GGUF.KeyLength).To(Equal(uint64(0)))
+		Expect(updated.Status.GGUF.ValueLength).To(Equal(uint64(0)))
 	})
 
 	// HTTPS sources deferred to the workload init container — see issue #363.
@@ -2063,6 +2128,189 @@ func buildTestGGUF(arch, name string, blockCount uint64, padBytes int) []byte {
 		buf.Write(make([]byte, padBytes))
 	}
 	return buf.Bytes()
+}
+
+// buildTestGQAGGUF is buildTestGGUF plus the grouped-query-attention metadata
+// keys (#2085). Each attention key is emitted independently when its value is
+// nonzero, so the real Llama 3.1 shape (kv head count present, lengths
+// absent) is expressible; a zero headCountKV omits the kv head count.
+func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, keyLength, valueLength uint64, padBytes int) []byte {
+	buf := &bytes.Buffer{}
+	wLE := func(v interface{}) { _ = binary.Write(buf, binary.LittleEndian, v) }
+	wStr := func(s string) {
+		wLE(uint64(len(s)))
+		buf.WriteString(s)
+	}
+	wKVString := func(k, v string) {
+		wStr(k)
+		wLE(uint32(8)) // string type tag
+		wStr(v)
+	}
+	wKVU64 := func(k string, v uint64) {
+		wStr(k)
+		wLE(uint32(10)) // uint64 type tag
+		wLE(v)
+	}
+
+	metaCount := uint64(3)
+	if headCount > 0 {
+		metaCount++
+	}
+	if headCountKV > 0 {
+		metaCount++
+	}
+	if keyLength > 0 {
+		metaCount++
+	}
+	if valueLength > 0 {
+		metaCount++
+	}
+	wLE(uint32(0x46554747)) // magic GGUF
+	wLE(uint32(3))          // version
+	wLE(uint64(0))          // tensor count (none, keeps the prefix small)
+	wLE(metaCount)          // metadata kv count
+
+	wKVString("general.architecture", arch)
+	wKVString("general.name", name)
+	wKVU64(arch+".block_count", blockCount)
+	if headCount > 0 {
+		wKVU64(arch+".attention.head_count", headCount)
+	}
+	if headCountKV > 0 {
+		wKVU64(arch+".attention.head_count_kv", headCountKV)
+	}
+	if keyLength > 0 {
+		wKVU64(arch+".attention.key_length", keyLength)
+	}
+	if valueLength > 0 {
+		wKVU64(arch+".attention.value_length", valueLength)
+	}
+
+	if padBytes > 0 {
+		buf.Write(make([]byte, padBytes))
+	}
+	return buf.Bytes()
+}
+
+// TestParseGGUFMetadataGQAFields pins the local-file parse path filling the
+// grouped-query-attention status fields (#2085). Dropping them from
+// ggufMetadataFromParsed fails this test at every fill site, since all three
+// parse paths share the helper.
+func TestParseGGUFMetadataGQAFields(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	ggufBytes := buildTestGQAGGUF("llama", "gqa-test-model", 32, 32, 8, 128, 128, 0)
+	if err := os.WriteFile(path, ggufBytes, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	r := &ModelReconciler{}
+	ggufMeta, err := r.parseGGUFMetadata(path)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata: %v", err)
+	}
+	if ggufMeta.HeadCountKV != 8 {
+		t.Errorf("HeadCountKV = %d, want 8", ggufMeta.HeadCountKV)
+	}
+	if ggufMeta.KeyLength != 128 {
+		t.Errorf("KeyLength = %d, want 128", ggufMeta.KeyLength)
+	}
+	if ggufMeta.ValueLength != 128 {
+		t.Errorf("ValueLength = %d, want 128", ggufMeta.ValueLength)
+	}
+
+	// A deepseek2-shaped fixture carries the dims the current converter
+	// writes for MLA models (one KV head, key/value lengths derived from
+	// kv_lora_rank): the dims must reach status unchanged.
+	mlaPath := filepath.Join(t.TempDir(), "mla.gguf")
+	mlaBytes := buildTestGQAGGUF("deepseek2", "mla-test-model", 27, 16, 1, 576, 512, 0)
+	if err := os.WriteFile(mlaPath, mlaBytes, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ggufMeta, err = r.parseGGUFMetadata(mlaPath)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata(mla): %v", err)
+	}
+	if ggufMeta.HeadCountKV != 1 || ggufMeta.KeyLength != 576 || ggufMeta.ValueLength != 512 {
+		t.Errorf("MLA dims = (%d, %d, %d), want (1, 576, 512)",
+			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
+	}
+
+	// The real Llama 3.1 producer shape: kv head count present, both lengths
+	// absent. The status must carry exactly that (8, 0, 0), not a filled-in
+	// guess.
+	noLengthsPath := filepath.Join(t.TempDir(), "no-lengths.gguf")
+	noLengthsBytes := buildTestGQAGGUF("llama", "no-lengths-model", 32, 32, 8, 0, 0, 0)
+	if err := os.WriteFile(noLengthsPath, noLengthsBytes, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ggufMeta, err = r.parseGGUFMetadata(noLengthsPath)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata(no-lengths): %v", err)
+	}
+	if ggufMeta.HeadCountKV != 8 || ggufMeta.KeyLength != 0 || ggufMeta.ValueLength != 0 {
+		t.Errorf("no-lengths GGUF fields = (%d, %d, %d), want (8, 0, 0)",
+			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
+	}
+
+	// A GGUF without the GQA keys must leave the fields zero, not guessed.
+	plainPath := filepath.Join(t.TempDir(), "plain.gguf")
+	if err := os.WriteFile(plainPath, buildTestGQAGGUF("llama", "plain-model", 32, 32, 0, 0, 0, 0), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ggufMeta, err = r.parseGGUFMetadata(plainPath)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata(plain): %v", err)
+	}
+	if ggufMeta.HeadCountKV != 0 || ggufMeta.KeyLength != 0 || ggufMeta.ValueLength != 0 {
+		t.Errorf("plain GGUF GQA fields = (%d, %d, %d), want (0, 0, 0)",
+			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
+	}
+}
+
+// TestParseRemoteGGUFMetadataGQAFields pins the remote http(s) header-read
+// path filling the grouped-query-attention status fields (#2085).
+func TestParseRemoteGGUFMetadataGQAFields(t *testing.T) {
+	ggufBytes := buildTestGQAGGUF("llama", "remote-gqa-model", 32, 32, 8, 128, 128, 4<<20)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(ggufBytes)))
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if rng := r.Header.Get("Range"); rng != "" && strings.HasPrefix(rng, "bytes=") {
+			var start, end int
+			if _, perr := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); perr == nil {
+				if end >= len(ggufBytes) {
+					end = len(ggufBytes) - 1
+				}
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(ggufBytes)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(ggufBytes[start : end+1])
+				return
+			}
+		}
+		_, _ = w.Write(ggufBytes)
+	}))
+	defer srv.Close()
+
+	model := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{Source: srv.URL + "/model.gguf"},
+	}
+	r := &ModelReconciler{AllowedRemoteHosts: testRemoteHosts}
+	ggufMeta, _, err := r.parseRemoteGGUFMetadata(context.Background(), model)
+	if err != nil {
+		t.Fatalf("parseRemoteGGUFMetadata: %v", err)
+	}
+	if ggufMeta.HeadCountKV != 8 {
+		t.Errorf("HeadCountKV = %d, want 8", ggufMeta.HeadCountKV)
+	}
+	if ggufMeta.KeyLength != 128 {
+		t.Errorf("KeyLength = %d, want 128", ggufMeta.KeyLength)
+	}
+	if ggufMeta.ValueLength != 128 {
+		t.Errorf("ValueLength = %d, want 128", ggufMeta.ValueLength)
+	}
 }
 
 // The metadata-read gate in reconcileRuntimeResolvedSource must admit s3://

@@ -413,6 +413,25 @@ type GGUFMetadata struct {
 	// +optional
 	HeadCount uint64 `json:"headCount,omitempty"`
 
+	// HeadCountKV is the number of key/value attention heads (grouped-query
+	// attention). 0 means the GGUF did not provide a usable scalar value
+	// (absent, array-valued, or written by an older controller); consumers
+	// must treat 0 as unknown and fall back to the embedding-width estimate.
+	// +optional
+	HeadCountKV uint64 `json:"headCountKV,omitempty"`
+
+	// KeyLength is the per-head key dimension from the GGUF attention metadata.
+	// 0 means the GGUF did not provide a usable scalar value; consumers treat
+	// it as unknown and derive it when needed.
+	// +optional
+	KeyLength uint64 `json:"keyLength,omitempty"`
+
+	// ValueLength is the per-head value dimension from the GGUF attention metadata.
+	// 0 means the GGUF did not provide a usable scalar value; consumers treat
+	// it as unknown and derive it when needed.
+	// +optional
+	ValueLength uint64 `json:"valueLength,omitempty"`
+
 	// TensorCount is the number of tensors in the model
 	// +optional
 	TensorCount uint64 `json:"tensorCount,omitempty"`

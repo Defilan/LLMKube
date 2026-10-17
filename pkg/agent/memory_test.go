@@ -17,11 +17,14 @@ limitations under the License.
 package agent
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"testing"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/pkg/gguf"
 )
 
 type mockMemoryProvider struct {
@@ -53,6 +56,59 @@ func (m *mockMemoryProvider) ProcessRSS(pid int) (uint64, error) {
 		}
 	}
 	return 0, fmt.Errorf("no RSS for pid %d", pid)
+}
+
+// TestEstimateModelMemory_ProducerBytesDeriveLengths covers the derive path
+// with real producer bytes: a GGUF in the actual Llama 3.1 8B shape (kv head
+// count present, both lengths absent) is parsed with pkg/gguf and estimated
+// from what the parser returns, so the embedding/HeadCount derivation is
+// exercised from the file onward rather than from hand-set options.
+func TestEstimateModelMemory_ProducerBytesDeriveLengths(t *testing.T) {
+	buf := &bytes.Buffer{}
+	wLE := func(v interface{}) { _ = binary.Write(buf, binary.LittleEndian, v) }
+	wStr := func(s string) {
+		wLE(uint64(len(s)))
+		buf.WriteString(s)
+	}
+	wKVString := func(k, v string) {
+		wStr(k)
+		wLE(uint32(8)) // string type tag
+		wStr(v)
+	}
+	wKVU32 := func(k string, v uint32) {
+		wStr(k)
+		wLE(uint32(4)) // uint32 type tag
+		wLE(v)
+	}
+
+	wLE(uint32(0x46554747)) // magic GGUF
+	wLE(uint32(3))          // version
+	wLE(uint64(0))          // tensor count
+	wLE(uint64(6))          // metadata kv count
+	wKVString("general.architecture", "llama")
+	wKVString("general.name", "llama-3.1-8b-producer-shape")
+	wKVU32("llama.block_count", 32)
+	wKVU32("llama.embedding_length", 4096)
+	wKVU32("llama.attention.head_count", 32)
+	wKVU32("llama.attention.head_count_kv", 8)
+
+	parsed, err := gguf.Parse(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("parse producer bytes: %v", err)
+	}
+	if parsed.HeadCountKV() != 8 || parsed.KeyLength() != 0 || parsed.ValueLength() != 0 {
+		t.Fatalf("parsed attention shape = (%d, %d, %d), want (8, 0, 0)",
+			parsed.HeadCountKV(), parsed.KeyLength(), parsed.ValueLength())
+	}
+
+	est := EstimateModelMemoryWithOptions(4*1024*1024*1024, parsed.BlockCount(), parsed.EmbeddingLength(),
+		131072, EstimateOptions{
+			HeadCount:   parsed.HeadCount(),
+			HeadCountKV: parsed.HeadCountKV(),
+		})
+	if want := uint64(17179869184); est.KVCacheBytes != want {
+		t.Errorf("producer-bytes estimate KV = %d, want %d (16 GiB, derived dims 4096/32)", est.KVCacheBytes, want)
+	}
 }
 
 func TestEstimateModelMemory_WithFullMetadata(t *testing.T) {
@@ -206,6 +262,247 @@ func TestEstimateModelMemory_UnknownCacheTypeFallsBackToF16(t *testing.T) {
 	if unknown.KVCacheBytes != f16.KVCacheBytes {
 		t.Errorf("unknown cache type should fall back to f16: got %d, want %d",
 			unknown.KVCacheBytes, f16.KVCacheBytes)
+	}
+}
+
+// TestEstimateModelMemoryWithOptions_GQAShape covers the grouped-query-attention
+// KV estimate (#2085): the GQA formula when the GGUF attention shape is known,
+// byte-identical legacy behavior when it is not, per-side cache-type bytes,
+// and the fallback and overflow guards.
+func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
+	const fileSize = uint64(4 * 1024 * 1024 * 1024) // 4 GiB
+	const kvGQA = uint64(17179869184)               // 32 layers * 131072 ctx * 8 kv heads * 128 dims * 4 bytes = 16 GiB
+	const kvLegacy = uint64(68719476736)            // 32 * 4096 * 131072 * 4 bytes = 64 GiB
+	const overhead = uint64(512 * 1024 * 1024)
+
+	tests := []struct {
+		name       string
+		layerCount uint64
+		embedSize  uint64
+		opts       EstimateOptions
+		wantKV     uint64
+		fallback   bool // expect the fileSize*1.2 heuristic instead of a KV term
+	}{
+		{
+			name:       "llama-3.1-8B shape with full GQA metadata",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128},
+			wantKV: kvGQA,
+		},
+		{
+			name:       "no GQA metadata matches the legacy formula exactly",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{},
+			wantKV: kvLegacy,
+		},
+		{
+			// Real Llama 3.1 8B GGUFs carry head_count_kv but no key/value
+			// lengths; the derived dims (4096/32 = 128) are llama.cpp's own
+			// allocation default for an absent length, so the GQA term is
+			// exact for the issue's flagship example.
+			name:       "llama-3.1-8B real-file shape (lengths absent) derives head dims",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8},
+			wantKV: kvGQA,
+		},
+		{
+			// A missing value length derives independently of an explicit key
+			// length, matching llama.cpp's per-side defaults: embed 2560 with
+			// 32 heads derives 80, not a mirror of the stated 256. A mirror
+			// implementation would charge 34359738240 instead.
+			name:       "value length absent derives independently of the stated key length",
+			layerCount: 32, embedSize: 2560,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 256},
+			wantKV: 22548578304, // 32 * 131072 * 8 * (256*2 + 80*2)
+		},
+		{
+			// Real Qwen 2.5 7B GGUFs: heads 28, kv heads 4, no lengths.
+			name:       "qwen2.5-7B real-file shape (lengths absent) derives head dims",
+			layerCount: 28, embedSize: 3584,
+			opts:   EstimateOptions{HeadCount: 28, HeadCountKV: 4},
+			wantKV: 7516192768, // 28 * 131072 * 4 * 128 * 4
+		},
+		{
+			// The multi-head-attention identity: with kv heads equal to head
+			// count the derived dims reproduce the legacy number exactly.
+			name:       "kv heads equal to headCount derives dims and matches legacy",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 32},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "equal head counts with non-divisible embedding falls back",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 48, HeadCountKV: 48},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "asymmetric cache types apply per-side bytes",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128, CacheTypeK: "q8_0"},
+			wantKV: 13153337344, // 4294967296 elems * (1.0625 + 2.0)
+		},
+		{
+			name:       "missing headCount falls back even with kv heads and lengths",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCountKV: 8, KeyLength: 128, ValueLength: 128},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "zero headCountKV falls back, no MHA substitution",
+			layerCount: 32, embedSize: 4096,
+			// keyLength 64 differs from the derivable 4096/32 = 128 so the
+			// row distinguishes the fallback from a headCount substitution:
+			// substituting would halve the KV term.
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 0, KeyLength: 64, ValueLength: 64},
+			wantKV: kvLegacy,
+		},
+		{
+			// Explicit dims must win even when the embedding/headCount
+			// derivation would fail its divisibility check (4096 % 48 != 0).
+			name:       "explicit head dims win over an underivable embedding ratio",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 48, HeadCountKV: 48, KeyLength: 256, ValueLength: 256},
+			wantKV: 206158430208, // 32 * 48 * 131072 * 256 * 4
+		},
+		{
+			// Element counts fit uint64 (2^62) while the f16 byte sum is 2^64,
+			// which does not; the row must take the fallback, not a garbage
+			// conversion.
+			name:       "byte totals beyond uint64 fall back",
+			layerCount: 1 << 28, embedSize: 256,
+			opts:     EstimateOptions{HeadCount: 256, HeadCountKV: 256, KeyLength: 512, ValueLength: 512},
+			fallback: true,
+		},
+		{
+			// Older deepseek2 conversions carry plain head dims (16 KV heads,
+			// key 192, value 128) and no *_mla keys, so llama-server runs the
+			// non-MLA path and allocates exactly this cell. The legacy
+			// embedding-width charge is 28991029248 here, 1.25x low.
+			name:       "deepseek-v2-lite legacy layout is charged what llama-server allocates",
+			layerCount: 27, embedSize: 2048,
+			opts: EstimateOptions{
+				HeadCount: 16, HeadCountKV: 16, KeyLength: 192, ValueLength: 128,
+			},
+			wantKV: 36238786560, // 27 * 16 * (192+128) * 2 * 131072
+		},
+		{
+			// Current-converter deepseek2 files are MLA layout (one KV head,
+			// key 576 = kv_lora_rank + rope, value 512) and llama-server
+			// stores only the compressed key cache, so the K+V charge is
+			// about 1.9x high on purpose; over-charging is the safe
+			// direction for admission.
+			name:       "deepseek-v2-lite MLA layout (kv heads 1, key 576, value 512) over-charges the compressed cache",
+			layerCount: 27, embedSize: 2048,
+			opts: EstimateOptions{
+				HeadCount: 16, HeadCountKV: 1, KeyLength: 576, ValueLength: 512,
+			},
+			wantKV: 7700742144, // 27 * 1 * (576+512) * 2 * 131072
+		},
+		{
+			// Real Gemma 7B GGUFs: 16 heads x 256 dims against a 3072
+			// embedding, so the attention-shape charge is higher than the
+			// embedding-width formula and matches what llama-server allocates.
+			name:       "gemma-7B shape (heads x head_dim above embedding width) estimates higher than legacy",
+			layerCount: 28, embedSize: 3072,
+			opts: EstimateOptions{
+				HeadCount: 16, HeadCountKV: 16, KeyLength: 256, ValueLength: 256,
+			},
+			wantKV: 60129542144, // 28 * 131072 * 16 * (256*2 + 256*2)
+		},
+		{
+			// q5_0's per-element cost (0.6875) gives a MaxUint64/4 bound, so
+			// element counts a fixed MaxUint64/8 bound would refuse now
+			// compute; the literal is exact (all factors are powers-of-two
+			// multiples).
+			name:       "q5_0 element counts between the legacy and derived bounds compute",
+			layerCount: 1 << 20, embedSize: 256,
+			opts: EstimateOptions{
+				HeadCount: 256, HeadCountKV: 256, KeyLength: 98304, ValueLength: 98304,
+				CacheTypeK: "q5_0", CacheTypeV: "q5_0",
+			},
+			wantKV: 4755801206503243776, // 33 * 2^57: two sides of 3*2^60 elements at 11/16 bytes
+		},
+		{
+			// f32's per-element cost (4.0) tightens the bound to MaxUint64/16,
+			// below the old fixed MaxUint64/8: these element counts must fall
+			// back instead of producing a byte total near the uint64 edge.
+			name:       "f32 byte totals above the derived bound fall back",
+			layerCount: 1 << 20, embedSize: 256,
+			opts: EstimateOptions{
+				HeadCount: 256, HeadCountKV: 256, KeyLength: 49152, ValueLength: 49152,
+				CacheTypeK: "f32", CacheTypeV: "f32",
+			},
+			fallback: true,
+		},
+		{
+			// layerCount*kvHeads*ctx stays below 2^64 (2^45) while
+			// base*keyLen overflows, so the row fires at the kElems guard
+			// specifically; the shape itself passes resolveKVShape (kv == q).
+			name:       "absurd shapes hit the overflow guard and fall back",
+			layerCount: 1 << 20, embedSize: 256,
+			opts:     EstimateOptions{HeadCount: 256, HeadCountKV: 256, KeyLength: 1048576, ValueLength: 1048576},
+			fallback: true,
+		},
+		{
+			// The legacy branch needs the same byte bound: the element
+			// product fits uint64 (2^61) while product times the f32/f32
+			// per-element cost (8.0) does not.
+			name:       "legacy byte totals beyond uint64 fall back",
+			layerCount: 1 << 32, embedSize: 4096,
+			opts:     EstimateOptions{CacheTypeK: "f32", CacheTypeV: "f32"},
+			fallback: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			est := EstimateModelMemoryWithOptions(fileSize, tt.layerCount, tt.embedSize, 131072, tt.opts)
+			if tt.fallback {
+				want := fallbackEstimate(fileSize)
+				if est.KVCacheBytes != 0 || est.TotalBytes != want.TotalBytes {
+					t.Errorf("expected fallback estimate, got KV=%d total=%d, want KV=%d total=%d",
+						est.KVCacheBytes, est.TotalBytes, want.KVCacheBytes, want.TotalBytes)
+				}
+				return
+			}
+			if est.KVCacheBytes != tt.wantKV {
+				t.Errorf("KV = %d, want %d", est.KVCacheBytes, tt.wantKV)
+			}
+			if want := fileSize + tt.wantKV + overhead; est.TotalBytes != want {
+				t.Errorf("total = %d, want %d", est.TotalBytes, want)
+			}
+		})
+	}
+
+	// The multi-head-attention path must reproduce the legacy branch
+	// byte-for-byte even with a quantized cache type, where the two float
+	// expressions could diverge by a rounding step.
+	mha := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 131072, EstimateOptions{
+		HeadCount: 32, HeadCountKV: 32, CacheTypeK: "q8_0",
+	})
+	legacyQ8 := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 131072, EstimateOptions{CacheTypeK: "q8_0"})
+	if mha.KVCacheBytes != legacyQ8.KVCacheBytes || mha.KVCacheBytes != 52613349376 {
+		t.Errorf("MHA q8_0 KV = %d, want %d (legacy branch)", mha.KVCacheBytes, legacyQ8.KVCacheBytes)
+	}
+
+	// The legacy 4-arg entry point must keep producing the no-metadata number.
+	legacy := EstimateModelMemory(fileSize, 32, 4096, 131072)
+	if legacy.KVCacheBytes != kvLegacy {
+		t.Errorf("legacy estimate = %d, want %d", legacy.KVCacheBytes, kvLegacy)
+	}
+}
+
+// A zero context must not panic in the GQA branch's divisions and must match
+// what the legacy branch produces for the same input (a zero KV term).
+func TestEstimateModelMemoryWithOptions_GQAZeroContext(t *testing.T) {
+	const fileSize = uint64(4 * 1024 * 1024 * 1024)
+	opts := EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128}
+	got := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 0, opts)
+	want := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 0, EstimateOptions{})
+	if got.KVCacheBytes != want.KVCacheBytes || got.TotalBytes != want.TotalBytes {
+		t.Errorf("zero context with GQA opts = (KV=%d total=%d), want legacy zero-context (KV=%d total=%d)",
+			got.KVCacheBytes, got.TotalBytes, want.KVCacheBytes, want.TotalBytes)
 	}
 }
 

@@ -2180,15 +2180,23 @@ func (a *MetalAgent) estimateModelMemory(
 			"cannot determine model size: %s", strings.Join(reasons, "; "))
 	}
 
-	var layerCount, embeddingSize uint64
+	var layerCount, embeddingSize, headCount, headCountKV, keyLength, valueLength uint64
 	if model.Status.GGUF != nil {
 		layerCount = model.Status.GGUF.LayerCount
 		embeddingSize = model.Status.GGUF.EmbeddingSize
+		headCount = model.Status.GGUF.HeadCount
+		headCountKV = model.Status.GGUF.HeadCountKV
+		keyLength = model.Status.GGUF.KeyLength
+		valueLength = model.Status.GGUF.ValueLength
 	}
 
 	return EstimateModelMemoryWithOptions(fileSizeBytes, layerCount, embeddingSize, contextSize, EstimateOptions{
-		CacheTypeK: cacheTypeK,
-		CacheTypeV: cacheTypeV,
+		CacheTypeK:  cacheTypeK,
+		CacheTypeV:  cacheTypeV,
+		HeadCount:   headCount,
+		HeadCountKV: headCountKV,
+		KeyLength:   keyLength,
+		ValueLength: valueLength,
 	}), nil
 }
 

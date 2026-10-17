@@ -705,6 +705,21 @@ spec:
                     description: HeadCount is the number of attention heads
                     format: int64
                     type: integer
+                  headCountKV:
+                    description: |-
+                      HeadCountKV is the number of key/value attention heads (grouped-query
+                      attention). 0 means the GGUF did not provide a usable scalar value
+                      (absent, array-valued, or written by an older controller); consumers
+                      must treat 0 as unknown and fall back to the embedding-width estimate.
+                    format: int64
+                    type: integer
+                  keyLength:
+                    description: |-
+                      KeyLength is the per-head key dimension from the GGUF attention metadata.
+                      0 means the GGUF did not provide a usable scalar value; consumers treat
+                      it as unknown and derive it when needed.
+                    format: int64
+                    type: integer
                   layerCount:
                     description: LayerCount is the number of transformer layers/blocks
                     format: int64
@@ -723,6 +738,13 @@ spec:
                     type: string
                   tensorCount:
                     description: TensorCount is the number of tensors in the model
+                    format: int64
+                    type: integer
+                  valueLength:
+                    description: |-
+                      ValueLength is the per-head value dimension from the GGUF attention metadata.
+                      0 means the GGUF did not provide a usable scalar value; consumers treat
+                      it as unknown and derive it when needed.
                     format: int64
                     type: integer
                 type: object
