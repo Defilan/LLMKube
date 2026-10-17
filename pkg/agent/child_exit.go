@@ -54,8 +54,10 @@ func (e *KilledAfterGraceError) Error() string {
 
 // errProcessAlreadyGone reports that a stop found no live process at the
 // PID: the signal hit ESRCH, or os reports the process already finished.
-// The engine is stopped. ECHILD from a Wait on an untracked PID proves
-// nothing about liveness and stays an error.
+// The engine is stopped. Only a failed signal sets it, because only that
+// proves the PID is dead. A Wait error on an untracked PID after SIGTERM was
+// delivered (ECHILD included) proves nothing about liveness, so it stays a
+// plain error and the eviction path still clears the block for it.
 var errProcessAlreadyGone = errors.New("process already gone")
 
 // stopGracePeriod is how long a child may ignore SIGTERM before it is
@@ -125,9 +127,11 @@ func withLogTail(err error, logPath string) error {
 }
 
 // childTracker maps the PID of every child an executor spawned to its reaper,
-// so StopProcess can learn the child is gone without a second wait. PIDs
-// absent here (a process adopted after an agent restart) fall back to
-// signalling and waiting on the PID directly. The zero value is ready to use.
+// so StopProcess can learn the child is gone without a second wait. A PID
+// absent here falls back to signalling and waiting on the PID directly.
+// Every spawn path tracks its child, so nothing reaches that fallback today;
+// it is for PIDs the agent did not spawn, which only adopting engines across
+// an agent restart (#2079) would produce. The zero value is ready to use.
 type childTracker struct {
 	childMu  sync.Mutex
 	children map[int]*childExit

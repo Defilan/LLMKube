@@ -271,7 +271,11 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		// SIGKILL after the grace period, an engine already gone, or a
 		// failed endpoint unregister. The eviction completed: keep the
 		// block so the Evicted condition's resourceVersion bump cannot
-		// respawn into Critical pressure, and count it below.
+		// respawn into Critical pressure, and count it below. After a
+		// failed unregister the endpoint stays advertised for the whole
+		// pressure period: nothing retries the withdrawal (the heartbeat
+		// re-registers only running processes), so traffic can still be
+		// routed to the stopped engine until it restarts.
 		a.logger.Warnw("eviction completed; engine stopped; keeping pressure block",
 			"key", key, "error", err)
 	}

@@ -162,8 +162,8 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 
 // StopProcess sends SIGTERM with a 10s grace period before SIGKILL. A child
 // this executor spawned is stopped through its reaper (which owns the Wait);
-// a PID it did not spawn (adopted after an agent restart) falls back to
-// signalling and waiting on it directly. vllm-swift's underlying Python
+// a PID it did not spawn falls back to signalling and waiting on it
+// directly (unreached until engines are adopted across restarts, #2079). vllm-swift's underlying Python
 // api_server respects SIGTERM and shuts down the engine cleanly.
 func (e *VLLMSwiftExecutor) StopProcess(pid int) error {
 	return e.stopChild(pid)

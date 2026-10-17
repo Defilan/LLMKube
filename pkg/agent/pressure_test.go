@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -494,10 +495,20 @@ type killedStopExecutor struct{ stubExecutor }
 
 func (killedStopExecutor) StopProcess(_ int) error { return &KilledAfterGraceError{PID: 999990} }
 
+// alreadyGoneStopExecutor reports the stop a signal to a dead PID produces
+// (child_exit.go): the engine was gone before the stop ran. Paired with
+// TestStopChild_AlreadyGoneIsTyped, which pins that the real stop path
+// produces this error (#2091).
+type alreadyGoneStopExecutor struct{ stubExecutor }
+
+func (alreadyGoneStopExecutor) StopProcess(pid int) error {
+	return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
+}
+
 // TestHandleMemoryPressure_EvictionTeardownOutcomes pins how the eviction
 // path reacts to each deleteProcess outcome (#2091): a SIGKILL after the
-// grace period and an endpoint-unregister failure both leave the engine
-// stopped, so the eviction completes and the block stays; only a stop that
+// grace period, an engine already gone, and an endpoint-unregister failure
+// all leave the engine stopped, so the eviction completes and the block stays; only a stop that
 // may have left the engine running clears the block.
 func TestHandleMemoryPressure_EvictionTeardownOutcomes(t *testing.T) {
 	tests := []struct {
@@ -512,6 +523,13 @@ func TestHandleMemoryPressure_EvictionTeardownOutcomes(t *testing.T) {
 		{
 			name:        "killed after grace keeps the block",
 			exec:        killedStopExecutor{},
+			wantBlocked: true,
+			wantEvicted: 1,
+			wantEvent:   true,
+		},
+		{
+			name:        "engine already gone keeps the block",
+			exec:        alreadyGoneStopExecutor{},
 			wantBlocked: true,
 			wantEvicted: 1,
 			wantEvent:   true,

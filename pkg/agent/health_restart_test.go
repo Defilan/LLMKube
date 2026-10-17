@@ -492,7 +492,7 @@ func TestHealthRestart_BackoffResetsAfterHealthyRun(t *testing.T) {
 // backoff to release its memory before a new engine loads the weights again.
 func TestHealthRestart_StopErrorDelaysStart(t *testing.T) {
 	f := newRestartFixture(t, "restart-stop-error")
-	f.exec.stopErr = errors.New("process 1111 did not exit gracefully, killed")
+	f.exec.stopErr = &KilledAfterGraceError{PID: 1111}
 	ctx := context.Background()
 
 	f.probe(DefaultHealthFailureThreshold)
@@ -937,7 +937,7 @@ func TestQueueRestart_DeletedBeforeRunNeverStarts(t *testing.T) {
 // weights while the killed one may still hold them.
 func TestHealthRestart_SpecChangeKeepsReleaseFloor(t *testing.T) {
 	f := newRestartFixture(t, "restart-release-floor")
-	f.exec.stopErr = errors.New("process 1111 did not exit gracefully, killed")
+	f.exec.stopErr = &KilledAfterGraceError{PID: 1111}
 	ctx := context.Background()
 
 	f.probe(DefaultHealthFailureThreshold)
