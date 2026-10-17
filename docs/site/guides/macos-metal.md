@@ -326,7 +326,8 @@ where that identity is exact.
 
 A Model parsed by an older controller keeps the
 embedding-width estimate until its GGUF metadata is re-parsed, which
-happens on the next download or when the Model's source changes.
+happens on the next download or when the Model's source changes;
+recreate the Model (or touch its source) to refresh it in place.
 
 Defaults are tuned by total system RAM:
 

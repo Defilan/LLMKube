@@ -289,6 +289,23 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			wantKV: kvLegacy,
 		},
 		{
+			// Explicit dims must win even when the embedding/headCount
+			// derivation would fail its divisibility check (4096 % 48 != 0).
+			name:       "explicit head dims win over an underivable embedding ratio",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 48, HeadCountKV: 48, KeyLength: 256, ValueLength: 256},
+			wantKV: 206158430208, // 32 * 48 * 131072 * 256 * 4
+		},
+		{
+			// Element counts fit uint64 (2^62) while the f16 byte sum is 2^64,
+			// which does not; the row must take the fallback, not a garbage
+			// conversion.
+			name:       "byte totals beyond uint64 fall back",
+			layerCount: 1 << 28, embedSize: 256,
+			opts:     EstimateOptions{HeadCount: 256, HeadCountKV: 256, KeyLength: 512, ValueLength: 512},
+			fallback: true,
+		},
+		{
 			// layerCount*kvHeads*ctx stays below 2^64 (2^45) while
 			// base*keyLen overflows, so the row fires at the kElems guard
 			// specifically; the shape itself passes resolveKVShape (kv == q).
@@ -317,6 +334,17 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 				t.Errorf("total = %d, want %d", est.TotalBytes, want)
 			}
 		})
+	}
+
+	// The multi-head-attention path must reproduce the legacy branch
+	// byte-for-byte even with a quantized cache type, where the two float
+	// expressions could diverge by a rounding step.
+	mha := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 131072, EstimateOptions{
+		HeadCount: 32, HeadCountKV: 32, CacheTypeK: "q8_0",
+	})
+	legacyQ8 := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 131072, EstimateOptions{CacheTypeK: "q8_0"})
+	if mha.KVCacheBytes != legacyQ8.KVCacheBytes || mha.KVCacheBytes != 52613349376 {
+		t.Errorf("MHA q8_0 KV = %d, want %d (legacy branch)", mha.KVCacheBytes, legacyQ8.KVCacheBytes)
 	}
 
 	// The legacy 4-arg entry point must keep producing the no-metadata number.

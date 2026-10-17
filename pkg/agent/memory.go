@@ -188,18 +188,18 @@ func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvH
 	if layerCount == 0 || opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount {
 		return 0, 0, 0, false
 	}
-	if opts.HeadCountKV == opts.HeadCount {
+	keyLen, valLen = opts.KeyLength, opts.ValueLength
+	if opts.HeadCountKV == opts.HeadCount && (keyLen == 0 || valLen == 0) {
 		if embeddingSize%opts.HeadCount != 0 {
 			return 0, 0, 0, false
 		}
 		derived := embeddingSize / opts.HeadCount
-		keyLen, valLen = derived, derived
-	}
-	if opts.KeyLength > 0 {
-		keyLen = opts.KeyLength
-	}
-	if opts.ValueLength > 0 {
-		valLen = opts.ValueLength
+		if keyLen == 0 {
+			keyLen = derived
+		}
+		if valLen == 0 {
+			valLen = derived
+		}
 	}
 	if keyLen == 0 || valLen == 0 {
 		return 0, 0, 0, false
@@ -247,6 +247,14 @@ func EstimateModelMemoryWithOptions(
 		}
 		vElems := base * valLen
 		if vElems/base != valLen {
+			return fallbackEstimate(fileSizeBytes)
+		}
+
+		// bytesPerK/V reach 4.0 (f32), so the byte totals can exceed uint64
+		// even though the element counts fit; a float64 sum out of uint64
+		// range converts to an implementation-defined value. Bound both
+		// sides so the sum stays convertible.
+		if kElems > math.MaxUint64/8 || vElems > math.MaxUint64/8 {
 			return fallbackEstimate(fileSizeBytes)
 		}
 
