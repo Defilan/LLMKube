@@ -432,6 +432,13 @@ type GGUFMetadata struct {
 	// +optional
 	ValueLength uint64 `json:"valueLength,omitempty"`
 
+	// KVLoraRank is the low-rank KV compression size from the GGUF attention
+	// metadata (multi-head latent attention). 0 means the GGUF did not
+	// provide it; a nonzero value marks a cache whose per-token cell is not
+	// head-shaped, and consumers keep the embedding-width estimate for it.
+	// +optional
+	KVLoraRank uint64 `json:"kvLoraRank,omitempty"`
+
 	// TensorCount is the number of tensors in the model
 	// +optional
 	TensorCount uint64 `json:"tensorCount,omitempty"`

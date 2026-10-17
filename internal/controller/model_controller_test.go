@@ -2130,8 +2130,9 @@ func buildTestGGUF(arch, name string, blockCount uint64, padBytes int) []byte {
 
 // buildTestGQAGGUF is buildTestGGUF plus the grouped-query-attention metadata
 // keys (#2085). A zero headCountKV omits the GQA keys entirely, producing the
-// no-metadata shape the estimator must treat exactly like the old formula.
-func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, keyLength, valueLength uint64, padBytes int) []byte {
+// no-metadata shape the estimator must treat exactly like the old formula. A
+// nonzero kvLoraRank adds the low-rank (MLA) marker key.
+func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, keyLength, valueLength, kvLoraRank uint64, padBytes int) []byte {
 	buf := &bytes.Buffer{}
 	wLE := func(v interface{}) { _ = binary.Write(buf, binary.LittleEndian, v) }
 	wStr := func(s string) {
@@ -2153,6 +2154,9 @@ func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, key
 	if headCountKV > 0 {
 		metaCount = 7
 	}
+	if kvLoraRank > 0 {
+		metaCount++
+	}
 	wLE(uint32(0x46554747)) // magic GGUF
 	wLE(uint32(3))          // version
 	wLE(uint64(0))          // tensor count (none, keeps the prefix small)
@@ -2167,6 +2171,9 @@ func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, key
 		wKVU64(arch+".attention.key_length", keyLength)
 		wKVU64(arch+".attention.value_length", valueLength)
 	}
+	if kvLoraRank > 0 {
+		wKVU64(arch+".attention.kv_lora_rank", kvLoraRank)
+	}
 
 	if padBytes > 0 {
 		buf.Write(make([]byte, padBytes))
@@ -2180,7 +2187,7 @@ func buildTestGQAGGUF(arch, name string, blockCount, headCount, headCountKV, key
 // parse paths share the helper.
 func TestParseGGUFMetadataGQAFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "model.gguf")
-	ggufBytes := buildTestGQAGGUF("llama", "gqa-test-model", 32, 32, 8, 128, 128, 0)
+	ggufBytes := buildTestGQAGGUF("llama", "gqa-test-model", 32, 32, 8, 128, 128, 0, 0)
 	if err := os.WriteFile(path, ggufBytes, 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
@@ -2199,10 +2206,33 @@ func TestParseGGUFMetadataGQAFields(t *testing.T) {
 	if ggufMeta.ValueLength != 128 {
 		t.Errorf("ValueLength = %d, want 128", ggufMeta.ValueLength)
 	}
+	if ggufMeta.KVLoraRank != 0 {
+		t.Errorf("KVLoraRank = %d, want 0", ggufMeta.KVLoraRank)
+	}
+
+	// A deepseek2-shaped fixture carries kv_lora_rank: the MLA marker must
+	// reach status so the estimator can keep these models on the legacy
+	// formula.
+	mlaPath := filepath.Join(t.TempDir(), "mla.gguf")
+	mlaBytes := buildTestGQAGGUF("deepseek2", "mla-test-model", 27, 16, 16, 192, 128, 512, 0)
+	if err := os.WriteFile(mlaPath, mlaBytes, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	ggufMeta, err = r.parseGGUFMetadata(mlaPath)
+	if err != nil {
+		t.Fatalf("parseGGUFMetadata(mla): %v", err)
+	}
+	if ggufMeta.KVLoraRank != 512 {
+		t.Errorf("KVLoraRank = %d, want 512", ggufMeta.KVLoraRank)
+	}
+	if ggufMeta.HeadCountKV != 16 || ggufMeta.KeyLength != 192 || ggufMeta.ValueLength != 128 {
+		t.Errorf("MLA dims = (%d, %d, %d), want (16, 192, 128)",
+			ggufMeta.HeadCountKV, ggufMeta.KeyLength, ggufMeta.ValueLength)
+	}
 
 	// A GGUF without the GQA keys must leave the fields zero, not guessed.
 	plainPath := filepath.Join(t.TempDir(), "plain.gguf")
-	if err := os.WriteFile(plainPath, buildTestGQAGGUF("llama", "plain-model", 32, 32, 0, 0, 0, 0), 0o600); err != nil {
+	if err := os.WriteFile(plainPath, buildTestGQAGGUF("llama", "plain-model", 32, 32, 0, 0, 0, 0, 0), 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
 	ggufMeta, err = r.parseGGUFMetadata(plainPath)
@@ -2218,7 +2248,7 @@ func TestParseGGUFMetadataGQAFields(t *testing.T) {
 // TestParseRemoteGGUFMetadataGQAFields pins the remote http(s) header-read
 // path filling the grouped-query-attention status fields (#2085).
 func TestParseRemoteGGUFMetadataGQAFields(t *testing.T) {
-	ggufBytes := buildTestGQAGGUF("llama", "remote-gqa-model", 32, 32, 8, 128, 128, 4<<20)
+	ggufBytes := buildTestGQAGGUF("llama", "remote-gqa-model", 32, 32, 8, 128, 128, 0, 4<<20)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Length", strconv.Itoa(len(ggufBytes)))
@@ -2258,6 +2288,9 @@ func TestParseRemoteGGUFMetadataGQAFields(t *testing.T) {
 	}
 	if ggufMeta.ValueLength != 128 {
 		t.Errorf("ValueLength = %d, want 128", ggufMeta.ValueLength)
+	}
+	if ggufMeta.KVLoraRank != 0 {
+		t.Errorf("KVLoraRank = %d, want 0", ggufMeta.KVLoraRank)
 	}
 }
 

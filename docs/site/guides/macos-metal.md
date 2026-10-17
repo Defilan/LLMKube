@@ -325,10 +325,12 @@ files (Llama 3.1 and Qwen 2.5 GGUFs carry the KV head count but not
 the lengths). The embedding-width fallback remains for GGUFs without
 a usable attention shape at all: no scalar head count, more KV heads
 than attention heads, or a head count that does not divide the
-embedding width. Two known over-charges remain by design: models with
-sliding-window layers (Gemma 3) are charged the full-attention head
-dims for every layer, and DeepSeek MLA models are charged their stated
-head dims, which exceeds the compressed cache.
+embedding width when a key or value length is missing from the file.
+Two known over-charges remain by design: models with sliding-window
+layers (Gemma 3) are charged the full-attention head dims for every
+layer, and DeepSeek MLA models (GGUFs carrying `kv_lora_rank`) keep
+the embedding-width estimate, which still exceeds their compressed
+cache.
 
 The estimate charges the total `--ctx-size` pool: llama-server
 shares that pool across `--parallel` slots rather than multiplying

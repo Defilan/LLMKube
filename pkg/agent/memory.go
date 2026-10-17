@@ -121,6 +121,12 @@ type EstimateOptions struct {
 	// ValueLength is the per-head value dimension. 0 means the GGUF did not
 	// provide a usable scalar value; resolved like KeyLength.
 	ValueLength uint64
+
+	// KVLoraRank is the GGUF kv_lora_rank. A nonzero value marks a low-rank
+	// (MLA) cache whose per-token cell is not head-shaped; the estimate then
+	// uses the embedding-width formula, keeping today's behavior for these
+	// models.
+	KVLoraRank uint64
 }
 
 // cacheTypeBytesPerElement returns the per-element byte cost of a llama.cpp
@@ -184,13 +190,18 @@ func EstimateModelMemory(fileSizeBytes uint64, layerCount, embeddingSize uint64,
 // n_embd/n_head and overrides it only when the GGUF carries the key), so the
 // derived cell is what the server allocates rather than a guess. Real files
 // split both ways: Llama 3.1 and Qwen 2.5 GGUFs carry head_count_kv but no
-// lengths, while Qwen 3 and Gemma 3 carry all three. Array-valued
-// head_count_kv (Jamba, Nemotron-H) reads as 0 and takes the same fallback.
+// lengths, while Qwen 3 and Gemma 3 carry all three; deepseek2 files carry
+// lengths plus kv_lora_rank, which keeps them on the embedding-width formula.
+// Array-valued head_count_kv (Jamba, Nemotron-H) reads as 0 and takes the
+// same fallback.
+// A GGUF carrying kv_lora_rank uses a low-rank (MLA) cache whose per-token
+// cell is not head-shaped; the head-dim formula does not describe it, so
+// those files keep the embedding-width estimate (#2085 scopes MLA out).
 // Models that do fall back are over-charged by HeadCount/HeadCountKV, and
 // the hybrid archs named above are charged further because their layer
 // count includes the non-attention layers.
 func resolveKVShape(embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen, valLen uint64, ok bool) {
-	if opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount {
+	if opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount || opts.KVLoraRank > 0 {
 		return 0, 0, 0, false
 	}
 	keyLen, valLen = opts.KeyLength, opts.ValueLength

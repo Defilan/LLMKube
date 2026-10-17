@@ -720,6 +720,14 @@ spec:
                       it as unknown and derive it when needed.
                     format: int64
                     type: integer
+                  kvLoraRank:
+                    description: |-
+                      KVLoraRank is the low-rank KV compression size from the GGUF attention
+                      metadata (multi-head latent attention). 0 means the GGUF did not
+                      provide it; a nonzero value marks a cache whose per-token cell is not
+                      head-shaped, and consumers keep the embedding-width estimate for it.
+                    format: int64
+                    type: integer
                   layerCount:
                     description: LayerCount is the number of transformer layers/blocks
                     format: int64

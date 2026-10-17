@@ -317,6 +317,29 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			fallback: true,
 		},
 		{
+			// Real DeepSeek-V2-Lite GGUFs carry kv_lora_rank: a low-rank (MLA)
+			// cache whose per-token cell is not head-shaped, so the head-dim
+			// formula does not describe it and the model keeps the legacy
+			// estimate instead of the 1.25x raise the stated dims would give.
+			name:       "deepseek-v2-lite MLA shape (kv_lora_rank present) keeps the legacy estimate",
+			layerCount: 27, embedSize: 2048,
+			opts: EstimateOptions{
+				HeadCount: 16, HeadCountKV: 16, KeyLength: 192, ValueLength: 128, KVLoraRank: 512,
+			},
+			wantKV: 28991029248, // 27 * 2048 * 131072 * 4, the legacy number
+		},
+		{
+			// Real Gemma 7B GGUFs: 16 heads x 256 dims against a 3072
+			// embedding, so the attention-shape charge is higher than the
+			// embedding-width formula and matches what llama-server allocates.
+			name:       "gemma-7B shape (heads x head_dim above embedding width) estimates higher than legacy",
+			layerCount: 28, embedSize: 3072,
+			opts: EstimateOptions{
+				HeadCount: 16, HeadCountKV: 16, KeyLength: 256, ValueLength: 256,
+			},
+			wantKV: 60129542144, // 28 * 131072 * 16 * (256*2 + 256*2)
+		},
+		{
 			// q5_0's per-element cost (0.6875) gives a MaxUint64/4 bound, so
 			// element counts a fixed MaxUint64/8 bound would refuse now
 			// compute; the literal is exact (all factors are powers-of-two

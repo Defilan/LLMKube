@@ -1314,6 +1314,7 @@ func ggufMetadataFromParsed(parsed *gguf.GGUFFile) *inferencev1alpha1.GGUFMetada
 		HeadCountKV:   parsed.HeadCountKV(),
 		KeyLength:     parsed.KeyLength(),
 		ValueLength:   parsed.ValueLength(),
+		KVLoraRank:    parsed.KVLoraRank(),
 		TensorCount:   parsed.Header.TensorCount,
 		FileVersion:   parsed.Header.Version,
 		License:       license.Normalize(parsed.License()),
