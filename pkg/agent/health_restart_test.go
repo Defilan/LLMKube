@@ -492,13 +492,34 @@ func TestHealthRestart_BackoffResetsAfterHealthyRun(t *testing.T) {
 // backoff to release its memory before a new engine loads the weights again.
 func TestHealthRestart_StopErrorDelaysStart(t *testing.T) {
 	f := newRestartFixture(t, "restart-stop-error")
-	f.exec.stopErr = errors.New("process 1111 did not exit gracefully, killed")
+	f.exec.stopErr = &KilledAfterGraceError{PID: 1111}
 	ctx := context.Background()
 
 	f.probe(DefaultHealthFailureThreshold)
 	f.agent.runDueRestarts(ctx)
 	if got := f.exec.starts(); got != 0 {
 		t.Fatalf("starts = %d right after a stop error, want 0", got)
+	}
+	f.advance(healthRestartInitialBackoff)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Errorf("starts = %d after the initial backoff, want 1", got)
+	}
+}
+
+// TestHealthRestart_KilledAfterGraceStopDelaysStart runs the same scenario
+// as TestHealthRestart_StopErrorDelaysStart against the typed error the
+// grace-period SIGKILL path really returns (#2091): the stop completed, but
+// the engine's memory may not be released yet, so the initial backoff stays.
+func TestHealthRestart_KilledAfterGraceStopDelaysStart(t *testing.T) {
+	f := newRestartFixture(t, "restart-stop-killed")
+	f.exec.stopErr = &KilledAfterGraceError{PID: 1111}
+	ctx := context.Background()
+
+	f.probe(DefaultHealthFailureThreshold)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 0 {
+		t.Fatalf("starts = %d right after a killed-after-grace stop, want 0", got)
 	}
 	f.advance(healthRestartInitialBackoff)
 	f.agent.runDueRestarts(ctx)
@@ -916,7 +937,7 @@ func TestQueueRestart_DeletedBeforeRunNeverStarts(t *testing.T) {
 // weights while the killed one may still hold them.
 func TestHealthRestart_SpecChangeKeepsReleaseFloor(t *testing.T) {
 	f := newRestartFixture(t, "restart-release-floor")
-	f.exec.stopErr = errors.New("process 1111 did not exit gracefully, killed")
+	f.exec.stopErr = &KilledAfterGraceError{PID: 1111}
 	ctx := context.Background()
 
 	f.probe(DefaultHealthFailureThreshold)

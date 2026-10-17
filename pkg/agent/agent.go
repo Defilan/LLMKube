@@ -1365,10 +1365,28 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	return nil
 }
 
+// errStopFailed marks the part of a deleteProcess error that means the
+// engine may still be running. The eviction path clears pressureBlocked on
+// this marker and on nothing else (#2091): a SIGKILL after the grace period,
+// an engine already gone, or an endpoint that failed to unregister all leave
+// the engine stopped and count as a completed eviction.
+var errStopFailed = errors.New("process may still be running after teardown")
+
+// engineStopped reports whether a stop error still means the engine is not
+// running: it was SIGKILLed after ignoring SIGTERM for the grace period, or
+// it was already gone when the stop ran (#2091).
+func engineStopped(err error) bool {
+	var killed *KilledAfterGraceError
+	return errors.As(err, &killed) || errors.Is(err, errProcessAlreadyGone)
+}
+
 // deleteProcess stops a running inference process. It uses the process's
 // Runtime field to pick the correct executor from the agent's executor
 // registry, so multi-runtime agents can stop each process with its own
-// backend (#525).
+// backend (#525). An error it returns either carries errStopFailed (the
+// engine may still be running) or is a teardown that completed with a
+// non-fatal residue: a SIGKILL after the grace period, an engine already
+// gone, or a failed endpoint unregister (#2091).
 func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	// Clear any remembered digest mismatch for the Model this InferenceService
 	// referenced, before the early-return below: a persistently-refused
@@ -1410,7 +1428,14 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 
 	var deleteErrors []error
 	if err := a.stopManagedProcess(ctx, process, true); err != nil {
-		deleteErrors = append(deleteErrors, err)
+		if engineStopped(err) {
+			// The engine is stopped; the teardown completed without grace.
+			// Keep the typed error so callers can tell it apart from a
+			// failed stop (#2091).
+			deleteErrors = append(deleteErrors, err)
+		} else {
+			deleteErrors = append(deleteErrors, fmt.Errorf("%w: %w", errStopFailed, err))
+		}
 	}
 
 	// Unregister after the process has stopped. UnregisterEndpoint is idempotent

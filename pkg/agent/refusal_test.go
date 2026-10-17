@@ -52,6 +52,9 @@ type recordingExecutor struct {
 	stopped  []int
 	onStart  func()
 	startErr error
+	// stopErr is what StopProcess returns when set, e.g. a
+	// *KilledAfterGraceError standing in for the grace-period SIGKILL path.
+	stopErr error
 }
 
 func (e *recordingExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) (*ManagedProcess, error) {
@@ -68,6 +71,9 @@ func (e *recordingExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) 
 
 func (e *recordingExecutor) StopProcess(pid int) error {
 	e.stopped = append(e.stopped, pid)
+	if e.stopErr != nil {
+		return e.stopErr
+	}
 	return nil
 }
 

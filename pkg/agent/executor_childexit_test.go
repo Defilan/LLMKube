@@ -18,11 +18,13 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -248,6 +250,73 @@ func TestMetalStartProcess_HungChildStillTimesOut(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error missing %q: %v", want, err)
 		}
+	}
+}
+
+// TestMetalStopProcess_KilledAfterGraceIsTyped pins the contract the
+// eviction path depends on (#2091): a child that ignores SIGTERM is
+// SIGKILLed after the grace period and the stop reports that outcome as a
+// *KilledAfterGraceError, whose message keeps the historical text. Without
+// the type, the eviction path cannot tell a completed teardown from a
+// failed one.
+func TestMetalStopProcess_KilledAfterGraceIsTyped(t *testing.T) {
+	bin := fakeLlamaServer(t, "trap '' TERM\nwhile :; do sleep 1; done\n")
+	e, cfg, _ := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess with a healthy child: %v", err)
+	}
+	oldGrace := stopGracePeriod
+	stopGracePeriod = 200 * time.Millisecond
+	t.Cleanup(func() { stopGracePeriod = oldGrace })
+
+	err = e.StopProcess(proc.PID)
+	var killed *KilledAfterGraceError
+	if !errors.As(err, &killed) {
+		t.Fatalf("StopProcess on a child that ignored SIGTERM = %v (%T), want *KilledAfterGraceError", err, err)
+	}
+	if killed.PID != proc.PID {
+		t.Errorf("KilledAfterGraceError.PID = %d, want %d", killed.PID, proc.PID)
+	}
+	if !strings.Contains(err.Error(), "did not exit gracefully, killed") {
+		t.Errorf("error message lost the historical text: %v", err)
+	}
+
+	// The SIGKILL must have landed: the child may need a moment to die.
+	gone := false
+	for i := 0; i < 50 && !gone; i++ {
+		gone = syscall.Kill(proc.PID, 0) == syscall.ESRCH
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !gone {
+		t.Errorf("process %d is still alive after a killed-after-grace stop", proc.PID)
+	}
+}
+
+// TestStopChild_AlreadyGoneIsTyped covers the other completed-teardown
+// outcome (#2091): a PID with no live process. os converts the dead-PID
+// signal to ErrProcessDone, and the stop must report errProcessAlreadyGone
+// rather than a plain signal failure.
+func TestStopChild_AlreadyGoneIsTyped(t *testing.T) {
+	// A process we spawned and reaped ourselves: its PID is known gone.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn sleep: %v", err)
+	}
+	pid := cmd.Process.Pid
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill sleep: %v", err)
+	}
+	// Wait reaps the child; the error is only its SIGKILL exit status.
+	_ = cmd.Wait()
+
+	var tracker childTracker
+	err := tracker.stopChild(pid)
+	if !errors.Is(err, errProcessAlreadyGone) {
+		t.Fatalf("stopChild on a gone PID = %v, want errProcessAlreadyGone", err)
 	}
 }
 
