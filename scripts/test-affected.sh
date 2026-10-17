@@ -57,7 +57,7 @@ if [ -n "$TA_TEST_CMD" ]; then
 	# The package list is one per line; flatten it for the command line.
 	pkgs_args=$(printf '%s\n' "$pkgs" | tr '\n' ' ')
 	eval "$TA_TEST_CMD $pkgs_args"
-	exit "$?"
+	exit
 fi
 
 : "${ENVTEST_K8S_VERSION:=$(go list -m -f '{{.Version}}' k8s.io/api | awk -F'[v.]' '{printf "1.%d", $3}')}"
