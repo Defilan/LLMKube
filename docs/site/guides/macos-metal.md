@@ -323,9 +323,11 @@ the head dims are derived as the embedding width divided by the
 attention head count, which is what llama-server itself uses for such
 files (Llama 3.1 and Qwen 2.5 GGUFs carry the KV head count but not
 the lengths). The embedding-width fallback remains for GGUFs without
-a usable attention shape at all: no scalar head count, more KV heads
-than attention heads, or a head count that does not divide the
-embedding width when a key or value length is missing from the file.
+a usable attention shape at all: no scalar KV head count (absent, or
+stored per layer as an array on hybrid archs), no scalar head count,
+more KV heads than attention heads, or a head count that does not
+divide the embedding width when a key or value length is missing from
+the file.
 Two known over-charges remain by design: models with sliding-window
 layers (Gemma 3) are charged the full-attention head dims for every
 layer, and DeepSeek MLA models (GGUFs carrying `kv_lora_rank`) keep
@@ -338,8 +340,9 @@ it, so admission does not scale with slot count.
 
 A Model parsed by an older controller keeps the
 embedding-width estimate until its GGUF metadata is re-parsed, which
-happens on the next download or when the Model's source changes;
-recreate the Model (or touch its source) to refresh it in place.
+happens on the next download or after any change to the Model's spec
+(a spec change advances the generation and the controller re-derives
+the status); editing the source file on disk does nothing.
 
 Defaults are tuned by total system RAM:
 

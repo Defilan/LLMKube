@@ -373,6 +373,15 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			opts:     EstimateOptions{HeadCount: 256, HeadCountKV: 256, KeyLength: 1048576, ValueLength: 1048576},
 			fallback: true,
 		},
+		{
+			// The legacy branch needs the same byte bound: the element
+			// product fits uint64 (2^61) while product times the f32/f32
+			// per-element cost (8.0) does not.
+			name:       "legacy byte totals beyond uint64 fall back",
+			layerCount: 1 << 32, embedSize: 4096,
+			opts:     EstimateOptions{CacheTypeK: "f32", CacheTypeV: "f32"},
+			fallback: true,
+		},
 	}
 
 	for _, tt := range tests {

@@ -482,6 +482,21 @@ func TestGQAAttentionAccessors(t *testing.T) {
 		t.Errorf("absent kv_lora_rank = %d, want 0", gguf.KVLoraRank())
 	}
 
+	// No general.architecture at all: every accessor must return 0 rather
+	// than read a ".attention.key" key with an empty prefix.
+	noArchMeta := []metadataEntry{
+		{key: "general.name", value: testString{s: "arch-less"}},
+	}
+	data = buildGGUF(noArchMeta, 0)
+	gguf, err = Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gguf.HeadCountKV() != 0 || gguf.KeyLength() != 0 || gguf.ValueLength() != 0 || gguf.KVLoraRank() != 0 {
+		t.Errorf("accessors without architecture = (%d, %d, %d, %d), want all 0",
+			gguf.HeadCountKV(), gguf.KeyLength(), gguf.ValueLength(), gguf.KVLoraRank())
+	}
+
 	// head_count_kv stored per layer as an array (Jamba, Nemotron-H style):
 	// must read as unknown (0), not as a guess from head_count.
 	arrMeta := []metadataEntry{

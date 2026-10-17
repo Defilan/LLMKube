@@ -281,6 +281,7 @@ var _ = Describe("Model Controller Reconcile", func() {
 		Expect(updated.Status.GGUF.HeadCountKV).To(Equal(uint64(0)))
 		Expect(updated.Status.GGUF.KeyLength).To(Equal(uint64(0)))
 		Expect(updated.Status.GGUF.ValueLength).To(Equal(uint64(0)))
+		Expect(updated.Status.GGUF.KVLoraRank).To(Equal(uint64(0)))
 	})
 
 	// HTTPS sources deferred to the workload init container — see issue #363.

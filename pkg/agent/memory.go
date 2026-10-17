@@ -303,9 +303,14 @@ func EstimateModelMemoryWithOptions(
 	}
 
 	bytesPerKV := cacheTypeBytesPerElement(opts.CacheTypeK) + cacheTypeBytesPerElement(opts.CacheTypeV)
-	// product is at most ~10^15 for absurd configs (1M ctx, 200B model);
-	// float64 represents integers up to 2^53 ≈ 9e15 exactly, so the conversion
-	// is lossless for any realistic input.
+	// Bound the byte total the same way the GQA branch bounds its sides:
+	// product fits uint64, but product times the per-element cost (8.0 at
+	// f32/f32) can leave uint64 range and convert to an
+	// implementation-defined value. Divisor is the cost rounded up, times
+	// four for headroom on both sides of the ceil.
+	if product > math.MaxUint64/(4*uint64(math.Ceil(bytesPerKV))) {
+		return fallbackEstimate(fileSizeBytes)
+	}
 	kvCache := uint64(math.Ceil(float64(product) * bytesPerKV))
 
 	total := fileSizeBytes + kvCache + uint64(overheadBytes)
