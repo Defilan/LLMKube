@@ -306,6 +306,31 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			fallback: true,
 		},
 		{
+			// q5_0's per-element cost (0.6875) gives a MaxUint64/4 bound, so
+			// element counts a fixed MaxUint64/8 bound would refuse now
+			// compute; the literal is exact (all factors are powers-of-two
+			// multiples).
+			name:       "q5_0 element counts between the legacy and derived bounds compute",
+			layerCount: 1 << 20, embedSize: 256,
+			opts: EstimateOptions{
+				HeadCount: 256, HeadCountKV: 256, KeyLength: 98304, ValueLength: 98304,
+				CacheTypeK: "q5_0", CacheTypeV: "q5_0",
+			},
+			wantKV: 4755801206503243776, // 33 * 2^57: two sides of 3*2^60 elements at 11/16 bytes
+		},
+		{
+			// f32's per-element cost (4.0) tightens the bound to MaxUint64/16,
+			// below the old fixed MaxUint64/8: these element counts must fall
+			// back instead of producing a byte total near the uint64 edge.
+			name:       "f32 byte totals above the derived bound fall back",
+			layerCount: 1 << 20, embedSize: 256,
+			opts: EstimateOptions{
+				HeadCount: 256, HeadCountKV: 256, KeyLength: 49152, ValueLength: 49152,
+				CacheTypeK: "f32", CacheTypeV: "f32",
+			},
+			fallback: true,
+		},
+		{
 			// layerCount*kvHeads*ctx stays below 2^64 (2^45) while
 			// base*keyLen overflows, so the row fires at the kElems guard
 			// specifically; the shape itself passes resolveKVShape (kv == q).

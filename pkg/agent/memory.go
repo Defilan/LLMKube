@@ -217,7 +217,10 @@ func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvH
 // KV term uses the grouped-query-attention shape
 // layers * headCountKV * context * (keyLength * bytesPerK + valueLength * bytesPerV)
 // instead; that is several times smaller for GQA models and identical to the
-// embedding-width formula for models without GQA metadata.
+// embedding-width formula for models without GQA metadata. Regardless of
+// shape, contextSize is the process-wide --ctx-size pool: llama-server shares
+// it across --parallel slots (total KV cells track the context size, not the
+// context size times the slot count), so the estimate takes no slot factor.
 func EstimateModelMemoryWithOptions(
 	fileSizeBytes uint64,
 	layerCount, embeddingSize uint64,
@@ -250,16 +253,15 @@ func EstimateModelMemoryWithOptions(
 			return fallbackEstimate(fileSizeBytes)
 		}
 
-		// bytesPerK/V reach 4.0 (f32), so the byte totals can exceed uint64
-		// even though the element counts fit; a float64 sum out of uint64
-		// range converts to an implementation-defined value. Bound both
-		// sides so the sum stays convertible.
-		if kElems > math.MaxUint64/8 || vElems > math.MaxUint64/8 {
-			return fallbackEstimate(fileSizeBytes)
-		}
-
 		bytesK := cacheTypeBytesPerElement(opts.CacheTypeK)
 		bytesV := cacheTypeBytesPerElement(opts.CacheTypeV)
+		// Bound each side's byte total to MaxUint64/4 so the float64 sum
+		// stays below 2^63 and the uint64 conversion is defined; the divisor
+		// is the per-element cost rounded up, not a fixed 8.
+		if kElems > math.MaxUint64/(4*uint64(math.Ceil(bytesK))) ||
+			vElems > math.MaxUint64/(4*uint64(math.Ceil(bytesV))) {
+			return fallbackEstimate(fileSizeBytes)
+		}
 		kvCache := uint64(math.Ceil(float64(kElems)*bytesK + float64(vElems)*bytesV))
 
 		total := fileSizeBytes + kvCache + uint64(overheadBytes)
