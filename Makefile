@@ -138,6 +138,48 @@ test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test-envtest GINKGO_SEED=$(GINKGO_SEED))"
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test ./internal/controller/ ./internal/foreman/controller/ -count=1
 
+# The gate and test-affected pin the seed inside the scripts (default 4242)
+# so go's test cache survives between rounds: go help test caches a result
+# only while the environment variables a test reads stay unchanged, and the
+# envtest suites read GINKGO_SEED. These recipes must not touch GINKGO_SEED:
+# the ifndef block above assigns a fresh seed whenever the caller did not.
+# Override from the environment or the command line (GINKGO_SEED=<n> make
+# gate). LINT_GOTOOLCHAIN pins the toolchain for the gate's lint step only,
+# for golangci-lint builds whose staticcheck panics under a newer Go.
+
+# One command per agent or human round. Regenerates and fails on uncommitted
+# regeneration drift, checks gofmt without rewriting, runs vet, then runs
+# lint-all and the full test suite in parallel (inside scripts/gate.sh, not
+# as make -j: targets sharing the manifests/generate prerequisites would
+# race the regeneration). Logs under ${TMPDIR:-/tmp}/llmkube-gate.
+.PHONY: gate
+gate: controller-gen golangci-lint setup-envtest ## Agent gate: regen + drift check, gofmt check, vet, then lint-all and tests in parallel.
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" ./scripts/gate.sh
+
+# BASE_REF is the ref test-affected diffs against. Fork contributors:
+# override with BASE_REF=origin/main.
+BASE_REF ?= upstream/main
+
+# Tests only the packages changed since BASE_REF (committed, staged,
+# unstaged and untracked) plus every package that depends on them, with the
+# gate's fixed seed so repeat runs hit go's test cache. The script runs the
+# regeneration itself, so it happens exactly once. go.mod/go.sum changes
+# select everything; no Go change selects nothing and exits 0.
+.PHONY: test-affected
+test-affected: setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" ./scripts/test-affected.sh
+
+# The gate, test-affected and seed-check scripts are shell, so go test never
+# runs their regression tests: make test-scripts does, locally and in CI
+# (.github/workflows/test.yml). Run it after editing any of those scripts or
+# cmd/affected-packages.
+.PHONY: test-scripts
+test-scripts: ## Run the shell regression tests (gate, test-affected, affected-packages, GINKGO_SEED single evaluation).
+	@bash scripts/gate_test.sh
+	@bash scripts/test-affected_test.sh
+	@bash scripts/affected-packages_test.sh
+	@bash scripts/check-ginkgo-seed_test.sh
+
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
 	helm lint charts/llmkube charts/foreman

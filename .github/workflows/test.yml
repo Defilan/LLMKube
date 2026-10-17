@@ -33,10 +33,11 @@ jobs:
       - name: Validate samples against CRD schemas
         run: make validate-samples
 
-      # Guards the seed's single evaluation (#1817): the gate log is where a
-      # seed is read to replay a failure.
-      - name: GINKGO_SEED expands once
-        run: scripts/check-ginkgo-seed_test.sh
+      # Shell regression suites go test never runs: the seed's single
+      # evaluation (#1817; the gate log is where a seed is read to replay a
+      # failure), make gate, make test-affected and cmd/affected-packages.
+      - name: Shell script tests
+        run: make test-scripts
 
       - name: Running Tests (seed 11)
         run: |
