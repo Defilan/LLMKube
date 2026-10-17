@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,7 +88,24 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 
 	var mu sync.Mutex
 	loaded := map[string]bool{}
+	hits := map[string]int{}
+	var hung atomic.Bool
+	// hangHealth counts down /health requests left to hang: a daemon busy
+	// for a few probes that then answers again (POST /__hang?health=N).
+	var hangHealth atomic.Int32
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /__hang", func(w http.ResponseWriter, r *http.Request) {
+		if n := r.URL.Query().Get("health"); n != "" {
+			v, err := strconv.ParseInt(n, 10, 32)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hangHealth.Store(int32(v))
+			return
+		}
+		hung.Store(true)
+	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {})
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		data := make([]map[string]string, 0, len(dirs))
@@ -116,6 +134,9 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 			Model string `json:"model"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		hits[req.Model]++
+		mu.Unlock()
 		dir, ok := resolve(req.Model)
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -127,12 +148,53 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 		mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"model": req.Model, "object": "chat.completion"})
 	})
+	// The unload route mirrors the executor's real target: a known, loaded
+	// model unloads with 200; an unknown or not-loaded model answers 404.
+	mux.HandleFunc("POST /v1/models/{model}/unload", func(w http.ResponseWriter, r *http.Request) {
+		model := r.PathValue("model")
+		mu.Lock()
+		defer mu.Unlock()
+		if !dirs[model] || !loaded[model] {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"detail": "Model '" + model + "' not found"})
+			return
+		}
+		loaded[model] = false
+	})
+	// Test-only: per-model chat completion counts, so tests can observe how
+	// often the executor warmed each model on this daemon process.
+	mux.HandleFunc("GET /__stats", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"chat_hits": hits})
+	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
 		os.Exit(2)
 	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// Once hung the daemon keeps the port but answers nothing, the shape of
+	// a daemon whose event loop is stuck. The flag is per-process, so a
+	// replacement daemon starts unhung.
+	takeHealthHang := func() bool {
+		for {
+			left := hangHealth.Load()
+			if left <= 0 {
+				return false
+			}
+			if hangHealth.CompareAndSwap(left, left-1) {
+				return true
+			}
+		}
+	}
+	gated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hung.Load() || (r.URL.Path == "/health" && takeHealthHang()) {
+			time.Sleep(24 * time.Hour)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	srv := &http.Server{Handler: gated, ReadHeaderTimeout: 5 * time.Second}
 	_ = srv.Serve(ln)
 	os.Exit(0)
 }

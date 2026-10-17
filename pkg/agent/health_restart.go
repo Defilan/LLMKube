@@ -294,7 +294,7 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 	a.logger.Warnw("stopping unhealthy process to restart it",
 		"namespace", proc.Namespace, "name", proc.Name, "pid", proc.PID, "consecutiveFailures", failures)
 	var notBefore time.Time
-	if err := a.stopManagedProcess(ctx, proc); err != nil {
+	if err := a.stopManagedProcess(ctx, proc, false); err != nil {
 		// A stop that failed, or that had to SIGKILL, may not have released
 		// the engine's memory yet: give it the initial backoff before a new
 		// engine wires another copy of the weights.

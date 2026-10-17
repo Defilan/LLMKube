@@ -1409,7 +1409,7 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	processRestarts.DeleteLabelValues(name, namespace)
 
 	var deleteErrors []error
-	if err := a.stopManagedProcess(ctx, process); err != nil {
+	if err := a.stopManagedProcess(ctx, process, true); err != nil {
 		deleteErrors = append(deleteErrors, err)
 	}
 
@@ -1432,8 +1432,12 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 // a.processes, with the executor that matches its runtime. For shared-daemon
 // runtimes (oMLX, Ollama) it unloads the model instead of killing the shared
 // daemon; for the others StopProcess sends SIGTERM and, after a grace period,
-// SIGKILL.
-func (a *MetalAgent) stopManagedProcess(ctx context.Context, process *ManagedProcess) error {
+// SIGKILL. forgetServed marks a terminal stop (delete, scale-to-zero, spec
+// teardown): the oMLX model is dropped from the executor's served set even
+// when the unload did not reach a hung daemon, so a later daemon replacement
+// does not reload a model nothing wants. The health restart passes false: its
+// model must survive in the set so the replacement reloads it.
+func (a *MetalAgent) stopManagedProcess(ctx context.Context, process *ManagedProcess, forgetServed bool) error {
 	// Pick the executor that matches the process's runtime.
 	exec := a.executors[process.Runtime]
 	if exec == nil {
@@ -1449,7 +1453,11 @@ func (a *MetalAgent) stopManagedProcess(ctx context.Context, process *ManagedPro
 		return nil
 	}
 	if omlx, ok := exec.(*OMLXExecutor); ok && process.ModelID != "" {
-		if err := omlx.UnloadModel(ctx, process.ModelID); err != nil {
+		err := omlx.UnloadModel(ctx, process.ModelID)
+		if forgetServed {
+			omlx.ForgetServedModel(process.ModelID)
+		}
+		if err != nil {
 			return fmt.Errorf("failed to unload oMLX model %s: %w", process.ModelID, err)
 		}
 		return nil
