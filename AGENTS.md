@@ -45,6 +45,8 @@ contributors share. The human onboarding narrative lives in
 | Build the metal-agent               | `make build-metal-agent`  |
 | Unit tests (envtest, all packages)  | `make test`             |
 | envtest suites only (fixed seed)    | `make test-envtest`     |
+| Affected packages while editing     | `make test-affected`    |
+| Agent gate (once per round)         | `make gate`             |
 | Helm chart lint + unit tests        | `make test-chart`       |
 | Alert rule behavior (promtool)      | `make test-chart-rules` |
 | E2E tests (needs Kind)              | `make test-e2e`         |
@@ -121,6 +123,28 @@ A change is not done until all of these hold.
   stub that constructs its payload with the same type the code decodes pins
   nothing: a rename of a wire field leaves it green. Feed the real producer's
   bytes, or assert both sides of the contract.
+
+### Agent gate
+
+- While editing: targeted package tests
+  (`go test ./internal/foo/ -run TestX -count=1`), plus `make test-affected`
+  for the blast radius. It tests every package changed since the merge base
+  with `upstream/main` (override with `BASE_REF=<ref>`; includes committed,
+  uncommitted and untracked changes) plus every package that depends on them,
+  with a fixed `GINKGO_SEED` (default 4242) so go's test cache works between
+  runs. `go.mod` or `go.sum` changes select everything; no Go change selects
+  nothing and exits 0. Excludes `test/e2e`.
+- Once per round, before review: `make gate`. It regenerates manifests and
+  DeepCopy and fails on uncommitted regeneration drift, checks gofmt without
+  rewriting, runs `go vet`, then runs `make lint-all` and the full test suite
+  in parallel. Logs land in `/tmp/llmkube-gate` (override `GATE_DIR`); it
+  prints one summary line per step and exits nonzero if any step failed. One
+  command covers the fmt/vet/lint/test pre-commit gate and the lint-all
+  pre-push check. A rerun with no edits reports `(cached)` for the suites.
+  If staticcheck panics under your Go toolchain, set
+  `LINT_GOTOOLCHAIN=<version>` (for example go1.26.9).
+- Full suite (what CI and the Foreman gate run): `make test`, random seed and
+  coverage profile, unchanged.
 
 ## Commits
 
