@@ -129,6 +129,46 @@ func headroomFixture(t *testing.T, objs ...runtimeObject) (*MetalAgent, *recordi
 	return a, ex
 }
 
+// TestHandleMemoryPressure_KilledEvictionBlocksRespawnUnderCritical is the
+// #2091 regression: an eviction whose stop had to SIGKILL completed, so the
+// block stays and the next watch event (the Evicted condition's write bumps
+// the resourceVersion) must not respawn the service while pressure is
+// Critical.
+func TestHandleMemoryPressure_KilledEvictionBlocksRespawnUnderCritical(t *testing.T) {
+	a, ex, rec := refusalFixture(t, MetalAgentConfig{EvictionEnabled: true},
+		refusalISVC("svc-a"), refusalISVC("svc-b"))
+	ex.stopErr = &KilledAfterGraceError{PID: 4242}
+	// Same priority, no watchdog RSS: the tie-break picks the older process.
+	a.processes["default/svc-a"] = &ManagedProcess{
+		Name: "svc-a", Namespace: "default", ModelPath: "/m.gguf",
+		PID: 4242, StartedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	a.processes["default/svc-b"] = &ManagedProcess{
+		Name: "svc-b", Namespace: "default", ModelPath: "/m.gguf",
+		PID: 4243, StartedAt: time.Now(),
+	}
+
+	a.handleMemoryPressure(context.Background(), MemoryPressureCritical, MemoryStats{
+		TotalMemory: 100 << 30, TotalRSS: 80 << 30,
+	})
+	if !a.isPressureBlocked("default/svc-a") {
+		t.Fatal("a completed eviction (SIGKILL after grace) must keep the pressure block")
+	}
+	_ = drainEvents(rec)
+
+	// The watch event the condition write triggers: the block guard must
+	// refuse the start.
+	if err := a.ensureProcess(context.Background(), refusalISVC("svc-a")); err != nil {
+		t.Fatalf("ensureProcess: %v", err)
+	}
+	if ex.starts != 0 {
+		t.Errorf("started %d engine(s) for an evicted service under Critical pressure, want 0", ex.starts)
+	}
+	if !a.isPressureBlocked("default/svc-a") {
+		t.Error("the pressure block must survive the watch event")
+	}
+}
+
 // TestHandleMemoryPressure_NormalQueuesEvictedRestart covers the hand-off: a
 // return to Normal lifts the block of an evicted service that fits and queues
 // its restart on the event loop, instead of starting it itself.

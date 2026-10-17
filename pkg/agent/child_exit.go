@@ -42,6 +42,26 @@ const processLogTailBytes = 64 << 10
 // errChildExited reports that the child exited before it became healthy.
 var errChildExited = errors.New("process exited before becoming healthy")
 
+// KilledAfterGraceError reports that a child ignored SIGTERM for the whole
+// grace period and was SIGKILLed. The engine is stopped: a teardown that
+// ends in this error completed, so the eviction path must not treat it as a
+// stop failure (#2091).
+type KilledAfterGraceError struct{ PID int }
+
+func (e *KilledAfterGraceError) Error() string {
+	return fmt.Sprintf("process %d did not exit gracefully, killed", e.PID)
+}
+
+// errProcessAlreadyGone reports that a stop found no live process at the
+// PID: the signal hit ESRCH, or os reports the process already finished.
+// The engine is stopped. ECHILD from a Wait on an untracked PID proves
+// nothing about liveness and stays an error.
+var errProcessAlreadyGone = errors.New("process already gone")
+
+// stopGracePeriod is how long a child may ignore SIGTERM before it is
+// SIGKILLed. A var so tests can shorten it; mirrors helpProbeTimeout.
+var stopGracePeriod = 10 * time.Second
+
 // childExit is the single reaper for a spawned child: one goroutine calls
 // cmd.Wait, records the result, and closes done. Everything else that needs
 // to know whether the child is gone (the health wait, StopProcess) selects on
@@ -150,6 +170,12 @@ func (t *childTracker) stopChild(pid int) error {
 	}
 
 	if err := process.Signal(syscall.SIGTERM); err != nil {
+		// os converts a signal to a dead PID into ErrProcessDone on every
+		// platform (exec_unix.go convertESRCH, pidfd_linux.go), so this is
+		// the "already gone" check for the untracked path.
+		if errors.Is(err, os.ErrProcessDone) {
+			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
+		}
 		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
 	}
 
@@ -160,9 +186,9 @@ func (t *childTracker) stopChild(pid int) error {
 	}()
 
 	select {
-	case <-time.After(10 * time.Second):
+	case <-time.After(stopGracePeriod):
 		_ = process.Kill()
-		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
+		return &KilledAfterGraceError{PID: pid}
 	case err := <-done:
 		return err
 	}
@@ -181,13 +207,18 @@ func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 	}
 
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		// The direct Kill surfaces a dead PID as raw ESRCH, unlike the
+		// os.Process.Signal path above.
+		if errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
+		}
 		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
 	}
 
 	select {
-	case <-time.After(10 * time.Second):
+	case <-time.After(stopGracePeriod):
 		_ = syscall.Kill(pid, syscall.SIGKILL)
-		return fmt.Errorf("process %d did not exit gracefully, killed", pid)
+		return &KilledAfterGraceError{PID: pid}
 	case <-exit.done:
 		return nil
 	}

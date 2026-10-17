@@ -507,6 +507,27 @@ func TestHealthRestart_StopErrorDelaysStart(t *testing.T) {
 	}
 }
 
+// TestHealthRestart_KilledAfterGraceStopDelaysStart runs the same scenario
+// as TestHealthRestart_StopErrorDelaysStart against the typed error the
+// grace-period SIGKILL path really returns (#2091): the stop completed, but
+// the engine's memory may not be released yet, so the initial backoff stays.
+func TestHealthRestart_KilledAfterGraceStopDelaysStart(t *testing.T) {
+	f := newRestartFixture(t, "restart-stop-killed")
+	f.exec.stopErr = &KilledAfterGraceError{PID: 1111}
+	ctx := context.Background()
+
+	f.probe(DefaultHealthFailureThreshold)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 0 {
+		t.Fatalf("starts = %d right after a killed-after-grace stop, want 0", got)
+	}
+	f.advance(healthRestartInitialBackoff)
+	f.agent.runDueRestarts(ctx)
+	if got := f.exec.starts(); got != 1 {
+		t.Errorf("starts = %d after the initial backoff, want 1", got)
+	}
+}
+
 // replacingChecker fails every probe of oldPort and, during the first one,
 // replaces the tracked process with replacement, as a spec change handled on
 // the event loop would while the probe is in flight.

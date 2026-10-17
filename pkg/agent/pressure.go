@@ -18,6 +18,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -256,17 +257,26 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	}
 
 	if err := a.deleteProcess(ctx, key); err != nil {
-		// If teardown failed, don't leave the entry in pressureBlocked: the
-		// process is presumably still running (or in an unknown state) and
-		// blocking respawn would mask the real problem.
-		a.mu.Lock()
-		delete(a.pressureBlocked, key)
-		a.mu.Unlock()
-		a.logger.Errorw("eviction failed; cleared pressure block", "key", key, "error", err)
-		return
+		// errStopFailed marks a stop that failed: the process is presumably
+		// still running (or in an unknown state) and blocking respawn would
+		// mask the real problem.
+		if errors.Is(err, errStopFailed) {
+			a.mu.Lock()
+			delete(a.pressureBlocked, key)
+			a.mu.Unlock()
+			a.logger.Errorw("eviction failed; cleared pressure block", "key", key, "error", err)
+			return
+		}
+		// Every other teardown error leaves the engine stopped (#2091): a
+		// SIGKILL after the grace period, an engine already gone, or a
+		// failed endpoint unregister. The eviction completed: keep the
+		// block so the Evicted condition's resourceVersion bump cannot
+		// respawn into Critical pressure, and count it below.
+		a.logger.Warnw("eviction completed; engine stopped; keeping pressure block",
+			"key", key, "error", err)
 	}
-	// Counted only here, once the process is actually stopped: a picked
-	// candidate whose teardown failed was not evicted.
+	// Counted once the engine is stopped: a picked candidate whose stop
+	// itself failed was not evicted (errStopFailed returned above).
 	evictionsTotal.Inc()
 
 	a.emitInferenceEvent(ctx, target, corev1.EventTypeWarning, EventReasonEvicted,

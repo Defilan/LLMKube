@@ -34,11 +34,21 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
 func newPressureTestAgent(t *testing.T, isvcs ...*inferencev1alpha1.InferenceService) *MetalAgent {
+	return newPressureTestAgentWithInterceptor(t, nil, isvcs...)
+}
+
+// newPressureTestAgentWithInterceptor is newPressureTestAgent with optional
+// interceptor funcs on the fake client, so a test can make individual API
+// calls (an UnregisterEndpoint delete, say) fail.
+func newPressureTestAgentWithInterceptor(
+	t *testing.T, funcs *interceptor.Funcs, isvcs ...*inferencev1alpha1.InferenceService,
+) *MetalAgent {
 	t.Helper()
 	// We need corev1 and discovery/v1 in the scheme so deleteProcess ->
 	// UnregisterEndpoint can issue Delete calls against Service/EndpointSlice
@@ -51,6 +61,9 @@ func newPressureTestAgent(t *testing.T, isvcs ...*inferencev1alpha1.InferenceSer
 	builder := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&inferencev1alpha1.InferenceService{})
 	for _, isvc := range isvcs {
 		builder = builder.WithObjects(isvc)
+	}
+	if funcs != nil {
+		builder = builder.WithInterceptorFuncs(*funcs)
 	}
 	k8sClient := builder.Build()
 
@@ -472,6 +485,123 @@ func readSkippedCounter(t *testing.T, reason string) float64 {
 type failingStopExecutor struct{ stubExecutor }
 
 func (failingStopExecutor) StopProcess(_ int) error { return errors.New("stop failed") }
+
+// killedStopExecutor reports the stop the grace-period SIGKILL path produces
+// (child_exit.go): a teardown that completed without grace. Paired with
+// TestMetalStopProcess_KilledAfterGraceIsTyped, which pins that the real
+// stop path produces this type (#2091).
+type killedStopExecutor struct{ stubExecutor }
+
+func (killedStopExecutor) StopProcess(_ int) error { return &KilledAfterGraceError{PID: 999990} }
+
+// TestHandleMemoryPressure_EvictionTeardownOutcomes pins how the eviction
+// path reacts to each deleteProcess outcome (#2091): a SIGKILL after the
+// grace period and an endpoint-unregister failure both leave the engine
+// stopped, so the eviction completes and the block stays; only a stop that
+// may have left the engine running clears the block.
+func TestHandleMemoryPressure_EvictionTeardownOutcomes(t *testing.T) {
+	tests := []struct {
+		name        string
+		exec        ProcessExecutor
+		funcs       *interceptor.Funcs
+		seed        func(t *testing.T, a *MetalAgent)
+		wantBlocked bool
+		wantEvicted float64
+		wantEvent   bool
+	}{
+		{
+			name:        "killed after grace keeps the block",
+			exec:        killedStopExecutor{},
+			wantBlocked: true,
+			wantEvicted: 1,
+			wantEvent:   true,
+		},
+		{
+			name: "failed endpoint unregister keeps the block",
+			exec: stubExecutor{},
+			funcs: &interceptor.Funcs{
+				Delete: func(
+					_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.DeleteOption,
+				) error {
+					return errors.New("apiserver unreachable")
+				},
+			},
+			seed: func(t *testing.T, a *MetalAgent) {
+				// deleteOwned only reaches Delete for an object the agent
+				// owns; without a seeded owned Service the missing object
+				// short-circuits and the unregister would succeed.
+				t.Helper()
+				svc := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+					Name:      a.registry.serviceNameFor("svc-low"),
+					Namespace: "default",
+					Labels:    map[string]string{managedByLabel: managedByValue},
+				}}
+				if err := a.config.K8sClient.Create(context.Background(), svc); err != nil {
+					t.Fatalf("seed owned service: %v", err)
+				}
+			},
+			wantBlocked: true,
+			wantEvicted: 1,
+			wantEvent:   true,
+		},
+		{
+			name:        "a stop that may leave the engine running clears the block",
+			exec:        failingStopExecutor{},
+			wantBlocked: false,
+			wantEvicted: 0,
+			wantEvent:   false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			low := newPressureTestISvc("svc-low", "low")
+			high := newPressureTestISvc("svc-high", "high")
+			a := newPressureTestAgentWithInterceptor(t, tc.funcs, low, high)
+			a.config.EvictionEnabled = true
+			a.executors["llama-server"] = tc.exec
+			a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
+			if tc.seed != nil {
+				tc.seed(t, a)
+			}
+			rec := record.NewFakeRecorder(32)
+			a.config.EventRecorder = rec
+			a.processes["default/svc-low"] = &ManagedProcess{
+				Name: "svc-low", Namespace: "default", Priority: "low",
+				ModelPath: "/m.gguf", PID: 999990, StartedAt: time.Now(),
+			}
+			a.processes["default/svc-high"] = &ManagedProcess{
+				Name: "svc-high", Namespace: "default", Priority: "high",
+				ModelPath: "/m.gguf", PID: 999991, StartedAt: time.Now(),
+			}
+
+			before := testutil.ToFloat64(evictionsTotal)
+			a.handleMemoryPressure(context.Background(), MemoryPressureCritical, MemoryStats{
+				TotalMemory: 100 << 30, TotalRSS: 80 << 30,
+			})
+
+			a.mu.RLock()
+			_, blocked := a.pressureBlocked["default/svc-low"]
+			a.mu.RUnlock()
+			if blocked != tc.wantBlocked {
+				t.Errorf("pressureBlocked[default/svc-low] present = %v, want %v", blocked, tc.wantBlocked)
+			}
+			if got := testutil.ToFloat64(evictionsTotal) - before; got != tc.wantEvicted {
+				t.Errorf("evictions_total delta = %v, want %v", got, tc.wantEvicted)
+			}
+			events := drainEvents(rec)
+			hasEvicted := false
+			for _, e := range events {
+				if strings.Contains(e, EventReasonEvicted) {
+					hasEvicted = true
+					break
+				}
+			}
+			if hasEvicted != tc.wantEvent {
+				t.Errorf("Evicted event present = %v, want %v (events: %v)", hasEvicted, tc.wantEvent, events)
+			}
+		})
+	}
+}
 
 // TestHandleMemoryPressure_CountsEvictionsTotal pins evictions_total: it rises
 // by exactly one when the watchdog actually stops a process, and does not move
