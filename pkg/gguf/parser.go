@@ -681,10 +681,6 @@ func (f *GGUFFile) KeyLength() uint64 { return f.attentionScalar("key_length") }
 // ValueLength returns the per-head value dimension.
 func (f *GGUFFile) ValueLength() uint64 { return f.attentionScalar("value_length") }
 
-// KVLoraRank returns the low-rank KV compression size (multi-head latent
-// attention). Nonzero marks a cache whose per-token cell is not head-shaped.
-func (f *GGUFFile) KVLoraRank() uint64 { return f.attentionScalar("kv_lora_rank") }
-
 // License returns the license identifier from the GGUF metadata.
 func (f *GGUFFile) License() string {
 	v, ok := f.GetMetadata("general.license")

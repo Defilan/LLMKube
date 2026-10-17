@@ -375,16 +375,29 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			fallback: true,
 		},
 		{
-			// Real DeepSeek-V2-Lite GGUFs carry kv_lora_rank: a low-rank (MLA)
-			// cache whose per-token cell is not head-shaped, so the head-dim
-			// formula does not describe it and the model keeps the legacy
-			// estimate instead of the 1.25x raise the stated dims would give.
-			name:       "deepseek-v2-lite MLA shape (kv_lora_rank present) keeps the legacy estimate",
+			// Older deepseek2 conversions carry plain head dims (16 KV heads,
+			// key 192, value 128) and no *_mla keys, so llama-server runs the
+			// non-MLA path and allocates exactly this cell. The legacy
+			// embedding-width charge is 28991029248 here, 1.25x low.
+			name:       "deepseek-v2-lite legacy layout is charged what llama-server allocates",
 			layerCount: 27, embedSize: 2048,
 			opts: EstimateOptions{
-				HeadCount: 16, HeadCountKV: 16, KeyLength: 192, ValueLength: 128, KVLoraRank: 512,
+				HeadCount: 16, HeadCountKV: 16, KeyLength: 192, ValueLength: 128,
 			},
-			wantKV: 28991029248, // 27 * 2048 * 131072 * 4, the legacy number
+			wantKV: 36238786560, // 27 * 16 * (192+128) * 2 * 131072
+		},
+		{
+			// Current-converter deepseek2 files are MLA layout (one KV head,
+			// key 576 = kv_lora_rank + rope, value 512) and llama-server
+			// stores only the compressed key cache, so the K+V charge is
+			// about 1.9x high on purpose; over-charging is the safe
+			// direction for admission.
+			name:       "deepseek-v2-lite MLA layout (kv heads 1, key 576, value 512) over-charges the compressed cache",
+			layerCount: 27, embedSize: 2048,
+			opts: EstimateOptions{
+				HeadCount: 16, HeadCountKV: 1, KeyLength: 576, ValueLength: 512,
+			},
+			wantKV: 7700742144, // 27 * 1 * (576+512) * 2 * 131072
 		},
 		{
 			// Real Gemma 7B GGUFs: 16 heads x 256 dims against a 3072

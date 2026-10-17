@@ -335,9 +335,11 @@ divide the embedding width when a key or value length is missing from
 the file.
 Two known over-charges remain by design: models with sliding-window
 layers (Gemma 3) are charged the full-attention head dims for every
-layer, and DeepSeek MLA models (GGUFs carrying `kv_lora_rank`) keep
-the embedding-width estimate, which still exceeds their compressed
-cache.
+layer, and DeepSeek MLA-layout files are charged their stated head
+dims even though llama-server stores only the compressed key cache,
+so they are over-charged. Older deepseek2 conversions carry plain
+head dims and no `*_mla` keys, run the non-MLA path, and are charged
+exactly what llama-server allocates.
 
 The estimate charges the total `--ctx-size` pool: llama-server
 shares that pool across `--parallel` slots rather than multiplying
