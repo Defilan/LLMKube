@@ -240,16 +240,32 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			wantKV: kvLegacy,
 		},
 		{
-			name:       "key and value lengths absent are derived from embedding/headCount",
+			// Deriving head dims is only exact when kv heads equal head
+			// count; a grouped shape without explicit dims must fall back.
+			name:       "kv heads below headCount without explicit dims falls back",
 			layerCount: 32, embedSize: 4096,
 			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8},
-			wantKV: kvGQA,
+			wantKV: kvLegacy,
 		},
 		{
-			name:       "key length absent only, value length present",
+			name:       "kv heads below headCount with only the value length present falls back",
 			layerCount: 32, embedSize: 4096,
 			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, ValueLength: 128},
-			wantKV: kvGQA,
+			wantKV: kvLegacy,
+		},
+		{
+			// The multi-head-attention identity: with kv heads equal to head
+			// count the derived dims reproduce the legacy number exactly.
+			name:       "kv heads equal to headCount derives dims and matches legacy",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 32},
+			wantKV: kvLegacy,
+		},
+		{
+			name:       "equal head counts with non-divisible embedding falls back",
+			layerCount: 32, embedSize: 4096,
+			opts:   EstimateOptions{HeadCount: 48, HeadCountKV: 48},
+			wantKV: kvLegacy,
 		},
 		{
 			name:       "asymmetric cache types apply per-side bytes",
@@ -273,18 +289,12 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			wantKV: kvLegacy,
 		},
 		{
-			name:       "embedding not divisible by headCount cannot derive head dims",
-			layerCount: 32, embedSize: 4096,
-			opts:   EstimateOptions{HeadCount: 48, HeadCountKV: 8},
-			wantKV: kvLegacy,
-		},
-		{
 			// layerCount*kvHeads*ctx stays below 2^64 (2^45) while
 			// base*keyLen overflows, so the row fires at the kElems guard
-			// specifically.
+			// specifically; the shape itself passes resolveKVShape (kv == q).
 			name:       "absurd shapes hit the overflow guard and fall back",
-			layerCount: 1 << 20, embedSize: 1,
-			opts:     EstimateOptions{HeadCount: 1, HeadCountKV: 256, KeyLength: 1048576, ValueLength: 1048576},
+			layerCount: 1 << 20, embedSize: 256,
+			opts:     EstimateOptions{HeadCount: 256, HeadCountKV: 256, KeyLength: 1048576, ValueLength: 1048576},
 			fallback: true,
 		},
 	}
@@ -313,6 +323,19 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 	legacy := EstimateModelMemory(fileSize, 32, 4096, 131072)
 	if legacy.KVCacheBytes != kvLegacy {
 		t.Errorf("legacy estimate = %d, want %d", legacy.KVCacheBytes, kvLegacy)
+	}
+}
+
+// A zero context must not panic in the GQA branch's divisions and must match
+// what the legacy branch produces for the same input (a zero KV term).
+func TestEstimateModelMemoryWithOptions_GQAZeroContext(t *testing.T) {
+	const fileSize = uint64(4 * 1024 * 1024 * 1024)
+	opts := EstimateOptions{HeadCount: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128}
+	got := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 0, opts)
+	want := EstimateModelMemoryWithOptions(fileSize, 32, 4096, 0, EstimateOptions{})
+	if got.KVCacheBytes != want.KVCacheBytes || got.TotalBytes != want.TotalBytes {
+		t.Errorf("zero context with GQA opts = (KV=%d total=%d), want legacy zero-context (KV=%d total=%d)",
+			got.KVCacheBytes, got.TotalBytes, want.KVCacheBytes, want.TotalBytes)
 	}
 }
 

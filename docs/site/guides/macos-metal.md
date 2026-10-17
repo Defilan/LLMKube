@@ -319,7 +319,12 @@ the InferenceService with `status.schedulingStatus: InsufficientMemory`.
 The KV-cache term is sized from the model's GGUF attention shape
 (KV head count and key/value length, i.e. grouped-query attention)
 when the file provides it, and from the full embedding width
-otherwise. A Model parsed by an older controller keeps the
+otherwise. Grouped-query models whose GGUF omits the key/value
+lengths also keep the embedding-width estimate: the head dims are
+only derived when the KV head count equals the attention head count,
+where that identity is exact.
+
+A Model parsed by an older controller keeps the
 embedding-width estimate until its GGUF metadata is re-parsed, which
 happens on the next download or when the Model's source changes.
 

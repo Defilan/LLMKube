@@ -490,7 +490,9 @@ The client-proxy listener only answers a request whose `Host` header names this 
 
 The Metal Agent estimates model memory requirements (weights + KV cache + overhead) before starting `llama-server`. If the model won't fit in the memory budget, the agent refuses to start it and sets the InferenceService status to `InsufficientMemory`.
 
-The KV-cache term is sized from the model's GGUF attention shape (KV head count and key/value length, i.e. grouped-query attention) when the file provides it, and from the full embedding width otherwise. A Model parsed by an older controller keeps the embedding-width estimate until its GGUF metadata is re-parsed, which happens on the next download or when the Model's source changes; recreate the Model (or touch its source) to refresh it in place.
+The KV-cache term is sized from the model's GGUF attention shape (KV head count and key/value length, i.e. grouped-query attention) when the file provides it, and from the full embedding width otherwise. Grouped-query models whose GGUF omits the key/value lengths also keep the embedding-width estimate: the head dims are only derived when the KV head count equals the attention head count, where that identity is exact.
+
+A Model parsed by an older controller keeps the embedding-width estimate until its GGUF metadata is re-parsed, which happens on the next download or when the Model's source changes; recreate the Model (or touch its source) to refresh it in place.
 
 By default, the budget is auto-detected based on total system RAM:
 

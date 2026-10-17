@@ -111,11 +111,13 @@ type EstimateOptions struct {
 	// value, and the historical embedding-width formula is used instead.
 	HeadCountKV uint64
 
-	// KeyLength is the per-head key dimension. 0 means unknown; the estimator
-	// derives embeddingSize / HeadCount when that divides evenly.
+	// KeyLength is the per-head key dimension. 0 means unknown: for grouped
+	// shapes (HeadCountKV < HeadCount) the estimate falls back unless both
+	// dims are explicit; for multi-head shapes it derives
+	// embeddingSize / HeadCount.
 	KeyLength uint64
 
-	// ValueLength is the per-head value dimension. 0 means unknown; derived
+	// ValueLength is the per-head value dimension. 0 means unknown; resolved
 	// like KeyLength.
 	ValueLength uint64
 }
@@ -175,23 +177,27 @@ func EstimateModelMemory(fileSizeBytes uint64, layerCount, embeddingSize uint64,
 // resolveKVShape resolves the per-layer KV geometry for the GQA-aware
 // estimate. ok is false whenever the GGUF did not provide a usable scalar
 // attention shape, in which case the caller must use the historical
-// embedding-width formula: for any plain multi-head-attention model that
-// formula is exact (head_count x embedding/head_count = embedding), and for
-// array-valued head_count_kv (Jamba, Nemotron-H) guessing head_count would
-// under-estimate.
+// embedding-width formula. Deriving head dims from embedding/headCount is
+// only exact for plain multi-head attention, where headCountKV == HeadCount
+// makes headCount * (embeddingSize/headCount) == embeddingSize hold by
+// algebra; for grouped-query shapes the per-layer KV cell is architecture
+// defined and a derived dim can under-estimate, so those require the GGUF's
+// explicit key_length and value_length. Array-valued head_count_kv (Jamba,
+// Nemotron-H) reads as 0 and takes the same fallback.
 func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen, valLen uint64, ok bool) {
-	if layerCount == 0 || opts.HeadCount == 0 || opts.HeadCountKV == 0 {
+	if layerCount == 0 || opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount {
 		return 0, 0, 0, false
 	}
-	if embeddingSize%opts.HeadCount != 0 {
-		return 0, 0, 0, false
+	if opts.HeadCountKV == opts.HeadCount {
+		if embeddingSize%opts.HeadCount != 0 {
+			return 0, 0, 0, false
+		}
+		derived := embeddingSize / opts.HeadCount
+		keyLen, valLen = derived, derived
 	}
-	derived := embeddingSize / opts.HeadCount
-	keyLen = derived
 	if opts.KeyLength > 0 {
 		keyLen = opts.KeyLength
 	}
-	valLen = derived
 	if opts.ValueLength > 0 {
 		valLen = opts.ValueLength
 	}
@@ -206,8 +212,9 @@ func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvH
 // layers * embedding * context * (bytesPerK + bytesPerV) where bytesPerK / V
 // come from cacheTypeBytesPerElement. With f16/f16 (the empty-string default)
 // it produces the same result as EstimateModelMemory. When the GGUF attention
-// shape is known (HeadCountKV > 0 and both head dims resolvable), the KV term
-// uses the grouped-query-attention shape
+// shape is known (HeadCountKV between 1 and HeadCount, with both head dims
+// present explicitly or derivable via the multi-head-attention identity), the
+// KV term uses the grouped-query-attention shape
 // layers * headCountKV * context * (keyLength * bytesPerK + valueLength * bytesPerV)
 // instead; that is several times smaller for GQA models and identical to the
 // embedding-width formula for models without GQA metadata.
@@ -221,14 +228,17 @@ func EstimateModelMemoryWithOptions(
 		return fallbackEstimate(fileSizeBytes)
 	}
 
-	if kvHeads, keyLen, valLen, ok := resolveKVShape(layerCount, embeddingSize, opts); ok {
+	// contextSize <= 0 routes to the legacy branch, which already degrades
+	// gracefully (a zero context yields a zero KV term); guarding here keeps
+	// the divisions below well-defined for any caller.
+	if kvHeads, keyLen, valLen, ok := resolveKVShape(layerCount, embeddingSize, opts); ok && contextSize > 0 {
 		ctx := uint64(contextSize) //nolint:gosec // G115: contextSize is CRD-validated ≥128 upstream
 		base := layerCount * kvHeads
 		if base/layerCount != kvHeads {
 			return fallbackEstimate(fileSizeBytes)
 		}
 		base *= ctx
-		if ctx != 0 && base/ctx != layerCount*kvHeads {
+		if base/ctx != layerCount*kvHeads {
 			return fallbackEstimate(fileSizeBytes)
 		}
 		kElems := base * keyLen
