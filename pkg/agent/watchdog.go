@@ -40,14 +40,35 @@ type MemoryStats struct {
 	PressureLevel   MemoryPressureLevel
 }
 
+// normalSamplesBeforeRecovery is how many consecutive Normal samples the
+// watchdog needs before it reports a return to Normal (30s at the default
+// 10s interval). A level hovering around the Warning threshold would
+// otherwise flap, and every reported return to Normal can restart evicted
+// services.
+const normalSamplesBeforeRecovery = 3
+
 // MemoryWatchdog periodically samples system memory and per-process RSS,
-// computes a pressure level, and updates Prometheus metrics.
+// computes a pressure level, and updates Prometheus metrics. It calls
+// onPressure on every sample at Warning or above, and with Normal once
+// normalSamplesBeforeRecovery consecutive samples have been Normal after a
+// higher level. After that, steady Normal samples call it only while
+// wantNormal reports true. A sample whose available memory cannot be read has
+// no level and is skipped.
 type MemoryWatchdog struct {
 	provider   MemoryProvider
 	processes  func() []processMemInfo
 	onPressure func(level MemoryPressureLevel, stats MemoryStats)
 	config     MemoryWatchdogConfig
 	logger     *zap.SugaredLogger
+	// wantNormal, when set, asks for steady Normal samples too: the agent
+	// sets it while evicted services wait for headroom to restart. Nil
+	// means steady Normal samples stay silent.
+	wantNormal func() bool
+	// lastLevel is the level last delivered to onPressure, and normalStreak
+	// counts the consecutive Normal samples since the last higher one. Only
+	// the goroutine running sample touches them.
+	lastLevel    MemoryPressureLevel
+	normalStreak int
 }
 
 // processMemInfo is the minimal info needed to sample a process's RSS.
@@ -102,6 +123,7 @@ func (w *MemoryWatchdog) sample() {
 	stats.TotalMemory = total
 
 	avail, err := w.provider.AvailableMemory()
+	availKnown := err == nil
 	if err != nil {
 		w.logger.Warnw("watchdog: failed to get available memory", "error", err)
 	} else {
@@ -130,11 +152,23 @@ func (w *MemoryWatchdog) sample() {
 		processRSSBytes.WithLabelValues(p.Name).Set(float64(rss))
 	}
 
+	// Without available memory the level is unknown: computing it from a
+	// zero reads as Critical, which could evict a process on a sensor
+	// error. Skip pressure evaluation for this sample, leaving the level
+	// gauge, lastLevel and the callback untouched, so the next good sample
+	// still compares against the last real level. It neither counts toward
+	// nor breaks a run of Normal samples.
+	if !availKnown {
+		return
+	}
+
 	// Compute pressure level
 	stats.PressureLevel = w.computePressure(stats)
 	memoryPressureLevelGauge.Set(float64(stats.PressureLevel))
 
 	if stats.PressureLevel >= MemoryPressureWarning {
+		w.normalStreak = 0
+		w.lastLevel = stats.PressureLevel
 		w.logger.Warnw("memory pressure detected",
 			"level", stats.PressureLevel.String(),
 			"available", formatMemory(stats.AvailableMemory),
@@ -145,6 +179,32 @@ func (w *MemoryWatchdog) sample() {
 		if w.onPressure != nil {
 			w.onPressure(stats.PressureLevel, stats)
 		}
+		return
+	}
+
+	if w.normalStreak < normalSamplesBeforeRecovery {
+		w.normalStreak++
+	}
+	switch {
+	case w.lastLevel >= MemoryPressureWarning && w.normalStreak >= normalSamplesBeforeRecovery:
+		// The callback needs the return to Normal to undo what it did
+		// under pressure: clearing eviction blocks (otherwise held until
+		// the agent restarts) and setting MemoryPressure conditions back
+		// to Normal.
+		w.logger.Infow("memory pressure returned to normal",
+			"previous", w.lastLevel.String(),
+			"available", formatMemory(stats.AvailableMemory),
+			"total", formatMemory(stats.TotalMemory),
+		)
+		w.lastLevel = MemoryPressureNormal
+	case w.lastLevel == MemoryPressureNormal && w.wantNormal != nil && w.wantNormal():
+		// Steady Normal, delivered so evicted services waiting for
+		// headroom can be retried against fresh numbers.
+	default:
+		return
+	}
+	if w.onPressure != nil {
+		w.onPressure(stats.PressureLevel, stats)
 	}
 }
 

@@ -6,7 +6,7 @@ The LLMKube metal-agent watchdog is reporting Warning or Critical memory pressur
 
 One or more of:
 
-- Kubernetes event on a managed `InferenceService` with reason `MemoryPressureLevelChanged`, type `Warning`, message containing `transitioned from Normal to Warning` or `transitioned from Normal to Critical`.
+- Kubernetes event on a managed `InferenceService` with reason `MemoryPressureLevelChanged`, type `Warning`, message containing `transitioned from normal to warning` or `transitioned from normal to critical`.
 
   ```bash
   kubectl get events -A --field-selector reason=MemoryPressureLevelChanged
@@ -167,6 +167,15 @@ If memory pressure is recurring on this host:
      --output=custom-columns='TIME:.lastTimestamp,REASON:.reason,MSG:.message' | tail -5
    ```
 
+   The recovery itself shows up as one type `Normal` event per managed
+   service, with a message containing `to normal`, and the agent logs
+   `memory pressure returned to normal`. The agent reports that only after
+   three consecutive Normal watchdog samples (30 seconds at the default
+   `--memory-watchdog-interval` of 10s), so a level hovering around the
+   Warning threshold does not flap; Warning and Critical are reported at
+   once. `llmkube_metal_agent_memory_pressure_level` follows every sample,
+   so it can read `0` up to that long before the event.
+
 2. **The managed services that should be running, are running.**
 
    ```bash
@@ -175,11 +184,50 @@ If memory pressure is recurring on this host:
 
    An eviction does **not** change the InferenceService spec. The agent kills
    the local process and sets the `MemoryPressure` condition with reason
-   `Evicted`; `spec.replicas` is left exactly as you set it, so a service
-   showing `replicas: 1` with no running process is the expected shape after
-   an eviction, not a stuck reconcile. The agent keeps that key blocked
-   in-memory so a controller event cannot respawn it mid-teardown, and clears
-   every block the moment pressure returns to Normal.
+   `Evicted`; `spec.replicas` is left exactly as you set it, so while
+   pressure is above Normal a service showing `replicas: 1` with no running
+   process is the expected shape after an eviction, not a stuck reconcile.
+   The agent keeps that key blocked in-memory so a controller event cannot
+   respawn it while pressure stays high.
+
+   Once pressure is reported back at Normal, the agent restarts an evicted
+   service only if there is room for it. At eviction it records the
+   process's resident memory (RSS). A service is restarted when the host's
+   available memory, minus that RSS, stays at or above the Warning
+   threshold (`--memory-pressure-warning`, default `0.20` of total memory).
+   Services restarted together count their RSS together, and a restart that
+   is queued but not yet running keeps its RSS counted. A service that does
+   not fit stays blocked, keeps `MemoryPressure=True` with reason `Evicted`,
+   and is checked again on every later watchdog sample while pressure stays
+   Normal; no other change to the InferenceService starts it in the
+   meantime. Without this, a service evicted for pressure that has not gone
+   away would come straight back and be evicted again: the pre-start
+   admission check compares the model's estimate with a fraction of total
+   memory and does not look at available memory.
+
+   A service evicted again within 10 minutes of being restarted this way
+   waits before its next restart: 1 minute, then twice as long on each
+   further quick re-eviction, up to 30 minutes. A service that stays up
+   for 10 minutes starts from no wait again.
+
+   Services that fit are queued on the agent's restart queue, the same one
+   health restarts use, and started one after another. Each start still goes
+   through every pre-start check, and counts in
+   `llmkube_metal_agent_process_restarts_total`. A service deleted, scaled to
+   zero or suspended in the meantime is not started. If pressure has left
+   Normal by the time a queued service's turn comes, it is blocked again
+   instead of started. A queued start that fails for another reason is
+   retried on the restart queue's backoff (10s, doubling, up to 5 minutes),
+   with a `RestartFailed` event each time. Its `MemoryPressure` condition goes
+   back to `False` with reason `Normal` once its engine is running.
+
+   A service still down after pressure has been Normal for a while either
+   still has no room or is still waiting out its backoff (the agent logs
+   `restarting evicted services that fit the headroom` with `stillBlocked`
+   and `available`, at info on the return to Normal and at debug on each
+   later check), or its start keeps failing: check its
+   `status.schedulingStatus`, its `RestartFailed` events, and the agent log
+   for `restart failed; retrying`.
 
 3. **`llmkube_metal_agent_evictions_skipped_total` is not climbing** unless eviction is intentionally disabled. The agent serves `/metrics` on `127.0.0.1:9090` only, so run this on the Mac itself (or over `ssh <metal-agent-host>`):
 

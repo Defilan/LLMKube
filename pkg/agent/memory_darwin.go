@@ -48,13 +48,19 @@ func (p *DarwinMemoryProvider) AvailableMemory() (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("vm_stat: %w", err)
 	}
-	return availableBytesFromVMStat(string(out)), nil
+	return availableBytesFromVMStat(string(out))
 }
 
 // availableBytesFromVMStat computes available memory from raw vm_stat
-// output. Pure (no exec) so it can be unit-tested with a fixture.
-func availableBytesFromVMStat(output string) uint64 {
-	pageSize, bodyLines := parseVMStatHeader(output)
+// output. Pure (no exec) so it can be unit-tested with a fixture. Output
+// with no page size in its header, or with none of the four page counts
+// below, is an error rather than zero bytes available: the watchdog would
+// read zero as Critical memory pressure.
+func availableBytesFromVMStat(output string) (uint64, error) {
+	pageSize, pageSizeParsed, bodyLines := parseVMStatHeader(output)
+	if !pageSizeParsed {
+		return 0, fmt.Errorf("vm_stat: no page size in the header line")
+	}
 
 	// macOS treats free, inactive, speculative, and purgeable pages as
 	// reclaimable/available (matching Activity Monitor's "memory
@@ -63,6 +69,7 @@ func availableBytesFromVMStat(output string) uint64 {
 	// large fraction of RAM is wired and the rest of the available
 	// budget lives in speculative + purgeable. See defilantech/LLMKube#578.
 	var freePages, inactivePages, speculativePages, purgeablePages uint64
+	found := 0
 	for _, line := range bodyLines {
 		line = strings.TrimSpace(line)
 		switch {
@@ -74,10 +81,16 @@ func availableBytesFromVMStat(output string) uint64 {
 			speculativePages = parseVMStatValue(line)
 		case strings.HasPrefix(line, "Pages purgeable:"):
 			purgeablePages = parseVMStatValue(line)
+		default:
+			continue
 		}
+		found++
+	}
+	if found == 0 {
+		return 0, fmt.Errorf("vm_stat: no free, inactive, speculative or purgeable page counts")
 	}
 
-	return (freePages + inactivePages + speculativePages + purgeablePages) * pageSize
+	return (freePages + inactivePages + speculativePages + purgeablePages) * pageSize, nil
 }
 
 // WiredMemory returns the amount of wired (non-pageable) memory by parsing vm_stat.
@@ -87,7 +100,7 @@ func (p *DarwinMemoryProvider) WiredMemory() (uint64, error) {
 		return 0, fmt.Errorf("vm_stat: %w", err)
 	}
 
-	pageSize, lines := parseVMStatHeader(string(out))
+	pageSize, _, lines := parseVMStatHeader(string(out))
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "Pages wired down:") {
@@ -114,10 +127,12 @@ func (p *DarwinMemoryProvider) ProcessRSS(pid int) (uint64, error) {
 }
 
 // parseVMStatHeader extracts the page size and body lines from vm_stat output.
-func parseVMStatHeader(output string) (uint64, []string) {
+// The bool reports whether the header carried a page size; when it did not,
+// the returned size is the Apple Silicon default of 16KB.
+func parseVMStatHeader(output string) (uint64, bool, []string) {
 	lines := strings.Split(output, "\n")
 	if len(lines) == 0 {
-		return 16384, nil
+		return 16384, false, nil
 	}
 
 	var pageSize uint64
@@ -133,9 +148,9 @@ func parseVMStatHeader(output string) (uint64, []string) {
 		}
 	}
 	if pageSize == 0 {
-		pageSize = 16384 // default to 16KB for Apple Silicon
+		return 16384, false, lines[1:] // default to 16KB for Apple Silicon
 	}
-	return pageSize, lines[1:]
+	return pageSize, true, lines[1:]
 }
 
 // parseVMStatValue extracts the numeric value from a vm_stat line like "Pages free:    123456."

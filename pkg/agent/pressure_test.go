@@ -18,10 +18,12 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -164,7 +166,8 @@ func (stubExecutor) StopProcess(_ int) error { return nil }
 // end-to-end test for the eviction path: guard satisfied, EvictionEnabled
 // true, multiple priorities — verifies the lowest-priority process is the
 // one removed from the managed map and the key lands in pressureBlocked so
-// a subsequent ensureProcess will not respawn it.
+// a subsequent ensureProcess will not respawn it, with its RSS recorded so a
+// restart can wait for room to take that memory back.
 func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *testing.T) {
 	low := newPressureTestISvc("svc-low", "low")
 	high := newPressureTestISvc("svc-high", "high")
@@ -184,6 +187,7 @@ func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *te
 
 	a.handleMemoryPressure(context.Background(), MemoryPressureCritical, MemoryStats{
 		TotalMemory: 100 << 30, TotalRSS: 80 << 30,
+		ProcessRSS: map[string]uint64{"svc-low": 30 << 30, "svc-high": 50 << 30},
 	})
 
 	a.mu.RLock()
@@ -194,8 +198,12 @@ func TestHandleMemoryPressure_EvictsLowestPriorityWhenEnabledAndAboveGuard(t *te
 	if _, stillRunning := a.processes["default/svc-high"]; !stillRunning {
 		t.Error("svc-high should still be running (only one eviction per tick)")
 	}
-	if !a.pressureBlocked["default/svc-low"] {
+	evicted, blocked := a.pressureBlocked["default/svc-low"]
+	if !blocked {
 		t.Error("evicted key must be in pressureBlocked to prevent respawn")
+	}
+	if evicted.rss != 30<<30 {
+		t.Errorf("recorded RSS = %d, want %d (svc-low's RSS at eviction)", evicted.rss, uint64(30<<30))
 	}
 }
 
@@ -224,7 +232,7 @@ func TestHandleMemoryPressure_DisabledHonorsCLIFlag(t *testing.T) {
 	if _, stillRunning := a.processes["default/svc-low"]; !stillRunning {
 		t.Error("EvictionEnabled=false must prevent eviction even at Critical+guard")
 	}
-	if a.pressureBlocked["default/svc-low"] {
+	if _, blocked := a.pressureBlocked["default/svc-low"]; blocked {
 		t.Error("no eviction means no pressureBlocked entry")
 	}
 }
@@ -238,7 +246,7 @@ func TestEnsureProcess_BlockedUnderCriticalSkipsRespawn(t *testing.T) {
 	a := newPressureTestAgent(t, isvc)
 	a.executors["llama-server"] = NewMetalExecutor("/fake/llama-server", "/tmp/models", newNopLogger())
 
-	a.pressureBlocked["default/svc-a"] = true
+	a.pressureBlocked["default/svc-a"] = evictedService{}
 	a.lastPressureLevel = MemoryPressureCritical
 
 	if err := a.ensureProcess(context.Background(), isvc); err != nil {
@@ -459,27 +467,109 @@ func readSkippedCounter(t *testing.T, reason string) float64 {
 	return m.GetCounter().GetValue()
 }
 
-// TestHandleMemoryPressure_NormalClearsBlockedSet verifies that when pressure
-// drops back to Normal, previously evicted services become respawnable again
-// (pressureBlocked is reset).
-func TestHandleMemoryPressure_NormalClearsBlockedSet(t *testing.T) {
-	isvc := newPressureTestISvc("svc-a", "low")
-	a := newPressureTestAgent(t, isvc)
+// failingStopExecutor is a stubExecutor whose StopProcess fails, so the
+// eviction's deleteProcess reports a teardown error.
+type failingStopExecutor struct{ stubExecutor }
 
-	a.pressureBlocked["default/svc-a"] = true
-	a.lastPressureLevel = MemoryPressureCritical
+func (failingStopExecutor) StopProcess(_ int) error { return errors.New("stop failed") }
 
-	a.handleMemoryPressure(context.Background(), MemoryPressureNormal, MemoryStats{
-		TotalMemory: 100 << 30, TotalRSS: 10 << 30,
-	})
-
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if len(a.pressureBlocked) != 0 {
-		t.Errorf("Normal pressure should reset pressureBlocked, got %d entries", len(a.pressureBlocked))
+// TestHandleMemoryPressure_CountsEvictionsTotal pins evictions_total: it rises
+// by exactly one when the watchdog actually stops a process, and does not move
+// when an eviction is skipped or the picked process's teardown fails.
+func TestHandleMemoryPressure_CountsEvictionsTotal(t *testing.T) {
+	addProcess := func(a *MetalAgent, name, priority string, pid int) {
+		a.processes["default/"+name] = &ManagedProcess{
+			Name: name, Namespace: "default", Priority: priority,
+			ModelPath: "/m.gguf", PID: pid, StartedAt: time.Now(),
+		}
 	}
-	if a.lastPressureLevel != MemoryPressureNormal {
-		t.Errorf("lastPressureLevel = %v, want Normal", a.lastPressureLevel)
+	one := func(a *MetalAgent) { addProcess(a, "svc-low", "low", 999990) }
+	two := func(a *MetalAgent) {
+		one(a)
+		addProcess(a, "svc-high", "high", 999991)
+	}
+	tests := []struct {
+		name      string
+		enabled   bool
+		exec      ProcessExecutor
+		processes func(*MetalAgent)
+		rssGiB    uint64
+		want      float64
+	}{
+		{"eviction", true, stubExecutor{}, two, 80, 1},
+		{"skipped: disabled", false, stubExecutor{}, two, 80, 0},
+		{"skipped: below guard", true, stubExecutor{}, two, 30, 0},
+		{"skipped: floor", true, stubExecutor{}, one, 80, 0},
+		{"teardown failed", true, failingStopExecutor{}, two, 80, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newPressureTestAgent(t)
+			a.config.EvictionEnabled = tc.enabled
+			a.executors["llama-server"] = tc.exec
+			a.registry = NewServiceRegistry(a.config.K8sClient, "", newNopLogger(), "")
+			tc.processes(a)
+
+			before := testutil.ToFloat64(evictionsTotal)
+			a.handleMemoryPressure(context.Background(), MemoryPressureCritical, MemoryStats{
+				TotalMemory: 100 << 30, TotalRSS: tc.rssGiB << 30,
+			})
+			if got := testutil.ToFloat64(evictionsTotal) - before; got != tc.want {
+				t.Errorf("evictions_total delta = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleMemoryPressure_ReturnToNormalSideEffects pins what a return to
+// Normal does to a running, never-evicted service now that the watchdog
+// delivers it: one Normal-type MemoryPressureLevelChanged event, the
+// condition back to False/Normal, and no EvictionSkipped event or skipped
+// counter.
+func TestHandleMemoryPressure_ReturnToNormalSideEffects(t *testing.T) {
+	isvc := newPressureTestISvc("svc-a", "normal")
+	a := newPressureTestAgent(t, isvc)
+	a.config.EvictionEnabled = true
+	rec := record.NewFakeRecorder(32)
+	a.config.EventRecorder = rec
+	a.processes["default/svc-a"] = &ManagedProcess{
+		Name: "svc-a", Namespace: "default", ModelPath: "/m.gguf",
+		Priority: "normal", StartedAt: time.Now(),
+	}
+	a.handleMemoryPressure(context.Background(), MemoryPressureWarning, MemoryStats{
+		TotalMemory: 100 << 30, TotalRSS: 25 << 30,
+	})
+	_ = drainEvents(rec)
+
+	reasons := []string{"disabled", "below_guard", SkipReasonEmpty, SkipReasonFloor,
+		SkipReasonAllProtected, SkipReasonRuntimeIneligible}
+	before := make(map[string]float64, len(reasons))
+	for _, r := range reasons {
+		before[r] = readSkippedCounter(t, r)
+	}
+
+	returnToNormal(a)
+
+	events := drainEvents(rec)
+	wantPrefix := corev1.EventTypeNormal + " " + EventReasonMemoryPressureLevelChanged
+	if len(events) != 1 || !strings.HasPrefix(events[0], wantPrefix) ||
+		!strings.Contains(events[0], "warning to normal") {
+		t.Errorf("events = %v, want exactly one Normal %s for warning to normal",
+			events, EventReasonMemoryPressureLevelChanged)
+	}
+	for _, r := range reasons {
+		if d := readSkippedCounter(t, r) - before[r]; d != 0 {
+			t.Errorf("evictions_skipped_total{reason=%q} moved by %v on a return to Normal", r, d)
+		}
+	}
+	got := &inferencev1alpha1.InferenceService{}
+	if err := a.config.K8sClient.Get(context.Background(),
+		types.NamespacedName{Namespace: "default", Name: "svc-a"}, got); err != nil {
+		t.Fatalf("get isvc: %v", err)
+	}
+	cond := meta.FindStatusCondition(got.Status.Conditions, ConditionMemoryPressure)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != ReasonMemoryNormal {
+		t.Errorf("MemoryPressure condition = %+v, want status False reason %s", cond, ReasonMemoryNormal)
 	}
 }
 
@@ -637,7 +727,7 @@ func TestEnsureProcess_EmitsRespawnBlockedEvent(t *testing.T) {
 	rec := record.NewFakeRecorder(32)
 	a.config.EventRecorder = rec
 
-	a.pressureBlocked["default/svc-a"] = true
+	a.pressureBlocked["default/svc-a"] = evictedService{}
 	a.lastPressureLevel = MemoryPressureCritical
 
 	if err := a.ensureProcess(context.Background(), isvc); err != nil {

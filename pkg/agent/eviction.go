@@ -17,7 +17,6 @@ limitations under the License.
 package agent
 
 import (
-	"path"
 	"sort"
 )
 
@@ -134,17 +133,15 @@ func pickEvictionTarget(processes map[string]*ManagedProcess, rss map[string]uin
 }
 
 // managedProcessRSSKey returns the key used to look up a process's RSS in the
-// MemoryStats.ProcessRSS map. The watchdog keys RSS by binary basename
-// (filepath.Base of the executable path), so we use the basename of
-// ManagedProcess.ModelPath as a proxy. This is a reasonable approximation
-// for llama-server processes started by MetalExecutor since each spawns one
-// llama-server per model. If the watchdog later switches to PID-keyed RSS,
-// adjust here.
+// MemoryStats.ProcessRSS map: the process's InferenceService name, which is
+// what the watchdog keys it by (processMemInfoSnapshot hands it each
+// process's Name). Two services with the same name in different namespaces
+// share one entry there. If the watchdog changes its key, change it here.
 func managedProcessRSSKey(p *ManagedProcess) string {
-	if p == nil || p.ModelPath == "" {
+	if p == nil {
 		return ""
 	}
-	return path.Base(p.ModelPath)
+	return p.Name
 }
 
 // shouldEvict returns true when the watchdog's pressure level warrants

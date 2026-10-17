@@ -139,6 +139,16 @@ func (a *MetalAgent) scheduleRestartLocked(key string, notBefore time.Time) time
 // any pending restart. reason is logged.
 func (a *MetalAgent) queueRestart(key string, notBefore time.Time, reason string) {
 	a.mu.Lock()
+	notBefore = a.queueRestartLocked(key, notBefore)
+	a.mu.Unlock()
+
+	a.logger.Infow("restart queued", "key", key, "reason", reason, "notBefore", notBefore)
+}
+
+// queueRestartLocked is queueRestart for a caller that holds a.mu, so the
+// queueing is atomic with the caller's own checks. It returns when the
+// restart may run. Must be called with a.mu held.
+func (a *MetalAgent) queueRestartLocked(key string, notBefore time.Time) time.Time {
 	st := a.restartStateLocked(key)
 	if st.pending && st.nextAt.After(notBefore) {
 		notBefore = st.nextAt
@@ -152,9 +162,7 @@ func (a *MetalAgent) queueRestart(key string, notBefore time.Time, reason string
 		st.delay = healthRestartInitialBackoff
 	}
 	a.armRestartLocked(st, st.nextAt)
-	a.mu.Unlock()
-
-	a.logger.Infow("restart queued", "key", key, "reason", reason, "notBefore", notBefore)
+	return notBefore
 }
 
 // armRestartLocked replaces st's wake-up with one at at, or wakes the event

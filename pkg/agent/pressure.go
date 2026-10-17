@@ -102,13 +102,17 @@ func (a *MetalAgent) emitInferenceEvent(
 // Behavior, in order:
 //
 //  1. Capture the new pressure level under the agent's mutex.
-//  2. If pressure dropped to Normal, clear pressureBlocked so the next
-//     ensureProcess can respawn previously evicted services.
+//  2. If pressure is Normal, pick the evicted services that fit the
+//     available memory (restartCandidatesLocked). The rest stay blocked;
+//     the watchdog keeps delivering Normal samples while any are waiting.
 //  3. Update the MemoryPressure condition on every managed
 //     InferenceService that has not already been observed at this level
 //     (covers level transitions and late-spawned processes during
 //     sustained pressure).
-//  4. If the level is Critical AND the friendly-fire guard says we're
+//  4. Queue the restart of the services step 2 picked
+//     (queueEvictedRestarts). The event loop starts them later; their
+//     condition leaves Evicted once their engine runs.
+//  5. If the level is Critical AND the friendly-fire guard says we're
 //     responsible for the pressure (shouldEvict), pick one process to
 //     evict, mark it blocked, and stop it. Only one eviction per watchdog
 //     tick to avoid stampedes. Skip-without-evict outcomes are recorded
@@ -120,10 +124,9 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	a.mu.Lock()
 	previous := a.lastPressureLevel
 	a.lastPressureLevel = level
-	if level == MemoryPressureNormal && len(a.pressureBlocked) > 0 {
-		a.logger.Infow("memory pressure cleared; unblocking previously evicted services",
-			"unblocked", len(a.pressureBlocked))
-		a.pressureBlocked = make(map[string]bool)
+	var restart []evictedRestart
+	if level == MemoryPressureNormal {
+		restart = a.restartCandidatesLocked(stats, level != previous)
 	}
 	// Reset observed-at-level when the level changes so each new level
 	// triggers a fresh round of condition patches.
@@ -137,10 +140,13 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 	// Determine which keys still need a condition patch at this level.
 	// New keys (added since the last tick) and unchanged keys at a new
 	// level both fall through; already-observed keys are skipped to keep
-	// the status churn quiet under sustained pressure.
+	// the status churn quiet under sustained pressure. The comma-ok matters
+	// at Normal: it is the map's zero value, so a plain lookup would read a
+	// key never patched at Normal as already observed there and leave its
+	// condition at Warning or Critical.
 	needsPatch := make(map[string]*ManagedProcess, len(snapshot))
 	for k, p := range snapshot {
-		if a.pressureObserved[k] != level {
+		if observed, ok := a.pressureObserved[k]; !ok || observed != level {
 			needsPatch[k] = p
 		}
 	}
@@ -178,6 +184,9 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 				EventReasonMemoryPressureLevelChanged, "%s", eventMsg)
 		}
 	}
+
+	// Queued only now, with a.mu released: queueRestart takes it.
+	a.queueEvictedRestarts(ctx, restart)
 
 	// Eviction path. Honored via the --eviction-enabled CLI flag (default
 	// false) so that operators must explicitly opt in to having the
@@ -229,9 +238,14 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 
 	// Mark blocked BEFORE deleteProcess so a controller event arriving
 	// during the (potentially slow) process teardown does not race ahead
-	// and respawn it.
+	// and respawn it. Record its RSS so a restart can wait for room to take
+	// that memory back, and when the restart backoff allows the next one.
 	a.mu.Lock()
-	a.pressureBlocked[key] = true
+	a.pressureBlocked[key] = evictedService{
+		rss:       stats.ProcessRSS[managedProcessRSSKey(target)],
+		notBefore: a.nextEvictedRestartLocked(key),
+	}
+	delete(a.pressureRestarting, key)
 	a.mu.Unlock()
 
 	if err := a.updateMemoryPressureCondition(ctx, target, MemoryPressureCritical,
@@ -251,6 +265,9 @@ func (a *MetalAgent) handleMemoryPressure(ctx context.Context, level MemoryPress
 		a.logger.Errorw("eviction failed; cleared pressure block", "key", key, "error", err)
 		return
 	}
+	// Counted only here, once the process is actually stopped: a picked
+	// candidate whose teardown failed was not evicted.
+	evictionsTotal.Inc()
 
 	a.emitInferenceEvent(ctx, target, corev1.EventTypeWarning, EventReasonEvicted,
 		"Process evicted to relieve memory pressure (priority=%s, totalRSS=%s of %s)",
@@ -344,5 +361,6 @@ func (a *MetalAgent) updateMemoryPressureCondition(
 func (a *MetalAgent) isPressureBlocked(key string) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.pressureBlocked[key]
+	_, blocked := a.pressureBlocked[key]
+	return blocked
 }

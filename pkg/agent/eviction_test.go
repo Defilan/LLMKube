@@ -62,12 +62,44 @@ func TestPickEvictionTarget_TieBreakByRSS(t *testing.T) {
 		},
 	}
 	rss := map[string]uint64{
-		"small.gguf": 1 << 30,
-		"large.gguf": 10 << 30,
+		"small": 1 << 30,
+		"large": 10 << 30,
 	}
 	target, _ := pickEvictionTarget(processes, rss)
 	if target == nil || target.Name != "large" {
 		t.Errorf("expected eviction of larger-RSS process %q, got %v", "large", target)
+	}
+}
+
+// TestPickEvictionTarget_TieBreakUsesWatchdogRSS feeds the selector the RSS map
+// the watchdog itself produces, not one built to match the selector's key: it
+// used to look RSS up by model file name while the watchdog keys it by
+// process name, so the RSS tie-break never matched and the older process was
+// always picked.
+func TestPickEvictionTarget_TieBreakUsesWatchdogRSS(t *testing.T) {
+	a := &MetalAgent{processes: map[string]*ManagedProcess{
+		"default/small": {
+			Name: "small", Namespace: "default", Priority: "normal", PID: 101,
+			ModelPath: "/models/small.gguf", StartedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		"default/large": {
+			Name: "large", Namespace: "default", Priority: "normal", PID: 102,
+			ModelPath: "/models/large.gguf", StartedAt: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
+		},
+	}}
+	provider := &mockMemoryProvider{
+		totalBytes: 64 << 30, availableBytes: 2 << 30,
+		processRSS: map[int]uint64{101: 1 << 30, 102: 10 << 30},
+	}
+	var stats MemoryStats
+	w := NewMemoryWatchdog(provider, a.processMemInfoSnapshot,
+		func(_ MemoryPressureLevel, s MemoryStats) { stats = s }, defaultTestConfig(), testLogger())
+	w.sample()
+
+	target, _ := pickEvictionTarget(a.processes, stats.ProcessRSS)
+	if target == nil || target.Name != "large" {
+		t.Errorf("evicted %v, want the larger-RSS process %q (RSS from the watchdog: %v)",
+			target, "large", stats.ProcessRSS)
 	}
 }
 
@@ -84,9 +116,9 @@ func TestPickEvictionTarget_TieBreakByStartedAt(t *testing.T) {
 			ModelPath: "/models/m.gguf", StartedAt: newer,
 		},
 	}
-	// Same priority, same RSS lookup key (both point at same basename → same RSS),
-	// so the tie-break should pick the older one.
-	rss := map[string]uint64{"m.gguf": 5 << 30}
+	// Same priority and the same RSS, so the tie-break should pick the older
+	// one.
+	rss := map[string]uint64{"older": 5 << 30, "newer": 5 << 30}
 	target, _ := pickEvictionTarget(processes, rss)
 	if target == nil || target.Name != "older" {
 		t.Errorf("expected eviction of older process, got %v", target)
