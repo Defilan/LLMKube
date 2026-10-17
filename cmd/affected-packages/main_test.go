@@ -41,7 +41,6 @@ func fixture() []node {
 		{ImportPath: variant("p_test"), Dir: "/r/p", Imports: []string{m("q")}},
 		{ImportPath: main, Dir: "/r/p", Imports: []string{variant("p"), variant("p_test")}},
 		{ImportPath: m("q"), Dir: "/r/q"},
-		{ImportPath: m("test/e2e"), Dir: "/r/test/e2e"},
 	}
 }
 
@@ -74,8 +73,11 @@ func TestSelectPackages(t *testing.T) {
 			want:  []string{"example.com/m/d"},
 		},
 		{
-			name:  "e2e-only change selects nothing",
-			files: []string{"test/e2e/e2e.go"},
+			// Real go list never emits a node for test/e2e: every file
+			// there is //go:build e2e gated. The change must select
+			// nothing, not trip the deleted-package fallback.
+			name:  "tag-gated e2e change selects nothing",
+			files: []string{"test/e2e/e2e_test.go"},
 			want:  []string{},
 		},
 		{

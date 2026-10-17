@@ -14,8 +14,6 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 BIN="$(mktemp -d)/affected-packages"
 go build -o "$BIN" "$ROOT/cmd/affected-packages" || fail "building cmd/affected-packages"
 
-BRANCH=""
-
 REPO=""
 BRANCH=""
 
@@ -34,7 +32,7 @@ new_repo() {
 	printf 'package q\n' >"$REPO/q/q.go"
 	printf 'package p\n' >"$REPO/p/p.go"
 	printf 'package p_test\n\nimport _ "example.com/m/q"\n' >"$REPO/p/p_test.go"
-	printf 'package e2e\n' >"$REPO/test/e2e/e2e.go"
+	printf '//go:build e2e\n\npackage e2e\n' >"$REPO/test/e2e/e2e.go"
 	git -C "$REPO" add -A
 	git -C "$REPO" commit -q --no-verify -m base
 	BRANCH="$(git -C "$REPO" symbolic-ref --short HEAD)"
@@ -70,7 +68,7 @@ example.com/m/q'
 new_repo
 printf 'package b // changed\n' >"$REPO/b/b.go"
 expect_pkgs "leaf change selects the package and its reverse dependencies" \
-	"$LEAF" "$(pkgs_of "$REPO")"
+	"$LEAF" "$(pkgs_of)"
 
 # The same holds for a committed change, on a work branch: the tool diffs
 # against the base ref, so work committed onto the base branch itself would
@@ -80,13 +78,13 @@ git -C "$REPO" checkout -q -b work
 git -C "$REPO" add -A
 git -C "$REPO" commit -q --no-verify -m change
 expect_pkgs "committed change selects the package and its reverse dependencies" \
-	"$LEAF" "$(pkgs_of "$REPO")"
+	"$LEAF" "$(pkgs_of)"
 
 # An untracked file in an existing package selects only that package.
 new_repo
 printf 'package d\n' >"$REPO/d/extra.go"
 expect_pkgs "untracked file selects only its package" \
-	"example.com/m/d" "$(pkgs_of "$REPO")"
+	"example.com/m/d" "$(pkgs_of)"
 
 # A rename must select the package that lost the file as well as the
 # package that gained it: rename detection reports only the destination,
@@ -103,17 +101,18 @@ example.com/m/e' "$(pkgs_of)"
 # A go.mod change selects everything except test/e2e.
 new_repo
 printf '\n// touched\n' >>"$REPO/go.mod"
-expect_pkgs "go.mod change selects everything" "$ALL" "$(pkgs_of "$REPO")"
+expect_pkgs "go.mod change selects everything" "$ALL" "$(pkgs_of)"
 
 # A change outside Go packages selects nothing and exits 0.
 new_repo
 echo x >"$REPO/README.md"
-expect_pkgs "docs-only change selects nothing" "" "$(pkgs_of "$REPO")"
+expect_pkgs "docs-only change selects nothing" "" "$(pkgs_of)"
 
-# A change under test/e2e selects nothing.
+# A change under the tag-gated test/e2e tree selects nothing: go list never
+# reports those files, and they are not build inputs for the unit gate.
 new_repo
-printf 'package e2e // changed\n' >"$REPO/test/e2e/e2e.go"
-expect_pkgs "e2e-only change selects nothing" "" "$(pkgs_of "$REPO")"
+printf '//go:build e2e\n\npackage e2e // changed\n' >"$REPO/test/e2e/e2e.go"
+expect_pkgs "e2e-only change selects nothing" "" "$(pkgs_of)"
 
 # Deleting a package directory selects everything: the changed .go files
 # belong to no listed package any more.
@@ -124,7 +123,7 @@ expect_pkgs "deleted package selects everything" \
 example.com/m/b
 example.com/m/c
 example.com/m/p
-example.com/m/q' "$(pkgs_of "$REPO")"
+example.com/m/q' "$(pkgs_of)"
 
 # A package whose test imports a changed package is selected through the
 # test variant of the dependency graph.
@@ -132,7 +131,7 @@ new_repo
 printf 'package q // changed\n' >"$REPO/q/q.go"
 expect_pkgs "test-only dependency selects the package owning the test" \
 	'example.com/m/p
-example.com/m/q' "$(pkgs_of "$REPO")"
+example.com/m/q' "$(pkgs_of)"
 
 # An unresolvable base ref is a clean error, not a partial answer.
 new_repo

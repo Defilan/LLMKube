@@ -47,6 +47,7 @@ contributors share. The human onboarding narrative lives in
 | envtest suites only (fixed seed)    | `make test-envtest`     |
 | Affected packages while editing     | `make test-affected`    |
 | Agent gate (once per round)         | `make gate`             |
+| Agent tooling script tests          | `make test-scripts`     |
 | Helm chart lint + unit tests        | `make test-chart`       |
 | Alert rule behavior (promtool)      | `make test-chart-rules` |
 | E2E tests (needs Kind)              | `make test-e2e`         |
@@ -132,8 +133,8 @@ A change is not done until all of these hold.
   with `upstream/main` (override with `BASE_REF=<ref>`; includes committed,
   uncommitted and untracked changes) plus every package that depends on them,
   with a fixed `GINKGO_SEED` (default 4242) so go's test cache works between
-  runs. `go.mod` or `go.sum` changes select everything; no Go change selects
-  nothing and exits 0. Excludes `test/e2e`.
+  runs. `go.mod`, `go.sum`, `go.work` or `go.work.sum` changes select
+  everything; no Go change selects nothing and exits 0. Excludes `test/e2e`.
 - Once per round, before review: `make gate`. It regenerates manifests and
   DeepCopy and fails on uncommitted regeneration drift, checks gofmt without
   rewriting, runs `go vet`, then runs `make lint-all` and the full test suite
@@ -141,8 +142,9 @@ A change is not done until all of these hold.
   `GATE_DIR`); it prints one summary line per step and exits nonzero if any
   step failed. One command covers the fmt/vet/lint/test pre-commit gate and
   the lint-all pre-push check. A rerun with no edits reports `(cached)` for
-  the suites. The gate does not regenerate the Helm chart CRDs; run
-  `make chart-crds` separately when `api/v1alpha1` types change. If
+  the suites; the gate writes no coverage profile, CI's `make test` does.
+  The gate does not regenerate the Helm chart CRDs; run `make chart-crds`
+  separately when `api/v1alpha1` types change. If
   staticcheck panics under your Go toolchain, set
   `LINT_GOTOOLCHAIN=<version>` (for example go1.26.9).
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and

@@ -169,6 +169,16 @@ BASE_REF ?= upstream/main
 test-affected: setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
 	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" ./scripts/test-affected.sh
 
+# The gate and test-affected are shell scripts, so go test never runs their
+# regression tests. One command for agents and humans; CI runs the same
+# scripts directly.
+.PHONY: test-scripts
+test-scripts: ## Run the shell regression tests for the gate, test-affected and affected-packages scripts.
+	@bash scripts/gate_test.sh
+	@bash scripts/test-affected_test.sh
+	@bash scripts/affected-packages_test.sh
+	@bash scripts/check-ginkgo-seed_test.sh
+
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
 	helm lint charts/llmkube charts/foreman

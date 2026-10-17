@@ -104,6 +104,26 @@ expect_line 'gate: regen +FAIL' "summary must report the regen failure"
 expect_line 'gate: drift +SKIPPED' "regen failure must skip the drift step"
 [ ! -e "$GATE_LOG_DIR/drift.log" ] || fail "skipped drift step must not write a log"
 
+# The built-in fmt check (no GATE_FMT_CMD override) must fail on an
+# unformatted file and name it, without rewriting anything.
+repo=$(new_repo)
+printf 'package t\n\nfunc F( ) {}\n' >"$repo/unfmt.go"
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_VET_CMD=true \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 1 "the built-in fmt check must fail on an unformatted file"
+expect_line 'gate: fmt +FAIL' "summary must report the fmt failure"
+grep -q 'unfmt.go' "$GATE_LOG_DIR/fmt.log" || fail "fmt log must name the unformatted file
+$(cat "$GATE_LOG_DIR/fmt.log")"
+[ "$(cat "$repo/unfmt.go")" = "$(printf 'package t\n\nfunc F( ) {}\n')" ] || fail "the fmt check must not rewrite the file"
+
+# The formatted counterpart passes.
+repo=$(new_repo)
+printf 'package t\n\nfunc F() {}\n' >"$repo/fmt.go"
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_VET_CMD=true \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 0 "the built-in fmt check must pass a formatted file"
+expect_line 'gate: fmt +PASS' "summary must report the fmt pass"
+
 # Regeneration drift: a stub regen that creates a file must fail the gate and
 # name the file.
 repo=$(new_repo)

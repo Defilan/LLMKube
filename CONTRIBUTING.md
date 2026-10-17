@@ -302,7 +302,8 @@ generated or substantially assisted by an AI tool, the following apply.
   under test is broken is not coverage.
 - The change must match the scope of the issue it claims to fix: no unrelated
   edits, no placeholder or fabricated content.
-- Run the gate locally first: `make test`, `make lint`.
+- Run the checks locally first: `make gate` (or `make test` and `make lint`
+  individually).
 
 **Unsolicited and drive-by PRs.**
 

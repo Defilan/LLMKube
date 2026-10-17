@@ -25,8 +25,9 @@ limitations under the License.
 // A change to go.mod, go.sum, go.work or go.work.sum selects every package,
 // as does a .go file that belongs to no listed package (its directory was
 // deleted) or any package go list reports an error for (the tree does not
-// compile). Changes outside Go packages select nothing. test/e2e is never
-// printed, matching make test.
+// compile). .go files under test/e2e are //go:build e2e gated, so go list
+// never reports them; changing one selects nothing. Changes outside Go
+// packages select nothing. test/e2e is never printed, matching make test.
 //
 // Usage:
 //
@@ -186,7 +187,7 @@ func modulePackages(nodes []node, root string) map[string]bool {
 			continue
 		}
 		pkg := testablePackage(nodes[i].ImportPath)
-		if pkg == "test/e2e" || strings.HasSuffix(pkg, "/test/e2e") {
+		if strings.HasSuffix(pkg, "/test/e2e") {
 			continue
 		}
 		out[pkg] = true
@@ -217,6 +218,14 @@ func packageDirs(nodes []node, root string) map[string][]*node {
 	return out
 }
 
+// isE2ETreePath reports whether a repo-relative path is inside test/e2e,
+// whose .go files are all //go:build e2e gated: go list never reports them
+// in the default build, so a change there selects nothing instead of every
+// package.
+func isE2ETreePath(p string) bool {
+	return strings.HasPrefix(p, "test/e2e/")
+}
+
 // mapFilesToPackages maps changed files to package directories by longest
 // matching directory prefix. It reports whether any .go file matched no
 // package at all: its directory was deleted, so nothing can be narrowed.
@@ -231,6 +240,12 @@ func mapFilesToPackages(files []string, dirs []string) (selected map[string]bool
 			}
 		}
 		if best == "" {
+			// test/e2e sources are //go:build e2e gated, so go list never
+			// reports their directory; they are not build inputs for the
+			// unit gate and must not trip the deleted-package fallback.
+			if isE2ETreePath(f) {
+				continue
+			}
 			if strings.HasSuffix(f, ".go") {
 				unmappedGo = true
 			}
