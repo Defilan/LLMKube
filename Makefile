@@ -138,6 +138,24 @@ test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test-envtest GINKGO_SEED=$(GINKGO_SEED))"
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test ./internal/controller/ ./internal/foreman/controller/ -count=1
 
+# The gate and test-affected pin the seed inside the scripts (default 4242)
+# so go's test cache survives between rounds: go help test caches a result
+# only while the environment variables a test reads stay unchanged, and the
+# envtest suites read GINKGO_SEED. These recipes must not touch GINKGO_SEED:
+# the ifndef block above assigns a fresh seed whenever the caller did not.
+# Override from the environment or the command line (GINKGO_SEED=<n> make
+# gate). LINT_GOTOOLCHAIN pins the toolchain for the gate's lint step only,
+# for golangci-lint builds whose staticcheck panics under a newer Go.
+
+# One command per agent or human round. Regenerates and fails on uncommitted
+# regeneration drift, checks gofmt without rewriting, runs vet, then runs
+# lint-all and the full test suite in parallel (inside scripts/gate.sh, not
+# as make -j: targets sharing the manifests/generate prerequisites would
+# race the regeneration). Logs under ${TMPDIR:-/tmp}/llmkube-gate.
+.PHONY: gate
+gate: controller-gen golangci-lint setup-envtest ## Agent gate: regen + drift check, gofmt check, vet, then lint-all and tests in parallel.
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" ./scripts/gate.sh
+
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
 	helm lint charts/llmkube charts/foreman
