@@ -14,7 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package controller
+// Package teststyle holds repository-wide checks on how tests are written.
+// They live in a package of their own because each one reads files across
+// the whole repository, and Go's test cache keys on the files and
+// directories a test reads: in a package with slow tests (internal/controller
+// before #2104), any edit anywhere would rerun the whole package.
+package teststyle
 
 import (
 	"fmt"
@@ -37,7 +42,7 @@ import (
 func TestAssertionCommentsDoNotRestateImplementation(t *testing.T) {
 	pattern := regexp.MustCompile(`By\("[^"]*\((returns|verifies|controller does|sets the|stores)`)
 
-	root := filepath.Join("..", "..")
+	root := filepath.Join("..", "..") // the module root, from internal/teststyle
 	var offenders []string
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
