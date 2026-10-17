@@ -38,13 +38,30 @@ import (
 )
 
 // hungOMLXFixture builds an omlxAliasFixture whose HTTP client times out in
-// 300ms, so a daemon that holds its port but answers nothing is seen as
-// unhealthy fast instead of after the default 10s.
+// 300ms and whose /health rechecks are 50ms apart, so a daemon that holds its
+// port but answers nothing is confirmed unhealthy in about a second instead
+// of after the default 10s probes 5s apart. The probe count stays the
+// default, so every hung-daemon test goes through the recheck.
 func hungOMLXFixture(t *testing.T, dirName string) (*OMLXExecutor, string) {
 	t.Helper()
 	e, modelPath := omlxAliasFixture(t, dirName)
 	e.httpClient = &http.Client{Timeout: 300 * time.Millisecond}
+	e.unhealthyProbeInterval = 50 * time.Millisecond
 	return e, modelPath
+}
+
+// hangOMLXHealth makes the daemon on port hang its next n /health requests
+// and then answer normally again: a daemon that is busy, not wedged.
+func hangOMLXHealth(t *testing.T, port, n int) {
+	t.Helper()
+	resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/__hang?health=%d", port, n), "", nil)
+	if err != nil {
+		t.Fatalf("hang the fake daemon's next %d health probes: %v", n, err)
+	}
+	defer drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("hang the fake daemon's next %d health probes: status %d", n, resp.StatusCode)
+	}
 }
 
 // addOMLXModelDir adds a second oMLX model directory to the fixture's model
@@ -365,6 +382,9 @@ func TestOMLXForeignHealthyDaemonNotRestarted(t *testing.T) {
 func TestOMLXStopHonorsContextCancellation(t *testing.T) {
 	e, modelPath := hungOMLXFixture(t, "Qwen3-8B-MLX-8bit")
 	e.stopTimeout = 5 * time.Second
+	// One probe, so the cancellation lands in the stop's SIGTERM grace this
+	// test is about rather than in the /health recheck before it.
+	e.unhealthyProbes = 1
 	cfg := ExecutorConfig{Name: "chat", Namespace: "ns", ModelSource: modelPath,
 		ModelName: "qwen3-8b", ServedModelName: "qwen3-8b"}
 	if _, err := e.StartProcess(context.Background(), cfg); err != nil {
@@ -548,5 +568,92 @@ func TestOMLXReloadSkipsRequestingModel(t *testing.T) {
 	}
 	if hits["Model-B"] == 0 {
 		t.Error("Model-B was never triggered by the reload")
+	}
+}
+
+// TestOMLXBusyDaemonKeptWhileAnyProbeAnswers: a live daemon this agent
+// started is replaced only after every one of the default three /health
+// probes fails. A daemon that misses one or two probes (busy loading a large
+// model for another service) and then answers must be kept, or every oMLX
+// model on the host restarts for nothing.
+func TestOMLXBusyDaemonKeptWhileAnyProbeAnswers(t *testing.T) {
+	for _, missed := range []int{1, 2} {
+		t.Run(fmt.Sprintf("%d missed probes", missed), func(t *testing.T) {
+			e, modelPath := hungOMLXFixture(t, "Qwen3-8B-MLX-8bit")
+			cfg := ExecutorConfig{Name: "chat", Namespace: "ns", ModelSource: modelPath,
+				ModelName: "qwen3-8b", ServedModelName: "qwen3-8b"}
+			first, err := e.StartProcess(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("first StartProcess: %v", err)
+			}
+
+			hangOMLXHealth(t, e.port, missed)
+
+			second, err := e.StartProcess(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("StartProcess against the busy daemon: %v", err)
+			}
+			if second.PID != first.PID {
+				t.Errorf("daemon replaced (PID %d -> %d) after %d missed probes; want it kept",
+					first.PID, second.PID, missed)
+			}
+			if !pidAlive(first.PID) {
+				t.Errorf("busy daemon %d was stopped", first.PID)
+			}
+		})
+	}
+}
+
+// TestOMLXExitedDaemonReplacedWithoutRecheck: a daemon this agent started
+// that has already exited holds no port and cannot recover, so it is
+// replaced at once. The recheck interval is set long enough that waiting
+// through it would be visible.
+func TestOMLXExitedDaemonReplacedWithoutRecheck(t *testing.T) {
+	e, modelPath := hungOMLXFixture(t, "Qwen3-8B-MLX-8bit")
+	e.unhealthyProbeInterval = 5 * time.Second
+	cfg := ExecutorConfig{Name: "chat", Namespace: "ns", ModelSource: modelPath,
+		ModelName: "qwen3-8b", ServedModelName: "qwen3-8b"}
+	first, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("first StartProcess: %v", err)
+	}
+	if err := syscall.Kill(first.PID, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill the daemon: %v", err)
+	}
+	waitPIDGone(t, first.PID)
+
+	core, logs := observer.New(zap.WarnLevel)
+	e.logger = zap.New(core).Sugar()
+
+	start := time.Now()
+	second, err := e.StartProcess(context.Background(), cfg)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("StartProcess after the daemon exited: %v", err)
+	}
+	if second.PID == first.PID {
+		t.Fatalf("daemon PID unchanged (%d) after it exited", first.PID)
+	}
+	if elapsed >= 4*time.Second {
+		t.Errorf("replacing an exited daemon took %s; it waited through the /health recheck", elapsed)
+	}
+	if !warnLogged(logs, "has exited") {
+		t.Errorf("expected a warning that the daemon exited, logs: %v", logs.All())
+	}
+}
+
+// TestOMLXColdStartLogsNoWarning: starting the first daemon on a port
+// nothing listens on is the normal path, so it must not log a warning that
+// reads like a fault.
+func TestOMLXColdStartLogsNoWarning(t *testing.T) {
+	e, _ := hungOMLXFixture(t, "Qwen3-8B-MLX-8bit")
+	core, logs := observer.New(zap.WarnLevel)
+	e.logger = zap.New(core).Sugar()
+
+	if err := e.ensureOMLXRunning(context.Background(), "Qwen3-8B-MLX-8bit", "qwen3-8b"); err != nil {
+		t.Fatalf("ensureOMLXRunning: %v", err)
+	}
+	if n := logs.Len(); n != 0 {
+		t.Errorf("cold start logged %d warnings, want 0: %v", n, logs.All())
 	}
 }

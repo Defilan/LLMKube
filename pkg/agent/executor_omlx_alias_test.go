@@ -90,8 +90,20 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 	loaded := map[string]bool{}
 	hits := map[string]int{}
 	var hung atomic.Bool
+	// hangHealth counts down /health requests left to hang: a daemon busy
+	// for a few probes that then answers again (POST /__hang?health=N).
+	var hangHealth atomic.Int32
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /__hang", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("POST /__hang", func(w http.ResponseWriter, r *http.Request) {
+		if n := r.URL.Query().Get("health"); n != "" {
+			v, err := strconv.ParseInt(n, 10, 32)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			hangHealth.Store(int32(v))
+			return
+		}
 		hung.Store(true)
 	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {})
@@ -164,8 +176,19 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 	// Once hung the daemon keeps the port but answers nothing, the shape of
 	// a daemon whose event loop is stuck. The flag is per-process, so a
 	// replacement daemon starts unhung.
+	takeHealthHang := func() bool {
+		for {
+			left := hangHealth.Load()
+			if left <= 0 {
+				return false
+			}
+			if hangHealth.CompareAndSwap(left, left-1) {
+				return true
+			}
+		}
+	}
 	gated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if hung.Load() {
+		if hung.Load() || (r.URL.Path == "/health" && takeHealthHang()) {
 			time.Sleep(24 * time.Hour)
 			return
 		}

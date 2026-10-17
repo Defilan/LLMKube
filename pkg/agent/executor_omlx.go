@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -44,10 +45,15 @@ const DefaultOMLXStartupTimeout = 120 * time.Second
 // Unlike MetalExecutor (one process per model), oMLX runs a single daemon that
 // serves all models from a shared model directory.
 type OMLXExecutor struct {
-	omlxBin        string
-	modelDir       string
-	port           int
-	process        *os.Process
+	omlxBin  string
+	modelDir string
+	port     int
+	process  *os.Process
+	// processExit is the reaper for process (watchChild), so the executor can
+	// tell a daemon that exited from one that is alive but not answering
+	// without a second Wait. Set and cleared together with process; guarded
+	// by mu.
+	processExit    *childExit
 	mu             sync.Mutex
 	logger         *zap.SugaredLogger
 	httpClient     *http.Client
@@ -55,6 +61,11 @@ type OMLXExecutor struct {
 	// stopTimeout bounds how long stopDaemonLocked waits for the daemon to
 	// exit on SIGTERM before killing it. Defaults to omlxStopTimeout.
 	stopTimeout time.Duration
+	// unhealthyProbes is how many consecutive failed /health probes, spaced
+	// unhealthyProbeInterval apart, it takes before a live daemon this agent
+	// started is stopped and replaced. Defaults to omlxUnhealthyProbes.
+	unhealthyProbes        int
+	unhealthyProbeInterval time.Duration
 	// servedModels is the set of model directory names the current daemon is
 	// serving, tracked so a daemon replacement can reload them. Neither the
 	// daemon's /v1/models/status (a hung daemon cannot answer it) nor the
@@ -99,9 +110,11 @@ func NewOMLXExecutor(omlxBin, modelDir string, port int, logger *zap.SugaredLogg
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		startupTimeout: DefaultOMLXStartupTimeout,
-		stopTimeout:    omlxStopTimeout,
-		basePath:       omlxDefaultBasePath(),
+		startupTimeout:         DefaultOMLXStartupTimeout,
+		stopTimeout:            omlxStopTimeout,
+		unhealthyProbes:        omlxUnhealthyProbes,
+		unhealthyProbeInterval: omlxUnhealthyProbeInterval,
+		basePath:               omlxDefaultBasePath(),
 	}
 }
 
@@ -343,9 +356,19 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context, modelID, servedNam
 		return err
 	}
 
-	// Check if oMLX is already responding
+	// Check if oMLX is already responding. One failed probe is not enough to
+	// replace a live daemon this agent started: a daemon busy loading a large
+	// model for another service can miss a probe, and replacing it restarts
+	// every oMLX model on the host.
+	healthy := e.isHealthy(ctx)
+	if !healthy && e.process != nil {
+		healthy, err = e.reprobeHealthLocked(ctx)
+		if err != nil {
+			return fmt.Errorf("oMLX daemon did not answer /health and the recheck was cancelled: %w", err)
+		}
+	}
 	replacedHung := false
-	if e.isHealthy(ctx) {
+	if healthy {
 		if !aliasChanged {
 			e.logger.Debugw("oMLX daemon already running", "port", e.port)
 			return nil
@@ -361,17 +384,27 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context, modelID, servedNam
 		if err := e.stopDaemonLocked(ctx); err != nil {
 			return fmt.Errorf("failed to restart oMLX daemon for alias %q: %w", servedName, err)
 		}
+	} else if e.process != nil && e.daemonExitedLocked() {
+		// It already exited, so it holds no port and there is nothing to
+		// stop: start the replacement now and reload what it served.
+		e.logger.Warnw("oMLX daemon the agent started has exited; starting a replacement",
+			"pid", e.process.Pid, "status", e.processExit.status(), "port", e.port)
+		e.process = nil
+		e.processExit = nil
+		replacedHung = true
 	} else if e.process != nil {
 		e.logger.Warnw("oMLX daemon is not answering /health; stopping it before replacing it",
-			"pid", e.process.Pid, "port", e.port)
+			"pid", e.process.Pid, "port", e.port, "failedProbes", max(e.unhealthyProbes, 1))
 		if err := e.stopDaemonLocked(ctx); err != nil {
 			return fmt.Errorf("failed to stop unresponsive oMLX daemon: %w", err)
 		}
 		replacedHung = true
-	} else {
+	} else if e.portAcceptsConnections() {
 		e.logger.Warnw("oMLX port is not answering and no daemon the agent started is tracked; "+
 			"starting a daemon anyway",
 			"port", e.port)
+	} else {
+		e.logger.Infow("no oMLX daemon is running on this port yet; starting one", "port", e.port)
 	}
 
 	e.logger.Infow("starting oMLX daemon", "bin", e.omlxBin, "modelDir", e.modelDir, "port", e.port)
@@ -393,6 +426,7 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context, modelID, servedNam
 	}
 
 	e.process = cmd.Process
+	e.processExit = watchChild(cmd)
 	e.logger.Infow("oMLX daemon started", "pid", cmd.Process.Pid)
 
 	// Wait for oMLX to become healthy. On real hardware the first model load
@@ -401,6 +435,7 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context, modelID, servedNam
 		// Best-effort kill if startup failed
 		_ = cmd.Process.Kill()
 		e.process = nil
+		e.processExit = nil
 		return fmt.Errorf("oMLX daemon failed to become healthy after %s: %w",
 			e.startupTimeout, err)
 	}
@@ -444,6 +479,16 @@ func (e *OMLXExecutor) registerAliasLocked(modelID, servedName string) (bool, er
 // stopDaemonLocked waits for the daemon to exit on SIGTERM before killing it.
 const omlxStopTimeout = 15 * time.Second
 
+// omlxUnhealthyProbes and omlxUnhealthyProbeInterval are the defaults for
+// OMLXExecutor.unhealthyProbes and unhealthyProbeInterval: three consecutive
+// failed /health probes, 5s apart, before a live daemon is replaced. With the
+// 10s probe timeout that is at most about 30s more than a single probe, paid
+// only on the unhealthy path.
+const (
+	omlxUnhealthyProbes        = 3
+	omlxUnhealthyProbeInterval = 5 * time.Second
+)
+
 // omlxReloadTimeout bounds how long reloadServedModelsLocked waits for one
 // model to report loaded on the replacement daemon, matching the per-model
 // wait StartProcess uses for a fresh start.
@@ -458,13 +503,10 @@ const omlxReloadBudget = 2 * time.Minute
 // no longer answers /health. Must be called with e.mu held and e.process set.
 func (e *OMLXExecutor) stopDaemonLocked(ctx context.Context) error {
 	p := e.process
+	exited := e.processExit.done
 	e.process = nil
+	e.processExit = nil
 
-	exited := make(chan struct{})
-	go func() {
-		_, _ = p.Wait()
-		close(exited)
-	}()
 	_ = p.Signal(syscall.SIGTERM)
 	select {
 	case <-exited:
@@ -482,6 +524,55 @@ func (e *OMLXExecutor) stopDaemonLocked(ctx context.Context) error {
 	return pollUntil(ctx, 100*time.Millisecond, e.stopTimeout, func(ctx context.Context) (bool, error) {
 		return !e.isHealthy(ctx), nil
 	})
+}
+
+// daemonExitedLocked reports whether the daemon this executor started has
+// exited. Must be called with e.mu held and e.process set.
+func (e *OMLXExecutor) daemonExitedLocked() bool {
+	select {
+	case <-e.processExit.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// reprobeHealthLocked re-probes /health after a failed probe, up to
+// unhealthyProbes probes in all, unhealthyProbeInterval apart. It reports
+// true as soon as one probe succeeds, and false once every probe failed or
+// the daemon exited meanwhile. Must be called with e.mu held and e.process
+// set.
+func (e *OMLXExecutor) reprobeHealthLocked(ctx context.Context) (bool, error) {
+	for probe := 2; probe <= e.unhealthyProbes; probe++ {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-e.processExit.done:
+			return false, nil
+		case <-time.After(e.unhealthyProbeInterval):
+		}
+		if e.isHealthy(ctx) {
+			e.logger.Infow("oMLX daemon answered /health on a recheck; keeping it",
+				"pid", e.process.Pid, "failedProbes", probe-1)
+			return true, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// portAcceptsConnections reports whether something accepts TCP connections
+// on the daemon port, which tells a foreign process holding the port apart
+// from a port nothing listens on yet.
+func (e *OMLXExecutor) portAcceptsConnections() bool {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", e.port), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // reloadServedModelsLocked re-loads on the fresh daemon every model the
