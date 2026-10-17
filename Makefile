@@ -156,6 +156,18 @@ test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites
 gate: controller-gen golangci-lint setup-envtest ## Agent gate: regen + drift check, gofmt check, vet, then lint-all and tests in parallel.
 	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" ./scripts/gate.sh
 
+# BASE_REF is the ref test-affected diffs against. Fork contributors:
+# override with BASE_REF=origin/main.
+BASE_REF ?= upstream/main
+
+# Tests only the packages changed since BASE_REF (committed, staged,
+# unstaged and untracked) plus every package that depends on them, with the
+# gate's fixed seed so repeat runs hit go's test cache. go.mod/go.sum changes
+# select everything; no Go change selects nothing and exits 0.
+.PHONY: test-affected
+test-affected: manifests generate setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" ./scripts/test-affected.sh
+
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
 	helm lint charts/llmkube charts/foreman
