@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,7 +88,11 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 
 	var mu sync.Mutex
 	loaded := map[string]bool{}
+	var hung atomic.Bool
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /__hang", func(w http.ResponseWriter, _ *http.Request) {
+		hung.Store(true)
+	})
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {})
 	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		data := make([]map[string]string, 0, len(dirs))
@@ -132,7 +137,17 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 	if err != nil {
 		os.Exit(2)
 	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// Once hung the daemon keeps the port but answers nothing, the shape of
+	// a daemon whose event loop is stuck. The flag is per-process, so a
+	// replacement daemon starts unhung.
+	gated := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hung.Load() {
+			time.Sleep(24 * time.Hour)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	srv := &http.Server{Handler: gated, ReadHeaderTimeout: 5 * time.Second}
 	_ = srv.Serve(ln)
 	os.Exit(0)
 }
