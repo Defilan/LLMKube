@@ -86,6 +86,24 @@ expect_line 'gate: lint +SKIPPED' "vet failure must skip the lint step"
 expect_line 'gate: test +SKIPPED' "vet failure must skip the test step"
 [ ! -e "$GATE_LOG_DIR/lint.log" ] || fail "skipped lint step must not write a log"
 
+# A fmt failure must short-circuit the parallel phase the same way.
+repo=$(new_repo)
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=false GATE_VET_CMD=true \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 1 "fmt failure must fail the gate"
+expect_line 'gate: fmt +FAIL' "summary must report the fmt failure"
+expect_line 'gate: lint +SKIPPED' "fmt failure must skip the lint step"
+expect_line 'gate: test +SKIPPED' "fmt failure must skip the test step"
+
+# A regen failure must skip drift and everything after it.
+repo=$(new_repo)
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=false GATE_FMT_CMD=true GATE_VET_CMD=true \
+	GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 1 "regen failure must fail the gate"
+expect_line 'gate: regen +FAIL' "summary must report the regen failure"
+expect_line 'gate: drift +SKIPPED' "regen failure must skip the drift step"
+[ ! -e "$GATE_LOG_DIR/drift.log" ] || fail "skipped drift step must not write a log"
+
 # Regeneration drift: a stub regen that creates a file must fail the gate and
 # name the file.
 repo=$(new_repo)

@@ -18,7 +18,9 @@ limitations under the License.
 // a base ref: the packages the changed files belong to (committed, staged,
 // unstaged and untracked) plus every package whose dependency graph reaches
 // them, including test-only dependencies, via go list -deps -test.
-// scripts/test-affected.sh feeds the output to go test.
+// scripts/test-affected.sh feeds the output to go test. Renames report both
+// sides (--no-renames), so the package that loses a file to a git mv stays
+// selected.
 //
 // A change to go.mod, go.sum, go.work or go.work.sum selects every package,
 // as does a .go file that belongs to no listed package (its directory was
@@ -297,10 +299,14 @@ func testablePackage(p string) string {
 
 // changedFiles collects every changed path since the merge base: committed
 // changes, staged and unstaged working-tree changes, and untracked files.
+// --no-renames makes a rename report both its source and its destination, so
+// the package that lost the file is selected too; rename detection (on by
+// default) would list only the destination and silently skip the source
+// package's suite and its reverse dependencies.
 func changedFiles(root, mergeBase string) ([]string, error) {
 	specs := [][]string{
-		{"diff", "--name-only", mergeBase, "HEAD"},
-		{"diff", "--name-only", "HEAD"},
+		{"diff", "--no-renames", "--name-only", mergeBase, "HEAD"},
+		{"diff", "--no-renames", "--name-only", "HEAD"},
 		{"ls-files", "--others", "--exclude-standard"},
 	}
 	seen := map[string]bool{}

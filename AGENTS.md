@@ -137,11 +137,13 @@ A change is not done until all of these hold.
 - Once per round, before review: `make gate`. It regenerates manifests and
   DeepCopy and fails on uncommitted regeneration drift, checks gofmt without
   rewriting, runs `go vet`, then runs `make lint-all` and the full test suite
-  in parallel. Logs land in `/tmp/llmkube-gate` (override `GATE_DIR`); it
-  prints one summary line per step and exits nonzero if any step failed. One
-  command covers the fmt/vet/lint/test pre-commit gate and the lint-all
-  pre-push check. A rerun with no edits reports `(cached)` for the suites.
-  If staticcheck panics under your Go toolchain, set
+  in parallel. Logs land in `${TMPDIR:-/tmp}/llmkube-gate` (override
+  `GATE_DIR`); it prints one summary line per step and exits nonzero if any
+  step failed. One command covers the fmt/vet/lint/test pre-commit gate and
+  the lint-all pre-push check. A rerun with no edits reports `(cached)` for
+  the suites. The gate does not regenerate the Helm chart CRDs; run
+  `make chart-crds` separately when `api/v1alpha1` types change. If
+  staticcheck panics under your Go toolchain, set
   `LINT_GOTOOLCHAIN=<version>` (for example go1.26.9).
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and
   coverage profile, unchanged.

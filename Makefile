@@ -162,10 +162,11 @@ BASE_REF ?= upstream/main
 
 # Tests only the packages changed since BASE_REF (committed, staged,
 # unstaged and untracked) plus every package that depends on them, with the
-# gate's fixed seed so repeat runs hit go's test cache. go.mod/go.sum changes
+# gate's fixed seed so repeat runs hit go's test cache. The script runs the
+# regeneration itself, so it happens exactly once. go.mod/go.sum changes
 # select everything; no Go change selects nothing and exits 0.
 .PHONY: test-affected
-test-affected: manifests generate setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
+test-affected: setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
 	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" ./scripts/test-affected.sh
 
 .PHONY: test-chart

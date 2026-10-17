@@ -27,6 +27,7 @@ new_repo() {
 	mkdir -p "$REPO/a" "$REPO/b" "$REPO/c" "$REPO/d" "$REPO/p" "$REPO/q" "$REPO/test/e2e"
 	printf 'module example.com/m\n\ngo 1.26\n' >"$REPO/go.mod"
 	printf 'package b\n' >"$REPO/b/b.go"
+	printf 'package b\n\nfunc Util() {}\n' >"$REPO/b/util.go"
 	printf 'package a\n\nimport _ "example.com/m/b"\n' >"$REPO/a/a.go"
 	printf 'package c\n\nimport _ "example.com/m/a"\n' >"$REPO/c/c.go"
 	printf 'package d\n' >"$REPO/d/d.go"
@@ -86,6 +87,18 @@ new_repo
 printf 'package d\n' >"$REPO/d/extra.go"
 expect_pkgs "untracked file selects only its package" \
 	"example.com/m/d" "$(pkgs_of "$REPO")"
+
+# A rename must select the package that lost the file as well as the
+# package that gained it: rename detection reports only the destination,
+# which would silently skip the source package's suite.
+new_repo
+mkdir -p "$REPO/e"
+git -C "$REPO" mv b/util.go e/util.go
+expect_pkgs "rename selects source and destination packages" \
+	'example.com/m/a
+example.com/m/b
+example.com/m/c
+example.com/m/e' "$(pkgs_of)"
 
 # A go.mod change selects everything except test/e2e.
 new_repo
