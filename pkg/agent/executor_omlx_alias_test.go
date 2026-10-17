@@ -88,6 +88,7 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 
 	var mu sync.Mutex
 	loaded := map[string]bool{}
+	hits := map[string]int{}
 	var hung atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /__hang", func(w http.ResponseWriter, _ *http.Request) {
@@ -121,6 +122,9 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 			Model string `json:"model"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		mu.Lock()
+		hits[req.Model]++
+		mu.Unlock()
 		dir, ok := resolve(req.Model)
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -131,6 +135,26 @@ func TestFakeOMLXDaemonProcess(t *testing.T) {
 		loaded[dir] = true
 		mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"model": req.Model, "object": "chat.completion"})
+	})
+	// The unload route mirrors the executor's real target: a known, loaded
+	// model unloads with 200; an unknown or not-loaded model answers 404.
+	mux.HandleFunc("POST /v1/models/{model}/unload", func(w http.ResponseWriter, r *http.Request) {
+		model := r.PathValue("model")
+		mu.Lock()
+		defer mu.Unlock()
+		if !dirs[model] || !loaded[model] {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"detail": "Model '" + model + "' not found"})
+			return
+		}
+		loaded[model] = false
+	})
+	// Test-only: per-model chat completion counts, so tests can observe how
+	// often the executor warmed each model on this daemon process.
+	mux.HandleFunc("GET /__stats", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"chat_hits": hits})
 	})
 
 	ln, err := net.Listen("tcp", "127.0.0.1:"+port)

@@ -144,12 +144,13 @@ func omlxModelLoaded(t *testing.T, port int, modelID string) bool {
 	return false
 }
 
-// omlxServedContains reports whether the executor tracks modelID as served.
-func omlxServedContains(t *testing.T, e *OMLXExecutor, modelID string) bool {
+// omlxModelATracked reports whether the executor tracks the fixture's
+// Model-A as served.
+func omlxModelATracked(t *testing.T, e *OMLXExecutor) bool {
 	t.Helper()
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	_, ok := e.servedModels[modelID]
+	_, ok := e.servedModels["Model-A"]
 	return ok
 }
 
@@ -399,10 +400,12 @@ func TestOMLXStopHonorsContextCancellation(t *testing.T) {
 	waitPIDGone(t, hungPID)
 }
 
-// TestOMLXUnloadTrackingSurvivesHungDaemon: an unload the daemon could not
-// answer leaves the model tracked, because the hung daemon may still be
-// serving it and a replacement must reload it; an unload the daemon answered
-// removes it from the set even when the unload itself failed.
+// TestOMLXUnloadTrackingSurvivesHungDaemon pins the served-set rule: a
+// confirmed unload (200) removes the model, anything else leaves it tracked.
+// A 404 for an unknown or not-loaded model and a hung daemon that never
+// answers all mean the daemon may still be serving the model, so a
+// replacement must reload it; only the agent's own lifecycle decision
+// (ForgetServedModel) removes a model without a confirmed unload.
 func TestOMLXUnloadTrackingSurvivesHungDaemon(t *testing.T) {
 	e, modelPath := hungOMLXFixture(t, "Model-A")
 	cfg := ExecutorConfig{Name: "a", Namespace: "ns", ModelSource: modelPath,
@@ -411,21 +414,39 @@ func TestOMLXUnloadTrackingSurvivesHungDaemon(t *testing.T) {
 		t.Fatalf("StartProcess: %v", err)
 	}
 
-	// The fake daemon has no unload route, so it answers 404: the model
-	// leaves the set although the unload errored.
-	if err := e.UnloadModel(context.Background(), "Model-A"); err == nil {
-		t.Fatal("unload of a non-loaded model returned nil")
+	// The fake daemon's unload route confirms the unload: the model leaves
+	// the set.
+	if err := e.UnloadModel(context.Background(), "Model-A"); err != nil {
+		t.Fatalf("confirmed unload: %v", err)
 	}
-	if omlxServedContains(t, e, "Model-A") {
-		t.Error("model still tracked after the daemon answered its unload")
+	if omlxModelATracked(t, e) {
+		t.Error("model still tracked after the daemon confirmed its unload")
 	}
 
 	// StartProcess tracks the model again on success.
 	if _, err := e.StartProcess(context.Background(), cfg); err != nil {
 		t.Fatalf("second StartProcess: %v", err)
 	}
-	if !omlxServedContains(t, e, "Model-A") {
+	if !omlxModelATracked(t, e) {
 		t.Fatal("model not tracked after a successful start")
+	}
+
+	// Unload the model behind the executor's back, so it is tracked but not
+	// loaded: the daemon refuses its unload with 404, and a refused unload
+	// must not drop the tracked model.
+	resp, err := http.Post(fmt.Sprintf("http://127.0.0.1:%d/v1/models/Model-A/unload", e.port), "", nil)
+	if err != nil {
+		t.Fatalf("direct unload: %v", err)
+	}
+	drainAndClose(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("direct unload of a loaded model = %d, want 200", resp.StatusCode)
+	}
+	if err := e.UnloadModel(context.Background(), "Model-A"); err == nil {
+		t.Fatal("unload of a not-loaded model returned nil")
+	}
+	if !omlxModelATracked(t, e) {
+		t.Error("tracked model dropped when its unload was refused with 404")
 	}
 
 	// Against a hung daemon the unload never gets an answer: the model must
@@ -434,7 +455,98 @@ func TestOMLXUnloadTrackingSurvivesHungDaemon(t *testing.T) {
 	if err := e.UnloadModel(context.Background(), "Model-A"); err == nil {
 		t.Fatal("unload against a hung daemon returned nil")
 	}
-	if !omlxServedContains(t, e, "Model-A") {
+	if !omlxModelATracked(t, e) {
 		t.Error("model dropped from the served set while the hung daemon may still serve it")
+	}
+}
+
+// TestOMLXTerminalStopForgetsServedModel: a terminal stop (delete,
+// scale-to-zero, spec teardown) records the agent's decision even when the
+// unload did not reach a hung daemon, so a later daemon replacement does not
+// reload a model whose service is gone. The health restart's stop passes
+// forgetServed=false and keeps the model tracked for exactly that reload.
+func TestOMLXTerminalStopForgetsServedModel(t *testing.T) {
+	e, modelPath := hungOMLXFixture(t, "Model-A")
+	cfg := ExecutorConfig{Name: "a", Namespace: "ns", ModelSource: modelPath,
+		ModelName: "Model-A", ServedModelName: "Model-A"}
+	if _, err := e.StartProcess(context.Background(), cfg); err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	a := &MetalAgent{
+		executors: map[string]ProcessExecutor{runtimeOMLX: e},
+		logger:    newNopLogger(),
+	}
+
+	hangOMLX(t, e.port)
+
+	proc := &ManagedProcess{Runtime: runtimeOMLX, ModelID: "Model-A"}
+
+	// The health-restart shape: the unload fails against the hung daemon and
+	// the model stays tracked, so the replacement reloads it.
+	if err := a.stopManagedProcess(context.Background(), proc, false); err == nil {
+		t.Fatal("stop against a hung daemon returned nil")
+	}
+	if !omlxModelATracked(t, e) {
+		t.Fatal("health-restart stop dropped the model the replacement must reload")
+	}
+
+	// The terminal shape: the model leaves the set although the unload still
+	// did not reach the hung daemon.
+	if err := a.stopManagedProcess(context.Background(), proc, true); err == nil {
+		t.Fatal("terminal stop against a hung daemon returned nil")
+	}
+	if omlxModelATracked(t, e) {
+		t.Error("deleted model stayed tracked; a later replacement would reload a model no service wants")
+	}
+}
+
+// omlxChatHits reads the fake daemon's per-model chat completion counts.
+func omlxChatHits(t *testing.T, port int) map[string]int {
+	t.Helper()
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/__stats", port))
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	defer drainAndClose(resp)
+	var stats struct {
+		ChatHits map[string]int `json:"chat_hits"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	return stats.ChatHits
+}
+
+// TestOMLXReloadSkipsRequestingModel: the caller that triggered the
+// replacement loads its own model right after ensureOMLXRunning returns, so
+// the reload must not warm it a second time; the other served models are
+// triggered by the reload.
+func TestOMLXReloadSkipsRequestingModel(t *testing.T) {
+	e, modelPath := hungOMLXFixture(t, "Model-A")
+	bPath := addOMLXModelDir(t, modelPath, "Model-B")
+	cfgA := ExecutorConfig{Name: "a", Namespace: "ns", ModelSource: modelPath,
+		ModelName: "Model-A", ServedModelName: "Model-A"}
+	cfgB := ExecutorConfig{Name: "b", Namespace: "ns", ModelSource: bPath,
+		ModelName: "Model-B", ServedModelName: "Model-B"}
+	if _, err := e.StartProcess(context.Background(), cfgA); err != nil {
+		t.Fatalf("first StartProcess A: %v", err)
+	}
+	if _, err := e.StartProcess(context.Background(), cfgB); err != nil {
+		t.Fatalf("first StartProcess B: %v", err)
+	}
+
+	hangOMLX(t, e.port)
+
+	if _, err := e.StartProcess(context.Background(), cfgA); err != nil {
+		t.Fatalf("StartProcess against the hung daemon: %v", err)
+	}
+
+	hits := omlxChatHits(t, e.port)
+	if hits["Model-A"] != 1 {
+		t.Errorf("Model-A warmed %d times on the replacement, want 1 (the caller's own warmup; the reload must skip it)",
+			hits["Model-A"])
+	}
+	if hits["Model-B"] == 0 {
+		t.Error("Model-B was never triggered by the reload")
 	}
 }

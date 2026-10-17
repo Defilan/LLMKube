@@ -241,13 +241,14 @@ func (e *OMLXExecutor) UnloadModel(ctx context.Context, modelID string) error {
 	}
 	defer drainAndClose(resp)
 
-	// The daemon answered, so its answer is authoritative: the model is no
-	// longer served, whether or not the unload succeeded.
-	e.forgetServedModel(modelID)
-
 	if resp.StatusCode != http.StatusOK {
+		// The daemon answered but did not confirm the unload, so the model
+		// may still be resident: it stays tracked.
 		return fmt.Errorf("oMLX unload returned status %d for model %s", resp.StatusCode, modelID)
 	}
+
+	// The daemon confirmed the unload; the model is no longer served.
+	e.ForgetServedModel(modelID)
 
 	e.logger.Infow("unloaded oMLX model", "modelID", modelID)
 	return nil
@@ -405,7 +406,7 @@ func (e *OMLXExecutor) ensureOMLXRunning(ctx context.Context, modelID, servedNam
 	}
 
 	if replacedHung {
-		e.reloadServedModelsLocked(ctx)
+		e.reloadServedModelsLocked(ctx, modelID)
 	}
 
 	return nil
@@ -448,6 +449,11 @@ const omlxStopTimeout = 15 * time.Second
 // wait StartProcess uses for a fresh start.
 const omlxReloadTimeout = 30 * time.Second
 
+// omlxReloadBudget bounds the whole reload of a replacement daemon. A model
+// the budget cuts off stays unloaded until its next request or its
+// service's next restart.
+const omlxReloadBudget = 2 * time.Minute
+
 // stopDaemonLocked stops the daemon this executor started and waits until it
 // no longer answers /health. Must be called with e.mu held and e.process set.
 func (e *OMLXExecutor) stopDaemonLocked(ctx context.Context) error {
@@ -479,17 +485,27 @@ func (e *OMLXExecutor) stopDaemonLocked(ctx context.Context) error {
 }
 
 // reloadServedModelsLocked re-loads on the fresh daemon every model the
-// replaced daemon served. Best-effort: a model that fails to reload stays
-// unloaded until its next request or its service's next restart, so a
-// failure here must not fail the replacement that already succeeded. Must be
-// called with e.mu held, right after a replacement daemon became healthy.
-func (e *OMLXExecutor) reloadServedModelsLocked(ctx context.Context) {
+// replaced daemon served, except skip: the caller that triggered the
+// replacement loads its own model right after this returns. Best-effort: a
+// model that fails to reload stays unloaded until its next request or its
+// service's next restart, so a failure here must not fail the replacement
+// that already succeeded. Must be called with e.mu held, right after a
+// replacement daemon became healthy.
+func (e *OMLXExecutor) reloadServedModelsLocked(ctx context.Context, skip string) {
 	if len(e.servedModels) == 0 {
 		return
 	}
 	e.logger.Infow("reloading models served by the replaced oMLX daemon",
 		"count", len(e.servedModels), "port", e.port)
+	// The reload holds e.mu; the budget keeps a host serving many models
+	// from stalling every other oMLX start for the sum of the per-model
+	// waits.
+	ctx, cancel := context.WithTimeout(ctx, omlxReloadBudget)
+	defer cancel()
 	for modelID := range e.servedModels {
+		if modelID == skip {
+			continue
+		}
 		if err := e.triggerModelLoad(ctx, modelID); err != nil {
 			e.logger.Warnw("failed to trigger oMLX model reload after daemon replacement",
 				"modelID", modelID, "error", err)
@@ -502,8 +518,11 @@ func (e *OMLXExecutor) reloadServedModelsLocked(ctx context.Context) {
 	}
 }
 
-// forgetServedModel drops modelID from the set of models the daemon serves.
-func (e *OMLXExecutor) forgetServedModel(modelID string) {
+// ForgetServedModel drops modelID from the set of models the daemon serves.
+// It is the agent's lifecycle decision (a delete, scale-to-zero or spec
+// teardown) recorded even when the unload did not reach a hung daemon, so a
+// later daemon replacement does not reload a model nothing wants.
+func (e *OMLXExecutor) ForgetServedModel(modelID string) {
 	e.mu.Lock()
 	delete(e.servedModels, modelID)
 	e.mu.Unlock()
