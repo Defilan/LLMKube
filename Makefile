@@ -169,12 +169,12 @@ BASE_REF ?= upstream/main
 test-affected: setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
 	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" ./scripts/test-affected.sh
 
-# The gate and test-affected are shell scripts, so go test never runs their
-# regression tests, and no workflow runs them yet: make test-scripts is the
-# only caller. Run it after editing any of the three scripts or
+# The gate, test-affected and seed-check scripts are shell, so go test never
+# runs their regression tests: make test-scripts does, locally and in CI
+# (.github/workflows/test.yml). Run it after editing any of those scripts or
 # cmd/affected-packages.
 .PHONY: test-scripts
-test-scripts: ## Run the shell regression tests for the gate, test-affected and affected-packages scripts.
+test-scripts: ## Run the shell regression tests (gate, test-affected, affected-packages, GINKGO_SEED single evaluation).
 	@bash scripts/gate_test.sh
 	@bash scripts/test-affected_test.sh
 	@bash scripts/affected-packages_test.sh

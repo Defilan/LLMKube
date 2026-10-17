@@ -24,9 +24,11 @@ limitations under the License.
 //
 // A change to go.mod, go.sum, go.work or go.work.sum selects every package,
 // as does a .go file that belongs to no listed package (its directory was
-// deleted) or any package go list reports an error for (the tree does not
-// compile). .go files under test/e2e are //go:build e2e gated, so go list
-// never reports them; changing one selects nothing. Changes outside Go
+// deleted, or it is a stray file such as an untracked scratch main.go where
+// no package lives) or any package go list reports an error for (the tree
+// does not compile). The run-everything fallback is announced on stderr.
+// .go files under test/e2e are //go:build e2e gated, so go list never
+// reports them; changing one selects nothing. Changes outside Go
 // packages select nothing. test/e2e is never printed, matching make test.
 //
 // Usage:
@@ -221,14 +223,16 @@ func packageDirs(nodes []node, root string) map[string][]*node {
 // isE2ETreePath reports whether a repo-relative path is inside test/e2e,
 // whose .go files are all //go:build e2e gated: go list never reports them
 // in the default build, so a change there selects nothing instead of every
-// package.
+// package. test/e2e is the only build-tag-gated tree today; a new one must be
+// added here, or every change to it falls back to selecting every package.
 func isE2ETreePath(p string) bool {
 	return strings.HasPrefix(p, "test/e2e/")
 }
 
 // mapFilesToPackages maps changed files to package directories by longest
 // matching directory prefix. It reports whether any .go file matched no
-// package at all: its directory was deleted, so nothing can be narrowed.
+// package at all (a deleted package directory or a stray file), in which
+// case nothing can be narrowed.
 func mapFilesToPackages(files []string, dirs []string) (selected map[string]bool, unmappedGo bool) {
 	selected = map[string]bool{}
 	for _, f := range files {

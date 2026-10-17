@@ -136,13 +136,23 @@ $(cat "$GATE_LOG_DIR/drift.log")"
 expect_line 'gate: lint +SKIPPED' "drift must skip the lint step"
 expect_line 'gate: test +SKIPPED' "drift must skip the test step"
 
-# A file that was already modified before regeneration, and that
-# regeneration leaves identical, is not drift.
+# A pre-existing untracked file is not drift.
 repo=$(new_repo)
 echo gen >"$repo/gen.yaml"
 run_gate GATE_ROOT="$repo" GATE_REGEN_CMD=true GATE_FMT_CMD=true GATE_VET_CMD=true \
 	GATE_LINT_CMD=true GATE_TEST_CMD=true
-expect_rc 0 "an already-modified file that regeneration leaves identical is not drift"
+expect_rc 0 "a pre-existing untracked file is not drift"
+
+# A tracked file that was already modified before regeneration, and that
+# regeneration rewrites to the same content, is not drift.
+repo=$(new_repo)
+echo v1 >"$repo/gen.yaml"
+git -C "$repo" add gen.yaml
+git -C "$repo" commit -q --no-verify -m gen
+echo v2 >"$repo/gen.yaml"
+run_gate GATE_ROOT="$repo" GATE_REGEN_CMD='echo v2 >gen.yaml' GATE_FMT_CMD=true \
+	GATE_VET_CMD=true GATE_LINT_CMD=true GATE_TEST_CMD=true
+expect_rc 0 "an already-modified tracked file that regeneration rewrites identically is not drift"
 
 # Lint and tests must overlap in time: the stubs record their start and end
 # epochs, and each step must still be running when the other finishes.

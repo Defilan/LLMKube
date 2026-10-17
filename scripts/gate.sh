@@ -81,12 +81,19 @@ lint_default() {
 	fi
 }
 
-test_cmd_default() {
+# test_default runs the suite directly, as scripts/test-affected.sh does, so
+# no path is re-parsed by eval. A failed envtest lookup fails the step with
+# its own message instead of running go test with empty KUBEBUILDER_ASSETS.
+test_default() {
 	: "${ENVTEST_K8S_VERSION:=$(go list -m -f '{{.Version}}' k8s.io/api | awk -F'[v.]' '{printf "1.%d", $3}')}"
 	local assets
-	assets="$("${ENVTEST_BIN:-bin/setup-envtest}" use "$ENVTEST_K8S_VERSION" --bin-dir "${BIN_DIR:-$PWD/bin}" -p path)"
-	printf 'KUBEBUILDER_ASSETS=%q GINKGO_SEED=%q go test $(go list ./... | grep -v %q)' \
-		"$assets" "$GINKGO_SEED" '/test/e2e$'
+	if ! assets="$("${ENVTEST_BIN:-bin/setup-envtest}" use "$ENVTEST_K8S_VERSION" --bin-dir "${BIN_DIR:-$PWD/bin}" -p path)" ||
+		[ -z "$assets" ]; then
+		echo "gate: setup-envtest found no assets for $ENVTEST_K8S_VERSION"
+		return 1
+	fi
+	# shellcheck disable=SC2046 # one argument per package, split on purpose
+	KUBEBUILDER_ASSETS="$assets" go test $(go list ./... | grep -v '/test/e2e$')
 }
 
 step_regen() { eval "$GATE_REGEN_CMD"; }
@@ -98,7 +105,7 @@ step_lint() {
 	if [ -n "$GATE_LINT_CMD" ]; then eval "$GATE_LINT_CMD"; else lint_default; fi
 }
 step_test() {
-	if [ -n "$GATE_TEST_CMD" ]; then eval "$GATE_TEST_CMD"; else eval "$(test_cmd_default)"; fi
+	if [ -n "$GATE_TEST_CMD" ]; then eval "$GATE_TEST_CMD"; else test_default; fi
 }
 
 run_logged() {

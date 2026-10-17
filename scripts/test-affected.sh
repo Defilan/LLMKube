@@ -64,4 +64,5 @@ fi
 : "${ENVTEST_BIN:=bin/setup-envtest}"
 : "${BIN_DIR:=$PWD/bin}"
 assets="$("$ENVTEST_BIN" use "$ENVTEST_K8S_VERSION" --bin-dir "$BIN_DIR" -p path)"
+# shellcheck disable=SC2086 # one argument per package, split on purpose
 KUBEBUILDER_ASSETS="$assets" GINKGO_SEED="$GINKGO_SEED" go test $pkgs

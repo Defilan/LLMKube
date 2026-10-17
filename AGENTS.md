@@ -149,13 +149,16 @@ A change is not done until all of these hold.
   `LINT_GOTOOLCHAIN=<version>` (for example go1.26.9).
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and
   coverage profile, unchanged.
-- Editing `scripts/gate.sh`, `scripts/test-affected.sh` or
-  `cmd/affected-packages` requires `make test-scripts`: go test never runs
-  the shell regression suites, and no CI workflow runs them yet, so
-  `make test-scripts` is the only guard.
+- Editing `scripts/gate.sh`, `scripts/test-affected.sh`,
+  `scripts/check-ginkgo-seed_test.sh` or `cmd/affected-packages` requires
+  `make test-scripts`: go test never runs the shell regression suites. CI
+  runs the same target.
 - The gate short-circuits: a failed regen, drift, fmt or vet step skips
   lint and tests (marked SKIPPED in the summary), so that round gets no
   lint or test signal until the failure is fixed and the gate reruns.
+  After an `api/v1alpha1` type change, the first `make gate` fails the drift
+  step by design: regeneration rewrote committed files. Commit the
+  regenerated output (and run `make chart-crds`), then rerun the gate.
 
 ## Commits
 
