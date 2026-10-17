@@ -714,8 +714,10 @@ spec:
                     format: int64
                     type: integer
                   keyLength:
-                    description: KeyLength is the per-head key dimension from the
-                      GGUF attention metadata.
+                    description: |-
+                      KeyLength is the per-head key dimension from the GGUF attention metadata.
+                      0 means the GGUF did not provide a usable scalar value; consumers treat
+                      it as unknown and derive it when needed.
                     format: int64
                     type: integer
                   layerCount:
@@ -739,8 +741,10 @@ spec:
                     format: int64
                     type: integer
                   valueLength:
-                    description: ValueLength is the per-head value dimension from
-                      the GGUF attention metadata.
+                    description: |-
+                      ValueLength is the per-head value dimension from the GGUF attention metadata.
+                      0 means the GGUF did not provide a usable scalar value; consumers treat
+                      it as unknown and derive it when needed.
                     format: int64
                     type: integer
                 type: object

@@ -1300,7 +1300,8 @@ func computeCacheKey(source string) string {
 
 // ggufMetadataFromParsed maps a parsed GGUF header into the status type. All
 // three parse paths (local file, remote http(s), s3) share it so a new field
-// is populated at every site by construction.
+// is populated at every site by construction; the local and remote paths are
+// pinned by test, the s3 path is covered only by this shared helper.
 func ggufMetadataFromParsed(parsed *gguf.GGUFFile) *inferencev1alpha1.GGUFMetadata {
 	return &inferencev1alpha1.GGUFMetadata{
 		Architecture:  parsed.Architecture(),

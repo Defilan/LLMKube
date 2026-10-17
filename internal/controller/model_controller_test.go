@@ -220,6 +220,69 @@ var _ = Describe("Model Controller Reconcile", func() {
 		Expect(updated.Status.LastUpdated).NotTo(BeNil())
 	})
 
+	// Accepted staleness for #2085: a Model whose Status.GGUF was written
+	// before the attention-shape fields existed keeps the embedding-width
+	// memory estimate until a re-download or a source change; the cache-hit
+	// path parses only when GGUF is nil, so it must not re-parse a populated
+	// one. A one-time status refresh is deliberately not part of this
+	// change, and no ticket tracks it yet.
+	It("keeps a populated GGUF status instead of re-parsing on the cache-hit path", func() {
+		modelName := "model-cached-legacy-gguf"
+		srcDir, err := os.MkdirTemp("", "llmkube-src-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(srcDir) }()
+		srcFile := filepath.Join(srcDir, "src-model.gguf")
+		Expect(os.WriteFile(srcFile, []byte("fake-model-data"), 0644)).To(Succeed())
+		source := fmt.Sprintf("file://%s", srcFile)
+
+		tempDir, err := os.MkdirTemp("", "llmkube-test-*")
+		Expect(err).NotTo(HaveOccurred())
+		defer func() { _ = os.RemoveAll(tempDir) }()
+
+		cacheKey := computeCacheKey(source)
+		modelDir := filepath.Join(tempDir, cacheKey)
+		Expect(os.MkdirAll(modelDir, 0755)).To(Succeed())
+		Expect(os.WriteFile(filepath.Join(modelDir, "model.gguf"), []byte("fake-model-data"), 0644)).To(Succeed())
+
+		model := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+			Spec:       inferencev1alpha1.ModelSpec{Source: source},
+		}
+		Expect(k8sClient.Create(ctx, model)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+		// Pre-upgrade status shape: GGUF populated, no attention-shape fields.
+		model.Status.GGUF = &inferencev1alpha1.GGUFMetadata{
+			Architecture:  "llama",
+			ModelName:     "legacy-parsed-model",
+			LayerCount:    32,
+			EmbeddingSize: 4096,
+			HeadCount:     32,
+		}
+		Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+		reconciler := &ModelReconciler{
+			Client:               k8sClient,
+			Scheme:               k8sClient.Scheme(),
+			StoragePath:          tempDir,
+			AllowedHostPathRoots: testLocalRoots,
+		}
+		result, err := reconciler.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: modelName, Namespace: "default"},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		updated := &inferencev1alpha1.Model{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: modelName, Namespace: "default"}, updated)).To(Succeed())
+		Expect(updated.Status.Phase).To(Equal(PhaseReady))
+		Expect(updated.Status.GGUF).NotTo(BeNil())
+		Expect(updated.Status.GGUF.LayerCount).To(Equal(uint64(32)))
+		Expect(updated.Status.GGUF.HeadCountKV).To(Equal(uint64(0)))
+		Expect(updated.Status.GGUF.KeyLength).To(Equal(uint64(0)))
+		Expect(updated.Status.GGUF.ValueLength).To(Equal(uint64(0)))
+	})
+
 	// HTTPS sources deferred to the workload init container — see issue #363.
 	// The controller does NOT download HTTP(S) sources because its filesystem
 	// (StoragePath) lives on the operator-namespace cache PVC, which Pods in

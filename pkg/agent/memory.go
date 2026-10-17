@@ -111,14 +111,15 @@ type EstimateOptions struct {
 	// value, and the historical embedding-width formula is used instead.
 	HeadCountKV uint64
 
-	// KeyLength is the per-head key dimension. 0 means unknown: for grouped
-	// shapes (HeadCountKV < HeadCount) the estimate falls back unless both
-	// dims are explicit; for multi-head shapes it derives
-	// embeddingSize / HeadCount.
+	// KeyLength is the per-head key dimension. 0 means the GGUF did not
+	// provide a usable scalar value; a missing side is then derived as
+	// embeddingSize / HeadCount, which is llama.cpp's own default for an
+	// absent length. Only a HeadCount that does not divide embeddingSize
+	// falls back to the embedding-width formula.
 	KeyLength uint64
 
-	// ValueLength is the per-head value dimension. 0 means unknown; resolved
-	// like KeyLength.
+	// ValueLength is the per-head value dimension. 0 means the GGUF did not
+	// provide a usable scalar value; resolved like KeyLength.
 	ValueLength uint64
 }
 
@@ -177,32 +178,31 @@ func EstimateModelMemory(fileSizeBytes uint64, layerCount, embeddingSize uint64,
 // resolveKVShape resolves the per-layer KV geometry for the GQA-aware
 // estimate. ok is false whenever the GGUF did not provide a usable scalar
 // attention shape, in which case the caller must use the historical
-// embedding-width formula. Deriving head dims from embedding/headCount is
-// only exact for plain multi-head attention, where headCountKV == HeadCount
-// makes headCount * (embeddingSize/headCount) == embeddingSize hold by
-// algebra; for grouped-query shapes the per-layer KV cell is architecture
-// defined and a derived dim can under-estimate, so those require the GGUF's
-// explicit key_length and value_length. Array-valued head_count_kv (Jamba,
-// Nemotron-H) reads as 0 and takes the same fallback.
-func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen, valLen uint64, ok bool) {
-	if layerCount == 0 || opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount {
+// embedding-width formula. A missing key_length or value_length is derived
+// as embeddingSize/HeadCount because that is llama.cpp's own allocation
+// default for an absent length (llama-model.cpp sets n_embd_head_k_full to
+// n_embd/n_head and overrides it only when the GGUF carries the key), so the
+// derived cell is what the server allocates rather than a guess. Real files
+// split both ways: Llama 3.1 and Qwen 2.5 GGUFs carry head_count_kv but no
+// lengths, while Qwen 3 and Gemma 3 carry all three. Array-valued
+// head_count_kv (Jamba, Nemotron-H) reads as 0 and takes the same fallback.
+// Models that do fall back are over-charged by HeadCount/HeadCountKV, and
+// the hybrid archs named above are charged further because their layer
+// count includes the non-attention layers.
+func resolveKVShape(embeddingSize uint64, opts EstimateOptions) (kvHeads, keyLen, valLen uint64, ok bool) {
+	if opts.HeadCount == 0 || opts.HeadCountKV == 0 || opts.HeadCountKV > opts.HeadCount {
 		return 0, 0, 0, false
 	}
 	keyLen, valLen = opts.KeyLength, opts.ValueLength
-	if opts.HeadCountKV == opts.HeadCount && (keyLen == 0 || valLen == 0) {
-		if embeddingSize%opts.HeadCount != 0 {
-			return 0, 0, 0, false
-		}
-		derived := embeddingSize / opts.HeadCount
-		if keyLen == 0 {
-			keyLen = derived
-		}
-		if valLen == 0 {
-			valLen = derived
-		}
-	}
-	if keyLen == 0 || valLen == 0 {
+	if (keyLen == 0 || valLen == 0) && embeddingSize%opts.HeadCount != 0 {
 		return 0, 0, 0, false
+	}
+	derived := embeddingSize / opts.HeadCount
+	if keyLen == 0 {
+		keyLen = derived
+	}
+	if valLen == 0 {
+		valLen = derived
 	}
 	return opts.HeadCountKV, keyLen, valLen, true
 }
@@ -213,7 +213,8 @@ func resolveKVShape(layerCount, embeddingSize uint64, opts EstimateOptions) (kvH
 // come from cacheTypeBytesPerElement. With f16/f16 (the empty-string default)
 // it produces the same result as EstimateModelMemory. When the GGUF attention
 // shape is known (HeadCountKV between 1 and HeadCount, with both head dims
-// present explicitly or derivable via the multi-head-attention identity), the
+// present explicitly or derived as embeddingSize/HeadCount, which is
+// llama.cpp's own default for an absent length), the
 // KV term uses the grouped-query-attention shape
 // layers * headCountKV * context * (keyLength * bytesPerK + valueLength * bytesPerV)
 // instead; that is several times smaller for GQA models and identical to the
@@ -231,10 +232,11 @@ func EstimateModelMemoryWithOptions(
 		return fallbackEstimate(fileSizeBytes)
 	}
 
-	// contextSize <= 0 routes to the legacy branch, which already degrades
-	// gracefully (a zero context yields a zero KV term); guarding here keeps
-	// the divisions below well-defined for any caller.
-	if kvHeads, keyLen, valLen, ok := resolveKVShape(layerCount, embeddingSize, opts); ok && contextSize > 0 {
+	// contextSize == 0 routes to the legacy branch, which yields a zero KV
+	// term for it; a negative value wraps in the legacy uint64 conversion
+	// and lands in the overflow fallback. Guarding here keeps the divisions
+	// below well-defined for any caller.
+	if kvHeads, keyLen, valLen, ok := resolveKVShape(embeddingSize, opts); ok && contextSize > 0 {
 		ctx := uint64(contextSize) //nolint:gosec // G115: contextSize is CRD-validated ≥128 upstream
 		base := layerCount * kvHeads
 		if base/layerCount != kvHeads {

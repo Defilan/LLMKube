@@ -421,10 +421,14 @@ type GGUFMetadata struct {
 	HeadCountKV uint64 `json:"headCountKV,omitempty"`
 
 	// KeyLength is the per-head key dimension from the GGUF attention metadata.
+	// 0 means the GGUF did not provide a usable scalar value; consumers treat
+	// it as unknown and derive it when needed.
 	// +optional
 	KeyLength uint64 `json:"keyLength,omitempty"`
 
 	// ValueLength is the per-head value dimension from the GGUF attention metadata.
+	// 0 means the GGUF did not provide a usable scalar value; consumers treat
+	// it as unknown and derive it when needed.
 	// +optional
 	ValueLength uint64 `json:"valueLength,omitempty"`
 

@@ -240,18 +240,29 @@ func TestEstimateModelMemoryWithOptions_GQAShape(t *testing.T) {
 			wantKV: kvLegacy,
 		},
 		{
-			// Deriving head dims is only exact when kv heads equal head
-			// count; a grouped shape without explicit dims must fall back.
-			name:       "kv heads below headCount without explicit dims falls back",
+			// Real Llama 3.1 8B GGUFs carry head_count_kv but no key/value
+			// lengths; the derived dims (4096/32 = 128) are llama.cpp's own
+			// allocation default for an absent length, so the GQA term is
+			// exact for the issue's flagship example.
+			name:       "llama-3.1-8B real-file shape (lengths absent) derives head dims",
 			layerCount: 32, embedSize: 4096,
 			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8},
-			wantKV: kvLegacy,
+			wantKV: kvGQA,
 		},
 		{
-			name:       "kv heads below headCount with only the value length present falls back",
+			// A missing key length derives while an explicit value length
+			// stands: llama.cpp defaults each side independently.
+			name:       "key length absent derives, value length present",
 			layerCount: 32, embedSize: 4096,
 			opts:   EstimateOptions{HeadCount: 32, HeadCountKV: 8, ValueLength: 128},
-			wantKV: kvLegacy,
+			wantKV: kvGQA,
+		},
+		{
+			// Real Qwen 2.5 7B GGUFs: heads 28, kv heads 4, no lengths.
+			name:       "qwen2.5-7B real-file shape (lengths absent) derives head dims",
+			layerCount: 28, embedSize: 3584,
+			opts:   EstimateOptions{HeadCount: 28, HeadCountKV: 4},
+			wantKV: 7516192768, // 28 * 131072 * 4 * 128 * 4
 		},
 		{
 			// The multi-head-attention identity: with kv heads equal to head
