@@ -114,8 +114,11 @@ type EstimateOptions struct {
 	// KeyLength is the per-head key dimension. 0 means the GGUF did not
 	// provide a usable scalar value; a missing side is then derived as
 	// embeddingSize / HeadCount, which is llama.cpp's own default for an
-	// absent length. Only a HeadCount that does not divide embeddingSize
-	// falls back to the embedding-width formula.
+	// absent length. The embedding-width formula applies when the GGUF has
+	// no scalar head count, no KV head count, more KV heads than attention
+	// heads, or a missing length while HeadCount does not divide
+	// embeddingSize; with both lengths explicit a non-dividing HeadCount
+	// still charges the head dims.
 	KeyLength uint64
 
 	// ValueLength is the per-head value dimension. 0 means the GGUF did not
