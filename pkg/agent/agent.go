@@ -2088,63 +2088,75 @@ func (a *MetalAgent) runHeartbeatLoop(ctx context.Context) {
 	}
 }
 
-// Shutdown gracefully shuts down all running processes. It uses each
-// process's Runtime field to pick the correct executor from the agent's
-// executor registry (#525).
+// Shutdown stops the agent's own work. Engines and their records are left in
+// place: they keep serving and the next agent process adopts them (#2079).
+// oMLX models are the exception until the oMLX daemon can be adopted: they are
+// unloaded as before, since the daemon dies with the agent's process group.
+// StopEngines is the explicit stop.
 func (a *MetalAgent) Shutdown(ctx context.Context) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	// No health restart may start an engine after shutdown.
 	for key := range a.restarts {
 		a.cancelRestartLocked(key)
 	}
-
-	a.logger.Infow("cleaning up running processes", "count", len(a.processes))
-
-	var shutdownErrors []error
-
-	for key, process := range a.processes {
-		// Pick the executor that matches the process's runtime.
-		exec := a.executors[process.Runtime]
-		if exec == nil {
-			// Fallback to the default executor if the runtime is unknown.
-			exec = a.executors[runtimeLlamaServer]
+	var omlx []*ManagedProcess
+	for _, p := range a.processes {
+		if p.Runtime == runtimeOMLX {
+			omlx = append(omlx, p)
 		}
+	}
+	kept := len(a.processes) - len(omlx)
+	a.mu.Unlock()
 
-		// For shared-daemon runtimes (oMLX, Ollama), unload each model instead of
-		// killing the daemon.
-		if ollama, ok := exec.(*OllamaExecutor); ok && process.ModelID != "" {
-			if err := ollama.UnloadModel(ctx, process.ModelID); err != nil {
-				shutdownErrors = append(shutdownErrors,
-					fmt.Errorf("failed to unload Ollama model %s: %w", key, err))
-				continue
+	var errs []error
+	for _, p := range omlx {
+		if err := a.stopManagedProcess(ctx, p, false); err != nil && !engineStopped(err) {
+			errs = append(errs, fmt.Errorf("unload oMLX model %s/%s: %w", p.Namespace, p.Name, err))
+			continue // the model may still be loaded: keep its record
+		}
+		a.removeEngineRecord(p)
+	}
+	a.logger.Infow("agent stopping; engines keep running for the next agent process to adopt", "engines", kept)
+	return errors.Join(errs...)
+}
+
+// StopEngines stops every engine this agent tracks: it withdraws the endpoint
+// (best effort), stops the engine with the executor that matches its runtime
+// (or the group of an adopted one), and removes the record of each engine that
+// is confirmed stopped. Unlike Shutdown, nothing is left for a later agent.
+func (a *MetalAgent) StopEngines(ctx context.Context) error {
+	a.mu.Lock()
+	for key := range a.restarts {
+		a.cancelRestartLocked(key)
+	}
+	procs := make([]*ManagedProcess, 0, len(a.processes))
+	for _, p := range a.processes {
+		procs = append(procs, p)
+	}
+	a.mu.Unlock()
+
+	a.logger.Infow("stopping all engines", "count", len(procs))
+
+	var errs []error
+	for _, p := range procs {
+		if a.registry != nil {
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Namespace: p.Namespace, Name: p.Name},
 			}
-		} else if omlx, ok := exec.(*OMLXExecutor); ok && process.ModelID != "" {
-			if err := omlx.UnloadModel(ctx, process.ModelID); err != nil {
-				shutdownErrors = append(shutdownErrors,
-					fmt.Errorf("failed to unload oMLX model %s: %w", key, err))
-				continue
-			}
-		} else {
-			if err := exec.StopProcess(process.PID); err != nil {
-				shutdownErrors = append(shutdownErrors,
-					fmt.Errorf("failed to stop %s: %w", key, err))
-				if !engineStopped(err) {
-					continue // the engine may still run: keep its record
-				}
+			if _, err := a.registry.WithdrawEndpointIfPresent(ctx, isvc); err != nil {
+				a.logger.Warnw("failed to withdraw endpoint",
+					"namespace", p.Namespace, "name", p.Name, "error", err)
 			}
 		}
-		// Reached only when the engine was stopped or unloaded: a stop that
-		// failed with the engine possibly alive, or a failed unload, keeps its record.
-		a.removeEngineRecord(process)
+		if err := a.stopManagedProcess(ctx, p, false); err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop %s/%s: %w", p.Namespace, p.Name, err))
+			if !engineStopped(err) {
+				continue // the engine may still run: keep its record
+			}
+		}
+		a.removeEngineRecord(p)
 	}
-
-	if len(shutdownErrors) > 0 {
-		return fmt.Errorf("shutdown errors: %w", errors.Join(shutdownErrors...))
-	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 // processMemInfoSnapshot returns a snapshot of process names and PIDs for the watchdog.
