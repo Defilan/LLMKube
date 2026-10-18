@@ -478,7 +478,7 @@ model" for the full flow.
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--ingress-port` | `9443` | TLS port of the ingress, on all interfaces. Open this port, not engine ports, in the macOS firewall. |
-| `--state-dir` | `~/Library/Application Support/llmkube/metal-agent` | Agent state. The ingress key and certificate live in `<state-dir>/ingress/`. A leading `~` is expanded to the agent's home and a relative path is made absolute; the resolved path is logged at startup. |
+| `--state-dir` | `~/Library/Application Support/llmkube/metal-agent` | Agent state: the ingress key and certificate in `<state-dir>/ingress/` (relay mode) and a record of each running engine in `<state-dir>/engines/` (both modes), used to keep engines across agent restarts. Created 0700; files 0600. A leading `~` is expanded to the agent's home and a relative path is made absolute; the resolved path is logged at startup. |
 | `--legacy-direct-endpoints` | `false` | DEPRECATED, removed in a future release. Engines on all interfaces without authentication, registered directly, no ingress. Only for a controller that predates relay support. |
 | `--client-port` | `9999` | Listener on `127.0.0.1:<port>` that forwards `/v1/*` to the current engine, for clients on the Mac itself. `0` disables it. |
 
@@ -900,6 +900,9 @@ client pod ──▶ <isvc> Service ──▶ <isvc>-relay pod ──TLS──�
   or others). It publishes the certificate's SPKI SHA-256 pin as the annotation
   `llmkube.ai/agent-ingress-spki` on the `<isvc>-agent` EndpointSlice. The
   relay accepts only a certificate matching that pin.
+  The agent also keeps one small JSON record per running engine under
+  `<state-dir>/engines/`; a start fails if the record cannot be written.
+  Engines still stop when the agent stops in this release.
 - **The relay, to the agent.** The controller creates a Secret
   `llmkube-metal-relay` (key `token`, label
   `llmkube.ai/managed-by: llmkube-controller`) in each namespace with Metal
