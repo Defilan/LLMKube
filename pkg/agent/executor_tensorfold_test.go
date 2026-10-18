@@ -18,7 +18,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -511,16 +510,7 @@ func TestTensorFoldStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
 	port := healthyPort(t)
 	e.allocatePort = func() (int, error) { return port, nil }
 	e.SetStartupTimeout(10 * time.Second)
-	var pid int
-	cfg.OnSpawned = func(sp SpawnedProcess) error { pid = sp.PID; return errors.New("disk full") }
-
-	if _, err := e.StartProcess(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "disk full") {
-		t.Fatalf("err = %v, want the OnSpawned error", err)
-	}
-	if pid == 0 {
-		t.Fatal("OnSpawned was not called")
-	}
-	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("child %d still alive after OnSpawned failed (kill 0: %v)", pid, err)
-	}
+	requireOnSpawnedErrorKillsChild(t, cfg, func(c ExecutorConfig) (*ManagedProcess, error) {
+		return e.StartProcess(context.Background(), c)
+	})
 }

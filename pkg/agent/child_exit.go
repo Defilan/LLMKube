@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -151,17 +152,38 @@ func (t *childTracker) trackChild(cmd *exec.Cmd) *childExit {
 
 // afterSpawn runs cfg.OnSpawned for a child that just started. When the hook
 // fails, the child is stopped and the error returned, so the caller fails the
-// start without leaving an unrecorded engine behind.
-func (t *childTracker) afterSpawn(cfg ExecutorConfig, cmd *exec.Cmd, port int, modelPath, logPath string) error {
+// start without leaving an unrecorded engine behind. A child that had already
+// exited reports that instead, with its log tail, so a crashed engine is not
+// blamed on the record. The recorded executable is the resolved path, so
+// adoption compares it with what the OS reports for the PID.
+func (t *childTracker) afterSpawn(
+	cfg ExecutorConfig, cmd *exec.Cmd, exit *childExit, port int, modelPath, logPath string,
+) error {
 	if cfg.OnSpawned == nil {
 		return nil
 	}
-	sp := SpawnedProcess{PID: cmd.Process.Pid, Port: port, Executable: cmd.Path, ModelPath: modelPath, LogPath: logPath}
-	if err := cfg.OnSpawned(sp); err != nil {
-		_ = t.stopChild(sp.PID)
-		return fmt.Errorf("record spawned process: %w", err)
+	executable := cmd.Path
+	if resolved, err := filepath.EvalSymlinks(cmd.Path); err == nil {
+		executable = resolved
 	}
-	return nil
+	sp := SpawnedProcess{PID: cmd.Process.Pid, Port: port, Executable: executable, ModelPath: modelPath, LogPath: logPath}
+	err := cfg.OnSpawned(sp)
+	if err == nil {
+		return nil
+	}
+	exited := false
+	if exit != nil {
+		select {
+		case <-exit.done:
+			exited = true
+		default:
+		}
+	}
+	_ = t.stopChild(sp.PID)
+	if exited {
+		return withLogTail(fmt.Errorf("engine %w (%s)", errChildExited, exit.status()), logPath)
+	}
+	return fmt.Errorf("record spawned process: %w", err)
 }
 
 func (t *childTracker) trackedChild(pid int) *childExit {

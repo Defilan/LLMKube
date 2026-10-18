@@ -127,7 +127,7 @@ func (e *TensorFoldExecutor) StartProcess(_ context.Context, config ExecutorConf
 	// The child holds the fd; close our handle.
 	_ = logFile.Close()
 	exit := e.trackChild(cmd)
-	if err := e.afterSpawn(config, cmd, port, modelPath, logPath); err != nil {
+	if err := e.afterSpawn(config, cmd, exit, port, modelPath, logPath); err != nil {
 		return nil, err
 	}
 

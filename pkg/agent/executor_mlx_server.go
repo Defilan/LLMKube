@@ -114,7 +114,7 @@ func (e *MLXServerExecutor) StartProcess(_ context.Context, config ExecutorConfi
 	// until the child exits.
 	_ = logFile.Close()
 	exit := e.trackChild(cmd)
-	if err := e.afterSpawn(config, cmd, e.port, modelPath, logPath); err != nil {
+	if err := e.afterSpawn(config, cmd, exit, e.port, modelPath, logPath); err != nil {
 		return nil, err
 	}
 
