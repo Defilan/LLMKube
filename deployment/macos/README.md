@@ -161,12 +161,18 @@ agent process adopts each engine with the same PID and no model reload, and logs
 the Service fail only for the few seconds the agent itself is down; in legacy
 mode they keep succeeding.
 
-Adoption checks each engine before trusting it: it is alive, its kernel start
-time, executable and process group match the record, it answers its health
-check, and it was started for the same bind mode (legacy `0.0.0.0` or relay
-loopback). An engine that fails the identity checks is left alone. An engine
-that is ours but not serving, or bound for the other mode, is stopped and
-started fresh. A service no longer assigned to this Mac (allowlist change,
+Adoption checks each engine before trusting it. Its PID must be alive, lead
+the recorded process group and have the recorded kernel start time. A process
+that fails these checks is provably not the engine the agent started, so it is
+never signalled and its record is discarded. One that passes them is ours, and
+is adopted when it also runs the recorded executable (the resolved binary or
+the path it was started through, so a `brew upgrade` that repoints
+`/opt/homebrew/bin/llama-server` does not prevent adoption), answers its health
+check, and was started for the same bind mode (legacy `0.0.0.0` or relay
+loopback). An engine that is ours but cannot be adopted is stopped and started
+fresh; one that cannot be stopped keeps its record for the next attempt.
+Ollama services are re-attached while the Ollama daemon answers its health
+check. A service no longer assigned to this Mac (allowlist change,
 reassignment, Model deleted) is stopped after the agent's first list.
 `llmkube_metal_agent_engines_adopted_total{result}` counts the outcomes.
 
@@ -182,11 +188,17 @@ launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
 llmkube-metal-agent stop-engines
 ```
 
-`stop-engines` stops every engine the agent started and removes its records. It
+`stop-engines` stops every engine the agent started (as a process group, after
+the same start-time check), unloads the model of each Ollama service, and
+removes each record once its engine is confirmed stopped. A record whose
+process is gone, or is now another program, is removed without a signal. An
+engine it cannot stop keeps its record, and the command exits 1 after trying
+the rest. With a kubeconfig it first withdraws each service's endpoint. It
 takes `--state-dir`, `--namespace`, `--kubeconfig`, `--kube-context`,
-`--ollama-port` and `--log-level`; pass the same `--state-dir` and namespace the
-agent runs with. `make uninstall-metal-agent` does both steps and then removes
-the binary and plist.
+`--ollama-port` and `--log-level`. Only `--state-dir` must match the agent's,
+since the records live under it; `--namespace` only affects log lines.
+`make uninstall-metal-agent` does both steps and then removes the binary and
+plist.
 
 Adopted engines keep the flags they started with, so a new agent default does
 not reach a running engine. After an upgrade, to apply new defaults, stop the
@@ -197,6 +209,22 @@ launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
 llmkube-metal-agent stop-engines
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.llmkube.metal-agent.plist
 ```
+
+Rolling the agent back to a release that predates engine adoption doubles
+every model: the older agent does not know the running engines, leaves them
+loaded and starts a second copy of each. Before installing an older agent,
+stop the agent and run `stop-engines` with the current binary, then install
+the older one:
+
+```bash
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+llmkube-metal-agent stop-engines   # the current binary, before it is replaced
+# then install the older agent and load its plist
+```
+
+If `stop-engines` exits 1, an engine is still running; check its output and
+run it again before installing the older agent.
 
 ### Model store
 

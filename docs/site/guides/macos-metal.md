@@ -163,7 +163,9 @@ template, so re-add your flags after a reinstall.
 Restarting the agent does not stop the engines it started: the new agent
 adopts them with the same PID and no model reload (oMLX services still
 reload). Engines keep the flags they started with. To stop them, run
-`llmkube-metal-agent stop-engines` after the `bootout`. See the
+`llmkube-metal-agent stop-engines` after the `bootout`. Before rolling the
+agent back to a release that predates adoption, do the same with the current
+binary, or the older agent loads a second copy of every model. See the
 [macOS deployment README](https://github.com/defilantech/LLMKube/blob/main/deployment/macos/README.md#agent-restarts-upgrades-and-stopping-engines).
 
 Without `--host-ip` the agent auto-detects an address: a Tailscale

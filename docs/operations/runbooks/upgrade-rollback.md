@@ -108,6 +108,24 @@ the relay pod would crashloop.
 If you roll the chart back (see Rollback below), roll the metal-agents
 back first, then roll back the chart, same order reversed.
 
+Rolling a metal-agent back to a release that predates engine adoption
+silently doubles every model on that Mac: the engines the current agent
+started keep running (they survive the agent by design), the older agent does
+not know them, and it starts a second copy of each. Before installing the
+older agent, stop the current agent and then its engines, with the current
+binary:
+
+```bash
+launchctl bootout gui/$(id -u)/com.llmkube.metal-agent
+while launchctl print gui/$(id -u)/com.llmkube.metal-agent >/dev/null 2>&1; do sleep 1; done
+llmkube-metal-agent stop-engines   # the current binary, before it is replaced
+```
+
+Then install the older agent. `stop-engines` exits 1 when an engine could not
+be stopped; that engine keeps its record, so read the output and rerun it
+before installing the older agent. See the metal-agent README section
+"Agent restarts, upgrades and stopping engines" for details.
+
 After either direction, check the Metal-related Events on the affected
 InferenceServices:
 
