@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -101,8 +100,14 @@ func stopRecordedEngine(ctx context.Context, cfg StopEnginesConfig, rec engineRe
 	case rec.PGID != rec.PID:
 		return fmt.Errorf("record has pgid %d for pid %d: not a group leader, left alone", rec.PGID, rec.PID)
 	}
-	if err := killFn(rec.PID, 0); errors.Is(err, syscall.ESRCH) {
-		return nil
+	// The start token is the identity proof: a dead PID or a PID another
+	// program now holds means the engine is gone; only then is the
+	// executable compared, so an unrelated live PID is never reported.
+	if err := verifyEngineIdentity(rec.PID, rec.StartToken, inspect); err != nil {
+		if errors.Is(err, errProcessAlreadyGone) {
+			return nil
+		}
+		return err
 	}
 	exes, err := inspect.Executables(rec.PID)
 	if err != nil {
