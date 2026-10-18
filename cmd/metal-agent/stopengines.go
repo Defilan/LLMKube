@@ -40,7 +40,8 @@ func parseStopEnginesArgs(args []string) (stopEnginesOptions, error) {
 	}
 	fs.StringVar(&opts.StateDir, "state-dir", "",
 		"Directory for agent state, as for the agent. Default: ~/Library/Application Support/llmkube/metal-agent.")
-	fs.StringVar(&opts.Namespace, "namespace", "default", "Kubernetes namespace the agent watched")
+	fs.StringVar(&opts.Namespace, "namespace", "default",
+		"Namespace the agent watched, for log lines only: every recorded engine is stopped")
 	fs.StringVar(&opts.KubeContext, "kube-context", "", "kubeconfig context to withdraw endpoints with")
 	fs.IntVar(&opts.OllamaPort, "ollama-port", agent.DefaultOllamaPort, "Port of the Ollama daemon")
 	fs.StringVar(&opts.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")

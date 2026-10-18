@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func stopEnginesCfg(dir string) StopEnginesConfig {
@@ -257,5 +260,128 @@ func TestRunStopEngines_ReusedPIDIsStoppedNotReported(t *testing.T) {
 	}
 	if recs, _ := store.List(); len(recs) != 0 {
 		t.Fatalf("record must be removed: %+v", recs)
+	}
+}
+
+// ollamaRecord writes an Ollama service's record (no PID) for modelID.
+func ollamaRecord(t *testing.T, dir, modelID string) *engineRecordStore {
+	t.Helper()
+	store := newEngineRecordStore(filepath.Join(dir, "engines"), "v", newProcessInspector(), nil)
+	if err := store.WriteProvisional("default", "s", runtimeOllama, SpawnedProcess{}); err != nil {
+		t.Fatal(err)
+	}
+	recs, _ := store.List()
+	if len(recs) != 1 {
+		t.Fatalf("setup: %+v", recs)
+	}
+	rec := recs[0]
+	rec.ModelID = modelID
+	if err := store.write(rec); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// With no logger configured, the Ollama executor still gets one: its success
+// log line must not dereference a nil logger.
+func TestRunStopEngines_NilLoggerReachesOllamaExecutor(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	p, _ := strconv.Atoi(portStr)
+	store := ollamaRecord(t, dir, "llama3.2:3b")
+	if err := RunStopEngines(context.Background(), StopEnginesConfig{StateDir: dir, OllamaPort: p}); err != nil {
+		t.Fatalf("RunStopEngines: %v", err)
+	}
+	if recs, _ := store.List(); len(recs) != 0 {
+		t.Fatalf("records left: %+v", recs)
+	}
+}
+
+// A daemon that refuses the connection is not running, so no model is loaded:
+// the record goes and nothing is reported.
+func TestRunStopEngines_OllamaNotRunningRemovesRecord(t *testing.T) {
+	dir := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close() // nothing listens on p now
+	store := ollamaRecord(t, dir, "llama3.2:3b")
+	cfg := stopEnginesCfg(dir)
+	cfg.OllamaPort = p
+	if err := RunStopEngines(context.Background(), cfg); err != nil {
+		t.Fatalf("RunStopEngines: %v", err)
+	}
+	if recs, _ := store.List(); len(recs) != 0 {
+		t.Fatalf("records left: %+v", recs)
+	}
+}
+
+// An Ollama daemon that answers with an error may still hold the model: the
+// record stays and the failure is reported.
+func TestRunStopEngines_OllamaErrorKeepsRecord(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	_, portStr, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	p, _ := strconv.Atoi(portStr)
+	store := ollamaRecord(t, dir, "llama3.2:3b")
+	cfg := stopEnginesCfg(dir)
+	cfg.OllamaPort = p
+	if err := RunStopEngines(context.Background(), cfg); err == nil {
+		t.Fatal("expected an error when Ollama fails the unload")
+	}
+	if recs, _ := store.List(); len(recs) != 1 {
+		t.Fatalf("record must be kept, got %+v", recs)
+	}
+}
+
+// An API server that never answers delays each engine's stop by at most
+// endpointWithdrawTimeout, not forever.
+func TestRunStopEngines_EndpointWithdrawalIsBounded(t *testing.T) {
+	orig := endpointWithdrawTimeout
+	endpointWithdrawTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { endpointWithdrawTimeout = orig })
+	dir := t.TempDir()
+	store := newEngineRecordStore(filepath.Join(dir, "engines"), "v",
+		fakeInspector{tokens: map[int]string{4242: "t"}}, nil)
+	// An oMLX record: stopping it sends no signal, so only the withdrawal waits.
+	if err := store.WriteProvisional("default", "s", runtimeOMLX, SpawnedProcess{PID: 4242, PGID: 4242}); err != nil {
+		t.Fatal(err)
+	}
+	base := fake.NewClientBuilder().WithScheme(newTestScheme()).Build()
+	hanging := interceptor.NewClient(base, interceptor.Funcs{
+		Get: func(
+			ctx context.Context, _ client.WithWatch, _ client.ObjectKey, _ client.Object, _ ...client.GetOption,
+		) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	// Cancelled at cleanup, so a withdrawal that ignores the timeout does not
+	// leave its goroutine blocked after the test fails.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cfg := stopEnginesCfg(dir)
+	cfg.K8sClient = hanging
+	done := make(chan error, 1)
+	go func() { done <- RunStopEngines(ctx, cfg) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunStopEngines: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunStopEngines still waiting on an API server that never answers")
+	}
+	if recs, _ := store.List(); len(recs) != 0 {
+		t.Fatalf("records left: %+v", recs)
 	}
 }
