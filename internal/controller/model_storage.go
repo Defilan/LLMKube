@@ -875,7 +875,8 @@ func invalidFileSetInitContainer(initImage string) corev1.Container {
 
 // cachePrepInitContainer returns the root-run prep init container that runs
 // BEFORE model-downloader in the cache-backed path. CSI drivers with
-// fsGroupPolicy=None (CephFS, NFS) never apply the pod fsGroup to the volume,
+// fsGroupPolicy=None (some NFS drivers, and CephFS when its driver is set that
+// way; ceph-csi defaults to File) never apply the pod fsGroup to the volume,
 // so the PVC root stays root:root 0755 and the non-root downloader (uid 100)
 // gets "permission denied" on mkdir. The prep chowns/chmods the mount root so
 // the downloader can write, without recursing over /models.
@@ -897,7 +898,8 @@ func invalidFileSetInitContainer(initImage string) corev1.Container {
 // "restricted" (which forbids adding any capability except NET_BIND_SERVICE,
 // and the chown of an unowned mount fundamentally needs CHOWN); see
 // docs/MODEL-CACHE.md "Security Considerations" for the restricted-PSA
-// alternatives (fsGroupPolicy=File CSI, emptyDir store, or a laxer policy).
+// alternatives (emptyDir store or a laxer policy; skipping the prep on
+// fsGroupPolicy=File drivers is #2057).
 //
 // The prep reuses the configurable initContainerImage (no hardcoded busybox)
 // so air-gapped clusters that mirror initContainerImage are covered.

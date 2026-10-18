@@ -138,6 +138,31 @@ var _ = Describe("Model Prefetch", func() {
 		})
 	})
 
+	// #2058: the prefetch Job mounts the same shared cache as the serving pods,
+	// so it gets the same fsGroupChangePolicy whenever it gets an fsGroup.
+	Describe("buildPrefetchJob security context", func() {
+		It("sets fsGroupChangePolicy OnRootMismatch alongside the default fsGroup", func() {
+			m := newPrefetchModel("fsgroup-policy")
+			seedPrefetchCacheKey(m)
+			job, err := prefetchReconciler().buildPrefetchJob(context.Background(), m, nil)
+			Expect(err).NotTo(HaveOccurred())
+			psc := job.Spec.Template.Spec.SecurityContext
+			Expect(psc).NotTo(BeNil())
+			Expect(psc.FSGroup).To(HaveValue(Equal(int64(102))))
+			Expect(psc.FSGroupChangePolicy).To(HaveValue(Equal(corev1.FSGroupChangeOnRootMismatch)))
+		})
+
+		It("sets no pod security context when the default fsGroup is disabled", func() {
+			m := newPrefetchModel("fsgroup-disabled")
+			seedPrefetchCacheKey(m)
+			r := prefetchReconciler()
+			r.DefaultFSGroup = 0
+			job, err := r.buildPrefetchJob(context.Background(), m, nil)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(job.Spec.Template.Spec.SecurityContext).To(BeNil())
+		})
+	})
+
 	Describe("reconcilePrefetch", func() {
 		It("does not handle models without prefetch", func() {
 			m := newPrefetchModel("no-prefetch")

@@ -510,6 +510,16 @@ trying to schedule. Options:
   binds via `WaitForFirstConsumer`.
 - Pre-provision a node-aligned PVC and reference it with `claimName`.
 
+### Slow pod starts that grow with the size of the cache
+
+On storage where Kubernetes applies the pod `fsGroup`, its default
+`fsGroupChangePolicy: Always` makes kubelet re-chown every file in the cache
+before each pod start. LLMKube sets `fsGroupChangePolicy: OnRootMismatch` next
+to the default `fsGroup` on inference pods and the prefetch Job, so after the
+first pass kubelet skips that walk. A `spec.podSecurityContext` you supply
+replaces the operator default, so add `fsGroupChangePolicy: OnRootMismatch`
+next to your own `fsGroup` there.
+
 ### Cache inspection with `llmkube cache list`
 
 The operator-managed shared and labeled per-service cache PVCs are discoverable
