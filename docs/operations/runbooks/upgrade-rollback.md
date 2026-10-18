@@ -148,7 +148,10 @@ it is fixed. Check them on every Mac before upgrading its metal-agent:
   unload before reinstalling: a `bootstrap` that runs too soon after
   `bootout` can fail with `Bootstrap failed: 5: Input/output error` and leave
   the agent unloaded. The last command prints `state = running` once the
-  agent is back. The new plist uses
+  agent is back. Engines started by the old agent keep running and the new
+  agent adopts them, so they keep the flags they started with; to apply new
+  defaults, run `llmkube-metal-agent stop-engines` after the `bootout` and
+  before reinstalling. The new plist uses
   the default store `~/Library/Application Support/llmkube/models` and logs to
   `~/Library/Logs/llmkube/metal-agent.log`. For a hand-maintained plist,
   remove the `--model-store /tmp/...` pair (or point it at a directory the
