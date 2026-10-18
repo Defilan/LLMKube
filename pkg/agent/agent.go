@@ -378,6 +378,16 @@ type MetalAgent struct {
 	// engineRecords keeps the on-disk record of each engine this agent
 	// started (<stateDir>/engines), so a restarted agent can adopt it (#2079).
 	engineRecords *engineRecordStore
+	// inspect reads the kernel identity of a PID (start token, executable). It
+	// is the record store's inspector, used again to verify recorded engines
+	// at adoption and before group-signalling an adopted one.
+	inspect processInspector
+	// healthChecker probes an engine's health endpoint, for the health monitor
+	// and for adoption.
+	healthChecker ProcessHealthChecker
+	// adopted holds the keys of the engines adopted at startup, whose
+	// endpoints the startup withdrawal leaves Ready. Guarded by mu.
+	adopted map[string]bool
 
 	// now returns the current time for the RelayNotAdopted watchdog.
 	// Defaults to time.Now; tests inject a fake clock.
@@ -437,6 +447,16 @@ type ManagedProcess struct {
 	// fit next to them, not just on its own (#2080). Zero when admission did
 	// not size the process (memory-check-mode=warn after a failed estimate).
 	AdmittedBytes uint64
+
+	// PGID and StartToken are the engine's process group and kernel start
+	// token, as its record holds them (#2079).
+	PGID       int
+	StartToken string
+	// Adopted marks an engine a previous agent process started and this one
+	// adopted at startup. It is not this process's child, so no executor
+	// tracks it: stopping it goes through stopEngineGroup, which re-proves
+	// its identity before signalling its group.
+	Adopted bool
 
 	// healthFailures counts this process's consecutive failed health probes.
 	// Guarded by MetalAgent.mu; a replacement process starts again at zero.
@@ -541,8 +561,8 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 	// alike; a directory that cannot be resolved fails each record write, and
 	// so each engine start, rather than the agent's startup.
 	stateDir, stateDirErr := resolveStateDir(config.StateDir, home)
-	records := newEngineRecordStore(
-		filepath.Join(stateDir, "engines"), config.Version, processInspectorFactory(), stateDirErr)
+	inspect := processInspectorFactory()
+	records := newEngineRecordStore(filepath.Join(stateDir, "engines"), config.Version, inspect, stateDirErr)
 	if stateDirErr != nil {
 		logger.Warnw("engine records unavailable: state directory not resolved",
 			"engineRecords", records.Dir(), "error", stateDirErr)
@@ -553,6 +573,8 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 	return &MetalAgent{
 		config:              config,
 		engineRecords:       records,
+		inspect:             inspect,
+		healthChecker:       NewDefaultProcessHealthChecker(5 * time.Second),
 		executors:           make(map[string]ProcessExecutor),
 		processes:           make(map[string]*ManagedProcess),
 		logger:              logger.With("component", "metal-agent"),
@@ -721,6 +743,10 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 		a.config.Version,
 	)
 
+	// Adopt engines a previous agent process left running, before the startup
+	// sweep withdraws their endpoints (#2079). Needs no API server.
+	a.adoptEngines(ctx)
+
 	// Put the registry in its mode (relay mode: identity + "<isvc>-agent"
 	// registrations) and clean up what earlier agent processes left behind,
 	// in that order; see prepareRegistry.
@@ -776,7 +802,7 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 	// Start health monitor
 	monitor := NewHealthMonitor(
 		a,
-		NewDefaultProcessHealthChecker(5*time.Second),
+		a.healthChecker,
 		30*time.Second,
 		a.logger.With("subsystem", "health-monitor"),
 	)
@@ -1121,12 +1147,19 @@ func (a *MetalAgent) withdrawAfterStartFailure(ctx context.Context, isvc *infere
 
 // withdrawInheritedEndpoints runs WithdrawOwnedEndpoints with the watcher's
 // ownership predicate, so the allowlist partition (#524) bounds which slices a
-// restarted agent may touch.
+// restarted agent may touch. The endpoint of an engine adopted at startup is
+// left alone: it is still serving (#2079).
 func (a *MetalAgent) withdrawInheritedEndpoints(ctx context.Context) {
 	if a.watcher == nil {
 		return
 	}
-	n, err := a.registry.WithdrawOwnedEndpoints(ctx, a.config.Namespace, a.watcher.owns)
+	withdraw := func(ctx context.Context, isvc *inferencev1alpha1.InferenceService) bool {
+		a.mu.RLock()
+		adopted := a.adopted[isvc.Namespace+"/"+isvc.Name]
+		a.mu.RUnlock()
+		return !adopted && a.watcher.owns(ctx, isvc)
+	}
+	n, err := a.registry.WithdrawOwnedEndpoints(ctx, a.config.Namespace, withdraw)
 	if err != nil {
 		a.logger.Warnw("startup endpoint withdrawal failed", "error", err)
 		return
@@ -1647,6 +1680,14 @@ func (a *MetalAgent) stopManagedProcess(ctx context.Context, process *ManagedPro
 		}
 		if err != nil {
 			return fmt.Errorf("failed to unload oMLX model %s: %w", process.ModelID, err)
+		}
+		return nil
+	}
+	if process.Adopted && process.PID > 0 {
+		// Not our child: no executor tracks it. Signal its group once its
+		// identity is proven again.
+		if err := stopEngineGroup(process.PID, process.PGID, process.StartToken, a.inspect); err != nil {
+			return fmt.Errorf("failed to stop adopted engine: %w", err)
 		}
 		return nil
 	}

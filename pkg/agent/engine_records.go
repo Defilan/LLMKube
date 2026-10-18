@@ -96,7 +96,9 @@ func (s *engineRecordStore) WriteProvisional(namespace, name, runtime string, sp
 
 // WriteRunning completes (or, for a shared-daemon service with no spawn,
 // creates) the record of a stored process, keeping the executable, process
-// group and log path a provisional record captured.
+// group and log path a provisional record captured. On success it sets
+// p.StartToken and p.PGID to the values written, so the process carries the
+// identity its record holds.
 func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 	tok, err := s.startToken(p.PID)
 	if err != nil {
@@ -111,7 +113,11 @@ func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 	if prev, ok := s.read(p.Namespace, p.Name); ok && prev.PID == p.PID {
 		rec.Executable, rec.LogPath, rec.PGID = prev.Executable, prev.LogPath, prev.PGID
 	}
-	return s.write(rec)
+	if err := s.write(rec); err != nil {
+		return err
+	}
+	p.StartToken, p.PGID = rec.StartToken, rec.PGID
+	return nil
 }
 
 // List reads every record in the directory. Records of another version or

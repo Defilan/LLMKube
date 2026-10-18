@@ -86,6 +86,22 @@ func TestEngineRecordStore_WriteRunningPIDZero(t *testing.T) {
 	}
 }
 
+// A completed record hands its identity back to the process, so the process
+// carries what a later agent will verify.
+func TestEngineRecordStore_WriteRunningSetsProcessIdentity(t *testing.T) {
+	s, _ := newTestRecordStore(t)
+	if err := s.WriteProvisional("default", "a", runtimeLlamaServer, SpawnedProcess{PID: 4242, PGID: 4242}); err != nil {
+		t.Fatal(err)
+	}
+	p := &ManagedProcess{Name: "a", Namespace: "default", PID: 4242, Runtime: runtimeLlamaServer}
+	if err := s.WriteRunning(p); err != nil {
+		t.Fatalf("WriteRunning: %v", err)
+	}
+	if p.StartToken != "100.000001" || p.PGID != 4242 {
+		t.Fatalf("process StartToken=%q PGID=%d, want the recorded token and group 4242", p.StartToken, p.PGID)
+	}
+}
+
 func TestEngineRecordStore_RemoveIsIdempotent(t *testing.T) {
 	s, dir := newTestRecordStore(t)
 	if err := s.WriteProvisional("default", "a", runtimeLlamaServer, SpawnedProcess{PID: 4242}); err != nil {
