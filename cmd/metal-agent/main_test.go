@@ -508,3 +508,19 @@ func TestTokenFileToRenew(t *testing.T) {
 		})
 	}
 }
+
+func TestStopEnginesSubcommandParsesItsFlags(t *testing.T) {
+	opts, err := parseStopEnginesArgs([]string{"--state-dir", "/x", "--namespace", "ns", "--ollama-port", "1234"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.StateDir != "/x" || opts.Namespace != "ns" || opts.OllamaPort != 1234 {
+		t.Fatalf("unexpected options %+v", opts)
+	}
+	if _, err := parseStopEnginesArgs([]string{"--no-such-flag"}); err == nil {
+		t.Fatal("an unknown flag must error")
+	}
+	if _, err := parseStopEnginesArgs([]string{"stray"}); err == nil {
+		t.Fatal("a stray argument must error")
+	}
+}
