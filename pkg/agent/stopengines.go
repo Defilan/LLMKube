@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,10 +19,16 @@ import (
 // DefaultOllamaPort is the port the agent expects Ollama on when none is set.
 const DefaultOllamaPort = 11434
 
+// endpointWithdrawTimeout bounds each endpoint withdrawal, so an unreachable
+// API server delays stopping the engines by at most this per service. A var
+// so tests can shorten it.
+var endpointWithdrawTimeout = 10 * time.Second
+
 // StopEnginesConfig configures RunStopEngines.
 type StopEnginesConfig struct {
 	StateDir string
-	// Namespace is only used in log lines; the records carry their own.
+	// Namespace is only logged; every record carries its own namespace and
+	// each one is stopped, whatever this says.
 	Namespace string
 	// K8sClient withdraws each service's endpoint before its engine stops.
 	// Nil skips the withdrawal.
@@ -40,6 +48,7 @@ func RunStopEngines(ctx context.Context, cfg StopEnginesConfig) error {
 	if logger == nil {
 		logger = zap.NewNop().Sugar()
 	}
+	cfg.Logger = logger // the Ollama executor logs through it
 	home, _ := os.UserHomeDir()
 	stateDir, err := resolveStateDir(cfg.StateDir, home)
 	if err != nil {
@@ -48,6 +57,7 @@ func RunStopEngines(ctx context.Context, cfg StopEnginesConfig) error {
 	inspect := newProcessInspector()
 	store := newEngineRecordStore(filepath.Join(stateDir, "engines"), "", inspect, nil)
 	recs, listErrs := store.List()
+	logger.Infow("stopping recorded engines", "records", store.Dir(), "count", len(recs), "namespace", cfg.Namespace)
 	errs := listErrs
 	var registry *ServiceRegistry
 	if cfg.K8sClient != nil {
@@ -73,8 +83,11 @@ func RunStopEngines(ctx context.Context, cfg StopEnginesConfig) error {
 }
 
 // withdrawEndpoint flips the service's endpoint to not ready. It is best
-// effort: a failure is logged and the engine is stopped regardless.
+// effort and bounded by endpointWithdrawTimeout: a failure is logged and the
+// engine is stopped regardless.
 func withdrawEndpoint(ctx context.Context, registry *ServiceRegistry, rec engineRecord, logger *zap.SugaredLogger) {
+	ctx, cancel := context.WithTimeout(ctx, endpointWithdrawTimeout)
+	defer cancel()
 	isvc := &inferencev1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Namespace: rec.Namespace, Name: rec.Name}}
 	if _, err := registry.WithdrawEndpointIfPresent(ctx, isvc); err != nil {
 		logger.Warnw("could not withdraw the endpoint", "key", rec.Namespace+"/"+rec.Name, "error", err)
@@ -92,11 +105,7 @@ func stopRecordedEngine(ctx context.Context, cfg StopEnginesConfig, rec engineRe
 		if rec.Runtime != runtimeOllama {
 			return nil
 		}
-		port := cfg.OllamaPort
-		if port == 0 {
-			port = DefaultOllamaPort
-		}
-		return NewOllamaExecutor(port, cfg.Logger).UnloadModel(ctx, rec.ModelID)
+		return unloadOllamaModel(ctx, cfg, rec.ModelID)
 	case rec.PGID != rec.PID:
 		return fmt.Errorf("record has pgid %d for pid %d: not a group leader, left alone", rec.PGID, rec.PID)
 	}
@@ -108,4 +117,20 @@ func stopRecordedEngine(ctx context.Context, cfg StopEnginesConfig, rec engineRe
 		return err
 	}
 	return nil
+}
+
+// unloadOllamaModel unloads a re-attached Ollama service's model. A daemon
+// that refuses the connection is not running, so no model is loaded and the
+// record can go.
+func unloadOllamaModel(ctx context.Context, cfg StopEnginesConfig, modelID string) error {
+	port := cfg.OllamaPort
+	if port == 0 {
+		port = DefaultOllamaPort
+	}
+	err := NewOllamaExecutor(port, cfg.Logger).UnloadModel(ctx, modelID)
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		cfg.Logger.Infow("Ollama is not running; no model to unload", "port", port, "modelID", modelID)
+		return nil
+	}
+	return err
 }
