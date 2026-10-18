@@ -57,6 +57,7 @@ const (
 	// this Mac's budget at admission. It is a warning, not a refusal, so it is
 	// not one of the SchedulingStatus reasons.
 	EventReasonMemoryBudgetClamped = "MemoryBudgetClamped"
+	EventReasonEngineRecordFailed  = "EngineRecordFailed"
 	// EventReasonMemoryCheckFailed and EventReasonInsufficientMemory equal
 	// the api/v1alpha1.Reason* constants of the same name; see the doc
 	// comment on inferencev1alpha1.MetalAgentRefusalReasons for why.

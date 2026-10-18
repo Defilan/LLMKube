@@ -291,6 +291,7 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 	st := a.restartStateLocked(key)
 	st.specHash = proc.SpecHash
 	a.mu.Unlock()
+	a.removeEngineRecord(proc)
 
 	a.logger.Warnw("stopping unhealthy process to restart it",
 		"namespace", proc.Namespace, "name", proc.Name, "pid", proc.PID, "consecutiveFailures", failures)

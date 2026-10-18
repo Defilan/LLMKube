@@ -67,6 +67,11 @@ func (e *restartExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) (*
 		return nil, e.startErr
 	}
 	e.pid++
+	if cfg.OnSpawned != nil {
+		if err := cfg.OnSpawned(SpawnedProcess{PID: e.pid, Port: 19000 + e.pid, Executable: "/fake/engine"}); err != nil {
+			return nil, err
+		}
+	}
 	return &ManagedProcess{
 		Name: cfg.Name, Namespace: cfg.Namespace, PID: e.pid, Port: 19000 + e.pid,
 		Healthy: true, StartedAt: e.now(),
