@@ -19,6 +19,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -568,4 +569,24 @@ func mustExtractPort(t *testing.T, raw string) int {
 		t.Fatalf("parse port from %q: %v", u.Port(), err)
 	}
 	return port
+}
+
+func TestVLLMSwiftStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
+	bin := fakeVLLMSwift(t, "exec sleep 60\n")
+	e, cfg, _ := vllmSwiftFixture(t, bin)
+	port := healthyPort(t)
+	e.allocatePort = func() (int, error) { return port, nil }
+	e.SetStartupTimeout(10 * time.Second)
+	var pid int
+	cfg.OnSpawned = func(sp SpawnedProcess) error { pid = sp.PID; return errors.New("disk full") }
+
+	if _, err := e.StartProcess(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("err = %v, want the OnSpawned error", err)
+	}
+	if pid == 0 {
+		t.Fatal("OnSpawned was not called")
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child %d still alive after OnSpawned failed (kill 0: %v)", pid, err)
+	}
 }
