@@ -52,10 +52,22 @@ func TestEnsureProcess_FailedStartRemovesRecord(t *testing.T) {
 	f := newRestartFixture(t, "fail")
 	delete(f.agent.processes, f.key)
 	dir := useTempRecords(t, f)
-	f.exec.startErr = errors.New("health check timed out")
+	recPath := filepath.Join(dir, "default_fail.json")
+	f.exec.failAfterSpawn = errors.New("health check timed out")
+	// Observe the file right after the spawn hook wrote the provisional record.
+	var existedAfterSpawn bool
+	f.exec.afterSpawn = func() {
+		_, err := os.Stat(recPath)
+		existedAfterSpawn = err == nil
+	}
 
-	_ = f.agent.ensureProcess(context.Background(), f.isvc)
-	if _, err := os.Stat(filepath.Join(dir, "default_fail.json")); !errors.Is(err, os.ErrNotExist) {
+	if err := f.agent.ensureProcess(context.Background(), f.isvc); err == nil {
+		t.Fatal("ensureProcess succeeded, want the start failure")
+	}
+	if !existedAfterSpawn {
+		t.Fatal("no provisional record right after the spawn")
+	}
+	if _, err := os.Stat(recPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("record left for a failed start: %v", err)
 	}
 }
@@ -76,6 +88,9 @@ func TestEnsureProcess_RecordWriteFailureFailsStart(t *testing.T) {
 	}
 	if _, running := f.agent.processes[f.key]; running {
 		t.Fatal("engine left running with no record")
+	}
+	if !f.sawEvent(EventReasonEngineRecordFailed) {
+		t.Fatal("no EngineRecordFailed event for the failed provisional write")
 	}
 }
 
@@ -126,5 +141,29 @@ func TestRestartUnhealthy_RemovesRecord(t *testing.T) {
 	f.probe(DefaultHealthFailureThreshold)
 	if _, err := os.Stat(recPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("record left after the health restart stopped the engine: %v", err)
+	}
+}
+
+func TestStopFailureKeepsRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(f *restartFixture)
+	}{
+		{"deleteProcess", func(f *restartFixture) { _ = f.agent.deleteProcess(context.Background(), f.key) }},
+		{"restartUnhealthy", func(f *restartFixture) { f.probe(DefaultHealthFailureThreshold) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRestartFixture(t, "keep")
+			delete(f.agent.processes, f.key)
+			dir := useTempRecords(t, f)
+			if err := f.agent.ensureProcess(context.Background(), f.isvc); err != nil {
+				t.Fatal(err)
+			}
+			f.exec.stopErr = errors.New("stop failed")
+			tc.stop(f)
+			if _, err := os.Stat(filepath.Join(dir, "default_keep.json")); err != nil {
+				t.Fatalf("record gone although the engine may still run: %v", err)
+			}
+		})
 	}
 }

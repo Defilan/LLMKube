@@ -1345,17 +1345,11 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	})
 	cfg.BindHost = a.engineBindHost()
 	ns, name := isvc.Namespace, isvc.Name
-	cfg.OnSpawned = func(sp SpawnedProcess) error {
-		return a.engineRecords.WriteProvisional(ns, name, runtime, sp)
-	}
+	cfg.OnSpawned = a.recordOnSpawn(ns, name, runtime)
 	// A start that fails after the provisional record was written leaves no
 	// record behind; a stored process keeps it.
 	stored := false
-	defer func() {
-		if !stored {
-			_ = a.engineRecords.Remove(ns, name)
-		}
-	}()
+	defer a.dropUnstoredRecord(ns, name, &stored)
 
 	// Start the process using the runtime-specific executor.
 	process, err := exec.StartProcess(ctx, cfg)
@@ -1485,7 +1479,6 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 
 	a.logger.Infow("stopping inference service", "key", key)
 	namespace, name := parseKey(key)
-	a.removeEngineRecord(process)
 
 	// Clean up per-process metrics
 	processHealthy.DeleteLabelValues(name, namespace)
@@ -1494,7 +1487,12 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	processRestarts.DeleteLabelValues(name, namespace)
 
 	var deleteErrors []error
-	if err := a.stopManagedProcess(ctx, process, true); err != nil {
+	stopErr := a.stopManagedProcess(ctx, process, true)
+	// The record goes only once the engine is confirmed stopped.
+	if stopErr == nil || engineStopped(stopErr) {
+		a.removeEngineRecord(process)
+	}
+	if err := stopErr; err != nil {
 		if engineStopped(err) {
 			// The engine is stopped; the teardown completed without grace.
 			// Keep the typed error so callers can tell it apart from a
@@ -1519,6 +1517,29 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	a.logger.Infow("stopped inference service", "key", key)
 	return nil
 }
+
+// recordOnSpawn is the ExecutorConfig.OnSpawned hook: it writes the
+// provisional record, naming the records directory in any failure.
+func (a *MetalAgent) recordOnSpawn(ns, name, runtime string) func(SpawnedProcess) error {
+	return func(sp SpawnedProcess) error {
+		if err := a.engineRecords.WriteProvisional(ns, name, runtime, sp); err != nil {
+			return fmt.Errorf("%w in %s: %w", errEngineRecordWrite, a.engineRecords.Dir(), err)
+		}
+		return nil
+	}
+}
+
+// dropUnstoredRecord removes the record of a start that never reached the
+// process table.
+func (a *MetalAgent) dropUnstoredRecord(ns, name string, stored *bool) {
+	if !*stored {
+		a.removeEngineRecord(&ManagedProcess{Namespace: ns, Name: name})
+	}
+}
+
+// errEngineRecordWrite marks a start that failed because the engine's record
+// could not be written.
+var errEngineRecordWrite = errors.New("could not record the engine")
 
 // completeEngineRecord turns the provisional record into the running one. A
 // process nothing can find after an agent restart is worse than one that did
@@ -2046,11 +2067,13 @@ func (a *MetalAgent) Shutdown(ctx context.Context) error {
 			if err := ollama.UnloadModel(ctx, process.ModelID); err != nil {
 				shutdownErrors = append(shutdownErrors,
 					fmt.Errorf("failed to unload Ollama model %s: %w", key, err))
+				continue
 			}
 		} else if omlx, ok := exec.(*OMLXExecutor); ok && process.ModelID != "" {
 			if err := omlx.UnloadModel(ctx, process.ModelID); err != nil {
 				shutdownErrors = append(shutdownErrors,
 					fmt.Errorf("failed to unload oMLX model %s: %w", key, err))
+				continue
 			}
 		} else {
 			if err := exec.StopProcess(process.PID); err != nil {
@@ -2059,7 +2082,8 @@ func (a *MetalAgent) Shutdown(ctx context.Context) error {
 				continue
 			}
 		}
-		// The engine is stopped or unloaded; a failed stop keeps its record.
+		// Reached only when the engine was stopped or unloaded: a failed stop or
+		// unload (every branch above) keeps its record.
 		a.removeEngineRecord(process)
 	}
 

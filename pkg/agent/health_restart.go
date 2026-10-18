@@ -291,12 +291,16 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 	st := a.restartStateLocked(key)
 	st.specHash = proc.SpecHash
 	a.mu.Unlock()
-	a.removeEngineRecord(proc)
 
 	a.logger.Warnw("stopping unhealthy process to restart it",
 		"namespace", proc.Namespace, "name", proc.Name, "pid", proc.PID, "consecutiveFailures", failures)
 	var notBefore time.Time
-	if err := a.stopManagedProcess(ctx, proc, false); err != nil {
+	stopErr := a.stopManagedProcess(ctx, proc, false)
+	// The record goes only once the engine is confirmed stopped.
+	if stopErr == nil || engineStopped(stopErr) {
+		a.removeEngineRecord(proc)
+	}
+	if err := stopErr; err != nil {
 		// A stop that failed, or that had to SIGKILL, may not have released
 		// the engine's memory yet: give it the initial backoff before a new
 		// engine wires another copy of the weights.
