@@ -710,19 +710,22 @@ modelSource:
 
 The equivalent controller flag is `--allowed-host-path-roots` (comma-separated). A source is permitted only when its cleaned path is within one of the configured roots; `..` escapes are rejected. The check is lexical and does not resolve symlinks, so only allowlist roots whose contents you control.
 
-### Automatic shared cache on `fsGroupPolicy: None` backends (CephFS, NFS)
+### Automatic shared cache on `fsGroupPolicy: None` backends
 
-The automatic shared-model-cache workflow is a first-class supported path, **including** on `fsGroupPolicy: None` CSIs such as CephFS and NFS. On those backends Kubernetes does not apply the pod `fsGroup` to the volume, so the PVC root stays `root:root` and the non-root model downloader cannot write to it. The `model-cache-prep` init container fixes the ownership for you so the cache just works. You do not need to pre-stage models or hand-manage a PVC.
+Whether Kubernetes applies the pod `fsGroup` to a volume depends on the CSI driver's `fsGroupPolicy` (`kubectl get csidriver <name> -o jsonpath='{.spec.fsGroupPolicy}'`), not on the filesystem. ceph-csi's CephFS driver defaults to `File`, so `fsGroup` is applied; a deployment can set its driver to `None` (some Rook CephFS installs do). NFS drivers vary, so check yours.
 
-The prep is the **compatibility implementation** for these backends, and it runs as **non-privileged root (uid 0)** with `ALL` capabilities dropped and only `CHOWN`+`FOWNER` added (no privilege escalation, read-only rootfs, seccomp `RuntimeDefault`). Root here is a backend-driven requirement, not an avoidable misconfiguration: chowning a root-owned mount needs `CAP_CHOWN`, the prep shells out to `chown`, and a non-root process loses its capabilities across `execve` (Kubernetes has no ambient-capability field), so the exec'd `chown` would fail `EPERM`. Root retains its capabilities across exec. (Running the prep non-root broke the shared cache on these backends in 0.8.20; reverted in 0.8.21. A future change may move the chown into a small dedicated helper that performs the syscall in its own entrypoint, which would let the prep run non-root again without the exec capability loss.)
+The automatic shared-model-cache workflow is a first-class supported path, **including** on `fsGroupPolicy: None` CSIs. On those backends Kubernetes does not apply the pod `fsGroup` to the volume, so the PVC root stays `root:root` and the non-root model downloader cannot write to it. The `model-cache-prep` init container fixes the ownership for you so the cache just works. You do not need to pre-stage models or hand-manage a PVC.
+
+The prep is the **compatibility implementation** for these backends. Today the operator adds it on every cache-backed pod, whatever the driver's policy: on a `File` driver kubelet has already applied the ownership and the prep only re-asserts it, so it is redundant there (tracked in #2057). It runs as **non-privileged root (uid 0)** with `ALL` capabilities dropped and only `CHOWN`+`FOWNER` added (no privilege escalation, read-only rootfs, seccomp `RuntimeDefault`). Root here is a backend-driven requirement, not an avoidable misconfiguration: chowning a root-owned mount needs `CAP_CHOWN`, the prep shells out to `chown`, and a non-root process loses its capabilities across `execve` (Kubernetes has no ambient-capability field), so the exec'd `chown` would fail `EPERM`. Root retains its capabilities across exec. (Running the prep non-root broke the shared cache on these backends in 0.8.20; reverted in 0.8.21. A future change may move the chown into a small dedicated helper that performs the syscall in its own entrypoint, which would let the prep run non-root again without the exec capability loss.)
 
 ### PSA `restricted`
 
-Because the prep needs root plus `CHOWN`/`FOWNER`, it cannot satisfy Pod Security Admission `restricted` (which forbids running as root and adding any capability except `NET_BIND_SERVICE`). This is a property of the storage backend, not of the cache feature: it applies only in the narrow intersection of an `fsGroupPolicy: None` backend AND a namespace that enforces `restricted`. If you are in exactly that case, the options are:
+Because the prep needs root plus `CHOWN`/`FOWNER`, it cannot satisfy Pod Security Admission `restricted` (which forbids running as root and adding any capability except `NET_BIND_SERVICE`). Only `fsGroupPolicy: None` backends actually need it, but since the operator currently adds it on every cache-backed pod (#2057), a namespace that enforces `restricted` rejects the shared cache on any backend. If you are in that case, the options are:
 
-- Use an `fsGroupPolicy: File` CSI so Kubernetes applies ownership itself and no prep is needed.
 - Use an `emptyDir` model store (no shared persistent cache).
 - Relax the namespace policy to `baseline`.
+
+Once #2057 lands, an `fsGroupPolicy: File` driver will also work, because Kubernetes applies the ownership itself and the prep can be skipped.
 
 ### `fsGroupChangePolicy` and pod start time on large caches
 
@@ -741,6 +744,8 @@ securityContext:
 With `OnRootMismatch`, kubelet skips the walk when the volume root already has the `fsGroup` GID, group `rwx` and the setgid bit, which is the state the first full pass leaves and the `model-cache-prep` step (`chown 0:<fsGroup>`, `chmod g+rwX`) keeps. If anything changes the root's group, the next start does the full walk again. On `fsGroupPolicy: None` backends kubelet changes no ownership at all, so the setting has no effect there.
 
 A user-supplied `spec.podSecurityContext` replaces the operator default entirely, so it does not get this setting. If you supply your own context on a large cache, add `fsGroupChangePolicy: OnRootMismatch` next to your `fsGroup`. When the default fsGroup is disabled (`--default-fsgroup=0`, the OpenShift preset), the operator sets neither field.
+
+One consequence of skipping the walk: kubelet no longer re-grants group write on every file at each start, so files keep the modes their writer gave them. That is fine for the operator's own paths, because every downloader runs as the same init-image user and the serving containers mount the cache read-only. If you switch `--init-container-image` to an image with a different UID on a cache that is already populated, a resumed download into a directory the old UID created can fail with `permission denied`; delete that model's cache directory (or fix its ownership once) and let it download again.
 
 ### Shared-cache group-write multi-tenancy
 
