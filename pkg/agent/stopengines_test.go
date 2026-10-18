@@ -225,3 +225,34 @@ func TestRunStopEngines_OllamaRecordUnloadsModel(t *testing.T) {
 		t.Fatalf("records left: %+v", recs)
 	}
 }
+
+func TestRunStopEngines_ReusedPIDIsStoppedNotReported(t *testing.T) {
+	dir := t.TempDir()
+	cmd := startSleeper(t)
+	pid := cmd.Process.Pid
+	// The record's token and executable both belong to a dead engine.
+	inspect := fakeInspector{tokens: map[int]string{pid: "dead-engine"}}
+	store := newEngineRecordStore(filepath.Join(dir, "engines"), "v", inspect, nil)
+	sp := SpawnedProcess{PID: pid, PGID: pid, Executable: "/not/the/engine"}
+	if err := store.WriteProvisional("default", "s", runtimeLlamaServer, sp); err != nil {
+		t.Fatal(err)
+	}
+	var sent []syscall.Signal
+	orig := killFn
+	killFn = func(p int, sig syscall.Signal) error { sent = append(sent, sig); return orig(p, 0) }
+	t.Cleanup(func() { killFn = orig })
+	if err := RunStopEngines(context.Background(), stopEnginesCfg(dir)); err != nil {
+		t.Fatalf("RunStopEngines: %v", err)
+	}
+	for _, s := range sent {
+		if s != 0 {
+			t.Fatalf("signal %v sent to a PID another program holds", s)
+		}
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Fatalf("the unrelated process must be untouched: %v", err)
+	}
+	if recs, _ := store.List(); len(recs) != 0 {
+		t.Fatalf("record must be removed: %+v", recs)
+	}
+}
