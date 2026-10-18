@@ -89,13 +89,18 @@ func TestEngineRecordStore_WriteRunningPIDZero(t *testing.T) {
 // A completed record hands its identity back to the process, so the process
 // carries what a later agent will verify.
 func TestEngineRecordStore_WriteRunningSetsProcessIdentity(t *testing.T) {
-	s, _ := newTestRecordStore(t)
-	if err := s.WriteProvisional("default", "a", runtimeLlamaServer, SpawnedProcess{PID: 4242, PGID: 4242}); err != nil {
+	s, dir := newTestRecordStore(t)
+	sp := SpawnedProcess{PID: 4242, PGID: 4242, BindHost: legacyBindHost}
+	if err := s.WriteProvisional("default", "a", runtimeLlamaServer, sp); err != nil {
 		t.Fatal(err)
 	}
 	p := &ManagedProcess{Name: "a", Namespace: "default", PID: 4242, Runtime: runtimeLlamaServer}
 	if err := s.WriteRunning(p); err != nil {
 		t.Fatalf("WriteRunning: %v", err)
+	}
+	// The bind host the engine was spawned with survives the completion.
+	if rec := readRecord(t, dir, "a"); rec["bindHost"] != legacyBindHost {
+		t.Fatalf("record bindHost = %v, want %s", rec["bindHost"], legacyBindHost)
 	}
 	if p.StartToken != "100.000001" || p.PGID != 4242 {
 		t.Fatalf("process StartToken=%q PGID=%d, want the recorded token and group 4242", p.StartToken, p.PGID)

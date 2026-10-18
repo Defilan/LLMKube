@@ -720,7 +720,7 @@ func (a *MetalAgent) Start(ctx context.Context) error {
 
 	// Adopt engines a previous agent process left running, before the startup
 	// sweep withdraws their endpoints (#2079). Needs no API server.
-	a.adoptEngines(ctx)
+	a.startAdoption(ctx)
 
 	// Put the registry in its mode (relay mode: identity + "<isvc>-agent"
 	// registrations) and clean up what earlier agent processes left behind,
