@@ -48,6 +48,12 @@ func TestEnsureProcess_WritesRunningRecord(t *testing.T) {
 	if rec["state"] != "running" || rec["specHash"] != computeSpecHash(f.isvc) || rec["executable"] != "/fake/engine" {
 		t.Fatalf("record = %v, want a running record with the spec hash and the spawned executable", rec)
 	}
+	// The admitted estimate travels with the record, so an agent that adopts
+	// the engine later counts its memory as committed (#2080).
+	proc := f.agent.processes[f.key]
+	if proc == nil || proc.AdmittedBytes == 0 || rec["admittedBytes"] != float64(proc.AdmittedBytes) {
+		t.Fatalf("record admittedBytes = %v, want the process's admitted estimate", rec["admittedBytes"])
+	}
 }
 
 func TestEnsureProcess_FailedStartRemovesRecord(t *testing.T) {

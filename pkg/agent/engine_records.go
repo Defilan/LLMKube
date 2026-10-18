@@ -50,6 +50,9 @@ type engineRecord struct {
 	Priority           string    `json:"priority,omitempty"`
 	EvictionProtection bool      `json:"evictionProtection,omitempty"`
 	StartedAt          time.Time `json:"startedAt,omitzero"`
+	// AdmittedBytes is the memory estimate the engine was admitted with, so an
+	// agent that adopts it counts that memory as committed (#2080).
+	AdmittedBytes uint64 `json:"admittedBytes,omitempty"`
 }
 
 // engineRecordStore keeps one record file per engine under dir
@@ -99,6 +102,7 @@ func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 		Namespace: p.Namespace, Name: p.Name, State: engineRecordRunning, PID: p.PID, StartToken: tok,
 		Port: p.Port, Runtime: p.Runtime, ModelPath: p.ModelPath, ModelID: p.ModelID, SpecHash: p.SpecHash,
 		Priority: p.Priority, EvictionProtection: p.EvictionProtection, StartedAt: p.StartedAt,
+		AdmittedBytes: p.AdmittedBytes,
 	}
 	if prev, ok := s.read(p.Namespace, p.Name); ok && prev.PID == p.PID {
 		rec.Executable, rec.LogPath = prev.Executable, prev.LogPath
