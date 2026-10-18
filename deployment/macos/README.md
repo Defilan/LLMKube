@@ -478,7 +478,7 @@ model" for the full flow.
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--ingress-port` | `9443` | TLS port of the ingress, on all interfaces. Open this port, not engine ports, in the macOS firewall. |
-| `--state-dir` | `~/Library/Application Support/llmkube/metal-agent` | Agent state. The ingress key and certificate live in `<state-dir>/ingress/`. A leading `~` is expanded to the agent's home and a relative path is made absolute; the resolved path is logged at startup. |
+| `--state-dir` | `~/Library/Application Support/llmkube/metal-agent` | Agent state: the ingress key and certificate in `<state-dir>/ingress/` (relay mode) and a record of each running engine in `<state-dir>/engines/` (both modes), for keeping engines across agent restarts in a later release. `<state-dir>` and `engines/` are 0700; record files 0600. A leading `~` is expanded to the agent's home and a relative path is made absolute; the resolved path is logged at startup. |
 | `--legacy-direct-endpoints` | `false` | DEPRECATED, removed in a future release. Engines on all interfaces without authentication, registered directly, no ingress. Only for a controller that predates relay support. |
 | `--client-port` | `9999` | Listener on `127.0.0.1:<port>` that forwards `/v1/*` to the current engine, for clients on the Mac itself. `0` disables it. |
 
@@ -639,6 +639,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_process_rss_bytes` | Gauge | Resident set size per managed process. Labels: `name` only (no `namespace`, so same-named InferenceServices in different namespaces share a series) |
 | `llmkube_metal_agent_memory_pressure_level` | Gauge | Memory pressure level: 0 Normal, 1 Warning, 2 Critical (see `--memory-pressure-warning` and `--memory-pressure-critical`) |
 | `llmkube_metal_agent_evictions_total` | Counter | Processes the memory watchdog evicted under Critical pressure (only with `--eviction-enabled`). Each eviction also emits an `Evicted` Warning event |
+| `llmkube_metal_agent_engine_record_errors_total` | Counter | Engine record writes that failed and failed the start |
 | `llmkube_metal_agent_evictions_skipped_total` | Counter | Times the watchdog was at Critical but did not evict. Labels: `reason` (`disabled`, `below_guard`, `empty`, `floor`, `all_protected`, `runtime_ineligible`) |
 | `llmkube_metal_agent_watch_consecutive_failures` | Gauge | Consecutive failed Kubernetes lists by the InferenceService watcher; resets to 0 on success. The agent exits for a launchd restart at `--max-watch-failures` |
 | `llmkube_metal_agent_watch_model_lookup_failing_services` | Gauge | InferenceServices whose referenced Model lookup is currently failing with an error other than NotFound; each is kept in its previous state until a lookup succeeds |
@@ -906,6 +907,10 @@ client pod ──▶ <isvc> Service ──▶ <isvc>-relay pod ──TLS──�
   InferenceServices. The relay mounts it and sends the token in the
   `X-LLMKube-Relay-Token` header, along with `X-LLMKube-Target: <ns>/<name>`
   naming the InferenceService. The agent reads the same Secret.
+
+In both modes the agent keeps one small JSON record per running engine under
+`<state-dir>/engines/`, and a start fails if the record cannot be written.
+Engines still stop when the agent stops in this release.
 
 Only the controller may create that Secret. Otherwise someone who can create
 Secrets in a namespace, but not read them, could create it first with a

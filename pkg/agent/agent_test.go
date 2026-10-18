@@ -1993,7 +1993,7 @@ func TestDeleteProcess_UsesProcessRuntime(t *testing.T) {
 	// Add a process with Runtime set to "llama-server"
 	agent.processes["default/test-isvc"] = &ManagedProcess{
 		Name:    "test-isvc",
-		PID:     12345,
+		PID:     deadPID(t),
 		Runtime: "llama-server",
 	}
 
@@ -2029,7 +2029,7 @@ func TestShutdown_UsesProcessRuntime(t *testing.T) {
 	// Add a process with Runtime set to "llama-server"
 	agent.processes["default/test-isvc"] = &ManagedProcess{
 		Name:    "test-isvc",
-		PID:     12345,
+		PID:     deadPID(t),
 		Runtime: "llama-server",
 	}
 

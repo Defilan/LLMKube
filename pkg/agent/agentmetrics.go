@@ -121,6 +121,13 @@ var (
 		},
 	)
 
+	engineRecordErrorsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "llmkube_metal_agent_engine_record_errors_total",
+			Help: "Engine record writes that failed and failed the start.",
+		},
+	)
+
 	evictionsSkippedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "llmkube_metal_agent_evictions_skipped_total",
@@ -227,6 +234,7 @@ func init() {
 		processRSSBytes,
 		memoryPressureLevelGauge,
 		evictionsTotal,
+		engineRecordErrorsTotal,
 		evictionsSkippedTotal,
 		watchConsecutiveFailures,
 		watchModelLookupFailingServices,

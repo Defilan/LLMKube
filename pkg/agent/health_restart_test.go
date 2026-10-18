@@ -55,8 +55,12 @@ type restartExecutor struct {
 	pid      int
 	now      func() time.Time
 	startErr error
-	stopErr  error
-	onStop   func()
+	// failAfterSpawn, when set, fails the start after the spawn hook ran, as
+	// a real executor does when the engine dies while loading its model.
+	failAfterSpawn error
+	afterSpawn     func()
+	stopErr        error
+	onStop         func()
 }
 
 func (e *restartExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) (*ManagedProcess, error) {
@@ -67,6 +71,17 @@ func (e *restartExecutor) StartProcess(_ context.Context, cfg ExecutorConfig) (*
 		return nil, e.startErr
 	}
 	e.pid++
+	if cfg.OnSpawned != nil {
+		if err := cfg.OnSpawned(SpawnedProcess{PID: e.pid, Port: 19000 + e.pid, Executable: "/fake/engine"}); err != nil {
+			return nil, err
+		}
+	}
+	if e.afterSpawn != nil {
+		e.afterSpawn()
+	}
+	if e.failAfterSpawn != nil {
+		return nil, e.failAfterSpawn
+	}
 	return &ManagedProcess{
 		Name: cfg.Name, Namespace: cfg.Namespace, PID: e.pid, Port: 19000 + e.pid,
 		Healthy: true, StartedAt: e.now(),

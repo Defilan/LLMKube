@@ -46,8 +46,18 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	omlxDefaultBasePath = func() string { return omlxBase }
+	home, err := os.MkdirTemp("", "agent-home-")
+	if err != nil {
+		panic(err)
+	}
+	// NewMetalAgent resolves the default state directory under HOME; no test
+	// may write engine records under the developer's real home.
+	_ = os.Setenv("HOME", home)
+	// Tests hand out fake PIDs, which the real inspector would reject.
+	processInspectorFactory = func() processInspector { return anyPIDInspector{} }
 	code := m.Run()
 	_ = os.RemoveAll(omlxBase)
+	_ = os.RemoveAll(home)
 	os.Exit(code)
 }
 

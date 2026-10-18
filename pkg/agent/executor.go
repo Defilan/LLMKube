@@ -155,6 +155,12 @@ type ExecutorConfig struct {
 	// pre-trust-boundary behavior of exposing engines directly on the LAN.
 	BindHost string
 
+	// OnSpawned, when set, is called right after the child process starts and
+	// before the startup health wait. A non-nil error stops the child and fails
+	// the start: the agent records every engine it spawns (#2079), and an
+	// engine it cannot record must not keep running.
+	OnSpawned func(SpawnedProcess) error
+
 	// TurboQuantBits sets the KV cache quantization bit width for the oMLX
 	// runtime (3, 6, or 8). Maps to oMLX --kv-cache-quant. When set, the
 	// oMLX daemon uses TurboQuant to compress the KV cache, reducing memory
@@ -356,6 +362,9 @@ func (e *MetalExecutor) StartProcess(ctx context.Context, config ExecutorConfig)
 	// The child holds the fd; close our handle.
 	_ = logFile.Close()
 	exit := e.trackChild(cmd)
+	if err := e.afterSpawn(config, cmd, exit, port, modelPath, logPath); err != nil {
+		return nil, err
+	}
 
 	process := &ManagedProcess{
 		Name:      config.Name,

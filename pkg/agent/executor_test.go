@@ -484,7 +484,7 @@ func TestOMLXSetStartupTimeout(t *testing.T) {
 func TestStopProcess_InvalidPID(t *testing.T) {
 	executor := NewMetalExecutor("/bin/llama-server", "/models", newNopLogger())
 
-	// PID 0 is the calling process's group — Signal will fail
+	// stopChild refuses a PID <= 0: kill(2) would treat it as a process group.
 	err := executor.StopProcess(-99999)
 	if err == nil {
 		t.Error("StopProcess with invalid PID should return error")

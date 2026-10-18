@@ -503,3 +503,14 @@ func readLines(t *testing.T, path string) []string {
 	}
 	return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 }
+
+func TestTensorFoldStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
+	bin := fakeTensorFold(t, "exec sleep 60\n")
+	e, cfg, _ := tensorFoldFixture(t, bin)
+	port := healthyPort(t)
+	e.allocatePort = func() (int, error) { return port, nil }
+	e.SetStartupTimeout(10 * time.Second)
+	requireOnSpawnedErrorKillsChild(t, cfg, func(c ExecutorConfig) (*ManagedProcess, error) {
+		return e.StartProcess(context.Background(), c)
+	})
+}

@@ -128,6 +128,9 @@ func (e *VLLMSwiftExecutor) StartProcess(ctx context.Context, config ExecutorCon
 	// inode alive until the child closes (or exits, which closes its fds).
 	_ = logFile.Close()
 	exit := e.trackChild(cmd)
+	if err := e.afterSpawn(config, cmd, exit, port, modelPath, logPath); err != nil {
+		return nil, err
+	}
 
 	process := &ManagedProcess{
 		Name:      config.Name,

@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,16 +54,17 @@ func (e *KilledAfterGraceError) Error() string {
 }
 
 // errProcessAlreadyGone reports that a stop found no live process at the
-// PID: the signal hit ESRCH, or os reports the process already finished.
-// The engine is stopped. Only a failed signal sets it, because only that
-// proves the PID is dead. A Wait error on an untracked PID after SIGTERM was
-// delivered (ECHILD included) proves nothing about liveness, so it stays a
-// plain error and the eviction path still clears the block for it.
+// PID: the signal hit ESRCH. The engine is stopped. Only a failed signal sets
+// it, because only that proves the PID is dead.
 var errProcessAlreadyGone = errors.New("process already gone")
 
 // stopGracePeriod is how long a child may ignore SIGTERM before it is
 // SIGKILLed. A var so tests can shorten it; mirrors helpProbeTimeout.
 var stopGracePeriod = 10 * time.Second
+
+// untrackedStopPoll is how often stopChild checks that an untracked PID, which
+// it cannot wait on, has exited.
+const untrackedStopPoll = 50 * time.Millisecond
 
 // childExit is the single reaper for a spawned child: one goroutine calls
 // cmd.Wait, records the result, and closes done. Everything else that needs
@@ -128,10 +130,10 @@ func withLogTail(err error, logPath string) error {
 
 // childTracker maps the PID of every child an executor spawned to its reaper,
 // so StopProcess can learn the child is gone without a second wait. A PID
-// absent here falls back to signalling and waiting on the PID directly.
-// Every spawn path tracks its child, so nothing reaches that fallback today;
-// it is for PIDs the agent did not spawn, which only adopting engines across
-// an agent restart (#2079) would produce. The zero value is ready to use.
+// absent here is signalled and polled until it exits, because it is not our
+// child and cannot be waited on. Every spawn path tracks its child, so nothing
+// reaches that path today; it is for engines adopted across an agent restart
+// (#2079). The zero value is ready to use.
 type childTracker struct {
 	childMu  sync.Mutex
 	children map[int]*childExit
@@ -148,6 +150,42 @@ func (t *childTracker) trackChild(cmd *exec.Cmd) *childExit {
 	return exit
 }
 
+// afterSpawn runs cfg.OnSpawned for a child that just started. When the hook
+// fails, the child is stopped and the error returned, so the caller fails the
+// start without leaving an unrecorded engine behind. A child that had already
+// exited reports that instead, with its log tail, so a crashed engine is not
+// blamed on the record. The recorded executable is the resolved path, so
+// adoption compares it with what the OS reports for the PID.
+func (t *childTracker) afterSpawn(
+	cfg ExecutorConfig, cmd *exec.Cmd, exit *childExit, port int, modelPath, logPath string,
+) error {
+	if cfg.OnSpawned == nil {
+		return nil
+	}
+	executable := cmd.Path
+	if resolved, err := filepath.EvalSymlinks(cmd.Path); err == nil {
+		executable = resolved
+	}
+	sp := SpawnedProcess{PID: cmd.Process.Pid, Port: port, Executable: executable, ModelPath: modelPath, LogPath: logPath}
+	err := cfg.OnSpawned(sp)
+	if err == nil {
+		return nil
+	}
+	exited := false
+	if exit != nil {
+		select {
+		case <-exit.done:
+			exited = true
+		default:
+		}
+	}
+	_ = t.stopChild(sp.PID)
+	if exited {
+		return withLogTail(fmt.Errorf("engine %w (%s)", errChildExited, exit.status()), logPath)
+	}
+	return fmt.Errorf("record spawned process: %w", err)
+}
+
 func (t *childTracker) trackedChild(pid int) *childExit {
 	t.childMu.Lock()
 	defer t.childMu.Unlock()
@@ -162,40 +200,34 @@ func (t *childTracker) untrackChild(pid int) {
 
 // stopChild sends SIGTERM with a 10s grace period before SIGKILL. A tracked
 // child is stopped through its reaper; an untracked PID is signalled and
-// waited on directly.
+// polled until it is gone.
 func (t *childTracker) stopChild(pid int) error {
+	if pid <= 0 {
+		// kill(2) treats 0 and negative values as process groups, never a single engine.
+		return fmt.Errorf("refusing to stop invalid PID %d", pid)
+	}
 	if exit := t.trackedChild(pid); exit != nil {
 		return t.stopTrackedChild(pid, exit)
 	}
 
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("failed to find process %d: %w", pid, err)
-	}
-
-	if err := process.Signal(syscall.SIGTERM); err != nil {
-		// os converts a signal to a dead PID into ErrProcessDone on every
-		// platform (exec_unix.go convertESRCH, pidfd_linux.go), so this is
-		// the "already gone" check for the untracked path.
-		if errors.Is(err, os.ErrProcessDone) {
+	// Untracked: a PID this process did not spawn (an engine adopted across an
+	// agent restart, #2079). It is not our child, so it cannot be waited on:
+	// os.Process.Wait returns ECHILD at once. Signal, then poll for it to go.
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
 		}
 		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
 	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := process.Wait()
-		done <- err
-	}()
-
-	select {
-	case <-time.After(stopGracePeriod):
-		_ = process.Kill()
-		return &KilledAfterGraceError{PID: pid}
-	case err := <-done:
-		return err
+	deadline := time.Now().Add(stopGracePeriod)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		time.Sleep(untrackedStopPoll)
 	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	return &KilledAfterGraceError{PID: pid}
 }
 
 // stopTrackedChild stops a child this executor spawned. Its reaper owns the
@@ -211,8 +243,6 @@ func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 	}
 
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
-		// The direct Kill surfaces a dead PID as raw ESRCH, unlike the
-		// os.Process.Signal path above.
 		if errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
 		}

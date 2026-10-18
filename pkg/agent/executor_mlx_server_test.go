@@ -348,3 +348,12 @@ func TestMLXServerStartProcess_LogTruncatedOnStart(t *testing.T) {
 		t.Errorf("log not truncated on start: %q", data)
 	}
 }
+
+func TestMLXServerStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
+	bin := fakeMLXServer(t, "exec sleep 60\n")
+	e, cfg, _ := mlxServerFixture(t, bin, healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	requireOnSpawnedErrorKillsChild(t, cfg, func(c ExecutorConfig) (*ManagedProcess, error) {
+		return e.StartProcess(context.Background(), c)
+	})
+}

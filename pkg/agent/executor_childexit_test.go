@@ -338,3 +338,181 @@ func TestTailLines(t *testing.T) {
 		t.Errorf("tailLines on a missing file = %q, want empty", got)
 	}
 }
+
+func TestMetalStartProcess_OnSpawnedSeesTheChild(t *testing.T) {
+	bin := fakeLlamaServer(t, "exec sleep 60\n")
+	e, cfg, logPath := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	var got SpawnedProcess
+	cfg.OnSpawned = func(sp SpawnedProcess) error { got = sp; return nil }
+	// The record carries the resolved path (a temp dir is a symlink on macOS).
+	wantBin, err := filepath.EvalSymlinks(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopProcess(proc.PID) })
+	if got.PID != proc.PID || got.Port != proc.Port || got.Executable != wantBin || got.LogPath != logPath {
+		t.Fatalf("OnSpawned got %+v, process %+v (bin %s, log %s)", got, proc, bin, logPath)
+	}
+}
+
+func TestMetalStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
+	bin := fakeLlamaServer(t, "exec sleep 60\n")
+	e, cfg, _ := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	var pid int
+	cfg.OnSpawned = func(sp SpawnedProcess) error { pid = sp.PID; return errors.New("disk full") }
+
+	if _, err := e.StartProcess(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("err = %v, want the OnSpawned error", err)
+	}
+	if pid == 0 {
+		t.Fatal("OnSpawned was not called")
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child %d still alive after OnSpawned failed (kill 0: %v)", pid, err)
+	}
+}
+
+func TestChildTracker_AfterSpawnStopsChildOnHookError(t *testing.T) {
+	var tr childTracker
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	tr.trackChild(cmd)
+	cfg := ExecutorConfig{OnSpawned: func(SpawnedProcess) error { return errors.New("no record") }}
+	if err := tr.afterSpawn(cfg, cmd, nil, 0, "", ""); err == nil {
+		t.Fatal("afterSpawn returned nil for a failing hook")
+	}
+	if err := syscall.Kill(cmd.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child still alive: %v", err)
+	}
+}
+
+func TestChildTracker_AfterSpawnReportsExitedChildNotRecordFailure(t *testing.T) {
+	var tr childTracker
+	cmd := exec.Command("sh", "-c", "echo boom >&2; exit 3")
+	logPath := filepath.Join(t.TempDir(), "engine.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	_ = logFile.Close()
+	exit := tr.trackChild(cmd)
+	<-exit.done
+	cfg := ExecutorConfig{OnSpawned: func(SpawnedProcess) error { return errors.New("no record") }}
+
+	err = tr.afterSpawn(cfg, cmd, exit, 0, "", logPath)
+	if !errors.Is(err, errChildExited) || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want the child-exited error with the log tail", err)
+	}
+	if strings.Contains(err.Error(), "record") {
+		t.Fatalf("err = %v, a crashed engine must not be reported as a record failure", err)
+	}
+}
+
+func TestStopChild_UntrackedEscalatesToSIGKILL(t *testing.T) {
+	orig := stopGracePeriod
+	stopGracePeriod = 300 * time.Millisecond
+	t.Cleanup(func() { stopGracePeriod = orig })
+
+	// The marker file proves the trap is installed before stopChild signals;
+	// otherwise SIGTERM can land first and the shell dies on it.
+	ready := filepath.Join(t.TempDir(), "ready")
+	cmd := exec.Command("sh", "-c", "trap '' TERM; : > "+ready+"; while :; do sleep 0.05; done")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = cmd.Wait() }() // reaper outside the tracker
+	for i := 0; i < 200; i++ {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(ready); err != nil {
+		t.Fatal("child never installed its SIGTERM trap")
+	}
+
+	var tr childTracker
+	err := tr.stopChild(cmd.Process.Pid)
+	var killed *KilledAfterGraceError
+	if !errors.As(err, &killed) {
+		t.Fatalf("err = %v, want KilledAfterGraceError for an untracked child that ignores SIGTERM", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(cmd.Process.Pid, 0) == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := syscall.Kill(cmd.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("untracked child still alive after stopChild: %v", err)
+	}
+}
+
+func TestStopChild_UntrackedExitsWithinGrace(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = cmd.Wait() }()
+
+	var tr childTracker
+	start := time.Now()
+	if err := tr.stopChild(cmd.Process.Pid); err != nil {
+		t.Fatalf("stopChild: %v", err)
+	}
+	if time.Since(start) >= stopGracePeriod {
+		t.Fatal("stopChild waited the whole grace period for a child that exits on SIGTERM")
+	}
+}
+
+func TestStopChild_RefusesNonPositivePID(t *testing.T) {
+	var tr childTracker
+	for _, pid := range []int{0, -1, -99999} {
+		if err := tr.stopChild(pid); err == nil {
+			t.Fatalf("stopChild(%d) = nil, want an error", pid)
+		}
+	}
+}
+
+// deadPID returns the PID of a process this test started and reaped, so
+// stopping it can never signal a live process on the developer's machine.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command("true")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run true: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+// requireOnSpawnedErrorKillsChild starts an engine whose OnSpawned hook fails
+// and checks the start fails with that error and the child is gone.
+func requireOnSpawnedErrorKillsChild(
+	t *testing.T, cfg ExecutorConfig, start func(ExecutorConfig) (*ManagedProcess, error),
+) {
+	t.Helper()
+	var pid int
+	cfg.OnSpawned = func(sp SpawnedProcess) error { pid = sp.PID; return errors.New("disk full") }
+	if _, err := start(cfg); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("err = %v, want the OnSpawned error", err)
+	}
+	if pid == 0 {
+		t.Fatal("OnSpawned was not called")
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child %d still alive after OnSpawned failed (kill 0: %v)", pid, err)
+	}
+}

@@ -108,6 +108,10 @@ func (a *MetalAgent) handleStartProcessError(
 	if errors.As(startErr, &slotErr) {
 		return a.refuseStart(ctx, isvc, EventReasonModelSourceNotAllowed, slotErr.Error())
 	}
+	if errors.Is(startErr, errEngineRecordWrite) {
+		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+			corev1.EventTypeWarning, EventReasonEngineRecordFailed, "Start failed: %v", startErr)
+	}
 	return fmt.Errorf("failed to start process: %w", startErr)
 }
 

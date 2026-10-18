@@ -264,6 +264,11 @@ type MetalAgentConfig struct {
 	LegacyDirectEndpoints bool
 }
 
+// processInspectorFactory builds the inspector NewMetalAgent hands the engine
+// record store. A variable so the package tests, whose engines carry fake
+// PIDs, can substitute one that accepts them.
+var processInspectorFactory = newProcessInspector
+
 // MetalAgent watches Kubernetes InferenceService resources and manages
 // native inference processes with Metal acceleration
 type MetalAgent struct {
@@ -344,6 +349,10 @@ type MetalAgent struct {
 	// "~" in a path checked against roots. Empty when it cannot be
 	// determined, in which case a "~"-prefixed path is refused.
 	home string
+
+	// engineRecords keeps the on-disk record of each engine this agent
+	// started (<stateDir>/engines), so a restarted agent can adopt it (#2079).
+	engineRecords *engineRecordStore
 
 	// now returns the current time for the RelayNotAdopted watchdog.
 	// Defaults to time.Now; tests inject a fake clock.
@@ -503,8 +512,22 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 			"are not checked; listener, registration, multi-node and distributed flags stay refused")
 	}
 
+	// The state directory holds the engine records in relay and legacy mode
+	// alike; a directory that cannot be resolved fails each record write, and
+	// so each engine start, rather than the agent's startup.
+	stateDir, stateDirErr := resolveStateDir(config.StateDir, home)
+	records := newEngineRecordStore(
+		filepath.Join(stateDir, "engines"), config.Version, processInspectorFactory(), stateDirErr)
+	if stateDirErr != nil {
+		logger.Warnw("engine records unavailable: state directory not resolved",
+			"engineRecords", records.Dir(), "error", stateDirErr)
+	} else {
+		logger.Infow("engine records directory", "engineRecords", records.Dir())
+	}
+
 	return &MetalAgent{
 		config:              config,
+		engineRecords:       records,
 		executors:           make(map[string]ProcessExecutor),
 		processes:           make(map[string]*ManagedProcess),
 		logger:              logger.With("component", "metal-agent"),
@@ -1327,6 +1350,12 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 		UBatchSize:     uBatchSize,
 	})
 	cfg.BindHost = a.engineBindHost()
+	ns, name := isvc.Namespace, isvc.Name
+	cfg.OnSpawned = a.recordOnSpawn(ns, name, runtime)
+	// A start that fails after the provisional record was written leaves no
+	// record behind; a stored process keeps it.
+	stored := false
+	defer a.dropUnstoredRecord(ns, name, &stored)
 
 	// Start the process using the runtime-specific executor.
 	process, err := exec.StartProcess(ctx, cfg)
@@ -1359,7 +1388,14 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	managedProcesses.Set(float64(len(a.processes)))
 	a.updateCommittedMetricLocked()
 	a.mu.Unlock()
+	// From here deleteProcess owns the engine and its record: it keeps the
+	// record when the stop fails, so the deferred drop must not remove it.
+	stored = true
 	processHealthy.WithLabelValues(isvc.Name, isvc.Namespace).Set(1)
+
+	if err := a.completeEngineRecord(ctx, key, process); err != nil {
+		return err
+	}
 
 	// Register service endpoint in Kubernetes
 	if err := a.registry.RegisterEndpointWithRetry(ctx, isvc, process.Port); err != nil {
@@ -1459,7 +1495,12 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	processRestarts.DeleteLabelValues(name, namespace)
 
 	var deleteErrors []error
-	if err := a.stopManagedProcess(ctx, process, true); err != nil {
+	stopErr := a.stopManagedProcess(ctx, process, true)
+	// The record goes only once the engine is confirmed stopped.
+	if stopErr == nil || engineStopped(stopErr) {
+		a.removeEngineRecord(process)
+	}
+	if err := stopErr; err != nil {
 		if engineStopped(err) {
 			// The engine is stopped; the teardown completed without grace.
 			// Keep the typed error so callers can tell it apart from a
@@ -1483,6 +1524,58 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 
 	a.logger.Infow("stopped inference service", "key", key)
 	return nil
+}
+
+// recordOnSpawn is the ExecutorConfig.OnSpawned hook: it writes the
+// provisional record, naming the records directory in any failure.
+func (a *MetalAgent) recordOnSpawn(ns, name, runtime string) func(SpawnedProcess) error {
+	return func(sp SpawnedProcess) error {
+		if err := a.engineRecords.WriteProvisional(ns, name, runtime, sp); err != nil {
+			engineRecordErrorsTotal.Inc()
+			return fmt.Errorf("%w in %s: %w", errEngineRecordWrite, a.engineRecords.Dir(), err)
+		}
+		return nil
+	}
+}
+
+// dropUnstoredRecord removes the record of a start that never reached the
+// process table.
+func (a *MetalAgent) dropUnstoredRecord(ns, name string, stored *bool) {
+	if !*stored {
+		a.removeEngineRecord(&ManagedProcess{Namespace: ns, Name: name})
+	}
+}
+
+// errEngineRecordWrite marks a start that failed because the engine's record
+// could not be written.
+var errEngineRecordWrite = errors.New("could not record the engine")
+
+// completeEngineRecord turns the provisional record into the running one. A
+// process nothing can find after an agent restart is worse than one that did
+// not start, so a failed write stops the engine and fails the start.
+func (a *MetalAgent) completeEngineRecord(ctx context.Context, key string, process *ManagedProcess) error {
+	err := a.engineRecords.WriteRunning(process)
+	if err == nil {
+		return nil
+	}
+	engineRecordErrorsTotal.Inc()
+	msg := fmt.Sprintf("could not record the engine in %s: %v", a.engineRecords.Dir(), err)
+	a.emitInferenceEvent(ctx, process, corev1.EventTypeWarning, EventReasonEngineRecordFailed, "Stopping: %s", msg)
+	if stopErr := a.deleteProcess(ctx, key); stopErr != nil {
+		a.logger.Warnw("failed to stop an engine whose record could not be written", "key", key, "error", stopErr)
+	}
+	return errors.New(msg)
+}
+
+// removeEngineRecord drops the record of an engine that has been stopped.
+func (a *MetalAgent) removeEngineRecord(process *ManagedProcess) {
+	if a.engineRecords == nil {
+		return // an agent assembled without NewMetalAgent (tests) keeps no records
+	}
+	if err := a.engineRecords.Remove(process.Namespace, process.Name); err != nil {
+		a.logger.Warnw("failed to remove engine record",
+			"namespace", process.Namespace, "name", process.Name, "error", err)
+	}
 }
 
 // stopManagedProcess stops a process the caller has already removed from
@@ -1984,18 +2077,26 @@ func (a *MetalAgent) Shutdown(ctx context.Context) error {
 			if err := ollama.UnloadModel(ctx, process.ModelID); err != nil {
 				shutdownErrors = append(shutdownErrors,
 					fmt.Errorf("failed to unload Ollama model %s: %w", key, err))
+				continue
 			}
 		} else if omlx, ok := exec.(*OMLXExecutor); ok && process.ModelID != "" {
 			if err := omlx.UnloadModel(ctx, process.ModelID); err != nil {
 				shutdownErrors = append(shutdownErrors,
 					fmt.Errorf("failed to unload oMLX model %s: %w", key, err))
+				continue
 			}
 		} else {
 			if err := exec.StopProcess(process.PID); err != nil {
 				shutdownErrors = append(shutdownErrors,
 					fmt.Errorf("failed to stop %s: %w", key, err))
+				if !engineStopped(err) {
+					continue // the engine may still run: keep its record
+				}
 			}
 		}
+		// Reached only when the engine was stopped or unloaded: a stop that
+		// failed with the engine possibly alive, or a failed unload, keeps its record.
+		a.removeEngineRecord(process)
 	}
 
 	if len(shutdownErrors) > 0 {
