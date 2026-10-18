@@ -30,6 +30,9 @@ type SpawnedProcess struct {
 	Executable string
 	ModelPath  string
 	LogPath    string
+	// BindHost is the address the engine listens on: loopback in relay
+	// mode, all interfaces in legacy mode.
+	BindHost string
 }
 
 // engineRecord is the on-disk record of one engine the agent started, read by
@@ -44,6 +47,7 @@ type engineRecord struct {
 	PGID               int       `json:"pgid"`
 	StartToken         string    `json:"startToken,omitempty"`
 	Executable         string    `json:"executable,omitempty"`
+	BindHost           string    `json:"bindHost,omitempty"`
 	Port               int       `json:"port"`
 	Runtime            string    `json:"runtime"`
 	ModelPath          string    `json:"modelPath,omitempty"`
@@ -90,13 +94,13 @@ func (s *engineRecordStore) WriteProvisional(namespace, name, runtime string, sp
 	return s.write(engineRecord{
 		Namespace: namespace, Name: name, State: engineRecordProvisional, PID: sp.PID, PGID: sp.PGID,
 		StartToken: tok, Executable: sp.Executable, Port: sp.Port, Runtime: runtime, ModelPath: sp.ModelPath,
-		LogPath: sp.LogPath,
+		LogPath: sp.LogPath, BindHost: sp.BindHost,
 	})
 }
 
 // WriteRunning completes (or, for a shared-daemon service with no spawn,
 // creates) the record of a stored process, keeping the executable, process
-// group and log path a provisional record captured. On success it sets
+// group, log path and bind host a provisional record captured. On success it sets
 // p.StartToken and p.PGID to the values written, so the process carries the
 // identity its record holds.
 func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
@@ -111,7 +115,7 @@ func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 		AdmittedBytes: p.AdmittedBytes,
 	}
 	if prev, ok := s.read(p.Namespace, p.Name); ok && prev.PID == p.PID {
-		rec.Executable, rec.LogPath, rec.PGID = prev.Executable, prev.LogPath, prev.PGID
+		rec.Executable, rec.LogPath, rec.PGID, rec.BindHost = prev.Executable, prev.LogPath, prev.PGID, prev.BindHost
 	}
 	if err := s.write(rec); err != nil {
 		return err

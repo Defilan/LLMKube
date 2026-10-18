@@ -385,7 +385,8 @@ func TestMetalStartProcess_OnSpawnedSeesTheChild(t *testing.T) {
 		t.Fatalf("StartProcess: %v", err)
 	}
 	t.Cleanup(func() { _ = e.StopProcess(proc.PID) })
-	if got.PID != proc.PID || got.Port != proc.Port || got.Executable != wantBin || got.LogPath != logPath {
+	if got.PID != proc.PID || got.Port != proc.Port || got.Executable != wantBin || got.LogPath != logPath ||
+		got.BindHost != engineBindHost {
 		t.Fatalf("OnSpawned got %+v, process %+v (bin %s, log %s)", got, proc, bin, logPath)
 	}
 }

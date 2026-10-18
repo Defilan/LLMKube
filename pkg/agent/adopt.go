@@ -15,6 +15,18 @@ const (
 	adoptionInterrupted = ""
 )
 
+// startAdoption adopts the engines a previous agent process left running and
+// seeds the watcher with their keys, so its first poll stops an adopted engine
+// whose service this agent no longer watches. Start calls it before the
+// watcher runs.
+func (a *MetalAgent) startAdoption(ctx context.Context) map[string]bool {
+	adopted := a.adoptEngines(ctx)
+	if a.watcher != nil {
+		a.watcher.SeedSeen(adopted)
+	}
+	return adopted
+}
+
 // adoptEngines reads the engine records a previous agent process left and
 // adopts each engine that is still ours and serving, so it keeps serving
 // instead of being reloaded (#2079). It needs no API server. An engine that is
@@ -85,21 +97,36 @@ func (a *MetalAgent) adoptOne(ctx context.Context, rec engineRecord) (outcome st
 		}
 	case !a.provenOurs(rec):
 		return adoptionDiscarded, false
+	case rec.BindHost != resolveBindHost(a.engineBindHost()):
+		// Ours but bound for another agent mode: a legacy engine listens on
+		// every interface without the relay's authentication, and a loopback
+		// engine is unreachable for a legacy-mode agent. No bind host
+		// recorded counts as another mode.
+		return a.stopUnwanted(rec, "bound for another agent mode")
 	case !a.serving(ctx, rec):
 		if ctx.Err() != nil {
 			return adoptionInterrupted, true
 		}
 		// Ours but not serving: crashed mid-load, hung, or still loading.
-		err := stopEngineGroup(rec.PID, rec.PGID, rec.StartToken, a.inspect)
-		if err != nil && !engineStopped(err) {
-			a.logger.Warnw("failed to stop an engine that is not serving; keeping its record",
-				"key", rec.Namespace+"/"+rec.Name, "pid", rec.PID, "error", err)
-			return adoptionStopped, true
-		}
-		return adoptionStopped, false
+		return a.stopUnwanted(rec, "not serving")
 	}
 	a.storeAdopted(rec)
 	return adoptionAdopted, false
+}
+
+// stopUnwanted stops an engine that is ours but not adopted, as a group. Its
+// record goes once the engine is confirmed stopped; one that may still run
+// keeps its record for a later stop.
+func (a *MetalAgent) stopUnwanted(rec engineRecord, why string) (outcome string, keepRecord bool) {
+	err := stopEngineGroup(rec.PID, rec.PGID, rec.StartToken, a.inspect)
+	if err != nil && !engineStopped(err) {
+		a.logger.Warnw("failed to stop an engine the agent does not adopt; keeping its record",
+			"key", rec.Namespace+"/"+rec.Name, "pid", rec.PID, "reason", why, "error", err)
+		return adoptionStopped, true
+	}
+	a.logger.Infow("stopped an engine the agent does not adopt",
+		"key", rec.Namespace+"/"+rec.Name, "pid", rec.PID, "reason", why)
+	return adoptionStopped, false
 }
 
 // provenOurs reports whether the record's PID is alive and is still the engine

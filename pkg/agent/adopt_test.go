@@ -87,11 +87,18 @@ func writeRunning(t *testing.T, a *MetalAgent, p *ManagedProcess) {
 }
 
 // writeSpawned writes the provisional record of engine PID 4242 on port 18080,
-// as the executor's OnSpawned hook would.
+// bound to loopback (relay mode), as the executor's OnSpawned hook would.
 func writeSpawned(t *testing.T, a *MetalAgent) {
 	t.Helper()
-	if err := a.engineRecords.WriteProvisional("default", "svc", runtimeLlamaServer,
-		SpawnedProcess{PID: 4242, PGID: 4242, Port: 18080, Executable: "/bin/engine"}); err != nil {
+	writeSpawnedOn(t, a, engineBindHost)
+}
+
+// writeSpawnedOn is writeSpawned with the engine bound to bindHost.
+func writeSpawnedOn(t *testing.T, a *MetalAgent, bindHost string) {
+	t.Helper()
+	if err := a.engineRecords.WriteProvisional("default", "svc", runtimeLlamaServer, SpawnedProcess{
+		PID: 4242, PGID: 4242, Port: 18080, Executable: "/bin/engine", BindHost: bindHost,
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -221,7 +228,7 @@ func TestAdopt_RecordWithoutGroupIsDiscarded(t *testing.T) {
 	// through syscall.Kill, not the killFn seam.
 	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
 	if err := a.engineRecords.WriteProvisional("default", "svc", runtimeLlamaServer,
-		SpawnedProcess{PID: 4242, Port: 18080, Executable: "/bin/engine"}); err != nil {
+		SpawnedProcess{PID: 4242, Port: 18080, Executable: "/bin/engine", BindHost: engineBindHost}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -320,6 +327,154 @@ type cancelingChecker struct{ cancel context.CancelFunc }
 func (c cancelingChecker) Check(ctx context.Context, _ int, _ string) (bool, error) {
 	c.cancel()
 	return false, ctx.Err()
+}
+
+// An engine bound for another agent mode is ours but not wanted: a legacy
+// engine on every interface must not keep serving unauthenticated beside a
+// relay-mode agent, and a loopback engine is unreachable for a legacy-mode
+// one. It is stopped as a group, never adopted.
+func TestAdopt_BindHostChangeStopsTheEngine(t *testing.T) {
+	cases := []struct {
+		name     string
+		legacy   bool
+		recorded string
+	}{
+		{"legacy engine, relay agent", false, legacyBindHost},
+		{"relay engine, legacy agent", true, engineBindHost},
+		{"no bind host recorded", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
+			a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+			a.config.LegacyDirectEndpoints = tc.legacy
+			writeSpawnedOn(t, a, tc.recorded)
+			before := testutil.ToFloat64(engineAdoptionsTotal.WithLabelValues(adoptionStopped))
+
+			if a.adoptEngines(context.Background())["default/svc"] {
+				t.Fatal("adopted an engine bound for another agent mode")
+			}
+			if !slices.Contains(*sent, fmt.Sprintf("%d:%d", -4242, syscall.SIGTERM)) {
+				t.Fatalf("signals = %v, want SIGTERM to process group 4242", *sent)
+			}
+			if recordExists(t, a, "svc") {
+				t.Fatal("the record of a stopped engine was kept")
+			}
+			if d := testutil.ToFloat64(engineAdoptionsTotal.WithLabelValues(adoptionStopped)) - before; d != 1 {
+				t.Fatalf("stopped counter moved by %v, want 1", d)
+			}
+		})
+	}
+}
+
+func TestAdopt_LegacyAgentAdoptsLegacyEngine(t *testing.T) {
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	a.config.LegacyDirectEndpoints = true
+	writeSpawnedOn(t, a, legacyBindHost)
+
+	if !a.adoptEngines(context.Background())["default/svc"] {
+		t.Fatal("legacy-mode agent did not adopt an engine bound for legacy mode")
+	}
+	onlyProbes(t, *sent, "an engine that was adopted")
+}
+
+// watchFixture gives the adoption agent an API with the InferenceService "svc"
+// (its Model on metal), a registry and a watcher polling every 10 ms.
+func watchFixture(t *testing.T, a *MetalAgent) *inferencev1alpha1.InferenceService {
+	t.Helper()
+	model := ggufModel(t, "svc")
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "svc"},
+	}
+	c := fake.NewClientBuilder().WithScheme(newTestScheme()).
+		WithStatusSubresource(&inferencev1alpha1.InferenceService{}).WithObjects(model, isvc).Build()
+	a.config.K8sClient = c
+	a.registry = NewServiceRegistry(c, "10.0.0.1", newNopLogger(), "")
+	a.watcher = NewInferenceServiceWatcher(c, "default", newNopLogger())
+	a.watcher.SetPollInterval(10 * time.Millisecond)
+	return isvc
+}
+
+// handleUntil runs the watcher and hands each event to the agent, as Start's
+// event loop does, until done reports the event it waited for was handled.
+func handleUntil(t *testing.T, a *MetalAgent, done func(InferenceServiceEvent) bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	events := make(chan InferenceServiceEvent)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		_ = a.watcher.Watch(ctx, events)
+	}()
+	defer func() { cancel(); <-watchDone }()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for the watcher's event")
+		case ev := <-events:
+			if err := a.handleEvent(ctx, ev); err != nil {
+				t.Fatalf("handle %s %s: %v", ev.Type, ev.InferenceService.Name, err)
+			}
+			if done(ev) {
+				return
+			}
+		}
+	}
+}
+
+// An adopted engine whose InferenceService still exists but is no longer this
+// agent's (here: left off the allowlist) is stopped by the first poll.
+func TestAdopt_UnwatchedServiceIsStoppedOnFirstPoll(t *testing.T) {
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	watchFixture(t, a)
+	a.watcher.SetNameAllowlist([]string{"another-isvc"})
+	writeSpawned(t, a)
+	writeRunning(t, a, &ManagedProcess{Name: "svc", Namespace: "default", PID: 4242, Port: 18080,
+		Runtime: runtimeLlamaServer, SpecHash: "h"})
+	if !a.startAdoption(context.Background())["default/svc"] {
+		t.Fatal("engine not adopted")
+	}
+
+	handleUntil(t, a, func(ev InferenceServiceEvent) bool { return ev.Type == EventTypeDeleted })
+
+	if _, ok := a.processes["default/svc"]; ok {
+		t.Fatal("the adopted engine of an unwatched service is still managed")
+	}
+	if !slices.Contains(*sent, fmt.Sprintf("%d:%d", -4242, syscall.SIGTERM)) {
+		t.Fatalf("signals = %v, want SIGTERM to process group 4242", *sent)
+	}
+	if recordExists(t, a, "svc") {
+		t.Fatal("the record of the stopped engine was kept")
+	}
+}
+
+// An adopted engine whose service is still owned with the same spec keeps
+// running through the first list and poll.
+func TestAdopt_OwnedServiceIsNotRestarted(t *testing.T) {
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	isvc := watchFixture(t, a)
+	writeSpawned(t, a)
+	writeRunning(t, a, &ManagedProcess{Name: "svc", Namespace: "default", PID: 4242, Port: 18080,
+		Runtime: runtimeLlamaServer, SpecHash: computeSpecHash(isvc)})
+	if !a.startAdoption(context.Background())["default/svc"] {
+		t.Fatal("engine not adopted")
+	}
+
+	// The first list sends Created; the seeded key makes the first poll send Updated.
+	handleUntil(t, a, func(ev InferenceServiceEvent) bool { return ev.Type == EventTypeUpdated })
+
+	if p := a.processes["default/svc"]; p == nil || p.PID != 4242 || !p.Adopted {
+		t.Fatalf("process = %+v, want the adopted engine kept", p)
+	}
+	onlyProbes(t, *sent, "an owned engine with an unchanged spec")
+	if !recordExists(t, a, "svc") {
+		t.Fatal("the record of the kept engine was removed")
+	}
 }
 
 func TestAdopt_OMLXRecordsAreDiscarded(t *testing.T) {

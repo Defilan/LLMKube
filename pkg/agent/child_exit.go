@@ -254,7 +254,10 @@ func (t *childTracker) afterSpawn(
 	if resolved, err := filepath.EvalSymlinks(cmd.Path); err == nil {
 		executable = resolved
 	}
-	sp := SpawnedProcess{PID: cmd.Process.Pid, Port: port, Executable: executable, ModelPath: modelPath, LogPath: logPath}
+	sp := SpawnedProcess{
+		PID: cmd.Process.Pid, Port: port, Executable: executable, ModelPath: modelPath, LogPath: logPath,
+		BindHost: bindHost(cfg),
+	}
 	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid {
 		sp.PGID = sp.PID
 	}
