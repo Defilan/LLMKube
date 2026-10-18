@@ -338,3 +338,56 @@ func TestTailLines(t *testing.T) {
 		t.Errorf("tailLines on a missing file = %q, want empty", got)
 	}
 }
+
+func TestMetalStartProcess_OnSpawnedSeesTheChild(t *testing.T) {
+	bin := fakeLlamaServer(t, "exec sleep 60\n")
+	e, cfg, logPath := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	var got SpawnedProcess
+	cfg.OnSpawned = func(sp SpawnedProcess) error { got = sp; return nil }
+
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopProcess(proc.PID) })
+	if got.PID != proc.PID || got.Port != proc.Port || got.Executable != bin || got.LogPath != logPath {
+		t.Fatalf("OnSpawned got %+v, process %+v (bin %s, log %s)", got, proc, bin, logPath)
+	}
+}
+
+func TestMetalStartProcess_OnSpawnedErrorKillsChild(t *testing.T) {
+	bin := fakeLlamaServer(t, "exec sleep 60\n")
+	e, cfg, _ := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	var pid int
+	cfg.OnSpawned = func(sp SpawnedProcess) error { pid = sp.PID; return errors.New("disk full") }
+
+	if _, err := e.StartProcess(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("err = %v, want the OnSpawned error", err)
+	}
+	if pid == 0 {
+		t.Fatal("OnSpawned was not called")
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child %d still alive after OnSpawned failed (kill 0: %v)", pid, err)
+	}
+}
+
+func TestChildTracker_AfterSpawnStopsChildOnHookError(t *testing.T) {
+	var tr childTracker
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	tr.trackChild(cmd)
+	cfg := ExecutorConfig{OnSpawned: func(SpawnedProcess) error { return errors.New("no record") }}
+	if err := tr.afterSpawn(cfg, cmd, 0, "", ""); err == nil {
+		t.Fatal("afterSpawn returned nil for a failing hook")
+	}
+	if err := syscall.Kill(cmd.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("child still alive: %v", err)
+	}
+}
