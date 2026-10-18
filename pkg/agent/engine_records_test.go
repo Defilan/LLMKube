@@ -149,3 +149,20 @@ func TestEngineRecordStore_ConcurrentKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestEngineRecordStore_ReadIgnoresSymlink(t *testing.T) {
+	s, dir := newTestRecordStore(t)
+	sp := SpawnedProcess{PID: 4242, Port: 1, Executable: "/bin/x"}
+	if err := s.WriteProvisional("default", "real", runtimeLlamaServer, sp); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.read("default", "real"); !ok {
+		t.Fatal("a regular record was not read")
+	}
+	if err := os.Symlink(filepath.Join(dir, "default_real.json"), filepath.Join(dir, "default_link.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.read("default", "link"); ok {
+		t.Fatal("a symlinked record was read, want it treated as no record")
+	}
+}

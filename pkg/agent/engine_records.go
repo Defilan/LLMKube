@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -128,7 +130,13 @@ func (s *engineRecordStore) startToken(pid int) (string, error) {
 }
 
 func (s *engineRecordStore) read(namespace, name string) (engineRecord, bool) {
-	data, err := os.ReadFile(s.path(namespace, name))
+	// O_NOFOLLOW: a symlink planted in the records directory is no record.
+	f, err := os.OpenFile(s.path(namespace, name), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return engineRecord{}, false
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return engineRecord{}, false
 	}
