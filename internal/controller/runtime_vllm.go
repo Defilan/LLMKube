@@ -52,6 +52,17 @@ func (b *VLLMBackend) SupportedArchitectures() []string { return nil }
 func (b *VLLMBackend) NeedsModelInit() bool             { return true }
 func (b *VLLMBackend) DefaultHPAMetric() string         { return "vllm:num_requests_running" }
 
+// NeedsSharedMemory reports whether vLLM runs several worker processes on the
+// node: BuildArgs defaults tensor parallelism to the GPU count, and an explicit
+// tensor or pipeline size above 1 does the same (#2099).
+func (b *VLLMBackend) NeedsSharedMemory(isvc *inferencev1alpha1.InferenceService, gpuCount int32) bool {
+	if gpuCount > 1 {
+		return true
+	}
+	cfg := isvc.Spec.VLLMConfig
+	return cfg != nil && anyAboveOne(cfg.TensorParallelSize, cfg.PipelineParallelSize)
+}
+
 // BuildCommand returns the entrypoint for the vLLM container, mirroring
 // SGLangBackend/PersonaPlexBackend. The stock vllm/vllm-openai image already
 // entrypoints on "vllm serve" (the positional-model form BuildArgs emits), so

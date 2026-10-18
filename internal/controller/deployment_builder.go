@@ -155,6 +155,61 @@ func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 	return nil
 }
 
+const (
+	devShmPath       = "/dev/shm"
+	devShmVolumeName = "llmkube-shm"
+)
+
+// devShmDefaultLimit is the /dev/shm cap with no memory limit to scale from, the
+// value the two-Spark DeepSeek lab mounts by hand.
+var devShmDefaultLimit = resource.MustParse("16Gi")
+
+// devShmVolume returns the memory-backed emptyDir to mount at /dev/shm, or nil
+// when the pod should keep the container runtime's default. Multi-process
+// runtimes (SharedMemoryRequirer) exchange tensors and NCCL buffers through
+// /dev/shm, and the 64 MiB default fails their engine start (#2099).
+//
+// It returns nil when:
+//   - the backend does not need it for this service;
+//   - spec.multiNode is set: member pods run with hostIPC, which gives them the
+//     host's /dev/shm, and are built from this template, so an emptyDir would
+//     shadow it;
+//   - the user already mounts /dev/shm through extraVolumeMounts (their volume,
+//     size and medium win, which is also how to opt out or resize), or already
+//     has a volume with the operator's name.
+//
+// The size is a cap, not a reservation: tmpfs pages are allocated as written and
+// charged to the pod's memory, so with a memory limit the cap is half of it (at
+// most 16Gi) and the engine keeps the other half.
+func devShmVolume(isvc *inferencev1alpha1.InferenceService, backend RuntimeBackend, gpuCount int32, memLimit *resource.Quantity) *corev1.Volume {
+	r, ok := backend.(SharedMemoryRequirer)
+	if !ok || !r.NeedsSharedMemory(isvc, gpuCount) || isvc.Spec.MultiNode != nil {
+		return nil
+	}
+	for _, m := range isvc.Spec.ExtraVolumeMounts {
+		if path.Clean(m.MountPath) == devShmPath {
+			return nil
+		}
+	}
+	for _, v := range isvc.Spec.ExtraVolumes {
+		if v.Name == devShmVolumeName {
+			return nil
+		}
+	}
+	limit := devShmDefaultLimit.DeepCopy()
+	if memLimit != nil && !memLimit.IsZero() {
+		if half := resource.NewQuantity(memLimit.Value()/2, resource.BinarySI); half.Cmp(limit) < 0 {
+			limit = *half
+		}
+	}
+	return &corev1.Volume{
+		Name: devShmVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: &limit},
+		},
+	}
+}
+
 // inferPodSecurityContext returns the user-supplied PodSecurityContext when
 // present, otherwise a default that works with the standard non-root init
 // container image (curlimages/curl, uid=101 gid=102).
@@ -563,6 +618,13 @@ func (r *InferenceServiceReconciler) constructDeployment(
 
 	container.Resources = buildContainerResources(isvc, model, gpuCount, gpuResourceName)
 
+	// Sized from the memory limit just resolved, so it must follow
+	// buildContainerResources.
+	shmVolume := devShmVolume(isvc, backend, gpuCount, container.Resources.Limits.Memory())
+	if shmVolume != nil {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: devShmVolumeName, MountPath: devShmPath})
+	}
+
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      isvc.Name,
@@ -598,6 +660,9 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		},
 	}
 	deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, isvc.Spec.ExtraVolumes...)
+	if shmVolume != nil {
+		deployment.Spec.Template.Spec.Volumes = append(deployment.Spec.Template.Spec.Volumes, *shmVolume)
+	}
 
 	// GPU-only scheduling: the device taint toleration and the shared-pool
 	// selector. Both are meaningless without a GPU request, so they stay gated.

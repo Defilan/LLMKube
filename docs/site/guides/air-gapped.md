@@ -733,28 +733,32 @@ InferenceService.
 
 ### Gotchas
 
-**`/dev/shm` for tensor parallel.** vLLM and SGLang move tensors
+**`/dev/shm` for tensor parallel.** vLLM, SGLang and TGI move tensors
 between GPU worker processes through shared memory, and the container
-runtime's default `/dev/shm` is far too small for tensor parallel > 1.
-LLMKube does not add one for you today; mount a memory-backed
-`emptyDir` through `spec.extraVolumes` and `spec.extraVolumeMounts`:
+runtime's default `/dev/shm` (64 MiB) is far too small for more than
+one worker. LLMKube mounts a memory-backed `emptyDir` at `/dev/shm`
+for you when a single-node service runs several workers: more than one
+GPU, or a tensor, pipeline or data-parallel size above 1. Its size cap
+is half the container's memory limit, at most 16Gi (16Gi when no limit
+is set). `spec.multiNode` ranks are left alone: they run with
+`hostIPC` and use the host's `/dev/shm`.
+
+To pick your own size, or to opt out, mount your own volume at
+`/dev/shm`; it replaces the operator's:
 
 ```yaml
 spec:
-  vllmConfig:
-    tensorParallelSize: 2
-  resources: { gpu: 2, cpu: "16", memory: 80Gi }
   extraVolumes:
     - name: dshm
-      emptyDir: { medium: Memory, sizeLimit: 16Gi }
+      emptyDir: { medium: Memory, sizeLimit: 32Gi }
   extraVolumeMounts:
     - { name: dshm, mountPath: /dev/shm }
 ```
 
 Pages written to a `medium: Memory` volume are charged to the pod's
 memory, so `resources.memory` (or `memoryLimit`) has to cover the
-runtime's own usage plus whatever lands in `/dev/shm`. Size it as
-added headroom, not as free space.
+runtime's own usage plus whatever lands in `/dev/shm`. The size cap
+is a ceiling, not a reservation; size memory with it as headroom.
 
 **Served model name.** vLLM is started with the model path as its
 positional argument and, unless you add one, no `--served-model-name`.

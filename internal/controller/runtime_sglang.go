@@ -81,6 +81,17 @@ func (b *SGLangBackend) SupportedArchitectures() []string { return nil }
 func (b *SGLangBackend) NeedsModelInit() bool             { return true }
 func (b *SGLangBackend) DefaultHPAMetric() string         { return "sglang:num_running_reqs" }
 
+// NeedsSharedMemory reports whether SGLang runs several worker processes on the
+// node: BuildArgs defaults --tp to the GPU count, and an explicit tensor,
+// expert or data-parallel size above 1 does the same (#2099).
+func (b *SGLangBackend) NeedsSharedMemory(isvc *inferencev1alpha1.InferenceService, gpuCount int32) bool {
+	if gpuCount > 1 {
+		return true
+	}
+	cfg := isvc.Spec.SGLangConfig
+	return cfg != nil && anyAboveOne(cfg.TensorParallelSize, cfg.ExpertParallelSize, cfg.DataParallelSize)
+}
+
 // BuildArgs generates the SGLang server CLI arguments. Order:
 //  1. --model-path, --host, --port (always)
 //  2. --served-model-name (auto-derived from ModelRef / model name)
