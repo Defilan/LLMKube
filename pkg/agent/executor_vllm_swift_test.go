@@ -359,16 +359,16 @@ func TestVLLMSwiftStopProcess_HappyPath(t *testing.T) {
 	// Spawn a `sleep` child the executor doesn't manage, then ask
 	// StopProcess to send it SIGTERM. This exercises the untracked-PID
 	// fallback in stopChild (a process adopted after an agent restart),
-	// which signals and waits on the PID directly. The default SIGTERM
-	// handler exits the child cleanly, which Wait() observes.
+	// which signals and polls the PID. The default SIGTERM handler exits the
+	// child cleanly.
 	cmd := exec.Command("sleep", "60")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("could not spawn sleep: %v", err)
 	}
-	defer func() {
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
-	}()
+	// A reaper outside the tracker, as launchd is for an adopted engine: an
+	// unreaped zombie would still answer kill(pid, 0) and look alive.
+	go func() { _ = cmd.Wait() }()
+	defer func() { _ = cmd.Process.Kill() }()
 
 	executor := NewVLLMSwiftExecutor("/bin/vllm-swift", "/models", newNopLogger())
 	if err := executor.StopProcess(cmd.Process.Pid); err != nil {
