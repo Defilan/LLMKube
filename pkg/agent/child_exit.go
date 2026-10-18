@@ -157,8 +157,9 @@ func verifyEngineIdentity(pid int, token string, inspect processInspector) error
 // to know whether the child is gone (the health wait, StopProcess) selects on
 // done instead of waiting again, since a second wait on a reaped PID fails.
 type childExit struct {
-	done chan struct{}
-	err  error // valid once done is closed
+	done  chan struct{}
+	err   error // valid once done is closed
+	group bool  // the child leads its own process group, so stops signal the group
 }
 
 func watchChild(cmd *exec.Cmd) *childExit {
@@ -227,6 +228,7 @@ type childTracker struct {
 
 func (t *childTracker) trackChild(cmd *exec.Cmd) *childExit {
 	exit := watchChild(cmd)
+	exit.group = cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid
 	t.childMu.Lock()
 	if t.children == nil {
 		t.children = map[int]*childExit{}
@@ -253,6 +255,9 @@ func (t *childTracker) afterSpawn(
 		executable = resolved
 	}
 	sp := SpawnedProcess{PID: cmd.Process.Pid, Port: port, Executable: executable, ModelPath: modelPath, LogPath: logPath}
+	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid {
+		sp.PGID = sp.PID
+	}
 	err := cfg.OnSpawned(sp)
 	if err == nil {
 		return nil
@@ -317,7 +322,8 @@ func (t *childTracker) stopChild(pid int) error {
 }
 
 // stopTrackedChild stops a child this executor spawned. Its reaper owns the
-// wait, so this only signals and watches done.
+// wait, so this only signals and watches done. A child that leads its own
+// process group is stopped by group, so helpers it forked go with it.
 func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 	defer t.untrackChild(pid)
 
@@ -328,7 +334,11 @@ func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 	default:
 	}
 
-	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+	target := pid
+	if exit.group {
+		target = -pid
+	}
+	if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
 			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
 		}
@@ -337,7 +347,7 @@ func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 
 	select {
 	case <-time.After(stopGracePeriod):
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		_ = syscall.Kill(target, syscall.SIGKILL)
 		return &KilledAfterGraceError{PID: pid}
 	case <-exit.done:
 		return nil

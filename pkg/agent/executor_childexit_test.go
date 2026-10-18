@@ -719,3 +719,66 @@ func TestStopEngineGroup_NoPGIDFallsBackToPID(t *testing.T) {
 		t.Fatalf("stopEngineGroup with pgid 0: %v", err)
 	}
 }
+
+func TestMetalStartProcess_EngineHasItsOwnProcessGroup(t *testing.T) {
+	bin := fakeLlamaServer(t, "exec sleep 60\n")
+	e, cfg, _ := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	var sp SpawnedProcess
+	cfg.OnSpawned = func(s SpawnedProcess) error { sp = s; return nil }
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	t.Cleanup(func() { _ = e.StopProcess(proc.PID) })
+	requireOwnProcessGroup(t, proc.PID, sp)
+}
+
+// requireOwnProcessGroup asserts the engine leads its own process group, apart
+// from the agent's, and that OnSpawned recorded that group.
+func requireOwnProcessGroup(t *testing.T, pid int, sp SpawnedProcess) {
+	t.Helper()
+	pgid, err := syscall.Getpgid(pid)
+	if err != nil || pgid != pid || sp.PGID != pid {
+		t.Fatalf("pgid = %d (%v), recorded %d; want the engine to lead its own group %d", pgid, err, sp.PGID, pid)
+	}
+	if pgid == syscall.Getpgrp() {
+		t.Fatal("engine shares the agent's process group")
+	}
+}
+
+func TestMetalStopProcess_StopsTheEngineGroup(t *testing.T) {
+	// The fake leaves a grandchild in its group; stopping the engine must take it too.
+	pidFile := filepath.Join(t.TempDir(), "grandchild.pid")
+	bin := fakeLlamaServer(t, "sleep 60 & echo $! > "+pidFile+"\nwait\n")
+	e, cfg, _ := childExitFixture(t, bin)
+	e.SetPort(healthyPort(t))
+	e.SetStartupTimeout(10 * time.Second)
+	proc, err := e.StartProcess(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("StartProcess: %v", err)
+	}
+	var grandchild int
+	for i := 0; i < 50 && grandchild == 0; i++ {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			_, _ = fmt.Sscanf(string(b), "%d", &grandchild)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if grandchild == 0 {
+		_ = e.StopProcess(proc.PID)
+		t.Fatal("fake engine did not start its grandchild")
+	}
+	if err := e.StopProcess(proc.PID); err != nil {
+		t.Fatalf("StopProcess: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for syscall.Kill(grandchild, 0) == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := syscall.Kill(grandchild, 0); !errors.Is(err, syscall.ESRCH) {
+		_ = syscall.Kill(grandchild, syscall.SIGKILL)
+		t.Fatalf("grandchild %d survived the engine stop: %v", grandchild, err)
+	}
+}
