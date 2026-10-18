@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type anyPIDInspector struct{}
@@ -165,5 +167,82 @@ func TestStopFailureKeepsRecord(t *testing.T) {
 				t.Fatalf("record gone although the engine may still run: %v", err)
 			}
 		})
+	}
+}
+
+func TestShutdown_RecordFollowsStopOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stopErr    error
+		wantRecord bool
+	}{
+		{"stopped", nil, false},
+		{"stop failed", errors.New("signal refused"), true},
+		{"killed after grace", &KilledAfterGraceError{PID: 1}, false},
+		{"already gone", errProcessAlreadyGone, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRestartFixture(t, "sd")
+			delete(f.agent.processes, f.key)
+			dir := useTempRecords(t, f)
+			if err := f.agent.ensureProcess(context.Background(), f.isvc); err != nil {
+				t.Fatal(err)
+			}
+			f.exec.stopErr = tc.stopErr
+			_ = f.agent.Shutdown(context.Background())
+			_, err := os.Stat(filepath.Join(dir, "default_sd.json"))
+			if tc.wantRecord && err != nil {
+				t.Fatalf("record gone although the engine may still run: %v", err)
+			}
+			if !tc.wantRecord && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("record left although the engine is stopped: %v", err)
+			}
+		})
+	}
+}
+
+func TestEnsureProcess_CompletionFailureWithFailedStopKeepsRecord(t *testing.T) {
+	f := newRestartFixture(t, "keepc")
+	delete(f.agent.processes, f.key)
+	dir := filepath.Join(t.TempDir(), "engines")
+	f.agent.engineRecords = newEngineRecordStore(dir, "v-test", &flipInspector{}, nil)
+	f.exec.stopErr = errors.New("stop failed")
+
+	if err := f.agent.ensureProcess(context.Background(), f.isvc); err == nil {
+		t.Fatal("ensureProcess succeeded, want the record failure")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "default_keepc.json")); err != nil {
+		t.Fatalf("record gone although the engine may still run: %v", err)
+	}
+}
+
+func TestEnsureProcess_RecordFailuresAreCounted(t *testing.T) {
+	// Provisional write failure: the records "directory" is a regular file.
+	f := newRestartFixture(t, "cnt1")
+	delete(f.agent.processes, f.key)
+	blocker := filepath.Join(t.TempDir(), "engines")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.agent.engineRecords = newEngineRecordStore(blocker, "v-test", anyPIDInspector{}, nil)
+	before := testutil.ToFloat64(engineRecordErrorsTotal)
+	if err := f.agent.ensureProcess(context.Background(), f.isvc); err == nil {
+		t.Fatal("ensureProcess succeeded, want the provisional write failure")
+	}
+	if got := testutil.ToFloat64(engineRecordErrorsTotal) - before; got != 1 {
+		t.Fatalf("provisional failure counted %v times, want 1", got)
+	}
+
+	// Completion write failure.
+	f = newRestartFixture(t, "cnt2")
+	delete(f.agent.processes, f.key)
+	f.agent.engineRecords = newEngineRecordStore(
+		filepath.Join(t.TempDir(), "engines"), "v-test", &flipInspector{}, nil)
+	before = testutil.ToFloat64(engineRecordErrorsTotal)
+	if err := f.agent.ensureProcess(context.Background(), f.isvc); err == nil {
+		t.Fatal("ensureProcess succeeded, want the completion write failure")
+	}
+	if got := testutil.ToFloat64(engineRecordErrorsTotal) - before; got != 1 {
+		t.Fatalf("completion failure counted %v times, want 1", got)
 	}
 }

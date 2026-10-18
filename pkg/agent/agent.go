@@ -518,6 +518,12 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 	stateDir, stateDirErr := resolveStateDir(config.StateDir, home)
 	records := newEngineRecordStore(
 		filepath.Join(stateDir, "engines"), config.Version, processInspectorFactory(), stateDirErr)
+	if stateDirErr != nil {
+		logger.Warnw("engine records unavailable: state directory not resolved",
+			"engineRecords", records.Dir(), "error", stateDirErr)
+	} else {
+		logger.Infow("engine records directory", "engineRecords", records.Dir())
+	}
 
 	return &MetalAgent{
 		config:              config,
@@ -1382,12 +1388,14 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	managedProcesses.Set(float64(len(a.processes)))
 	a.updateCommittedMetricLocked()
 	a.mu.Unlock()
+	// From here deleteProcess owns the engine and its record: it keeps the
+	// record when the stop fails, so the deferred drop must not remove it.
+	stored = true
 	processHealthy.WithLabelValues(isvc.Name, isvc.Namespace).Set(1)
 
 	if err := a.completeEngineRecord(ctx, key, process); err != nil {
 		return err
 	}
-	stored = true
 
 	// Register service endpoint in Kubernetes
 	if err := a.registry.RegisterEndpointWithRetry(ctx, isvc, process.Port); err != nil {
@@ -1523,6 +1531,7 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 func (a *MetalAgent) recordOnSpawn(ns, name, runtime string) func(SpawnedProcess) error {
 	return func(sp SpawnedProcess) error {
 		if err := a.engineRecords.WriteProvisional(ns, name, runtime, sp); err != nil {
+			engineRecordErrorsTotal.Inc()
 			return fmt.Errorf("%w in %s: %w", errEngineRecordWrite, a.engineRecords.Dir(), err)
 		}
 		return nil
@@ -1549,6 +1558,7 @@ func (a *MetalAgent) completeEngineRecord(ctx context.Context, key string, proce
 	if err == nil {
 		return nil
 	}
+	engineRecordErrorsTotal.Inc()
 	msg := fmt.Sprintf("could not record the engine in %s: %v", a.engineRecords.Dir(), err)
 	a.emitInferenceEvent(ctx, process, corev1.EventTypeWarning, EventReasonEngineRecordFailed, "Stopping: %s", msg)
 	if stopErr := a.deleteProcess(ctx, key); stopErr != nil {
@@ -2079,11 +2089,13 @@ func (a *MetalAgent) Shutdown(ctx context.Context) error {
 			if err := exec.StopProcess(process.PID); err != nil {
 				shutdownErrors = append(shutdownErrors,
 					fmt.Errorf("failed to stop %s: %w", key, err))
-				continue
+				if !engineStopped(err) {
+					continue // the engine may still run: keep its record
+				}
 			}
 		}
-		// Reached only when the engine was stopped or unloaded: a failed stop or
-		// unload (every branch above) keeps its record.
+		// Reached only when the engine was stopped or unloaded: a stop that
+		// failed with the engine possibly alive, or a failed unload, keeps its record.
 		a.removeEngineRecord(process)
 	}
 
