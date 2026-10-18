@@ -259,8 +259,9 @@ func (t *childTracker) trackChild(cmd *exec.Cmd) *childExit {
 // fails, the child is stopped and the error returned, so the caller fails the
 // start without leaving an unrecorded engine behind. A child that had already
 // exited reports that instead, with its log tail, so a crashed engine is not
-// blamed on the record. The recorded executable is the resolved path, so
-// adoption compares it with what the OS reports for the PID.
+// blamed on the record. The executable is recorded both resolved and as
+// executed, so adoption still recognizes the engine after a Homebrew upgrade
+// repoints the bin/ symlink it was started through.
 func (t *childTracker) afterSpawn(
 	cfg ExecutorConfig, cmd *exec.Cmd, exit *childExit, port int, modelPath, logPath string,
 ) error {
@@ -272,8 +273,8 @@ func (t *childTracker) afterSpawn(
 		executable = resolved
 	}
 	sp := SpawnedProcess{
-		PID: cmd.Process.Pid, Port: port, Executable: executable, ModelPath: modelPath, LogPath: logPath,
-		BindHost: bindHost(cfg),
+		PID: cmd.Process.Pid, Port: port, Executable: executable, LaunchPath: cmd.Path, ModelPath: modelPath,
+		LogPath: logPath, BindHost: bindHost(cfg),
 	}
 	if cmd.SysProcAttr != nil && cmd.SysProcAttr.Setpgid {
 		sp.PGID = sp.PID

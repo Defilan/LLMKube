@@ -375,7 +375,8 @@ func TestMetalStartProcess_OnSpawnedSeesTheChild(t *testing.T) {
 	e.SetStartupTimeout(10 * time.Second)
 	var got SpawnedProcess
 	cfg.OnSpawned = func(sp SpawnedProcess) error { got = sp; return nil }
-	// The record carries the resolved path (a temp dir is a symlink on macOS).
+	// The record carries the resolved path (a temp dir is a symlink on macOS)
+	// and the path as executed.
 	wantBin, err := filepath.EvalSymlinks(bin)
 	if err != nil {
 		t.Fatal(err)
@@ -386,8 +387,8 @@ func TestMetalStartProcess_OnSpawnedSeesTheChild(t *testing.T) {
 		t.Fatalf("StartProcess: %v", err)
 	}
 	t.Cleanup(func() { _ = e.StopProcess(proc.PID) })
-	if got.PID != proc.PID || got.Port != proc.Port || got.Executable != wantBin || got.LogPath != logPath ||
-		got.BindHost != engineBindHost {
+	if got.PID != proc.PID || got.Port != proc.Port || got.Executable != wantBin || got.LaunchPath != bin ||
+		got.LogPath != logPath || got.BindHost != engineBindHost {
 		t.Fatalf("OnSpawned got %+v, process %+v (bin %s, log %s)", got, proc, bin, logPath)
 	}
 }

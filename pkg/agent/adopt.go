@@ -30,9 +30,10 @@ func (a *MetalAgent) startAdoption(ctx context.Context) map[string]bool {
 // adoptEngines reads the engine records a previous agent process left and
 // adopts each engine that is still ours and serving, so it keeps serving
 // instead of being reloaded (#2079). It needs no API server. An engine that is
-// ours but not serving is stopped as a group; anything whose identity cannot
-// be confirmed is discarded without being signalled. Records it cannot parse
-// are logged and left alone. It returns the adopted keys (namespace/name),
+// ours (its start token matches) but cannot be adopted, because its executable
+// changed, it is not serving or it is bound for another mode, is stopped as a
+// group; a record whose process is not provably ours is discarded without a
+// signal. Records it cannot parse are logged and left alone. It returns the adopted keys (namespace/name),
 // which the startup endpoint withdrawal skips.
 func (a *MetalAgent) adoptEngines(ctx context.Context) map[string]bool {
 	adopted := map[string]bool{}
@@ -97,6 +98,12 @@ func (a *MetalAgent) adoptOne(ctx context.Context, rec engineRecord) (outcome st
 		}
 	case !a.provenOurs(rec):
 		return adoptionDiscarded, false
+	case !a.runsRecordedExecutable(rec):
+		// The start token proves the process is the one the agent forked, but
+		// it now runs something else than recorded (a wrapper that exec'd the
+		// engine, an interpreter flag): keeping it serving is not safe,
+		// forgetting it would orphan it.
+		return a.stopUnwanted(rec, "executable changed")
 	case rec.BindHost != resolveBindHost(a.engineBindHost()):
 		// Ours but bound for another agent mode: a legacy engine listens on
 		// every interface without the relay's authentication, and a loopback
@@ -129,11 +136,12 @@ func (a *MetalAgent) stopUnwanted(rec engineRecord, why string) (outcome string,
 	return adoptionStopped, false
 }
 
-// provenOurs reports whether the record's PID is alive and is still the engine
-// the record describes: same kernel start token, same resolved executable, and
-// leader of the recorded process group. Every engine the agent spawns leads
-// its own group, so a record without one is malformed (and stopEngineGroup
-// would refuse it anyway). Any lookup error counts as not ours. It sends only the existence probe.
+// provenOurs reports whether the record's PID is alive and is still the
+// process the agent forked: same kernel start token (exec does not change it)
+// and leader of the recorded process group. Every engine the agent spawns
+// leads its own group, so a record without one is malformed (and
+// stopEngineGroup would refuse it anyway). Any lookup error counts as not
+// ours. It sends only the existence probe.
 func (a *MetalAgent) provenOurs(rec engineRecord) bool {
 	if rec.PGID != rec.PID {
 		return false
@@ -142,11 +150,15 @@ func (a *MetalAgent) provenOurs(rec engineRecord) bool {
 		return false
 	}
 	tok, err := a.inspect.StartToken(rec.PID)
-	if err != nil || rec.StartToken == "" || tok != rec.StartToken {
-		return false
-	}
+	return err == nil && rec.StartToken != "" && tok == rec.StartToken
+}
+
+// runsRecordedExecutable reports whether a proven-ours engine still runs the
+// program it was recorded with, under either recorded path. Adoption requires
+// it; a failed lookup counts as a mismatch.
+func (a *MetalAgent) runsRecordedExecutable(rec engineRecord) bool {
 	exes, err := a.inspect.Executables(rec.PID)
-	return err == nil && executableMatches(exes, rec.Executable)
+	return err == nil && executableMatches(exes, rec.executablePaths()...)
 }
 
 // serving probes the runtime's health endpoint on the recorded port, as the
