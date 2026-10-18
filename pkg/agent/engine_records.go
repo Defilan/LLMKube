@@ -24,10 +24,14 @@ const (
 // SpawnedProcess is what an executor knows about a child right after
 // cmd.Start, passed to ExecutorConfig.OnSpawned.
 type SpawnedProcess struct {
-	PID        int
-	PGID       int
-	Port       int
+	PID  int
+	PGID int
+	Port int
+	// Executable is the spawned program with symlinks resolved; LaunchPath is
+	// the path as executed. A Homebrew relink changes what the first resolves
+	// to, so adoption accepts either.
 	Executable string
+	LaunchPath string
 	ModelPath  string
 	LogPath    string
 	// BindHost is the address the engine listens on: loopback in relay
@@ -47,6 +51,7 @@ type engineRecord struct {
 	PGID               int       `json:"pgid"`
 	StartToken         string    `json:"startToken,omitempty"`
 	Executable         string    `json:"executable,omitempty"`
+	LaunchPath         string    `json:"launchPath,omitempty"`
 	BindHost           string    `json:"bindHost,omitempty"`
 	Port               int       `json:"port"`
 	Runtime            string    `json:"runtime"`
@@ -60,6 +65,12 @@ type engineRecord struct {
 	// AdmittedBytes is the memory estimate the engine was admitted with, so an
 	// agent that adopts it counts that memory as committed (#2080).
 	AdmittedBytes uint64 `json:"admittedBytes,omitempty"`
+}
+
+// executablePaths are the paths the engine was recorded under, resolved and
+// as executed, for executableMatches.
+func (r engineRecord) executablePaths() []string {
+	return []string{r.Executable, r.LaunchPath}
 }
 
 // engineRecordStore keeps one record file per engine under dir
@@ -93,14 +104,14 @@ func (s *engineRecordStore) WriteProvisional(namespace, name, runtime string, sp
 	}
 	return s.write(engineRecord{
 		Namespace: namespace, Name: name, State: engineRecordProvisional, PID: sp.PID, PGID: sp.PGID,
-		StartToken: tok, Executable: sp.Executable, Port: sp.Port, Runtime: runtime, ModelPath: sp.ModelPath,
-		LogPath: sp.LogPath, BindHost: sp.BindHost,
+		StartToken: tok, Executable: sp.Executable, LaunchPath: sp.LaunchPath, Port: sp.Port, Runtime: runtime,
+		ModelPath: sp.ModelPath, LogPath: sp.LogPath, BindHost: sp.BindHost,
 	})
 }
 
 // WriteRunning completes (or, for a shared-daemon service with no spawn,
-// creates) the record of a stored process, keeping the executable, process
-// group, log path and bind host a provisional record captured. On success it sets
+// creates) the record of a stored process, keeping the executable paths,
+// process group, log path and bind host a provisional record captured. On success it sets
 // p.StartToken and p.PGID to the values written, so the process carries the
 // identity its record holds.
 func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
@@ -115,7 +126,8 @@ func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 		AdmittedBytes: p.AdmittedBytes,
 	}
 	if prev, ok := s.read(p.Namespace, p.Name); ok && prev.PID == p.PID {
-		rec.Executable, rec.LogPath, rec.PGID, rec.BindHost = prev.Executable, prev.LogPath, prev.PGID, prev.BindHost
+		rec.Executable, rec.LaunchPath = prev.Executable, prev.LaunchPath
+		rec.LogPath, rec.PGID, rec.BindHost = prev.LogPath, prev.PGID, prev.BindHost
 	}
 	if err := s.write(rec); err != nil {
 		return err

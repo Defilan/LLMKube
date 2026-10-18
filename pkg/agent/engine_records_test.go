@@ -47,13 +47,14 @@ func newTestRecordStore(t *testing.T) (*engineRecordStore, string) {
 
 func TestEngineRecordStore_ProvisionalThenRunning(t *testing.T) {
 	s, dir := newTestRecordStore(t)
-	sp := SpawnedProcess{PID: 4242, Port: 53111, Executable: "/opt/homebrew/bin/llama-server",
-		ModelPath: "/m/x.gguf", LogPath: "/m/llama-server-default-a.log"}
+	sp := SpawnedProcess{PID: 4242, Port: 53111, Executable: "/opt/homebrew/Cellar/llama.cpp/1/bin/llama-server",
+		LaunchPath: "/opt/homebrew/bin/llama-server", ModelPath: "/m/x.gguf", LogPath: "/m/llama-server-default-a.log"}
 	if err := s.WriteProvisional("default", "a", runtimeLlamaServer, sp); err != nil {
 		t.Fatalf("WriteProvisional: %v", err)
 	}
 	rec := readRecord(t, dir, "a")
-	if rec["state"] != "provisional" || rec["startToken"] != "100.000001" || rec["executable"] != sp.Executable {
+	if rec["state"] != "provisional" || rec["startToken"] != "100.000001" || rec["executable"] != sp.Executable ||
+		rec["launchPath"] != sp.LaunchPath {
 		t.Fatalf("provisional record = %v", rec)
 	}
 	if info, _ := os.Stat(filepath.Join(dir, "default_a.json")); info.Mode().Perm() != 0o600 {
@@ -70,8 +71,9 @@ func TestEngineRecordStore_ProvisionalThenRunning(t *testing.T) {
 	}
 	rec = readRecord(t, dir, "a")
 	if rec["state"] != "running" || rec["specHash"] != "abc" || rec["priority"] != "high" ||
-		rec["executable"] != sp.Executable || rec["logPath"] != sp.LogPath || rec["version"] != float64(2) {
-		t.Fatalf("running record = %v, want spec fields plus the provisional executable and log path", rec)
+		rec["executable"] != sp.Executable || rec["launchPath"] != sp.LaunchPath || rec["logPath"] != sp.LogPath ||
+		rec["version"] != float64(2) {
+		t.Fatalf("running record = %v, want spec fields plus the provisional executable paths and log path", rec)
 	}
 }
 

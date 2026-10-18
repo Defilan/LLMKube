@@ -192,31 +192,91 @@ func TestAdopt_DeadPIDIsDiscarded(t *testing.T) {
 	}
 }
 
-func TestAdopt_ExecutableMismatchIsDiscarded(t *testing.T) {
+// requireStoppedAsGroup asserts adoption stopped engine 4242 as a group,
+// removed its record and counted it as stopped.
+func requireStoppedAsGroup(t *testing.T, a *MetalAgent, sent []string, stoppedBefore float64) {
+	t.Helper()
+	if !slices.Contains(sent, fmt.Sprintf("%d:%d", -4242, syscall.SIGTERM)) {
+		t.Fatalf("signals = %v, want SIGTERM to process group 4242", sent)
+	}
+	if recordExists(t, a, "svc") {
+		t.Fatal("the record of a stopped engine was kept")
+	}
+	if d := testutil.ToFloat64(engineAdoptionsTotal.WithLabelValues(adoptionStopped)) - stoppedBefore; d != 1 {
+		t.Fatalf("stopped counter moved by %v, want 1", d)
+	}
+}
+
+// The start token proves the process is the one the agent forked, so a
+// changed executable (a wrapper that exec'd the engine, say) makes it ours but
+// not adoptable: stopped and started fresh, never discarded and orphaned.
+func TestAdopt_ExecutableMismatchIsStopped(t *testing.T) {
 	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
 	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
 	writeSpawned(t, a)
 	a.inspect = adoptInspector{tokens: in.tokens, exes: map[int]string{4242: "/usr/bin/other"}}
+	before := testutil.ToFloat64(engineAdoptionsTotal.WithLabelValues(adoptionStopped))
 
 	if a.adoptEngines(context.Background())["default/svc"] {
 		t.Fatal("adopted a process running a different binary")
 	}
-	onlyProbes(t, *sent, "a process running a different binary")
-	if recordExists(t, a, "svc") {
-		t.Fatal("the record was kept")
+	requireStoppedAsGroup(t, a, *sent, before)
+}
+
+// An engine whose executable changed and that could not be stopped may still
+// run: its record stays for a later stop.
+func TestAdopt_ExecutableMismatchFailedStopKeepsRecord(t *testing.T) {
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/usr/bin/other"}}
+	a, _ := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	writeSpawned(t, a)
+	scripted := killFn
+	killFn = func(pid int, sig syscall.Signal) error {
+		if sig == syscall.SIGTERM {
+			return syscall.EPERM
+		}
+		return scripted(pid, sig)
+	}
+
+	if a.adoptEngines(context.Background())["default/svc"] {
+		t.Fatal("adopted a process running a different binary")
+	}
+	if !recordExists(t, a, "svc") {
+		t.Fatal("the record of an engine that may still run was removed")
 	}
 }
 
-func TestAdopt_InspectionErrorIsDiscarded(t *testing.T) {
+// The executable as launched (a Homebrew bin/ link) is recorded beside the
+// resolved one; a match on either adopts.
+func TestAdopt_LaunchPathMatchAdopts(t *testing.T) {
+	const link = "/opt/homebrew/bin/llama-server"
+	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: link}}
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
+	if err := a.engineRecords.WriteProvisional("default", "svc", runtimeLlamaServer, SpawnedProcess{
+		PID: 4242, PGID: 4242, Port: 18080, BindHost: engineBindHost,
+		Executable: "/opt/homebrew/Cellar/llama.cpp/1/bin/llama-server", LaunchPath: link,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !a.adoptEngines(context.Background())["default/svc"] {
+		t.Fatal("did not adopt an engine whose recorded launch path matches")
+	}
+	onlyProbes(t, *sent, "an engine that was adopted")
+}
+
+// A token-proven engine whose executable cannot be read is not adoptable, but
+// it is still ours: stopped, not discarded.
+func TestAdopt_InspectionErrorIsStopped(t *testing.T) {
 	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
-	a, sent := newAdoptAgent(t, in, false, map[int]bool{4242: true}) // not serving either
+	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
 	writeSpawned(t, a)
 	a.inspect = adoptInspector{tokens: in.tokens} // Executables fails
+	before := testutil.ToFloat64(engineAdoptionsTotal.WithLabelValues(adoptionStopped))
 
 	if a.adoptEngines(context.Background())["default/svc"] {
 		t.Fatal("adopted a process whose executable could not be read")
 	}
-	onlyProbes(t, *sent, "a process whose identity could not be confirmed")
+	requireStoppedAsGroup(t, a, *sent, before)
 }
 
 // A record of an engine that does not lead its own process group is not one

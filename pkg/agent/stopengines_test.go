@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -23,6 +24,8 @@ func stopEnginesCfg(dir string) StopEnginesConfig {
 
 // startSleeper starts a `sleep` in its own process group, reaps it in the
 // background, and kills its group on cleanup so a failing test leaves nothing.
+// A sleeper already reaped is not signalled: it was alone in its group, so the
+// group is gone and its ID may have been reused.
 func startSleeper(t *testing.T) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command("sleep", "30")
@@ -33,6 +36,11 @@ func startSleeper(t *testing.T) *exec.Cmd {
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()
 	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		case <-time.After(100 * time.Millisecond): // a test that saw ESRCH: let the reaper finish
+		}
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		<-done
 	})
@@ -112,32 +120,27 @@ func TestRunStopEngines_PGIDNotPIDIsLeftAloneAndReported(t *testing.T) {
 	}
 }
 
-func TestRunStopEngines_ExecutableMismatchIsLeftAlone(t *testing.T) {
+// The start token proves the process is the one the agent forked, so an
+// executable that no longer matches the record (a Homebrew relink, a wrapper
+// that exec'd the engine) does not keep it from being stopped.
+func TestRunStopEngines_ExecutableMismatchIsStopped(t *testing.T) {
 	dir := t.TempDir()
 	cmd := startSleeper(t)
 	in := newProcessInspector()
 	store := newEngineRecordStore(filepath.Join(dir, "engines"), "v", in, nil)
-	if err := store.WriteProvisional("default", "s", runtimeLlamaServer,
-		SpawnedProcess{PID: cmd.Process.Pid, PGID: cmd.Process.Pid, Executable: "/not/the/engine"}); err != nil {
+	if err := store.WriteProvisional("default", "s", runtimeLlamaServer, SpawnedProcess{
+		PID: cmd.Process.Pid, PGID: cmd.Process.Pid, Executable: "/not/the/engine", LaunchPath: "/not/the/link",
+	}); err != nil {
 		t.Fatal(err)
 	}
-	var sent []syscall.Signal
-	orig := killFn
-	killFn = func(pid int, sig syscall.Signal) error { sent = append(sent, sig); return orig(pid, 0) }
-	t.Cleanup(func() { killFn = orig })
-	if err := RunStopEngines(context.Background(), stopEnginesCfg(dir)); err == nil {
-		t.Fatal("expected an error for an executable mismatch")
+	if err := RunStopEngines(context.Background(), stopEnginesCfg(dir)); err != nil {
+		t.Fatalf("RunStopEngines: %v", err)
 	}
-	for _, s := range sent {
-		if s != 0 {
-			t.Fatalf("signal %v sent to a process with a different executable", s)
-		}
+	if err := syscall.Kill(cmd.Process.Pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("engine still alive: %v", err)
 	}
-	if err := syscall.Kill(cmd.Process.Pid, 0); err != nil {
-		t.Fatalf("process should still be alive: %v", err)
-	}
-	if recs, _ := store.List(); len(recs) != 1 {
-		t.Fatalf("record must be kept, got %+v", recs)
+	if recs, _ := store.List(); len(recs) != 0 {
+		t.Fatalf("records left: %+v", recs)
 	}
 }
 

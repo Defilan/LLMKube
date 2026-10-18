@@ -100,22 +100,10 @@ func stopRecordedEngine(ctx context.Context, cfg StopEnginesConfig, rec engineRe
 	case rec.PGID != rec.PID:
 		return fmt.Errorf("record has pgid %d for pid %d: not a group leader, left alone", rec.PGID, rec.PID)
 	}
-	// The start token is the identity proof: a dead PID or a PID another
-	// program now holds means the engine is gone; only then is the
-	// executable compared, so an unrelated live PID is never reported.
-	if err := verifyEngineIdentity(rec.PID, rec.StartToken, inspect); err != nil {
-		if errors.Is(err, errProcessAlreadyGone) {
-			return nil
-		}
-		return err
-	}
-	exes, err := inspect.Executables(rec.PID)
-	if err != nil {
-		return fmt.Errorf("process %d: cannot read its executable, left alone: %w", rec.PID, err)
-	}
-	if !executableMatches(exes, rec.Executable) {
-		return fmt.Errorf("process %d is not the recorded executable %q, left alone", rec.PID, rec.Executable)
-	}
+	// stopEngineGroup signals only after the start token proves the PID is
+	// the process the agent forked: a dead PID or one another program now
+	// holds is already gone (record removed), while an engine whose
+	// executable changed since it was recorded is still ours and is stopped.
 	if err := stopEngineGroup(rec.PID, rec.PGID, rec.StartToken, inspect); !engineStopped(err) {
 		return err
 	}

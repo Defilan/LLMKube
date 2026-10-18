@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"slices"
 	"strings"
 )
 
@@ -43,8 +41,9 @@ func (procfsProcessInspector) StartToken(pid int) (string, error) {
 	return fields[startTimeField], nil
 }
 
-// Executables is the resolved /proc/<pid>/exe plus the first two absolute
-// fields of /proc/<pid>/cmdline (argv[0], and argv[1] for a #! script).
+// Executables is /proc/<pid>/exe plus the first two absolute fields of
+// /proc/<pid>/cmdline (argv[0], and argv[1] for a #! script), each as read and
+// symlink-resolved.
 func (procfsProcessInspector) Executables(pid int) ([]string, error) {
 	if _, err := os.Stat("/proc/self/stat"); err != nil {
 		return nil, errProcessInspectUnsupported
@@ -57,18 +56,7 @@ func (procfsProcessInspector) Executables(pid int) ([]string, error) {
 		args := strings.Split(string(data), "\x00")
 		raw = append(raw, args[:min(len(args), 2)]...)
 	}
-	var out []string
-	for _, p := range raw {
-		if !filepath.IsAbs(p) {
-			continue
-		}
-		if resolved, err := filepath.EvalSymlinks(p); err == nil {
-			p = resolved
-		}
-		if !slices.Contains(out, p) {
-			out = append(out, p)
-		}
-	}
+	out := executableCandidates(raw)
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no executable path for PID %d", pid)
 	}
