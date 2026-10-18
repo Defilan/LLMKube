@@ -1,0 +1,145 @@
+package agent
+
+import (
+	"context"
+)
+
+// Outcomes of evaluating one engine record at startup, the result label of
+// engineAdoptionsTotal.
+const (
+	adoptionAdopted   = "adopted"
+	adoptionStopped   = "stopped"
+	adoptionDiscarded = "discarded"
+	// adoptionInterrupted is not counted: the context ended before the record
+	// could be judged, so it is left as found.
+	adoptionInterrupted = ""
+)
+
+// adoptEngines reads the engine records a previous agent process left and
+// adopts each engine that is still ours and serving, so it keeps serving
+// instead of being reloaded (#2079). It needs no API server. An engine that is
+// ours but not serving is stopped as a group; anything whose identity cannot
+// be confirmed is discarded without being signalled. Records it cannot parse
+// are logged and left alone. It returns the adopted keys (namespace/name),
+// which the startup endpoint withdrawal skips.
+func (a *MetalAgent) adoptEngines(ctx context.Context) map[string]bool {
+	adopted := map[string]bool{}
+	recs, errs := a.engineRecords.List()
+	for _, err := range errs {
+		a.logger.Warnw("ignoring engine record", "error", err)
+	}
+	for _, rec := range recs {
+		key := rec.Namespace + "/" + rec.Name
+		outcome, keepRecord := a.adoptOne(ctx, rec)
+		if outcome == adoptionInterrupted {
+			// The agent is stopping: leave this and every later record for
+			// the next agent process.
+			a.logger.Infow("engine adoption interrupted; leaving the remaining records", "key", key)
+			break
+		}
+		engineAdoptionsTotal.WithLabelValues(outcome).Inc()
+		if outcome == adoptionAdopted {
+			adopted[key] = true
+			a.logger.Infow("adopted engine from a previous agent process",
+				"key", key, "pid", rec.PID, "port", rec.Port, "runtime", rec.Runtime)
+			continue
+		}
+		if !keepRecord {
+			if err := a.engineRecords.Remove(rec.Namespace, rec.Name); err != nil {
+				a.logger.Warnw("failed to remove engine record", "key", key, "error", err)
+			}
+		}
+		a.logger.Infow("did not adopt engine", "key", key, "pid", rec.PID, "outcome", outcome)
+	}
+	a.mu.Lock()
+	a.adopted = adopted
+	managedProcesses.Set(float64(len(a.processes)))
+	a.updateCommittedMetricLocked()
+	a.mu.Unlock()
+	return adopted
+}
+
+// adoptOne applies the adoption decision table to one record and, for an
+// adopted engine, stores its ManagedProcess. keepRecord is true for an engine
+// it tried and failed to stop, which may still be running, and for a record
+// the context ended before it could judge: a health probe cut short proves
+// nothing, so it never stops an engine.
+func (a *MetalAgent) adoptOne(ctx context.Context, rec engineRecord) (outcome string, keepRecord bool) {
+	if ctx.Err() != nil {
+		return adoptionInterrupted, true
+	}
+	switch {
+	case rec.Runtime == runtimeOMLX:
+		// The oMLX daemon is not adopted; its services reload.
+		return adoptionDiscarded, false
+	case rec.PID <= 0:
+		// Only an external daemon (Ollama) has no PID: re-attach while it serves.
+		if rec.Runtime != runtimeOllama {
+			return adoptionDiscarded, false
+		}
+		if !a.serving(ctx, rec) {
+			if ctx.Err() != nil {
+				return adoptionInterrupted, true
+			}
+			return adoptionDiscarded, false
+		}
+	case !a.provenOurs(rec):
+		return adoptionDiscarded, false
+	case !a.serving(ctx, rec):
+		if ctx.Err() != nil {
+			return adoptionInterrupted, true
+		}
+		// Ours but not serving: crashed mid-load, hung, or still loading.
+		err := stopEngineGroup(rec.PID, rec.PGID, rec.StartToken, a.inspect)
+		if err != nil && !engineStopped(err) {
+			a.logger.Warnw("failed to stop an engine that is not serving; keeping its record",
+				"key", rec.Namespace+"/"+rec.Name, "pid", rec.PID, "error", err)
+			return adoptionStopped, true
+		}
+		return adoptionStopped, false
+	}
+	a.storeAdopted(rec)
+	return adoptionAdopted, false
+}
+
+// provenOurs reports whether the record's PID is alive and is still the engine
+// the record describes: same kernel start token, same resolved executable, and
+// leader of the recorded process group. Every engine the agent spawns leads
+// its own group, so a record without one is malformed; refusing it also keeps
+// adoption off stopEngineGroup's single-PID fallback. Any lookup error counts
+// as not ours. It sends only the existence probe.
+func (a *MetalAgent) provenOurs(rec engineRecord) bool {
+	if rec.PGID != rec.PID {
+		return false
+	}
+	if killFn(rec.PID, 0) != nil {
+		return false
+	}
+	tok, err := a.inspect.StartToken(rec.PID)
+	if err != nil || rec.StartToken == "" || tok != rec.StartToken {
+		return false
+	}
+	exes, err := a.inspect.Executables(rec.PID)
+	return err == nil && executableMatches(exes, rec.Executable)
+}
+
+// serving probes the runtime's health endpoint on the recorded port, as the
+// health monitor does.
+func (a *MetalAgent) serving(ctx context.Context, rec engineRecord) bool {
+	ok, err := a.healthChecker.Check(ctx, rec.Port, healthProbePath(rec.Runtime))
+	return err == nil && ok
+}
+
+// storeAdopted inserts the ManagedProcess of an adopted engine with every
+// recorded field.
+func (a *MetalAgent) storeAdopted(rec engineRecord) {
+	a.mu.Lock()
+	a.processes[rec.Namespace+"/"+rec.Name] = &ManagedProcess{
+		Name: rec.Name, Namespace: rec.Namespace, PID: rec.PID, PGID: rec.PGID, StartToken: rec.StartToken,
+		Port: rec.Port, ModelPath: rec.ModelPath, ModelID: rec.ModelID, StartedAt: rec.StartedAt, Healthy: true,
+		SpecHash: rec.SpecHash, Priority: rec.Priority, EvictionProtection: rec.EvictionProtection,
+		Runtime: rec.Runtime, AdmittedBytes: rec.AdmittedBytes, Adopted: true,
+	}
+	a.mu.Unlock()
+	processHealthy.WithLabelValues(rec.Name, rec.Namespace).Set(1)
+}
