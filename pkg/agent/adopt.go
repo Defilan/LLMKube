@@ -132,9 +132,8 @@ func (a *MetalAgent) stopUnwanted(rec engineRecord, why string) (outcome string,
 // provenOurs reports whether the record's PID is alive and is still the engine
 // the record describes: same kernel start token, same resolved executable, and
 // leader of the recorded process group. Every engine the agent spawns leads
-// its own group, so a record without one is malformed; refusing it also keeps
-// adoption off stopEngineGroup's single-PID fallback. Any lookup error counts
-// as not ours. It sends only the existence probe.
+// its own group, so a record without one is malformed (and stopEngineGroup
+// would refuse it anyway). Any lookup error counts as not ours. It sends only the existence probe.
 func (a *MetalAgent) provenOurs(rec engineRecord) bool {
 	if rec.PGID != rec.PID {
 		return false

@@ -62,9 +62,10 @@ var errProcessAlreadyGone = errors.New("process already gone")
 // SIGKILLed. A var so tests can shorten it; mirrors helpProbeTimeout.
 var stopGracePeriod = 10 * time.Second
 
-// untrackedStopPoll is how often stopChild checks that an untracked PID, which
-// it cannot wait on, has exited.
-const untrackedStopPoll = 50 * time.Millisecond
+// stopPollInterval is how often a stop checks that a PID it cannot wait on,
+// or the rest of a process group, has exited. A var so tests can pin the
+// number of polls.
+var stopPollInterval = 50 * time.Millisecond
 
 // signalFunc sends sig to pid (negative for a process group); a var so tests
 // can script the kernel's answers.
@@ -79,14 +80,11 @@ var killFn signalFunc = syscall.Kill
 // escalates on doubt: EPERM, a lookup error or a changed start token returns an
 // error instead of SIGKILL. Only a proven-gone process or a changed token wraps
 // errProcessAlreadyGone; a failed lookup is a plain error so the caller keeps
-// the record of an engine that may still run. pgid <= 0 (a record with no
-// group) falls back to stopping the single PID.
+// the record of an engine that may still run. A record with no group of its
+// own (pgid <= 0 or pgid != pid) is refused without a signal.
 func stopEngineGroup(pid, pgid int, token string, inspect processInspector) error {
 	if pid <= 0 {
 		return fmt.Errorf("refusing to stop invalid PID %d", pid)
-	}
-	if pgid <= 0 {
-		return (&childTracker{}).stopChild(pid)
 	}
 	if pgid != pid {
 		return fmt.Errorf("refusing to signal process group %d: not led by engine PID %d", pgid, pid)
@@ -101,44 +99,63 @@ func stopEngineGroup(pid, pgid int, token string, inspect processInspector) erro
 		return fmt.Errorf("failed to send SIGTERM to process group %d: %w", pgid, err)
 	}
 	deadline := time.Now().Add(stopGracePeriod)
-	leaderGone := false
 	for time.Now().Before(deadline) {
-		if !leaderGone {
-			err := killFn(pid, 0)
-			if errors.Is(err, syscall.EPERM) {
-				return fmt.Errorf("process %d is no longer ours (EPERM); not escalating", pid)
-			}
-			leaderGone = errors.Is(err, syscall.ESRCH)
+		err := killFn(pid, 0)
+		if errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("process %d is no longer ours (EPERM); not escalating", pid)
 		}
-		if leaderGone {
-			// A member may outlive the leader and ignore SIGTERM. ESRCH means
-			// the group is empty; EPERM is macOS's answer for a group holding
-			// only zombies.
-			err := killFn(-pgid, 0)
-			if errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM) {
-				return nil
-			}
+		if errors.Is(err, syscall.ESRCH) {
+			return drainProcessGroup(pid, pgid, deadline, killFn)
 		}
-		time.Sleep(untrackedStopPoll)
+		sleepUntil(deadline, stopPollInterval)
 	}
-	// A group still has members, so its ID cannot have been reused; only a
-	// living leader needs the identity re-check.
-	if !leaderGone {
-		if err := verifyEngineIdentity(pid, token, inspect); err != nil {
-			return err
+	// The leader may have exited since the last poll: then only its group is
+	// left, and a group with members cannot have had its ID reused. A living
+	// leader needs the identity re-check before SIGKILL.
+	if err := verifyEngineIdentity(pid, token, inspect); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return drainProcessGroup(pid, pgid, deadline, killFn)
 		}
+		return err
 	}
 	_ = killFn(-pgid, syscall.SIGKILL)
 	return &KilledAfterGraceError{PID: pid}
 }
 
+// drainProcessGroup finishes a group stop whose leader is gone. A member may
+// outlive the leader and ignore SIGTERM, and with its own group it would
+// outlive the agent too, so the group is polled until deadline and any member
+// still in it is SIGKILLed. ESRCH means the group is empty; EPERM is macOS's
+// answer for a group holding only zombies. It probes at least once, so a
+// caller at its deadline still learns whether members remain.
+func drainProcessGroup(pid, pgid int, deadline time.Time, kill signalFunc) error {
+	for {
+		err := kill(-pgid, 0)
+		if errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		sleepUntil(deadline, stopPollInterval)
+	}
+	_ = kill(-pgid, syscall.SIGKILL)
+	return &KilledAfterGraceError{PID: pid}
+}
+
+// sleepUntil sleeps for poll, or less when deadline comes first.
+func sleepUntil(deadline time.Time, poll time.Duration) {
+	time.Sleep(max(min(poll, time.Until(deadline)), 0))
+}
+
 // verifyEngineIdentity proves pid is alive with the recorded start token. A
-// dead PID or a changed token wraps errProcessAlreadyGone; a failed lookup or
-// EPERM is a plain error so no caller treats the engine as stopped.
+// dead PID or a changed token wraps errProcessAlreadyGone (a dead PID also
+// wraps syscall.ESRCH, so a caller can tell it from a reused one); a failed
+// lookup or EPERM is a plain error so no caller treats the engine as stopped.
 func verifyEngineIdentity(pid int, token string, inspect processInspector) error {
 	if err := killFn(pid, 0); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			return fmt.Errorf("process %d: %w", pid, errProcessAlreadyGone)
+			return fmt.Errorf("process %d: %w (%w)", pid, errProcessAlreadyGone, err)
 		}
 		return fmt.Errorf("cannot confirm process %d is ours: %w", pid, err)
 	}
@@ -318,7 +335,7 @@ func (t *childTracker) stopChild(pid int) error {
 		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 			return nil
 		}
-		time.Sleep(untrackedStopPoll)
+		time.Sleep(stopPollInterval)
 	}
 	_ = syscall.Kill(pid, syscall.SIGKILL)
 	return &KilledAfterGraceError{PID: pid}
@@ -326,7 +343,10 @@ func (t *childTracker) stopChild(pid int) error {
 
 // stopTrackedChild stops a child this executor spawned. Its reaper owns the
 // wait, so this only signals and watches done. A child that leads its own
-// process group is stopped by group, so helpers it forked go with it.
+// process group is stopped by group, so helpers it forked go with it: once the
+// leader exits, the rest of the group gets what is left of the grace period
+// before it is SIGKILLed, since a member that ignores SIGTERM would otherwise
+// outlive the agent unrecorded.
 func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 	defer t.untrackChild(pid)
 
@@ -348,13 +368,17 @@ func (t *childTracker) stopTrackedChild(pid int, exit *childExit) error {
 		return fmt.Errorf("failed to send SIGTERM to process %d: %w", pid, err)
 	}
 
+	deadline := time.Now().Add(stopGracePeriod)
 	select {
 	case <-time.After(stopGracePeriod):
 		_ = syscall.Kill(target, syscall.SIGKILL)
 		return &KilledAfterGraceError{PID: pid}
 	case <-exit.done:
+	}
+	if !exit.group {
 		return nil
 	}
+	return drainProcessGroup(pid, pid, deadline, syscall.Kill)
 }
 
 // waitForChildHealthy polls http://127.0.0.1:<port>/health until it returns

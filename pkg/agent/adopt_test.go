@@ -223,9 +223,8 @@ func TestAdopt_InspectionErrorIsDiscarded(t *testing.T) {
 // the agent spawned: never adopted or signalled.
 func TestAdopt_RecordWithoutGroupIsDiscarded(t *testing.T) {
 	in := adoptInspector{tokens: map[int]string{4242: "t1"}, exes: map[int]string{4242: "/bin/engine"}}
-	// Serving, so a missing group check shows as an adoption; a failed health
-	// check would reach stopEngineGroup's single-PID fallback, which signals
-	// through syscall.Kill, not the killFn seam.
+	// Serving, so a missing group check shows as an adoption rather than as
+	// stopEngineGroup's refusal.
 	a, sent := newAdoptAgent(t, in, true, map[int]bool{4242: true})
 	if err := a.engineRecords.WriteProvisional("default", "svc", runtimeLlamaServer,
 		SpawnedProcess{PID: 4242, Port: 18080, Executable: "/bin/engine", BindHost: engineBindHost}); err != nil {
