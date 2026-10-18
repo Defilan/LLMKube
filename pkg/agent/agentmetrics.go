@@ -69,6 +69,14 @@ var (
 		},
 	)
 
+	memoryCommittedBytes = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "llmkube_metal_agent_memory_committed_bytes",
+			Help: "Memory admitted to running and starting processes in bytes; " +
+				"new models are admitted against the budget minus this.",
+		},
+	)
+
 	memoryEstimatedBytes = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "llmkube_metal_agent_memory_estimated_bytes",
@@ -212,6 +220,7 @@ func init() {
 		processRestarts,
 		healthCheckDuration,
 		memoryBudgetBytes,
+		memoryCommittedBytes,
 		memoryEstimatedBytes,
 		systemMemoryAvailableBytes,
 		systemMemoryWiredBytes,

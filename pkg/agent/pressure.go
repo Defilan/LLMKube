@@ -53,6 +53,10 @@ const (
 	EventReasonEvicted                    = "Evicted"
 	EventReasonEvictionSkipped            = "EvictionSkipped"
 	EventReasonRespawnBlocked             = "RespawnBlocked"
+	// EventReasonMemoryBudgetClamped marks a Model memory budget lowered to
+	// this Mac's budget at admission. It is a warning, not a refusal, so it is
+	// not one of the SchedulingStatus reasons.
+	EventReasonMemoryBudgetClamped = "MemoryBudgetClamped"
 	// EventReasonMemoryCheckFailed and EventReasonInsufficientMemory equal
 	// the api/v1alpha1.Reason* constants of the same name; see the doc
 	// comment on inferencev1alpha1.MetalAgentRefusalReasons for why.

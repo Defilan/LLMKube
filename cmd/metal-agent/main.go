@@ -94,6 +94,9 @@ type AgentConfig struct {
 	IngressPort               int
 	StateDir                  string
 	LegacyDirectEndpoints     bool
+
+	// AllowModelMemoryBudgetOverride: see agent.MetalAgentConfig.
+	AllowModelMemoryBudgetOverride bool
 }
 
 // splitCSV parses a comma-separated string into a trimmed []string,
@@ -511,6 +514,9 @@ func main() {
 	flag.StringVar(&cfg.MemoryCheckMode, "memory-check-mode", agent.MemoryCheckModeEnforce,
 		"What to do when the pre-flight memory check cannot be completed: "+
 			"\"enforce\" refuses to start the process (fail closed), \"warn\" logs and starts it anyway")
+	flag.BoolVar(&cfg.AllowModelMemoryBudgetOverride, "allow-model-memory-budget-override", false,
+		"Let a Model's spec.hardware.memoryBudget or memoryFraction exceed this Mac's budget "+
+			"(total * memory-fraction); by default such a budget is clamped to it with a Warning event")
 	flag.DurationVar(&cfg.WatchdogInterval, "memory-watchdog-interval", 10*time.Second,
 		"How often to check memory pressure (0 to disable)")
 	flag.Float64Var(&cfg.MemoryPressureWarning, "memory-pressure-warning", 0.20,
@@ -789,6 +795,8 @@ func main() {
 		IngressPort:               cfg.IngressPort,
 		StateDir:                  cfg.StateDir,
 		LegacyDirectEndpoints:     cfg.LegacyDirectEndpoints,
+
+		AllowModelMemoryBudgetOverride: cfg.AllowModelMemoryBudgetOverride,
 	}
 	if cfg.WatchdogInterval > 0 {
 		agentCfg.WatchdogConfig = &agent.MemoryWatchdogConfig{
