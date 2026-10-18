@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -1413,6 +1414,57 @@ func TestInferPodSecurityContext_VulkanDRIRenderGID(t *testing.T) {
 			if g == renderGID {
 				t.Errorf("user override must not gain the operator render GID %d", renderGID)
 			}
+		}
+	})
+}
+
+// TestInferPodSecurityContext_FSGroupChangePolicy pins #2058: whenever the
+// operator sets fsGroup it also sets fsGroupChangePolicy OnRootMismatch, so
+// kubelet skips the recursive ownership walk of the model cache once the
+// volume root already matches. Without an operator fsGroup the policy stays
+// unset, and a user-supplied context is never touched.
+func TestInferPodSecurityContext_FSGroupChangePolicy(t *testing.T) {
+	const renderGID = int64(991)
+	emptyISVC := &inferencev1alpha1.InferenceService{}
+
+	for _, vulkan := range []bool{false, true} {
+		t.Run(fmt.Sprintf("default fsGroup sets OnRootMismatch (vulkan=%v)", vulkan), func(t *testing.T) {
+			psc := inferPodSecurityContext(emptyISVC, 102, renderGID, vulkan)
+			if psc.FSGroup == nil || *psc.FSGroup != 102 {
+				t.Fatalf("FSGroup = %v, want 102", psc.FSGroup)
+			}
+			if psc.FSGroupChangePolicy == nil || *psc.FSGroupChangePolicy != corev1.FSGroupChangeOnRootMismatch {
+				t.Errorf("FSGroupChangePolicy = %v, want %q", psc.FSGroupChangePolicy, corev1.FSGroupChangeOnRootMismatch)
+			}
+		})
+	}
+
+	// --default-fsgroup <= 0 (OpenShift): no fsGroup, so no policy. An SCC may
+	// still inject an fsGroup, and with the prep chowning the root to 100:100 the
+	// root would never match it anyway, so the policy is left to the platform.
+	for _, disabled := range []int64{0, -1} {
+		t.Run(fmt.Sprintf("disabled default fsGroup (%d) leaves the policy unset", disabled), func(t *testing.T) {
+			psc := inferPodSecurityContext(emptyISVC, disabled, renderGID, false)
+			if psc.FSGroup != nil {
+				t.Errorf("FSGroup = %d, want nil", *psc.FSGroup)
+			}
+			if psc.FSGroupChangePolicy != nil {
+				t.Errorf("FSGroupChangePolicy = %q, want nil", *psc.FSGroupChangePolicy)
+			}
+		})
+	}
+
+	t.Run("user-supplied podSecurityContext is not given a policy", func(t *testing.T) {
+		fsGroup := int64(2000)
+		user := &corev1.PodSecurityContext{FSGroup: &fsGroup}
+		got := inferPodSecurityContext(&inferencev1alpha1.InferenceService{
+			Spec: inferencev1alpha1.InferenceServiceSpec{PodSecurityContext: user},
+		}, 102, renderGID, false)
+		if got != user {
+			t.Fatalf("user-supplied PodSecurityContext not returned verbatim: got %v, want %v", got, user)
+		}
+		if got.FSGroupChangePolicy != nil {
+			t.Errorf("FSGroupChangePolicy = %q on a user context, want nil (the user owns it)", *got.FSGroupChangePolicy)
 		}
 	})
 }

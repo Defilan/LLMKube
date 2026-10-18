@@ -375,7 +375,7 @@ func (r *ModelReconciler) buildPrefetchJob(ctx context.Context, model *inference
 	var podSecurity *corev1.PodSecurityContext
 	if r.DefaultFSGroup > 0 {
 		fs := r.DefaultFSGroup
-		podSecurity = &corev1.PodSecurityContext{FSGroup: &fs}
+		podSecurity = &corev1.PodSecurityContext{FSGroup: &fs, FSGroupChangePolicy: fsGroupChangeOnRootMismatch()}
 	}
 
 	image := r.InitContainerImage

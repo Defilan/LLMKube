@@ -165,6 +165,16 @@ func resolveEnableServiceLinks(backend RuntimeBackend) *bool {
 // which makes the volume writable for the curl init container and readable
 // for the inference container regardless of its primary UID.
 //
+// Whenever the default fsGroup is set, fsGroupChangePolicy is set to
+// OnRootMismatch (#2058). With the Kubernetes default (Always) kubelet walks the
+// whole volume and changes the group and mode of every entry on every pod
+// start, which on a large shared model cache, especially on a network
+// filesystem, is paid on every restart and grows with the cache. OnRootMismatch
+// skips the walk when the volume root already has the fsGroup GID, group rwx
+// and the setgid bit; the model-cache-prep step (chown 0:<fsGroup>, chmod
+// g+rwX) keeps the root in that state. On storage that applies no fsGroup at
+// all (CSI fsGroupPolicy None) the field has no effect.
+//
 // defaultFSGroup <= 0 disables the default. This is the recommended setting on
 // OpenShift, where the restricted-v2 SCC injects an appropriate fsGroup from
 // the namespace's allocated range and rejects pods with explicit values
@@ -200,11 +210,19 @@ func inferPodSecurityContext(isvc *inferencev1alpha1.InferenceService, defaultFS
 	if defaultFSGroup > 0 {
 		fsGroup := defaultFSGroup
 		psc.FSGroup = &fsGroup
+		psc.FSGroupChangePolicy = fsGroupChangeOnRootMismatch()
 	}
 	if vulkan && driRenderGID > 0 {
 		psc.SupplementalGroups = append(psc.SupplementalGroups, driRenderGID)
 	}
 	return psc
+}
+
+// fsGroupChangeOnRootMismatch returns the fsGroupChangePolicy the operator sets
+// next to every fsGroup it renders (inference pods and the prefetch Job).
+func fsGroupChangeOnRootMismatch() *corev1.PodFSGroupChangePolicy {
+	policy := corev1.FSGroupChangeOnRootMismatch
+	return &policy
 }
 
 func inferContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *corev1.SecurityContext {

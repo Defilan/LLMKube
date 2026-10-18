@@ -3503,6 +3503,8 @@ var _ = Describe("Security Context Configuration", func() {
 			Expect(podSecCtx).NotTo(BeNil())
 			Expect(podSecCtx.FSGroup).NotTo(BeNil())
 			Expect(*podSecCtx.FSGroup).To(Equal(int64(102)))
+			// #2058: kubelet skips the recursive chown of the cache once its root matches.
+			Expect(podSecCtx.FSGroupChangePolicy).To(HaveValue(Equal(corev1.FSGroupChangeOnRootMismatch)))
 			Expect(podSecCtx.SeccompProfile).NotTo(BeNil())
 			Expect(podSecCtx.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
 		})
@@ -3534,6 +3536,7 @@ var _ = Describe("Security Context Configuration", func() {
 			podSecCtx := deployment.Spec.Template.Spec.SecurityContext
 			Expect(podSecCtx).NotTo(BeNil())
 			Expect(podSecCtx.FSGroup).To(BeNil())
+			Expect(podSecCtx.FSGroupChangePolicy).To(BeNil())
 			Expect(podSecCtx.SeccompProfile).NotTo(BeNil())
 			Expect(podSecCtx.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
 		})
@@ -3559,6 +3562,7 @@ var _ = Describe("Security Context Configuration", func() {
 			podSecCtx := deployment.Spec.Template.Spec.SecurityContext
 			Expect(podSecCtx).NotTo(BeNil())
 			Expect(podSecCtx.FSGroup).To(BeNil())
+			Expect(podSecCtx.FSGroupChangePolicy).To(BeNil())
 			Expect(podSecCtx.RunAsNonRoot).NotTo(BeNil())
 			Expect(*podSecCtx.RunAsNonRoot).To(BeTrue())
 		})

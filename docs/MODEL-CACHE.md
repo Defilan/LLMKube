@@ -724,6 +724,24 @@ Because the prep needs root plus `CHOWN`/`FOWNER`, it cannot satisfy Pod Securit
 - Use an `emptyDir` model store (no shared persistent cache).
 - Relax the namespace policy to `baseline`.
 
+### `fsGroupChangePolicy` and pod start time on large caches
+
+On storage where Kubernetes applies the pod `fsGroup` (CSI drivers with `fsGroupPolicy: File`, and under the default `ReadWriteOnceWithFSType` a `ReadWriteOnce` volume with an `fsType`), the default `fsGroupChangePolicy` is `Always`: before every pod start, kubelet walks the entire volume and changes the group and permissions of every file and directory. A shared model cache is the worst case for that walk, since it grows with every model you add, and on a network filesystem each change is a metadata round trip.
+
+The operator therefore sets `fsGroupChangePolicy: OnRootMismatch` wherever it sets the default `fsGroup` (inference pods and the prefetch Job):
+
+```yaml
+securityContext:
+  fsGroup: 102
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+```
+
+With `OnRootMismatch`, kubelet skips the walk when the volume root already has the `fsGroup` GID, group `rwx` and the setgid bit, which is the state the first full pass leaves and the `model-cache-prep` step (`chown 0:<fsGroup>`, `chmod g+rwX`) keeps. If anything changes the root's group, the next start does the full walk again. On `fsGroupPolicy: None` backends kubelet changes no ownership at all, so the setting has no effect there.
+
+A user-supplied `spec.podSecurityContext` replaces the operator default entirely, so it does not get this setting. If you supply your own context on a large cache, add `fsGroupChangePolicy: OnRootMismatch` next to your `fsGroup`. When the default fsGroup is disabled (`--default-fsgroup=0`, the OpenShift preset), the operator sets neither field.
+
 ### Shared-cache group-write multi-tenancy
 
 In `shared` mode, the cache-prep init container sets `chmod g+rwX /models`, making the cache root writable by any pod in the same `fsGroup`. On a shared cache PVC, multiple InferenceServices share that `fsGroup` and can write to each other's cached model files.
