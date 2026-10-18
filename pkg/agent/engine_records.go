@@ -7,13 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
 
 // engineRecordVersion is the record format. A record with any other version is
 // ignored by adoption (PR 2) rather than misread.
-const engineRecordVersion = 1
+const engineRecordVersion = 2
 
 const (
 	engineRecordProvisional = "provisional"
@@ -24,6 +25,7 @@ const (
 // cmd.Start, passed to ExecutorConfig.OnSpawned.
 type SpawnedProcess struct {
 	PID        int
+	PGID       int
 	Port       int
 	Executable string
 	ModelPath  string
@@ -39,6 +41,7 @@ type engineRecord struct {
 	Name               string    `json:"name"`
 	State              string    `json:"state"`
 	PID                int       `json:"pid"`
+	PGID               int       `json:"pgid"`
 	StartToken         string    `json:"startToken,omitempty"`
 	Executable         string    `json:"executable,omitempty"`
 	Port               int       `json:"port"`
@@ -85,14 +88,15 @@ func (s *engineRecordStore) WriteProvisional(namespace, name, runtime string, sp
 		return err
 	}
 	return s.write(engineRecord{
-		Namespace: namespace, Name: name, State: engineRecordProvisional, PID: sp.PID, StartToken: tok,
-		Executable: sp.Executable, Port: sp.Port, Runtime: runtime, ModelPath: sp.ModelPath, LogPath: sp.LogPath,
+		Namespace: namespace, Name: name, State: engineRecordProvisional, PID: sp.PID, PGID: sp.PGID,
+		StartToken: tok, Executable: sp.Executable, Port: sp.Port, Runtime: runtime, ModelPath: sp.ModelPath,
+		LogPath: sp.LogPath,
 	})
 }
 
 // WriteRunning completes (or, for a shared-daemon service with no spawn,
-// creates) the record of a stored process, keeping the executable and log path
-// a provisional record captured.
+// creates) the record of a stored process, keeping the executable, process
+// group and log path a provisional record captured.
 func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 	tok, err := s.startToken(p.PID)
 	if err != nil {
@@ -105,9 +109,44 @@ func (s *engineRecordStore) WriteRunning(p *ManagedProcess) error {
 		AdmittedBytes: p.AdmittedBytes,
 	}
 	if prev, ok := s.read(p.Namespace, p.Name); ok && prev.PID == p.PID {
-		rec.Executable, rec.LogPath = prev.Executable, prev.LogPath
+		rec.Executable, rec.LogPath, rec.PGID = prev.Executable, prev.LogPath, prev.PGID
 	}
 	return s.write(rec)
+}
+
+// List reads every record in the directory. Records of another version or
+// unparsable files are skipped and reported, never acted on.
+func (s *engineRecordStore) List() ([]engineRecord, []error) {
+	if s.dirErr != nil {
+		return nil, []error{s.dirErr}
+	}
+	entries, err := os.ReadDir(s.dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, []error{fmt.Errorf("list engine records in %s: %w", s.dir, err)}
+	}
+	var recs []engineRecord
+	var errs []error
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || filepath.Ext(name) != ".json" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		ns, n, ok := strings.Cut(strings.TrimSuffix(name, ".json"), "_")
+		if !ok {
+			errs = append(errs, fmt.Errorf("engine record %s: unexpected file name", name))
+			continue
+		}
+		rec, ok := s.read(ns, n)
+		if !ok {
+			errs = append(errs, fmt.Errorf("engine record %s: unreadable or not version %d", name, engineRecordVersion))
+			continue
+		}
+		recs = append(recs, rec)
+	}
+	return recs, errs
 }
 
 // Remove deletes the record; a missing record is not an error.
