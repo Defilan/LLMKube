@@ -292,6 +292,7 @@ shape.
 | `llmkube_metal_agent_process_restarts_total` | Process restarts from health monitoring |
 | `llmkube_metal_agent_health_check_duration_seconds` | Health check probe duration |
 | `llmkube_metal_agent_memory_budget_bytes` | Total memory budget for model serving |
+| `llmkube_metal_agent_memory_committed_bytes` | Memory admitted to running and starting models |
 | `llmkube_metal_agent_memory_estimated_bytes` | Estimated memory usage per process |
 
 This is a subset. The full list, including the memory-pressure, eviction,

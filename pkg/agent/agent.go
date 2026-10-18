@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -135,6 +136,11 @@ type MetalAgentConfig struct {
 	// closed and refuses to start the process; MemoryCheckModeWarn logs and
 	// proceeds (the legacy behavior).
 	MemoryCheckMode string
+	// AllowModelMemoryBudgetOverride lets a Model's spec.hardware.memoryBudget
+	// or memoryFraction exceed this Mac's budget (total * MemoryFraction).
+	// False (the default) clamps such a Model budget to the Mac's budget with
+	// a Warning event, so a Model cannot raise the limit its Mac's owner set.
+	AllowModelMemoryBudgetOverride bool
 
 	// WatchdogConfig configures the memory pressure watchdog. Nil disables it.
 	WatchdogConfig *MemoryWatchdogConfig
@@ -315,6 +321,14 @@ type MetalAgent struct {
 	// twice, enough to exhaust host memory.
 	starting map[string]bool
 
+	// reservedMemory holds the admitted estimate of each start that
+	// passed memory admission and has not yet stored its process, keyed like
+	// processes. Admission counts it next to running processes, so two
+	// services starting at once cannot both fit into the same free budget;
+	// the start moves it onto ManagedProcess.AdmittedBytes or releases it.
+	// Guarded by mu.
+	reservedMemory map[string]uint64
+
 	// restarts holds the health-restart backoff of each service whose engine
 	// the health monitor has restarted (see health_restart.go).
 	restarts map[string]*restartBackoff
@@ -383,6 +397,12 @@ type ManagedProcess struct {
 	// so deleteProcess and Shutdown can pick the correct executor even
 	// when the agent hosts multiple runtimes concurrently (#525).
 	Runtime string
+
+	// AdmittedBytes is the memory estimate this process was admitted with.
+	// Memory admission sums it across running processes, so a new model must
+	// fit next to them, not just on its own (#2080). Zero when admission did
+	// not size the process (memory-check-mode=warn after a failed estimate).
+	AdmittedBytes uint64
 
 	// healthFailures counts this process's consecutive failed health probes.
 	// Guarded by MetalAgent.mu; a replacement process starts again at zero.
@@ -499,6 +519,7 @@ func NewMetalAgent(config MetalAgentConfig) *MetalAgent {
 		evictionBackoff:     make(map[string]*evictionBackoff),
 		pressureObserved:    make(map[string]MemoryPressureLevel),
 		starting:            make(map[string]bool),
+		reservedMemory:      make(map[string]uint64),
 		restarts:            make(map[string]*restartBackoff),
 		restartWake:         make(chan struct{}, 1),
 		now:                 time.Now,
@@ -1275,11 +1296,16 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	if err := a.checkMemoryAdmission(ctx, isvc, model, contextSize, cacheTypeK, cacheTypeV); err != nil {
 		return err
 	}
+	// Admission reserved the estimate; give it back unless the store below
+	// moves it onto the process record.
+	defer a.releaseAdmission(key)
 
 	// Apple Silicon defaults: flash-attn and mlock both ON. The user can
-	// disable flash-attn by setting spec.flashAttention=false; mlock has no
-	// CRD opt-out because the macOS wired-collector eviction it prevents is
-	// the entire reason the Metal agent exists in the first place.
+	// disable flash-attn by setting spec.flashAttention=false. mlock has no
+	// CRD field, because the macOS wired-collector eviction it prevents is the
+	// entire reason the Metal agent exists; a service that must not wire its
+	// weights chooses its own load mode in extraArgs (for example
+	// "--load-mode mmap"), which suppresses the agent's (hasLoadModeExtraArg).
 	flashAttn := true
 	if isvc.Spec.FlashAttention != nil {
 		flashAttn = *isvc.Spec.FlashAttention
@@ -1323,10 +1349,15 @@ func (a *MetalAgent) reconcileProcess(ctx context.Context, isvc *inferencev1alph
 	// correct executor even when the agent hosts multiple runtimes (#525).
 	process.Runtime = runtime
 
-	// Store process and update metrics
+	// Store process and update metrics. The admission reservation moves onto
+	// the record in the same critical section, so the budget it holds is
+	// never counted twice or dropped in between.
 	a.mu.Lock()
+	process.AdmittedBytes = a.reservedMemory[key]
+	delete(a.reservedMemory, key)
 	a.processes[key] = process
 	managedProcesses.Set(float64(len(a.processes)))
+	a.updateCommittedMetricLocked()
 	a.mu.Unlock()
 	processHealthy.WithLabelValues(isvc.Name, isvc.Namespace).Set(1)
 
@@ -1415,6 +1446,7 @@ func (a *MetalAgent) deleteProcess(ctx context.Context, key string) error {
 	}
 	delete(a.processes, key)
 	managedProcesses.Set(float64(len(a.processes)))
+	a.updateCommittedMetricLocked()
 	a.mu.Unlock()
 
 	a.logger.Infow("stopping inference service", "key", key)
@@ -2021,6 +2053,16 @@ func (a *MetalAgent) checkMemoryAdmission(
 	}
 	memoryEstimatedBytes.WithLabelValues(isvc.Name, isvc.Namespace).Set(float64(estimate.TotalBytes))
 
+	// This Mac's budget, the limit its owner set with --memory-fraction. Every
+	// admitted model shares it, and a Model budget may not exceed it.
+	total, totalErr := a.memoryProvider.TotalMemory()
+	if totalErr != nil {
+		return a.failMemoryCheck(ctx, isvc,
+			fmt.Sprintf("memory budget check failed: failed to get total memory: %v", totalErr))
+	}
+	hostBudget := uint64(float64(total) * a.memoryFraction)
+	memoryBudgetBytes.Set(float64(hostBudget))
+
 	resolved, resolveErr := ResolveMemoryBudget(model.Spec.Hardware, a.memoryFraction)
 	if resolveErr != nil {
 		return a.failMemoryCheck(ctx, isvc, fmt.Sprintf("memory budget resolution failed: %v", resolveErr))
@@ -2032,7 +2074,6 @@ func (a *MetalAgent) checkMemoryAdmission(
 	switch resolved.Mode {
 	case BudgetModeAbsolute:
 		budget = CheckMemoryBudgetAbsolute(resolved.Bytes, estimate)
-		memoryBudgetBytes.Set(float64(resolved.Bytes))
 	default: // BudgetModeFraction
 		var budgetErr error
 		budget, budgetErr = CheckMemoryBudget(a.memoryProvider, estimate, resolved.Fraction)
@@ -2041,14 +2082,37 @@ func (a *MetalAgent) checkMemoryAdmission(
 		}
 	}
 
+	// A Model's memoryBudget or memoryFraction may lower this Mac's limit for
+	// itself but not raise it, unless the agent allows overrides (#2080).
+	clamped := false
+	if budget.BudgetBytes > hostBudget && !a.config.AllowModelMemoryBudgetOverride {
+		a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+			corev1.EventTypeWarning, EventReasonMemoryBudgetClamped,
+			"Model %s budget %s (%s) exceeds this Mac's budget %s (%s total * %.0f%%); clamped to it. "+
+				"Start the metal-agent with --allow-model-memory-budget-override to allow it",
+			model.Name, formatMemory(budget.BudgetBytes), resolved.Source,
+			formatMemory(hostBudget), formatMemory(total), a.memoryFraction*100,
+		)
+		budget = CheckMemoryBudgetAbsolute(hostBudget, estimate)
+		clamped = true
+	}
+
 	if !budget.Fits {
 		var msg string
-		if resolved.Mode == BudgetModeAbsolute {
+		switch {
+		case clamped:
+			msg = fmt.Sprintf("estimated %s required, budget %s (the Model's budget, clamped to this Mac's: %s total * %.0f%%)",
+				formatMemory(budget.EstimateBytes),
+				formatMemory(budget.BudgetBytes),
+				formatMemory(total),
+				a.memoryFraction*100,
+			)
+		case resolved.Mode == BudgetModeAbsolute:
 			msg = fmt.Sprintf("estimated %s required, budget %s (absolute from CRD)",
 				formatMemory(budget.EstimateBytes),
 				formatMemory(budget.BudgetBytes),
 			)
-		} else {
+		default:
 			msg = fmt.Sprintf("estimated %s required, budget %s (%s total * %.0f%%)",
 				formatMemory(budget.EstimateBytes),
 				formatMemory(budget.BudgetBytes),
@@ -2056,23 +2120,43 @@ func (a *MetalAgent) checkMemoryAdmission(
 				resolved.Fraction*100,
 			)
 		}
-		a.logger.Warnw("model does not fit in memory budget",
-			"estimate", formatMemory(budget.EstimateBytes),
-			"budget", formatMemory(budget.BudgetBytes),
-			"source", resolved.Source,
-		)
-		isvc.Status.SchedulingStatus = EventReasonInsufficientMemory
-		isvc.Status.SchedulingMessage = msg
-		if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
-			a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
-		}
-		return fmt.Errorf("insufficient memory: %s", msg)
+		return a.refuseInsufficientMemory(ctx, isvc, msg, "source", resolved.Source)
 	}
+
+	// The model fits on its own; it must also fit next to every running and
+	// starting process. The check and the reservation share one critical
+	// section, so two services starting at once cannot both claim the same
+	// free budget. A respawn is checked against everything but its own key:
+	// its previous engine is already stopped. An override-raised Model budget
+	// raises the shared limit for this admission too.
+	key := types.NamespacedName{Namespace: isvc.Namespace, Name: isvc.Name}.String()
+	capacity := max(hostBudget, budget.BudgetBytes)
+	a.mu.Lock()
+	committed, holders := a.committedMemoryLocked(key)
+	if committed+estimate.TotalBytes > capacity {
+		a.mu.Unlock()
+		var free uint64
+		if committed < capacity {
+			free = capacity - committed
+		}
+		msg := fmt.Sprintf("estimated %s required, %s of the %s budget already committed to %s, %s free",
+			formatMemory(estimate.TotalBytes),
+			formatMemory(committed),
+			formatMemory(capacity),
+			describeMemoryHolders(holders),
+			formatMemory(free),
+		)
+		return a.refuseInsufficientMemory(ctx, isvc, msg, "committed", formatMemory(committed))
+	}
+	a.reservedMemory[key] = estimate.TotalBytes
+	a.updateCommittedMetricLocked()
+	a.mu.Unlock()
 
 	a.logger.Infow("memory check passed",
 		"estimate", formatMemory(budget.EstimateBytes),
 		"budget", formatMemory(budget.BudgetBytes),
 		"headroom", formatMemory(budget.HeadroomBytes),
+		"committed", formatMemory(committed),
 		"source", resolved.Source,
 	)
 
@@ -2086,6 +2170,80 @@ func (a *MetalAgent) checkMemoryAdmission(
 	}
 
 	return nil
+}
+
+// refuseInsufficientMemory refuses a start that does not fit: it records msg on
+// the InferenceService status, emits a Warning event with it, and returns the
+// error the caller hands back to the reconcile loop.
+func (a *MetalAgent) refuseInsufficientMemory(
+	ctx context.Context,
+	isvc *inferencev1alpha1.InferenceService,
+	msg string,
+	logKV ...interface{},
+) error {
+	a.logger.Warnw("model does not fit in memory budget",
+		append([]interface{}{"namespace", isvc.Namespace, "name", isvc.Name, "reason", msg}, logKV...)...)
+	isvc.Status.SchedulingStatus = EventReasonInsufficientMemory
+	isvc.Status.SchedulingMessage = msg
+	if updateErr := a.config.K8sClient.Status().Update(ctx, isvc); updateErr != nil {
+		a.logger.Warnw("failed to update InferenceService status", "error", updateErr)
+	}
+	a.emitInferenceEvent(ctx, &ManagedProcess{Namespace: isvc.Namespace, Name: isvc.Name},
+		corev1.EventTypeWarning, EventReasonInsufficientMemory, "Refusing to start: %s", msg)
+	return fmt.Errorf("insufficient memory: %s", msg)
+}
+
+// committedMemoryLocked sums the admitted estimates of running processes and
+// of starts holding a reservation, skipping exclude, and returns the keys that
+// hold memory, sorted. Caller holds a.mu.
+func (a *MetalAgent) committedMemoryLocked(exclude string) (uint64, []string) {
+	perKey := make(map[string]uint64, len(a.processes)+len(a.reservedMemory))
+	for k, p := range a.processes {
+		perKey[k] += p.AdmittedBytes
+	}
+	for k, b := range a.reservedMemory {
+		perKey[k] += b
+	}
+	var sum uint64
+	holders := make([]string, 0, len(perKey))
+	for k, b := range perKey {
+		if k == exclude || b == 0 {
+			continue
+		}
+		sum += b
+		holders = append(holders, k)
+	}
+	sort.Strings(holders)
+	return sum, holders
+}
+
+// updateCommittedMetricLocked publishes the committed total. Caller holds a.mu.
+func (a *MetalAgent) updateCommittedMetricLocked() {
+	committed, _ := a.committedMemoryLocked("")
+	memoryCommittedBytes.Set(float64(committed))
+}
+
+// releaseAdmission drops key's admission reservation, if it still holds one.
+// The start path defers it, so a start that fails or returns early after
+// admission gives its budget back; a successful start has already moved the
+// reservation onto its process record, which makes this a no-op.
+func (a *MetalAgent) releaseAdmission(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, held := a.reservedMemory[key]; !held {
+		return
+	}
+	delete(a.reservedMemory, key)
+	a.updateCommittedMetricLocked()
+}
+
+// describeMemoryHolders renders the services holding memory for a refusal
+// message: "2 services (default/a, default/b)".
+func describeMemoryHolders(holders []string) string {
+	if len(holders) == 1 {
+		return "1 service (" + holders[0] + ")"
+	}
+	return fmt.Sprintf("%d services (%s)", len(holders), strings.Join(holders, ", "))
 }
 
 // failMemoryCheck handles a memory admission check that could not be

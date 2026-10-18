@@ -284,6 +284,7 @@ func (a *MetalAgent) restartUnhealthy(ctx context.Context, key string, proc *Man
 	}
 	delete(a.processes, key)
 	managedProcesses.Set(float64(len(a.processes)))
+	a.updateCommittedMetricLocked()
 	a.starting[key] = true
 	// Held from before the stop: a delete handled while the engine stops
 	// cancels it, and that is how the check below sees the delete.

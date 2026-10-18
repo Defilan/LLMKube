@@ -149,10 +149,15 @@ If memory pressure is recurring on this host:
 
    The precedence chain is `spec.hardware.memoryBudget`, then
    `spec.hardware.memoryFraction`, then the agent's `--memory-fraction`.
-   The metal-agent enforces the resolved budget at spawn time and refuses
-   to start a process whose estimate exceeds it, which heads off the
-   failure mode upstream of the watchdog. If the pre-flight estimate cannot
-   be computed at all, `--memory-check-mode` decides what happens:
+   A Model budget can only lower the agent's limit for that model: a value
+   above the agent's budget is clamped to it with a `MemoryBudgetClamped`
+   Warning event, unless the agent runs with
+   `--allow-model-memory-budget-override`. The metal-agent enforces the
+   resolved budget at spawn time and refuses to start a process whose
+   estimate exceeds it, or whose estimate does not fit next to the services
+   already running on the Mac (the agent's budget is shared), which heads off
+   the failure mode upstream of the watchdog. If the pre-flight estimate
+   cannot be computed at all, `--memory-check-mode` decides what happens:
    `enforce` (the default) fails closed, `warn` starts the process anyway.
 
 4. **Move heavy models to a host with more memory.** If the same M2 Pro keeps hitting Critical with a 30B model, that is a sizing problem, not a runbook problem.
@@ -202,8 +207,9 @@ If memory pressure is recurring on this host:
    Normal; no other change to the InferenceService starts it in the
    meantime. Without this, a service evicted for pressure that has not gone
    away would come straight back and be evicted again: the pre-start
-   admission check compares the model's estimate with a fraction of total
-   memory and does not look at available memory.
+   admission check compares the model's estimate, plus what the services
+   still running have committed, with a fraction of total memory and does
+   not look at available memory.
 
    A service evicted again within 10 minutes of being restarted this way
    waits before its next restart: 1 minute, then twice as long on each

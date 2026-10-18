@@ -522,6 +522,25 @@ To set this in the launchd plist:
     <string>0.75</string>                 <!-- 75% of system memory -->
 ```
 
+**The budget is shared by every model on the Mac.** A new model is admitted only if its estimate fits in the budget minus what is already committed to running models and to starts in flight. On a 64 GB Mac (48 GB budget), a second 40 GB model is refused while a first one is running, and the refusal names the services holding the memory:
+
+```text
+estimated 40.1 GB required, 40.1 GB of the 48.0 GB budget already committed to 1 service (default/llama-a), 8.0 GB free
+```
+
+A service that stops (deleted, scaled to zero, evicted under memory pressure) gives its share back. `llmkube_metal_agent_memory_committed_bytes` reports the committed total next to `llmkube_metal_agent_memory_budget_bytes`.
+
+**A Model can lower its own budget, not raise the Mac's.** `spec.hardware.memoryBudget` and `spec.hardware.memoryFraction` on a Model still cap that model, but a value above this Mac's budget is clamped to it, with a `MemoryBudgetClamped` Warning event on the InferenceService. To let Model budgets exceed the Mac's (for example on a dedicated machine whose owner manages placement by hand), start the agent with `--allow-model-memory-budget-override`; an overriding Model budget then also raises the shared limit for that model's admission.
+
+**Turning off mlock for one service.** The agent starts llama-server with its weights locked in memory (`--load-mode mmap+mlock`, or `--mlock` on llama.cpp builds before 0.5.0), because macOS otherwise reclaims unlocked GPU memory under pressure. A service that must not wire its weights sets its own load mode in `extraArgs`, which replaces the agent's:
+
+```yaml
+spec:
+  extraArgs: ["--load-mode", "mmap"]
+```
+
+Admission still counts the full estimate for such a service.
+
 ## Apple Silicon Power Metrics (for InferCost)
 
 The Metal Agent can publish real-time CPU / GPU / ANE / Combined power gauges sourced from macOS `powermetrics`. These gauges are designed to be scraped by [InferCost](https://github.com/defilantech/infercost) for per-token cost attribution on Apple Silicon (where DCGM doesn't exist). The feature is **disabled by default** because `powermetrics` requires root.
@@ -613,6 +632,7 @@ The Metal Agent exposes an HTTP server on `127.0.0.1:9090` (configurable via `--
 | `llmkube_metal_agent_process_restarts_total` | Counter | Engine restart attempts, counted per attempt (a retry after a failed restart counts again). Labels: `name`, `namespace` |
 | `llmkube_metal_agent_health_check_duration_seconds` | Histogram | Duration of health check probes. Labels: `name`, `namespace` |
 | `llmkube_metal_agent_memory_budget_bytes` | Gauge | Total memory budget for model serving |
+| `llmkube_metal_agent_memory_committed_bytes` | Gauge | Memory admitted to running and starting models; new models must fit in the budget minus this |
 | `llmkube_metal_agent_memory_estimated_bytes` | Gauge | Estimated memory per process. Labels: `name`, `namespace` |
 | `llmkube_metal_agent_system_memory_available_bytes` | Gauge | Available system memory, sampled by the memory watchdog (`--memory-watchdog-interval`, default 10s) |
 | `llmkube_metal_agent_system_memory_wired_bytes` | Gauge | Wired (non-pageable) system memory, sampled by the memory watchdog |
@@ -1198,6 +1218,7 @@ kubectl get isvc <name> -o jsonpath='{.status.schedulingMessage}'
 To resolve:
 - **Use a smaller quantization** (e.g. Q4_K_M instead of Q8_0) to reduce model weight size
 - **Reduce context size** in the InferenceService spec to lower KV cache requirements
+- **Stop or scale down another service on the same Mac** when the message says the budget is already committed: the budget is shared by every model the agent runs
 - **Increase the memory fraction** with `--memory-fraction 0.9` if this is a dedicated inference machine
 - **Close other applications** to free unified memory
 
