@@ -102,6 +102,26 @@ type ProbeCustomizer interface {
 	CustomizeProbes(isvc *inferencev1alpha1.InferenceService, port int32, startup, liveness, readiness *corev1.Probe)
 }
 
+// SharedMemoryRequirer is optionally implemented by backends that run several
+// worker processes on one node and exchange data through /dev/shm (tensor,
+// pipeline or data parallelism, NCCL's intra-node transport). When it returns
+// true, the deployment builder mounts a memory-backed emptyDir at /dev/shm,
+// because the container runtime's default is 64 MiB (#2099). gpuCount is the
+// resolved device-plugin GPU count, 0 for DRA-allocated GPUs.
+type SharedMemoryRequirer interface {
+	NeedsSharedMemory(isvc *inferencev1alpha1.InferenceService, gpuCount int32) bool
+}
+
+// anyAboveOne reports whether any of the given parallelism sizes is set above 1.
+func anyAboveOne(sizes ...*int32) bool {
+	for _, s := range sizes {
+		if s != nil && *s > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveBackend returns the RuntimeBackend for the given InferenceService.
 // Declared as a var so tests can stub it.
 var resolveBackend = func(isvc *inferencev1alpha1.InferenceService) RuntimeBackend {
