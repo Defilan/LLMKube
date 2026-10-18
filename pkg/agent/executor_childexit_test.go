@@ -516,3 +516,90 @@ func requireOnSpawnedErrorKillsChild(
 		t.Fatalf("child %d still alive after OnSpawned failed (kill 0: %v)", pid, err)
 	}
 }
+
+func TestStopEngineGroup_KillsTheWholeGroup(t *testing.T) {
+	orig := stopGracePeriod
+	stopGracePeriod = 300 * time.Millisecond
+	t.Cleanup(func() { stopGracePeriod = orig })
+	// A leader that ignores SIGTERM and a child in its group that also ignores it.
+	script := "trap '' TERM; sh -c \"trap '' TERM; sleep 30\" & echo $! > \"$1\"; while :; do sleep 0.05; done"
+	cmd := exec.Command("sh", "-c", script, "sh", filepath.Join(t.TempDir(), "child.pid"))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = cmd.Wait() }()
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+	in := newProcessInspector()
+	tok, err := in.StartToken(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // let the child start and install its trap
+	err = stopEngineGroup(cmd.Process.Pid, cmd.Process.Pid, tok, in)
+	var killed *KilledAfterGraceError
+	if !errors.As(err, &killed) {
+		t.Fatalf("err = %v, want KilledAfterGraceError", err)
+	}
+	// The group is gone: signalling it fails with ESRCH. macOS answers EPERM while
+	// the group holds only zombies launchd has not reaped yet, so wait that out.
+	deadline := time.Now().Add(5 * time.Second)
+	probe := syscall.Kill(-cmd.Process.Pid, 0)
+	for (probe == nil || errors.Is(probe, syscall.EPERM)) && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		probe = syscall.Kill(-cmd.Process.Pid, 0)
+	}
+	if !errors.Is(probe, syscall.ESRCH) {
+		t.Fatalf("process group still alive: %v", probe)
+	}
+}
+
+func TestStopEngineGroup_EPERMNeverEscalates(t *testing.T) {
+	var sent []syscall.Signal
+	orig := killFn
+	killFn = func(pid int, sig syscall.Signal) error {
+		sent = append(sent, sig)
+		if sig == 0 {
+			return syscall.EPERM
+		}
+		return nil
+	}
+	t.Cleanup(func() { killFn = orig })
+	if err := stopEngineGroup(4242, 4242, "tok", fakeInspector{tokens: map[int]string{4242: "tok"}}); err == nil {
+		t.Fatal("EPERM on the liveness probe returned nil")
+	}
+	for _, s := range sent {
+		if s == syscall.SIGKILL {
+			t.Fatal("SIGKILL sent after EPERM")
+		}
+	}
+}
+
+func TestStopEngineGroup_TokenChangedNeverKills(t *testing.T) {
+	orig, origGrace := killFn, stopGracePeriod
+	stopGracePeriod = 100 * time.Millisecond
+	var sent []syscall.Signal
+	killFn = func(pid int, sig syscall.Signal) error { sent = append(sent, sig); return nil } // stays "alive"
+	t.Cleanup(func() { killFn, stopGracePeriod = orig, origGrace })
+	err := stopEngineGroup(4242, 4242, "old", fakeInspector{tokens: map[int]string{4242: "new"}})
+	if !errors.Is(err, errProcessAlreadyGone) {
+		t.Fatalf("err = %v, want errProcessAlreadyGone when the PID was reused", err)
+	}
+	for _, s := range sent {
+		if s == syscall.SIGKILL {
+			t.Fatal("SIGKILL sent to a reused PID")
+		}
+	}
+}
+
+func TestStopEngineGroup_NoPGIDFallsBackToPID(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	if err := stopEngineGroup(cmd.Process.Pid, 0, "", newProcessInspector()); err != nil {
+		t.Fatalf("stopEngineGroup with pgid 0: %v", err)
+	}
+}

@@ -66,6 +66,48 @@ var stopGracePeriod = 10 * time.Second
 // it cannot wait on, has exited.
 const untrackedStopPoll = 50 * time.Millisecond
 
+// signalFunc sends sig to pid (negative for a process group); a var so tests
+// can script the kernel's answers.
+type signalFunc func(pid int, sig syscall.Signal) error
+
+var killFn signalFunc = syscall.Kill
+
+// stopEngineGroup stops an engine the agent did not spawn in this process (an
+// adopted engine, #2079) by signalling its process group. It never escalates on
+// doubt: EPERM on the liveness probe, or a start token that changed (the PID
+// was reused), returns an error instead of SIGKILL. pgid <= 0 (a record with no
+// group) falls back to stopping the single PID.
+func stopEngineGroup(pid, pgid int, token string, inspect processInspector) error {
+	if pid <= 0 {
+		return fmt.Errorf("refusing to stop invalid PID %d", pid)
+	}
+	if pgid <= 0 {
+		return (&childTracker{}).stopChild(pid)
+	}
+	if err := killFn(-pgid, syscall.SIGTERM); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("process group %d: %w", pgid, errProcessAlreadyGone)
+		}
+		return fmt.Errorf("failed to send SIGTERM to process group %d: %w", pgid, err)
+	}
+	deadline := time.Now().Add(stopGracePeriod)
+	for time.Now().Before(deadline) {
+		err := killFn(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		if errors.Is(err, syscall.EPERM) {
+			return fmt.Errorf("process %d is no longer ours (EPERM); not escalating", pid)
+		}
+		time.Sleep(untrackedStopPoll)
+	}
+	if now, err := inspect.StartToken(pid); err != nil || now != token {
+		return fmt.Errorf("process %d changed identity during the stop: %w", pid, errProcessAlreadyGone)
+	}
+	_ = killFn(-pgid, syscall.SIGKILL)
+	return &KilledAfterGraceError{PID: pid}
+}
+
 // childExit is the single reaper for a spawned child: one goroutine calls
 // cmd.Wait, records the result, and closes done. Everything else that needs
 // to know whether the child is gone (the health wait, StopProcess) selects on

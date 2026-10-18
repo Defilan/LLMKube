@@ -15,6 +15,8 @@ type anyPIDInspector struct{}
 
 func (anyPIDInspector) StartToken(pid int) (string, error) { return "tok", nil }
 
+func (anyPIDInspector) Executables(pid int) ([]string, error) { return []string{"/fake/engine"}, nil }
+
 // flipInspector answers the first lookup and fails every later one, so the
 // provisional write succeeds and the completion write fails.
 type flipInspector struct{ calls int }
@@ -252,3 +254,5 @@ func TestEnsureProcess_RecordFailuresAreCounted(t *testing.T) {
 		t.Fatalf("completion failure counted %v times, want 1", got)
 	}
 }
+
+func (i *flipInspector) Executables(pid int) ([]string, error) { return []string{"/fake/engine"}, nil }
