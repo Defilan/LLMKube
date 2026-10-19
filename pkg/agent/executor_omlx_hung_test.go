@@ -141,6 +141,30 @@ func waitPIDGone(t *testing.T, pid int) {
 	t.Fatalf("process %d still alive after 2s", pid)
 }
 
+// stopOMLXDaemon SIGSTOPs pid and waits until the daemon on port stops
+// answering /health. kill() only queues the signal: on a loaded runner the
+// daemon can answer a few more requests first, and a StartProcess that sees
+// it healthy takes the "already running" path instead of the replacement
+// these tests are about.
+func stopOMLXDaemon(t *testing.T, pid, port int) {
+	t.Helper()
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+		t.Fatalf("SIGSTOP the daemon: %v", err)
+	}
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err != nil {
+			return
+		}
+		_ = resp.Body.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("daemon %d still answers /health on port %d 5s after SIGSTOP", pid, port)
+}
+
 // omlxModelLoaded reports whether the daemon on port reports modelID loaded.
 func omlxModelLoaded(t *testing.T, port int, modelID string) bool {
 	t.Helper()
@@ -314,9 +338,7 @@ func TestOMLXStoppedDaemonKilledAfterGrace(t *testing.T) {
 	}
 	hungPID := first.PID
 
-	if err := syscall.Kill(hungPID, syscall.SIGSTOP); err != nil {
-		t.Fatalf("SIGSTOP the daemon: %v", err)
-	}
+	stopOMLXDaemon(t, hungPID, e.port)
 
 	second, err := e.StartProcess(context.Background(), cfg)
 	if err != nil {
@@ -394,9 +416,7 @@ func TestOMLXStopHonorsContextCancellation(t *testing.T) {
 	hungPID := e.process.Pid
 	e.mu.Unlock()
 
-	if err := syscall.Kill(hungPID, syscall.SIGSTOP); err != nil {
-		t.Fatalf("SIGSTOP the daemon: %v", err)
-	}
+	stopOMLXDaemon(t, hungPID, e.port)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
