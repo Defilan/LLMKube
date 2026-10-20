@@ -19,6 +19,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -40,6 +41,7 @@ const (
 	cachePurgeComponent = "cache-purge"
 	managedByLabel      = "app.kubernetes.io/managed-by"
 	managedByValue      = "llmkube-cli"
+	cachePurgeRunLabel  = "llmkube.dev/cache-purge-run"
 
 	// cacheKeyDirPattern matches the directory names the operator writes under
 	// the cache mount (/models/<key>, key from cachekey.Compute).
@@ -54,6 +56,11 @@ var (
 	purgeExec  = execInPod
 	purgeWait  = waitForPodRunning
 	purgeSleep = time.Sleep
+	// purgeRunID stamps every pod a single command creates, so a stale pod is
+	// replaced while a pod another llmkube invocation is using is left alone.
+	purgeRunID = func() string {
+		return cachekey.Compute(fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid()))
+	}
 )
 
 var (
@@ -98,20 +105,25 @@ type purgeTarget struct {
 }
 
 // targetedClaims narrows the claims in a namespace to the ones that can hold
-// modelName's files: the shared cache, the claims the model's own
-// InferenceServices bring with spec.modelCache.claimName, and their
-// "<isvc>-model-cache" per-service claims. The claims of services that do not
-// reference the model stay untouched, so clearing one model does not create a
-// read-write pod on every running service's volume or fail on their attach
-// timeouts. all is every cache claim in the namespace, in the order
-// cachePVCandidates returns.
+// modelName's files: the claims the model's own InferenceServices bring with
+// spec.modelCache.claimName, and their "<isvc>-model-cache" per-service claims.
+// The shared cache counts only when the Model has no InferenceService the
+// purge could consult (prefetch-era Models, or a service not yet created), so
+// a model that demonstrably lives on per-service or override claims never
+// costs a pod on the shared claim, which a shared-mode service may hold under
+// RWO. The claims of services that do not reference the model stay untouched,
+// so clearing one model does not create a read-write pod on every running
+// service's volume or fail on their attach timeouts. all is every cache claim
+// in the namespace, in the order cachePVCandidates returns.
 func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName string) []purgeTarget {
-	own := map[string]bool{modelCachePVCName: true}
+	own := map[string]bool{}
+	consulted := false
 	for i := range svcs {
 		svc := &svcs[i]
 		if svc.Name != modelName && svc.Spec.ModelRef != modelName {
 			continue
 		}
+		consulted = true
 		// A service with a claimName override mounts that claim; without one
 		// the operator gives it its own per-service claim (#928).
 		if claim := userModelCacheClaimName(svc); claim != "" {
@@ -121,12 +133,25 @@ func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService
 		own[perServiceCacheClaimName(svc.Name)] = true
 	}
 
+	if !consulted {
+		own[modelCachePVCName] = true
+	}
+
 	var selected []purgeTarget
 	for _, target := range all {
 		if own[target.Name] {
 			selected = append(selected, target)
 		}
 	}
+	sort.SliceStable(selected, func(i, j int) bool {
+		if selected[i].Name == modelCachePVCName {
+			return true
+		}
+		if selected[j].Name == modelCachePVCName {
+			return false
+		}
+		return selected[i].Name < selected[j].Name
+	})
 	return selected
 }
 
@@ -169,10 +194,10 @@ func purgePodName(pvcName string) string {
 // createPurgePodForPVC creates the pod that removes entries from a cache claim.
 // It mounts the claim read-write at the same path the inspector reads it from.
 func createPurgePodForPVC(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, runID string,
 ) (string, error) {
 	podName := purgePodName(pvcName)
-	pod := newCacheAccessPod(podName, pvcName, cachePurgeComponent, "purge", false)
+	pod := newCacheAccessPodForRun(podName, pvcName, cachePurgeComponent, "purge", false, runID)
 	pod.Namespace = namespace
 	if _, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return "", err
@@ -189,12 +214,13 @@ func ensurePurgePod(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
 ) (string, error) {
 	podName := purgePodName(pvcName)
-	_, err := createPurgePodForPVC(ctx, clientset, namespace, pvcName)
+	runID := purgeRunID()
+	_, err := createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
 	if apierrors.IsAlreadyExists(err) {
-		if err := replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName); err != nil {
+		if err := replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName, runID); err != nil {
 			return "", err
 		}
-		_, err = createPurgePodForPVC(ctx, clientset, namespace, pvcName)
+		_, err = createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
 	}
 	if err != nil {
 		return "", fmt.Errorf("failed to create purge pod for PVC %s: %w", pvcName, err)
@@ -213,9 +239,10 @@ func ensurePurgePod(
 // The delete is asynchronous: recreating the pod while the API server still
 // holds the old one fails with AlreadyExists and the name stays occupied until
 // the kubelet confirms termination, so a unit-test-speed retry is not enough.
-// Only our own pod is removed; an unlabelled pod at that name is an error.
+// Only a stale llmkube purge pod is removed: an unlabelled pod at that name,
+// or one another live invocation stamped, is an error.
 func replaceStalePurgePod(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName, runID string,
 ) error {
 	existing, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
@@ -227,6 +254,12 @@ func replaceStalePurgePod(
 	if existing.Labels[managedByLabel] != managedByValue ||
 		existing.Labels[modelCacheLabel] != cachePurgeComponent {
 		return fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache purge pod", podName)
+	}
+	// A pod stamped by a live run is in use: its idles at that claim and is
+	// deleted when the run ends. Only a pod from a run that never cleaned up
+	// (no stamp at all) or this run's own leftover is replaced.
+	if stamp := existing.Labels[cachePurgeRunLabel]; stamp != "" && stamp != runID && !purgePodAbandoned(existing) {
+		return fmt.Errorf("refusing to delete pod %s: another llmkube cache purge run is using it", podName)
 	}
 	deleteCacheAccessPod(ctx, clientset, namespace, podName)
 
@@ -248,6 +281,13 @@ func replaceStalePurgePod(
 		}
 		purgeSleep(time.Second)
 	}
+}
+
+// purgePodAbandoned reports whether a stamped pod has outlived the process
+// that created it. It cannot be told apart from a live run by the object
+// alone, so age is the only signal: a purge pod lives for seconds.
+func purgePodAbandoned(pod *corev1.Pod) bool {
+	return time.Since(pod.CreationTimestamp.Time) > 10*time.Minute
 }
 
 // withPurgePod runs fn inside a pod that mounts pvcName read-write, then

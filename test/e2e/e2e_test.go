@@ -2132,6 +2132,105 @@ spec:
 				Expect(output).To(ContainSubstring("orphaned cache entries"))
 			})
 		})
+
+		Context("cache clear removes entries from the PVC", func() {
+			// #2127: `cache clear` printed a `kubectl exec rm` against the
+			// distroless controller and removed nothing. These specs prove the
+			// entry leaves the claim, which no unit test can.
+			const (
+				clearNs = "e2e-cache-clear"
+				key     = "deadbeef01234567"
+				other   = "feedface01234567"
+			)
+
+			writeDir := func(dir string) {
+				cmd := exec.Command("kubectl", "run", "cache-writer-"+dir[:8],
+					"--restart=Never", "--namespace", clearNs, "--image=busybox:1.37.0",
+					"--overrides", fmt.Sprintf(`{
+						"spec": {
+							"containers": [{
+								"name": "writer",
+								"image": "busybox:1.37.0",
+								"command": ["sh", "-c", "mkdir -p /models/%s && echo data > /models/%s/model.gguf"],
+								"volumeMounts": [{"name": "cache", "mountPath": "/models"}]
+							}],
+							"volumes": [{"name": "cache", "persistentVolumeClaim": {"claimName": "llmkube-model-cache"}}],
+							"restartPolicy": "Never"
+						}
+					}`, dir, dir))
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create cache-writer pod")
+				Eventually(func(g Gomega) {
+					out, _ := utils.Run(exec.Command("kubectl", "get", "pod", "cache-writer-"+dir[:8],
+						"-n", clearNs, "-o", "jsonpath={.status.phase}"))
+					g.Expect(out).To(Equal("Succeeded"))
+				}, 2*time.Minute).Should(Succeed())
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "cache-writer-"+dir[:8],
+					"-n", clearNs, "--grace-period=0", "--force"))
+			}
+
+			// cacheDirs reads /models through a throwaway pod and returns the
+			// entry names, the only observable that settles the bug.
+			cacheDirs := func() []string {
+				_, _ = utils.Run(exec.Command("kubectl", "run", "cache-reader", "--restart=Never",
+					"--namespace", clearNs, "--image=busybox:1.37.0",
+					"--overrides", `{"spec":{"containers":[{"name":"reader","image":"busybox:1.37.0","command":["sh","-c","ls -1 /models"],"volumeMounts":[{"name":"cache","mountPath":"/models"}]}],"volumes":[{"name":"cache","persistentVolumeClaim":{"claimName":"llmkube-model-cache"}}],"restartPolicy":"Never"}}`))
+				Eventually(func(g Gomega) {
+					out, _ := utils.Run(exec.Command("kubectl", "get", "pod", "cache-reader",
+						"-n", clearNs, "-o", "jsonpath={.status.phase}"))
+					g.Expect(out).To(Equal("Succeeded"))
+				}, 2*time.Minute).Should(Succeed())
+				out, _ := utils.Run(exec.Command("kubectl", "logs", "cache-reader", "-n", clearNs))
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "cache-reader",
+					"-n", clearNs, "--grace-period=0", "--force"))
+				return strings.Fields(out)
+			}
+
+			BeforeEach(func() {
+				if os.Getenv("LLMKUBE_E2E_LONGHORN") == "true" {
+					Skip("the purge pod mounts the claim read-write; Longhorn RWO blocks the second attach")
+				}
+				_, _ = utils.Run(exec.Command("kubectl", "create", "ns", clearNs))
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llmkube-model-cache
+  namespace: %s
+  labels:
+    app.kubernetes.io/component: model-cache
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+`, clearNs))
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create cache PVC")
+			})
+
+			AfterEach(func() {
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clearNs, "--ignore-not-found"))
+			})
+
+			It("removes the named orphaned entry and leaves the others", func() {
+				writeDir(key)
+				writeDir(other)
+
+				By("clearing the orphaned entry")
+				out, err := utils.Run(exec.Command("./"+cliPath, "cache", "clear",
+					"--orphaned", "--force", "-n", clearNs))
+				Expect(err).NotTo(HaveOccurred(), out)
+				Expect(out).To(ContainSubstring("/models/" + key))
+
+				By("checking the PVC itself")
+				Eventually(func(g Gomega) {
+					dirs := cacheDirs()
+					g.Expect(dirs).NotTo(ContainElement(key), "cache clear reported success but the entry is still on the PVC")
+					g.Expect(dirs).NotTo(ContainElement(other))
+				}, 2*time.Minute).Should(Succeed())
+			})
+		})
 	})
 
 	Context("OpenShift SCC admission", func() {

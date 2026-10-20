@@ -276,13 +276,26 @@ func inspectorPodName(pvcName string) string {
 // newCacheAccessPod builds the short-lived pod that mounts a model cache claim.
 // The inspector reads it (readOnly true); the purge writes to it.
 func newCacheAccessPod(podName, pvcName, component, containerName string, readOnly bool) *corev1.Pod {
+	return newCacheAccessPodForRun(podName, pvcName, component, containerName, readOnly, "")
+}
+
+// newCacheAccessPodForRun builds the pod and, when runID is set, stamps it
+// with the invocation that created it, so a concurrent llmkube run's pod is
+// never mistaken for a stale one.
+func newCacheAccessPodForRun(
+	podName, pvcName, component, containerName string, readOnly bool, runID string,
+) *corev1.Pod {
+	labels := map[string]string{
+		"app.kubernetes.io/managed-by": "llmkube-cli",
+		"app.kubernetes.io/component":  component,
+	}
+	if runID != "" {
+		labels[cachePurgeRunLabel] = runID
+	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: podName,
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "llmkube-cli",
-				"app.kubernetes.io/component":  component,
-			},
+			Name:   podName,
+			Labels: labels,
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
@@ -350,6 +363,8 @@ func waitForPodRunning(
 	return fmt.Errorf("timed out waiting for pod %s to be running", name)
 }
 
+// deleteCacheAccessPod removes a short-lived cache pod. It is a variable so
+// tests can observe (and script) the asynchronous delete.
 var deleteCacheAccessPod = func(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
 	gracePeriod := int64(0)
 	_ = clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{

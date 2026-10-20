@@ -114,7 +114,7 @@ func TestNewPurgePod(t *testing.T) {
 	pvcName := "my-isvc-model-cache"
 	clientset := fakeclientset.NewClientset()
 
-	podName, err := createPurgePodForPVC(context.Background(), clientset, "test-ns", pvcName)
+	podName, err := createPurgePodForPVC(context.Background(), clientset, "test-ns", pvcName, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -650,14 +650,36 @@ func TestTargetedClaims(t *testing.T) {
 		want  []string
 	}{
 		{
-			name:  "claimName override narrows to the shared and the override",
+			name:  "claimName override targets the override only",
 			all:   []purgeTarget{shared, overrideClaim, unrelatedPerService},
 			svcs:  []inferencev1alpha1.InferenceService{svc("my-model", "my-model", "isvc-cache")},
 			model: "my-model",
-			want:  []string{"llmkube-model-cache", "isvc-cache"},
+			want:  []string{"isvc-cache"},
 		},
 		{
-			name:  "unrelated per-service claims stay untouched",
+			name: "unrelated per-service claims stay untouched",
+			all:  []purgeTarget{shared, overrideClaim, unrelatedPerService},
+			svcs: []inferencev1alpha1.InferenceService{
+				svc("my-model", "my-model", "isvc-cache"),
+				svc("other-isvc", "other-model", ""),
+			},
+			model: "my-model",
+			want:  []string{"isvc-cache"},
+		},
+		{
+			// Every matching service sits on its own claim, so the model never
+			// reached the shared cache; a pod there would only stall on RWO
+			// attach while a shared-mode service holds it.
+			name:  "shared claim is skipped when every matching service is per-service",
+			all:   []purgeTarget{shared, ownPerService},
+			svcs:  []inferencev1alpha1.InferenceService{svc("chat-api", "llama", "")},
+			model: "llama",
+			want:  []string{"chat-api-model-cache"},
+		},
+		{
+			// No InferenceService to consult (prefetch-era Model), so the
+			// shared cache is the only possible home.
+			name:  "no matching service falls back to the shared claim",
 			all:   []purgeTarget{shared, unrelatedPerService},
 			svcs:  []inferencev1alpha1.InferenceService{svc("other-isvc", "other-model", "")},
 			model: "my-model",
@@ -665,8 +687,9 @@ func TestTargetedClaims(t *testing.T) {
 		},
 		{
 			// The per-service claim is named after the InferenceService, not
-			// the Model (controller modelCachePVCName: "<isvc>-model-cache").
-			name:  "perService claim is named after the service that serves the model",
+			// the Model (controller controller modelCachePVCName:
+			// "<isvc>-model-cache").
+			name:  "per-service claim is named after the service that serves the model",
 			all:   []purgeTarget{ownPerService, unrelatedPerService},
 			svcs:  []inferencev1alpha1.InferenceService{svc("chat-api", "llama", "")},
 			model: "llama",
@@ -705,5 +728,49 @@ func TestDiscoveredClaims(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "llmkube-model-cache,isvc-model-cache" {
 		t.Errorf("discoveredClaims = %v, want the operator-managed claims only", names)
+	}
+}
+
+// TestReplaceStalePurgePod_LiveRunLeftAlone pins the ownership rule for a
+// purge pod another invocation is using: two `cache clear` runs in one
+// namespace share the deterministic pod name, so a stamped pod must only be
+// replaced once it is old enough to be a leftover, never while it is live.
+func TestReplaceStalePurgePod_LiveRunLeftAlone(t *testing.T) {
+	pvcName := "llmkube-model-cache"
+	podName := purgePodName(pvcName)
+	live := newCacheAccessPodForRun(podName, pvcName, cachePurgeComponent, "purge", false, "other-run")
+	live.Namespace = "default"
+	live.CreationTimestamp = metav1.NewTime(time.Now())
+	clientset := fakeclientset.NewClientset(live)
+
+	origDelete, origSleep := deleteCacheAccessPod, purgeSleep
+	t.Cleanup(func() { deleteCacheAccessPod, purgeSleep = origDelete, origSleep })
+	var deletes int
+	deleteCacheAccessPod = func(ctx context.Context, c kubernetes.Interface, ns, name string) {
+		deletes++
+		origDelete(ctx, c, ns, name)
+	}
+	purgeSleep = func(time.Duration) {}
+
+	err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run")
+	if err == nil {
+		t.Fatal("expected an error rather than replacing a live run's pod")
+	}
+	if !strings.Contains(err.Error(), "another llmkube cache purge run") {
+		t.Errorf("error = %q, want it to name the concurrent run", err)
+	}
+	if deletes != 0 {
+		t.Errorf("a live run's purge pod was deleted %d time(s)", deletes)
+	}
+
+	// The same pod is replaced once it has outlived any plausible purge.
+	pod, _ := clientset.CoreV1().Pods("default").Get(context.Background(), podName, metav1.GetOptions{})
+	if pod == nil {
+		t.Fatal("live pod vanished")
+	}
+	pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+	_, _ = clientset.CoreV1().Pods("default").Update(context.Background(), pod, metav1.UpdateOptions{})
+	if err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run"); err != nil {
+		t.Errorf("an abandoned stamped pod must be replaced: %v", err)
 	}
 }
