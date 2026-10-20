@@ -427,7 +427,7 @@ func runCacheClear(opts *cacheClearOptions) error {
 		}
 	}
 
-	targets, err := resolvePurgeTargets(ctx, k8sClient, opts.namespace, opts.model)
+	targets, svcs, err := resolvePurgeTargets(ctx, k8sClient, opts.namespace)
 	if err != nil {
 		return err
 	}
@@ -437,7 +437,7 @@ func runCacheClear(opts *cacheClearOptions) error {
 	if len(keys) > 0 {
 		// A named model's files live on the claim its own InferenceService
 		// mounts, not on every cache claim in the namespace.
-		targets = targetedClaims(targets, opts.model)
+		targets = targetedClaims(targets, svcs, opts.model)
 	}
 
 	clientset, err := kubernetes.NewForConfig(cfg)
@@ -468,7 +468,7 @@ func runCacheClear(opts *cacheClearOptions) error {
 		case opts.orphaned:
 			outcome, err = purgeOrphanedEntries(ctx, cfg, clientset, opts.namespace, target.Name, active)
 		default:
-			outcome, err = purgeAllEntries(ctx, cfg, clientset, opts.namespace, target.Name, target.UserOwned)
+			outcome, err = purgeAllEntries(ctx, cfg, clientset, opts.namespace, target.Name)
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("purging cache PVC %s: %w", target.Name, err))

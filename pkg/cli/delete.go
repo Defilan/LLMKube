@@ -92,6 +92,7 @@ func runDelete(opts *deleteOptions) error {
 
 	var cacheKey string
 	var cacheTargets []purgeTarget
+	var cacheSvcs []inferencev1alpha1.InferenceService
 	if opts.purgeCache {
 		// Resolve the key and the claims before deleting: in perService mode
 		// the claim is owner-ref'd to the InferenceService and is collected
@@ -100,7 +101,7 @@ func runDelete(opts *deleteOptions) error {
 		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, purgeModel); err != nil {
 			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
 		} else if cacheKey = cachekey.EffectiveKey(purgeModel); cacheKey != "" {
-			if cacheTargets, err = resolvePurgeTargets(ctx, k8sClient, opts.namespace, opts.name); err != nil {
+			if cacheTargets, cacheSvcs, err = resolvePurgeTargets(ctx, k8sClient, opts.namespace); err != nil {
 				fmt.Printf("Warning: failed to resolve the model cache: %v\n", err)
 			}
 		}
@@ -140,7 +141,7 @@ func runDelete(opts *deleteOptions) error {
 	// The InferenceService stays mounted on its claim until it is gone, so its
 	// deletion (issued above) is what frees a strict RWO claim for the purge.
 	if opts.purgeCache && cacheKey != "" {
-		targets := targetedClaims(cacheTargets, opts.name)
+		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name)
 		if len(targets) == 0 {
 			fmt.Printf("⚠️  No model cache PVC found in namespace '%s'; nothing to purge\n", opts.namespace)
 			fmt.Printf("\n✓ Deployment '%s' deleted successfully\n", opts.name)

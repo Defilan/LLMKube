@@ -540,9 +540,9 @@ read-write, one pod per claim, deleted as soon as it is done.
 `cache clear` with no flag and `cache clear --orphaned` act on the claims
 `cache list` discovers: `llmkube-model-cache` and the labeled per-service
 `<isvc>-model-cache`. `cache clear --model` and `delete --purge-cache` target
-only the claim that can hold that model's files: the shared cache, or the
-`spec.modelCache.claimName` the model's own InferenceServices bring. Two things
-follow from that:
+only the claims that can hold that model's files: the shared cache, the
+`<isvc>-model-cache` of the InferenceServices that serve the model, and any
+`spec.modelCache.claimName` those services bring. Two things follow from that:
 
 - It needs your own permission to create and exec into pods in the namespace.
   On a `restricted`-profile namespace the pod is rejected, the same way
@@ -551,10 +551,9 @@ follow from that:
   so the purge fails with a timeout naming the claim. Delete the
   InferenceService first, then purge.
 
-On a user-owned `claimName` claim, `cache clear` (all entries) only removes
-directories named like cache keys, so data the operator did not write is left
-alone. `--model` and `--orphaned` validate the key as a single path segment and
-remove only `/models/<key>`.
+Every mode removes only directories named like a cache key (16 hex characters)
+and a `--model` key must validate as a single path segment, so the command
+removes `/models/<key>` and never data the operator did not write.
 
 Clearing the entry of a model that is still serving removes the file from the
 volume, but the running process keeps its open handle and serves the old bytes

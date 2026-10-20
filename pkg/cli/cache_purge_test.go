@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -44,8 +45,9 @@ var nilRESTConfig = &rest.Config{}
 // Every exec'd command is appended to *cmds in order.
 func fakePurgeExec(t *testing.T, result execFunc, cmds *[][]string) {
 	t.Helper()
-	origExec, origWait := purgeExec, purgeWait
-	t.Cleanup(func() { purgeExec, purgeWait = origExec, origWait })
+	origExec, origWait, origSleep := purgeExec, purgeWait, purgeSleep
+	t.Cleanup(func() { purgeExec, purgeWait, purgeSleep = origExec, origWait, origSleep })
+	purgeSleep = func(time.Duration) {}
 	purgeExec = func(_ context.Context, _ *rest.Config, _ kubernetes.Interface,
 		_, _, _ string, command []string) (string, error) {
 		*cmds = append(*cmds, command)
@@ -167,22 +169,66 @@ func TestNewPurgePod(t *testing.T) {
 
 func TestEnsurePurgePod_ReplacesStale(t *testing.T) {
 	pvcName := "llmkube-model-cache"
-	stale := newCacheAccessPod(purgePodName(pvcName), pvcName, cachePurgeComponent, "purge", false)
+	podName := purgePodName(pvcName)
+	stale := newCacheAccessPod(podName, pvcName, cachePurgeComponent, "purge", false)
 	stale.Namespace = "default"
 	clientset := fakeclientset.NewClientset(stale)
+
+	// The delete is asynchronous on a real API server: the pod keeps its name
+	// until the kubelet acks it. This fake scripts exactly that, keeping the
+	// pod readable for two polls after the delete.
+	var (
+		deleting    bool
+		lingering   int
+		seenGone    bool
+		earlyCreate int
+	)
+	clientset.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if deleting && !seenGone {
+			earlyCreate++
+			return true, nil, apierrors.NewAlreadyExists(
+				corev1.SchemeGroupVersion.WithResource("pods").GroupResource(), podName)
+		}
+		return false, nil, nil
+	})
+	clientset.PrependReactor("get", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.GetAction).GetName() != podName {
+			return false, nil, nil
+		}
+		if !deleting {
+			return true, stale.DeepCopy(), nil
+		}
+		lingering++
+		if lingering <= 2 {
+			pod := stale.DeepCopy()
+			pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+			return true, pod, nil
+		}
+		seenGone = true
+		return true, nil, apierrors.NewNotFound(
+			corev1.SchemeGroupVersion.WithResource("pods").GroupResource(), podName)
+	})
+
+	origDelete, origSleep := deleteCacheAccessPod, purgeSleep
+	t.Cleanup(func() { deleteCacheAccessPod, purgeSleep = origDelete, origSleep })
+	deleteCacheAccessPod = func(ctx context.Context, c kubernetes.Interface, ns, name string) {
+		deleting = true
+		origDelete(ctx, c, ns, name)
+	}
+	purgeSleep = func(time.Duration) {}
+
 	var cmds [][]string
 	fakePurgeExec(t, func(command []string) (string, error) { return "", nil }, &cmds)
 
-	podName, err := ensurePurgePod(context.Background(), clientset, "default", pvcName)
+	got, err := ensurePurgePod(context.Background(), clientset, "default", pvcName)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if podName != purgePodName(pvcName) {
-		t.Errorf("pod name = %q, want %q", podName, purgePodName(pvcName))
+	if got != podName {
+		t.Errorf("pod name = %q, want %q", got, podName)
 	}
-	if _, err := clientset.CoreV1().Pods("default").Get(
-		context.Background(), podName, metav1.GetOptions{}); err != nil {
-		t.Fatalf("purge pod not recreated: %v", err)
+	if earlyCreate > 0 {
+		t.Errorf("recreated the purge pod %d time(s) before the stale one was gone", earlyCreate)
 	}
 }
 
@@ -351,7 +397,7 @@ func capturePurgeScripts(t *testing.T) *[]string {
 			return "", nil
 		}
 		if strings.Contains(command[2], "ls -1 /models") {
-			return "deadbeef01234567\n0123456789abcdef\nkeep-me.txt\n", nil
+			return "deadbeef01234567\n0123456789abcdef\nkeep-me.txt\nit's here\n", nil
 		}
 		rmCmds = append(rmCmds, command[2])
 		return "", nil
@@ -384,8 +430,8 @@ func TestPurgeOrphanedEntries(t *testing.T) {
 	if strings.Contains(cmd, "'/models/0123456789abcdef'") {
 		t.Errorf("active entry was removed: %q", cmd)
 	}
-	if len(outcome.Skipped) != 1 || outcome.Skipped[0] != "keep-me.txt" {
-		t.Errorf("skipped = %v, want [keep-me.txt]", outcome.Skipped)
+	if strings.Join(outcome.Skipped, ",") != "keep-me.txt,it's here" {
+		t.Errorf("skipped = %v, want [keep-me.txt it's here]", outcome.Skipped)
 	}
 }
 
@@ -394,17 +440,18 @@ func TestPurgeAllEntries_OperatorClaim(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	if _, err := purgeAllEntries(context.Background(), nilRESTConfig, clientset,
-		"default", "llmkube-model-cache", false); err != nil {
+		"default", "llmkube-model-cache"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	cmd := lastRMCmd(t, *cmds)
-	for _, want := range []string{
-		"'/models/deadbeef01234567'", "'/models/0123456789abcdef'", "'/models/keep-me.txt'",
-	} {
+	for _, want := range []string{"'/models/deadbeef01234567'", "'/models/0123456789abcdef'"} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("operator claim: %s missing from %q", want, cmd)
 		}
+	}
+	if strings.Contains(cmd, "keep-me.txt") || strings.Contains(cmd, "it's") {
+		t.Errorf("operator claim: a non-key name reached the shell: %q", cmd)
 	}
 }
 
@@ -413,7 +460,7 @@ func TestPurgeAllEntries_UserClaim(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	outcome, err := purgeAllEntries(context.Background(), nilRESTConfig, clientset,
-		"default", "user-claim", true)
+		"default", "user-claim")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -426,8 +473,8 @@ func TestPurgeAllEntries_UserClaim(t *testing.T) {
 	if strings.Contains(cmd, "keep-me.txt") {
 		t.Errorf("user claim: non-key entry was removed: %q", cmd)
 	}
-	if len(outcome.Skipped) != 1 || outcome.Skipped[0] != "keep-me.txt" {
-		t.Errorf("skipped = %v, want [keep-me.txt]", outcome.Skipped)
+	if strings.Join(outcome.Skipped, ",") != "keep-me.txt,it's here" {
+		t.Errorf("skipped = %v, want [keep-me.txt it's here]", outcome.Skipped)
 	}
 }
 
@@ -484,21 +531,21 @@ func TestCachePVCandidates(t *testing.T) {
 		WithObjects(shared, perIsvc, userClaim, otherClaim, named, refs, unrelated).
 		Build()
 
-	got, err := cachePVCandidates(context.Background(), k8sClient, "default", "model-a")
+	got, _, err := cachePVCandidates(context.Background(), k8sClient, "default")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := []string{"labeled-model-cache", "llmkube-model-cache", "my-cache-claim"}
+	want := []string{"labeled-model-cache", "llmkube-model-cache", "my-cache-claim", "other-cache-claim"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("candidates = %v, want %v (user claim from the named service, or one serving the model)", got, want)
+		t.Errorf("candidates = %v, want %v (the discovered caches plus every claimName override)", got, want)
 	}
 
-	all, err := cachePVCandidates(context.Background(), k8sClient, "default", "")
+	all, _, err := cachePVCandidates(context.Background(), k8sClient, "default")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if strings.Join(all, ",") != "labeled-model-cache,llmkube-model-cache" {
-		t.Errorf("candidates without a model = %v, want only the discovered operator caches", all)
+	if strings.Join(all, ",") != strings.Join(want, ",") {
+		t.Errorf("candidates = %v, want the discovered caches plus the override", all)
 	}
 }
 
@@ -580,39 +627,56 @@ func TestPurgeKey_MultiFileModel(t *testing.T) {
 
 func TestTargetedClaims(t *testing.T) {
 	shared := purgeTarget{Name: "llmkube-model-cache"}
-	userClaim := purgeTarget{Name: "isvc-cache", UserOwned: true}
-	perService := purgeTarget{Name: "other-isvc-model-cache"}
-	ownPerService := purgeTarget{Name: "my-model-model-cache"}
+	overrideClaim := purgeTarget{Name: "isvc-cache", UserOwned: true}
+	ownPerService := purgeTarget{Name: "chat-api-model-cache"}
+	unrelatedPerService := purgeTarget{Name: "other-isvc-model-cache"}
+
+	svc := func(name, modelRef, claim string) inferencev1alpha1.InferenceService {
+		s := inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: modelRef},
+		}
+		if claim != "" {
+			s.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}
+		}
+		return s
+	}
 
 	tests := []struct {
 		name  string
 		all   []purgeTarget
+		svcs  []inferencev1alpha1.InferenceService
 		model string
 		want  []string
 	}{
 		{
 			name:  "claimName override narrows to the shared and the override",
-			all:   []purgeTarget{shared, userClaim, perService},
+			all:   []purgeTarget{shared, overrideClaim, unrelatedPerService},
+			svcs:  []inferencev1alpha1.InferenceService{svc("my-model", "my-model", "isvc-cache")},
 			model: "my-model",
 			want:  []string{"llmkube-model-cache", "isvc-cache"},
 		},
 		{
 			name:  "unrelated per-service claims stay untouched",
-			all:   []purgeTarget{shared, perService},
+			all:   []purgeTarget{shared, unrelatedPerService},
+			svcs:  []inferencev1alpha1.InferenceService{svc("other-isvc", "other-model", "")},
 			model: "my-model",
 			want:  []string{"llmkube-model-cache"},
 		},
 		{
-			name:  "perService without the shared claim falls back to the model's own claim",
-			all:   []purgeTarget{perService, ownPerService},
-			model: "my-model",
-			want:  []string{"my-model-model-cache"},
+			// The per-service claim is named after the InferenceService, not
+			// the Model (controller modelCachePVCName: "<isvc>-model-cache").
+			name:  "perService claim is named after the service that serves the model",
+			all:   []purgeTarget{ownPerService, unrelatedPerService},
+			svcs:  []inferencev1alpha1.InferenceService{svc("chat-api", "llama", "")},
+			model: "llama",
+			want:  []string{"chat-api-model-cache"},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := targetedClaims(tt.all, tt.model)
+			got := targetedClaims(tt.all, tt.svcs, tt.model)
 			var names []string
 			for _, target := range got {
 				names = append(names, target.Name)

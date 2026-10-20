@@ -350,7 +350,7 @@ func waitForPodRunning(
 	return fmt.Errorf("timed out waiting for pod %s to be running", name)
 }
 
-func deleteCacheAccessPod(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
+var deleteCacheAccessPod = func(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
 	gracePeriod := int64(0)
 	_ = clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{
 		GracePeriodSeconds: &gracePeriod,

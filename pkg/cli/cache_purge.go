@@ -51,8 +51,9 @@ const (
 
 // Test seams: the unit tests have no cluster to exec in or wait on.
 var (
-	purgeExec = execInPod
-	purgeWait = waitForPodRunning
+	purgeExec  = execInPod
+	purgeWait  = waitForPodRunning
+	purgeSleep = time.Sleep
 )
 
 var (
@@ -86,65 +87,53 @@ func validateCacheKey(key string) error {
 	return nil
 }
 
-// targetedClaims narrows the claims resolved for modelName to the ones that
-// can hold that model's files: the claims its own InferenceServices bring with
-// spec.modelCache.claimName, plus the shared cache; otherwise the shared cache
-// alone. The per-service "<isvc>-model-cache" claims of unrelated services
-// stay untouched, so clearing one model does not create a read-write pod on
-// every running service's volume. all is every claim in the namespace.
-func targetedClaims(all []purgeTarget, modelName string) []purgeTarget {
-	own := map[string]bool{}
-	for _, target := range claimsOfModelServices(all) {
-		own[target.Name] = true
-	}
-	own[modelCachePVCName] = true
+// purgeTarget is a cache claim a purge may act on. UserOwned marks a claim a
+// Model's own InferenceServices bring with spec.modelCache.claimName; the
+// operator creates and garbage-collects those without the cache label, so they
+// are reachable only through the service spec. Order is the shared claim
+// first, then the rest by name.
+type purgeTarget struct {
+	Name      string
+	UserOwned bool
+}
 
-	// The shared claim is right whenever the model has no claimName override;
-	// with one, the operator warns the override is ignored and everything stays
-	// in that first-consumer claim instead (see delete.go).
+// targetedClaims narrows the claims in a namespace to the ones that can hold
+// modelName's files: the shared cache, the claims the model's own
+// InferenceServices bring with spec.modelCache.claimName, and their
+// "<isvc>-model-cache" per-service claims. The claims of services that do not
+// reference the model stay untouched, so clearing one model does not create a
+// read-write pod on every running service's volume or fail on their attach
+// timeouts. all is every cache claim in the namespace, in the order
+// cachePVCandidates returns.
+func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName string) []purgeTarget {
+	own := map[string]bool{modelCachePVCName: true}
+	for i := range svcs {
+		svc := &svcs[i]
+		if svc.Name != modelName && svc.Spec.ModelRef != modelName {
+			continue
+		}
+		// A service with a claimName override mounts that claim; without one
+		// the operator gives it its own per-service claim (#928).
+		if claim := userModelCacheClaimName(svc); claim != "" {
+			own[claim] = true
+			continue
+		}
+		own[perServiceCacheClaimName(svc.Name)] = true
+	}
+
 	var selected []purgeTarget
 	for _, target := range all {
-		if target.Name == modelCachePVCName {
+		if own[target.Name] {
 			selected = append(selected, target)
-		}
-	}
-	for _, target := range all {
-		if target.UserOwned && own[target.Name] {
-			selected = append(selected, target)
-		}
-	}
-	if len(selected) == 0 {
-		// perService mode without a claimName override: the model's own
-		// "<isvc>-model-cache" is the only place its files can be.
-		if ownTargets := perServiceClaimsForModel(all, modelName); len(ownTargets) > 0 {
-			return ownTargets
 		}
 	}
 	return selected
 }
 
-// perServiceClaimsForModel returns the operator per-service claims that a
-// model's own InferenceServices mount.
-func perServiceClaimsForModel(all []purgeTarget, modelName string) []purgeTarget {
-	expected := modelName + "-model-cache"
-	var own []purgeTarget
-	for _, target := range all {
-		if !target.UserOwned && target.Name == expected {
-			own = append(own, target)
-		}
-	}
-	return own
-}
-
-// claimsOfModelServices returns the user-owned claims among the targets.
-func claimsOfModelServices(targets []purgeTarget) []purgeTarget {
-	var own []purgeTarget
-	for _, target := range targets {
-		if target.UserOwned {
-			own = append(own, target)
-		}
-	}
-	return own
+// perServiceCacheClaimName mirrors the controller's naming for a per-service
+// cache claim (internal/controller modelCachePVCName).
+func perServiceCacheClaimName(isvcName string) string {
+	return isvcName + "-model-cache"
 }
 
 // purgeKey returns the key `cache clear --model` removes for a model, or an
@@ -187,24 +176,15 @@ func ensurePurgePod(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
 ) (string, error) {
 	podName := purgePodName(pvcName)
-	for attempt := 0; attempt < 2; attempt++ {
-		if _, err := createPurgePodForPVC(ctx, clientset, namespace, pvcName); err == nil {
-			break
-		} else if !apierrors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("failed to create purge pod for PVC %s: %w", pvcName, err)
+	_, err := createPurgePodForPVC(ctx, clientset, namespace, pvcName)
+	if apierrors.IsAlreadyExists(err) {
+		if err := replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName); err != nil {
+			return "", err
 		}
-
-		existing, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-		if err != nil {
-			return "", fmt.Errorf("failed to read existing purge pod %s: %w", podName, err)
-		}
-		if existing.Labels[managedByLabel] != managedByValue ||
-			existing.Labels[modelCacheLabel] != cachePurgeComponent {
-			return "", fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache purge pod", podName)
-		}
-		// A pod left by an interrupted run still holds the claim; removing it
-		// lets the create above succeed on the second attempt.
-		deleteCacheAccessPod(ctx, clientset, namespace, podName)
+		_, err = createPurgePodForPVC(ctx, clientset, namespace, pvcName)
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to create purge pod for PVC %s: %w", pvcName, err)
 	}
 
 	if err := purgeWait(ctx, clientset, namespace, podName, 120*time.Second); err != nil {
@@ -212,6 +192,49 @@ func ensurePurgePod(
 		return "", fmt.Errorf("purge pod for PVC %s failed to start: %w", pvcName, err)
 	}
 	return podName, nil
+}
+
+// replaceStalePurgePod removes a pod an interrupted run left behind and waits
+// for the object to be gone.
+//
+// The delete is asynchronous: recreating the pod while the API server still
+// holds the old one fails with AlreadyExists and the name stays occupied until
+// the kubelet confirms termination, so a unit-test-speed retry is not enough.
+// Only our own pod is removed; an unlabelled pod at that name is an error.
+func replaceStalePurgePod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
+) error {
+	existing, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read existing purge pod %s: %w", podName, err)
+	}
+	if existing.Labels[managedByLabel] != managedByValue ||
+		existing.Labels[modelCacheLabel] != cachePurgeComponent {
+		return fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache purge pod", podName)
+	}
+	deleteCacheAccessPod(ctx, clientset, namespace, podName)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		pod, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read terminating purge pod %s: %w", podName, err)
+		}
+		// A terminating pod keeps its name until the kubelet acks the delete.
+		if pod.DeletionTimestamp != nil && time.Now().After(deadline) {
+			return fmt.Errorf("purge pod %s for PVC %s is still terminating after 30s", podName, pvcName)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("purge pod %s for PVC %s was not deleted within 30s", podName, pvcName)
+		}
+		purgeSleep(time.Second)
+	}
 }
 
 // withPurgePod runs fn inside a pod that mounts pvcName read-write, then
@@ -378,17 +401,19 @@ func purgeCacheKeys(
 	return outcome, err
 }
 
-// purgeAllEntries removes every cache entry from one claim. On a user-owned
-// claim (/models may hold data the operator did not write) only the
-// cache-key-shaped directories are eligible.
+// purgeAllEntries removes every cache entry from one claim.
+//
+// Only cache-key-shaped directories are eligible, on an operator claim and on
+// a user-owned one alike: the operator writes nothing else, and a directory
+// name with a quote or a space cannot be passed to the pod's shell safely.
 func purgeAllEntries(
 	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
-	namespace, pvcName string, userOwned bool,
+	namespace, pvcName string,
 ) (purgeOutcome, error) {
 	return purgeListed(ctx, cfg, clientset, namespace, pvcName,
 		func(entries []string) (del, skip []string) {
 			for _, name := range entries {
-				if userOwned && !cacheKeyDirRe.MatchString(name) {
+				if !cacheKeyDirRe.MatchString(name) {
 					skip = append(skip, name)
 					continue
 				}
@@ -426,11 +451,15 @@ func purgeOrphanedEntries(
 // modelName or serving it. User-owned claims are outside the discovery label
 // contract, so they only appear through the service spec.
 func cachePVCandidates(
-	ctx context.Context, k8sClient client.Client, namespace, modelName string,
-) ([]string, error) {
+	ctx context.Context, k8sClient client.Client, namespace string,
+) ([]string, []inferencev1alpha1.InferenceService, error) {
 	infos, err := discoverCachePVCs(ctx, k8sClient, namespace)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	svcs, err := modelServices(ctx, k8sClient, namespace)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	seen := map[string]bool{}
@@ -445,54 +474,26 @@ func cachePVCandidates(
 	for _, info := range infos {
 		add(info.Name)
 	}
-
-	if modelName != "" {
-		claims, err := userClaimsForModel(ctx, k8sClient, namespace, modelName)
-		if err != nil {
-			return nil, err
-		}
-		for _, claim := range claims {
-			add(claim)
-		}
+	// User-owned claims are outside the discovery label contract, so they only
+	// appear through the service spec.
+	for i := range svcs {
+		add(userModelCacheClaimName(&svcs[i]))
 	}
 
 	sort.Strings(candidates)
-	return candidates, nil
+	return candidates, svcs, nil
 }
 
-// userClaimsForModel returns the claims that mount a model's cache: those of an
-// InferenceService named after the model, and those of every service whose
-// modelRef names it.
-func userClaimsForModel(
-	ctx context.Context, k8sClient client.Client, namespace, modelName string,
-) ([]string, error) {
-	var claims []string
-
-	named := &inferencev1alpha1.InferenceService{}
-	err := k8sClient.Get(ctx, client.ObjectKey{Name: modelName, Namespace: namespace}, named)
-	switch {
-	case err == nil:
-		if claim := userModelCacheClaimName(named); claim != "" {
-			claims = append(claims, claim)
-		}
-	case !apierrors.IsNotFound(err):
-		return nil, fmt.Errorf("failed to get InferenceService '%s': %w", modelName, err)
-	}
-
+// modelServices returns every InferenceService in namespace, which carries the
+// claims a purge may target beyond the label-discovered ones.
+func modelServices(
+	ctx context.Context, k8sClient client.Client, namespace string,
+) ([]inferencev1alpha1.InferenceService, error) {
 	list := &inferencev1alpha1.InferenceServiceList{}
 	if err := k8sClient.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return nil, fmt.Errorf("failed to list InferenceServices: %w", err)
 	}
-	for i := range list.Items {
-		svc := &list.Items[i]
-		if svc.Name == modelName || svc.Spec.ModelRef != modelName {
-			continue
-		}
-		if claim := userModelCacheClaimName(svc); claim != "" {
-			claims = append(claims, claim)
-		}
-	}
-	return claims, nil
+	return list.Items, nil
 }
 
 // userModelCacheClaimName mirrors the controller's helper: the claim a service
@@ -504,29 +505,19 @@ func userModelCacheClaimName(isvc *inferencev1alpha1.InferenceService) string {
 	return isvc.Spec.ModelCache.ClaimName
 }
 
-// purgePlan is resolved once per command: which claims exist, and whether each
-// is user-owned (so --all must not delete data the operator did not write).
-type purgeTarget struct {
-	Name      string
-	UserOwned bool
-}
-
 // resolvePurgeTargets keeps the candidates that exist and records who owns each.
 func resolvePurgeTargets(
-	ctx context.Context, k8sClient client.Client, namespace, modelName string,
-) ([]purgeTarget, error) {
-	candidates, err := cachePVCandidates(ctx, k8sClient, namespace, modelName)
+	ctx context.Context, k8sClient client.Client, namespace string,
+) ([]purgeTarget, []inferencev1alpha1.InferenceService, error) {
+	candidates, svcs, err := cachePVCandidates(ctx, k8sClient, namespace)
 	if err != nil {
-		return nil, err
-	}
-
-	claims, err := userClaimsForModel(ctx, k8sClient, namespace, modelName)
-	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	userOwned := map[string]bool{}
-	for _, claim := range claims {
-		userOwned[claim] = true
+	for i := range svcs {
+		if claim := userModelCacheClaimName(&svcs[i]); claim != "" {
+			userOwned[claim] = true
+		}
 	}
 
 	var targets []purgeTarget
@@ -536,11 +527,14 @@ func resolvePurgeTargets(
 		switch {
 		case err == nil:
 			targets = append(targets, purgeTarget{Name: name, UserOwned: userOwned[name]})
-		case apierrors.IsNotFound(err):
 			continue
-		default:
-			return nil, fmt.Errorf("failed to get cache PVC %s: %w", name, err)
+		case apierrors.IsNotFound(err):
+			// A user's claimName override can point at a claim that is being
+			// collected with its InferenceService; the others are discovered
+			// and therefore exist.
+			continue
 		}
+		return nil, nil, fmt.Errorf("failed to get cache PVC %s: %w", name, err)
 	}
-	return targets, nil
+	return targets, svcs, nil
 }
