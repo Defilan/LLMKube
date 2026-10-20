@@ -180,7 +180,7 @@ func TestGroupNeedsRecreateStartupBudget(t *testing.T) {
 	t.Run("an override below 30m does not lower the floor", func(t *testing.T) {
 		// A fast-fail override (10 failures at 10s) must not shrink the group
 		// deadlines below the built-in 30m.
-		shortHead, _ := ringWithOverride(t, &corev1.Probe{
+		shortHead, shortWorker := ringWithOverride(t, &corev1.Probe{
 			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/true"}}},
 			PeriodSeconds:    10,
 			FailureThreshold: 10,
@@ -188,6 +188,9 @@ func TestGroupNeedsRecreateStartupBudget(t *testing.T) {
 		obs := []memberObservation{{rank: 0, desired: shortHead, existing: runningSince(shortHead, shortHead.Name, 20*time.Minute)}}
 		if reason, _, _ := groupNeedsRecreate(obs, hash, now, time.Time{}, time.Time{}); reason != "" {
 			t.Errorf("reason = %q, want none: a short probe must not shorten the group budget", reason)
+		}
+		if w := startupWindow(shortWorker.Spec.Containers[0].StartupProbe); w < multiNodeStartupBudget {
+			t.Errorf("worker startup window = %v, want at least the built-in %v", w, multiNodeStartupBudget)
 		}
 	})
 

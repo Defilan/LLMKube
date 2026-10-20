@@ -363,6 +363,10 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "HeadNotReady" {
 		t.Errorf("head past budget: got %q", reason)
 	}
+	obs[0].existing = mk("h", corev1.PodRunning, false, 0, "abc")
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
+		t.Errorf("head with no start time must wait: got %q", reason)
+	}
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
 	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("head inside budget must wait: got %q", reason)

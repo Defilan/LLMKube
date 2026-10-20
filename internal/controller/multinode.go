@@ -297,9 +297,10 @@ func memberPodFromTemplate(
 			// container, and MemberRestarted then recreates the group.
 			c.StartupProbe = rendezvousProbe(host, port, 10, 180)
 			// Adopt the head's window, not its failure count: the worker's
-			// period can differ from the head's.
+			// period can differ from the head's. Raise-only, like the group
+			// budget, so a short probe cannot cut the worker's 30m rendezvous.
 			if head := tmpl.Spec.Containers[0].StartupProbe; head != nil {
-				if w := startupWindow(head); w > 0 {
+				if w := startupWindow(head); w > startupWindow(c.StartupProbe) {
 					c.StartupProbe.FailureThreshold = startupFailureThreshold(w, c.StartupProbe)
 				}
 			}
@@ -593,10 +594,12 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 	return "", "", nil
 }
 
-// headNotReadyFor is how long rank 0 has been Running but no runtime container
-// has become ready. The startup probe's window starts when the container
-// starts, after the staging init containers, so a head that is not Running yet
-// reports zero and the staging gate holds the deadline.
+// headNotReadyFor is how long the head's runtime has had to answer. The
+// startup probe's window starts when a runtime container starts, so a head
+// still in its staging init reports zero (and is Pending, so the deadline is
+// gated off anyway); a Running head whose container status is not yet readable
+// falls back to the pod's creation time. An inference pod has exactly one
+// runtime container.
 func headNotReadyFor(p *corev1.Pod, now time.Time) time.Duration {
 	if p.Status.Phase != corev1.PodRunning {
 		return 0
@@ -608,7 +611,10 @@ func headNotReadyFor(p *corev1.Pod, now time.Time) time.Duration {
 		}
 	}
 	if started.IsZero() {
-		return 0
+		if p.CreationTimestamp.IsZero() {
+			return 0
+		}
+		started = p.CreationTimestamp.Time
 	}
 	return now.Sub(started)
 }
