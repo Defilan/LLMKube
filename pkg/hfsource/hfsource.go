@@ -328,10 +328,11 @@ func canonicalRepoID(repoID string) string {
 // CanonicalSource returns the spelling of source that identifies the model it
 // names, and is what the cache key is derived from, so every spelling of one
 // repository shares one cache directory. An hf:// source and a bare org/repo
-// source are rebuilt from ParseHFSource (which also folds the scheme case);
-// parse errors return source unchanged, as validation reports them.
+// source are rebuilt from the parsed repo ID and revision (which also folds the
+// scheme case); parse errors return source unchanged, as validation reports
+// them.
 //
-// Every other source passes through untouched. An https:// repo base that ends
+// Every other source passes through untouched: an https:// repo base that ends
 // in "/" already owns a download on disk, and the runtime resolves URL forms
 // itself, so rewriting them would orphan cached weights.
 func CanonicalSource(source string) string {
@@ -366,27 +367,23 @@ func splitBareRepoID(source string) (repoID, revision string, ok bool) {
 	repoPart, revisionPart := source, ""
 	if atIdx := strings.Index(source, "@"); atIdx >= 0 {
 		repoPart, revisionPart = source[:atIdx], source[atIdx+1:]
+		if revisionPart != "" && strings.ContainsAny(revisionPart, " \t\n\r") {
+			return "", "", false
+		}
+		// Same rule as ParseHFSource, so the bare form and hf:// agree.
+		revisionPart = strings.TrimRight(revisionPart, "/")
 	}
 	// Count the non-empty segments, so a trailing slash is the same bare form.
-	kept := make([]string, 0, 2)
-	for _, s := range strings.Split(repoPart, "/") {
-		if s == "" {
-			continue
-		}
-		kept = append(kept, s)
-	}
-	if len(kept) != 2 {
+	canonical := canonicalRepoID(repoPart)
+	if canonical == "" || strings.Count(canonical, "/") != 1 {
 		return "", "", false
 	}
-	for _, s := range kept {
+	for _, s := range strings.Split(canonical, "/") {
 		if !isRepoIDSegment(s) {
 			return "", "", false
 		}
 	}
-	if revisionPart != "" && strings.ContainsAny(revisionPart, " \t\n\r") {
-		return "", "", false
-	}
-	return kept[0] + "/" + kept[1], revisionPart, true
+	return canonical, revisionPart, true
 }
 
 // isRepoIDSegment reports whether s is one path segment of a Hub repo ID: at

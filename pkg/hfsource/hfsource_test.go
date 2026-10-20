@@ -378,6 +378,8 @@ func TestCanonicalSource(t *testing.T) {
 		{"bare repo id", "org/repo", "hf://org/repo"},
 		{"bare repo id trailing slash", "org/repo/", "hf://org/repo"},
 		{"bare repo id with rev", "org/repo@v1.0", "hf://org/repo@v1.0"},
+		{"bare repo id rev trailing slash", "org/repo@v1.0/", "hf://org/repo@v1.0"},
+		{"bare repo id rev and repo trailing slash", "org/repo/@v1.0/", "hf://org/repo@v1.0"},
 		{"repo name with dots", "org/Model.v2", "hf://org/Model.v2"},
 		{"https resolve base", "https://huggingface.co/org/repo/resolve/main/",
 			"https://huggingface.co/org/repo/resolve/main/"},
@@ -415,6 +417,24 @@ func TestCanonicalSourceOneRepoOneSpelling(t *testing.T) {
 	for _, s := range spellings {
 		if got := CanonicalSource(s); got != want {
 			t.Errorf("CanonicalSource(%q) = %q, want %q (the form %q canonicalizes to)", s, got, want, spellings[0])
+		}
+	}
+}
+
+// CanonicalSource must be a fixed point: feeding its output back in must not
+// produce a third spelling, or a cache key would depend on how many times it
+// had been applied. A bare revision that kept its trailing slash broke this.
+func TestCanonicalSourceIsIdempotent(t *testing.T) {
+	sources := []string{
+		"hf://org/repo", "hf://org/repo/", "HF://org/repo", "hf://org//repo",
+		"hf://org/repo@v1.0", "hf://org/repo@v1.0/", "hf://org/repo/@v1.0",
+		"org/repo", "org/repo/", "org/repo@v1.0", "org/repo@v1.0/", "org/repo/@v1.0/",
+		"https://huggingface.co/org/repo/resolve/main/", "s3://bucket/key/", "/models/x.gguf",
+	}
+	for _, s := range sources {
+		once := CanonicalSource(s)
+		if twice := CanonicalSource(once); twice != once {
+			t.Errorf("CanonicalSource(%q) = %q, and CanonicalSource(%q) = %q; want a fixed point", s, once, once, twice)
 		}
 	}
 }

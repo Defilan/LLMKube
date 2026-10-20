@@ -38,16 +38,17 @@ import (
 // function the controller and CLI agree on when they need to derive a cache
 // key from a model source URL (or local path) without consulting status.
 //
-// The fingerprint is taken over the source's canonical spelling, so two
-// spellings of one repository (hf://org/repo and hf://org/repo/) share a cache
-// directory. Non-repo sources are hashed verbatim, so an existing download is
-// never orphaned by a rewrite.
+// The fingerprint covers the source's canonical spelling, so every spelling of
+// one repository shares a cache directory: a bare org/repo hashes as
+// hf://org/repo, which supersedes the digest an older release computed for the
+// bare form. URL-shaped sources (https, s3, pvc, file, absolute paths) are
+// hashed verbatim, so their existing cache directories are unchanged.
 //
-// The output is the first 16 hex characters of SHA-256(source), matching the
-// historical convention used by both the controller and the CLI before this
-// package existed. Keeping the prefix short keeps PVC directory names
-// manageable while the full 64-char digest is still recoverable by callers
-// that need it.
+// The output is the first 16 hex characters of SHA-256(canonical source),
+// matching the historical convention used by both the controller and the CLI
+// before this package existed. Keeping the prefix short keeps PVC directory
+// names manageable while the full 64-char digest is still recoverable by
+// callers that need it.
 func Compute(source string) string {
 	hash := sha256.Sum256([]byte(hfsource.CanonicalSource(source)))
 	return hex.EncodeToString(hash[:])[:16]

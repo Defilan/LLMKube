@@ -847,10 +847,6 @@ func modelStagingPlan(model *inferencev1alpha1.Model) (*StagingPlan, error) {
 	return plan, nil
 }
 
-// stagedFileEntries returns the file entries to stage: spec.files as written,
-// or, when it holds a glob, the expansion the Model controller recorded in
-// status.stagedFiles. The expansion is trusted only for the current generation;
-// one written for an older spec would stage the wrong set.
 // errStagedFilesNotCurrent reports a glob in spec.files whose expansion the
 // Model controller has not recorded for the current generation. It is the one
 // staging error whose cause is not in spec.files, so the generated init

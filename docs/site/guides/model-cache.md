@@ -327,7 +327,11 @@ source; any other plain `https://` base is rejected for `spec.files`.
 
 A repo source copied from the Hub with a trailing slash (`hf://org/repo/`,
 `org/repo/`) is the same repository as the plain spelling: it lists, stages
-and serves identically, and it shares one cache directory with it.
+and serves identically, and it shares one cache directory with it. The cache
+key is derived from that canonical spelling, so a Model whose source was the
+bare `org/repo` form re-keys to a new directory on its first reconcile after
+upgrading, re-downloads once into it, and its previous directory then shows up
+in `llmkube cache list --orphaned`.
 
 Globs in `spec.files` are expanded against the repository's file listing,
 which the Model controller reads from the Hub API of the same host the files

@@ -505,6 +505,9 @@ func TestModelStorageConfig_StagedFilesNotCurrent(t *testing.T) {
 	if !errors.Is(err, errStagedFilesNotCurrent) {
 		t.Fatalf("modelStagingPlan error = %v, want errStagedFilesNotCurrent", err)
 	}
+	if plan != nil {
+		t.Fatalf("modelStagingPlan returned a plan alongside its error: %+v", plan)
+	}
 
 	for _, useCache := range []bool{true, false} {
 		cfg := buildModelStorageConfig(stale, nil, "default", useCache, "", "", "curl:8.18.0", 0, nil, "")
@@ -562,9 +565,6 @@ func TestModelStorageConfig_StagedFilesNotCurrent(t *testing.T) {
 		" has no spec.files glob expansion recorded for its current generation. The controller expands globs from the source repository listing; run kubectl describe model " + hostile.Name + " to see the cause."
 	if got != want {
 		t.Errorf("message = %q, want %q", got, want)
-	}
-	if plan != nil {
-		t.Errorf("modelStagingPlan returned a plan alongside its error: %+v", plan)
 	}
 }
 
