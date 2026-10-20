@@ -61,10 +61,22 @@ func NewDeleteCommand() *cobra.Command {
 	return cmd
 }
 
+// Test seams so runDelete can be driven against a fake client and clientset.
+var (
+	deleteKubeConfig = config.GetConfig
+	deleteClientset  = func(cfg *rest.Config) (kubernetes.Interface, error) { return kubernetes.NewForConfig(cfg) }
+	newDeleteClient  = func(cfg *rest.Config) (deleteCRClient, error) {
+		return client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	}
+)
+
+// deleteCRClient is the subset of the controller-runtime client delete uses.
+type deleteCRClient = client.Client
+
 func runDelete(opts *deleteOptions) error {
 	ctx := context.Background()
 
-	cfg, err := config.GetConfig()
+	cfg, err := deleteKubeConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
@@ -73,9 +85,25 @@ func runDelete(opts *deleteOptions) error {
 		return fmt.Errorf("failed to add scheme: %w", err)
 	}
 
-	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	k8sClient, err := newDeleteClient(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
+	}
+
+	var cacheKey string
+	var cacheTargets []purgeTarget
+	if opts.purgeCache {
+		// Resolve the key and the claims before deleting: in perService mode
+		// the claim is owner-ref'd to the InferenceService and is collected
+		// with it.
+		purgeModel := &inferencev1alpha1.Model{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, purgeModel); err != nil {
+			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
+		} else if cacheKey = cachekey.EffectiveKey(purgeModel); cacheKey != "" {
+			if cacheTargets, err = resolvePurgeTargets(ctx, k8sClient, opts.namespace, opts.name); err != nil {
+				fmt.Printf("Warning: failed to resolve the model cache: %v\n", err)
+			}
+		}
 	}
 
 	fmt.Printf("Deleting InferenceService '%s' in namespace '%s'...\n", opts.name, opts.namespace)
@@ -99,21 +127,6 @@ func runDelete(opts *deleteOptions) error {
 		},
 	}
 
-	var cacheKey string
-	var cacheTargets []purgeTarget
-	if opts.purgeCache {
-		// Resolve the key and the claims before deleting: in perService mode
-		// the claim is owner-ref'd to the InferenceService and is collected
-		// with it.
-		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, model); err != nil {
-			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
-		} else if cacheKey = cachekey.EffectiveKey(model); cacheKey != "" {
-			if cacheTargets, err = resolvePurgeTargets(ctx, k8sClient, opts.namespace, opts.name); err != nil {
-				fmt.Printf("Warning: failed to resolve the model cache: %v\n", err)
-			}
-		}
-	}
-
 	if err := k8sClient.Delete(ctx, model); err != nil {
 		fmt.Printf("Warning: failed to delete Model: %v\n", err)
 	} else {
@@ -127,13 +140,13 @@ func runDelete(opts *deleteOptions) error {
 	// The InferenceService stays mounted on its claim until it is gone, so its
 	// deletion (issued above) is what frees a strict RWO claim for the purge.
 	if opts.purgeCache && cacheKey != "" {
-		targets := targetedClaims(cacheTargets)
+		targets := targetedClaims(cacheTargets, opts.name)
 		if len(targets) == 0 {
 			fmt.Printf("⚠️  No model cache PVC found in namespace '%s'; nothing to purge\n", opts.namespace)
 			fmt.Printf("\n✓ Deployment '%s' deleted successfully\n", opts.name)
 			return nil
 		}
-		clientset, err := kubernetes.NewForConfig(cfg)
+		clientset, err := deleteClientset(cfg)
 		if err != nil {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
 		}

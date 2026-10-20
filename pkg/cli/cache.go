@@ -127,13 +127,13 @@ func newCacheClearCommand() *cobra.Command {
 		Short: "Clear cached models",
 		Long: `Remove entries from the persistent model cache.
 
-Entries are removed through a short-lived pod that mounts the namespace's
-cache claim read-write; the controller does not mount it. The claims are
-the ones ` + "`cache list`" + ` discovers, plus any spec.modelCache.claimName set by an
-InferenceService.
+Entries are removed through a short-lived pod that mounts the cache claim
+read-write; the controller does not mount it.
 
-By default, clears all cached models. Use --model to clear a specific
-model's cache entry, or --orphaned to remove every entry no Model uses.
+By default, clears every entry of the cache claims ` + "`cache list`" + ` discovers.
+Use --model to clear a specific model's cache entry (which also reaches a
+spec.modelCache.claimName its InferenceService brings), or --orphaned to
+remove every entry no Model uses.
 
 WARNING: Clearing the cache will cause models to be re-downloaded
 when InferenceServices restart or new pods are created.
@@ -434,9 +434,11 @@ func runCacheClear(opts *cacheClearOptions) error {
 	if len(targets) == 0 {
 		return fmt.Errorf("no model cache PVC found in namespace '%s'", opts.namespace)
 	}
-	// A named model's files live on the claim its InferenceService mounts, not
-	// on every cache claim in the namespace.
-	targets = targetedClaims(targets)
+	if len(keys) > 0 {
+		// A named model's files live on the claim its own InferenceService
+		// mounts, not on every cache claim in the namespace.
+		targets = targetedClaims(targets, opts.model)
+	}
 
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {

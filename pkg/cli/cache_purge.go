@@ -86,13 +86,54 @@ func validateCacheKey(key string) error {
 	return nil
 }
 
-// targetedClaims narrows resolved claims to the ones a model's own services
-// bring with spec.modelCache.claimName, when any.
-func targetedClaims(targets []purgeTarget) []purgeTarget {
-	if own := claimsOfModelServices(targets); len(own) > 0 {
-		return own
+// targetedClaims narrows the claims resolved for modelName to the ones that
+// can hold that model's files: the claims its own InferenceServices bring with
+// spec.modelCache.claimName, plus the shared cache; otherwise the shared cache
+// alone. The per-service "<isvc>-model-cache" claims of unrelated services
+// stay untouched, so clearing one model does not create a read-write pod on
+// every running service's volume. all is every claim in the namespace.
+func targetedClaims(all []purgeTarget, modelName string) []purgeTarget {
+	own := map[string]bool{}
+	for _, target := range claimsOfModelServices(all) {
+		own[target.Name] = true
 	}
-	return targets
+	own[modelCachePVCName] = true
+
+	// The shared claim is right whenever the model has no claimName override;
+	// with one, the operator warns the override is ignored and everything stays
+	// in that first-consumer claim instead (see delete.go).
+	var selected []purgeTarget
+	for _, target := range all {
+		if target.Name == modelCachePVCName {
+			selected = append(selected, target)
+		}
+	}
+	for _, target := range all {
+		if target.UserOwned && own[target.Name] {
+			selected = append(selected, target)
+		}
+	}
+	if len(selected) == 0 {
+		// perService mode without a claimName override: the model's own
+		// "<isvc>-model-cache" is the only place its files can be.
+		if ownTargets := perServiceClaimsForModel(all, modelName); len(ownTargets) > 0 {
+			return ownTargets
+		}
+	}
+	return selected
+}
+
+// perServiceClaimsForModel returns the operator per-service claims that a
+// model's own InferenceServices mount.
+func perServiceClaimsForModel(all []purgeTarget, modelName string) []purgeTarget {
+	expected := modelName + "-model-cache"
+	var own []purgeTarget
+	for _, target := range all {
+		if !target.UserOwned && target.Name == expected {
+			own = append(own, target)
+		}
+	}
+	return own
 }
 
 // claimsOfModelServices returns the user-owned claims among the targets.

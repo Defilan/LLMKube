@@ -532,7 +532,9 @@ the user's responsibility to manage its lifecycle.
 `cache clear` removes entries instead of printing a command to run. One
 short-lived `busybox` pod per cache claim mounts it read-write, removes only
 validated `/models/<key>` paths, and is deleted straight after. `--model
-<name>` clears one model, `--orphaned` clears every entry no Model references,
+<name>` clears one model and also reaches a `spec.modelCache.claimName` its
+InferenceService brings, `--orphaned` clears every entry no Model references
+across the label-discovered claims,
 and `-n` picks the namespace. The command needs your own permission to create
 and exec into pods there, and strict RWO storage refuses the second attach while
 a serving pod holds the claim; delete the InferenceService first in that case.

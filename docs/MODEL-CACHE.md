@@ -534,11 +534,15 @@ llmkube cache clear
 llmkube cache clear --force
 ```
 
-Entries are removed by a short-lived `busybox` pod that mounts the namespace's
-cache claim read-write, one pod per claim, deleted as soon as it is done. The
-command targets the claims `cache list` discovers (`llmkube-model-cache` and the
-labeled per-service `<isvc>-model-cache`), plus any `spec.modelCache.claimName`
-the namespace's InferenceServices bring. Two things follow from that:
+Entries are removed by a short-lived `busybox` pod that mounts the cache claim
+read-write, one pod per claim, deleted as soon as it is done.
+
+`cache clear` with no flag and `cache clear --orphaned` act on the claims
+`cache list` discovers: `llmkube-model-cache` and the labeled per-service
+`<isvc>-model-cache`. `cache clear --model` and `delete --purge-cache` target
+only the claim that can hold that model's files: the shared cache, or the
+`spec.modelCache.claimName` the model's own InferenceServices bring. Two things
+follow from that:
 
 - It needs your own permission to create and exec into pods in the namespace.
   On a `restricted`-profile namespace the pod is rejected, the same way

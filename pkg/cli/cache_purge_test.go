@@ -579,17 +579,47 @@ func TestPurgeKey_MultiFileModel(t *testing.T) {
 }
 
 func TestTargetedClaims(t *testing.T) {
-	all := []purgeTarget{
-		{Name: "llmkube-model-cache"},
-		{Name: "isvc-cache", UserOwned: true},
-	}
-	got := targetedClaims(all)
-	if len(got) != 1 || got[0].Name != "isvc-cache" {
-		t.Errorf("targetedClaims = %v, want only isvc-cache", got)
+	shared := purgeTarget{Name: "llmkube-model-cache"}
+	userClaim := purgeTarget{Name: "isvc-cache", UserOwned: true}
+	perService := purgeTarget{Name: "other-isvc-model-cache"}
+	ownPerService := purgeTarget{Name: "my-model-model-cache"}
+
+	tests := []struct {
+		name  string
+		all   []purgeTarget
+		model string
+		want  []string
+	}{
+		{
+			name:  "claimName override narrows to the shared and the override",
+			all:   []purgeTarget{shared, userClaim, perService},
+			model: "my-model",
+			want:  []string{"llmkube-model-cache", "isvc-cache"},
+		},
+		{
+			name:  "unrelated per-service claims stay untouched",
+			all:   []purgeTarget{shared, perService},
+			model: "my-model",
+			want:  []string{"llmkube-model-cache"},
+		},
+		{
+			name:  "perService without the shared claim falls back to the model's own claim",
+			all:   []purgeTarget{perService, ownPerService},
+			model: "my-model",
+			want:  []string{"my-model-model-cache"},
+		},
 	}
 
-	shared := []purgeTarget{{Name: "llmkube-model-cache"}}
-	if got := targetedClaims(shared); len(got) != 1 || got[0].Name != "llmkube-model-cache" {
-		t.Errorf("targetedClaims = %v, want the shared claim unchanged", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := targetedClaims(tt.all, tt.model)
+			var names []string
+			for _, target := range got {
+				names = append(names, target.Name)
+			}
+			if strings.Join(names, ",") != strings.Join(tt.want, ",") {
+				t.Errorf("targetedClaims = %v, want %v", names, tt.want)
+			}
+		})
 	}
 }
