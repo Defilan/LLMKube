@@ -527,6 +527,17 @@ through the `app.kubernetes.io/component=model-cache` label. A user-managed
 `claimName` PVC is not necessarily labeled as an operator cache; it remains
 the user's responsibility to manage its lifecycle.
 
+### Removing cache entries with `llmkube cache clear`
+
+`cache clear` removes entries instead of printing a command to run. One
+short-lived `busybox` pod per cache claim mounts it read-write, removes only
+validated `/models/<key>` paths, and is deleted straight after. `--model
+<name>` clears one model, `--orphaned` clears every entry no Model references,
+and `-n` picks the namespace. The command needs your own permission to create
+and exec into pods there, and strict RWO storage refuses the second attach while
+a serving pod holds the claim; delete the InferenceService first in that case.
+`delete <name> --purge-cache` uses the same mechanism.
+
 ### Relaxing the taint
 
 As an alternative to pre-provisioning, changing a GPU node's taint from

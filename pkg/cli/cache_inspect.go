@@ -172,7 +172,7 @@ func inspectSinglePVC(
 		if err != nil {
 			return nil, fmt.Errorf("failed to create inspector pod for PVC %s: %w", pvcInfo.Name, err)
 		}
-		defer deleteInspectorPod(context.Background(), clientset, namespace, podName)
+		defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
 		createdPod = true
 
 		// 120s accommodates slower storage classes (Longhorn, OpenShift CSI,
@@ -273,31 +273,29 @@ func inspectorPodName(pvcName string) string {
 	return "llmkube-cache-inspector-" + cachekey.Compute(pvcName)
 }
 
-func createInspectorPodForPVC(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
-) (string, error) {
-	podName := inspectorPodName(pvcName)
-	pod := &corev1.Pod{
+// newCacheAccessPod builds the short-lived pod that mounts a model cache claim.
+// The inspector reads it (readOnly true); the purge writes to it.
+func newCacheAccessPod(podName, pvcName, component, containerName string, readOnly bool) *corev1.Pod {
+	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podName,
-			Namespace: namespace,
+			Name: podName,
 			Labels: map[string]string{
 				"app.kubernetes.io/managed-by": "llmkube-cli",
-				"app.kubernetes.io/component":  "cache-inspector",
+				"app.kubernetes.io/component":  component,
 			},
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
 			Containers: []corev1.Container{
 				{
-					Name:    "inspector",
+					Name:    containerName,
 					Image:   "busybox:1.37.0",
 					Command: []string{"sleep", "300"},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "model-cache",
 							MountPath: defaultModelMountPath,
-							ReadOnly:  true,
+							ReadOnly:  readOnly,
 						},
 					},
 				},
@@ -308,13 +306,21 @@ func createInspectorPodForPVC(
 					VolumeSource: corev1.VolumeSource{
 						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 							ClaimName: pvcName,
-							ReadOnly:  true,
+							ReadOnly:  readOnly,
 						},
 					},
 				},
 			},
 		},
 	}
+}
+
+func createInspectorPodForPVC(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+) (string, error) {
+	podName := inspectorPodName(pvcName)
+	pod := newCacheAccessPod(podName, pvcName, "cache-inspector", "inspector", true)
+	pod.Namespace = namespace
 
 	_, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -344,7 +350,7 @@ func waitForPodRunning(
 	return fmt.Errorf("timed out waiting for pod %s to be running", name)
 }
 
-func deleteInspectorPod(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
+func deleteCacheAccessPod(ctx context.Context, clientset kubernetes.Interface, namespace, name string) {
 	gracePeriod := int64(0)
 	_ = clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{
 		GracePeriodSeconds: &gracePeriod,

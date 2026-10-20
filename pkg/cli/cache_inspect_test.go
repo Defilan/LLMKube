@@ -897,13 +897,13 @@ func TestWaitForPodRunning_ContextCancelled(t *testing.T) {
 	}
 }
 
-func TestDeleteInspectorPod(t *testing.T) {
+func TestDeleteCacheAccessPod(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "llmkube-cache-inspector", Namespace: "default"},
 	}
 	clientset := fakeclientset.NewClientset(pod)
 
-	deleteInspectorPod(context.Background(), clientset, "default", "llmkube-cache-inspector")
+	deleteCacheAccessPod(context.Background(), clientset, "default", "llmkube-cache-inspector")
 
 	_, err := clientset.CoreV1().Pods("default").Get(context.Background(), "llmkube-cache-inspector", metav1.GetOptions{})
 	if err == nil {
@@ -911,11 +911,11 @@ func TestDeleteInspectorPod(t *testing.T) {
 	}
 }
 
-func TestDeleteInspectorPod_NonexistentPod(t *testing.T) {
+func TestDeleteCacheAccessPod_NonexistentPod(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	// Should not panic when deleting a pod that doesn't exist
-	deleteInspectorPod(context.Background(), clientset, "default", "nonexistent")
+	deleteCacheAccessPod(context.Background(), clientset, "default", "nonexistent")
 }
 
 func TestInspectPVCCache_NoPVC(t *testing.T) {

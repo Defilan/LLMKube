@@ -17,7 +17,10 @@ limitations under the License.
 package cli
 
 import (
+	"io"
 	"testing"
+
+	"github.com/spf13/cobra"
 
 	"github.com/defilantech/llmkube/pkg/cachekey"
 )
@@ -141,11 +144,22 @@ func TestNewCacheClearCommand(t *testing.T) {
 		t.Errorf("Use = %q, want %q", cmd.Use, "clear")
 	}
 
-	expectedFlags := []string{"model", "namespace", "force"}
+	expectedFlags := []string{"model", "namespace", "force", "orphaned"}
 	for _, name := range expectedFlags {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Errorf("Missing flag %q", name)
 		}
+	}
+}
+
+func TestNewCacheClearCommand_MutuallyExclusive(t *testing.T) {
+	cmd := newCacheClearCommand()
+	cmd.RunE = func(*cobra.Command, []string) error { return nil }
+	cmd.SetArgs([]string{"--model", "a", "--orphaned"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("--model with --orphaned must be rejected")
 	}
 }
 
