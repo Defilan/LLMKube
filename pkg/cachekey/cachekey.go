@@ -31,11 +31,17 @@ import (
 	"encoding/hex"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	hfsource "github.com/defilantech/llmkube/pkg/hfsource"
 )
 
 // Compute returns a stable, short fingerprint of source. It is the single
 // function the controller and CLI agree on when they need to derive a cache
 // key from a model source URL (or local path) without consulting status.
+//
+// The fingerprint is taken over the source's canonical spelling, so two
+// spellings of one repository (hf://org/repo and hf://org/repo/) share a cache
+// directory. Non-repo sources are hashed verbatim, so an existing download is
+// never orphaned by a rewrite.
 //
 // The output is the first 16 hex characters of SHA-256(source), matching the
 // historical convention used by both the controller and the CLI before this
@@ -43,7 +49,7 @@ import (
 // manageable while the full 64-char digest is still recoverable by callers
 // that need it.
 func Compute(source string) string {
-	hash := sha256.Sum256([]byte(source))
+	hash := sha256.Sum256([]byte(hfsource.CanonicalSource(source)))
 	return hex.EncodeToString(hash[:])[:16]
 }
 

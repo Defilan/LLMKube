@@ -58,6 +58,41 @@ func TestComputeMatchesSHA256Prefix(t *testing.T) {
 	}
 }
 
+// Every spelling of one repository must land on one cache directory, since a
+// duplicate key means a second multi-gigabyte download and a cache list that
+// disagrees with what delete --purge-cache removes.
+func TestComputeSameKeyForRepoSpellings(t *testing.T) {
+	spellings := []string{
+		"hf://org/repo", "hf://org/repo/", "HF://org/repo", "org/repo", "org/repo/",
+	}
+	want := Compute(deterministicKeySource)
+	for _, s := range spellings {
+		if got := Compute(s); got != want {
+			t.Errorf("Compute(%q) = %q, want %q (the key Compute(%q) returns)", s, got, want, deterministicKeySource)
+		}
+	}
+}
+
+// A source that already names a URL to download from is hashed verbatim: its
+// current key owns a download on disk, and re-keying it would orphan the file.
+func TestComputeKeepsHTTPSourceVerbatim(t *testing.T) {
+	for _, source := range []string{
+		"https://huggingface.co/org/repo/resolve/main/",
+		"https://example.com/models/repo/",
+		"s3://bucket/prefix/",
+		"/models/local/",
+		"pvc://claim/path/",
+	} {
+		want := sha256.Sum256([]byte(source))
+		wantStr := hex.EncodeToString(want[:])[:16]
+		if got := Compute(source); got != wantStr {
+			t.Errorf("Compute(%q) = %q, want the verbatim digest %q", source, got, wantStr)
+		}
+	}
+}
+
+const deterministicKeySource = "hf://org/repo"
+
 func TestComputeEmptySource(t *testing.T) {
 	got := Compute("")
 	if len(got) != 16 {
@@ -103,6 +138,21 @@ func TestEffectiveKeyMultiFileNonMetal(t *testing.T) {
 	got := EffectiveKey(model)
 	if got != want {
 		t.Errorf("EffectiveKey multi-file non-metal = %q, want %q", got, want)
+	}
+}
+
+// The effective key of a multi-file Model is its repository's key, so the
+// trailing-slash spelling a user copies from the Hub directory listing points
+// at the same cached files as the plain spelling.
+func TestEffectiveKeyTrailingSlashRepo(t *testing.T) {
+	plain := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{Source: "hf://example/model", Files: []string{"model.gguf"}},
+	}
+	slashed := &inferencev1alpha1.Model{
+		Spec: inferencev1alpha1.ModelSpec{Source: "hf://example/model/", Files: []string{"model.gguf"}},
+	}
+	if a, b := EffectiveKey(plain), EffectiveKey(slashed); a != b {
+		t.Errorf("EffectiveKey differs by spelling: %q != %q", a, b)
 	}
 }
 

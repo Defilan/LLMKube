@@ -29,6 +29,10 @@ func TestNormalizeHFSource(t *testing.T) {
 	}{
 		{"hf scheme", "hf://org/repo", "https://huggingface.co/org/repo/resolve/main/"},
 		{"hf scheme with rev", "hf://org/repo@v1.0", "https://huggingface.co/org/repo/resolve/v1.0/"},
+		{"hf scheme with trailing slash", "hf://org/repo/", "https://huggingface.co/org/repo/resolve/main/"},
+		{"hf scheme with doubled slash", "hf://org//repo//", "https://huggingface.co/org/repo/resolve/main/"},
+		{"uppercase scheme", "HF://org/repo", "https://huggingface.co/org/repo/resolve/main/"},
+		{"bare repo id with trailing slash passes through", "org/repo/", "org/repo/"},
 		{"bare repo id passes through", "org/repo", "org/repo"},
 		{"non-hf url passes through", "https://example.com/model.gguf", "https://example.com/model.gguf"},
 		{"hf landing page", "https://huggingface.co/org/repo", "https://huggingface.co/org/repo/resolve/main/"},
@@ -208,10 +212,20 @@ func TestParseHFSource(t *testing.T) {
 		{"hf scheme", "hf://org/repo", "org/repo", "", false},
 		{"hf scheme with rev", "hf://org/repo@main", "org/repo", "main", false},
 		{"bare form", "org/repo@v1.0", "org/repo", "v1.0", false},
+		{"trailing slash", "hf://org/repo/", "org/repo", "", false},
+		{"trailing slash bare form", "org/repo/", "org/repo", "", false},
+		{"leading slash", "hf:///org/repo", "org/repo", "", false},
+		{"doubled interior slash", "hf://org//repo", "org/repo", "", false},
+		{"trailing slash before revision", "hf://org/repo/@main", "org/repo", "main", false},
+		{"trailing slash on revision", "hf://org/repo@main/", "org/repo", "main", false},
+		{"uppercase scheme", "HF://org/repo", "org/repo", "", false},
+		{"mixed case scheme", "Hf://org/repo@v1", "org/repo", "v1", false},
+		{"bare form with trailing slash and rev", "org/repo/@v1.0", "org/repo", "v1.0", false},
 		{"https url", "https://huggingface.co/Qwen/Qwen3-8B", "Qwen/Qwen3-8B", "", false},
 		{"https url with tree rev", "https://huggingface.co/Qwen/Qwen3-8B/tree/main", "Qwen/Qwen3-8B", "main", false},
 		{"file url rejected", "https://huggingface.co/org/repo/resolve/main/model.gguf", "", "", true},
 		{"empty scheme", "hf://", "", "", true},
+		{"empty scheme with slash", "hf:///", "", "", true},
 		{"empty rev", "hf://org/repo@", "", "", true},
 		{"rev whitespace", "hf://org/repo@main branch", "", "", true},
 	}
@@ -342,6 +356,65 @@ func TestNormalizeProducesResolveURL(t *testing.T) {
 		got := NormalizeHFSource(src)
 		if !strings.HasPrefix(got, "https://huggingface.co/") || !strings.Contains(got, "/resolve/") {
 			t.Errorf("NormalizeHFSource(%q) = %q, want an https://huggingface.co resolve URL", src, got)
+		}
+	}
+}
+
+// CanonicalSource is what the cache key is derived from, so one repository
+// must have exactly one canonical spelling no matter how the operator wrote it.
+// Everything that is not an hf:// or bare org/repo repo source must come back
+// byte-for-byte, because its current spelling already names a download on disk.
+func TestCanonicalSource(t *testing.T) {
+	tests := []struct {
+		name, source, want string
+	}{
+		{"hf scheme", "hf://org/repo", "hf://org/repo"},
+		{"hf scheme trailing slash", "hf://org/repo/", "hf://org/repo"},
+		{"hf scheme doubled slash", "hf://org//repo", "hf://org/repo"},
+		{"hf scheme leading slash", "hf:///org/repo", "hf://org/repo"},
+		{"hf scheme with rev", "hf://org/repo@v1.0", "hf://org/repo@v1.0"},
+		{"hf scheme rev trailing slash", "hf://org/repo@v1.0/", "hf://org/repo@v1.0"},
+		{"uppercase scheme folds", "HF://org/repo", "hf://org/repo"},
+		{"bare repo id", "org/repo", "hf://org/repo"},
+		{"bare repo id trailing slash", "org/repo/", "hf://org/repo"},
+		{"bare repo id with rev", "org/repo@v1.0", "hf://org/repo@v1.0"},
+		{"repo name with dots", "org/Model.v2", "hf://org/Model.v2"},
+		{"https resolve base", "https://huggingface.co/org/repo/resolve/main/",
+			"https://huggingface.co/org/repo/resolve/main/"},
+		{"https landing page", "https://huggingface.co/org/repo", "https://huggingface.co/org/repo"},
+		{"https single file", "https://example.com/model.gguf", "https://example.com/model.gguf"},
+		{"s3", "s3://bucket/key/", "s3://bucket/key/"},
+		{"file", "file:///models/x.gguf", "file:///models/x.gguf"},
+		{"pvc", "pvc://claim/path/", "pvc://claim/path/"},
+		{"absolute path", "/models/x.gguf", "/models/x.gguf"},
+		{"single segment is not a repo", "model.gguf", "model.gguf"},
+		{"three segments is not a repo", "org/repo/sub/", "org/repo/sub/"},
+		{"leading dash segment is not a repo", "org/-repo", "org/-repo"},
+		{"underscore-leading segment is not a repo", "org/_repo", "org/_repo"},
+		{"empty", "", ""},
+		{"broken hf scheme", "hf://", "hf://"},
+		{"empty rev", "hf://org/repo@", "hf://org/repo@"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanonicalSource(tc.source); got != tc.want {
+				t.Errorf("CanonicalSource(%q) = %q, want %q", tc.source, got, tc.want)
+			}
+		})
+	}
+}
+
+// Every spelling of one repository canonicalizes to one string, which is the
+// property the shared cache key depends on.
+func TestCanonicalSourceOneRepoOneSpelling(t *testing.T) {
+	spellings := []string{
+		"hf://org/repo", "hf://org/repo/", "HF://org/repo", "hf:///org/repo",
+		"hf://org//repo", "org/repo", "org/repo/",
+	}
+	want := CanonicalSource(spellings[0])
+	for _, s := range spellings {
+		if got := CanonicalSource(s); got != want {
+			t.Errorf("CanonicalSource(%q) = %q, want %q (the form %q canonicalizes to)", s, got, want, spellings[0])
 		}
 	}
 }

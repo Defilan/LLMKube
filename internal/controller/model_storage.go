@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -850,13 +851,24 @@ func modelStagingPlan(model *inferencev1alpha1.Model) (*StagingPlan, error) {
 // or, when it holds a glob, the expansion the Model controller recorded in
 // status.stagedFiles. The expansion is trusted only for the current generation;
 // one written for an older spec would stage the wrong set.
+// errStagedFilesNotCurrent reports a glob in spec.files whose expansion the
+// Model controller has not recorded for the current generation. It is the one
+// staging error whose cause is not in spec.files, so the generated init
+// container names the Model's status instead of blaming the file list.
+var errStagedFilesNotCurrent = errors.New("staged files are not current for the Model's generation")
+
+// stagedFileEntries returns the file entries to stage: spec.files as written,
+// or, when it holds a glob, the expansion the Model controller recorded in
+// status.stagedFiles. The expansion is trusted only for the current generation;
+// one written for an older spec would stage the wrong set.
 func stagedFileEntries(model *inferencev1alpha1.Model) ([]string, error) {
 	if !filesHaveGlob(model.Spec.Files) {
 		return model.Spec.Files, nil
 	}
 	gen, ok := availableObservedGeneration(model)
 	if len(model.Status.StagedFiles) == 0 || !ok || gen != model.Generation {
-		return nil, fmt.Errorf("spec.files has a glob and the Model has not recorded its expansion for generation %d", model.Generation)
+		return nil, fmt.Errorf("%w: spec.files has a glob and the Model has not recorded its expansion for generation %d",
+			errStagedFilesNotCurrent, model.Generation)
 	}
 	return model.Status.StagedFiles, nil
 }
@@ -871,6 +883,38 @@ func invalidFileSetInitContainer(initImage string) corev1.Container {
 		Image:   initImage,
 		Command: []string{"sh", "-c", `echo "ERROR: InvalidFileSet - model spec.files/spec.mmproj configuration is invalid. Check file paths, directory escapes, and glob patterns."; exit 1`},
 	}
+}
+
+// staleStagedFilesInitContainer returns the fail-closed init container for a
+// Model whose spec.files glob has no expansion recorded for its current
+// generation. The reader is someone looking at the pod, not the file list, and
+// the cause is in the Model's status (a listing that failed, a spec change the
+// controller has not re-resolved yet), so the message sends them there. It
+// keeps the model-downloader name so the init-container diagnosis sees it.
+//
+// The message is a printf template with the name passed as an argument from
+// MODEL_NAME, never interpolated into the shell: the Model name comes from the
+// API and must not be able to run anything or truncate the message.
+func staleStagedFilesInitContainer(initImage, modelName string) corev1.Container {
+	return corev1.Container{
+		Name:  "model-downloader",
+		Image: initImage,
+		Command: []string{"sh", "-c",
+			`printf 'ERROR: StagedFilesNotCurrent - Model %s has no spec.files glob expansion recorded for its current generation. The controller expands globs from the source repository listing; run kubectl describe model %s to see the cause.\n' "$MODEL_NAME" "$MODEL_NAME"; exit 1`},
+		Env: []corev1.EnvVar{{Name: "MODEL_NAME", Value: modelName}},
+	}
+}
+
+// modelStagingErrorInitContainer names the cause when multi-file staging
+// cannot be planned. A glob whose expansion is missing is a controller-state
+// problem, so it says so; every other failure (a malformed file set, a
+// directory escape, a glob that matched nothing) keeps the InvalidFileSet
+// message, which correctly points at spec.files.
+func modelStagingErrorInitContainer(err error, model *inferencev1alpha1.Model, initImage string) corev1.Container {
+	if errors.Is(err, errStagedFilesNotCurrent) {
+		return staleStagedFilesInitContainer(initImage, model.Name)
+	}
+	return invalidFileSetInitContainer(initImage)
 }
 
 // cachePrepInitContainer returns the root-run prep init container that runs
@@ -1417,7 +1461,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		return modelStorageConfig{
 			modelPath: stagedCachePath(cacheDir, "model.gguf"),
 			initContainers: []corev1.Container{
-				invalidFileSetInitContainer(initContainerImage),
+				modelStagingErrorInitContainer(err, model, initContainerImage),
 			},
 			volumes: []corev1.Volume{
 				{
@@ -1556,7 +1600,7 @@ func buildEmptyDirStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev
 		return modelStorageConfig{
 			modelPath: fmt.Sprintf("/models/%s-%s/model.gguf", namespace, model.Name),
 			initContainers: []corev1.Container{
-				invalidFileSetInitContainer(initContainerImage),
+				modelStagingErrorInitContainer(err, model, initContainerImage),
 			},
 			volumes: []corev1.Volume{
 				{Name: "model-storage", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
