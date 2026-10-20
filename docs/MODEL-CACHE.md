@@ -551,9 +551,10 @@ only the claims that can hold that model's files: the shared cache, the
   so the purge fails with a timeout naming the claim. Delete the
   InferenceService first, then purge.
 
-Every mode removes only directories named like a cache key (16 hex characters)
-and a `--model` key must validate as a single path segment, so the command
-removes `/models/<key>` and never data the operator did not write.
+The namespace-wide modes remove only directories named like a cache key (16 hex
+characters). `--model` and `delete --purge-cache` validate the key as a single
+path segment first. Either way the command removes `/models/<key>` and never
+data the operator did not write.
 
 Clearing the entry of a model that is still serving removes the file from the
 volume, but the running process keeps its open handle and serves the old bytes

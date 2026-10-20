@@ -2213,7 +2213,7 @@ spec:
 				_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", clearNs, "--ignore-not-found"))
 			})
 
-			It("removes the named orphaned entry and leaves the others", func() {
+			It("removes orphaned entries from the PVC", func() {
 				writeDir(key)
 				writeDir(other)
 
