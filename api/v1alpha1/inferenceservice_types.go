@@ -799,6 +799,20 @@ type InferenceServiceSpec struct {
 	// +optional
 	ProbeOverrides *ProbeOverrides `json:"probeOverrides,omitempty"`
 
+	// StartupTimeout gives the runtime's startup probe a longer budget without
+	// restating the probe. The operator keeps the backend's own startup probe
+	// (handler, period, timeout) and sets failureThreshold to
+	// ceil(startupTimeout / periodSeconds), minimum 1, so a large checkpoint
+	// on slow storage is not killed mid-load: 90m on a 10s period is a
+	// failureThreshold of 540. Omitted, each runtime's own 30m budget applies.
+	// The kubelet's window is failureThreshold * periodSeconds, so the budget
+	// is quantized up to the next probe period. probeOverrides.startup replaces
+	// the startup probe outright and then this field does not apply. Changing
+	// it changes the pod template, so it rolls the pods.
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="startupTimeout must be a positive duration, for example 90m"
+	// +optional
+	StartupTimeout *metav1.Duration `json:"startupTimeout,omitempty"`
+
 	// SkipModelInit disables the model-downloader init container.
 	// Use when the model is baked into the image or downloaded by the
 	// container itself (e.g., via HF_TOKEN).

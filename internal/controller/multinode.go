@@ -66,17 +66,14 @@ const (
 	// unformed mask in memberRestartFatal is measured from.
 	ConditionMultiNodeStaged = "MultiNodeStaged"
 
-	// multiNodeStartupBudget bounds how long rank 0 may stay Running but not
-	// Ready before the group is recreated. It matches the vLLM startup probe's
-	// budget (180 x 10s) so a slow but honest weight load is not punished.
+	// multiNodeStartupBudget is how long rank 0 would have to stay Running but
+	// not Ready for that alone to recreate the group. It matches the vLLM
+	// startup probe's budget (180 x 10s) so a slow but honest weight load is
+	// not punished. The group deadlines read the window of the head's desired
+	// startup probe instead, so spec.startupTimeout and probeOverrides.startup
+	// are not cut short here; this value is the fallback when the desired head
+	// carries no startup probe with a budget.
 	multiNodeStartupBudget = 30 * time.Minute
-
-	// multiNodePostStagingBudget bounds how long a group that never formed may
-	// keep collecting runtime restarts after its members have finished staging.
-	// The runtimes still have to rendezvous once the runtimes come up, but that
-	// window has an end: past this the restarts are a crashloop, not rendezvous
-	// noise, and the group is recreated. It matches the rank 0 startup budget.
-	multiNodePostStagingBudget = multiNodeStartupBudget
 
 	// multiNodeMaxInitRestarts bounds how many times a member's init containers
 	// may restart while the group waits for staging. Formation masking must not
@@ -292,11 +289,17 @@ func memberPodFromTemplate(
 		c.StartupProbe, c.LivenessProbe, c.ReadinessProbe = nil, nil, nil
 		c.Ports = nil
 		if host, port, ok := rendezvousEndpoint(c.Args); ok {
-			// Startup gets the head's own budget (10s x 180 = 30m) to form the
-			// rendezvous; after that, 30s x 10 = five minutes of unreachable
-			// rendezvous restarts the container, and MemberRestarted then
-			// recreates the group.
+			// Startup gets the same budget as the head's own startup probe
+			// (180 x 10s unless spec.startupTimeout or probeOverrides.startup
+			// raised it) to form the rendezvous: a worker that restarts while
+			// the head is still loading recreates the group. After that,
+			// 30s x 10 = five minutes of unreachable rendezvous restarts the
+			// container, and MemberRestarted then recreates the group.
 			c.StartupProbe = rendezvousProbe(host, port, 10, 180)
+			applyStartupTimeout(isvc.Spec.StartupTimeout, c.StartupProbe)
+			if head := tmpl.Spec.Containers[0].StartupProbe; head != nil && head.FailureThreshold > 0 {
+				c.StartupProbe.FailureThreshold = head.FailureThreshold
+			}
 			c.LivenessProbe = rendezvousProbe(host, port, 30, 10)
 		}
 	}
@@ -450,16 +453,16 @@ func memberStaged(p *corev1.Pod) bool {
 // restarts would kill the member still staging and discard its progress, which
 // never converges (#1757), so they are masked.
 //
-// The mask ends at stagedAt + multiNodePostStagingBudget, not at formation
-// alone: a member's weights load can outlast its downloader by minutes while
-// the runtimes still find each other, but past the budget an unformed group
-// whose members have stopped staging is a crashloop and the group is recreated
-// rather than masked forever.
+// The mask ends at stagedAt + budget, not at formation alone: a member's
+// weights load can outlast its downloader by minutes while the runtimes still
+// find each other, but past the budget an unformed group whose members have
+// stopped staging is a crashloop and the group is recreated rather than masked
+// forever. budget is the group's startup budget, derived by groupNeedsRecreate.
 //
 // After formation the old strictness holds: a termination that finished after
 // formedAt is a real crash. A restart with no readable termination is also
 // fatal, so an untraceable restart cannot hide behind the masking.
-func memberRestartFatal(cs corev1.ContainerStatus, formedAt, stagedAt, now time.Time) bool {
+func memberRestartFatal(cs corev1.ContainerStatus, formedAt, stagedAt, now time.Time, budget time.Duration) bool {
 	t := cs.LastTerminationState.Terminated
 	if t == nil {
 		t = cs.State.Terminated
@@ -470,7 +473,7 @@ func memberRestartFatal(cs corev1.ContainerStatus, formedAt, stagedAt, now time.
 		}
 		return t.FinishedAt.Time.IsZero() || t.FinishedAt.Time.After(formedAt)
 	}
-	if stagedAt.IsZero() || now.Sub(stagedAt) <= multiNodePostStagingBudget {
+	if stagedAt.IsZero() || now.Sub(stagedAt) <= budget {
 		return false
 	}
 	return true
@@ -509,14 +512,29 @@ func multiNodeStagedAt(isvc *inferencev1alpha1.InferenceService) time.Time {
 // whose staging never finishes.
 //
 // stagedAt (the MultiNodeStaged timestamp) is the unformed mask's deadline:
-// past stagedAt + multiNodePostStagingBudget a restart is finally fatal, so a
+// past stagedAt + the group's startup budget a restart is finally fatal, so a
 // group that never forms cannot be masked forever. A staging member that hangs
 // without restarting (Running, RestartCount 0) is deliberately not bounded
 // here: a 184 GiB download legitimately exceeds any fixed budget.
 //
+// The group's startup budget is the window of the desired rank-0 pod's startup
+// probe, which is where spec.startupTimeout and probeOverrides.startup land.
+// Reading it off the desired pod rather than a constant keeps both deadlines
+// from cutting short a budget the spec asked for; a desired head with no
+// startup budget falls back to multiNodeStartupBudget.
+//
 // trigger is the member the reason is about, so a failure can be attributed
 // to one pod and counted once however many reconciles its teardown spans.
 func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, formedAt, stagedAt time.Time) (reason, msg string, trigger *corev1.Pod) {
+	budget := multiNodeStartupBudget
+	for _, o := range obs {
+		if o.rank != 0 || o.desired == nil || len(o.desired.Spec.Containers) == 0 {
+			continue
+		}
+		if w := startupWindow(o.desired.Spec.Containers[0].StartupProbe); w > 0 {
+			budget = w
+		}
+	}
 	stagingAny := false
 	for _, o := range obs {
 		p := o.existing
@@ -550,7 +568,7 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 			continue
 		}
 		for _, cs := range p.Status.ContainerStatuses {
-			if cs.RestartCount > 0 && memberRestartFatal(cs, formedAt, stagedAt, now) {
+			if cs.RestartCount > 0 && memberRestartFatal(cs, formedAt, stagedAt, now, budget) {
 				return multiNodeReasonMemberRestarted, fmt.Sprintf("%s restarted %d time(s)%s", p.Name, cs.RestartCount, lastTerminationDetail(cs)), p
 			}
 		}
@@ -562,8 +580,8 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 				continue
 			}
 			if o.rank == 0 && p.Status.Phase == corev1.PodRunning && !podReady(p) &&
-				!p.CreationTimestamp.IsZero() && now.Sub(p.CreationTimestamp.Time) > multiNodeStartupBudget {
-				return multiNodeReasonHeadNotReady, fmt.Sprintf("%s not Ready after %s", p.Name, multiNodeStartupBudget), p
+				!p.CreationTimestamp.IsZero() && now.Sub(p.CreationTimestamp.Time) > budget {
+				return multiNodeReasonHeadNotReady, fmt.Sprintf("%s not Ready after %s", p.Name, budget), p
 			}
 		}
 	}
@@ -1233,7 +1251,7 @@ func setMultiNodeStatus(isvc *inferencev1alpha1.InferenceService, desired []*cor
 		// That path creates the missing member without a teardown, so nothing
 		// else clears this condition, and leaving it True would measure the
 		// post-staging deadline from a staging episode that already ended.
-		// A stale stamp older than multiNodePostStagingBudget makes the next
+		// A stale stamp older than the group's startup budget makes the next
 		// waiting-runtime restart fatal and recreates the group out from under
 		// the download, which is the #1757 loop this file exists to prevent.
 		meta.RemoveStatusCondition(&isvc.Status.Conditions, ConditionMultiNodeStaged)
