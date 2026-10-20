@@ -687,3 +687,23 @@ func TestTargetedClaims(t *testing.T) {
 		})
 	}
 }
+
+// TestDiscoveredClaims pins the namespace-wide scope: `cache clear` and
+// `--orphaned` act on the claims `cache list` discovers, so a spec.modelCache
+// .claimName, which may be a throwing RWO volume a serving pod holds, is never
+// swept by them.
+func TestDiscoveredClaims(t *testing.T) {
+	all := []purgeTarget{
+		{Name: "llmkube-model-cache"},
+		{Name: "isvc-model-cache"},
+		{Name: "user-claim", UserOwned: true},
+	}
+	got := discoveredClaims(all)
+	names := make([]string, 0, len(got))
+	for _, target := range got {
+		names = append(names, target.Name)
+	}
+	if strings.Join(names, ",") != "llmkube-model-cache,isvc-model-cache" {
+		t.Errorf("discoveredClaims = %v, want the operator-managed claims only", names)
+	}
+}

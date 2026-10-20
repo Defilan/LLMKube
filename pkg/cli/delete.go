@@ -187,7 +187,7 @@ func purgeDeleteTargets(
 		return errors.Join(errs...)
 	}
 	if keysAbsentEverywhere([]string{cacheKey}, outcomes) {
-		fmt.Printf("Nothing to remove: the entry is not on the namespace's cache claims.\n")
+		fmt.Printf("%s is not on any cache claim in namespace '%s'.\n", cacheKey, namespace)
 	}
 	return nil
 }

@@ -130,6 +130,19 @@ func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService
 	return selected
 }
 
+// discoveredClaims keeps the operator-managed claims, the ones `cache list`
+// discovers by label or by name, and drops the user-owned claimName targets.
+func discoveredClaims(all []purgeTarget) []purgeTarget {
+	var discovered []purgeTarget
+	for _, target := range all {
+		if target.UserOwned {
+			continue
+		}
+		discovered = append(discovered, target)
+	}
+	return discovered
+}
+
 // perServiceCacheClaimName mirrors the controller's naming for a per-service
 // cache claim (internal/controller modelCachePVCName).
 func perServiceCacheClaimName(isvcName string) string {

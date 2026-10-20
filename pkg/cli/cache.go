@@ -438,6 +438,11 @@ func runCacheClear(opts *cacheClearOptions) error {
 		// A named model's files live on the claim its own InferenceService
 		// mounts, not on every cache claim in the namespace.
 		targets = targetedClaims(targets, svcs, opts.model)
+	} else {
+		// The namespace-wide modes act on what `cache list` discovers. A
+		// user's claimName is not a discovery target: it may be mounted by a
+		// throwing RWO service, and the sweep would stall on it.
+		targets = discoveredClaims(targets)
 	}
 
 	clientset, err := kubernetes.NewForConfig(cfg)
@@ -483,7 +488,9 @@ func runCacheClear(opts *cacheClearOptions) error {
 		return errors.Join(errs...)
 	}
 	if keysAbsentEverywhere(keys, outcomes) {
-		fmt.Printf("\nNothing to remove: %s is not in the cache of namespace '%s'.\n", keys[0], opts.namespace)
+		// The per-claim report already said "already absent"; say what it
+		// means for the command as a whole.
+		fmt.Printf("\n%s is not in the cache of namespace '%s'; nothing was removed.\n", keys[0], opts.namespace)
 	}
 	return nil
 }
