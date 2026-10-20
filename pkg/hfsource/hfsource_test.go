@@ -360,10 +360,11 @@ func TestNormalizeProducesResolveURL(t *testing.T) {
 	}
 }
 
-// CanonicalSource is what the cache key is derived from, so one repository
-// must have exactly one canonical spelling no matter how the operator wrote it.
-// Everything that is not an hf:// or bare org/repo repo source must come back
-// byte-for-byte, because its current spelling already names a download on disk.
+// CanonicalSource is what the cache key is derived from, so the separator and
+// scheme-case variants of one repository must collapse to one spelling per
+// form (hf:// or bare). Everything that is not an hf:// or bare org/repo repo
+// source must come back byte-for-byte, because its current spelling already
+// names a download on disk.
 func TestCanonicalSource(t *testing.T) {
 	tests := []struct {
 		name, source, want string
@@ -375,12 +376,12 @@ func TestCanonicalSource(t *testing.T) {
 		{"hf scheme with rev", "hf://org/repo@v1.0", "hf://org/repo@v1.0"},
 		{"hf scheme rev trailing slash", "hf://org/repo@v1.0/", "hf://org/repo@v1.0"},
 		{"uppercase scheme folds", "HF://org/repo", "hf://org/repo"},
-		{"bare repo id", "org/repo", "hf://org/repo"},
-		{"bare repo id trailing slash", "org/repo/", "hf://org/repo"},
-		{"bare repo id with rev", "org/repo@v1.0", "hf://org/repo@v1.0"},
-		{"bare repo id rev trailing slash", "org/repo@v1.0/", "hf://org/repo@v1.0"},
-		{"bare repo id rev and repo trailing slash", "org/repo/@v1.0/", "hf://org/repo@v1.0"},
-		{"repo name with dots", "org/Model.v2", "hf://org/Model.v2"},
+		{"bare repo id stays bare", "org/repo", "org/repo"},
+		{"bare repo id trailing slash", "org/repo/", "org/repo"},
+		{"bare repo id with rev", "org/repo@v1.0", "org/repo@v1.0"},
+		{"bare repo id rev trailing slash", "org/repo@v1.0/", "org/repo@v1.0"},
+		{"bare repo id rev and repo trailing slash", "org/repo/@v1.0/", "org/repo@v1.0"},
+		{"repo name with dots", "org/Model.v2", "org/Model.v2"},
 		{"https resolve base", "https://huggingface.co/org/repo/resolve/main/",
 			"https://huggingface.co/org/repo/resolve/main/"},
 		{"https landing page", "https://huggingface.co/org/repo", "https://huggingface.co/org/repo"},
@@ -406,17 +407,34 @@ func TestCanonicalSource(t *testing.T) {
 	}
 }
 
-// Every spelling of one repository canonicalizes to one string, which is the
-// property the shared cache key depends on.
+// Every variant of one repository within a form canonicalizes to one string,
+// which is the property the shared cache key depends on.
 func TestCanonicalSourceOneRepoOneSpelling(t *testing.T) {
-	spellings := []string{
-		"hf://org/repo", "hf://org/repo/", "HF://org/repo", "hf:///org/repo",
-		"hf://org//repo", "org/repo", "org/repo/",
+	for _, spellings := range [][]string{
+		{"hf://org/repo", "hf://org/repo/", "HF://org/repo", "hf:///org/repo", "hf://org//repo"},
+		{"org/repo", "org/repo/", "org//repo"},
+		{"hf://org/repo@v1.0", "hf://org/repo@v1.0/", "hf://org/repo/@v1.0", "Hf://org//repo@v1.0"},
+		{"org/repo@v1.0", "org/repo@v1.0/", "org/repo/@v1.0/"},
+	} {
+		want := CanonicalSource(spellings[0])
+		for _, s := range spellings {
+			if got := CanonicalSource(s); got != want {
+				t.Errorf("CanonicalSource(%q) = %q, want %q (the form %q canonicalizes to)", s, got, want, spellings[0])
+			}
+		}
 	}
-	want := CanonicalSource(spellings[0])
-	for _, s := range spellings {
-		if got := CanonicalSource(s); got != want {
-			t.Errorf("CanonicalSource(%q) = %q, want %q (the form %q canonicalizes to)", s, got, want, spellings[0])
+}
+
+// A spelling that already worked must canonicalize to itself, byte for byte:
+// its cache key, and so its cached files, must survive an upgrade. Folding the
+// bare form into hf:// broke this for every bare-form multi-file Model.
+func TestCanonicalSourceKeepsWorkingSpellings(t *testing.T) {
+	for _, s := range []string{
+		"hf://org/repo", "hf://org/repo@v1.0", "hf://org/repo@refs/pr/1",
+		"org/repo", "org/repo@v1.0", "org/repo@refs/pr/1", "Org/Model.v2",
+	} {
+		if got := CanonicalSource(s); got != s {
+			t.Errorf("CanonicalSource(%q) = %q, want it unchanged", s, got)
 		}
 	}
 }

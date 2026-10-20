@@ -58,17 +58,31 @@ func TestComputeMatchesSHA256Prefix(t *testing.T) {
 	}
 }
 
-// Every spelling of one repository must land on one cache directory, since a
-// duplicate key means a second multi-gigabyte download and a cache list that
-// disagrees with what delete --purge-cache removes.
+// The separator and scheme-case variants of one repository must land on one
+// cache directory per form, since a duplicate key means a second
+// multi-gigabyte download and a cache list that disagrees with what
+// delete --purge-cache removes.
 func TestComputeSameKeyForRepoSpellings(t *testing.T) {
-	spellings := []string{
-		"hf://org/repo", "hf://org/repo/", "HF://org/repo", "org/repo", "org/repo/",
+	for want, spellings := range map[string][]string{
+		"hf://org/repo": {"hf://org/repo/", "HF://org/repo", "hf://org//repo"},
+		"org/repo":      {"org/repo/", "org//repo"},
+	} {
+		for _, s := range spellings {
+			if got := Compute(s); got != Compute(want) {
+				t.Errorf("Compute(%q) = %q, want %q (the key Compute(%q) returns)", s, got, Compute(want), want)
+			}
+		}
 	}
-	want := Compute(deterministicKeySource)
-	for _, s := range spellings {
-		if got := Compute(s); got != want {
-			t.Errorf("Compute(%q) = %q, want %q (the key Compute(%q) returns)", s, got, want, deterministicKeySource)
+}
+
+// A spelling that worked before canonicalization keeps the digest an older
+// release computed for it, so an upgrade neither moves nor re-stages its
+// cached files.
+func TestComputeKeepsWorkingRepoKeys(t *testing.T) {
+	for _, source := range []string{"hf://org/repo", "hf://org/repo@v1.0", "org/repo", "org/repo@v1.0"} {
+		want := sha256.Sum256([]byte(source))
+		if got := Compute(source); got != hex.EncodeToString(want[:])[:16] {
+			t.Errorf("Compute(%q) = %q, want the pre-upgrade digest %q", source, got, hex.EncodeToString(want[:])[:16])
 		}
 	}
 }
@@ -90,8 +104,6 @@ func TestComputeKeepsHTTPSourceVerbatim(t *testing.T) {
 		}
 	}
 }
-
-const deterministicKeySource = "hf://org/repo"
 
 func TestComputeEmptySource(t *testing.T) {
 	got := Compute("")

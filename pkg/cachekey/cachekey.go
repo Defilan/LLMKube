@@ -38,11 +38,11 @@ import (
 // function the controller and CLI agree on when they need to derive a cache
 // key from a model source URL (or local path) without consulting status.
 //
-// The fingerprint covers the source's canonical spelling, so every spelling of
-// one repository shares a cache directory: a bare org/repo hashes as
-// hf://org/repo, which supersedes the digest an older release computed for the
-// bare form. URL-shaped sources (https, s3, pvc, file, absolute paths) are
-// hashed verbatim, so their existing cache directories are unchanged.
+// The fingerprint covers the source's canonical spelling (see
+// hfsource.CanonicalSource), so hf://org/repo/ shares a cache directory with
+// hf://org/repo, and org/repo/ with org/repo. Every spelling that worked before
+// canonicalizes to itself, so no existing key changes; URL-shaped sources
+// (https, s3, pvc, file, absolute paths) are hashed verbatim.
 //
 // The output is the first 16 hex characters of SHA-256(canonical source),
 // matching the historical convention used by both the controller and the CLI

@@ -326,11 +326,17 @@ func canonicalRepoID(repoID string) string {
 }
 
 // CanonicalSource returns the spelling of source that identifies the model it
-// names, and is what the cache key is derived from, so every spelling of one
-// repository shares one cache directory. An hf:// source and a bare org/repo
-// source are rebuilt from the parsed repo ID and revision (which also folds the
-// scheme case); parse errors return source unchanged, as validation reports
-// them.
+// names, and is what the cache key is derived from, so the spellings of one
+// repository that differ only in separators or scheme case share one cache
+// directory. An hf:// source is rebuilt as hf://<repo>[@rev] and a bare
+// org/repo source as <repo>[@rev], each from the parsed repo ID and revision;
+// parse errors return source unchanged, as validation reports them.
+//
+// The two forms stay distinct on purpose. Every spelling that already worked
+// (hf://org/repo, org/repo, either with a clean @rev) canonicalizes to itself,
+// so its key and its cached files are unchanged by an upgrade; folding the
+// bare form into hf:// would move every bare-form multi-file Model to a new
+// directory and re-stage it for no gain.
 //
 // Every other source passes through untouched: an https:// repo base that ends
 // in "/" already owns a download on disk, and the runtime resolves URL forms
@@ -341,20 +347,21 @@ func CanonicalSource(source string) string {
 		if err != nil {
 			return source
 		}
-		return hfSourceString(repoID, revision)
+		return "hf://" + repoSourceString(repoID, revision)
 	}
 	if repoID, revision, ok := splitBareRepoID(source); ok {
-		return hfSourceString(repoID, revision)
+		return repoSourceString(repoID, revision)
 	}
 	return source
 }
 
-// hfSourceString renders the canonical hf:// spelling of a parsed source.
-func hfSourceString(repoID, revision string) string {
+// repoSourceString renders <repo>[@rev], the part of a canonical repo source
+// after any scheme.
+func repoSourceString(repoID, revision string) string {
 	if revision != "" {
-		return "hf://" + repoID + "@" + revision
+		return repoID + "@" + revision
 	}
-	return "hf://" + repoID
+	return repoID
 }
 
 // splitBareRepoID parses the bare "org/repo[@rev]" form that isHFRepoSource
