@@ -677,6 +677,27 @@ func TestTargetedClaims(t *testing.T) {
 			want:  []string{"chat-api-model-cache"},
 		},
 		{
+			// The default install: shared mode, so no per-service claim exists
+			// and the serving service's pods mount llmkube-model-cache.
+			name:  "shared mode serves from the shared claim",
+			all:   []purgeTarget{shared},
+			svcs:  []inferencev1alpha1.InferenceService{svc("chat-api", "llama", "")},
+			model: "llama",
+			want:  []string{"llmkube-model-cache"},
+		},
+		{
+			// One matching service brings an override, the other has no
+			// per-service claim and so serves from the shared cache.
+			name: "a matching service without a claimName and no per-service claim uses the shared claim",
+			all:  []purgeTarget{shared, overrideClaim},
+			svcs: []inferencev1alpha1.InferenceService{
+				svc("chat-api", "llama", "isvc-cache"),
+				svc("chat-worker", "llama", ""),
+			},
+			model: "llama",
+			want:  []string{"llmkube-model-cache", "isvc-cache"},
+		},
+		{
 			// No InferenceService to consult (prefetch-era Model), so the
 			// shared cache is the only possible home.
 			name:  "no matching service falls back to the shared claim",
@@ -713,7 +734,7 @@ func TestTargetedClaims(t *testing.T) {
 
 // TestDiscoveredClaims pins the namespace-wide scope: `cache clear` and
 // `--orphaned` act on the claims `cache list` discovers, so a spec.modelCache
-// .claimName, which may be a throwing RWO volume a serving pod holds, is never
+// .claimName, which may be an RWO volume a serving pod holds, is never
 // swept by them.
 func TestDiscoveredClaims(t *testing.T) {
 	all := []purgeTarget{
@@ -772,5 +793,31 @@ func TestReplaceStalePurgePod_LiveRunLeftAlone(t *testing.T) {
 	_, _ = clientset.CoreV1().Pods("default").Update(context.Background(), pod, metav1.UpdateOptions{})
 	if err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run"); err != nil {
 		t.Errorf("an abandoned stamped pod must be replaced: %v", err)
+	}
+}
+
+// TestReplaceStalePurgePod_FinishedPodReplaced pins the other abandoned case:
+// a fresh pod whose sleep has already exited (Succeeded or Failed) holds
+// nothing, so it is replaced instead of blocking the next run for ten minutes.
+func TestReplaceStalePurgePod_FinishedPodReplaced(t *testing.T) {
+	for _, phase := range []corev1.PodPhase{corev1.PodSucceeded, corev1.PodFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			pvcName := "llmkube-model-cache"
+			podName := purgePodName(pvcName)
+			finished := newCacheAccessPodForRun(podName, pvcName, cachePurgeComponent, "purge", false, "other-run")
+			finished.Namespace = "default"
+			finished.CreationTimestamp = metav1.NewTime(time.Now())
+			finished.Status.Phase = phase
+			clientset := fakeclientset.NewClientset(finished)
+
+			origSleep := purgeSleep
+			t.Cleanup(func() { purgeSleep = origSleep })
+			purgeSleep = func(time.Duration) {}
+
+			err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run")
+			if err != nil {
+				t.Fatalf("a finished stamped pod must be replaced: %v", err)
+			}
+		})
 	}
 }

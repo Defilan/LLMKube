@@ -93,6 +93,7 @@ func runDelete(opts *deleteOptions) error {
 	var cacheKey string
 	var cacheTargets []purgeTarget
 	var cacheSvcs []inferencev1alpha1.InferenceService
+	var cacheResolveErr error
 	if opts.purgeCache {
 		// Resolve the key and the claims before deleting: in perService mode
 		// the claim is owner-ref'd to the InferenceService and is collected
@@ -101,9 +102,7 @@ func runDelete(opts *deleteOptions) error {
 		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, purgeModel); err != nil {
 			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
 		} else if cacheKey = cachekey.EffectiveKey(purgeModel); cacheKey != "" {
-			if cacheTargets, cacheSvcs, err = resolvePurgeTargets(ctx, k8sClient, opts.namespace); err != nil {
-				fmt.Printf("Warning: failed to resolve the model cache: %v\n", err)
-			}
+			cacheTargets, cacheSvcs, cacheResolveErr = resolvePurgeTargets(ctx, k8sClient, opts.namespace)
 		}
 	}
 
@@ -141,9 +140,30 @@ func runDelete(opts *deleteOptions) error {
 	// The InferenceService stays mounted on its claim until it is gone, so its
 	// deletion (issued above) is what frees a strict RWO claim for the purge.
 	if opts.purgeCache && cacheKey != "" {
+		if cacheResolveErr != nil {
+			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
+				"run 'llmkube cache clear -n %s' to clear what remains", cacheResolveErr, opts.namespace)
+		}
 		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name)
-		if len(targets) == 0 {
-			fmt.Printf("⚠️  No model cache PVC found in namespace '%s'; nothing to purge\n", opts.namespace)
+		var owned, purged []purgeTarget
+		for _, target := range targets {
+			// The operator garbage-collects a claim owner-ref'd to the service
+			// just deleted, and a pod mounting a terminating claim never
+			// schedules.
+			if target.InferenceService == opts.name {
+				owned = append(owned, target)
+				continue
+			}
+			purged = append(purged, target)
+		}
+		for _, target := range owned {
+			fmt.Printf("Cache PVC '%s' is removed with InferenceService '%s'; not purging it separately\n",
+				target.Name, opts.name)
+		}
+		if len(purged) == 0 {
+			if len(owned) == 0 {
+				fmt.Printf("⚠️  No model cache PVC found in namespace '%s'; nothing to purge\n", opts.namespace)
+			}
 			fmt.Printf("\n✓ Deployment '%s' deleted successfully\n", opts.name)
 			return nil
 		}
@@ -152,7 +172,7 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
 		}
 		fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
-		if err := purgeDeleteTargets(ctx, cfg, clientset, opts.namespace, cacheKey, targets); err != nil {
+		if err := purgeDeleteTargets(ctx, cfg, clientset, opts.namespace, cacheKey, purged); err != nil {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", err, opts.namespace)
 		}

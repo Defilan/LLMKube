@@ -440,8 +440,9 @@ func runCacheClear(opts *cacheClearOptions) error {
 		targets = targetedClaims(targets, svcs, opts.model)
 	} else {
 		// The namespace-wide modes act on what `cache list` discovers. A
-		// user's claimName is not a discovery target: it may be mounted by a
-		// throwing RWO service, and the sweep would stall on it.
+		// user's claimName is not a discovery target: it may be mounted by an
+		// RWO service that fails the second attach, and the sweep would stall
+		// on it.
 		targets = discoveredClaims(targets)
 	}
 

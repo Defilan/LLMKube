@@ -97,25 +97,35 @@ func validateCacheKey(key string) error {
 // purgeTarget is a cache claim a purge may act on. UserOwned marks a claim a
 // Model's own InferenceServices bring with spec.modelCache.claimName; the
 // operator creates and garbage-collects those without the cache label, so they
-// are reachable only through the service spec. Order is the shared claim
-// first, then the rest by name.
+// are reachable only through the service spec. InferenceService names the
+// service whose owner reference makes the operator garbage-collect the claim
+// (empty when no such owner). Order is the shared claim first, then the rest
+// by name.
 type purgeTarget struct {
-	Name      string
-	UserOwned bool
+	Name             string
+	UserOwned        bool
+	InferenceService string
 }
 
 // targetedClaims narrows the claims in a namespace to the ones that can hold
 // modelName's files: the claims the model's own InferenceServices bring with
-// spec.modelCache.claimName, and their "<isvc>-model-cache" per-service claims.
-// The shared cache counts only when the Model has no InferenceService the
-// purge could consult (prefetch-era Models, or a service not yet created), so
-// a model that demonstrably lives on per-service or override claims never
-// costs a pod on the shared claim, which a shared-mode service may hold under
-// RWO. The claims of services that do not reference the model stay untouched,
-// so clearing one model does not create a read-write pod on every running
-// service's volume or fail on their attach timeouts. all is every cache claim
-// in the namespace, in the order cachePVCandidates returns.
+// spec.modelCache.claimName, and the claim each of those services' pods mounts
+// otherwise, which is the service's "<isvc>-model-cache" only in perService
+// mode and the shared cache in the default shared mode (internal/controller
+// modelCachePVCName). The shared cache also counts when the Model has no
+// InferenceService the purge could consult (prefetch-era Models, or a service
+// not yet created), so a model that demonstrably lives on per-service or
+// override claims never costs a pod on the shared claim, which a shared-mode
+// service may hold under RWO. The claims of services that do not reference the
+// model stay untouched, so clearing one model does not create a read-write pod
+// on every running service's volume or fail on their attach timeouts. all is
+// every cache claim in the namespace, in the order cachePVCandidates returns.
 func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService, modelName string) []purgeTarget {
+	exists := make(map[string]bool, len(all))
+	for _, target := range all {
+		exists[target.Name] = true
+	}
+
 	own := map[string]bool{}
 	consulted := false
 	for i := range svcs {
@@ -124,13 +134,19 @@ func targetedClaims(all []purgeTarget, svcs []inferencev1alpha1.InferenceService
 			continue
 		}
 		consulted = true
-		// A service with a claimName override mounts that claim; without one
-		// the operator gives it its own per-service claim (#928).
+		// A service with a claimName override mounts that claim. Without one
+		// the operator gives it a per-service claim only in perService mode,
+		// which is the mode whose claim exists here; otherwise its pods mount
+		// the shared cache.
 		if claim := userModelCacheClaimName(svc); claim != "" {
 			own[claim] = true
 			continue
 		}
-		own[perServiceCacheClaimName(svc.Name)] = true
+		if perService := perServiceCacheClaimName(svc.Name); exists[perService] {
+			own[perService] = true
+			continue
+		}
+		own[modelCachePVCName] = true
 	}
 
 	if !consulted {
@@ -255,7 +271,7 @@ func replaceStalePurgePod(
 		existing.Labels[modelCacheLabel] != cachePurgeComponent {
 		return fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache purge pod", podName)
 	}
-	// A pod stamped by a live run is in use: its idles at that claim and is
+	// A pod stamped by a live run is in use: it waits at that claim and is
 	// deleted when the run ends. Only a pod from a run that never cleaned up
 	// (no stamp at all) or this run's own leftover is replaced.
 	if stamp := existing.Labels[cachePurgeRunLabel]; stamp != "" && stamp != runID && !purgePodAbandoned(existing) {
@@ -285,8 +301,13 @@ func replaceStalePurgePod(
 
 // purgePodAbandoned reports whether a stamped pod has outlived the process
 // that created it. It cannot be told apart from a live run by the object
-// alone, so age is the only signal: a purge pod lives for seconds.
+// alone, so age is the only signal unless the pod has finished: its
+// `sleep 300` has exited, so nothing is using it.
 func purgePodAbandoned(pod *corev1.Pod) bool {
+	switch pod.Status.Phase {
+	case corev1.PodSucceeded, corev1.PodFailed:
+		return true
+	}
 	return time.Since(pod.CreationTimestamp.Time) > 10*time.Minute
 }
 
@@ -558,7 +579,8 @@ func userModelCacheClaimName(isvc *inferencev1alpha1.InferenceService) string {
 	return isvc.Spec.ModelCache.ClaimName
 }
 
-// resolvePurgeTargets keeps the candidates that exist and records who owns each.
+// resolvePurgeTargets keeps the candidates that exist and records who owns
+// each.
 func resolvePurgeTargets(
 	ctx context.Context, k8sClient client.Client, namespace string,
 ) ([]purgeTarget, []inferencev1alpha1.InferenceService, error) {
@@ -572,6 +594,14 @@ func resolvePurgeTargets(
 			userOwned[claim] = true
 		}
 	}
+	infos, err := discoverCachePVCs(ctx, k8sClient, namespace)
+	if err != nil {
+		return nil, nil, err
+	}
+	ownedBy := map[string]string{}
+	for _, info := range infos {
+		ownedBy[info.Name] = info.InferenceService
+	}
 
 	var targets []purgeTarget
 	for _, name := range candidates {
@@ -579,7 +609,11 @@ func resolvePurgeTargets(
 		err := k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: namespace}, pvc)
 		switch {
 		case err == nil:
-			targets = append(targets, purgeTarget{Name: name, UserOwned: userOwned[name]})
+			targets = append(targets, purgeTarget{
+				Name:             name,
+				UserOwned:        userOwned[name],
+				InferenceService: ownedBy[name],
+			})
 			continue
 		case apierrors.IsNotFound(err):
 			// A user's claimName override can point at a claim that is being

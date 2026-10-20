@@ -32,6 +32,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/defilantech/llmkube/pkg/cachekey"
 	"github.com/defilantech/llmkube/test/utils"
 )
 
@@ -2228,6 +2229,51 @@ spec:
 					dirs := cacheDirs()
 					g.Expect(dirs).NotTo(ContainElement(key), "cache clear reported success but the entry is still on the PVC")
 					g.Expect(dirs).NotTo(ContainElement(other))
+				}, 2*time.Minute).Should(Succeed())
+			})
+
+			// The reported path: a default (shared-mode) install where the
+			// model's InferenceService brings no claimName, so its pods mount
+			// llmkube-model-cache. --orphaned never reaches targetedClaims.
+			It("removes the --model entry from the shared claim of a serving service", func() {
+				modelKey := cachekey.Compute("hf://e2e/clear-by-model")
+				writeDir(modelKey)
+				writeDir(other)
+
+				By("creating a Model and a paused InferenceService that reference the entry")
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: clear-by-model
+  namespace: %s
+spec:
+  source: "hf://e2e/clear-by-model"
+  files: ["model.gguf", "model-00001-of-00001.gguf"]
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: chat-api
+  namespace: %s
+spec:
+  modelRef: clear-by-model
+  replicas: 0
+`, clearNs, clearNs))
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to apply the Model and InferenceService")
+
+				By("clearing the model's entry by name")
+				out, err := utils.Run(exec.Command("./"+cliPath, "cache", "clear",
+					"--model", "clear-by-model", "--force", "-n", clearNs))
+				Expect(err).NotTo(HaveOccurred(), out)
+				Expect(out).To(ContainSubstring("/models/" + modelKey))
+
+				By("checking the PVC itself")
+				Eventually(func(g Gomega) {
+					dirs := cacheDirs()
+					g.Expect(dirs).NotTo(ContainElement(modelKey), "cache clear --model reported success but the entry is still on the PVC")
+					g.Expect(dirs).To(ContainElement(other))
 				}, 2*time.Minute).Should(Succeed())
 			})
 		})
