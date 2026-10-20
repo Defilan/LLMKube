@@ -296,9 +296,12 @@ func memberPodFromTemplate(
 			// 30s x 10 = five minutes of unreachable rendezvous restarts the
 			// container, and MemberRestarted then recreates the group.
 			c.StartupProbe = rendezvousProbe(host, port, 10, 180)
-			applyStartupTimeout(isvc.Spec.StartupTimeout, c.StartupProbe)
-			if head := tmpl.Spec.Containers[0].StartupProbe; head != nil && head.FailureThreshold > 0 {
-				c.StartupProbe.FailureThreshold = head.FailureThreshold
+			// Adopt the head's window, not its failure count: the worker's
+			// period can differ from the head's.
+			if head := tmpl.Spec.Containers[0].StartupProbe; head != nil {
+				if w := startupWindow(head); w > 0 {
+					c.StartupProbe.FailureThreshold = startupFailureThreshold(w, c.StartupProbe)
+				}
 			}
 			c.LivenessProbe = rendezvousProbe(host, port, 30, 10)
 		}
@@ -517,11 +520,13 @@ func multiNodeStagedAt(isvc *inferencev1alpha1.InferenceService) time.Time {
 // without restarting (Running, RestartCount 0) is deliberately not bounded
 // here: a 184 GiB download legitimately exceeds any fixed budget.
 //
-// The group's startup budget is the window of the desired rank-0 pod's startup
-// probe, which is where spec.startupTimeout and probeOverrides.startup land.
-// Reading it off the desired pod rather than a constant keeps both deadlines
-// from cutting short a budget the spec asked for; a desired head with no
-// startup budget falls back to multiNodeStartupBudget.
+// The group's startup budget starts at multiNodeStartupBudget and is raised,
+// never lowered, to the window of the desired rank-0 pod's startup probe, which
+// is where spec.startupTimeout and probeOverrides.startup land. A spec probe
+// shorter than the built-in budget does not shorten the group deadlines: those
+// also have to cover a restart loop caused by something other than a slow
+// load. The head's deadline runs from the first runtime container's start, so
+// a long staging init does not consume it.
 //
 // trigger is the member the reason is about, so a failure can be attributed
 // to one pod and counted once however many reconciles its teardown spans.
@@ -531,9 +536,10 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 		if o.rank != 0 || o.desired == nil || len(o.desired.Spec.Containers) == 0 {
 			continue
 		}
-		if w := startupWindow(o.desired.Spec.Containers[0].StartupProbe); w > 0 {
+		if w := startupWindow(o.desired.Spec.Containers[0].StartupProbe); w > budget {
 			budget = w
 		}
+		break
 	}
 	stagingAny := false
 	for _, o := range obs {
@@ -579,13 +585,32 @@ func groupNeedsRecreate(obs []memberObservation, hash string, now time.Time, for
 			if p == nil {
 				continue
 			}
-			if o.rank == 0 && p.Status.Phase == corev1.PodRunning && !podReady(p) &&
-				!p.CreationTimestamp.IsZero() && now.Sub(p.CreationTimestamp.Time) > budget {
+			if o.rank == 0 && p.Status.Phase == corev1.PodRunning && !podReady(p) && headNotReadyFor(p, now) > budget {
 				return multiNodeReasonHeadNotReady, fmt.Sprintf("%s not Ready after %s", p.Name, budget), p
 			}
 		}
 	}
 	return "", "", nil
+}
+
+// headNotReadyFor is how long rank 0 has been Running but no runtime container
+// has become ready. The startup probe's window starts when the container
+// starts, after the staging init containers, so a head that is not Running yet
+// reports zero and the staging gate holds the deadline.
+func headNotReadyFor(p *corev1.Pod, now time.Time) time.Duration {
+	if p.Status.Phase != corev1.PodRunning {
+		return 0
+	}
+	started := time.Time{}
+	for _, cs := range p.Status.ContainerStatuses {
+		if r := cs.State.Running; r != nil && !r.StartedAt.IsZero() && (started.IsZero() || r.StartedAt.Time.Before(started)) {
+			started = r.StartedAt.Time
+		}
+	}
+	if started.IsZero() {
+		return 0
+	}
+	return now.Sub(started)
 }
 
 // lastTerminationDetail renders the exit code, reason and an excerpt of the

@@ -85,24 +85,37 @@ func TestConstructMemberPodsStartupTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("probeOverrides.startup reaches the worker", func(t *testing.T) {
-		isvc, model := multiNodeFixture()
-		isvc.Spec.ProbeOverrides = &inferencev1alpha1.ProbeOverrides{
-			Startup: &corev1.Probe{
-				ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/true"}}},
-				PeriodSeconds:    10,
-				FailureThreshold: 900,
-			},
+	// The override runs on a 30s period, so copying the head's failure count
+	// instead of its window would give the worker 180 x 10s (30m), not the
+	// head's 180 x 30s (90m).
+	t.Run("probeOverrides.startup reaches the worker as a window", func(t *testing.T) {
+		head, worker := ringWithOverride(t, &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/true"}}},
+			PeriodSeconds:    30,
+			FailureThreshold: 180,
+		})
+		hw, ww := startupWindow(head.Spec.Containers[0].StartupProbe), startupWindow(worker.Spec.Containers[0].StartupProbe)
+		if ww != hw {
+			t.Errorf("worker startup window = %v, want the head's %v", ww, hw)
 		}
-		r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-		pods, _, err := r.constructMemberPods(isvc, model, nil, "", "")
-		if err != nil {
-			t.Fatalf("constructMemberPods: %v", err)
-		}
-		if got := pods[1].Spec.Containers[0].StartupProbe.FailureThreshold; got != 900 {
-			t.Errorf("worker startup failureThreshold = %d, want the head override's 900", got)
+		if got := worker.Spec.Containers[0].StartupProbe.FailureThreshold; got != 540 {
+			t.Errorf("worker startup failureThreshold = %d, want 540 at its 10s period", got)
 		}
 	})
+}
+
+// ringWithOverride renders the multi-node fixture with spec.probeOverrides.startup
+// set and returns the head and worker pods.
+func ringWithOverride(t *testing.T, startup *corev1.Probe) (head, worker *corev1.Pod) {
+	t.Helper()
+	isvc, model := multiNodeFixture()
+	isvc.Spec.ProbeOverrides = &inferencev1alpha1.ProbeOverrides{Startup: startup}
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	pods, _, err := r.constructMemberPods(isvc, model, nil, "", "")
+	if err != nil {
+		t.Fatalf("constructMemberPods: %v", err)
+	}
+	return pods[0], pods[1]
 }
 
 // TestGroupNeedsRecreateStartupBudget pins that the group deadlines read the
@@ -123,27 +136,58 @@ func TestGroupNeedsRecreateStartupBudget(t *testing.T) {
 		p.Status.Phase = corev1.PodRunning
 		return p
 	}
+	// runningSince is a head whose runtime container started ago.
+	runningSince := func(src *corev1.Pod, name string, ago time.Duration) *corev1.Pod {
+		p := running(src, name)
+		p.CreationTimestamp = metav1.NewTime(now.Add(-ago - 10*time.Minute))
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+			Name:  src.Spec.Containers[0].Name,
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(now.Add(-ago))}},
+		}}
+		return p
+	}
 
 	t.Run("a 90m head is not recreated at 45m", func(t *testing.T) {
-		h := running(head, head.Name)
-		h.CreationTimestamp = metav1.NewTime(now.Add(-45 * time.Minute))
-		obs := []memberObservation{{rank: 0, desired: desired[0], existing: h}}
+		obs := []memberObservation{{rank: 0, desired: desired[0], existing: runningSince(head, head.Name, 45*time.Minute)}}
 		if reason, _, _ := groupNeedsRecreate(obs, hash, now, time.Time{}, time.Time{}); reason != "" {
 			t.Errorf("reason = %q, want none inside the 90m budget", reason)
 		}
-		h.CreationTimestamp = metav1.NewTime(now.Add(-91 * time.Minute))
+		obs[0].existing = runningSince(head, head.Name, 91*time.Minute)
 		if reason, _, _ := groupNeedsRecreate(obs, hash, now, time.Time{}, time.Time{}); reason != multiNodeReasonHeadNotReady {
 			t.Errorf("reason = %q, want %s past the 90m budget", reason, multiNodeReasonHeadNotReady)
 		}
 	})
 
+	t.Run("a long staging init does not consume the head's budget", func(t *testing.T) {
+		// Created 100m ago with a 70m download, so the runtime has been up
+		// 30m: the probe window has barely started and must not recreate.
+		h := runningSince(head, head.Name, 30*time.Minute)
+		h.CreationTimestamp = metav1.NewTime(now.Add(-100 * time.Minute))
+		obs := []memberObservation{{rank: 0, desired: desired[0], existing: h}}
+		if reason, _, _ := groupNeedsRecreate(obs, hash, now, time.Time{}, time.Time{}); reason != "" {
+			t.Errorf("reason = %q, want none while the runtime is inside its window", reason)
+		}
+	})
+
 	t.Run("a default head is recreated at 45m", func(t *testing.T) {
 		plainHead, _, plainDesired := buildRingPods(t, nil)
-		h := running(plainHead, plainHead.Name)
-		h.CreationTimestamp = metav1.NewTime(now.Add(-45 * time.Minute))
-		obs := []memberObservation{{rank: 0, desired: plainDesired[0], existing: h}}
+		obs := []memberObservation{{rank: 0, desired: plainDesired[0], existing: runningSince(plainHead, plainHead.Name, 45*time.Minute)}}
 		if reason, _, _ := groupNeedsRecreate(obs, hash, now, time.Time{}, time.Time{}); reason != multiNodeReasonHeadNotReady {
 			t.Errorf("reason = %q, want %s past the 30m budget", reason, multiNodeReasonHeadNotReady)
+		}
+	})
+
+	t.Run("an override below 30m does not lower the floor", func(t *testing.T) {
+		// A fast-fail override (10 failures at 10s) must not shrink the group
+		// deadlines below the built-in 30m.
+		shortHead, _ := ringWithOverride(t, &corev1.Probe{
+			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/bin/true"}}},
+			PeriodSeconds:    10,
+			FailureThreshold: 10,
+		})
+		obs := []memberObservation{{rank: 0, desired: shortHead, existing: runningSince(shortHead, shortHead.Name, 20*time.Minute)}}
+		if reason, _, _ := groupNeedsRecreate(obs, hash, now, time.Time{}, time.Time{}); reason != "" {
+			t.Errorf("reason = %q, want none: a short probe must not shorten the group budget", reason)
 		}
 	})
 

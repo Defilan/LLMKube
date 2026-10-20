@@ -808,7 +808,9 @@ type InferenceServiceSpec struct {
 	// The kubelet's window is failureThreshold * periodSeconds, so the budget
 	// is quantized up to the next probe period. probeOverrides.startup replaces
 	// the startup probe outright and then this field does not apply. Changing
-	// it changes the pod template, so it rolls the pods.
+	// it changes the pod template, so it rolls the pods. It sets the in-cluster
+	// kubelet probe only: on Metal the startup budget is the metal-agent's
+	// --llama-server-startup-timeout (and its per-engine peers).
 	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="startupTimeout must be a positive duration, for example 90m"
 	// +optional
 	StartupTimeout *metav1.Duration `json:"startupTimeout,omitempty"`
