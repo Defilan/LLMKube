@@ -244,36 +244,60 @@ func TestActivatorSwapWhenIdle(t *testing.T) {
 	}
 }
 
-// TestActivatorHoldBudgetExceeded verifies that when the target never becomes
-// ready within the caller's budget, Acquire returns ErrHoldBudgetExceeded (which
-// the proxy maps to 503 + Retry-After) and, with no other caller waiting, the
-// pending activation is cancelled (Deactivate) so the pool does not complete a
-// useless swap.
-func TestActivatorHoldBudgetExceeded(t *testing.T) {
+// TestActivatorFreshSwapAfterUnwaitedAbandon verifies that a swap failure
+// recorded while nobody was waiting is not surfaced to a request that arrives
+// afterwards: it starts a fresh load instead of failing with a swap it never
+// made.
+func TestActivatorFreshSwapAfterUnwaitedAbandon(t *testing.T) {
 	fake := newFakeMemberController()
-	// Block Activate so the swap never completes within the caller budget.
-	fake.activateGate = make(chan struct{})
+	fake.noAutoReady = true
+	fake.setPhase("coder", modelReadyPhase)
 	a := NewActivator(context.Background(), fake, "r", nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	_, err := a.Acquire(ctx, testPool("judge"))
-	if !errors.Is(err, ErrHoldBudgetExceeded) {
-		t.Fatalf("Acquire err = %v, want ErrHoldBudgetExceeded", err)
+	// The first caller gives up while the swap is still activating; the swap
+	// then fails with nobody waiting on it.
+	fake.activateGate = make(chan struct{})
+	fake.activateFail = map[string]bool{"judge": true}
+	firstCtx, firstCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer firstCancel()
+	if _, err := a.Acquire(firstCtx, budgetPool("judge", 5*time.Second)); !errors.Is(err, ErrHoldBudgetExceeded) {
+		t.Fatalf("first Acquire err = %v, want ErrHoldBudgetExceeded", err)
 	}
-	// Unblock so the goroutine can unwind cleanly.
 	close(fake.activateGate)
+	waitFor(t, "the unwaited swap to record its failure", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		pr := a.pools["lab/heavy-slot"]
+		return !pr.swapping && len(pr.swapErr) > 0
+	})
 
-	// The sole caller gave up: the pending activation for judge must be
-	// cancelled so the pool does not leave judge scaled up for nobody.
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if fake.deactivateCount("judge") >= 1 {
-			return
+	// A later request gets its own load, not the abandoned swap's error.
+	fake.mu.Lock()
+	fake.activateFail = map[string]bool{}
+	fake.activateGate = nil
+	fake.mu.Unlock()
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer secondCancel()
+	done := make(chan error, 1)
+	go func() {
+		rel, err := a.Acquire(secondCtx, budgetPool("judge", 5*time.Second))
+		if err == nil {
+			rel()
 		}
-		time.Sleep(5 * time.Millisecond)
+		done <- err
+	}()
+	waitFor(t, "the second request to activate judge", func() bool {
+		return fake.activateCount("judge") >= 2
+	})
+	fake.setPhase("judge", modelReadyPhase)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("second Acquire err = %v; a request was failed with a swap it never made", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second Acquire never completed")
 	}
-	t.Fatalf("judge deactivate count = %d, want >=1 (cancel-on-timeout)", fake.deactivateCount("judge"))
 }
 
 // TestActivatorCoalesceHoldsCrossModelUntilDrain verifies the anti-thrash core:
@@ -573,8 +597,9 @@ func TestActivatorIfIdleWaitsOnInFlightSwap(t *testing.T) {
 
 // waitFor polls cond until it holds or the timeout elapses, so tests can
 // synchronise on activator state without fixed sleeps.
-func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
+	const timeout = 3 * time.Second
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if cond() {
@@ -595,68 +620,61 @@ func budgetPool(member string, budget time.Duration) *BackendPool {
 	}
 }
 
-// TestActivatorStaleDeactivateDoesNotUndoNewActivation is the #1837 wedge, half
-// one: the last waiter for a member leaves and schedules a deactivate, a new
-// request for the same member arrives in that window and activates it, and the
-// stale deactivate must not scale it back to zero. It used to, and because
-// Activate is idempotent-by-check and never re-issued, the new swap then waited
-// forever on a member that could never become Ready.
-func TestActivatorStaleDeactivateDoesNotUndoNewActivation(t *testing.T) {
-	fake := newFakeMemberController()
-	fake.noAutoReady = true
-	a := NewActivator(context.Background(), fake, "r", nil)
+// TestDeactivateIfUnwantedGuards pins the #1837 guard directly: a deferred
+// deactivate never lands on a member the pool wants, so it can never scale back
+// a member that an activation issued after it was scheduled just scaled up.
+func TestDeactivateIfUnwantedGuards(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(pr *poolRuntime)
+		want    int
+	}{
+		{
+			name:    "deactivates a member nothing claims",
+			prepare: func(pr *poolRuntime) {},
+			want:    1,
+		},
+		{
+			name: "keeps a member that was wanted again",
+			prepare: func(pr *poolRuntime) {
+				pr.waiting["coder"] = 1
+			},
+			want: 0,
+		},
+		{
+			name: "keeps the resident",
+			prepare: func(pr *poolRuntime) {
+				pr.resident = "coder"
+			},
+			want: 0,
+		},
+		{
+			name: "keeps a member an in-flight swap is activating",
+			prepare: func(pr *poolRuntime) {
+				pr.swapping = true
+				pr.swapTarget = "coder"
+				pr.swapGen = 7
+			},
+			want: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFakeMemberController()
+			a := NewActivator(context.Background(), fake, "r", nil)
+			a.mu.Lock()
+			pr := a.runtime(testPool("coder"))
+			pr.swapping = false
+			pr.swapTarget = ""
+			tc.prepare(pr)
+			a.mu.Unlock()
 
-	secondDone := make(chan error, 1)
-	var once sync.Once
-	a.beforeDeactivate = func(member string) {
-		if member != "coder" {
-			return
-		}
-		once.Do(func() {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				release, err := a.Acquire(ctx, testPool("coder"))
-				if err == nil {
-					release()
-				}
-				secondDone <- err
-			}()
-			// Hold the deactivate in its old losing window until the second
-			// waiter has actually issued its Activate.
-			waitFor(t, 3*time.Second, "second Activate for coder", func() bool {
-				return fake.activateCount("coder") >= 2
-			})
+			a.deactivateIfUnwanted(pr, "coder")
+
+			if got := fake.deactivateCount("coder"); got != tc.want {
+				t.Fatalf("Deactivate(coder) called %d times, want %d", got, tc.want)
+			}
 		})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if _, err := a.Acquire(ctx, testPool("coder")); !errors.Is(err, ErrHoldBudgetExceeded) {
-		t.Fatalf("first Acquire err = %v, want ErrHoldBudgetExceeded", err)
-	}
-
-	waitFor(t, 3*time.Second, "second waiter to activate coder", func() bool {
-		return fake.activateCount("coder") >= 2
-	})
-	// Give the stale deactivate time to land if it is going to.
-	time.Sleep(250 * time.Millisecond)
-
-	if got := fake.deactivateCount("coder"); got != 0 {
-		t.Fatalf("Deactivate(coder) called %d times; the stale deactivate undid a live activation", got)
-	}
-	if got := fake.replicaCount("coder"); got != 1 {
-		t.Fatalf("coder replicas = %d, want 1", got)
-	}
-
-	fake.setPhase("coder", modelReadyPhase)
-	select {
-	case err := <-secondDone:
-		if err != nil {
-			t.Fatalf("second Acquire: %v", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("second waiter never served: the swap is waiting on a member that was scaled back to zero")
 	}
 }
 
@@ -695,7 +713,7 @@ func TestActivatorAbandonsSwapAtDeadline(t *testing.T) {
 		t.Fatalf("resident = %q, want judge to still own the slot", resident)
 	}
 
-	waitFor(t, 3*time.Second, "abandoned target to be deactivated", func() bool {
+	waitFor(t, "abandoned target to be deactivated", func() bool {
 		return fake.deactivateCount("coder") >= 1
 	})
 

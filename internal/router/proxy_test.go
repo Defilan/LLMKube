@@ -676,7 +676,9 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	fb := newFakeBackend(t)
 
 	// Activation never completes: Activate blocks on a gate that is never
-	// closed, so the caller's hold budget expires first.
+	// closed, so the caller's hold budget expires first. The pool's swapBudget
+	// bounds the swap, so the abandoned load does not hold the slot for the
+	// router's full response-header timeout.
 	fake := newFakeMemberController()
 	fake.activateGate = make(chan struct{})
 
@@ -689,10 +691,11 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 			// does not wait the 120s proxy default.
 			Timeout: 50 * time.Millisecond,
 			Pool: &BackendPool{
-				Name:      "heavy-slot",
-				Namespace: "lab",
-				Member:    "coder",
-				Members:   []string{"coder", "judge"},
+				Name:       "heavy-slot",
+				Namespace:  "lab",
+				Member:     "coder",
+				Members:    []string{"coder", "judge"},
+				SwapBudget: 100 * time.Millisecond,
 			},
 		}},
 		DefaultRoute: "coder",
@@ -727,7 +730,9 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 		t.Errorf("backend calls = %d, want 0 (must not dispatch when activation never completed)", fb.calls.Load())
 	}
 
-	// Let the blocked activation goroutine unwind.
+	// Let the blocked activation goroutine unwind. The swap is still in flight
+	// until its budget expires, so this only releases the blocked Activate; it
+	// does not wait for the swap to publish.
 	close(fake.activateGate)
 }
 
@@ -1266,10 +1271,16 @@ func TestProxyMetricsNonZeroAfterSmokeRun(t *testing.T) {
 	// types (which differ per metric kind) and instead uses the
 	// common dto.Metric protobuf that every metric implements via
 	// Write.
+	//
+	// Collect sends every series synchronously, so the channel is drained
+	// concurrently: a fixed buffer deadlocks once the registry grows past it,
+	// and the series count depends on label values other tests have created.
 	var foundRequests, foundDuration, foundBudget, foundHealth bool
-	ch := make(chan prometheus.Metric, 64)
-	ctrlmetrics.Registry.(prometheus.Collector).Collect(ch)
-	close(ch)
+	ch := make(chan prometheus.Metric)
+	go func() {
+		ctrlmetrics.Registry.(prometheus.Collector).Collect(ch)
+		close(ch)
+	}()
 	for m := range ch {
 		desc := m.Desc().String()
 		if strings.Contains(desc, `llmkube_router_requests_total`) {
