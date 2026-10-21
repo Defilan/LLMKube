@@ -363,6 +363,10 @@ func TestGroupReadinessAndRecreate(t *testing.T) {
 	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "HeadNotReady" {
 		t.Errorf("head past budget: got %q", reason)
 	}
+	obs[0].existing = mk("h", corev1.PodRunning, false, 0, "abc")
+	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
+		t.Errorf("head with no start time must wait: got %q", reason)
+	}
 	obs[0].existing.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
 	if reason, _, _ := groupNeedsRecreate(obs, "abc", now, now, now); reason != "" {
 		t.Errorf("head inside budget must wait: got %q", reason)
@@ -413,8 +417,9 @@ func TestGroupNeedsRecreateWorkerRestartStillTriggersRecreate(t *testing.T) {
 // are formation noise. The noise ends at the group's formation timestamp, and
 // a staging member whose init containers keep dying is bounded by
 // MemberInitLoop so masking cannot hide a permanently broken download. When
-// the group never forms, the noise ends at stagedAt + multiNodePostStagingBudget
-// instead, so a runtime crashloop after staging is recreated rather than masked.
+// the group never forms, the noise ends at stagedAt + the group's startup
+// budget instead, so a runtime crashloop after staging is recreated rather
+// than masked.
 func TestGroupNeedsRecreateFormation(t *testing.T) {
 	now := time.Now()
 	// mkWaiting is a member whose runtime has been up, exited and been
@@ -513,7 +518,7 @@ func TestGroupNeedsRecreateFormation(t *testing.T) {
 				{rank: 1, existing: mkWaiting("w", 0, time.Time{})},
 			},
 			formedAt: time.Time{},
-			stagedAt: now.Add(-multiNodePostStagingBudget - time.Minute),
+			stagedAt: now.Add(-multiNodeStartupBudget - time.Minute),
 			want:     "MemberRestarted",
 		},
 	}
@@ -648,8 +653,8 @@ func TestSetMultiNodeStatusReadyMembers(t *testing.T) {
 // the teardown paths removed it, but a member replaced in place (node reboot,
 // eviction, a deleted pod) is recreated without a teardown. Its replacement
 // re-downloads while the condition still carries the PREVIOUS staging
-// episode's timestamp, so once that stamp ages past multiNodePostStagingBudget
-// the next waiting-runtime restart is judged fatal and the group is recreated
+// episode's timestamp, so once that stamp ages past the startup budget the
+// next waiting-runtime restart is judged fatal and the group is recreated
 // out from under the download: the #1757 loop, restored.
 func TestSetMultiNodeStatusStagedClearedOnRestage(t *testing.T) {
 	isvc, _ := multiNodeFixture()
@@ -689,7 +694,7 @@ func TestSetMultiNodeStatusStagedClearedOnRestage(t *testing.T) {
 	for i := range isvc.Status.Conditions {
 		if isvc.Status.Conditions[i].Type == ConditionMultiNodeStaged {
 			isvc.Status.Conditions[i].LastTransitionTime =
-				metav1.NewTime(time.Now().Add(-2 * multiNodePostStagingBudget))
+				metav1.NewTime(time.Now().Add(-2 * multiNodeStartupBudget))
 		}
 	}
 

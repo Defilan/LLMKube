@@ -544,6 +544,10 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	if pc, ok := backend.(ProbeCustomizer); ok {
 		pc.CustomizeProbes(isvc, port, startupProbe, livenessProbe, readinessProbe)
 	}
+	// spec.startupTimeout only widens the budget of the probe the runtime
+	// built; handler and period stay the runtime's, and probeOverrides.startup
+	// still replaces the probe wholesale below.
+	applyStartupTimeout(isvc.Spec.StartupTimeout, startupProbe)
 	if isvc.Spec.ProbeOverrides != nil {
 		if isvc.Spec.ProbeOverrides.Startup != nil {
 			startupProbe = isvc.Spec.ProbeOverrides.Startup

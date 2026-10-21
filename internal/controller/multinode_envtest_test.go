@@ -504,7 +504,7 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(k8sClient.Get(ctx, key, &aging)).To(Succeed())
 		ageCond := meta.FindStatusCondition(aging.Status.Conditions, ConditionMultiNodeStaged)
 		Expect(ageCond).NotTo(BeNil())
-		ageCond.LastTransitionTime = metav1.NewTime(time.Now().Add(-multiNodePostStagingBudget - time.Minute))
+		ageCond.LastTransitionTime = metav1.NewTime(time.Now().Add(-multiNodeStartupBudget - time.Minute))
 		Expect(k8sClient.Status().Update(ctx, &aging)).To(Succeed())
 
 		reconcileOnce() // past the deadline the crashloop recreates the group

@@ -831,6 +831,11 @@ func (in *InferenceServiceSpec) DeepCopyInto(out *InferenceServiceSpec) {
 		*out = new(ProbeOverrides)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.StartupTimeout != nil {
+		in, out := &in.StartupTimeout, &out.StartupTimeout
+		*out = new(v1.Duration)
+		**out = **in
+	}
 	if in.SkipModelInit != nil {
 		in, out := &in.SkipModelInit, &out.SkipModelInit
 		*out = new(bool)
