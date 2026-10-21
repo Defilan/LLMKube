@@ -39,16 +39,48 @@ jobs:
       - name: Shell script tests
         run: make test-scripts
 
+      # go test -json records every test's elapsed time; the report script
+      # streams the text to this log as `go test -v` would and keeps the JSON
+      # for the timing summary below (#2141). shell: bash runs the pipeline
+      # under -o pipefail, so make's exit status still fails the step.
       - name: Running Tests (seed 11)
+        shell: bash
         run: |
           go mod tidy
-          make test GINKGO_SEED=11
+          make test GINKGO_SEED=11 GO_TEST_FLAGS=-json 2>&1 \
+            | tee test-report-seed11.jsonl | hack/go-test-report.sh stream
 
       # Spec-order pollution only shows under some seeds, so CI runs the
       # envtest suites a second time under a second fixed seed (#1693).
       # `make test` and the Foreman gate stay single-pass.
       - name: Envtest suites (seed 22)
-        run: make test-envtest GINKGO_SEED=22
+        shell: bash
+        run: |
+          make test-envtest GINKGO_SEED=22 GO_TEST_FLAGS=-json 2>&1 \
+            | tee test-report-seed22.jsonl | hack/go-test-report.sh stream
+
+      # Where the time went: package times, failures, tests a -timeout killed
+      # mid-run, and the slowest tests. Runs after a failure too, which is
+      # when it matters most.
+      - name: Test timing report
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          for f in test-report-seed*.jsonl; do
+            [ -f "$f" ] || continue
+            echo "### $f"
+            hack/go-test-report.sh summary "$f" 25
+            echo
+          done
+
+      - name: Upload test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-test-report
+          path: test-report-seed*.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload coverage to Codecov
         # make test writes cover.out via `go test -coverprofile`.
