@@ -15,6 +15,7 @@
 # Environment (all optional):
 #   BASE_REF          ref to diff against (default upstream/main)
 #   GINKGO_SEED       ginkgo seed (default 4242)
+#   GO_TEST_TIMEOUT   go test -timeout (default 20m, as make test; #2141)
 #   ENVTEST_BIN, BIN_DIR, ENVTEST_K8S_VERSION
 #                     passed by the Makefile, derived when unset
 #   TA_REGEN_CMD      regeneration command override (default: make manifests
@@ -65,4 +66,4 @@ fi
 : "${BIN_DIR:=$PWD/bin}"
 assets="$("$ENVTEST_BIN" use "$ENVTEST_K8S_VERSION" --bin-dir "$BIN_DIR" -p path)"
 # shellcheck disable=SC2086 # one argument per package, split on purpose
-KUBEBUILDER_ASSETS="$assets" GINKGO_SEED="$GINKGO_SEED" go test $pkgs
+KUBEBUILDER_ASSETS="$assets" GINKGO_SEED="$GINKGO_SEED" go test -timeout "${GO_TEST_TIMEOUT:-20m}" $pkgs

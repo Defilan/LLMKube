@@ -19,6 +19,9 @@
 #   GATE_DIR          log directory (default ${TMPDIR:-/tmp}/llmkube-gate)
 #   GATE_ROOT         repo root (default: the checkout this script lives in)
 #   GINKGO_SEED       ginkgo seed for the test step (default 4242)
+#   GO_TEST_TIMEOUT   go test -timeout for the test step (default 20m; go's
+#                     own 10m default is too close for internal/controller,
+#                     #2141)
 #   LINT_GOTOOLCHAIN  GOTOOLCHAIN for the lint step only, e.g. go1.26.10
 #                     (empty: use the default toolchain)
 #   ENVTEST_BIN, BIN_DIR, ENVTEST_K8S_VERSION
@@ -93,7 +96,7 @@ test_default() {
 		return 1
 	fi
 	# shellcheck disable=SC2046 # one argument per package, split on purpose
-	KUBEBUILDER_ASSETS="$assets" go test $(go list ./... | grep -v '/test/e2e$')
+	KUBEBUILDER_ASSETS="$assets" go test -timeout "${GO_TEST_TIMEOUT:-20m}" $(go list ./... | grep -v '/test/e2e$')
 }
 
 step_regen() { eval "$GATE_REGEN_CMD"; }

@@ -125,10 +125,17 @@ ifndef GINKGO_SEED
 GINKGO_SEED := $(shell date +%s)
 endif
 
+# go test kills a package binary after 10 minutes by default, and
+# internal/controller runs right at that on CI runners (#2141), so the test
+# targets set the limit explicitly. GO_TEST_FLAGS appends flags to go test;
+# CI passes -json to record per-test timings (hack/go-test-report.sh).
+GO_TEST_TIMEOUT ?= 20m
+GO_TEST_FLAGS ?=
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test GINKGO_SEED=$(GINKGO_SEED))"
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test $$(go list ./... | grep -v '/test/e2e$$') -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test -timeout $(GO_TEST_TIMEOUT) $(GO_TEST_FLAGS) $$(go list ./... | grep -v '/test/e2e$$') -coverprofile cover.out
 
 # The envtest suites only, so CI can run a second fixed seed over just the
 # specs whose ordering matters (#1693). Not part of the Foreman gate: the
@@ -136,7 +143,7 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 .PHONY: test-envtest
 test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites only (CI second seed pass, #1693).
 	@echo "ginkgo seed: $(GINKGO_SEED) (replay: make test-envtest GINKGO_SEED=$(GINKGO_SEED))"
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test ./internal/controller/ ./internal/foreman/controller/ -count=1
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" GINKGO_SEED=$(GINKGO_SEED) go test -timeout $(GO_TEST_TIMEOUT) $(GO_TEST_FLAGS) ./internal/controller/ ./internal/foreman/controller/ -count=1
 
 # The gate and test-affected pin the seed inside the scripts (default 4242)
 # so go's test cache survives between rounds: go help test caches a result
@@ -154,7 +161,7 @@ test-envtest: manifests generate fmt vet setup-envtest ## Run the envtest suites
 # race the regeneration). Logs under ${TMPDIR:-/tmp}/llmkube-gate.
 .PHONY: gate
 gate: controller-gen golangci-lint setup-envtest ## Agent gate: regen + drift check, gofmt check, vet, then lint-all and tests in parallel.
-	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" ./scripts/gate.sh
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" GO_TEST_TIMEOUT="$(GO_TEST_TIMEOUT)" ./scripts/gate.sh
 
 # BASE_REF is the ref test-affected diffs against. Fork contributors:
 # override with BASE_REF=origin/main.
@@ -167,7 +174,7 @@ BASE_REF ?= upstream/main
 # select everything; no Go change selects nothing and exits 0.
 .PHONY: test-affected
 test-affected: setup-envtest ## Test packages affected by changes since BASE_REF plus their reverse dependencies.
-	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" ./scripts/test-affected.sh
+	@ENVTEST_BIN="$(ENVTEST)" BIN_DIR="$(LOCALBIN)" ENVTEST_K8S_VERSION="$(ENVTEST_K8S_VERSION)" BASE_REF="$(BASE_REF)" GO_TEST_TIMEOUT="$(GO_TEST_TIMEOUT)" ./scripts/test-affected.sh
 
 # The gate, test-affected and seed-check scripts are shell, so go test never
 # runs their regression tests: make test-scripts does, locally and in CI
