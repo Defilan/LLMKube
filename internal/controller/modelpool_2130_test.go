@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"syscall"
 	"time"
@@ -39,8 +40,6 @@ import (
 // member named spec.default and an on-demand member that holds the slot.
 var _ = Describe("ModelPool #2130", func() {
 	const (
-		reproDefault  = "qwen-27b"
-		reproOnDemand = "muse-glimmer"
 		// idleProbeLoading is what llama.cpp answers on every path while it is
 		// still loading the model (tools/server/server-http.cpp,
 		// middleware_server_state), built with the repo's own format string from
@@ -295,7 +294,7 @@ var _ = Describe("ModelPool #2130", func() {
 		// path answers 503 (llama.cpp server-http.cpp middleware_server_state).
 		createPod(f, "on-demand", false)
 		setPhase(f, "on-demand", PhaseCreating, 0)
-		f.idleErr[member(f, "on-demand")] = fmt.Errorf(idleProbeLoading)
+		f.idleErr[member(f, "on-demand")] = errors.New(idleProbeLoading)
 
 		activate(f, "default")
 		reconcile(f)

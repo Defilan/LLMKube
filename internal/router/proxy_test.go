@@ -675,27 +675,27 @@ func TestProxy503WhenNoRoute(t *testing.T) {
 func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	fb := newFakeBackend(t)
 
-	// Activation never completes: Activate blocks on a gate that is never
-	// closed, so the caller's hold budget expires first. The pool's swapBudget
-	// bounds the swap, so the abandoned load does not hold the slot for the
-	// router's full response-header timeout.
+	// The target never becomes Ready, so its swap is still loading when the
+	// caller's hold budget (pool.SwapBudget) expires and ends the request with
+	// 503 + Retry-After. A swap that ends first would surface as a 502: the
+	// hold and the swap deadline are both derived from the same budget, so the
+	// fixture keeps the swap loading rather than racing the two timers.
 	fake := newFakeMemberController()
-	fake.activateGate = make(chan struct{})
+	fake.noAutoReady = true
 
 	cfg := &Config{
 		Backends: []Backend{{
 			Name:    "coder",
 			Tier:    "local",
 			Address: fb.URL(),
-			// The per-backend timeout bounds the activation hold, so the test
-			// does not wait the 120s proxy default.
+			// Unused by the hold, which is pool.SwapBudget.
 			Timeout: 50 * time.Millisecond,
 			Pool: &BackendPool{
 				Name:       "heavy-slot",
 				Namespace:  "lab",
 				Member:     "coder",
 				Members:    []string{"coder", "judge"},
-				SwapBudget: 100 * time.Millisecond,
+				SwapBudget: 300 * time.Millisecond,
 			},
 		}},
 		DefaultRoute: "coder",
@@ -729,11 +729,6 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	if fb.calls.Load() != 0 {
 		t.Errorf("backend calls = %d, want 0 (must not dispatch when activation never completed)", fb.calls.Load())
 	}
-
-	// Let the blocked activation goroutine unwind. The swap is still in flight
-	// until its budget expires, so this only releases the blocked Activate; it
-	// does not wait for the swap to publish.
-	close(fake.activateGate)
 }
 
 // TestProxyPoolSwapBudgetDecoupledFromDispatchTimeout is the decoupling guard:
