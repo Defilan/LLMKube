@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"syscall"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -83,6 +84,20 @@ func createMemberPod(ctx context.Context, member string) *corev1.Pod {
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 	return pod
+}
+
+// createMemberPodRunning creates a member Pod whose server container is running,
+// so the member has a Pod that could be serving. Without a status the Pod has no
+// running container and counts as not serving.
+func createMemberPodRunning(ctx context.Context, member string) {
+	pod := createMemberPod(ctx, member)
+	pod.Status = corev1.PodStatus{
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name:  "server",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}},
+	}
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
 }
 
 var _ = Describe("ModelPool Controller", func() {
@@ -256,7 +271,7 @@ var _ = Describe("ModelPool Controller", func() {
 		Expect(replicasOfMember(ctx, "judge")).To(Equal(int32(0)))
 	})
 
-	It("fails closed when the incumbent idle check is unreachable", func() {
+	It("fails closed when the incumbent's idleness cannot be established", func() {
 		Expect(k8sClient.Create(ctx, modelPoolMemberFixture("judge", 1))).To(Succeed())
 		Expect(k8sClient.Create(ctx, modelPoolMemberFixture("coder", 0))).To(Succeed())
 		createPool(inferencev1alpha1.ModelPoolSwapPolicySticky, "judge")
@@ -265,7 +280,10 @@ var _ = Describe("ModelPool Controller", func() {
 		setMemberPhase(ctx, "judge", PhaseReady, 1)
 		reconcile()
 
-		idleErr["judge"] = fmt.Errorf("connection refused")
+		// A serving Pod whose probe times out: a refusal is not the only way a
+		// probe fails, and a timeout cannot say whether work is in flight.
+		createMemberPodRunning(ctx, "judge")
+		idleErr["judge"] = fmt.Errorf("dial tcp 10.0.0.7:8080: i/o timeout")
 
 		coder := &inferencev1alpha1.InferenceService{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "coder", Namespace: "default"}, coder)).To(Succeed())
@@ -282,6 +300,38 @@ var _ = Describe("ModelPool Controller", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(inferencev1alpha1.ReasonIdleCheckFailed))
+	})
+
+	It("drains a member that reports Ready but is not serving (#2130)", func() {
+		Expect(k8sClient.Create(ctx, modelPoolMemberFixture("judge", 1))).To(Succeed())
+		Expect(k8sClient.Create(ctx, modelPoolMemberFixture("coder", 0))).To(Succeed())
+		createPool(inferencev1alpha1.ModelPoolSwapPolicySticky, "judge")
+
+		reconcile()
+		setMemberPhase(ctx, "judge", PhaseReady, 1)
+		reconcile()
+
+		// Stale Ready: judge's Pod is terminating and its server refuses the
+		// dial. Nothing can accept work, so the swap must proceed instead of
+		// deferring on an "ambiguous" probe error.
+		judgePod := createMemberPod(ctx, "judge")
+		Expect(k8sClient.Delete(ctx, judgePod)).To(Succeed())
+		idleErr["judge"] = fmt.Errorf("dial tcp 10.0.0.7:8080: %w", syscall.ECONNREFUSED)
+
+		coder := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "coder", Namespace: "default"}, coder)).To(Succeed())
+		coder.Spec.Replicas = ptr.To(int32(1))
+		Expect(k8sClient.Update(ctx, coder)).To(Succeed())
+
+		reconcile()
+
+		Expect(replicasOfMember(ctx, "judge")).To(Equal(int32(0)),
+			"a member that cannot be serving must be drained, not held")
+		pool := &inferencev1alpha1.ModelPool{}
+		Expect(k8sClient.Get(ctx, poolKey, pool)).To(Succeed())
+		cond := findPoolCondition(pool.Status.Conditions, inferencev1alpha1.ConditionModelPoolSwapDeferred)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 	})
 
 	It("never reports two members resident across a fast interleaved swap", func() {

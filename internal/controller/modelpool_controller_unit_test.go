@@ -244,8 +244,13 @@ func TestApplyReclaimOwner(t *testing.T) {
 			return false, errIdleUnsupported
 		}}
 		owner, requeue := r.applyReclaimOwner(context.Background(), pool, members, "coder")
-		if owner != "coder" || pool.Status.ResidentIdleSince != nil || requeue != modelPoolReclaimPoll {
-			t.Fatalf("probe-fail: owner=%q requeue=%v idleSince=%v", owner, requeue, pool.Status.ResidentIdleSince)
+		if owner != "coder" || requeue != modelPoolReclaimPoll {
+			t.Fatalf("probe-fail: owner=%q requeue=%v", owner, requeue)
+		}
+		// The clock is held where it was, not reset: an elapsed window must
+		// survive a poll the resident did not answer.
+		if pool.Status.ResidentIdleSince == nil || !pool.Status.ResidentIdleSince.Time.Equal(longAgo.Time) {
+			t.Fatalf("probe-fail: idleSince=%v want it held at %v", pool.Status.ResidentIdleSince, longAgo.Time)
 		}
 	})
 

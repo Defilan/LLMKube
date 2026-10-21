@@ -235,7 +235,21 @@ that keeps the member busy across polls holds the slot, but a sparse trickle of
 short, sub-poll requests can slip between samples and let the slot reclaim during
 a lull. Size the grace to outlast a genuine quiet period, and expect the guard to
 keep the on-demand model resident only while its traffic keeps at least one poll
-busy.
+busy. A poll the resident does not answer holds the clock where it is rather than
+restarting it, so whether the server happened to be up at poll time does not
+change when the slot is reclaimed.
+
+A member whose server is not answering is also not held resident on the drain
+side. For a non-resident member that reports `Ready`, the idle probe answers
+first, so a busy member is still deferred. The member's Pods are consulted only
+when the connection is refused, because then nothing on its Service path is
+accepting work: no Pod, a Pod that is terminating, or a Pod with no running
+server container cannot be serving, and one running Pod is the Pod the Service
+would have forwarded to. Those are drained. A member that does not report
+`Ready` is not probed at all: it cannot be serving, so it drains as before. A
+probe failure that could still hide in-flight work, a timeout, a non-200
+response, an absent idle endpoint, or a refusal among two or more running Pods,
+still fails closed and defers the swap, as does a member the probe reports busy.
 
 ### Serving on the warm member instead of waiting: `poolActivation: IfIdle`
 

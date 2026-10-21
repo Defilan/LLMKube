@@ -23,7 +23,6 @@ import (
 	"sort"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -68,11 +67,15 @@ const defaultReclaimAfter = 300 * time.Second
 //
 // Drain-before-unload reuses the same /slots idleness contract as the
 // InferenceService rollout drain (#1088): a busy incumbent is never scaled down,
-// and an unreachable idle check fails closed (incumbent stays resident). Unlike
-// a rollout, there is no idleTimeout force branch: the reconciler never
-// force-unloads a resident member on a timer, only when it is genuinely idle.
-// The bound on a waiting request is the router's hold budget (503 +
-// Retry-After), not a controller-side force.
+// and an idle check that cannot establish idleness fails closed (incumbent stays
+// resident). For a member that reports Ready, a refused probe is not ambiguity:
+// it is decided together with the member's Pod state, so a member that is
+// terminating, has no running container, or has a single Pod no longer listening
+// is drained instead of holding the slot. A member that does not report Ready is
+// not probed at all. Unlike a rollout, there is no idleTimeout force branch: the
+// reconciler never force-unloads a resident member on a timer. The bound on a
+// waiting request is the router's hold budget (503 + Retry-After), not a
+// controller-side force.
 type ModelPoolReconciler struct {
 	client.Client
 	Scheme     *runtime.Scheme
@@ -143,11 +146,16 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// event would otherwise surface.
 	owner, reclaimRequeue := r.applyReclaimOwner(ctx, pool, members, owner)
 
-	// Drain every non-owner. A non-owner that is currently serving (Ready) is
-	// the incumbent being displaced: idle-gate it through the shared /slots
-	// contract so an in-flight request finishes before its VRAM is freed. A
-	// busy incumbent, or one whose idleness cannot be established, is NEVER
-	// scaled down (fail-closed, no force-unload); the swap simply defers.
+	// Drain every non-owner. A non-owner that reports Ready could still be
+	// serving, so it is the incumbent being displaced: idle-gate it through
+	// memberIdleVerdict, which asks the shared /slots probe first and reads the
+	// member's Pods only when the probe is refused, so an in-flight request
+	// finishes before its VRAM is freed. A member that does not report Ready is
+	// not serving at all (llama.cpp answers 503 on every path while it loads,
+	// and a terminated one has no listener), so probing it could only establish
+	// nothing and would hold the incumbent. A busy incumbent, or one whose
+	// idleness cannot be established, is NEVER scaled down (fail-closed, no
+	// force-unload); the swap simply defers.
 	//
 	// othersClear tracks whether every non-owner has fully released the GPU. It
 	// gates on the incumbent's Pods being *gone*, not merely on the Stopped
@@ -167,18 +175,25 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if !ok {
 			continue
 		}
+		// One Pod list answers both questions below: a Terminating Pod counts as
+		// present for othersClear (its allocation is not released yet) and is
+		// not serving for the verdict.
+		pods, perr := r.memberPods(ctx, isvc)
+		if perr != nil {
+			return ctrl.Result{}, perr
+		}
 		if memberReady(isvc) {
-			idle, ierr := r.memberIdle(ctx, isvc)
-			if ierr != nil {
-				// Fail closed: keep the incumbent resident.
-				log.Info("member idle check failed; deferring swap", "member", name, "error", ierr)
-				deferReason = inferencev1alpha1.ReasonIdleCheckFailed
-				othersClear = false
-				continue
-			}
-			if !idle {
+			switch r.memberIdleVerdict(ctx, isvc, pods) {
+			case idleVerdictIdle:
+			case idleVerdictBusy:
 				// Busy: let the in-flight request finish; do not unload.
 				deferReason = inferencev1alpha1.ReasonPodsBusy
+				othersClear = false
+				continue
+			default:
+				// Fail closed: keep the incumbent resident.
+				log.Info("member idleness unestablished; deferring swap", "member", name)
+				deferReason = inferencev1alpha1.ReasonIdleCheckFailed
 				othersClear = false
 				continue
 			}
@@ -186,11 +201,7 @@ func (r *ModelPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.ensureReplicas(ctx, isvc, 0); err != nil {
 			return ctrl.Result{}, err
 		}
-		gone, perr := r.memberPodsGone(ctx, isvc)
-		if perr != nil {
-			return ctrl.Result{}, perr
-		}
-		if !gone {
+		if len(pods) > 0 {
 			// Incumbent scaled to zero but its Pods (and the GPU/unified-memory
 			// allocation) are not yet released; the owner must wait so the two
 			// never co-reside.
@@ -353,9 +364,10 @@ func resolveSlotOwner(pool *inferencev1alpha1.ModelPool, members map[string]*inf
 // returns the slot to the background model. It returns the (possibly overridden)
 // owner and a requeue interval that keeps the reconciler polling idle state
 // while a non-default member is resident (no watch fires on a busy->idle
-// transition). Idle-probe failure is fail-closed: the clock resets and the slot
-// is not reclaimed. The idle clock lives in status.ResidentIdleSince, which
-// updateStatus persists untouched; it self-clears once the default is resident.
+// transition). Idle-probe failure is fail-closed: the clock holds its value and
+// the slot is not reclaimed on that poll. The idle clock lives in
+// status.ResidentIdleSince, which updateStatus persists untouched; it
+// self-clears once the default is resident.
 func (r *ModelPoolReconciler) applyReclaimOwner(
 	ctx context.Context,
 	pool *inferencev1alpha1.ModelPool,
@@ -392,10 +404,11 @@ func (r *ModelPoolReconciler) applyReclaimOwner(
 
 	idle, err := r.memberIdle(ctx, residentISVC)
 	if err != nil {
-		// Fail closed: an unestablished idle state never reclaims. Reset the
-		// clock and poll again shortly.
-		log.Info("reclaim idle check failed; resetting idle clock", "member", resident, "error", err)
-		pool.Status.ResidentIdleSince = nil
+		// Fail closed: an unestablished idle state never reclaims. The clock is
+		// held rather than reset because this returns before the elapsed check,
+		// so a reclaim still only fires on a reconcile whose probe answered
+		// idle, and the drain that follows probes again before unloading.
+		log.Info("reclaim idle check failed; holding idle clock", "member", resident, "error", err)
 		return owner, modelPoolReclaimPoll
 	}
 	if !idle {
@@ -779,26 +792,4 @@ func replicasOf(isvc *inferencev1alpha1.InferenceService) int32 {
 // memberReady reports whether a member InferenceService is serving.
 func memberReady(isvc *inferencev1alpha1.InferenceService) bool {
 	return isvc != nil && isvc.Status.Phase == PhaseReady
-}
-
-// memberPodsGone reports whether a member InferenceService has no Pods left, so
-// its GPU / unified-memory allocation is fully released and another member may
-// safely load. It lists Pods by the same labels the InferenceService reconciler
-// applies and returns true only when none remain (a Terminating Pod still holds
-// the allocation, so it counts as present). This gates on real Pod termination
-// rather than the Stopped phase, which flips as soon as desiredReplicas and
-// readyReplicas both reach zero, i.e. while the old Pod is still terminating.
-func (r *ModelPoolReconciler) memberPodsGone(ctx context.Context, isvc *inferencev1alpha1.InferenceService) (bool, error) {
-	if isvc == nil {
-		return true, nil
-	}
-	podList := &corev1.PodList{}
-	labels := client.MatchingLabels{
-		"app":                           isvc.Name,
-		"inference.llmkube.dev/service": isvc.Name,
-	}
-	if err := r.List(ctx, podList, client.InNamespace(isvc.Namespace), labels); err != nil {
-		return false, err
-	}
-	return len(podList.Items) == 0, nil
 }
