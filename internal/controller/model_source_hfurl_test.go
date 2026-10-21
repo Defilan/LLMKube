@@ -78,6 +78,11 @@ func TestHFServeArg(t *testing.T) {
 		{"https://huggingface.co/Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.6-35B-A3B"},
 		{"https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/abc123", "Qwen/Qwen3.6-35B-A3B@abc123"},
 		{"https://HuggingFace.co/Qwen/Qwen3.6-35B-A3B?library=vllm", "Qwen/Qwen3.6-35B-A3B"},
+		// huggingface_hub's validate_repo_id rejects a repo id with more than
+		// one "/", so the trailing-slash spelling must reach the engine bare.
+		{"hf://Qwen/Qwen-Image-2.1/", "Qwen/Qwen-Image-2.1"},
+		{"Qwen/Qwen-Image-2.1/", "Qwen/Qwen-Image-2.1"},
+		{"hf://Qwen/Qwen-Image-2.1/@main", "Qwen/Qwen-Image-2.1@main"},
 		{"s3://bucket/model.gguf", "s3://bucket/model.gguf"}, // non-HF passthrough
 	}
 	for _, tc := range cases {

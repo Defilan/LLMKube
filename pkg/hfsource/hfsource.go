@@ -252,6 +252,13 @@ func ExtractHFRepoFromURL(source string) (repoID, revision string, ok bool) {
 // Accepts "hf://org/repo@rev", "org/repo@rev", and
 // "https://huggingface.co/org/repo[/tree/rev|...]" forms.
 // Returns (repoID, revision, error) where revision is "" if not specified.
+//
+// Every returned repo ID is canonical: exactly the non-empty path segments the
+// source names, so a trailing or doubled separator ("hf://org/repo/",
+// "org//repo") parses to the same repo as the plain spelling. Every URL built
+// from the parse is then single-slash, which is the form huggingface.co and
+// huggingface_hub both accept. The scheme prefix matches case-insensitively,
+// like every other classifier on source.
 func ParseHFSource(source string) (repoID, revision string, err error) {
 	if IsHuggingFaceURL(source) {
 		repoID, revision, ok := ExtractHFRepoFromURL(source)
@@ -266,42 +273,151 @@ func ParseHFSource(source string) (repoID, revision string, err error) {
 		}
 		return repoID, revision, nil
 	}
-	normalized := strings.TrimPrefix(source, "hf://")
+	normalized := source
+	if HasSchemeFold(source, "hf://") {
+		normalized = source[len("hf://"):]
+	}
 	if normalized == "" {
 		return "", "", fmt.Errorf("empty hf repo source: %s", source)
 	}
 
 	// Split on @ to extract revision
 	atIdx := strings.Index(normalized, "@")
+	revisionPart := ""
 	if atIdx >= 0 {
-		repoID = normalized[:atIdx]
-		revision = normalized[atIdx+1:]
+		revisionPart = normalized[atIdx+1:]
+		repoID = canonicalRepoID(normalized[:atIdx])
 		if repoID == "" {
 			return "", "", fmt.Errorf("empty repo ID in hf source: %s", source)
 		}
-		if revision == "" {
+		if revisionPart == "" {
 			return "", "", fmt.Errorf("empty revision in hf source: %s", source)
 		}
 		// Reject whitespace in revision (common user error)
-		if strings.ContainsAny(revision, " \t\n\r") {
+		if strings.ContainsAny(revisionPart, " \t\n\r") {
 			return "", "", fmt.Errorf("hf revision must not contain whitespace: %s", source)
+		}
+		revision = strings.TrimRight(revisionPart, "/")
+		if revision == "" {
+			return "", "", fmt.Errorf("empty revision in hf source: %s", source)
 		}
 		return repoID, revision, nil
 	}
 
 	// No @rev specified
-	repoID = normalized
+	repoID = canonicalRepoID(normalized)
 	if repoID == "" {
 		return "", "", fmt.Errorf("empty repo ID in hf source: %s", source)
 	}
 	return repoID, "", nil
 }
 
+// canonicalRepoID joins the non-empty "/"-separated segments of a repo ID, so
+// a leading, trailing or doubled separator collapses to the plain form.
+func canonicalRepoID(repoID string) string {
+	segments := strings.Split(repoID, "/")
+	kept := segments[:0]
+	for _, s := range segments {
+		if s != "" {
+			kept = append(kept, s)
+		}
+	}
+	return strings.Join(kept, "/")
+}
+
+// CanonicalSource returns the spelling of source that identifies the model it
+// names, and is what the cache key is derived from, so the spellings of one
+// repository that differ only in separators or scheme case share one cache
+// directory. An hf:// source is rebuilt as hf://<repo>[@rev] and a bare
+// org/repo source as <repo>[@rev], each from the parsed repo ID and revision;
+// parse errors return source unchanged, as validation reports them.
+//
+// The two forms stay distinct on purpose. Every spelling that already worked
+// (hf://org/repo, org/repo, either with a clean @rev) canonicalizes to itself,
+// so its key and its cached files are unchanged by an upgrade; folding the
+// bare form into hf:// would move every bare-form multi-file Model to a new
+// directory and re-stage it for no gain.
+//
+// Every other source passes through untouched: an https:// repo base that ends
+// in "/" already owns a download on disk, and the runtime resolves URL forms
+// itself, so rewriting them would orphan cached weights.
+func CanonicalSource(source string) string {
+	if HasSchemeFold(source, "hf://") {
+		repoID, revision, err := ParseHFSource(source)
+		if err != nil {
+			return source
+		}
+		return "hf://" + repoSourceString(repoID, revision)
+	}
+	if repoID, revision, ok := splitBareRepoID(source); ok {
+		return repoSourceString(repoID, revision)
+	}
+	return source
+}
+
+// repoSourceString renders <repo>[@rev], the part of a canonical repo source
+// after any scheme.
+func repoSourceString(repoID, revision string) string {
+	if revision != "" {
+		return repoID + "@" + revision
+	}
+	return repoID
+}
+
+// splitBareRepoID parses the bare "org/repo[@rev]" form that isHFRepoSource
+// classifies as a repo. It is deliberately narrow: any other string is not a
+// repository reference and must not be rewritten.
+func splitBareRepoID(source string) (repoID, revision string, ok bool) {
+	if source == "" || strings.Contains(source, "://") || strings.HasPrefix(source, "/") {
+		return "", "", false
+	}
+	repoPart, revisionPart := source, ""
+	if atIdx := strings.Index(source, "@"); atIdx >= 0 {
+		repoPart, revisionPart = source[:atIdx], source[atIdx+1:]
+		if revisionPart != "" && strings.ContainsAny(revisionPart, " \t\n\r") {
+			return "", "", false
+		}
+		// Same rule as ParseHFSource, so the bare form and hf:// agree.
+		revisionPart = strings.TrimRight(revisionPart, "/")
+	}
+	// Count the non-empty segments, so a trailing slash is the same bare form.
+	canonical := canonicalRepoID(repoPart)
+	if canonical == "" || strings.Count(canonical, "/") != 1 {
+		return "", "", false
+	}
+	for _, s := range strings.Split(canonical, "/") {
+		if !isRepoIDSegment(s) {
+			return "", "", false
+		}
+	}
+	return canonical, revisionPart, true
+}
+
+// isRepoIDSegment reports whether s is one path segment of a Hub repo ID: at
+// least one character, containing only the ASCII set huggingface_hub allows,
+// and starting with an alphanumeric.
+func isRepoIDSegment(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case i > 0 && (c == '-' || c == '_' || c == '.'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // NormalizeHFSource converts an HF source to its full HTTPS resolve URL.
 // For hf://org/repo@rev, returns "https://huggingface.co/org/repo/resolve/rev/".
 // For hf://org/repo (no rev), returns "https://huggingface.co/org/repo/resolve/main/".
 // For https://huggingface.co/org/repo[/tree/rev|...], returns the equivalent
-// resolve URL. Non-hf sources pass through unchanged.
+// resolve URL, built from the canonical repo ID. Non-hf sources pass through
+// unchanged.
 func NormalizeHFSource(source string) string {
 	if IsHuggingFaceURL(source) {
 		repoID, revision, err := ParseHFSource(source)

@@ -17,11 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
+	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -472,4 +476,104 @@ func TestMergeStorageConfigs(t *testing.T) {
 			t.Errorf("target was appended to in place")
 		}
 	})
+}
+
+// A glob in spec.files whose expansion the Model has not recorded for its
+// current generation is not a bad file list: the pod was built before the
+// controller expanded it, or the listing failed. The pod must say so and name
+// the Model, because the cause lives in the Model's status. A file set that is
+// genuinely invalid keeps the InvalidFileSet message, which does point at
+// spec.files.
+func TestModelStorageConfig_StagedFilesNotCurrent(t *testing.T) {
+	stale := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen-image", Namespace: "default", Generation: 2},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source: "hf://Qwen/Qwen-Image-2.1/",
+			Files:  []string{"model_index.json", "*/*.safetensors"},
+		},
+		// An expansion written for generation 1 does not cover generation 2.
+		Status: inferencev1alpha1.ModelStatus{
+			StagedFiles: []string{"model_index.json"},
+			Conditions: []metav1.Condition{{
+				Type:               ConditionAvailable,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: 1,
+			}},
+		},
+	}
+	plan, err := modelStagingPlan(stale)
+	if !errors.Is(err, errStagedFilesNotCurrent) {
+		t.Fatalf("modelStagingPlan error = %v, want errStagedFilesNotCurrent", err)
+	}
+	if plan != nil {
+		t.Fatalf("modelStagingPlan returned a plan alongside its error: %+v", plan)
+	}
+
+	for _, useCache := range []bool{true, false} {
+		cfg := buildModelStorageConfig(stale, nil, "default", useCache, "", "", "curl:8.18.0", 0, nil, "")
+		if len(cfg.initContainers) != 1 {
+			t.Fatalf("useCache=%v: got %d init containers, want the single fail-closed one", useCache, len(cfg.initContainers))
+		}
+		c := cfg.initContainers[0]
+		cmd := strings.Join(c.Command, " ")
+		if c.Name != "model-downloader" {
+			t.Errorf("useCache=%v: init container name = %q, want model-downloader so the transfer diagnosis sees it", useCache, c.Name)
+		}
+		if !strings.Contains(cmd, "StagedFilesNotCurrent") || strings.Contains(cmd, "InvalidFileSet") {
+			t.Errorf("useCache=%v: command = %q; want the StagedFilesNotCurrent message and not InvalidFileSet", useCache, cmd)
+		}
+		if got := modelNameEnv(c); got != stale.Name {
+			t.Errorf("useCache=%v: MODEL_NAME = %q, want %q", useCache, got, stale.Name)
+		}
+	}
+
+	// The same Model with a genuinely invalid file set keeps the generic text.
+	bad := stale.DeepCopy()
+	bad.Name = "bad"
+	bad.Spec.Files = []string{"../../etc/passwd"}
+	bad.Status.StagedFiles = nil
+	for _, useCache := range []bool{true, false} {
+		cfg := buildModelStorageConfig(bad, nil, "default", useCache, "", "", "curl:8.18.0", 0, nil, "")
+		cmd := strings.Join(cfg.initContainers[0].Command, " ")
+		if !strings.Contains(cmd, "InvalidFileSet") || strings.Contains(cmd, "StagedFilesNotCurrent") {
+			t.Errorf("useCache=%v: command = %q; a directory escape must keep the InvalidFileSet message", useCache, cmd)
+		}
+	}
+
+	// A Model name carrying shell metacharacters must never reach the script
+	// as shell syntax: it is passed through MODEL_NAME and printf, so the
+	// rendered line is the message with the name printed literally.
+	hostile := stale.DeepCopy()
+	hostile.Name = "x'; rm -rf / #"
+	cfg := buildModelStorageConfig(hostile, nil, "default", true, "", "", "curl:8.18.0", 0, nil, "")
+	hc := cfg.initContainers[0]
+	script := hc.Command[2]
+	if strings.Contains(script, hostile.Name) {
+		t.Errorf("script contains the Model name verbatim: %q", script)
+	}
+	if got := modelNameEnv(hc); got != hostile.Name {
+		t.Errorf("MODEL_NAME = %q, want %q", got, hostile.Name)
+	}
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(cmd.Environ(), "MODEL_NAME="+hostile.Name)
+	out, runErr := cmd.CombinedOutput()
+	if runErr == nil {
+		t.Error("the fail-closed command exited 0; it must fail the pod")
+	}
+	got := strings.TrimSpace(string(out))
+	want := "ERROR: StagedFilesNotCurrent - Model " + hostile.Name +
+		" has no spec.files glob expansion recorded for its current generation. The controller expands globs from the source repository listing; run kubectl describe model " + hostile.Name + " to see the cause."
+	if got != want {
+		t.Errorf("message = %q, want %q", got, want)
+	}
+}
+
+// modelNameEnv returns the MODEL_NAME env value the fail-closed container sets.
+func modelNameEnv(c corev1.Container) string {
+	for _, e := range c.Env {
+		if e.Name == "MODEL_NAME" {
+			return e.Value
+		}
+	}
+	return ""
 }

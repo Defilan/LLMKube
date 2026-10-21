@@ -78,6 +78,12 @@ func TestMatchModelTransferFailure_Signatures(t *testing.T) {
 			wantReason: ReasonModelSourceNotFound,
 		},
 		{
+			name: "pod built before the Model recorded its glob expansion",
+			msg: "ERROR: StagedFilesNotCurrent - Model qwen has no spec.files glob expansion recorded for its current generation. " +
+				"The controller expands globs from the source repository listing; run kubectl describe model qwen to see the cause.",
+			wantReason: ReasonStagedFilesNotCurrent,
+		},
+		{
 			name:       "pre-staged pvc artifact fails its digest",
 			msg:        "ERROR: SHA256 mismatch for the pre-staged /model-source/model.gguf: expected d9ba44419f2a73ed1a666885066c65a235ab70f337e2b31cbb3d062a5f5b8d4b, computed 0000000000000000000000000000000000000000000000000000000000000000",
 			wantReason: ReasonModelPVCDigestMismatch,
@@ -152,6 +158,9 @@ func TestMatchModelTransferFailure_UnknownIsNotDiagnosed(t *testing.T) {
 		"",
 		"Model downloaded successfully",
 		"curl: (18) transfer closed with outstanding read data remaining",
+		// The generic file-set message must stay unlabelled: it also covers a
+		// genuinely invalid spec.files, which the Model's own condition names.
+		`ERROR: InvalidFileSet - model spec.files/spec.mmproj configuration is invalid. Check file paths, directory escapes, and glob patterns.`,
 	} {
 		if reason, _, ok := matchModelTransferFailure(msg); ok {
 			t.Errorf("msg %q was diagnosed as %q; unknown failures must not be labelled", msg, reason)

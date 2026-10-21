@@ -83,6 +83,12 @@ const (
 	// ephemeral storage, or an emptyDir sizeLimit smaller than the model.
 	ReasonModelTransferOutOfSpace = "ModelTransferOutOfSpace"
 
+	// ReasonStagedFilesNotCurrent: a pod was built before the Model controller
+	// recorded the glob expansion in status.stagedFiles, so the downloader
+	// refused to stage a pattern it cannot expand. The cause is the Model's
+	// status, not spec.files.
+	ReasonStagedFilesNotCurrent = "StagedFilesNotCurrent"
+
 	// ReasonModelTransferSucceeded is set when ModelTransferHealthy flips back
 	// to True: a pod has since got past its init containers.
 	ReasonModelTransferSucceeded = "ModelTransferSucceeded"
@@ -101,6 +107,15 @@ type modelTransferSignature struct {
 // cannot be tied to a real message does not belong here, because a confident
 // wrong label is worse than the bare exit code the user already has.
 var modelTransferSignatures = []modelTransferSignature{
+	{
+		// A pod built before the Model recorded its glob expansion. The token
+		// is unique to that message and lowercase, so it cannot shadow the
+		// digest or curl entries below.
+		reason: ReasonStagedFilesNotCurrent,
+		remedy: "the Model has not recorded its spec.files glob expansion for the pod's generation; " +
+			"check the Model's status (a failed repository listing is the usual cause), and once it is Ready the pod is rebuilt",
+		matches: []string{"stagedfilesnotcurrent"},
+	},
 	{
 		// A multi-file staging failure. Every per-file failure prints
 		// "spec.fileSha256 mismatch", so this must be matched before the

@@ -31,6 +31,9 @@ func TestStagingRepoBase(t *testing.T) {
 		{"endpoint with trailing slash", "nvidia/GLM-5.3-Flash-NVFP4", repoBaseMirror + "/", repoBaseMirror + "/nvidia/GLM-5.3-Flash-NVFP4/resolve/main/"},
 		{"hf scheme with revision via the mirror", "hf://org/repo@abc123", repoBaseMirror, repoBaseMirror + "/org/repo/resolve/abc123/"},
 		{"hf scheme without a mirror", "hf://org/repo", "", "https://huggingface.co/org/repo/resolve/main/"},
+		{"hf scheme with a trailing slash", "hf://org/repo/", "", "https://huggingface.co/org/repo/resolve/main/"},
+		{"hf scheme with a trailing slash via the mirror", "hf://org/repo/", repoBaseMirror, repoBaseMirror + "/org/repo/resolve/main/"},
+		{"bare repo id with a trailing slash", "org/repo/", "", "https://huggingface.co/org/repo/resolve/main/"},
 		{"huggingface.co repo URL via the mirror", "https://huggingface.co/org/repo/resolve/main/", repoBaseMirror, repoBaseMirror + "/org/repo/resolve/main/"},
 		{"mirror repo base is already a URL", repoBaseMirror + "/org/repo/resolve/main/", repoBaseMirror, repoBaseMirror + "/org/repo/resolve/main/"},
 		{"s3 is not a repo", "s3://bucket/prefix", repoBaseMirror, "s3://bucket/prefix"},
@@ -216,6 +219,65 @@ func TestReconcile_GlobWithPrefetchReachesReady(t *testing.T) {
 			want := "config.json generation_config.json tokenizer.json tokenizer_config.json vocab.json model.safetensors"
 			if got := strings.Join(stored.Status.StagedFiles, " "); stored.Status.Phase != PhaseReady || got != want {
 				t.Errorf("phase = %q, stagedFiles = %q; want Ready and %q (conditions=%+v)", stored.Status.Phase, got, want, stored.Status.Conditions)
+			}
+		})
+	}
+}
+
+// A source copied from the Hub with a trailing slash is the same repository as
+// the plain spelling, so the glob expands from the plain listing path and the
+// Model reaches Ready. The handler answers 404 for anything but the exact
+// single-slash path, as huggingface.co does: a doubled slash after the repo id
+// 404s both the tree API and the resolve path, so a doubled path here surfaces
+// as a Failed Model rather than a passing test.
+func TestReconcile_TrailingSlashRepoSource(t *testing.T) {
+	body, err := os.ReadFile("testdata/hflisting/artifactory-tree-qwen.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantPath = "/artifactory/api/huggingfaceml/hf-remote/api/models/Qwen/Qwen2.5-0.5B-Instruct/tree/main"
+	var gotPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPaths = append(gotPaths, r.URL.EscapedPath())
+		if r.URL.EscapedPath() != wantPath {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+	endpoint := srv.URL + "/artifactory/api/huggingfaceml/hf-remote"
+
+	for _, source := range []string{"hf://Qwen/Qwen2.5-0.5B-Instruct/", "Qwen/Qwen2.5-0.5B-Instruct/"} {
+		t.Run(source, func(t *testing.T) {
+			gotPaths = nil
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "default", Generation: 1},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:          source,
+					Format:          "safetensors",
+					SourceSecretRef: &corev1.LocalObjectReference{Name: "huggingface"},
+					Files:           []string{"config.json", "*.json", "*.safetensors"},
+				},
+			}
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
+				Data:       map[string][]byte{"HF_ENDPOINT": []byte(endpoint)},
+			}
+			r := newMultiFileGateReconciler(t, model, secret)
+			r.AllowedRemoteHosts = []string{"127.0.0.1"}
+			if _, err := r.reconcileRuntimeResolvedSource(context.Background(), model, ""); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			stored := getModel(t, r, "qwen")
+			want := "config.json generation_config.json tokenizer.json tokenizer_config.json vocab.json model.safetensors"
+			got := strings.Join(stored.Status.StagedFiles, " ")
+			if stored.Status.Phase != PhaseReady || got != want {
+				t.Errorf("phase = %q, stagedFiles = %q; want Ready and %q (conditions=%+v, requested paths=%v)",
+					stored.Status.Phase, got, want, stored.Status.Conditions, gotPaths)
+			}
+			if !containsString(gotPaths, wantPath) {
+				t.Errorf("listing requested %v; want the canonical path %q", gotPaths, wantPath)
 			}
 		})
 	}

@@ -325,6 +325,12 @@ or a `huggingface.co` repo URL) is staged from `HF_ENDPOINT` when the
 base, `<HF_ENDPOINT>/<org>/<repo>/resolve/<revision>/`, also works as the
 source; any other plain `https://` base is rejected for `spec.files`.
 
+A repo source copied from the Hub with a trailing slash (`hf://org/repo/`,
+`org/repo/`) is the same repository as the plain spelling: it lists, stages
+and serves identically, and it shares one cache directory with it. The
+`hf://org/repo` and bare `org/repo` forms keep separate cache directories, as
+before, so no existing Model changes directory on upgrade.
+
 Globs in `spec.files` are expanded against the repository's file listing,
 which the Model controller reads from the Hub API of the same host the files
 are downloaded from. Other sources need explicit paths.
@@ -336,6 +342,9 @@ are downloaded from. Other sources need explicit paths.
   `sub/x.safetensors`; write `sub/*.safetensors`).
 - A failed listing fails the Model with reason `RepoListingFailed` and the
   cause, and is retried every minute.
+- A serving pod built before the expansion is recorded for its generation
+  exits with `StagedFilesNotCurrent`, naming the Model whose status holds the
+  cause, rather than blaming `spec.files`.
 - A glob turns off `spec.prefetch`: the expansion is written when the Model
   reconciles, after prefetch would run, so the files stage when the serving
   pod starts instead.
