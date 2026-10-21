@@ -19,7 +19,7 @@
 #   GATE_DIR          log directory (default ${TMPDIR:-/tmp}/llmkube-gate)
 #   GATE_ROOT         repo root (default: the checkout this script lives in)
 #   GINKGO_SEED       ginkgo seed for the test step (default 4242)
-#   LINT_GOTOOLCHAIN  GOTOOLCHAIN for the lint step only, e.g. go1.26.9
+#   LINT_GOTOOLCHAIN  GOTOOLCHAIN for the lint step only, e.g. go1.26.10
 #                     (empty: use the default toolchain)
 #   ENVTEST_BIN, BIN_DIR, ENVTEST_K8S_VERSION
 #                     setup-envtest binary, local bin dir and k8s version;
