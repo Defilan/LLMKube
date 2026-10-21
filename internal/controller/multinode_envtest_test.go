@@ -176,6 +176,9 @@ var _ = Describe("multiNode group reconcile", func() {
 			_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: ns}})
 			Eventually(memberPods).Should(BeEmpty())
 			Eventually(func() bool {
+				return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: ns}, &corev1.Service{}))
+			}).Should(BeTrue(), "an orphaned Service would hold the name for the next spec")
+			Eventually(func() bool {
 				var got inferencev1alpha1.InferenceService
 				return apierrors.IsNotFound(k8sClient.Get(ctx, key, &got))
 			}).Should(BeTrue())

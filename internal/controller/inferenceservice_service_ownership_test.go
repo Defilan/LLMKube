@@ -586,9 +586,13 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 
 			got := &inferencev1alpha1.InferenceService{}
 			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			Expect(got.Status.Phase).NotTo(Equal(PhaseFailed),
+				"base wrote PhaseFailed here (inferenceservice_controller.go:1258); a Service this service created is not a failure")
+			degraded := meta.FindStatusCondition(got.Status.Conditions, ConditionDegraded)
+			if degraded != nil {
+				Expect(degraded.Message).NotTo(ContainSubstring("Failed to create Service"))
+			}
 			Expect(got.Status.SchedulingStatus).NotTo(Equal(serviceNameTaken))
-			Expect(got.Status.SchedulingMessage).NotTo(ContainSubstring("Failed to create Service"),
-				"a Service this service created is not a refusal")
 		})
 
 		It("routes a create-time name race into the refusal", func() {

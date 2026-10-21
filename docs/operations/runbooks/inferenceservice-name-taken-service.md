@@ -73,7 +73,7 @@ the workload:
    kubectl get service <name> -n <namespace> -o jsonpath='{.spec.selector}{"\n"}{.spec.ports}{"\n"}'
    ```
 
-   Four cases:
+   Cases:
 
    - **No owner references at all, and no `llmkube.ai/managed-by` label**:
      something other than LLMKube created a Service with this name (a
@@ -87,10 +87,20 @@ the workload:
      referenced service still exists: `kubectl get inferenceservice <name>
      -o jsonpath='{.metadata.uid}'`. If it does not, wait for garbage
      collection.
+   - **A controller reference to a Kind other than `InferenceService`** (or to
+     an `InferenceService` in another API group): another operator owns the
+     name. The message is the generic one, because the operator only attributes
+     a refusal to another InferenceService when the reference is one. Rename
+     whichever object has the weaker claim.
    - **`llmkube.ai/managed-by: metal-agent` and no controller reference**: this
      is the operator's own agent's Service, and it is *not* a refusal. The
-     controller adopts it. If you are reading this case in an event, the agent
-     label is missing or spelled differently.
+     controller adopts it. Seeing this event for such a Service means the label
+     is missing or spelled differently; the label is only honoured on a Service
+     that no other controller owns.
+   - **`llmkube.ai/managed-by: metal-agent` *and* another controller's
+     reference**: still refused, with the generic message. Another controller
+     owns the name, and the label does not override that. This is what a
+     hand-applied or copied label looks like.
    - **A controller reference to this service's UID**: the refusal is stale and
      clears on the next reconcile.
 
