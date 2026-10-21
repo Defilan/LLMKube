@@ -18,11 +18,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -58,10 +61,22 @@ func NewDeleteCommand() *cobra.Command {
 	return cmd
 }
 
+// Test seams so runDelete can be driven against a fake client and clientset.
+var (
+	deleteKubeConfig = config.GetConfig
+	deleteClientset  = func(cfg *rest.Config) (kubernetes.Interface, error) { return kubernetes.NewForConfig(cfg) }
+	newDeleteClient  = func(cfg *rest.Config) (deleteCRClient, error) {
+		return client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	}
+)
+
+// deleteCRClient is the subset of the controller-runtime client delete uses.
+type deleteCRClient = client.Client
+
 func runDelete(opts *deleteOptions) error {
 	ctx := context.Background()
 
-	cfg, err := config.GetConfig()
+	cfg, err := deleteKubeConfig()
 	if err != nil {
 		return fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
@@ -70,9 +85,25 @@ func runDelete(opts *deleteOptions) error {
 		return fmt.Errorf("failed to add scheme: %w", err)
 	}
 
-	k8sClient, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	k8sClient, err := newDeleteClient(cfg)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
+	}
+
+	var cacheKey string
+	var cacheTargets []purgeTarget
+	var cacheSvcs []inferencev1alpha1.InferenceService
+	var cacheResolveErr error
+	if opts.purgeCache {
+		// Resolve the key and the claims before deleting: in perService mode
+		// the claim is owner-ref'd to the InferenceService and is collected
+		// with it.
+		purgeModel := &inferencev1alpha1.Model{}
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, purgeModel); err != nil {
+			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
+		} else if cacheKey = cachekey.EffectiveKey(purgeModel); cacheKey != "" {
+			cacheTargets, cacheSvcs, cacheResolveErr = resolvePurgeTargets(ctx, k8sClient, opts.namespace)
+		}
 	}
 
 	fmt.Printf("Deleting InferenceService '%s' in namespace '%s'...\n", opts.name, opts.namespace)
@@ -96,33 +127,87 @@ func runDelete(opts *deleteOptions) error {
 		},
 	}
 
-	// If --purge-cache is set, get the cache key before deleting the model
-	var cacheKey string
-	if opts.purgeCache {
-		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.name, Namespace: opts.namespace}, model); err != nil {
-			fmt.Printf("Warning: failed to get Model for cache purge: %v\n", err)
-		} else {
-			cacheKey = cachekey.EffectiveKey(model)
-		}
-	}
-
 	if err := k8sClient.Delete(ctx, model); err != nil {
 		fmt.Printf("Warning: failed to delete Model: %v\n", err)
 	} else {
 		fmt.Printf("✓ Model '%s' deleted\n", opts.name)
 	}
 
-	if opts.purgeCache {
-		if cacheKey != "" {
-			fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
-			fmt.Printf("To purge the cache, run:\n")
-			fmt.Printf("  kubectl exec -n llmkube-system deploy/llmkube-controller-manager -- \\\n")
-			fmt.Printf("    rm -rf /models/%s\n", cacheKey)
-		} else {
-			fmt.Printf("⚠️  Model has no cache key; nothing to purge\n")
+	if opts.purgeCache && cacheKey == "" {
+		fmt.Printf("⚠️  Model has no cache key; nothing to purge\n")
+	}
+
+	// The InferenceService stays mounted on its claim until it is gone, so its
+	// deletion (issued above) is what frees a strict RWO claim for the purge.
+	if opts.purgeCache && cacheKey != "" {
+		if cacheResolveErr != nil {
+			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
+				"run 'llmkube cache clear -n %s' to clear what remains", cacheResolveErr, opts.namespace)
+		}
+		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name)
+		var owned, purged []purgeTarget
+		for _, target := range targets {
+			// The operator garbage-collects a claim owner-ref'd to the service
+			// just deleted, and a pod mounting a terminating claim never
+			// schedules.
+			if target.InferenceService == opts.name {
+				owned = append(owned, target)
+				continue
+			}
+			purged = append(purged, target)
+		}
+		for _, target := range owned {
+			fmt.Printf("Cache PVC '%s' is removed with InferenceService '%s'; not purging it separately\n",
+				target.Name, opts.name)
+		}
+		if len(purged) == 0 {
+			if len(owned) == 0 {
+				fmt.Printf("⚠️  No model cache PVC found in namespace '%s'; nothing to purge\n", opts.namespace)
+			}
+			fmt.Printf("\n✓ Deployment '%s' deleted successfully\n", opts.name)
+			return nil
+		}
+		clientset, err := deleteClientset(cfg)
+		if err != nil {
+			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
+		}
+		fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
+		if err := purgeDeleteTargets(ctx, cfg, clientset, opts.namespace, cacheKey, purged); err != nil {
+			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
+				"run 'llmkube cache clear -n %s' to clear what remains", err, opts.namespace)
 		}
 	}
 
 	fmt.Printf("\n✓ Deployment '%s' deleted successfully\n", opts.name)
+	return nil
+}
+
+// purgeDeleteTargets removes cacheKey from every resolved claim, purging each
+// claim on its own so one failure is reported with the claim it belongs to.
+func purgeDeleteTargets(
+	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	namespace, cacheKey string, targets []purgeTarget,
+) error {
+	if len(targets) == 0 {
+		return fmt.Errorf("no model cache PVC found")
+	}
+
+	var errs []error
+	var outcomes []purgeOutcome
+	for _, target := range targets {
+		outcome, err := purgeCacheKeys(ctx, cfg, clientset, namespace, target.Name, []string{cacheKey})
+		if err != nil {
+			errs = append(errs, fmt.Errorf("cache PVC %s: %w", target.Name, err))
+			continue
+		}
+		outcomes = append(outcomes, outcome)
+	}
+	reportPurgeOutcomes(outcomes)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	if keysAbsentEverywhere([]string{cacheKey}, outcomes) {
+		fmt.Printf("%s is not on any cache claim in namespace '%s'.\n", cacheKey, namespace)
+	}
 	return nil
 }

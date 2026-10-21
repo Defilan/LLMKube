@@ -524,12 +524,47 @@ Total: 2 cache entries, 2 models
 # Clear cache for a specific model
 llmkube cache clear --model llama-2-7b
 
+# Remove every entry that no Model references
+llmkube cache clear --orphaned
+
 # Clear all cache (with confirmation)
 llmkube cache clear
 
 # Force clear without confirmation
 llmkube cache clear --force
 ```
+
+Entries are removed by a short-lived `busybox` pod that mounts the cache claim
+read-write, one pod per claim, deleted as soon as it is done.
+
+`cache clear` with no flag and `cache clear --orphaned` act on the claims
+`cache list` discovers: `llmkube-model-cache` and the labeled per-service
+`<isvc>-model-cache`. `cache clear --model` and `delete --purge-cache` target
+only the claims that can hold that model's files: the
+`spec.modelCache.claimName` of the InferenceServices that serve the model, the
+`<isvc>-model-cache` of those services in `perService` mode, and the shared
+cache, which is where their pods mount in the default `shared` mode (and the
+only home when the Model has no InferenceService). Two things follow from that:
+
+- It needs your own permission to create and exec into pods in the namespace.
+  On a `restricted`-profile namespace the pod is rejected, the same way
+  `cache list` is.
+- A strict RWO claim that a serving pod still holds cannot be double-attached,
+  so the purge fails with a timeout naming the claim. Delete the
+  InferenceService first, then purge.
+
+The namespace-wide modes remove only directories named like a cache key (16 hex
+characters). `--model` and `delete --purge-cache` validate the key as a single
+path segment first. Either way the command removes `/models/<key>` and never
+data the operator did not write.
+
+Clearing the entry of a model that is still serving removes the file from the
+volume, but the running process keeps its open handle and serves the old bytes
+until it restarts; the next start re-downloads.
+
+`delete --purge-cache` differs from `cache clear --model` in one case: a
+`perService` `<isvc>-model-cache` is owner-ref'd to the InferenceService, so the
+delete reports that the claim goes with the service instead of purging it.
 
 ### Preload Models
 
@@ -642,6 +677,10 @@ If the cache PVC runs out of space:
 
 2. Clear unused models:
    ```bash
+   llmkube cache clear --orphaned -n <namespace>
+   ```
+   Then, if that is not enough, a specific model:
+   ```bash
    llmkube cache clear --model <unused-model> -n <namespace>
    ```
 
@@ -655,10 +694,9 @@ If the cache PVC runs out of space:
 
 If you suspect cache corruption:
 
-1. Clear the specific cache entry by deleting the directory in the PVC:
+1. Clear the specific cache entry, which removes the directory from the PVC:
    ```bash
-   # Find a pod in the namespace to exec into
-   kubectl exec -n <namespace> <pod-name> -- rm -rf /models/<cache-key>
+   llmkube cache clear --model <model-name> --force -n <namespace>
    ```
 
 2. Delete and recreate the InferenceService to trigger re-download:

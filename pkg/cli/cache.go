@@ -18,6 +18,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -38,6 +40,14 @@ const (
 	statusActive   = "active"
 	statusOrphaned = "orphaned"
 )
+
+// cacheClearOptions carries the flags of `cache clear`.
+type cacheClearOptions struct {
+	model     string
+	namespace string
+	force     bool
+	orphaned  bool
+}
 
 // CacheEntry represents a cached model
 type CacheEntry struct {
@@ -110,28 +120,44 @@ orphaned cache entries that have no corresponding Model resource.`,
 }
 
 func newCacheClearCommand() *cobra.Command {
-	var modelName string
-	var namespace string
-	var force bool
+	var opts cacheClearOptions
 
 	cmd := &cobra.Command{
 		Use:   "clear",
 		Short: "Clear cached models",
-		Long: `Clear models from the persistent cache.
+		Long: `Remove entries from the persistent model cache.
 
-By default, clears all cached models. Use --model to clear a specific
-model's cache entry.
+Entries are removed through a short-lived pod that mounts the cache claim
+read-write; the controller does not mount it.
+
+By default, clears every entry of the cache claims ` + "`cache list`" + ` discovers.
+Use --model to clear a specific model's cache entry (which also reaches a
+spec.modelCache.claimName its InferenceService brings), or --orphaned to
+remove every entry no Model uses.
 
 WARNING: Clearing the cache will cause models to be re-downloaded
-when InferenceServices restart or new pods are created.`,
+when InferenceServices restart or new pods are created.
+
+Examples:
+  # Clear a specific model's cache entry
+  llmkube cache clear --model llama-3.1-8b -n default
+
+  # Remove every entry that no Model references
+  llmkube cache clear --orphaned -n default
+
+  # Clear all cache without confirmation
+  llmkube cache clear --force -n default
+`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCacheClear(modelName, namespace, force)
+			return runCacheClear(&opts)
 		},
 	}
 
-	cmd.Flags().StringVar(&modelName, "model", "", "Clear cache for a specific model")
-	cmd.Flags().StringVarP(&namespace, "namespace", "n", "default", "Kubernetes namespace (used with --model)")
-	cmd.Flags().BoolVar(&force, "force", false, "Force clear without confirmation")
+	cmd.Flags().StringVar(&opts.model, "model", "", "Clear cache for a specific model")
+	cmd.Flags().StringVarP(&opts.namespace, "namespace", "n", "default", "Kubernetes namespace")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "Force clear without confirmation")
+	cmd.Flags().BoolVar(&opts.orphaned, "orphaned", false, "Clear only orphaned cache entries (no matching Model)")
+	cmd.MarkFlagsMutuallyExclusive("model", "orphaned")
 
 	return cmd
 }
@@ -195,36 +221,7 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 	}
 
 	cacheEntries := make(map[string]*CacheEntry)
-	for _, model := range modelList.Items {
-		cacheKey := cachekey.EffectiveKey(&model)
-		if cacheKey == "" {
-			// metal / single-file runtime-resolved models are never cached
-			// under a derived key; skip them so they do not show up as
-			// phantom entries.
-			continue
-		}
-
-		entry, exists := cacheEntries[cacheKey]
-		if !exists {
-			entry = &CacheEntry{
-				CacheKey:   cacheKey,
-				Source:     model.Spec.Source,
-				ModelNames: []string{},
-				Status:     statusActive,
-			}
-			cacheEntries[cacheKey] = entry
-		}
-
-		modelName := model.Name
-		if allNamespaces {
-			modelName = fmt.Sprintf("%s/%s", model.Namespace, model.Name)
-		}
-		entry.ModelNames = append(entry.ModelNames, modelName)
-
-		if model.Status.Size != "" {
-			entry.SizeHuman = model.Status.Size
-		}
-	}
+	seedCacheEntries(modelList.Items, allNamespaces, cacheEntries)
 
 	// Inspect actual PVC contents (only for single-namespace mode)
 	var pvcInspected bool
@@ -327,7 +324,52 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 	return nil
 }
 
-func runCacheClear(modelName, namespace string, force bool) error {
+// seedCacheEntries records one active entry per cache key. `cache list` and
+// `cache clear --orphaned` share it so the two never disagree about which
+// entries a Model still references.
+func seedCacheEntries(models []inferencev1alpha1.Model, allNamespaces bool, entries map[string]*CacheEntry) {
+	for _, model := range models {
+		cacheKey := cachekey.EffectiveKey(&model)
+		if cacheKey == "" {
+			// metal / single-file runtime-resolved models are never cached
+			// under a derived key; skip them so they do not show up as
+			// phantom entries.
+			continue
+		}
+
+		entry, exists := entries[cacheKey]
+		if !exists {
+			entry = &CacheEntry{
+				CacheKey:   cacheKey,
+				Source:     model.Spec.Source,
+				ModelNames: []string{},
+				Status:     statusActive,
+			}
+			entries[cacheKey] = entry
+		}
+
+		modelName := model.Name
+		if allNamespaces {
+			modelName = fmt.Sprintf("%s/%s", model.Namespace, model.Name)
+		}
+		entry.ModelNames = append(entry.ModelNames, modelName)
+
+		if model.Status.Size != "" {
+			entry.SizeHuman = model.Status.Size
+		}
+	}
+}
+
+// confirm prints prompt and reads a yes/no answer from stdin.
+func confirm(prompt string) bool {
+	fmt.Printf("%s [y/N] ", prompt)
+	var response string
+	_, _ = fmt.Scanln(&response)
+	response = strings.ToLower(strings.TrimSpace(response))
+	return response == "y" || response == "yes"
+}
+
+func runCacheClear(opts *cacheClearOptions) error {
 	ctx := context.Background()
 
 	// Get Kubernetes client
@@ -345,59 +387,159 @@ func runCacheClear(modelName, namespace string, force bool) error {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
 
-	if modelName != "" {
-		// Clear specific model's cache
+	var keys []string
+	active := map[string]bool{}
+
+	switch {
+	case opts.model != "":
 		model := &inferencev1alpha1.Model{}
-		if err := k8sClient.Get(ctx, client.ObjectKey{Name: modelName, Namespace: namespace}, model); err != nil {
-			return fmt.Errorf("failed to get model '%s': %w", modelName, err)
+		if err := k8sClient.Get(ctx, client.ObjectKey{Name: opts.model, Namespace: opts.namespace}, model); err != nil {
+			return fmt.Errorf("failed to get model '%s': %w", opts.model, err)
 		}
-
-		if model.Status.CacheKey == "" {
-			return fmt.Errorf("model '%s' does not have a cache key (may not be cached)", modelName)
+		key, err := purgeKey(model, opts.model)
+		if err != nil {
+			return err
 		}
+		keys = append(keys, key)
 
-		if !force {
-			fmt.Printf("This will clear the cache entry for model '%s' (cache key: %s)\n", modelName, model.Status.CacheKey)
-			fmt.Printf("The model will be re-downloaded when the InferenceService restarts.\n")
-			fmt.Printf("Continue? [y/N] ")
-
-			var response string
-			_, _ = fmt.Scanln(&response)
-			if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
+		if !opts.force {
+			if !confirm(fmt.Sprintf(
+				"This will clear the cache entry for model '%s' (cache key: %s)\n"+
+					"The model will be re-downloaded when the InferenceService restarts.\nContinue?", opts.model, key)) {
 				fmt.Println("Cancelled.")
 				return nil
 			}
 		}
-
-		// Clear cache by deleting the model's cache key directory
-		// Note: This requires exec into the controller pod or direct PVC access
-		fmt.Printf("To clear the cache, delete the directory on the model-cache PVC:\n")
-		fmt.Printf("  kubectl exec -n llmkube-system deploy/llmkube-controller-manager -- \\\n")
-		fmt.Printf("    rm -rf /models/%s\n", model.Status.CacheKey)
-		fmt.Printf("\nAlternatively, delete and recreate the Model resource to trigger a re-download.\n")
-
-		return nil
-	}
-
-	// Clear all cache
-	if !force {
-		fmt.Printf("This will clear ALL cached models.\n")
-		fmt.Printf("All models will be re-downloaded when InferenceServices restart.\n")
-		fmt.Printf("Continue? [y/N] ")
-
-		var response string
-		_, _ = fmt.Scanln(&response)
-		if strings.ToLower(response) != "y" && strings.ToLower(response) != "yes" {
-			fmt.Println("Cancelled.")
-			return nil
+	case opts.orphaned:
+		if !opts.force {
+			if !confirm("This will remove every cache entry that no Model references.") {
+				fmt.Println("Cancelled.")
+				return nil
+			}
+		}
+	default:
+		if !opts.force {
+			if !confirm("This will clear ALL cached models.\n" +
+				"All models will be re-downloaded when InferenceServices restart.\nContinue?") {
+				fmt.Println("Cancelled.")
+				return nil
+			}
 		}
 	}
 
-	fmt.Printf("To clear all cache, run:\n")
-	fmt.Printf("  kubectl exec -n llmkube-system deploy/llmkube-controller-manager -- rm -rf /models/*\n")
-	fmt.Printf("\nNote: Do not delete the /models directory itself, only its contents.\n")
+	targets, svcs, err := resolvePurgeTargets(ctx, k8sClient, opts.namespace)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no model cache PVC found in namespace '%s'", opts.namespace)
+	}
+	if len(keys) > 0 {
+		// A named model's files live on the claim its own InferenceService
+		// mounts, not on every cache claim in the namespace.
+		targets = targetedClaims(targets, svcs, opts.model)
+	} else {
+		// The namespace-wide modes act on what `cache list` discovers. A
+		// user's claimName is not a discovery target: it may be mounted by an
+		// RWO service that fails the second attach, and the sweep would stall
+		// on it.
+		targets = discoveredClaims(targets)
+	}
 
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create clientset: %w", err)
+	}
+
+	if opts.orphaned {
+		list := &inferencev1alpha1.ModelList{}
+		if err := k8sClient.List(ctx, list, client.InNamespace(opts.namespace)); err != nil {
+			return fmt.Errorf("failed to list models: %w", err)
+		}
+		entries := make(map[string]*CacheEntry)
+		seedCacheEntries(list.Items, false, entries)
+		for key := range entries {
+			active[key] = true
+		}
+	}
+
+	var errs []error
+	var outcomes []purgeOutcome
+	for _, target := range targets {
+		var outcome purgeOutcome
+		var err error
+		switch {
+		case len(keys) > 0:
+			outcome, err = purgeCacheKeys(ctx, cfg, clientset, opts.namespace, target.Name, keys)
+		case opts.orphaned:
+			outcome, err = purgeOrphanedEntries(ctx, cfg, clientset, opts.namespace, target.Name, active)
+		default:
+			outcome, err = purgeAllEntries(ctx, cfg, clientset, opts.namespace, target.Name)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("purging cache PVC %s: %w", target.Name, err))
+			continue
+		}
+		outcomes = append(outcomes, outcome)
+	}
+
+	reportPurgeOutcomes(outcomes)
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	if keysAbsentEverywhere(keys, outcomes) {
+		// The per-claim report already said "already absent"; say what it
+		// means for the command as a whole.
+		fmt.Printf("\n%s is not in the cache of namespace '%s'; nothing was removed.\n", keys[0], opts.namespace)
+	}
 	return nil
+}
+
+// keysAbsentEverywhere reports whether the single requested key was absent on
+// every PVC, so the caller can say so instead of printing a bare success.
+func keysAbsentEverywhere(keys []string, outcomes []purgeOutcome) bool {
+	if len(keys) != 1 {
+		return false
+	}
+	want := defaultModelMountPath + "/" + keys[0]
+	for _, outcome := range outcomes {
+		for _, path := range outcome.Removed {
+			if path == want {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// reportPurgeOutcomes prints what each PVC's purge did.
+func reportPurgeOutcomes(outcomes []purgeOutcome) {
+	var total int
+	for _, outcome := range outcomes {
+		if outcome.isEmpty() {
+			continue
+		}
+		fmt.Printf("\nCache PVC %s:\n", outcome.PVC)
+		for _, path := range outcome.Removed {
+			fmt.Printf("  removed %s\n", path)
+			total++
+		}
+		for _, path := range outcome.Absent {
+			fmt.Printf("  already absent %s\n", path)
+		}
+		for _, name := range outcome.Skipped {
+			fmt.Printf("  left %s (not a cache key directory)\n", name)
+		}
+	}
+	if total > 0 {
+		fmt.Printf("\nRemoved %d cache entr", total)
+		if total == 1 {
+			fmt.Println("y.")
+		} else {
+			fmt.Println("ies.")
+		}
+	}
 }
 
 func runCachePreload(modelID, namespace string) error {
