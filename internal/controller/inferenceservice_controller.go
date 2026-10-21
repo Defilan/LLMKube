@@ -788,9 +788,13 @@ func (e *serviceNameTakenError) Error() string {
 // this InferenceService controls. A Service carrying the metal-agent's
 // managed-by label is accepted: that is the operator's own agent handing the
 // name back when a Model stops being accelerator: metal, the same consent
-// reconcileRelayService reads. The controller-reference branch is resolved
-// first, so a Service with another controller's reference is refused even
-// when it also carries that label. Anything else (no controller reference) is
+// reconcileRelayService reads. So is a Service carrying the
+// inference.llmkube.dev/service label this controller's own sync writes, which
+// is what the metal transition leaves behind on a release that replaced the
+// managed-by label without stamping an owner reference. The
+// controller-reference branch is resolved first, so a Service with another
+// controller's reference is refused even when it also carries either label.
+// Anything else (no controller reference, no operator-written label) is
 // refused, never adopted, never overwritten, and never deleted, because
 // spec.selector decides where the name routes traffic.
 func ensureServiceOwned(isvc *inferencev1alpha1.InferenceService, existing *corev1.Service) error {
@@ -810,6 +814,15 @@ func ensureServiceOwned(isvc *inferencev1alpha1.InferenceService, existing *core
 		return taken
 	}
 	if existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent {
+		return nil
+	}
+	// No controller reference and no managed-by label, but the service label
+	// this controller's own sync writes names this InferenceService: the
+	// metal-agent's Service after an accelerator: metal to pod transition that
+	// ran on a release whose sync replaced the managed-by label, before this
+	// controller stamped an owner reference on what it adopted. Refusing it
+	// would degrade a service that is already serving.
+	if existing.Labels["inference.llmkube.dev/service"] == isvc.Name {
 		return nil
 	}
 	return taken

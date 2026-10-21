@@ -482,6 +482,54 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 			Expect(got.Labels).To(HaveKeyWithValue("inference.llmkube.dev/service", name))
 		})
 
+		It("adopts the Service a pre-upgrade metal transition left behind", func() {
+			name := "svc-agent-leftover"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			// Exactly what a shipped release leaves after the metal to pod
+			// transition: the base-version sync replaced the agent's
+			// managed-by label with the controller's own labels and never
+			// stamped an owner reference. No controller reference, no
+			// managed-by label, but the operator-written service label is
+			// present.
+			leftover := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sanitizeDNSName(name),
+					Namespace: "default",
+					Labels: map[string]string{
+						"app":                           name,
+						"inference.llmkube.dev/service": name,
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Type:     corev1.ServiceTypeClusterIP,
+					Selector: map[string]string{"app": name, "inference.llmkube.dev/service": name},
+					Ports: []corev1.ServicePort{{
+						Name:       "http",
+						Port:       8080,
+						TargetPort: intstr.FromInt(8080),
+						Protocol:   corev1.ProtocolTCP,
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, leftover)).To(Succeed())
+			clusterIP := leftover.Spec.ClusterIP
+
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			Expect(isvc.Status.SchedulingStatus).To(BeEmpty(),
+				"a serving service this controller already synced must not be refused on upgrade")
+
+			got := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sanitizeDNSName(name), Namespace: "default"}, got)).To(Succeed())
+			Expect(got.Spec.ClusterIP).To(Equal(clusterIP))
+			Expect(metav1.IsControlledBy(got, isvc)).To(BeTrue(),
+				"the leftover is adopted, so it is garbage-collected with the InferenceService")
+		})
+
 		It("stamps its controller reference on the adopted Service", func() {
 			name := "svc-agent-owned"
 			r := setupDeploymentOwnershipFixture(ctx, name)
@@ -588,8 +636,7 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
 			Expect(got.Status.Phase).NotTo(Equal(PhaseFailed),
 				"base wrote PhaseFailed here (inferenceservice_controller.go:1258); a Service this service created is not a failure")
-			degraded := meta.FindStatusCondition(got.Status.Conditions, ConditionDegraded)
-			if degraded != nil {
+			if degraded := meta.FindStatusCondition(got.Status.Conditions, ConditionDegraded); degraded != nil {
 				Expect(degraded.Message).NotTo(ContainSubstring("Failed to create Service"))
 			}
 			Expect(got.Status.SchedulingStatus).NotTo(Equal(serviceNameTaken))

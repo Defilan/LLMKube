@@ -80,7 +80,16 @@ the workload:
      hand-rolled Service, another operator, a leftover). The selector tells you
      whose traffic it carries. This includes a legacy object from before the
      controller stamped owner references: such an object is refused, not
-     adopted.
+     adopted. One exception is adopted rather than refused: see the
+     operator-written label case below.
+   - **No owner references, no `llmkube.ai/managed-by`, but
+     `inference.llmkube.dev/service: <this service>`**: the operator wrote that
+     label, so this is a Service a previous release already synced. The case
+     that produces it is a completed `accelerator: metal` to pod transition on
+     a release whose sync replaced the agent's label without stamping an owner
+     reference. The controller adopts it and does not refuse. If it *is* being
+     refused, raise the operator version: this guidance applies from the
+     release that added the refusal.
    - **A controller reference to a different `InferenceService` UID**: a
      same-name service was deleted and recreated before garbage collection
      removed its old Service, or the old Service was orphaned. Check whether the
@@ -151,11 +160,13 @@ the workload:
   not create are never adopted, overwritten, or deleted.
 - Every Service the controller creates carries this InferenceService's
   controller reference, verified in every tagged release from v0.2.0 through
-  v0.10.4, so upgrade in place is unaffected.
-- The one Service the controller adopts is the one its own metal-agent wrote,
-  identified by the `llmkube.ai/managed-by: metal-agent` label. Adoption stamps
-  the controller reference, so the Service is garbage-collected with the
-  InferenceService rather than leaking.
+  v0.10.5, so upgrade in place is unaffected.
+- The Services the controller adopts are the ones it can prove it wrote: its
+  own metal-agent's Service (`llmkube.ai/managed-by: metal-agent`), and the
+  Service a metal to pod transition left behind on an earlier release (no
+  owner reference, but the operator's own `inference.llmkube.dev/service`
+  label). Adoption stamps the controller reference, so neither survives the
+  InferenceService that owns it.
 
 ## Related
 
