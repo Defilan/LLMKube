@@ -286,6 +286,8 @@ var _ = Describe("ModelPool #2130", func() {
 			"the default member takes the slot after the reclaim")
 	})
 
+	// Parity guard, not a reproduction: the non-Ready gate is base behavior,
+	// and this spec holds it so a probe there cannot come back.
 	It("does not probe a member that is not Ready (#2130)", func() {
 		f := newFixture("repro-not-ready")
 		defer cleanup(f)
@@ -308,6 +310,8 @@ var _ = Describe("ModelPool #2130", func() {
 			"a member that is not Ready must not defer the swap: %s", cond.Message)
 	})
 
+	// Parity guard, not a reproduction: base already lets an activation win the
+	// slot from a resident that is not Ready, and this pins that it stays so.
 	It("hands the slot to an activated member when the resident goes not Ready (#2130)", func() {
 		f := newFixture("repro-resident-not-ready")
 		defer cleanup(f)
