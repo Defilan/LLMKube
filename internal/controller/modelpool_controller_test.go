@@ -65,9 +65,9 @@ func setMemberPhase(ctx context.Context, name, phase string, ready int32) {
 }
 
 // createMemberPod creates a Pod labeled the way the InferenceService reconciler
-// labels member Pods, so ModelPoolReconciler.memberPodsGone counts it as
-// present. Used to simulate an incumbent whose Pod is still terminating (its
-// GPU / unified-memory allocation not yet released) after being scaled to zero.
+// labels member Pods, so ModelPoolReconciler.memberPods counts it as present.
+// Used to simulate an incumbent whose Pod is still terminating (its GPU /
+// unified-memory allocation not yet released) after being scaled to zero.
 func createMemberPod(ctx context.Context, member string) *corev1.Pod {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{

@@ -37,6 +37,9 @@ type fakeMemberController struct {
 	// noAutoReady stops Activate from making the target Ready, modelling a
 	// member whose pod never comes up.
 	noAutoReady bool
+	// phaseErr, when non-nil for a member, makes WaitReady fail with it after
+	// waitFor long, the way a failed API read does after the scale-up patched.
+	phaseErr map[string]error
 }
 
 func newFakeMemberController() *fakeMemberController {
@@ -46,6 +49,7 @@ func newFakeMemberController() *fakeMemberController {
 		deactivateN:  make(map[string]int),
 		activateFail: make(map[string]bool),
 		replicas:     make(map[string]int),
+		phaseErr:     make(map[string]error),
 	}
 }
 
@@ -115,7 +119,16 @@ func (f *fakeMemberController) WaitReady(ctx context.Context, namespace, isvc st
 	for {
 		f.mu.Lock()
 		p := f.phase[isvc]
+		perr := f.phaseErr[isvc]
 		f.mu.Unlock()
+		if perr != nil {
+			select {
+			case <-time.After(100 * time.Millisecond):
+				return perr
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		if p == modelReadyPhase {
 			return nil
 		}
@@ -728,5 +741,36 @@ func TestActivatorAbandonsSwapAtDeadline(t *testing.T) {
 	release()
 	if got := fake.activateCount("judge"); got != 0 {
 		t.Fatalf("Activate(judge) called %d times; the resident did not take the fast path", got)
+	}
+}
+
+// TestActivatorCleansUpFailedSwapWithNoWaiter covers the swap failure that is not
+// the deadline: Activate has already scaled the target up, then the readiness
+// read fails and the caller that wanted it has gone. Nothing cancels the swap
+// any more, so without an explicit scale-down the target would hold the slot
+// with no traffic.
+func TestActivatorCleansUpFailedSwapWithNoWaiter(t *testing.T) {
+	fake := newFakeMemberController()
+	fake.setPhase("judge", modelReadyPhase)
+	fake.mu.Lock()
+	fake.phaseErr["coder"] = errors.New("get member lab/coder: connection reset")
+	fake.mu.Unlock()
+	a := NewActivator(context.Background(), fake, "r", nil)
+
+	// The only caller for coder gives up while the swap is still running.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := a.Acquire(ctx, budgetPool("coder", 5*time.Second)); !errors.Is(err, ErrHoldBudgetExceeded) {
+		t.Fatalf("Acquire err = %v, want ErrHoldBudgetExceeded", err)
+	}
+
+	waitFor(t, "the failed swap's target to be scaled back down", func() bool {
+		return fake.deactivateCount("coder") >= 1
+	})
+	if got := fake.replicaCount("coder"); got != 0 {
+		t.Fatalf("coder replicas = %d after the swap failed with no waiter; want 0", got)
+	}
+	if got := fake.activateCount("coder"); got != 1 {
+		t.Fatalf("coder activate count = %d, want 1", got)
 	}
 }

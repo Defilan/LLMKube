@@ -368,6 +368,17 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 			prommetrics.ModelPoolSwapFailuresTotal.
 				WithLabelValues(a.router, pr.pool, target, "error").Inc()
 			pr.swapErr[target] = errors.New("model pool swap failed for member " + target + ": " + err.Error())
+			// The target may already be scaled up: Activate patches replicas
+			// before WaitReady runs. Nothing cancels the swap any more, so a
+			// failed swap whose callers have all left would keep the slot with
+			// no traffic. Scale it back when no caller is waiting; a caller that
+			// still is schedules its own deactivate when it gives up.
+			if a.ctrl != nil && pr.waiting[target] == 0 {
+				if derr := a.ctrl.Deactivate(a.baseCtx, pr.namespace, target); derr != nil {
+					a.logger.Warn("model pool deactivate after failed swap failed",
+						"pool", pr.pool, "member", target, "error", derr)
+				}
+			}
 			pr.notify()
 			return
 		}

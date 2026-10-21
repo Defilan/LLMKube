@@ -355,6 +355,17 @@ restarted. Abandoning the swap reopens the resident's fast path, and the next
 request for the target starts a fresh swap. A pool with no explicit
 `swapBudget` uses twice the router's response-header timeout as the bound.
 
+A swap that has started runs to `Ready` or to that deadline even when the
+request that started it goes away. A caller that times out or disconnects is
+dropped, and other requests for the pool are held until the swap finishes, but
+the load continues, so the retry finds the member warm instead of paying for a
+second cold load. Only the deadline scales a target back down, and a swap that
+fails for another reason scales its own target back down once no caller is
+waiting on it. The hedge is that a request for the member that is still loaded
+waits out a swap nobody else wanted, because the resident's fast path is closed
+for every swap in flight, waited on or not. With 45 to 90 second boots that wait
+is bounded by `swapBudget`, and the alternative was a cold load on every retry.
+
 ### A pooled router runs one replica
 
 When any backend resolves to a ModelPool member, the operator pins the router
