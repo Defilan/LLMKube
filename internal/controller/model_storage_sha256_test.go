@@ -92,6 +92,9 @@ func requireInitShellEnvironment(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl not available; skipping behavioral sha256 test")
 	}
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not available; the cached init scripts lock the cache dir with it")
+	}
 	probe := filepath.Join(t.TempDir(), "probe")
 	if err := os.WriteFile(probe, []byte("abc"), 0o644); err != nil {
 		t.Fatalf("probe file: %v", err)

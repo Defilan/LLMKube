@@ -293,6 +293,8 @@ modelCache:
   accessMode: ReadWriteMany
 ```
 
+The volume must support file locking. Downloaders that share a cache directory take turns through `flock` on `.llmkube-download.lock`, so pods on different nodes rely on the volume to enforce that lock across nodes. NFSv4 and CephFS provide it. An NFSv3 mount with `nolock` does not, so two pods downloading the same model at once can corrupt it. Init images that override the default must provide `flock`.
+
 #### Strictly tainted GPU nodes
 
 When a GPU node carries a hard `NoSchedule` taint, dynamic provisioning can fail for reasons unrelated to the inference pod's tolerations. The safest approach is to pre-provision a PVC bound to the tainted node and reference it through `spec.modelCache.claimName`.

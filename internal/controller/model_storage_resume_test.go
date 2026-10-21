@@ -181,6 +181,9 @@ func TestModelDownloadResume_Behavioral(t *testing.T) {
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl not available; skipping behavioral resume test")
 	}
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not available; the cached init scripts lock the cache dir with it")
+	}
 	probe := filepath.Join(t.TempDir(), "probe")
 	if err := os.WriteFile(probe, []byte("abc"), 0o644); err != nil {
 		t.Fatalf("probe file: %v", err)
@@ -537,6 +540,9 @@ func assertIgnoringOriginRestarts(t *testing.T, v resumeVariant) {
 // a HEAD (and, with no --max-time on the curl, a possible stall on an air-gapped
 // node) to a start that previously made none.
 func TestWarmCacheIfNotPresentMakesNoNetworkRequest(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not available; the cached init scripts lock the cache dir with it")
+	}
 	var requests atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)

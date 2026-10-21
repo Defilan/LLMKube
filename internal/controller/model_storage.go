@@ -462,16 +462,19 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 	}
 
 	if useCache {
+		// The lock is taken after the mkdir, which it needs, and before any
+		// sweep or transfer; see cacheDirLock.
+		mkcache := `mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock
 		if isLocal {
-			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && `+publish("$MODEL_PATH.tmp")+` && echo 'Model copied successfully'`, "Model already cached, skipping copy")
+			return fns + pre + mkcache + `rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Copying model from local source...'; cp /host-model/model.gguf "$MODEL_PATH.tmp" && `+publish("$MODEL_PATH.tmp")+` && echo 'Model copied successfully'`, "Model already cached, skipping copy")
 		}
 		if isS3 {
-			return fns + pre + `mkdir -p "$CACHE_DIR" && rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
+			return fns + pre + mkcache + `rm -f "$MODEL_PATH.tmp" && ` + frames(`echo 'Downloading model from S3...'; `+downloadProgressFn+s3AuthFn+`download_with_progress "$MODEL_PATH.tmp" "" s3_curl -f -L -o "$MODEL_PATH.tmp" "${AWS_ENDPOINT_URL}/${S3_BUCKET}/${S3_KEY}" --no-progress-meter && `+publish("$MODEL_PATH.tmp")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 		}
 		if refreshPolicy == RefreshPolicyOnChange {
-			return fns + pre + "mkdir -p \"$CACHE_DIR\" && " + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
+			return fns + pre + mkcache + debrisSweep() + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
 		}
-		return fns + pre + `mkdir -p "$CACHE_DIR" && ` + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
+		return fns + pre + mkcache + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+partialSizeGuard+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already cached, skipping download")
 	}
 
 	if isLocal {
@@ -483,7 +486,7 @@ func buildModelInitCommand(isLocal, isS3, useCache, isHFAuth, withSHA256 bool, r
 	if refreshPolicy == RefreshPolicyOnChange {
 		return fns + pre + hfAuthPrefix(isHFAuth) + remoteRevalidateScript(isHFAuth, withSHA256)
 	}
-	return fns + pre + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
+	return fns + pre + downloadProgressFn + hfAuthPrefix(isHFAuth) + frames(`echo 'Downloading model...'; `+resumePrologue(isHFAuth)+`download_with_progress "$MODEL_PARTIAL" "$remote_size" `+curlCmd(isHFAuth)+` -f -L -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && `+partialSizeGuard+publish("$MODEL_PARTIAL")+` && echo 'Model downloaded successfully'`, "Model already exists, skipping download")
 }
 
 // remoteRevalidateScript implements RefreshPolicy=OnChange for http/https
@@ -561,7 +564,7 @@ func remoteRevalidateScript(isHFAuth, withSHA256 bool) string {
 		unchanged +
 		`else ` +
 		validatorDeriveAndSweep() +
-		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && ` + publish + `; then ` +
+		`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + c + ` -fsSL -C - -o "$MODEL_PARTIAL" "$MODEL_SOURCE" --no-progress-meter && ` + partialSizeGuard + publish + `; then ` +
 		`echo 'Model revalidated (downloaded)'; ` +
 		`elif [ -f "$MODEL_PATH" ]; then ` + keepCached +
 		`else echo 'ERROR: model missing and revalidation failed'; exit 1; fi; ` +
@@ -687,6 +690,30 @@ func validatorDeriveAndSweep() string {
 		`find "$(dirname "$MODEL_PATH")" -maxdepth 1 -name '*.tmp' ! -name "$(basename "$MODEL_PARTIAL")" -delete; ` +
 		`[ "$accept_ranges" = bytes ] || rm -f "$MODEL_PARTIAL"; `
 }
+
+// cacheDirLock serializes downloaders that share "$CACHE_DIR" (#2110). Two
+// `curl -C -` writers on one partial each append from their own offset, and a
+// terminating pod's curl keeps writing through its grace period while the
+// replacement starts. The lock is on fd 9, which every child inherits, so it is
+// held until the last process holding it, curl included, exits, and the kernel
+// drops it if that process dies. Every sweep, probe, transfer and publish runs
+// under it. The lockfile must not match *.tmp and is never deleted: unlinking
+// a held lockfile lets the next pod lock a fresh inode. A directory this uid
+// cannot write cannot have two writers, so the lock is skipped there; `command`
+// stops a failed exec redirection from exiting the shell.
+const cacheDirLock = `if [ -w "$CACHE_DIR" ]; then ` +
+	`command -v flock >/dev/null 2>&1 || { echo "ERROR: the init image must provide flock to lock $CACHE_DIR" >&2; exit 1; }; ` +
+	`command exec 9>"$CACHE_DIR/.llmkube-download.lock" || { echo "ERROR: could not open $CACHE_DIR/.llmkube-download.lock" >&2; exit 1; }; ` +
+	`if ! flock -n 9; then echo 'Waiting for the download lock held by another pod...'; ` +
+	`flock 9 || { echo "ERROR: could not lock $CACHE_DIR/.llmkube-download.lock; the cache volume must support file locking (NFS needs a lock daemon)" >&2; exit 1; }; fi; ` +
+	`else echo "WARNING: $CACHE_DIR is not writable by uid $(id -u); skipping the download lock" >&2; fi; `
+
+// partialSizeGuard fails a resumable transfer whose partial does not match the
+// advertised Content-Length, and deletes the partial so the next start begins
+// from byte 0. It cannot catch an interleave of equal size; cacheDirLock is
+// what prevents that.
+const partialSizeGuard = `case "$remote_size" in ''|0) ;; *) if [ "$(stat -c %s "$MODEL_PARTIAL" 2>/dev/null || echo 0)" != "$remote_size" ]; then ` +
+	`echo "ERROR: $MODEL_PARTIAL is $(stat -c %s "$MODEL_PARTIAL" 2>/dev/null || echo 0) bytes but the origin advertised $remote_size; discarded it" >&2; rm -f "$MODEL_PARTIAL"; false; fi;; esac && `
 
 // headProbeFormat is the curl -w write-out both resume probes emit. Line 1 is
 // the validator the partial is keyed on, line 2 is the server's Accept-Ranges,
@@ -1037,7 +1064,7 @@ func multiFileInitEnvVars(source, cacheDir string, files []string, digests map[s
 // MODEL_PATH and MODEL_SOURCE per file for those helpers; the loop runs in a
 // pipeline subshell, so the assignments do not leak.
 func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refreshPolicy string) string {
-	prefix := `mkdir -p "$CACHE_DIR" && `
+	prefix := `mkdir -p "$CACHE_DIR" || exit 1; ` + cacheDirLock
 	sweep := `find "$CACHE_DIR" -name '*.tmp' -delete`
 	if !useCache {
 		prefix = `mkdir -p /models && `
@@ -1145,7 +1172,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 			`echo "Model artifact $rel revalidated (unchanged, skipped download)"; ` +
 			`else ` +
 			validatorDeriveAndSweep() +
-			`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + publishFile("$MODEL_PARTIAL") + `; then ` +
+			`if download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -fsSL -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + partialSizeGuard + publishFile("$MODEL_PARTIAL") + `; then ` +
 			`echo "Model artifact $rel revalidated (downloaded)"; ` +
 			keepCachedTail +
 			`fi; ` +
@@ -1155,7 +1182,7 @@ func buildMultiFileInitCommand(useCache, isS3, isHFAuth, withSHA256 bool, refres
 
 	download := `echo "Downloading model artifact $rel..."; ` +
 		`MODEL_PATH="$dest"; MODEL_SOURCE="$url"; ` + resumePrologue(isHFAuth) +
-		`download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + publishFile("$MODEL_PARTIAL") + ` || { echo "ERROR: failed to download $rel"; exit 1; }; `
+		`download_with_progress "$MODEL_PARTIAL" "$remote_size" ` + curlCmd(isHFAuth) + ` -f -L -C - -o "$MODEL_PARTIAL" "$url" --no-progress-meter && ` + partialSizeGuard + publishFile("$MODEL_PARTIAL") + ` || { echo "ERROR: failed to download $rel"; exit 1; }; `
 	body := normalizeFn + hfAuthPrefix(isHFAuth) +
 		`SOURCE="$(normalize_hf_source "$MODEL_SOURCE")" && ` +
 		`printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
