@@ -43,11 +43,11 @@ type MemberController interface {
 	// idempotent.
 	Activate(ctx context.Context, namespace, isvc string) error
 
-	// Deactivate cancels a pending activation by scaling isvc back to zero
-	// replicas. Called when a held request gives up (budget exceeded or client
-	// disconnect) and no other caller still wants the member, so the pool does
-	// not complete a useless swap. Idempotent; scaling an already-zero member is
-	// a no-op.
+	// Deactivate scales isvc back to zero replicas. Called when a held request
+	// gives up and no other caller still wants the member, and by the swap
+	// goroutine to clean up a target after a deadline abandonment or a swap
+	// failure with no waiters, so the pool does not keep a member scaled up for
+	// nobody. Idempotent; scaling an already-zero member is a no-op.
 	Deactivate(ctx context.Context, namespace, isvc string) error
 
 	// WaitReady blocks until isvc reports the Ready phase or ctx is done.

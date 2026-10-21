@@ -61,9 +61,11 @@ func (r *ModelPoolReconciler) memberPods(ctx context.Context, isvc *inferencev1a
 	return podList.Items, nil
 }
 
-// classifyMemberPods counts the member's Pods that could still be serving. A Pod
-// under deletion, or with no container in Running, cannot: its server is
-// shutting down, has not started, or has already exited.
+// classifyMemberPods counts the member's Pods with at least one running
+// container. A Pod under deletion, or with no container in Running, cannot be
+// serving. A Pod whose sidecar runs while its server container has exited is
+// still counted, which only matters for the two-or-more-Pod refusal case and
+// only biases it toward failing closed.
 func classifyMemberPods(pods []corev1.Pod) int {
 	running := 0
 	for i := range pods {
