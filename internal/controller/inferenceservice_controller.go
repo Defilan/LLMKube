@@ -759,6 +759,10 @@ func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Conte
 // bounded requeue instead of a reconcile error.
 type serviceNameTakenError struct {
 	ns, name, owner string
+	// ownerName is the controlling reference's name, so the previous-owner
+	// message names the InferenceService that held the name rather than the
+	// Service (which is the sanitized form of the same name).
+	ownerName string
 	// previous is set when the controller is an InferenceService with this
 	// service's name but another UID: a deleted predecessor whose Service
 	// garbage collection has not removed yet (a GitOps delete-and-recreate).
@@ -768,7 +772,7 @@ type serviceNameTakenError struct {
 func (e *serviceNameTakenError) Error() string {
 	if e.previous {
 		return fmt.Sprintf("Service %s/%s is still controlled by a previous InferenceService named %s (uid %s) that was deleted; "+
-			"it is removed when garbage collection finishes, and this service is reconciled again then", e.ns, e.name, e.name, e.owner)
+			"it is removed when garbage collection finishes, and this service is reconciled again then", e.ns, e.name, e.ownerName, e.owner)
 	}
 	if e.owner != "" {
 		return fmt.Sprintf("Service %s/%s is already controlled by another InferenceService (uid %s); "+
@@ -784,26 +788,29 @@ func (e *serviceNameTakenError) Error() string {
 // this InferenceService controls. A Service carrying the metal-agent's
 // managed-by label is accepted: that is the operator's own agent handing the
 // name back when a Model stops being accelerator: metal, the same consent
-// reconcileRelayService reads. Anything else (no controller reference, or
-// another controller's reference) is refused, never adopted, never
-// overwritten, and never deleted, because spec.selector decides where the
-// name routes traffic.
+// reconcileRelayService reads. The controller-reference branch is resolved
+// first, so a Service with another controller's reference is refused even
+// when it also carries that label. Anything else (no controller reference) is
+// refused, never adopted, never overwritten, and never deleted, because
+// spec.selector decides where the name routes traffic.
 func ensureServiceOwned(isvc *inferencev1alpha1.InferenceService, existing *corev1.Service) error {
 	if metav1.IsControlledBy(existing, isvc) {
 		return nil
 	}
-	if existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent {
-		return nil
-	}
 	taken := &serviceNameTakenError{ns: existing.GetNamespace(), name: existing.GetName()}
-	if ref := metav1.GetControllerOf(existing); ref != nil && ref.Kind == "InferenceService" {
+	if ref := metav1.GetControllerOf(existing); ref != nil {
 		// The owner ref's APIVersion is "<group>/<version>" (or bare version
 		// for the core group); match the group so a same-Kind controller in
 		// another API group is not misreported as another InferenceService.
-		if strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
+		if ref.Kind == "InferenceService" && strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
 			taken.owner = string(ref.UID)
+			taken.ownerName = ref.Name
 			taken.previous = ref.Name == isvc.Name
 		}
+		return taken
+	}
+	if existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent {
+		return nil
 	}
 	return taken
 }
@@ -846,6 +853,15 @@ func (r *InferenceServiceReconciler) refuseServiceNameTaken(ctx context.Context,
 		phase = PhaseSuspended
 	} else if desiredReplicas == 0 {
 		phase = PhaseStopped
+	}
+	// The refusal stops the sequence before reconcileHPA. Autoscaling not
+	// being configured leaves the condition's removal to reconcileHPA, so do
+	// it here: a mode switch while the name is taken would otherwise strand a
+	// stale AutoscalingReady. An HPA this service owns is left alone, since
+	// it scales this service's own Deployment, so a configured one keeps its
+	// condition as reconcileHPA last left it.
+	if isvc.Spec.Autoscaling == nil {
+		removeAutoscalingReadyCondition(isvc)
 	}
 	// Ready is forced to zero while Observed carries what this pass actually
 	// read of the Deployment: the refusal ran after that read, unlike the
@@ -1247,8 +1263,9 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 					res, updateErr := r.refuseServiceNameTaken(ctx, isvc, nameTakenPreviously, modelReady, desiredReplicas, counts, guardErr)
 					return nil, res, updateErr
 				}
-				// Ours: a concurrent reconcile created it.
-				return service, nil, nil
+				// Ours: a concurrent reconcile created it; return the object
+				// that actually exists so the caller sees the live Service.
+				return raced, nil, nil
 			}
 			log.Error(err, "Failed to create Service")
 			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Service", nil)

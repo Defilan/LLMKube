@@ -200,6 +200,91 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 			Expect(isvc.Status.SchedulingMessage).NotTo(ContainSubstring("rename one of the services"))
 		})
 
+		It("reports Suspended, not Failed, while the foreign Service holds the name", func() {
+			name := "svc-foreign-suspended"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Spec.Suspend = true
+			Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+			Expect(k8sClient.Create(ctx, foreignISVCService(name))).To(Succeed())
+
+			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			Expect(isvc.Status.Phase).To(Equal(PhaseSuspended),
+				"suspending is the user's intent; the refusal must not turn it into Failed")
+			Expect(isvc.Status.SchedulingStatus).To(Equal(serviceNameTaken),
+				"the diagnosis rides the marker even while suspended")
+			cond := meta.FindStatusCondition(isvc.Status.Conditions, ConditionDegraded)
+			Expect(cond).To(BeNil(), "Suspended removes Degraded; the refusal must not re-set it")
+		})
+
+		It("refuses a forged metal-agent label on a Service another controller owns", func() {
+			name := "svc-foreign-forged-label"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			recorder := events.NewFakeRecorder(20)
+			r.Recorder = recorder
+
+			controller := true
+			foreign := foreignISVCService(name)
+			foreign.Labels[inferencev1alpha1.LabelManagedBy] = inferencev1alpha1.ManagedByMetalAgent
+			foreign.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: inferencev1alpha1.GroupVersion.String(),
+				Kind:       "InferenceService",
+				Name:       "other-isvc",
+				UID:        "uid-other",
+				Controller: &controller,
+			}}
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+			// A reconcile error here is the bug this pins: the acceptance path
+			// would hand the object to setControllerReferenceUnblocked, which
+			// returns AlreadyOwned and hot-loops on every pass.
+			result, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred(), "the label must not override another controller's reference")
+			Expect(result.RequeueAfter).To(Equal(2 * time.Minute))
+			expectServiceNameTaken(ctx, name)
+
+			got := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: sanitizeDNSName(name), Namespace: "default"}, got)).To(Succeed())
+			Expect(got.OwnerReferences).To(HaveLen(1))
+			Expect(got.OwnerReferences[0].Name).To(Equal("other-isvc"))
+			Expect(got.Spec.Selector).To(Equal(map[string]string{"app": "someone-else"}))
+		})
+
+		It("clears a stale AutoscalingReady when autoscaling is not configured", func() {
+			name := "svc-foreign-noautoscale"
+			r := setupDeploymentOwnershipFixture(ctx, name)
+			defer cleanupDeploymentOwnershipFixture(ctx, name)
+
+			isvc := getDeploymentOwnershipISVC(ctx, name)
+			isvc.Status.Conditions = append(isvc.Status.Conditions, metav1.Condition{
+				Type:               ConditionAutoscalingReady,
+				Status:             metav1.ConditionTrue,
+				ObservedGeneration: 1,
+				LastTransitionTime: metav1.Now(),
+				Reason:             ReasonHPAManaged,
+				Message:            "from a pass before autoscaling was removed",
+			})
+			Expect(k8sClient.Status().Update(ctx, isvc)).To(Succeed())
+
+			Expect(k8sClient.Create(ctx, foreignISVCService(name))).To(Succeed())
+
+			_, err := reconcileDeploymentOwnershipFixture(ctx, r, name)
+			Expect(err).NotTo(HaveOccurred())
+
+			isvc = getDeploymentOwnershipISVC(ctx, name)
+			Expect(isvc.Status.SchedulingStatus).To(Equal(serviceNameTaken))
+			Expect(meta.FindStatusCondition(isvc.Status.Conditions, ConditionAutoscalingReady)).To(BeNil(),
+				"the refusal stops before reconcileHPA, so it must remove a condition that autoscaling=removed no longer supports")
+		})
+
 		It("proceeds once the foreign Service is deleted", func() {
 			name := "svc-foreign-recovered"
 			r := setupDeploymentOwnershipFixture(ctx, name)
@@ -435,6 +520,77 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 	})
 
 	Context("a create that loses the name", func() {
+		It("continues when the Service at the name is its own", func() {
+			name := "svc-create-owned"
+			scheme := k8sClient.Scheme()
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: "uid-svc-owned"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: name + "-model",
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server",
+				},
+			}
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: name + "-model", Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source:   "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{Accelerator: "cpu"},
+				},
+				Status: inferencev1alpha1.ModelStatus{Phase: PhaseReady},
+			}
+
+			// The same race as the spec above, except the object the Create
+			// collides with is this service's own Service (a concurrent
+			// reconcile got there first). The reconcile must continue rather
+			// than report a create failure the operator would chase.
+			c := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(model, isvc).
+				WithStatusSubresource(&inferencev1alpha1.InferenceService{}, &inferencev1alpha1.Model{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Create: func(ictx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if svc, ok := obj.(*corev1.Service); ok {
+							owned := svc.DeepCopy()
+							controller := true
+							owned.OwnerReferences = []metav1.OwnerReference{{
+								APIVersion: inferencev1alpha1.GroupVersion.String(),
+								Kind:       "InferenceService",
+								Name:       isvc.Name,
+								UID:        isvc.UID,
+								Controller: &controller,
+							}}
+							if err := cl.Create(ictx, owned, opts...); err != nil {
+								return err
+							}
+							return apierrors.NewAlreadyExists(corev1.Resource("services"), obj.GetName())
+						}
+						return cl.Create(ictx, obj, opts...)
+					},
+				}).
+				Build()
+
+			r := &InferenceServiceReconciler{
+				Client:             c,
+				Scheme:             scheme,
+				Recorder:           events.NewFakeRecorder(20),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+
+			_, err := r.Reconcile(context.Background(), reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: name, Namespace: "default"},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: "default"}, got)).To(Succeed())
+			Expect(got.Status.SchedulingStatus).NotTo(Equal(serviceNameTaken))
+			Expect(got.Status.SchedulingMessage).NotTo(ContainSubstring("Failed to create Service"),
+				"a Service this service created is not a refusal")
+		})
+
 		It("routes a create-time name race into the refusal", func() {
 			name := "svc-create-race"
 			scheme := k8sClient.Scheme()

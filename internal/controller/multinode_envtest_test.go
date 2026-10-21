@@ -166,12 +166,14 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		DeferCleanup(func() {
 			_ = k8sClient.Delete(ctx, isvc)
-			// envtest runs no garbage collector: remove the members by hand
-			// and wait for them to go so the next spec starts clean.
+			// envtest runs no garbage collector: remove the members and the
+			// Service by hand, since both are owner-referenced, and wait for
+			// them to go so the next spec starts clean.
 			for _, p := range memberPods() {
 				pod := p
 				_ = k8sClient.Delete(ctx, &pod, client.GracePeriodSeconds(0))
 			}
+			_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: ns}})
 			Eventually(memberPods).Should(BeEmpty())
 			Eventually(func() bool {
 				var got inferencev1alpha1.InferenceService

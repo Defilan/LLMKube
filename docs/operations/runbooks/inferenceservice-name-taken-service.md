@@ -46,9 +46,10 @@ the workload:
   resolves to the foreign Service rather than to this service's pods.
 - An HPA this service owns is left in place. It targets this service's own
   Deployment, which is still serving, so nothing foreign is being scaled.
-- Idle scale-to-zero does not run during the episode. The workload keeps
-  running, unattached to traffic, until the name is freed or the service is
-  scaled down or suspended by its owner.
+- The workload keeps running, unattached to traffic, until the name is freed
+  or the service is scaled down or suspended by its owner. Max-pod-lifetime
+  recycling probes idle through the Service name, so during the episode that
+  probe reaches whatever the foreign Service selects, not this service's pods.
 
 ## Diagnose
 
@@ -105,25 +106,34 @@ the workload:
 
 ## Recover
 
-1. **Delete or rename the foreign Service** once you have confirmed it is not
-   yours:
+1. **Delete the foreign Service** once you have confirmed it is not yours:
 
    ```bash
    kubectl delete service <name> -n <namespace>
    ```
 
-   The controller recreates its own Service within the two-minute bounded
-   requeue, or immediately when the deletion event for a Service it owns
-   arrives. `status.schedulingStatus` clears and `status.endpoint` returns.
+   The controller's next pass recreates its own Service. That pass comes on the
+   two-minute bounded requeue, which is the only path for this refusal:
+   `Owns` maps only objects this controller owns, so the foreign Service's
+   deletion produces no event here. `status.schedulingStatus` clears and
+   `status.endpoint` returns on that pass.
 
-2. **Or rename the InferenceService** if the foreign Service has the better
-   claim to the name:
+2. **Or give the InferenceService a new name** if the foreign Service has the
+   better claim to the shared name. `metadata.name` is immutable on update, so
+   this is a delete and re-create, not a rename in place:
 
    ```bash
-   kubectl patch inferenceservice <name> --type=merge -p '{"metadata":{"name":"<newname>"}}'
+   kubectl get inferenceservice <name> -n <namespace> -o yaml > new.yaml
+   # edit metadata.name in new.yaml, then:
+   kubectl delete inferenceservice <name> -n <namespace>
+   kubectl apply -f new.yaml
    ```
 
-   A renamed service generates a new Service name and provisions normally.
+   The new object generates a new Service name and provisions normally. The
+   old object's Deployment and the objects it owns are garbage collected with
+   it, so the workload is rebuilt under the new name. A foreign Service left at
+   the old name is untouched, since the operator never deletes what it did not
+   create.
 
 ## Prevention
 
