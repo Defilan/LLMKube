@@ -432,7 +432,18 @@ func (r *InferenceServiceReconciler) servingStorage(
 	// service that declined the cache mounts an emptyDir instead of a claim
 	// nobody created (#1451).
 	useCache := modelWantsCacheVolume(model, isvc, r.ModelCachePath)
-	storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpoint)
+	if g := r.prefetchGate(isvc, model); g.applies && g.satisfied {
+		// The weights are already on the claim (#2136): mount it read-only
+		// and verify the names the Job recorded, rather than run the
+		// downloader on the serving node.
+		var staged []string
+		if g.entry != nil {
+			staged = g.entry.Files
+		}
+		storageConfig = buildPrefetchedStorageConfig(model, effectiveCacheService(isvc, model), r.ModelCacheMode, r.InitContainerImage, staged)
+	} else {
+		storageConfig = buildModelStorageConfig(model, isvc, isvc.Namespace, useCache, r.ModelCacheMode, r.CACertConfigMap, r.InitContainerImage, r.DefaultFSGroup, r.AllowedHostPathRoots, hfEndpoint)
+	}
 	modelPath = servedModelPath(isvc, model, storageConfig)
 
 	// The draft's weights ride in the same pod, under the SAME gate as the

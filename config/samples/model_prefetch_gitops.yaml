@@ -1,0 +1,59 @@
+# Prefetch for a GitOps-applied Model + InferenceService pair (#2136).
+#
+# The Model names the cache claim it is staged into (spec.modelCache), so the
+# prefetch target does not depend on which object the sync applies first, and
+# the service inherits the same claim. The service asks for the staging with
+# modelCache.prefetch: it creates no pods until the prefetch Job has filled the
+# claim, and its pods then mount the claim read-only with no downloader, so
+# the checkpoint is never downloaded on the GPU nodes.
+#
+# Notes:
+# - Qwen2.5-0.5B-Instruct is about 1 GiB, so the whole flow runs in minutes.
+#   The same manifests stage a 190 GiB checkpoint; a gated repository also
+#   needs spec.sourceSecretRef naming a Secret with HF_TOKEN.
+# - A glob in spec.files is expanded from the repository listing before the
+#   Job is built, as it is for the serving pods. Every pattern must match at
+#   least one file.
+# - prefetchAffinity keeps the download off the GPU nodes. That needs a claim
+#   every node can reach (an RWX class, a blob mount). A claim on one GPU
+#   node's local disk can only be filled from that node: drop the affinity
+#   and pin the Job there with prefetchNodeSelector instead (the Job pod
+#   requests no GPU, so the download still stays out of the serving pods).
+#   A Job that cannot be scheduled never finishes; the Model's
+#   status.prefetch entry says why, and deleting the Job retries it.
+# - Progress is in the Model's status.prefetch (one entry per claim) and in
+#   the service's ModelPrefetched condition.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen2-5-0-5b-instruct
+  namespace: default
+spec:
+  source: Qwen/Qwen2.5-0.5B-Instruct
+  format: safetensors
+  files:
+    - config.json
+    - "*.json"
+    - "*.safetensors"
+  prefetch: true
+  modelCache:
+    claimName: model-cache
+  prefetchAffinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.present
+                operator: DoesNotExist
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen
+  namespace: default
+spec:
+  modelRef: qwen2-5-0-5b-instruct
+  runtime: vllm
+  modelCache:
+    claimName: model-cache
+    prefetch: true

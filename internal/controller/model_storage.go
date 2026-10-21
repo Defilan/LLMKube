@@ -853,6 +853,41 @@ func effectiveModelCacheKey(model *inferencev1alpha1.Model) string {
 	return cachekey.EffectiveKey(model)
 }
 
+// singleFileStagedBasename is the name a single-file Model is staged under
+// in its cache directory. It matches the basename the Model controller
+// renames the file to after parsing GGUF metadata: Status.Path when the
+// controller populated it, so a cache hit lands on the same file, else the
+// canonical basename, so an init container creates the file at the path the
+// controller would.
+func singleFileStagedBasename(model *inferencev1alpha1.Model) string {
+	if model.Status.Path != "" {
+		return filepath.Base(model.Status.Path)
+	}
+	return canonicalModelBasename(model)
+}
+
+// prefetchStagedFileNames is stagedFileNamesFromPlan for a Model whose plan
+// is resolved here, with that plan; an unresolvable plan yields the
+// single-file name and a nil plan.
+func prefetchStagedFileNames(model *inferencev1alpha1.Model) ([]string, *StagingPlan) {
+	plan, err := modelStagingPlan(model)
+	if err != nil {
+		plan = nil
+	}
+	return stagedFileNamesFromPlan(model, plan), plan
+}
+
+// stagedFileNamesFromPlan lists the cache-relative names a Model's files are
+// staged under, primary first: the plan's files for a multi-file Model, or
+// the single-file basename. plan is modelStagingPlan's result, nil for a
+// single file.
+func stagedFileNamesFromPlan(model *inferencev1alpha1.Model, plan *StagingPlan) []string {
+	if plan != nil {
+		return append([]string(nil), plan.Files...)
+	}
+	return []string{singleFileStagedBasename(model)}
+}
+
 // modelStagingPlan resolves the model's declared files into a staging plan.
 // Returns nil when there is no multi-file staging. Returns an error when
 // multi-file fields are set but resolution fails (fail-closed).
@@ -1545,16 +1580,7 @@ func buildCachedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1a
 		}
 	}
 
-	// Match the basename the Model controller renames the file to after
-	// parsing GGUF metadata. If the controller has already populated
-	// Status.Path, use that basename verbatim so the init container's cache
-	// hit lands on the same file. Otherwise (e.g. HF repo sources where the
-	// controller does no download), use the canonical basename so the init
-	// container creates the file at the same path the controller would.
-	basename := canonicalModelBasename(model)
-	if model.Status.Path != "" {
-		basename = filepath.Base(model.Status.Path)
-	}
+	basename := singleFileStagedBasename(model)
 	modelPath := fmt.Sprintf("%s/%s", cacheDir, basename)
 
 	initVolumeMounts := []corev1.VolumeMount{
@@ -2073,4 +2099,107 @@ func (r *InferenceServiceReconciler) ensureModelCachePVC(ctx context.Context, is
 
 	log.Info("Created model cache PVC", "namespace", namespace, "name", pvcName)
 	return nil
+}
+
+// buildPrefetchedStorageConfig renders the storage of a pod whose weights a
+// prefetch Job already staged: the cache claim mounted read-only, at the same
+// paths the download path uses, with a single init container that checks the
+// staged files are present (and the primary file's spec.sha256 when one is
+// pinned) and fails naming the cause. No cache-prep (the Job prepared the
+// claim) and no downloader: a pod that would download on the serving node is
+// the failure this exists to prevent.
+//
+// staged is the file list the Job recorded on the Model's entry. It is
+// authoritative over anything derived from the Model now: a single-file
+// name is derived from GGUF metadata the Model may have parsed only after
+// the Job ran, and the Job wrote the name it had then.
+func buildPrefetchedStorageConfig(model *inferencev1alpha1.Model, isvc *inferencev1alpha1.InferenceService, cacheMode string, initContainerImage string, staged []string) (cfg modelStorageConfig) {
+	defer func() { applyInitContainerDiagnostics(cfg.initContainers) }()
+	cacheDir := fmt.Sprintf("/models/%s", effectiveModelCacheKey(model))
+	volumes := []corev1.Volume{{
+		Name: "model-cache",
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: modelCachePVCName(isvc, cacheMode),
+				ReadOnly:  true,
+			},
+		},
+	}}
+	mounts := []corev1.VolumeMount{{Name: "model-cache", MountPath: "/models", ReadOnly: true}}
+
+	plan, err := modelStagingPlan(model)
+	if err != nil {
+		return modelStorageConfig{
+			modelPath:      stagedCachePath(cacheDir, "model.gguf"),
+			initContainers: []corev1.Container{modelStagingErrorInitContainer(err, model, initContainerImage)},
+			volumes:        volumes,
+			volumeMounts:   mounts,
+		}
+	}
+	var (
+		modelPath string
+		stagedDir string
+		files     []string
+	)
+	files = staged
+	if len(files) == 0 {
+		files = stagedFileNamesFromPlan(model, plan)
+	}
+	modelPath = stagedCachePath(cacheDir, files[0])
+	if plan != nil {
+		stagedDir = cacheDir
+	}
+
+	env := []corev1.EnvVar{
+		{Name: "CACHE_DIR", Value: cacheDir},
+		{Name: "MODEL_FILES", Value: strings.Join(files, "\n")},
+		{Name: "MODEL_NAME", Value: model.Name},
+	}
+	// A pinned single-file digest is enforced here as it is on a pvc://
+	// mount (#1979): the downloader that would have checked it did not run
+	// in this pod. Per-file digests of a multi-file set were checked by the
+	// Job as it staged each file.
+	digest := ""
+	if plan == nil && model.Spec.SHA256 != "" {
+		digest = strings.ToLower(model.Spec.SHA256)
+		env = append(env, corev1.EnvVar{Name: "MODEL_PATH", Value: modelPath}, corev1.EnvVar{Name: "MODEL_SHA256", Value: digest})
+	}
+
+	return modelStorageConfig{
+		modelPath: modelPath,
+		stagedDir: stagedDir,
+		initContainers: []corev1.Container{{
+			Name:            "model-verify",
+			Image:           initContainerImage,
+			Command:         []string{"sh", "-c", buildPrefetchVerifyCommand(digest != "")},
+			Env:             env,
+			VolumeMounts:    mounts,
+			SecurityContext: initContainerSecurityContext(isvc),
+		}},
+		volumes:      volumes,
+		volumeMounts: mounts,
+	}
+}
+
+// buildPrefetchVerifyCommand checks every staged file is present on the
+// read-only cache mount, and with verifyDigest hashes the primary file
+// against MODEL_SHA256 as buildPVCVerifyCommand does (no stamp: the mount is
+// read-only). The file list and the Model name arrive through env and are
+// printed as printf arguments, never interpolated into the shell. The loop
+// runs in a pipeline subshell, so a missing file exits that subshell and the
+// trailing `|| exit 1` fails the container.
+func buildPrefetchVerifyCommand(verifyDigest bool) string {
+	cmd := `printf '%s\n' "$MODEL_FILES" | while IFS= read -r rel; do ` +
+		`[ -n "$rel" ] || continue; ` +
+		`if [ ! -f "$CACHE_DIR/$rel" ] || [ ! -r "$CACHE_DIR/$rel" ]; then ` +
+		`printf 'ERROR: PrefetchedFilesMissing - %s is not on the cache claim. Model %s was expected to be staged there by its prefetch job (see the Model status.prefetch); not downloading on the serving node.\n' "$CACHE_DIR/$rel" "$MODEL_NAME" >&2; ` +
+		`exit 1; fi; done || exit 1; `
+	if verifyDigest {
+		cmd = sha256HashFns + cmd +
+			`llmkube_precheck_sha256 || exit 1; ` +
+			`actual=$(llmkube_sha256_hash "$MODEL_PATH") || exit 1; ` +
+			`if [ "$actual" != "$MODEL_SHA256" ]; then echo "ERROR: SHA256 mismatch for the prefetched $MODEL_PATH: expected $MODEL_SHA256, computed $actual" >&2; exit 1; fi; ` +
+			`echo "Prefetched model verified against spec.sha256"; `
+	}
+	return cmd + `echo "Prefetched model files present under $CACHE_DIR"`
 }

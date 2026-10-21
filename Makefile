@@ -236,6 +236,39 @@ test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expect
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+# A kind cluster for the e2e specs that need more than one node: a control
+# plane and two workers that mount one host directory, one worker labeled as
+# the GPU node (test/e2e/kind-multinode.yaml). test-e2e-multinode runs the
+# "Multi-node" specs on it; today that is the prefetch spec. Reuses an
+# existing cluster of the same name like setup-test-e2e does, so run
+# cleanup-test-e2e first when a single-node one is up.
+E2E_SHARED_CACHE_DIR ?= /tmp/llmkube-e2e-shared-cache
+
+.PHONY: setup-test-e2e-multinode
+setup-test-e2e-multinode: ## Set up a two-worker Kind cluster with a shared host directory if it does not exist
+	@command -v $(KIND) >/dev/null 2>&1 || { \
+		echo "Kind is not installed. Please install Kind manually."; \
+		exit 1; \
+	}
+	@mkdir -p "$(E2E_SHARED_CACHE_DIR)" $(LOCALBIN)
+	@case "$$($(KIND) get clusters)" in \
+		*"$(KIND_CLUSTER)"*) \
+			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+		*) \
+			echo "Creating two-worker Kind cluster '$(KIND_CLUSTER)' sharing $(E2E_SHARED_CACHE_DIR)..."; \
+			sed "s|__SHARED_CACHE_DIR__|$(E2E_SHARED_CACHE_DIR)|" test/e2e/kind-multinode.yaml > $(LOCALBIN)/kind-multinode.yaml; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --config $(LOCALBIN)/kind-multinode.yaml ;; \
+	esac
+
+.PHONY: test-e2e-multinode
+test-e2e-multinode: setup-test-e2e-multinode manifests generate fmt vet ## Run the e2e specs that need two workers sharing a host directory (needs Kind).
+	@# A rerun must stage afresh, not verify the previous run's bytes.
+	@test -n "$(E2E_SHARED_CACHE_DIR)" && test "$(E2E_SHARED_CACHE_DIR)" != "/" || { echo "refusing to empty E2E_SHARED_CACHE_DIR='$(E2E_SHARED_CACHE_DIR)'"; exit 1; }
+	@find "$(E2E_SHARED_CACHE_DIR)" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+	LLMKUBE_E2E_MULTINODE=true KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -timeout 30m -tags=e2e ./test/e2e/ -v -ginkgo.v \
+		-ginkgo.focus='Multi-node'
+	$(MAKE) cleanup-test-e2e
+
 # Runs only the "APISIX ai-proxy-multi in front of an InferenceService"
 # Context (test/e2e/apisix_e2e_test.go): it Helm-installs the operator chart
 # and APISIX (chart 2.18.0, standalone mode) and serves the stub upstream as

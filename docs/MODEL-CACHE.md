@@ -172,9 +172,10 @@ spec:
 ## Prefetch (Eager Download)
 
 By default a `Model` with a remote source is only a declaration: nothing is
-downloaded until the first `InferenceService` referencing it starts. Set
-`spec.prefetch: true` to have the operator pull the artifact into the shared
-cache immediately:
+downloaded until the first `InferenceService` referencing it starts, and the
+download then runs in that pod's init container, on the serving node. Set
+`spec.prefetch: true` to have the operator stage the artifact into a model
+cache claim ahead of the serving pods:
 
 ```yaml
 apiVersion: inference.llmkube.dev/v1alpha1
@@ -188,18 +189,156 @@ spec:
 ```
 
 The controller runs an owner-referenced download Job that reuses the same
-init-container downloader the serving path uses, writing into the
-namespace's shared cache PVC (`llmkube-model-cache`, created on demand).
-`status.phase` moves `Downloading` -> `Ready`; once `Ready`, the first
-`InferenceService` starts from a cache hit instead of a cold download.
+init-container downloader the serving path uses. `status.phase` moves
+`Downloading` -> `Ready`; once `Ready`, the first `InferenceService` starts
+from a cache hit instead of a cold download. A glob in `spec.files` is
+expanded from the repository listing before the Job is built, exactly as it
+is for the serving pods, so a multi-file checkpoint such as
+`files: [config.json, "*.json", "*.safetensors"]` prefetches too.
+
+### Where the download lands
+
+The Job stages into one claim, chosen in this order:
+
+1. `spec.modelCache.claimName` on the Model, when set. The Job writes there
+   and never falls back, whatever services exist.
+2. Otherwise the single `spec.modelCache.claimName` the referencing
+   `InferenceService`s agree on (#1676).
+3. Otherwise the namespace's shared cache (`llmkube-model-cache`, created on
+   demand).
+
+`spec.modelCache` on the Model takes the same fields as an
+`InferenceService`'s: `claimName`, `persistence`, `storageClassName` and
+`prefetch` (an alias of `spec.prefetch`). It is also the default for the
+services that reference the Model: a service with no `modelCache` block of
+its own resolves the Model's, so the claim is declared once. A service that
+sets its own block still wins. `persistence: Ephemeral` cannot be combined
+with prefetch; the API server rejects it.
+
+Every claim the Model has been staged into is recorded in `status.prefetch`,
+one entry per claim with the Job name, the phase (`Pending`, `Running`,
+`Succeeded`, `Failed`) and a fingerprint of what was staged. A spec change
+that alters the files (the source, `files`, a revision, `fileSha256`) runs
+a new prefetch; one that does not (placement, tolerations) only refreshes
+the entry. Deleting a finished Job retries it.
+
+Two conditions report what the field could not do:
+
+- `PrefetchSkipped=True` (reason `SourceNotPrefetchable`): `spec.prefetch`
+  is set on a source the downloader does not stage (local paths, `pvc://`,
+  `oci://`, `s3://`).
+- `PrefetchTargetMismatch=True` (reason `ClaimMismatch`): a referencing
+  service mounts a claim the Model was not staged into, so that service
+  downloads at serve time. Once a download has completed the operator does
+  not move it: a service that appears later with another claim is reported
+  here, and gets a `PrefetchTargetMismatch` warning event of its own. Set
+  `modelCache.prefetch` on that service, or `modelCache.claimName` on the
+  Model, to stage there. While the Job is still running, a service that
+  appears with another claim retargets it instead.
+
+### Letting the service require a prefetch
+
+An `InferenceService` can ask for its own staging with
+`spec.modelCache.prefetch: true`, whether or not the Model sets
+`spec.prefetch`:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: Model
+metadata:
+  name: qwen2-5-0-5b-instruct
+spec:
+  source: Qwen/Qwen2.5-0.5B-Instruct   # about 1 GiB; a gated repo adds sourceSecretRef
+  format: safetensors
+  files: [config.json, "*.json", "*.safetensors"]
+  modelCache:
+    claimName: model-cache
+  prefetchAffinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - {key: nvidia.com/gpu.present, operator: DoesNotExist}
+---
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: qwen
+spec:
+  modelRef: qwen2-5-0-5b-instruct
+  runtime: vllm
+  modelCache:
+    claimName: model-cache
+    prefetch: true
+```
+
+With the field set:
+
+- The Model controller runs a prefetch Job for this Model into the claim
+  this service's pods mount (`claimName`, else the Model's
+  `modelCache.claimName`, else the operator cache), placed by the Model's
+  `prefetchNodeSelector`, `prefetchTolerations` and `prefetchAffinity`. The
+  download happens on the nodes meant for downloads, never on the serving
+  nodes. One Model can be staged into several claims; each has its own Job
+  (`<model>-prefetch-<claim hash>`) and `status.prefetch` entry.
+- The service creates no pods until that prefetch has succeeded for the
+  Model's current spec, and reports `ModelPrefetched=False` with reason
+  `WaitingForPrefetch` (also in `status.schedulingStatus`) meanwhile, or
+  `WaitingForModel` while the Model has not derived its cache key yet. A
+  later change that needs new weights holds the same way: the live
+  Deployment keeps serving the old template until the new prefetch
+  completes, then rolls. A failed prefetch shows as `PrefetchFailed` and the
+  workload stays as it was; delete the Job to retry. While a hold is on, a
+  replica change other than to zero waits with the template, and a
+  `multiNode` group that loses a member is recreated only once the
+  prefetch finishes.
+- Once staged, the serving pods only consume the cache: the claim is
+  mounted read-only, there is no `model-cache-prep` or `model-downloader`
+  init container, and a `model-verify` init container checks the files the
+  Job recorded on the entry are present (and hashes a single file against
+  `spec.sha256` when one is pinned). If a file is missing the pod fails with
+  `PrefetchedFilesMissing` (surfaced on the `ModelTransferHealthy`
+  condition) rather than downloading on the serving node. The prefetch sets
+  no Hub-offline variable: put `HF_HUB_OFFLINE=1` in `spec.env` when the
+  runtime must not reach the Hub for anything the Job did not stage (see
+  the air-gapped guide).
+- Use a `ReadWriteMany` (or `ReadOnlyMany`) claim when the serving pods run
+  on other nodes than the Job. A `ReadWriteOnce` claim attaches to one node:
+  the first staging works because the Job finishes before the pods attach,
+  but a later re-stage or re-verification while pods mount the claim
+  elsewhere stalls on `Multi-Attach` and is reported as `PrefetchStalled`.
+  On a single-writer claim the Model therefore skips the routine
+  re-verification while a pod mounts the claim (the entry says so and
+  stays usable), and a re-stage after `PrefetchedFilesMissing` still runs
+  but needs the consuming service suspended (`spec.suspend`) to release
+  the attachment when the Job lands on another node.
+- `prefetch: true` means "serve only from a prefetched cache". A request the
+  pods could not consume is refused, not ignored: the service reports
+  `ModelPrefetched=False` with reason `PrefetchUnsupported`, creates no pods
+  (or keeps its live Deployment as it is), and no Job runs. That covers
+  model caching disabled on the operator, a runtime the operator does not
+  stage (TGI, `generic` without `stageModel`, `skipModelInit: true`), a
+  `speculativeDecoding.draftModelRef` (the draft is not prefetched), a
+  `multiNode` member with its own `modelCache.claimName` (that member's pod
+  mounts a claim the prefetch does not fill), and a source the downloader
+  does not stage ahead of time (`s3://`). The field
+  is `PrefetchNotApplicable`, and not waited for, only where nothing
+  downloads at serve time: Metal, `pvc://`, `oci://` and local sources.
+
+Applied together by GitOps, the pair above is safe in either order: the
+Model names the claim, the service inherits or repeats it, and the service
+waits for the staging it asked for. The request itself is not inherited:
+`modelCache.prefetch` on the Model is `spec.prefetch`, which stages the
+Model's own claim and holds no service, so a service that must wait sets
+`modelCache.prefetch` in its own block.
 
 ### Placing the prefetch pod
 
-A node-pinned cache (a `WaitForFirstConsumer` local-path claim referenced by
-an `InferenceService`'s `spec.modelCache.claimName`) binds to whichever node
-the prefetch pod schedules to. `spec.prefetchTolerations` and
-`spec.prefetchNodeSelector` steer that placement so the model lands on the
-node that will serve it:
+A node-pinned cache (a `WaitForFirstConsumer` local-path claim) binds to
+whichever node the prefetch pod schedules to. `spec.prefetchTolerations`,
+`spec.prefetchNodeSelector` and `spec.prefetchAffinity` steer that placement
+so the model lands on the node that will serve it, or stays off the GPU
+nodes while it downloads:
 
 ```yaml
 spec:
@@ -209,23 +348,79 @@ spec:
       operator: Exists
   prefetchNodeSelector:
     example.com/node-pool: gpu
+  prefetchAffinity:
+    nodeAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          preference:
+            matchExpressions:
+              - {key: example.com/node-pool, operator: In, values: [downloads]}
 ```
 
-Both fields govern only where the download runs, never where the model is
+All three govern only where the download runs, never where the model is
 served.
+
+Placement has to reach the claim. A claim on one node's local disk (a
+`WaitForFirstConsumer` local-path volume that is already bound, a hostPath
+PV) can only be filled from that node, so a rule that keeps the Job off the
+GPU nodes leaves it unschedulable when the claim lives on one. The Job pod
+requests no GPU, so pinning it to the claim's node with
+`prefetchNodeSelector` still keeps the download out of the serving pods; an
+off-GPU rule is for a claim every node can reach (an RWX class, a blob
+mount). A Job whose pod cannot be scheduled never completes and never fails:
+the Model stays `Downloading`, its `status.prefetch` entry and `Progressing`
+condition carry the scheduler's message (reason `PrefetchUnschedulable`, for
+example `volume node affinity conflict`), and a `PrefetchUnschedulable`
+warning event is recorded. A pod that was scheduled but has not started
+within five minutes (an image pull, a volume that cannot attach) is reported
+the same way as `PrefetchStalled`, with the container's waiting reason. Fix
+the placement or the claim, then delete the Job to retry.
 
 Limitations:
 
-- Prefetch applies to remote sources (`https://`, `hf://`). Local paths and
-  `pvc://` sources ignore the field.
-- Prefetch targets the **shared** cache only. `perService` cache PVCs bind
-  at serve time and cannot be pre-populated; pre-stage those fleets with a
-  `pvc://` source instead.
-- A failed prefetch Job sets `status.phase: Failed`; check the Job's pod
-  logs (`<model-name>-prefetch`). The Job self-cleans 24 hours after
-  finishing and is garbage-collected with the Model.
+- Prefetch applies to remote sources (`https://`, `hf://`, and a bare
+  repository ID with `spec.files`). Local paths, `pvc://`, `oci://` and
+  `s3://` sources set `PrefetchSkipped` instead.
+- In `perService` cache mode the operator-created `<isvc>-model-cache`
+  claim binds where the first consumer schedules. A Model-level
+  `spec.prefetch` targets the shared cache there and is reported as a
+  `PrefetchTargetMismatch`; `modelCache.prefetch` on the service stages into
+  the per-service claim, with the Job as that first consumer, so set the
+  Model's prefetch placement to the node the service will run on.
+- A failed prefetch Job sets `status.phase: Failed` on a Model that asked
+  for it; check the Job's pod logs (the name is in `status.prefetch`). The
+  Job self-cleans 24 hours after finishing and is garbage-collected with
+  the Model.
+- There is no timeout on a prefetch Job. A pod that cannot be scheduled is
+  reported as above; a pod that is scheduled but stalls (a slow or hung
+  source) is visible only in its logs.
 
-See `config/samples/model_prefetch.yaml` for a complete example.
+### When the staged files disappear
+
+`status.prefetch` records that a claim was filled; it cannot see the claim
+afterwards. If the files go away (`llmkube cache clear`, a claim deleted and
+recreated under the same name, a wiped volume), two things bring them back
+without a rollout:
+
+- The serving pods of a service with `modelCache.prefetch` fail
+  `model-verify` with `PrefetchedFilesMissing`, which the service reports on
+  `ModelTransferHealthy`. The service then deletes the Model's prefetch Job
+  for its claim, the Model stages again, and the failing pods pass
+  `model-verify` on their next init retry. This happens once per failure
+  episode: a claim the serving node cannot reach at all stays reported
+  rather than re-staged in a loop.
+- The Model re-verifies a claim whenever its prefetch Job is gone: a day
+  after it finished (the Job's TTL), or when someone deletes it. With the
+  files still in place that is a cache hit and completes in seconds. The
+  entry stays `Succeeded` and the Model `Ready` while the check runs, so no
+  service is held for it; the entry's message and the Model's `Progressing`
+  condition (reason `PrefetchReverifying`) show it, and only a failed check
+  moves the entry to `Failed`. So "delete the Job" is always an available
+  retry, and a wiped claim is refilled within a day even with no pods to
+  notice.
+
+See `config/samples/model_prefetch.yaml` and
+`config/samples/model_prefetch_gitops.yaml` for complete examples.
 
 ## Configuration
 
@@ -434,6 +629,10 @@ Behavior:
   it, weights land under the usual `<cacheKey>/` subdirectory, and the serving
   container mounts it read-only. `RefreshPolicy` and cache-key semantics are
   unchanged, so multiple models can safely share one claim.
+- The block can live on the Model instead: a service with no `modelCache`
+  of its own resolves `Model.spec.modelCache`, so a claim shared by every
+  service of a model is declared once (see Prefetch above). A service's own
+  block still wins.
 - The operator **never creates or deletes** the claim — you own it end-to-end
   (unlike `perService` mode, where the operator provisions and
   garbage-collects `<isvc>-model-cache`). If the claim does not exist, the

@@ -19,6 +19,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -549,6 +550,81 @@ func TestCachePVCandidates(t *testing.T) {
 	}
 }
 
+// TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim drives the
+// real listing: a service that shares a model's name but references another
+// Model must not bring that other Model's claim into the purge, while a
+// service that references the model and has no block of its own does inherit
+// the model's claim.
+func TestResolvePurgeTargets_InheritsOnlyTheReferencedModelsClaim(t *testing.T) {
+	const ns = "default"
+	pvc := func(name string, labeled bool) *corev1.PersistentVolumeClaim {
+		p := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
+		if labeled {
+			p.Labels = map[string]string{modelCacheLabel: modelCacheLabelValue}
+		}
+		return p
+	}
+	model := func(name, claim string, staged ...string) *inferencev1alpha1.Model {
+		m := &inferencev1alpha1.Model{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       inferencev1alpha1.ModelSpec{Source: "hf://org/" + name},
+		}
+		if claim != "" {
+			m.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{ClaimName: claim}
+		}
+		for _, c := range staged {
+			m.Status.Prefetch = append(m.Status.Prefetch,
+				inferencev1alpha1.PrefetchStatus{ClaimName: c, Phase: inferencev1alpha1.PrefetchPhaseSucceeded})
+		}
+		return m
+	}
+	svc := func(name, modelRef string) *inferencev1alpha1.InferenceService {
+		return &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: modelRef},
+		}
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(newCLIScheme()).WithObjects(
+		pvc(modelCachePVCName, true), pvc("other-claim", false), pvc("qwen-claim", false),
+		model("other", "other-claim"), model("qwen", "qwen-claim", modelCachePVCName),
+		svc("qwen", "other"), svc("svc-a", "qwen"),
+	).Build()
+	ctx := context.Background()
+
+	targets, svcs, err := resolvePurgeTargets(ctx, k8sClient, ns)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	names := func(targets []purgeTarget) []string {
+		out := make([]string, 0, len(targets))
+		for _, tgt := range targets {
+			out = append(out, tgt.Name)
+		}
+		return out
+	}
+	qwenClaim, qwenStaged := modelCacheClaims(ctx, k8sClient, ns, "qwen")
+	if !slices.Equal(qwenStaged, []string{modelCachePVCName}) {
+		t.Errorf("modelCacheClaims staged = %v, want the status.prefetch claim %s", qwenStaged, modelCachePVCName)
+	}
+	forQwen := names(targetedClaims(targets, svcs, "qwen", qwenClaim, qwenStaged))
+	if !slices.Contains(forQwen, modelCachePVCName) {
+		t.Errorf("clearing qwen targets %v, want %s too: status.prefetch records a staging there", forQwen, modelCachePVCName)
+	}
+	if slices.Contains(forQwen, "other-claim") {
+		t.Errorf("clearing qwen targets %v: other-claim belongs to Model other, "+
+			"which service qwen references but model qwen does not own", forQwen)
+	}
+	if !slices.Contains(forQwen, "qwen-claim") {
+		t.Errorf("clearing qwen targets %v, want qwen-claim: "+
+			"svc-a references qwen with no block and inherits its claim", forQwen)
+	}
+	otherClaim, otherStaged := modelCacheClaims(ctx, k8sClient, ns, "other")
+	forOther := names(targetedClaims(targets, svcs, "other", otherClaim, otherStaged))
+	if !slices.Contains(forOther, "other-claim") || slices.Contains(forOther, "qwen-claim") {
+		t.Errorf("clearing other targets %v, want other-claim and not qwen-claim", forOther)
+	}
+}
+
 func TestSeedCacheEntries(t *testing.T) {
 	metal := inferencev1alpha1.Model{
 		ObjectMeta: metav1.ObjectMeta{Name: "metal-model", Namespace: "ns"},
@@ -642,13 +718,68 @@ func TestTargetedClaims(t *testing.T) {
 		return s
 	}
 
+	modelClaim := purgeTarget{Name: "model-cache", UserOwned: true}
+	svcWithBlock := func(name, modelRef string) inferencev1alpha1.InferenceService {
+		s := svc(name, modelRef, "")
+		s.Spec.ModelCache = &inferencev1alpha1.ModelCacheSpec{Prefetch: true}
+		return s
+	}
+
 	tests := []struct {
-		name  string
-		all   []purgeTarget
-		svcs  []inferencev1alpha1.InferenceService
-		model string
-		want  []string
+		name       string
+		all        []purgeTarget
+		svcs       []inferencev1alpha1.InferenceService
+		model      string
+		modelClaim string
+		staged     []string
+		want       []string
 	}{
+		{
+			// The controller's sticky target: the Model staged into the shared
+			// cache before the service and its claim appeared, and keeps
+			// staging there, so the files are on both.
+			name:   "the claims status.prefetch records are targets beside the service's",
+			all:    []purgeTarget{shared, overrideClaim, unrelatedPerService},
+			svcs:   []inferencev1alpha1.InferenceService{svc("qwen", "qwen", "isvc-cache")},
+			model:  "qwen",
+			staged: []string{"llmkube-model-cache"},
+			want:   []string{"llmkube-model-cache", "isvc-cache"},
+		},
+		{
+			// #2136: the Model names the claim and the service inherits it;
+			// the service's own spec says nothing.
+			name:       "a Model's claimName is the target with or without a service",
+			all:        []purgeTarget{shared, modelClaim, unrelatedPerService},
+			svcs:       []inferencev1alpha1.InferenceService{svc("qwen", "qwen", "")},
+			model:      "qwen",
+			modelClaim: "model-cache",
+			want:       []string{"model-cache"},
+		},
+		{
+			// A block of its own, even one naming no claim, mounts the
+			// default claim, as the controller resolves it.
+			name:       "a service with its own modelCache block does not inherit the Model's claim",
+			all:        []purgeTarget{shared, modelClaim},
+			svcs:       []inferencev1alpha1.InferenceService{svcWithBlock("qwen", "qwen")},
+			model:      "qwen",
+			modelClaim: "model-cache",
+			want:       []string{"llmkube-model-cache", "model-cache"},
+		},
+		{
+			name:       "a service named after the model but referencing another does not inherit",
+			all:        []purgeTarget{shared, modelClaim},
+			svcs:       []inferencev1alpha1.InferenceService{svc("qwen", "other-model", "")},
+			model:      "qwen",
+			modelClaim: "model-cache",
+			want:       []string{"llmkube-model-cache", "model-cache"},
+		},
+		{
+			name:       "a prefetch-era Model with no service targets its own claim, not the shared cache",
+			all:        []purgeTarget{shared, modelClaim},
+			model:      "qwen",
+			modelClaim: "model-cache",
+			want:       []string{"model-cache"},
+		},
 		{
 			name:  "claimName override targets the override only",
 			all:   []purgeTarget{shared, overrideClaim, unrelatedPerService},
@@ -720,7 +851,7 @@ func TestTargetedClaims(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := targetedClaims(tt.all, tt.svcs, tt.model)
+			got := targetedClaims(tt.all, tt.svcs, tt.model, tt.modelClaim, tt.staged)
 			var names []string
 			for _, target := range got {
 				names = append(names, target.Name)

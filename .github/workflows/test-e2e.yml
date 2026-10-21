@@ -146,6 +146,44 @@ jobs:
         if: always()
         run: make cleanup-test-e2e
 
+  test-e2e-multinode:
+    name: Run on Ubuntu (kind, two workers, shared host directory)
+    runs-on: ubuntu-latest
+    # Best-effort while the two-worker harness settles in CI, like the other
+    # recent e2e jobs; the default kind job above remains the merge gate.
+    continue-on-error: true
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install the latest version of kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      # The specs that need more than one node: the target creates a
+      # control plane and two workers that share one host directory
+      # (test/e2e/kind-multinode.yaml) and runs the "Multi-node" specs on
+      # it. Today that is the prefetch spec: a Job on one worker fills a
+      # hostPath claim both mount, and a pod pinned to the other consumes it.
+      - name: Running the multi-node e2e
+        run: |
+          go mod tidy
+          make test-e2e-multinode
+
+      - name: Tear down the kind cluster
+        if: always()
+        run: kind delete cluster --name llmkube-test-e2e || true
+
   test-e2e-longhorn:
     name: Run on Ubuntu (kind + Longhorn, restrictive storage)
     runs-on: ubuntu-latest

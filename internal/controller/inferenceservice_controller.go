@@ -182,6 +182,7 @@ func initContainerSecurityContext(isvc *inferencev1alpha1.InferenceService) *cor
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=inferenceservices/finalizers,verbs=update
 // +kubebuilder:rbac:groups=inference.llmkube.dev,resources=models,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;delete
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;delete
@@ -232,6 +233,10 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	// A service with no modelCache block of its own resolves the Model's
+	// (#2136), in memory: never written back to the spec.
+	inheritModelCache(inferenceService, model)
+
 	draftModel, draftReady, draftResult, err := r.getDraftModelForInferenceService(ctx, inferenceService)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -275,6 +280,7 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	r.warnIgnoredModelCacheClaim(inferenceService, model)
+	r.warnPrefetchTargetMismatch(inferenceService, model)
 	r.warnUnboundedEphemeralCache(inferenceService)
 
 	isMetal := isMetalModel(model)
@@ -315,6 +321,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		// containers only, as the driver diagnosis scans the runtime container
 		// only, so one failure never collects two contradictory diagnoses.
 		r.reconcileModelTransferCondition(ctx, inferenceService)
+		// A prefetched claim whose files the pods found missing is staged
+		// again by deleting the Model's Job (#2136).
+		r.restagePrefetchOnMissingFiles(ctx, inferenceService, model)
 	}
 
 	endpoint := r.constructEndpoint(inferenceService, service)
@@ -987,6 +996,9 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			},
 		}
 		rollResult, err := r.reconcileRolloutPolicy(ctx, isvc, svc)
+		// Its status writes decoded the stored spec back into isvc, which
+		// drops an inherited modelCache (#2136).
+		inheritModelCache(isvc, model)
 		if err != nil {
 			log.Error(err, "Failed to reconcile rollout policy")
 			return nil, replicaCounts{}, nil, nil, err
@@ -1010,6 +1022,7 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 				log.Error(updateErr, "Failed to clear stale RolloutDeferred condition")
 				return nil, replicaCounts{}, nil, nil, updateErr
 			}
+			inheritModelCache(isvc, model)
 		}
 	}
 
@@ -1499,6 +1512,11 @@ func (r *InferenceServiceReconciler) reconcileWorkload(
 		if err := r.teardownRelay(ctx, isvc); err != nil {
 			return nil, replicaCounts{}, nil, nil, err
 		}
+	}
+	// A requested prefetch that has not landed holds whatever serves today
+	// (#2136): no pods before the first one, no new template after it.
+	if held, dep, counts, result, err := r.holdForPrefetch(ctx, isvc, model, desiredReplicas, modelReady); held || err != nil {
+		return dep, counts, nil, result, err
 	}
 	if isvc.Spec.MultiNode != nil {
 		// A multiNode group runs no Deployment, so a marker left by a
