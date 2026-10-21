@@ -235,7 +235,21 @@ that keeps the member busy across polls holds the slot, but a sparse trickle of
 short, sub-poll requests can slip between samples and let the slot reclaim during
 a lull. Size the grace to outlast a genuine quiet period, and expect the guard to
 keep the on-demand model resident only while its traffic keeps at least one poll
-busy.
+busy. A poll the resident does not answer holds the clock where it is rather than
+restarting it, so whether the server happened to be up at poll time does not
+change when the slot is reclaimed.
+
+A member whose server is not answering is also not held resident on the drain
+side. For a non-resident member that reports `Ready`, the idle probe answers
+first, so a busy member is still deferred. The member's Pods are consulted only
+when the connection is refused, because then nothing on its Service path is
+accepting work: no Pod, a Pod that is terminating, or a Pod with no running
+server container cannot be serving, and one running Pod is the Pod the Service
+would have forwarded to. Those are drained. A member that does not report
+`Ready` is not probed at all: it cannot be serving, so it drains as before. A
+probe failure that could still hide in-flight work, a timeout, a non-200
+response, an absent idle endpoint, or a refusal among two or more running Pods,
+still fails closed and defers the swap, as does a member the probe reports busy.
 
 ### Serving on the warm member instead of waiting: `poolActivation: IfIdle`
 
@@ -340,6 +354,17 @@ including requests for the member that is still loaded - until the proxy was
 restarted. Abandoning the swap reopens the resident's fast path, and the next
 request for the target starts a fresh swap. A pool with no explicit
 `swapBudget` uses twice the router's response-header timeout as the bound.
+
+A swap that has started runs to `Ready` or to that deadline even when the
+request that started it goes away. A caller that times out or disconnects is
+dropped, and other requests for the pool are held until the swap finishes, but
+the load continues, so the retry finds the member warm instead of paying for a
+second cold load. Only the deadline scales a target back down, and a swap that
+fails for another reason scales its own target back down once no caller is
+waiting on it. The hedge is that a request for the member that is still loaded
+waits out a swap nobody else wanted, because the resident's fast path is closed
+for every swap in flight, waited on or not. With 45 to 90 second boots that wait
+is bounded by `swapBudget`, and the alternative was a cold load on every retry.
 
 ### A pooled router runs one replica
 

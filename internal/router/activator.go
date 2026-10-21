@@ -43,11 +43,11 @@ type MemberController interface {
 	// idempotent.
 	Activate(ctx context.Context, namespace, isvc string) error
 
-	// Deactivate cancels a pending activation by scaling isvc back to zero
-	// replicas. Called when a held request gives up (budget exceeded or client
-	// disconnect) and no other caller still wants the member, so the pool does
-	// not complete a useless swap. Idempotent; scaling an already-zero member is
-	// a no-op.
+	// Deactivate scales isvc back to zero replicas. Called when a held request
+	// gives up and no other caller still wants the member, and by the swap
+	// goroutine to clean up a target after a deadline abandonment or a swap
+	// failure with no waiters, so the pool does not keep a member scaled up for
+	// nobody. Idempotent; scaling an already-zero member is a no-op.
 	Deactivate(ctx context.Context, namespace, isvc string) error
 
 	// WaitReady blocks until isvc reports the Ready phase or ctx is done.
@@ -78,12 +78,6 @@ type Activator struct {
 	// adding an API round-trip to the hot path.
 	resyncInterval time.Duration
 
-	// beforeDeactivate, when non-nil, runs just before a deferred deactivate
-	// re-takes the lock to re-check whether its member is still unwanted. It
-	// exists so tests can drive a new activation into exactly the window that
-	// used to lose the race described below. Always nil in production.
-	beforeDeactivate func(member string)
-
 	mu    sync.Mutex
 	pools map[string]*poolRuntime
 }
@@ -107,11 +101,8 @@ type poolRuntime struct {
 	// completes so no request is dispatched to a member that is being torn down.
 	// The swap runs under the Activator's baseCtx, not any caller context, so a
 	// client disconnecting mid-swap never aborts an in-progress load.
-	// swapCancel cancels the in-flight swap when the last caller for the target
-	// gives up (cancel-on-timeout).
 	swapping   bool
 	swapTarget string
-	swapCancel context.CancelFunc
 
 	// swapGen identifies the swap that currently owns the fields above. A
 	// cancelled swap's goroutine can wake up after a fresh swap for the same
@@ -122,7 +113,8 @@ type poolRuntime struct {
 
 	// swapErr records the outcome of the most recent failed swap, keyed by the
 	// target member, so the waiter that requested that member surfaces the
-	// error instead of hanging. Cleared when taken.
+	// error instead of hanging. It is cleared when a request for that member
+	// arrives, so only a caller already waiting on the swap can observe it.
 	swapErr map[string]error
 
 	// inflight counts in-flight blocking requests per member. waiting counts
@@ -211,6 +203,9 @@ func (a *Activator) AcquireWithMode(ctx context.Context, p *BackendPool, mode st
 
 	pr.waiting[member]++
 	a.observeWaiting(pr, member)
+	// Only a caller that was already inside the failed swap sees its outcome; a
+	// request arriving afterwards starts a fresh load instead.
+	delete(pr.swapErr, member)
 	holdStart := time.Now()
 
 	release := func() {
@@ -230,28 +225,19 @@ func (a *Activator) AcquireWithMode(ctx context.Context, p *BackendPool, mode st
 		a.mu.Lock()
 		pr.waiting[member]--
 		a.observeWaiting(pr, member)
-		// Cancel-on-timeout: if this was the last caller waiting for member and
-		// member never became resident, cancel a pending activation so the pool
-		// does not complete a useless swap and leave a member scaled up that
-		// nobody is using. Cancelling only ever scales the target back down; the
-		// controller drains the incumbent solely when idle, so this can never
-		// produce a two-resident state.
+		// A started swap keeps loading: a target that comes up is warm for the
+		// retry, and spec.swapBudget is what bounds one that never does, so the
+		// lone caller that gave up does not throw away a load already paid for.
+		// Only a member no activation claims is scaled back down.
+		//
+		// The deactivate stays asynchronous (it is a live API call and this is a
+		// request goroutine), but it must re-check pool state under the lock
+		// before patching: a request for the same member can arrive in this
+		// window, start a swap and scale the member up, and a stale deactivate
+		// landing afterwards would scale it back to zero.
 		if pr.waiting[member] == 0 && pr.resident != member {
-			if pr.swapping && pr.swapTarget == member && pr.swapCancel != nil {
-				pr.swapCancel()
-			}
-			// Remember which swap generation this deactivate was scheduled
-			// against; anything newer means the member was wanted again.
-			gen := pr.swapGen
 			a.mu.Unlock()
-			// The deactivate stays asynchronous (it is a live API call and this
-			// is a request goroutine), but it must re-check pool state under the
-			// lock before patching: a request for the same member can arrive in
-			// this window, start a swap and scale the member up, and a stale
-			// deactivate landing afterwards would scale it back to zero. Activate
-			// is idempotent-by-check and never re-issued, so the swap would then
-			// wait forever on a member that can never become Ready.
-			go a.deactivateIfUnwanted(pr, member, gen)
+			go a.deactivateIfUnwanted(pr, member)
 			return
 		}
 		a.mu.Unlock()
@@ -317,16 +303,14 @@ func (a *Activator) AcquireWithMode(ctx context.Context, p *BackendPool, mode st
 // lets a caller give up (budget exceeded / disconnect) without aborting the
 // in-progress model load.
 //
-// budget bounds the whole swap (activate + wait-ready). Without it the only exit
-// is swapCancel, which fires only when the last waiter for target leaves, so a
-// client that retries on 503 keeps a doomed swap alive forever: swapping stays
-// true, the resident's fast path stays closed, and every request on the pool
-// burns its hold budget and 503s until the proxy is restarted.
+// budget bounds the whole swap (activate + wait-ready) and is its only exit, so
+// a target that never becomes Ready is abandoned at the deadline and the
+// resident's fast path reopens. A caller giving up does not end the swap: the
+// load keeps running so the target can come up warm for the retry.
 func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdStart time.Time, budget time.Duration) {
 	swapCtx, cancel := context.WithTimeout(a.baseCtx, resolveSwapDeadline(budget))
 	pr.swapping = true
 	pr.swapTarget = target
-	pr.swapCancel = cancel
 	pr.swapGen++
 	gen := pr.swapGen
 	delete(pr.swapErr, target)
@@ -350,11 +334,11 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 		}
 		pr.swapping = false
 		pr.swapTarget = ""
-		pr.swapCancel = nil
 		if err != nil {
-			// A cancelled swap (last caller gave up) is not a failure: the
-			// target was scaled back down by the cancel path, so just clear the
-			// swap state and wake any waiters.
+			// A cancelled swap is not a failure: only the Activator's baseCtx
+			// being cancelled reaches here (the swap context derives from it and
+			// the deadline case is handled below), so just clear the swap state
+			// and wake any waiters.
 			if swapCtx.Err() != nil && !errors.Is(swapCtx.Err(), context.DeadlineExceeded) {
 				pr.notify()
 				return
@@ -384,6 +368,17 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 			prommetrics.ModelPoolSwapFailuresTotal.
 				WithLabelValues(a.router, pr.pool, target, "error").Inc()
 			pr.swapErr[target] = errors.New("model pool swap failed for member " + target + ": " + err.Error())
+			// The target may already be scaled up: Activate patches replicas
+			// before WaitReady runs. Nothing cancels the swap any more, so a
+			// failed swap whose callers have all left would keep the slot with
+			// no traffic. Scale it back when no caller is waiting; a caller that
+			// still is schedules its own deactivate when it gives up.
+			if a.ctrl != nil && pr.waiting[target] == 0 {
+				if derr := a.ctrl.Deactivate(a.baseCtx, pr.namespace, target); derr != nil {
+					a.logger.Warn("model pool deactivate after failed swap failed",
+						"pool", pr.pool, "member", target, "error", derr)
+				}
+			}
 			pr.notify()
 			return
 		}
@@ -417,23 +412,19 @@ const defaultSwapDeadline = 2 * defaultResponseHeaderTimeout
 
 // deactivateIfUnwanted scales member back to zero unless the pool has since
 // decided it wants that member after all: a new waiter arrived, the member
-// became resident, or a swap newer than gen (the generation this deactivate was
-// scheduled against) is activating it right now. The re-check and the patch both
-// happen under a.mu, and every path that issues an Activate sets its swap state
-// under a.mu before its goroutine calls the controller, so a deactivate can no
-// longer land on top of an activation issued after it was scheduled. Caller must
+// became resident, or an in-flight swap is activating it right now. The re-check
+// and the patch both happen under a.mu, and every path that issues an Activate
+// sets its swap state under a.mu before its goroutine calls the controller, so a
+// deactivate can only ever land on a member no activation claims. Caller must
 // not hold a.mu.
-func (a *Activator) deactivateIfUnwanted(pr *poolRuntime, member string, gen uint64) {
+func (a *Activator) deactivateIfUnwanted(pr *poolRuntime, member string) {
 	if a.ctrl == nil {
 		return
-	}
-	if a.beforeDeactivate != nil {
-		a.beforeDeactivate(member)
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if pr.waiting[member] > 0 || pr.resident == member ||
-		(pr.swapping && pr.swapTarget == member && pr.swapGen != gen) {
+		(pr.swapping && pr.swapTarget == member) {
 		return
 	}
 	if err := a.ctrl.Deactivate(a.baseCtx, pr.namespace, member); err != nil {

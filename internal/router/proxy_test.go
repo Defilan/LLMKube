@@ -675,24 +675,27 @@ func TestProxy503WhenNoRoute(t *testing.T) {
 func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	fb := newFakeBackend(t)
 
-	// Activation never completes: Activate blocks on a gate that is never
-	// closed, so the caller's hold budget expires first.
+	// The target never becomes Ready, so its swap is still loading when the
+	// caller's hold budget (pool.SwapBudget) expires and ends the request with
+	// 503 + Retry-After. A swap that ends first would surface as a 502: the
+	// hold and the swap deadline are both derived from the same budget, so the
+	// fixture keeps the swap loading rather than racing the two timers.
 	fake := newFakeMemberController()
-	fake.activateGate = make(chan struct{})
+	fake.noAutoReady = true
 
 	cfg := &Config{
 		Backends: []Backend{{
 			Name:    "coder",
 			Tier:    "local",
 			Address: fb.URL(),
-			// The per-backend timeout bounds the activation hold, so the test
-			// does not wait the 120s proxy default.
+			// Unused by the hold, which is pool.SwapBudget.
 			Timeout: 50 * time.Millisecond,
 			Pool: &BackendPool{
-				Name:      "heavy-slot",
-				Namespace: "lab",
-				Member:    "coder",
-				Members:   []string{"coder", "judge"},
+				Name:       "heavy-slot",
+				Namespace:  "lab",
+				Member:     "coder",
+				Members:    []string{"coder", "judge"},
+				SwapBudget: 300 * time.Millisecond,
 			},
 		}},
 		DefaultRoute: "coder",
@@ -726,9 +729,6 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 	if fb.calls.Load() != 0 {
 		t.Errorf("backend calls = %d, want 0 (must not dispatch when activation never completed)", fb.calls.Load())
 	}
-
-	// Let the blocked activation goroutine unwind.
-	close(fake.activateGate)
 }
 
 // TestProxyPoolSwapBudgetDecoupledFromDispatchTimeout is the decoupling guard:
@@ -1266,10 +1266,16 @@ func TestProxyMetricsNonZeroAfterSmokeRun(t *testing.T) {
 	// types (which differ per metric kind) and instead uses the
 	// common dto.Metric protobuf that every metric implements via
 	// Write.
+	//
+	// Collect sends every series synchronously, so the channel is drained
+	// concurrently: a fixed buffer deadlocks once the registry grows past it,
+	// and the series count depends on label values other tests have created.
 	var foundRequests, foundDuration, foundBudget, foundHealth bool
-	ch := make(chan prometheus.Metric, 64)
-	ctrlmetrics.Registry.(prometheus.Collector).Collect(ch)
-	close(ch)
+	ch := make(chan prometheus.Metric)
+	go func() {
+		ctrlmetrics.Registry.(prometheus.Collector).Collect(ch)
+		close(ch)
+	}()
 	for m := range ch {
 		desc := m.Desc().String()
 		if strings.Contains(desc, `llmkube_router_requests_total`) {
