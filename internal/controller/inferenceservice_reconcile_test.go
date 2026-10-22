@@ -1887,6 +1887,106 @@ var _ = Describe("Reconcile lifecycle", func() {
 			Expect(got.Status.WaitingFor).To(BeEmpty())
 		})
 
+		It("reports WaitingForGPU when no replica serves and the replacement is Pending on the GPU", func() {
+			// The other half of the rollout phase rule: with nothing serving,
+			// the scheduling probe decides, so a replacement waiting on the GPUs
+			// its predecessor still holds reads as queued. At replicas 1 that is
+			// the normal state mid-rollout (#2131).
+			modelName := "model-sched-rollout-zero-ready"
+			isvcName := "isvc-sched-rollout-zero-ready"
+
+			model := &inferencev1alpha1.Model{
+				ObjectMeta: metav1.ObjectMeta{Name: modelName, Namespace: "default"},
+				Spec: inferencev1alpha1.ModelSpec{
+					Source: "https://example.com/model.gguf",
+					Hardware: &inferencev1alpha1.HardwareSpec{
+						Accelerator: "cuda",
+						GPU:         &inferencev1alpha1.GPUSpec{Enabled: true, Count: 4, Vendor: "nvidia", Layers: -1},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+
+			model.Status.Phase = PhaseReady
+			Expect(k8sClient.Status().Update(ctx, model)).To(Succeed())
+
+			replicas := int32(1)
+			isvc := &inferencev1alpha1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: "default"},
+				Spec: inferencev1alpha1.InferenceServiceSpec{
+					ModelRef: modelName,
+					Replicas: &replicas,
+					Image:    "ghcr.io/ggml-org/llama.cpp:server-cuda13",
+				},
+			}
+			Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, isvc)
+				dep := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, dep); err == nil {
+					_ = k8sClient.Delete(ctx, dep)
+				}
+				svc := &corev1.Service{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: "default"}, svc); err == nil {
+					_ = k8sClient.Delete(ctx, svc)
+				}
+				pods := &corev1.PodList{}
+				_ = k8sClient.List(ctx, pods, client.InNamespace("default"),
+					client.MatchingLabels{"inference.llmkube.dev/service": isvcName})
+				for i := range pods.Items {
+					_ = k8sClient.Delete(ctx, &pods.Items[i])
+				}
+			}()
+
+			reconciler := &InferenceServiceReconciler{
+				Client:             k8sClient,
+				Scheme:             k8sClient.Scheme(),
+				InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			}
+			key := types.NamespacedName{Name: isvcName, Namespace: "default"}
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			// The only pod is being replaced: nothing Ready.
+			dep := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+			dep.Status.Replicas = 1
+			dep.Status.ReadyReplicas = 0
+			dep.Status.AvailableReplicas = 0
+			Expect(k8sClient.Status().Update(ctx, dep)).To(Succeed())
+
+			pending := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "pending-replacement-zero-ready",
+					Namespace: "default",
+					Labels: map[string]string{
+						"app":                           isvcName,
+						"inference.llmkube.dev/service": isvcName,
+					},
+				},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "server", Image: "busybox"}}},
+			}
+			Expect(k8sClient.Create(ctx, pending)).To(Succeed())
+			pending.Status.Phase = corev1.PodPending
+			pending.Status.Conditions = []corev1.PodCondition{{
+				Type:    corev1.PodScheduled,
+				Status:  corev1.ConditionFalse,
+				Reason:  corev1.PodReasonUnschedulable,
+				Message: "0/2 nodes are available: 2 Insufficient nvidia.com/gpu.",
+			}}
+			Expect(k8sClient.Status().Update(ctx, pending)).To(Succeed())
+
+			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+
+			got := &inferencev1alpha1.InferenceService{}
+			Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+			Expect(got.Status.Phase).To(Equal(PhaseWaitingForGPU),
+				"with nothing serving, a Pending replacement is all there is to report")
+			Expect(got.Status.SchedulingStatus).To(Equal("InsufficientGPU"))
+		})
+
 		It("should clear the controller's own schedulingStatus once the service is Ready", func() {
 			modelName := "model-sched-clear"
 			isvcName := "isvc-sched-clear"

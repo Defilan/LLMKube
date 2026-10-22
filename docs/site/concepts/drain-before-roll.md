@@ -93,7 +93,7 @@ Before opting in, check four things:
 - **Mixed versions during the window.** A rollout that changes the model (a `ModelPool` move, a changed `modelRef`) serves the old and the new version side by side until every replica is replaced. For a template change the old version cannot serve, keep `Recreate`.
 - **Replica count.** `Recreate` on a single replica and `OneAtATime` on a single replica both replace the only pod, so the strategy only avoids downtime from `replicas: 2` up.
 
-While a replacement is Pending on `Insufficient nvidia.com/gpu`, the service reports `Progressing`, not `WaitingForGPU`: the replicas still serving mean it is mid-rollout, not queued for GPU. That Pending state is normal during a one-at-a-time rollout. The outgoing pod still holds its GPUs until it finishes draining, so the replacement cannot schedule until then; it is not the #192 deadlock, which only appears when the Deployment expects a pod beyond `spec.replicas`.
+While a replacement is Pending on `Insufficient nvidia.com/gpu` and at least one replica still serves, the service reports `Progressing`, not `WaitingForGPU`: a serving replica means it is mid-rollout, not queued for GPU. That Pending state is normal during a one-at-a-time rollout. The outgoing pod holds its GPUs until it finishes draining, so the replacement cannot schedule until then; it is not the #192 deadlock, which only appears when the Deployment asks for a pod beyond `spec.replicas`. At `replicas: 1`, or in any window where no replica is Ready, no serving replica masks the probe, so the service can report `WaitingForGPU` until the outgoing pod releases its GPUs.
 
 ## Fail-closed semantics
 

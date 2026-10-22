@@ -272,6 +272,22 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 				model.Spec.Hardware.Accelerator = "metal"
 				return model
 			}(), rolloutStrategyIgnoredMetalMessage),
+			Entry("multiNode group with an explicit Recreate", func() *inferencev1alpha1.InferenceService {
+				// The resolver answers "no strategy" for a multiNode group
+				// rather than base's Recreate. Restoring Recreate there would
+				// make strategyReflects call this field honoured, so a user
+				// asking for Recreate on a group that runs no Deployment would
+				// stop being told it has no effect.
+				isvc := strategyISVC("warn-multinode-recreate", "m", 2)
+				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyRecreate}
+				isvc.Spec.MultiNode = &inferencev1alpha1.MultiNodeSpec{
+					Members: []inferencev1alpha1.MultiNodeMember{
+						{Node: "node-a"},
+						{Node: "node-b"},
+					},
+				}
+				return isvc
+			}(), gpuModelWithCount("m", 1), rolloutStrategyIgnoredMultiNodeMessage),
 			Entry("multiNode group", func() *inferencev1alpha1.InferenceService {
 				isvc := strategyISVC("warn-multinode", "m", 2)
 				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
