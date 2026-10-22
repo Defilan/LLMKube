@@ -166,17 +166,23 @@ var _ = Describe("multiNode group reconcile", func() {
 		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
 		DeferCleanup(func() {
 			_ = k8sClient.Delete(ctx, isvc)
-			// envtest runs no garbage collector: remove the members by hand
-			// and wait for them to go so the next spec starts clean.
+			// envtest runs no garbage collector: remove the members and the
+			// Service by hand, since both are owner-referenced. The
+			// InferenceService is waited out first, so no reconcile can wake
+			// and recreate the Service after its own delete.
+			Eventually(func() bool {
+				var got inferencev1alpha1.InferenceService
+				return apierrors.IsNotFound(k8sClient.Get(ctx, key, &got))
+			}).Should(BeTrue())
 			for _, p := range memberPods() {
 				pod := p
 				_ = k8sClient.Delete(ctx, &pod, client.GracePeriodSeconds(0))
 			}
 			Eventually(memberPods).Should(BeEmpty())
+			_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: isvcName, Namespace: ns}})
 			Eventually(func() bool {
-				var got inferencev1alpha1.InferenceService
-				return apierrors.IsNotFound(k8sClient.Get(ctx, key, &got))
-			}).Should(BeTrue())
+				return apierrors.IsNotFound(k8sClient.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: ns}, &corev1.Service{}))
+			}).Should(BeTrue(), "an orphaned Service would hold the name for the next spec")
 		})
 	})
 

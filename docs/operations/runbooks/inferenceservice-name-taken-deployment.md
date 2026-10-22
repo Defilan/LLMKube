@@ -202,5 +202,6 @@ name can.
 - The refusal is one of the operator's ownership guards: objects LLMKube did
   not create are never adopted, overwritten, or deleted, and a refused
   sequence creates or updates nothing past the refused step
-- Same defect class, still unguarded: the Service upsert in
-  `reconcileService` (#2086)
+- The Service holding the generated name is guarded the same way, with its
+  own `ServiceNameTaken` marker; see
+  [`inferenceservice-name-taken-service.md`](./inferenceservice-name-taken-service.md)

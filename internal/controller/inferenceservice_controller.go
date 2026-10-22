@@ -295,7 +295,9 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	service, result, err := r.reconcileService(ctx, inferenceService, modelReady, desiredReplicas, isMetal)
+	// counts rides along so a Service refusal can report the replica count
+	// this pass actually read.
+	service, result, err := r.reconcileService(ctx, inferenceService, modelReady, desiredReplicas, isMetal, counts)
 	if err != nil || result != nil {
 		if result != nil {
 			return *result, err
@@ -589,6 +591,13 @@ type replicaCounts struct {
 // (routerProxyNameTakenRequeueAfter, hpaNameTakenRequeueAfter).
 const deploymentNameTakenRequeueAfter = 2 * time.Minute
 
+// serviceNameTakenRequeueAfter is the bounded requeue for a Service
+// name-taken refusal, on the same cadence as the Deployment, router-proxy and
+// HPA refusals. The controller owns no object at that name, so Owns maps none
+// of the foreign Service's events to this reconcile: deleting or renaming it
+// takes effect only on this timer.
+const serviceNameTakenRequeueAfter = 2 * time.Minute
+
 // deploymentNameTakenError reports a Deployment whose generated name is held
 // by an existing object this InferenceService does not control.
 // reconcileDeployment turns it into the DeploymentNameTaken scheduling status
@@ -625,7 +634,7 @@ func (e *deploymentNameTakenError) Error() string {
 // with the DeploymentNameTaken marker; the multiNode and metal paths run no
 // Deployment and clear a stale marker instead. The relay Deployment
 // (teardownRelay) and the router-proxy Deployment carry their own gates; the
-// Service upsert in reconcileService is not gated yet (#2086).
+// Service upsert in reconcileService is gated by ensureServiceOwned.
 func ensureDeploymentOwned(isvc *inferencev1alpha1.InferenceService, existing *appsv1.Deployment) error {
 	if metav1.IsControlledBy(existing, isvc) {
 		return nil
@@ -741,6 +750,179 @@ func (r *InferenceServiceReconciler) refuseDeploymentNameTaken(ctx context.Conte
 		0, isvc.Status.Replicas, desiredReplicas, "", taken.Error(),
 		&SchedulingInfo{Status: inferencev1alpha1.ReasonDeploymentNameTaken, Message: taken.Error()})
 	res.RequeueAfter = earliestPositive(res.RequeueAfter, deploymentNameTakenRequeueAfter)
+	return &res, updateErr
+}
+
+// serviceNameTakenError reports a Service whose generated name is held by an
+// existing object this InferenceService did not create.
+// reconcileService turns it into the ServiceNameTaken scheduling status and a
+// bounded requeue instead of a reconcile error.
+type serviceNameTakenError struct {
+	ns, name, owner string
+	// ownerName is the controlling reference's name, so the previous-owner
+	// message names the InferenceService that held the name rather than the
+	// Service (which is the sanitized form of the same name).
+	ownerName string
+	// previous is set when the controller is an InferenceService with this
+	// service's name but another UID: a deleted predecessor whose Service
+	// garbage collection has not removed yet (a GitOps delete-and-recreate).
+	previous bool
+	// agentOwner is the InferenceService named by the metal-agent's
+	// llmkube.ai/inference-service label when the object is the agent's
+	// Service for a different InferenceService. agentLabel is set whenever the
+	// managed-by label claims the agent, so a missing inference-service label
+	// is reported as such instead of as an object LLMKube never created.
+	agentOwner string
+	agentLabel bool
+}
+
+func (e *serviceNameTakenError) Error() string {
+	if e.previous {
+		return fmt.Sprintf("Service %s/%s is still controlled by a previous InferenceService named %s (uid %s) that was deleted; "+
+			"it is removed when garbage collection finishes, and this service is reconciled again then", e.ns, e.name, e.ownerName, e.owner)
+	}
+	if e.owner != "" {
+		return fmt.Sprintf("Service %s/%s is already controlled by another InferenceService (uid %s); "+
+			"refusing to overwrite it; rename one of the services", e.ns, e.name, e.owner)
+	}
+	if e.agentOwner != "" {
+		return fmt.Sprintf("Service %s/%s is the metal-agent's Service for InferenceService %s, whose name generates the same Service; "+
+			"refusing to overwrite it; rename one of the InferenceServices", e.ns, e.name, e.agentOwner)
+	}
+	if e.agentLabel {
+		return fmt.Sprintf("Service %s/%s carries the metal-agent's managed-by label but no %s label naming an InferenceService; "+
+			"refusing to overwrite it; delete or rename the object, or rename the InferenceService", e.ns, e.name, agentServiceLabel)
+	}
+	return fmt.Sprintf("Service %s/%s already exists and is not controlled by this InferenceService; "+
+		"refusing to overwrite it (LLMKube did not create it); delete or rename the object, or rename the InferenceService",
+		e.ns, e.name)
+}
+
+// agentServiceLabel is the key the metal-agent stamps with the InferenceService
+// name on every Service and EndpointSlice it writes (pkg/agent/registry.go:53),
+// beside llmkube.ai/managed-by on all of them.
+const agentServiceLabel = "llmkube.ai/inference-service"
+
+// agentServiceOwnedBy reports whether existing is the metal-agent's Service for
+// this InferenceService. The managed-by label alone does not say which
+// InferenceService the agent wrote the Service for: sanitizeDNSName maps "a.b"
+// and "a-b" onto one Service name, so a sibling InferenceService's agent
+// Service carries it too.
+func agentServiceOwnedBy(existing *corev1.Service, isvc *inferencev1alpha1.InferenceService) bool {
+	return existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent &&
+		existing.Labels[agentServiceLabel] == isvc.Name
+}
+
+// ensureServiceOwned is the ownership gate for the Service writes in
+// reconcileService: the create and the in-place field sync. Write only what
+// this InferenceService controls. A Service carrying the metal-agent's
+// managed-by label and the inference-service label naming this InferenceService
+// is accepted: that is the operator's own agent handing the name back when a
+// Model stops being accelerator: metal, the same consent
+// reconcileRelayService reads. So is a Service carrying the
+// inference.llmkube.dev/service label this controller's own sync writes, which
+// is what the metal transition leaves behind on a release that replaced the
+// managed-by label without stamping an owner reference. The
+// controller-reference branch is resolved first, so a Service with another
+// controller's reference is refused even when it also carries either label.
+// The agent's managed-by label decides on its own after that, so a Service
+// claiming it is refused unless the inference-service label names this
+// InferenceService: that label is the only record of which service the Service
+// serves, and sanitizeDNSName maps distinct names onto one Service name.
+// Anything else (no controller reference, no operator-written label) is
+// refused, never adopted, never overwritten, and never deleted, because
+// spec.selector decides where the name routes traffic.
+func ensureServiceOwned(isvc *inferencev1alpha1.InferenceService, existing *corev1.Service) error {
+	if metav1.IsControlledBy(existing, isvc) {
+		return nil
+	}
+	taken := &serviceNameTakenError{ns: existing.GetNamespace(), name: existing.GetName()}
+	if ref := metav1.GetControllerOf(existing); ref != nil {
+		// The owner ref's APIVersion is "<group>/<version>" (or bare version
+		// for the core group); match the group so a same-Kind controller in
+		// another API group is not misreported as another InferenceService.
+		if ref.Kind == "InferenceService" && strings.SplitN(ref.APIVersion, "/", 2)[0] == inferencev1alpha1.GroupVersion.Group {
+			taken.owner = string(ref.UID)
+			taken.ownerName = ref.Name
+			taken.previous = ref.Name == isvc.Name
+		}
+		return taken
+	}
+	if agentServiceOwnedBy(existing, isvc) {
+		return nil
+	}
+	if existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent {
+		taken.agentLabel = true
+		taken.agentOwner = existing.Labels[agentServiceLabel]
+		return taken
+	}
+	// No controller reference and no managed-by label, but the service label
+	// this controller's own sync writes names this InferenceService: the
+	// metal-agent's Service after an accelerator: metal to pod transition that
+	// ran on a release whose sync replaced the managed-by label, before this
+	// controller stamped an owner reference on what it adopted. Refusing it
+	// would degrade a service that is already serving.
+	if existing.Labels["inference.llmkube.dev/service"] == isvc.Name {
+		return nil
+	}
+	return taken
+}
+
+// clearServiceNameTaken drops the ServiceNameTaken diagnosis this controller
+// wrote once the name is usable again. The status writer preserves scheduling
+// fields when a pass returns no SchedulingInfo, so without this a recovered
+// service would keep advertising the refusal.
+func clearServiceNameTaken(isvc *inferencev1alpha1.InferenceService) {
+	if isvc.Status.SchedulingStatus != inferencev1alpha1.ReasonServiceNameTaken {
+		return
+	}
+	isvc.Status.SchedulingStatus = ""
+	isvc.Status.SchedulingMessage = ""
+	isvc.Status.WaitingFor = ""
+}
+
+// refuseServiceNameTaken records a Service name-taken refusal and returns the
+// stop result every refusal path returns: a Warning event once per episode,
+// the marker on the scheduling status, and the bounded requeue. The reported
+// phase follows the precedence determinePhase uses, so a suspended or
+// scaled-to-zero service keeps reporting Suspended or Stopped. Nothing is
+// deleted: the Service decides where the generated name routes, so the
+// sequence stops before anything that would confirm a route (the endpoint and
+// the normal phase write), while the Deployment and any HPA this service owns
+// keep serving either way.
+func (r *InferenceServiceReconciler) refuseServiceNameTaken(ctx context.Context, isvc *inferencev1alpha1.InferenceService, nameTakenPreviously bool, modelReady bool, desiredReplicas int32, counts replicaCounts, taken error) (*ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	// The event fires before the status write, so "once per episode" assumes
+	// that write persisted; a write conflict re-fires the event on the next
+	// bounded requeue for the same episode.
+	log.Info("Refusing to overwrite a Service this InferenceService does not control", "error", taken)
+	if !nameTakenPreviously && r.Recorder != nil {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning,
+			inferencev1alpha1.ReasonServiceNameTaken, "Reconcile", "%s", taken.Error())
+	}
+
+	phase := PhaseFailed
+	if isvc.Spec.Suspend {
+		phase = PhaseSuspended
+	} else if desiredReplicas == 0 {
+		phase = PhaseStopped
+	}
+	// The refusal stops the sequence before reconcileHPA. Autoscaling not
+	// being configured leaves the condition's removal to reconcileHPA, so do
+	// it here: a mode switch while the name is taken would otherwise strand a
+	// stale AutoscalingReady. An HPA this service owns is left alone, since
+	// it scales this service's own Deployment, so a configured one keeps its
+	// condition as reconcileHPA last left it.
+	if isvc.Spec.Autoscaling == nil {
+		removeAutoscalingReadyCondition(isvc)
+	}
+	// Ready is forced to zero while Observed carries what this pass actually
+	// read of the Deployment: the refusal ran after that read, unlike the
+	// Deployment refusal, which has no workload observation to report.
+	res, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, phase, modelReady,
+		0, counts.Observed, desiredReplicas, "", taken.Error(),
+		&SchedulingInfo{Status: inferencev1alpha1.ReasonServiceNameTaken, Message: taken.Error()})
+	res.RequeueAfter = earliestPositive(res.RequeueAfter, serviceNameTakenRequeueAfter)
 	return &res, updateErr
 }
 
@@ -1084,11 +1266,15 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	return deployment, replicaCounts{Ready: readyReplicas, Observed: observedReplicas}, nil, nil, nil
 }
 
-func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc *inferencev1alpha1.InferenceService, modelReady bool, desiredReplicas int32, isMetal bool) (*corev1.Service, *ctrl.Result, error) {
+func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc *inferencev1alpha1.InferenceService, modelReady bool, desiredReplicas int32, isMetal bool, counts replicaCounts) (*corev1.Service, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	if isMetal {
 		log.Info("Metal accelerator detected, skipping Service creation (managed by Metal Agent)")
+		// A metal service wants no Service write, so a marker left by a
+		// pod-backed pass is stale; drop it before the metal status writes
+		// persist it.
+		clearServiceNameTaken(isvc)
 		// Return a minimal Service object so constructEndpoint can still build
 		// the endpoint URL from the sanitized name.
 		return &corev1.Service{
@@ -1098,6 +1284,12 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 			},
 		}, nil, nil
 	}
+
+	// The Get below decides the name's state: drop a stale marker here so the
+	// create, adoption, and sync paths all persist it cleared, and the guard
+	// re-sets it when the object at the name is foreign.
+	nameTakenPreviously := isvc.Status.SchedulingStatus == inferencev1alpha1.ReasonServiceNameTaken
+	clearServiceNameTaken(isvc)
 
 	service := r.constructService(isvc)
 	if err := setControllerReferenceUnblocked(isvc, service, r.Scheme); err != nil {
@@ -1110,6 +1302,24 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 	if err != nil && apierrors.IsNotFound(err) {
 		log.Info("Creating new Service", "name", service.Name)
 		if err := r.Create(ctx, service); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				// A foreign object took the name between the Get above and
+				// this Create: the same race the gate closes, reached from
+				// the other side. Route it through the refusal instead of
+				// wedging on an error no requeue would clear (nothing maps
+				// the foreign Service's events here).
+				raced := &corev1.Service{}
+				if getErr := r.Get(ctx, types.NamespacedName{Name: service.Name, Namespace: service.Namespace}, raced); getErr != nil {
+					return nil, nil, getErr
+				}
+				if guardErr := ensureServiceOwned(isvc, raced); guardErr != nil {
+					res, updateErr := r.refuseServiceNameTaken(ctx, isvc, nameTakenPreviously, modelReady, desiredReplicas, counts, guardErr)
+					return nil, res, updateErr
+				}
+				// Ours: a concurrent reconcile created it; return the object
+				// that actually exists so the caller sees the live Service.
+				return raced, nil, nil
+			}
 			log.Error(err, "Failed to create Service")
 			result, updateErr := r.updateStatusWithSchedulingInfo(ctx, isvc, PhaseFailed, modelReady, 0, isvc.Status.Replicas, desiredReplicas, "", "Failed to create Service", nil)
 			return nil, &result, updateErr
@@ -1118,6 +1328,20 @@ func (r *InferenceServiceReconciler) reconcileService(ctx context.Context, isvc 
 		log.Error(err, "Failed to get Service")
 		return nil, nil, err
 	} else {
+		// Refuse before any write to an object this service did not create.
+		if guardErr := ensureServiceOwned(isvc, existingService); guardErr != nil {
+			res, updateErr := r.refuseServiceNameTaken(ctx, isvc, nameTakenPreviously, modelReady, desiredReplicas, counts, guardErr)
+			return nil, res, updateErr
+		}
+		// An accepted but uncontrolled Service (the metal-agent's) becomes
+		// this service's child here, so it is garbage-collected with it
+		// instead of leaking when the InferenceService is deleted.
+		if !metav1.IsControlledBy(existingService, isvc) {
+			if err := setControllerReferenceUnblocked(isvc, existingService, r.Scheme); err != nil {
+				log.Error(err, "Failed to set controller reference on adopted Service")
+				return nil, nil, err
+			}
+		}
 		// Service exists — sync mutable fields from the desired spec.
 		// Preserve the allocated nodePort when the type is not changing,
 		// and always preserve ClusterIP (immutable).

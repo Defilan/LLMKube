@@ -560,9 +560,9 @@ func (r *InferenceServiceReconciler) reconcileRelayService(ctx context.Context, 
 		return fmt.Errorf("get Service %s/%s: %w", desired.Namespace, desired.Name, err)
 	}
 
-	agentWritten := existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent
+	agentWritten := agentServiceOwnedBy(existing, isvc)
 	if !metav1.IsControlledBy(existing, isvc) && !agentWritten {
-		return fmt.Errorf("relay: Service %s/%s exists and is not managed by the metal-agent or this InferenceService",
+		return fmt.Errorf("relay: Service %s/%s is not controlled by this InferenceService or written by its metal-agent",
 			existing.Namespace, existing.Name)
 	}
 

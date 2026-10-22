@@ -307,3 +307,12 @@ const ReasonRelaySecretNotManaged string = "RelaySecretNotManaged"
 // It is controller-written, so it is deliberately not in
 // MetalAgentRefusalReasons, which lists only agent refusals.
 const ReasonDeploymentNameTaken string = "DeploymentNameTaken"
+
+// ReasonServiceNameTaken is the Status.SchedulingStatus (and Warning Event
+// reason) the controller writes when a Service already holds the name the
+// InferenceService generates and this service neither controls it nor
+// received it from the metal-agent. The controller refuses to overwrite it,
+// since spec.selector decides where that name routes traffic (#2086). It is
+// controller-written, so it is deliberately not in MetalAgentRefusalReasons,
+// which lists only agent refusals.
+const ReasonServiceNameTaken string = "ServiceNameTaken"
