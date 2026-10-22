@@ -108,7 +108,9 @@ Shows cache entries with their size, status, and which Model resources
 are using each cache entry. Each cache claim is read through a short-lived
 read-only pod the command creates and deletes, so it works even when the
 only other pod mounting the claim cannot run a shell. The command fails
-when it cannot read a claim, rather than reporting the cache as empty.`,
+when no discovered claim can be read, rather than reporting the cache as
+empty; a claim that cannot be read while others can is skipped with a
+warning.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCacheList(namespace, allNamespaces, orphanedOnly)
 		},
