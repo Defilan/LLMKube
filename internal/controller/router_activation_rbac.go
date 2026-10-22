@@ -24,24 +24,37 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
+// routerNeedsEndpointWatch reports whether the router's proxy tracks pods
+// itself: any local backend with resolution: endpoint.
+func routerNeedsEndpointWatch(mr *inferencev1alpha1.ModelRouter) bool {
+	for _, b := range mr.Spec.Backends {
+		if b.InferenceServiceRef != nil && b.Resolution == inferencev1alpha1.RouterBackendResolutionEndpoint {
+			return true
+		}
+	}
+	return false
+}
+
 // reconcileRouterActivationRBAC provisions the least-privilege RBAC the
-// router-proxy needs to activate ModelPool members: a ServiceAccount, a
-// namespaced Role that can get/list/watch/patch InferenceServices (and read
-// their status), and a RoleBinding. All three are owner-referenced to the
-// ModelRouter so they are garbage-collected with it.
+// router-proxy needs: a ServiceAccount, a namespaced Role, and a RoleBinding.
+// The Role carries what the proxy uses, ModelPool activation (get/list/watch/
+// update/patch on InferenceServices, get on their status) and endpoint
+// tracking (get/list/watch on EndpointSlices). All three objects are
+// owner-referenced to the ModelRouter so they are garbage-collected with it.
 //
-// When hasPools is false the router needs no API access; this is a no-op (the
-// proxy runs under the namespace default SA). The objects are only created,
-// never deleted on the false path, so a router that briefly drops its last pool
-// keeps the (unused) SA rather than churning RBAC on every toggle. The RBAC is
-// harmless without --enable-activation, which the deployment omits when
-// unpooled.
+// When the router has neither pools nor endpoint backends it needs no API
+// access; this is a no-op (the proxy runs under the namespace default SA). The
+// objects are only created, never deleted on that path, so a router that
+// briefly drops its last pool keeps the (unused) SA rather than churning RBAC
+// on every toggle. The RBAC is harmless without --enable-activation, which the
+// deployment omits when unpooled.
 func (r *ModelRouterReconciler) reconcileRouterActivationRBAC(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
 	hasPools bool,
 ) error {
-	if !hasPools {
+	watch := routerNeedsEndpointWatch(mr)
+	if !hasPools && !watch {
 		return nil
 	}
 	name := routerProxyResourceName(mr.Name)
@@ -57,24 +70,35 @@ func (r *ModelRouterReconciler) reconcileRouterActivationRBAC(
 		return fmt.Errorf("reconcile router-proxy ServiceAccount: %w", err)
 	}
 
+	var rules []rbacv1.PolicyRule
+	if hasPools {
+		rules = append(rules,
+			rbacv1.PolicyRule{
+				APIGroups: []string{"inference.llmkube.dev"},
+				Resources: []string{"inferenceservices"},
+				Verbs:     []string{"get", "list", "watch", "update", "patch"},
+			},
+			rbacv1.PolicyRule{
+				APIGroups: []string{"inference.llmkube.dev"},
+				Resources: []string{"inferenceservices/status"},
+				Verbs:     []string{"get"},
+			})
+	}
+	if watch {
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups: []string{"discovery.k8s.io"},
+			Resources: []string{"endpointslices"},
+			Verbs:     []string{"get", "list", "watch"},
+		})
+	}
+
 	role := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: mr.Namespace,
 			Labels:    routerProxyLabels(mr),
 		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"inference.llmkube.dev"},
-				Resources: []string{"inferenceservices"},
-				Verbs:     []string{"get", "list", "watch", "update", "patch"},
-			},
-			{
-				APIGroups: []string{"inference.llmkube.dev"},
-				Resources: []string{"inferenceservices/status"},
-				Verbs:     []string{"get"},
-			},
-		},
+		Rules: rules,
 	}
 	if err := r.upsertActivationRole(ctx, mr, role); err != nil {
 		return fmt.Errorf("reconcile router-proxy Role: %w", err)

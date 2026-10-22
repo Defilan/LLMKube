@@ -194,9 +194,12 @@ func (r *ModelRouterReconciler) resolveBackend(
 			status.Tier = backendTierLocal
 		}
 		if b.Resolution == inferencev1alpha1.RouterBackendResolutionEndpoint {
-			endpoints, svcAddr, msg := r.resolveInferenceServiceEndpoints(ctx, mr.Namespace, b.InferenceServiceRef.Name)
+			endpoints, source, svcAddr, msg := r.resolveInferenceServiceEndpoints(ctx, mr.Namespace, b.InferenceServiceRef.Name)
 			wire.Address = svcAddr
-			wire.Endpoints = endpoints
+			// The proxy tracks the pods itself; the controller compiles only
+			// the Service identity, so pod churn does not change the config
+			// hash and never re-rolls the proxy. endpoints feeds status only.
+			wire.EndpointSource = source
 			status.Address = svcAddr
 			if len(endpoints) == 0 {
 				status.Healthy = false
@@ -343,9 +346,9 @@ func (r *ModelRouterReconciler) localBackendServedModel(
 	return model.Name
 }
 
-// resolveInferenceServiceEndpoints returns one "http://<podIP>:<port>" URL per
-// ready pod behind the InferenceService's Service, plus the Service DNS URL to
-// fall back to when the endpoint set is empty. Endpoint resolution is opt-in
+// resolveInferenceServiceEndpoints returns the ready pod URLs (used for status
+// only), the Service identity the proxy watches, and the Service DNS URL to
+// fall back to. Endpoint resolution is opt-in
 // (spec.backends[].resolution = "endpoint") because it only helps an
 // in-cluster backend whose pod churn the controller can watch; the external
 // path stays service-level, and a metal member is out-of-cluster and has no
@@ -353,13 +356,13 @@ func (r *ModelRouterReconciler) localBackendServedModel(
 func (r *ModelRouterReconciler) resolveInferenceServiceEndpoints(
 	ctx context.Context,
 	namespace, name string,
-) (endpoints []string, serviceAddr, msg string) {
+) (endpoints []string, source *router.EndpointSource, serviceAddr, msg string) {
 	isvc := &inferencev1alpha1.InferenceService{}
 	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, isvc); err != nil {
 		if errors.IsNotFound(err) {
-			return nil, "", fmt.Sprintf("InferenceService %q not found in namespace %q", name, namespace)
+			return nil, nil, "", fmt.Sprintf("InferenceService %q not found in namespace %q", name, namespace)
 		}
-		return nil, "", fmt.Sprintf("InferenceService %q lookup failed: %v", name, err)
+		return nil, nil, "", fmt.Sprintf("InferenceService %q lookup failed: %v", name, err)
 	}
 	port := int32(8080)
 	if isvc.Spec.Endpoint != nil && isvc.Spec.Endpoint.Port > 0 {
@@ -367,14 +370,15 @@ func (r *ModelRouterReconciler) resolveInferenceServiceEndpoints(
 	}
 	svcName := sanitizeDNSName(isvc.Name)
 	serviceAddr = fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", svcName, isvc.Namespace, port)
+	source = &router.EndpointSource{Namespace: isvc.Namespace, Service: svcName, Port: port}
 
 	endpointSlices := &discoveryv1.EndpointSliceList{}
 	if err := r.List(ctx, endpointSlices,
 		client.InNamespace(namespace),
 		client.MatchingLabels{"kubernetes.io/service-name": svcName}); err != nil {
-		return nil, serviceAddr, fmt.Sprintf("list EndpointSlices for %q: %v", svcName, err)
+		return nil, source, serviceAddr, fmt.Sprintf("list EndpointSlices for %q: %v", svcName, err)
 	}
-	return collectReadyReplicaURLs(endpointSlices, port), serviceAddr, ""
+	return collectReadyReplicaURLs(endpointSlices, port), source, serviceAddr, ""
 }
 
 // resolveBackendPool finds the ModelPool a member InferenceService belongs to

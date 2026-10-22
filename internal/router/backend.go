@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -193,7 +194,7 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 		h := &backendHealth{}
 		h.healthy.Store(true)
 		d.health.Store(b.Name, h)
-		if len(b.Endpoints) > 0 {
+		if len(b.Endpoints) > 0 && b.EndpointSource == nil {
 			d.endpoints.Store(b.Name, b.Endpoints)
 			for _, ep := range b.Endpoints {
 				eh := &backendHealth{}
@@ -260,21 +261,62 @@ func (d *Dispatcher) dispatchable(key string) bool {
 // endpoints are skipped; when every endpoint is quarantined the rotation
 // returns one anyway so the half-open probe still happens.
 func (d *Dispatcher) pickEndpoint(backend *Backend) string {
-	n := len(backend.Endpoints)
+	eps := d.liveEndpoints(backend)
+	n := len(eps)
 	if n == 0 {
 		return ""
 	}
 	if n == 1 {
-		return backend.Endpoints[0]
+		return eps[0]
 	}
 	start := int(d.endpointCursor(backend.Name).Add(1)-1) % n //nolint:gosec // modulo bounds the value below n, an int
 	for i := 0; i < n; i++ {
-		ep := backend.Endpoints[(start+i)%n]
+		ep := eps[(start+i)%n]
 		if d.dispatchable(healthKey(backend.Name, ep)) {
 			return ep
 		}
 	}
-	return backend.Endpoints[start]
+	return eps[start]
+}
+
+// SetEndpoints replaces the live endpoint set of a backend whose pods the
+// proxy tracks (an EndpointSource backend). The set is stored sorted so every
+// replica sees the same order. New endpoints start healthy; health entries of
+// endpoints that left are dropped, so a pod that later reuses an IP does not
+// inherit an old quarantine. An empty set makes dispatch fall back to the
+// backend's Address.
+func (d *Dispatcher) SetEndpoints(name string, endpoints []string) {
+	next := append([]string(nil), endpoints...)
+	sort.Strings(next)
+	var prev []string
+	if v, ok := d.endpoints.Load(name); ok {
+		prev = v.([]string)
+	}
+	keep := make(map[string]bool, len(next))
+	for _, ep := range next {
+		keep[ep] = true
+		d.healthFor(healthKey(name, ep))
+	}
+	for _, ep := range prev {
+		if !keep[ep] {
+			d.health.Delete(healthKey(name, ep))
+		}
+	}
+	d.endpoints.Store(name, next)
+}
+
+// liveEndpoints returns the endpoint set dispatch uses for backend: the set
+// SetEndpoints last stored (seeded from Backend.Endpoints at construction),
+// else the configured list. An EndpointSource backend never uses the
+// configured list: until its first sync it dispatches to Address.
+func (d *Dispatcher) liveEndpoints(backend *Backend) []string {
+	if v, ok := d.endpoints.Load(backend.Name); ok {
+		return v.([]string)
+	}
+	if backend.EndpointSource != nil {
+		return nil
+	}
+	return backend.Endpoints
 }
 
 // dispatchTarget resolves the base URL a dispatch to backend should use: the

@@ -147,6 +147,18 @@ var (
 		[]string{labelRouter, "tier"},
 	)
 
+	// RouterEndpointSourceReady reports whether the router proxy's
+	// EndpointSlice watch for an endpoint-resolution backend has synced
+	// (1) or not (0, for example when the proxy may not list EndpointSlices);
+	// at 0 the proxy dispatches to the backend's Service address.
+	RouterEndpointSourceReady = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "llmkube_router_endpoint_source_ready",
+			Help: "Whether the router proxy's EndpointSlice watch for a backend has synced (1) or not (0).",
+		},
+		[]string{labelRouter, "backend"},
+	)
+
 	RouterBackendHealth = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "llmkube_router_backend_health",
@@ -465,6 +477,7 @@ var AllCollectors = []prometheus.Collector{
 	RouterFailClosedTotal,
 	RouterActiveBackends,
 	RouterBackendHealth,
+	RouterEndpointSourceReady,
 	RouterFirstTokenSeconds,
 	RouterBudgetUtilization,
 	RouterTokenBudgetUtilization,

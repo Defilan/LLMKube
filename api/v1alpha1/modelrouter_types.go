@@ -237,8 +237,9 @@ type RouterBackend struct {
 	// Resolution selects how a local (inferenceServiceRef) backend's upstream
 	// address is resolved. "service" (the default) dispatches to the
 	// InferenceService's ClusterIP Service DNS name, so a keep-alive client
-	// can pin to one pod through conntrack. "endpoint" compiles one address
-	// per ready pod and the router-proxy balances requests across them.
+	// can pin to one pod through conntrack. "endpoint" has the router-proxy
+	// track the ready pods behind the Service itself and balance requests
+	// across them.
 	// External backends ignore this field.
 	// +kubebuilder:validation:Enum=service;endpoint
 	// +kubebuilder:default=service
@@ -747,6 +748,11 @@ type RouterProxySpec struct {
 	// backends. Passthrough to the Pod spec.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations are applied to the router-proxy pod, so it can be pinned
+	// next to tainted GPU nodes together with nodeSelector.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the

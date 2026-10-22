@@ -188,7 +188,8 @@ func (r *ModelRouterReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 // the ConfigMap (router_config_builder.go), the Deployment
 // (router_deployment_builder.go), the two Services
 // (router_service_builder.go), and the ServiceAccount, Role, and RoleBinding
-// (router_activation_rbac.go, only when the router had pools).
+// (router_activation_rbac.go, only when the router had pools or an
+// endpoint-resolution backend).
 //
 // Each object is fetched by its known name, never via a List: a non-Proxy
 // router pays a few cached Gets per reconcile in steady state, and a name

@@ -94,6 +94,13 @@ type Backend struct {
 	// (the Service DNS) for a backend whose endpoint set is empty.
 	Endpoints []string `json:"endpoints,omitempty"`
 
+	// EndpointSource names the Service whose ready pods the proxy balances
+	// across, for a backend that declares endpoint resolution. The proxy
+	// watches the Service's EndpointSlices and keeps the set current; Address
+	// stays the fallback while the set is empty or the watch has not synced.
+	// When both are present, EndpointSource wins over Endpoints.
+	EndpointSource *EndpointSource `json:"endpointSource,omitempty"`
+
 	// Provider identifies the upstream API surface for external backends
 	// ("anthropic", "openai", "litellm", etc.). Empty for local backends.
 	Provider string `json:"provider,omitempty"`
@@ -150,6 +157,13 @@ type Backend struct {
 	// and charges 0 USD against dollar budgets. Compiled from
 	// ModelRouter.spec.backends[].costPerMillionTokens.
 	CostPerMillionTokens *TokenCost `json:"costPerMillionTokens,omitempty"`
+}
+
+// EndpointSource identifies the Service behind an endpoint-resolution backend.
+type EndpointSource struct {
+	Namespace string `json:"namespace"`
+	Service   string `json:"service"`
+	Port      int32  `json:"port"`
 }
 
 // TokenCost prices prompt and completion tokens per million, in USD. The
@@ -370,6 +384,9 @@ func (c *Config) Validate() error {
 		}
 		if b.Address == "" && len(b.Endpoints) == 0 {
 			return fmt.Errorf("backends[%d] %s: address is required", i, b.Name)
+		}
+		if s := b.EndpointSource; s != nil && (s.Namespace == "" || s.Service == "" || s.Port <= 0) {
+			return fmt.Errorf("backends[%d] %s: endpointSource needs namespace, service and a positive port", i, b.Name)
 		}
 	}
 	if c.DefaultRoute != "" && !names[c.DefaultRoute] {
