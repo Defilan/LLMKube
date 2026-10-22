@@ -2026,7 +2026,7 @@ spec:
 				}
 			})
 
-			It("should create and clean up inspector pod when no existing pods mount the PVC", func() {
+			It("should create and clean up its own pod, not borrow one that mounts the claim", func() {
 				By("creating a namespace with a PVC but no running pods")
 				inspectorNs := "e2e-cache-inspector"
 				cmd := exec.Command("kubectl", "create", "ns", inspectorNs)
@@ -2062,15 +2062,125 @@ spec:
 					_, _ = fmt.Fprintf(GinkgoWriter, "cache list output (may warn): %s\n", output)
 				}
 
-				By("verifying the inspector pod was cleaned up")
+				By("verifying no inspector pod was left behind")
 				verifyInspectorGone := func(g Gomega) {
-					cmd := exec.Command("kubectl", "get", "pod", "llmkube-cache-inspector",
-						"-n", inspectorNs, "--ignore-not-found", "-o", "jsonpath={.metadata.name}")
+					cmd := exec.Command("kubectl", "get", "pods", "-n", inspectorNs,
+						"-l", "app.kubernetes.io/component=cache-inspector",
+						"--ignore-not-found", "-o", "jsonpath={.items[*].metadata.name}")
 					output, err := utils.Run(cmd)
 					g.Expect(err).NotTo(HaveOccurred())
 					g.Expect(output).To(BeEmpty(), "Inspector pod should be deleted after cache list completes")
 				}
 				Eventually(verifyInspectorGone, 1*time.Minute).Should(Succeed())
+			})
+
+			It("should read the shared cache when a shell-less pod mounts it", func() {
+				// #2140: in shared mode the chart mounts the claim into the
+				// distroless controller, which has no shell. cache list used to
+				// exec `sh` in that pod, skip the claim and report nothing
+				// orphaned. This reproduces it with a shell-less pod without
+				// replacing the running operator.
+				shelllessNs := "e2e-cache-shellless"
+				cmd := exec.Command("kubectl", "create", "ns", shelllessNs)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				defer func() {
+					cmd := exec.Command("kubectl", "delete", "ns", shelllessNs, "--ignore-not-found")
+					_, _ = utils.Run(cmd)
+				}()
+
+				By("creating the labeled shared cache PVC")
+				cmd = exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: llmkube-model-cache
+  namespace: %s
+  labels:
+    app.kubernetes.io/component: model-cache
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+`, shelllessNs))
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create PVC")
+
+				By("populating one cache-key directory on the claim")
+				cmd = exec.Command("kubectl", "run", "shellless-cache-seed",
+					"--restart=Never",
+					"--namespace", shelllessNs,
+					"--image=busybox:1.37.0",
+					"--overrides", fmt.Sprintf(`{
+						"spec": {
+							"containers": [{
+								"name": "seed",
+								"image": "busybox:1.37.0",
+								"command": ["sh", "-c", "mkdir -p /models/deadbeef01234567 && echo 'fake-data' > /models/deadbeef01234567/model.gguf"],
+								"volumeMounts": [{"name": "cache", "mountPath": "/models"}]
+							}],
+							"volumes": [{
+								"name": "cache",
+								"persistentVolumeClaim": {"claimName": "llmkube-model-cache"}
+							}],
+							"restartPolicy": "Never"
+						}
+					}`),
+				)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create cache seed pod")
+				verifySeedDone := func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pod", "shellless-cache-seed",
+						"-n", shelllessNs, "-o", "jsonpath={.status.phase}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal("Succeeded"))
+				}
+				Eventually(verifySeedDone, 2*time.Minute).Should(Succeed())
+				cmd = exec.Command("kubectl", "delete", "pod", "shellless-cache-seed",
+					"-n", shelllessNs, "--grace-period=0", "--force")
+				_, _ = utils.Run(cmd)
+
+				By("starting a shell-less pod that mounts the claim, as the controller does")
+				cmd = exec.Command("kubectl", "run", "shellless-cache-holder",
+					"--restart=Never",
+					"--namespace", shelllessNs,
+					"--image=registry.k8s.io/pause:3.9",
+					"--overrides", `{
+						"spec": {
+							"containers": [{
+								"name": "holder",
+								"image": "registry.k8s.io/pause:3.9",
+								"volumeMounts": [{"name": "cache", "mountPath": "/models"}]
+							}],
+							"volumes": [{
+								"name": "cache",
+								"persistentVolumeClaim": {"claimName": "llmkube-model-cache"}
+							}]
+						}
+					}`,
+				)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create shell-less pod")
+				verifyHolderRunning := func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pod", "shellless-cache-holder",
+						"-n", shelllessNs, "-o", "jsonpath={.status.phase}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal("Running"))
+				}
+				Eventually(verifyHolderRunning, 2*time.Minute).Should(Succeed())
+
+				By("listing the cache, which must read it rather than exec a shell in that pod")
+				cmd = exec.Command("./"+cliPath, "cache", "list", "-n", shelllessNs, "--orphaned")
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "cache list failed: %s", output)
+				Expect(output).NotTo(ContainSubstring("warning: skipping cache PVC"),
+					"the claim was skipped instead of read")
+				Expect(output).To(ContainSubstring("deadbeef01234567"))
 			})
 		})
 

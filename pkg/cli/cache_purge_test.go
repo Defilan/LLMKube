@@ -173,6 +173,9 @@ func TestEnsurePurgePod_ReplacesStale(t *testing.T) {
 	podName := purgePodName(pvcName)
 	stale := newCacheAccessPod(podName, pvcName, cachePurgeComponent, "purge", false)
 	stale.Namespace = "default"
+	// A pod with no stamp (no run label) is the interrupted-run case, which
+	// purgePodAbandoned reads as abandoned (#2140 refactor: behavior preserved).
+	stale.CreationTimestamp = metav1.NewTime(time.Now().Add(-11 * time.Minute))
 	clientset := fakeclientset.NewClientset(stale)
 
 	// The delete is asynchronous on a real API server: the pod keeps its name
@@ -243,6 +246,16 @@ func TestEnsurePurgePod_RefusesForeignPod(t *testing.T) {
 		},
 	}
 	clientset := fakeclientset.NewClientset(foreign)
+
+	// No pod can start in the fake, so the wait is stubbed to whatever the
+	// guard lets through: without the guard this test must fail on the
+	// refusal, not hang.
+	origWait, origSleep := purgeWait, purgeSleep
+	t.Cleanup(func() { purgeWait, purgeSleep = origWait, origSleep })
+	purgeSleep = func(time.Duration) {}
+	purgeWait = func(_ context.Context, _ kubernetes.Interface, _, _ string, _ time.Duration) error {
+		return nil
+	}
 
 	_, err := ensurePurgePod(context.Background(), clientset, "default", pvcName)
 	if err == nil {
@@ -904,7 +917,7 @@ func TestReplaceStalePurgePod_LiveRunLeftAlone(t *testing.T) {
 	}
 	purgeSleep = func(time.Duration) {}
 
-	err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run")
+	err := replaceStalePurgePod(context.Background(), clientset, "default", podName, "this-run")
 	if err == nil {
 		t.Fatal("expected an error rather than replacing a live run's pod")
 	}
@@ -922,7 +935,7 @@ func TestReplaceStalePurgePod_LiveRunLeftAlone(t *testing.T) {
 	}
 	pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 	_, _ = clientset.CoreV1().Pods("default").Update(context.Background(), pod, metav1.UpdateOptions{})
-	if err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run"); err != nil {
+	if err := replaceStalePurgePod(context.Background(), clientset, "default", podName, "this-run"); err != nil {
 		t.Errorf("an abandoned stamped pod must be replaced: %v", err)
 	}
 }
@@ -945,7 +958,7 @@ func TestReplaceStalePurgePod_FinishedPodReplaced(t *testing.T) {
 			t.Cleanup(func() { purgeSleep = origSleep })
 			purgeSleep = func(time.Duration) {}
 
-			err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run")
+			err := replaceStalePurgePod(context.Background(), clientset, "default", podName, "this-run")
 			if err != nil {
 				t.Fatalf("a finished stamped pod must be replaced: %v", err)
 			}

@@ -19,6 +19,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -142,125 +143,53 @@ func inspectPVCCache(
 	// would suppress STATUS and regress the listing to the pre-inspection
 	// format (#767).
 	allEntries := []PVCCacheEntry{}
+	var failures []error
 	for _, pvcInfo := range pvcInfos {
-		entries, err := inspectSinglePVC(ctx, cfg, k8sClient, clientset, namespace, pvcInfo)
+		entries, err := inspectSinglePVC(ctx, cfg, clientset, namespace, pvcInfo)
 		if err != nil {
-			// One PVC failing to inspect (e.g. no running pod mounts it and an
-			// inspector pod cannot start) must not blank the entire listing;
-			// skip it and surface the caches we can read.
-			fmt.Fprintf(os.Stderr, "warning: skipping cache PVC %s: %v\n", pvcInfo.Name, err)
+			// One PVC failing to inspect (a volume that cannot attach, an
+			// inspector pod that cannot start) must not blank the entire
+			// listing; skip it and surface the caches we can read.
+			failures = append(failures, fmt.Errorf("%s: %w", pvcInfo.Name, err))
 			continue
 		}
 		allEntries = append(allEntries, entries...)
+	}
+
+	// Zero readable claims is an error: `cache list --orphaned` must never
+	// answer "none" from a cache it did not read.
+	if len(failures) == len(pvcInfos) {
+		return nil, fmt.Errorf("cannot read any model cache claim in namespace %s: %w",
+			namespace, errors.Join(failures...))
+	}
+	for _, failure := range failures {
+		fmt.Fprintf(os.Stderr, "warning: skipping cache PVC %v\n", failure)
 	}
 	return allEntries, nil
 }
 
 // inspectSinglePVC inspects the contents of one model cache PVC.
+//
+// Own pod, never a borrowed one: in the default shared cache mode the shared
+// claim is mounted by the distroless controller, which has no shell, and a
+// serving container mounts it read-only (#2140).
 func inspectSinglePVC(
-	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
 	namespace string, pvcInfo PVCInfo,
 ) ([]PVCCacheEntry, error) {
-	pod, containerName, err := findPodWithPVC(ctx, k8sClient, namespace, pvcInfo.Name)
+	podName, err := ensureCacheAccessPod(ctx, clientset, namespace, pvcInfo.Name, inspectorPodKind)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find pod with cache PVC %s: %w", pvcInfo.Name, err)
+		return nil, fmt.Errorf("failed to create inspector pod for PVC %s: %w", pvcInfo.Name, err)
 	}
+	defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
 
-	createdPod := false
-	if pod == nil {
-		podName, err := createInspectorPodForPVC(ctx, clientset, namespace, pvcInfo.Name)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create inspector pod for PVC %s: %w", pvcInfo.Name, err)
-		}
-		defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
-		createdPod = true
-
-		// 120s accommodates slower storage classes (Longhorn, OpenShift CSI,
-		// remote-attach disks) where PVC binding plus volume attach can exceed
-		// the original 60s. Fast local-path setups still resolve in seconds; the
-		// only effect of the higher ceiling is a longer wait when the inspector
-		// genuinely cannot start, which is acceptable for a one-off CLI command.
-		if err := waitForPodRunning(ctx, clientset, namespace, podName, 120*time.Second); err != nil {
-			return nil, fmt.Errorf("inspector pod failed to start: %w", err)
-		}
-
-		pod = &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace}}
-		containerName = "inspector"
-	}
-
-	mountPath := defaultModelMountPath
-	if !createdPod {
-		mountPath = findMountPathForPVC(pod, containerName, pvcInfo.Name)
-	}
-
-	output, err := execInPod(ctx, cfg, clientset, namespace, pod.Name, containerName,
-		[]string{"sh", "-c", fmt.Sprintf("du -sb %s/*/ 2>/dev/null || true", mountPath)})
+	output, err := purgeExec(ctx, cfg, clientset, namespace, podName, inspectorPodKind.container,
+		[]string{"sh", "-c", fmt.Sprintf("du -sb %s/*/ 2>/dev/null || true", defaultModelMountPath)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to exec in pod: %w", err)
 	}
 
 	return parseDuOutput(output, pvcInfo.InferenceService), nil
-}
-
-func findPodWithPVC(
-	ctx context.Context, k8sClient client.Client, namespace, pvcName string,
-) (*corev1.Pod, string, error) {
-	podList := &corev1.PodList{}
-	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace)); err != nil {
-		return nil, "", fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	for i := range podList.Items {
-		pod := &podList.Items[i]
-		if pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-
-		for _, vol := range pod.Spec.Volumes {
-			if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {
-				containerName := findContainerWithVolume(pod, vol.Name)
-				if containerName != "" {
-					return pod, containerName, nil
-				}
-			}
-		}
-	}
-
-	return nil, "", nil
-}
-
-func findContainerWithVolume(pod *corev1.Pod, volumeName string) string {
-	for _, c := range pod.Spec.Containers {
-		for _, vm := range c.VolumeMounts {
-			if vm.Name == volumeName {
-				return c.Name
-			}
-		}
-	}
-	for _, c := range pod.Spec.InitContainers {
-		for _, vm := range c.VolumeMounts {
-			if vm.Name == volumeName {
-				return c.Name
-			}
-		}
-	}
-	return ""
-}
-
-func findMountPathForPVC(pod *corev1.Pod, containerName, pvcName string) string {
-	for _, c := range pod.Spec.Containers {
-		if c.Name == containerName {
-			for _, vm := range c.VolumeMounts {
-				for _, vol := range pod.Spec.Volumes {
-					pvc := vol.PersistentVolumeClaim
-					if vol.Name == vm.Name && pvc != nil && pvc.ClaimName == pvcName {
-						return vm.MountPath
-					}
-				}
-			}
-		}
-	}
-	return defaultModelMountPath
 }
 
 // inspectorPodName returns a per-PVC inspector pod name. Each cache list run
@@ -270,7 +199,7 @@ func findMountPathForPVC(pod *corev1.Pod, containerName, pvcName string) string 
 // PVC keeps it unique per PVC and DNS-1123 safe (cachekey.Compute is a 16-char
 // hex digest).
 func inspectorPodName(pvcName string) string {
-	return "llmkube-cache-inspector-" + cachekey.Compute(pvcName)
+	return cacheInspectorPodPrefix + cachekey.Compute(pvcName)
 }
 
 // newCacheAccessPod builds the short-lived pod that mounts a model cache claim.
@@ -331,17 +260,16 @@ func newCacheAccessPodForRun(
 func createInspectorPodForPVC(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
 ) (string, error) {
-	podName := inspectorPodName(pvcName)
-	pod := newCacheAccessPod(podName, pvcName, "cache-inspector", "inspector", true)
-	pod.Namespace = namespace
-
-	_, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
-	if err != nil {
-		return "", err
-	}
-	return podName, nil
+	return createCacheAccessPod(ctx, clientset, namespace, pvcName, inspectorPodKind, "")
 }
 
+// waitForPodRunning polls until the pod reports Running.
+//
+// 120s accommodates slower storage classes (Longhorn, OpenShift CSI,
+// remote-attach disks) where PVC binding plus volume attach can exceed the
+// original 60s. Fast local-path setups still resolve in seconds; the only
+// effect of the higher ceiling is a longer wait when the pod genuinely cannot
+// start, which is acceptable for a one-off CLI command.
 func waitForPodRunning(
 	ctx context.Context, clientset kubernetes.Interface,
 	namespace, name string, timeout time.Duration,

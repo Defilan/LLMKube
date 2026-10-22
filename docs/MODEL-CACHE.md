@@ -654,8 +654,11 @@ Behavior:
 - `llmkube cache list` discovers the shared cache and operator-managed
   per-service cache PVCs. A user-managed `spec.modelCache.claimName` PVC is
   outside the operator's cache label/discovery contract and may not appear in
-  the listing. Cache inspection may need a running pod or a transient inspector
-  pod for Pending `WaitForFirstConsumer` claims.
+  the listing. Each claim is read through a short-lived read-only pod the
+  command creates and deletes, including a Pending `WaitForFirstConsumer`
+  claim, which that pod binds. `cache list` needs permission to create,
+  exec into and delete pods in the namespace, and exits nonzero when it cannot
+  read any discovered claim.
 
 ### Per-Service Storage Class
 
@@ -749,8 +752,7 @@ only home when the Model has no InferenceService). Two things follow from that:
 
 - It needs your own permission to create and exec into pods in the namespace.
   On a `restricted`-profile namespace the pod is rejected, the same way
-  `cache list` is.
-- A strict RWO claim that a serving pod still holds cannot be double-attached,
+  `cache list` is.- A strict RWO claim that a serving pod still holds cannot be double-attached,
   so the purge fails with a timeout naming the claim. Delete the
   InferenceService first, then purge.
 

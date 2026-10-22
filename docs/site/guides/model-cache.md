@@ -553,6 +553,15 @@ through the `app.kubernetes.io/component=model-cache` label. A user-managed
 `claimName` PVC is not necessarily labeled as an operator cache; it remains
 the user's responsibility to manage its lifecycle.
 
+`cache list` reads each claim through a short-lived read-only `busybox` pod it
+creates and deletes, rather than executing in a pod that happens to mount the
+claim. In the default `shared` mode the controller mounts the shared claim and
+its image has no shell, so borrowing that pod cannot work. The command needs
+your own permission to create and delete pods in the namespace, and
+`pods/exec` for the command it runs. When no discovered claim can be read it
+exits nonzero and says why, instead of reporting an empty or fully active
+cache. `--all-namespaces` does not inspect claims and creates no pod.
+
 ### Removing cache entries with `llmkube cache clear`
 
 `cache clear` removes entries instead of printing a command to run. One
