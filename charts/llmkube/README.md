@@ -336,6 +336,19 @@ hand-imported.
 |-----------|-------------|---------|
 | `metalRelay.secretCreatePolicy.enabled` | Install a `ValidatingAdmissionPolicy` and binding that let only the controller's ServiceAccount create the per-namespace Metal relay token Secret `llmkube-metal-relay`. Updates (token rotation) and deletes (revocation) are not restricted. Rendered only when the cluster serves `admissionregistration.k8s.io/v1` `ValidatingAdmissionPolicy` (Kubernetes 1.30 or newer). Tools that render offline, such as `helm template` or Argo CD, must pass `--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy`, or the policy is skipped. | `true` |
 
+### Metal Agent Identity Parameters
+
+Opt-in (`#2152`): the chart renders the same least-privilege identity as `deployment/macos/metal-agent-rbac.yaml`, so a Helm upgrade keeps the agent's permissions current. The rules are kept identical by `make check-metal-agent-rbac`. The chart never creates the agent's kubeconfig: mint it with `kubectl create token` (see `deployment/macos/README.md`).
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `metalAgent.rbac.enabled` | Render the agent's ServiceAccount, Role (or ClusterRole) and binding. Off by default. | `false` |
+| `metalAgent.rbac.scope` | `namespaced` renders a Role and RoleBinding per listed namespace (agent watching one namespace). `cluster` renders a ClusterRole and ClusterRoleBinding (agent watching all namespaces, `--namespace ""`). Any other value fails the render. | `namespaced` |
+| `metalAgent.rbac.namespaces` | Namespaces to install into under `scope: namespaced`, e.g. `[default]`. Required in that scope; the render fails on an empty list rather than defaulting to the release namespace. Namespaces must exist before the install (Helm creates only the release namespace). Removing one from the list deletes its objects on upgrade. | `[]` |
+| `metalAgent.rbac.secretNames` | Pin the agent's `secrets get` to these names. Empty grants reads of every Secret in scope, because the agent also reads Model `sourceSecretRef` credentials. `[llmkube-metal-relay]` narrows it when no Model uses `sourceSecretRef`. Under `scope: cluster`, empty means cluster-wide Secret read. | `[]` |
+| `metalAgent.rbac.serviceAccount.create` | Create the ServiceAccount. `false` binds an identity you already manage. | `true` |
+| `metalAgent.rbac.serviceAccount.name` | ServiceAccount name, shared by the Role/ClusterRole and binding. Empty uses `llmkube-metal-agent`, the name the `kubectl create token` recipe uses. Required when `create` is `false`. | `""` |
+
 ### Model cache storage
 
 `modelCache.mode` defaults to `shared`: the operator mounts the chart's cache

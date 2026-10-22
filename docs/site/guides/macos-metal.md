@@ -94,6 +94,12 @@ bundled installer with that kubeconfig:
 make install-metal-agent METAL_KUBECONFIG="$KC"   # KC=$HOME/.kube/llmkube-metal-agent.yaml
 ```
 
+If you installed LLMKube with Helm, the chart can create that ServiceAccount
+and its Role instead (`metalAgent.rbac`), so a `helm upgrade` keeps the agent's
+permissions in step with the release. The kubeconfig is still minted by hand:
+the chart never creates a token Secret. See the same README section for the
+values block and the migration from the hand-applied manifest.
+
 Without `METAL_KUBECONFIG` the agent connects with the current context
 of `~/.kube/config`, usually an admin identity. Under launchd it does
 not see your shell's `$KUBECONFIG`.

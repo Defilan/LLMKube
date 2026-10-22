@@ -90,6 +90,10 @@ check-helm-rbac: manifests ## Verify the Helm charts' RBAC covers every kubebuil
 check-helm-webhook-cert: ## Verify the webhook serving cert names the capped Service (#1885).
 	@./scripts/check-helm-webhook-cert.sh
 
+.PHONY: check-metal-agent-rbac
+check-metal-agent-rbac: ## Verify the chart's metal-agent identity matches deployment/macos/metal-agent-rbac.yaml (#2152).
+	@go run ./cmd/check-metal-agent-rbac --root .
+
 .PHONY: sync-reviewer-prompts
 sync-reviewer-prompts: ## Sync reviewer.md into spec.systemPrompt of every reviewer Agent manifest (#804).
 	@go run ./cmd/sync-reviewer-prompts

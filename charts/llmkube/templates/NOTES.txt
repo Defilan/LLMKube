@@ -130,6 +130,29 @@ DOCUMENTATION:
 - Minikube Quickstart: https://github.com/defilantech/LLMKube/blob/main/docs/minikube-quickstart.md
 
 For GPU deployments, see: https://github.com/defilantech/LLMKube/blob/main/docs/gpu-setup-guide.md
+{{- if .Values.metalAgent.rbac.enabled }}
+
+---
+METAL AGENT (macOS):
+
+  The metal-agent's least-privilege identity is installed. Mint its kubeconfig
+  from the ServiceAccount (the chart does not create a token Secret):
+
+{{- if eq .Values.metalAgent.rbac.scope "cluster" }}
+  kubectl create token llmkube-metal-agent -n {{ include "llmkube.namespace" . }} --duration=8760h
+  Scope: cluster-wide (the agent runs with --namespace "")
+
+  This identity can read Secrets in every namespace unless
+  metalAgent.rbac.secretNames pins the read; see deployment/macos/README.md.
+{{- else }}
+{{- range uniq (.Values.metalAgent.rbac.namespaces | default list) }}
+  kubectl create token {{ include "llmkube.metalAgent.serviceAccountName" $ }} -n {{ . }} --duration=8760h
+{{- end }}
+
+  Then follow "Dedicated kubeconfig with least-privilege RBAC" in
+  deployment/macos/README.md, skipping its `kubectl apply` step.
+{{- end }}
+{{- end }}
 
 ---
 Happy inferencing!

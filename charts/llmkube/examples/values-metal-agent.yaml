@@ -1,0 +1,23 @@
+# Opt in to the chart-managed metal-agent identity (#2152), as an alternative
+# to `kubectl apply -f deployment/macos/metal-agent-rbac.yaml`.
+#
+# The chart renders the same ServiceAccount, Role and RoleBinding as that
+# manifest into each listed namespace, and `make check-metal-agent-rbac` keeps
+# the rules identical. It never renders the agent's kubeconfig: mint it with
+#   kubectl create token llmkube-metal-agent -n default --duration=8760h
+# and follow "Dedicated kubeconfig with least-privilege RBAC" in
+# deployment/macos/README.md.
+#
+# The namespaces must exist before this installs.
+metalAgent:
+  rbac:
+    enabled: true
+    # The agent's --namespace flag defaults to "default"; list the namespaces
+    # it actually watches. For all namespaces, use scope: cluster instead.
+    scope: namespaced
+    namespaces:
+      - default
+    # Narrow the Secret read to the relay token. Drop this (or add names) if a
+    # Model uses spec.sourceSecretRef credentials in this namespace.
+    secretNames:
+      - llmkube-metal-relay

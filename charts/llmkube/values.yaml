@@ -673,6 +673,46 @@ metalRelay:
     # (Kubernetes 1.30 or newer).
     enabled: true
 
+# Least-privilege identity for the macOS metal-agent (#2152). The agent runs
+# outside the cluster and authenticates with a kubeconfig, so it needs its own
+# ServiceAccount rather than your admin credentials. Off by default; when on,
+# the chart renders the same identity as deployment/macos/metal-agent-rbac.yaml
+# and a CI check (make check-metal-agent-rbac) fails if the two rule sets drift.
+#
+# The chart never renders a token Secret: mint the agent's kubeconfig with
+# `kubectl create token` (see deployment/macos/README.md), so credentials stay
+# out of the release and rot on your schedule rather than the chart's.
+metalAgent:
+  rbac:
+    # Render the agent's ServiceAccount, Role (or ClusterRole) and binding.
+    enabled: false
+    # namespaced: a Role and RoleBinding in each namespace listed below, for an
+    # agent watching ONE namespace (`--namespace <ns>`, its flag's "default").
+    # cluster: a ClusterRole and ClusterRoleBinding, for an agent watching all
+    # namespaces (`--namespace ""`).
+    scope: namespaced
+    # Namespaces to install into under scope namespaced, e.g. [default] for an
+    # agent left on its flag default. Required in that scope, and deliberately
+    # not defaulted to the release namespace: the agent's own default is
+    # "default", not llmkube-system, so a silent default would put the identity
+    # somewhere the agent never looks. These must exist before the install,
+    # because Helm creates only the release namespace. Removing a namespace
+    # from the list deletes its three objects.
+    namespaces: []
+    # Pin the agent's Secret read to these names. Empty grants get on all
+    # Secrets in each namespace because the agent also reads Model
+    # sourceSecretRef credentials (HF_TOKEN, AWS_*). Narrow it to
+    # [llmkube-metal-relay] when no Model uses sourceSecretRef. Under scope
+    # cluster, empty means the agent can read every Secret in the cluster.
+    secretNames: []
+    serviceAccount:
+      # Create the ServiceAccount. false binds an identity you already manage,
+      # which serviceAccount.name then requires.
+      create: true
+      # Name of the ServiceAccount. Empty uses llmkube-metal-agent, the name
+      # deployment/macos/README.md's `kubectl create token` recipe uses.
+      name: ""
+
 # Network policies for the controller manager pod
 networkPolicies:
   enabled: false

@@ -70,6 +70,7 @@ contributors share. The human onboarding narrative lives in
 | Regenerate DeepCopy methods         | `make generate`         |
 | Regenerate CRDs into the Helm chart | `make chart-crds`       |
 | Check AGENTS.md references resolve  | `make check-agents-md`  |
+| Chart metal-agent RBAC vs manifest  | `make check-metal-agent-rbac` |
 
 ## Definition of done
 
@@ -78,7 +79,8 @@ A change is not done until all of these hold.
 1. The pre-commit gate passes: `make fmt`, `make vet`, `make lint`, `make test`.
 2. The pre-push gate passes: `make lint-all`. If `charts/` changed, run
    `make test-chart`, plus `make test-chart-rules` if the PrometheusRule
-   changed. If CRD types in `api/v1alpha1/` changed, run
+   changed, plus `make check-metal-agent-rbac` if the metal-agent identity
+   template or its values changed. If CRD types in `api/v1alpha1/` changed, run
    `make generate` and `make chart-crds`, then `git status` must be clean.
    Uncommitted generated files mean a step was skipped, and the CI CRD sync
    check will fail.

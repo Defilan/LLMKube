@@ -347,13 +347,34 @@ The agent doesn't need your admin credentials.
 with only the permissions the agent uses (read InferenceServices and Models,
 update InferenceService status, manage the Services and EndpointSlices that
 publish each server, write events, read the relay token Secret and
-`sourceSecretRef` secrets). Mint a kubeconfig from it:
+`sourceSecretRef` secrets).
+
+If you installed LLMKube with Helm, the chart can create the same identity for
+you, so a `helm upgrade` keeps the agent's permissions current instead of
+leaving them to a file someone applied by hand:
+
+```yaml
+metalAgent:
+  rbac:
+    enabled: true
+    scope: namespaced        # cluster for an agent watching all namespaces
+    namespaces: [default]    # the namespace(s) the agent watches; must exist
+    secretNames: [llmkube-metal-relay]  # pin the Secret read; omit to read all
+```
+
+`make check-metal-agent-rbac` fails CI if the chart's rules drift from
+`metal-agent-rbac.yaml`. The chart never creates the token Secret: mint the
+kubeconfig below and skip its `kubectl apply` step. Without Helm, apply the
+manifest as the recipe does.
+
+Mint a kubeconfig from the identity:
 
 ```bash
 NS=default                                  # the namespace the agent watches (--namespace)
 KC=$HOME/.kube/llmkube-metal-agent.yaml
 CA=$(mktemp)                                # private temp file for the cluster CA
 
+# Without Helm. With metalAgent.rbac.enabled the chart already created these.
 kubectl apply -n "$NS" -f deployment/macos/metal-agent-rbac.yaml
 
 SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
@@ -393,7 +414,21 @@ unusable CA.
 cap `--duration` below what you ask for. When it expires the agent logs
 `Unauthorized`; rerun the `create token` and `set-credentials` steps. The
 manifest is namespace-scoped: running the agent with `--namespace ""` (all
-namespaces) needs the same rules in a ClusterRole and ClusterRoleBinding.
+namespaces) needs the same rules in a ClusterRole and ClusterRoleBinding,
+which `metalAgent.rbac.scope: cluster` renders.
+
+Moving from the hand-applied manifest to the chart: Helm refuses to adopt
+objects it did not create, so an install that already applied
+`metal-agent-rbac.yaml` fails with `invalid ownership metadata`. Delete the
+three objects first, then upgrade with `metalAgent.rbac.enabled: true`. The
+token already minted stays valid, because the chart recreates the
+ServiceAccount with the same name.
+
+Update an existing `metalAgent.rbac.namespaces` list and the namespaces you
+removed have their ServiceAccount, Role and RoleBinding deleted on upgrade,
+because Helm removes everything that leaves the release manifest. Namespaces
+the chart installs into must exist: Helm creates only the release namespace,
+not the ones the chart names.
 
 The agent's client also looks up API groups through the API server's
 discovery endpoints (`/api`, `/apis`), which any authenticated identity can
