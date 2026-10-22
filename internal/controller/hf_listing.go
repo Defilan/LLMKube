@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -172,20 +173,39 @@ type hfTreeEntry struct {
 }
 
 // hfTreeSize decodes the tree API's per-file size. A value the listing cannot
-// read as a positive byte count is unknown, not an error: the size is extra
-// information here, and failing the page would turn a listing that used to
-// expand globs into RepoListingFailed.
+// read, digit for digit, as a whole number of bytes is unknown, not an error:
+// the size is extra information here, and failing the page would turn a
+// listing that used to expand globs into RepoListingFailed.
 type hfTreeSize int64
 
 func (s *hfTreeSize) UnmarshalJSON(b []byte) error {
-	raw := strings.Trim(string(b), `"`)
-	var n int64
-	if _, err := fmt.Sscan(raw, &n); err != nil || n < 1 {
+	n, ok := parseWholeBytes(string(b))
+	if !ok || n < 1 {
 		*s = 0
 		return nil
 	}
 	*s = hfTreeSize(n)
 	return nil
+}
+
+// parseWholeBytes reads a JSON scalar's text as a byte count. A zero fraction
+// is exact ("1610612736.0" is the same byte count); anything else, including
+// an exponent, needs a float or a truncation to read, and a truncated size
+// understates what staging writes (#2121).
+func parseWholeBytes(b string) (int64, bool) {
+	s := strings.TrimSpace(strings.Trim(b, `"`))
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, true
+	}
+	whole, frac, ok := strings.Cut(s, ".")
+	if !ok || strings.Trim(frac, "0") != "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(whole, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func fetchHFTreePage(ctx context.Context, client *http.Client, pageURL, token string) ([]hfTreeEntry, string, error) {

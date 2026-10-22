@@ -610,9 +610,59 @@ func TestReconcileRuntimeResolved_StagedSizeTotal(t *testing.T) {
 	}
 }
 
+// No recorded producer sends a non-integer size; this pins what happens when a
+// mirrored tree API does. A size read only up to its first integer digit is a
+// small positive byte count, so the total covers every file and understates
+// what staging writes.
+func TestReconcileRuntimeResolved_NonIntegerSizeIsUnknown(t *testing.T) {
+	body := `[
+		{"type":"file","path":"config.json","size":16770},
+		{"type":"file","path":"model-00001-of-00002.safetensors","size":"1.5 GB"},
+		{"type":"file","path":"model-00002-of-00002.safetensors","size":100}
+	]`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+
+	endpoint := srv.URL + "/artifactory/api/huggingfaceml/hf-remote"
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "glm", Namespace: "default", Generation: 1},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source:          endpoint + "/nvidia/GLM-5.3-Flash-NVFP4/resolve/main/",
+			Format:          "safetensors",
+			SourceSecretRef: &corev1.LocalObjectReference{Name: "huggingface"},
+			Files:           []string{"config.json", "*.safetensors"},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "huggingface", Namespace: "default"},
+		Data:       map[string][]byte{"HF_ENDPOINT": []byte(endpoint)},
+	}
+	r := newMultiFileGateReconciler(t, model, secret)
+	r.AllowedRemoteHosts = []string{"127.0.0.1"}
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "glm", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	stored := getModel(t, r, "glm")
+	if stored.Status.Phase != PhaseReady {
+		t.Fatalf("phase = %q, want Ready; an unreadable size must not fail the page", stored.Status.Phase)
+	}
+	want := []string{"config.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"}
+	if !reflect.DeepEqual(stored.Status.StagedFiles, want) {
+		t.Errorf("stagedFiles = %v, want %v (the glob still expands)", stored.Status.StagedFiles, want)
+	}
+	if stored.Status.Size != "" {
+		t.Errorf("status.size = %q, want %q: a size that is not a whole number of bytes is unknown, not a total", stored.Status.Size, "")
+	}
+}
+
 // The tree API's size is extra information for every listing, so a shape the
 // controller cannot read as a byte count must not fail the page: an entry
-// with an unreadable size is unknown, and the glob still expands.
+// with an unreadable size is unknown, and the glob still expands. A size is
+// read only when it is exactly a whole number of bytes.
 func TestHFTreeSize(t *testing.T) {
 	tests := []struct {
 		name string
@@ -627,6 +677,16 @@ func TestHFTreeSize(t *testing.T) {
 		{"object", `{"type":"file","path":"a","size":{"bytes":12}}`, 0},
 		{"empty string", `{"type":"file","path":"a","size":""}`, 0},
 		{"negative", `{"type":"file","path":"a","size":-5}`, 0},
+		{"unit string", `{"type":"file","path":"a","size":"1.5 GB"}`, 0},
+		{"exponent", `{"type":"file","path":"a","size":1.5e9}`, 0},
+		{"exponent integer", `{"type":"file","path":"a","size":1e9}`, 0},
+		{"trailing garbage", `{"type":"file","path":"a","size":"12abc"}`, 0},
+		{"fraction", `{"type":"file","path":"a","size":1.5}`, 0},
+		{"empty fraction", `{"type":"file","path":"a","size":"12."}`, 12},
+		{"plus sign", `{"type":"file","path":"a","size":"+12"}`, 12},
+		{"padded", `{"type":"file","path":"a","size":" 12 "}`, 12},
+		{"zero", `{"type":"file","path":"a","size":0}`, 0},
+		{"overflow", `{"type":"file","path":"a","size":9223372036854775808}`, 0},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
