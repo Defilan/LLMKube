@@ -894,7 +894,7 @@ func crossNamespaceRouterFixture(ns, name, gwNS, svc string) *inferencev1alpha1.
 }
 
 // makeBackendISvcInNamespace creates a ready backend InferenceService in an
-// explicit namespace (makeBackendISvc is pinned to testNS).
+// explicit namespace (makeBackendISvc reads the package testNS).
 func makeBackendISvcInNamespace(t *testing.T, c client.Client, ns, name string) {
 	t.Helper()
 	isvc := &inferencev1alpha1.InferenceService{
@@ -926,7 +926,7 @@ func setISvcReadyReplicasInNamespace(t *testing.T, c client.Client, ns, name str
 }
 
 // getUnstructuredInNamespace fetches one unstructured object from an explicit
-// namespace (getUnstructured is pinned to testNS).
+// namespace (getUnstructured reads the package testNS).
 func getUnstructuredInNamespace(t *testing.T, c client.Client, gvk schema.GroupVersionKind, ns, name string) *unstructured.Unstructured {
 	t.Helper()
 	u := &unstructured.Unstructured{}
@@ -966,7 +966,7 @@ func sameNamespaceRouterFixture(ns, name, svc string) *inferencev1alpha1.ModelRo
 }
 
 // getPolicyInNamespace fetches one AgentgatewayPolicy from an explicit
-// namespace (getUnstructured is pinned to testNS).
+// namespace (getUnstructured reads the package testNS).
 func getPolicyInNamespace(t *testing.T, c client.Client, ns, name string) *unstructured.Unstructured {
 	t.Helper()
 	u := &unstructured.Unstructured{}
@@ -980,7 +980,7 @@ func getPolicyInNamespace(t *testing.T, c client.Client, ns, name string) *unstr
 }
 
 // assertNoPolicyInNamespace asserts an AgentgatewayPolicy is absent from an
-// explicit namespace (assertNotExists is pinned to testNS).
+// explicit namespace (assertNotExists reads the package testNS).
 func assertNoPolicyInNamespace(t *testing.T, c client.Client, ns, name string) {
 	t.Helper()
 	u := &unstructured.Unstructured{}
@@ -993,7 +993,7 @@ func assertNoPolicyInNamespace(t *testing.T, c client.Client, ns, name string) {
 }
 
 // assertNotExistsInNamespace asserts an unstructured object of the given GVK
-// is absent from an explicit namespace (assertNotExists is pinned to testNS).
+// is absent from an explicit namespace (assertNotExists reads the package testNS).
 func assertNotExistsInNamespace(t *testing.T, c client.Client, gvk schema.GroupVersionKind, ns, name string) {
 	t.Helper()
 	u := &unstructured.Unstructured{}

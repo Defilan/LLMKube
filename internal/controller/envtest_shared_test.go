@@ -41,10 +41,13 @@ import (
 // kube-apiserver, about 4 s; the tests below used to start 63 of them and the
 // package ran into go test's 10 minute timeout on CI runners.
 //
-// Package-level testNS is a fresh namespace per test, so tests sharing a
-// server never see each other's objects. That is only sound because no test in
-// this package calls t.Parallel: the helpers assign testNS before the test
-// runs, and a parallel test would race another's assignment.
+// Package-level testNS is the namespace the current test's env helper created,
+// so tests sharing a server never see each other's objects. It changes when a
+// test calls an env helper, and it changes when a test calls
+// newTestNamespace, so a test that takes its own namespace still finds
+// everything it names off testNS in the namespace it created. That is only
+// sound because no test in this package calls t.Parallel: a parallel test
+// would race another's assignment.
 var (
 	sharedEnvMu        sync.Mutex
 	sharedEnvs         = map[string]*sharedEnv{}
@@ -147,34 +150,55 @@ func stopSharedTestEnvs() {
 }
 
 // newTestNamespace creates a namespace with a generated name on the server and
-// returns it, so tests that share the server never collide.
+// makes it the current test's testNS, for a test that wants to create its
+// object somewhere exact and then look it up through the shared helpers.
 func newTestNamespace(t *testing.T, c client.Client) string {
 	t.Helper()
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "llmkube-test-"}}
 	if err := c.Create(context.Background(), ns); err != nil {
 		t.Fatalf("create test namespace: %v", err)
 	}
+	testNS = ns.Name
 	return ns.Name
 }
 
 // newTestNS points testNS at a fresh namespace. Every env helper calls it
 // before returning, so a test and its fixtures agree on one namespace.
 func newTestNS(t *testing.T, c client.Client) {
-	testNS = newTestNamespace(t, c)
+	newTestNamespace(t, c)
 }
 
 // TestMain stops the shared environments after all tests have run, and fails
 // the package (not just one test) when a start went past the budget: a
 // ran-away control plane count is what pushed internal/controller into go
-// test's timeout (#2141).
+// test's timeout (#2141). The report goes to stdout and stderr so it lands in
+// the log and in the `go test -json` artifact, which is where a timeout's
+// cause is read from (hack/go-test-report.sh).
 func TestMain(m *testing.M) {
 	code := m.Run()
 	stopSharedTestEnvs()
 	if n := controlPlanes.Load(); n > maxTestControlPlanes {
-		fmt.Fprintf(os.Stderr,
+		report := fmt.Sprintf(
 			"envtest control planes started: %d (budget %d); shared set and its first caller:\n  %s\n",
 			n, maxTestControlPlanes, strings.Join(controlPlaneStarts, "\n  "))
+		_, _ = fmt.Fprint(os.Stdout, report)
+		_, _ = fmt.Fprint(os.Stderr, report)
 		code = 1
 	}
 	os.Exit(code)
+}
+
+// TestNewTestNamespaceMovesTestNS pins the invariant the fixture helpers depend
+// on: after newTestNamespace, testNS is the namespace it just created. A test
+// that takes its own namespace and then names a fixture off testNS
+// (getUnstructured, assertNotExists, setISvcReadyReplicas and the rest) would
+// otherwise read whichever namespace the previous test left behind and look for
+// its object in the wrong place.
+func TestNewTestNamespaceMovesTestNS(t *testing.T) {
+	c, _, _ := sharedTestEnv(t, baseCRDPath)
+
+	ns := newTestNamespace(t, c)
+	if testNS != ns {
+		t.Fatalf("newTestNamespace returned %s but left testNS at %s: a test naming a fixture off testNS would look in the wrong namespace", ns, testNS)
+	}
 }

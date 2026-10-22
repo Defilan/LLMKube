@@ -124,7 +124,7 @@ func expectDecoratorHit(t *testing.T, hits chan reconcile.Request, want types.Na
 func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
 	defer stop()
-	ns := newTestNamespace(t, mgr.GetClient())
+	ns := testNS
 	hits := make(chan reconcile.Request, 1024)
 	rec := &ModelReconciler{
 		Client:    mgr.GetClient(),
@@ -153,7 +153,7 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
 	defer stop()
-	ns := newTestNamespace(t, mgr.GetClient())
+	ns := testNS
 	hits := make(chan reconcile.Request, 1024)
 	rec := &InferenceServiceReconciler{
 		Client:   mgr.GetClient(),
@@ -174,4 +174,35 @@ func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	}
 
 	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: isvc.Name})
+}
+
+// TestExpectDecoratorHitIgnoresAnotherObjectsReconcile pins the filter
+// expectDecoratorHit exists for: on a shared API server the manager's startup
+// LIST enqueues every object of that kind, so a bare hit would let an earlier
+// test's object satisfy the assertion for this one. A foreign hit alone must
+// leave the assertion waiting rather than return on it, which is what happens
+// once the wanted request arrives.
+func TestExpectDecoratorHitIgnoresAnotherObjectsReconcile(t *testing.T) {
+	want := types.NamespacedName{Namespace: "llmkube-test-foreign", Name: "someone-elses-isvc"}
+	hits := make(chan reconcile.Request, 2)
+	hits <- reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "llmkube-test-earlier", Name: "absent-isvc"}}
+
+	done := make(chan struct{})
+	go func() {
+		expectDecoratorHit(t, hits, want)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("a foreign object's reconcile satisfied the assertion: the filter is gone")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	hits <- reconcile.Request{NamespacedName: want}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wanted request never satisfied the assertion")
+	}
 }

@@ -62,7 +62,7 @@ func reconcileSLO(t *testing.T, r *InferenceServiceSLOReconciler, isvc *inferenc
 	}
 }
 
-// nolint:unparam // ns is parameterized for clarity at call sites even though existing tests all use testNS
+// nolint:unparam // ns is parameterized: most call sites pass testNS, the cleanup test passes the hand-authored object's namespace
 func getSLO(t *testing.T, c client.Client, ns, name string) (*unstructured.Unstructured, error) {
 	t.Helper()
 	u := &unstructured.Unstructured{}
