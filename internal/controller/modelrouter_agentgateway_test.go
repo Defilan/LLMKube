@@ -19,10 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,7 +40,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -54,89 +51,18 @@ import (
 // spec shapes server-side, and the minimal HTTPRoute stub.
 const inferenceExtensionTestCRDDir = "../../test/crd/inference-extension"
 
-// startAgentGatewayTestEnv starts an envtest with (or without) the vendored
-// Inference Extension / agentgateway CRDs registered alongside the base LLMKube
-// CRDs, mirroring startGatewayTestEnv. With CRDs, the API server is SHARED:
-// one envtest per distinct CRD set, started lazily, stopped by TestMain. Every
-// test works in its own generated namespace (newTestNamespace), so tests stay
-// independent on the shared server. Without CRDs - or with a SUBSET, which is
-// how the missing-kind tests pin the gate - the test keeps a private
-// environment, because those tests need CRDs ABSENT.
+// startAgentGatewayTestEnv returns the shared envtest with (or without) the
+// vendored Inference Extension / agentgateway CRDs registered alongside the
+// base LLMKube CRDs, mirroring startGatewayTestEnv. Both paths share a control
+// plane with every other test that loads the same CRD set; without CRDs the
+// set is the base CRDs alone, so those tests still see them ABSENT. A SUBSET
+// (startAgentGatewayTestEnvWithCRDs) stays private, because the missing-kind
+// tests need that subset and nothing else.
 func startAgentGatewayTestEnv(t *testing.T, withCRDs bool) (client.Client, *rest.Config, func()) {
 	if !withCRDs {
-		return startAgentGatewayTestEnvWithCRDs(t)
+		return sharedTestEnv(t, baseCRDPath)
 	}
-	return startSharedAgentGatewayTestEnv(t, baseCRDPath, inferenceExtensionTestCRDDir)
-}
-
-// Shared envtest state. Starting an envtest is an apiserver plus an etcd
-// (~4s locally, more on CI); before sharing, this suite started 23 of them and
-// pushed the package past Go's 10 minute test timeout.
-var (
-	sharedAgentGatewayMu   sync.Mutex
-	sharedAgentGatewayEnvs = map[string]*sharedAgentGatewayEnv{}
-)
-
-type sharedAgentGatewayEnv struct {
-	env    *envtest.Environment
-	cfg    *rest.Config
-	client client.Client
-}
-
-// startSharedAgentGatewayTestEnv returns the shared envtest for the given CRD
-// path set, starting it lazily on first use. The returned stop function is a
-// no-op: the environment is stopped by TestMain after all tests have run.
-func startSharedAgentGatewayTestEnv(t *testing.T, crdPaths ...string) (client.Client, *rest.Config, func()) {
-	t.Helper()
-	key := strings.Join(crdPaths, "\x00")
-	sharedAgentGatewayMu.Lock()
-	shared, ok := sharedAgentGatewayEnvs[key]
-	if !ok {
-		env := &envtest.Environment{
-			CRDDirectoryPaths:     crdPaths,
-			ErrorIfCRDPathMissing: true,
-		}
-		if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
-			env.BinaryAssetsDirectory = dir
-		}
-		cfg, err := env.Start()
-		if err != nil {
-			sharedAgentGatewayMu.Unlock()
-			t.Fatalf("start shared envtest: %v", err)
-		}
-		if err := inferencev1alpha1.AddToScheme(scheme.Scheme); err != nil {
-			sharedAgentGatewayMu.Unlock()
-			t.Fatalf("add scheme: %v", err)
-		}
-		c, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
-		if err != nil {
-			sharedAgentGatewayMu.Unlock()
-			t.Fatalf("new shared client: %v", err)
-		}
-		shared = &sharedAgentGatewayEnv{env: env, cfg: cfg, client: c}
-		sharedAgentGatewayEnvs[key] = shared
-	}
-	sharedAgentGatewayMu.Unlock()
-	return shared.client, shared.cfg, func() {}
-}
-
-// stopSharedAgentGatewayEnvs stops every shared envtest environment. Called
-// from TestMain after all tests have run.
-func stopSharedAgentGatewayEnvs() {
-	sharedAgentGatewayMu.Lock()
-	defer sharedAgentGatewayMu.Unlock()
-	for _, shared := range sharedAgentGatewayEnvs {
-		_ = shared.env.Stop()
-	}
-	sharedAgentGatewayEnvs = map[string]*sharedAgentGatewayEnv{}
-}
-
-// TestMain stops the shared envtest environments after all tests have run; a
-// shared environment outlives any single test's stop function.
-func TestMain(m *testing.M) {
-	code := m.Run()
-	stopSharedAgentGatewayEnvs()
-	os.Exit(code)
+	return sharedTestEnv(t, baseCRDPath, inferenceExtensionTestCRDDir)
 }
 
 // startAgentGatewayTestEnvWithCRDs starts an envtest loading baseCRDPath plus
@@ -146,28 +72,7 @@ func TestMain(m *testing.M) {
 // design: these tests need CRDs ABSENT.
 func startAgentGatewayTestEnvWithCRDs(t *testing.T, extraCRDPaths ...string) (client.Client, *rest.Config, func()) {
 	t.Helper()
-	crdPaths := append([]string{baseCRDPath}, extraCRDPaths...)
-	env := &envtest.Environment{
-		CRDDirectoryPaths:     crdPaths,
-		ErrorIfCRDPathMissing: true,
-	}
-	if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
-		env.BinaryAssetsDirectory = dir
-	}
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	s := scheme.Scheme
-	if err := inferencev1alpha1.AddToScheme(s); err != nil {
-		t.Fatalf("add scheme: %v", err)
-	}
-	c, err := client.New(cfg, client.Options{Scheme: s})
-	if err != nil {
-		_ = env.Stop()
-		t.Fatalf("new client: %v", err)
-	}
-	return c, cfg, func() { _ = env.Stop() }
+	return privateTestEnv(t, append([]string{baseCRDPath}, extraCRDPaths...)...)
 }
 
 // newModelRouterAgentGatewayReconciler builds an agentgateway reconciler backed
@@ -986,17 +891,6 @@ func crossNamespaceRouterFixture(ns, name, gwNS, svc string) *inferencev1alpha1.
 			},
 		},
 	}
-}
-
-// newTestNamespace creates a namespace with a generated name on the shared
-// API server, so tests that share the server never collide.
-func newTestNamespace(t *testing.T, c client.Client) string {
-	t.Helper()
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "agw-test-"}}
-	if err := c.Create(context.Background(), ns); err != nil {
-		t.Fatalf("create test namespace: %v", err)
-	}
-	return ns.Name
 }
 
 // makeBackendISvcInNamespace creates a ready backend InferenceService in an

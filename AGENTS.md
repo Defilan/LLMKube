@@ -114,6 +114,12 @@ A change is not done until all of these hold.
 - Unit tests use `envtest` (controller-runtime); they run with `make test` and
   need no live cluster. For the blessed envtest patterns and the common traps,
   see `docs/contributing/envtest-guide.md`.
+- A test must not start its own envtest control plane. In `internal/controller`
+  the control plane is started once per CRD path set in
+  `internal/controller/envtest_shared_test.go` (`sharedTestEnv`), and each test
+  works in its own namespace (`newTestNamespace`); do not call `t.Parallel`
+  there. `make test-scripts` fails on a test that constructs an
+  `envtest.Environment` of its own (#2141).
 - Assert observable behavior, not internal implementation detail.
 - envtest runs as cluster-admin, so it cannot catch a missing
   `+kubebuilder:rbac` marker. After a controller change that adds an API
@@ -157,9 +163,9 @@ A change is not done until all of these hold.
 - Full suite (what CI and the Foreman gate run): `make test`, random seed and
   coverage profile, unchanged.
 - Editing `scripts/gate.sh`, `scripts/test-affected.sh`,
-  `scripts/check-ginkgo-seed_test.sh` or `cmd/affected-packages` requires
-  `make test-scripts`: go test never runs the shell regression suites. CI
-  runs the same target.
+  `scripts/check-ginkgo-seed_test.sh`, `scripts/check-envtest-sharing_test.sh`
+  or `cmd/affected-packages` requires `make test-scripts`: go test never runs
+  the shell regression suites. CI runs the same target.
 - The gate short-circuits: a failed regen, drift, fmt or vet step skips
   lint and tests (marked SKIPPED in the summary), so that round gets no
   lint or test signal until the failure is fixed and the gate reruns.

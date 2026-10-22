@@ -5,9 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -18,32 +16,14 @@ import (
 
 func startValidationTestEnv(t *testing.T) (client.Client, func()) {
 	t.Helper()
-	env := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
-		env.BinaryAssetsDirectory = dir
-	}
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	s := scheme.Scheme
-	if err := inferencev1alpha1.AddToScheme(s); err != nil {
-		t.Fatalf("add scheme: %v", err)
-	}
-	c, err := client.New(cfg, client.Options{Scheme: s})
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	return c, func() { _ = env.Stop() }
+	c, _, _ := sharedTestEnv(t, filepath.Join("..", "..", "config", "crd", "bases"))
+	return c, func() {}
 }
 
 func sloISvc(name string, slo *inferencev1alpha1.SLOSpec) *inferencev1alpha1.InferenceService {
 	isvc := &inferencev1alpha1.InferenceService{}
 	isvc.Name = name
-	isvc.Namespace = "default"
+	isvc.Namespace = testNS
 	isvc.Spec.ModelRef = "test-model"
 	isvc.Spec.SLO = slo
 	return isvc
@@ -82,7 +62,7 @@ func TestSLOValidation(t *testing.T) {
 
 	// Defaulting: window and indicator are stamped by the API server.
 	got := &inferencev1alpha1.InferenceService{}
-	if err := c.Get(ctx, client.ObjectKey{Namespace: "default", Name: "slo-val-0"}, got); err != nil {
+	if err := c.Get(ctx, client.ObjectKey{Namespace: testNS, Name: "slo-val-0"}, got); err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	if got.Spec.SLO.Window != "28d" || got.Spec.SLO.Indicator != "availability" {

@@ -32,7 +32,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -42,15 +41,15 @@ type schemaGVK = schema.GroupVersionKind
 // These tests are plain Go tests (not the Ginkgo suite) because they need
 // precise control over whether the Envoy AI Gateway CRDs are present: the
 // happy-path cases want them registered, while the CRDs-absent no-op case wants
-// them deliberately missing. Each case spins up its own envtest with the
-// appropriate CRDDirectoryPaths so the two worlds never bleed together.
+// them deliberately missing. That is two CRD sets, so the two worlds are two
+// shared control planes (envtest_shared_test.go) and never bleed together.
 
 const (
 	baseCRDPath    = "../../config/crd/bases"
 	aigwTestCRDDir = "../../test/crd/aigateway"
 )
 
-// startGatewayTestEnv boots an envtest with the LLMKube base CRDs and,
+// startGatewayTestEnv returns the shared envtest with the LLMKube base CRDs and,
 // optionally, the aigw test-stub CRDs. It returns a client plus a stop func.
 func startGatewayTestEnv(t *testing.T, withGatewayCRDs bool) (client.Client, *rest.Config, func()) {
 	t.Helper()
@@ -59,32 +58,7 @@ func startGatewayTestEnv(t *testing.T, withGatewayCRDs bool) (client.Client, *re
 	if withGatewayCRDs {
 		crdPaths = append(crdPaths, filepath.Join(aigwTestCRDDir))
 	}
-
-	env := &envtest.Environment{
-		CRDDirectoryPaths:     crdPaths,
-		ErrorIfCRDPathMissing: true,
-	}
-	if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
-		env.BinaryAssetsDirectory = dir
-	}
-
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-
-	s := scheme.Scheme
-	if err := inferencev1alpha1.AddToScheme(s); err != nil {
-		t.Fatalf("add scheme: %v", err)
-	}
-
-	c, err := client.New(cfg, client.Options{Scheme: s})
-	if err != nil {
-		_ = env.Stop()
-		t.Fatalf("new client: %v", err)
-	}
-
-	return c, cfg, func() { _ = env.Stop() }
+	return sharedTestEnv(t, crdPaths...)
 }
 
 // newGatewayReconciler builds a reconciler backed by a client whose RESTMapper
@@ -105,8 +79,6 @@ func newGatewayReconciler(t *testing.T, cfg *rest.Config) *InferenceServiceGatew
 	}
 	return &InferenceServiceGatewayReconciler{Client: c, Scheme: scheme.Scheme}
 }
-
-const testNS = "default"
 
 func makeInferenceService(name string, gw *inferencev1alpha1.GatewaySpec) *inferencev1alpha1.InferenceService {
 	endpoint := &inferencev1alpha1.EndpointSpec{Port: 8080}
@@ -169,8 +141,8 @@ func TestGatewayReconcile_OptedInGeneratesResources(t *testing.T) {
 
 	// Backend targets the InferenceService Service fqdn + port.
 	backend := getUnstructured(t, c, backendGVK(), name)
-	if host := backendHostname(t, backend); host != "qwen-isvc.default.svc.cluster.local" {
-		t.Errorf("backend hostname = %q, want qwen-isvc.default.svc.cluster.local", host)
+	if host := backendHostname(t, backend); host != "qwen-isvc."+testNS+".svc.cluster.local" {
+		t.Errorf("backend hostname = %q, want qwen-isvc.%s.svc.cluster.local", host, testNS)
 	}
 	assertOwnedBy(t, backend, isvc)
 

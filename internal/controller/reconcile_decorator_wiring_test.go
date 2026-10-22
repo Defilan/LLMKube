@@ -27,7 +27,6 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -43,25 +42,12 @@ import (
 // pinned because the InferenceService controller is the one #2069 actually
 // froze.
 
-// startWiringManager boots an envtest environment and a started manager for
-// the decorator wiring tests. The returned stop function cancels the manager
-// and waits for it to exit.
+// startWiringManager starts a manager on the shared envtest for the decorator
+// wiring tests. The returned stop function cancels the manager and waits for
+// it to exit; the control plane itself outlives the test.
 func startWiringManager(t *testing.T) (ctrl.Manager, func()) {
 	t.Helper()
-	testEnv := &envtest.Environment{
-		BinaryAssetsDirectory: getFirstFoundEnvTestBinaryDir(),
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	cfg, err := testEnv.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := testEnv.Stop(); err != nil {
-			t.Logf("stop envtest: %v", err)
-		}
-	})
+	_, cfg, _ := sharedTestEnv(t, filepath.Join("..", "..", "config", "crd", "bases"))
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -122,6 +108,7 @@ func expectDecoratorHit(t *testing.T, hits chan struct{}) {
 
 func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
+	ns := newTestNamespace(t, mgr.GetClient())
 	hits := make(chan struct{}, 8)
 	rec := &ModelReconciler{
 		Client:    mgr.GetClient(),
@@ -135,7 +122,7 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	}
 
 	model := &inferencev1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: ns},
 		Spec: inferencev1alpha1.ModelSpec{
 			Source: "https://example.com/model.gguf", Format: "gguf", Quantization: "Q4_K_M",
 		},
@@ -150,6 +137,7 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 
 func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
+	ns := newTestNamespace(t, mgr.GetClient())
 	hits := make(chan struct{}, 8)
 	rec := &InferenceServiceReconciler{
 		Client:   mgr.GetClient(),
@@ -162,7 +150,7 @@ func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	}
 
 	isvc := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: ns},
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "decorator-wiring-model"},
 	}
 	if err := mgr.GetClient().Create(context.Background(), isvc); err != nil {

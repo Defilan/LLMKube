@@ -168,8 +168,8 @@ func TestModelRouterGateway_FailoverProducesResources(t *testing.T) {
 	// A Backend + AIServiceBackend per backend, named after the RouterBackend.
 	for _, name := range []string{"qwen-cuda", "qwen-metal"} {
 		backend := getUnstructured(t, c, backendGVK(), name)
-		if host := backendHostname(t, backend); host != name+".default.svc.cluster.local" {
-			t.Errorf("backend %s hostname = %q, want %s.default.svc.cluster.local", name, host, name)
+		if host := backendHostname(t, backend); host != name+"."+testNS+".svc.cluster.local" {
+			t.Errorf("backend %s hostname = %q, want %s.%s.svc.cluster.local", name, host, name, testNS)
 		}
 		assertOwnedByRouter(t, backend, mr)
 
