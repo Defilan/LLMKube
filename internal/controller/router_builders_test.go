@@ -1711,3 +1711,41 @@ func TestCompileRouterConfigHashIgnoresPodChurn(t *testing.T) {
 		t.Errorf("config hash changed with pod count (%s vs %s): pod churn would re-roll the proxy", a.Hash, b.Hash)
 	}
 }
+
+// TestRouterDeploymentEndpointWatchIdentityAndTolerations: an endpoint router's
+// proxy runs under its ServiceAccount with ROUTER_NAME set, tolerations pass
+// through, and a router with neither pools nor endpoint backends is unchanged.
+func TestRouterDeploymentEndpointWatchIdentityAndTolerations(t *testing.T) {
+	r := &ModelRouterReconciler{}
+	plain := canonicalModelRouter()
+	plainDep := r.newRouterDeployment(plain, "h", false)
+	if sa := plainDep.Spec.Template.Spec.ServiceAccountName; sa != "" {
+		t.Errorf("plain router ServiceAccountName = %q, want empty (no API access)", sa)
+	}
+	if len(plainDep.Spec.Template.Spec.Tolerations) != 0 {
+		t.Errorf("plain router tolerations = %v, want none", plainDep.Spec.Template.Spec.Tolerations)
+	}
+
+	mr := canonicalModelRouter()
+	mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{Tolerations: []corev1.Toleration{{
+		Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule,
+	}}}
+	dep := r.newRouterDeployment(mr, "h", false)
+	spec := dep.Spec.Template.Spec
+	if spec.ServiceAccountName != routerProxyResourceName(mr.Name) {
+		t.Errorf("ServiceAccountName = %q, want %q", spec.ServiceAccountName, routerProxyResourceName(mr.Name))
+	}
+	var routerName string
+	for _, e := range spec.Containers[0].Env {
+		if e.Name == "ROUTER_NAME" {
+			routerName = e.Value
+		}
+	}
+	if routerName != mr.Name {
+		t.Errorf("ROUTER_NAME = %q, want %q", routerName, mr.Name)
+	}
+	if len(spec.Tolerations) != 1 || spec.Tolerations[0].Key != "nvidia.com/gpu" {
+		t.Errorf("tolerations = %v, want the nvidia.com/gpu toleration", spec.Tolerations)
+	}
+}

@@ -747,6 +747,11 @@ type RouterProxySpec struct {
 	// backends. Passthrough to the Pod spec.
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations are applied to the router-proxy pod, so it can be pinned
+	// next to tainted GPU nodes together with nodeSelector.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the

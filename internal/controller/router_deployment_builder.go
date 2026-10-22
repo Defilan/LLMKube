@@ -101,6 +101,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	var imagePullSecrets []corev1.LocalObjectReference
 	var revisionHistoryLimit *int32
 	var nodeSelector map[string]string
+	var tolerations []corev1.Toleration
 
 	if mr.Spec.Proxy != nil {
 		if mr.Spec.Proxy.Replicas != nil {
@@ -115,6 +116,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		}
 		imagePullSecrets = mr.Spec.Proxy.ImagePullSecrets
 		nodeSelector = mr.Spec.Proxy.NodeSelector
+		tolerations = mr.Spec.Proxy.Tolerations
 	}
 	// A pooled router must run exactly one proxy replica: ModelPool activation
 	// serializes swaps through a single in-process lock, so a second replica
@@ -137,12 +139,12 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		routerProxyConfigHashAnnotation: configHash,
 	}
 
-	// Activation-enabled proxies run under a dedicated ServiceAccount bound to
-	// a Role that can scale pooled InferenceServices; unpooled routers keep the
-	// namespace default SA and no API access.
+	// Proxies that call the API (ModelPool activation, endpoint tracking) run
+	// under a dedicated ServiceAccount bound to the Role reconcileRouterActivationRBAC
+	// provisions; other routers keep the namespace default SA and no API access.
 	serviceAccountName := ""
 	env := []corev1.EnvVar{}
-	if hasPools {
+	if hasPools || routerNeedsEndpointWatch(mr) {
 		serviceAccountName = routerProxyResourceName(mr.Name)
 		env = append(env, corev1.EnvVar{Name: "ROUTER_NAME", Value: mr.Name})
 	}
@@ -167,6 +169,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 					SecurityContext:    routerProxyPodSecurityContext(),
 					ImagePullSecrets:   imagePullSecrets,
 					NodeSelector:       nodeSelector,
+					Tolerations:        tolerations,
 					Containers: []corev1.Container{
 						{
 							Name:            routerProxyContainerName,

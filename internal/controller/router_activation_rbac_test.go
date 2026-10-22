@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -130,4 +131,64 @@ func roleGrantsISVCWrite(role *rbacv1.Role) bool {
 		}
 	}
 	return false
+}
+
+// TestReconcileRouterActivationRBACEndpointWatch: a router with an endpoint
+// backend and no pools gets the ServiceAccount and a Role that can read
+// EndpointSlices and nothing else; a pooled router with an endpoint backend
+// gets both sets of rules in its one Role.
+func TestReconcileRouterActivationRBACEndpointWatch(t *testing.T) {
+	scheme := activationRBACScheme(t)
+	ctx := context.Background()
+	endpointRouter := func(name string) *inferencev1alpha1.ModelRouter {
+		return &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", UID: types.UID("uid-" + name)},
+			Spec: inferencev1alpha1.ModelRouterSpec{Backends: []inferencev1alpha1.RouterBackend{{
+				Name: "q", InferenceServiceRef: &corev1.LocalObjectReference{Name: "q"},
+				Resolution: inferencev1alpha1.RouterBackendResolutionEndpoint,
+			}}},
+		}
+	}
+	readsSlices := func(role *rbacv1.Role) bool {
+		for _, rule := range role.Rules {
+			if len(rule.APIGroups) == 1 && rule.APIGroups[0] == "discovery.k8s.io" &&
+				len(rule.Resources) == 1 && rule.Resources[0] == "endpointslices" &&
+				reflect.DeepEqual(rule.Verbs, []string{"get", "list", "watch"}) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, tc := range []struct {
+		name      string
+		pools     bool
+		wantWrite bool
+	}{{"watch-only", false, false}, {"watch-and-pools", true, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			mr := endpointRouter(tc.name)
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mr).Build()
+			r := &ModelRouterReconciler{Client: c, Scheme: scheme}
+			if err := r.reconcileRouterActivationRBAC(ctx, mr, tc.pools); err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			name := routerProxyResourceName(mr.Name)
+			if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: "ns"}, &corev1.ServiceAccount{}); err != nil {
+				t.Fatalf("ServiceAccount: %v", err)
+			}
+			if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: "ns"}, &rbacv1.RoleBinding{}); err != nil {
+				t.Fatalf("RoleBinding: %v", err)
+			}
+			role := &rbacv1.Role{}
+			if err := c.Get(ctx, types.NamespacedName{Name: name, Namespace: "ns"}, role); err != nil {
+				t.Fatalf("Role: %v", err)
+			}
+			if !readsSlices(role) {
+				t.Errorf("Role rules = %+v, want get/list/watch on endpointslices", role.Rules)
+			}
+			if got := roleGrantsISVCWrite(role); got != tc.wantWrite {
+				t.Errorf("InferenceService write = %v, want %v", got, tc.wantWrite)
+			}
+		})
+	}
 }
