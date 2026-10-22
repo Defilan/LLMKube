@@ -180,6 +180,51 @@ spec:
 
 Use it on multi-replica local backends where one client should not pin one pod. A single replica gains nothing — there is only one endpoint to rotate to — and out-of-cluster backends (the metal-agent path, `external:` providers) have no `EndpointSlices` to compile, so they stay service-level.
 
+## Several models on dataPlane: AgentGateway
+
+With `dataPlane: AgentGateway`, each backend's `InferenceService` becomes an `InferencePool`, and agentgateway asks that pool's Endpoint Picker (EPP) which pod serves each request. A Gateway API Inference Extension EPP binds to exactly one pool, so a router that fronts several models gives each backend its own picker:
+
+```yaml
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: ModelRouter
+metadata:
+  name: b200-models
+spec:
+  dataPlane: AgentGateway
+  agentGatewayRef:
+    name: ai-gateway
+  backends:
+    - name: glm
+      inferenceServiceRef:
+        name: glm-53
+      endpointPicker:
+        service: {name: glm-epp, port: 9002}
+    - name: qwen
+      inferenceServiceRef:
+        name: qwen-38
+      endpointPicker:
+        service: {name: qwen-epp, port: 9002}
+  rules:
+    - name: glm
+      match: {models: [glm-5.3]}
+      route: {backends: [glm]}
+    - name: qwen
+      match: {models: [qwen-3.8]}
+      route: {backends: [qwen]}
+```
+
+`agentGatewayRef.endpointPicker` and `endpointPickerPort` remain the router-wide default for any backend without its own picker. The router reports `AgentGatewayReady=False` when:
+
+- two pools would share one picker (`MultipleInferencePoolsUnsupported`), which is what the default does when backends reference more than one `InferenceService`; the same reason covers two `InferenceService` names that compile to one pool name, such as `glm.53` and `glm-53`;
+- two backends on the same `InferenceService` name different pickers (`ConflictingEndpointPicker`);
+- a pool has no picker at all (`EndpointPickerRequired`).
+
+The pickers are yours to run; LLMKube references them by Service name and port in the router's namespace. A backend without its own picker uses the picker another backend on the same `InferenceService` names, and only then the router default.
+
+Each `InferencePool` is named after its `InferenceService`, and a router never adopts a pool another router created. When you move from one router per model to one router for several, delete the per-model routers first: until their pools are garbage-collected, the combined router reports `GeneratedResourceNameTaken`.
+
+`primary-fallback` routes each rule to its first healthy backend. When that backend's `InferenceService` has no ready replica, the next reconcile moves the rule to the next backend. Failover follows replica readiness, not individual request errors: a primary that is up but failing requests keeps its traffic.
+
 ## Composition with LiteLLM
 
 LLMKube does not replace [LiteLLM](https://github.com/BerriAI/litellm). For organizations already running a LiteLLM proxy as their cloud-provider abstraction, point a `ModelRouter` external backend at it:

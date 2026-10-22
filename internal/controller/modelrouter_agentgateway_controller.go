@@ -70,11 +70,18 @@ const (
 	// disables the generated model extraction or is silently disabled by it,
 	// and no condition reports the dropped field.
 	modelRouterAgentGatewayReasonPolicyConflict = "ConflictingPreRoutingPolicy"
-	// modelRouterAgentGatewayReasonMultiPool marks a router whose backends
-	// resolve to more than one InferencePool while agentGatewayRef names a
-	// single Endpoint Picker: a GIE EPP binds to exactly one pool, so the
+	// modelRouterAgentGatewayReasonMultiPool marks a router where two
+	// InferencePools would share one Endpoint Picker (or two InferenceServices
+	// compile to one pool name): a GIE EPP binds to exactly one pool, so the
 	// compiled shape would make endpoint decisions for the wrong pool.
 	modelRouterAgentGatewayReasonMultiPool = "MultipleInferencePoolsUnsupported"
+	// modelRouterAgentGatewayReasonConflictingPicker marks backends on the same
+	// InferenceService that name different Endpoint Pickers: one pool has one
+	// picker.
+	modelRouterAgentGatewayReasonConflictingPicker = "ConflictingEndpointPicker"
+	// modelRouterAgentGatewayReasonPickerRequired marks an InferencePool that
+	// resolves no Endpoint Picker: no backend override and no router default.
+	modelRouterAgentGatewayReasonPickerRequired = "EndpointPickerRequired"
 	// modelRouterAgentGatewayReasonGatewayNotFound marks an agentGatewayRef
 	// whose Gateway does not exist (or whose kind is not registered). The
 	// router previously went Ready against a missing Gateway; nothing it
@@ -465,13 +472,12 @@ func (r *ModelRouterAgentGatewayReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonUnsafeSensitiveRoute, msg)
 	}
 
-	// Fail loud when the router would compile to more than one InferencePool:
-	// agentGatewayRef names a single Endpoint Picker and a GIE EPP binds to
-	// exactly one pool, so the compiled shape would make endpoint decisions for
-	// the wrong pool. Same pure check the webhook runs (modelrouter_webhook.go),
-	// so admission and reconcile cannot diverge.
-	if msg := agentGatewayMultiplePoolsMessage(mr); msg != "" {
-		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, modelRouterAgentGatewayReasonMultiPool, msg)
+	// Fail loud unless every InferencePool resolves exactly one Endpoint
+	// Picker and no picker serves two pools: a GIE EPP binds to exactly one
+	// pool. Same pure check the webhook runs (modelrouter_webhook.go), so
+	// admission and reconcile cannot diverge.
+	if _, reason, msg := agentGatewayResolvePoolPickers(mr); reason != "" {
+		return ctrl.Result{}, r.setAgentGatewayNotReady(ctx, mr, reason, msg)
 	}
 
 	ejected, err := r.reconcileAgentGatewayResources(ctx, mr)
@@ -584,6 +590,9 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
 ) ([]agentGatewayBackendResource, error) {
+	// The reconcile guard already refused any router whose pickers do not
+	// resolve, so every pool has an entry here.
+	pickers, _, _ := agentGatewayResolvePoolPickers(mr)
 	resolved := make([]agentGatewayBackendResource, 0, len(mr.Spec.Backends))
 	for _, b := range mr.Spec.Backends {
 		if b.External != nil {
@@ -615,6 +624,7 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 			PoolName: sanitizeDNSName(isvc.Name),
 			FQDN:     fmt.Sprintf("%s.%s.svc.cluster.local", sanitizeDNSName(isvc.Name), isvc.Namespace),
 			Port:     port,
+			Picker:   pickers[sanitizeDNSName(isvc.Name)],
 			// A backend is healthy iff its InferenceService has at least one ready
 			// replica. An unhealthy backend is ejected from the route's
 			// backendRefs while its InferencePool stays in place for re-add on
@@ -690,31 +700,6 @@ func (r *ModelRouterAgentGatewayReconciler) requiredCRDsMissing(log logr.Logger)
 		r.detector = newCRDDetector("agentgateway", modelRouterAgentGatewayGVKs())
 	})
 	return r.detector.PresentMissing(r.Client, log)
-}
-
-// agentGatewayMultiplePoolsMessage returns a non-empty message when the
-// router's backends reference more than one distinct InferenceService (hence
-// compile to more than one generated InferencePool) while spec.agentGatewayRef
-// names a single Endpoint Picker. A Gateway API Inference Extension EPP binds
-// to exactly one pool, so one picker cannot serve several pools: with N > 1 the
-// EPP would make endpoint decisions for the wrong pool. External backends are
-// not counted here (the reconciler rejects them separately). This is the same
-// pure check the webhook runs, so admission and reconcile cannot diverge.
-func agentGatewayMultiplePoolsMessage(mr *inferencev1alpha1.ModelRouter) string {
-	distinct := make(map[string]bool, len(mr.Spec.Backends))
-	for _, b := range mr.Spec.Backends {
-		if b.External != nil || b.InferenceServiceRef == nil {
-			continue
-		}
-		distinct[b.InferenceServiceRef.Name] = true
-	}
-	if len(distinct) <= 1 {
-		return ""
-	}
-	return fmt.Sprintf("backends reference %d distinct InferenceServices, which compile to %d InferencePools, but "+
-		"agentGatewayRef.endpointPicker names a single Endpoint Picker and a Gateway API Inference Extension EPP binds "+
-		"to exactly one pool; with several pools the picker would make endpoint decisions for the wrong pool. "+
-		"Use one dataPlane: AgentGateway ModelRouter per InferenceService", len(distinct), len(distinct))
 }
 
 // agentGatewayPolicyNamespace is the namespace the model-extraction
@@ -1303,6 +1288,9 @@ type agentGatewayBackendResource struct {
 	FQDN string
 	// Port is the Service port the pool targets.
 	Port int64
+	// Picker is the Endpoint Picker the backend's InferencePool references,
+	// resolved by agentGatewayResolvePoolPickers.
+	Picker agentGatewayPicker
 	// Healthy reports whether the referenced InferenceService currently has at
 	// least one ready replica. An unhealthy backend is dropped from the route's
 	// backendRefs while its InferencePool stays in place.

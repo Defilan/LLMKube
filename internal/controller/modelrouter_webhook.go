@@ -174,7 +174,7 @@ func agentGatewayModeViolations(mr *inferencev1alpha1.ModelRouter, specPath *fie
 		errs = append(errs, field.Required(specPath.Child("agentGatewayRef"),
 			"dataPlane is AgentGateway but spec.agentGatewayRef is unset; cannot attach a pool or route"))
 	}
-	if msg := agentGatewayMultiplePoolsMessage(mr); msg != "" {
+	if _, reason, msg := agentGatewayResolvePoolPickers(mr); reason != "" {
 		errs = append(errs, field.Invalid(specPath.Child("backends"), nil, msg))
 	}
 	if msg := agentGatewayUnsupportedMatchMessage(mr); msg != "" {

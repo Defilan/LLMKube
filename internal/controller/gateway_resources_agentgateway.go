@@ -106,14 +106,14 @@ func inferencePoolSelectorLabels(isvcName string) map[string]interface{} {
 
 // newAgentGatewayInferencePool builds the inference.networking.k8s.io
 // InferencePool for one backend. It selects the referenced InferenceService's
-// pods by label and references the operator's Endpoint Picker so agentgateway
+// pods by label and references the backend's resolved Endpoint Picker so agentgateway
 // can select a model-server endpoint per request. Lives in the ModelRouter
 // namespace.
 func newAgentGatewayInferencePool(mr *inferencev1alpha1.ModelRouter, b agentGatewayBackendResource) *unstructured.Unstructured {
 	epRef := map[string]interface{}{
-		metadataNameField: mr.Spec.AgentGatewayRef.EndpointPicker,
+		metadataNameField: b.Picker.Name,
 		"port": map[string]interface{}{
-			"number": int64(mr.Spec.AgentGatewayRef.EndpointPickerPort),
+			"number": int64(b.Picker.Port),
 		},
 	}
 
@@ -285,6 +285,8 @@ func compileAgentGatewayRuleMatches(rule agentGatewayRuleResource) []interface{}
 // poolFor maps RouterBackend.Name to the pool name. Two backends may share one
 // pool (same referenced InferenceService), so refs are deduped by pool name in
 // first-appearance order; ejection already filtered by backend name upstream.
+// Only the first resolved pool is emitted: see the primary-fallback note in the
+// body.
 func compileAgentGatewayRouteBackendRefs(refs []agentGatewayBackendRef, poolFor map[string]string) []interface{} {
 	out := make([]interface{}, 0, len(refs))
 	seen := make(map[string]bool, len(refs))
@@ -299,6 +301,15 @@ func compileAgentGatewayRouteBackendRefs(refs []agentGatewayBackendRef, poolFor 
 			"kind":            inferencePoolKind,
 			"group":           inferenceExtensionGroup,
 		})
+	}
+	// primary-fallback routes to the first healthy backend only. Gateway API
+	// backendRef weights load-balance, so emitting every pool would split
+	// traffic evenly instead of failing over. Ejection (agentGatewayEjectUnhealthy)
+	// already dropped unhealthy backends, or kept the original list when every
+	// backend was unhealthy, so the first ref is the first healthy backend or
+	// the primary.
+	if len(out) > 1 {
+		out = out[:1]
 	}
 	return out
 }
