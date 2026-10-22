@@ -686,13 +686,6 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	gpuNodeSelector := map[string]string{}
 
 	if gpuCount > 0 {
-		// Use Recreate strategy for GPU workloads to prevent deadlock:
-		// RollingUpdate requires the new pod to be Ready before terminating the old,
-		// but the new pod cannot schedule if the old pod holds the only available GPU(s).
-		deployment.Spec.Strategy = appsv1.DeploymentStrategy{
-			Type: appsv1.RecreateDeploymentStrategyType,
-		}
-
 		gpuTolerations = []corev1.Toleration{
 			{
 				// Keyed off the sharing-resolved name so a partitioned pod
@@ -744,8 +737,11 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	// (GPU toleration when count > 0, shared-pool selector, user entries last):
 	// the claim drives placement, not the pod spec, but a GPU-tainted node
 	// still needs the toleration (#2061).
-	if len(modelResourceClaims(model)) > 0 {
-		applyDRAPodScheduling(deployment)
+	//
+	// Applied once, after the merge, so the DRA answer wins over the GPU
+	// device-plugin one; resolveRolloutStrategy is the single authority for it.
+	if strategy, _ := resolveRolloutStrategy(isvc, model); strategy.Type != "" {
+		deployment.Spec.Strategy = strategy
 	}
 
 	// TopologySpreadConstraints and Affinity are general pod-scheduling
@@ -832,19 +828,6 @@ func applyArchNodeAffinity(deployment *appsv1.Deployment, archs []string) {
 		}
 	}
 	deployment.Spec.Template.Spec.Affinity = affinity
-}
-
-// applyDRAPodScheduling sets the DRA-specific Recreate strategy (a new pod
-// cannot get the claim while the old one holds it). NodeSelector and
-// tolerations are deliberately NOT set here: constructDeployment's
-// unconditional merge already applied the GPU taint toleration
-// (gpuCount > 0), the shared-pool selector, and the user's entries, in the
-// device-plugin path's order. Overwriting them here dropped the GPU
-// toleration from any DRA Model that declares count (#2061).
-func applyDRAPodScheduling(deployment *appsv1.Deployment) {
-	deployment.Spec.Strategy = appsv1.DeploymentStrategy{
-		Type: appsv1.RecreateDeploymentStrategyType,
-	}
 }
 
 // modelResourceClaims safely extracts DRA resource claims from the model spec.

@@ -1,0 +1,58 @@
+# InferenceService that rolls a multi-replica GPU service one pod at a time
+# (#2131).
+#
+# The default for a GPU service is Recreate: every replica stops before any
+# replacement starts. A replacement pod cannot schedule while an old pod holds
+# its GPU, so anything else would deadlock on a node whose GPUs a replica has
+# already claimed (#192). The cost is that a pod-template change takes the whole
+# service down for the reload: for a large checkpoint that is the weight load
+# plus warmup on every replica.
+#
+# strategy: OneAtATime replaces one pod at a time (RollingUpdate, maxSurge 0,
+# maxUnavailable 1). maxSurge 0 is what keeps #192 fixed: the Deployment never
+# runs more pods than spec.replicas, so it removes an old pod before creating
+# its replacement and never needs a spare GPU. At replicas >= 2 the remaining
+# replicas keep serving at reduced capacity; at replicas 1 it behaves like
+# Recreate, replacing the only pod.
+#
+# Read this before opting in:
+#
+#   - A shared ReadWriteOnce model cache (the default cache mode unless the
+#     operator runs with an RWX storage class) cannot be attached by the
+#     replacement while the outgoing pod still holds it. The replacement sits
+#     Pending until the volume is released, so the rollout stalls at reduced
+#     capacity instead of progressing. Use a ReadWriteMany cache with more than
+#     one replica. The operator's perService cache mode does not help: its claim
+#     is also ReadWriteOnce and binds on the first pod's node.
+#   - The replacement pod reports Insufficient nvidia.com/gpu for as long as the
+#     outgoing pod takes to drain, because that pod still holds its GPUs. This
+#     is expected and is not the deadlock OneAtATime avoids: the Deployment
+#     never asks for more pods than replicas.
+#   - progressDeadlineSeconds stays at the Kubernetes default of 600s. A rollout
+#     step longer than that reports ProgressDeadlineExceeded even though the
+#     Deployment controller keeps making progress.
+#   - A rollout that swaps the model (a ModelPool move, a changed modelRef)
+#     serves the old and the new version side by side until every replica is
+#     replaced. For a template change the old version cannot serve, use the
+#     default Recreate instead.
+#   - Ignored on a non-GPU service (it already rolls with the Kubernetes
+#     default), on a DRA service (a replacement cannot get the resource claim
+#     while the old pod holds it, so it keeps Recreate), on a metal service and
+#     on a multiNode group (neither runs a Deployment). The operator emits a
+#     RolloutStrategyIgnored warning.
+apiVersion: inference.llmkube.dev/v1alpha1
+kind: InferenceService
+metadata:
+  name: inferenceservice-rollout-one-at-a-time
+spec:
+  modelRef: llama-3b-gpu
+  runtime: llamacpp
+  # Two or more replicas are where this strategy earns its keep.
+  replicas: 2
+  resources:
+    gpu: 1
+  rolloutPolicy:
+    # Keep this off unless the service can spare one replica while the other
+    # loads: waitForIdle only decides when the rollout starts, not how pods are
+    # replaced.
+    strategy: OneAtATime

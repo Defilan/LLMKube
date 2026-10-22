@@ -4992,6 +4992,29 @@ spec:
                       when omitted or set to 0.
                     minimum: 0
                     type: integer
+                  strategy:
+                    description: |-
+                      Strategy selects how a template change replaces the serving pods. Recreate
+                      is the default: every replica stops before any replacement starts, because
+                      a replacement pod cannot schedule while an old pod holds its GPU. OneAtATime
+                      rolls one replica at a time (maxSurge 0, maxUnavailable 1), so it never
+                      needs a spare GPU and the other replicas keep serving at reduced capacity;
+                      at replicas 1 both strategies replace the only pod. Only a GPU service on
+                      the device-plugin path honours this field: a non-GPU service already rolls
+                      with the Kubernetes default, a DRA service keeps Recreate, a metal service
+                      runs no Deployment, and a multiNode group runs none either. A replica whose
+                      replacement cannot attach a ReadWriteOnce model cache waits Pending until
+                      the old pod releases it, so a shared RWO cache stalls the rollout at
+                      reduced capacity; use a ReadWriteMany cache. A replacement pod reports
+                      Insufficient nvidia.com/gpu while the outgoing pod drains; that is
+                      expected, not the #192 deadlock. Changing only this field needs no drain
+                      once the live Deployment carries the operator's template-hash annotation;
+                      before that first stamped pass, and while a deferred template change is
+                      held, the strategy travels with that held update.
+                    enum:
+                    - Recreate
+                    - OneAtATime
+                    type: string
                   waitForIdle:
                     description: |-
                       WaitForIdle indicates whether to wait for all backend slots to report idle

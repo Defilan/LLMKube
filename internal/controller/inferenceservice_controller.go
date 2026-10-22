@@ -1191,6 +1191,15 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			// to Service/HPA/status by returning without a result. The
 			// RolloutDeferred=True condition (set by reconcileRolloutPolicy)
 			// drives a requeue in Reconcile.
+			//
+			// A change that only sets rolloutPolicy.strategy normally does not
+			// reach here: the strategy is not part of the hashed pod template, so
+			// on its own it reports templateChanged=false and lands below without
+			// a drain check (#2131). It does reach here when the stored hash is
+			// missing (a Deployment created before the annotation existed, which
+			// this check reads as changed) or when a real template change is in
+			// flight; in both cases the held update carries the strategy with it,
+			// along with the rest of the Deployment spec, replicas included.
 			return existingDeployment, replicaCounts{
 				Ready:    existingDeployment.Status.ReadyReplicas,
 				Observed: existingDeployment.Status.Replicas,
@@ -1628,6 +1637,9 @@ func (r *InferenceServiceReconciler) emitSpecAdvisoryEvents(isvc *inferencev1alp
 	if needsCPUOffloadNoopWarning(isvc) {
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "CPUOffloadUnverified", "Reconcile",
 			cpuOffloadIneffectiveMessage)
+	}
+	if ignored, msg := ignoredRolloutStrategy(isvc, model); ignored {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonRolloutStrategyIgnored, "Reconcile", "%s", msg)
 	}
 }
 
