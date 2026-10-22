@@ -123,6 +123,7 @@ func expectDecoratorHit(t *testing.T, hits chan reconcile.Request, want types.Na
 
 func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
+	defer stop()
 	ns := newTestNamespace(t, mgr.GetClient())
 	hits := make(chan reconcile.Request, 1024)
 	rec := &ModelReconciler{
@@ -147,11 +148,11 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	}
 
 	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: model.Name})
-	stop()
 }
 
 func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
+	defer stop()
 	ns := newTestNamespace(t, mgr.GetClient())
 	hits := make(chan reconcile.Request, 1024)
 	rec := &InferenceServiceReconciler{
@@ -173,5 +174,4 @@ func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	}
 
 	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: isvc.Name})
-	stop()
 }

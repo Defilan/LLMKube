@@ -16,10 +16,10 @@
 # sharing and the TestMain budget, so it fails here instead of on a runner
 # eleven minutes into the job.
 #
-# Scoped to internal/controller on purpose: the other envtest packages
-# (internal/foreman/controller, internal/watchcanary, pkg/cli) finish in 7, 12
-# and 19 s, 64 to 171 times under the 20m limit, so the rule would be churn
-# there.
+# Scoped to internal/controller on purpose. The other envtest packages finish
+# well inside the limit and keep their own control planes: internal/watchcanary
+# 7 s, pkg/cli 12 s, internal/foreman/controller 19 s, 64 to 171 times under
+# the 20m limit. The rule would be churn there.
 #
 # Usage: scripts/check-envtest-sharing_test.sh
 set -euo pipefail
@@ -36,7 +36,7 @@ while IFS= read -r file; do
 	*" $file "*) ;;
 	*) offenders+="${file#"$ROOT"/}"$'\n' ;;
 	esac
-done < <(grep -l 'envtest\.Environment{' "$PKG"/*_test.go || true)
+done < <(grep -l 'envtest\.Environment' "$PKG"/*_test.go || true)
 
 if [[ -n "$offenders" ]]; then
 	echo "FAIL: these tests construct an envtest.Environment of their own:" >&2

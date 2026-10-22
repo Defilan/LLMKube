@@ -114,12 +114,14 @@ A change is not done until all of these hold.
 - Unit tests use `envtest` (controller-runtime); they run with `make test` and
   need no live cluster. For the blessed envtest patterns and the common traps,
   see `docs/contributing/envtest-guide.md`.
-- A test must not start its own envtest control plane. In `internal/controller`
-  the control plane is started once per CRD path set in
+- In `internal/controller`, a test must not start its own envtest control
+  plane: it is started once per CRD path set in
   `internal/controller/envtest_shared_test.go` (`sharedTestEnv`), and each test
   works in its own namespace (`newTestNamespace`); do not call `t.Parallel`
   there. `make test-scripts` fails on a test that constructs an
-  `envtest.Environment` of its own (#2141).
+  `envtest.Environment` of its own (#2141). The other envtest packages
+  (`pkg/cli`, `internal/watchcanary`, `internal/foreman/controller`) keep their
+  own control planes; they run in seconds.
 - Assert observable behavior, not internal implementation detail.
 - envtest runs as cluster-admin, so it cannot catch a missing
   `+kubebuilder:rbac` marker. After a controller change that adds an API

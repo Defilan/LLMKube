@@ -144,8 +144,10 @@ The CRD path set is the sharing key, so two tests that need different CRDs are
 two control planes and can never see each other's CRDs. A test that asserts a
 CRD is ABSENT shares the base set (which has nothing extra registered) or, when
 it needs a subset, uses `privateTestEnv`. Every helper assigns a fresh
-`testNS` before returning, so name fixtures off `testNS`, never `"default"`,
-and never call `t.Parallel` in this package: it would race that assignment.
+`testNS` before returning, so name fixtures off `testNS`, never `"default"`.
+A test may take one more namespace from `newTestNamespace` when it wants its
+objects independent of `testNS`; that is the only way to leave `testNS` alone.
+Never call `t.Parallel` in this package: it would race the assignment.
 `TestMain` fails the package when a run starts more control planes than
 `maxTestControlPlanes`, and `make test-scripts` fails on a test that builds an
 `envtest.Environment` of its own.
