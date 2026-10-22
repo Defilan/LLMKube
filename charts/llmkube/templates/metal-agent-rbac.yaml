@@ -25,6 +25,7 @@ binding for an agent watching all namespaces (--namespace "").
 {{- fail "metalAgent.rbac.serviceAccount.name is required when metalAgent.rbac.serviceAccount.create is false" }}
 {{- end }}
 {{- if eq $scope "cluster" }}
+{{- if $rbac.serviceAccount.create }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -33,8 +34,8 @@ metadata:
   labels:
     {{- include "llmkube.labels" . | nindent 4 }}
     {{- toYaml $component | nindent 4 }}
-{{- if $rbac.serviceAccount.create }}
 ---
+{{- end }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -60,7 +61,6 @@ subjects:
   - kind: ServiceAccount
     name: {{ $saName }}
     namespace: {{ include "llmkube.namespace" . }}
-{{- end }}
 {{- else }}
 {{- $namespaces := uniq ($rbac.namespaces | default list) }}
 {{- if not $namespaces }}

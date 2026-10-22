@@ -1289,6 +1289,9 @@ func TestNeedsHelm(t *testing.T) {
 	if !needsHelm([]string{"fmt", ChartCheck}) {
 		t.Error("needsHelm should be true when the chart check is present")
 	}
+	if !needsHelm([]string{"fmt", MetalAgentRBACCheck}) {
+		t.Error("needsHelm should be true when the metal-agent RBAC check is present; it renders the chart")
+	}
 	if needsHelm([]string{"fmt", "vet", "lint", "test"}) {
 		t.Error("needsHelm should be false without a chart check")
 	}

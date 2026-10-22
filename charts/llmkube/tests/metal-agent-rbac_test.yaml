@@ -188,6 +188,43 @@ tests:
           count: 8
         documentIndex: 1
 
+  # create: false must not render a ServiceAccount in either scope, and must
+  # still grant: an agent watching all namespaces that gets no ClusterRole is
+  # Forbidden on every call.
+  - it: binds a pre-existing ServiceAccount cluster-wide without creating it
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.scope: cluster
+      metalAgent.rbac.serviceAccount.create: false
+      metalAgent.rbac.serviceAccount.name: metal-agent-prod
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ClusterRole
+        documentIndex: 0
+      - isKind:
+          of: ClusterRoleBinding
+        documentIndex: 1
+      - equal:
+          path: roleRef
+          value:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: metal-agent-prod
+        documentIndex: 1
+      - equal:
+          path: subjects[0].name
+          value: metal-agent-prod
+        documentIndex: 1
+      - equal:
+          path: subjects[0].namespace
+          value: llmkube-system
+        documentIndex: 1
+
   - it: pins the Secret read to the listed names
     release:
       name: rel

@@ -420,9 +420,15 @@ which `metalAgent.rbac.scope: cluster` renders.
 Moving from the hand-applied manifest to the chart: Helm refuses to adopt
 objects it did not create, so an install that already applied
 `metal-agent-rbac.yaml` fails with `invalid ownership metadata`. Delete the
-three objects first, then upgrade with `metalAgent.rbac.enabled: true`. The
-token already minted stays valid, because the chart recreates the
-ServiceAccount with the same name.
+three objects first, then upgrade with `metalAgent.rbac.enabled: true`.
+
+Under `scope: cluster` the ClusterRoleBinding names the ServiceAccount in the
+release namespace, because that is where the chart creates it. If you set
+`serviceAccount.create: false`, the identity you bind must live there.
+Deleting the ServiceAccount gives its replacement a new UID, and the API
+server validates a bound token against that UID, so the token you minted for
+the old one stops working: re-run `kubectl create token` and the
+`set-credentials` step after the upgrade, then restart the agent.
 
 Update an existing `metalAgent.rbac.namespaces` list and the namespaces you
 removed have their ServiceAccount, Role and RoleBinding deleted on upgrade,

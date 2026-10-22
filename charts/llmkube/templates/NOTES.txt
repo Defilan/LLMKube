@@ -139,7 +139,7 @@ METAL AGENT (macOS):
   from the ServiceAccount (the chart does not create a token Secret):
 
 {{- if eq .Values.metalAgent.rbac.scope "cluster" }}
-  kubectl create token llmkube-metal-agent -n {{ include "llmkube.namespace" . }} --duration=8760h
+  kubectl create token {{ include "llmkube.metalAgent.serviceAccountName" . }} -n {{ include "llmkube.namespace" . }} --duration=8760h
   Scope: cluster-wide (the agent runs with --namespace "")
 
   This identity can read Secrets in every namespace unless

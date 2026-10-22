@@ -707,7 +707,9 @@ metalAgent:
     secretNames: []
     serviceAccount:
       # Create the ServiceAccount. false binds an identity you already manage,
-      # which serviceAccount.name then requires.
+      # which serviceAccount.name then requires; under scope namespaced that
+      # identity must exist in EVERY listed namespace, since each gets its own
+      # RoleBinding subject.
       create: true
       # Name of the ServiceAccount. Empty uses llmkube-metal-agent, the name
       # deployment/macos/README.md's `kubectl create token` recipe uses.
