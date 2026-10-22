@@ -251,7 +251,7 @@ func inspectorPodName(pvcName string) string {
 var (
 	purgePodKind = cacheAccessPodKind{
 		noun:      "purge",
-		component: "cache-purge",
+		component: cachePurgeComponent,
 		container: "purge",
 		readOnly:  false,
 	}
