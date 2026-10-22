@@ -934,6 +934,7 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 	logger.Info("Source is runtime-resolved, skipping controller-side download", "source", model.Spec.Source, "cacheKey", cacheKey)
 
 	// Validate multi-file staging before marking Ready.
+	stagedSize := ""
 	if hasMultiFileStaging(model) {
 		repoFiles, listErr := r.repoFileListing(ctx, model)
 		if listErr != nil {
@@ -946,7 +947,7 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 			llmkubemetrics.ReconcileTotal.WithLabelValues("model", "error").Inc()
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
-		plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, repoFiles)
+		plan, err := ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, hfFilePaths(repoFiles))
 		if err != nil {
 			model.Status.Phase = PhaseFailed
 			if updateErr := r.updateStatus(ctx, model, ConditionDegraded, metav1.ConditionTrue, "InvalidFileSet", err.Error()); updateErr != nil {
@@ -956,6 +957,9 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 			return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
 		}
 		model.Status.StagedFiles = plan.Files
+		if total, ok := hfTotalSize(repoFiles, plan.Files); ok {
+			stagedSize = formatBytes(total)
+		}
 	} else {
 		model.Status.StagedFiles = nil
 	}
@@ -963,7 +967,9 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 	model.Status.Phase = PhaseReady
 	model.Status.Path = ""
 	model.Status.CacheKey = cacheKey
-	model.Status.Size = "0"
+	// No measured size yet. A literal "0" reads as a measurement to the CLI and
+	// to the metal agent's admission check; an empty string reads as unknown.
+	model.Status.Size = ""
 
 	// For remote http(s) GGUF sources, read the metadata via an HTTP range
 	// (header-only) request so Status carries architecture/layers/size without
@@ -980,6 +986,12 @@ func (r *ModelReconciler) reconcileRuntimeResolvedSource(ctx context.Context, mo
 				model.Status.Size = formatBytes(size)
 			}
 		}
+	}
+
+	// The listing sizes the whole staged set; a probe of the source base
+	// names one file that staging does not write, so the staged total wins.
+	if stagedSize != "" {
+		model.Status.Size = stagedSize
 	}
 
 	model.Status.AcceleratorReady = r.checkAcceleratorAvailability(ctx, model)

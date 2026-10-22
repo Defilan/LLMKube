@@ -1933,7 +1933,11 @@ spec:
                   Populated after download/copy for integrity tracking.
                 type: string
               size:
-                description: Size represents the size of the downloaded model file
+                description: |-
+                  Size is a human-readable byte count such as "190.4 GiB": the downloaded
+                  file, the cache entry, the probed remote GGUF, or the total of the staged
+                  files when spec.files expands against a repository listing. Empty when the
+                  controller could not measure the source.
                 type: string
               sourceContentLength:
                 description: |-

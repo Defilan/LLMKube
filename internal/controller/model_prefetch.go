@@ -416,7 +416,7 @@ func (r *ModelReconciler) prefetchStagingPlan(ctx context.Context, model *infere
 	if err != nil {
 		return nil, err, nil
 	}
-	plan, planErr = ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, repoFiles)
+	plan, planErr = ResolveFileSet(model.Spec.Files, model.Spec.Mmproj, hfFilePaths(repoFiles))
 	return plan, nil, planErr
 }
 
