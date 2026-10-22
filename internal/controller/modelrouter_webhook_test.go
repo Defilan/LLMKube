@@ -187,7 +187,7 @@ func TestModelRouterValidator_Create(t *testing.T) {
 // validAgentGatewayRouter returns a valid dataPlane: AgentGateway router with
 // ONE backend, hence one generated InferencePool: the only multi-ref shape the
 // agentgateway plane compiles while a single Endpoint Picker serves it
-// (agentGatewayMultiplePoolsMessage). The Gateway reference is cross-namespace
+// (agentGatewayResolvePoolPickers). The Gateway reference is cross-namespace
 // (the common setup), which admission accepts.
 func validAgentGatewayRouter() *inferencev1alpha1.ModelRouter {
 	return &inferencev1alpha1.ModelRouter{
@@ -429,5 +429,33 @@ func TestModelRouterValidator_Delete(t *testing.T) {
 	mr.Spec.Rules[0].Route.Strategy = "shadow"
 	if _, err := v.ValidateDelete(ctx, mr); err != nil {
 		t.Fatalf("expected ValidateDelete to always allow, got %v", err)
+	}
+}
+
+// TestModelRouterValidator_AgentGatewayModeAcceptsPerBackendPickers: two
+// InferenceServices with a picker each are admitted (#1991).
+func TestModelRouterValidator_AgentGatewayModeAcceptsPerBackendPickers(t *testing.T) {
+	v := &ModelRouterValidator{}
+	mr := validAgentGatewayRouter()
+	mr.Spec.AgentGatewayRef.EndpointPicker, mr.Spec.AgentGatewayRef.EndpointPickerPort = "", 0
+	mr.Spec.Backends = []inferencev1alpha1.RouterBackend{
+		pickerBackend("qwen-cuda", "qwen-cuda", "qwen-epp", 9002),
+		pickerBackend("glm-cuda", "glm-cuda", "glm-epp", 9002),
+	}
+	mr.Spec.Rules[0].Route.Backends = []string{"qwen-cuda", "glm-cuda"}
+	if _, err := v.ValidateCreate(context.Background(), mr); err != nil {
+		t.Fatalf("per-backend pickers must be admitted: %v", err)
+	}
+}
+
+// TestModelRouterValidator_AgentGatewayModeRejectsMissingPicker: a pool with no
+// picker and no router default is rejected at apply time.
+func TestModelRouterValidator_AgentGatewayModeRejectsMissingPicker(t *testing.T) {
+	v := &ModelRouterValidator{}
+	mr := validAgentGatewayRouter()
+	mr.Spec.AgentGatewayRef.EndpointPicker, mr.Spec.AgentGatewayRef.EndpointPickerPort = "", 0
+	_, err := v.ValidateCreate(context.Background(), mr)
+	if err == nil || !apierrors.IsInvalid(err) || !strings.Contains(err.Error(), "has no Endpoint Picker") {
+		t.Fatalf("want an Invalid error naming the missing picker, got %v", err)
 	}
 }
