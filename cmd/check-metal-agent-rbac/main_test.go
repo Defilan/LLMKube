@@ -26,6 +26,31 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
+// TestWithPins pins the pin helper: it narrows the unpinned Secret read and
+// leaves a rule the manifest already narrowed alone, so a future split into a
+// pinned relay rule plus an unpinned sourceSecretRef rule is not over-pinned.
+func TestWithPins(t *testing.T) {
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"}, ResourceNames: []string{"keep-me"}},
+	}
+
+	if got := withPins(rules, nil); len(got) != 2 || got[0].ResourceNames != nil {
+		t.Fatalf("empty pins must return the rules unchanged, got %v", got)
+	}
+
+	got := withPins(rules, []string{"a"})
+	if strings.Join(got[0].ResourceNames, ",") != "a" {
+		t.Fatalf("unpinned Secret rule was not narrowed: %v", got[0].ResourceNames)
+	}
+	if strings.Join(got[1].ResourceNames, ",") != "keep-me" {
+		t.Fatalf("an already-narrowed rule was overwritten: %v", got[1].ResourceNames)
+	}
+	if rules[0].ResourceNames != nil {
+		t.Fatal("withPins mutated its input")
+	}
+}
+
 // TestCompareRules pins the comparison's edge cases: a missing rule, an extra
 // rule, a resourceNames mismatch, and that rule order and grouping do not
 // count as drift.
@@ -129,6 +154,19 @@ func TestCompareRules(t *testing.T) {
 			},
 			want: withPins(manifest, []string{"a"}),
 			pins: []string{"a"},
+		},
+		{
+			// Both rules name the same resources and verbs; only the
+			// nonResourceURLs grant differs, so this fails only when the key
+			// carries that field.
+			name: "nonResourceURLs is part of the key",
+			got:  manifest,
+			want: []rbacv1.PolicyRule{
+				manifest[0],
+				{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get"},
+					NonResourceURLs: []string{"/api", "/apis"}},
+			},
+			wantSub: "chart rules are missing:",
 		},
 		{
 			name: "configured pin but the render is unpinned",

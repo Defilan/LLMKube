@@ -151,6 +151,11 @@ METAL AGENT (macOS):
 
   Then follow "Dedicated kubeconfig with least-privilege RBAC" in
   deployment/macos/README.md, skipping its `kubectl apply` step.
+{{- if not .Values.metalAgent.rbac.secretNames }}
+
+  This identity can read every Secret in the listed namespace(s). Set
+  metalAgent.rbac.secretNames to narrow it.
+{{- end }}
 {{- end }}
 {{- end }}
 

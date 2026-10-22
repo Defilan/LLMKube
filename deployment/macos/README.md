@@ -432,7 +432,10 @@ the old one stops working: re-run `kubectl create token` and the
 
 Update an existing `metalAgent.rbac.namespaces` list and the namespaces you
 removed have their ServiceAccount, Role and RoleBinding deleted on upgrade,
-because Helm removes everything that leaves the release manifest. Namespaces
+because Helm removes everything that leaves the release manifest. Adding a
+namespace back creates a fresh ServiceAccount with a new UID, so the token
+minted for the previous one stops working: re-run `kubectl create token` and
+`set-credentials` for that namespace. Namespaces
 the chart installs into must exist: Helm creates only the release namespace,
 not the ones the chart names.
 

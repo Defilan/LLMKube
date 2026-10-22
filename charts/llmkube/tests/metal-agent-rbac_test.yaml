@@ -146,6 +146,22 @@ tests:
       - failedTemplate:
           errorPattern: "metalAgent.rbac.scope"
 
+  # The schema enum already rejects this, so the same render reaches the
+  # template only through a values file applied without schema validation.
+  # The template still refuses rather than silently dropping the list.
+  - it: refuses a namespace list under cluster scope
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.scope: cluster
+      metalAgent.rbac.namespaces:
+        - ml
+    asserts:
+      - failedTemplate:
+          errorPattern: "metalAgent.rbac.namespaces is unused"
+
   - it: grants the same rules cluster-wide with scope cluster
     release:
       name: rel

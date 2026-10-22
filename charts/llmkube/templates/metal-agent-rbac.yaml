@@ -24,6 +24,9 @@ binding for an agent watching all namespaces (--namespace "").
 {{- if and (not $rbac.serviceAccount.create) (not $rbac.serviceAccount.name) }}
 {{- fail "metalAgent.rbac.serviceAccount.name is required when metalAgent.rbac.serviceAccount.create is false" }}
 {{- end }}
+{{- if and (eq $scope "cluster") $rbac.namespaces }}
+{{- fail "metalAgent.rbac.namespaces is unused when metalAgent.rbac.scope is cluster: the ClusterRole covers every namespace, so remove the list or set scope namespaced" }}
+{{- end }}
 {{- if eq $scope "cluster" }}
 {{- if $rbac.serviceAccount.create }}
 apiVersion: v1

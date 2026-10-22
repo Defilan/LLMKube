@@ -72,6 +72,8 @@ var renders = []render{
 		namespaces: []string{"ml"},
 		secretPins: []string{"llmkube-metal-relay"},
 	},
+	// The cluster-wide read is the highest-stakes branch of the pin option.
+	{name: "cluster-pinned", scope: "cluster", secretPins: []string{"llmkube-metal-relay"}},
 }
 
 func main() {
@@ -304,7 +306,10 @@ func withPins(rules []rbacv1.PolicyRule, pins []string) []rbacv1.PolicyRule {
 	out := make([]rbacv1.PolicyRule, len(rules))
 	copy(out, rules)
 	for i := range out {
-		if has(out[i].APIGroups, "") && has(out[i].Resources, "secrets") && has(out[i].Verbs, "get") {
+		// A rule the manifest already narrowed is left alone: only the
+		// unpinned grant is what secretNames is narrowing.
+		if has(out[i].APIGroups, "") && has(out[i].Resources, "secrets") &&
+			has(out[i].Verbs, "get") && len(out[i].ResourceNames) == 0 {
 			out[i].ResourceNames = append([]string(nil), pins...)
 		}
 	}
@@ -372,8 +377,8 @@ func ruleSet(rules []rbacv1.PolicyRule) map[string]bool {
 		resources := sortedCopy(r.Resources)
 		verbs := sortedCopy(r.Verbs)
 		names := sortedCopy(r.ResourceNames)
-		out[fmt.Sprintf("apiGroups=%q resources=%q verbs=%q resourceNames=%q",
-			groups, resources, verbs, names)] = true
+		out[fmt.Sprintf("apiGroups=%q resources=%q verbs=%q resourceNames=%q nonResourceURLs=%q",
+			groups, resources, verbs, names, sortedCopy(r.NonResourceURLs))] = true
 	}
 	return out
 }
