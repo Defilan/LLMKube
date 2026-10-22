@@ -155,3 +155,47 @@ func TestEndpointWatcherForbiddenKeepsAddress(t *testing.T) {
 func cacheTombstone(obj *discoveryv1.EndpointSlice) interface{} {
 	return cache.DeletedFinalStateUnknown{Key: obj.Namespace + "/" + obj.Name, Obj: obj}
 }
+
+func TestEndpointWatcherTwoNamespaces(t *testing.T) {
+	cfg := &Config{Backends: []Backend{
+		{Name: "a", Tier: "local", Address: "http://x", EndpointSource: &EndpointSource{Namespace: "ns-a", Service: "qwen", Port: 8080}},
+		{Name: "b", Tier: "local", Address: "http://y", EndpointSource: &EndpointSource{Namespace: "ns-b", Service: "qwen", Port: 9090}},
+	}}
+	d := NewDispatcher(cfg)
+	sa := watchedSlice("qwen-a", "qwen", true, "10.0.1.1")
+	sa.Namespace = "ns-a"
+	sb := watchedSlice("qwen-b", "qwen", true, "10.0.2.2")
+	sb.Namespace = "ns-b"
+	w := NewEndpointWatcher(fake.NewClientset(sa, sb), cfg, d, "r-two", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Start(ctx)
+	waitForSet(t, d, "a", []string{"http://10.0.1.1:8080"})
+	waitForSet(t, d, "b", []string{"http://10.0.2.2:9090"})
+}
+
+func TestEndpointWatcherIgnoresUnwatchedService(t *testing.T) {
+	cfg := twoBackendsOneService()
+	d := NewDispatcher(cfg)
+	cs := fake.NewClientset(watchedSlice("qwen-1", "qwen", true, "10.0.0.1"))
+	w := NewEndpointWatcher(cs, cfg, d, "r-unwatched", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go w.Start(ctx)
+	waitForSet(t, d, "a", []string{"http://10.0.0.1:8080"})
+
+	if _, err := cs.DiscoveryV1().EndpointSlices("ns").Create(ctx,
+		watchedSlice("other-1", "other", true, "10.9.9.9"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// A later event for the watched Service proves the other slice was processed first.
+	if _, err := cs.DiscoveryV1().EndpointSlices("ns").Create(ctx,
+		watchedSlice("qwen-2", "qwen", true, "10.0.0.2"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitForSet(t, d, "a", []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"})
+	waitForSet(t, d, "b", []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"})
+	if _, ok := d.endpoints.Load("plain"); ok {
+		t.Error("plain backend received endpoints")
+	}
+}

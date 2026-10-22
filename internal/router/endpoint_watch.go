@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -56,6 +57,8 @@ type EndpointWatcher struct {
 	// services lists the Service names per namespace.
 	services map[string][]string
 	listers  map[string]discoverylisters.EndpointSliceLister
+	// mu serializes recompute so a stale list never overwrites a newer one.
+	mu sync.Mutex
 }
 
 // NewEndpointWatcher indexes cfg's EndpointSource backends. It starts nothing.
@@ -89,6 +92,7 @@ func (w *EndpointWatcher) HasSources() bool { return len(w.byService) > 0 }
 // endpoint_source_ready gauge stays 0.
 func (w *EndpointWatcher) Start(ctx context.Context) {
 	var synced []cache.InformerSynced
+	var factories []informers.SharedInformerFactory
 	for ns, svcs := range w.services {
 		sort.Strings(svcs)
 		selector := discoveryv1.LabelServiceName + " in (" + strings.Join(svcs, ",") + ")"
@@ -106,7 +110,11 @@ func (w *EndpointWatcher) Start(ctx context.Context) {
 			continue
 		}
 		synced = append(synced, inf.Informer().HasSynced)
-		factory.Start(ctx.Done())
+		factories = append(factories, factory)
+	}
+	// Start only after every lister is registered: handlers read w.listers.
+	for _, f := range factories {
+		f.Start(ctx.Done())
 	}
 
 	warn := time.AfterFunc(syncWarnAfter, func() {
@@ -148,6 +156,8 @@ func (w *EndpointWatcher) recompute(namespace, service string) {
 	if len(backends) == 0 {
 		return
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	var slices []*discoveryv1.EndpointSlice
 	if lister, ok := w.listers[namespace]; ok {
 		sel := labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: service})
