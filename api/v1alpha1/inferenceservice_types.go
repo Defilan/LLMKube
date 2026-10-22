@@ -995,6 +995,20 @@ type InferenceServiceSpec struct {
 	MaxPodLifetimeIdleTimeoutSeconds *int64 `json:"maxPodLifetimeIdleTimeoutSeconds,omitempty"`
 }
 
+// Deployment pod-replacement strategies selectable through
+// spec.rolloutPolicy.strategy. The CRD enum is built from these so the API and
+// the controller cannot drift.
+const (
+	// RolloutStrategyRecreate replaces every replica before starting any. It is
+	// the default for a GPU workload: a replacement pod cannot schedule while an
+	// old pod holds its GPU (#192).
+	RolloutStrategyRecreate = "Recreate"
+	// RolloutStrategyOneAtATime replaces one replica at a time
+	// (RollingUpdate, maxSurge 0, maxUnavailable 1), so the remaining replicas
+	// keep serving at reduced capacity.
+	RolloutStrategyOneAtATime = "OneAtATime"
+)
+
 // RolloutPolicySpec defines how deployment updates should be gated on backend idleness.
 type RolloutPolicySpec struct {
 	// WaitForIdle indicates whether to wait for all backend slots to report idle
@@ -1020,6 +1034,23 @@ type RolloutPolicySpec struct {
 	// slots are stuck in a non-idle state.
 	// +optional
 	Force bool `json:"force,omitempty"`
+
+	// Strategy selects how a template change replaces the serving pods. Recreate
+	// is the default: every replica stops before any replacement starts, because
+	// a replacement pod cannot schedule while an old pod holds its GPU. OneAtATime
+	// rolls one replica at a time (maxSurge 0, maxUnavailable 1), so it never
+	// needs a spare GPU and the other replicas keep serving at reduced capacity;
+	// at replicas 1 both strategies replace the only pod. Only a GPU service on
+	// the device-plugin path honours this field: a non-GPU service already rolls
+	// with the Kubernetes default, a DRA service keeps Recreate, and a multiNode
+	// group runs no Deployment. A replica whose replacement cannot attach a
+	// ReadWriteOnce model cache waits Pending until the old pod releases it, so a
+	// shared RWO cache stalls the rollout at reduced capacity; use a
+	// ReadWriteMany cache, or the operator's perService cache mode (one RWO and
+	// node-local claim per service).
+	// +kubebuilder:validation:Enum=Recreate;OneAtATime
+	// +optional
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // DisruptionSpec controls the operator-managed node-disruption annotations on

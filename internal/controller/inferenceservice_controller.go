@@ -1629,6 +1629,9 @@ func (r *InferenceServiceReconciler) emitSpecAdvisoryEvents(isvc *inferencev1alp
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, "CPUOffloadUnverified", "Reconcile",
 			cpuOffloadIneffectiveMessage)
 	}
+	if ignored, msg := ignoredRolloutStrategy(isvc, model); ignored {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonRolloutStrategyIgnored, "Reconcile", "%s", msg)
+	}
 }
 
 // InferenceServiceReconcileConcurrency is how many InferenceServices

@@ -4992,6 +4992,25 @@ spec:
                       when omitted or set to 0.
                     minimum: 0
                     type: integer
+                  strategy:
+                    description: |-
+                      Strategy selects how a template change replaces the serving pods. Recreate
+                      is the default: every replica stops before any replacement starts, because
+                      a replacement pod cannot schedule while an old pod holds its GPU. OneAtATime
+                      rolls one replica at a time (maxSurge 0, maxUnavailable 1), so it never
+                      needs a spare GPU and the other replicas keep serving at reduced capacity;
+                      at replicas 1 both strategies replace the only pod. Only a GPU service on
+                      the device-plugin path honours this field: a non-GPU service already rolls
+                      with the Kubernetes default, a DRA service keeps Recreate, and a multiNode
+                      group runs no Deployment. A replica whose replacement cannot attach a
+                      ReadWriteOnce model cache waits Pending until the old pod releases it, so a
+                      shared RWO cache stalls the rollout at reduced capacity; use a
+                      ReadWriteMany cache, or the operator's perService cache mode (one RWO and
+                      node-local claim per service).
+                    enum:
+                    - Recreate
+                    - OneAtATime
+                    type: string
                   waitForIdle:
                     description: |-
                       WaitForIdle indicates whether to wait for all backend slots to report idle

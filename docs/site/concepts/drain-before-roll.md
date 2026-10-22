@@ -1,6 +1,6 @@
 ---
 title: Drain Before Roll
-description: Defer pod-template rollouts until all inference replicas are idle, avoiding dropped in-flight generations. Supports llama.cpp, vLLM, TGI, SGLang, and custom runtimes via annotation.
+description: Defer pod-template rollouts until all inference replicas are idle, avoiding dropped in-flight generations, and choose whether a GPU service replaces all replicas at once or one pod at a time. Supports llama.cpp, vLLM, TGI, SGLang, and custom runtimes via annotation.
 ---
 
 # Drain Before Roll
@@ -62,6 +62,37 @@ The controller appends the annotation value to each replica's base URL. A 2xx re
 The controller does not probe the load-balanced `Service` URL. Instead, it lists the service's `EndpointSlice` objects and probes **each endpoint address individually — both ready and not-ready**. This ensures a busy replica behind a healthy Service doesn't cause the idle check to pass incorrectly, and that a not-ready replica still processing accepted generations is not silently skipped.
 
 The rollout waits until **every** reachable replica reports idle. If even one is busy or unreachable, the entire rollout defers. When no EndpointSlices exist yet (freshly created Deployment), the controller falls back to a single Service URL probe for backward compatibility. When EndpointSlices exist but contain no reachable addresses at all, the state is treated as **undetermined** and the rollout defers (fail-closed) rather than silently proceeding over possibly in-flight work.
+
+## Pod replacement strategy
+
+`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate.
+
+| Workload | Default | With `strategy: OneAtATime` |
+|---|---|---|
+| GPU, device plugin | `Recreate` | `RollingUpdate`, `maxSurge: 0`, `maxUnavailable: 1` |
+| GPU, DRA resource claims | `Recreate` | `Recreate` (the field is ignored, with a `RolloutStrategyIgnored` warning) |
+| Non-GPU (device plugin count 0, no claims) | Kubernetes default (25%/25%) | unchanged, with a `RolloutStrategyIgnored` warning |
+| `spec.multiNode` | no Deployment | unchanged, with a `RolloutStrategyIgnored` warning |
+
+`Recreate` is the GPU default because a replacement pod cannot schedule while an old pod holds its GPU: a rolling update that needs a spare GPU deadlocks (#192). The cost is that every pod-template change stops every replica before starting any.
+
+`OneAtATime` gets the same guarantee a different way. With `maxSurge: 0` the Deployment never runs more pods than `spec.replicas`, so it scales an old pod down before creating its replacement and never needs a spare GPU. At `replicas >= 2` the other replicas keep serving at reduced capacity while each replacement loads; at `replicas: 1` it is the same one-pod replacement `Recreate` performs, since there is no second replica to keep serving.
+
+```yaml
+spec:
+  replicas: 2
+  rolloutPolicy:
+    strategy: OneAtATime   # default: Recreate
+```
+
+Before opting in, check four things:
+
+- **Model cache access mode.** A `ReadWriteOnce` cache (the shared cache's default unless the operator is configured for `ReadWriteMany`) cannot be attached by the replacement while the outgoing pod holds it. The replacement stays Pending until the volume is released and the rollout stalls at reduced capacity. Use a `ReadWriteMany` cache, or the operator's `perService` cache mode, with more than one replica.
+- **Startup time vs `progressDeadlineSeconds`.** It stays at the Kubernetes default of 600s. A single step longer than that reports `ProgressDeadlineExceeded` even though the Deployment controller keeps making progress; `kubectl rollout status` surfaces it as a failure.
+- **Mixed versions during the window.** A rollout that changes the model (a `ModelPool` move, a changed `modelRef`) serves the old and the new version side by side until every replica is replaced. For a template change the old version cannot serve, keep `Recreate`.
+- **Replica count.** `Recreate` on a single replica and `OneAtATime` on a single replica both replace the only pod, so the strategy only avoids downtime from `replicas: 2` up.
+
+While a replacement is Pending on `Insufficient nvidia.com/gpu`, the service reports `Progressing`, not `WaitingForGPU`: the replicas still serving mean it is mid-rollout, not queued for GPU.
 
 ## Fail-closed semantics
 
