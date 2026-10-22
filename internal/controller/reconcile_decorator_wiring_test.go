@@ -108,15 +108,26 @@ func recordingDecorator(hits chan reconcile.Request) func(reconcile.Reconciler) 
 // reached the decorator at all.
 func expectDecoratorHit(t *testing.T, hits chan reconcile.Request, want types.NamespacedName) {
 	t.Helper()
-	deadline := time.After(10 * time.Second)
+	if !drainUntilWanted(hits, want, 10*time.Second) {
+		t.Fatalf("the decorator was never invoked for %s: SetupWithManager did not apply it at the Complete site", want)
+	}
+}
+
+// drainUntilWanted discards reconciles of other objects until one for want
+// arrives, and reports whether it did before the timeout. It returns a bool
+// rather than failing so a test can drive it from a goroutine: t.Fatalf must
+// run on the test's own goroutine, and a failure raised after the test returns
+// is silently dropped.
+func drainUntilWanted(hits chan reconcile.Request, want types.NamespacedName, timeout time.Duration) bool {
+	deadline := time.After(timeout)
 	for {
 		select {
 		case req := <-hits:
 			if req.NamespacedName == want {
-				return
+				return true
 			}
 		case <-deadline:
-			t.Fatalf("the decorator was never invoked for %s: SetupWithManager did not apply it at the Complete site", want)
+			return false
 		}
 	}
 }
@@ -187,21 +198,26 @@ func TestExpectDecoratorHitIgnoresAnotherObjectsReconcile(t *testing.T) {
 	hits := make(chan reconcile.Request, 2)
 	hits <- reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "llmkube-test-earlier", Name: "absent-isvc"}}
 
-	done := make(chan struct{})
+	done := make(chan bool, 1)
 	go func() {
-		expectDecoratorHit(t, hits, want)
-		close(done)
+		done <- drainUntilWanted(hits, want, 10*time.Second)
 	}()
 
 	select {
-	case <-done:
-		t.Fatal("a foreign object's reconcile satisfied the assertion: the filter is gone")
+	case got := <-done:
+		if got {
+			t.Fatal("a foreign object's reconcile satisfied the assertion: the filter is gone")
+		}
+		t.Fatal("the drain gave up instead of waiting for the wanted request")
 	case <-time.After(200 * time.Millisecond):
 	}
 
 	hits <- reconcile.Request{NamespacedName: want}
 	select {
-	case <-done:
+	case got := <-done:
+		if !got {
+			t.Fatal("the wanted request never satisfied the assertion")
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the wanted request never satisfied the assertion")
 	}

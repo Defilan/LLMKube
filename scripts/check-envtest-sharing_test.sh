@@ -36,7 +36,7 @@ while IFS= read -r file; do
 	*" $file "*) ;;
 	*) offenders+="${file#"$ROOT"/}"$'\n' ;;
 	esac
-done < <(grep -l 'envtest\.Environment' "$PKG"/*_test.go || true)
+done < <(grep -rl --include='*_test.go' 'envtest\.Environment' "$PKG" || true)
 
 if [[ -n "$offenders" ]]; then
 	echo "FAIL: these tests construct an envtest.Environment of their own:" >&2
