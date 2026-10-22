@@ -186,9 +186,70 @@ func TestReconcileRouterActivationRBACEndpointWatch(t *testing.T) {
 			if !readsSlices(role) {
 				t.Errorf("Role rules = %+v, want get/list/watch on endpointslices", role.Rules)
 			}
+			wantRules := 1
+			if tc.wantWrite {
+				wantRules = 3
+			}
+			if len(role.Rules) != wantRules {
+				t.Errorf("Role has %d rules, want exactly %d: %+v", len(role.Rules), wantRules, role.Rules)
+			}
 			if got := roleGrantsISVCWrite(role); got != tc.wantWrite {
 				t.Errorf("InferenceService write = %v, want %v", got, tc.wantWrite)
 			}
 		})
+	}
+}
+
+// TestReconcileRouterActivationRBACAddsEndpointRuleOnTransition: the same
+// ModelRouter object gains an endpoint-resolution backend between reconciles;
+// the one Role must grow from the two InferenceService rules to those plus the
+// EndpointSlices rule.
+func TestReconcileRouterActivationRBACAddsEndpointRuleOnTransition(t *testing.T) {
+	scheme := activationRBACScheme(t)
+	ctx := context.Background()
+	mr := &inferencev1alpha1.ModelRouter{ObjectMeta: metav1.ObjectMeta{Name: "r1", Namespace: "ns", UID: "uid-1"}}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mr).Build()
+	r := &ModelRouterReconciler{Client: c, Scheme: scheme}
+	key := types.NamespacedName{Name: routerProxyResourceName(mr.Name), Namespace: "ns"}
+
+	hasSlices := func(role *rbacv1.Role) bool {
+		for _, rule := range role.Rules {
+			for _, res := range rule.Resources {
+				if res == "endpointslices" {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	if err := r.reconcileRouterActivationRBAC(ctx, mr, true); err != nil {
+		t.Fatalf("reconcile (pools only): %v", err)
+	}
+	role := &rbacv1.Role{}
+	if err := c.Get(ctx, key, role); err != nil {
+		t.Fatalf("Role: %v", err)
+	}
+	if len(role.Rules) != 2 || hasSlices(role) || !roleGrantsISVCWrite(role) {
+		t.Fatalf("pools-only Role rules = %+v, want exactly the two InferenceService rules", role.Rules)
+	}
+
+	mr.Spec.Backends = []inferencev1alpha1.RouterBackend{{
+		Name: "q", InferenceServiceRef: &corev1.LocalObjectReference{Name: "q"},
+		Resolution: inferencev1alpha1.RouterBackendResolutionEndpoint,
+	}}
+	if err := r.reconcileRouterActivationRBAC(ctx, mr, true); err != nil {
+		t.Fatalf("reconcile (after adding endpoint backend): %v", err)
+	}
+	role = &rbacv1.Role{}
+	if err := c.Get(ctx, key, role); err != nil {
+		t.Fatalf("Role: %v", err)
+	}
+	if len(role.Rules) != 3 || !hasSlices(role) || !roleGrantsISVCWrite(role) {
+		t.Errorf("transitioned Role rules = %+v, want the two InferenceService rules plus endpointslices", role.Rules)
+	}
+	roles := &rbacv1.RoleList{}
+	if err := c.List(ctx, roles); err != nil || len(roles.Items) != 1 {
+		t.Errorf("Role count = %d (err %v), want 1", len(roles.Items), err)
 	}
 }

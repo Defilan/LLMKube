@@ -194,7 +194,7 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 		h := &backendHealth{}
 		h.healthy.Store(true)
 		d.health.Store(b.Name, h)
-		if len(b.Endpoints) > 0 {
+		if len(b.Endpoints) > 0 && b.EndpointSource == nil {
 			d.endpoints.Store(b.Name, b.Endpoints)
 			for _, ep := range b.Endpoints {
 				eh := &backendHealth{}
@@ -307,10 +307,14 @@ func (d *Dispatcher) SetEndpoints(name string, endpoints []string) {
 
 // liveEndpoints returns the endpoint set dispatch uses for backend: the set
 // SetEndpoints last stored (seeded from Backend.Endpoints at construction),
-// else the configured list.
+// else the configured list. An EndpointSource backend never uses the
+// configured list: until its first sync it dispatches to Address.
 func (d *Dispatcher) liveEndpoints(backend *Backend) []string {
 	if v, ok := d.endpoints.Load(backend.Name); ok {
 		return v.([]string)
+	}
+	if backend.EndpointSource != nil {
+		return nil
 	}
 	return backend.Endpoints
 }

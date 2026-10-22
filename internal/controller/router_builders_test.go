@@ -320,7 +320,7 @@ func TestCompileRouterConfigEndpointResolution(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
 		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
 	}
-	r := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1", "10.0.0.2"))
+	r := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor(true, "10.0.0.1", "10.0.0.2"))
 
 	compiled, err := r.compileRouterConfig(context.Background(), mr)
 	if err != nil {
@@ -360,7 +360,7 @@ func TestCompileRouterConfigEndpointResolutionFallback(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
 		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
 	}
-	slices := endpointSliceFor("qwen3-coder", testBuilderNs, false, "10.0.0.9")
+	slices := endpointSliceFor(false, "10.0.0.9")
 
 	service := newRouterReconcilerForTest(t, mr, isvc, secret, slices)
 	compiled, err := service.compileRouterConfig(context.Background(), mr)
@@ -404,9 +404,10 @@ func TestCompileRouterConfigEndpointResolutionFallback(t *testing.T) {
 	}
 }
 
-// endpointSliceFor builds an EndpointSlice labelled for the named Service, so
-// the router config builder's service-name selector finds it.
-func endpointSliceFor(service, namespace string, ready bool, addrs ...string) *discoveryv1.EndpointSlice {
+// endpointSliceFor builds an EndpointSlice labelled for the qwen3-coder
+// Service, so the router config builder's service-name selector finds it.
+func endpointSliceFor(ready bool, addrs ...string) *discoveryv1.EndpointSlice {
+	const service, namespace = "qwen3-coder", testBuilderNs
 	eps := make([]discoveryv1.Endpoint, 0, len(addrs))
 	for _, a := range addrs {
 		eps = append(eps, discoveryv1.Endpoint{
@@ -1669,7 +1670,7 @@ func TestFindModelRoutersForEndpointSlice(t *testing.T) {
 	r := &ModelRouterReconciler{Client: c, Scheme: scheme}
 
 	reqs := r.findModelRoutersForEndpointSlice(context.Background(),
-		endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1"))
+		endpointSliceFor(true, "10.0.0.1"))
 
 	if len(reqs) != 1 {
 		t.Fatalf("got %d requests, want 1 (only the endpoint-resolution router)", len(reqs))
@@ -1696,8 +1697,8 @@ func TestCompileRouterConfigHashIgnoresPodChurn(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
 		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
 	}
-	one := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1"))
-	three := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1", "10.0.0.2", "10.0.0.3"))
+	one := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor(true, "10.0.0.1"))
+	three := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor(true, "10.0.0.1", "10.0.0.2", "10.0.0.3"))
 
 	a, err := one.compileRouterConfig(context.Background(), mr)
 	if err != nil {

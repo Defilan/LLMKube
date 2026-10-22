@@ -79,3 +79,12 @@ func TestSetEndpointsSortsAndDropsLeftHealth(t *testing.T) {
 		t.Error("a returning endpoint inherited the old quarantine")
 	}
 }
+
+func TestEndpointSourceWinsOverStaticEndpoints(t *testing.T) {
+	cfg := endpointSourceConfig()
+	cfg.Backends[0].Endpoints = []string{"http://10.9.9.9:8080"}
+	d := NewDispatcher(cfg)
+	if got := d.pickEndpoint(&cfg.Backends[0]); got != "" {
+		t.Errorf("before sync: pick = %q, want empty (Address fallback), the static list must not seed an EndpointSource backend", got)
+	}
+}
