@@ -590,6 +590,9 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
 ) ([]agentGatewayBackendResource, error) {
+	// The reconcile guard already refused any router whose pickers do not
+	// resolve, so every pool has an entry here.
+	pickers, _, _ := agentGatewayResolvePoolPickers(mr)
 	resolved := make([]agentGatewayBackendResource, 0, len(mr.Spec.Backends))
 	for _, b := range mr.Spec.Backends {
 		if b.External != nil {
@@ -621,6 +624,7 @@ func (r *ModelRouterAgentGatewayReconciler) resolveAgentGatewayBackends(
 			PoolName: sanitizeDNSName(isvc.Name),
 			FQDN:     fmt.Sprintf("%s.%s.svc.cluster.local", sanitizeDNSName(isvc.Name), isvc.Namespace),
 			Port:     port,
+			Picker:   pickers[sanitizeDNSName(isvc.Name)],
 			// A backend is healthy iff its InferenceService has at least one ready
 			// replica. An unhealthy backend is ejected from the route's
 			// backendRefs while its InferencePool stays in place for re-add on
@@ -1284,6 +1288,9 @@ type agentGatewayBackendResource struct {
 	FQDN string
 	// Port is the Service port the pool targets.
 	Port int64
+	// Picker is the Endpoint Picker the backend's InferencePool references,
+	// resolved by agentGatewayResolvePoolPickers.
+	Picker agentGatewayPicker
 	// Healthy reports whether the referenced InferenceService currently has at
 	// least one ready replica. An unhealthy backend is dropped from the route's
 	// backendRefs while its InferencePool stays in place.

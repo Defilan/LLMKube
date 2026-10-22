@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -3081,5 +3082,162 @@ func TestModelRouterAgentGateway_EndpointPickerCEL(t *testing.T) {
 	half.Spec.AgentGatewayRef.EndpointPicker = "epp"
 	if err := c.Create(context.Background(), half); err == nil || !strings.Contains(err.Error(), "set together") {
 		t.Errorf("router default with name but no port: got %v, want the pairing message", err)
+	}
+}
+
+// TestModelRouterAgentGateway_PerBackendPickersCompile: two InferenceServices,
+// a picker each, compile two pools that each reference their own picker, and
+// the router goes Ready (#1991). A third backend with no picker and no default
+// turns the router EndpointPickerRequired.
+func TestModelRouterAgentGateway_PerBackendPickersCompile(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "glm-53")
+	makeBackendISvcInNamespace(t, c, ns, "qwen-38")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "two-models", Namespace: ns},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:       inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{Name: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				pickerBackend("glm", "glm-53", "glm-epp", 9002),
+				pickerBackend("qwen", "qwen-38", "qwen-epp", 9012),
+			},
+			Rules: []inferencev1alpha1.RouterRule{
+				{Name: "glm", Match: &inferencev1alpha1.RuleMatch{Models: []string{"glm-5.3"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"glm"}}},
+				{Name: "qwen", Match: &inferencev1alpha1.RuleMatch{Models: []string{"qwen-3.8"}},
+					Route: inferencev1alpha1.RuleRoute{Backends: []string{"qwen"}}},
+			},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+	reconcileAgentGatewayRouter(t, r, mr)
+
+	for pool, want := range map[string]agentGatewayPicker{"glm-53": {"glm-epp", 9002}, "qwen-38": {"qwen-epp", 9012}} {
+		u := getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, pool)
+		name, _, _ := unstructured.NestedString(u.Object, "spec", "endpointPickerRef", "name")
+		port, _, _ := unstructured.NestedInt64(u.Object, "spec", "endpointPickerRef", "port", "number")
+		if name != want.Name || port != int64(want.Port) {
+			t.Errorf("pool %s endpointPickerRef = %s:%d, want %s:%d", pool, name, port, want.Name, want.Port)
+		}
+	}
+	fresh := &inferencev1alpha1.ModelRouter{}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	if cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected AgentGatewayReady=True, got %+v", cond)
+	}
+
+	// A backend with no picker and no router default: refused, nothing new.
+	makeBackendISvcInNamespace(t, c, ns, "orphan")
+	fresh.Spec.Backends = append(fresh.Spec.Backends, pickerBackend("orphan", "orphan", "", 0))
+	if err := c.Update(context.Background(), fresh); err != nil {
+		t.Fatalf("update modelrouter: %v", err)
+	}
+	reconcileAgentGatewayRouter(t, r, fresh)
+	assertNotExistsInNamespace(t, c, inferencePoolGVK(), ns, "orphan")
+	if err := c.Get(context.Background(), types.NamespacedName{Name: mr.Name, Namespace: ns}, fresh); err != nil {
+		t.Fatalf("get modelrouter: %v", err)
+	}
+	cond := apimeta.FindStatusCondition(fresh.Status.Conditions, ModelRouterAgentGatewayConditionReady)
+	if cond == nil || cond.Reason != modelRouterAgentGatewayReasonPickerRequired {
+		t.Errorf("expected AgentGatewayReady=False/%s, got %+v", modelRouterAgentGatewayReasonPickerRequired, cond)
+	}
+}
+
+// TestModelRouterAgentGateway_DefaultPickerRendersUnchanged pins Review Focus
+// 4: a router on the router-wide picker renders endpointPickerRef exactly as
+// before #1991, name and port.
+func TestModelRouterAgentGateway_DefaultPickerRendersUnchanged(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "qwen-cuda")
+	mr := sameNamespaceRouterFixture(ns, "default-picker", "qwen-cuda")
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	reconcileAgentGatewayRouter(t, newModelRouterAgentGatewayReconciler(t, cfg), mr)
+
+	u := getUnstructuredInNamespace(t, c, inferencePoolGVK(), ns, "qwen-cuda")
+	// The API server fills the CRD's defaults (failureMode, group, kind) in
+	// the stored object; the operator writes name and port, so those are what
+	// must not change.
+	name, _, _ := unstructured.NestedString(u.Object, "spec", "endpointPickerRef", "name")
+	port, _, _ := unstructured.NestedInt64(u.Object, "spec", "endpointPickerRef", "port", "number")
+	if name != mr.Spec.AgentGatewayRef.EndpointPicker || port != int64(mr.Spec.AgentGatewayRef.EndpointPickerPort) {
+		t.Errorf("endpointPickerRef = %s:%d, want %s:%d", name, port,
+			mr.Spec.AgentGatewayRef.EndpointPicker, mr.Spec.AgentGatewayRef.EndpointPickerPort)
+	}
+}
+
+// TestModelRouterAgentGateway_PrimaryFallbackFirstHealthy: a primary-fallback
+// rule over two pools renders one backendRef, the first healthy backend, and
+// moves to the second when the first has no ready replica (#1991). Gateway API
+// weights split traffic, so two refs would be a 50/50 split.
+func TestModelRouterAgentGateway_PrimaryFallbackFirstHealthy(t *testing.T) {
+	c, cfg, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+	makeGateway(t, c, ns, "ai-gateway", nil, nil)
+	makeBackendISvcInNamespace(t, c, ns, "primary")
+	makeBackendISvcInNamespace(t, c, ns, "fallback")
+
+	mr := &inferencev1alpha1.ModelRouter{
+		ObjectMeta: metav1.ObjectMeta{Name: "pf", Namespace: ns},
+		Spec: inferencev1alpha1.ModelRouterSpec{
+			DataPlane:       inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+			AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{Name: "ai-gateway"},
+			Backends: []inferencev1alpha1.RouterBackend{
+				pickerBackend("primary", "primary", "primary-epp", 9002),
+				pickerBackend("fallback", "fallback", "fallback-epp", 9002),
+			},
+			Rules: []inferencev1alpha1.RouterRule{{
+				Name:  "r",
+				Match: &inferencev1alpha1.RuleMatch{Models: []string{"m"}},
+				Route: inferencev1alpha1.RuleRoute{Backends: []string{"primary", "fallback"}, Strategy: "primary-fallback"},
+			}},
+		},
+	}
+	if err := c.Create(context.Background(), mr); err != nil {
+		t.Fatalf("create modelrouter: %v", err)
+	}
+	r := newModelRouterAgentGatewayReconciler(t, cfg)
+
+	refsOf := func() []string {
+		t.Helper()
+		route := getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "pf")
+		rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
+		var names []string
+		for _, ref := range rules[0].(map[string]interface{})["backendRefs"].([]interface{}) {
+			names = append(names, ref.(map[string]interface{})["name"].(string))
+		}
+		return names
+	}
+
+	reconcileAgentGatewayRouter(t, r, mr)
+	if got := refsOf(); !reflect.DeepEqual(got, []string{"primary"}) {
+		t.Errorf("healthy primary: backendRefs = %v, want [primary]", got)
+	}
+
+	setISvcReadyReplicasInNamespace(t, c, ns, "primary", 0)
+	reconcileAgentGatewayRouter(t, r, mr)
+	if got := refsOf(); !reflect.DeepEqual(got, []string{"fallback"}) {
+		t.Errorf("primary down: backendRefs = %v, want [fallback]", got)
+	}
+
+	setISvcReadyReplicasInNamespace(t, c, ns, "fallback", 0)
+	reconcileAgentGatewayRouter(t, r, mr)
+	if got := refsOf(); !reflect.DeepEqual(got, []string{"primary"}) {
+		t.Errorf("both down: backendRefs = %v, want [primary] (ejection keeps the original list)", got)
 	}
 }
