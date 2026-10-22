@@ -205,16 +205,21 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 		})
 	})
 
-	It("leaves a metal service without a strategy even when its model declares a GPU count", func() {
-		// resolveGPUCount reads the Model's declared count, so a metal model
-		// that names one would otherwise reach the GPU branch and get a
-		// Deployment strategy that no metal Deployment consumes.
+	It("reports a metal service's strategy as ignored even when its model declares a GPU count", func() {
+		// Asserted through the caller the metal path actually reaches: the
+		// metal reconcile returns before constructDeployment, so the resolver's
+		// metal answer surfaces as this warning. resolveGPUCount reads the
+		// Model's declared count, so without the metal case a metal model that
+		// names one would take the GPU branch and be told the field was
+		// honoured.
 		model := gpuModelWithCount("strategy-metal", 1)
 		model.Spec.Hardware.Accelerator = "metal"
 		isvc := strategyISVC("strategy-metal", "strategy-metal", 2)
 		isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
 
-		expectNoStrategy(reconciler.constructDeployment(isvc, model, nil, 2, "", ""))
+		ignored, msg := ignoredRolloutStrategy(isvc, model)
+		Expect(ignored).To(BeTrue())
+		Expect(msg).To(Equal(rolloutStrategyIgnoredMetalMessage))
 	})
 
 	Context("the ignored-field warning", func() {
@@ -365,7 +370,10 @@ var _ = Describe("Rollout strategy envtest (#2131)", func() {
 			"a one-at-a-time rollout runs at full size; maxSurge 0 caps the total, it does not shrink it")
 	})
 
-	It("flips on a template change without restarting the pods", func() {
+	It("lands a strategy-only edit on a live Deployment without touching the pod template", func() {
+		// The spec below sets only rolloutPolicy.strategy, so its body and name
+		// agree: the strategy reaches the live Deployment and the pod-template
+		// hash does not move, so no pod is restarted.
 		name := "strategy-envtest-flip"
 		createModel(name)
 		newISVC(name, name, 2)
@@ -513,11 +521,15 @@ var _ = Describe("Rollout strategy envtest (#2131)", func() {
 
 		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
 		isvc.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server-cuda13-v2"
+		wantReplicas := int32(3)
+		isvc.Spec.Replicas = &wantReplicas
 		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
 		reconcileOnce(reconciler, name)
 
 		held := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, key, held)).To(Succeed())
+		Expect(*held.Spec.Replicas).To(Equal(int32(2)),
+			"the held update carries the replica count with the template, so a scale change waits too")
 		Expect(held.Spec.Template.Spec.Containers[0].Image).To(Equal(original),
 			"a busy backend keeps the live template until it goes idle")
 
@@ -527,6 +539,60 @@ var _ = Describe("Rollout strategy envtest (#2131)", func() {
 		Expect(cond).NotTo(BeNil())
 		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		Expect(cond.Reason).To(Equal(ReasonPodsBusy))
+	})
+
+	It("defers a strategy-only edit on a Deployment that predates the template hash", func() {
+		// The input class the docs name: a missing desired-template-hash
+		// annotation reads as changed, so even a strategy-only edit enters the
+		// drain gate and waits with the held spec. Base behaviour, pinned here
+		// because the field doc and the concept page claim a strategy-only edit
+		// needs no drain (#2131).
+		busy := busyIdleServer()
+		defer busy.Close()
+
+		name := "strategy-envtest-legacy-no-hash"
+		createModel(name)
+
+		isvc := strategyISVC(name, name, 2)
+		isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{
+			WaitForIdle:        true,
+			IdleTimeoutSeconds: 600,
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		created = append(created, name)
+
+		reconciler := &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			RolloutIdleBaseURL: busy.URL,
+		}
+		key := types.NamespacedName{Name: name, Namespace: "default"}
+		reconcileOnce(reconciler, name)
+
+		// Strip the annotation the operator stamps, standing in for a
+		// Deployment created before the annotation existed.
+		legacy := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, legacy)).To(Succeed())
+		delete(legacy.Annotations, AnnotationDesiredTemplateHash)
+		Expect(k8sClient.Update(ctx, legacy)).To(Succeed())
+
+		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
+		isvc.Spec.RolloutPolicy.Strategy = inferencev1alpha1.RolloutStrategyOneAtATime
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+		reconcileOnce(reconciler, name)
+
+		got := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		cond := meta.FindStatusCondition(got.Status.Conditions, ConditionRolloutDeferred)
+		Expect(cond).NotTo(BeNil(),
+			"a missing template hash reads as changed, so the strategy waits with the held update")
+		Expect(cond.Reason).To(Equal(ReasonPodsBusy))
+
+		afterDep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, afterDep)).To(Succeed())
+		Expect(afterDep.Spec.Strategy.Type).NotTo(Equal(appsv1.RollingUpdateDeploymentStrategyType),
+			"the held pass must not write the strategy either")
 	})
 
 	It("rejects an unknown strategy at admission", func() {
@@ -583,6 +649,8 @@ var _ = Describe("Rollout strategy envtest (#2131)", func() {
 			default:
 				Expect(got).To(ContainElement(ContainSubstring(ReasonRolloutStrategyIgnored)),
 					"a set strategy on a CPU service must not be accepted silently (#1503)")
+				Expect(got).To(ContainElement(ContainSubstring("a non-GPU service")),
+					"the event must name the cause that fired, not a generic reason")
 				return
 			}
 		}

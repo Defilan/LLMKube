@@ -65,7 +65,7 @@ The rollout waits until **every** reachable replica reports idle. If even one is
 
 ## Pod replacement strategy
 
-`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate. The strategy is not part of the hashed pod template, so changing only `strategy` is not a template change and lands while a backend is busy. The exception is a service already holding a deferred template change: that held update carries the new strategy with it when it eventually applies.
+`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate. The strategy is not part of the hashed pod template, so changing only `strategy` is not a pod-template change and is not gated on idleness once the live Deployment carries the operator's template-hash annotation. Two inputs still travel with a held update: a Deployment created before that annotation existed (a missing hash reads as changed), and a service already holding a deferred template change.
 
 | Workload | Default | With `strategy: OneAtATime` |
 |---|---|---|

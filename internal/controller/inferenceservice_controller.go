@@ -1192,12 +1192,14 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			// RolloutDeferred=True condition (set by reconcileRolloutPolicy)
 			// drives a requeue in Reconcile.
 			//
-			// A change that only sets rolloutPolicy.strategy never reaches
-			// here: the strategy is not part of the hashed pod template, so on
-			// its own it reports templateChanged=false and lands below without a
-			// drain check (#2131). This branch therefore only ever holds a real
-			// pod-template change, and it keeps holding the whole Deployment
-			// spec with it, replicas included.
+			// A change that only sets rolloutPolicy.strategy normally does not
+			// reach here: the strategy is not part of the hashed pod template, so
+			// on its own it reports templateChanged=false and lands below without
+			// a drain check (#2131). It does reach here when the stored hash is
+			// missing (a Deployment created before the annotation existed, which
+			// this check reads as changed) or when a real template change is in
+			// flight; in both cases the held update carries the strategy with it,
+			// along with the rest of the Deployment spec, replicas included.
 			return existingDeployment, replicaCounts{
 				Ready:    existingDeployment.Status.ReadyReplicas,
 				Observed: existingDeployment.Status.Replicas,

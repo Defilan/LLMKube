@@ -996,8 +996,9 @@ type InferenceServiceSpec struct {
 }
 
 // Deployment pod-replacement strategies selectable through
-// spec.rolloutPolicy.strategy. The CRD enum is built from these so the API and
-// the controller cannot drift.
+// spec.rolloutPolicy.strategy. The field's +kubebuilder:validation:Enum marker
+// mirrors these values by hand; edit both together, or the API will reject a
+// value the controller supports.
 const (
 	// RolloutStrategyRecreate replaces every replica before starting any. It is
 	// the default for a GPU workload: a replacement pod cannot schedule while an
@@ -1049,8 +1050,9 @@ type RolloutPolicySpec struct {
 	// reduced capacity; use a ReadWriteMany cache. A replacement pod reports
 	// Insufficient nvidia.com/gpu while the outgoing pod drains; that is
 	// expected, not the #192 deadlock. Changing only this field needs no drain
-	// and lands while a backend is busy, unless a pod-template change is
-	// already deferred, in which case the held update carries it.
+	// once the live Deployment carries the operator's template-hash annotation;
+	// before that first stamped pass, and while a deferred template change is
+	// held, the strategy travels with that held update.
 	// +kubebuilder:validation:Enum=Recreate;OneAtATime
 	// +optional
 	Strategy string `json:"strategy,omitempty"`
