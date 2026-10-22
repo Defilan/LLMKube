@@ -304,8 +304,8 @@ func TestCompileRouterConfigOMLXServedModelWireTag(t *testing.T) {
 }
 
 // TestCompileRouterConfigEndpointResolution verifies opt-in endpoint resolution
-// (#1812): with resolution=endpoint the backend compiles one address per ready
-// pod and keeps the Service DNS name as the fallback.
+// (#1812): with resolution=endpoint the backend compiles the Service identity
+// the proxy watches, keeps the Service DNS name as the fallback, and no pod IPs.
 func TestCompileRouterConfigEndpointResolution(t *testing.T) {
 	mr := canonicalModelRouter()
 	mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
@@ -330,17 +330,16 @@ func TestCompileRouterConfigEndpointResolution(t *testing.T) {
 	if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
 		t.Fatalf("unmarshal compiled JSON: %v", err)
 	}
-	want := []string{"http://10.0.0.1:8080", "http://10.0.0.2:8080"}
-	if len(cfg.Backends[0].Endpoints) != len(want) {
-		t.Fatalf("endpoints = %v, want %v", cfg.Backends[0].Endpoints, want)
+	b := cfg.Backends[0]
+	if len(b.Endpoints) != 0 {
+		t.Errorf("endpoints = %v, want none: the proxy tracks pods itself", b.Endpoints)
 	}
-	for i := range want {
-		if cfg.Backends[0].Endpoints[i] != want[i] {
-			t.Errorf("endpoints[%d] = %q, want %q", i, cfg.Backends[0].Endpoints[i], want[i])
-		}
+	want := &router.EndpointSource{Namespace: testBuilderNs, Service: "qwen3-coder", Port: 8080}
+	if b.EndpointSource == nil || *b.EndpointSource != *want {
+		t.Errorf("endpointSource = %+v, want %+v", b.EndpointSource, want)
 	}
-	if !strings.Contains(cfg.Backends[0].Address, "qwen3-coder."+testBuilderNs+".svc.cluster.local") {
-		t.Errorf("fallback address = %q, want the Service DNS name", cfg.Backends[0].Address)
+	if !strings.Contains(b.Address, "qwen3-coder."+testBuilderNs+".svc.cluster.local") {
+		t.Errorf("fallback address = %q, want the Service DNS name", b.Address)
 	}
 }
 
@@ -1677,5 +1676,38 @@ func TestFindModelRoutersForEndpointSlice(t *testing.T) {
 	}
 	if reqs[0].Name != withEndpoints.Name {
 		t.Errorf("enqueued %q, want %q", reqs[0].Name, withEndpoints.Name)
+	}
+}
+
+// TestCompileRouterConfigHashIgnoresPodChurn: pods coming and going behind an
+// endpoint-resolution backend must not change the compiled config, so the
+// proxy Deployment is not re-rolled.
+func TestCompileRouterConfigHashIgnoresPodChurn(t *testing.T) {
+	mr := canonicalModelRouter()
+	mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef: "qwen3-coder",
+			Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+		},
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+		Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+	}
+	one := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1"))
+	three := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor("qwen3-coder", testBuilderNs, true, "10.0.0.1", "10.0.0.2", "10.0.0.3"))
+
+	a, err := one.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compile (1 pod): %v", err)
+	}
+	b, err := three.compileRouterConfig(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("compile (3 pods): %v", err)
+	}
+	if a.Hash != b.Hash {
+		t.Errorf("config hash changed with pod count (%s vs %s): pod churn would re-roll the proxy", a.Hash, b.Hash)
 	}
 }
