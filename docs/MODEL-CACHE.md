@@ -656,9 +656,12 @@ Behavior:
   outside the operator's cache label/discovery contract and may not appear in
   the listing. Each claim is read through a short-lived read-only pod the
   command creates and deletes, including a Pending `WaitForFirstConsumer`
-  claim, which that pod binds. `cache list` needs permission to create,
-  exec into and delete pods in the namespace, and exits nonzero when it cannot
-  read any discovered claim.
+  claim, which that pod binds. On a multi-node cluster the pod is pinned to
+  the node whose kubelet holds the claim, so a strict RWO serving pod does not
+  make it stall on Multi-Attach; a claim nothing holds is not pinned, and the
+  pod is its first consumer. `cache list` needs permission to create, exec
+  into and delete pods in the namespace, and exits nonzero when it cannot read
+  any discovered claim.
 
 ### Per-Service Storage Class
 
@@ -752,9 +755,10 @@ only home when the Model has no InferenceService). Two things follow from that:
 
 - It needs your own permission to create and exec into pods in the namespace.
   On a `restricted`-profile namespace the pod is rejected, the same way
-  `cache list` is.- A strict RWO claim that a serving pod still holds cannot be double-attached,
-  so the purge fails with a timeout naming the claim. Delete the
-  InferenceService first, then purge.
+  `cache list` is.
+- A strict RWO claim that a serving pod still holds cannot be attached a second
+  time on another node, so the purge fails with a timeout naming the claim.
+  Delete the InferenceService first, then purge.
 
 The namespace-wide modes remove only directories named like a cache key (16 hex
 characters). `--model` and `delete --purge-cache` validate the key as a single

@@ -35,7 +35,6 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/defilantech/llmkube/pkg/cachekey"
 	k8sscheme "k8s.io/client-go/kubernetes/scheme"
 )
 
@@ -145,12 +144,13 @@ func inspectPVCCache(
 	allEntries := []PVCCacheEntry{}
 	var failures []error
 	for _, pvcInfo := range pvcInfos {
-		entries, err := inspectSinglePVC(ctx, cfg, clientset, namespace, pvcInfo)
+		entries, err := inspectSinglePVC(ctx, cfg, k8sClient, clientset, namespace, pvcInfo)
 		if err != nil {
 			// One PVC failing to inspect (a volume that cannot attach, an
 			// inspector pod that cannot start) must not blank the entire
 			// listing; skip it and surface the caches we can read.
 			failures = append(failures, fmt.Errorf("%s: %w", pvcInfo.Name, err))
+			fmt.Fprintf(os.Stderr, "warning: skipping cache PVC %s: %v\n", pvcInfo.Name, err)
 			continue
 		}
 		allEntries = append(allEntries, entries...)
@@ -162,9 +162,6 @@ func inspectPVCCache(
 		return nil, fmt.Errorf("cannot read any model cache claim in namespace %s: %w",
 			namespace, errors.Join(failures...))
 	}
-	for _, failure := range failures {
-		fmt.Fprintf(os.Stderr, "warning: skipping cache PVC %v\n", failure)
-	}
 	return allEntries, nil
 }
 
@@ -174,38 +171,76 @@ func inspectPVCCache(
 // claim is mounted by the distroless controller, which has no shell, and a
 // serving container mounts it read-only (#2140).
 func inspectSinglePVC(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace string, pvcInfo PVCInfo,
 ) ([]PVCCacheEntry, error) {
-	podName, err := ensureCacheAccessPod(ctx, clientset, namespace, pvcInfo.Name, inspectorPodKind)
+	node, err := claimHolderNode(ctx, k8sClient, namespace, pvcInfo.Name)
+	if err != nil {
+		return nil, err
+	}
+	if node != "" {
+		podName, err := ensureInspectorPodOn(ctx, clientset, namespace, pvcInfo.Name, node)
+		if err != nil {
+			return nil, err
+		}
+		defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
+		return readCacheEntries(ctx, cfg, clientset, namespace, podName, pvcInfo.InferenceService)
+	}
+
+	podName, err := ensureCacheAccessPod(ctx, clientset, namespace, pvcInfo.Name,
+		inspectorPodName(pvcInfo.Name), inspectorPodKind, purgeRunID(),
+		func(runID string) (string, error) {
+			return createInspectorPodForPVC(ctx, clientset, namespace, pvcInfo.Name)
+		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create inspector pod for PVC %s: %w", pvcInfo.Name, err)
 	}
 	defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
+	return readCacheEntries(ctx, cfg, clientset, namespace, podName, pvcInfo.InferenceService)
+}
 
+// createInspectorPodForPVC creates the read-only pod that reads a cache claim.
+func createInspectorPodForPVC(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+) (string, error) {
+	return createCacheAccessPod(ctx, clientset, namespace, pvcName, inspectorPodName(pvcName),
+		inspectorPodKind, "", "")
+}
+
+// readCacheEntries runs the size listing in the inspector pod and parses it.
+func readCacheEntries(
+	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	namespace, podName, isvcName string,
+) ([]PVCCacheEntry, error) {
 	output, err := purgeExec(ctx, cfg, clientset, namespace, podName, inspectorPodKind.container,
 		[]string{"sh", "-c", fmt.Sprintf("du -sb %s/*/ 2>/dev/null || true", defaultModelMountPath)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to exec in pod: %w", err)
 	}
-
-	return parseDuOutput(output, pvcInfo.InferenceService), nil
+	return parseDuOutput(output, isvcName), nil
 }
 
-// inspectorPodName returns a per-PVC inspector pod name. Each cache list run
-// may inspect several PVCs in sequence; a single shared pod name would collide
-// (AlreadyExists) with the previous inspector while it is still terminating,
-// causing every PVC after the first to be skipped. Deriving the name from the
-// PVC keeps it unique per PVC and DNS-1123 safe (cachekey.Compute is a 16-char
-// hex digest).
-func inspectorPodName(pvcName string) string {
-	return cacheInspectorPodPrefix + cachekey.Compute(pvcName)
-}
-
-// newCacheAccessPod builds the short-lived pod that mounts a model cache claim.
-// The inspector reads it (readOnly true); the purge writes to it.
-func newCacheAccessPod(podName, pvcName, component, containerName string, readOnly bool) *corev1.Pod {
-	return newCacheAccessPodForRun(podName, pvcName, component, containerName, readOnly, "")
+// claimHolderNode returns the node whose kubelet holds pvcName attached, or ""
+// when nothing runs there. A strict RWO claim a running pod holds cannot be
+// attached a second time, so the inspector has to land on that node; nowhere
+// is known yet, the pod binds the claim itself (WaitForFirstConsumer).
+func claimHolderNode(ctx context.Context, k8sClient client.Client, namespace, pvcName string) (string, error) {
+	podList := &corev1.PodList{}
+	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace)); err != nil {
+		return "", fmt.Errorf("failed to list pods: %w", err)
+	}
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Status.Phase != corev1.PodRunning || pod.Spec.NodeName == "" {
+			continue
+		}
+		for _, vol := range pod.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {
+				return pod.Spec.NodeName, nil
+			}
+		}
+	}
+	return "", nil
 }
 
 // newCacheAccessPodForRun builds the pod and, when runID is set, stamps it
@@ -221,7 +256,7 @@ func newCacheAccessPodForRun(
 	if runID != "" {
 		labels[cachePurgeRunLabel] = runID
 	}
-	return &corev1.Pod{
+	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   podName,
 			Labels: labels,
@@ -255,12 +290,32 @@ func newCacheAccessPodForRun(
 			},
 		},
 	}
+	return pod
 }
 
-func createInspectorPodForPVC(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
-) (string, error) {
-	return createCacheAccessPod(ctx, clientset, namespace, pvcName, inspectorPodKind, "")
+// newCacheAccessPodOnNode builds the pod pinned to node when one is given: the
+// claim is attached there, so scheduling anywhere else is the Multi-Attach
+// error the pod would stall on.
+func newCacheAccessPodOnNode(
+	podName, pvcName, component, containerName string, readOnly bool, runID, node string,
+) *corev1.Pod {
+	pod := newCacheAccessPodForRun(podName, pvcName, component, containerName, readOnly, runID)
+	if node != "" {
+		pod.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key:      "kubernetes.io/hostname",
+							Operator: corev1.NodeSelectorOpIn,
+							Values:   []string{node},
+						}},
+					}},
+				},
+			},
+		}
+	}
+	return pod
 }
 
 // waitForPodRunning polls until the pod reports Running.

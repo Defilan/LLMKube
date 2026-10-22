@@ -171,7 +171,7 @@ func TestNewPurgePod(t *testing.T) {
 func TestEnsurePurgePod_ReplacesStale(t *testing.T) {
 	pvcName := "llmkube-model-cache"
 	podName := purgePodName(pvcName)
-	stale := newCacheAccessPod(podName, pvcName, cachePurgeComponent, "purge", false)
+	stale := newCacheAccessPodForRun(podName, pvcName, cachePurgeComponent, "purge", false, "")
 	stale.Namespace = "default"
 	// A pod with no stamp (no run label) is the interrupted-run case, which
 	// purgePodAbandoned reads as abandoned (#2140 refactor: behavior preserved).
@@ -917,7 +917,7 @@ func TestReplaceStalePurgePod_LiveRunLeftAlone(t *testing.T) {
 	}
 	purgeSleep = func(time.Duration) {}
 
-	err := replaceStalePurgePod(context.Background(), clientset, "default", podName, "this-run")
+	err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run")
 	if err == nil {
 		t.Fatal("expected an error rather than replacing a live run's pod")
 	}
@@ -935,7 +935,7 @@ func TestReplaceStalePurgePod_LiveRunLeftAlone(t *testing.T) {
 	}
 	pod.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 	_, _ = clientset.CoreV1().Pods("default").Update(context.Background(), pod, metav1.UpdateOptions{})
-	if err := replaceStalePurgePod(context.Background(), clientset, "default", podName, "this-run"); err != nil {
+	if err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run"); err != nil {
 		t.Errorf("an abandoned stamped pod must be replaced: %v", err)
 	}
 }
@@ -958,7 +958,7 @@ func TestReplaceStalePurgePod_FinishedPodReplaced(t *testing.T) {
 			t.Cleanup(func() { purgeSleep = origSleep })
 			purgeSleep = func(time.Duration) {}
 
-			err := replaceStalePurgePod(context.Background(), clientset, "default", podName, "this-run")
+			err := replaceStalePurgePod(context.Background(), clientset, "default", pvcName, podName, "this-run")
 			if err != nil {
 				t.Fatalf("a finished stamped pod must be replaced: %v", err)
 			}

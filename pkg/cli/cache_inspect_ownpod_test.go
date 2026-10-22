@@ -31,6 +31,7 @@ import (
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
 	k8stesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -71,11 +72,11 @@ func shelllessCachePod(pvcName string) *corev1.Pod {
 	}
 }
 
-// cacheClaim is a discovered model cache claim.
-func cacheClaim(name string) *corev1.PersistentVolumeClaim {
+// cacheClaim is the discovered shared cache claim.
+func cacheClaim() *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
+			Name:      modelCachePVCName,
 			Namespace: "test-ns",
 			Labels:    map[string]string{modelCacheLabel: modelCacheLabelValue},
 		},
@@ -150,7 +151,7 @@ func TestInspectPVCCacheUsesOwnPodWhenAPodMountsTheClaim(t *testing.T) {
 	borrowable := shelllessCachePod(modelCachePVCName)
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(cacheListScheme()).
-		WithObjects(cacheClaim(modelCachePVCName), borrowable).
+		WithObjects(cacheClaim(), borrowable).
 		Build()
 	// Base lists pods from this client to pick one to borrow; pin that the
 	// fixture is the pod it would find.
@@ -169,7 +170,7 @@ func TestInspectPVCCacheUsesOwnPodWhenAPodMountsTheClaim(t *testing.T) {
 	}, &calls)
 
 	_, panicked := execTarget(func() {
-		_, _ = inspectSinglePVC(context.Background(), &rest.Config{}, clientset, "test-ns",
+		_, _ = inspectSinglePVC(context.Background(), &rest.Config{}, k8sClient, clientset, "test-ns",
 			PVCInfo{Name: modelCachePVCName})
 	})
 
@@ -197,7 +198,7 @@ func TestInspectPVCCacheUsesOwnPodWhenAPodMountsTheClaim(t *testing.T) {
 func TestInspectPVCCacheFailsWhenNoPVCIsReadable(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().
 		WithScheme(cacheListScheme()).
-		WithObjects(cacheClaim(modelCachePVCName)).
+		WithObjects(cacheClaim()).
 		Build()
 	clientset := fakeclientset.NewClientset()
 	clientset.PrependReactor("create", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
@@ -213,34 +214,91 @@ func TestInspectPVCCacheFailsWhenNoPVCIsReadable(t *testing.T) {
 	}
 }
 
-// The two cache-access pods differ by the access they need: the inspector
-// reads, the purge writes. A kind that mixed them up would either fail on a
-// strict RWO claim or delete entries it was only asked to list.
-func TestCacheAccessPodKinds(t *testing.T) {
-	if !inspectorPodKind.readOnly {
-		t.Error("the inspector pod mounts the claim read-write")
+// pinnedTo lists the nodes a pod's required node affinity accepts.
+func pinnedTo(pod *corev1.Pod) []string {
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil ||
+		pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return nil
 	}
-	if purgePodKind.readOnly {
-		t.Error("the purge pod mounts the claim read-only")
+	var nodes []string
+	for _, term := range pod.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == "kubernetes.io/hostname" {
+				nodes = append(nodes, expr.Values...)
+			}
+		}
 	}
-	if inspectorPodKind.component == purgePodKind.component {
-		t.Errorf("both kinds carry the component label %q", inspectorPodKind.component)
-	}
-	if inspectorPodKind.namePrefix == purgePodKind.namePrefix {
-		t.Errorf("both kinds name their pods %q", inspectorPodKind.namePrefix)
+	return nodes
+}
+
+// A strict RWO claim a running pod holds is attached on that pod's node, so
+// the inspector has to land there or stall on Multi-Attach. A claim nothing
+// holds must not be pinned: the pod is its first consumer.
+func TestInspectPVCCachePinsInspectorToTheClaimHolderNode(t *testing.T) {
+	withNode := func(name string, phase corev1.PodPhase, node string) *corev1.Pod {
+		pod := shelllessCachePod(modelCachePVCName)
+		pod.Name = name
+		pod.Spec.NodeName = node
+		pod.Status.Phase = phase
+		return pod
 	}
 
-	clientset := fakeclientset.NewClientset()
-	if _, err := createCacheAccessPod(context.Background(), clientset, "test-ns",
-		modelCachePVCName, inspectorPodKind, ""); err != nil {
-		t.Fatalf("create inspector pod: %v", err)
-	}
-	pod, err := clientset.CoreV1().Pods("test-ns").Get(context.Background(),
-		inspectorPodName(modelCachePVCName), metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("get inspector pod: %v", err)
-	}
-	if !pod.Spec.Containers[0].VolumeMounts[0].ReadOnly || !pod.Spec.Volumes[0].PersistentVolumeClaim.ReadOnly {
-		t.Error("the inspector pod spec mounts the claim read-write")
+	tests := []struct {
+		name string
+		pods []*corev1.Pod
+		want []string
+	}{{
+		name: "a running holder on node-b",
+		pods: []*corev1.Pod{withNode("serving", corev1.PodRunning, "node-b")},
+		want: []string{"node-b"},
+	}, {
+		name: "nothing holds the claim",
+		pods: nil,
+		want: nil,
+	}, {
+		name: "a holder that is not running is no holder",
+		pods: []*corev1.Pod{withNode("pending", corev1.PodPending, "node-c")},
+		want: nil,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := []client.Object{cacheClaim()}
+			for _, pod := range tt.pods {
+				objs = append(objs, pod)
+			}
+			k8sClient := fake.NewClientBuilder().WithScheme(cacheListScheme()).WithObjects(objs...).Build()
+
+			origExec, origWait, origSleep := purgeExec, purgeWait, purgeSleep
+			t.Cleanup(func() { purgeExec, purgeWait, purgeSleep = origExec, origWait, origSleep })
+			purgeSleep = func(time.Duration) {}
+			purgeWait = func(_ context.Context, _ kubernetes.Interface, _, _ string, _ time.Duration) error {
+				return nil
+			}
+			purgeExec = func(context.Context, *rest.Config, kubernetes.Interface,
+				string, string, string, []string) (string, error) {
+				return "", nil
+			}
+
+			// Keep the pod: recording the delete would leave nothing to read.
+			origDelete := deleteCacheAccessPod
+			t.Cleanup(func() { deleteCacheAccessPod = origDelete })
+			deleteCacheAccessPod = func(context.Context, kubernetes.Interface, string, string) {}
+
+			clientset := fakeclientset.NewClientset()
+			if _, err := inspectSinglePVC(context.Background(), &rest.Config{}, k8sClient, clientset,
+				"test-ns", PVCInfo{Name: modelCachePVCName}); err != nil {
+				t.Fatalf("inspectSinglePVC: %v", err)
+			}
+
+			pod, err := clientset.CoreV1().Pods("test-ns").Get(context.Background(),
+				inspectorPodName(modelCachePVCName), metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("get the inspector pod the run created: %v", err)
+			}
+			if got := pinnedTo(pod); len(got) != len(tt.want) || (len(got) == 1 && got[0] != tt.want[0]) {
+				t.Errorf("inspector pinned to %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

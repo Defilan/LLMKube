@@ -560,7 +560,10 @@ its image has no shell, so borrowing that pod cannot work. The command needs
 your own permission to create and delete pods in the namespace, and
 `pods/exec` for the command it runs. When no discovered claim can be read it
 exits nonzero and says why, instead of reporting an empty or fully active
-cache. `--all-namespaces` does not inspect claims and creates no pod.
+cache. On a multi-node cluster the pod is pinned to the node holding the
+claim, so a strict RWO serving pod does not make it stall on Multi-Attach; a
+claim nothing holds is not pinned, and the pod is its first consumer.
+`--all-namespaces` does not inspect claims and creates no pod.
 
 ### Removing cache entries with `llmkube cache clear`
 

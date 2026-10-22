@@ -147,7 +147,7 @@ func seedShelllessSharedCache(t *testing.T, cfg *rest.Config, namespace string) 
 	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
 		t.Fatalf("create namespace: %v", err)
 	}
-	pvc := cacheClaim(modelCachePVCName)
+	pvc := cacheClaim()
 	pvc.Namespace = namespace
 	if err := c.Create(ctx, pvc); err != nil {
 		t.Fatalf("create claim: %v", err)

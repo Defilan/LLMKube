@@ -378,7 +378,8 @@ func TestRunDelete_PurgeTargetsClaimsStatusPrefetchRecords(t *testing.T) {
 			purged[action.(k8stesting.CreateAction).GetObject().(*corev1.Pod).Name] = true
 		}
 	}
-	if len(purged) != 2 || !purged[purgePodName(modelCachePVCName)] || !purged[purgePodName("moved-claim")] {
+	sharedPod, movedPod := purgePodName(modelCachePVCName), purgePodName("moved-claim")
+	if len(purged) != 2 || !purged[sharedPod] || !purged[movedPod] {
 		t.Errorf("purge pods = %v, want one on %s (status.prefetch) and one on moved-claim (the service)",
 			purged, modelCachePVCName)
 	}
