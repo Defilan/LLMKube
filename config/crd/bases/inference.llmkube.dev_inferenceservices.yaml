@@ -5001,12 +5001,12 @@ spec:
                       needs a spare GPU and the other replicas keep serving at reduced capacity;
                       at replicas 1 both strategies replace the only pod. Only a GPU service on
                       the device-plugin path honours this field: a non-GPU service already rolls
-                      with the Kubernetes default, a DRA service keeps Recreate, and a multiNode
-                      group runs no Deployment. A replica whose replacement cannot attach a
-                      ReadWriteOnce model cache waits Pending until the old pod releases it, so a
-                      shared RWO cache stalls the rollout at reduced capacity; use a
-                      ReadWriteMany cache, or the operator's perService cache mode (one RWO and
-                      node-local claim per service).
+                      with the Kubernetes default, a DRA service keeps Recreate, a metal service
+                      runs no Deployment, and a multiNode group runs none either. A replica whose
+                      replacement cannot attach a ReadWriteOnce model cache waits Pending until
+                      the old pod releases it, so a shared RWO cache stalls the rollout at
+                      reduced capacity; use a ReadWriteMany cache. A deferred waitForIdle
+                      rollout does not hold a change that only sets this field.
                     enum:
                     - Recreate
                     - OneAtATime

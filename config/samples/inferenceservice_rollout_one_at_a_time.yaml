@@ -21,8 +21,9 @@
 #     operator runs with an RWX storage class) cannot be attached by the
 #     replacement while the outgoing pod still holds it. The replacement sits
 #     Pending until the volume is released, so the rollout stalls at reduced
-#     capacity instead of progressing. Use a ReadWriteMany cache, or the
-#     operator's perService cache mode, with more than one replica.
+#     capacity instead of progressing. Use a ReadWriteMany cache with more than
+#     one replica. The operator's perService cache mode does not help: its claim
+#     is also ReadWriteOnce and binds on the first pod's node.
 #   - progressDeadlineSeconds stays at the Kubernetes default of 600s. A rollout
 #     step longer than that reports ProgressDeadlineExceeded even though the
 #     Deployment controller keeps making progress.
@@ -32,8 +33,9 @@
 #     default Recreate instead.
 #   - Ignored on a non-GPU service (it already rolls with the Kubernetes
 #     default), on a DRA service (a replacement cannot get the resource claim
-#     while the old pod holds it, so it keeps Recreate), and on a multiNode
-#     group (no Deployment). The operator emits a RolloutStrategyIgnored warning.
+#     while the old pod holds it, so it keeps Recreate), on a metal service and
+#     on a multiNode group (neither runs a Deployment). The operator emits a
+#     RolloutStrategyIgnored warning.
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService
 metadata:

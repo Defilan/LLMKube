@@ -18,12 +18,15 @@ package controller
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
@@ -188,6 +191,18 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 		})
 	})
 
+	It("leaves a metal service without a strategy even when its model declares a GPU count", func() {
+		// resolveGPUCount reads the Model's declared count, so a metal model
+		// that names one would otherwise reach the GPU branch and get a
+		// Deployment strategy that no metal Deployment consumes.
+		model := gpuModelWithCount("strategy-metal", 1)
+		model.Spec.Hardware.Accelerator = "metal"
+		isvc := strategyISVC("strategy-metal", "strategy-metal", 2)
+		isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
+
+		expectNoStrategy(reconciler.constructDeployment(isvc, model, nil, 2, "", ""))
+	})
+
 	Context("the ignored-field warning", func() {
 		It("is silent when the field is unset", func() {
 			isvc := strategyISVC("warn-unset", "m", 2)
@@ -202,20 +217,19 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 			Expect(ignored).To(BeFalse())
 		})
 
-		DescribeTable("fires when the field cannot apply",
-			func(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) {
+		// Each entry names the cause that fired, so a warning that tells a
+		// multiNode user about resource claims is a failure, not a pass.
+		DescribeTable("fires when the field cannot apply, naming the cause",
+			func(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, want string) {
 				ignored, msg := ignoredRolloutStrategy(isvc, model)
 				Expect(ignored).To(BeTrue())
-				Expect(msg).To(ContainSubstring("spec.rolloutPolicy.strategy is ignored"))
-				Expect(msg).To(ContainSubstring("non-GPU"))
-				Expect(msg).To(ContainSubstring("DRA"))
-				Expect(msg).To(ContainSubstring("multiNode"))
+				Expect(msg).To(Equal(want))
 			},
 			Entry("non-GPU service", func() *inferencev1alpha1.InferenceService {
 				isvc := strategyISVC("warn-cpu", "m", 2)
 				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
 				return isvc
-			}(), cpuModelForStrategy("m")),
+			}(), cpuModelForStrategy("m"), rolloutStrategyIgnoredMessage),
 			Entry("DRA service", func() *inferencev1alpha1.InferenceService {
 				isvc := strategyISVC("warn-dra", "m", 2)
 				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
@@ -227,7 +241,17 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 					{Name: "gpu", ResourceClaimName: &claimName},
 				}
 				return model
-			}()),
+			}(), rolloutStrategyIgnoredDRAMessage),
+			Entry("metal service", func() *inferencev1alpha1.InferenceService {
+				isvc := strategyISVC("warn-metal", "m", 2)
+				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
+				return isvc
+			}(), func() *inferencev1alpha1.Model {
+				model := gpuModelWithCount("m", 1)
+				model.Spec.Hardware.Accelerator = "metal"
+				model.Spec.Hardware.GPU = nil
+				return model
+			}(), rolloutStrategyIgnoredMetalMessage),
 			Entry("multiNode group", func() *inferencev1alpha1.InferenceService {
 				isvc := strategyISVC("warn-multinode", "m", 2)
 				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
@@ -238,8 +262,28 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 					},
 				}
 				return isvc
-			}(), gpuModelWithCount("m", 1)),
+			}(), gpuModelWithCount("m", 1), rolloutStrategyIgnoredMultiNodeMessage),
 		)
+	})
+})
+
+// strategyDeltaOnly answers whether a pass changes only the pod-replacement
+// strategy, which is the case the idle gate must not hold (#2131).
+var _ = Describe("strategyDeltaOnly (#2131)", func() {
+	base := &appsv1.Deployment{}
+	base.Spec.Template.Spec.Containers = []corev1.Container{{Name: "server", Image: "a"}}
+
+	It("holds when the pod template differs", func() {
+		desired := base.DeepCopy()
+		desired.Spec.Template.Spec.Containers[0].Image = "b"
+		Expect(strategyDeltaOnly(base, desired)).To(BeFalse())
+	})
+
+	It("does not hold when only the strategy differs", func() {
+		desired := base.DeepCopy()
+		desired.Spec.Strategy = oneAtATimeStrategy()
+		Expect(strategyDeltaOnly(base, desired)).To(BeTrue(),
+			"a strategy-only change replaces no pod, so the idle gate has nothing to protect")
 	})
 })
 
@@ -383,17 +427,78 @@ var _ = Describe("Rollout strategy envtest (#2131)", func() {
 		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
 		Expect(dep.Spec.Strategy.RollingUpdate).NotTo(BeNil())
 
-		// Opt back out. The API server forbids rollingUpdate under Recreate, so
-		// this is the path that catches a stale RollingUpdate block.
+		// Opt back out by removing the field. The API server forbids
+		// rollingUpdate under Recreate, so this is the path that catches a
+		// stale RollingUpdate block surviving a switch back.
 		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
-		isvc.Spec.RolloutPolicy.Strategy = inferencev1alpha1.RolloutStrategyRecreate
+		isvc.Spec.RolloutPolicy.Strategy = ""
 		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+
+		persisted := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, persisted)).To(Succeed())
+		Expect(persisted.Spec.RolloutPolicy.Strategy).To(BeEmpty(),
+			"the field must actually be removed, not set to another value")
 
 		reconcileOnce(reconciler, name)
 
 		reverted := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, key, reverted)).To(Succeed())
 		expectRecreate(reverted)
+	})
+
+	It("holds a template change while the backend reports busy", func() {
+		// The fixture the strategy-only case depends on: a busy backend makes
+		// the reconcile defer a pod-template change and leave the live
+		// Deployment on the old template.
+		busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/slots" {
+				_, _ = w.Write([]byte(`[{"id":0,"is_processing":true}]`))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer busy.Close()
+
+		name := "strategy-envtest-idle-gate"
+		createModel(name)
+
+		isvc := strategyISVC(name, name, 2)
+		isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{
+			WaitForIdle:        true,
+			IdleTimeoutSeconds: 600,
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		created = append(created, name)
+
+		reconciler := &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			RolloutIdleBaseURL: busy.URL,
+		}
+		key := types.NamespacedName{Name: name, Namespace: "default"}
+		reconcileOnce(reconciler, name)
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+		original := dep.Spec.Template.Spec.Containers[0].Image
+
+		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
+		isvc.Spec.Image = "ghcr.io/ggml-org/llama.cpp:server-cuda13-v2"
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+		reconcileOnce(reconciler, name)
+
+		held := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, held)).To(Succeed())
+		Expect(held.Spec.Template.Spec.Containers[0].Image).To(Equal(original),
+			"a busy backend keeps the live template until it goes idle")
+
+		got := &inferencev1alpha1.InferenceService{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		cond := meta.FindStatusCondition(got.Status.Conditions, ConditionRolloutDeferred)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		Expect(cond.Reason).To(Equal(ReasonPodsBusy))
 	})
 
 	It("rejects an unknown strategy at admission", func() {

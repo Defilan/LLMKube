@@ -27,15 +27,36 @@ import (
 // ReasonRolloutStrategyIgnored is the Warning event reason for an
 // InferenceService whose spec.rolloutPolicy.strategy cannot apply to it: the
 // workload already rolls with the Kubernetes default (non-GPU), must not
-// overlap pods (DRA claims), or runs no Deployment at all (multiNode).
+// overlap pods (DRA claims), or runs no Deployment at all (metal, multiNode).
 const ReasonRolloutStrategyIgnored = "RolloutStrategyIgnored"
 
-const rolloutStrategyIgnoredMessage = "spec.rolloutPolicy.strategy is ignored: only a GPU service on the device-plugin path replaces pods with a pod-replacement strategy (a non-GPU service already rolls with the Kubernetes default, a DRA service keeps Recreate, and a multiNode group runs no Deployment)"
+const rolloutStrategyIgnoredMessage = "spec.rolloutPolicy.strategy is ignored: a non-GPU service already rolls with the Kubernetes default"
+
+const rolloutStrategyIgnoredDRAMessage = "spec.rolloutPolicy.strategy is ignored: a DRA service keeps Recreate, because a replacement pod cannot get the resource claim while the old pod holds it"
+
+const rolloutStrategyIgnoredMetalMessage = "spec.rolloutPolicy.strategy is ignored: a metal service runs no Deployment and no pod-replacement strategy"
+
+const rolloutStrategyIgnoredMultiNodeMessage = "spec.rolloutPolicy.strategy is ignored: a multiNode group runs no Deployment"
+
+// rolloutStrategyIgnoredCause returns the message naming why this service's
+// strategy cannot apply. It mirrors resolveRolloutStrategy's order exactly, so a
+// warning cannot name a cause the resolver did not take, or miss one it did.
+func rolloutStrategyIgnoredCause(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) string {
+	switch {
+	case isvc != nil && isvc.Spec.MultiNode != nil:
+		return rolloutStrategyIgnoredMultiNodeMessage
+	case len(modelResourceClaims(model)) > 0:
+		return rolloutStrategyIgnoredDRAMessage
+	case isMetalModel(model):
+		return rolloutStrategyIgnoredMetalMessage
+	default:
+		return rolloutStrategyIgnoredMessage
+	}
+}
 
 // requestedRolloutStrategy returns the strategy the user asked for, or "" when
-// the field is unset. An unknown value is returned as-is so the caller can
-// report it as ignored; the CRD enum rejects one at admission, but a stored
-// object from before the enum existed must not be silently honoured.
+// the field is unset. An unknown value is returned as-is rather than coerced,
+// so the caller reports it as ignored instead of silently honouring it.
 func requestedRolloutStrategy(isvc *inferencev1alpha1.InferenceService) string {
 	if isvc == nil || isvc.Spec.RolloutPolicy == nil {
 		return ""
@@ -67,6 +88,10 @@ func resolveRolloutStrategy(
 		strategy = appsv1.DeploymentStrategy{}
 	case len(modelResourceClaims(model)) > 0:
 		strategy = recreateStrategy()
+	case isMetalModel(model):
+		// The metal-agent runs the engine natively on the Mac; there is no
+		// Deployment to carry a strategy.
+		strategy = appsv1.DeploymentStrategy{}
 	case resolveGPUCount(isvc, model) <= 0:
 		strategy = appsv1.DeploymentStrategy{}
 	case requested == inferencev1alpha1.RolloutStrategyOneAtATime:
@@ -129,5 +154,5 @@ func ignoredRolloutStrategy(
 	if honoured {
 		return false, ""
 	}
-	return true, rolloutStrategyIgnoredMessage
+	return true, rolloutStrategyIgnoredCause(isvc, model)
 }

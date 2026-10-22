@@ -65,12 +65,13 @@ The rollout waits until **every** reachable replica reports idle. If even one is
 
 ## Pod replacement strategy
 
-`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate.
+`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate. A deferred `waitForIdle` rollout does not hold a change that only sets `strategy`, because such a change replaces no pod; it lands on the Deployment at the next reconcile.
 
 | Workload | Default | With `strategy: OneAtATime` |
 |---|---|---|
 | GPU, device plugin | `Recreate` | `RollingUpdate`, `maxSurge: 0`, `maxUnavailable: 1` |
 | GPU, DRA resource claims | `Recreate` | `Recreate` (the field is ignored, with a `RolloutStrategyIgnored` warning) |
+| Metal (`accelerator: metal`) | no Deployment | unchanged, with a `RolloutStrategyIgnored` warning |
 | Non-GPU (device plugin count 0, no claims) | Kubernetes default (25%/25%) | unchanged, with a `RolloutStrategyIgnored` warning |
 | `spec.multiNode` | no Deployment | unchanged, with a `RolloutStrategyIgnored` warning |
 
@@ -87,7 +88,7 @@ spec:
 
 Before opting in, check four things:
 
-- **Model cache access mode.** A `ReadWriteOnce` cache (the shared cache's default unless the operator is configured for `ReadWriteMany`) cannot be attached by the replacement while the outgoing pod holds it. The replacement stays Pending until the volume is released and the rollout stalls at reduced capacity. Use a `ReadWriteMany` cache, or the operator's `perService` cache mode, with more than one replica.
+- **Model cache access mode.** A `ReadWriteOnce` cache (the shared cache's default unless the operator is configured for `ReadWriteMany`) cannot be attached by the replacement while the outgoing pod holds it. The replacement stays Pending until the volume is released and the rollout stalls at reduced capacity. Use a `ReadWriteMany` cache with more than one replica. The operator's `perService` cache mode does not help here: its claim is also `ReadWriteOnce`, bound on the node the first pod scheduled to, so a replacement placed on another node stalls the same way.
 - **Startup time vs `progressDeadlineSeconds`.** It stays at the Kubernetes default of 600s. A single step longer than that reports `ProgressDeadlineExceeded` even though the Deployment controller keeps making progress; `kubectl rollout status` surfaces it as a failure.
 - **Mixed versions during the window.** A rollout that changes the model (a `ModelPool` move, a changed `modelRef`) serves the old and the new version side by side until every replica is replaced. For a template change the old version cannot serve, keep `Recreate`.
 - **Replica count.** `Recreate` on a single replica and `OneAtATime` on a single replica both replace the only pod, so the strategy only avoids downtime from `replicas: 2` up.
