@@ -128,3 +128,30 @@ func discoveredClaimsFor(t *testing.T, k8sClient client.Client, namespace string
 	}
 	return infos
 }
+
+// A create failure must say why once: ensureCacheAccessPod already names the
+// kind and the claim, so inspectSinglePVC must not wrap it again.
+func TestInspectSinglePVCReportsCreateFailureOnce(t *testing.T) {
+	k8sClient := fake.NewClientBuilder().WithScheme(cacheListScheme()).
+		WithObjects(cacheClaim()).Build()
+	clientset := fakeclientset.NewClientset()
+	clientset.PrependReactor("create", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("pods is forbidden")
+	})
+
+	origWait, origSleep := purgeWait, purgeSleep
+	t.Cleanup(func() { purgeWait, purgeSleep = origWait, origSleep })
+	purgeSleep = func(time.Duration) {}
+	purgeWait = func(_ context.Context, _ kubernetes.Interface, _, _ string, _ time.Duration) error {
+		return nil
+	}
+
+	_, err := inspectSinglePVC(context.Background(), &rest.Config{}, k8sClient, clientset,
+		"test-ns", PVCInfo{Name: modelCachePVCName})
+	if err == nil {
+		t.Fatal("want an error when the inspector pod cannot be created")
+	}
+	if n := strings.Count(err.Error(), "failed to create inspector pod for PVC"); n != 1 {
+		t.Errorf("error names the create failure %d times, want 1: %v", n, err)
+	}
+}

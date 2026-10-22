@@ -195,7 +195,7 @@ func inspectSinglePVC(
 			return createInspectorPodForRun(ctx, clientset, namespace, pvcInfo.Name, runID, holder)
 		})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create inspector pod for PVC %s: %w", pvcInfo.Name, err)
+		return nil, err
 	}
 	defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
 	return readCacheEntries(ctx, cfg, clientset, namespace, podName, pvcInfo.InferenceService)
