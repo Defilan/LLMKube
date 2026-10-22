@@ -542,6 +542,7 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 					Labels: map[string]string{
 						"app":                            name,
 						inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent,
+						"llmkube.ai/inference-service":   name,
 					},
 				},
 				Spec: corev1.ServiceSpec{

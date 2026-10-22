@@ -767,6 +767,13 @@ type serviceNameTakenError struct {
 	// service's name but another UID: a deleted predecessor whose Service
 	// garbage collection has not removed yet (a GitOps delete-and-recreate).
 	previous bool
+	// agentOwner is the InferenceService named by the metal-agent's
+	// llmkube.ai/inference-service label when the object is the agent's
+	// Service for a different InferenceService. agentLabel is set whenever the
+	// managed-by label claims the agent, so a missing inference-service label
+	// is reported as such instead of as an object LLMKube never created.
+	agentOwner string
+	agentLabel bool
 }
 
 func (e *serviceNameTakenError) Error() string {
@@ -778,22 +785,50 @@ func (e *serviceNameTakenError) Error() string {
 		return fmt.Sprintf("Service %s/%s is already controlled by another InferenceService (uid %s); "+
 			"refusing to overwrite it; rename one of the services", e.ns, e.name, e.owner)
 	}
+	if e.agentOwner != "" {
+		return fmt.Sprintf("Service %s/%s is the metal-agent's Service for InferenceService %s, whose name generates the same Service; "+
+			"refusing to overwrite it; rename one of the InferenceServices", e.ns, e.name, e.agentOwner)
+	}
+	if e.agentLabel {
+		return fmt.Sprintf("Service %s/%s carries the metal-agent's managed-by label but no %s label naming an InferenceService; "+
+			"refusing to overwrite it; delete or rename the object, or rename the InferenceService", e.ns, e.name, agentServiceLabel)
+	}
 	return fmt.Sprintf("Service %s/%s already exists and is not controlled by this InferenceService; "+
 		"refusing to overwrite it (LLMKube did not create it); delete or rename the object, or rename the InferenceService",
 		e.ns, e.name)
 }
 
+// agentServiceLabel is the key the metal-agent stamps with the InferenceService
+// name on every Service and EndpointSlice it writes (pkg/agent/registry.go:53),
+// beside llmkube.ai/managed-by on all of them.
+const agentServiceLabel = "llmkube.ai/inference-service"
+
+// agentServiceOwnedBy reports whether existing is the metal-agent's Service for
+// this InferenceService. The managed-by label alone does not say which
+// InferenceService the agent wrote the Service for: sanitizeDNSName maps "a.b"
+// and "a-b" onto one Service name, so a sibling InferenceService's agent
+// Service carries it too.
+func agentServiceOwnedBy(existing *corev1.Service, isvc *inferencev1alpha1.InferenceService) bool {
+	return existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent &&
+		existing.Labels[agentServiceLabel] == isvc.Name
+}
+
 // ensureServiceOwned is the ownership gate for the Service writes in
 // reconcileService: the create and the in-place field sync. Write only what
 // this InferenceService controls. A Service carrying the metal-agent's
-// managed-by label is accepted: that is the operator's own agent handing the
-// name back when a Model stops being accelerator: metal, the same consent
+// managed-by label and the inference-service label naming this InferenceService
+// is accepted: that is the operator's own agent handing the name back when a
+// Model stops being accelerator: metal, the same consent
 // reconcileRelayService reads. So is a Service carrying the
 // inference.llmkube.dev/service label this controller's own sync writes, which
 // is what the metal transition leaves behind on a release that replaced the
 // managed-by label without stamping an owner reference. The
 // controller-reference branch is resolved first, so a Service with another
 // controller's reference is refused even when it also carries either label.
+// The agent's managed-by label decides on its own after that, so a Service
+// claiming it is refused unless the inference-service label names this
+// InferenceService: that label is the only record of which service the Service
+// serves, and sanitizeDNSName maps distinct names onto one Service name.
 // Anything else (no controller reference, no operator-written label) is
 // refused, never adopted, never overwritten, and never deleted, because
 // spec.selector decides where the name routes traffic.
@@ -813,8 +848,13 @@ func ensureServiceOwned(isvc *inferencev1alpha1.InferenceService, existing *core
 		}
 		return taken
 	}
-	if existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent {
+	if agentServiceOwnedBy(existing, isvc) {
 		return nil
+	}
+	if existing.Labels[inferencev1alpha1.LabelManagedBy] == inferencev1alpha1.ManagedByMetalAgent {
+		taken.agentLabel = true
+		taken.agentOwner = existing.Labels[agentServiceLabel]
+		return taken
 	}
 	// No controller reference and no managed-by label, but the service label
 	// this controller's own sync writes names this InferenceService: the

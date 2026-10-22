@@ -28,6 +28,14 @@ One or more of:
 - The message variant `is already controlled by another InferenceService
   (uid <uid>)` instead: the object at that name carries a controller reference
   to a different `InferenceService` UID.
+- The message variant `is the metal-agent's Service for InferenceService
+  <name>` instead: another InferenceService's metal-agent wrote the Service at
+  this name, and the two names generate one Service name (a dot and a dash
+  both sanitize to a dash). No action is possible on this Service: it serves
+  the other service.
+- The message variant `carries the metal-agent's managed-by label but no
+  llmkube.ai/inference-service label` instead: the label that says whose
+  Service it is is missing.
 - The message variant `is still controlled by a previous InferenceService
   named <name> (uid <uid>) that was deleted`: the InferenceService was deleted
   and recreated under the same name (for example a GitOps replace) before
@@ -69,7 +77,7 @@ the workload:
 2. **Inspect whatever holds the name.** This is the decision point.
 
    ```bash
-   kubectl get service <name> -n <namespace> -o jsonpath='{.metadata.ownerReferences}' | jq
+   kubectl get service <name> -n <namespace> -o jsonpath='{.metadata.ownerReferences}{"\n"}{.metadata.labels}{"\n"}' | jq
    kubectl get service <name> -n <namespace> -o jsonpath='{.spec.selector}{"\n"}{.spec.ports}{"\n"}'
    ```
 
@@ -101,11 +109,24 @@ the workload:
      name. The message is the generic one, because the operator only attributes
      a refusal to another InferenceService when the reference is one. Rename
      whichever object has the weaker claim.
-   - **`llmkube.ai/managed-by: metal-agent` and no controller reference**: this
-     is the operator's own agent's Service, and it is *not* a refusal. The
-     controller adopts it. Seeing this event for such a Service means the label
-     is missing or spelled differently; the label is only honoured on a Service
-     that no other controller owns.
+   - **`llmkube.ai/managed-by: metal-agent` and no controller reference, with
+     `llmkube.ai/inference-service: <this service>`**: this is the operator's
+     own agent's Service, and it is *not* a refusal. The controller adopts it.
+     Both labels are written together by every tagged release from v0.3.0
+     through v0.10.5; the label is only honoured on a Service that no other
+     controller owns and that names this InferenceService.
+   - **`llmkube.ai/managed-by: metal-agent` naming another InferenceService**:
+     refused, with a message naming that InferenceService. This is another
+     service's agent Service at the same generated name: names that differ
+     only in dots and dashes (`a.b` and `a-b`) generate one Service name, and
+     that Service carries the other service's process. Adopting it would move
+     its traffic to this service's pods and garbage-collect it with this
+     service. Rename one of the two InferenceServices.
+   - **`llmkube.ai/managed-by: metal-agent` with no `llmkube.ai/inference-service`
+     label**: refused, with a message naming the missing label. Nothing
+     attributes the Service to an InferenceService, and the agent writes both
+     labels on every Service it creates, so this is a hand-applied or partially
+     edited label set.
    - **`llmkube.ai/managed-by: metal-agent` *and* another controller's
      reference**: still refused, with the generic message. Another controller
      owns the name, and the label does not override that. This is what a
@@ -162,11 +183,13 @@ the workload:
   controller reference, verified in every tagged release from v0.2.0 through
   v0.10.5, so upgrade in place is unaffected.
 - The Services the controller adopts are the ones it can prove it wrote: its
-  own metal-agent's Service (`llmkube.ai/managed-by: metal-agent`), and the
+  own metal-agent's Service (the agent's `llmkube.ai/managed-by: metal-agent`
+  plus the `llmkube.ai/inference-service` label naming this InferenceService,
+  both written on every Service the agent creates from v0.3.0 on), and the
   Service a metal to pod transition left behind on an earlier release (no
-  owner reference, but the operator's own `inference.llmkube.dev/service`
-  label). Adoption stamps the controller reference, so neither survives the
-  InferenceService that owns it.
+  owner reference, no managed-by label, but the operator's own
+  `inference.llmkube.dev/service` label). Adoption stamps the controller
+  reference, so neither survives the InferenceService that owns it.
 
 ## Related
 

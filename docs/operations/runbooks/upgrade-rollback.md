@@ -254,10 +254,12 @@ the new default store is a directory the agent has never populated.
   `internal/controller/inferenceservice_controller.go`), verified in every
   tagged release from v0.2.0 through v0.10.5, so upgrade in place is
   unaffected. Two Services the controller adopts are not foreign: the one its
-  own metal-agent wrote (`llmkube.ai/managed-by: metal-agent`), which is how a
-  Model that stops being `accelerator: metal` hands the name back, and the
-  Service a metal to pod transition left behind on an earlier release (no
-  controller reference, no managed-by label, but the operator's own
+  own metal-agent wrote (`llmkube.ai/managed-by: metal-agent` plus the
+  `llmkube.ai/inference-service` label naming that InferenceService, both
+  written on every Service the agent creates), which is how a Model that stops
+  being `accelerator: metal` hands the name back, and the Service a metal to
+  pod transition left behind on an earlier release (no controller reference,
+  no managed-by label, but the operator's own
   `inference.llmkube.dev/service` label). Adoption now stamps the controller
   reference, so neither is left behind when the InferenceService is deleted. A
   service whose name is taken recovers by deleting or renaming the foreign

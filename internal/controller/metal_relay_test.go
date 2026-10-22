@@ -533,13 +533,17 @@ var _ = Describe("metal relay mode", func() {
 		})
 
 		// agentService is the Service a metal-agent writes: ClusterIP,
-		// selectorless, managed-by metal-agent.
+		// selectorless, managed-by metal-agent and the inference-service label
+		// naming the InferenceService it serves.
 		agentService := func(name string, port int32) *corev1.Service {
 			return &corev1.Service{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      name,
 					Namespace: namespace,
-					Labels:    map[string]string{inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent},
+					Labels: map[string]string{
+						inferencev1alpha1.LabelManagedBy: inferencev1alpha1.ManagedByMetalAgent,
+						"llmkube.ai/inference-service":   name,
+					},
 				},
 				Spec: corev1.ServiceSpec{
 					Type:  corev1.ServiceTypeClusterIP,
@@ -740,7 +744,7 @@ var _ = Describe("metal relay mode", func() {
 
 			_, err := reconciler.reconcileRelay(ctx, isvc, pinA)
 			Expect(err).To(HaveOccurred())
-			Expect(err.Error()).To(ContainSubstring("is not managed by the metal-agent or this InferenceService"))
+			Expect(err.Error()).To(ContainSubstring("is not controlled by this InferenceService or written by its metal-agent"))
 
 			after := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(svc), after)).To(Succeed())
@@ -902,10 +906,10 @@ var _ = Describe("metal relay mode", func() {
 			_, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: name, Namespace: namespace},
 			})
-			Expect(err).To(MatchError(ContainSubstring("is not managed by the metal-agent or this InferenceService")))
+			Expect(err).To(MatchError(ContainSubstring("is not controlled by this InferenceService or written by its metal-agent")))
 			Expect(drainEvents()).To(ContainElement(SatisfyAll(
 				HavePrefix("Warning"), ContainSubstring("RelayReconcileFailed"),
-				ContainSubstring("is not managed by the metal-agent or this InferenceService"))))
+				ContainSubstring("is not controlled by this InferenceService or written by its metal-agent"))))
 			got := &inferencev1alpha1.InferenceService{}
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, got)).To(Succeed())
 			Expect(got.Status.Phase).NotTo(Equal(PhaseReady))
