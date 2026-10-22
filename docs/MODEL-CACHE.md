@@ -754,7 +754,7 @@ only the claims that can hold that model's files: the
 cache, which is where their pods mount in the default `shared` mode (and the
 only home when the Model has no InferenceService). Two things follow from that:
 
-- It needs your own permission to list, get, create and delete pods in the
+- It needs your own permission to get, create and delete pods in the
   namespace, and to exec into the one it creates. On a `restricted`-profile
   namespace the pod is rejected, the same way `cache list` is.
 - A strict RWO claim that a serving pod still holds cannot be attached a second

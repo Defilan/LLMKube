@@ -306,13 +306,29 @@ func TestInspectPVCCachePinsInspectorToTheClaimHolderNode(t *testing.T) {
 		want:        []string{"node-e"},
 		wantTolerat: true,
 	}, {
-		name: "a holder being deleted is no holder",
+		name: "a holder still shutting down keeps the claim on its node",
+		pods: []*corev1.Pod{func() *corev1.Pod {
+			p := withNode("graceful", corev1.PodRunning, "node-c")
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			p.Finalizers = []string{"test/hold"}
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "manager", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+			}}
+			return p
+		}()},
+		want: []string{"node-c"},
+	}, {
+		name: "a holder being deleted with nothing running is no holder",
 		pods: []*corev1.Pod{func() *corev1.Pod {
 			p := withNode("terminating", corev1.PodRunning, "node-c")
 			now := metav1.Now()
 			p.DeletionTimestamp = &now
 			// The fake client refuses a deletion timestamp with no finalizer.
 			p.Finalizers = []string{"test/hold"}
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "manager", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{}},
+			}}
 			return p
 		}()},
 		want: nil,

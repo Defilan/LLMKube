@@ -250,7 +250,7 @@ func claimHolder(ctx context.Context, k8sClient client.Client, namespace, pvcNam
 		case corev1.PodSucceeded, corev1.PodFailed:
 			continue
 		}
-		if pod.Spec.NodeName == "" || pod.DeletionTimestamp != nil {
+		if pod.Spec.NodeName == "" || holderTerminated(pod) {
 			continue
 		}
 		for _, vol := range pod.Spec.Volumes {
@@ -260,6 +260,30 @@ func claimHolder(ctx context.Context, k8sClient client.Client, namespace, pvcNam
 		}
 	}
 	return nil, nil
+}
+
+// holderTerminated reports whether a pod being deleted has no container left
+// running, the condition the attach/detach controller reads as terminated
+// (kubernetes pkg/volume/util.IsPodTerminated). A pod still inside its
+// termination grace period keeps the volume attached.
+func holderTerminated(pod *corev1.Pod) bool {
+	if pod.DeletionTimestamp == nil {
+		return false
+	}
+	return noContainerRunning(pod.Status.InitContainerStatuses) &&
+		noContainerRunning(pod.Status.ContainerStatuses) &&
+		noContainerRunning(pod.Status.EphemeralContainerStatuses)
+}
+
+// noContainerRunning reports whether every status is terminated or waiting,
+// or there are none.
+func noContainerRunning(statuses []corev1.ContainerStatus) bool {
+	for _, status := range statuses {
+		if status.State.Terminated == nil && status.State.Waiting == nil {
+			return false
+		}
+	}
+	return true
 }
 
 // newCacheAccessPodForRun builds the pod and, when runID is set, stamps it
