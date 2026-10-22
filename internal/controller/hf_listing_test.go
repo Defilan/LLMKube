@@ -98,7 +98,6 @@ func TestListHFRepoFiles_RealResponses(t *testing.T) {
 			if err != nil {
 				t.Fatalf("listHFRepoFiles: %v", err)
 			}
-			sort.Strings(tt.want)
 			if got := hfFilePaths(entries); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("files =\n%v\nwant\n%v", got, tt.want)
 			}
