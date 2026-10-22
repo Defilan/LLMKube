@@ -107,8 +107,9 @@ are the usual starting points.
 
 A control plane is an etcd plus a kube-apiserver, about 4 s to start. Starting
 one per test made `internal/controller` run at go test's 10 minute default
-timeout on CI runners, so the Tests job failed at random (#2141). The package
-started 63 of them; it now starts 6.
+timeout on CI runners, so the Tests job failed at random (#2141). Outside the
+Ginkgo suite the package started 63 of them and now starts 6; counting the
+suite's own, a full run starts 7.
 
 **Wrong:**
 

@@ -17,9 +17,9 @@
 # eleven minutes into the job.
 #
 # Scoped to internal/controller on purpose: the other envtest packages
-# (internal/foreman/controller, internal/watchcanary, pkg/cli) start one or two
-# control planes per run and finish in 10-26 s, three orders of magnitude
-# below the ceiling, so the rule would be churn there.
+# (internal/foreman/controller, internal/watchcanary, pkg/cli) finish in 7, 12
+# and 19 s, 64 to 171 times under the 20m limit, so the rule would be churn
+# there.
 #
 # Usage: scripts/check-envtest-sharing_test.sh
 set -euo pipefail

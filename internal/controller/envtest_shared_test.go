@@ -55,11 +55,11 @@ var (
 
 // maxTestControlPlanes is the number of control planes a run of this package
 // may start: four shared CRD sets (base, base+aigateway, base+pyrra,
-// base+inference-extension), two private CRD subsets, the Ginkgo suite's, and
-// one of headroom. Exceeding it means a test went back to its own environment.
-// The headroom is a single start, so a test that adds a fifth shared set fails
-// here until this count is raised deliberately.
-const maxTestControlPlanes = 8
+// base+inference-extension), two private CRD subsets, and the Ginkgo suite's,
+// which counts itself in suite_test.go. A clean run starts 7 and anything
+// above fails here, so a genuinely needed fifth shared set raises this
+// constant deliberately rather than silently spending slack.
+const maxTestControlPlanes = 7
 
 type sharedEnv struct {
 	env    *envtest.Environment

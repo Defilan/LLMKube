@@ -86,7 +86,9 @@ func startWiringManager(t *testing.T) (ctrl.Manager, func()) {
 // recordingDecorator returns a ReconcileDecorator that reports which request
 // it was invoked for and short-circuits the inner reconciler: the inner's
 // behavior is not the wiring test's subject, and short-circuiting keeps the
-// test hermetic.
+// test hermetic. It reports every namespace: a drop would fail the very
+// assertion the hits channel feeds, so the buffered channel is sized far
+// above the objects a run leaves on the shared server.
 func recordingDecorator(hits chan reconcile.Request) func(reconcile.Reconciler) reconcile.Reconciler {
 	return func(_ reconcile.Reconciler) reconcile.Reconciler {
 		return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -122,7 +124,7 @@ func expectDecoratorHit(t *testing.T, hits chan reconcile.Request, want types.Na
 func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
 	ns := newTestNamespace(t, mgr.GetClient())
-	hits := make(chan reconcile.Request, 8)
+	hits := make(chan reconcile.Request, 1024)
 	rec := &ModelReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
@@ -151,7 +153,7 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
 	ns := newTestNamespace(t, mgr.GetClient())
-	hits := make(chan reconcile.Request, 8)
+	hits := make(chan reconcile.Request, 1024)
 	rec := &InferenceServiceReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
