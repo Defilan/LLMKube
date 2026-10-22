@@ -24,6 +24,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -82,14 +83,15 @@ func startWiringManager(t *testing.T) (ctrl.Manager, func()) {
 	}
 }
 
-// recordingDecorator returns a ReconcileDecorator that signals hits and
-// short-circuits the inner reconciler: the inner's behavior is not the wiring
-// test's subject, and short-circuiting keeps the test hermetic.
-func recordingDecorator(hits chan struct{}) func(reconcile.Reconciler) reconcile.Reconciler {
+// recordingDecorator returns a ReconcileDecorator that reports which request
+// it was invoked for and short-circuits the inner reconciler: the inner's
+// behavior is not the wiring test's subject, and short-circuiting keeps the
+// test hermetic.
+func recordingDecorator(hits chan reconcile.Request) func(reconcile.Reconciler) reconcile.Reconciler {
 	return func(_ reconcile.Reconciler) reconcile.Reconciler {
 		return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 			select {
-			case hits <- struct{}{}:
+			case hits <- req:
 			default:
 			}
 			return reconcile.Result{}, nil
@@ -97,19 +99,30 @@ func recordingDecorator(hits chan struct{}) func(reconcile.Reconciler) reconcile
 	}
 }
 
-func expectDecoratorHit(t *testing.T, hits chan struct{}) {
+// expectDecoratorHit waits for the decorated controller to reconcile want. The
+// manager watches its kind cluster-wide, so on a shared API server the startup
+// LIST also enqueues earlier tests' objects; a bare hit would let one of those
+// satisfy the assertion and stop it pinning that the object this test created
+// reached the decorator at all.
+func expectDecoratorHit(t *testing.T, hits chan reconcile.Request, want types.NamespacedName) {
 	t.Helper()
-	select {
-	case <-hits:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the decorator was never invoked: SetupWithManager did not apply it at the Complete site")
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case req := <-hits:
+			if req.NamespacedName == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("the decorator was never invoked for %s: SetupWithManager did not apply it at the Complete site", want)
+		}
 	}
 }
 
 func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
 	ns := newTestNamespace(t, mgr.GetClient())
-	hits := make(chan struct{}, 8)
+	hits := make(chan reconcile.Request, 8)
 	rec := &ModelReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
@@ -131,14 +144,14 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 		t.Fatalf("create model: %v", err)
 	}
 
-	expectDecoratorHit(t, hits)
+	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: model.Name})
 	stop()
 }
 
 func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
 	ns := newTestNamespace(t, mgr.GetClient())
-	hits := make(chan struct{}, 8)
+	hits := make(chan reconcile.Request, 8)
 	rec := &InferenceServiceReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -157,6 +170,6 @@ func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 		t.Fatalf("create inferenceservice: %v", err)
 	}
 
-	expectDecoratorHit(t, hits)
+	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: isvc.Name})
 	stop()
 }

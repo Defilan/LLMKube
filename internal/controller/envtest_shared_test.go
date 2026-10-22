@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,8 @@ var (
 // may start: four shared CRD sets (base, base+aigateway, base+pyrra,
 // base+inference-extension), two private CRD subsets, the Ginkgo suite's, and
 // one of headroom. Exceeding it means a test went back to its own environment.
+// The headroom is a single start, so a test that adds a fifth shared set fails
+// here until this count is raised deliberately.
 const maxTestControlPlanes = 8
 
 type sharedEnv struct {
@@ -71,12 +74,16 @@ type sharedEnv struct {
 // set the tests genuinely need.
 func sharedTestEnv(t *testing.T, crdPaths ...string) (client.Client, *rest.Config, func()) {
 	t.Helper()
-	key := strings.Join(crdPaths, "\x00")
+	// Sorted, so the same set written in a different order is the same set: an
+	// order-sensitive key would quietly cost another full control plane.
+	sorted := slices.Clone(crdPaths)
+	slices.Sort(sorted)
+	key := strings.Join(sorted, "\x00")
 	sharedEnvMu.Lock()
 	shared, ok := sharedEnvs[key]
 	var startErr error
 	if !ok {
-		shared, startErr = startTestEnv(crdPaths, t.Name())
+		shared, startErr = startTestEnv(sorted, t.Name())
 		if startErr == nil {
 			sharedEnvs[key] = shared
 		}
