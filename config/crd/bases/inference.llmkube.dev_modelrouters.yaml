@@ -91,16 +91,17 @@ spec:
                 properties:
                   endpointPicker:
                     description: |-
-                      EndpointPicker names the EPP Service agentgateway consults for endpoint
-                      selection. Required so each generated InferencePool can reference the
-                      picker; agentgateway cannot select endpoints without it. The Service
-                      lives in this ModelRouter's namespace: GIE v1's endpointPickerRef has no
-                      namespace field, so the pool references it same-namespace.
+                      EndpointPicker names the router-wide default EPP Service. A backend's
+                      own endpointPicker overrides it. A Gateway API Inference Extension EPP
+                      binds to exactly one InferencePool, so the default serves a router whose
+                      backends all reference one InferenceService; with several, set
+                      spec.backends[].endpointPicker. The Service lives in this ModelRouter's
+                      namespace: GIE v1's endpointPickerRef has no namespace field.
                     type: string
                   endpointPickerPort:
                     description: |-
-                      EndpointPickerPort is the port the EPP Service listens on. agentgateway
-                      dials the picker on this port.
+                      EndpointPickerPort is the port the default EPP Service listens on. Set
+                      together with endpointPicker.
                     format: int32
                     maximum: 65535
                     minimum: 1
@@ -120,10 +121,11 @@ spec:
                       regardless.
                     type: string
                 required:
-                - endpointPicker
-                - endpointPickerPort
                 - name
                 type: object
+                x-kubernetes-validations:
+                - message: endpointPicker and endpointPickerPort must be set together
+                  rule: has(self.endpointPicker) == has(self.endpointPickerPort)
               backends:
                 description: |-
                   Backends are the candidate destinations the router can dispatch to.
@@ -168,6 +170,40 @@ spec:
                         from the user-facing model identifier (e.g. Name "claude-opus-4"
                         with DisplayName "claude-opus-4-20250514").
                       type: string
+                    endpointPicker:
+                      description: |-
+                        EndpointPicker selects the Endpoint Picker (EPP) that chooses a pod for
+                        this backend's InferencePool on dataPlane: AgentGateway. When unset, the
+                        router-wide spec.agentGatewayRef.endpointPicker applies. A Gateway API
+                        Inference Extension EPP binds to exactly one InferencePool, so a router
+                        with backends on several InferenceServices sets a picker per backend.
+                        Ignored by the Proxy and Gateway data planes.
+                      properties:
+                        service:
+                          description: |-
+                            Service names an EPP Service in the ModelRouter's namespace. GIE v1's
+                            endpointPickerRef has no namespace field, so the pool references it
+                            same-namespace.
+                          properties:
+                            name:
+                              description: Name is the EPP Service's name.
+                              minLength: 1
+                              type: string
+                            port:
+                              description: Port is the port the EPP Service listens
+                                on.
+                              format: int32
+                              maximum: 65535
+                              minimum: 1
+                              type: integer
+                          required:
+                          - name
+                          - port
+                          type: object
+                      type: object
+                      x-kubernetes-validations:
+                      - message: endpointPicker.service is required
+                        rule: has(self.service)
                     external:
                       description: |-
                         External describes an out-of-cluster provider (Anthropic, OpenAI,
@@ -1031,8 +1067,12 @@ spec:
                           type: string
                         strategy:
                           default: primary-fallback
-                          description: Strategy selects how multiple backends are
-                            used.
+                          description: |-
+                            Strategy selects how multiple backends are used. On dataPlane:
+                            AgentGateway only primary-fallback compiles, and a rule routes to its
+                            first healthy backend: when that backend's InferenceService has no
+                            ready replica, the next reconcile moves the rule to the next backend.
+                            Failover there follows replica readiness, not individual request errors.
                           enum:
                           - primary-fallback
                           - weighted

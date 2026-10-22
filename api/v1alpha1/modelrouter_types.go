@@ -245,6 +245,15 @@ type RouterBackend struct {
 	// +optional
 	Resolution string `json:"resolution,omitempty"`
 
+	// EndpointPicker selects the Endpoint Picker (EPP) that chooses a pod for
+	// this backend's InferencePool on dataPlane: AgentGateway. When unset, the
+	// router-wide spec.agentGatewayRef.endpointPicker applies. A Gateway API
+	// Inference Extension EPP binds to exactly one InferencePool, so a router
+	// with backends on several InferenceServices sets a picker per backend.
+	// Ignored by the Proxy and Gateway data planes.
+	// +optional
+	EndpointPicker *RouterEndpointPicker `json:"endpointPicker,omitempty"`
+
 	// Capabilities advertised by this backend. Rules can require
 	// capabilities (e.g. ["tools", "vision", "long-context"]) to filter
 	// candidates.
@@ -428,7 +437,11 @@ type RuleRoute struct {
 	// +kubebuilder:validation:MinItems=1
 	Backends []string `json:"backends"`
 
-	// Strategy selects how multiple backends are used.
+	// Strategy selects how multiple backends are used. On dataPlane:
+	// AgentGateway only primary-fallback compiles, and a rule routes to its
+	// first healthy backend: when that backend's InferenceService has no
+	// ready replica, the next reconcile moves the rule to the next backend.
+	// Failover there follows replica readiness, not individual request errors.
 	// +kubebuilder:validation:Enum=primary-fallback;weighted;shadow
 	// +kubebuilder:default=primary-fallback
 	// +optional
@@ -753,6 +766,7 @@ type MCPServerSpec struct {
 // server endpoint per request for each generated InferencePool. The Gateway,
 // the Gateway API Inference Extension CRDs, and a running EPP are documented
 // prerequisites that LLMKube does not install or own.
+// +kubebuilder:validation:XValidation:rule="has(self.endpointPicker) == has(self.endpointPickerPort)",message="endpointPicker and endpointPickerPort must be set together"
 type AgentGatewayReference struct {
 	// Name is the agentgateway Gateway's name.
 	// +kubebuilder:validation:Required
@@ -769,20 +783,44 @@ type AgentGatewayReference struct {
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
-	// EndpointPicker names the EPP Service agentgateway consults for endpoint
-	// selection. Required so each generated InferencePool can reference the
-	// picker; agentgateway cannot select endpoints without it. The Service
-	// lives in this ModelRouter's namespace: GIE v1's endpointPickerRef has no
-	// namespace field, so the pool references it same-namespace.
-	// +kubebuilder:validation:Required
-	EndpointPicker string `json:"endpointPicker"`
+	// EndpointPicker names the router-wide default EPP Service. A backend's
+	// own endpointPicker overrides it. A Gateway API Inference Extension EPP
+	// binds to exactly one InferencePool, so the default serves a router whose
+	// backends all reference one InferenceService; with several, set
+	// spec.backends[].endpointPicker. The Service lives in this ModelRouter's
+	// namespace: GIE v1's endpointPickerRef has no namespace field.
+	// +optional
+	EndpointPicker string `json:"endpointPicker,omitempty"`
 
-	// EndpointPickerPort is the port the EPP Service listens on. agentgateway
-	// dials the picker on this port.
-	// +kubebuilder:validation:Required
+	// EndpointPickerPort is the port the default EPP Service listens on. Set
+	// together with endpointPicker.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
-	EndpointPickerPort int32 `json:"endpointPickerPort"`
+	// +optional
+	EndpointPickerPort int32 `json:"endpointPickerPort,omitempty"`
+}
+
+// RouterEndpointPicker selects the Endpoint Picker for one backend's
+// InferencePool. Exactly one member is set.
+// +kubebuilder:validation:XValidation:rule="has(self.service)",message="endpointPicker.service is required"
+type RouterEndpointPicker struct {
+	// Service names an EPP Service in the ModelRouter's namespace. GIE v1's
+	// endpointPickerRef has no namespace field, so the pool references it
+	// same-namespace.
+	// +optional
+	Service *EndpointPickerService `json:"service,omitempty"`
+}
+
+// EndpointPickerService is an EPP Service and the port agentgateway dials.
+type EndpointPickerService struct {
+	// Name is the EPP Service's name.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Port is the port the EPP Service listens on.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port"`
 }
 
 // ModelRouterStatus reports the observed state of a ModelRouter.

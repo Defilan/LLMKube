@@ -3039,3 +3039,47 @@ func agentGatewayRouteModelOfRule(t *testing.T, rule map[string]interface{}) str
 
 // ensure apierrors import is used (assertNotExists relies on it).
 var _ = apierrors.IsNotFound
+
+// TestModelRouterAgentGateway_EndpointPickerCEL pins the admission shape of the
+// picker fields (#1991): a backend picker must name a service, and the router
+// default must set name and port together or not at all.
+func TestModelRouterAgentGateway_EndpointPickerCEL(t *testing.T) {
+	c, _, stop := startAgentGatewayTestEnv(t, true)
+	defer stop()
+	ns := newTestNamespace(t, c)
+
+	base := func(name string) *inferencev1alpha1.ModelRouter {
+		return &inferencev1alpha1.ModelRouter{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: inferencev1alpha1.ModelRouterSpec{
+				DataPlane:       inferencev1alpha1.ModelRouterDataPlaneAgentGateway,
+				AgentGatewayRef: &inferencev1alpha1.AgentGatewayReference{Name: "ai-gateway"},
+				Backends: []inferencev1alpha1.RouterBackend{{
+					Name:                "a",
+					InferenceServiceRef: corev1LocalRef("a"),
+					EndpointPicker: &inferencev1alpha1.RouterEndpointPicker{
+						Service: &inferencev1alpha1.EndpointPickerService{Name: "a-epp", Port: 9002},
+					},
+				}},
+				DefaultRoute: "a",
+			},
+		}
+	}
+
+	ok := base("ok")
+	if err := c.Create(context.Background(), ok); err != nil {
+		t.Fatalf("a backend picker with no router default must be admitted: %v", err)
+	}
+
+	empty := base("empty-picker")
+	empty.Spec.Backends[0].EndpointPicker = &inferencev1alpha1.RouterEndpointPicker{}
+	if err := c.Create(context.Background(), empty); err == nil || !strings.Contains(err.Error(), "endpointPicker.service is required") {
+		t.Errorf("endpointPicker without service: got %v, want the CEL message", err)
+	}
+
+	half := base("half-default")
+	half.Spec.AgentGatewayRef.EndpointPicker = "epp"
+	if err := c.Create(context.Background(), half); err == nil || !strings.Contains(err.Error(), "set together") {
+		t.Errorf("router default with name but no port: got %v, want the pairing message", err)
+	}
+}
