@@ -19,6 +19,8 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -113,6 +115,28 @@ func stubCacheExec(t *testing.T, answer execFunc, calls *[]execCall) {
 		})
 		return answer(command)
 	}
+}
+
+// captureStderr runs fn with os.Stderr redirected to a pipe and returns what
+// it printed.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		out, _ := io.ReadAll(r)
+		done <- string(out)
+	}()
+	defer func() { os.Stderr = orig }()
+	fn()
+	_ = w.Close()
+	os.Stderr = orig
+	return <-done
 }
 
 // podNames lists the pods in namespace, so a test can assert what was created
@@ -243,14 +267,26 @@ func TestInspectPVCCachePinsInspectorToTheClaimHolderNode(t *testing.T) {
 		return pod
 	}
 
+	tainted := withNode("gpu-serving", corev1.PodRunning, "node-d")
+	tainted.Spec.Tolerations = []corev1.Toleration{{
+		Key: "nvidia.com/gpu", Operator: corev1.TolerationOpEqual, Value: "present",
+		Effect: corev1.TaintEffectNoSchedule,
+	}}
+
 	tests := []struct {
-		name string
-		pods []*corev1.Pod
-		want []string
+		name        string
+		pods        []*corev1.Pod
+		want        []string
+		wantTolerat bool
 	}{{
 		name: "a running holder on node-b",
 		pods: []*corev1.Pod{withNode("serving", corev1.PodRunning, "node-b")},
 		want: []string{"node-b"},
+	}, {
+		name:        "a holder on a tainted node carries its toleration",
+		pods:        []*corev1.Pod{tainted},
+		want:        []string{"node-d"},
+		wantTolerat: true,
 	}, {
 		name: "nothing holds the claim",
 		pods: nil,
@@ -298,6 +334,17 @@ func TestInspectPVCCachePinsInspectorToTheClaimHolderNode(t *testing.T) {
 			}
 			if got := pinnedTo(pod); len(got) != len(tt.want) || (len(got) == 1 && got[0] != tt.want[0]) {
 				t.Errorf("inspector pinned to %v, want %v", got, tt.want)
+			}
+			if tt.wantTolerat {
+				if len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "nvidia.com/gpu" {
+					t.Errorf("inspector tolerations = %v, want the holder's nvidia.com/gpu one",
+						pod.Spec.Tolerations)
+				}
+			}
+			// A pod another run holds is refused by this stamp; unstamped it
+			// would be deleted instead.
+			if stamp := pod.Labels[cachePurgeRunLabel]; stamp == "" {
+				t.Error("inspector pod carries no run stamp, so a concurrent run would take it over")
 			}
 		})
 	}

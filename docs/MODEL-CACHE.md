@@ -659,9 +659,10 @@ Behavior:
   claim, which that pod binds. On a multi-node cluster the pod is pinned to
   the node whose kubelet holds the claim, so a strict RWO serving pod does not
   make it stall on Multi-Attach; a claim nothing holds is not pinned, and the
-  pod is its first consumer. `cache list` needs permission to create, exec
-  into and delete pods in the namespace, and exits nonzero when it cannot read
-  any discovered claim.
+  pod is its first consumer. `cache list` needs permission to list, create,
+  exec into and delete pods in the namespace, and exits nonzero when it cannot
+  read any discovered claim. The inspector copies the holder's tolerations, so
+  a tainted node that runs the claim does not reject it.
 
 ### Per-Service Storage Class
 

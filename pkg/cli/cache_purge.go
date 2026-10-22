@@ -267,9 +267,10 @@ var (
 // the claim at the path the inspector reads it from and the purge writes to.
 func createCacheAccessPod(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
-	kind cacheAccessPodKind, runID, node string,
+	kind cacheAccessPodKind, runID, node string, tolerations []corev1.Toleration,
 ) (string, error) {
-	pod := newCacheAccessPodOnNode(podName, pvcName, kind.component, kind.container, kind.readOnly, runID, node)
+	pod := newCacheAccessPodOnNode(podName, pvcName, kind.component, kind.container, kind.readOnly,
+		runID, node, tolerations)
 	pod.Namespace = namespace
 	if _, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return "", err
@@ -283,7 +284,7 @@ func createPurgePodForPVC(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, runID string,
 ) (string, error) {
 	return createCacheAccessPod(ctx, clientset, namespace, pvcName, purgePodName(pvcName),
-		purgePodKind, runID, "")
+		purgePodKind, runID, "", nil)
 }
 
 // ensurePurgePod returns a running purge pod, creating it when absent.
@@ -297,6 +298,14 @@ func ensurePurgePod(
 		})
 }
 
+// replaceStalePurgePod removes a purge pod an interrupted run left behind and
+// waits for the object to be gone.
+func replaceStalePurgePod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName, runID string,
+) error {
+	return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, purgePodKind, runID)
+}
+
 // ensureCacheAccessPod returns a running pod of kind kind that mounts pvcName,
 // named podName and created by create, creating it when absent.
 //
@@ -307,16 +316,16 @@ func ensureCacheAccessPod(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
 	kind cacheAccessPodKind, runID string, create func(runID string) (string, error),
 ) (string, error) {
+	replace := func() error {
+		return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, kind, runID)
+	}
+	if kind.component == purgePodKind.component {
+		replace = func() error {
+			return replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName, runID)
+		}
+	}
 	_, err := create(runID)
 	if apierrors.IsAlreadyExists(err) {
-		replace := func() error {
-			return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, kind, runID)
-		}
-		if kind.component == purgePodKind.component {
-			replace = func() error {
-				return replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName, runID)
-			}
-		}
 		if err := replace(); err != nil {
 			return "", err
 		}
@@ -331,27 +340,6 @@ func ensureCacheAccessPod(
 		return "", fmt.Errorf("%s pod for PVC %s failed to start: %w", kind.noun, pvcName, err)
 	}
 	return podName, nil
-}
-
-// replaceStalePurgePod removes a purge pod an interrupted run left behind and
-// waits for the object to be gone.
-func replaceStalePurgePod(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName, runID string,
-) error {
-	return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, purgePodKind, runID)
-}
-
-// ensureInspectorPodOn returns a running inspector pod pinned to node, which
-// holds the claim attached.
-func ensureInspectorPodOn(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, node string,
-) (string, error) {
-	return ensureCacheAccessPod(ctx, clientset, namespace, pvcName, inspectorPodName(pvcName),
-		inspectorPodKind, purgeRunID(),
-		func(runID string) (string, error) {
-			return createCacheAccessPod(ctx, clientset, namespace, pvcName, inspectorPodName(pvcName),
-				inspectorPodKind, runID, node)
-		})
 }
 
 // replaceStaleCacheAccessPod removes a pod of kind kind that an interrupted run

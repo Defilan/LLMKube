@@ -18,10 +18,20 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
+	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // The two cache-access pods differ by the access they need: the inspector
@@ -42,8 +52,8 @@ func TestCacheAccessPodKinds(t *testing.T) {
 	}
 
 	clientset := fakeclientset.NewClientset()
-	if _, err := createInspectorPodForPVC(context.Background(), clientset, "test-ns",
-		modelCachePVCName); err != nil {
+	if _, err := createInspectorPodForRun(context.Background(), clientset, "test-ns",
+		modelCachePVCName, purgeRunID(), nil); err != nil {
 		t.Fatalf("create inspector pod: %v", err)
 	}
 	pod, err := clientset.CoreV1().Pods("test-ns").Get(context.Background(),
@@ -57,4 +67,64 @@ func TestCacheAccessPodKinds(t *testing.T) {
 	if pod.Labels[modelCacheLabel] != "cache-inspector" {
 		t.Errorf("inspector component label = %q, want %q", pod.Labels[modelCacheLabel], "cache-inspector")
 	}
+}
+
+// One unreadable claim must not fail a listing that read another: warn on
+// stderr, return the entries that were read, exit 0.
+func TestInspectPVCCacheWarnsAndSkipsOneUnreadableClaim(t *testing.T) {
+	readable, unreadable := cacheClaim(), cacheClaim()
+	readable.Name = "llmkube-model-cache"
+	unreadable.Name = "isvc-a-model-cache"
+
+	k8sClient := fake.NewClientBuilder().WithScheme(cacheListScheme()).
+		WithObjects(readable, unreadable).Build()
+	clientset := fakeclientset.NewClientset()
+	// Refuse only the second claim's pod.
+	clientset.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		for _, vol := range pod.Spec.Volumes {
+			if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == unreadable.Name {
+				return true, nil, errors.New("pods is forbidden")
+			}
+		}
+		return false, nil, nil
+	})
+
+	origExec, origWait, origSleep := purgeExec, purgeWait, purgeSleep
+	t.Cleanup(func() { purgeExec, purgeWait, purgeSleep = origExec, origWait, origSleep })
+	purgeSleep = func(time.Duration) {}
+	purgeWait = func(_ context.Context, _ kubernetes.Interface, _, _ string, _ time.Duration) error {
+		return nil
+	}
+	purgeExec = func(context.Context, *rest.Config, kubernetes.Interface,
+		string, string, string, []string) (string, error) {
+		return "4294967296\t/models/0123456789abcdef/\n", nil
+	}
+
+	stderr := captureStderr(t, func() {
+		entries, err := inspectPVCInfos(context.Background(), &rest.Config{}, k8sClient, clientset,
+			"test-ns", discoveredClaimsFor(t, k8sClient, "test-ns"))
+		if err != nil {
+			t.Fatalf("one readable claim must not fail the listing: %v", err)
+		}
+		if len(entries) != 1 || entries[0].CacheKey != "0123456789abcdef" {
+			t.Errorf("entries = %+v, want the one key the readable claim holds", entries)
+		}
+	})
+	if !strings.Contains(stderr, "skipping cache PVC "+unreadable.Name) {
+		t.Errorf("stderr = %q, want a warning naming %s", stderr, unreadable.Name)
+	}
+	if strings.Contains(stderr, readable.Name) {
+		t.Errorf("stderr = %q, want no warning for the claim that was read", stderr)
+	}
+}
+
+// discoveredClaimsFor returns the cache claims discoverCachePVCs finds.
+func discoveredClaimsFor(t *testing.T, k8sClient client.Client, namespace string) []PVCInfo {
+	t.Helper()
+	infos, err := discoverCachePVCs(context.Background(), k8sClient, namespace)
+	if err != nil {
+		t.Fatalf("discover cache PVCs: %v", err)
+	}
+	return infos
 }

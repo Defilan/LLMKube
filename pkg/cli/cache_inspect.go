@@ -120,6 +120,7 @@ func discoverCachePVCs(ctx context.Context, k8sClient client.Client, namespace s
 	return infos, nil
 }
 
+// inspectPVCCache reads every discovered cache claim.
 func inspectPVCCache(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, namespace string,
 ) ([]PVCCacheEntry, error) {
@@ -130,11 +131,20 @@ func inspectPVCCache(
 	if len(pvcInfos) == 0 {
 		return nil, nil
 	}
-
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create clientset: %w", err)
 	}
+	return inspectPVCInfos(ctx, cfg, k8sClient, clientset, namespace, pvcInfos)
+}
+
+// inspectPVCInfos reads each discovered claim and applies the per-claim
+// policy: skip a claim that cannot be read, and fail only when every claim
+// failed.
+func inspectPVCInfos(
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client,
+	clientset kubernetes.Interface, namespace string, pvcInfos []PVCInfo,
+) ([]PVCCacheEntry, error) {
 
 	// Non-nil even when no per-PVC entries are found: a successful inspection
 	// of an empty (e.g. not-yet-downloaded) cache must still tell runCacheList
@@ -174,23 +184,15 @@ func inspectSinglePVC(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace string, pvcInfo PVCInfo,
 ) ([]PVCCacheEntry, error) {
-	node, err := claimHolderNode(ctx, k8sClient, namespace, pvcInfo.Name)
+	holder, err := claimHolder(ctx, k8sClient, namespace, pvcInfo.Name)
 	if err != nil {
 		return nil, err
-	}
-	if node != "" {
-		podName, err := ensureInspectorPodOn(ctx, clientset, namespace, pvcInfo.Name, node)
-		if err != nil {
-			return nil, err
-		}
-		defer deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
-		return readCacheEntries(ctx, cfg, clientset, namespace, podName, pvcInfo.InferenceService)
 	}
 
 	podName, err := ensureCacheAccessPod(ctx, clientset, namespace, pvcInfo.Name,
 		inspectorPodName(pvcInfo.Name), inspectorPodKind, purgeRunID(),
 		func(runID string) (string, error) {
-			return createInspectorPodForPVC(ctx, clientset, namespace, pvcInfo.Name)
+			return createInspectorPodForRun(ctx, clientset, namespace, pvcInfo.Name, runID, holder)
 		})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create inspector pod for PVC %s: %w", pvcInfo.Name, err)
@@ -199,12 +201,22 @@ func inspectSinglePVC(
 	return readCacheEntries(ctx, cfg, clientset, namespace, podName, pvcInfo.InferenceService)
 }
 
-// createInspectorPodForPVC creates the read-only pod that reads a cache claim.
-func createInspectorPodForPVC(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+// createInspectorPodForRun creates the read-only pod that reads a cache claim,
+// stamped with runID so a concurrent run's pod is refused rather than taken
+// over, and pinned to holder's node and tolerations when holder is set: that
+// is where the claim is attached and what scheduling there needs.
+func createInspectorPodForRun(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, runID string,
+	holder *corev1.Pod,
 ) (string, error) {
+	node, tolerations := "", []corev1.Toleration(nil)
+	if holder != nil {
+		// Copy so a later mutation of the live object cannot reach the pod.
+		node = holder.Spec.NodeName
+		tolerations = append(tolerations, holder.Spec.Tolerations...)
+	}
 	return createCacheAccessPod(ctx, clientset, namespace, pvcName, inspectorPodName(pvcName),
-		inspectorPodKind, "", "")
+		inspectorPodKind, runID, node, tolerations)
 }
 
 // readCacheEntries runs the size listing in the inspector pod and parses it.
@@ -220,14 +232,16 @@ func readCacheEntries(
 	return parseDuOutput(output, isvcName), nil
 }
 
-// claimHolderNode returns the node whose kubelet holds pvcName attached, or ""
-// when nothing runs there. A strict RWO claim a running pod holds cannot be
-// attached a second time, so the inspector has to land on that node; nowhere
-// is known yet, the pod binds the claim itself (WaitForFirstConsumer).
-func claimHolderNode(ctx context.Context, k8sClient client.Client, namespace, pvcName string) (string, error) {
+// claimHolder returns a running pod that mounts pvcName and is scheduled, or
+// nil when nothing holds the claim. A strict RWO claim a running pod holds is
+// attached on that pod's node, so the inspector has to land there, under the
+// same tolerations; with no holder the inspector binds the claim itself
+// (WaitForFirstConsumer). With several holders the first is taken: they share
+// the claim, so any of their nodes has it attached.
+func claimHolder(ctx context.Context, k8sClient client.Client, namespace, pvcName string) (*corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace)); err != nil {
-		return "", fmt.Errorf("failed to list pods: %w", err)
+		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -236,11 +250,11 @@ func claimHolderNode(ctx context.Context, k8sClient client.Client, namespace, pv
 		}
 		for _, vol := range pod.Spec.Volumes {
 			if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == pvcName {
-				return pod.Spec.NodeName, nil
+				return pod, nil
 			}
 		}
 	}
-	return "", nil
+	return nil, nil
 }
 
 // newCacheAccessPodForRun builds the pod and, when runID is set, stamps it
@@ -293,14 +307,16 @@ func newCacheAccessPodForRun(
 	return pod
 }
 
-// newCacheAccessPodOnNode builds the pod pinned to node when one is given: the
-// claim is attached there, so scheduling anywhere else is the Multi-Attach
-// error the pod would stall on.
+// newCacheAccessPodOnNode builds the pod pinned to node, with the tolerations
+// that node needs, when one is given: the claim is attached there, so
+// scheduling anywhere else is the Multi-Attach error the pod would stall on.
 func newCacheAccessPodOnNode(
 	podName, pvcName, component, containerName string, readOnly bool, runID, node string,
+	tolerations []corev1.Toleration,
 ) *corev1.Pod {
 	pod := newCacheAccessPodForRun(podName, pvcName, component, containerName, readOnly, runID)
 	if node != "" {
+		pod.Spec.Tolerations = tolerations
 		pod.Spec.Affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{

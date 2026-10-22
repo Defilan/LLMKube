@@ -557,8 +557,9 @@ the user's responsibility to manage its lifecycle.
 creates and deletes, rather than executing in a pod that happens to mount the
 claim. In the default `shared` mode the controller mounts the shared claim and
 its image has no shell, so borrowing that pod cannot work. The command needs
-your own permission to create and delete pods in the namespace, and
-`pods/exec` for the command it runs. When no discovered claim can be read it
+your own permission to list, create and delete pods in the namespace, and
+`pods/exec` for the command it runs; it copies the mounting pod's tolerations,
+so a tainted node does not reject it. When no discovered claim can be read it
 exits nonzero and says why, instead of reporting an empty or fully active
 cache. On a multi-node cluster the pod is pinned to the node holding the
 claim, so a strict RWO serving pod does not make it stall on Multi-Attach; a
