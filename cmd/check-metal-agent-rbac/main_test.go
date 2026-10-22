@@ -69,7 +69,28 @@ func TestCompareRules(t *testing.T) {
 			got:  manifest[1:],
 			want: manifest,
 			// The chart is the copy that loses the grant.
-			wantSub: "chart rules are missing: apiGroups=[inference.llmkube.dev]",
+			wantSub: `chart rules are missing: apiGroups=["inference.llmkube.dev"]`,
+		},
+		// The core group is the empty string, so a dropped apiGroups on a core
+		// rule must not collapse onto the same key as apiGroups: [""]. Formatting
+		// the key with %v made both print "[]" and the drift passed silently.
+		{
+			name: "chart drops the core-group apiGroups",
+			got: []rbacv1.PolicyRule{
+				manifest[0],
+				{Resources: []string{"secrets"}, Verbs: []string{"get"}},
+			},
+			want:    manifest,
+			wantSub: `chart rules are missing: apiGroups=[""]`,
+		},
+		{
+			name: "chart adds an empty apiGroups where the manifest has the core group",
+			got: []rbacv1.PolicyRule{
+				manifest[0],
+				{APIGroups: []string{}, Resources: []string{"secrets"}, Verbs: []string{"get"}},
+			},
+			want:    manifest,
+			wantSub: `chart rules are missing: apiGroups=[""]`,
 		},
 		{
 			name: "extra rule",

@@ -58,10 +58,11 @@ type render struct {
 	secretPins []string
 }
 
-// renders covers every branch of templates/metal-agent-rbac.yaml that produces
-// a Role or ClusterRole: both scopes, with the Secret read unpinned and pinned.
-// The namespaced renders use two namespaces so a template that ignores the
-// loop fails instead of passing on a single-element list.
+// renders covers both scopes, with the Secret read unpinned and pinned. The
+// namespaced renders use two namespaces so a template that ignores the loop
+// fails instead of passing on a single-element list. serviceAccount.create
+// false is covered by the chart's unit tests, not here: it changes which
+// documents render, not the rules those documents carry.
 var renders = []render{
 	{name: "namespaced", scope: "namespaced", namespaces: []string{"ml", "team-b"}},
 	{name: "cluster", scope: "cluster"},
@@ -371,7 +372,7 @@ func ruleSet(rules []rbacv1.PolicyRule) map[string]bool {
 		resources := sortedCopy(r.Resources)
 		verbs := sortedCopy(r.Verbs)
 		names := sortedCopy(r.ResourceNames)
-		out[fmt.Sprintf("apiGroups=%v resources=%v verbs=%v resourceNames=%v",
+		out[fmt.Sprintf("apiGroups=%q resources=%q verbs=%q resourceNames=%q",
 			groups, resources, verbs, names)] = true
 	}
 	return out
