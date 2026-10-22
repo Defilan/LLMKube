@@ -308,8 +308,9 @@ spec:
                         Resolution selects how a local (inferenceServiceRef) backend's upstream
                         address is resolved. "service" (the default) dispatches to the
                         InferenceService's ClusterIP Service DNS name, so a keep-alive client
-                        can pin to one pod through conntrack. "endpoint" compiles one address
-                        per ready pod and the router-proxy balances requests across them.
+                        can pin to one pod through conntrack. "endpoint" has the router-proxy
+                        track the ready pods behind the Service itself and balance requests
+                        across them.
                         External backends ignore this field.
                       enum:
                       - service
