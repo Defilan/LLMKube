@@ -316,6 +316,9 @@ func ensureCacheAccessPod(
 	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
 	kind cacheAccessPodKind, runID string, create func(runID string) (string, error),
 ) (string, error) {
+	// The two branches reach the same takeover; the purge one keeps
+	// replaceStalePurgePod as the path's entry point rather than a
+	// test-only symbol.
 	replace := func() error {
 		return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, kind, runID)
 	}

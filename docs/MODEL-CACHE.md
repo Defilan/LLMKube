@@ -659,10 +659,10 @@ Behavior:
   claim, which that pod binds. On a multi-node cluster the pod is pinned to
   the node whose kubelet holds the claim, so a strict RWO serving pod does not
   make it stall on Multi-Attach; a claim nothing holds is not pinned, and the
-  pod is its first consumer. `cache list` needs permission to list, create,
-  exec into and delete pods in the namespace, and exits nonzero when it cannot
-  read any discovered claim. The inspector copies the holder's tolerations, so
-  a tainted node that runs the claim does not reject it.
+  pod is its first consumer. `cache list` needs permission to list, get,
+  create, exec into and delete pods in the namespace, and exits nonzero when
+  it cannot read any discovered claim. The inspector copies the holder's
+  tolerations, so a tainted node that runs the claim does not reject it.
 
 ### Per-Service Storage Class
 
@@ -754,9 +754,9 @@ only the claims that can hold that model's files: the
 cache, which is where their pods mount in the default `shared` mode (and the
 only home when the Model has no InferenceService). Two things follow from that:
 
-- It needs your own permission to create and exec into pods in the namespace.
-  On a `restricted`-profile namespace the pod is rejected, the same way
-  `cache list` is.
+- It needs your own permission to list, get, create and delete pods in the
+  namespace, and to exec into the one it creates. On a `restricted`-profile
+  namespace the pod is rejected, the same way `cache list` is.
 - A strict RWO claim that a serving pod still holds cannot be attached a second
   time on another node, so the purge fails with a timeout naming the claim.
   Delete the InferenceService first, then purge.

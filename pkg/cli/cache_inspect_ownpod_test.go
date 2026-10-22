@@ -267,6 +267,11 @@ func TestInspectPVCCachePinsInspectorToTheClaimHolderNode(t *testing.T) {
 		return pod
 	}
 
+	pendingTainted := withNode("pending-gpu", corev1.PodPending, "node-e")
+	pendingTainted.Spec.Tolerations = []corev1.Toleration{{
+		Key: "nvidia.com/gpu", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule,
+	}}
+
 	tainted := withNode("gpu-serving", corev1.PodRunning, "node-d")
 	tainted.Spec.Tolerations = []corev1.Toleration{{
 		Key: "nvidia.com/gpu", Operator: corev1.TolerationOpEqual, Value: "present",
@@ -292,8 +297,28 @@ func TestInspectPVCCachePinsInspectorToTheClaimHolderNode(t *testing.T) {
 		pods: nil,
 		want: nil,
 	}, {
-		name: "a holder that is not running is no holder",
+		name: "a holder still pulling its image holds the claim on its node",
 		pods: []*corev1.Pod{withNode("pending", corev1.PodPending, "node-c")},
+		want: []string{"node-c"},
+	}, {
+		name:        "a pending holder on a tainted node is pinned and tolerated",
+		pods:        []*corev1.Pod{pendingTainted},
+		want:        []string{"node-e"},
+		wantTolerat: true,
+	}, {
+		name: "a holder being deleted is no holder",
+		pods: []*corev1.Pod{func() *corev1.Pod {
+			p := withNode("terminating", corev1.PodRunning, "node-c")
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			// The fake client refuses a deletion timestamp with no finalizer.
+			p.Finalizers = []string{"test/hold"}
+			return p
+		}()},
+		want: nil,
+	}, {
+		name: "a finished pod holds nothing",
+		pods: []*corev1.Pod{withNode("finished", corev1.PodSucceeded, "node-c")},
 		want: nil,
 	}}
 

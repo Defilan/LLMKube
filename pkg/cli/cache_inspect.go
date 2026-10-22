@@ -232,12 +232,13 @@ func readCacheEntries(
 	return parseDuOutput(output, isvcName), nil
 }
 
-// claimHolder returns a running pod that mounts pvcName and is scheduled, or
-// nil when nothing holds the claim. A strict RWO claim a running pod holds is
-// attached on that pod's node, so the inspector has to land there, under the
-// same tolerations; with no holder the inspector binds the claim itself
-// (WaitForFirstConsumer). With several holders the first is taken: they share
-// the claim, so any of their nodes has it attached.
+// claimHolder returns the pod a strict RWO claim is attached for, or nil when
+// nothing holds it: the volume is attached for any assigned pod that has not
+// terminated, including one still pulling its image (the attach/detach
+// controller's rule, not phase Running). The inspector has to land on that
+// pod's node, under the same tolerations; with no holder the inspector binds
+// the claim itself (WaitForFirstConsumer). With several holders the first is
+// taken: they share the claim, so any of their nodes has it attached.
 func claimHolder(ctx context.Context, k8sClient client.Client, namespace, pvcName string) (*corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace)); err != nil {
@@ -245,7 +246,11 @@ func claimHolder(ctx context.Context, k8sClient client.Client, namespace, pvcNam
 	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Status.Phase != corev1.PodRunning || pod.Spec.NodeName == "" {
+		switch pod.Status.Phase {
+		case corev1.PodSucceeded, corev1.PodFailed:
+			continue
+		}
+		if pod.Spec.NodeName == "" || pod.DeletionTimestamp != nil {
 			continue
 		}
 		for _, vol := range pod.Spec.Volumes {
