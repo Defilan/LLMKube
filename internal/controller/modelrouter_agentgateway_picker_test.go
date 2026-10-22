@@ -112,6 +112,22 @@ func TestAgentGatewayResolvePoolPickers(t *testing.T) {
 		wantReason: modelRouterAgentGatewayReasonMultiPool,
 		wantMsg:    `both compile to InferencePool "glm-53"`,
 	}, {
+		// Only the collision check guards this shape: one shared picker and one
+		// computed pool name would otherwise compile, and the second
+		// InferenceService's pool apply would overwrite the first.
+		name: "names that sanitize to one pool, both on the router default",
+		mr: pickerRouter("epp", 9002,
+			pickerBackend("a", "glm.53", "", 0),
+			pickerBackend("b", "glm-53", "", 0)),
+		wantReason: modelRouterAgentGatewayReasonMultiPool,
+		wantMsg:    `both compile to InferencePool "glm-53"`,
+	}, {
+		name: "a backend with no picker inherits its pool's picker over the router default",
+		mr: pickerRouter("epp", 9002,
+			pickerBackend("a", "qwen", "qwen-epp", 9002),
+			pickerBackend("b", "qwen", "", 0)),
+		wantPools: map[string]agentGatewayPicker{"qwen": {"qwen-epp", 9002}},
+	}, {
 		name: "external backends are not counted",
 		mr: func() *inferencev1alpha1.ModelRouter {
 			mr := pickerRouter("epp", 9002, pickerBackend("a", "qwen", "", 0))

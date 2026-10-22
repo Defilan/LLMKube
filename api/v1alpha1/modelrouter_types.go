@@ -247,7 +247,8 @@ type RouterBackend struct {
 
 	// EndpointPicker selects the Endpoint Picker (EPP) that chooses a pod for
 	// this backend's InferencePool on dataPlane: AgentGateway. When unset, the
-	// router-wide spec.agentGatewayRef.endpointPicker applies. A Gateway API
+	// backend uses the picker another backend on the same InferenceService
+	// names, else the router-wide spec.agentGatewayRef.endpointPicker. A Gateway API
 	// Inference Extension EPP binds to exactly one InferencePool, so a router
 	// with backends on several InferenceServices sets a picker per backend.
 	// Ignored by the Proxy and Gateway data planes.

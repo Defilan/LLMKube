@@ -215,11 +215,13 @@ spec:
 
 `agentGatewayRef.endpointPicker` and `endpointPickerPort` remain the router-wide default for any backend without its own picker. The router reports `AgentGatewayReady=False` when:
 
-- two pools would share one picker (`MultipleInferencePoolsUnsupported`), which is what the default does when backends reference more than one `InferenceService`;
+- two pools would share one picker (`MultipleInferencePoolsUnsupported`), which is what the default does when backends reference more than one `InferenceService`; the same reason covers two `InferenceService` names that compile to one pool name, such as `glm.53` and `glm-53`;
 - two backends on the same `InferenceService` name different pickers (`ConflictingEndpointPicker`);
 - a pool has no picker at all (`EndpointPickerRequired`).
 
-The pickers are yours to run; LLMKube references them by Service name and port in the router's namespace.
+The pickers are yours to run; LLMKube references them by Service name and port in the router's namespace. A backend without its own picker uses the picker another backend on the same `InferenceService` names, and only then the router default.
+
+Each `InferencePool` is named after its `InferenceService`, and a router never adopts a pool another router created. When you move from one router per model to one router for several, delete the per-model routers first: until their pools are garbage-collected, the combined router reports `GeneratedResourceNameTaken`.
 
 `primary-fallback` routes each rule to its first healthy backend. When that backend's `InferenceService` has no ready replica, the next reconcile moves the rule to the next backend. Failover follows replica readiness, not individual request errors: a primary that is up but failing requests keeps its traffic.
 

@@ -3217,8 +3217,9 @@ func TestModelRouterAgentGateway_PrimaryFallbackFirstHealthy(t *testing.T) {
 		t.Helper()
 		route := getUnstructuredInNamespace(t, c, gatewayHTTPRouteGVK(), ns, "pf")
 		rules, _, _ := unstructured.NestedSlice(route.Object, "spec", "rules")
-		var names []string
-		for _, ref := range rules[0].(map[string]interface{})["backendRefs"].([]interface{}) {
+		refs := rules[0].(map[string]interface{})["backendRefs"].([]interface{})
+		names := make([]string, 0, len(refs))
+		for _, ref := range refs {
 			names = append(names, ref.(map[string]interface{})["name"].(string))
 		}
 		return names
