@@ -108,6 +108,20 @@ func expectNoStrategy(deployment *appsv1.Deployment) {
 	Expect(deployment.Spec.Strategy.RollingUpdate).To(BeNil())
 }
 
+// busyIdleServer reports every replica as processing, so the drain check
+// defers. Pointing the reconciler at it is how the existing drain-before-roll
+// tests prove a deferral; a pod with no EndpointSlice instead falls through to
+// the Service-URL path, which reports errNoEndpoints rather than busy.
+func busyIdleServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slots" {
+			_, _ = w.Write([]byte(`[{"id":0,"is_processing":true}]`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+}
+
 var _ = Describe("Rollout strategy (#2131)", func() {
 	var reconciler *InferenceServiceReconciler
 
@@ -247,9 +261,10 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 				isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{Strategy: inferencev1alpha1.RolloutStrategyOneAtATime}
 				return isvc
 			}(), func() *inferencev1alpha1.Model {
+				// The declared GPU count stays set, so this entry also pins the
+				// metal case ahead of the GPU-count one in the resolver.
 				model := gpuModelWithCount("m", 1)
 				model.Spec.Hardware.Accelerator = "metal"
-				model.Spec.Hardware.GPU = nil
 				return model
 			}(), rolloutStrategyIgnoredMetalMessage),
 			Entry("multiNode group", func() *inferencev1alpha1.InferenceService {
@@ -264,26 +279,6 @@ var _ = Describe("Rollout strategy (#2131)", func() {
 				return isvc
 			}(), gpuModelWithCount("m", 1), rolloutStrategyIgnoredMultiNodeMessage),
 		)
-	})
-})
-
-// strategyDeltaOnly answers whether a pass changes only the pod-replacement
-// strategy, which is the case the idle gate must not hold (#2131).
-var _ = Describe("strategyDeltaOnly (#2131)", func() {
-	base := &appsv1.Deployment{}
-	base.Spec.Template.Spec.Containers = []corev1.Container{{Name: "server", Image: "a"}}
-
-	It("holds when the pod template differs", func() {
-		desired := base.DeepCopy()
-		desired.Spec.Template.Spec.Containers[0].Image = "b"
-		Expect(strategyDeltaOnly(base, desired)).To(BeFalse())
-	})
-
-	It("does not hold when only the strategy differs", func() {
-		desired := base.DeepCopy()
-		desired.Spec.Strategy = oneAtATimeStrategy()
-		Expect(strategyDeltaOnly(base, desired)).To(BeTrue(),
-			"a strategy-only change replaces no pod, so the idle gate has nothing to protect")
 	})
 })
 
@@ -446,17 +441,50 @@ var _ = Describe("Rollout strategy envtest (#2131)", func() {
 		expectRecreate(reverted)
 	})
 
-	It("holds a template change while the backend reports busy", func() {
-		// The fixture the strategy-only case depends on: a busy backend makes
-		// the reconcile defer a pod-template change and leave the live
-		// Deployment on the old template.
-		busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/slots" {
-				_, _ = w.Write([]byte(`[{"id":0,"is_processing":true}]`))
-				return
-			}
-			w.WriteHeader(http.StatusNotFound)
-		}))
+	It("lands a strategy-only edit while the backend reports busy", func() {
+		// The strategy is not part of the hashed pod template, so on its own it
+		// reports templateChanged=false and the reconcile skips the drain check
+		// entirely (#2131). The busy fixture is what makes the assertion mean
+		// something: with a template change, the same backend defers.
+		busy := busyIdleServer()
+		defer busy.Close()
+
+		name := "strategy-envtest-strategy-only"
+		createModel(name)
+
+		isvc := strategyISVC(name, name, 2)
+		isvc.Spec.RolloutPolicy = &inferencev1alpha1.RolloutPolicySpec{
+			WaitForIdle:        true,
+			IdleTimeoutSeconds: 600,
+		}
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		created = append(created, name)
+
+		reconciler := &InferenceServiceReconciler{
+			Client:             k8sClient,
+			Scheme:             k8sClient.Scheme(),
+			InitContainerImage: "docker.io/curlimages/curl:8.18.0",
+			RolloutIdleBaseURL: busy.URL,
+		}
+		key := types.NamespacedName{Name: name, Namespace: "default"}
+		reconcileOnce(reconciler, name)
+
+		Expect(k8sClient.Get(ctx, key, isvc)).To(Succeed())
+		isvc.Spec.RolloutPolicy.Strategy = inferencev1alpha1.RolloutStrategyOneAtATime
+		Expect(k8sClient.Update(ctx, isvc)).To(Succeed())
+		reconcileOnce(reconciler, name)
+
+		dep := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, key, dep)).To(Succeed())
+		Expect(dep.Spec.Strategy.Type).To(Equal(appsv1.RollingUpdateDeploymentStrategyType),
+			"a strategy-only edit changes no pod, so it must not wait for the backend to go idle")
+	})
+
+	It("still holds a template change and its replicas while the backend reports busy", func() {
+		// A deferred template change holds the whole Deployment spec, replicas
+		// included: the strategy guard that once excused a template-equal pass
+		// is gone, and this pins what remains (#2131).
+		busy := busyIdleServer()
 		defer busy.Close()
 
 		name := "strategy-envtest-idle-gate"

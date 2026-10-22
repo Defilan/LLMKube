@@ -24,6 +24,10 @@
 #     capacity instead of progressing. Use a ReadWriteMany cache with more than
 #     one replica. The operator's perService cache mode does not help: its claim
 #     is also ReadWriteOnce and binds on the first pod's node.
+#   - The replacement pod reports Insufficient nvidia.com/gpu for as long as the
+#     outgoing pod takes to drain, because that pod still holds its GPUs. This
+#     is expected and is not the deadlock OneAtATime avoids: the Deployment
+#     never asks for more pods than replicas.
 #   - progressDeadlineSeconds stays at the Kubernetes default of 600s. A rollout
 #     step longer than that reports ProgressDeadlineExceeded even though the
 #     Deployment controller keeps making progress.

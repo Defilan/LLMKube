@@ -388,17 +388,6 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return finalResult, nil
 }
 
-// strategyDeltaOnly reports whether the only difference between the live
-// Deployment and the desired one is the pod-replacement strategy. The desired
-// template was just compared to the live one, so comparing the two Templates
-// here answers whether the current pass changes any pod. A test exercises this
-// predicate directly; envtest cannot reach the deferral it guards, because a
-// held update leaves the desired template permanently behind the live one and
-// every later pass also carries the held template change.
-func strategyDeltaOnly(live, desired *appsv1.Deployment) bool {
-	return apiequality.Semantic.DeepEqual(live.Spec.Template, desired.Spec.Template)
-}
-
 // earliestPositive merges the requeue timers Reconcile collects without
 // allowing a zero timer (which means "no requeue") to win a plain minimum.
 func earliestPositive(values ...time.Duration) time.Duration {
@@ -1196,17 +1185,19 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 			log.Error(err, "Failed to reconcile rollout policy")
 			return nil, replicaCounts{}, nil, nil, err
 		}
-		if rollResult.RequeueAfter > 0 && !strategyDeltaOnly(existingDeployment, deployment) {
+		if rollResult.RequeueAfter > 0 {
 			// Rollout deferred until idle: hold the pod-template Update so the
 			// live Deployment keeps serving the old template, but fall through
 			// to Service/HPA/status by returning without a result. The
 			// RolloutDeferred=True condition (set by reconcileRolloutPolicy)
 			// drives a requeue in Reconcile.
-			// A strategy-only change is not held: the idle gate protects the
-			// pods the rollout replaces, and this change replaces none. Holding
-			// it would also strand the setting behind a busy backend, so the
-			// service would report RolloutDeferred for a reason that has
-			// nothing to do with it (#2131).
+			//
+			// A change that only sets rolloutPolicy.strategy never reaches
+			// here: the strategy is not part of the hashed pod template, so on
+			// its own it reports templateChanged=false and lands below without a
+			// drain check (#2131). This branch therefore only ever holds a real
+			// pod-template change, and it keeps holding the whole Deployment
+			// spec with it, replicas included.
 			return existingDeployment, replicaCounts{
 				Ready:    existingDeployment.Status.ReadyReplicas,
 				Observed: existingDeployment.Status.Replicas,

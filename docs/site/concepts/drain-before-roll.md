@@ -65,7 +65,7 @@ The rollout waits until **every** reachable replica reports idle. If even one is
 
 ## Pod replacement strategy
 
-`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate. A deferred `waitForIdle` rollout does not hold a change that only sets `strategy`, because such a change replaces no pod; it lands on the Deployment at the next reconcile.
+`waitForIdle` decides *when* a rollout starts. `rolloutPolicy.strategy` decides *how* the pods are replaced, and the two are independent: setting `strategy` alone does not turn on the idle gate. The strategy is not part of the hashed pod template, so changing only `strategy` is not a template change and lands while a backend is busy. The exception is a service already holding a deferred template change: that held update carries the new strategy with it when it eventually applies.
 
 | Workload | Default | With `strategy: OneAtATime` |
 |---|---|---|
@@ -93,7 +93,7 @@ Before opting in, check four things:
 - **Mixed versions during the window.** A rollout that changes the model (a `ModelPool` move, a changed `modelRef`) serves the old and the new version side by side until every replica is replaced. For a template change the old version cannot serve, keep `Recreate`.
 - **Replica count.** `Recreate` on a single replica and `OneAtATime` on a single replica both replace the only pod, so the strategy only avoids downtime from `replicas: 2` up.
 
-While a replacement is Pending on `Insufficient nvidia.com/gpu`, the service reports `Progressing`, not `WaitingForGPU`: the replicas still serving mean it is mid-rollout, not queued for GPU.
+While a replacement is Pending on `Insufficient nvidia.com/gpu`, the service reports `Progressing`, not `WaitingForGPU`: the replicas still serving mean it is mid-rollout, not queued for GPU. That Pending state is normal during a one-at-a-time rollout. The outgoing pod still holds its GPUs until it finishes draining, so the replacement cannot schedule until then; it is not the #192 deadlock, which only appears when the Deployment expects a pod beyond `spec.replicas`.
 
 ## Fail-closed semantics
 

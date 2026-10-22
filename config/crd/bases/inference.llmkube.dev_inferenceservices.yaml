@@ -5005,8 +5005,11 @@ spec:
                       runs no Deployment, and a multiNode group runs none either. A replica whose
                       replacement cannot attach a ReadWriteOnce model cache waits Pending until
                       the old pod releases it, so a shared RWO cache stalls the rollout at
-                      reduced capacity; use a ReadWriteMany cache. A deferred waitForIdle
-                      rollout does not hold a change that only sets this field.
+                      reduced capacity; use a ReadWriteMany cache. A replacement pod reports
+                      Insufficient nvidia.com/gpu while the outgoing pod drains; that is
+                      expected, not the #192 deadlock. Changing only this field needs no drain
+                      and lands while a backend is busy, unless a pod-template change is
+                      already deferred, in which case the held update carries it.
                     enum:
                     - Recreate
                     - OneAtATime
