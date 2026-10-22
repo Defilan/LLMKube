@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -154,6 +155,15 @@ func main() {
 	}
 
 	proxy := router.NewProxy(cfg, logger, proxyOpts...)
+
+	// Endpoint-resolution backends: the proxy tracks their pods itself, so pod
+	// churn never redeploys it. A watch that cannot start or sync leaves
+	// dispatch on each backend's Service address.
+	if watcher := newEndpointWatcher(cfg, proxy, logger); watcher != nil {
+		go watcher.Start(baseCtx)
+		logger.Info("endpoint watch started")
+	}
+
 	mux := http.NewServeMux()
 	proxy.Mount(mux)
 
@@ -254,6 +264,27 @@ func newLogger(format string) *slog.Logger {
 	default:
 		return slog.New(slog.NewJSONHandler(os.Stdout, opts))
 	}
+}
+
+// newEndpointWatcher builds the EndpointSlice watcher when the config has an
+// EndpointSource backend, or returns nil. A client that cannot be built is
+// logged, not fatal: dispatch then uses each backend's Service address.
+func newEndpointWatcher(cfg *router.Config, proxy *router.Proxy, logger *slog.Logger) *router.EndpointWatcher {
+	probe := router.NewEndpointWatcher(nil, cfg, proxy.Dispatcher(), routerNameFromEnv(), logger)
+	if !probe.HasSources() {
+		return nil
+	}
+	restCfg, err := ctrl.GetConfig()
+	if err != nil {
+		logger.Error("endpoint watch: no Kubernetes config; dispatching to Service addresses", "error", err)
+		return nil
+	}
+	cs, err := kubernetes.NewForConfig(restCfg)
+	if err != nil {
+		logger.Error("endpoint watch: build client; dispatching to Service addresses", "error", err)
+		return nil
+	}
+	return router.NewEndpointWatcher(cs, cfg, proxy.Dispatcher(), routerNameFromEnv(), logger)
 }
 
 // newActivator builds the ModelPool Activator backed by an in-cluster

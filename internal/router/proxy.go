@@ -66,6 +66,10 @@ func WithDispatcherOptions(opts ...DispatcherOption) ProxyOption {
 	}
 }
 
+// Dispatcher returns the proxy's dispatcher, so the endpoint watcher can feed
+// it live endpoint sets.
+func (p *Proxy) Dispatcher() *Dispatcher { return p.disp }
+
 // WithRouterName sets the router name used in metric labels and OTel
 // span attributes. Defaults to "default" when omitted.
 func WithRouterName(name string) ProxyOption {
