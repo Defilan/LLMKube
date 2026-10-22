@@ -36,6 +36,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
+	"github.com/defilantech/llmkube/internal/router"
 )
 
 // AnnotationDesiredTemplateHash stores a SHA-256 hash of the desired pod template
@@ -114,21 +115,14 @@ func resolveIdlePort(isvc *inferencev1alpha1.InferenceService, backend RuntimeBa
 
 // collectReadyReplicaURLs builds a list of "http://<addr>:<port>" URLs from
 // the ready endpoints in the given EndpointSliceList. Per Kubernetes convention,
-// an endpoint with Conditions.Ready == nil is treated as ready.
+// an endpoint with Conditions.Ready == nil is treated as ready. It delegates to
+// router.ReadyEndpointURLs so the proxy applies the same rule.
 func collectReadyReplicaURLs(slices *discoveryv1.EndpointSliceList, port int32) []string {
-	var urls []string
+	ptrs := make([]*discoveryv1.EndpointSlice, 0, len(slices.Items))
 	for i := range slices.Items {
-		for j := range slices.Items[i].Endpoints {
-			ep := &slices.Items[i].Endpoints[j]
-			if ep.Conditions.Ready != nil && !*ep.Conditions.Ready {
-				continue
-			}
-			for _, addr := range ep.Addresses {
-				urls = append(urls, fmt.Sprintf("http://%s:%d", addr, port))
-			}
-		}
+		ptrs = append(ptrs, &slices.Items[i])
 	}
-	return urls
+	return router.ReadyEndpointURLs(ptrs, port)
 }
 
 // collectNotReadyReplicaURLs builds a list of "http://<addr>:<port>" URLs from
