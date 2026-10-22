@@ -234,6 +234,10 @@ var _ = Describe("InferenceService Service ownership (#2086)", func() {
 			controller := true
 			foreign := foreignISVCService(name)
 			foreign.Labels[inferencev1alpha1.LabelManagedBy] = inferencev1alpha1.ManagedByMetalAgent
+			// Both labels the agent writes, so the consent branch can match
+			// this object; with only managed-by, swapping that branch below the
+			// controller-reference branch leaves this spec green.
+			foreign.Labels["llmkube.ai/inference-service"] = name
 			foreign.OwnerReferences = []metav1.OwnerReference{{
 				APIVersion: inferencev1alpha1.GroupVersion.String(),
 				Kind:       "InferenceService",
