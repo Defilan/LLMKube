@@ -105,8 +105,12 @@ func newCacheListCommand() *cobra.Command {
 		Long: `List all models in the persistent cache.
 
 Shows cache entries with their size, status, and which Model resources
-are using each cache entry. Inspects the actual PVC contents to detect
-orphaned cache entries that have no corresponding Model resource.`,
+are using each cache entry. Each cache claim is read through a short-lived
+read-only pod the command creates and deletes, so it works even when the
+only other pod mounting the claim cannot run a shell. The command fails
+when no discovered claim can be read, rather than reporting the cache as
+empty; a claim that cannot be read while others can is skipped with a
+warning.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCacheList(namespace, allNamespaces, orphanedOnly)
 		},
@@ -228,8 +232,9 @@ func runCacheList(namespace string, allNamespaces bool, orphanedOnly bool) error
 	if !allNamespaces {
 		pvcEntries, err := inspectPVCCache(ctx, cfg, k8sClient, namespace)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not inspect PVC contents: %v\n", err)
-		} else if pvcEntries != nil {
+			return fmt.Errorf("cannot read the model cache: %w", err)
+		}
+		if pvcEntries != nil {
 			pvcInspected = true
 			for _, pe := range pvcEntries {
 				if entry, exists := cacheEntries[pe.CacheKey]; exists {

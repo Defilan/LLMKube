@@ -171,8 +171,11 @@ func TestNewPurgePod(t *testing.T) {
 func TestEnsurePurgePod_ReplacesStale(t *testing.T) {
 	pvcName := "llmkube-model-cache"
 	podName := purgePodName(pvcName)
-	stale := newCacheAccessPod(podName, pvcName, cachePurgeComponent, "purge", false)
+	stale := newCacheAccessPodForRun(podName, pvcName, cachePurgeComponent, "purge", false, "")
 	stale.Namespace = "default"
+	// A pod with no stamp (no run label) is the interrupted-run case, which
+	// purgePodAbandoned reads as abandoned (#2140 refactor: behavior preserved).
+	stale.CreationTimestamp = metav1.NewTime(time.Now().Add(-11 * time.Minute))
 	clientset := fakeclientset.NewClientset(stale)
 
 	// The delete is asynchronous on a real API server: the pod keeps its name
@@ -243,6 +246,16 @@ func TestEnsurePurgePod_RefusesForeignPod(t *testing.T) {
 		},
 	}
 	clientset := fakeclientset.NewClientset(foreign)
+
+	// No pod can start in the fake, so the wait is stubbed to whatever the
+	// guard lets through: without the guard this test must fail on the
+	// refusal, not hang.
+	origWait, origSleep := purgeWait, purgeSleep
+	t.Cleanup(func() { purgeWait, purgeSleep = origWait, origSleep })
+	purgeSleep = func(time.Duration) {}
+	purgeWait = func(_ context.Context, _ kubernetes.Interface, _, _ string, _ time.Duration) error {
+		return nil
+	}
 
 	_, err := ensurePurgePod(context.Background(), clientset, "default", pvcName)
 	if err == nil {

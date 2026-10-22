@@ -654,8 +654,15 @@ Behavior:
 - `llmkube cache list` discovers the shared cache and operator-managed
   per-service cache PVCs. A user-managed `spec.modelCache.claimName` PVC is
   outside the operator's cache label/discovery contract and may not appear in
-  the listing. Cache inspection may need a running pod or a transient inspector
-  pod for Pending `WaitForFirstConsumer` claims.
+  the listing. Each claim is read through a short-lived read-only pod the
+  command creates and deletes, including a Pending `WaitForFirstConsumer`
+  claim, which that pod binds. On a multi-node cluster the pod is pinned to
+  the node whose kubelet holds the claim, so a strict RWO serving pod does not
+  make it stall on Multi-Attach; a claim nothing holds is not pinned, and the
+  pod is its first consumer. `cache list` needs permission to list, get,
+  create, exec into and delete pods in the namespace, and exits nonzero when
+  it cannot read any discovered claim. The inspector copies the holder's
+  tolerations, so a tainted node that runs the claim does not reject it.
 
 ### Per-Service Storage Class
 
@@ -747,12 +754,12 @@ only the claims that can hold that model's files: the
 cache, which is where their pods mount in the default `shared` mode (and the
 only home when the Model has no InferenceService). Two things follow from that:
 
-- It needs your own permission to create and exec into pods in the namespace.
-  On a `restricted`-profile namespace the pod is rejected, the same way
-  `cache list` is.
-- A strict RWO claim that a serving pod still holds cannot be double-attached,
-  so the purge fails with a timeout naming the claim. Delete the
-  InferenceService first, then purge.
+- It needs your own permission to get, create and delete pods in the
+  namespace, and to exec into the one it creates. On a `restricted`-profile
+  namespace the pod is rejected, the same way `cache list` is.
+- A strict RWO claim that a serving pod still holds cannot be attached a second
+  time on another node, so the purge fails with a timeout naming the claim.
+  Delete the InferenceService first, then purge.
 
 The namespace-wide modes remove only directories named like a cache key (16 hex
 characters). `--model` and `delete --purge-cache` validate the key as a single

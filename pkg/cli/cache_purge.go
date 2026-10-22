@@ -37,7 +37,9 @@ import (
 )
 
 const (
-	cachePurgePodPrefix = "llmkube-cache-purge-"
+	cachePurgePodPrefix     = "llmkube-cache-purge-"
+	cacheInspectorPodPrefix = "llmkube-cache-inspector-"
+	// cachePurgeComponent is the purge pod's component label.
 	cachePurgeComponent = "cache-purge"
 	managedByLabel      = "app.kubernetes.io/managed-by"
 	managedByValue      = "llmkube-cli"
@@ -51,6 +53,10 @@ const (
 	cacheKeySegmentPattern = `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`
 )
 
+// Both cache-access paths, the purge and the inspector, create their pod,
+// wait for it and exec in it through these seams, so a unit test drives
+// either without a cluster.
+//
 // Test seams: the unit tests have no cluster to exec in or wait on.
 var (
 	purgeExec  = execInPod
@@ -219,20 +225,52 @@ func purgeKey(model *inferencev1alpha1.Model, modelName string) (string, error) 
 	return key, nil
 }
 
+// cacheAccessPodKind names one of the two short-lived pods the CLI creates to
+// reach a model cache claim: the purge pod, which writes, and the inspector
+// pod, which only reads.
+type cacheAccessPodKind struct {
+	// noun names the pod in the messages a refusal produces.
+	noun      string
+	component string
+	container string
+	readOnly  bool
+}
+
 // purgePodName returns the deterministic purge pod name for a claim. The hash
-// keeps it unique per claim and DNS-1123 safe, as inspectorPodName does for the
-// inspector.
+// keeps it unique per claim and DNS-1123 safe (cachekey.Compute is a 16-char
+// hex digest).
 func purgePodName(pvcName string) string {
 	return cachePurgePodPrefix + cachekey.Compute(pvcName)
 }
 
-// createPurgePodForPVC creates the pod that removes entries from a cache claim.
-// It mounts the claim read-write at the same path the inspector reads it from.
-func createPurgePodForPVC(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, runID string,
+// inspectorPodName returns the deterministic inspector pod name for a claim.
+func inspectorPodName(pvcName string) string {
+	return cacheInspectorPodPrefix + cachekey.Compute(pvcName)
+}
+
+var (
+	purgePodKind = cacheAccessPodKind{
+		noun:      "purge",
+		component: cachePurgeComponent,
+		container: "purge",
+		readOnly:  false,
+	}
+	inspectorPodKind = cacheAccessPodKind{
+		noun:      "inspector",
+		component: "cache-inspector",
+		container: "inspector",
+		readOnly:  true,
+	}
+)
+
+// createCacheAccessPod creates the pod that mounts a cache claim. It mounts
+// the claim at the path the inspector reads it from and the purge writes to.
+func createCacheAccessPod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
+	kind cacheAccessPodKind, runID, node string, tolerations []corev1.Toleration,
 ) (string, error) {
-	podName := purgePodName(pvcName)
-	pod := newCacheAccessPodForRun(podName, pvcName, cachePurgeComponent, "purge", false, runID)
+	pod := newCacheAccessPodOnNode(podName, pvcName, kind.component, kind.container, kind.readOnly,
+		runID, node, tolerations)
 	pod.Namespace = namespace
 	if _, err := clientset.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
 		return "", err
@@ -240,61 +278,101 @@ func createPurgePodForPVC(
 	return podName, nil
 }
 
+// createPurgePodForPVC creates the pod that removes entries from a cache
+// claim, mounting it read-write.
+func createPurgePodForPVC(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, runID string,
+) (string, error) {
+	return createCacheAccessPod(ctx, clientset, namespace, pvcName, purgePodName(pvcName),
+		purgePodKind, runID, "", nil)
+}
+
 // ensurePurgePod returns a running purge pod, creating it when absent.
+func ensurePurgePod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+) (string, error) {
+	return ensureCacheAccessPod(ctx, clientset, namespace, pvcName, purgePodName(pvcName),
+		purgePodKind, purgeRunID(),
+		func(runID string) (string, error) {
+			return createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
+		})
+}
+
+// replaceStalePurgePod removes a purge pod an interrupted run left behind and
+// waits for the object to be gone.
+func replaceStalePurgePod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName, runID string,
+) error {
+	return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, purgePodKind, runID)
+}
+
+// ensureCacheAccessPod returns a running pod of kind kind that mounts pvcName,
+// named podName and created by create, creating it when absent.
 //
 // The pod is ours to replace only when it carries both the managed-by and
 // component labels; an unlabelled or foreign pod at that name is an error
 // rather than something to delete.
-func ensurePurgePod(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+func ensureCacheAccessPod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
+	kind cacheAccessPodKind, runID string, create func(runID string) (string, error),
 ) (string, error) {
-	podName := purgePodName(pvcName)
-	runID := purgeRunID()
-	_, err := createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
+	// The two branches reach the same takeover; the purge one keeps
+	// replaceStalePurgePod as the path's entry point rather than a
+	// test-only symbol.
+	replace := func() error {
+		return replaceStaleCacheAccessPod(ctx, clientset, namespace, pvcName, podName, kind, runID)
+	}
+	if kind.component == purgePodKind.component {
+		replace = func() error {
+			return replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName, runID)
+		}
+	}
+	_, err := create(runID)
 	if apierrors.IsAlreadyExists(err) {
-		if err := replaceStalePurgePod(ctx, clientset, namespace, pvcName, podName, runID); err != nil {
+		if err := replace(); err != nil {
 			return "", err
 		}
-		_, err = createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
+		_, err = create(runID)
 	}
 	if err != nil {
-		return "", fmt.Errorf("failed to create purge pod for PVC %s: %w", pvcName, err)
+		return "", fmt.Errorf("failed to create %s pod for PVC %s: %w", kind.noun, pvcName, err)
 	}
 
 	if err := purgeWait(ctx, clientset, namespace, podName, 120*time.Second); err != nil {
 		deleteCacheAccessPod(context.Background(), clientset, namespace, podName)
-		return "", fmt.Errorf("purge pod for PVC %s failed to start: %w", pvcName, err)
+		return "", fmt.Errorf("%s pod for PVC %s failed to start: %w", kind.noun, pvcName, err)
 	}
 	return podName, nil
 }
 
-// replaceStalePurgePod removes a pod an interrupted run left behind and waits
-// for the object to be gone.
+// replaceStaleCacheAccessPod removes a pod of kind kind that an interrupted run
+// left behind and waits for the object to be gone.
 //
 // The delete is asynchronous: recreating the pod while the API server still
 // holds the old one fails with AlreadyExists and the name stays occupied until
 // the kubelet confirms termination, so a unit-test-speed retry is not enough.
-// Only a stale llmkube purge pod is removed: an unlabelled pod at that name,
-// or one another live invocation stamped, is an error.
-func replaceStalePurgePod(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName, runID string,
+// Only a stale llmkube pod of this kind is removed: an unlabelled pod at that
+// name, or one another live invocation stamped, is an error.
+func replaceStaleCacheAccessPod(
+	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName, podName string,
+	kind cacheAccessPodKind, runID string,
 ) error {
 	existing, err := clientset.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("failed to read existing purge pod %s: %w", podName, err)
+		return fmt.Errorf("failed to read existing %s pod %s: %w", kind.noun, podName, err)
 	}
 	if existing.Labels[managedByLabel] != managedByValue ||
-		existing.Labels[modelCacheLabel] != cachePurgeComponent {
-		return fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache purge pod", podName)
+		existing.Labels[modelCacheLabel] != kind.component {
+		return fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache %s pod", podName, kind.noun)
 	}
 	// A pod stamped by a live run is in use: it waits at that claim and is
 	// deleted when the run ends. Only a pod from a run that never cleaned up
 	// (no stamp at all) or this run's own leftover is replaced.
 	if stamp := existing.Labels[cachePurgeRunLabel]; stamp != "" && stamp != runID && !purgePodAbandoned(existing) {
-		return fmt.Errorf("refusing to delete pod %s: another llmkube cache purge run is using it", podName)
+		return fmt.Errorf("refusing to delete pod %s: another llmkube cache %s run is using it", podName, kind.noun)
 	}
 	deleteCacheAccessPod(ctx, clientset, namespace, podName)
 
@@ -305,14 +383,14 @@ func replaceStalePurgePod(
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("failed to read terminating purge pod %s: %w", podName, err)
+			return fmt.Errorf("failed to read terminating %s pod %s: %w", kind.noun, podName, err)
 		}
 		// A terminating pod keeps its name until the kubelet acks the delete.
 		if pod.DeletionTimestamp != nil && time.Now().After(deadline) {
-			return fmt.Errorf("purge pod %s for PVC %s is still terminating after 30s", podName, pvcName)
+			return fmt.Errorf("%s pod %s for PVC %s is still terminating after 30s", kind.noun, podName, pvcName)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("purge pod %s for PVC %s was not deleted within 30s", podName, pvcName)
+			return fmt.Errorf("%s pod %s for PVC %s was not deleted within 30s", kind.noun, podName, pvcName)
 		}
 		purgeSleep(time.Second)
 	}
