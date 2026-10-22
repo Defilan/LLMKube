@@ -355,6 +355,9 @@ are downloaded from. Other sources need explicit paths.
 - The expansion is recorded in `status.stagedFiles` when the Model reconciles
   a new generation. Files added upstream later are not picked up until the
   spec changes.
+- `status.size` is the total of the staged files when the listing carries every
+  staged file's size, the probed size for a remote GGUF or `s3://` source, and
+  otherwise empty. An empty size means unknown, not zero.
 - A pattern matches within one directory (`*.safetensors` does not match
   `sub/x.safetensors`; write `sub/*.safetensors`).
 - A failed listing fails the Model with reason `RepoListingFailed` and the

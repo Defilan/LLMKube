@@ -559,7 +559,10 @@ type ModelStatus struct {
 	// +optional
 	Phase string `json:"phase,omitempty"`
 
-	// Size represents the size of the downloaded model file
+	// Size is a human-readable byte count such as "190.4 GiB": the downloaded
+	// file, the cache entry, the probed remote GGUF, or the total of the staged
+	// files when spec.files expands against a repository listing. Empty when the
+	// controller could not measure the source.
 	// +optional
 	Size string `json:"size,omitempty"`
 

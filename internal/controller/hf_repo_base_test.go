@@ -168,6 +168,10 @@ func TestReconcileRuntimeResolved_BareRepoIDListsFromMirror(t *testing.T) {
 	if got := strings.Join(stored.Status.StagedFiles, " "); stored.Status.Phase != PhaseReady || got != want {
 		t.Errorf("phase = %q, stagedFiles = %q; want Ready and %q (conditions=%+v)", stored.Status.Phase, got, want, stored.Status.Conditions)
 	}
+	// 997,914,508 bytes summed from the recorded tree response (#2121).
+	if stored.Status.Size != "951.7 MiB" {
+		t.Errorf("status.size = %q, want %q (the staged total)", stored.Status.Size, "951.7 MiB")
+	}
 }
 
 // A glob in spec.files no longer turns prefetch off (#2136): the prefetch path
@@ -376,5 +380,30 @@ func TestReconcile_TrailingSlashRepoSource(t *testing.T) {
 				t.Errorf("listing requested %v; want the canonical path %q", gotPaths, wantPath)
 			}
 		})
+	}
+}
+
+// #2121: a runtime-resolved Model with nothing to list or probe has no
+// measured size, so status.size stays empty. A literal "0" reads as a real
+// measurement to every consumer.
+func TestReconcile_RuntimeResolvedRepoIDSizeUnset(t *testing.T) {
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "tiny", Namespace: "default", Generation: 1},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source: "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+		},
+	}
+	r := newMultiFileGateReconciler(t, model)
+	if _, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: "tiny", Namespace: "default"},
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	stored := getModel(t, r, "tiny")
+	if stored.Status.Phase != PhaseReady {
+		t.Fatalf("phase = %q, want Ready; conditions=%+v", stored.Status.Phase, stored.Status.Conditions)
+	}
+	if stored.Status.Size != "" {
+		t.Errorf("status.size = %q, want it unset for a Model the controller never sized", stored.Status.Size)
 	}
 }

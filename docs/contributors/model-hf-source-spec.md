@@ -60,7 +60,7 @@ The new method should:
 - Set `model.Status.Phase = PhaseReady`
 - Set `model.Status.Path = ""` (intentionally empty — runtime uses `Spec.Source` directly)
 - Set `model.Status.CacheKey = ""` (not cached by the operator)
-- Set `model.Status.Size = "0"` (field is a string)
+- Set `model.Status.Size = ""` (a string; empty when nothing measured the source, never a placeholder `"0"`; the multi-file path sets the staged total, see `model-cache.md`)
 - Set a `Ready` condition with reason like `RuntimeResolved` and a message like `"Source is runtime-resolved (e.g., HuggingFace repo ID); runtime will fetch at startup"`
 - Emit a `ModelStatus` metric with a new status value (`runtime-resolved`) or reuse `ready`
 - Return `ctrl.Result{}` (no requeue)

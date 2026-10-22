@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -93,13 +94,14 @@ func hfTreeURL(base, repo, escapedRev string) string {
 	return base + "/api/models/" + repo + "/tree/" + escapedRev + "?recursive=true"
 }
 
-// listHFRepoFiles returns every file path in the repository treeURL lists,
-// sorted, following the tree API's Link pagination. A page link must stay on
-// the listing's origin, since the bearer token rides on every page request.
-func listHFRepoFiles(ctx context.Context, client *http.Client, treeURL, token string) ([]string, error) {
+// listHFRepoFiles returns every file entry in the repository treeURL lists,
+// sorted by path, following the tree API's Link pagination. A page link must
+// stay on the listing's origin, since the bearer token rides on every page
+// request.
+func listHFRepoFiles(ctx context.Context, client *http.Client, treeURL, token string) ([]hfTreeEntry, error) {
 	ctx, cancel := context.WithTimeout(ctx, hfListingTimeout)
 	defer cancel()
-	files := []string{}
+	files := []hfTreeEntry{}
 	next := treeURL
 	for page := 0; next != ""; page++ {
 		if page == maxHFListingPages {
@@ -114,18 +116,76 @@ func listHFRepoFiles(ctx context.Context, client *http.Client, treeURL, token st
 		}
 		for _, e := range entries {
 			if e.Type == "file" {
-				files = append(files, e.Path)
+				files = append(files, e)
 			}
 		}
 		next = link
 	}
-	sort.Strings(files)
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return files, nil
 }
 
+// hfFilePaths returns the paths of the listed entries, or nil for no listing.
+// The nil is load-bearing: ResolveFileSet reads an empty list as "the listing
+// matched nothing" and a nil as "this source has no listing at all".
+func hfFilePaths(entries []hfTreeEntry) []string {
+	if entries == nil {
+		return nil
+	}
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		paths = append(paths, e.Path)
+	}
+	return paths
+}
+
+// hfTotalSize returns the summed size of files, and false when this listing
+// cannot size them. All or nothing on purpose: a partial total understates
+// what staging writes, and the metal agent admits a process from this number
+// before it starts, so a low total is worse than none.
+func hfTotalSize(entries []hfTreeEntry, files []string) (int64, bool) {
+	if len(files) == 0 || len(entries) == 0 {
+		return 0, false
+	}
+	sizes := make(map[string]int64, len(entries))
+	for _, e := range entries {
+		sizes[e.Path] = int64(e.Size)
+	}
+	var total int64
+	for _, f := range files {
+		size, ok := sizes[f]
+		if !ok || size <= 0 {
+			return 0, false
+		}
+		if total > math.MaxInt64-size {
+			return 0, false
+		}
+		total += size
+	}
+	return total, true
+}
+
 type hfTreeEntry struct {
-	Type string `json:"type"`
-	Path string `json:"path"`
+	Type string     `json:"type"`
+	Path string     `json:"path"`
+	Size hfTreeSize `json:"size"`
+}
+
+// hfTreeSize decodes the tree API's per-file size. A value the listing cannot
+// read as a positive byte count is unknown, not an error: the size is extra
+// information here, and failing the page would turn a listing that used to
+// expand globs into RepoListingFailed.
+type hfTreeSize int64
+
+func (s *hfTreeSize) UnmarshalJSON(b []byte) error {
+	raw := strings.Trim(string(b), `"`)
+	var n int64
+	if _, err := fmt.Sscan(raw, &n); err != nil || n < 1 {
+		*s = 0
+		return nil
+	}
+	*s = hfTreeSize(n)
+	return nil
 }
 
 func fetchHFTreePage(ctx context.Context, client *http.Client, pageURL, token string) ([]hfTreeEntry, string, error) {
@@ -204,7 +264,7 @@ func linkRelIsNext(params string) bool {
 // repoFileListing lists the Model's source repository when spec.files holds a
 // glob, and returns nil when no glob needs one. A source with no listing also
 // returns nil, leaving ResolveFileSet to reject the glob.
-func (r *ModelReconciler) repoFileListing(ctx context.Context, model *inferencev1alpha1.Model) ([]string, error) {
+func (r *ModelReconciler) repoFileListing(ctx context.Context, model *inferencev1alpha1.Model) ([]hfTreeEntry, error) {
 	if !filesHaveGlob(model.Spec.Files) {
 		return nil, nil
 	}

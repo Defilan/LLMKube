@@ -1340,7 +1340,8 @@ var _ = Describe("Runtime-Resolved Source Reconcile", func() {
 		Expect(updated.Status.Phase).To(Equal(PhaseReady))
 		Expect(updated.Status.Path).To(BeEmpty())
 		Expect(updated.Status.CacheKey).To(BeEmpty())
-		Expect(updated.Status.Size).To(Equal("0"))
+		// Nothing lists or probes this source, so the size is unknown (#2121).
+		Expect(updated.Status.Size).To(BeEmpty())
 		Expect(updated.Status.LastUpdated).NotTo(BeNil())
 
 		// Verify Available condition with RuntimeResolved reason
@@ -1475,6 +1476,9 @@ var _ = Describe("Multi-File Staging Reconcile", func() {
 			"MTP/gemma-4-31B-it-Q8_0-MTP.gguf",
 			"mmproj-F16.gguf",
 		}))
+		// Explicit paths need no listing, so nothing sized the staged set
+		// (#2121).
+		Expect(updated.Status.Size).To(BeEmpty())
 
 		var hasRuntimeResolved bool
 		for _, cond := range updated.Status.Conditions {
@@ -2460,7 +2464,7 @@ var _ = Describe("Model Controller remote GGUF metadata (#728, Task 2)", func() 
 		// never connected: no GGUF metadata, no size, zero requests served.
 		Expect(updated.Status.Phase).To(Equal(PhaseReady))
 		Expect(updated.Status.GGUF).To(BeNil(), "guard must prevent the remote metadata read")
-		Expect(updated.Status.Size).To(Equal("0"))
+		Expect(updated.Status.Size).To(BeEmpty(), "a blocked probe measures nothing, so the size stays unknown")
 		Expect(hits).To(Equal(0), "the SSRF guard must block the connection at dial time")
 	})
 })
@@ -2555,7 +2559,9 @@ var _ = Describe("Model spec.source re-resolve", func() {
 		// file, so the only way to observe the invalidation is the nil that
 		// a stale resolve would have left as the old file's metadata.
 		Expect(updated.Status.GGUF).To(BeNil(), "GGUF metadata from the previous source must not survive a spec change")
-		Expect(updated.Status.Size).To(Equal("0"))
+		// /b.gguf is not a GGUF file, so the probe measures nothing and the old
+		// source's size must not survive either (#2121).
+		Expect(updated.Status.Size).To(BeEmpty())
 		Expect(updated.Status.SourceETag).To(BeEmpty(), "the fingerprint baseline must be reset so the next revalidation re-baselines")
 
 		// The Available condition must reflect the generation that re-resolved,
