@@ -231,7 +231,7 @@ func TestEnsurePurgePod_ReplacesStale(t *testing.T) {
 	var cmds [][]string
 	fakePurgeExec(t, func(command []string) (string, error) { return "", nil }, &cmds)
 
-	got, err := ensurePurgePod(context.Background(), purgeTestClient(), clientset, "default", pvcName)
+	got, err := ensurePurgePod(context.Background(), purgeTestClient(), clientset, "default", purgeTarget{Name: pvcName})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestEnsurePurgePod_RefusesForeignPod(t *testing.T) {
 		return nil
 	}
 
-	_, err := ensurePurgePod(context.Background(), purgeTestClient(), clientset, "default", pvcName)
+	_, err := ensurePurgePod(context.Background(), purgeTestClient(), clientset, "default", purgeTarget{Name: pvcName})
 	if err == nil {
 		t.Fatal("expected an error for a foreign pod at the purge pod name")
 	}
@@ -356,7 +356,7 @@ func TestPurgeCacheKeys_CreatesAndCleansUp(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	outcome, err := purgeCacheKeys(context.Background(), nilRESTConfig, purgeTestClient(), clientset,
-		"default", "llmkube-model-cache", []string{"deadbeef01234567"})
+		"default", purgeTarget{Name: "llmkube-model-cache"}, []string{"deadbeef01234567"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -377,7 +377,7 @@ func TestPurgeCacheKeys_RejectsTraversal(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	_, err := purgeCacheKeys(context.Background(), nilRESTConfig, purgeTestClient(), clientset,
-		"default", "llmkube-model-cache", []string{"../etc/passwd"})
+		"default", purgeTarget{Name: "llmkube-model-cache"}, []string{"../etc/passwd"})
 	if err == nil {
 		t.Fatal("expected an error for a key that is not one path segment")
 	}
@@ -397,7 +397,7 @@ func TestPurgeCacheKeys_Absent(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	outcome, err := purgeCacheKeys(context.Background(), nilRESTConfig, purgeTestClient(), clientset,
-		"default", "llmkube-model-cache", []string{"deadbeef01234567"})
+		"default", purgeTarget{Name: "llmkube-model-cache"}, []string{"deadbeef01234567"})
 	if err != nil {
 		t.Fatalf("an absent entry must not be an error: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestPurgeOrphanedEntries(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	outcome, err := purgeOrphanedEntries(context.Background(), nilRESTConfig, purgeTestClient(), clientset,
-		"default", "llmkube-model-cache", map[string]bool{"0123456789abcdef": true})
+		"default", purgeTarget{Name: "llmkube-model-cache"}, map[string]bool{"0123456789abcdef": true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestPurgeAllEntries_OperatorClaim(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	if _, err := purgeAllEntries(context.Background(), nilRESTConfig, purgeTestClient(), clientset,
-		"default", "llmkube-model-cache"); err != nil {
+		"default", purgeTarget{Name: "llmkube-model-cache"}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -481,7 +481,7 @@ func TestPurgeAllEntries_UserClaim(t *testing.T) {
 	clientset := fakeclientset.NewClientset()
 
 	outcome, err := purgeAllEntries(context.Background(), nilRESTConfig, purgeTestClient(), clientset,
-		"default", "user-claim")
+		"default", purgeTarget{Name: "user-claim", UserOwned: true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

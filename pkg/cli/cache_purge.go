@@ -111,6 +111,9 @@ type purgeTarget struct {
 	Name             string
 	UserOwned        bool
 	InferenceService string
+	// SinglePod is claimSinglePod of the claim as resolution read it, the one
+	// read that happens before a caller's own delete can collect the claim.
+	SinglePod bool
 }
 
 // targetedClaims narrows the claims in a namespace to the ones that can hold
@@ -215,23 +218,6 @@ func perServiceCacheClaimName(isvcName string) string {
 	return isvcName + "-model-cache"
 }
 
-// stagedPurgeClaims resolves the claims `delete --purge-cache --name` acts on
-// from state read before its deletes, and records their access modes then: the
-// InferenceService delete may collect the claim (a perService claim is
-// owner-ref'd to it), and the purge must still know what mode it had.
-func stagedPurgeClaims(
-	ctx context.Context, k8sClient client.Client, namespace, name, modelClaim string,
-	stagedClaims []string, targets []purgeTarget, svcs []inferencev1alpha1.InferenceService,
-) []purgeTarget {
-	targets = targetedClaims(targets, svcs, name, modelClaim, stagedClaims)
-	claims := make([]string, len(targets))
-	for i, target := range targets {
-		claims[i] = target.Name
-	}
-	snapshotSecondMountClaims(ctx, k8sClient, namespace, claims)
-	return targets
-}
-
 // purgeKey returns the key `cache clear --model` removes for a model, or an
 // error when the model has none.
 func purgeKey(model *inferencev1alpha1.Model, modelName string) (string, error) {
@@ -309,16 +295,22 @@ func createPurgePodForPVC(
 // cannot be mounted a second time while a pod holds it.
 func ensurePurgePod(
 	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace, pvcName string,
+	namespace string, target purgeTarget,
 ) (string, error) {
 	runID := purgeRunID()
-	if err := purgeSecondMountBlocker(ctx, k8sClient, namespace, pvcName, runID); err != nil {
+	pods := &corev1.PodList{}
+	if err := k8sClient.List(ctx, pods, client.InNamespace(namespace)); err != nil {
+		// No pod list means no evidence of a holder, and base did not look.
+		pods = &corev1.PodList{}
+	}
+	if err := secondMountBlocker(claimHolder(pods.Items, target.Name), target.Name,
+		purgePodName(target.Name), purgePodKind, runID, target.SinglePod); err != nil {
 		return "", err
 	}
-	return ensureCacheAccessPod(ctx, clientset, namespace, pvcName, purgePodName(pvcName),
+	return ensureCacheAccessPod(ctx, clientset, namespace, target.Name, purgePodName(target.Name),
 		purgePodKind, runID,
 		func(runID string) (string, error) {
-			return createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
+			return createPurgePodForPVC(ctx, clientset, namespace, target.Name, runID)
 		})
 }
 
@@ -438,10 +430,10 @@ func purgePodAbandoned(pod *corev1.Pod) bool {
 // mounts the claim read-only and may have no shell at all, and a strict RWO
 // claim cannot be double-attached while that pod runs.
 func withPurgePod(
-	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface, namespace, pvcName string,
-	fn func(ctx context.Context, podName string) error,
+	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
+	namespace string, target purgeTarget, fn func(ctx context.Context, podName string) error,
 ) error {
-	podName, err := ensurePurgePod(ctx, k8sClient, clientset, namespace, pvcName)
+	podName, err := ensurePurgePod(ctx, k8sClient, clientset, namespace, target)
 	if err != nil {
 		return err
 	}
@@ -542,10 +534,10 @@ func verifyCachePathsGone(
 // purgeListed removes what choose selects from the claim's cache directories.
 func purgeListed(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace, pvcName string, choose func(entries []string) (del, skip []string),
+	namespace string, target purgeTarget, choose func(entries []string) (del, skip []string),
 ) (purgeOutcome, error) {
-	outcome := purgeOutcome{PVC: pvcName}
-	err := withPurgePod(ctx, k8sClient, clientset, namespace, pvcName,
+	outcome := purgeOutcome{PVC: target.Name}
+	err := withPurgePod(ctx, k8sClient, clientset, namespace, target,
 		func(ctx context.Context, podName string) error {
 			entries, err := listCacheDirs(ctx, cfg, clientset, namespace, podName)
 			if err != nil {
@@ -571,11 +563,11 @@ func purgeListed(
 // validated before a pod is created.
 func purgeCacheKeys(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace, pvcName string, keys []string,
+	namespace string, target purgeTarget, keys []string,
 ) (purgeOutcome, error) {
 	for _, key := range keys {
 		if err := validateCacheKey(key); err != nil {
-			return purgeOutcome{PVC: pvcName}, err
+			return purgeOutcome{PVC: target.Name}, err
 		}
 	}
 
@@ -584,8 +576,8 @@ func purgeCacheKeys(
 		paths[i] = defaultModelMountPath + "/" + key
 	}
 
-	outcome := purgeOutcome{PVC: pvcName}
-	err := withPurgePod(ctx, k8sClient, clientset, namespace, pvcName,
+	outcome := purgeOutcome{PVC: target.Name}
+	err := withPurgePod(ctx, k8sClient, clientset, namespace, target,
 		func(ctx context.Context, podName string) error {
 			removed, absent, err := deleteCachePaths(ctx, cfg, clientset, namespace, podName, paths)
 			outcome.Removed = removed
@@ -602,9 +594,9 @@ func purgeCacheKeys(
 // name with a quote or a space cannot be passed to the pod's shell safely.
 func purgeAllEntries(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace, pvcName string,
+	namespace string, target purgeTarget,
 ) (purgeOutcome, error) {
-	return purgeListed(ctx, cfg, k8sClient, clientset, namespace, pvcName,
+	return purgeListed(ctx, cfg, k8sClient, clientset, namespace, target,
 		func(entries []string) (del, skip []string) {
 			for _, name := range entries {
 				if !cacheKeyDirRe.MatchString(name) {
@@ -621,9 +613,9 @@ func purgeAllEntries(
 // Model references.
 func purgeOrphanedEntries(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace, pvcName string, active map[string]bool,
+	namespace string, target purgeTarget, active map[string]bool,
 ) (purgeOutcome, error) {
-	return purgeListed(ctx, cfg, k8sClient, clientset, namespace, pvcName,
+	return purgeListed(ctx, cfg, k8sClient, clientset, namespace, target,
 		func(entries []string) (del, skip []string) {
 			for _, name := range entries {
 				if !cacheKeyDirRe.MatchString(name) {
@@ -782,6 +774,7 @@ func resolvePurgeTargets(
 				Name:             name,
 				UserOwned:        userOwned[name],
 				InferenceService: ownedBy[name],
+				SinglePod:        claimSinglePod(pvc),
 			})
 			continue
 		case apierrors.IsNotFound(err):

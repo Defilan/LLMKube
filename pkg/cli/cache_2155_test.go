@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -453,7 +454,6 @@ func TestDeletePurgeRefusesAHeldReadWriteOncePodClaim(t *testing.T) {
 		t.Fatalf("create InferenceService: %v", err)
 	}
 	// Another command in this process must not answer for this run's claims.
-	forgetSecondMountSnapshot()
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
 	err := runDeleteCommandFor2155(t, "a-model", env.namespace)
@@ -488,12 +488,12 @@ func TestCacheListReplacesItsOwnStaleInspectorOnAReadWriteOncePodClaim(t *testin
 }
 
 // Parity: a claim that cannot be read tells nothing about its access mode, and
-// an unpinned strict claim stalls on Multi-Attach, so base's pin is kept.
+// an unpinned strict claim stalls on Multi-Attach, so base's pin is kept. The
+// claim is shareable, which is the only shape that discriminates: read, it
+// would leave the inspector unpinned, so a pin can only come from the
+// unknown-mode fallback.
 func TestCacheListKeepsTheBasePinWhenTheClaimReadIsRefused(t *testing.T) {
-	// No snapshot by a caller's own delete: the mode comes from this read.
-	forgetSecondMountSnapshot()
-
-	pvc := dynamicClaim(corev1.ReadWriteOnce)
+	pvc := dynamicClaim(corev1.ReadWriteMany)
 	holder := mountedPod("serving")
 	c := fake.NewClientBuilder().WithScheme(cacheListScheme()).
 		WithObjects(pvc, holder).Build()
@@ -501,17 +501,67 @@ func TestCacheListKeepsTheBasePinWhenTheClaimReadIsRefused(t *testing.T) {
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
 	// A claim read the caller may not make, as a namespace-scoped user without
-	// RBAC on persistentvolumeclaims gets.
-	forbidClaimGet = true
-	t.Cleanup(func() { forbidClaimGet = false })
-
-	if _, err := inspectPVCInfos(context.Background(), nilRESTConfig, c,
-		clientset, "test-ns", []PVCInfo{{Name: modelCachePVCName}}); err != nil {
+	// RBAC on persistentvolumeclaims gets. The client is injected, so no
+	// production seam has to exist for the read to fail.
+	if _, err := inspectPVCInfos(context.Background(), nilRESTConfig,
+		refusingClaimClient{Client: c}, clientset, "test-ns",
+		[]PVCInfo{{Name: modelCachePVCName}}); err != nil {
 		t.Fatalf("inspectPVCInfos against a refusing claim read: %v", err)
 	}
 	pod := getCreatedPod(t, clientset, "test-ns", inspectorPodName(modelCachePVCName))
 	if got := pinnedTo(pod); len(got) != 1 || got[0] != "node-b" {
 		t.Errorf("inspector pinned to %v, want [node-b]: the access mode is unknown", got)
+	}
+}
+
+// refusingClaimClient fails every claim read.
+type refusingClaimClient struct {
+	client.Client
+}
+
+func (r refusingClaimClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object,
+	opts ...client.GetOption,
+) error {
+	if _, ok := obj.(*corev1.PersistentVolumeClaim); ok {
+		return apierrors.NewForbidden(corev1.Resource("persistentvolumeclaims"), key.Name,
+			errString("User cannot get resource persistentvolumeclaims"))
+	}
+	return r.Client.Get(ctx, key, obj, opts...)
+}
+
+// The purge refuses a ReadWriteOncePod claim from the mode its target carries,
+// which is what resolution read before the caller's own delete could collect
+// the claim.
+func TestPurgeRefusesAReadWriteOncePodClaimFromItsResolvedTarget(t *testing.T) {
+	pvc := dynamicClaim(corev1.ReadWriteOncePod)
+	pvc.Namespace = "test-ns"
+	c := fake.NewClientBuilder().WithScheme(cacheListEnvScheme()).
+		WithObjects(pvc, mountedPod("serving")).Build()
+	clientset := fakeclientset.NewClientset()
+	var cmds [][]string
+	fakePurgeExec(t, func([]string) (string, error) { return "", nil }, &cmds)
+
+	targets, _, err := resolvePurgeTargets(context.Background(), c, "test-ns")
+	if err != nil {
+		t.Fatalf("resolvePurgeTargets: %v", err)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("targets = %+v, want the one cache claim", targets)
+	}
+	// The claim is gone by purge time, as a claim a delete collected is: only
+	// the mode carried on the target can answer.
+	if err := c.Delete(context.Background(), pvc); err != nil {
+		t.Fatalf("delete the claim: %v", err)
+	}
+
+	if _, err := purgeCacheKeys(context.Background(), nilRESTConfig, c, clientset,
+		"test-ns", targets[0], []string{"deadbeef01234567"}); err == nil {
+		t.Fatal("purge succeeded; want the ReadWriteOncePod refusal")
+	} else if !strings.Contains(err.Error(), "ReadWriteOncePod") {
+		t.Errorf("error = %q, want it to name the access mode", err)
+	}
+	if podExists(t, clientset, "test-ns", purgePodName(modelCachePVCName)) {
+		t.Error("a purge pod was created for a claim it cannot mount")
 	}
 }
 
@@ -593,17 +643,8 @@ func TestCacheAccessPodShapeThroughTheCommand(t *testing.T) {
 	}
 }
 
-// Seams this change introduces, declared here so the file compiles on base,
-// where production never reads them.
-var (
-	// forbidClaimGet makes every cache-claim read fail, as a namespace-scoped
-	// caller without RBAC on persistentvolumeclaims gets.
-	forbidClaimGet bool
-)
-
 // runDeleteCommandFor2155 executes delete with --purge-cache.
 func runDeleteCommandFor2155(t *testing.T, name, namespace string) error {
-	t.Helper()
 	t.Helper()
 	cmd := NewDeleteCommand()
 	cmd.SetArgs([]string{name, "--purge-cache", "-n", namespace})
@@ -613,7 +654,3 @@ func runDeleteCommandFor2155(t *testing.T, name, namespace string) error {
 	cmd.SetErr(io.Discard)
 	return cmd.Execute()
 }
-
-// forgetSecondMountSnapshot is test-cleanup only: base keeps no snapshot, so
-// there is nothing to drop and the file compiles on both trees.
-func forgetSecondMountSnapshot() {}
