@@ -6374,9 +6374,10 @@ spec:
                       ReasoningParser selects the reasoning-content parser, e.g. glm45, glm47,
                       deepseek_v4. Maps to vLLM --reasoning-parser, which vLLM validates
                       against its registry: the value must exist in the image you run or the
-                      server refuses to start with "invalid reasoning parser". Not an enum for the same
-                      reason as ToolCallParser. Emitted alone; vLLM has no paired flag. A
-                      parser already set in spec.extraArgs wins.
+                      server refuses to start with "invalid reasoning parser". Not an enum for
+                      the same reason as ToolCallParser (41 at the pinned v0.25.1). Emitted
+                      alone; vLLM has no paired flag. A parser already set in spec.extraArgs
+                      wins.
                     type: string
                   speculative:
                     description: |-
@@ -6475,10 +6476,10 @@ spec:
                       vLLM ignores a parser unless auto tool choice is on, so a request with
                       tool_choice: auto fails with "requires --enable-auto-tool-choice and
                       --tool-call-parser". Not an enum because vLLM registers parsers every
-                      release (43 at v0.25.1), so the value must exist in the image you run or
-                      vLLM refuses to start with "invalid tool call parser". A parser already
-                      set in spec.extraArgs wins, and the pairing's two flags are each skipped
-                      independently when already in spec.extraArgs.
+                      release (42 at the pinned v0.25.1), so the value must exist in the image
+                      you run or vLLM refuses to start with "invalid tool call parser". A parser
+                      already set in spec.extraArgs wins, and the pairing's two flags are each
+                      skipped independently when already in spec.extraArgs.
                     type: string
                 type: object
             required:
