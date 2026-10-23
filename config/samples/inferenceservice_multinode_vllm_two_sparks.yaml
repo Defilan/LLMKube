@@ -7,6 +7,11 @@
 # The fabric block is per member on purpose: the same cable has a different
 # NIC and HCA name at each end. rdmaResource is the RDMA shared device plugin's
 # extended resource; it adds CAP_IPC_LOCK so NCCL can pin memory.
+#
+# The parser triple in extraArgs below (--reasoning-parser, --tool-call-parser,
+# --enable-auto-tool-choice) has a typed form that passes the auto-tool-choice
+# flag itself: vllmConfig.reasoningParser and vllmConfig.toolCallParser. This
+# spec keeps the measured extraArgs form, which still works; extraArgs lands last.
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService
 metadata:

@@ -60,7 +60,9 @@ parallel across the whole group.
 
 `toolCallParser` and `reasoningParser` are free-form values from the vLLM
 image's parser registry. Setting `toolCallParser` also passes
-`--enable-auto-tool-choice`, because vLLM ignores a parser without it.
+`--enable-auto-tool-choice`, because vLLM ignores a parser without it. The two
+names are picked independently: GLM-5.3 runs `toolCallParser: glm47` with
+`reasoningParser: glm45`, matching the parsers its model card names.
 
 ## Why fabric settings are per member
 
