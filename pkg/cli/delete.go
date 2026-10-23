@@ -20,9 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/spf13/cobra"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -201,15 +201,25 @@ func runDelete(opts *deleteOptions) error {
 // servingPodsOf reports whether a pod belongs to name, the InferenceService
 // this run deleted: its cascade is asynchronous, so its serving pod can still
 // be mounting the claim when the purge looks.
-func servingPodsOf(name string) func(*corev1.Pod) bool {
-	return func(pod *corev1.Pod) bool {
-		if owner := metav1.GetControllerOf(pod); owner != nil && owner.Kind == "ReplicaSet" && owner.Name != "" {
-			if strings.HasPrefix(owner.Name, name+"-") {
-				return true
+//
+// The proof is the owner chain: the pod's controller ReplicaSet, and that
+// ReplicaSet's controller, must both reach name. A ReplicaSet whose name merely
+// starts with name and a hyphen is not proof, because a service called
+// "<name>-v2" owns those.
+func servingPodsOf(ctx context.Context, k8sClient client.Client, namespace, name string) func(*corev1.Pod) bool {
+	owned := map[string]bool{}
+	sets := &appsv1.ReplicaSetList{}
+	if err := k8sClient.List(ctx, sets, client.InNamespace(namespace)); err == nil {
+		for i := range sets.Items {
+			set := &sets.Items[i]
+			if owner := metav1.GetControllerOf(set); owner != nil && owner.Kind == "InferenceService" && owner.Name == name {
+				owned[set.Name] = true
 			}
 		}
-		return pod.Labels["app.kubernetes.io/instance"] == name ||
-			pod.Labels["app"] == name
+	}
+	return func(pod *corev1.Pod) bool {
+		owner := metav1.GetControllerOf(pod)
+		return owner != nil && owner.Kind == "ReplicaSet" && owned[owner.Name]
 	}
 }
 
@@ -223,11 +233,12 @@ func purgeDeleteTargets(
 		return fmt.Errorf("no model cache PVC found")
 	}
 
+	releasing := servingPodsOf(ctx, k8sClient, namespace, deletedService)
 	var errs []error
 	var outcomes []purgeOutcome
 	for _, target := range targets {
 		outcome, err := purgeCacheKeysReleasing(ctx, cfg, k8sClient, clientset, namespace, target,
-			servingPodsOf(deletedService), []string{cacheKey})
+			releasing, []string{cacheKey})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cache PVC %s: %w", target.Name, err))
 			continue
