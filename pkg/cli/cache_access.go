@@ -129,12 +129,20 @@ func secondMountBlocker(holder *corev1.Pod, pvcName, ownPod string,
 	if holder.Name == ownPod {
 		return nil
 	}
-	// Any llmkube cache-access pod this run may replace, of either kind: a
-	// leaked inspector and a leaked purge pod are both removed by the run that
-	// needs the claim, so refusing leaves the user a message that names a pod
-	// llmkube would delete.
-	if isCacheAccessPod(holder) && !cacheAccessPodInUse(holder, runID) {
+	// A cache pod of this kind is deleted at this pod's deterministic name, so
+	// the run that needs the claim replaces it.
+	if cacheAccessPodOurs(holder, kind) && !cacheAccessPodInUse(holder, runID) {
 		return nil
+	}
+	if isCacheAccessPod(holder) && !cacheAccessPodInUse(holder, runID) {
+		// A leftover of the other kind sits at a name no run deletes, so no
+		// run will free the claim: say so instead of waiting out the start
+		// timeout on a pod that cannot mount.
+		return fmt.Errorf("claim %s is ReadWriteOncePod and pod %q holds it; "+
+			"only one pod can mount a ReadWriteOncePod claim, so the %s pod cannot start. "+
+			"That pod is a leftover llmkube cache pod, not a serving pod, so nothing will "+
+			"remove it; delete it and retry, or use a ReadWriteOnce or ReadWriteMany claim",
+			pvcName, holder.Name, kind.noun)
 	}
 	return fmt.Errorf("claim %s is ReadWriteOncePod and pod %q holds it; "+
 		"only one pod can mount a ReadWriteOncePod claim, so the %s pod cannot start. "+

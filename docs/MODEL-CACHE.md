@@ -830,8 +830,10 @@ owner chain: the ReplicaSet that owns the pod, and the Deployment that owns
 that ReplicaSet, must reach the service being deleted. For that check `cache
 clear` and `delete --purge-cache` need `list pods`, and `delete --purge-cache`
 also needs `get replicasets`; without either it falls back to the old wait,
-while `cache list` reports the pod-list failure as it always has. `cache
-list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
+while `cache list` reports the pod-list failure as it always has. A cache pod
+llmkube itself left behind at the name the command does not use is named as
+such: no run will free that claim, so the message says to delete the pod.
+`cache list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
 claim: a `ReadWriteMany` or `ReadOnlyMany` claim is never pinned.
 
 `cache clear` with no flag and `cache clear --orphaned` act on the claims
