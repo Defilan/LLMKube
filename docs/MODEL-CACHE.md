@@ -753,9 +753,12 @@ on any node, so `cache list`, `cache clear` and `delete --purge-cache` refuse
 it at once, naming the access mode and the holding pod, instead of waiting for
 a pod that can never start. A pod that is already being deleted releases the
 claim, so it is waited for, not refused, and so is the serving pod `delete
---purge-cache` itself is tearing down. For that check `cache clear` and
-`delete --purge-cache` need `list pods`; without it they fall back to the old
-wait, while `cache list` reports the pod-list failure as it always has. `cache
+--purge-cache` itself is tearing down, which it recognises from the pod's
+owner chain: the ReplicaSet that owns the pod, and the Deployment that owns
+that ReplicaSet, must reach the service being deleted. For that check `cache
+clear` and `delete --purge-cache` need `list pods`, and `delete --purge-cache`
+also needs `get replicasets`; without either it falls back to the old wait,
+while `cache list` reports the pod-list failure as it always has. `cache
 list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
 claim: a `ReadWriteMany` or `ReadOnlyMany` claim is never pinned.
 

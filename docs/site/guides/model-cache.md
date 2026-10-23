@@ -574,9 +574,12 @@ holds is not pinned either: the pod is its first consumer. A
 time on any node, so the command fails at once and names the mode and the
 holding pod instead of waiting for a pod that can never start; a pod that is
 already being deleted releases the claim, so it is waited for, as is the
-serving pod `delete --purge-cache` is tearing down. The check lists pods in the
-namespace, so `cache clear` and `delete --purge-cache` need `list pods` for it;
-without that permission they fall back to the old wait.
+serving pod `delete --purge-cache` is tearing down, recognised by the owner
+chain: the ReplicaSet that owns the pod and the Deployment that owns that
+ReplicaSet must reach the service being deleted. The check lists pods in the
+namespace, so `cache clear` and `delete --purge-cache` need `list pods` for it,
+and `delete --purge-cache` also needs `get replicasets`; without them the
+command falls back to the old wait.
 `--all-namespaces` does not inspect claims and creates no pod.
 
 Both short-lived pods run `busybox:1.37.0`. On a cluster that cannot pull it,
