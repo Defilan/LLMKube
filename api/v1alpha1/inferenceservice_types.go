@@ -483,8 +483,8 @@ type InferenceServiceSpec struct {
 	Suspend bool `json:"suspend,omitempty"`
 
 	// RevisionHistoryLimit caps how many old ReplicaSets the inference
-	// Deployment keeps for rollback. Unset uses the Kubernetes default (10);
-	// 0 keeps none.
+	// Deployment keeps for rollback. Unset keeps 3 old ReplicaSets; 0 keeps
+	// none.
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty"`

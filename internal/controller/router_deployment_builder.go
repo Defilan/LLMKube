@@ -99,7 +99,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	image := r.routerProxyImage()
 	var resources corev1.ResourceRequirements
 	var imagePullSecrets []corev1.LocalObjectReference
-	var revisionHistoryLimit *int32
+	var revisionHistoryLimit *int32 // nil: use the default
 	var nodeSelector map[string]string
 	var tolerations []corev1.Toleration
 
@@ -157,7 +157,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas:             &replicas,
-			RevisionHistoryLimit: revisionHistoryLimit,
+			RevisionHistoryLimit: revisionHistoryLimitOrDefault(revisionHistoryLimit),
 			Selector:             &metav1.LabelSelector{MatchLabels: podLabels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{

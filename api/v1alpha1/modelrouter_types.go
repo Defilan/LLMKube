@@ -699,7 +699,7 @@ type RouterProxySpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// RevisionHistoryLimit caps how many old ReplicaSets the proxy Deployment
-	// keeps for rollback. Unset uses the Kubernetes default (10); 0 keeps none.
+	// keeps for rollback. Unset keeps 3 old ReplicaSets; 0 keeps none.
 	// Useful to bound ReplicaSet buildup, since the proxy re-rolls on every
 	// config change.
 	// +kubebuilder:validation:Minimum=0
