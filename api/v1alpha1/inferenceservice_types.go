@@ -2065,7 +2065,9 @@ type SGLangConfig struct {
 	// GLM stops at glm45: SGLang has no glm47 reasoning detector, and
 	// --reasoning-parser rejects a value outside its choices at startup. The
 	// enum lists the values LLMKube supports, not every key in SGLang's
-	// detector map; pass another through spec.extraArgs.
+	// detector map; an unsupported value goes in spec.extraArgs, and the field
+	// must then be cleared because SGLang does not suppress a typed parser the
+	// way the vLLM fields do.
 	// +kubebuilder:validation:Enum=qwen3;deepseek-r1;glm45
 	// +optional
 	ReasoningParser string `json:"reasoningParser,omitempty"`

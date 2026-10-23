@@ -72,9 +72,11 @@ func TestVLLMBuildArgs(t *testing.T) {
 		// exactlyOnce is a list of flags that must appear exactly once, so an
 		// extraArgs duplicate is caught.
 		exactlyOnce []string
-		model       *inferencev1alpha1.Model
-		name        string
-		spec        *inferencev1alpha1.InferenceServiceSpec
+		// exactArgs, when set, is the complete argv the case must produce.
+		exactArgs []string
+		model     *inferencev1alpha1.Model
+		name      string
+		spec      *inferencev1alpha1.InferenceServiceSpec
 	}{
 		{
 			model: model,
@@ -602,6 +604,12 @@ func TestVLLMBuildArgs(t *testing.T) {
 			contains:    []FlagCheck{{"--tool-call-parser", "hermes"}, {"--enable-auto-tool-choice", ""}},
 			notContains: []string{"glm47"},
 			exactlyOnce: []string{"--tool-call-parser", "--enable-auto-tool-choice"},
+			// The whole argv, so "adds nothing" means a byte-for-byte match and
+			// not merely the absence of one string.
+			exactArgs: []string{
+				"/models/test", "--port", "8000", "--host", "::",
+				"--tool-call-parser", "hermes", "--enable-auto-tool-choice",
+			},
 		},
 		{
 			model: model,
@@ -650,6 +658,9 @@ func TestVLLMBuildArgs(t *testing.T) {
 				if n := countFlagAnyForm(args, f); n != 1 {
 					t.Errorf("expected %q exactly once, got %d in args: %v", f, n, args)
 				}
+			}
+			if tc.exactArgs != nil && !reflect.DeepEqual(args, tc.exactArgs) {
+				t.Errorf("expected argv %v, got %v", tc.exactArgs, args)
 			}
 		})
 	}
