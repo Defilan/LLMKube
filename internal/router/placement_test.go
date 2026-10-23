@@ -18,7 +18,6 @@ package router
 
 import (
 	"fmt"
-	"math/rand/v2"
 	"net/http"
 	"testing"
 	"time"
@@ -101,8 +100,10 @@ func TestPlaceSessionAgreesAcrossReplicasUnderLoad(t *testing.T) {
 	headers := []string{"x-session-affinity"}
 	d1, b1, eps := balancedDispatcher(headers, 8, clock)
 	d2, b2, _ := balancedDispatcher(headers, 8, clock)
-	shuffled := append([]string(nil), eps...)
-	rand.New(rand.NewPCG(1, 2)).Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+	shuffled := make([]string, 0, len(eps))
+	for _, i := range []int{5, 2, 7, 0, 6, 3, 1, 4} {
+		shuffled = append(shuffled, eps[i])
+	}
 	d2.SetEndpoints("qwen", shuffled)
 	// Unequal, non-idle loads; the first pod runs hot enough to spill its
 	// sessions while the others keep theirs.
