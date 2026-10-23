@@ -1798,7 +1798,7 @@ func TestCompileRouterConfigBalancing(t *testing.T) {
 			t.Fatal(err)
 		}
 		bal := cfg.Backends[0].Balancing
-		if bal == nil || bal.Mode != router.BalancingLoadAware || bal.MaxLoadPercent != 150 ||
+		if bal == nil || bal.Mode != router.BalancingLoadAware ||
 			len(bal.SessionHeaders) != 2 || bal.SessionHeaders[1] != "x-openwebui-chat-id" {
 			t.Errorf("runtime %q: balancing = %+v", tc.runtime, bal)
 		}

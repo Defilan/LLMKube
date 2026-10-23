@@ -708,7 +708,6 @@ func (r *ModelRouterReconciler) compileBalancing(ctx context.Context, namespace,
 	out := &router.Balancing{Mode: b.Mode}
 	if sa := b.SessionAffinity; sa != nil {
 		out.SessionHeaders = append([]string(nil), sa.Headers...)
-		out.MaxLoadPercent = sa.MaxLoadPercent
 	}
 	if out.Mode != router.BalancingLoadAware {
 		return out, nil, nil

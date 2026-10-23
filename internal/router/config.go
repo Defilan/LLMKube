@@ -183,8 +183,11 @@ const (
 	BalancingLoadAware  = "LoadAware"
 )
 
-// DefaultMaxLoadPercent is the session spill bound when none is set.
-const DefaultMaxLoadPercent int32 = 125
+// Bounds on Balancing.SessionIdleTimeout, mirroring the CRD's validation.
+const (
+	minSessionIdleTimeout = time.Minute
+	maxSessionIdleTimeout = 24 * time.Hour
+)
 
 // Balancing is a backend's placement policy.
 type Balancing struct {
@@ -193,17 +196,22 @@ type Balancing struct {
 	// SessionHeaders name the request headers that identify a session, in
 	// priority order; the first present with a non-empty value is the key.
 	SessionHeaders []string `json:"sessionHeaders,omitempty"`
-	// MaxLoadPercent bounds a pod's load, as a percentage of the average
-	// across eligible pods, before a session spills. 0 means the default.
-	MaxLoadPercent int32 `json:"maxLoadPercent,omitempty"`
+	// SessionIdleTimeout is how long a session's pod binding survives with
+	// no request. 0 means the picker's default. A 0.10.7 controller also
+	// writes maxLoadPercent; the field is no longer read and is ignored on
+	// decode.
+	SessionIdleTimeout time.Duration `json:"sessionIdleTimeout,omitempty"`
 }
 
-// LoadPercent returns MaxLoadPercent, or DefaultMaxLoadPercent when unset.
-func (b *Balancing) LoadPercent() int32 {
-	if b.MaxLoadPercent == 0 {
-		return DefaultMaxLoadPercent
+// HasSessionAffinity reports whether any LoadAware backend names session
+// headers, so the proxy needs the session sweeper.
+func (c *Config) HasSessionAffinity() bool {
+	for _, b := range c.Backends {
+		if b.Balancing != nil && b.Balancing.Mode == BalancingLoadAware && len(b.Balancing.SessionHeaders) > 0 {
+			return true
+		}
 	}
-	return b.MaxLoadPercent
+	return false
 }
 
 // MetricsProfile names the engine gauges the proxy reads from each pod.
@@ -486,8 +494,9 @@ func validateBalancing(i int, b Backend) error {
 		default:
 			return fmt.Errorf("backends[%d] %s: balancing mode %q must be %s or %s", i, b.Name, bal.Mode, BalancingRoundRobin, BalancingLoadAware)
 		}
-		if bal.MaxLoadPercent != 0 && (bal.MaxLoadPercent < 101 || bal.MaxLoadPercent > 1000) {
-			return fmt.Errorf("backends[%d] %s: balancing maxLoadPercent %d must be between 101 and 1000", i, b.Name, bal.MaxLoadPercent)
+		if t := bal.SessionIdleTimeout; t != 0 && (t < minSessionIdleTimeout || t > maxSessionIdleTimeout) {
+			return fmt.Errorf("backends[%d] %s: balancing sessionIdleTimeout %s must be between %s and %s",
+				i, b.Name, t, minSessionIdleTimeout, maxSessionIdleTimeout)
 		}
 		for _, h := range bal.SessionHeaders {
 			// Mirrors the CRD's items pattern and length bound: an RFC 7230

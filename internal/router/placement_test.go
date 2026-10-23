@@ -17,11 +17,20 @@ limitations under the License.
 package router
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/router/picker"
 )
 
@@ -68,80 +77,255 @@ func TestPlaceLoadAwarePicksLeastLoaded(t *testing.T) {
 	d.RecordSample("qwen", eps[0], picker.Sample{Running: 9, At: now})
 	d.RecordSample("qwen", eps[1], picker.Sample{Running: 1, At: now})
 	d.RecordSample("qwen", eps[2], picker.Sample{Running: 5, At: now})
-	ep, res := d.place(b, http.Header{})
+	ep, res, _ := d.place(b, http.Header{})
 	if ep != eps[1] || res != picker.LeastLoaded {
 		t.Errorf("place = %s/%s, want %s least_loaded", ep, res, eps[1])
 	}
 }
 
-func TestPlaceSessionStickyAcrossReplicas(t *testing.T) {
+func TestPlaceSessionStaysWhileNothingQueues(t *testing.T) {
+	d, b, eps := balancedDispatcher([]string{"x-session-affinity"}, 3)
+	now := d.nowFn()
+	d.RecordSample("qwen", eps[0], picker.Sample{Running: 2, At: now})
+	d.RecordSample("qwen", eps[1], picker.Sample{Running: 3, At: now})
+	d.RecordSample("qwen", eps[2], picker.Sample{Running: 1, At: now})
 	h := http.Header{}
 	h.Set("X-Session-Affinity", "agent-1")
-	d1, b1, _ := balancedDispatcher([]string{"x-session-affinity"}, 8)
-	d2, b2, _ := balancedDispatcher([]string{"x-session-affinity"}, 8)
-	ep1, res := d1.place(b1, h)
-	ep2, _ := d2.place(b2, h)
-	if res != picker.Sticky || ep1 != ep2 {
-		t.Errorf("replicas placed the session on %s and %s (%s), want the same pod, sticky", ep1, ep2, res)
+	first, res, _ := d.place(b, h)
+	if first == "" || res != picker.LeastLoaded {
+		t.Fatalf("first place = %q/%s, want a pod, least_loaded", first, res)
 	}
-	for i := 0; i < 5; i++ {
-		if ep, _ := d1.place(b1, h); ep != ep1 {
-			t.Fatalf("session moved from %s to %s while idle", ep1, ep)
+	for i := 0; i < 10; i++ {
+		ep, res, reason := d.place(b, h)
+		if ep != first || res != picker.Sticky || reason != picker.ReasonNone {
+			t.Fatalf("request %d: place = %s/%s/%q, want %s sticky", i, ep, res, reason, first)
 		}
 	}
 }
 
-// TestPlaceSessionAgreesAcrossReplicasUnderLoad: two proxy replicas that see
-// the same pods in a different order and the same engine samples place every
-// session on the same pod, whether it stays home or spills.
-func TestPlaceSessionAgreesAcrossReplicasUnderLoad(t *testing.T) {
-	t0 := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
-	clock := WithNowFunc(func() time.Time { return t0 })
-	headers := []string{"x-session-affinity"}
-	d1, b1, eps := balancedDispatcher(headers, 8, clock)
-	d2, b2, _ := balancedDispatcher(headers, 8, clock)
-	shuffled := make([]string, 0, len(eps))
-	for _, i := range []int{5, 2, 7, 0, 6, 3, 1, 4} {
-		shuffled = append(shuffled, eps[i])
-	}
-	d2.SetEndpoints("qwen", shuffled)
-	// Unequal, non-idle loads; the first pod runs hot enough to spill its
-	// sessions while the others keep theirs.
-	for i, ep := range eps {
-		smp := picker.Sample{Running: []float64{8, 1, 2, 2, 1, 2, 3, 1}[i], Waiting: float64(i % 2), At: t0}
-		d1.RecordSample("qwen", ep, smp)
-		d2.RecordSample("qwen", ep, smp)
-	}
-
-	results := map[picker.Result]int{}
-	for k := 0; k < 200; k++ {
-		h := http.Header{}
-		h.Set("X-Session-Affinity", fmt.Sprintf("agent-%d", k))
-		ep1, res1 := d1.place(b1, h)
-		ep2, res2 := d2.place(b2, h)
-		if ep1 != ep2 || res1 != res2 {
-			t.Errorf("session %d: replicas placed it on %s (%s) and %s (%s), want the same pod", k, ep1, res1, ep2, res2)
-		}
-		results[res1]++
-	}
-	if results[picker.Sticky] == 0 || results[picker.Spill] == 0 {
-		t.Errorf("results = %v, want both sticky and spilled sessions so both paths are compared", results)
-	}
-}
-
-func TestPlaceSessionSpillsOffQuarantinedHomeAndReturns(t *testing.T) {
+func TestPlaceSessionMigratesOffQuarantinedPodAndStays(t *testing.T) {
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	clock := WithNowFunc(func() time.Time { return now })
+	d, b, _ := balancedDispatcher([]string{"x-session-affinity"}, 4, clock, WithQuarantineDuration(time.Minute))
 	h := http.Header{}
 	h.Set("X-Session-Affinity", "agent-2")
-	d, b, _ := balancedDispatcher([]string{"x-session-affinity"}, 4)
-	home, _ := d.place(b, h)
+	home, _, _ := d.place(b, h)
 	d.markUnhealthy("qwen", home)
-	ep, res := d.place(b, h)
-	if ep == home || ep == "" || res != picker.Spill {
-		t.Fatalf("quarantined home: place = %s/%s, want another pod as a spill", ep, res)
+	ep, res, reason := d.place(b, h)
+	if ep == home || ep == "" || res != picker.Migrated || reason != picker.ReasonNotReady {
+		t.Fatalf("quarantined pod: place = %s/%s/%q, want another pod, migrated, not_ready", ep, res, reason)
 	}
-	d.markHealthy("qwen", home)
-	if ep, res := d.place(b, h); ep != home || res != picker.Sticky {
-		t.Errorf("after recovery: place = %s/%s, want home %s sticky", ep, res, home)
+	// The quarantine expires inside the idle timeout; the session stays on
+	// its new pod rather than returning to the old one.
+	now = now.Add(2 * time.Minute)
+	for i := 0; i < 3; i++ {
+		if ep2, res2, _ := d.place(b, h); ep2 != ep || res2 != picker.Sticky {
+			t.Fatalf("after the quarantine expired: place = %s/%s, want %s sticky", ep2, res2, ep)
+		}
+	}
+}
+
+func TestPlaceRoundRobinIgnoresSessionHeaders(t *testing.T) {
+	cfg := &Config{Backends: []Backend{{
+		Name: "qwen", Tier: "local", Address: "http://qwen.ns.svc.cluster.local:8000",
+		EndpointSource: &EndpointSource{Namespace: "ns", Service: "qwen", Port: 8000},
+		Balancing:      &Balancing{Mode: BalancingRoundRobin, SessionHeaders: []string{"x-session-affinity"}},
+	}}}
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{"http://10.0.2.1:8000", "http://10.0.2.2:8000", "http://10.0.2.3:8000"})
+	h := http.Header{}
+	h.Set("X-Session-Affinity", "agent-1")
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		ep, res, reason := d.place(&d.cfg.Backends[0], h)
+		if res != "" || reason != picker.ReasonNone {
+			t.Errorf("round robin reported %q/%q, want empty", res, reason)
+		}
+		seen[ep] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("same-header requests landed on %v, want a rotation across all three pods", seen)
+	}
+	if _, ok := d.sessions.Load("qwen"); ok {
+		t.Error("a round-robin backend created a session table")
+	}
+}
+
+func TestPlaceEmptySessionHeaderIsNoSession(t *testing.T) {
+	d, b, _ := balancedDispatcher([]string{"x-session-affinity"}, 3)
+	h := http.Header{}
+	h.Set("X-Session-Affinity", "   ")
+	ep, res, _ := d.place(b, h)
+	if ep == "" || res != picker.LeastLoaded {
+		t.Fatalf("blank header: place = %q/%s, want least_loaded", ep, res)
+	}
+	if v, ok := d.sessions.Load("qwen"); ok && v.(*picker.Sessions).Len() != 0 {
+		t.Errorf("a blank header bound %d sessions, want none", v.(*picker.Sessions).Len())
+	}
+}
+
+func TestSweeperRacesPlacementSafely(t *testing.T) {
+	var clockMu sync.Mutex
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	clock := WithNowFunc(func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return now
+	})
+	d, b, _ := balancedDispatcher([]string{"x-session-affinity"}, 4, clock)
+
+	stop := make(chan struct{})
+	var sweeper sync.WaitGroup
+	sweeper.Add(1)
+	go func() {
+		defer sweeper.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			clockMu.Lock()
+			now = now.Add(time.Second)
+			at := now
+			clockMu.Unlock()
+			d.SweepSessions(at)
+		}
+	}()
+
+	const keys, workers, rounds = 200, 32, 20
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				for k := w; k < keys; k += workers {
+					h := http.Header{}
+					h.Set("X-Session-Affinity", fmt.Sprintf("agent-%d", k))
+					if ep, _, _ := d.place(b, h); ep == "" {
+						t.Errorf("key %d placed on no pod", k)
+						return
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(stop)
+	sweeper.Wait()
+
+	// Every key placed within the idle timeout, so each is still bound to one pod.
+	v, _ := d.sessions.Load("qwen")
+	tbl := v.(*picker.Sessions)
+	if got := tbl.Len(); got != keys {
+		t.Fatalf("table holds %d bindings, want %d", got, keys)
+	}
+	clockMu.Lock()
+	at := now
+	clockMu.Unlock()
+	for k := 0; k < keys; k++ {
+		h := http.Header{}
+		h.Set("X-Session-Affinity", fmt.Sprintf("agent-%d", k))
+		ep1, res1, _ := d.place(b, h)
+		ep2, _, _ := d.place(b, h)
+		if res1 != picker.Sticky || ep1 != ep2 {
+			t.Fatalf("key %d at %s: place = %s/%s then %s, want one pod, sticky", k, at, ep1, res1, ep2)
+		}
+	}
+}
+
+func TestSessionBindingsGauge(t *testing.T) {
+	d, b, _ := balancedDispatcher([]string{"x-session-affinity"}, 3, WithRouterLabel("gauge-router"))
+	for i := 0; i < 3; i++ {
+		h := http.Header{}
+		h.Set("X-Session-Affinity", fmt.Sprintf("agent-%d", i))
+		d.place(b, h)
+	}
+	d.SweepSessions(d.nowFn())
+	if got := testutil.ToFloat64(prommetrics.RouterSessionBindings.WithLabelValues("gauge-router", "qwen")); got != 3 {
+		t.Errorf("llmkube_router_session_bindings = %v, want 3", got)
+	}
+}
+
+func TestPlacementReasonLabel(t *testing.T) {
+	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	clock := WithNowFunc(func() time.Time { return now })
+	d, b, _ := balancedDispatcher([]string{"x-session-affinity"}, 4, clock, WithRouterLabel("reason-router"))
+	counter := func(result, reason string) float64 {
+		return testutil.ToFloat64(prommetrics.RouterPlacementsTotal.WithLabelValues("reason-router", "qwen", result, reason))
+	}
+	h := http.Header{}
+	h.Set("X-Session-Affinity", "agent-1")
+	home, res, reason := d.place(b, h)
+	d.countPlacement("qwen", res, reason)
+	stickyBefore := counter("sticky", "")
+	ep, res, reason := d.place(b, h)
+	d.countPlacement("qwen", res, reason)
+	if ep != home || counter("sticky", "") != stickyBefore+1 {
+		t.Errorf("sticky placement: counter {sticky,\"\"} = %v, want %v", counter("sticky", ""), stickyBefore+1)
+	}
+	migratedBefore := counter("migrated", "not_ready")
+	d.markUnhealthy("qwen", home)
+	_, res, reason = d.place(b, h)
+	d.countPlacement("qwen", res, reason)
+	if counter("migrated", "not_ready") != migratedBefore+1 {
+		t.Errorf("migration: counter {migrated,not_ready} = %v, want %v", counter("migrated", "not_ready"), migratedBefore+1)
+	}
+}
+
+// TestSessionValueNeverExposed: the session header value is hashed into a
+// table key and never stored, logged or used as a metric label.
+func TestSessionValueNeverExposed(t *testing.T) {
+	const secret = "secret-session-123"
+	upstream := newFakeBackend(t)
+	cfg := &Config{
+		Backends: []Backend{{
+			Name: "qwen", Tier: "local", Address: upstream.URL(),
+			Endpoints: []string{upstream.URL()},
+			Balancing: &Balancing{Mode: BalancingLoadAware, SessionHeaders: []string{"x-session-affinity"}},
+			Metrics:   &vllmProfile,
+		}},
+		DefaultRoute: "qwen",
+		Policy:       Policy{Classification: ClassificationPolicy{Mode: "header-only"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	proxy := NewProxy(cfg, logger, WithRouterName("secret-router"))
+	mux := http.NewServeMux()
+	proxy.Mount(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"qwen","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Session-Affinity", secret)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request = %d, want 200", rec.Code)
+	}
+	if upstream.calls.Load() != 1 {
+		t.Fatalf("upstream calls = %d, want 1", upstream.calls.Load())
+	}
+
+	if strings.Contains(logs.String(), secret) {
+		t.Errorf("log output contains the session value:\n%s", logs.String())
+	}
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range families {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if strings.Contains(lp.GetValue(), secret) {
+					t.Errorf("metric %s label %s=%q contains the session value", mf.GetName(), lp.GetName(), lp.GetValue())
+				}
+			}
+		}
 	}
 }
 
@@ -154,7 +338,7 @@ func TestPlaceRoundRobinUnchanged(t *testing.T) {
 	d.SetEndpoints("qwen", []string{"http://10.0.2.1:8000", "http://10.0.2.2:8000"})
 	seen := map[string]bool{}
 	for i := 0; i < 4; i++ {
-		ep, res := d.place(&d.cfg.Backends[0], http.Header{"X-Session-Affinity": {"s"}})
+		ep, res, _ := d.place(&d.cfg.Backends[0], http.Header{"X-Session-Affinity": {"s"}})
 		if res != "" {
 			t.Errorf("an unbalanced backend reported result %q", res)
 		}
