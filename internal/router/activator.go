@@ -13,6 +13,7 @@ package router
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -25,6 +26,12 @@ import (
 // maps it to a 503 + Retry-After (the standards-correct "temporarily
 // unavailable" signal), never a 429.
 var ErrHoldBudgetExceeded = errors.New("model pool activation hold budget exceeded")
+
+// ErrSwapDeadlineExceeded is returned by Activator.Acquire when the swap for
+// its target was abandoned at the pool's swap deadline because the member never
+// became resident. The proxy maps it to the same 503 + Retry-After as
+// ErrHoldBudgetExceeded: it is the same transient, retryable condition.
+var ErrSwapDeadlineExceeded = errors.New("model pool swap abandoned at its deadline")
 
 // ErrIncumbentBusy is returned by Activator.AcquireWithMode under
 // PoolActivationIfIdle when the target member is not resident and the
@@ -176,8 +183,9 @@ func (pr *poolRuntime) notify() {
 // dispatches, holding the request open (coalescing behind same-model demand and
 // draining the incumbent) until the swap is safe. It returns a release func the
 // caller must invoke exactly once when the request completes. A non-nil error
-// (ErrHoldBudgetExceeded or a context error) means the caller should not
-// dispatch; an in-progress load is never aborted by a caller giving up.
+// (ErrHoldBudgetExceeded, ErrSwapDeadlineExceeded, or a context error) means
+// the caller should not dispatch; an in-progress load is never aborted by a
+// caller giving up.
 func (a *Activator) Acquire(ctx context.Context, p *BackendPool) (func(), error) {
 	return a.AcquireWithMode(ctx, p, PoolActivationWait)
 }
@@ -349,8 +357,8 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 					"from", incumbent, "to", target, "elapsed", elapsed.String())
 				prommetrics.ModelPoolSwapFailuresTotal.
 					WithLabelValues(a.router, pr.pool, target, "deadline").Inc()
-				pr.swapErr[target] = errors.New("model pool swap to member " + target +
-					" abandoned after " + elapsed.String() + "; target never became resident")
+				pr.swapErr[target] = fmt.Errorf("%w: to member %s after %s; target never became resident",
+					ErrSwapDeadlineExceeded, target, elapsed)
 				// Scale the abandoned target back down. Done while still holding
 				// mu, so a waiter that is about to start a fresh swap for the
 				// same member cannot have its Activate undone by this patch.
