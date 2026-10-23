@@ -215,6 +215,23 @@ func perServiceCacheClaimName(isvcName string) string {
 	return isvcName + "-model-cache"
 }
 
+// stagedPurgeClaims resolves the claims `delete --purge-cache --name` acts on
+// from state read before its deletes, and records their access modes then: the
+// InferenceService delete may collect the claim (a perService claim is
+// owner-ref'd to it), and the purge must still know what mode it had.
+func stagedPurgeClaims(
+	ctx context.Context, k8sClient client.Client, namespace, name, modelClaim string,
+	stagedClaims []string, targets []purgeTarget, svcs []inferencev1alpha1.InferenceService,
+) []purgeTarget {
+	targets = targetedClaims(targets, svcs, name, modelClaim, stagedClaims)
+	claims := make([]string, len(targets))
+	for i, target := range targets {
+		claims[i] = target.Name
+	}
+	snapshotSecondMountClaims(ctx, k8sClient, namespace, claims)
+	return targets
+}
+
 // purgeKey returns the key `cache clear --model` removes for a model, or an
 // error when the model has none.
 func purgeKey(model *inferencev1alpha1.Model, modelName string) (string, error) {

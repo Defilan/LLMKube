@@ -109,7 +109,7 @@ Shows cache entries with their size, status, and which Model resources
 are using each cache entry. Each cache claim is read through a short-lived
 read-only pod the command creates and deletes, so it works even when the
 only other pod mounting the claim cannot run a shell. That pod runs
-That pod runs busybox:1.37.0 unless --cache-image or LLMKUBE_CACHE_IMAGE
+busybox:1.37.0 unless --cache-image or LLMKUBE_CACHE_IMAGE
 names another image, which is what an air-gapped cluster needs. The command
 fails when no discovered claim can be read, rather than reporting the cache
 as empty; a claim that cannot be read while others can is skipped with a

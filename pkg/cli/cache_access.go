@@ -64,6 +64,48 @@ func withCacheImage(image string, fn func() error) error {
 // persistentvolumeclaims gets.
 var claimReadClient = func(c client.Client) client.Client { return c }
 
+// Second-mount snapshots, taken by a caller before the delete that collects the
+// claims. A perService claim is owner-ref'd to its InferenceService, so it can
+// be gone by purge time; its access mode is what was read before that delete.
+//
+// The map is replaced as a whole by snapshotSecondMountClaims and never mutated
+// afterwards, so a purge in another run cannot see a half snapshot.
+var (
+	// secondMountSinglePod marks a claim the snapshot read as ReadWriteOncePod.
+	secondMountSinglePod = map[secondMountClaimKey]bool{}
+)
+
+// clearSecondMountSnapshot drops the snapshot so a later command reads the
+// claims afresh.
+func clearSecondMountSnapshot() {
+	secondMountSinglePod = map[secondMountClaimKey]bool{}
+}
+
+// secondMountClaimKey identifies a claim in a snapshot.
+type secondMountClaimKey struct{ namespace, name string }
+
+// snapshotSecondMountClaims reads the access mode of every claim a purge may
+// act on before the caller deletes anything, and returns what a later
+// secondMountBlocker needs when the claim itself is gone.
+func snapshotSecondMountClaims(
+	ctx context.Context, k8sClient client.Client, namespace string, claims []string,
+) {
+	// A claim the read fails for stays absent, so an unknown mode refuses
+	// nothing and keeps base behavior.
+	singlePod := map[secondMountClaimKey]bool{}
+	for _, claim := range claims {
+		key := secondMountClaimKey{namespace: namespace, name: claim}
+		claimObject := readCacheClaim(ctx, k8sClient, namespace, claim)
+		if claimObject == nil {
+			continue
+		}
+		// Presence keys the snapshot, so a claim read as not single-pod is still
+		// answerable from it.
+		singlePod[key] = claimSinglePod(claimObject)
+	}
+	secondMountSinglePod = singlePod
+}
+
 // readCacheClaim reads a cache claim. A claim that cannot be read (including a
 // forbidden one) yields nil, and the access mode counts as unknown: an
 // unpinned strict claim stalls on Multi-Attach, so the pre-#2155 pin is the
@@ -73,8 +115,10 @@ func readCacheClaim(
 ) *corev1.PersistentVolumeClaim {
 	pvc := &corev1.PersistentVolumeClaim{}
 	if err := claimReadClient(k8sClient).Get(ctx, client.ObjectKey{Name: pvcName, Namespace: namespace}, pvc); err != nil {
+
 		return nil
 	}
+
 	return pvc
 }
 
@@ -108,18 +152,32 @@ func claimSinglePod(pvc *corev1.PersistentVolumeClaim) bool {
 	return false
 }
 
+// claimSinglePodNow answers whether claim is ReadWriteOncePod from the caller's
+// snapshot when it has one, and from the live object otherwise. The snapshot is
+// the only answer once the caller has deleted what collects the claim.
+func claimSinglePodNow(ctx context.Context, k8sClient client.Client, namespace, pvcName string) bool {
+	key := secondMountClaimKey{namespace: namespace, name: pvcName}
+	if singlePod, ok := secondMountSinglePod[key]; ok {
+		return singlePod
+	}
+	return claimSinglePod(readCacheClaim(ctx, k8sClient, namespace, pvcName))
+}
+
 // secondMountBlocker returns the error to fail with when another pod holds a
 // ReadWriteOncePod claim and will keep holding it, or nil when the run may
-// create its pod.
+// create its pod; singlePod is claimSinglePodNow's answer for the claim.
 //
-// It fires only for a holder that will not release the claim on its own: a
-// terminating pod is no holder at all (claimHolder), and the pod this run
-// replaces at ownPod is deleted before the claim is mounted. Waiting for
-// either is what base did, and what works.
-func secondMountBlocker(pvc *corev1.PersistentVolumeClaim, holder *corev1.Pod, pvcName, ownPod string,
-	kind cacheAccessPodKind, runID string,
+// A pod that is being deleted releases the claim on its own, as does the pod
+// this run replaces at ownPod, so waiting for either is what base did and what
+// works. A pod that is merely running never releases it, so waiting only runs
+// out the start timeout.
+func secondMountBlocker(holder *corev1.Pod, pvcName, ownPod string,
+	kind cacheAccessPodKind, runID string, singlePod bool,
 ) error {
-	if holder == nil || !claimSinglePod(pvc) {
+	if holder == nil || !singlePod {
+		return nil
+	}
+	if holder.DeletionTimestamp != nil {
 		return nil
 	}
 	if holder.Name == ownPod {
@@ -140,8 +198,7 @@ func secondMountBlocker(pvc *corev1.PersistentVolumeClaim, holder *corev1.Pod, p
 func purgeSecondMountBlocker(
 	ctx context.Context, k8sClient client.Client, namespace, pvcName, runID string,
 ) error {
-	claim := readCacheClaim(ctx, k8sClient, namespace, pvcName)
-	if claim == nil || !claimSinglePod(claim) {
+	if !claimSinglePodNow(ctx, k8sClient, namespace, pvcName) {
 		return nil
 	}
 	pods := &corev1.PodList{}
@@ -150,7 +207,8 @@ func purgeSecondMountBlocker(
 		return nil
 	}
 	holder := claimHolder(pods.Items, pvcName)
-	return secondMountBlocker(claim, holder, pvcName, purgePodName(pvcName), purgePodKind, runID)
+	// The decision is made; the blocker only needs the mode to report it.
+	return secondMountBlocker(holder, pvcName, purgePodName(pvcName), purgePodKind, runID, true)
 }
 
 // cacheAccessPodOurs reports whether pod is a cache-access pod of this kind,

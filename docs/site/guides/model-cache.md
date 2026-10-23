@@ -572,7 +572,8 @@ pinned, since it is attached wherever the pod schedules, and a claim nothing
 holds is not pinned either: the pod is its first consumer. A
 `ReadWriteOncePod` claim that another pod still holds cannot be mounted a second
 time on any node, so the command fails at once and names the mode and the
-holding pod instead of waiting for a pod that can never start.
+holding pod instead of waiting for a pod that can never start; a pod that is
+already being deleted releases the claim, so it is waited for.
 `--all-namespaces` does not inspect claims and creates no pod.
 
 Both short-lived pods run `busybox:1.37.0`. On a cluster that cannot pull it,
@@ -584,7 +585,8 @@ read the same setting.
 
 `cache clear` removes entries instead of printing a command to run. One
 short-lived pod per cache claim (the same image, set the same way) mounts it
-read-write, removes only
+read-write, refuses a `ReadWriteOncePod` claim another pod still holds, and
+removes only
 validated `/models/<key>` paths, and is deleted straight after. `--model
 <name>` clears one model on the claims its own InferenceServices mount (their
 `spec.modelCache.claimName`, their `<isvc>-model-cache` in `perService` mode,
