@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
@@ -39,7 +40,7 @@ func TestParseEngineGaugesExactNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	running, waiting, kv, err := parseEngineGauges(f, vllmProfile)
 	if err != nil {
 		t.Fatal(err)
@@ -75,7 +76,7 @@ func TestParseEngineGaugesExactNames(t *testing.T) {
 	}
 }
 
-func scrapedConfig(urls ...string) *Config {
+func scrapedConfig() *Config {
 	return &Config{Backends: []Backend{{
 		Name: "qwen", Tier: "local", Address: "http://qwen.ns.svc.cluster.local:8000",
 		EndpointSource: &EndpointSource{Namespace: "ns", Service: "qwen", Port: 8000},
@@ -135,5 +136,64 @@ func TestLoadScraperIgnoresUnbalancedBackends(t *testing.T) {
 	cfg.Backends[0].Metrics = nil
 	if NewLoadScraper(cfg, NewDispatcher(cfg), "r", slog.New(slog.NewTextHandler(io.Discard, nil))).HasTargets() {
 		t.Error("a backend without a metrics profile must not be scraped")
+	}
+}
+
+func TestLoadScraperDropsDepartedEndpointSeries(t *testing.T) {
+	body, _ := os.ReadFile("testdata/vllm-metrics.txt")
+	serve := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
+	}
+	keep, gone := serve(), serve()
+	defer keep.Close()
+	defer gone.Close()
+
+	cfg := scrapedConfig()
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{keep.URL, gone.URL})
+	s := NewLoadScraper(cfg, d, "r-depart", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.scrapeOnce(context.Background())
+	d.SetEndpoints("qwen", []string{keep.URL})
+	s.scrapeOnce(context.Background())
+
+	for name, vec := range map[string]*prometheus.GaugeVec{"load": prommetrics.RouterEndpointLoad, "fresh": prommetrics.RouterEndpointMetricsFresh} {
+		if vec.DeleteLabelValues("r-depart", "qwen", gone.URL) {
+			t.Errorf("%s gauge series of the departed endpoint survived", name)
+		}
+		if !vec.DeleteLabelValues("r-depart", "qwen", keep.URL) {
+			t.Errorf("%s gauge series of the kept endpoint is missing", name)
+		}
+	}
+}
+
+func TestLoadScraperSkipsEndpointThatLeftMidScrape(t *testing.T) {
+	body, _ := os.ReadFile("testdata/vllm-metrics.txt")
+	started, release := make(chan struct{}), make(chan struct{})
+	leaving := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write(body)
+	}))
+	defer leaving.Close()
+
+	cfg := scrapedConfig()
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{leaving.URL})
+	s := NewLoadScraper(cfg, d, "r-leave", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	done := make(chan struct{})
+	go func() {
+		s.scrapeOnce(context.Background())
+		close(done)
+	}()
+	<-started
+	d.SetEndpoints("qwen", nil) // the pod leaves while its scrape is in flight
+	close(release)
+	<-done
+
+	if _, ok := d.loads.Load(healthKey("qwen", leaving.URL)); ok {
+		t.Error("a scrape that finished after the pod left re-created its load record")
+	}
+	if prommetrics.RouterEndpointLoad.DeleteLabelValues("r-leave", "qwen", leaving.URL) {
+		t.Error("a departed endpoint has a load gauge series")
 	}
 }

@@ -51,13 +51,23 @@ type LoadScraper struct {
 	targets    []scrapeTarget
 	routerName string
 	logger     *slog.Logger
+
+	// written is the (backend, endpoint) pairs whose gauge series the last
+	// scrapeOnce wrote. The scraper owns both gauge series: it alone writes
+	// and deletes them, from scrapeOnce, so a departed endpoint's series
+	// cannot be brought back by a late scrape. scrapeOnce must not run
+	// concurrently with itself.
+	written map[gaugeKey]struct{}
 }
+
+type gaugeKey struct{ backend, endpoint string }
 
 // NewLoadScraper indexes the backends that need scraping. It starts nothing.
 func NewLoadScraper(cfg *Config, disp *Dispatcher, routerName string, logger *slog.Logger) *LoadScraper {
 	s := &LoadScraper{
 		disp: disp, routerName: routerName, logger: logger,
-		client: &http.Client{Timeout: scrapeTimeout},
+		client:  &http.Client{Timeout: scrapeTimeout},
+		written: map[gaugeKey]struct{}{},
 	}
 	for _, b := range cfg.Backends {
 		if b.Balancing == nil || b.Balancing.Mode != BalancingLoadAware || b.Metrics == nil {
@@ -101,12 +111,16 @@ func (s *LoadScraper) scrapeOnce(ctx context.Context) {
 					s.logger.Debug("engine metrics scrape failed", "backend", tgt.backend, "endpoint", ep, "error", err)
 					return
 				}
+				if !s.stillLive(tgt.backend, ep) {
+					return // the pod left while this scrape was in flight
+				}
 				s.disp.RecordSample(tgt.backend, ep, picker.Sample{Running: running, Waiting: waiting, KVUsage: kv, At: s.disp.nowFn()})
 			}(tgt, ep)
 		}
 	}
 	wg.Wait()
 	now := s.disp.nowFn()
+	current := map[gaugeKey]struct{}{}
 	for _, tgt := range s.targets {
 		for _, ep := range s.disp.EndpointsOf(tgt.backend) {
 			l := s.disp.loadFor(tgt.backend, ep)
@@ -117,8 +131,26 @@ func (s *LoadScraper) scrapeOnce(ctx context.Context) {
 				fresh = 1
 			}
 			prommetrics.RouterEndpointMetricsFresh.WithLabelValues(s.routerName, tgt.backend, ep).Set(fresh)
+			current[gaugeKey{tgt.backend, ep}] = struct{}{}
 		}
 	}
+	for k := range s.written {
+		if _, ok := current[k]; !ok {
+			prommetrics.RouterEndpointLoad.DeleteLabelValues(s.routerName, k.backend, k.endpoint)
+			prommetrics.RouterEndpointMetricsFresh.DeleteLabelValues(s.routerName, k.backend, k.endpoint)
+		}
+	}
+	s.written = current
+}
+
+// stillLive reports whether endpoint is in backend's current endpoint set.
+func (s *LoadScraper) stillLive(backend, endpoint string) bool {
+	for _, ep := range s.disp.EndpointsOf(backend) {
+		if ep == endpoint {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *LoadScraper) scrape(ctx context.Context, endpoint string, p MetricsProfile) (float64, float64, float64, error) {
