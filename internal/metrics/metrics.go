@@ -181,6 +181,17 @@ var (
 		[]string{labelRouter, "backend", "endpoint"},
 	)
 
+	// RouterDispatchRetriesTotal counts requests the router proxy retried on a
+	// fresh connection after a reused keep-alive connection failed before any
+	// response byte (reason="stale_connection").
+	RouterDispatchRetriesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_router_dispatch_retries_total",
+			Help: "Requests the router proxy retried on a fresh connection, by reason.",
+		},
+		[]string{labelRouter, "backend", "reason"},
+	)
+
 	// RouterPlacementsTotal counts the router proxy's placement decisions for
 	// balanced backends by result (least_loaded, sticky, spill, fallback or
 	// migrated) and, for a spill or migration, the reason (waiting, kv_full or
@@ -524,6 +535,7 @@ var AllCollectors = []prometheus.Collector{
 	RouterEndpointSourceReady,
 	RouterEndpointLoad,
 	RouterEndpointMetricsFresh,
+	RouterDispatchRetriesTotal,
 	RouterPlacementsTotal,
 	RouterSessionBindings,
 	RouterFirstTokenSeconds,

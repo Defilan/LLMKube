@@ -110,7 +110,7 @@ func TestPlaceSessionMigratesOffQuarantinedPodAndStays(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Session-Affinity", "agent-2")
 	home, _, _ := d.place(b, h)
-	d.markUnhealthy("qwen", home)
+	quarantineEndpoint(d, "qwen", home)
 	ep, res, reason := d.place(b, h)
 	if ep == home || ep == "" || res != picker.Migrated || reason != picker.ReasonNotReady {
 		t.Fatalf("quarantined pod: place = %s/%s/%q, want another pod, migrated, not_ready", ep, res, reason)
@@ -272,7 +272,7 @@ func TestPlacementReasonLabel(t *testing.T) {
 		t.Errorf("sticky placement: counter {sticky,\"\"} = %v, want %v", counter("sticky", ""), stickyBefore+1)
 	}
 	migratedBefore := counter("migrated", "not_ready")
-	d.markUnhealthy("qwen", home)
+	quarantineEndpoint(d, "qwen", home)
 	_, res, reason = d.place(b, h)
 	d.countPlacement("qwen", res, reason)
 	if counter("migrated", "not_ready") != migratedBefore+1 {
@@ -352,5 +352,12 @@ func TestPlaceRoundRobinUnchanged(t *testing.T) {
 	}
 	if len(seen) != 2 {
 		t.Errorf("round-robin picks = %v, want both endpoints", seen)
+	}
+}
+
+// quarantineEndpoint fails an endpoint enough times in a row to quarantine it.
+func quarantineEndpoint(d *Dispatcher, backend, ep string) {
+	for i := 0; i < endpointFailuresToQuarantine; i++ {
+		d.markUnhealthy(backend, ep)
 	}
 }

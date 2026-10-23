@@ -106,6 +106,7 @@ func NewProxy(cfg *Config, logger *slog.Logger, opts ...ProxyOption) *Proxy {
 	for _, opt := range opts {
 		opt(p)
 	}
+	p.disp.logger = logger
 	return p
 }
 
@@ -331,7 +332,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 				return
 			}
 			writeError(w, http.StatusBadGateway, "all backends failed: "+err.Error())
-			p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed, budgetAudit{})
+			p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed, budgetAudit{}, "error", err.Error())
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
@@ -835,6 +836,7 @@ func (p *Proxy) audit(
 	outcome string,
 	elapsed time.Duration,
 	ba budgetAudit,
+	extra ...any,
 ) {
 	attrs := []any{
 		"model", f.Model,
@@ -869,6 +871,7 @@ func (p *Proxy) audit(
 	// `timeoutMs=<expected>` and reconcile vs the CRD spec.
 	attrs = append(attrs, "timeoutMs",
 		resolveDispatchTimeout(&dec, chosen, p.disp.ResponseHeaderTimeout()).Milliseconds())
+	attrs = append(attrs, extra...)
 	p.logger.Info("router.dispatch", attrs...)
 }
 
