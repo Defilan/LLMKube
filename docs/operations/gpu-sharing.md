@@ -346,7 +346,10 @@ swap: it scales the target back to zero, logs `model pool swap abandoned` at
 `ERROR` with the pool, the two members and the elapsed time, counts it in
 `llmkube_modelpool_swap_failures_total{router,pool,member,reason}` (with
 `reason="deadline"`; an activation the controller rejected outright is counted
-with `reason="error"`), and fails the waiting requests with a swap error. This
+with `reason="error"`), and fails the waiting requests with `503` and a
+`Retry-After`, the same retryable signal as a hold that runs out of budget.
+Whichever of the two deadlines passes first, the client is told to retry rather
+than read the response as an upstream outage. This
 matters because the pool is otherwise unusable while a swap is in flight: the
 resident member's fast path is closed for the duration, so an unbounded swap
 whose target can never become `Ready` would 503 every request on the pool -

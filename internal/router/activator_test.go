@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // fakeMemberController is an in-memory MemberController for activator tests. It
@@ -701,6 +704,8 @@ func TestActivatorAbandonsSwapAtDeadline(t *testing.T) {
 	fake.noAutoReady = true
 	fake.setPhase("judge", modelReadyPhase)
 	a := NewActivator(context.Background(), fake, "r", nil)
+	failures := prommetrics.ModelPoolSwapFailuresTotal.WithLabelValues("r", "heavy-slot", "coder", "deadline")
+	before := testutil.ToFloat64(failures)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -712,6 +717,12 @@ func TestActivatorAbandonsSwapAtDeadline(t *testing.T) {
 	if errors.Is(err, ErrHoldBudgetExceeded) {
 		t.Fatalf("Acquire err = %v after %s; the swap was never bounded, the caller just ran out of hold budget",
 			err, time.Since(start))
+	}
+	if !errors.Is(err, ErrSwapDeadlineExceeded) {
+		t.Fatalf("Acquire err = %v, want ErrSwapDeadlineExceeded so the proxy answers 503 + Retry-After", err)
+	}
+	if got := testutil.ToFloat64(failures) - before; got != 1 {
+		t.Errorf("swap_failures_total{reason=deadline} delta = %v, want 1", got)
 	}
 
 	a.mu.Lock()

@@ -289,7 +289,9 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			// outlived the swap window. 503 + Retry-After is the standards-correct
 			// "temporarily unavailable" signal so well-behaved clients back off
 			// deterministically; 429 would wrongly imply rate limiting.
-			if errors.Is(err, ErrHoldBudgetExceeded) {
+			// An abandoned swap is the same condition as an expired hold, so the
+			// status here does not depend on which of the two timers fires first.
+			if errors.Is(err, ErrHoldBudgetExceeded) || errors.Is(err, ErrSwapDeadlineExceeded) {
 				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
 				writeError(w, http.StatusServiceUnavailable,
 					"model pool activation did not complete within the request budget; retry")

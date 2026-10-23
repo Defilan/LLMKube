@@ -677,9 +677,8 @@ func TestProxyPoolActivationTimeout503RetryAfter(t *testing.T) {
 
 	// The target never becomes Ready, so its swap is still loading when the
 	// caller's hold budget (pool.SwapBudget) expires and ends the request with
-	// 503 + Retry-After. A swap that ends first would surface as a 502: the
-	// hold and the swap deadline are both derived from the same budget, so the
-	// fixture keeps the swap loading rather than racing the two timers.
+	// 503 + Retry-After. The hold and the swap deadline are both derived from
+	// the same budget, so either may fire first; both answer 503.
 	fake := newFakeMemberController()
 	fake.noAutoReady = true
 
