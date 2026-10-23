@@ -824,7 +824,10 @@ A `ReadWriteOncePod` claim another pod holds cannot be mounted a second time
 on any node, so `cache list`, `cache clear` and `delete --purge-cache` refuse
 it at once, naming the access mode and the holding pod, instead of waiting for
 a pod that can never start. A pod that is already being deleted releases the
-claim, so it is waited for, not refused. `cache
+claim, so it is waited for, not refused, and so is the serving pod `delete
+--purge-cache` itself is tearing down. The refusal reads the pods in the
+namespace, so it needs `list pods`; without that permission the command falls
+back to the old wait. `cache
 list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
 claim: a `ReadWriteMany` or `ReadOnlyMany` claim is never pinned.
 

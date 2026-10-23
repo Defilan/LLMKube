@@ -195,7 +195,7 @@ func inspectSinglePVC(
 	holder := claimHolder(pods.Items, pvcInfo.Name)
 	runID := purgeRunID()
 	if err := secondMountBlocker(holder, pvcInfo.Name, inspectorPodName(pvcInfo.Name),
-		inspectorPodKind, runID, claimSinglePod(claim)); err != nil {
+		inspectorPodKind, runID, claimSinglePod(claim), nil); err != nil {
 		return nil, err
 	}
 	// A shareable claim is attached wherever it is needed, so pinning the

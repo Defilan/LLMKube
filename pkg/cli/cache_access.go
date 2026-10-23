@@ -105,19 +105,25 @@ func claimSinglePod(pvc *corev1.PersistentVolumeClaim) bool {
 
 // secondMountBlocker returns the error to fail with when another pod holds a
 // ReadWriteOncePod claim and will keep holding it, or nil when the run may
-// create its pod; singlePod is claimSinglePodNow's answer for the claim.
+// create its pod; singlePod is the caller's answer for the claim
+// (purgeTarget.SinglePod on the purge path, the live read on the inspector
+// path). releasing reports a holder whose own delete is already underway, such
+// as the serving pod a `delete --purge-cache` is tearing down.
 //
 // A pod that is being deleted releases the claim on its own, as does the pod
 // this run replaces at ownPod, so waiting for either is what base did and what
 // works. A pod that is merely running never releases it, so waiting only runs
 // out the start timeout.
 func secondMountBlocker(holder *corev1.Pod, pvcName, ownPod string,
-	kind cacheAccessPodKind, runID string, singlePod bool,
+	kind cacheAccessPodKind, runID string, singlePod bool, releasing func(*corev1.Pod) bool,
 ) error {
 	if holder == nil || !singlePod {
 		return nil
 	}
 	if holder.DeletionTimestamp != nil {
+		return nil
+	}
+	if releasing != nil && releasing(holder) {
 		return nil
 	}
 	if holder.Name == ownPod {

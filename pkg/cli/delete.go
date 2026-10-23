@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -185,8 +187,7 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
 		}
 		fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
-		err = purgeDeleteTargets(ctx, cfg, k8sClient, clientset, opts.namespace, cacheKey, purged)
-		// The snapshot covers this run's deletes only.
+		err = purgeDeleteTargets(ctx, cfg, k8sClient, clientset, opts.namespace, opts.name, cacheKey, purged)
 		if err != nil {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", err, opts.namespace)
@@ -197,11 +198,26 @@ func runDelete(opts *deleteOptions) error {
 	return nil
 }
 
+// servingPodsOf reports whether a pod belongs to name, the InferenceService
+// this run deleted: its cascade is asynchronous, so its serving pod can still
+// be mounting the claim when the purge looks.
+func servingPodsOf(name string) func(*corev1.Pod) bool {
+	return func(pod *corev1.Pod) bool {
+		if owner := metav1.GetControllerOf(pod); owner != nil && owner.Kind == "ReplicaSet" && owner.Name != "" {
+			if strings.HasPrefix(owner.Name, name+"-") {
+				return true
+			}
+		}
+		return pod.Labels["app.kubernetes.io/instance"] == name ||
+			pod.Labels["app"] == name
+	}
+}
+
 // purgeDeleteTargets removes cacheKey from every resolved claim, purging each
 // claim on its own so one failure is reported with the claim it belongs to.
 func purgeDeleteTargets(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace, cacheKey string, targets []purgeTarget,
+	namespace, deletedService, cacheKey string, targets []purgeTarget,
 ) error {
 	if len(targets) == 0 {
 		return fmt.Errorf("no model cache PVC found")
@@ -210,7 +226,8 @@ func purgeDeleteTargets(
 	var errs []error
 	var outcomes []purgeOutcome
 	for _, target := range targets {
-		outcome, err := purgeCacheKeys(ctx, cfg, k8sClient, clientset, namespace, target, []string{cacheKey})
+		outcome, err := purgeCacheKeysReleasing(ctx, cfg, k8sClient, clientset, namespace, target,
+			servingPodsOf(deletedService), []string{cacheKey})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cache PVC %s: %w", target.Name, err))
 			continue
