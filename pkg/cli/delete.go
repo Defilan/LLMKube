@@ -22,7 +22,6 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -202,24 +201,39 @@ func runDelete(opts *deleteOptions) error {
 // this run deleted: its cascade is asynchronous, so its serving pod can still
 // be mounting the claim when the purge looks.
 //
-// The proof is the owner chain: the pod's controller ReplicaSet, and that
-// ReplicaSet's controller, must both reach name. A ReplicaSet whose name merely
-// starts with name and a hyphen is not proof, because a service called
-// "<name>-v2" owns those.
-func servingPodsOf(ctx context.Context, k8sClient client.Client, namespace, name string) func(*corev1.Pod) bool {
-	owned := map[string]bool{}
-	sets := &appsv1.ReplicaSetList{}
-	if err := k8sClient.List(ctx, sets, client.InNamespace(namespace)); err == nil {
-		for i := range sets.Items {
-			set := &sets.Items[i]
-			if owner := metav1.GetControllerOf(set); owner != nil && owner.Kind == "InferenceService" && owner.Name == name {
-				owned[set.Name] = true
-			}
-		}
-	}
+// The proof is the owner chain the deployment controller builds: the pod's
+// controller ReplicaSet, whose own controller is the Deployment named after the
+// InferenceService. A ReplicaSet whose name merely starts with name and a
+// hyphen is not proof, because the Deployment of a service called "<name>-v2"
+// produces "<name>-v2-<hash>" names too.
+func servingPodsOf(
+	ctx context.Context, clientset kubernetes.Interface, namespace, name string,
+) func(*corev1.Pod) bool {
+	verdicts := map[string]bool{}
 	return func(pod *corev1.Pod) bool {
 		owner := metav1.GetControllerOf(pod)
-		return owner != nil && owner.Kind == "ReplicaSet" && owned[owner.Name]
+		if owner == nil || owner.Kind != "ReplicaSet" || owner.Name == "" {
+			return false
+		}
+		if verdict, ok := verdicts[owner.Name]; ok {
+			return verdict
+		}
+		// Unreadable, because the ReplicaSet is already collected or the read
+		// is forbidden, is not evidence of another Deployment: waiting is what
+		// base did, and refusing fails a purge that would otherwise succeed.
+		// A readable ReplicaSet must be proven owned by the Deployment named
+		// after the service, since one under no Deployment holds the claim
+		// just as hard.
+		verdict := true
+		if set, err := clientset.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{}); err == nil {
+			verdict = false
+			if controller := metav1.GetControllerOf(set); controller != nil &&
+				controller.Kind == "Deployment" && controller.Name == name {
+				verdict = true
+			}
+		}
+		verdicts[owner.Name] = verdict
+		return verdict
 	}
 }
 
@@ -233,7 +247,7 @@ func purgeDeleteTargets(
 		return fmt.Errorf("no model cache PVC found")
 	}
 
-	releasing := servingPodsOf(ctx, k8sClient, namespace, deletedService)
+	releasing := servingPodsOf(ctx, clientset, namespace, deletedService)
 	var errs []error
 	var outcomes []purgeOutcome
 	for _, target := range targets {
