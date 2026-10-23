@@ -320,12 +320,9 @@ func newCacheAccessPodForRun(
 			RestartPolicy: corev1.RestartPolicyNever,
 			Containers: []corev1.Container{
 				{
-					Name:  containerName,
-					Image: cacheAccessImageName(),
-					// A mirror tagged :latest would otherwise be pulled on
-					// every run, on a cluster that may not reach it at all.
-					ImagePullPolicy: corev1.PullIfNotPresent,
-					Command:         []string{"sleep", "300"},
+					Name:    containerName,
+					Image:   "busybox:1.37.0",
+					Command: []string{"sleep", "300"},
 					VolumeMounts: []corev1.VolumeMount{
 						{
 							Name:      "model-cache",

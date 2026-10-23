@@ -107,10 +107,10 @@ func newCacheListCommand() *cobra.Command {
 Shows cache entries with their size, status, and which Model resources
 are using each cache entry. Each cache claim is read through a short-lived
 read-only pod the command creates and deletes, so it works even when the
-only other pod mounting the claim cannot run a shell. The command fails
-when no discovered claim can be read, rather than reporting the cache as
-empty; a claim that cannot be read while others can is skipped with a
-warning.`,
+only other pod mounting the claim cannot run a shell. That pod runs
+The command fails when no discovered claim can be read, rather than
+reporting the cache as empty; a claim that cannot be read while others can
+is skipped with a warning.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runCacheList(namespace, allNamespaces, orphanedOnly)
 		},
@@ -476,11 +476,11 @@ func runCacheClear(opts *cacheClearOptions) error {
 		var err error
 		switch {
 		case len(keys) > 0:
-			outcome, err = purgeCacheKeys(ctx, cfg, clientset, opts.namespace, target.Name, keys)
+			outcome, err = purgeCacheKeys(ctx, cfg, k8sClient, clientset, opts.namespace, target.Name, keys)
 		case opts.orphaned:
-			outcome, err = purgeOrphanedEntries(ctx, cfg, clientset, opts.namespace, target.Name, active)
+			outcome, err = purgeOrphanedEntries(ctx, cfg, k8sClient, clientset, opts.namespace, target.Name, active)
 		default:
-			outcome, err = purgeAllEntries(ctx, cfg, clientset, opts.namespace, target.Name)
+			outcome, err = purgeAllEntries(ctx, cfg, k8sClient, clientset, opts.namespace, target.Name)
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("purging cache PVC %s: %w", target.Name, err))

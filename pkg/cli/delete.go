@@ -176,7 +176,7 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
 		}
 		fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
-		if err := purgeDeleteTargets(ctx, cfg, clientset, opts.namespace, cacheKey, purged); err != nil {
+		if err := purgeDeleteTargets(ctx, cfg, k8sClient, clientset, opts.namespace, cacheKey, purged); err != nil {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", err, opts.namespace)
 		}
@@ -189,7 +189,7 @@ func runDelete(opts *deleteOptions) error {
 // purgeDeleteTargets removes cacheKey from every resolved claim, purging each
 // claim on its own so one failure is reported with the claim it belongs to.
 func purgeDeleteTargets(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace, cacheKey string, targets []purgeTarget,
 ) error {
 	if len(targets) == 0 {
@@ -199,7 +199,7 @@ func purgeDeleteTargets(
 	var errs []error
 	var outcomes []purgeOutcome
 	for _, target := range targets {
-		outcome, err := purgeCacheKeys(ctx, cfg, clientset, namespace, target.Name, []string{cacheKey})
+		outcome, err := purgeCacheKeys(ctx, cfg, k8sClient, clientset, namespace, target.Name, []string{cacheKey})
 		if err != nil {
 			errs = append(errs, fmt.Errorf("cache PVC %s: %w", target.Name, err))
 			continue
