@@ -89,7 +89,7 @@ func runtimeHFMirrorEnv(backend RuntimeBackend, isvc *inferencev1alpha1.Inferenc
 	// Under spec.hubOffline the runtime makes no request, so the endpoint and
 	// the token it would authenticate with are dead env, and the conflict this
 	// reports cannot arise.
-	if isvc.Spec.HubOffline {
+	if ptr.Deref(isvc.Spec.HubOffline, false) {
 		return nil, false
 	}
 	if hfEndpoint == "" || model == nil || model.Spec.SourceSecretRef == nil ||

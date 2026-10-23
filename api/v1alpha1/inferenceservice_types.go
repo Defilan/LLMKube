@@ -865,11 +865,13 @@ type InferenceServiceSpec struct {
 	// +optional
 	StageModel *bool `json:"stageModel,omitempty"`
 
-	// HubOffline keeps the serving container off the Hugging Face Hub: it is
-	// given HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so any lookup the
-	// operator did not stage (a tokenizer in another repository, remote code,
-	// an adapter named by repository id) fails at once instead of downloading
-	// on the serving node. Defaults to false.
+	// HubOffline keeps the Hugging Face libraries in the serving container
+	// (huggingface_hub, transformers, which vLLM, SGLang and TGI use) offline:
+	// the container is given HF_HUB_OFFLINE=1 and TRANSFORMERS_OFFLINE=1, so
+	// any lookup the operator did not stage (a tokenizer in another
+	// repository, remote code, an adapter or draft named by repository id)
+	// fails at once instead of downloading on the serving node. llama.cpp's
+	// own downloader does not read these variables. Unset means false.
 	//
 	// An explicit spec.env entry with the same name lands after the operator's
 	// and wins. The runtime mirror env (HF_ENDPOINT and the HF_TOKEN that goes
@@ -886,7 +888,7 @@ type InferenceServiceSpec struct {
 	// metal-agent does not forward spec.env, so neither this field nor a
 	// spec.env entry reaches it.
 	// +optional
-	HubOffline bool `json:"hubOffline,omitempty"`
+	HubOffline *bool `json:"hubOffline,omitempty"`
 
 	// ModelCache overrides where this InferenceService caches model weights:
 	// when claimName is set, the named user-owned PVC is mounted as the

@@ -66,7 +66,10 @@ func TestHubOfflineEnv(t *testing.T) {
 	isvc := func(runtime string, offline bool, mutate func(*inferencev1alpha1.InferenceServiceSpec)) *inferencev1alpha1.InferenceService {
 		s := &inferencev1alpha1.InferenceService{
 			ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
-			Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: runtime, ModelRef: "qwen", HubOffline: offline},
+			Spec:       inferencev1alpha1.InferenceServiceSpec{Runtime: runtime, ModelRef: "qwen"},
+		}
+		if offline {
+			s.Spec.HubOffline = ptr.To(true)
 		}
 		if mutate != nil {
 			mutate(&s.Spec)
@@ -78,10 +81,9 @@ func TestHubOfflineEnv(t *testing.T) {
 	}
 
 	cases := []struct {
-		name     string
-		isvc     *inferencev1alpha1.InferenceService
-		model    *inferencev1alpha1.Model
-		replicas int32
+		name  string
+		isvc  *inferencev1alpha1.InferenceService
+		model *inferencev1alpha1.Model
 		// wantOffline is the HF_HUB_OFFLINE entries the serving container gets.
 		wantOffline []corev1.EnvVar
 		// wantEndpoint says whether the mirror env is still added.
@@ -152,29 +154,18 @@ func TestHubOfflineEnv(t *testing.T) {
 			},
 		},
 		{
-			// Both variables must reach every member of a multiNode group;
-			// memberPodFromTemplate rewrites rank pods from the template.
-			name:     "a multiNode member inherits the field",
-			isvc:     isvc(RuntimeVLLM, true, nil),
-			model:    repoModel("qwen", "hf-mirror"),
-			replicas: 1,
-			wantOffline: []corev1.EnvVar{
-				{Name: "HF_HUB_OFFLINE", Value: wantHubOffline},
-				{Name: "TRANSFORMERS_OFFLINE", Value: wantTransformersOff},
-			},
+			name:  "an explicit false adds nothing",
+			isvc:  isvc(RuntimeVLLM, false, func(s *inferencev1alpha1.InferenceServiceSpec) { s.HubOffline = ptr.To(false) }),
+			model: repoModel("qwen", "hf-mirror"),
+			// No offline env; the mirror still applies.
+			wantEndpoint: true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
-			replicas := tc.replicas
-			if replicas == 0 {
-				// skipModelInit services want no init container; the staged
-				// case needs one, which the builder decides on its own.
-				replicas = 1
-			}
-			dep := r.constructDeployment(tc.isvc, tc.model, nil, replicas, testMirror, "")
+			dep := r.constructDeployment(tc.isvc, tc.model, nil, 1, testMirror, "")
 
 			for _, want := range tc.wantOffline {
 				got := servingEnv(dep, want.Name)
@@ -190,7 +181,7 @@ func TestHubOfflineEnv(t *testing.T) {
 				}
 			}
 
-			if tc.isvc.Spec.HubOffline {
+			if ptr.Deref(tc.isvc.Spec.HubOffline, false) {
 				// The mirror's own pair is what the field makes dead: the
 				// optional HF_TOKEN that runtimeHFMirrorEnv adds from the
 				// Model's Secret alongside HF_ENDPOINT. A backends' own
@@ -231,7 +222,7 @@ func TestHubOfflineEnvUserEnvWins(t *testing.T) {
 	svc := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
 		Spec: inferencev1alpha1.InferenceServiceSpec{
-			Runtime: RuntimeVLLM, ModelRef: "qwen", HubOffline: true,
+			Runtime: RuntimeVLLM, ModelRef: "qwen", HubOffline: ptr.To(true),
 			Env: []corev1.EnvVar{
 				{Name: "HF_HUB_OFFLINE", Value: "0"},
 				{Name: "TRANSFORMERS_OFFLINE", Value: "0"},
@@ -325,7 +316,7 @@ var _ = Describe("runtime hub offline reconcile", func() {
 
 	It("warns when TGI would fetch a repo id under the field", func() {
 		createModel("Qwen/Qwen3.8-27B-FP8")
-		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{Runtime: "tgi", HubOffline: true})
+		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{Runtime: "tgi", HubOffline: ptr.To(true)})
 		Expect(got).To(ContainElement(SatisfyAll(
 			ContainSubstring(ReasonHubOfflineRuntimeDownload),
 			ContainSubstring("tgi"),
@@ -338,13 +329,13 @@ var _ = Describe("runtime hub offline reconcile", func() {
 
 	It("does not warn for a staged vLLM service", func() {
 		createModel("Qwen/Qwen3.8-27B-FP8")
-		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{Runtime: RuntimeVLLM, HubOffline: true})
+		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{Runtime: RuntimeVLLM, HubOffline: ptr.To(true)})
 		Expect(got).NotTo(ContainElement(ContainSubstring(ReasonHubOfflineRuntimeDownload)))
 	})
 
 	It("does not warn for a pre-staged pvc source", func() {
 		createModel("pvc://models/Qwen3-8B-FP8")
-		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{Runtime: "tgi", HubOffline: true})
+		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{Runtime: "tgi", HubOffline: ptr.To(true)})
 		Expect(got).NotTo(ContainElement(ContainSubstring(ReasonHubOfflineRuntimeDownload)))
 	})
 
@@ -357,7 +348,7 @@ var _ = Describe("runtime hub offline reconcile", func() {
 	It("does not emit the mirror conflict under the field", func() {
 		createModel("Qwen/Qwen3.8-27B-FP8")
 		got := reconcileService(inferencev1alpha1.InferenceServiceSpec{
-			Runtime: RuntimeVLLM, HubOffline: true, SkipModelInit: ptr.To(true),
+			Runtime: RuntimeVLLM, HubOffline: ptr.To(true), SkipModelInit: ptr.To(true),
 			VLLMConfig: &inferencev1alpha1.VLLMConfig{HFTokenSecretRef: &corev1.SecretKeySelector{
 				LocalObjectReference: corev1.LocalObjectReference{Name: "hf-public"}, Key: "token",
 			}},
@@ -365,3 +356,31 @@ var _ = Describe("runtime hub offline reconcile", func() {
 		Expect(got).NotTo(ContainElement(ContainSubstring(ReasonHFMirrorNotApplied)))
 	})
 })
+
+// Every member of a multiNode group gets the offline env: memberPodFromTemplate
+// specialises each rank's pod from the service's template, and must keep it.
+func TestHubOfflineEnvReachesMultiNodeMembers(t *testing.T) {
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "default"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			Runtime: RuntimeVLLM, ModelRef: "qwen", HubOffline: ptr.To(true),
+			MultiNode: &inferencev1alpha1.MultiNodeSpec{Members: []inferencev1alpha1.MultiNodeMember{{Node: "n0"}, {Node: "n1"}}},
+		},
+	}
+	model := &inferencev1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{Name: "qwen", Namespace: "default"},
+		Spec:       inferencev1alpha1.ModelSpec{Source: "Qwen/Qwen3.8-27B-FP8"},
+	}
+	r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
+	tmpl := r.constructDeployment(isvc, model, nil, 1, "", "").Spec.Template
+	mnb := resolveBackend(isvc).(MultiNodeArgsBuilder)
+	for rank, member := range isvc.Spec.MultiNode.Members {
+		pod := memberPodFromTemplate(tmpl, isvc, member, int32(rank), mnb) //nolint:gosec // G115: two members
+		env := pod.Spec.Containers[0].Env
+		for _, name := range []string{"HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"} {
+			if got := envValue(env, name); got != "1" {
+				t.Errorf("rank %d: %s = %q, want \"1\"", rank, name, got)
+			}
+		}
+	}
+}

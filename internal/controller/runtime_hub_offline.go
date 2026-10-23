@@ -18,6 +18,7 @@ package controller
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -33,7 +34,7 @@ const ReasonHubOfflineRuntimeDownload = "HubOfflineRuntimeDownload"
 // TRANSFORMERS_OFFLINE as its fallback, and transformers 4.41 and older read
 // only the latter.
 func hubOfflineEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar {
-	if isvc == nil || !isvc.Spec.HubOffline {
+	if isvc == nil || !ptr.Deref(isvc.Spec.HubOffline, false) {
 		return nil
 	}
 	return []corev1.EnvVar{
@@ -48,7 +49,7 @@ func hubOfflineEnv(isvc *inferencev1alpha1.InferenceService) []corev1.EnvVar {
 // pre-staged and non-Hub sources have no Hub lookup to fail, so they are
 // excluded by isHFRepoSource.
 func hubOfflineRuntimeDownload(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, backend RuntimeBackend) bool {
-	if isvc == nil || model == nil || !isvc.Spec.HubOffline {
+	if isvc == nil || model == nil || !ptr.Deref(isvc.Spec.HubOffline, false) {
 		return false
 	}
 	if operatorStagesModel(isvc, backend) {
@@ -60,6 +61,6 @@ func hubOfflineRuntimeDownload(isvc *inferencev1alpha1.InferenceService, model *
 // hubOfflineRuntimeDownloadMessage names the failure and the ways out.
 func hubOfflineRuntimeDownloadMessage(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model) string {
 	return "spec.hubOffline is set, but runtime " + resolveServingRuntime(isvc) + " downloads Model " + model.Name +
-		" itself on the serving node, so its start fails. Let the operator stage the Model (drop spec.skipModelInit, or set spec.stageModel: true), " +
+		" itself on the serving node, and its Hugging Face download fails offline. Let the operator stage the Model (drop spec.skipModelInit, or set spec.stageModel: true), " +
 		"serve a pvc:// source, or unset spec.hubOffline"
 }
