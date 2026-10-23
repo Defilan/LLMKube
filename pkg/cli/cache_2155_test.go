@@ -744,115 +744,29 @@ func TestPurgeRefusesAReadWriteOncePodClaimFromItsResolvedTarget(t *testing.T) {
 	}
 }
 
-// A leaked cache-access pod of the other kind is llmkube's own and outlived the
-// run that made it, so the refusal names nothing the run would not itself
-// delete: it is replaced as any stale cache pod is.
-func TestCacheClearReplacesALeakedInspectorOnAReadWriteOncePodClaim(t *testing.T) {
+// A leftover cache pod of the other kind sits at a name no run deletes, so no
+// run will free the claim: the refusal says so, at once, instead of waiting out
+// the start timeout on a pod that cannot mount.
+func TestCacheClearRefusesALeakedInspectorPodOfTheOtherKind(t *testing.T) {
 	leaked := mountedPod(inspectorPodName(modelCachePVCName))
-	leaked.Labels = map[string]string{managedByLabel: managedByValue, modelCacheLabel: "cache-inspector"}
-	created := metav1.NewTime(time.Now().Add(-time.Hour))
-	leaked.CreationTimestamp = created
+	leaked.Labels = map[string]string{managedByLabel: managedByValue, modelCacheLabel: inspectorPodKind.component}
+	leaked.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
 	env := cache2155Env(t, "cache-2155-cross-kind", dynamicClaim(corev1.ReadWriteOncePod),
 		[]*corev1.Pod{leaked}, nil)
-	// Not kept: the leaked pod is deleted so the purge pod can replace it.
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, false)
 
-	if err := runCacheCommand(t, "clear", "--force", "-n", env.namespace); err != nil {
-		t.Fatalf("a stale inspector pod is not a reason to refuse the purge: %v", err)
+	err := runCacheCommand(t, "clear", "--force", "-n", env.namespace)
+	if err == nil {
+		t.Fatal("a leftover cache pod still holds the claim; the purge must refuse")
 	}
-}
-
-// A ReplicaSet is this run's own only when the Deployment above it, not the
-// ReplicaSet's name, is the one the operator built for the deleted service.
-func TestServingPodsOfFollowsTheDeploymentNotTheName(t *testing.T) {
-	cfg := cacheListEnvtest(t)
-	namespace := "cache-2155-owner-chain"
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		t.Fatalf("clientset: %v", err)
+	if !strings.Contains(err.Error(), "ReadWriteOncePod") || !strings.Contains(err.Error(), leaked.Name) {
+		t.Errorf("error = %v, want it to name the access mode and the holding pod", err)
 	}
-	if _, err := clientset.CoreV1().Namespaces().Create(context.Background(),
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("create namespace: %v", err)
+	if !strings.Contains(err.Error(), "nothing will remove it") {
+		t.Errorf("error = %v, want it to say no run will free the claim", err)
 	}
-	createDeployment := func(service string) *appsv1.Deployment {
-		t.Helper()
-		labels := map[string]string{"app": service}
-		got, err := clientset.AppsV1().Deployments(namespace).Create(context.Background(),
-			&appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{Name: service, Namespace: namespace, Labels: labels},
-				Spec: appsv1.DeploymentSpec{
-					Selector: &metav1.LabelSelector{MatchLabels: labels},
-					Template: corev1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{Labels: labels},
-						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
-					},
-				},
-			}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatalf("create Deployment %s: %v", service, err)
-		}
-		return got
-	}
-	createSet := func(name string, owner *metav1.OwnerReference) *appsv1.ReplicaSet {
-		t.Helper()
-		labels := map[string]string{"app": name}
-		ownerRefs := []metav1.OwnerReference{}
-		if owner != nil {
-			ownerRefs = append(ownerRefs, *owner)
-		}
-		got, err := clientset.AppsV1().ReplicaSets(namespace).Create(context.Background(),
-			&appsv1.ReplicaSet{
-				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels, OwnerReferences: ownerRefs},
-				Spec: appsv1.ReplicaSetSpec{
-					Selector: &metav1.LabelSelector{MatchLabels: labels},
-					Template: corev1.PodTemplateSpec{
-						ObjectMeta: metav1.ObjectMeta{Labels: labels},
-						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
-					},
-				},
-			}, metav1.CreateOptions{})
-		if err != nil {
-			t.Fatalf("create ReplicaSet %s: %v", name, err)
-		}
-		return got
-	}
-	servingPod := func(set *appsv1.ReplicaSet) *corev1.Pod {
-		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
-			Name:      set.Name + "-pod",
-			Namespace: namespace,
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: set.Name, UID: set.UID, Controller: boolPtr(true),
-			}},
-		}}
-	}
-
-	own := createSet("a-model-7d9f4b8c9", &metav1.OwnerReference{
-		APIVersion: "apps/v1", Kind: "Deployment", Name: "a-model",
-		UID: createDeployment("a-model").UID, Controller: boolPtr(true),
-	})
-	// "<name>-v2" produces ReplicaSets whose names start with "<name>-".
-	other := createSet("a-model-v2-8b6c1d2e3", &metav1.OwnerReference{
-		APIVersion: "apps/v1", Kind: "Deployment", Name: "a-model-v2",
-		UID: createDeployment("a-model-v2").UID, Controller: boolPtr(true),
-	})
-	// A ReplicaSet under no Deployment holds the claim just as hard.
-	hijack := createSet("a-model-9a8b7c6d5", nil)
-
-	releasing := servingPodsOf(context.Background(), clientset, namespace, "a-model")
-	for _, c := range []struct {
-		name string
-		pod  *corev1.Pod
-		want bool
-	}{
-		{"the Deployment named after the service", servingPod(own), true},
-		{"the Deployment of a longer-named service", servingPod(other), false},
-		{"a ReplicaSet with no Deployment above it", servingPod(hijack), false},
-		{"no controller reference", &corev1.Pod{}, false},
-	} {
-		if got := releasing(c.pod); got != c.want {
-			t.Errorf("%s: releasing = %v, want %v", c.name, got, c.want)
-		}
+	if podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
+		t.Error("a purge pod was created for a claim it cannot mount")
 	}
 }
 

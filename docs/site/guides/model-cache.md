@@ -579,7 +579,8 @@ chain: the ReplicaSet that owns the pod and the Deployment that owns that
 ReplicaSet must reach the service being deleted. The check lists pods in the
 namespace, so `cache clear` and `delete --purge-cache` need `list pods` for it,
 and `delete --purge-cache` also needs `get replicasets`; without them the
-command falls back to the old wait.
+command falls back to the old wait. A cache pod llmkube left behind at the name
+the command does not use is named as such, since no run will free that claim.
 `--all-namespaces` does not inspect claims and creates no pod.
 
 Both short-lived pods run `busybox:1.37.0`. On a cluster that cannot pull it,
