@@ -523,7 +523,7 @@ func TestDeletePurgeWaitsForTheServingPodItIsTearingDown(t *testing.T) {
 	nodeTheServingPods(t, env.clientset, env.namespace, createServingChain(t, env, "a-model", "7d9f4b8c9"))
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
-	if err := runDeleteCommandFor2155(t, "a-model", env.namespace); err != nil {
+	if err := runDeleteCommandFor2155(t, env.namespace); err != nil {
 		t.Fatalf("the serving pod this run deletes must be waited for, not refused: %v", err)
 	}
 	if !podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
@@ -537,23 +537,11 @@ func nodeTheServingPods(t *testing.T, clientset kubernetes.Interface, namespace 
 	t.Helper()
 	for _, pod := range pods {
 		pod.Spec.NodeName = "node-b"
-		if _, err := clientset.CoreV1().Pods(namespace).Update(context.Background(), pod, metav1.UpdateOptions{}); err != nil {
+		if _, err := clientset.CoreV1().Pods(namespace).Update(
+			context.Background(), pod, metav1.UpdateOptions{}); err != nil {
 			t.Fatalf("place %s on a node: %v", pod.Name, err)
 		}
 	}
-}
-
-func existsInCandidates(env *cacheCommandEnv) bool {
-	c, _, err := cachePVCandidates(context.Background(), env.cr, env.namespace)
-	if err != nil {
-		return false
-	}
-	for _, n := range c {
-		if n == perServiceCacheClaimName("a-model") {
-			return true
-		}
-	}
-	return false
 }
 
 // A chain that cannot be read is not proof the pod belongs to someone else:
@@ -574,7 +562,7 @@ func TestDeletePurgeWaitsWhenTheServingPodOwnershipCannotBeRead(t *testing.T) {
 	}
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
-	if err := runDeleteCommandFor2155(t, "a-model", env.namespace); err != nil {
+	if err := runDeleteCommandFor2155(t, env.namespace); err != nil {
 		t.Fatalf("an unreadable owner chain must fall back to the wait, not refuse: %v", err)
 	}
 	if !podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
@@ -603,7 +591,7 @@ func TestDeletePurgeRefusesAPodOfAServiceWhoseNameStartsWithIt(t *testing.T) {
 	}
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
-	err := runDeleteCommandFor2155(t, "a-model", env.namespace)
+	err := runDeleteCommandFor2155(t, env.namespace)
 	if err == nil || !strings.Contains(err.Error(), "ReadWriteOncePod") {
 		t.Fatalf("another service's pod is not exempt as this run's own pod: err = %v", err)
 	}
@@ -635,7 +623,7 @@ func TestDeletePurgeRefusesAHeldReadWriteOncePodClaim(t *testing.T) {
 	// Another command in this process must not answer for this run's claims.
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
-	err := runDeleteCommandFor2155(t, "a-model", env.namespace)
+	err := runDeleteCommandFor2155(t, env.namespace)
 	if err == nil {
 		t.Fatal("delete --purge-cache succeeded; want the ReadWriteOncePod refusal")
 	}
@@ -770,6 +758,98 @@ func TestCacheClearRefusesALeakedInspectorPodOfTheOtherKind(t *testing.T) {
 	}
 }
 
+// A ReplicaSet is this run's own only when the Deployment above it, not the
+// ReplicaSet's name, is the one the operator built for the deleted service.
+func TestServingPodsOfFollowsTheDeploymentNotTheName(t *testing.T) {
+	cfg := cacheListEnvtest(t)
+	namespace := "cache-2155-owner-chain"
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		t.Fatalf("clientset: %v", err)
+	}
+	if _, err := clientset.CoreV1().Namespaces().Create(context.Background(),
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+	labelsFor := func(name string) map[string]string { return map[string]string{"app": name} }
+	createDeployment := func(service string) *metav1.OwnerReference {
+		t.Helper()
+		labels := labelsFor(service)
+		template := corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: labels},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
+		}
+		got, err := clientset.AppsV1().Deployments(namespace).Create(context.Background(), &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: service, Namespace: namespace, Labels: labels},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: labels},
+				Template: template,
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("create Deployment %s: %v", service, err)
+		}
+		return &metav1.OwnerReference{
+			APIVersion: "apps/v1", Kind: "Deployment", Name: got.Name, UID: got.UID, Controller: boolPtr(true),
+		}
+	}
+	createSet := func(name string, owner *metav1.OwnerReference) *appsv1.ReplicaSet {
+		t.Helper()
+		labels := labelsFor(name)
+		var refs []metav1.OwnerReference
+		if owner != nil {
+			refs = append(refs, *owner)
+		}
+		got, err := clientset.AppsV1().ReplicaSets(namespace).Create(context.Background(), &appsv1.ReplicaSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels, OwnerReferences: refs},
+			Spec: appsv1.ReplicaSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: labels},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: labels},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
+				},
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("create ReplicaSet %s: %v", name, err)
+		}
+		return got
+	}
+	servingPod := func(set *appsv1.ReplicaSet) *corev1.Pod {
+		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      set.Name + "-pod",
+			Namespace: namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: set.Name, UID: set.UID, Controller: boolPtr(true),
+			}},
+		}}
+	}
+
+	own := createSet("a-model-7d9f4b8c9", createDeployment("a-model"))
+	// "<name>-v2" produces ReplicaSets whose names start with "<name>-".
+	other := createSet("a-model-v2-8b6c1d2e3", createDeployment("a-model-v2"))
+	// A ReplicaSet under no Deployment holds the claim just as hard.
+	orphan := createSet("a-model-9a8b7c6d5", nil)
+	gone := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "a-model-collected"}}
+
+	releasing := servingPodsOf(context.Background(), clientset, namespace, "a-model")
+	for _, c := range []struct {
+		name string
+		pod  *corev1.Pod
+		want bool
+	}{
+		{"the Deployment named after the service", servingPod(own), true},
+		{"the Deployment of a longer-named service", servingPod(other), false},
+		{"a ReplicaSet with no Deployment above it", servingPod(orphan), false},
+		{"a ReplicaSet already collected", servingPod(gone), true},
+		{"no controller reference", &corev1.Pod{}, false},
+	} {
+		if got := releasing(c.pod); got != c.want {
+			t.Errorf("%s: releasing = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // Parity: purge pods are never pinned on base, and this change does not start
 // pinning them.
 func TestPurgePodIsNotPinnedToTheHolder(t *testing.T) {
@@ -848,11 +928,12 @@ func TestCacheAccessPodShapeThroughTheCommand(t *testing.T) {
 	}
 }
 
-// runDeleteCommandFor2155 executes delete with --purge-cache.
-func runDeleteCommandFor2155(t *testing.T, name, namespace string) error {
+// runDeleteCommandFor2155 executes delete --purge-cache for the service every
+// case here deletes.
+func runDeleteCommandFor2155(t *testing.T, namespace string) error {
 	t.Helper()
 	cmd := NewDeleteCommand()
-	cmd.SetArgs([]string{name, "--purge-cache", "-n", namespace})
+	cmd.SetArgs([]string{"a-model", "--purge-cache", "-n", namespace})
 	cmd.SilenceUsage = true
 	cmd.SilenceErrors = true
 	cmd.SetOut(io.Discard)

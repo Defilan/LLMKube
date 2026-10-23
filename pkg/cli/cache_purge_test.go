@@ -231,7 +231,8 @@ func TestEnsurePurgePod_ReplacesStale(t *testing.T) {
 	var cmds [][]string
 	fakePurgeExec(t, func(command []string) (string, error) { return "", nil }, &cmds)
 
-	got, err := ensurePurgePod(context.Background(), purgeTestClient(), clientset, "default", purgeTarget{Name: pvcName})
+	got, err := ensurePurgePodReleasing(context.Background(), purgeTestClient(), clientset, "default",
+		purgeTarget{Name: pvcName}, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -264,7 +265,8 @@ func TestEnsurePurgePod_RefusesForeignPod(t *testing.T) {
 		return nil
 	}
 
-	_, err := ensurePurgePod(context.Background(), purgeTestClient(), clientset, "default", purgeTarget{Name: pvcName})
+	_, err := ensurePurgePodReleasing(context.Background(), purgeTestClient(), clientset, "default",
+		purgeTarget{Name: pvcName}, nil)
 	if err == nil {
 		t.Fatal("expected an error for a foreign pod at the purge pod name")
 	}
