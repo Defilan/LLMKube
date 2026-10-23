@@ -25,6 +25,11 @@ controllerManager:
   # Number of controller replicas (recommended: 1 for active/passive HA)
   replicaCount: 1
 
+  # Old ReplicaSets kept on the controller Deployment. Helm upgrades otherwise
+  # leave up to 10 scaled-to-zero ReplicaSets behind (Kubernetes default);
+  # use `helm rollback` to roll back. 0 keeps none.
+  revisionHistoryLimit: 3
+
   # Leader election configuration
   leaderElection:
     enabled: true

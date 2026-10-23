@@ -113,6 +113,7 @@ fit, keeping the role suffix that identifies the object.
 | `controllerManager.initContainer.repository` | Init container image repository | `docker.io/curlimages/curl` |
 | `controllerManager.initContainer.tag` | Init container image tag | `8.18.0` |
 | `controllerManager.replicaCount` | Number of controller replicas | `1` |
+| `controllerManager.revisionHistoryLimit` | Old ReplicaSets kept on the controller Deployment (0 keeps none) | `3` |
 | `controllerManager.leaderElection.enabled` | Enable leader election | `true` |
 | `controllerManager.resources.limits.cpu` | CPU limit | `500m` |
 | `controllerManager.resources.limits.memory` | Memory limit | `2Gi` |

@@ -1,0 +1,28 @@
+suite: controller revisionHistoryLimit
+templates:
+  - deployment.yaml
+
+tests:
+  # Old ReplicaSets are useless on a Helm-managed Deployment (rollback is
+  # `helm rollback`), so the chart keeps 3 instead of the Kubernetes 10 (#2177).
+  - it: should default revisionHistoryLimit to 3
+    asserts:
+      - equal:
+          path: spec.revisionHistoryLimit
+          value: 3
+
+  - it: should honor an override
+    set:
+      controllerManager.revisionHistoryLimit: 1
+    asserts:
+      - equal:
+          path: spec.revisionHistoryLimit
+          value: 1
+
+  - it: should render 0 rather than dropping it as falsy
+    set:
+      controllerManager.revisionHistoryLimit: 0
+    asserts:
+      - equal:
+          path: spec.revisionHistoryLimit
+          value: 0

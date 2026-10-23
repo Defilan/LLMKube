@@ -7,6 +7,7 @@ metadata:
     {{- include "llmkube.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.controllerManager.replicaCount }}
+  revisionHistoryLimit: {{ .Values.controllerManager.revisionHistoryLimit }}
   selector:
     matchLabels:
       {{- include "llmkube.selectorLabels" . | nindent 6 }}
