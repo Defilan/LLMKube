@@ -482,8 +482,19 @@ func (d *Dispatcher) Dispatch(
 	if backend == nil {
 		return nil, fmt.Errorf("dispatch: backend is nil")
 	}
-	endpoint, placed, reason, tokens := d.place(backend, headers, int64(len(requestBody)))
-	d.countPlacement(backend.Name, placed, reason)
+	// count_tokens tokenizes the conversation without a prefill: it is placed
+	// without the session header, adds no prefill tokens, leaves the
+	// session's binding and size record to the real turns, and is not counted
+	// as a placement.
+	tokenCount := isTokenCountPath(path)
+	placeHeaders, placeBytes := headers, int64(len(requestBody))
+	if tokenCount {
+		placeHeaders, placeBytes = nil, 0
+	}
+	endpoint, placed, reason, tokens := d.place(backend, placeHeaders, placeBytes)
+	if !tokenCount {
+		d.countPlacement(backend.Name, placed, reason)
+	}
 	release := d.track(backend.Name, endpoint)
 	releasePrefill := d.trackPrefill(backend.Name, endpoint, tokens)
 	url := joinURL(dispatchTarget(backend, endpoint), path)
