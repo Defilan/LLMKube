@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // defaultQuarantineDuration is how long a backend stays in the
@@ -116,6 +118,10 @@ type Dispatcher struct {
 	// endpoint. 0 disables the guard. Defaults to defaultStreamIdleTimeout.
 	streamIdleTimeout time.Duration
 
+	// routerName labels the per-endpoint load gauges. Empty unless set with
+	// WithRouterLabel.
+	routerName string
+
 	// nowFn is overridable in tests.
 	nowFn func() time.Time
 }
@@ -128,6 +134,12 @@ type DispatcherOption func(*Dispatcher)
 // for fifteen seconds to verify recovery.
 func WithQuarantineDuration(d time.Duration) DispatcherOption {
 	return func(disp *Dispatcher) { disp.quarantineDuration = d }
+}
+
+// WithRouterLabel sets the router label value on the dispatcher's per-endpoint
+// metrics, so a departed endpoint's gauge series can be dropped.
+func WithRouterLabel(name string) DispatcherOption {
+	return func(disp *Dispatcher) { disp.routerName = name }
 }
 
 // WithNowFunc overrides the dispatcher's time source. Tests use it to
@@ -302,6 +314,8 @@ func (d *Dispatcher) SetEndpoints(name string, endpoints []string) {
 		if !keep[ep] {
 			d.health.Delete(healthKey(name, ep))
 			d.loads.Delete(healthKey(name, ep))
+			prommetrics.RouterEndpointLoad.DeleteLabelValues(d.routerName, name, ep)
+			prommetrics.RouterEndpointMetricsFresh.DeleteLabelValues(d.routerName, name, ep)
 		}
 	}
 	d.endpoints.Store(name, next)
