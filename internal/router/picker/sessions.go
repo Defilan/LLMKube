@@ -35,6 +35,10 @@ const (
 	// PressureMarginNoSample is the same margin when the bound pod has no fresh
 	// sample, so the load is only this replica's in-flight count.
 	PressureMarginNoSample int64 = 8
+	// MinPodsForLoadMoves is the fewest dispatchable pods at which a queue and
+	// a load gap alone move a session. Below it every move lands on a cold
+	// prefix cache, so only a KV-full pod sheds.
+	MinPodsForLoadMoves = 3
 )
 
 type binding struct {
@@ -154,7 +158,8 @@ func (s *Sessions) Place(key uint64, cands []Candidate, now time.Time, tieStart 
 
 // pressure reports whether the bound pod should shed the session, and to which
 // pod. It returns ReasonNone when the session should stay. A target never has a
-// fresh KV reading at or above KVFullThreshold.
+// fresh KV reading at or above KVFullThreshold. On a pool of fewer than
+// MinPodsForLoadMoves dispatchable pods only a KV-full bound pod sheds.
 func pressure(bound Candidate, cands []Candidate, now time.Time, tieStart int) (string, Reason) {
 	others := make([]Candidate, 0, len(cands))
 	for _, c := range Eligible(cands, now) {
@@ -178,10 +183,11 @@ func pressure(bound Candidate, cands []Candidate, now time.Time, tieStart int) (
 		}
 	}
 	gap := Load(bound, now) - Load(least, now)
+	small := len(cands) < MinPodsForLoadMoves
 
 	bs := freshSample(bound, now)
 	if bs == nil {
-		if gap >= PressureMarginNoSample {
+		if !small && gap >= PressureMarginNoSample {
 			return leastEP, ReasonWaiting
 		}
 		return "", ReasonNone
@@ -190,6 +196,9 @@ func pressure(bound Candidate, cands []Candidate, now time.Time, tieStart int) (
 		return "", ReasonNone
 	}
 	full := bs.KVUsage >= KVFullThreshold
+	if small && !full {
+		return "", ReasonNone
+	}
 	reason := ReasonWaiting
 	if full {
 		reason = ReasonKVFull
