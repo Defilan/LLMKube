@@ -136,6 +136,55 @@ spec:
                     RouterBackend is one candidate destination for routed requests.
                     Exactly one of InferenceServiceRef or External must be set.
                   properties:
+                    balancing:
+                      description: |-
+                        Balancing places requests across this backend's pods by load and keeps
+                        a session on its pod until it runs hot. Requires resolution: endpoint.
+                        Unset keeps round-robin.
+                        Applies to the Proxy data plane only; ignored by the Gateway and
+                        AgentGateway data planes.
+                      properties:
+                        mode:
+                          default: RoundRobin
+                          description: |-
+                            Mode is RoundRobin (today's behavior) or LoadAware: the pod with the
+                            least work, read from the engine's own metrics where LLMKube has a
+                            profile for the runtime (vLLM) and from in-flight requests otherwise.
+                          enum:
+                          - RoundRobin
+                          - LoadAware
+                          type: string
+                        sessionAffinity:
+                          description: |-
+                            SessionAffinity keeps a session on one pod while that pod's load stays
+                            within maxLoadPercent of the average.
+                          properties:
+                            headers:
+                              description: |-
+                                Headers identify a session, in priority order; the first present with a
+                                non-empty value is the key. Compared case-insensitively. Only a hash of
+                                the value is used. Each name is an RFC 7230 header token.
+                              items:
+                                maxLength: 256
+                                minLength: 1
+                                pattern: ^[A-Za-z0-9!#$%&'*+.^_|~`-]+$
+                                type: string
+                              maxItems: 8
+                              minItems: 1
+                              type: array
+                            maxLoadPercent:
+                              default: 125
+                              description: |-
+                                MaxLoadPercent bounds a pod's load, as a percentage of the average
+                                across eligible pods, before a session spills to the next pod.
+                              format: int32
+                              maximum: 1000
+                              minimum: 101
+                              type: integer
+                          required:
+                          - headers
+                          type: object
+                      type: object
                     capabilities:
                       description: |-
                         Capabilities advertised by this backend. Rules can require
@@ -347,6 +396,11 @@ spec:
                   required:
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: 'balancing requires an inferenceServiceRef backend with
+                      resolution: endpoint'
+                    rule: '!has(self.balancing) || (has(self.inferenceServiceRef)
+                      && has(self.resolution) && self.resolution == ''endpoint'')'
                 minItems: 1
                 type: array
               dataPlane:

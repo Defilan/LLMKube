@@ -159,6 +159,38 @@ var (
 		[]string{labelRouter, "backend"},
 	)
 
+	// RouterEndpointLoad is the router proxy's load estimate for one pod of a
+	// LoadAware backend: the engine's running plus waiting requests from a
+	// fresh scrape, plus requests this proxy sent since; without a fresh
+	// scrape, this proxy's in-flight count.
+	RouterEndpointLoad = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "llmkube_router_endpoint_load",
+			Help: "Router proxy load estimate for one pod of a LoadAware backend.",
+		},
+		[]string{labelRouter, "backend", "endpoint"},
+	)
+
+	// RouterEndpointMetricsFresh is 1 while the router proxy holds a scrape
+	// of a pod's engine metrics younger than 5 s, else 0.
+	RouterEndpointMetricsFresh = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "llmkube_router_endpoint_metrics_fresh",
+			Help: "Whether the router proxy holds a fresh engine-metrics sample for a pod (1) or not (0).",
+		},
+		[]string{labelRouter, "backend", "endpoint"},
+	)
+
+	// RouterPlacementsTotal counts the router proxy's placement decisions for
+	// balanced backends by result: least_loaded, sticky, spill or fallback.
+	RouterPlacementsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_router_placements_total",
+			Help: "Router proxy placement decisions for balanced backends, by result.",
+		},
+		[]string{labelRouter, "backend", "result"},
+	)
+
 	RouterBackendHealth = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "llmkube_router_backend_health",
@@ -478,6 +510,9 @@ var AllCollectors = []prometheus.Collector{
 	RouterActiveBackends,
 	RouterBackendHealth,
 	RouterEndpointSourceReady,
+	RouterEndpointLoad,
+	RouterEndpointMetricsFresh,
+	RouterPlacementsTotal,
 	RouterFirstTokenSeconds,
 	RouterBudgetUtilization,
 	RouterTokenBudgetUtilization,

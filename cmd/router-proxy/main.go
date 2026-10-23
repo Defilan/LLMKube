@@ -142,6 +142,7 @@ func main() {
 			router.WithQuarantineDuration(*quarantineDuration),
 			router.WithResponseHeaderTimeout(*responseHeaderTimeout),
 			router.WithStreamIdleTimeout(*streamIdleTimeout),
+			router.WithRouterLabel(routerNameFromEnv()),
 		),
 	}
 	if *enableActivation {
@@ -162,6 +163,12 @@ func main() {
 	if watcher := newEndpointWatcher(cfg, proxy, logger); watcher != nil {
 		go watcher.Start(baseCtx)
 		logger.Info("endpoint watch started")
+	}
+
+	// LoadAware backends: scrape each pod's engine metrics once a second.
+	if scraper := router.NewLoadScraper(cfg, proxy.Dispatcher(), routerNameFromEnv(), logger); scraper.HasTargets() {
+		go scraper.Start(baseCtx)
+		logger.Info("engine metrics scraper started")
 	}
 
 	mux := http.NewServeMux()

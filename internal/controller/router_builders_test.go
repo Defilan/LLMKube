@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,11 +23,13 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/router"
@@ -1749,4 +1752,120 @@ func TestRouterDeploymentEndpointWatchIdentityAndTolerations(t *testing.T) {
 	if len(spec.Tolerations) != 1 || spec.Tolerations[0].Key != "nvidia.com/gpu" {
 		t.Errorf("tolerations = %v, want the nvidia.com/gpu toleration", spec.Tolerations)
 	}
+}
+
+// TestCompileRouterConfigBalancing: an endpoint backend with balancing
+// compiles the policy, and a vLLM backend gets the vLLM metrics profile; a
+// llama.cpp backend gets the policy but no profile.
+func TestCompileRouterConfigBalancing(t *testing.T) {
+	for _, tc := range []struct {
+		runtime     string
+		wantProfile bool
+	}{{"vllm", true}, {"", false}} {
+		mr := canonicalModelRouter()
+		mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+		mr.Spec.Backends[0].Balancing = &inferencev1alpha1.BackendBalancing{
+			Mode: inferencev1alpha1.BalancingModeLoadAware,
+			SessionAffinity: &inferencev1alpha1.SessionAffinity{
+				Headers: []string{"x-session-affinity", "x-openwebui-chat-id"}, MaxLoadPercent: 150,
+			},
+		}
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "qwen3-coder", Runtime: tc.runtime,
+				Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+			},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+			Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+		}
+		r := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor(true, "10.0.0.1"))
+		compiled, err := r.compileRouterConfig(context.Background(), mr)
+		if err != nil {
+			t.Fatalf("runtime %q: compile: %v", tc.runtime, err)
+		}
+		var cfg router.Config
+		if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		bal := cfg.Backends[0].Balancing
+		if bal == nil || bal.Mode != router.BalancingLoadAware || bal.MaxLoadPercent != 150 ||
+			len(bal.SessionHeaders) != 2 || bal.SessionHeaders[1] != "x-openwebui-chat-id" {
+			t.Errorf("runtime %q: balancing = %+v", tc.runtime, bal)
+		}
+		if got := cfg.Backends[0].Metrics != nil; got != tc.wantProfile {
+			t.Errorf("runtime %q: metrics profile present = %v, want %v", tc.runtime, got, tc.wantProfile)
+		}
+		if tc.wantProfile && cfg.Backends[0].Metrics.Waiting != "vllm:num_requests_waiting" {
+			t.Errorf("vllm profile = %+v", cfg.Backends[0].Metrics)
+		}
+	}
+}
+
+// TestCompileRouterConfigBalancingLookupError: a LoadAware backend whose
+// InferenceService lookup fails with anything but NotFound fails the compile,
+// so the previous config is kept rather than replaced by one without the
+// metrics profile (a different hash, and a second roll once the lookup
+// recovers). NotFound still compiles the balancing policy without a profile.
+func TestCompileRouterConfigBalancingLookupError(t *testing.T) {
+	compileWith := func(t *testing.T, lookupErr error) (*compiledConfig, error) {
+		t.Helper()
+		mr := canonicalModelRouter()
+		mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+		mr.Spec.Backends[0].Balancing = &inferencev1alpha1.BackendBalancing{Mode: inferencev1alpha1.BalancingModeLoadAware}
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "qwen3-coder", Runtime: "vllm",
+				Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+			},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+			Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+		}
+		r := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor(true, "10.0.0.1"))
+		// keyedBackends and endpoint resolution read the InferenceService
+		// first; once the EndpointSlices are listed, the balancing lookup is
+		// the next InferenceService Get, and it returns lookupErr.
+		var listed atomic.Bool
+		r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*discoveryv1.EndpointSliceList); ok {
+					listed.Store(true)
+				}
+				return c.List(ctx, list, opts...)
+			},
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*inferencev1alpha1.InferenceService); ok && listed.Load() {
+					return lookupErr
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		})
+		return r.compileRouterConfig(context.Background(), mr)
+	}
+
+	t.Run("transient error fails the compile", func(t *testing.T) {
+		_, err := compileWith(t, apierrors.NewServiceUnavailable("apiserver unavailable"))
+		if err == nil || !strings.Contains(err.Error(), "apiserver unavailable") {
+			t.Fatalf("compile err = %v, want the InferenceService lookup error", err)
+		}
+	})
+
+	t.Run("NotFound compiles without a profile", func(t *testing.T) {
+		compiled, err := compileWith(t, apierrors.NewNotFound(inferencev1alpha1.GroupVersion.WithResource("inferenceservices").GroupResource(), "qwen3-coder"))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		var cfg router.Config
+		if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Backends[0].Balancing == nil || cfg.Backends[0].Metrics != nil {
+			t.Errorf("balancing = %+v, metrics = %+v, want balancing and no profile", cfg.Backends[0].Balancing, cfg.Backends[0].Metrics)
+		}
+	})
 }

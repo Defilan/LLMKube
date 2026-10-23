@@ -22,6 +22,13 @@ import (
 	"time"
 )
 
+// pickEndpoint places a request that carries no headers, so the tests can
+// read the chosen pod directly.
+func (d *Dispatcher) pickEndpoint(backend *Backend) string {
+	ep, _ := d.place(backend, nil)
+	return ep
+}
+
 func endpointSourceConfig() *Config {
 	return &Config{Backends: []Backend{{
 		Name: "qwen", Tier: "local", Address: "http://qwen.ns.svc.cluster.local:8080",

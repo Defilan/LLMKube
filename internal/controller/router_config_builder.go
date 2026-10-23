@@ -82,6 +82,9 @@ type compiledConfig struct {
 // rather than failing the whole compile; the proxy treats them as
 // unhealthy and skips them at request time. This matches the existing
 // model_controller convention of degraded-but-running over fail-stop.
+// A transient lookup error that would change the compiled config (the
+// balancing metrics profile) fails the compile instead, keeping the
+// previous config.
 func (r *ModelRouterReconciler) compileRouterConfig(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
@@ -103,7 +106,10 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 
 	for i := range mr.Spec.Backends {
 		b := &mr.Spec.Backends[i]
-		wire, status := r.resolveBackend(ctx, mr, b)
+		wire, status, err := r.resolveBackend(ctx, mr, b)
+		if err != nil {
+			return nil, err
+		}
 		if slices.Contains(keyed, b.Name) {
 			status.Healthy = false
 			status.Message = appendMsg(status.Message, keyedBackendsMessage([]string{b.Name}))
@@ -159,12 +165,14 @@ func (r *ModelRouterReconciler) compileRouterConfig(
 }
 
 // resolveBackend turns one ModelRouter backend into its proxy wire
-// representation plus the BackendStatus the reconciler reports.
+// representation plus the BackendStatus the reconciler reports. An error
+// means the backend could not be compiled faithfully and the compile must
+// fail, keeping the previous config.
 func (r *ModelRouterReconciler) resolveBackend(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
 	b *inferencev1alpha1.RouterBackend,
-) (router.Backend, inferencev1alpha1.BackendStatus) {
+) (router.Backend, inferencev1alpha1.BackendStatus, error) {
 	now := metav1.Now()
 	status := inferencev1alpha1.BackendStatus{
 		Name:          b.Name,
@@ -200,6 +208,11 @@ func (r *ModelRouterReconciler) resolveBackend(
 			// the Service identity, so pod churn does not change the config
 			// hash and never re-rolls the proxy. endpoints feeds status only.
 			wire.EndpointSource = source
+			var err error
+			wire.Balancing, wire.Metrics, err = r.compileBalancing(ctx, mr.Namespace, b.InferenceServiceRef.Name, b.Balancing)
+			if err != nil {
+				return wire, status, err
+			}
 			status.Address = svcAddr
 			if len(endpoints) == 0 {
 				status.Healthy = false
@@ -235,7 +248,7 @@ func (r *ModelRouterReconciler) resolveBackend(
 		if addr == "" {
 			status.Healthy = false
 			status.Message = urlMsg
-			return wire, status
+			return wire, status, nil
 		}
 		if b.External.CredentialsSecretRef != nil {
 			// Resolving the well-known env var only when the user
@@ -260,7 +273,7 @@ func (r *ModelRouterReconciler) resolveBackend(
 		status.Healthy = false
 		status.Message = "no inferenceServiceRef or external provider declared"
 	}
-	return wire, status
+	return wire, status, nil
 }
 
 // resolveExternalURL applies the per-provider URL default when the user
@@ -669,4 +682,46 @@ func newRouterConfigMap(mr *inferencev1alpha1.ModelRouter, compiled *compiledCon
 			routerProxyConfigKey: string(compiled.JSON),
 		},
 	}
+}
+
+// vllmMetricsProfile is the engine metrics the router proxy reads from a vLLM
+// pod for LoadAware placement. Names as served by vLLM's /metrics on the API
+// port (vllm/v1/metrics/loggers.py).
+func vllmMetricsProfile() *router.MetricsProfile {
+	return &router.MetricsProfile{
+		Path:    "/metrics",
+		Running: "vllm:num_requests_running",
+		Waiting: "vllm:num_requests_waiting",
+		KVUsage: "vllm:kv_cache_usage_perc",
+	}
+}
+
+// compileBalancing translates a backend's balancing block, and attaches the
+// metrics profile for runtimes LLMKube has one for. A missing
+// InferenceService compiles without a profile; any other lookup error is
+// returned, because compiling without the profile would change the config
+// hash and roll the proxy twice (once now, once when the lookup recovers).
+func (r *ModelRouterReconciler) compileBalancing(ctx context.Context, namespace, isvcName string, b *inferencev1alpha1.BackendBalancing) (*router.Balancing, *router.MetricsProfile, error) {
+	if b == nil {
+		return nil, nil, nil
+	}
+	out := &router.Balancing{Mode: b.Mode}
+	if sa := b.SessionAffinity; sa != nil {
+		out.SessionHeaders = append([]string(nil), sa.Headers...)
+		out.MaxLoadPercent = sa.MaxLoadPercent
+	}
+	if out.Mode != router.BalancingLoadAware {
+		return out, nil, nil
+	}
+	isvc := &inferencev1alpha1.InferenceService{}
+	if err := r.Get(ctx, types.NamespacedName{Name: isvcName, Namespace: namespace}, isvc); err != nil {
+		if errors.IsNotFound(err) {
+			return out, nil, nil
+		}
+		return nil, nil, fmt.Errorf("backend balancing: get InferenceService %s/%s: %w", namespace, isvcName, err)
+	}
+	if resolveServingRuntime(isvc) == RuntimeVLLM {
+		return out, vllmMetricsProfile(), nil
+	}
+	return out, nil, nil
 }

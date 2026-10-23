@@ -28,6 +28,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // Default-route strategies. These mirror the CRD enum and decide what the
@@ -101,6 +103,15 @@ type Backend struct {
 	// When both are present, EndpointSource wins over Endpoints.
 	EndpointSource *EndpointSource `json:"endpointSource,omitempty"`
 
+	// Balancing selects how the proxy places requests across an
+	// endpoint-resolution backend's pods. Nil keeps round-robin.
+	Balancing *Balancing `json:"balancing,omitempty"`
+
+	// Metrics names the engine metrics the proxy scrapes from each pod for
+	// LoadAware placement. Set by the controller only for runtimes with a
+	// known profile; without it, LoadAware uses in-flight counts alone.
+	Metrics *MetricsProfile `json:"metrics,omitempty"`
+
 	// Provider identifies the upstream API surface for external backends
 	// ("anthropic", "openai", "litellm", etc.). Empty for local backends.
 	Provider string `json:"provider,omitempty"`
@@ -164,6 +175,43 @@ type EndpointSource struct {
 	Namespace string `json:"namespace"`
 	Service   string `json:"service"`
 	Port      int32  `json:"port"`
+}
+
+// Balancing modes.
+const (
+	BalancingRoundRobin = "RoundRobin"
+	BalancingLoadAware  = "LoadAware"
+)
+
+// DefaultMaxLoadPercent is the session spill bound when none is set.
+const DefaultMaxLoadPercent int32 = 125
+
+// Balancing is a backend's placement policy.
+type Balancing struct {
+	// Mode is RoundRobin (also when empty) or LoadAware.
+	Mode string `json:"mode,omitempty"`
+	// SessionHeaders name the request headers that identify a session, in
+	// priority order; the first present with a non-empty value is the key.
+	SessionHeaders []string `json:"sessionHeaders,omitempty"`
+	// MaxLoadPercent bounds a pod's load, as a percentage of the average
+	// across eligible pods, before a session spills. 0 means the default.
+	MaxLoadPercent int32 `json:"maxLoadPercent,omitempty"`
+}
+
+// LoadPercent returns MaxLoadPercent, or DefaultMaxLoadPercent when unset.
+func (b *Balancing) LoadPercent() int32 {
+	if b.MaxLoadPercent == 0 {
+		return DefaultMaxLoadPercent
+	}
+	return b.MaxLoadPercent
+}
+
+// MetricsProfile names the engine gauges the proxy reads from each pod.
+type MetricsProfile struct {
+	Path    string `json:"path"`
+	Running string `json:"running"`
+	Waiting string `json:"waiting"`
+	KVUsage string `json:"kvUsage,omitempty"`
 }
 
 // TokenCost prices prompt and completion tokens per million, in USD. The
@@ -388,6 +436,9 @@ func (c *Config) Validate() error {
 		if s := b.EndpointSource; s != nil && (s.Namespace == "" || s.Service == "" || s.Port <= 0) {
 			return fmt.Errorf("backends[%d] %s: endpointSource needs namespace, service and a positive port", i, b.Name)
 		}
+		if err := validateBalancing(i, b); err != nil {
+			return err
+		}
 	}
 	if c.DefaultRoute != "" && !names[c.DefaultRoute] {
 		return fmt.Errorf("defaultRoute %q does not name an existing backend", c.DefaultRoute)
@@ -421,6 +472,37 @@ func (c *Config) Validate() error {
 		}
 	}
 	return c.validateBudgets(ruleNames)
+}
+
+// validateBalancing checks a backend's balancing and metrics-profile settings.
+// maxSessionHeaderNameLen matches the CRD's items MaxLength on
+// sessionAffinity.headers.
+const maxSessionHeaderNameLen = 256
+
+func validateBalancing(i int, b Backend) error {
+	if bal := b.Balancing; bal != nil {
+		switch bal.Mode {
+		case "", BalancingRoundRobin, BalancingLoadAware:
+		default:
+			return fmt.Errorf("backends[%d] %s: balancing mode %q must be %s or %s", i, b.Name, bal.Mode, BalancingRoundRobin, BalancingLoadAware)
+		}
+		if bal.MaxLoadPercent != 0 && (bal.MaxLoadPercent < 101 || bal.MaxLoadPercent > 1000) {
+			return fmt.Errorf("backends[%d] %s: balancing maxLoadPercent %d must be between 101 and 1000", i, b.Name, bal.MaxLoadPercent)
+		}
+		for _, h := range bal.SessionHeaders {
+			// Mirrors the CRD's items pattern and length bound: an RFC 7230
+			// token, so surrounding whitespace or a stray character fails
+			// here rather than never matching a request header.
+			if len(h) > maxSessionHeaderNameLen || !httpguts.ValidHeaderFieldName(h) {
+				return fmt.Errorf("backends[%d] %s: balancing session header name %q must be an HTTP header token of at most %d characters",
+					i, b.Name, h, maxSessionHeaderNameLen)
+			}
+		}
+	}
+	if m := b.Metrics; m != nil && (m.Path == "" || m.Running == "" || m.Waiting == "") {
+		return fmt.Errorf("backends[%d] %s: metrics profile needs path, running and waiting", i, b.Name)
+	}
+	return nil
 }
 
 // validateBudgets mirrors the controller's validateBudgets so a hand-edited

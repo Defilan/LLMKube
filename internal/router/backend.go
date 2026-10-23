@@ -93,6 +93,12 @@ type Dispatcher struct {
 	// them, keyed by backend name, so IsHealthy can decide from the endpoint
 	// set without the caller passing the Backend.
 	endpoints sync.Map // backendName -> []string
+	loads     sync.Map // healthKey -> *endpointLoad
+
+	// rings caches the consistent-hash ring per balanced backend, rebuilt when
+	// the endpoint set changes. It holds endpoint addresses only, never a
+	// session value.
+	rings sync.Map // backendName -> *ringCache
 
 	// cursors is the round-robin position per endpoint backend. Consecutive
 	// requests advance it so a keep-alive client spreads across pods.
@@ -115,6 +121,10 @@ type Dispatcher struct {
 	// endpoint. 0 disables the guard. Defaults to defaultStreamIdleTimeout.
 	streamIdleTimeout time.Duration
 
+	// routerName labels the per-endpoint load gauges. Empty unless set with
+	// WithRouterLabel.
+	routerName string
+
 	// nowFn is overridable in tests.
 	nowFn func() time.Time
 }
@@ -127,6 +137,12 @@ type DispatcherOption func(*Dispatcher)
 // for fifteen seconds to verify recovery.
 func WithQuarantineDuration(d time.Duration) DispatcherOption {
 	return func(disp *Dispatcher) { disp.quarantineDuration = d }
+}
+
+// WithRouterLabel sets the router label value on the dispatcher's per-endpoint
+// metrics.
+func WithRouterLabel(name string) DispatcherOption {
+	return func(disp *Dispatcher) { disp.routerName = name }
 }
 
 // WithNowFunc overrides the dispatcher's time source. Tests use it to
@@ -255,13 +271,12 @@ func (d *Dispatcher) dispatchable(key string) bool {
 	return until > 0 && d.nowFn().UnixNano() >= until
 }
 
-// pickEndpoint chooses the pod to dispatch to for a backend that balances
-// across its endpoints. Consecutive calls rotate so a keep-alive client spreads
+// roundRobin chooses the pod to dispatch to among eps, the backend's live
+// endpoint set. Consecutive calls rotate so a keep-alive client spreads
 // across pods rather than pinning to one through conntrack. Quarantined
 // endpoints are skipped; when every endpoint is quarantined the rotation
 // returns one anyway so the half-open probe still happens.
-func (d *Dispatcher) pickEndpoint(backend *Backend) string {
-	eps := d.liveEndpoints(backend)
+func (d *Dispatcher) roundRobin(backend *Backend, eps []string) string {
 	n := len(eps)
 	if n == 0 {
 		return ""
@@ -300,6 +315,7 @@ func (d *Dispatcher) SetEndpoints(name string, endpoints []string) {
 	for _, ep := range prev {
 		if !keep[ep] {
 			d.health.Delete(healthKey(name, ep))
+			d.loads.Delete(healthKey(name, ep))
 		}
 	}
 	d.endpoints.Store(name, next)
@@ -412,7 +428,9 @@ func (d *Dispatcher) Dispatch(
 	if backend == nil {
 		return nil, fmt.Errorf("dispatch: backend is nil")
 	}
-	endpoint := d.pickEndpoint(backend)
+	endpoint, placed := d.place(backend, headers)
+	d.countPlacement(backend.Name, placed)
+	release := d.track(backend.Name, endpoint)
 	url := joinURL(dispatchTarget(backend, endpoint), path)
 
 	// Send the model name this backend actually serves, not the
@@ -423,15 +441,17 @@ func (d *Dispatcher) Dispatch(
 	// guard can abort a body that went silent without touching the caller's
 	// context.
 	reqCtx, reqCancel := context.WithCancel(ctx)
-	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody))
+	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody)) //nolint:gosec // G704: url is the configured backend address or a pod from the controller-managed endpoint set; the session header is only hashed onto the ring
 	if err != nil {
 		reqCancel()
+		release()
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 
 	d.copyForwardedHeaders(headers, req.Header)
 	if err := d.applyCredentials(backend, req); err != nil {
 		reqCancel()
+		release()
 		return nil, err
 	}
 
@@ -452,7 +472,7 @@ func (d *Dispatcher) Dispatch(
 		req.Close = true
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := d.client.Do(req) //nolint:gosec // G704: same destination as the request above, never derived from request headers
 	if err != nil {
 		// A per-attempt context deadline (caller's
 		// context.WithTimeout, eg the rule.timeout path from #461)
@@ -469,6 +489,7 @@ func (d *Dispatcher) Dispatch(
 			d.markUnhealthy(backend.Name, endpoint)
 		}
 		reqCancel()
+		release()
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	if resp.StatusCode >= 500 {
@@ -490,6 +511,7 @@ func (d *Dispatcher) Dispatch(
 	} else {
 		resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: reqCancel}
 	}
+	resp.Body = &releaseOnCloseBody{ReadCloser: resp.Body, release: release}
 	return resp, nil
 }
 
