@@ -1750,3 +1750,53 @@ func TestRouterDeploymentEndpointWatchIdentityAndTolerations(t *testing.T) {
 		t.Errorf("tolerations = %v, want the nvidia.com/gpu toleration", spec.Tolerations)
 	}
 }
+
+// TestCompileRouterConfigBalancing: an endpoint backend with balancing
+// compiles the policy, and a vLLM backend gets the vLLM metrics profile; a
+// llama.cpp backend gets the policy but no profile.
+func TestCompileRouterConfigBalancing(t *testing.T) {
+	for _, tc := range []struct {
+		runtime     string
+		wantProfile bool
+	}{{"vllm", true}, {"", false}} {
+		mr := canonicalModelRouter()
+		mr.Spec.Backends[0].Resolution = inferencev1alpha1.RouterBackendResolutionEndpoint
+		mr.Spec.Backends[0].Balancing = &inferencev1alpha1.BackendBalancing{
+			Mode: inferencev1alpha1.BalancingModeLoadAware,
+			SessionAffinity: &inferencev1alpha1.SessionAffinity{
+				Headers: []string{"x-session-affinity", "x-openwebui-chat-id"}, MaxLoadPercent: 150,
+			},
+		}
+		isvc := &inferencev1alpha1.InferenceService{
+			ObjectMeta: metav1.ObjectMeta{Name: "qwen3-coder", Namespace: testBuilderNs},
+			Spec: inferencev1alpha1.InferenceServiceSpec{
+				ModelRef: "qwen3-coder", Runtime: tc.runtime,
+				Endpoint: &inferencev1alpha1.EndpointSpec{Port: 8080},
+			},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "anthropic-key", Namespace: testBuilderNs},
+			Data:       map[string][]byte{"ANTHROPIC_API_KEY": []byte("test")},
+		}
+		r := newRouterReconcilerForTest(t, mr, isvc, secret, endpointSliceFor(true, "10.0.0.1"))
+		compiled, err := r.compileRouterConfig(context.Background(), mr)
+		if err != nil {
+			t.Fatalf("runtime %q: compile: %v", tc.runtime, err)
+		}
+		var cfg router.Config
+		if err := json.Unmarshal(compiled.JSON, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		bal := cfg.Backends[0].Balancing
+		if bal == nil || bal.Mode != router.BalancingLoadAware || bal.MaxLoadPercent != 150 ||
+			len(bal.SessionHeaders) != 2 || bal.SessionHeaders[1] != "x-openwebui-chat-id" {
+			t.Errorf("runtime %q: balancing = %+v", tc.runtime, bal)
+		}
+		if got := cfg.Backends[0].Metrics != nil; got != tc.wantProfile {
+			t.Errorf("runtime %q: metrics profile present = %v, want %v", tc.runtime, got, tc.wantProfile)
+		}
+		if tc.wantProfile && cfg.Backends[0].Metrics.Waiting != "vllm:num_requests_waiting" {
+			t.Errorf("vllm profile = %+v", cfg.Backends[0].Metrics)
+		}
+	}
+}

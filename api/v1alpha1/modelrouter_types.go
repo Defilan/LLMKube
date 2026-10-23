@@ -201,6 +201,7 @@ type ModelRouterSpec struct {
 
 // RouterBackend is one candidate destination for routed requests.
 // Exactly one of InferenceServiceRef or External must be set.
+// +kubebuilder:validation:XValidation:rule="!has(self.balancing) || (has(self.inferenceServiceRef) && has(self.resolution) && self.resolution == 'endpoint')",message="balancing requires an inferenceServiceRef backend with resolution: endpoint"
 type RouterBackend struct {
 	// Name is the stable identifier used by rules and observability labels.
 	// Must be lowercase alphanumeric or '-'.
@@ -255,6 +256,12 @@ type RouterBackend struct {
 	// Ignored by the Proxy and Gateway data planes.
 	// +optional
 	EndpointPicker *RouterEndpointPicker `json:"endpointPicker,omitempty"`
+
+	// Balancing places requests across this backend's pods by load and keeps
+	// a session on its pod until it runs hot. Requires resolution: endpoint.
+	// Unset keeps round-robin.
+	// +optional
+	Balancing *BackendBalancing `json:"balancing,omitempty"`
 
 	// Capabilities advertised by this backend. Rules can require
 	// capabilities (e.g. ["tools", "vision", "long-context"]) to filter
@@ -805,6 +812,46 @@ type AgentGatewayReference struct {
 	// +kubebuilder:validation:Maximum=65535
 	// +optional
 	EndpointPickerPort int32 `json:"endpointPickerPort,omitempty"`
+}
+
+// Balancing modes for RouterBackend.balancing.mode.
+const (
+	BalancingModeRoundRobin = "RoundRobin"
+	BalancingModeLoadAware  = "LoadAware"
+)
+
+// BackendBalancing is a backend's placement policy.
+type BackendBalancing struct {
+	// Mode is RoundRobin (today's behavior) or LoadAware: the pod with the
+	// least work, read from the engine's own metrics where LLMKube has a
+	// profile for the runtime (vLLM) and from in-flight requests otherwise.
+	// +kubebuilder:validation:Enum=RoundRobin;LoadAware
+	// +kubebuilder:default=RoundRobin
+	// +optional
+	Mode string `json:"mode,omitempty"`
+
+	// SessionAffinity keeps a session on one pod while that pod's load stays
+	// within maxLoadPercent of the average.
+	// +optional
+	SessionAffinity *SessionAffinity `json:"sessionAffinity,omitempty"`
+}
+
+// SessionAffinity identifies sessions and bounds how hot their pod may run.
+type SessionAffinity struct {
+	// Headers identify a session, in priority order; the first present with a
+	// non-empty value is the key. Compared case-insensitively. Only a hash of
+	// the value is used.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	Headers []string `json:"headers"`
+
+	// MaxLoadPercent bounds a pod's load, as a percentage of the average
+	// across eligible pods, before a session spills to the next pod.
+	// +kubebuilder:validation:Minimum=101
+	// +kubebuilder:validation:Maximum=1000
+	// +kubebuilder:default=125
+	// +optional
+	MaxLoadPercent int32 `json:"maxLoadPercent,omitempty"`
 }
 
 // RouterEndpointPicker selects the Endpoint Picker for one backend's

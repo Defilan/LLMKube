@@ -182,6 +182,31 @@ spec:
 
 Use it on multi-replica local backends where one client should not pin one pod. A single replica gains nothing — there is only one endpoint to rotate to — and out-of-cluster backends (the metal-agent path, `external:` providers) have no `EndpointSlices` to compile, so they stay service-level.
 
+## Load-aware balancing
+
+Round-robin spreads requests evenly, but agent sessions carry very different amounts of work: one copy can draw the long, uncached prompts and queue while others idle. `balancing` places each request by load instead, and keeps a conversation on its pod while that pod has room.
+
+```yaml
+spec:
+  backends:
+    - name: qwen
+      inferenceServiceRef:
+        name: qwen3-8-27b
+      resolution: endpoint
+      balancing:
+        mode: LoadAware
+        sessionAffinity:
+          headers: [x-session-affinity, x-openwebui-chat-id, x-opencode-session]
+          maxLoadPercent: 125
+```
+
+- **Load** for a vLLM backend is the pod's own running plus waiting requests, read from its `/metrics` once a second, plus the requests this proxy sent since. A pod whose KV cache is 90% full or more takes no new work while another pod has room. Other runtimes, and any pod whose metrics are more than 5 seconds old, use this proxy's in-flight count.
+- **Without a session header**, each request goes to the least-loaded pod.
+- **With one**, the first header present names the session; only its hash is used. The session stays on its pod until that pod's load passes `maxLoadPercent` of the average, then spills to the next pod, and returns once its pod has room again. Every proxy replica places a session on the same pod.
+- `mode: RoundRobin` (the default) with `sessionAffinity` keeps sessions sticky using in-flight counts only.
+
+Decisions are visible as `llmkube_router_placements_total{result}` (`least_loaded`, `sticky`, `spill`, `fallback`), with `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` per pod.
+
 ## Several models on dataPlane: AgentGateway
 
 With `dataPlane: AgentGateway`, each backend's `InferenceService` becomes an `InferencePool`, and agentgateway asks that pool's Endpoint Picker (EPP) which pod serves each request. A Gateway API Inference Extension EPP binds to exactly one pool, so a router that fronts several models gives each backend its own picker:
