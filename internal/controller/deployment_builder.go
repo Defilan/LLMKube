@@ -604,8 +604,11 @@ func (r *InferenceServiceReconciler) constructDeployment(
 	if eb, ok := backend.(EnvBuilder); ok {
 		container.Env = append(container.Env, eb.BuildEnv(isvc)...)
 	}
+	// Mirror env, then the Hub-offline env, then spec.env: the user's entry for
+	// any of these names comes last and wins.
 	mirrorEnv, _ := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint)
 	container.Env = append(container.Env, mirrorEnv...)
+	container.Env = append(container.Env, hubOfflineEnv(isvc)...)
 	if len(isvc.Spec.Env) > 0 {
 		container.Env = append(container.Env, isvc.Spec.Env...)
 	}

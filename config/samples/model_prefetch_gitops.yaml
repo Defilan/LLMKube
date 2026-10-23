@@ -57,3 +57,7 @@ spec:
   modelCache:
     claimName: model-cache
     prefetch: true
+  # The Job stages the checkpoint, so the serving pods can stay off the Hub:
+  # any lookup the Job did not stage fails at start instead of downloading on a
+  # GPU node.
+  hubOffline: true

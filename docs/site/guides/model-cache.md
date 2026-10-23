@@ -157,6 +157,16 @@ downloader. See the Prefetch section of `docs/MODEL-CACHE.md` for the full
 contract, including the `PrefetchTargetMismatch` and `PrefetchSkipped`
 conditions.
 
+Pair `modelCache.prefetch` with `spec.hubOffline: true` on the service: the Job
+stages the checkpoint, and the serving container gets `HF_HUB_OFFLINE=1` and
+`TRANSFORMERS_OFFLINE=1`, so any Hub lookup the operator did not stage (a
+tokenizer in another repository, remote code, a draft or adapter named by
+repository id) fails at start instead of downloading on the serving node. Leave
+the operator staging the Model: a service with `skipModelInit: true`, TGI, or
+`generic` without `stageModel` downloads the Model itself, cannot start under
+`hubOffline`, and gets a `HubOfflineRuntimeDownload` Warning event. See the
+air-gapped guide.
+
 ### Why a tolerated inference pod may still have a Pending PVC
 
 Some dynamic provisioners create a per-node helper pod to provision volumes.
@@ -294,6 +304,10 @@ The token follows the same rule as the operator's downloads. The runtime sends
   gets a `HFMirrorNotApplied` Warning event naming the fix.
 
 A `spec.env` entry for `HF_ENDPOINT` or `HF_TOKEN` still wins.
+
+`spec.hubOffline: true` drops this mirror env (`HF_ENDPOINT` and the token that
+goes with it), because an offline runtime makes no request to send them to; see
+the prefetch section above.
 
 A Model can name one mirror origin. A speculative-decoding draft Model that
 the runtime downloads itself uses the target Model's mirror, because both run

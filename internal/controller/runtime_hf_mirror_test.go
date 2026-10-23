@@ -38,8 +38,8 @@ import (
 
 const testMirror = "https://mirror.corp.example/artifactory/api/huggingfaceml/hf"
 
-// mirrorEnv returns the serving container's env entries for name, in order.
-func mirrorEnv(dep *appsv1.Deployment, name string) []corev1.EnvVar {
+// servingEnv returns the serving container's env entries for name, in order.
+func servingEnv(dep *appsv1.Deployment, name string) []corev1.EnvVar {
 	var out []corev1.EnvVar
 	for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
 		if e.Name == name {
@@ -174,7 +174,7 @@ func TestRuntimeHFMirrorEnv(t *testing.T) {
 			r := &InferenceServiceReconciler{ModelCachePath: "/models", ModelCacheMode: ModelCacheModePerService}
 			dep := r.constructDeployment(tc.isvc, tc.model, nil, 1, tc.hfEndpoint, "")
 
-			endpoints := mirrorEnv(dep, "HF_ENDPOINT")
+			endpoints := servingEnv(dep, "HF_ENDPOINT")
 			if tc.wantEndpoint {
 				if len(endpoints) != 1 || endpoints[0].Value != testMirror || endpoints[0].ValueFrom != nil {
 					t.Fatalf("HF_ENDPOINT = %+v, want one literal %q", endpoints, testMirror)
@@ -183,7 +183,7 @@ func TestRuntimeHFMirrorEnv(t *testing.T) {
 				t.Fatalf("HF_ENDPOINT = %+v, want none", endpoints)
 			}
 
-			tokens := mirrorEnv(dep, "HF_TOKEN")
+			tokens := servingEnv(dep, "HF_TOKEN")
 			if len(tokens) != len(tc.wantTokens) {
 				t.Fatalf("HF_TOKEN entries = %+v, want %+v", tokens, tc.wantTokens)
 			}
@@ -216,7 +216,7 @@ func TestRuntimeHFMirrorEnvUserEnvWins(t *testing.T) {
 			Env: []corev1.EnvVar{{Name: "HF_ENDPOINT", Value: "https://user.example"}},
 		},
 	}
-	endpoints := mirrorEnv(r.constructDeployment(svc, model, nil, 1, testMirror, ""), "HF_ENDPOINT")
+	endpoints := servingEnv(r.constructDeployment(svc, model, nil, 1, testMirror, ""), "HF_ENDPOINT")
 	if len(endpoints) != 2 || endpoints[len(endpoints)-1].Value != "https://user.example" {
 		t.Fatalf("HF_ENDPOINT entries = %+v, want the operator's first and the user's last", endpoints)
 	}
@@ -300,7 +300,7 @@ var _ = Describe("runtime HF mirror reconcile", func() {
 
 	It("points the runtime at the trimmed mirror from the Model's Secret", func() {
 		dep := reconcileService(nil)
-		Expect(mirrorEnv(dep, "HF_ENDPOINT")).To(ConsistOf(corev1.EnvVar{Name: "HF_ENDPOINT", Value: testMirror}))
+		Expect(servingEnv(dep, "HF_ENDPOINT")).To(ConsistOf(corev1.EnvVar{Name: "HF_ENDPOINT", Value: testMirror}))
 		Expect(drainEvents()).NotTo(ContainElement(ContainSubstring(ReasonHFMirrorNotApplied)))
 	})
 
@@ -308,7 +308,7 @@ var _ = Describe("runtime HF mirror reconcile", func() {
 		dep := reconcileService(&inferencev1alpha1.VLLMConfig{HFTokenSecretRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: "hf-public"}, Key: "token",
 		}})
-		Expect(mirrorEnv(dep, "HF_ENDPOINT")).To(BeEmpty())
+		Expect(servingEnv(dep, "HF_ENDPOINT")).To(BeEmpty())
 		Expect(drainEvents()).To(ContainElement(SatisfyAll(
 			ContainSubstring(ReasonHFMirrorNotApplied),
 			ContainSubstring(secretName),
