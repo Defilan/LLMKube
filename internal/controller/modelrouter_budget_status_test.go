@@ -30,7 +30,6 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 	"github.com/defilantech/llmkube/internal/router"
@@ -126,30 +125,12 @@ func TestRouterHasBudgets(t *testing.T) {
 	}
 }
 
-// startBudgetTestEnv boots an envtest environment with the llmkube CRDs, the
+// startBudgetTestEnv returns the shared envtest with the llmkube CRDs, the
 // same shape as the SLO suite, so the reconciler can create and read real
 // ModelRouter objects.
 func startBudgetTestEnv(t *testing.T) (client.Client, *rest.Config, func()) {
 	t.Helper()
-	env := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
-		env.BinaryAssetsDirectory = dir
-	}
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	if err := inferencev1alpha1.AddToScheme(scheme.Scheme); err != nil {
-		t.Fatalf("scheme: %v", err)
-	}
-	c, err := client.New(cfg, client.Options{Scheme: scheme.Scheme})
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	return c, cfg, func() { _ = env.Stop() }
+	return sharedTestEnv(t, filepath.Join("..", "..", "config", "crd", "bases"))
 }
 
 // budgetedModelRouter builds a minimal router that declares one token budget,
@@ -158,7 +139,7 @@ func budgetedModelRouter(name string) *inferencev1alpha1.ModelRouter {
 	maxTokens := int64(1000)
 	mr := &inferencev1alpha1.ModelRouter{}
 	mr.Name = name
-	mr.Namespace = "default"
+	mr.Namespace = testNS
 	mr.Spec.Backends = []inferencev1alpha1.RouterBackend{
 		{
 			Name: "cloud-opus",

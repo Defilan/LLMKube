@@ -24,10 +24,10 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -43,25 +43,12 @@ import (
 // pinned because the InferenceService controller is the one #2069 actually
 // froze.
 
-// startWiringManager boots an envtest environment and a started manager for
-// the decorator wiring tests. The returned stop function cancels the manager
-// and waits for it to exit.
+// startWiringManager starts a manager on the shared envtest for the decorator
+// wiring tests. The returned stop function cancels the manager and waits for
+// it to exit; the control plane itself outlives the test.
 func startWiringManager(t *testing.T) (ctrl.Manager, func()) {
 	t.Helper()
-	testEnv := &envtest.Environment{
-		BinaryAssetsDirectory: getFirstFoundEnvTestBinaryDir(),
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
-		ErrorIfCRDPathMissing: true,
-	}
-	cfg, err := testEnv.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := testEnv.Stop(); err != nil {
-			t.Logf("stop envtest: %v", err)
-		}
-	})
+	_, cfg, _ := sharedTestEnv(t, filepath.Join("..", "..", "config", "crd", "bases"))
 
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -96,14 +83,17 @@ func startWiringManager(t *testing.T) (ctrl.Manager, func()) {
 	}
 }
 
-// recordingDecorator returns a ReconcileDecorator that signals hits and
-// short-circuits the inner reconciler: the inner's behavior is not the wiring
-// test's subject, and short-circuiting keeps the test hermetic.
-func recordingDecorator(hits chan struct{}) func(reconcile.Reconciler) reconcile.Reconciler {
+// recordingDecorator returns a ReconcileDecorator that reports which request
+// it was invoked for and short-circuits the inner reconciler: the inner's
+// behavior is not the wiring test's subject, and short-circuiting keeps the
+// test hermetic. It reports every namespace: a drop would fail the very
+// assertion the hits channel feeds, so the buffered channel is sized far
+// above the objects a run leaves on the shared server.
+func recordingDecorator(hits chan reconcile.Request) func(reconcile.Reconciler) reconcile.Reconciler {
 	return func(_ reconcile.Reconciler) reconcile.Reconciler {
 		return reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 			select {
-			case hits <- struct{}{}:
+			case hits <- req:
 			default:
 			}
 			return reconcile.Result{}, nil
@@ -111,18 +101,42 @@ func recordingDecorator(hits chan struct{}) func(reconcile.Reconciler) reconcile
 	}
 }
 
-func expectDecoratorHit(t *testing.T, hits chan struct{}) {
+// expectDecoratorHit waits for the decorated controller to reconcile want. The
+// manager watches its kind cluster-wide, so on a shared API server the startup
+// LIST also enqueues earlier tests' objects; a bare hit would let one of those
+// satisfy the assertion and stop it pinning that the object this test created
+// reached the decorator at all.
+func expectDecoratorHit(t *testing.T, hits chan reconcile.Request, want types.NamespacedName) {
 	t.Helper()
-	select {
-	case <-hits:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the decorator was never invoked: SetupWithManager did not apply it at the Complete site")
+	if !drainUntilWanted(hits, want, 10*time.Second) {
+		t.Fatalf("the decorator was never invoked for %s: SetupWithManager did not apply it at the Complete site", want)
+	}
+}
+
+// drainUntilWanted discards reconciles of other objects until one for want
+// arrives, and reports whether it did before the timeout. It returns a bool
+// rather than failing so a test can drive it from a goroutine: t.Fatalf must
+// run on the test's own goroutine, and a failure raised after the test returns
+// is silently dropped.
+func drainUntilWanted(hits chan reconcile.Request, want types.NamespacedName, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case req := <-hits:
+			if req.NamespacedName == want {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
 	}
 }
 
 func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
-	hits := make(chan struct{}, 8)
+	defer stop()
+	ns := testNS
+	hits := make(chan reconcile.Request, 1024)
 	rec := &ModelReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
@@ -135,7 +149,7 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 	}
 
 	model := &inferencev1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: ns},
 		Spec: inferencev1alpha1.ModelSpec{
 			Source: "https://example.com/model.gguf", Format: "gguf", Quantization: "Q4_K_M",
 		},
@@ -144,13 +158,14 @@ func TestReconcileDecoratorReachesTheController(t *testing.T) {
 		t.Fatalf("create model: %v", err)
 	}
 
-	expectDecoratorHit(t, hits)
-	stop()
+	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: model.Name})
 }
 
 func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	mgr, stop := startWiringManager(t)
-	hits := make(chan struct{}, 8)
+	defer stop()
+	ns := testNS
+	hits := make(chan reconcile.Request, 1024)
 	rec := &InferenceServiceReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -162,13 +177,48 @@ func TestInferenceServiceDecoratorReachesTheController(t *testing.T) {
 	}
 
 	isvc := &inferencev1alpha1.InferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "decorator-wiring", Namespace: ns},
 		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "decorator-wiring-model"},
 	}
 	if err := mgr.GetClient().Create(context.Background(), isvc); err != nil {
 		t.Fatalf("create inferenceservice: %v", err)
 	}
 
-	expectDecoratorHit(t, hits)
-	stop()
+	expectDecoratorHit(t, hits, types.NamespacedName{Namespace: ns, Name: isvc.Name})
+}
+
+// TestExpectDecoratorHitIgnoresAnotherObjectsReconcile pins the filter
+// expectDecoratorHit exists for: on a shared API server the manager's startup
+// LIST enqueues every object of that kind, so a bare hit would let an earlier
+// test's object satisfy the assertion for this one. A foreign hit alone must
+// leave the assertion waiting rather than return on it, which is what happens
+// once the wanted request arrives.
+func TestExpectDecoratorHitIgnoresAnotherObjectsReconcile(t *testing.T) {
+	want := types.NamespacedName{Namespace: "llmkube-test-foreign", Name: "someone-elses-isvc"}
+	hits := make(chan reconcile.Request, 2)
+	hits <- reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "llmkube-test-earlier", Name: "absent-isvc"}}
+
+	done := make(chan bool, 1)
+	go func() {
+		done <- drainUntilWanted(hits, want, 10*time.Second)
+	}()
+
+	select {
+	case got := <-done:
+		if got {
+			t.Fatal("a foreign object's reconcile satisfied the assertion: the filter is gone")
+		}
+		t.Fatal("the drain gave up instead of waiting for the wanted request")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	hits <- reconcile.Request{NamespacedName: want}
+	select {
+	case got := <-done:
+		if !got {
+			t.Fatal("the wanted request never satisfied the assertion")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wanted request never satisfied the assertion")
+	}
 }

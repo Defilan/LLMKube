@@ -12,7 +12,6 @@ import (
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
@@ -28,23 +27,7 @@ func startSLOTestEnv(t *testing.T, withPyrraCRD bool) (client.Client, *rest.Conf
 	if withPyrraCRD {
 		crdPaths = append(crdPaths, pyrraTestCRDDir)
 	}
-	env := &envtest.Environment{CRDDirectoryPaths: crdPaths, ErrorIfCRDPathMissing: true}
-	if dir := getFirstFoundEnvTestBinaryDir(); dir != "" {
-		env.BinaryAssetsDirectory = dir
-	}
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("start envtest: %v", err)
-	}
-	s := scheme.Scheme
-	if err := inferencev1alpha1.AddToScheme(s); err != nil {
-		t.Fatalf("scheme: %v", err)
-	}
-	c, err := client.New(cfg, client.Options{Scheme: s})
-	if err != nil {
-		t.Fatalf("client: %v", err)
-	}
-	return c, cfg, func() { _ = env.Stop() }
+	return sharedTestEnv(t, crdPaths...)
 }
 
 func newSLOReconciler(t *testing.T, cfg *rest.Config, enabled bool) *InferenceServiceSLOReconciler {
@@ -61,7 +44,7 @@ func createSLOISvc(t *testing.T, c client.Client, name, runtime string, slo *inf
 	t.Helper()
 	isvc := &inferencev1alpha1.InferenceService{}
 	isvc.Name = name
-	isvc.Namespace = "default"
+	isvc.Namespace = testNS
 	isvc.Spec.ModelRef = name + "-model"
 	isvc.Spec.Runtime = runtime
 	isvc.Spec.SLO = slo
@@ -79,7 +62,7 @@ func reconcileSLO(t *testing.T, r *InferenceServiceSLOReconciler, isvc *inferenc
 	}
 }
 
-// nolint:unparam // ns is parameterized for clarity at call sites even though existing tests all use "default"
+// nolint:unparam // ns is parameterized: most call sites pass testNS, the cleanup test passes the hand-authored object's namespace
 func getSLO(t *testing.T, c client.Client, ns, name string) (*unstructured.Unstructured, error) {
 	t.Helper()
 	u := &unstructured.Unstructured{}
@@ -95,7 +78,7 @@ func TestSLOReconcile_AvailabilityCreatesResource(t *testing.T) {
 	r := newSLOReconciler(t, cfg, true)
 	reconcileSLO(t, r, isvc)
 
-	u, err := getSLO(t, c, "default", "avail-isvc-availability")
+	u, err := getSLO(t, c, testNS, "avail-isvc-availability")
 	if err != nil {
 		t.Fatalf("SLO resource not created: %v", err)
 	}
@@ -123,7 +106,7 @@ func TestSLOReconcile_UnsupportedLatencyRuntime(t *testing.T) {
 	r := newSLOReconciler(t, cfg, true)
 	reconcileSLO(t, r, isvc)
 
-	if _, err := getSLO(t, c, "default", "lat-llama-latency"); err == nil {
+	if _, err := getSLO(t, c, testNS, "lat-llama-latency"); err == nil {
 		t.Fatalf("SLO resource should not exist for unsupported runtime")
 	}
 	fresh := &inferencev1alpha1.InferenceService{}
@@ -140,7 +123,7 @@ func TestSLOReconcile_UnsetDeletesResource(t *testing.T) {
 	isvc := createSLOISvc(t, c, "unset-isvc", "llamacpp", &inferencev1alpha1.SLOSpec{Objective: "99"})
 	r := newSLOReconciler(t, cfg, true)
 	reconcileSLO(t, r, isvc)
-	if _, err := getSLO(t, c, "default", "unset-isvc-availability"); err != nil {
+	if _, err := getSLO(t, c, testNS, "unset-isvc-availability"); err != nil {
 		t.Fatalf("precondition: SLO should exist: %v", err)
 	}
 
@@ -152,7 +135,7 @@ func TestSLOReconcile_UnsetDeletesResource(t *testing.T) {
 	}
 	reconcileSLO(t, r, fresh)
 
-	if _, err := getSLO(t, c, "default", "unset-isvc-availability"); err == nil {
+	if _, err := getSLO(t, c, testNS, "unset-isvc-availability"); err == nil {
 		t.Fatalf("SLO resource should be deleted after spec.slo removal")
 	}
 
@@ -178,7 +161,7 @@ func TestSLOReconcile_CleanupPreservesUnmanagedSLO(t *testing.T) {
 	handAuthored := &unstructured.Unstructured{}
 	handAuthored.SetGroupVersionKind(pyrraSLOGVK())
 	handAuthored.SetName("hand-authored-slo")
-	handAuthored.SetNamespace("default")
+	handAuthored.SetNamespace(testNS)
 	// Only the InferenceService label, deliberately no managed-by label: this
 	// simulates an operator hand-writing an SLO for the same service outside
 	// the llmkube reconciler.
@@ -188,7 +171,7 @@ func TestSLOReconcile_CleanupPreservesUnmanagedSLO(t *testing.T) {
 		"window": "28d",
 		"indicator": map[string]interface{}{
 			"bool_gauge": map[string]interface{}{
-				"metric": `up{namespace="default",service="handwritten-isvc"}`,
+				"metric": "up{namespace=\"" + testNS + "\",service=\"handwritten-isvc\"}",
 			},
 		},
 	}
@@ -198,7 +181,7 @@ func TestSLOReconcile_CleanupPreservesUnmanagedSLO(t *testing.T) {
 
 	r := newSLOReconciler(t, cfg, true)
 	reconcileSLO(t, r, isvc)
-	if _, err := getSLO(t, c, "default", "handwritten-isvc-availability"); err != nil {
+	if _, err := getSLO(t, c, testNS, "handwritten-isvc-availability"); err != nil {
 		t.Fatalf("precondition: rendered SLO should exist: %v", err)
 	}
 
@@ -210,10 +193,10 @@ func TestSLOReconcile_CleanupPreservesUnmanagedSLO(t *testing.T) {
 	}
 	reconcileSLO(t, r, fresh)
 
-	if _, err := getSLO(t, c, "default", "handwritten-isvc-availability"); err == nil {
+	if _, err := getSLO(t, c, testNS, "handwritten-isvc-availability"); err == nil {
 		t.Fatalf("rendered SLO should be deleted after spec.slo removal")
 	}
-	if _, err := getSLO(t, c, "default", "hand-authored-slo"); err != nil {
+	if _, err := getSLO(t, c, testNS, "hand-authored-slo"); err != nil {
 		t.Fatalf("hand-authored SLO should survive cleanup: %v", err)
 	}
 }
@@ -233,10 +216,10 @@ func TestSLOReconcile_RenameDeletesStale(t *testing.T) {
 	}
 	reconcileSLO(t, r, fresh)
 
-	if _, err := getSLO(t, c, "default", "renamed-slo"); err != nil {
+	if _, err := getSLO(t, c, testNS, "renamed-slo"); err != nil {
 		t.Fatalf("renamed SLO missing: %v", err)
 	}
-	if _, err := getSLO(t, c, "default", "rename-isvc-availability"); err == nil {
+	if _, err := getSLO(t, c, testNS, "rename-isvc-availability"); err == nil {
 		t.Fatalf("stale SLO should be deleted after rename")
 	}
 }
@@ -263,7 +246,7 @@ func TestSLOReconcile_DisabledSetsCondition(t *testing.T) {
 	r := newSLOReconciler(t, cfg, false)
 	reconcileSLO(t, r, isvc)
 
-	if _, err := getSLO(t, c, "default", "disabled-isvc-availability"); err == nil {
+	if _, err := getSLO(t, c, testNS, "disabled-isvc-availability"); err == nil {
 		t.Fatalf("SLO resource should not be created when integration disabled")
 	}
 	fresh := &inferencev1alpha1.InferenceService{}
@@ -280,7 +263,7 @@ func TestSLOReconcile_MetalSetsDataSourceCondition(t *testing.T) {
 
 	model := &inferencev1alpha1.Model{}
 	model.Name = "metal-isvc-model"
-	model.Namespace = "default"
+	model.Namespace = testNS
 	model.Spec.Source = "https://example.com/m.gguf"
 	model.Spec.Hardware = &inferencev1alpha1.HardwareSpec{Accelerator: "metal"}
 	if err := c.Create(context.Background(), model); err != nil {
@@ -292,7 +275,7 @@ func TestSLOReconcile_MetalSetsDataSourceCondition(t *testing.T) {
 	reconcileSLO(t, r, isvc)
 
 	// Rendered anyway (render + warn per the spec).
-	if _, err := getSLO(t, c, "default", "metal-isvc-availability"); err != nil {
+	if _, err := getSLO(t, c, testNS, "metal-isvc-availability"); err != nil {
 		t.Fatalf("SLO should render for Metal ISvc: %v", err)
 	}
 	fresh := &inferencev1alpha1.InferenceService{}

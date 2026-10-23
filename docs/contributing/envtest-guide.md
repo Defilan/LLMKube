@@ -103,6 +103,57 @@ controller path and mirror its fixture and reconcile-driving pattern. The two
 files above (`drain_before_roll_test.go` and `inferenceservice_storage_test.go`)
 are the usual starting points.
 
+## 5. One Control Plane per CRD Set
+
+A control plane is an etcd plus a kube-apiserver, about 4 s to start. Starting
+one per test made `internal/controller` run at go test's 10 minute default
+timeout on CI runners, so the Tests job failed at random (#2141). Outside the
+Ginkgo suite the package started 63 of them and now starts 6; counting the
+suite's own, a full run starts 7.
+
+**Wrong:**
+
+```go
+func myEnv(t *testing.T, withCRDs bool) (client.Client, *rest.Config, func()) {
+	env := &envtest.Environment{CRDDirectoryPaths: []string{baseCRDPath}}
+	cfg, err := env.Start() // a full control plane per test
+	...
+}
+```
+
+**Right:**
+
+```go
+func myEnv(t *testing.T, withCRDs bool) (client.Client, *rest.Config, func()) {
+	crdPaths := []string{baseCRDPath}
+	if withCRDs {
+		crdPaths = append(crdPaths, myTestCRDDir)
+	}
+	return sharedTestEnv(t, crdPaths...) // one control plane per CRD set
+}
+
+func TestThing(t *testing.T) {
+	c, cfg, stop := myEnv(t, true)
+	defer stop()        // a no-op for a shared set; TestMain stops it
+	ns := testNS        // already a fresh namespace for this test
+	...
+}
+```
+
+The CRD path set is the sharing key, so two tests that need different CRDs are
+two control planes and can never see each other's CRDs. A test that asserts a
+CRD is ABSENT shares the base set (which has nothing extra registered) or, when
+it needs a subset, uses `privateTestEnv`. Every helper assigns a fresh
+`testNS` before returning, so name fixtures off `testNS`, never `"default"`.
+`newTestNamespace` creates another namespace and makes it the current
+`testNS`, so a test that takes one still finds everything it names off
+`testNS` there. Never call `newTestNamespace` and then keep using the
+namespace a helper assigned earlier: that one is no longer `testNS`. Never
+call `t.Parallel` in this package: it would race the assignment.
+`TestMain` fails the package when a run starts more control planes than
+`maxTestControlPlanes`, and `make test-scripts` fails on a test that builds an
+`envtest.Environment` of its own.
+
 ## Why This Exists
 
 These traps cost real review cycles. The #1250 run (shipped in #1262) converged
@@ -111,4 +162,5 @@ fields stripped by the API server and an unstubbed HTTP probe. The same traps
 affect human first-time contributors. This guide captures the knowledge that
 previously lived only in scattered existing tests and maintainers' heads.
 
-See issue #1263 for the background.
+See issue #1263 for the background. Section 5 came from #2141, where a test per
+control plane turned a slow package into a flaky one.

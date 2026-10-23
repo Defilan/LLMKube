@@ -183,13 +183,17 @@ test-affected: setup-envtest ## Test packages affected by changes since BASE_REF
 # The gate, test-affected and seed-check scripts are shell, so go test never
 # runs their regression tests: make test-scripts does, locally and in CI
 # (.github/workflows/test.yml). Run it after editing any of those scripts or
-# cmd/affected-packages.
+# cmd/affected-packages. check-envtest-sharing_test.sh is a source rule rather
+# than a script test, but it belongs to the same set: a test that starts its
+# own envtest control plane is what took internal/controller into go test's
+# timeout (#2141).
 .PHONY: test-scripts
-test-scripts: ## Run the shell regression tests (gate, test-affected, affected-packages, GINKGO_SEED single evaluation).
+test-scripts: ## Run the shell regression tests (gate, test-affected, affected-packages, GINKGO_SEED single evaluation, envtest sharing).
 	@bash scripts/gate_test.sh
 	@bash scripts/test-affected_test.sh
 	@bash scripts/affected-packages_test.sh
 	@bash scripts/check-ginkgo-seed_test.sh
+	@bash scripts/check-envtest-sharing_test.sh
 
 .PHONY: test-chart
 test-chart: ## Lint and unit-test the Helm charts (requires helm + helm-unittest plugin).
