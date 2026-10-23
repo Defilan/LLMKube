@@ -149,12 +149,12 @@ var _ = Describe("InferenceService endpoint auth CRD validation", func() {
 	})
 })
 
-// spec.endpoint.apiKeySecretRef and externalTrafficPolicy are InferenceService
-// fields; the router-proxy (internal/controller/router_service_builder.go
-// newRouterService) only reads endpoint.port and endpoint.type, so a silently
-// accepted apiKeySecretRef would make a user believe the router endpoint is
-// authenticated when it is not. A failure here means the generated CRD does
-// not enforce the CEL rule that blocks both fields on ModelRouter.
+// spec.endpoint.apiKeySecretRef is an InferenceService field; the router-proxy
+// does not read it, so a silently accepted apiKeySecretRef would make a user
+// believe the router endpoint is authenticated when it is not. A failure here
+// means the generated CRD does not enforce the CEL rule that blocks it on
+// ModelRouter. externalTrafficPolicy is honoured by newRouterService and goes
+// through the shared EndpointSpec rule (NodePort or LoadBalancer only).
 var _ = Describe("ModelRouter endpoint auth CRD validation", func() {
 	ctx := context.Background()
 	keyRef := &corev1.SecretKeySelector{
@@ -186,10 +186,16 @@ var _ = Describe("ModelRouter endpoint auth CRD validation", func() {
 	})
 	It("rejects apiKeySecretRef", func() {
 		reject(newMR(&inferencev1alpha1.EndpointSpec{APIKeySecretRef: keyRef}),
-			"ModelRouter does not support them")
+			"ModelRouter does not support it")
 	})
-	It("rejects externalTrafficPolicy", func() {
-		reject(newMR(&inferencev1alpha1.EndpointSpec{Type: "NodePort", ExternalTrafficPolicy: "Local"}),
-			"ModelRouter does not support them")
+	It("admits externalTrafficPolicy Local on a NodePort endpoint", func() {
+		admit(newMR(&inferencev1alpha1.EndpointSpec{Type: "NodePort", ExternalTrafficPolicy: "Local"}))
+	})
+	It("admits externalTrafficPolicy Local on a LoadBalancer endpoint", func() {
+		admit(newMR(&inferencev1alpha1.EndpointSpec{Type: "LoadBalancer", ExternalTrafficPolicy: "Local"}))
+	})
+	It("rejects externalTrafficPolicy on a ClusterIP endpoint", func() {
+		reject(newMR(&inferencev1alpha1.EndpointSpec{Type: "ClusterIP", ExternalTrafficPolicy: "Local"}),
+			"externalTrafficPolicy requires endpoint.type NodePort or LoadBalancer")
 	})
 })

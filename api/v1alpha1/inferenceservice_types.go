@@ -1139,8 +1139,7 @@ type EndpointSpec struct {
 	// ExternalTrafficPolicy sets the Service's externalTrafficPolicy. Local
 	// preserves the client source IP on a NodePort or LoadBalancer, which an IP
 	// allowlist (NetworkPolicy) needs. Unset keeps the Kubernetes default
-	// (Cluster). Requires endpoint.type NodePort or LoadBalancer. Not supported
-	// on ModelRouter.
+	// (Cluster). Requires endpoint.type NodePort or LoadBalancer.
 	// +kubebuilder:validation:Enum=Cluster;Local
 	// +optional
 	ExternalTrafficPolicy string `json:"externalTrafficPolicy,omitempty"`

@@ -59,6 +59,26 @@ The controller compiles `ModelRouter.spec` into a JSON config, writes it to a `C
 
 Since every spec change re-rolls the pods, set `spec.proxy.revisionHistoryLimit` to cap how many old `ReplicaSet`s are kept (`0` keeps none); unset uses the Kubernetes default of 10. `InferenceService` has the same knob at `spec.revisionHistoryLimit`.
 
+### Exposing the proxy and sandboxing its pod
+
+`spec.endpoint` shapes the data-plane `Service` in front of the proxy. `type: NodePort` or `LoadBalancer` exposes it beyond the cluster, and on a `NodePort` router `spec.endpoint.nodePort` pins the node port. When `nodePort` is unset, the port Kubernetes allocated stays the same across reconciles.
+
+`spec.endpoint.externalTrafficPolicy` (`Cluster` or `Local`, only with `type` NodePort or LoadBalancer) is applied to that `Service`. `Local` preserves the client source IP, but traffic only reaches nodes that run a proxy replica, so pair it with `spec.proxy.nodeSelector` or enough replicas. `spec.endpoint.apiKeySecretRef` is not supported on a `ModelRouter`.
+
+`spec.proxy.runtimeClassName` runs the proxy pod under a RuntimeClass, for example a sandboxed runtime such as gVisor or Kata. Unset leaves the pod spec unchanged.
+
+```yaml
+spec:
+  endpoint:
+    type: NodePort
+    nodePort: 30801
+    externalTrafficPolicy: Local
+  proxy:
+    runtimeClassName: gvisor
+    nodeSelector:
+      kubernetes.io/hostname: edge-1
+```
+
 ## The fail-closed gate
 
 The headline differentiator. A rule that matches sensitive classifications (default: `pii`, `phi`) and is marked `failClosed: true` has two guarantees:
