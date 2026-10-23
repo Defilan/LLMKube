@@ -234,8 +234,8 @@ spec:
 Without a session header, each request goes to the least-loaded pod. With one, the first configured header present names the session. Only a hash of its value is kept.
 
 - **A new session** goes to the least-loaded pod and is remembered there.
-- **A known session stays on its pod**, with two exceptions. It moves if its pod has requests waiting and is clearly busier than the least-loaded pod: 4 requests more when engine metrics are available, 8 without them. It also moves if its pod is KV-full and queuing while a non-full pod is available.
-- **A session that moved stays on its new pod.** It cannot move again for pressure within 60 seconds.
+- **A known session stays on its pod**, with two exceptions. With fresh engine metrics, it moves if its pod has requests waiting and carries 4 or more requests than the least-loaded pod. Without fresh metrics, it moves on an in-flight gap of 8 or more alone, with no waiting requests needed. It also moves if its pod is KV-full and queuing and the target has a fresh sample showing KV room, at any load gap. If the target has no such sample, the gap of 4 still applies. A pod whose fresh sample is KV-full is never a target.
+- **A session that moved stays on its new pod.** It cannot move again for pressure for 60 seconds, and after that it can.
 - **A session whose pod left** (not ready, or quarantined by the circuit breaker) moves at once.
 - **KV-full alone does not move a session.** Only new sessions avoid KV-full pods.
 - **If the table is full** (100,000 sessions per backend), a new session falls back to a consistent-hash home pod and is not remembered.
@@ -254,7 +254,7 @@ Each proxy replica keeps its own binding table in memory. A restart starts it em
 - `sticky`: a known session stayed on its pod.
 - `spill`: a session moved off a pod under pressure (`waiting` or `kv_full`) and is now bound to the new pod.
 - `migrated`: a session moved because its pod left (`not_ready`).
-- `fallback`: the table was full and the consistent-hash home was used.
+- `fallback`: the table was full and the consistent-hash home was used, or no pod was dispatchable (all quarantined or circuit-open) and the request went round-robin over the live endpoints. A fallback count alone does not mean the table is full.
 
 `reason` is set only for `spill` and `migrated`, and empty otherwise. `llmkube_router_session_bindings{router,backend}` is the current number of bindings. Per pod, `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` cover `LoadAware` backends with a metrics profile (vLLM today).
 
