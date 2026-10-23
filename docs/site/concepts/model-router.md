@@ -136,7 +136,7 @@ After `kubectl apply`:
 - `kubectl get configmap coding-router-router-proxy` contains the compiled JSON config.
 - The endpoint is `http://coding-router-router-proxy.<namespace>.svc.cluster.local:8080/v1/chat/completions`.
 
-Point any OpenAI-compatible client at that URL and it just works. The proxy serves the OpenAI-compatible routes at their standard paths, and every POST route is matched on the request's `model` field against the same rule set:
+Point any OpenAI-compatible client at that URL and it just works. The proxy serves the OpenAI-compatible routes, and the Anthropic Messages API, at their standard paths, and every POST route is matched on the request's `model` field against the same rule set:
 
 | Route | Serves |
 |---|---|
@@ -144,7 +144,11 @@ Point any OpenAI-compatible client at that URL and it just works. The proxy serv
 | `POST /v1/completions` | Legacy completions: what fill-in-the-middle / IDE autocomplete clients and benchmark tools such as `vllm bench serve --backend openai` send |
 | `POST /v1/embeddings` | Embeddings |
 | `POST /v1/rerank` | Reranking |
+| `POST /v1/messages` | Anthropic Messages API: Claude Code and the Anthropic SDKs |
+| `POST /v1/messages/count_tokens` | Anthropic token counting |
 | `GET /v1/models` | Model discovery |
+
+The two Anthropic routes are placed, balanced and session-bound exactly like chat completions, and headers such as `anthropic-version` and `anthropic-beta` pass through. The backend must serve them itself: vLLM does natively; a backend that does not returns its own `404`, which reaches the client unchanged and does not count against the backend. Token budgets charge Anthropic responses from their own usage fields (cached input included), and errors the router itself returns on these routes use the Anthropic error shape.
 
 Headers that change routing:
 

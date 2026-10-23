@@ -152,6 +152,10 @@ func (p *Proxy) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/completions", p.handleCompletion("/v1/completions"))
 	mux.HandleFunc("POST /v1/embeddings", p.handleCompletion("/v1/embeddings"))
 	mux.HandleFunc("POST /v1/rerank", p.handleCompletion("/v1/rerank"))
+	// The Anthropic Messages API carries model and stream where chat
+	// completions does, so the same handler places and streams it.
+	mux.HandleFunc("POST /v1/messages", p.handleCompletion("/v1/messages"))
+	mux.HandleFunc("POST /v1/messages/count_tokens", p.handleCompletion("/v1/messages/count_tokens"))
 	mux.HandleFunc("GET /v1/models", p.handleModels)
 	mux.HandleFunc("GET /health", p.handleHealth)
 	mux.HandleFunc("GET /healthz", p.handleHealth)
@@ -208,10 +212,11 @@ func (p *Proxy) handleModels(w http.ResponseWriter, _ *http.Request) {
 // chat completions, and a hardcoded path silently turns an embeddings request
 // into a chat request at the upstream.
 func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
+	anthropic := isAnthropicPath(upstreamPath)
 	return func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "request body: "+err.Error())
+			writeErrorFor(anthropic, w, http.StatusBadRequest, "request body: "+err.Error())
 			return
 		}
 
@@ -221,19 +226,19 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			// that does not parse is a request error, not a routing error:
 			// answering 503 "no rule matched" would send the caller to their
 			// routing config instead of their request (issue #2074).
-			writeError(w, http.StatusBadRequest, "request body: "+err.Error())
+			writeErrorFor(anthropic, w, http.StatusBadRequest, "request body: "+err.Error())
 			return
 		}
 
 		decision := p.matcher.Match(&features)
 		if len(decision.Backends) == 0 {
-			writeError(w, http.StatusServiceUnavailable, "no rule matched and no defaultRoute configured")
+			writeErrorFor(anthropic, w, http.StatusServiceUnavailable, "no rule matched and no defaultRoute configured")
 			p.audit(features, decision, nil, http.StatusServiceUnavailable, "no_route", 0, budgetAudit{})
 			return
 		}
 
 		if err := p.enforceFailClosed(&features, &decision); err != nil {
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeErrorFor(anthropic, w, http.StatusServiceUnavailable, err.Error())
 			p.audit(features, decision, nil, http.StatusServiceUnavailable, "fail_closed", 0, budgetAudit{})
 			p.observeFailClosed(&features, &decision)
 			return
@@ -253,7 +258,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 					secs = 1
 				}
 				w.Header().Set("Retry-After", strconv.Itoa(secs))
-				writeError(w, http.StatusTooManyRequests, "budget exhausted: "+exhausted)
+				writeErrorFor(anthropic, w, http.StatusTooManyRequests, "budget exhausted: "+exhausted)
 				p.observeRequest(&features, &decision, nil, "budget_exceeded", 0)
 				p.audit(features, decision, nil, http.StatusTooManyRequests, "budget_exceeded", 0,
 					budgetAudit{Exhausted: exhausted})
@@ -265,7 +270,8 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 		// is taken from the provider's own count and a stream that reports none
 		// is charged zero. The rewrite is gated on a budget applying to this
 		// request; unbudgeted traffic dispatches untouched.
-		if isStream && len(scopeKeys) > 0 {
+		// An Anthropic stream always reports usage and has no stream_options.
+		if isStream && len(scopeKeys) > 0 && !anthropic {
 			if injected, changed := InjectStreamUsage(body); changed {
 				body = injected
 			}
@@ -294,7 +300,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			// status here does not depend on which of the two timers fires first.
 			if errors.Is(err, ErrHoldBudgetExceeded) || errors.Is(err, ErrSwapDeadlineExceeded) {
 				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
-				writeError(w, http.StatusServiceUnavailable,
+				writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
 					"model pool activation did not complete within the request budget; retry")
 				p.audit(features, decision, nil, http.StatusServiceUnavailable,
 					"pool_activation_timeout", elapsed, budgetAudit{})
@@ -308,7 +314,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			// 502 that reads as an upstream outage.
 			if errors.Is(err, ErrIncumbentBusy) {
 				w.Header().Set("Retry-After", modelPoolRetryAfterSeconds)
-				writeError(w, http.StatusServiceUnavailable,
+				writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
 					"model pool incumbent busy; no preferred member is warm, retry")
 				p.audit(features, decision, nil, http.StatusServiceUnavailable,
 					"pool_incumbent_busy", elapsed, budgetAudit{})
@@ -324,14 +330,14 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			// not egress because policy said so, not because of a generic
 			// upstream outage).
 			if decision.FailClosed {
-				writeError(w, http.StatusServiceUnavailable,
+				writeErrorFor(anthropic, w, http.StatusServiceUnavailable,
 					"fail-closed: all rule backends unhealthy: "+err.Error())
 				p.audit(features, decision, nil, http.StatusServiceUnavailable,
 					"fail_closed_runtime", elapsed, budgetAudit{})
 				p.observeFailClosed(&features, &decision)
 				return
 			}
-			writeError(w, http.StatusBadGateway, "all backends failed: "+err.Error())
+			writeErrorFor(anthropic, w, http.StatusBadGateway, "all backends failed: "+err.Error())
 			p.audit(features, decision, nil, http.StatusBadGateway, "all_backends_failed", elapsed, budgetAudit{}, "error", err.Error())
 			return
 		}
@@ -362,7 +368,7 @@ func (p *Proxy) handleCompletion(upstreamPath string) http.HandlerFunc {
 			if p.hasUSDBudget && !chosen.pricesTokens() {
 				prommetrics.RouterBudgetUnchargedTotal.WithLabelValues(p.routerName, "no_pricing").Inc()
 			}
-			prompt, completion, usageOK := parseUsage(captured.Bytes(), streamed)
+			prompt, completion, usageOK := parseUsageFor(anthropic, captured.Bytes(), streamed)
 			if usageOK {
 				usd := CostUSD(prompt, completion, chosen.CostPerMillionTokens)
 				p.budgets.Charge(scopeKeys, prompt+completion, usd)
@@ -464,11 +470,18 @@ func (p *Proxy) budgetScopeKeys(f *RequestFeatures, dec *MatchResult) []string {
 	return keys
 }
 
-// parseUsage extracts token usage from a captured response body. Streaming
-// and non-streaming bodies need different parsers; a streamed response or a
-// body that looks like SSE goes through the SSE scanner, everything else
-// through the JSON parser.
-func parseUsage(body []byte, streamed bool) (prompt, completion int64, ok bool) {
+// parseUsageFor extracts token usage from a captured response body, in the
+// shape of the API the request used: an Anthropic Messages response reports
+// usage in its own fields. Streaming and non-streaming bodies need different
+// parsers; a streamed response or a body that looks like SSE goes through the
+// SSE scanner, everything else through the JSON parser.
+func parseUsageFor(anthropic bool, body []byte, streamed bool) (prompt, completion int64, ok bool) {
+	if anthropic && len(body) > 0 {
+		if streamed || looksLikeSSE(body) {
+			return AnthropicUsageTokensFromSSE(body)
+		}
+		return AnthropicUsageTokens(body)
+	}
 	if len(body) == 0 {
 		return 0, 0, false
 	}
@@ -938,6 +951,41 @@ func (p *Proxy) updateActiveBackendsMetrics() {
 	for tier, count := range tierCount {
 		prommetrics.RouterActiveBackends.WithLabelValues(p.routerName, tier).Set(float64(count))
 	}
+}
+
+// isAnthropicPath reports whether path is an Anthropic Messages API route.
+func isAnthropicPath(path string) bool {
+	return path == "/v1/messages" || strings.HasPrefix(path, "/v1/messages/")
+}
+
+// writeErrorFor writes an error the router itself produces in the shape of
+// the API the client called: Anthropic clients parse
+// {"type":"error","error":{"type","message"}}.
+func writeErrorFor(anthropic bool, w http.ResponseWriter, code int, msg string) {
+	if !anthropic {
+		writeError(w, code, msg)
+		return
+	}
+	errType := "api_error"
+	switch {
+	case code == http.StatusBadRequest:
+		errType = "invalid_request_error"
+	case code == http.StatusNotFound:
+		errType = "not_found_error"
+	case code == http.StatusRequestEntityTooLarge:
+		errType = "request_too_large"
+	case code == http.StatusTooManyRequests:
+		errType = "rate_limit_error"
+	case code == http.StatusServiceUnavailable:
+		errType = "overloaded_error"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	body, _ := json.Marshal(map[string]any{
+		"type":  "error",
+		"error": map[string]any{"type": errType, "message": msg},
+	})
+	_, _ = w.Write(body)
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
