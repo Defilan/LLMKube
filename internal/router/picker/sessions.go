@@ -135,13 +135,18 @@ func (s *Sessions) Place(key uint64, cands []Candidate, now time.Time, tieStart 
 }
 
 // pressure reports whether the bound pod should shed the session, and to which
-// pod. It returns ReasonNone when the session should stay.
+// pod. It returns ReasonNone when the session should stay. A target never has a
+// fresh KV reading at or above KVFullThreshold.
 func pressure(bound Candidate, cands []Candidate, now time.Time, tieStart int) (string, Reason) {
 	others := make([]Candidate, 0, len(cands))
 	for _, c := range Eligible(cands, now) {
-		if c.Endpoint != bound.Endpoint {
-			others = append(others, c)
+		if c.Endpoint == bound.Endpoint {
+			continue
 		}
+		if cs := freshSample(c, now); cs != nil && cs.KVUsage >= KVFullThreshold {
+			continue
+		}
+		others = append(others, c)
 	}
 	if len(others) == 0 {
 		return "", ReasonNone
@@ -166,15 +171,18 @@ func pressure(bound Candidate, cands []Candidate, now time.Time, tieStart int) (
 	if bs.Waiting <= 0 {
 		return "", ReasonNone
 	}
-	if bs.KVUsage >= KVFullThreshold {
-		// Never move to another full pod, or to one whose KV is unknown.
-		if ls := freshSample(least, now); ls != nil && ls.KVUsage < KVFullThreshold {
-			return leastEP, ReasonKVFull
-		}
-		return "", ReasonNone
+	full := bs.KVUsage >= KVFullThreshold
+	reason := ReasonWaiting
+	if full {
+		reason = ReasonKVFull
+	}
+	// A full pod sheds at any gap, but only to a pod known to have KV room;
+	// otherwise it needs the load gap like any queued pod.
+	if ls := freshSample(least, now); full && ls != nil && ls.KVUsage < KVFullThreshold {
+		return leastEP, reason
 	}
 	if gap >= PressureMargin {
-		return leastEP, ReasonWaiting
+		return leastEP, reason
 	}
 	return "", ReasonNone
 }

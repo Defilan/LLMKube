@@ -243,3 +243,28 @@ func TestSessionsConcurrentFirstRequestsBindOnce(t *testing.T) {
 		t.Fatalf("Len = %d, want 1", s.Len())
 	}
 }
+
+func TestSessionsKVFullQueuedShedsToStaleTargetByGap(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindTo(t, s, 1, "a", t0)
+	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), bare("b", 0)}, t0, "b", Spill, ReasonKVFull)
+}
+
+func TestSessionsKVFullQueuedStaysWhenStaleTargetGapSmall(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindTo(t, s, 1, "a", t0)
+	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), bare("b", 27)}, t0, "a", Sticky, ReasonNone)
+}
+
+func TestSessionsAllKVFullStaysEvenWithLargeGap(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindTo(t, s, 1, "a", t0)
+	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), pod("b", 2, 0, 0.95)}, t0, "a", Sticky, ReasonNone)
+}
+
+func TestSessionsQueuedNotKVFullNeverTargetsFullPod(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindTo(t, s, 1, "a", t0)
+	cands := []Candidate{pod("a", 15, 5, 0.5), pod("b", 1, 0, 0.95), pod("c", 15, 0, 0.5)}
+	place(t, s, 1, cands, t0, "c", Spill, ReasonWaiting)
+}
