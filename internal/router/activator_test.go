@@ -718,6 +718,9 @@ func TestActivatorAbandonsSwapAtDeadline(t *testing.T) {
 		t.Fatalf("Acquire err = %v after %s; the swap was never bounded, the caller just ran out of hold budget",
 			err, time.Since(start))
 	}
+	if !errors.Is(err, ErrSwapDeadlineExceeded) {
+		t.Fatalf("Acquire err = %v, want ErrSwapDeadlineExceeded so the proxy answers 503 + Retry-After", err)
+	}
 	if got := testutil.ToFloat64(failures) - before; got != 1 {
 		t.Errorf("swap_failures_total{reason=deadline} delta = %v, want 1", got)
 	}
