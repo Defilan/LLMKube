@@ -523,7 +523,9 @@ func TestModelRouterValidator_MaxLoadPercentWarns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "deprecated") {
-		t.Fatalf("expected exactly one deprecation warning, got %v", warnings)
+	want := "spec.backends[0].balancing.sessionAffinity.maxLoadPercent is deprecated and has no effect; " +
+		"if you never set it, it was defaulted by an older LLMKube and can be removed with a JSON patch"
+	if len(warnings) != 1 || warnings[0] != want {
+		t.Fatalf("expected exactly one deprecation warning %q, got %v", want, warnings)
 	}
 }

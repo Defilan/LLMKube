@@ -120,6 +120,8 @@ var _ = Describe("ModelRouter backend balancing admission", func() {
 		Expect(ok).To(BeTrue())
 		Expect(backends).To(HaveLen(1))
 		bal, _ := backends[0].(map[string]any)["balancing"].(map[string]any)
+		Expect(bal).NotTo(BeNil())
+		Expect(bal["mode"]).To(Equal("RoundRobin"))
 		Expect(bal).NotTo(HaveKey("sessionHeaders"))
 
 		var seen []string

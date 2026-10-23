@@ -841,8 +841,9 @@ type BackendBalancing struct {
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
-	// SessionAffinity keeps a session on the pod it was first placed on, for
-	// as long as the session stays active. It requires mode: LoadAware; with
+	// SessionAffinity places a new session on the least-loaded pod. The session
+	// stays there unless that pod is queuing and clearly busier than another
+	// pod, and then it stays where it moved. It requires mode: LoadAware; with
 	// RoundRobin it is ignored and the router emits a SessionAffinityIgnored
 	// warning event.
 	// +optional
@@ -864,14 +865,14 @@ type SessionAffinity struct {
 
 	// IdleTimeout is how long a session may go without a request before the
 	// router forgets which pod it was on. The next request from that session
-	// is placed again by load. Defaults to the router's built-in value when
+	// is placed again by load. Defaults to the 30m when
 	// unset. Must be between 1m and 24h.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1m') && duration(self) <= duration('24h')",message="idleTimeout must be between 1m and 24h"
 	// +optional
 	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
 
 	// MaxLoadPercent is deprecated and has no effect since this release:
-	// sessions are now placed from the per-pod load table, not spilled by a
+	// sessions are now placed from the session binding table, not spilled by a
 	// load threshold. It is still accepted so existing manifests keep
 	// applying, and will be removed in a later API version.
 	// +kubebuilder:validation:Minimum=101

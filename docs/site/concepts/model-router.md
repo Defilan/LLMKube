@@ -234,7 +234,7 @@ spec:
 Without a session header, each request goes to the least-loaded pod. With one, the first configured header present names the session. Only a hash of its value is kept.
 
 - **A new session** goes to the least-loaded pod and is remembered there.
-- **A known session stays on its pod**, with two exceptions. With fresh engine metrics, it moves if its pod has requests waiting and carries 4 or more requests than the least-loaded pod. Without fresh metrics, it moves on an in-flight gap of 8 or more alone, with no waiting requests needed. It also moves if its pod is KV-full and queuing and the target has a fresh sample showing KV room, at any load gap. If the target has no such sample, the gap of 4 still applies. A pod whose fresh sample is KV-full is never a target.
+- **A known session stays on its pod** unless one of three things moves it. With fresh engine metrics, it moves if its pod has requests waiting and carries at least 4 more requests than the least-loaded pod. Without fresh metrics, it moves on an in-flight gap of 8 or more alone, with no waiting requests needed. It also moves if its pod is KV-full and queuing and the target has a fresh sample showing KV room, as long as the target is no busier than the full pod; a KV-full pod sheds only to a pod no busier than itself, so a herd cannot pile onto one target. If the target has no such sample, the gap of 4 still applies. A pod whose fresh sample is KV-full is never a spill target. When every pod is KV-full, a session whose pod left can still land on a full pod.
 - **A session that moved stays on its new pod.** It cannot move again for pressure for 60 seconds, and after that it can.
 - **A session whose pod left** (not ready, or quarantined by the circuit breaker) moves at once.
 - **KV-full alone does not move a session.** Only new sessions avoid KV-full pods.
@@ -261,6 +261,14 @@ Each proxy replica keeps its own binding table in memory. A restart starts it em
 ### Upgrading from `maxLoadPercent`
 
 `sessionAffinity.maxLoadPercent` is deprecated and ignored. The webhook returns a warning when it is set, so remove it from your manifests. An existing `RoundRobin` router that has `sessionAffinity` keeps serving with its affinity ignored, and gets a `SessionAffinityIgnored` Warning event. Change it to `mode: LoadAware` to get sessions back.
+
+Every LoadAware router created under 0.10.7 got `maxLoadPercent: 125` from the old CRD default, so the warning can fire even if your manifest never set it, and removing the field from the manifest does not clear it. Remove the stored value with a JSON patch, using the backend's index for `<i>`:
+
+```bash
+kubectl patch modelrouter <name> --type=json -p '[{"op":"remove","path":"/spec/backends/<i>/balancing/sessionAffinity/maxLoadPercent"}]'
+```
+
+A ModelRouter whose `spec.proxy.image` is pinned to a 0.10.7 proxy keeps the old ring behavior, and under the new controller any custom `maxLoadPercent` falls back to 125, because the controller no longer compiles it. Unpin the image.
 
 ## Several models on dataPlane: AgentGateway
 

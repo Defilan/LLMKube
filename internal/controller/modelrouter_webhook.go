@@ -230,7 +230,8 @@ func balancingWarnings(mr *inferencev1alpha1.ModelRouter) admission.Warnings {
 			continue
 		}
 		warnings = append(warnings, fmt.Sprintf(
-			"spec.backends[%d].balancing.sessionAffinity.maxLoadPercent is deprecated and has no effect", i))
+			"spec.backends[%d].balancing.sessionAffinity.maxLoadPercent is deprecated and has no effect; "+
+				"if you never set it, it was defaulted by an older LLMKube and can be removed with a JSON patch", i))
 	}
 	return warnings
 }
