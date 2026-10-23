@@ -17,13 +17,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 )
 
 // defaultQuarantineDuration is how long a backend stays in the
@@ -36,15 +40,21 @@ import (
 const defaultQuarantineDuration = 15 * time.Second
 
 // defaultIdleConnTimeout caps how long the shared transport keeps
-// idle keep-alive connections to upstreams in its pool. The 10s value
-// is short enough that local llama-server / vLLM connections expire
-// before the upstream's own idle reaper closes them server-side
-// (which is what causes the "silent 30s stall on a healthy backend"
-// failure mode), but long enough to amortize the TCP handshake across
-// burst traffic in a typical agentic workload. Cloud-tier backends
-// bypass the pool entirely by setting `Connection: close` per request
-// in Dispatch; see the cloud-tier branch there for why.
-const defaultIdleConnTimeout = 10 * time.Second
+// idle keep-alive connections to upstreams in its pool. It must be
+// shorter than the upstreams' own idle reapers, so the proxy always
+// closes an idle connection first: vLLM closes idle keep-alive
+// connections after 5s (VLLM_HTTP_TIMEOUT_KEEP_ALIVE), and reusing one
+// it is closing fails the request with an EOF (#2195). 4s still
+// amortizes the TCP handshake across burst traffic in an agentic
+// workload. Cloud-tier backends bypass the pool entirely by setting
+// `Connection: close` per request in Dispatch; see the cloud-tier
+// branch there for why.
+const defaultIdleConnTimeout = 4 * time.Second
+
+// endpointFailuresToQuarantine is how many failures in a row quarantine a
+// pod that is still in the endpoint set. One failure alone is too often a
+// connection blip, and quarantining a pod rebinds every session on it.
+const endpointFailuresToQuarantine = 2
 
 // defaultResponseHeaderTimeout caps how long the dispatcher waits for
 // the upstream to begin sending response headers. For non-streaming
@@ -79,6 +89,9 @@ const defaultStreamIdleTimeout = 300 * time.Second
 type backendHealth struct {
 	healthy         atomic.Bool
 	quarantineUntil atomic.Int64 // unix nano; 0 when healthy
+	// failures counts failures since the last success, for endpoint
+	// entries; see endpointFailuresToQuarantine.
+	failures atomic.Int32
 }
 
 // Dispatcher knows how to forward an inbound request to a chosen backend.
@@ -87,7 +100,12 @@ type backendHealth struct {
 type Dispatcher struct {
 	cfg    *Config
 	client *http.Client
-	health sync.Map // healthKey -> *backendHealth
+	// freshClient shares client's settings with keep-alives off, so each
+	// request it sends dials a new connection. Only the stale-connection
+	// retry uses it: setting Request.Close does not stop the transport
+	// handing out another pooled connection.
+	freshClient *http.Client
+	health      sync.Map // healthKey -> *backendHealth
 
 	// endpoints holds the per-pod addresses for backends that balance across
 	// them, keyed by backend name, so IsHealthy can decide from the endpoint
@@ -132,6 +150,9 @@ type Dispatcher struct {
 
 	// nowFn is overridable in tests.
 	nowFn func() time.Time
+
+	// logger records quarantines. NewProxy sets it to the proxy's logger.
+	logger *slog.Logger
 }
 
 // DispatcherOption customizes a Dispatcher at construction time.
@@ -195,22 +216,27 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 		responseHeaderTimeout: defaultResponseHeaderTimeout,
 		streamIdleTimeout:     defaultStreamIdleTimeout,
 		nowFn:                 time.Now,
+		logger:                slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(d)
+	}
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       defaultIdleConnTimeout,
+		ResponseHeaderTimeout: d.responseHeaderTimeout,
 	}
 	d.client = &http.Client{
 		// Streaming requests can be long-lived. The per-request
 		// context is the real deadline; this caps idle and connect
 		// phases to prevent leaking goroutines on dead backends.
-		Timeout: 0,
-		Transport: &http.Transport{
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       defaultIdleConnTimeout,
-			ResponseHeaderTimeout: d.responseHeaderTimeout,
-		},
+		Timeout:   0,
+		Transport: transport,
 	}
+	fresh := transport.Clone()
+	fresh.DisableKeepAlives = true
+	d.freshClient = &http.Client{Timeout: 0, Transport: fresh}
 	for _, b := range cfg.Backends {
 		h := &backendHealth{}
 		h.healthy.Store(true)
@@ -404,8 +430,21 @@ func (d *Dispatcher) MarkUnhealthy(name string) {
 // actually talked to, so one bad pod does not skip the backend's siblings.
 func (d *Dispatcher) markUnhealthy(name, endpoint string) {
 	h := d.healthFor(healthKey(name, endpoint))
+	if endpoint != "" && h.failures.Add(1) < endpointFailuresToQuarantine {
+		return
+	}
+	d.quarantine(name, endpoint, h)
+}
+
+// quarantine skips an endpoint (or the whole backend when endpoint is empty)
+// for quarantineDuration, without waiting for repeated failures. The stream
+// idle guard uses it directly: a pod that accepted a request and then went
+// silent for the whole idle timeout is wedged, not blipping.
+func (d *Dispatcher) quarantine(name, endpoint string, h *backendHealth) {
 	h.healthy.Store(false)
 	h.quarantineUntil.Store(d.nowFn().Add(d.quarantineDuration).UnixNano())
+	d.logger.Warn("router quarantined upstream", "backend", name, "endpoint", endpoint,
+		"for", d.quarantineDuration.String())
 }
 
 // markHealthy clears quarantine on one endpoint (or the whole backend when
@@ -414,6 +453,7 @@ func (d *Dispatcher) markHealthy(name, endpoint string) {
 	h := d.healthFor(healthKey(name, endpoint))
 	h.healthy.Store(true)
 	h.quarantineUntil.Store(0)
+	h.failures.Store(0)
 }
 
 // Dispatch forwards the request to the named backend and returns the
@@ -445,46 +485,31 @@ func (d *Dispatcher) Dispatch(
 	// The request runs under its own cancellable context so the stream idle
 	// guard can abort a body that went silent without touching the caller's
 	// context.
-	reqCtx, reqCancel := context.WithCancel(ctx)
-	req, err := http.NewRequestWithContext(reqCtx, method, url, newSentOnceBody(outboundBody)) //nolint:gosec // G704: url is the configured backend address or a pod from the controller-managed endpoint set; the session header is only hashed onto the ring
+	reqCancel, req, reused, err := d.newUpstreamRequest(ctx, backend, method, url, headers, outboundBody)
 	if err != nil {
-		reqCancel()
-		release()
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	// The transport keeps the request until the response body is done, so a
-	// bytes.Reader body (and the GetBody closure NewRequest builds for one)
-	// would hold the whole prompt for the length of the stream (#2194).
-	// sentOnceBody drops it once written; the length is set explicitly so
-	// the request is not sent chunked.
-	req.ContentLength = int64(len(outboundBody))
-	req.GetBody = nil
-
-	d.copyForwardedHeaders(headers, req.Header)
-	if err := d.applyCredentials(backend, req); err != nil {
-		reqCancel()
 		release()
 		return nil, err
 	}
 
-	// Cloud-tier backends commonly sit behind load balancers (AWS NLB,
-	// Cloudflare, Anthropic / OpenAI global LB) that aggressively
-	// recycle idle TCP connections without telling the client. Setting
-	// Connection: close on every outbound request opts that backend
-	// out of the shared keep-alive pool entirely: Go's http.Transport
-	// honors the header and closes the conn after this exchange
-	// regardless of pool capacity. The per-request handshake cost is
-	// negligible compared to typical cloud upstream latency, and we
-	// trade it for never seeing a "stale conn -> 30s silent stall"
-	// fingerprint. Local-tier backends keep the pool; their
-	// IdleConnTimeout (defaultIdleConnTimeout, 10s) is short enough
-	// that we don't see the same stale-conn failure mode.
-	if strings.EqualFold(backend.Tier, "cloud") {
-		req.Header.Set("Connection", "close")
-		req.Close = true
-	}
-
 	resp, err := d.client.Do(req) //nolint:gosec // G704: same destination as the request above, never derived from request headers
+	if err != nil && reused.Load() && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		// A reused keep-alive connection failed before any response byte:
+		// the upstream closed it while it sat idle. That is the
+		// connection's fault, not the pod's, so retry once on a fresh
+		// connection to the same pod (the session's cache stays warm)
+		// and do not count it against the pod (#2195).
+		prommetrics.RouterDispatchRetriesTotal.WithLabelValues(d.routerName, backend.Name, "stale_connection").Inc()
+		reqCancel()
+		var rerr error
+		reqCancel, req, _, rerr = d.newUpstreamRequest(ctx, backend, method, url, headers, outboundBody)
+		if rerr != nil {
+			release()
+			return nil, rerr
+		}
+		// A client with keep-alives off: the pool may hold more connections
+		// the upstream has already closed.
+		resp, err = d.freshClient.Do(req) //nolint:gosec // G704: same destination as above
+	}
 	if err != nil {
 		// A per-attempt context deadline (caller's
 		// context.WithTimeout, eg the rule.timeout path from #461)
@@ -517,7 +542,7 @@ func (d *Dispatcher) Dispatch(
 			// The upstream accepted the request and sent headers, then
 			// stopped producing bytes: a wedged backend, not a client
 			// disconnect or a rule deadline, so quarantine the endpoint.
-			d.markUnhealthy(name, endpoint)
+			d.quarantine(name, endpoint, d.healthFor(healthKey(name, endpoint)))
 			reqCancel()
 		}, reqCancel)
 	} else {
@@ -780,4 +805,59 @@ func (s *sentOnceBody) Close() error {
 	s.buf = nil
 	s.mu.Unlock()
 	return nil
+}
+
+// newUpstreamRequest builds one outbound request under its own cancellable
+// context, so the stream idle guard can abort a body that went silent without
+// touching the caller's context. reused reports, once the request has been
+// sent, whether it went out on a pooled keep-alive connection.
+func (d *Dispatcher) newUpstreamRequest(
+	ctx context.Context,
+	backend *Backend,
+	method, url string,
+	headers http.Header,
+	outboundBody []byte,
+) (context.CancelFunc, *http.Request, *atomic.Bool, error) {
+	reused := &atomic.Bool{}
+	reqCtx, reqCancel := context.WithCancel(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { reused.Store(info.Reused) },
+	}))
+	req, err := http.NewRequestWithContext(reqCtx, method, url, newSentOnceBody(outboundBody)) //nolint:gosec // G704: url is the configured backend address or a pod from the controller-managed endpoint set; the session header is only hashed onto the ring
+	if err != nil {
+		reqCancel()
+		return nil, nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	// The transport keeps the request until the response body is done, so a
+	// bytes.Reader body (and the GetBody closure NewRequest builds for one)
+	// would hold the whole prompt for the length of the stream (#2194).
+	// sentOnceBody drops it once written; the length is set explicitly so
+	// the request is not sent chunked.
+	req.ContentLength = int64(len(outboundBody))
+	req.GetBody = nil
+
+	d.copyForwardedHeaders(headers, req.Header)
+	if err := d.applyCredentials(backend, req); err != nil {
+		reqCancel()
+		return nil, nil, nil, err
+	}
+
+	// Cloud-tier backends commonly sit behind load balancers (AWS NLB,
+	// Cloudflare, Anthropic / OpenAI global LB) that aggressively
+	// recycle idle TCP connections without telling the client. Setting
+	// Connection: close on every outbound request opts that backend
+	// out of the shared keep-alive pool entirely: Go's http.Transport
+	// honors the header and closes the conn after this exchange
+	// regardless of pool capacity. The per-request handshake cost is
+	// negligible compared to typical cloud upstream latency, and we
+	// trade it for never seeing a "stale conn -> 30s silent stall"
+	// fingerprint. Local-tier backends keep the pool; their
+	// IdleConnTimeout (defaultIdleConnTimeout) is shorter than their
+	// upstreams' idle reapers, and a stale reused connection is retried
+	// once on a fresh one.
+	if strings.EqualFold(backend.Tier, "cloud") {
+		req.Header.Set("Connection", "close")
+		req.Close = true
+	}
+
+	return reqCancel, req, reused, nil
 }

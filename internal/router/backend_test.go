@@ -745,7 +745,8 @@ func TestDispatcherQuarantinesOneEndpoint(t *testing.T) {
 	}}}
 	disp := NewDispatcher(cfg, WithQuarantineDuration(time.Minute))
 
-	// First dispatch rotates to the bad endpoint and quarantines it.
+	// First dispatch rotates to the bad endpoint: one failure, not yet
+	// quarantined (endpointFailuresToQuarantine).
 	resp, err := disp.Dispatch(context.Background(), &cfg.Backends[0],
 		http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(`{"model":"m"}`))
 	if err != nil {
@@ -757,9 +758,9 @@ func TestDispatcherQuarantinesOneEndpoint(t *testing.T) {
 		t.Fatal("one bad endpoint must not mark the whole backend unhealthy")
 	}
 
-	// Two more dispatches: rotation would return to the bad endpoint on the
-	// third, so honouring the endpoint quarantine is observable as bad=1, good=2.
-	for i := 0; i < 2; i++ {
+	// Four more: the bad endpoint's second failure (dispatch 3) quarantines
+	// it, so rotation skips it on dispatch 5: bad=2, good=3.
+	for i := 0; i < 4; i++ {
 		resp, err = disp.Dispatch(context.Background(), &cfg.Backends[0],
 			http.MethodPost, "/v1/chat/completions", http.Header{}, []byte(`{"model":"m"}`))
 		if err != nil {
@@ -767,8 +768,8 @@ func TestDispatcherQuarantinesOneEndpoint(t *testing.T) {
 		}
 		_ = resp.Body.Close()
 	}
-	if badHits.Load() != 1 || goodHits.Load() != 2 {
-		t.Errorf("after 3 dispatches hits = bad:%d good:%d, want bad:1 good:2 (the 5xx pod must be quarantined, not retried)",
+	if badHits.Load() != 2 || goodHits.Load() != 3 {
+		t.Errorf("after 5 dispatches hits = bad:%d good:%d, want bad:2 good:3 (two 5xx in a row must quarantine the pod)",
 			badHits.Load(), goodHits.Load())
 	}
 }

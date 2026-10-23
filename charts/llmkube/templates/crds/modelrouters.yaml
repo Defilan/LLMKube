@@ -912,7 +912,9 @@ spec:
                     description: |-
                       QuarantineDuration controls how long the proxy keeps a backend in
                       the "skip" state after a 5xx or network error before allowing a
-                      half-open probe. Default 15s when unset. Shorter windows make the
+                      half-open probe. A pod of an endpoint-resolution backend is
+                      quarantined after two such failures in a row, or at once when a
+                      stream goes silent past streamIdleTimeout. Default 15s when unset. Shorter windows make the
                       proxy recover faster from transient blips; longer windows reduce
                       probe load on genuinely-down upstreams. Tests can shrink this to
                       sub-second to verify recovery without sleeping the full default.

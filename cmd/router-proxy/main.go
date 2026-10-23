@@ -60,7 +60,8 @@ func main() {
 		"How long to wait for in-flight requests on SIGTERM before forcing a close.")
 	quarantineDuration := flag.Duration("quarantine-duration", 15*time.Second,
 		"How long a backend stays in the quarantined (skip) state after a "+
-			"5xx / network error before becoming eligible for a half-open "+
+			"5xx / network error (two in a row for a pod of an endpoint "+
+			"backend) before becoming eligible for a half-open "+
 			"probe. Shorter windows recover faster from transient blips; "+
 			"longer windows reduce probe load on genuinely-down upstreams.")
 	streamIdleTimeout := flag.Duration("stream-idle-timeout", 300*time.Second,
