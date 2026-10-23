@@ -190,3 +190,28 @@ func TestRingPickWithNoCandidates(t *testing.T) {
 		t.Errorf("no candidates: pick %q, want empty", ep)
 	}
 }
+
+func TestRingSpreadsSessionHomesEvenly(t *testing.T) {
+	const pods, keys = 8, 10000
+	eps := endpoints(pods)
+	ring := NewRing(eps)
+	counts := make(map[string]int, pods)
+	for i := 0; i < keys; i++ {
+		counts[ring.Home(fmt.Sprintf("session-%d", i))]++
+	}
+	ideal := keys / pods
+	lo, hi := ideal*3/4, ideal*5/4
+	minC, maxC := keys, 0
+	for _, ep := range eps {
+		c := counts[ep]
+		if c < minC {
+			minC = c
+		}
+		if c > maxC {
+			maxC = c
+		}
+	}
+	if minC < lo || maxC > hi {
+		t.Errorf("session homes per pod: min %d, max %d, want every pod within [%d, %d] (ideal %d)", minC, maxC, lo, hi, ideal)
+	}
+}

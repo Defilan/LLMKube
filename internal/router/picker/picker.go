@@ -136,10 +136,22 @@ type Ring struct {
 	owner  map[uint64]string
 }
 
+// hash64 hashes ring points and session keys. It is FNV-1a 64 followed by the
+// splitmix64 finalizer. FNV-1a alone mixes its high bits poorly for strings
+// that differ only in their last bytes (an endpoint's "#0".."#127" virtual node
+// suffixes, or "session-N" keys), which clusters a pod's virtual nodes into a
+// few contiguous ring arcs and skews how sessions are distributed. The
+// finalizer avalanches those bits so the points spread across the ring.
 func hash64(s string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(s))
-	return h.Sum64()
+	x := h.Sum64()
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
 }
 
 // NewRing builds a ring with VirtualNodes positions per endpoint.
