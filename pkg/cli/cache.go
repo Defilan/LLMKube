@@ -489,11 +489,11 @@ func runCacheClear(opts *cacheClearOptions) error {
 		var err error
 		switch {
 		case len(keys) > 0:
-			outcome, err = purgeCacheKeys(ctx, cfg, k8sClient, clientset, opts.namespace, target.Name, keys)
+			outcome, err = purgeCacheKeys(ctx, cfg, k8sClient, clientset, opts.namespace, target, keys)
 		case opts.orphaned:
-			outcome, err = purgeOrphanedEntries(ctx, cfg, k8sClient, clientset, opts.namespace, target.Name, active)
+			outcome, err = purgeOrphanedEntries(ctx, cfg, k8sClient, clientset, opts.namespace, target, active)
 		default:
-			outcome, err = purgeAllEntries(ctx, cfg, k8sClient, clientset, opts.namespace, target.Name)
+			outcome, err = purgeAllEntries(ctx, cfg, k8sClient, clientset, opts.namespace, target)
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("purging cache PVC %s: %w", target.Name, err))
