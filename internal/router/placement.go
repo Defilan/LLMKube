@@ -128,6 +128,11 @@ func (d *Dispatcher) place(backend *Backend, headers http.Header, bodyBytes int6
 	return ep, res, picker.ReasonNone, picker.EstimateTokens(bodyBytes)
 }
 
+// isTokenCountPath reports whether path only counts a prompt's tokens.
+func isTokenCountPath(path string) bool {
+	return path == "/v1/messages/count_tokens"
+}
+
 // countPlacement records a balanced placement decision.
 func (d *Dispatcher) countPlacement(backend string, res picker.Result, reason picker.Reason) {
 	if res == "" {
