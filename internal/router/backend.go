@@ -95,6 +95,11 @@ type Dispatcher struct {
 	endpoints sync.Map // backendName -> []string
 	loads     sync.Map // healthKey -> *endpointLoad
 
+	// rings caches the consistent-hash ring per balanced backend, rebuilt when
+	// the endpoint set changes. It holds endpoint addresses only, never a
+	// session value.
+	rings sync.Map // backendName -> *ringCache
+
 	// cursors is the round-robin position per endpoint backend. Consecutive
 	// requests advance it so a keep-alive client spreads across pods.
 	cursors sync.Map // backendName -> *atomic.Uint64
@@ -266,13 +271,19 @@ func (d *Dispatcher) dispatchable(key string) bool {
 	return until > 0 && d.nowFn().UnixNano() >= until
 }
 
-// pickEndpoint chooses the pod to dispatch to for a backend that balances
-// across its endpoints. Consecutive calls rotate so a keep-alive client spreads
+// pickEndpoint chooses the pod for callers that carry no request headers: it
+// is place with no headers.
+func (d *Dispatcher) pickEndpoint(backend *Backend) string {
+	ep, _ := d.place(backend, nil)
+	return ep
+}
+
+// roundRobin chooses the pod to dispatch to among eps, the backend's live
+// endpoint set. Consecutive calls rotate so a keep-alive client spreads
 // across pods rather than pinning to one through conntrack. Quarantined
 // endpoints are skipped; when every endpoint is quarantined the rotation
 // returns one anyway so the half-open probe still happens.
-func (d *Dispatcher) pickEndpoint(backend *Backend) string {
-	eps := d.liveEndpoints(backend)
+func (d *Dispatcher) roundRobin(backend *Backend, eps []string) string {
 	n := len(eps)
 	if n == 0 {
 		return ""
@@ -424,7 +435,8 @@ func (d *Dispatcher) Dispatch(
 	if backend == nil {
 		return nil, fmt.Errorf("dispatch: backend is nil")
 	}
-	endpoint := d.pickEndpoint(backend)
+	endpoint, placed := d.place(backend, headers)
+	d.countPlacement(backend.Name, placed)
 	release := d.track(backend.Name, endpoint)
 	url := joinURL(dispatchTarget(backend, endpoint), path)
 
@@ -436,7 +448,7 @@ func (d *Dispatcher) Dispatch(
 	// guard can abort a body that went silent without touching the caller's
 	// context.
 	reqCtx, reqCancel := context.WithCancel(ctx)
-	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody))
+	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody)) //nolint:gosec // G704: url is the configured backend address or a pod from the controller-managed endpoint set; the session header is only hashed onto the ring
 	if err != nil {
 		reqCancel()
 		release()
@@ -467,7 +479,7 @@ func (d *Dispatcher) Dispatch(
 		req.Close = true
 	}
 
-	resp, err := d.client.Do(req)
+	resp, err := d.client.Do(req) //nolint:gosec // G704: same destination as the request above, never derived from request headers
 	if err != nil {
 		// A per-attempt context deadline (caller's
 		// context.WithTimeout, eg the rule.timeout path from #461)

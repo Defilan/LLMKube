@@ -181,6 +181,16 @@ var (
 		[]string{labelRouter, "backend", "endpoint"},
 	)
 
+	// RouterPlacementsTotal counts the router proxy's placement decisions for
+	// balanced backends by result: least_loaded, sticky, spill or fallback.
+	RouterPlacementsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "llmkube_router_placements_total",
+			Help: "Router proxy placement decisions for balanced backends, by result.",
+		},
+		[]string{labelRouter, "backend", "result"},
+	)
+
 	RouterBackendHealth = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "llmkube_router_backend_health",
@@ -502,6 +512,7 @@ var AllCollectors = []prometheus.Collector{
 	RouterEndpointSourceReady,
 	RouterEndpointLoad,
 	RouterEndpointMetricsFresh,
+	RouterPlacementsTotal,
 	RouterFirstTokenSeconds,
 	RouterBudgetUtilization,
 	RouterTokenBudgetUtilization,
