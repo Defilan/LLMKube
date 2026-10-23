@@ -69,6 +69,9 @@ func TestVLLMBuildArgs(t *testing.T) {
 		contains []FlagCheck
 		// notContains is just a list of flags that must NOT appear anywhere in args.
 		notContains []string
+		// exactlyOnce is a list of flags that must appear exactly once, so an
+		// extraArgs duplicate is caught.
+		exactlyOnce []string
 		model       *inferencev1alpha1.Model
 		name        string
 		spec        *inferencev1alpha1.InferenceServiceSpec
@@ -480,6 +483,8 @@ func TestVLLMBuildArgs(t *testing.T) {
 					MaxNumBatchedTokens:  ptrInt32(8192),
 					Quantization:         "fp8",
 					TensorParallelSize:   ptrInt32(2),
+					ToolCallParser:       "glm47",
+					ReasoningParser:      "glm45",
 				},
 			},
 			contains: []FlagCheck{
@@ -493,7 +498,107 @@ func TestVLLMBuildArgs(t *testing.T) {
 				{"--max-num-seqs", "1"},
 				{"--quantization", "fp8"},
 				{"--tensor-parallel-size", "2"},
+				{"--tool-call-parser", "glm47"},
+				{"--enable-auto-tool-choice", ""},
+				{"--reasoning-parser", "glm45"},
 			},
+		},
+		{
+			model: model,
+			name:  "toolCallParser emits the auto-tool-choice pairing",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ToolCallParser: "glm47"},
+			},
+			contains: []FlagCheck{
+				{"--tool-call-parser", "glm47"},
+				{"--enable-auto-tool-choice", ""},
+			},
+			notContains: []string{"--reasoning-parser"},
+		},
+		{
+			model: model,
+			name:  "toolCallParser unset emits neither flag",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{},
+			},
+			notContains: []string{"--tool-call-parser", "--enable-auto-tool-choice", "--reasoning-parser"},
+		},
+		{
+			model: model,
+			name:  "nil vllmConfig emits no parser flags",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: nil,
+			},
+			notContains: []string{"--tool-call-parser", "--enable-auto-tool-choice", "--reasoning-parser"},
+		},
+		{
+			model: model,
+			name:  "toolCallParser with --tool-call-parser in extraArgs still pairs",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				ExtraArgs:  []string{"--tool-call-parser", "hermes"},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ToolCallParser: "glm47"},
+			},
+			// The user's parser wins, and auto tool choice must still be on or
+			// their parser is inert.
+			contains:    []FlagCheck{{"--tool-call-parser", "hermes"}, {"--enable-auto-tool-choice", ""}},
+			notContains: []string{"glm47"},
+			exactlyOnce: []string{"--tool-call-parser", "--enable-auto-tool-choice"},
+		},
+		{
+			model: model,
+			name:  "toolCallParser with an inline --tool-call-parser in extraArgs emits once",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				ExtraArgs:  []string{"--tool-call-parser=hermes"},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ToolCallParser: "glm47"},
+			},
+			contains:    []FlagCheck{{"--enable-auto-tool-choice", ""}},
+			exactlyOnce: []string{"--tool-call-parser"},
+		},
+		{
+			model: model,
+			name:  "toolCallParser with --enable-auto-tool-choice in extraArgs emits it once",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				ExtraArgs:  []string{"--enable-auto-tool-choice"},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ToolCallParser: "glm47"},
+			},
+			contains:    []FlagCheck{{"--tool-call-parser", "glm47"}},
+			exactlyOnce: []string{"--enable-auto-tool-choice"},
+		},
+		{
+			model: model,
+			name:  "reasoningParser emits alone",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ReasoningParser: "glm45"},
+			},
+			contains:    []FlagCheck{{"--reasoning-parser", "glm45"}},
+			notContains: []string{"--tool-call-parser", "--enable-auto-tool-choice"},
+		},
+		{
+			model: model,
+			name:  "reasoningParser with --reasoning-parser in extraArgs emits once",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				ExtraArgs:  []string{"--reasoning-parser", "deepseek_v4"},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ReasoningParser: "glm45"},
+			},
+			contains:    []FlagCheck{{"--reasoning-parser", "deepseek_v4"}},
+			notContains: []string{"glm45"},
+			exactlyOnce: []string{"--reasoning-parser"},
 		},
 	}
 
@@ -512,6 +617,11 @@ func TestVLLMBuildArgs(t *testing.T) {
 			for _, f := range tc.notContains {
 				if containsArg(args, f, "") {
 					t.Errorf("expected %q NOT in args, got: %v", f, args)
+				}
+			}
+			for _, f := range tc.exactlyOnce {
+				if n := countFlagAnyForm(args, f); n != 1 {
+					t.Errorf("expected %q exactly once, got %d in args: %v", f, n, args)
 				}
 			}
 		})
@@ -535,11 +645,24 @@ func TestVLLMBuildArgsDeterministic(t *testing.T) {
 				EnableChunkedPrefill: ptrBool(true),
 				MaxNumBatchedTokens:  ptrInt32(8192),
 				AttentionBackend:     "FLASHINFER",
+				ToolCallParser:       "glm47",
+				ReasoningParser:      "glm45",
 			},
 		},
 	}
 
 	first := backend.BuildArgs(isvc, model, "/models/x", "", 8000)
+	if !containsArg(first, "--tool-call-parser", "glm47") {
+		t.Fatalf("fixture does not emit --tool-call-parser glm47: %v", first)
+	}
+	// The two parser flags follow struct-declaration order (ToolCallParser
+	// before ReasoningParser), so the argv reads in the order vllmConfig is
+	// documented to render.
+	toolIdx := indexOfFlag(first, "--tool-call-parser")
+	reasonIdx := indexOfFlag(first, "--reasoning-parser")
+	if toolIdx < 0 || reasonIdx < 0 || toolIdx > reasonIdx {
+		t.Fatalf("want --tool-call-parser before --reasoning-parser, got: %v", first)
+	}
 	for i := 0; i < 10; i++ {
 		got := backend.BuildArgs(isvc, model, "/models/x", "", 8000)
 		if len(got) != len(first) {

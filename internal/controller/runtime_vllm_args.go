@@ -128,6 +128,30 @@ func appendQuantization(args []string, quantization string) []string {
 	return args
 }
 
+// appendToolCallParser emits the parser and the auto tool choice flag that
+// makes it take effect. The two are guarded separately so an extraArgs value
+// suppresses only its own flag: vLLM renders a parser inert unless auto tool
+// choice is on, so pairing a user-supplied parser with the flag is the point.
+func appendToolCallParser(args []string, parser string, extraArgs []string) []string {
+	if parser == "" {
+		return args
+	}
+	if !hasMatchingExtraArg(extraArgs, "tool-call-parser") {
+		args = append(args, "--tool-call-parser", parser)
+	}
+	if !hasMatchingExtraArg(extraArgs, "enable-auto-tool-choice") {
+		args = append(args, "--enable-auto-tool-choice")
+	}
+	return args
+}
+
+func appendReasoningParser(args []string, parser string, extraArgs []string) []string {
+	if parser != "" && !hasMatchingExtraArg(extraArgs, "reasoning-parser") {
+		return append(args, "--reasoning-parser", parser)
+	}
+	return args
+}
+
 func appendMaxModelLen(args []string, maxModelLen *int32) []string {
 	if maxModelLen != nil {
 		return append(args, "--max-model-len", fmt.Sprintf("%d", *maxModelLen))

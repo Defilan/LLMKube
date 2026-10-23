@@ -34,6 +34,8 @@ spec:
     enableExpertParallel: true
     kvCacheDtype: fp8_e4m3
     maxModelLen: 262144
+    toolCallParser: deepseek_v4
+    reasoningParser: deepseek_v4
   multiNode:
     rdmaResource: rdma/rdma_shared_device_a
     ibGIDIndex: 3
@@ -55,6 +57,10 @@ torch.distributed rendezvous at rank 0's fabric address.
 pipelineParallelSize` and must equal `members x resources.gpu`: every GPU in
 the group is a rank. Leave both sizes unset and the operator derives tensor
 parallel across the whole group.
+
+`toolCallParser` and `reasoningParser` are free-form values from the vLLM
+image's parser registry. Setting `toolCallParser` also passes
+`--enable-auto-tool-choice`, because vLLM ignores a parser without it.
 
 ## Why fabric settings are per member
 

@@ -1563,6 +1563,27 @@ type VLLMConfig struct {
 	// +optional
 	EnableExpertParallel *bool `json:"enableExpertParallel,omitempty"`
 
+	// ToolCallParser selects the tool-call parser, e.g. glm47, hermes. Maps to
+	// vLLM --tool-call-parser, always together with --enable-auto-tool-choice:
+	// vLLM ignores a parser unless auto tool choice is on, so a request with
+	// tool_choice: auto fails with "requires --enable-auto-tool-choice and
+	// --tool-call-parser". Not an enum because vLLM registers parsers every
+	// release (43 at v0.25.1), so the value must exist in the image you run or
+	// vLLM refuses to start with "invalid tool call parser". A parser already
+	// set in spec.extraArgs wins, and the pairing's two flags are each skipped
+	// independently when already in spec.extraArgs.
+	// +optional
+	ToolCallParser string `json:"toolCallParser,omitempty"`
+
+	// ReasoningParser selects the reasoning-content parser, e.g. glm45, glm47,
+	// deepseek_v4. Maps to vLLM --reasoning-parser, which vLLM validates
+	// against its registry: the value must exist in the image you run or the
+	// server refuses to start with "invalid reasoning parser". Not an enum for the same
+	// reason as ToolCallParser. Emitted alone; vLLM has no paired flag. A
+	// parser already set in spec.extraArgs wins.
+	// +optional
+	ReasoningParser string `json:"reasoningParser,omitempty"`
+
 	// HFTokenSecretRef references a Secret containing the HuggingFace token.
 	// +optional
 	HFTokenSecretRef *corev1.SecretKeySelector `json:"hfTokenSecretRef,omitempty"`
@@ -2026,13 +2047,21 @@ type SGLangConfig struct {
 	// Agentic glue
 	// ToolCallParser selects the tool-call extraction format. For foreman
 	// tool-loop workloads. Maps to SGLang --tool-call-parser flag.
-	// +kubebuilder:validation:Enum=llama3;qwen3;qwen25;hermes;functionary;mistral
+	//
+	// glm is the GLM-4.5/4.7 MoE detector; SGLang v0.5.15 rewrites a passed
+	// glm45 to glm with a deprecation warning, so both spellings work.
+	// qwen3 and functionary are kept for objects written against earlier
+	// releases even though the pinned image no longer registers them.
+	// +kubebuilder:validation:Enum=llama3;qwen3;qwen25;hermes;functionary;mistral;glm;glm45;glm47
 	// +optional
 	ToolCallParser string `json:"toolCallParser,omitempty"`
 
 	// ReasoningParser selects the reasoning-content extraction format. For
 	// thinking models (qwen3, deepseek-r1). Maps to SGLang --reasoning-parser.
-	// +kubebuilder:validation:Enum=qwen3;deepseek-r1
+	//
+	// GLM stops at glm45: SGLang has no glm47 reasoning detector, and
+	// --reasoning-parser rejects a value outside its choices at startup.
+	// +kubebuilder:validation:Enum=qwen3;deepseek-r1;glm45
 	// +optional
 	ReasoningParser string `json:"reasoningParser,omitempty"`
 

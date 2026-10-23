@@ -432,6 +432,8 @@ func TestVLLMConfigRoundTrip(t *testing.T) {
 		Quantization:       "awq",
 		Dtype:              "bfloat16",
 		AttentionBackend:   "FLASHINFER",
+		ToolCallParser:     "glm47",
+		ReasoningParser:    "glm45",
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
