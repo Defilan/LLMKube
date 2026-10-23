@@ -147,6 +147,8 @@ func (b *VLLMBackend) BuildArgs(isvc *inferencev1alpha1.InferenceService, model 
 			)
 		}
 		args = appendEnableExpertParallel(args, cfg.EnableExpertParallel)
+		args = appendToolCallParser(args, cfg.ToolCallParser, isvc.Spec.ExtraArgs)
+		args = appendReasoningParser(args, cfg.ReasoningParser, isvc.Spec.ExtraArgs)
 
 		args, err = appendCPUOffloadGB(args, cfg.CPUOffloadGB, hasGPUPresent(isvc, model))
 		if err != nil {

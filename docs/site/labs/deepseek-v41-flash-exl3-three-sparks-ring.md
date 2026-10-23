@@ -215,6 +215,10 @@ The serving arguments that are load-bearing:
 - `--served-model-name DeepSeek-V4.1-Flash-EXL3`, with the `deepseek_v41`
   reasoning and tool parsers and `--enable-auto-tool-choice`. The endpoint
   speaks OpenAI function calling, which is what Foreman's agent loop requires.
+  The parsers now have a typed form (`vllmConfig.toolCallParser` and
+  `vllmConfig.reasoningParser`, the first of which passes
+  `--enable-auto-tool-choice` itself); this build kept them in `extraArgs`,
+  which still works.
 - Vision on: no `--language-model-only`, with `--limit-mm-per-prompt
   '{"image":4}'` and `--mm-processor-cache-gb 0`. The processor cache lives in
   the API server on rank 0 only (measured 1.16 GiB there, nothing on ranks 1

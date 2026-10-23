@@ -47,6 +47,29 @@ func containsArg(args []string, flag, value string) bool {
 	return false
 }
 
+// countFlagAnyForm counts flag in both the separate form (--flag value) and
+// the inline form (--flag=value). countArg matches only the verbatim form,
+// which tests that tell --metrics=true from a bare --metrics rely on.
+func countFlagAnyForm(args []string, flag string) int {
+	n := 0
+	for _, a := range args {
+		if a == flag || strings.HasPrefix(a, flag+"=") {
+			n++
+		}
+	}
+	return n
+}
+
+// indexOfFlag returns the position of flag in args, or -1.
+func indexOfFlag(args []string, flag string) int {
+	for i, a := range args {
+		if a == flag || strings.HasPrefix(a, flag+"=") {
+			return i
+		}
+	}
+	return -1
+}
+
 // ptrString, ptrBool, ptrInt32 are local helpers so tests read naturally.
 func ptrBool(b bool) *bool          { return &b }
 func ptrFloat64(f float64) *float64 { return &f }

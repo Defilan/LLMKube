@@ -209,6 +209,13 @@ non-zero ranks. Rank 0 serves the API. See the
 [multi-node inference guide](../guides/multi-node-inference) for the API and
 its failure semantics.
 
+The spec above is the one this build ran. The parser triple in `extraArgs`
+(`--reasoning-parser deepseek_v4`, `--tool-call-parser deepseek_v4`,
+`--enable-auto-tool-choice`) now has a typed form,
+`vllmConfig.reasoningParser` and `vllmConfig.toolCallParser`: the second
+passes `--enable-auto-tool-choice` itself, so the pair replaces all three
+lines. Leaving them in `extraArgs` still works, since `extraArgs` lands last.
+
 The persistent cache mount at `/cache` matters more than it looks. It holds the
 Triton, Inductor, FlashInfer and CUDA JIT caches, and on this platform the
 upstream CUDA image ships no `sm_121` binaries, so everything is JIT compiled on

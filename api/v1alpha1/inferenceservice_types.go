@@ -1563,6 +1563,29 @@ type VLLMConfig struct {
 	// +optional
 	EnableExpertParallel *bool `json:"enableExpertParallel,omitempty"`
 
+	// ToolCallParser selects the tool-call parser, e.g. glm47, hermes. Maps to
+	// vLLM --tool-call-parser, always together with --enable-auto-tool-choice:
+	// vLLM ignores a parser unless auto tool choice is on, so a request with
+	// tool_choice: auto fails with "requires --enable-auto-tool-choice and
+	// --tool-call-parser". Not an enum because vLLM registers a parser per
+	// model family, every release (see vllm/tool_parsers/__init__.py in the
+	// image you run), so the value must exist in that registry or vLLM refuses
+	// to start with "invalid tool call parser". A parser already set in
+	// spec.extraArgs wins, and the pairing's two flags are each skipped
+	// independently when already in spec.extraArgs.
+	// +optional
+	ToolCallParser string `json:"toolCallParser,omitempty"`
+
+	// ReasoningParser selects the reasoning-content parser, e.g. glm45, glm47,
+	// deepseek_v4. Maps to vLLM --reasoning-parser, which vLLM validates
+	// against its registry (vllm/reasoning/__init__.py in the image you run):
+	// the value must be there or the server refuses to start with "invalid
+	// reasoning parser". Not an enum for the same reason as ToolCallParser.
+	// Emitted alone; vLLM has no paired flag. A parser already set in
+	// spec.extraArgs wins.
+	// +optional
+	ReasoningParser string `json:"reasoningParser,omitempty"`
+
 	// HFTokenSecretRef references a Secret containing the HuggingFace token.
 	// +optional
 	HFTokenSecretRef *corev1.SecretKeySelector `json:"hfTokenSecretRef,omitempty"`
@@ -2026,13 +2049,26 @@ type SGLangConfig struct {
 	// Agentic glue
 	// ToolCallParser selects the tool-call extraction format. For foreman
 	// tool-loop workloads. Maps to SGLang --tool-call-parser flag.
-	// +kubebuilder:validation:Enum=llama3;qwen3;qwen25;hermes;functionary;mistral
+	//
+	// glm and glm45 both select the GLM-4.5/4.7 MoE detector; SGLang
+	// v0.5.15.post1 also logs a deprecation warning for a passed glm45 and
+	// rewrites it to glm (server_args.py), so either spelling works. qwen3 and
+	// functionary are kept for objects written against earlier releases even
+	// though the pinned image no longer registers them.
+	// +kubebuilder:validation:Enum=llama3;qwen3;qwen25;hermes;functionary;mistral;glm;glm45;glm47
 	// +optional
 	ToolCallParser string `json:"toolCallParser,omitempty"`
 
 	// ReasoningParser selects the reasoning-content extraction format. For
 	// thinking models (qwen3, deepseek-r1). Maps to SGLang --reasoning-parser.
-	// +kubebuilder:validation:Enum=qwen3;deepseek-r1
+	//
+	// GLM stops at glm45: SGLang has no glm47 reasoning detector, and
+	// --reasoning-parser rejects a value outside its choices at startup. The
+	// enum lists the values LLMKube supports, not every key in SGLang's
+	// detector map; an unsupported value goes in spec.extraArgs, and the field
+	// must then be cleared because SGLang does not suppress a typed parser the
+	// way the vLLM fields do.
+	// +kubebuilder:validation:Enum=qwen3;deepseek-r1;glm45
 	// +optional
 	ReasoningParser string `json:"reasoningParser,omitempty"`
 
