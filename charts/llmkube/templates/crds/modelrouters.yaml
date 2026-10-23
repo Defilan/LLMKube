@@ -183,8 +183,8 @@ spec:
                               description: |-
                                 IdleTimeout is how long a session may go without a request before the
                                 router forgets which pod it was on. The next request from that session
-                                is placed again by load. Defaults to the 30m when
-                                unset. Must be between 1m and 24h.
+                                is placed again by load. Defaults to 30m when unset. Must be between
+                                1m and 24h.
                               type: string
                               x-kubernetes-validations:
                               - message: idleTimeout must be between 1m and 24h

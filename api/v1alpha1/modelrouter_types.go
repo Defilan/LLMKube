@@ -865,8 +865,8 @@ type SessionAffinity struct {
 
 	// IdleTimeout is how long a session may go without a request before the
 	// router forgets which pod it was on. The next request from that session
-	// is placed again by load. Defaults to the 30m when
-	// unset. Must be between 1m and 24h.
+	// is placed again by load. Defaults to 30m when unset. Must be between
+	// 1m and 24h.
 	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1m') && duration(self) <= duration('24h')",message="idleTimeout must be between 1m and 24h"
 	// +optional
 	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
