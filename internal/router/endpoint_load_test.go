@@ -26,6 +26,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/router/picker"
 )
 
@@ -124,10 +127,11 @@ func loadAwareBackend(url string) (*Config, *Backend) {
 
 func prefill(d *Dispatcher, ep string) int64 { return d.loadFor("qwen", ep).prefill.Load() }
 
-// promptBody returns a valid chat body of exactly n bytes.
-func promptBody(n int) []byte {
+// promptBody returns a valid chat body of exactly 4,000 bytes, which
+// estimates to 1,000 prompt tokens.
+func promptBody() []byte {
 	head, tail := `{"model":"qwen","messages":[{"role":"user","content":"`, `"}]}`
-	return []byte(head + strings.Repeat("a", n-len(head)-len(tail)) + tail)
+	return []byte(head + strings.Repeat("a", 4000-len(head)-len(tail)) + tail)
 }
 
 func TestDispatchHoldsPrefillUntilFirstByte(t *testing.T) {
@@ -147,7 +151,7 @@ func TestDispatchHoldsPrefillUntilFirstByte(t *testing.T) {
 	d := NewDispatcher(cfg)
 	d.SetEndpoints("qwen", []string{srv.URL})
 
-	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +179,7 @@ func TestDispatchReleasesPrefillOnCloseWithoutRead(t *testing.T) {
 	d := NewDispatcher(cfg)
 	d.SetEndpoints("qwen", []string{srv.URL})
 
-	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +191,7 @@ func TestDispatchReleasesPrefillOnCloseWithoutRead(t *testing.T) {
 }
 
 func TestDispatchReleasesPrefillOnFailures(t *testing.T) {
-	body := promptBody(4000)
+	body := promptBody()
 
 	dead := "http://127.0.0.1:1"
 	cfg, b := loadAwareBackend(dead)
@@ -247,7 +251,7 @@ func TestDispatchRoundRobinCountsNoPrefill(t *testing.T) {
 	cfg, b := singleEndpointBackend(srv.URL)
 	d := NewDispatcher(cfg)
 	d.SetEndpoints("qwen", []string{srv.URL})
-	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +297,7 @@ func TestPrefillReleasesAfterEndpointLeaves(t *testing.T) {
 	cfg, b := loadAwareBackend(srv.URL)
 	d := NewDispatcher(cfg)
 	d.SetEndpoints("qwen", []string{srv.URL})
-	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,5 +363,18 @@ func TestPrefillConcurrentDispatchEndsAtZero(t *testing.T) {
 	}
 	if got := d.ExpirePrefill(time.Now().Add(24 * time.Hour)); got != 0 {
 		t.Errorf("ledger entries left = %d, want 0", got)
+	}
+}
+
+func TestTrackPrefillCountsEstimatedTokens(t *testing.T) {
+	cfg, _ := loadAwareBackend("http://unused")
+	d := NewDispatcher(cfg, WithRouterLabel("r-count"))
+	c := prommetrics.RouterPrefillTokensEstimatedTotal.WithLabelValues("r-count", "qwen", "ep")
+	before := testutil.ToFloat64(c)
+	d.trackPrefill("qwen", "ep", 1000)()
+	d.trackPrefill("qwen", "ep", 2000)()
+	d.trackPrefill("qwen", "ep", 0)()
+	if got := testutil.ToFloat64(c) - before; got != 3000 {
+		t.Errorf("estimated-tokens counter rose by %v, want 3000", got)
 	}
 }

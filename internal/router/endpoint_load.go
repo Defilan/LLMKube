@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	prommetrics "github.com/defilantech/llmkube/internal/metrics"
 	"github.com/defilantech/llmkube/internal/router/picker"
 )
 
@@ -100,6 +101,7 @@ func (d *Dispatcher) trackPrefill(backend, endpoint string, tokens int64) func()
 	}
 	l := d.loadFor(backend, endpoint)
 	l.prefill.Add(tokens)
+	prommetrics.RouterPrefillTokensEstimatedTotal.WithLabelValues(d.routerName, backend, endpoint).Add(float64(tokens))
 
 	d.prefillMu.Lock()
 	if d.prefillLedger == nil {
