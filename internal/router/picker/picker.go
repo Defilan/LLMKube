@@ -56,6 +56,19 @@ const (
 	Sticky      Result = "sticky"
 	Spill       Result = "spill"
 	Fallback    Result = "fallback"
+	// Migrated means the session's pod left the candidate set and the session
+	// was rebound.
+	Migrated Result = "migrated"
+)
+
+// Reason names what pressure moved a session off its pod.
+type Reason string
+
+const (
+	ReasonNone     Reason = ""
+	ReasonWaiting  Reason = "waiting"
+	ReasonKVFull   Reason = "kv_full"
+	ReasonNotReady Reason = "not_ready"
 )
 
 const (
@@ -152,6 +165,11 @@ func hash64(s string) uint64 {
 	x *= 0x94d049bb133111eb
 	x ^= x >> 31
 	return x
+}
+
+// SessionHash hashes a session key for the session table.
+func SessionHash(key string) uint64 {
+	return hash64(key)
 }
 
 // NewRing builds a ring with VirtualNodes positions per endpoint.
