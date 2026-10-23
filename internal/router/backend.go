@@ -353,6 +353,9 @@ func (d *Dispatcher) SetEndpoints(name string, endpoints []string) {
 		if !keep[ep] {
 			d.health.Delete(healthKey(name, ep))
 			d.loads.Delete(healthKey(name, ep))
+			// Backends without a metrics profile have no scraper to drop
+			// this per-pod series, so departure drops it here.
+			prommetrics.RouterPrefillTokensEstimatedTotal.DeleteLabelValues(d.routerName, name, ep)
 		}
 	}
 	d.endpoints.Store(name, next)

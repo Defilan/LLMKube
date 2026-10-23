@@ -378,3 +378,20 @@ func TestTrackPrefillCountsEstimatedTokens(t *testing.T) {
 		t.Errorf("estimated-tokens counter rose by %v, want 3000", got)
 	}
 }
+
+// A LoadAware backend without a metrics profile has no scraper, so the
+// departure path must drop the estimated-tokens series itself.
+func TestSetEndpointsDropsDepartedPrefillCounterSeries(t *testing.T) {
+	cfg, _ := loadAwareBackend("http://unused")
+	d := NewDispatcher(cfg, WithRouterLabel("r-leave"))
+	d.SetEndpoints("qwen", []string{"http://10.0.0.1:8000", "http://10.0.0.2:8000"})
+	d.trackPrefill("qwen", "http://10.0.0.1:8000", 1000)()
+	d.trackPrefill("qwen", "http://10.0.0.2:8000", 1000)()
+	d.SetEndpoints("qwen", []string{"http://10.0.0.2:8000"})
+	if prommetrics.RouterPrefillTokensEstimatedTotal.DeleteLabelValues("r-leave", "qwen", "http://10.0.0.1:8000") {
+		t.Error("estimated-tokens series of the departed endpoint survived")
+	}
+	if !prommetrics.RouterPrefillTokensEstimatedTotal.DeleteLabelValues("r-leave", "qwen", "http://10.0.0.2:8000") {
+		t.Error("estimated-tokens series of the kept endpoint is missing")
+	}
+}
