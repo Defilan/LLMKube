@@ -254,6 +254,83 @@ func TestCacheClearFailsFastOnAHeldReadWriteOncePodClaim(t *testing.T) {
 	}
 }
 
+// The cache-access image can be pointed at an air-gapped mirror (#2155, item 2).
+const (
+	cacheImageEnv2155  = "LLMKUBE_CACHE_IMAGE"
+	cacheMirrorFixture = "registry.local:5000/llmkube/busybox:latest"
+)
+
+func TestCacheAccessPodsUseTheConfiguredImage(t *testing.T) {
+	const mirror = cacheMirrorFixture
+
+	t.Run("flag on cache list reaches the inspector", func(t *testing.T) {
+		env := cache2155Env(t, "cache-2155-image-list", dynamicClaim(corev1.ReadWriteOnce),
+			[]*corev1.Pod{mountedPod("serving")}, modelWithCacheKey())
+		stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+		if err := runCacheCommand(t, "list", "-n", env.namespace, "--cache-image", mirror); err != nil {
+			t.Fatalf("cache list --cache-image: %v", err)
+		}
+		container := getCreatedPod(t, env.clientset, env.namespace,
+			inspectorPodName(modelCachePVCName)).Spec.Containers[0]
+		if container.Image != mirror {
+			t.Errorf("image = %q, want %q", container.Image, mirror)
+		}
+		if container.ImagePullPolicy != corev1.PullIfNotPresent {
+			t.Errorf("pull policy = %q, want %q", container.ImagePullPolicy, corev1.PullIfNotPresent)
+		}
+	})
+
+	t.Run("flag on cache clear reaches the purge pod", func(t *testing.T) {
+		env := cache2155Env(t, "cache-2155-image-clear", dynamicClaim(corev1.ReadWriteOnce), nil, nil)
+		stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+		if err := runCacheCommand(t, "clear", "--force", "-n", env.namespace, "--cache-image", mirror); err != nil {
+			t.Fatalf("cache clear --cache-image: %v", err)
+		}
+		container := getCreatedPod(t, env.clientset, env.namespace,
+			purgePodName(modelCachePVCName)).Spec.Containers[0]
+		if container.Image != mirror {
+			t.Errorf("image = %q, want %q", container.Image, mirror)
+		}
+		if container.ImagePullPolicy != corev1.PullIfNotPresent {
+			t.Errorf("pull policy = %q, want %q", container.ImagePullPolicy, corev1.PullIfNotPresent)
+		}
+	})
+
+	t.Run("environment reaches the inspector with no flag", func(t *testing.T) {
+		t.Setenv(cacheImageEnv2155, mirror)
+		env := cache2155Env(t, "cache-2155-image-env", dynamicClaim(corev1.ReadWriteOnce),
+			[]*corev1.Pod{mountedPod("serving")}, modelWithCacheKey())
+		stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+		if err := runCacheCommand(t, "list", "-n", env.namespace); err != nil {
+			t.Fatalf("cache list: %v", err)
+		}
+		container := getCreatedPod(t, env.clientset, env.namespace,
+			inspectorPodName(modelCachePVCName)).Spec.Containers[0]
+		if container.Image != mirror {
+			t.Errorf("image = %q, want %q", container.Image, mirror)
+		}
+	})
+
+	t.Run("flag beats the environment", func(t *testing.T) {
+		t.Setenv(cacheImageEnv2155, "other.local/busybox:1.37.0")
+		env := cache2155Env(t, "cache-2155-image-flag", dynamicClaim(corev1.ReadWriteOnce),
+			[]*corev1.Pod{mountedPod("serving")}, modelWithCacheKey())
+		stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+		if err := runCacheCommand(t, "list", "-n", env.namespace, "--cache-image", mirror); err != nil {
+			t.Fatalf("cache list --cache-image: %v", err)
+		}
+		container := getCreatedPod(t, env.clientset, env.namespace,
+			inspectorPodName(modelCachePVCName)).Spec.Containers[0]
+		if container.Image != mirror {
+			t.Errorf("image = %q, want the flag's %q", container.Image, mirror)
+		}
+	})
+}
+
 // Parity: a strict RWO claim a pod holds is attached on that pod's node, so the
 // inspector must land there. Passing on base and the branch alike.
 func TestCacheListPinsTheInspectorForAReadWriteOnceClaim(t *testing.T) {
@@ -364,6 +441,7 @@ func TestPurgePodIsNotPinnedToTheHolder(t *testing.T) {
 // Parity: with nothing configured, both cache-access pods run the image they
 // always did.
 func TestCacheAccessPodsDefaultToBusybox(t *testing.T) {
+	t.Setenv(cacheImageEnv2155, "")
 
 	env := cache2155Env(t, "cache-2155-default-image", dynamicClaim(corev1.ReadWriteOnce),
 		[]*corev1.Pod{mountedPod("serving")}, modelWithCacheKey())

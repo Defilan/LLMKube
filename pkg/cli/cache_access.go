@@ -19,10 +19,45 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+const (
+	// defaultCacheAccessImage is the image both cache-access pods run when
+	// nothing sets one.
+	defaultCacheAccessImage = "busybox:1.37.0"
+	// cacheImageEnv sets the cache-access pod image for every cache command.
+	cacheImageEnv = "LLMKUBE_CACHE_IMAGE"
+)
+
+// cacheAccessImage is the image the --cache-image flag selected for this run;
+// empty when the flag did not set one.
+var cacheAccessImage string
+
+// cacheAccessImageName resolves the cache-access pod image: the flag, then
+// LLMKUBE_CACHE_IMAGE, then the busybox default. Both the inspector and the
+// purge pod read it here, so an air-gapped mirror reaches all three commands.
+func cacheAccessImageName() string {
+	if cacheAccessImage != "" {
+		return cacheAccessImage
+	}
+	if image := os.Getenv(cacheImageEnv); image != "" {
+		return image
+	}
+	return defaultCacheAccessImage
+}
+
+// withCacheImage runs fn with image as the cache-access pod image, restoring
+// the previous setting afterwards.
+func withCacheImage(image string, fn func() error) error {
+	previous := cacheAccessImage
+	cacheAccessImage = image
+	defer func() { cacheAccessImage = previous }()
+	return fn()
+}
 
 // claimReadClient is the client the cache commands read claims through. It is
 // a variable so a test can refuse the read, as a caller without RBAC on
