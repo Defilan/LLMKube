@@ -578,6 +578,18 @@ func TestVLLMBuildArgs(t *testing.T) {
 		},
 		{
 			model: model,
+			name:  "toolCallParser with an inline --enable-auto-tool-choice in extraArgs emits it once",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:    "vllm",
+				ModelRef:   "test-model",
+				ExtraArgs:  []string{"--enable-auto-tool-choice=true"},
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ToolCallParser: "glm47"},
+			},
+			contains:    []FlagCheck{{"--tool-call-parser", "glm47"}},
+			exactlyOnce: []string{"--enable-auto-tool-choice"},
+		},
+		{
+			model: model,
 			name:  "reasoningParser emits alone",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:    "vllm",
