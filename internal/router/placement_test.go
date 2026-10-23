@@ -18,6 +18,7 @@ package router
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"testing"
 	"time"
@@ -25,14 +26,14 @@ import (
 	"github.com/defilantech/llmkube/internal/router/picker"
 )
 
-func balancedDispatcher(headers []string, n int) (*Dispatcher, *Backend, []string) {
+func balancedDispatcher(headers []string, n int, opts ...DispatcherOption) (*Dispatcher, *Backend, []string) {
 	cfg := &Config{Backends: []Backend{{
 		Name: "qwen", Tier: "local", Address: "http://qwen.ns.svc.cluster.local:8000",
 		EndpointSource: &EndpointSource{Namespace: "ns", Service: "qwen", Port: 8000},
 		Balancing:      &Balancing{Mode: BalancingLoadAware, SessionHeaders: headers},
 		Metrics:        &vllmProfile,
 	}}}
-	d := NewDispatcher(cfg, WithQuarantineDuration(time.Hour))
+	d := NewDispatcher(cfg, append([]DispatcherOption{WithQuarantineDuration(time.Hour)}, opts...)...)
 	eps := make([]string, n)
 	for i := range eps {
 		eps[i] = fmt.Sprintf("http://10.0.1.%d:8000", i+1)
@@ -88,6 +89,42 @@ func TestPlaceSessionStickyAcrossReplicas(t *testing.T) {
 		if ep, _ := d1.place(b1, h); ep != ep1 {
 			t.Fatalf("session moved from %s to %s while idle", ep1, ep)
 		}
+	}
+}
+
+// TestPlaceSessionAgreesAcrossReplicasUnderLoad: two proxy replicas that see
+// the same pods in a different order and the same engine samples place every
+// session on the same pod, whether it stays home or spills.
+func TestPlaceSessionAgreesAcrossReplicasUnderLoad(t *testing.T) {
+	t0 := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	clock := WithNowFunc(func() time.Time { return t0 })
+	headers := []string{"x-session-affinity"}
+	d1, b1, eps := balancedDispatcher(headers, 8, clock)
+	d2, b2, _ := balancedDispatcher(headers, 8, clock)
+	shuffled := append([]string(nil), eps...)
+	rand.New(rand.NewPCG(1, 2)).Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+	d2.SetEndpoints("qwen", shuffled)
+	// Unequal, non-idle loads; the first pod runs hot enough to spill its
+	// sessions while the others keep theirs.
+	for i, ep := range eps {
+		smp := picker.Sample{Running: []float64{8, 1, 2, 2, 1, 2, 3, 1}[i], Waiting: float64(i % 2), At: t0}
+		d1.RecordSample("qwen", ep, smp)
+		d2.RecordSample("qwen", ep, smp)
+	}
+
+	results := map[picker.Result]int{}
+	for k := 0; k < 200; k++ {
+		h := http.Header{}
+		h.Set("X-Session-Affinity", fmt.Sprintf("agent-%d", k))
+		ep1, res1 := d1.place(b1, h)
+		ep2, res2 := d2.place(b2, h)
+		if ep1 != ep2 || res1 != res2 {
+			t.Errorf("session %d: replicas placed it on %s (%s) and %s (%s), want the same pod", k, ep1, res1, ep2, res2)
+		}
+		results[res1]++
+	}
+	if results[picker.Sticky] == 0 || results[picker.Spill] == 0 {
+		t.Errorf("results = %v, want both sticky and spilled sessions so both paths are compared", results)
 	}
 }
 
