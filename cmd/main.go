@@ -691,6 +691,7 @@ func main() {
 		Scheme:            mgr.GetScheme(),
 		RouterProxyImage:  routerProxyImage,
 		DefaultLiteLLMURL: defaultLiteLLMURL,
+		Recorder:          mgr.GetEventRecorder("modelrouter-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelRouter")
 		os.Exit(1)

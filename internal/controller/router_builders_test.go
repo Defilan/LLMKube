@@ -1798,7 +1798,7 @@ func TestCompileRouterConfigBalancing(t *testing.T) {
 			t.Fatal(err)
 		}
 		bal := cfg.Backends[0].Balancing
-		if bal == nil || bal.Mode != router.BalancingLoadAware || bal.MaxLoadPercent != 150 ||
+		if bal == nil || bal.Mode != router.BalancingLoadAware ||
 			len(bal.SessionHeaders) != 2 || bal.SessionHeaders[1] != "x-openwebui-chat-id" {
 			t.Errorf("runtime %q: balancing = %+v", tc.runtime, bal)
 		}
@@ -1875,4 +1875,61 @@ func TestCompileRouterConfigBalancingLookupError(t *testing.T) {
 			t.Errorf("balancing = %+v, metrics = %+v, want balancing and no profile", cfg.Backends[0].Balancing, cfg.Backends[0].Metrics)
 		}
 	})
+}
+
+func compileBalancingForTest(t *testing.T, b *inferencev1alpha1.BackendBalancing) (*router.Balancing, []byte) {
+	t.Helper()
+	r := newRouterReconcilerForTest(t, canonicalModelRouter())
+	out, _, err := r.compileBalancing(context.Background(), testBuilderNs, "qwen3-coder", b)
+	if err != nil {
+		t.Fatalf("compileBalancing: %v", err)
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out, data
+}
+
+func TestCompileBalancingLoadAwareIdleTimeout(t *testing.T) {
+	b := &inferencev1alpha1.BackendBalancing{
+		Mode: inferencev1alpha1.BalancingModeLoadAware,
+		SessionAffinity: &inferencev1alpha1.SessionAffinity{
+			Headers:     []string{"x-session-affinity"},
+			IdleTimeout: &metav1.Duration{Duration: 45 * time.Minute},
+		},
+	}
+	out, _ := compileBalancingForTest(t, b)
+	if out.SessionIdleTimeout != 45*time.Minute {
+		t.Errorf("SessionIdleTimeout = %v, want 45m", out.SessionIdleTimeout)
+	}
+	b.SessionAffinity.IdleTimeout = nil
+	out, _ = compileBalancingForTest(t, b)
+	if out.SessionIdleTimeout != 0 {
+		t.Errorf("unset SessionIdleTimeout = %v, want 0", out.SessionIdleTimeout)
+	}
+}
+
+func TestCompileBalancingIgnoresMaxLoadPercent(t *testing.T) {
+	_, data := compileBalancingForTest(t, &inferencev1alpha1.BackendBalancing{
+		Mode: inferencev1alpha1.BalancingModeLoadAware,
+		SessionAffinity: &inferencev1alpha1.SessionAffinity{
+			Headers: []string{"x-session-affinity"}, MaxLoadPercent: 300,
+		},
+	})
+	if strings.Contains(string(data), "maxLoadPercent") {
+		t.Errorf("compiled balancing carries maxLoadPercent: %s", data)
+	}
+}
+
+func TestCompileBalancingRoundRobinDropsAffinity(t *testing.T) {
+	for _, mode := range []string{inferencev1alpha1.BalancingModeRoundRobin, ""} {
+		out, _ := compileBalancingForTest(t, &inferencev1alpha1.BackendBalancing{
+			Mode:            mode,
+			SessionAffinity: &inferencev1alpha1.SessionAffinity{Headers: []string{"x-session-affinity"}},
+		})
+		if len(out.SessionHeaders) != 0 {
+			t.Errorf("mode %q: SessionHeaders = %v, want none", mode, out.SessionHeaders)
+		}
+	}
 }

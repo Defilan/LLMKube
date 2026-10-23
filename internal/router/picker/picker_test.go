@@ -97,75 +97,21 @@ func endpoints(n int) []string {
 	return out
 }
 
-func idle(eps []string) []Candidate {
-	out := make([]Candidate, len(eps))
-	for i, ep := range eps {
-		out[i] = Candidate{Endpoint: ep}
-	}
-	return out
-}
-
 func TestRingStickyAndDeterministic(t *testing.T) {
 	eps := endpoints(8)
 	a, b := NewRing(eps), NewRing(append([]string(nil), eps...))
 	for i := 0; i < 1000; i++ {
 		key := fmt.Sprintf("session-%d", i)
-		ep1, res := a.Pick(key, idle(eps), t0, 125)
-		ep2, _ := b.Pick(key, idle(eps), t0, 125)
-		if res != Sticky || ep1 != a.Home(key) {
-			t.Fatalf("%s: idle pick %s/%s, want its home %s sticky", key, ep1, res, a.Home(key))
+		home := a.Home(key)
+		if home == "" {
+			t.Fatalf("%s: no home on a non-empty ring", key)
 		}
-		if ep1 != ep2 {
-			t.Fatalf("%s: two rings disagree (%s vs %s)", key, ep1, ep2)
+		if home != b.Home(key) {
+			t.Fatalf("%s: two rings disagree (%s vs %s)", key, home, b.Home(key))
 		}
-	}
-}
-
-func TestRingSpillsWhenHomeIsHot(t *testing.T) {
-	eps := endpoints(4)
-	r := NewRing(eps)
-	key := "agent-42"
-	home := r.Home(key)
-	cands := idle(eps)
-	for i := range cands {
-		if cands[i].Endpoint == home {
-			cands[i].InFlight = 10 // far above 125% of the average
+		if again := a.Home(key); again != home {
+			t.Fatalf("%s: home moved from %s to %s", key, home, again)
 		}
-	}
-	ep, res := r.Pick(key, cands, t0, 125)
-	if ep == home || res != Spill {
-		t.Fatalf("hot home: pick %s/%s, want a spill away from %s", ep, res, home)
-	}
-	// The bound: no candidate is chosen above it.
-	var sum int64
-	for _, c := range cands {
-		sum += Load(c, t0)
-	}
-	bound := ceilDiv((sum+1)*125, 100*int64(len(cands)))
-	for _, c := range cands {
-		if c.Endpoint == ep && Load(c, t0)+1 > bound {
-			t.Errorf("picked %s with load %d over bound %d", ep, Load(c, t0), bound)
-		}
-	}
-}
-
-func TestRingHomeMissingFromCandidatesSpills(t *testing.T) {
-	eps := endpoints(4)
-	r := NewRing(eps)
-	key := "agent-7"
-	home := r.Home(key)
-	var cands []Candidate
-	for _, c := range idle(eps) {
-		if c.Endpoint != home { // the home pod is quarantined
-			cands = append(cands, c)
-		}
-	}
-	ep, res := r.Pick(key, cands, t0, 125)
-	if ep == "" || ep == home || res != Spill {
-		t.Fatalf("pick %s/%s, want another pod as a spill", ep, res)
-	}
-	if ep2, res2 := r.Pick(key, idle(eps), t0, 125); ep2 != home || res2 != Sticky {
-		t.Errorf("after recovery: pick %s/%s, want home %s sticky", ep2, res2, home)
 	}
 }
 
@@ -182,12 +128,6 @@ func TestRingMovesFewKeysWhenAPodJoins(t *testing.T) {
 	frac := float64(moved) / keys
 	if frac < 0.5/9 || frac > 2.0/9 {
 		t.Errorf("moved %.3f of keys when one of 9 pods joined, want between %.3f and %.3f", frac, 0.5/9, 2.0/9)
-	}
-}
-
-func TestRingPickWithNoCandidates(t *testing.T) {
-	if ep, _ := NewRing(endpoints(3)).Pick("k", nil, t0, 125); ep != "" {
-		t.Errorf("no candidates: pick %q, want empty", ep)
 	}
 }
 

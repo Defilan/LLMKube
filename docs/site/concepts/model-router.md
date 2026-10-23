@@ -206,7 +206,7 @@ Use it on multi-replica local backends where one client should not pin one pod. 
 
 ## Load-aware balancing
 
-Round-robin spreads requests evenly, but agent sessions carry very different amounts of work: one copy can draw the long, uncached prompts and queue while others idle. `balancing` places each request by load instead, and keeps a conversation on its pod while that pod has room.
+Round-robin spreads requests evenly, but agent sessions carry very different amounts of work: one copy can draw the long, uncached prompts and queue while others idle. `balancing` places each request by load instead, and keeps a conversation on its pod unless that pod is clearly the wrong place for it.
 
 ```yaml
 spec:
@@ -218,16 +218,57 @@ spec:
       balancing:
         mode: LoadAware
         sessionAffinity:
-          headers: [x-session-affinity, x-openwebui-chat-id, x-opencode-session]
-          maxLoadPercent: 125
+          headers: [x-session-affinity, x-openwebui-chat-id, x-opencode-session, x-session-id]
+          idleTimeout: 30m
 ```
 
-- **Load** for a vLLM backend is the pod's own running plus waiting requests, read from its `/metrics` once a second, plus the requests this proxy sent since. A pod whose KV cache is 90% full or more takes no new work while another pod has room. Other runtimes, and any pod whose metrics are more than 5 seconds old, use this proxy's in-flight count.
-- **Without a session header**, each request goes to the least-loaded pod.
-- **With one**, the first header present names the session; only its hash is used. The session stays on its pod until that pod's load passes `maxLoadPercent` of the average, then spills to the next pod, and returns once its pod has room again. Proxy replicas agree on a session's home pod; near the spill bound, where each replica also counts its own in-flight requests, they may briefly place it differently.
-- `mode: RoundRobin` (the default) with `sessionAffinity` keeps sessions sticky using in-flight counts only.
+`sessionAffinity` requires `mode: LoadAware`. The webhook rejects it with `mode: RoundRobin` when a router is created or its spec changes.
 
-Decisions are visible as `llmkube_router_placements_total{result}` (`least_loaded`, `sticky`, `spill`, `fallback`), with `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` per pod for `LoadAware` backends with a metrics profile (vLLM today).
+### How load is read
+
+- **Load** for a vLLM backend is the pod's own running plus waiting requests, read from its `/metrics` once a second, plus the requests this proxy sent since. Other runtimes, and any pod whose metrics are more than 5 seconds old, use this proxy's in-flight count.
+- A pod whose KV cache is 90% full or more is KV-full. New sessions avoid KV-full pods while another pod has room.
+
+### Where a session goes
+
+Without a session header, each request goes to the least-loaded pod. With one, the first configured header present names the session. Only a hash of its value is kept.
+
+- **A new session** goes to the least-loaded pod and is remembered there.
+- **A known session stays on its pod** unless one of three things moves it. With fresh engine metrics, it moves if its pod has requests waiting and carries at least 4 more requests than the least-loaded pod. Without fresh metrics, it moves on an in-flight gap of 8 or more alone, with no waiting requests needed. It also moves if its pod is KV-full and queuing and the target has a fresh sample showing KV room, as long as the target is no busier than the full pod; a KV-full pod sheds only to a pod no busier than itself, so a herd cannot pile onto one target. If the target has no such sample, the gap of 4 still applies. A pod whose fresh sample is KV-full is never a spill target. When every pod is KV-full, a session whose pod left can still land on a full pod.
+- **A session that moved stays on its new pod.** It cannot move again for pressure for 60 seconds, and after that it can.
+- **A session whose pod left** (not ready, or quarantined by the circuit breaker) moves at once.
+- **KV-full alone does not move a session.** Only new sessions avoid KV-full pods.
+- **If the table is full** (100,000 sessions per backend), a new session falls back to a consistent-hash home pod and is not remembered.
+
+`idleTimeout` drops a binding that has gone unused that long. The default is 30m, and the allowed range is 1m to 24h. Common agent headers are `x-session-affinity`, `x-openwebui-chat-id`, `x-opencode-session` and `x-session-id`.
+
+### Running more than one proxy replica
+
+Each proxy replica keeps its own binding table in memory. A restart starts it empty, and the table stores only the hash of the session header. With more than one proxy replica, a session that lands on different replicas gets different bindings. Hash the session header to a proxy replica upstream so a session always reaches the same replica, for example with APISIX `chash` on the header.
+
+### Reading the metrics
+
+`llmkube_router_placements_total{router,backend,result,reason}` counts decisions. `result` is one of:
+
+- `least_loaded`: a request without a binding, or a new session, went to the least-loaded pod.
+- `sticky`: a known session stayed on its pod.
+- `spill`: a session moved off a pod under pressure (`waiting` or `kv_full`) and is now bound to the new pod.
+- `migrated`: a session moved because its pod left (`not_ready`).
+- `fallback`: the table was full and the consistent-hash home was used, or no pod was dispatchable (all quarantined or circuit-open) and the request went round-robin over the live endpoints. A fallback count alone does not mean the table is full.
+
+`reason` is set only for `spill` and `migrated`, and empty otherwise. `llmkube_router_session_bindings{router,backend}` is the current number of bindings. It counts every session used within `idleTimeout`, not only live ones, so a client that starts a new session whenever one ends can hold several times its concurrent session count. Per pod, `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` cover `LoadAware` backends with a metrics profile (vLLM today).
+
+### Upgrading from `maxLoadPercent`
+
+`sessionAffinity.maxLoadPercent` is deprecated and ignored. The webhook returns a warning when it is set, so remove it from your manifests. An existing `RoundRobin` router that has `sessionAffinity` keeps serving with its affinity ignored, and gets a `SessionAffinityIgnored` Warning event. Change it to `mode: LoadAware` to get sessions back.
+
+Every LoadAware router created under 0.10.7 got `maxLoadPercent: 125` from the old CRD default, so the warning can fire even if your manifest never set it, and removing the field from the manifest does not clear it. Remove the stored value with a JSON patch, using the backend's index for `<i>`:
+
+```bash
+kubectl patch modelrouter <name> --type=json -p '[{"op":"remove","path":"/spec/backends/<i>/balancing/sessionAffinity/maxLoadPercent"}]'
+```
+
+A ModelRouter whose `spec.proxy.image` is pinned to a 0.10.7 proxy keeps the old ring behavior, and under the new controller any custom `maxLoadPercent` falls back to 125, because the controller no longer compiles it. Unpin the image.
 
 ## Several models on dataPlane: AgentGateway
 

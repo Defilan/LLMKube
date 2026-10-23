@@ -323,3 +323,23 @@ func TestConfigValidateBudgets(t *testing.T) {
 		})
 	}
 }
+
+func TestConfigHasSessionAffinity(t *testing.T) {
+	hdr := []string{"x-session-id"}
+	cases := []struct {
+		name string
+		bal  *Balancing
+		want bool
+	}{
+		{"round robin with headers", &Balancing{Mode: BalancingRoundRobin, SessionHeaders: hdr}, false},
+		{"load aware without headers", &Balancing{Mode: BalancingLoadAware}, false},
+		{"load aware with headers", &Balancing{Mode: BalancingLoadAware, SessionHeaders: hdr}, true},
+		{"no balancing", nil, false},
+	}
+	for _, c := range cases {
+		cfg := &Config{Backends: []Backend{{Name: "a", Balancing: c.bal}}}
+		if got := cfg.HasSessionAffinity(); got != c.want {
+			t.Errorf("%s: HasSessionAffinity = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

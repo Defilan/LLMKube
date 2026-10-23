@@ -841,13 +841,17 @@ type BackendBalancing struct {
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
-	// SessionAffinity keeps a session on one pod while that pod's load stays
-	// within maxLoadPercent of the average.
+	// SessionAffinity places a new session on the least-loaded pod. The session
+	// stays there unless that pod is queuing and clearly busier than another
+	// pod, and then it stays where it moved. It requires mode: LoadAware; with
+	// RoundRobin it is ignored and the router emits a SessionAffinityIgnored
+	// warning event.
 	// +optional
 	SessionAffinity *SessionAffinity `json:"sessionAffinity,omitempty"`
 }
 
-// SessionAffinity identifies sessions and bounds how hot their pod may run.
+// SessionAffinity identifies sessions and sets how long the router remembers
+// the pod each one was placed on.
 type SessionAffinity struct {
 	// Headers identify a session, in priority order; the first present with a
 	// non-empty value is the key. Compared case-insensitively. Only a hash of
@@ -859,11 +863,20 @@ type SessionAffinity struct {
 	// +kubebuilder:validation:items:Pattern="^[A-Za-z0-9!#$%&'*+.^_|~\x60-]+$"
 	Headers []string `json:"headers"`
 
-	// MaxLoadPercent bounds a pod's load, as a percentage of the average
-	// across eligible pods, before a session spills to the next pod.
+	// IdleTimeout is how long a session may go without a request before the
+	// router forgets which pod it was on. The next request from that session
+	// is placed again by load. Defaults to 30m when unset. Must be between
+	// 1m and 24h.
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('1m') && duration(self) <= duration('24h')",message="idleTimeout must be between 1m and 24h"
+	// +optional
+	IdleTimeout *metav1.Duration `json:"idleTimeout,omitempty"`
+
+	// MaxLoadPercent is deprecated and has no effect since this release:
+	// sessions are now placed from the session binding table, not spilled by a
+	// load threshold. It is still accepted so existing manifests keep
+	// applying, and will be removed in a later API version.
 	// +kubebuilder:validation:Minimum=101
 	// +kubebuilder:validation:Maximum=1000
-	// +kubebuilder:default=125
 	// +optional
 	MaxLoadPercent int32 `json:"maxLoadPercent,omitempty"`
 }

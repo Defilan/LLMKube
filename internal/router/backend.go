@@ -100,6 +100,11 @@ type Dispatcher struct {
 	// session value.
 	rings sync.Map // backendName -> *ringCache
 
+	// sessions holds the session-to-pod binding table per LoadAware backend,
+	// created on first use. The proxy's config is fixed for its life, so a
+	// table is never dropped at runtime. Keys are hashes of session values.
+	sessions sync.Map // backendName -> *picker.Sessions
+
 	// cursors is the round-robin position per endpoint backend. Consecutive
 	// requests advance it so a keep-alive client spreads across pods.
 	cursors sync.Map // backendName -> *atomic.Uint64
@@ -428,8 +433,8 @@ func (d *Dispatcher) Dispatch(
 	if backend == nil {
 		return nil, fmt.Errorf("dispatch: backend is nil")
 	}
-	endpoint, placed := d.place(backend, headers)
-	d.countPlacement(backend.Name, placed)
+	endpoint, placed, reason := d.place(backend, headers)
+	d.countPlacement(backend.Name, placed, reason)
 	release := d.track(backend.Name, endpoint)
 	url := joinURL(dispatchTarget(backend, endpoint), path)
 

@@ -56,6 +56,19 @@ const (
 	Sticky      Result = "sticky"
 	Spill       Result = "spill"
 	Fallback    Result = "fallback"
+	// Migrated means the session's pod left the candidate set and the session
+	// was rebound.
+	Migrated Result = "migrated"
+)
+
+// Reason names what pressure moved a session off its pod.
+type Reason string
+
+const (
+	ReasonNone     Reason = ""
+	ReasonWaiting  Reason = "waiting"
+	ReasonKVFull   Reason = "kv_full"
+	ReasonNotReady Reason = "not_ready"
 )
 
 const (
@@ -154,6 +167,11 @@ func hash64(s string) uint64 {
 	return x
 }
 
+// SessionHash hashes a session key for the session table.
+func SessionHash(key string) uint64 {
+	return hash64(key)
+}
+
 // NewRing builds a ring with VirtualNodes positions per endpoint.
 func NewRing(endpoints []string) *Ring {
 	r := &Ring{owner: make(map[uint64]string, len(endpoints)*VirtualNodes)}
@@ -186,45 +204,4 @@ func (r *Ring) Home(key string) string {
 		return ""
 	}
 	return r.owner[r.points[r.start(key)]]
-}
-
-func ceilDiv(a, b int64) int64 {
-	return (a + b - 1) / b
-}
-
-// Pick walks the ring from the key and returns the first candidate whose load
-// stays within maxLoadPercent of the average. The result is Sticky when that
-// is the key's home and Spill otherwise. The walk always ends: if every
-// candidate had load+1 > bound, the loads would sum to at least n*bound, which
-// is more than their sum.
-func (r *Ring) Pick(key string, cands []Candidate, now time.Time, maxLoadPercent int32) (string, Result) {
-	if len(cands) == 0 || len(r.points) == 0 {
-		return "", ""
-	}
-	loads := make(map[string]int64, len(cands))
-	var sum int64
-	for _, c := range cands {
-		l := Load(c, now)
-		loads[c.Endpoint] = l
-		sum += l
-	}
-	n := int64(len(cands))
-	bound := ceilDiv((sum+1)*int64(maxLoadPercent), 100*n)
-	home := r.Home(key)
-	start := r.start(key)
-	for i := 0; i < len(r.points); i++ {
-		ep := r.owner[r.points[(start+i)%len(r.points)]]
-		l, ok := loads[ep]
-		if !ok || l+1 > bound {
-			continue
-		}
-		if ep == home {
-			return ep, Sticky
-		}
-		return ep, Spill
-	}
-	// Unreachable while every candidate is on the ring; a candidate missing
-	// from the ring falls back to the least loaded.
-	ep, _ := PickLeastLoaded(cands, now, 0)
-	return ep, Spill
 }

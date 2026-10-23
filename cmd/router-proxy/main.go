@@ -171,6 +171,12 @@ func main() {
 		logger.Info("engine metrics scraper started")
 	}
 
+	// Session-affine LoadAware backends: expire idle session bindings.
+	if cfg.HasSessionAffinity() {
+		go proxy.Dispatcher().RunSessionSweeper(baseCtx, 30*time.Second)
+		logger.Info("session sweeper started")
+	}
+
 	mux := http.NewServeMux()
 	proxy.Mount(mux)
 

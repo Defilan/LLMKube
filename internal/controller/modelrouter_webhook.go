@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -62,7 +63,7 @@ func SetupModelRouterWebhookWithManager(mgr ctrl.Manager) error {
 // ValidateCreate validates a ModelRouter on creation.
 func (v *ModelRouterValidator) ValidateCreate(ctx context.Context, mr *inferencev1alpha1.ModelRouter) (admission.Warnings, error) {
 	logf.FromContext(ctx).V(1).Info("validating ModelRouter create", "name", mr.Name, "namespace", mr.Namespace)
-	return nil, v.validate(mr)
+	return balancingWarnings(mr), v.validate(mr)
 }
 
 // ValidateUpdate validates a ModelRouter on update. We grandfather updates that
@@ -79,7 +80,7 @@ func (v *ModelRouterValidator) ValidateUpdate(ctx context.Context, oldMR, mr *in
 		return nil, nil
 	}
 	log.Info("validating ModelRouter update", "name", mr.Name, "namespace", mr.Namespace)
-	return nil, v.validate(mr)
+	return balancingWarnings(mr), v.validate(mr)
 }
 
 // ValidateDelete is a no-op: deleting a ModelRouter is always allowed (owner-ref
@@ -105,6 +106,12 @@ func (v *ModelRouterValidator) validate(mr *inferencev1alpha1.ModelRouter) error
 	for _, e := range validateModelRouter(mr) {
 		errs = append(errs, field.Invalid(field.NewPath(e.Field), nil, e.Message))
 	}
+
+	// Balancing rules apply to every data plane. They live here and not in
+	// validateModelRouter, which also drives the reconciler's Validated
+	// condition: an existing RoundRobin router with sessionAffinity must keep
+	// serving, so the rule is enforced at admission only.
+	errs = append(errs, balancingViolations(mr, specPath)...)
 
 	// Gateway-mode honest-boundary checks. These mirror the reconciler's
 	// fail-loud guards in ModelRouterGatewayReconciler.Reconcile, in the same
@@ -194,4 +201,37 @@ func agentGatewayModeViolations(mr *inferencev1alpha1.ModelRouter, specPath *fie
 	}
 
 	return errs
+}
+
+// balancingViolations rejects a backend that sets balancing.sessionAffinity
+// without balancing.mode: LoadAware. An empty mode counts as not LoadAware.
+// Pure (mr.Spec only).
+func balancingViolations(mr *inferencev1alpha1.ModelRouter, specPath *field.Path) field.ErrorList {
+	var errs field.ErrorList
+	for i, b := range mr.Spec.Backends {
+		if b.Balancing == nil || b.Balancing.SessionAffinity == nil {
+			continue
+		}
+		if b.Balancing.Mode != inferencev1alpha1.BalancingModeLoadAware {
+			errs = append(errs, field.Invalid(
+				specPath.Child("backends").Index(i).Child("balancing", "sessionAffinity"),
+				nil, "sessionAffinity requires balancing.mode: LoadAware"))
+		}
+	}
+	return errs
+}
+
+// balancingWarnings returns one admission warning per backend that still sets
+// the deprecated sessionAffinity.maxLoadPercent. Pure (mr.Spec only).
+func balancingWarnings(mr *inferencev1alpha1.ModelRouter) admission.Warnings {
+	var warnings admission.Warnings
+	for i, b := range mr.Spec.Backends {
+		if b.Balancing == nil || b.Balancing.SessionAffinity == nil || b.Balancing.SessionAffinity.MaxLoadPercent == 0 {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"spec.backends[%d].balancing.sessionAffinity.maxLoadPercent is deprecated and has no effect; "+
+				"if you never set it, it was defaulted by an older LLMKube and can be removed with a JSON patch", i))
+	}
+	return warnings
 }

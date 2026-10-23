@@ -182,13 +182,25 @@ var (
 	)
 
 	// RouterPlacementsTotal counts the router proxy's placement decisions for
-	// balanced backends by result: least_loaded, sticky, spill or fallback.
+	// balanced backends by result (least_loaded, sticky, spill, fallback or
+	// migrated) and, for a spill or migration, the reason (waiting, kv_full or
+	// not_ready; empty otherwise).
 	RouterPlacementsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "llmkube_router_placements_total",
-			Help: "Router proxy placement decisions for balanced backends, by result.",
+			Help: "Router proxy placement decisions for balanced backends, by result and reason.",
 		},
-		[]string{labelRouter, "backend", "result"},
+		[]string{labelRouter, "backend", "result", "reason"},
+	)
+
+	// RouterSessionBindings is the number of session-to-pod bindings a
+	// LoadAware backend currently holds, refreshed by the proxy's sweeper.
+	RouterSessionBindings = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "llmkube_router_session_bindings",
+			Help: "Session-to-pod bindings held by the router proxy for a backend.",
+		},
+		[]string{labelRouter, "backend"},
 	)
 
 	RouterBackendHealth = prometheus.NewGaugeVec(
@@ -513,6 +525,7 @@ var AllCollectors = []prometheus.Collector{
 	RouterEndpointLoad,
 	RouterEndpointMetricsFresh,
 	RouterPlacementsTotal,
+	RouterSessionBindings,
 	RouterFirstTokenSeconds,
 	RouterBudgetUtilization,
 	RouterTokenBudgetUtilization,
