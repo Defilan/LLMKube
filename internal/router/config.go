@@ -434,23 +434,8 @@ func (c *Config) Validate() error {
 		if s := b.EndpointSource; s != nil && (s.Namespace == "" || s.Service == "" || s.Port <= 0) {
 			return fmt.Errorf("backends[%d] %s: endpointSource needs namespace, service and a positive port", i, b.Name)
 		}
-		if bal := b.Balancing; bal != nil {
-			switch bal.Mode {
-			case "", BalancingRoundRobin, BalancingLoadAware:
-			default:
-				return fmt.Errorf("backends[%d] %s: balancing mode %q must be %s or %s", i, b.Name, bal.Mode, BalancingRoundRobin, BalancingLoadAware)
-			}
-			if bal.MaxLoadPercent != 0 && (bal.MaxLoadPercent < 101 || bal.MaxLoadPercent > 1000) {
-				return fmt.Errorf("backends[%d] %s: balancing maxLoadPercent %d must be between 101 and 1000", i, b.Name, bal.MaxLoadPercent)
-			}
-			for _, h := range bal.SessionHeaders {
-				if strings.TrimSpace(h) == "" {
-					return fmt.Errorf("backends[%d] %s: balancing session header names must be non-empty", i, b.Name)
-				}
-			}
-		}
-		if m := b.Metrics; m != nil && (m.Path == "" || m.Running == "" || m.Waiting == "") {
-			return fmt.Errorf("backends[%d] %s: metrics profile needs path, running and waiting", i, b.Name)
+		if err := validateBalancing(i, b); err != nil {
+			return err
 		}
 	}
 	if c.DefaultRoute != "" && !names[c.DefaultRoute] {
@@ -485,6 +470,29 @@ func (c *Config) Validate() error {
 		}
 	}
 	return c.validateBudgets(ruleNames)
+}
+
+// validateBalancing checks a backend's balancing and metrics-profile settings.
+func validateBalancing(i int, b Backend) error {
+	if bal := b.Balancing; bal != nil {
+		switch bal.Mode {
+		case "", BalancingRoundRobin, BalancingLoadAware:
+		default:
+			return fmt.Errorf("backends[%d] %s: balancing mode %q must be %s or %s", i, b.Name, bal.Mode, BalancingRoundRobin, BalancingLoadAware)
+		}
+		if bal.MaxLoadPercent != 0 && (bal.MaxLoadPercent < 101 || bal.MaxLoadPercent > 1000) {
+			return fmt.Errorf("backends[%d] %s: balancing maxLoadPercent %d must be between 101 and 1000", i, b.Name, bal.MaxLoadPercent)
+		}
+		for _, h := range bal.SessionHeaders {
+			if strings.TrimSpace(h) == "" {
+				return fmt.Errorf("backends[%d] %s: balancing session header names must be non-empty", i, b.Name)
+			}
+		}
+	}
+	if m := b.Metrics; m != nil && (m.Path == "" || m.Running == "" || m.Waiting == "") {
+		return fmt.Errorf("backends[%d] %s: metrics profile needs path, running and waiting", i, b.Name)
+	}
+	return nil
 }
 
 // validateBudgets mirrors the controller's validateBudgets so a hand-edited

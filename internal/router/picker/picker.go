@@ -113,14 +113,17 @@ func PickLeastLoaded(cands []Candidate, now time.Time, tieStart int) (string, Re
 	if n == 0 {
 		return "", ""
 	}
+	// Reduce the magnitude of tieStart with an unsigned modulo, so start is in
+	// [0, n) for any tieStart, math.MinInt included (no signed negation).
+	mag := uint(tieStart)
 	if tieStart < 0 {
-		tieStart = -tieStart
+		mag = uint(-(tieStart + 1)) + 1
 	}
-	best, bestLoad := -1, int64(0)
-	for i := 0; i < n; i++ {
-		j := (tieStart + i) % n
-		l := Load(cands[j], now)
-		if best < 0 || l < bestLoad {
+	start := int(mag % uint(n))
+	best, bestLoad := start, Load(cands[start], now)
+	for i := 1; i < n; i++ {
+		j := (start + i) % n
+		if l := Load(cands[j], now); l < bestLoad {
 			best, bestLoad = j, l
 		}
 	}

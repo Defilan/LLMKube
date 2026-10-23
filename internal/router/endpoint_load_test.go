@@ -86,7 +86,8 @@ func TestDispatchReleasesInFlightOnFailureAndCancel(t *testing.T) {
 
 	dead := "http://127.0.0.1:1"
 	d.SetEndpoints("qwen", []string{dead})
-	if _, err := d.Dispatch(context.Background(), b, http.MethodPost, "/x", http.Header{}, []byte(`{}`)); err == nil {
+	if resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/x", http.Header{}, []byte(`{}`)); err == nil {
+		_ = resp.Body.Close()
 		t.Fatal("dispatch to a closed port succeeded")
 	}
 	if got := inflight(d, dead); got != 0 {
