@@ -129,8 +129,8 @@ func secondMountBlocker(holder *corev1.Pod, pvcName, ownPod string,
 	if holder.Name == ownPod {
 		return nil
 	}
-	// A cache pod of this kind is deleted at this pod's deterministic name, so
-	// the run that needs the claim replaces it.
+	// An abandoned cache pod of this kind is replaced by the run that needs the
+	// claim, at a name this run would delete if that name is its own.
 	if cacheAccessPodOurs(holder, kind) && !cacheAccessPodInUse(holder, runID) {
 		return nil
 	}
