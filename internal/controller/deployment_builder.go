@@ -648,7 +648,7 @@ func (r *InferenceServiceReconciler) constructDeployment(
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas:             &replicas,
-			RevisionHistoryLimit: isvc.Spec.RevisionHistoryLimit,
+			RevisionHistoryLimit: revisionHistoryLimitOrDefault(isvc.Spec.RevisionHistoryLimit),
 			Selector: &metav1.LabelSelector{
 				// Selector uses the immutable subset only; the model label
 				// is allowed to change when the user edits spec.modelRef
@@ -951,4 +951,20 @@ func ParseRuntimeImageOverrides(flagValue string) (map[string]string, error) {
 		overrides[key] = img
 	}
 	return overrides, nil
+}
+
+// defaultRevisionHistoryLimit is how many old ReplicaSets LLMKube-managed
+// Deployments keep when the user does not set one. The operator reconciles
+// these Deployments, so `kubectl rollout undo` is reverted on the next
+// reconcile and the Kubernetes default of 10 only accumulates dead ReplicaSets.
+const defaultRevisionHistoryLimit int32 = 3
+
+// revisionHistoryLimitOrDefault returns a copy of the user-set limit (0 is a
+// valid user choice and is kept), or the LLMKube default when unset.
+func revisionHistoryLimitOrDefault(limit *int32) *int32 {
+	v := defaultRevisionHistoryLimit
+	if limit != nil {
+		v = *limit
+	}
+	return &v
 }

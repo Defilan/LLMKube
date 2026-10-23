@@ -621,9 +621,9 @@ var _ = Describe("Multi-GPU Deployment Construction", func() {
 			}
 		}
 
-		It("should leave the field nil when unset (apiserver default applies)", func() {
+		It("should default to 3 old ReplicaSets when unset", func() {
 			deployment := reconciler.constructDeployment(newISVC(nil), model, nil, 1, "", "")
-			Expect(deployment.Spec.RevisionHistoryLimit).To(BeNil())
+			Expect(deployment.Spec.RevisionHistoryLimit).To(HaveValue(Equal(int32(3))))
 		})
 
 		It("should plumb an explicit value (including 0) onto the Deployment", func() {
@@ -632,6 +632,13 @@ var _ = Describe("Multi-GPU Deployment Construction", func() {
 				Expect(deployment.Spec.RevisionHistoryLimit).NotTo(BeNil())
 				Expect(*deployment.Spec.RevisionHistoryLimit).To(Equal(want))
 			}
+		})
+
+		It("should not change the pod template hash, so no pods restart", func() {
+			unset := reconciler.constructDeployment(newISVC(nil), model, nil, 1, "", "")
+			five := int32(5)
+			set := reconciler.constructDeployment(newISVC(&five), model, nil, 1, "", "")
+			Expect(desiredTemplateHash(set.Spec.Template)).To(Equal(desiredTemplateHash(unset.Spec.Template)))
 		})
 	})
 
