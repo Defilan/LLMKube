@@ -166,7 +166,8 @@ func TestPlaceEmptySessionHeaderIsNoSession(t *testing.T) {
 
 func TestSweeperRacesPlacementSafely(t *testing.T) {
 	var clockMu sync.Mutex
-	now := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	now := start
 	clock := WithNowFunc(func() time.Time {
 		clockMu.Lock()
 		defer clockMu.Unlock()
@@ -185,8 +186,13 @@ func TestSweeperRacesPlacementSafely(t *testing.T) {
 				return
 			default:
 			}
+			// The fake clock advances in bounded steps and stops well inside
+			// the 30m idle timeout, so every key placed during the test is
+			// still live; the sweeper keeps sweeping at the capped time.
 			clockMu.Lock()
-			now = now.Add(time.Second)
+			if now.Sub(start) < 20*time.Minute {
+				now = now.Add(time.Second)
+			}
 			at := now
 			clockMu.Unlock()
 			d.SweepSessions(at)

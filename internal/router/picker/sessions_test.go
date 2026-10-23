@@ -58,10 +58,10 @@ func TestSessionsStaysWhileNothingQueues(t *testing.T) {
 	place(t, s, 1, cands, t0, "a", Sticky, ReasonNone)
 }
 
-// bindTo binds key to ep by making it the only candidate.
-func bindTo(t *testing.T, s *Sessions, key uint64, ep string, now time.Time) {
+// bindToA binds key 1 to pod "a" by making it the only candidate.
+func bindToA(t *testing.T, s *Sessions, now time.Time) {
 	t.Helper()
-	place(t, s, key, []Candidate{pod(ep, 0, 0, 0.1)}, now, ep, LeastLoaded, ReasonNone)
+	place(t, s, 1, []Candidate{pod("a", 0, 0, 0.1)}, now, "a", LeastLoaded, ReasonNone)
 }
 
 func TestSessionsSpillsOnQueueAndMargin(t *testing.T) {
@@ -77,7 +77,7 @@ func TestSessionsSpillsOnQueueAndMargin(t *testing.T) {
 	}
 	for _, c := range cases {
 		s := NewSessions(0, 10)
-		bindTo(t, s, 1, "a", t0)
+		bindToA(t, s, t0)
 		cands := []Candidate{pod("a", 20, 2, 0.1), pod("b", c.leastRunning, 0, 0.1)}
 		place(t, s, 1, cands, t0, c.want, c.res, c.reason)
 	}
@@ -85,14 +85,14 @@ func TestSessionsSpillsOnQueueAndMargin(t *testing.T) {
 
 func TestSessionsDoesNotReturnHomeAfterSpill(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 15, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
 	place(t, s, 1, []Candidate{pod("a", 0, 0, 0.1), pod("b", 15, 0, 0.1)}, t0.Add(time.Second), "b", Sticky, ReasonNone)
 }
 
 func TestSessionsCooldown(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
 	// b is now under pressure with a gap of 6.
 	at := func(d time.Duration) time.Time { return t0.Add(d) }
@@ -109,7 +109,7 @@ func TestSessionsCooldown(t *testing.T) {
 
 func TestSessionsMigratesWhenPodLeaves(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
 	// b leaves inside the cooldown.
 	now := t0.Add(5 * time.Second)
@@ -121,19 +121,19 @@ func TestSessionsMigratesWhenPodLeaves(t *testing.T) {
 
 func TestSessionsKVFullAloneDoesNotMove(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 5, 0, 0.95), pod("b", 0, 0, 0.4)}, t0, "a", Sticky, ReasonNone)
 }
 
 func TestSessionsKVFullAndQueuedSpillsAtLevelLoad(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 4, 1, 0.95), pod("b", 5, 0, 0.4)}, t0, "b", Spill, ReasonKVFull)
 }
 
 func TestSessionsAllKVFullStays(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	cands := []Candidate{pod("a", 5, 2, 0.95), pod("b", 5, 2, 0.95)}
 	place(t, s, 1, cands, t0, "a", Sticky, ReasonNone)
 	place(t, s, 1, cands, t0.Add(time.Second), "a", Sticky, ReasonNone)
@@ -141,13 +141,13 @@ func TestSessionsAllKVFullStays(t *testing.T) {
 
 func TestSessionsSinglePodNeverSpills(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 5, 10, 0.5)}, t0, "a", Sticky, ReasonNone)
 }
 
 func TestSessionsNoSampleUsesInFlightMargin(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{bare("a", 12), bare("b", 5)}, t0, "a", Sticky, ReasonNone)
 	place(t, s, 1, []Candidate{bare("a", 13), bare("b", 5)}, t0, "b", Spill, ReasonWaiting)
 }
@@ -246,25 +246,25 @@ func TestSessionsConcurrentFirstRequestsBindOnce(t *testing.T) {
 
 func TestSessionsKVFullQueuedShedsToStaleTargetByGap(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), bare("b", 0)}, t0, "b", Spill, ReasonKVFull)
 }
 
 func TestSessionsKVFullQueuedStaysWhenStaleTargetGapSmall(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), bare("b", 27)}, t0, "a", Sticky, ReasonNone)
 }
 
 func TestSessionsAllKVFullStaysEvenWithLargeGap(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), pod("b", 2, 0, 0.95)}, t0, "a", Sticky, ReasonNone)
 }
 
 func TestSessionsQueuedNotKVFullNeverTargetsFullPod(t *testing.T) {
 	s := NewSessions(0, 10)
-	bindTo(t, s, 1, "a", t0)
+	bindToA(t, s, t0)
 	cands := []Candidate{pod("a", 15, 5, 0.5), pod("b", 1, 0, 0.95), pod("c", 15, 0, 0.5)}
 	place(t, s, 1, cands, t0, "c", Spill, ReasonWaiting)
 }
