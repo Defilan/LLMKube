@@ -41,6 +41,7 @@ type deleteOptions struct {
 
 func NewDeleteCommand() *cobra.Command {
 	opts := &deleteOptions{}
+	var image string
 
 	cmd := &cobra.Command{
 		Use:     "delete [NAME]",
@@ -50,13 +51,17 @@ func NewDeleteCommand() *cobra.Command {
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.name = args[0]
-			return runDelete(opts)
+			return withCacheImage(image, func() error {
+				return runDelete(opts)
+			})
 		},
 	}
 
 	cmd.Flags().StringVarP(&opts.namespace, "namespace", "n", "default", "Kubernetes namespace")
 	cmd.Flags().BoolVar(&opts.purgeCache, "purge-cache", false,
 		"Also purge the model from the persistent cache when deleting the deployment")
+	cmd.Flags().StringVar(&image, "cache-image", "",
+		"Image for the short-lived pod that purges the cache (default busybox:1.37.0, or $"+cacheImageEnv+")")
 
 	return cmd
 }
