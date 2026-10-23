@@ -213,6 +213,7 @@ func (r *ModelRouterReconciler) resolveBackend(
 			if err != nil {
 				return wire, status, err
 			}
+			r.warnSessionAffinityIgnored(mr, b)
 			status.Address = svcAddr
 			if len(endpoints) == 0 {
 				status.Healthy = false
@@ -696,6 +697,23 @@ func vllmMetricsProfile() *router.MetricsProfile {
 	}
 }
 
+// modelRouterReasonSessionAffinityIgnored is the event reason for a backend
+// that sets sessionAffinity without mode: LoadAware.
+const modelRouterReasonSessionAffinityIgnored = "SessionAffinityIgnored"
+
+// warnSessionAffinityIgnored emits one Warning event when a backend carries
+// sessionAffinity but is not LoadAware, so the compiled config silently
+// dropping the headers is visible to the operator. Nil-safe on the recorder.
+func (r *ModelRouterReconciler) warnSessionAffinityIgnored(mr *inferencev1alpha1.ModelRouter, b *inferencev1alpha1.RouterBackend) {
+	if r.Recorder == nil || b.Balancing == nil || b.Balancing.SessionAffinity == nil ||
+		b.Balancing.Mode == inferencev1alpha1.BalancingModeLoadAware {
+		return
+	}
+	r.Recorder.Eventf(mr, nil, corev1.EventTypeWarning, modelRouterReasonSessionAffinityIgnored, "Reconcile",
+		"backend %q sets balancing.sessionAffinity but balancing.mode is not LoadAware, so session affinity is ignored; set balancing.mode: LoadAware to enable it",
+		b.Name)
+}
+
 // compileBalancing translates a backend's balancing block, and attaches the
 // metrics profile for runtimes LLMKube has one for. A missing
 // InferenceService compiles without a profile; any other lookup error is
@@ -706,8 +724,13 @@ func (r *ModelRouterReconciler) compileBalancing(ctx context.Context, namespace,
 		return nil, nil, nil
 	}
 	out := &router.Balancing{Mode: b.Mode}
-	if sa := b.SessionAffinity; sa != nil {
+	// Session affinity only means something to LoadAware placement. Under
+	// RoundRobin the headers are not compiled; resolveBackend warns about it.
+	if sa := b.SessionAffinity; sa != nil && out.Mode == router.BalancingLoadAware {
 		out.SessionHeaders = append([]string(nil), sa.Headers...)
+		if sa.IdleTimeout != nil {
+			out.SessionIdleTimeout = sa.IdleTimeout.Duration
+		}
 	}
 	if out.Mode != router.BalancingLoadAware {
 		return out, nil, nil
