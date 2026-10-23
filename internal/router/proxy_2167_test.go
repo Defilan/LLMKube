@@ -141,6 +141,7 @@ func TestProxyPoolAbandonedSwap503RetryAfter(t *testing.T) {
 	// it, so the swap's deadline is what ends its wait.
 	secondCtx, secondCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer secondCancel()
+	secondStart := time.Now()
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req2167(t).WithContext(secondCtx))
 
@@ -159,12 +160,52 @@ func TestProxyPoolAbandonedSwap503RetryAfter(t *testing.T) {
 	if got := fake.activateCount("coder"); got != 1 {
 		t.Errorf("activate count = %d, want 1 (the waiter must observe the abandoned swap, not start a fresh load)", got)
 	}
-	if !strings.Contains(logs.String(), "outcome=pool_activation_timeout") {
-		t.Errorf("audit log missing outcome=pool_activation_timeout:\n%s", logs.String())
+	if !abandonedSwapAuditLine(logs.String(), secondStart) {
+		t.Errorf("audit log has no status=503 outcome=pool_activation_timeout line for the abandoned-swap request:\n%s",
+			logs.String())
 	}
 	waitFor(t, "the abandoned target to be scaled back down", func() bool {
 		return fake.deactivateCount("coder") >= 1
 	})
+}
+
+// abandonedSwapAuditLine reports whether the audit log holds a 503
+// pool_activation_timeout dispatch that began at or after start. The first
+// request's own hold timeout logs the same token before the swap is abandoned,
+// so matching the token alone pins nothing about the abandoned swap.
+func abandonedSwapAuditLine(log string, start time.Time) bool {
+	for _, line := range strings.Split(log, "\n") {
+		if !strings.Contains(line, "msg=router.dispatch") ||
+			!strings.Contains(line, "status=503") ||
+			!strings.Contains(line, "outcome=pool_activation_timeout") {
+			continue
+		}
+		at, ok := auditLineTime(line)
+		if ok && !at.Before(start) {
+			return true
+		}
+	}
+	return false
+}
+
+// auditLineTime returns the wall-clock time slog's TextHandler stamped on line,
+// truncated to the millisecond the handler prints. The truncation makes the
+// comparison lenient by up to a millisecond, which the second request's held
+// wait covers. The zone offset carries no colon, so the stamp parses as
+// RFC3339Nano.
+func auditLineTime(line string) (time.Time, bool) {
+	for _, field := range strings.Fields(line) {
+		stamp, ok := strings.CutPrefix(field, "time=")
+		if !ok {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return at, true
+	}
+	return time.Time{}, false
 }
 
 // TestProxyPoolSwapErrorStays502 pins the other half of #2167: a swap that fails
