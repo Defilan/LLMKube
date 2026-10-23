@@ -5534,7 +5534,9 @@ spec:
                       thinking models (qwen3, deepseek-r1). Maps to SGLang --reasoning-parser.
 
                       GLM stops at glm45: SGLang has no glm47 reasoning detector, and
-                      --reasoning-parser rejects a value outside its choices at startup.
+                      --reasoning-parser rejects a value outside its choices at startup. The
+                      enum lists the values LLMKube supports, not every key in SGLang's
+                      detector map; pass another through spec.extraArgs.
                     enum:
                     - qwen3
                     - deepseek-r1

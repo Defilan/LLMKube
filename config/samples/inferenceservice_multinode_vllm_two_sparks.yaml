@@ -10,7 +10,7 @@
 #
 # The parser triple in extraArgs below (--reasoning-parser, --tool-call-parser,
 # --enable-auto-tool-choice) has a typed form that passes the auto-tool-choice
-# flag itself: vllmConfig.reasoningParser and vllmConfig.toolCallParser. This
+# flag itself: vllmConfig.toolCallParser and vllmConfig.reasoningParser. This
 # spec keeps the measured extraArgs form, which still works; extraArgs lands last.
 apiVersion: inference.llmkube.dev/v1alpha1
 kind: InferenceService

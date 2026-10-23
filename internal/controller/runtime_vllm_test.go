@@ -590,6 +590,21 @@ func TestVLLMBuildArgs(t *testing.T) {
 		},
 		{
 			model: model,
+			name:  "toolCallParser fully covered by extraArgs contributes neither flag",
+			spec: &inferencev1alpha1.InferenceServiceSpec{
+				Runtime:   "vllm",
+				ModelRef:  "test-model",
+				ExtraArgs: []string{"--tool-call-parser", "hermes", "--enable-auto-tool-choice"},
+				// Both flags are already the user's, so the typed field adds
+				// nothing and the argv carries exactly the extraArgs pair.
+				VLLMConfig: &inferencev1alpha1.VLLMConfig{ToolCallParser: "glm47"},
+			},
+			contains:    []FlagCheck{{"--tool-call-parser", "hermes"}, {"--enable-auto-tool-choice", ""}},
+			notContains: []string{"glm47"},
+			exactlyOnce: []string{"--tool-call-parser", "--enable-auto-tool-choice"},
+		},
+		{
+			model: model,
 			name:  "reasoningParser emits alone",
 			spec: &inferencev1alpha1.InferenceServiceSpec{
 				Runtime:    "vllm",

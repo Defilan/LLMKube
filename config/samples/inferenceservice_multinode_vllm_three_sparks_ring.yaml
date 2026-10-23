@@ -55,8 +55,8 @@ spec:
     # EP stays off: the TP3 DSpark patch relaxes the 128-expert divisibility check only when
     # expert parallelism is off and every expert stays local to its rank.
   # The parser triple below (--reasoning-parser, --tool-call-parser, --enable-auto-tool-choice)
-  # has a typed form that passes the auto-tool-choice flag itself: vllmConfig.reasoningParser
-  # and vllmConfig.toolCallParser. This spec keeps the measured extraArgs form; extraArgs lands last.
+  # has a typed form that passes the auto-tool-choice flag itself: vllmConfig.toolCallParser
+  # and vllmConfig.reasoningParser. This spec keeps the measured extraArgs form; extraArgs lands last.
   extraArgs:
     - --served-model-name
     - DeepSeek-V4.1-Flash-EXL3
