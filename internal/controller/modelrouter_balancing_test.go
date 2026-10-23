@@ -54,6 +54,26 @@ var _ = Describe("ModelRouter backend balancing admission", func() {
 		Expect(mr.Spec.Backends[0].Balancing.SessionAffinity.MaxLoadPercent).To(Equal(int32(125)))
 	})
 
+	It("rejects an empty or padded session header name", func() {
+		for _, name := range []string{"", " x-foo "} {
+			mr := newMR(inferencev1alpha1.RouterBackendResolutionEndpoint)
+			mr.Spec.Backends[0].Balancing.SessionAffinity.Headers = []string{name}
+			err := k8sClient.Create(ctx, mr)
+			if err == nil {
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, mr) })
+			}
+			Expect(err).To(HaveOccurred(), "header name %q", name)
+			Expect(err.Error()).To(ContainSubstring("sessionAffinity.headers"))
+		}
+	})
+
+	It("admits a session header name using every RFC 7230 token character", func() {
+		mr := newMR(inferencev1alpha1.RouterBackendResolutionEndpoint)
+		mr.Spec.Backends[0].Balancing.SessionAffinity.Headers = []string{"X-Session_ID.v2", "!#$%&'*+-.^_`|~"}
+		Expect(k8sClient.Create(ctx, mr)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, mr) })
+	})
+
 	It("rejects balancing on a service-resolution backend", func() {
 		mr := newMR(inferencev1alpha1.RouterBackendResolutionService)
 		err := k8sClient.Create(ctx, mr)

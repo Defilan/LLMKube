@@ -28,6 +28,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // Default-route strategies. These mirror the CRD enum and decide what the
@@ -473,6 +475,10 @@ func (c *Config) Validate() error {
 }
 
 // validateBalancing checks a backend's balancing and metrics-profile settings.
+// maxSessionHeaderNameLen matches the CRD's items MaxLength on
+// sessionAffinity.headers.
+const maxSessionHeaderNameLen = 256
+
 func validateBalancing(i int, b Backend) error {
 	if bal := b.Balancing; bal != nil {
 		switch bal.Mode {
@@ -484,8 +490,12 @@ func validateBalancing(i int, b Backend) error {
 			return fmt.Errorf("backends[%d] %s: balancing maxLoadPercent %d must be between 101 and 1000", i, b.Name, bal.MaxLoadPercent)
 		}
 		for _, h := range bal.SessionHeaders {
-			if strings.TrimSpace(h) == "" {
-				return fmt.Errorf("backends[%d] %s: balancing session header names must be non-empty", i, b.Name)
+			// Mirrors the CRD's items pattern and length bound: an RFC 7230
+			// token, so surrounding whitespace or a stray character fails
+			// here rather than never matching a request header.
+			if len(h) > maxSessionHeaderNameLen || !httpguts.ValidHeaderFieldName(h) {
+				return fmt.Errorf("backends[%d] %s: balancing session header name %q must be an HTTP header token of at most %d characters",
+					i, b.Name, h, maxSessionHeaderNameLen)
 			}
 		}
 	}

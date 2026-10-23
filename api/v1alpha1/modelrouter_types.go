@@ -840,9 +840,12 @@ type BackendBalancing struct {
 type SessionAffinity struct {
 	// Headers identify a session, in priority order; the first present with a
 	// non-empty value is the key. Compared case-insensitively. Only a hash of
-	// the value is used.
+	// the value is used. Each name is an RFC 7230 header token.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=256
+	// +kubebuilder:validation:items:Pattern="^[A-Za-z0-9!#$%&'*+.^_|~\x60-]+$"
 	Headers []string `json:"headers"`
 
 	// MaxLoadPercent bounds a pod's load, as a percentage of the average

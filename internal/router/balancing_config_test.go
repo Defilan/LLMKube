@@ -44,6 +44,7 @@ func TestValidateBalancing(t *testing.T) {
 		balancedConfig(&Balancing{Mode: BalancingLoadAware, SessionHeaders: []string{"x-session-affinity"}, MaxLoadPercent: 125}, vllm),
 		balancedConfig(&Balancing{Mode: BalancingRoundRobin}, nil),
 		balancedConfig(&Balancing{}, nil),
+		balancedConfig(&Balancing{SessionHeaders: []string{"X-Session_ID.v2", "!#$%&'*+-.^_`|~"}}, nil),
 	} {
 		if err := ok.Validate(); err != nil {
 			t.Errorf("valid config rejected: %v", err)
@@ -54,6 +55,11 @@ func TestValidateBalancing(t *testing.T) {
 		"load percent 100":        balancedConfig(&Balancing{MaxLoadPercent: 100}, nil),
 		"load percent 1001":       balancedConfig(&Balancing{MaxLoadPercent: 1001}, nil),
 		"empty header name":       balancedConfig(&Balancing{SessionHeaders: []string{""}}, nil),
+		"padded header name":      balancedConfig(&Balancing{SessionHeaders: []string{" x-foo "}}, nil),
+		"header name with space":  balancedConfig(&Balancing{SessionHeaders: []string{"x session"}}, nil),
+		"header name with colon":  balancedConfig(&Balancing{SessionHeaders: []string{"x-session:"}}, nil),
+		"header name non-ASCII":   balancedConfig(&Balancing{SessionHeaders: []string{"x-sessión"}}, nil),
+		"header name too long":    balancedConfig(&Balancing{SessionHeaders: []string{strings.Repeat("x", 257)}}, nil),
 		"profile without path":    balancedConfig(&Balancing{Mode: BalancingLoadAware}, &MetricsProfile{Running: "a", Waiting: "b"}),
 		"profile without waiting": balancedConfig(&Balancing{Mode: BalancingLoadAware}, &MetricsProfile{Path: "/metrics", Running: "a"}),
 	} {

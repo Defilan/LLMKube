@@ -161,8 +161,11 @@ spec:
                               description: |-
                                 Headers identify a session, in priority order; the first present with a
                                 non-empty value is the key. Compared case-insensitively. Only a hash of
-                                the value is used.
+                                the value is used. Each name is an RFC 7230 header token.
                               items:
+                                maxLength: 256
+                                minLength: 1
+                                pattern: ^[A-Za-z0-9!#$%&'*+.^_|~`-]+$
                                 type: string
                               maxItems: 8
                               minItems: 1
