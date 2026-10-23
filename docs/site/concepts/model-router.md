@@ -256,7 +256,7 @@ Each proxy replica keeps its own binding table in memory. A restart starts it em
 - `migrated`: a session moved because its pod left (`not_ready`).
 - `fallback`: the table was full and the consistent-hash home was used, or no pod was dispatchable (all quarantined or circuit-open) and the request went round-robin over the live endpoints. A fallback count alone does not mean the table is full.
 
-`reason` is set only for `spill` and `migrated`, and empty otherwise. `llmkube_router_session_bindings{router,backend}` is the current number of bindings. Per pod, `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` cover `LoadAware` backends with a metrics profile (vLLM today).
+`reason` is set only for `spill` and `migrated`, and empty otherwise. `llmkube_router_session_bindings{router,backend}` is the current number of bindings. It counts every session used within `idleTimeout`, not only live ones, so a client that starts a new session whenever one ends can hold several times its concurrent session count. Per pod, `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` cover `LoadAware` backends with a metrics profile (vLLM today).
 
 ### Upgrading from `maxLoadPercent`
 
