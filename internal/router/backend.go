@@ -271,13 +271,6 @@ func (d *Dispatcher) dispatchable(key string) bool {
 	return until > 0 && d.nowFn().UnixNano() >= until
 }
 
-// pickEndpoint chooses the pod for callers that carry no request headers: it
-// is place with no headers.
-func (d *Dispatcher) pickEndpoint(backend *Backend) string {
-	ep, _ := d.place(backend, nil)
-	return ep
-}
-
 // roundRobin chooses the pod to dispatch to among eps, the backend's live
 // endpoint set. Consecutive calls rotate so a keep-alive client spreads
 // across pods rather than pinning to one through conntrack. Quarantined
