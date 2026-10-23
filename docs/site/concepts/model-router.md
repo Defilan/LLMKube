@@ -206,7 +206,7 @@ Use it on multi-replica local backends where one client should not pin one pod. 
 
 ## Load-aware balancing
 
-Round-robin spreads requests evenly, but agent sessions carry very different amounts of work: one copy can draw the long, uncached prompts and queue while others idle. `balancing` places each request by load instead, and keeps a conversation on its pod while that pod has room.
+Round-robin spreads requests evenly, but agent sessions carry very different amounts of work: one copy can draw the long, uncached prompts and queue while others idle. `balancing` places each request by load instead, and keeps a conversation on its pod unless that pod is clearly the wrong place for it.
 
 ```yaml
 spec:
@@ -218,16 +218,49 @@ spec:
       balancing:
         mode: LoadAware
         sessionAffinity:
-          headers: [x-session-affinity, x-openwebui-chat-id, x-opencode-session]
-          maxLoadPercent: 125
+          headers: [x-session-affinity, x-openwebui-chat-id, x-opencode-session, x-session-id]
+          idleTimeout: 30m
 ```
 
-- **Load** for a vLLM backend is the pod's own running plus waiting requests, read from its `/metrics` once a second, plus the requests this proxy sent since. A pod whose KV cache is 90% full or more takes no new work while another pod has room. Other runtimes, and any pod whose metrics are more than 5 seconds old, use this proxy's in-flight count.
-- **Without a session header**, each request goes to the least-loaded pod.
-- **With one**, the first header present names the session; only its hash is used. The session stays on its pod until that pod's load passes `maxLoadPercent` of the average, then spills to the next pod, and returns once its pod has room again. Proxy replicas agree on a session's home pod; near the spill bound, where each replica also counts its own in-flight requests, they may briefly place it differently.
-- `mode: RoundRobin` (the default) with `sessionAffinity` keeps sessions sticky using in-flight counts only.
+`sessionAffinity` requires `mode: LoadAware`. The webhook rejects it with `mode: RoundRobin` when a router is created or its spec changes.
 
-Decisions are visible as `llmkube_router_placements_total{result}` (`least_loaded`, `sticky`, `spill`, `fallback`), with `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` per pod for `LoadAware` backends with a metrics profile (vLLM today).
+### How load is read
+
+- **Load** for a vLLM backend is the pod's own running plus waiting requests, read from its `/metrics` once a second, plus the requests this proxy sent since. Other runtimes, and any pod whose metrics are more than 5 seconds old, use this proxy's in-flight count.
+- A pod whose KV cache is 90% full or more is KV-full. New sessions avoid KV-full pods while another pod has room.
+
+### Where a session goes
+
+Without a session header, each request goes to the least-loaded pod. With one, the first configured header present names the session. Only a hash of its value is kept.
+
+- **A new session** goes to the least-loaded pod and is remembered there.
+- **A known session stays on its pod**, with two exceptions. It moves if its pod has requests waiting and is clearly busier than the least-loaded pod: 4 requests more when engine metrics are available, 8 without them. It also moves if its pod is KV-full and queuing while a non-full pod is available.
+- **A session that moved stays on its new pod.** It cannot move again for pressure within 60 seconds.
+- **A session whose pod left** (not ready, or quarantined by the circuit breaker) moves at once.
+- **KV-full alone does not move a session.** Only new sessions avoid KV-full pods.
+- **If the table is full** (100,000 sessions per backend), a new session falls back to a consistent-hash home pod and is not remembered.
+
+`idleTimeout` drops a binding that has gone unused that long. The default is 30m, and the allowed range is 1m to 24h. Common agent headers are `x-session-affinity`, `x-openwebui-chat-id`, `x-opencode-session` and `x-session-id`.
+
+### Running more than one proxy replica
+
+Each proxy replica keeps its own binding table in memory. A restart starts it empty, and the table stores only the hash of the session header. With more than one proxy replica, a session that lands on different replicas gets different bindings. Hash the session header to a proxy replica upstream so a session always reaches the same replica, for example with APISIX `chash` on the header.
+
+### Reading the metrics
+
+`llmkube_router_placements_total{router,backend,result,reason}` counts decisions. `result` is one of:
+
+- `least_loaded`: a request without a binding, or a new session, went to the least-loaded pod.
+- `sticky`: a known session stayed on its pod.
+- `spill`: a session moved off a pod under pressure (`waiting` or `kv_full`) and is now bound to the new pod.
+- `migrated`: a session moved because its pod left (`not_ready`).
+- `fallback`: the table was full and the consistent-hash home was used.
+
+`reason` is set only for `spill` and `migrated`, and empty otherwise. `llmkube_router_session_bindings{router,backend}` is the current number of bindings. Per pod, `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` cover `LoadAware` backends with a metrics profile (vLLM today).
+
+### Upgrading from `maxLoadPercent`
+
+`sessionAffinity.maxLoadPercent` is deprecated and ignored. The webhook returns a warning when it is set, so remove it from your manifests. An existing `RoundRobin` router that has `sessionAffinity` keeps serving with its affinity ignored, and gets a `SessionAffinityIgnored` Warning event. Change it to `mode: LoadAware` to get sessions back.
 
 ## Several models on dataPlane: AgentGateway
 
