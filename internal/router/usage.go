@@ -181,3 +181,72 @@ func looksLikeSSE(body []byte) bool {
 	}
 	return false
 }
+
+// anthropicUsage is the usage object of the Anthropic Messages API. Its
+// input_tokens excludes cached input, which the two cache fields carry, so
+// the prompt total that budgets charge is their sum.
+type anthropicUsage struct {
+	InputTokens         *int64 `json:"input_tokens"`
+	OutputTokens        *int64 `json:"output_tokens"`
+	CacheReadTokens     *int64 `json:"cache_read_input_tokens"`
+	CacheCreationTokens *int64 `json:"cache_creation_input_tokens"`
+}
+
+func (u *anthropicUsage) counts() (prompt, completion int64, ok bool) {
+	if u == nil || (u.InputTokens == nil && u.OutputTokens == nil) {
+		return 0, 0, false
+	}
+	for _, p := range []*int64{u.InputTokens, u.CacheReadTokens, u.CacheCreationTokens} {
+		if p != nil && *p > 0 {
+			prompt += *p
+		}
+	}
+	if u.OutputTokens != nil && *u.OutputTokens > 0 {
+		completion = *u.OutputTokens
+	}
+	return prompt, completion, true
+}
+
+// AnthropicUsageTokens extracts usage from a non-streaming Anthropic Messages
+// response. ok is false when the body carries no usage object.
+func AnthropicUsageTokens(body []byte) (prompt, completion int64, ok bool) {
+	var env struct {
+		Usage *anthropicUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return 0, 0, false
+	}
+	return env.Usage.counts()
+}
+
+// AnthropicUsageTokensFromSSE extracts usage from a buffered Anthropic
+// Messages stream. The Anthropic API reports input in message_start and
+// output in message_delta; vLLM reports both in the final message_delta. The
+// largest value of each side across the stream covers both.
+func AnthropicUsageTokensFromSSE(body []byte) (prompt, completion int64, ok bool) {
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		payload, found := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
+		if !found {
+			continue
+		}
+		var event struct {
+			Usage   *anthropicUsage `json:"usage"`
+			Message *struct {
+				Usage *anthropicUsage `json:"usage"`
+			} `json:"message"`
+		}
+		if err := json.Unmarshal(bytes.TrimSpace(payload), &event); err != nil {
+			continue
+		}
+		usages := []*anthropicUsage{event.Usage}
+		if event.Message != nil {
+			usages = append(usages, event.Message.Usage)
+		}
+		for _, u := range usages {
+			if p, c, ok2 := u.counts(); ok2 {
+				prompt, completion, ok = max(prompt, p), max(completion, c), true
+			}
+		}
+	}
+	return prompt, completion, ok
+}
