@@ -101,6 +101,15 @@ type Backend struct {
 	// When both are present, EndpointSource wins over Endpoints.
 	EndpointSource *EndpointSource `json:"endpointSource,omitempty"`
 
+	// Balancing selects how the proxy places requests across an
+	// endpoint-resolution backend's pods. Nil keeps round-robin.
+	Balancing *Balancing `json:"balancing,omitempty"`
+
+	// Metrics names the engine metrics the proxy scrapes from each pod for
+	// LoadAware placement. Set by the controller only for runtimes with a
+	// known profile; without it, LoadAware uses in-flight counts alone.
+	Metrics *MetricsProfile `json:"metrics,omitempty"`
+
 	// Provider identifies the upstream API surface for external backends
 	// ("anthropic", "openai", "litellm", etc.). Empty for local backends.
 	Provider string `json:"provider,omitempty"`
@@ -164,6 +173,43 @@ type EndpointSource struct {
 	Namespace string `json:"namespace"`
 	Service   string `json:"service"`
 	Port      int32  `json:"port"`
+}
+
+// Balancing modes.
+const (
+	BalancingRoundRobin = "RoundRobin"
+	BalancingLoadAware  = "LoadAware"
+)
+
+// DefaultMaxLoadPercent is the session spill bound when none is set.
+const DefaultMaxLoadPercent int32 = 125
+
+// Balancing is a backend's placement policy.
+type Balancing struct {
+	// Mode is RoundRobin (also when empty) or LoadAware.
+	Mode string `json:"mode,omitempty"`
+	// SessionHeaders name the request headers that identify a session, in
+	// priority order; the first present with a non-empty value is the key.
+	SessionHeaders []string `json:"sessionHeaders,omitempty"`
+	// MaxLoadPercent bounds a pod's load, as a percentage of the average
+	// across eligible pods, before a session spills. 0 means the default.
+	MaxLoadPercent int32 `json:"maxLoadPercent,omitempty"`
+}
+
+// LoadPercent returns MaxLoadPercent, or DefaultMaxLoadPercent when unset.
+func (b *Balancing) LoadPercent() int32 {
+	if b.MaxLoadPercent == 0 {
+		return DefaultMaxLoadPercent
+	}
+	return b.MaxLoadPercent
+}
+
+// MetricsProfile names the engine gauges the proxy reads from each pod.
+type MetricsProfile struct {
+	Path    string `json:"path"`
+	Running string `json:"running"`
+	Waiting string `json:"waiting"`
+	KVUsage string `json:"kvUsage,omitempty"`
 }
 
 // TokenCost prices prompt and completion tokens per million, in USD. The
@@ -387,6 +433,24 @@ func (c *Config) Validate() error {
 		}
 		if s := b.EndpointSource; s != nil && (s.Namespace == "" || s.Service == "" || s.Port <= 0) {
 			return fmt.Errorf("backends[%d] %s: endpointSource needs namespace, service and a positive port", i, b.Name)
+		}
+		if bal := b.Balancing; bal != nil {
+			switch bal.Mode {
+			case "", BalancingRoundRobin, BalancingLoadAware:
+			default:
+				return fmt.Errorf("backends[%d] %s: balancing mode %q must be %s or %s", i, b.Name, bal.Mode, BalancingRoundRobin, BalancingLoadAware)
+			}
+			if bal.MaxLoadPercent != 0 && (bal.MaxLoadPercent < 101 || bal.MaxLoadPercent > 1000) {
+				return fmt.Errorf("backends[%d] %s: balancing maxLoadPercent %d must be between 101 and 1000", i, b.Name, bal.MaxLoadPercent)
+			}
+			for _, h := range bal.SessionHeaders {
+				if strings.TrimSpace(h) == "" {
+					return fmt.Errorf("backends[%d] %s: balancing session header names must be non-empty", i, b.Name)
+				}
+			}
+		}
+		if m := b.Metrics; m != nil && (m.Path == "" || m.Running == "" || m.Waiting == "") {
+			return fmt.Errorf("backends[%d] %s: metrics profile needs path, running and waiting", i, b.Name)
 		}
 	}
 	if c.DefaultRoute != "" && !names[c.DefaultRoute] {
