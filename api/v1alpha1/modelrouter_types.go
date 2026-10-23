@@ -771,6 +771,23 @@ type RouterProxySpec struct {
 	// next to tainted GPU nodes together with nodeSelector.
 	// +optional
 	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
+	// Affinity is passed through to the router-proxy pod, for node affinity
+	// or pod anti-affinity against the proxy's own replicas. The proxy pods
+	// carry the stable labels app: <router>-router-proxy and
+	// inference.llmkube.dev/model-router: <router> to select on.
+	// +optional
+	Affinity *corev1.Affinity `json:"affinity,omitempty"`
+
+	// TopologySpreadConstraints are passed through to the router-proxy pod,
+	// for example one replica per node with topologyKey
+	// kubernetes.io/hostname and the labels above. When replicas is more
+	// than 1 and a constraint uses whenUnsatisfiable: DoNotSchedule (or the
+	// affinity requires pod anti-affinity), the proxy rolls out with
+	// maxSurge 0 and maxUnavailable 1, because a surge pod could never be
+	// placed.
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 }
 
 // MCPServerSpec configures a Model Context Protocol endpoint on the

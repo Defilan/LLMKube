@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
@@ -70,6 +71,9 @@ func (r *ModelRouterReconciler) reconcileRouterDeployment(
 	// pass through. Fixes #456.
 	existing.Spec.Replicas = desired.Spec.Replicas
 	existing.Spec.RevisionHistoryLimit = desired.Spec.RevisionHistoryLimit
+	// An unset strategy is filled with the Kubernetes default by the API
+	// server, so dropping the no-surge rule goes back to the default.
+	existing.Spec.Strategy = desired.Spec.Strategy
 	existing.Spec.Template.Spec = desired.Spec.Template.Spec
 	existing.Spec.Template.Labels = mergePreservingExternal(
 		existing.Spec.Template.Labels,
@@ -103,6 +107,8 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	var nodeSelector map[string]string
 	var tolerations []corev1.Toleration
 	var runtimeClassName *string
+	var affinity *corev1.Affinity
+	var topologySpread []corev1.TopologySpreadConstraint
 
 	if mr.Spec.Proxy != nil {
 		if mr.Spec.Proxy.Replicas != nil {
@@ -119,6 +125,8 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		nodeSelector = mr.Spec.Proxy.NodeSelector
 		tolerations = mr.Spec.Proxy.Tolerations
 		runtimeClassName = mr.Spec.Proxy.RuntimeClassName
+		affinity = mr.Spec.Proxy.Affinity
+		topologySpread = mr.Spec.Proxy.TopologySpreadConstraints
 	}
 	// A pooled router must run exactly one proxy replica: ModelPool activation
 	// serializes swaps through a single in-process lock, so a second replica
@@ -130,6 +138,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	if resources.Requests == nil && resources.Limits == nil {
 		resources = defaultRouterProxyResources()
 	}
+	strategy := routerProxyStrategy(replicas, affinity, topologySpread)
 
 	envFrom := credentialsEnvFrom(mr)
 
@@ -160,6 +169,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		Spec: appsv1.DeploymentSpec{
 			Replicas:             &replicas,
 			RevisionHistoryLimit: revisionHistoryLimitOrDefault(revisionHistoryLimit),
+			Strategy:             strategy,
 			Selector:             &metav1.LabelSelector{MatchLabels: podLabels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
@@ -167,12 +177,14 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: serviceAccountName,
-					SecurityContext:    routerProxyPodSecurityContext(),
-					ImagePullSecrets:   imagePullSecrets,
-					NodeSelector:       nodeSelector,
-					Tolerations:        tolerations,
-					RuntimeClassName:   runtimeClassName,
+					ServiceAccountName:        serviceAccountName,
+					SecurityContext:           routerProxyPodSecurityContext(),
+					ImagePullSecrets:          imagePullSecrets,
+					NodeSelector:              nodeSelector,
+					Tolerations:               tolerations,
+					RuntimeClassName:          runtimeClassName,
+					Affinity:                  affinity,
+					TopologySpreadConstraints: topologySpread,
 					Containers: []corev1.Container{
 						{
 							Name:            routerProxyContainerName,
@@ -354,4 +366,32 @@ func (r *ModelRouterReconciler) routerProxyImage() string {
 		return r.RouterProxyImage
 	}
 	return defaultRouterProxyImage
+}
+
+// routerProxyStrategy rolls a multi-replica proxy one replica at a time when its
+// placement is hard (a DoNotSchedule topology spread, or required pod
+// anti-affinity): with one replica per node on every eligible node, the default
+// surge pod can never be placed and the rollout would hang. Otherwise the
+// strategy stays unset, which is the Kubernetes default (#2198).
+func routerProxyStrategy(replicas int32, affinity *corev1.Affinity, spread []corev1.TopologySpreadConstraint) appsv1.DeploymentStrategy {
+	if replicas <= 1 || !hardProxyPlacement(affinity, spread) {
+		return appsv1.DeploymentStrategy{}
+	}
+	return appsv1.DeploymentStrategy{
+		Type: appsv1.RollingUpdateDeploymentStrategyType,
+		RollingUpdate: &appsv1.RollingUpdateDeployment{
+			MaxSurge:       ptr.To(intstr.FromInt32(0)),
+			MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+		},
+	}
+}
+
+func hardProxyPlacement(affinity *corev1.Affinity, spread []corev1.TopologySpreadConstraint) bool {
+	for _, c := range spread {
+		if c.WhenUnsatisfiable == corev1.DoNotSchedule {
+			return true
+		}
+	}
+	return affinity != nil && affinity.PodAntiAffinity != nil &&
+		len(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0
 }

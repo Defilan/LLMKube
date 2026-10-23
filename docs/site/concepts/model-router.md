@@ -65,7 +65,7 @@ These `spec.endpoint` and `spec.proxy` options apply to `dataPlane: Proxy`, the 
 
 `spec.endpoint` shapes the data-plane `Service` in front of the proxy. `type: NodePort` or `LoadBalancer` exposes it beyond the cluster. `spec.endpoint.nodePort` pins the node port and applies only to `type: NodePort`; it is ignored for `LoadBalancer`, as on `InferenceService`. When `nodePort` is unset, the port Kubernetes allocated stays the same across reconciles. Removing a previously pinned `nodePort` also keeps that port; to get a new one, change `type` or recreate the `Service`.
 
-`spec.endpoint.externalTrafficPolicy` (`Cluster` or `Local`, only with `type` NodePort or LoadBalancer) is applied to that `Service`. `Local` preserves the client source IP, but traffic only reaches nodes that run a proxy replica, so pair it with `spec.proxy.nodeSelector` or enough replicas. `spec.endpoint.apiKeySecretRef` is not supported on a `ModelRouter`.
+`spec.endpoint.externalTrafficPolicy` (`Cluster` or `Local`, only with `type` NodePort or LoadBalancer) is applied to that `Service`. `Local` preserves the client source IP, but traffic only reaches nodes that run a proxy replica, so pair it with `spec.proxy.nodeSelector`, or with one replica per node (below). `spec.endpoint.apiKeySecretRef` is not supported on a `ModelRouter`.
 
 `spec.proxy.runtimeClassName` runs the proxy pod under a RuntimeClass, for example a sandboxed runtime such as gVisor or Kata. Unset leaves the pod spec unchanged.
 
@@ -80,6 +80,33 @@ spec:
     nodeSelector:
       kubernetes.io/hostname: edge-1
 ```
+
+### One proxy replica per node
+
+`spec.proxy.affinity` and `spec.proxy.topologySpreadConstraints` are passed through to the proxy pod, as on `InferenceService`. The proxy pods carry two stable labels to select on: `app: <router>-router-proxy` and `inference.llmkube.dev/model-router: <router>`.
+
+For a highly available edge on two GPU nodes, run one replica per node and send each node's traffic to its own replica with `externalTrafficPolicy: Local`. An upstream that hashes the session header across the nodes' addresses then keeps every session on one replica, and its session bindings stay on that replica:
+
+```yaml
+metadata:
+  name: all-models
+spec:
+  endpoint:
+    type: NodePort
+    nodePort: 30802
+    externalTrafficPolicy: Local
+  proxy:
+    replicas: 2
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: all-models-router-proxy
+```
+
+With `replicas` above 1 and a hard placement rule (a constraint with `whenUnsatisfiable: DoNotSchedule`, or required pod anti-affinity), the proxy Deployment rolls out with `maxSurge: 0` and `maxUnavailable: 1`: an extra replica could never be placed, so the default surge would hang the rollout. The proxy rolls on every LLMKube upgrade, and while one replica restarts, its node's NodePort has no local endpoint, so the upstream should fail over to the other node's address. Soft rules (`ScheduleAnyway`, preferred affinity) and single-replica routers keep the default rollout. A router with ModelPools always runs one replica.
 
 ## The fail-closed gate
 
