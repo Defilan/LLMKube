@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	prommetrics "github.com/defilantech/llmkube/internal/metrics"
+	"github.com/defilantech/llmkube/internal/router/picker"
 )
 
 var vllmProfile = MetricsProfile{Path: "/metrics", Running: "vllm:num_requests_running", Waiting: "vllm:num_requests_waiting", KVUsage: "vllm:kv_cache_usage_perc"}
@@ -123,6 +125,50 @@ func TestLoadScraperRecordsSamplesAndFreshness(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(prommetrics.RouterEndpointLoad.WithLabelValues("r-scrape", "qwen", good.URL)); got != 9 {
 		t.Errorf("load gauge for the good endpoint = %v, want 9", got)
+	}
+}
+
+// TestLoadScraperFailedScrapeAgesOut: once a pod's scrapes start failing, its
+// last sample is not refreshed, and past picker.StaleAfter the fresh gauge
+// drops to 0 and the load gauge falls back to this replica's in-flight count.
+func TestLoadScraperFailedScrapeAgesOut(t *testing.T) {
+	body, _ := os.ReadFile("testdata/vllm-metrics.txt")
+	var failing atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			http.Error(w, "engine down", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	t0 := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(t0.UnixNano())
+	cfg := scrapedConfig()
+	d := NewDispatcher(cfg, WithNowFunc(func() time.Time { return time.Unix(0, clock.Load()).UTC() }))
+	d.SetEndpoints("qwen", []string{srv.URL})
+	s := NewLoadScraper(cfg, d, "r-stale", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s.scrapeOnce(context.Background())
+	first := d.loadFor("qwen", srv.URL).sample.Load()
+	if first == nil || !first.At.Equal(t0) {
+		t.Fatalf("first sample = %+v, want one stamped %v", first, t0)
+	}
+
+	failing.Store(true)
+	d.loadFor("qwen", srv.URL).inflight.Store(3)
+	clock.Store(t0.Add(picker.StaleAfter + time.Second).UnixNano())
+	s.scrapeOnce(context.Background())
+
+	if got := d.loadFor("qwen", srv.URL).sample.Load(); got != first {
+		t.Errorf("a failed scrape replaced the sample: %+v, want the first sample kept", got)
+	}
+	if got := testutil.ToFloat64(prommetrics.RouterEndpointMetricsFresh.WithLabelValues("r-stale", "qwen", srv.URL)); got != 0 {
+		t.Errorf("fresh gauge after the sample aged out = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(prommetrics.RouterEndpointLoad.WithLabelValues("r-stale", "qwen", srv.URL)); got != 3 {
+		t.Errorf("load gauge after the sample aged out = %v, want the in-flight count 3", got)
 	}
 }
 
