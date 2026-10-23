@@ -145,6 +145,8 @@ spec:
                         Balancing places requests across this backend's pods by load and keeps
                         a session on its pod until it runs hot. Requires resolution: endpoint.
                         Unset keeps round-robin.
+                        Applies to the Proxy data plane only; ignored by the Gateway and
+                        AgentGateway data planes.
                       properties:
                         mode:
                           default: RoundRobin
