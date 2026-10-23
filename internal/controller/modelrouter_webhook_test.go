@@ -459,3 +459,71 @@ func TestModelRouterValidator_AgentGatewayModeRejectsMissingPicker(t *testing.T)
 		t.Fatalf("want an Invalid error naming the missing picker, got %v", err)
 	}
 }
+
+// affinityRouter returns a valid gateway router whose first backend carries the
+// given balancing mode plus a sessionAffinity block.
+func affinityRouter(mode string) *inferencev1alpha1.ModelRouter {
+	mr := validGatewayRouter()
+	mr.Spec.Backends[0].Balancing = &inferencev1alpha1.BackendBalancing{
+		Mode:            mode,
+		SessionAffinity: &inferencev1alpha1.SessionAffinity{Headers: []string{"x-session-id"}},
+	}
+	return mr
+}
+
+func TestModelRouterValidator_SessionAffinityNeedsLoadAware(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	_, err := v.ValidateCreate(ctx, affinityRouter(inferencev1alpha1.BalancingModeRoundRobin))
+	if err == nil {
+		t.Fatalf("expected RoundRobin plus sessionAffinity to be rejected")
+	}
+	if !strings.Contains(err.Error(), "spec.backends[0].balancing.sessionAffinity") ||
+		!strings.Contains(err.Error(), "sessionAffinity requires balancing.mode: LoadAware") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// An empty mode is not LoadAware either.
+	if _, err := v.ValidateCreate(ctx, affinityRouter("")); err == nil {
+		t.Fatalf("expected empty mode plus sessionAffinity to be rejected")
+	}
+
+	if _, err := v.ValidateCreate(ctx, affinityRouter(inferencev1alpha1.BalancingModeLoadAware)); err != nil {
+		t.Fatalf("expected LoadAware plus sessionAffinity to be accepted, got %v", err)
+	}
+}
+
+func TestModelRouterValidator_SessionAffinityUnchangedSpecGrandfathered(t *testing.T) {
+	v := &ModelRouterValidator{}
+	ctx := context.Background()
+
+	old := affinityRouter(inferencev1alpha1.BalancingModeRoundRobin)
+
+	unchanged := old.DeepCopy()
+	unchanged.Labels = map[string]string{"patched": "true"}
+	if _, err := v.ValidateUpdate(ctx, old.DeepCopy(), unchanged); err != nil {
+		t.Fatalf("expected unchanged spec to be grandfathered, got %v", err)
+	}
+
+	changed := old.DeepCopy()
+	changed.Spec.Backends[1].Name = "qwen-metal-2"
+	changed.Spec.Rules[0].Route.Backends[1] = "qwen-metal-2"
+	if _, err := v.ValidateUpdate(ctx, old.DeepCopy(), changed); err == nil {
+		t.Fatalf("expected a spec-changing update to be re-validated and rejected")
+	}
+}
+
+func TestModelRouterValidator_MaxLoadPercentWarns(t *testing.T) {
+	v := &ModelRouterValidator{}
+	mr := affinityRouter(inferencev1alpha1.BalancingModeLoadAware)
+	mr.Spec.Backends[0].Balancing.SessionAffinity.MaxLoadPercent = 125
+
+	warnings, err := v.ValidateCreate(context.Background(), mr)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "deprecated") {
+		t.Fatalf("expected exactly one deprecation warning, got %v", warnings)
+	}
+}
