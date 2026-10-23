@@ -86,6 +86,12 @@ func runtimeHFTokenRef(backend RuntimeBackend, isvc *inferencev1alpha1.Inference
 //     that token would go to an origin its Secret never named. conflict
 //     reports this case so the caller can say so.
 func runtimeHFMirrorEnv(backend RuntimeBackend, isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, hfEndpoint string) (env []corev1.EnvVar, conflict bool) {
+	// Under spec.hubOffline the runtime makes no request, so the endpoint and
+	// the token it would authenticate with are dead env, and the conflict this
+	// reports cannot arise.
+	if isvc.Spec.HubOffline {
+		return nil, false
+	}
 	if hfEndpoint == "" || model == nil || model.Spec.SourceSecretRef == nil ||
 		!isHFRepoSource(model.Spec.Source) || operatorStagesModel(isvc, backend) {
 		return nil, false

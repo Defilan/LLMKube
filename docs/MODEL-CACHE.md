@@ -299,9 +299,9 @@ With the field set:
   `spec.sha256` when one is pinned). If a file is missing the pod fails with
   `PrefetchedFilesMissing` (surfaced on the `ModelTransferHealthy`
   condition) rather than downloading on the serving node. The prefetch sets
-  no Hub-offline variable: put `HF_HUB_OFFLINE=1` in `spec.env` when the
-  runtime must not reach the Hub for anything the Job did not stage (see
-  the air-gapped guide).
+  no Hub-offline variable: set `spec.hubOffline: true` when the runtime
+  must not reach the Hub for anything the Job did not stage (see the
+  air-gapped guide).
 - Use a `ReadWriteMany` (or `ReadOnlyMany`) claim when the serving pods run
   on other nodes than the Job. A `ReadWriteOnce` claim attaches to one node:
   the first staging works because the Job finishes before the pods attach,

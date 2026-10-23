@@ -295,6 +295,14 @@ The token follows the same rule as the operator's downloads. The runtime sends
 
 A `spec.env` entry for `HF_ENDPOINT` or `HF_TOKEN` still wins.
 
+`spec.hubOffline: true` sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`
+on the serving container, so any Hub lookup the operator did not stage fails at
+start instead of downloading on the serving node. It drops the mirror env above
+(`HF_ENDPOINT` and the token that goes with it) because an offline runtime makes
+no request to send them to. It is the field to pair with `modelCache.prefetch`:
+the Job stages the checkpoint, and the serving pods cannot reach the Hub for
+anything else. See the air-gapped guide.
+
 A Model can name one mirror origin. A speculative-decoding draft Model that
 the runtime downloads itself uses the target Model's mirror, because both run
 in the same container.

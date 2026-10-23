@@ -640,8 +640,7 @@ spec:
   vllmConfig:
     maxModelLen: 32768
   extraArgs: ["--served-model-name", "qwen3-8b-fp8"]
-  env:
-    - { name: HF_HUB_OFFLINE, value: "1" }   # fail fast on any Hub lookup
+  hubOffline: true   # fail fast on any Hub lookup
   endpoint: { port: 8000, type: ClusterIP }
   resources: { gpu: 1, cpu: "8", memory: 32Gi }
 ```
@@ -847,11 +846,22 @@ kubectl -n default port-forward svc/qwen3-8b-fp8 8000:8000 &
 curl -sS http://localhost:8000/v1/models
 ```
 
-**No Hub calls at serve time.** `HF_HUB_OFFLINE=1` in `spec.env` makes
-any Hugging Face lookup the runtime still attempts (custom code, a
-tokenizer reference to another repo) fail immediately with a clear
-error, instead of waiting out network timeouts against a blocked
-host.
+**No Hub calls at serve time.** `spec.hubOffline: true` sets
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` on the serving
+container, so any Hugging Face lookup the runtime still attempts
+(custom code, a tokenizer reference to another repo) fails immediately
+with a clear error, instead of waiting out network timeouts against a
+blocked host. The operator's own downloader init containers keep their
+Hub access, since that is the path that stages the Model. An explicit
+`spec.env` entry with the same name wins. The field does not apply on
+the Metal agent: it runs no serving container, and the agent does not
+forward `spec.env` either.
+
+The field needs the operator to stage the Model, or a `pvc://` source.
+A runtime that downloads the Model itself instead (`skipModelInit:
+true`, TGI, `generic` without `stageModel`) fails at start under it,
+and the InferenceService gets a `HubOfflineRuntimeDownload` Warning
+event naming the fix.
 
 **Leave `skipModelInit` unset.** The repo's vLLM samples that pull
 straight from the Hub set `skipModelInit: true` and

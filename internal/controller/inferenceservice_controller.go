@@ -1010,12 +1010,22 @@ func (r *InferenceServiceReconciler) reconcileDeployment(ctx context.Context, is
 	// sourceSecretRef (#1900). A Model on the host named by HF_ENDPOINT gets
 	// the bearer token; a nil draftModel (the helper is nil-safe) names none.
 	hfEndpoint := hfEndpointFromSecret(ctx, r.Client, model)
+	// The backend the runtime resolved to, shared by the mirror check and the
+	// hub-offline check below so both read the same runtime.
+	backend := resolveBackend(isvc)
 	// A runtime that downloads the Model itself gets the mirror too, unless
 	// its token lives in another Secret; say so rather than silently going to
 	// huggingface.co.
-	if _, conflict := runtimeHFMirrorEnv(resolveBackend(isvc), isvc, model, hfEndpoint); conflict && r.Recorder != nil {
+	if _, conflict := runtimeHFMirrorEnv(backend, isvc, model, hfEndpoint); conflict && r.Recorder != nil {
 		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonHFMirrorNotApplied, "Reconcile",
 			"%s", hfMirrorNotAppliedMessage(model))
+	}
+	// spec.hubOffline forbids what a self-fetching runtime must do. This is
+	// after the metal return above because a metal service has no serving
+	// container to set env on, so the combination cannot arise there.
+	if hubOfflineRuntimeDownload(isvc, model, backend) && r.Recorder != nil {
+		r.Recorder.Eventf(isvc, nil, corev1.EventTypeWarning, ReasonHubOfflineRuntimeDownload, "Reconcile",
+			"%s", hubOfflineRuntimeDownloadMessage(isvc, model))
 	}
 	deployment := r.constructDeployment(isvc, model, draftModel, desiredReplicas,
 		hfEndpoint, hfEndpointFromSecret(ctx, r.Client, draftModel))
