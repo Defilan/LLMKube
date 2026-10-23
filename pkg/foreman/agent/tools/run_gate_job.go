@@ -89,13 +89,19 @@ const MaxLogTailBytes = 32 * 1024
 var DefaultGateChecks = []string{
 	"fmt", "vet", "lint", "lint-deadcode", "test",
 	"generate", "manifests", "chart-crds", "foreman-chart-crds", "federation-chart-crds",
-	"check-reviewer-prompts", "check-agents-md", "test-scripts", ChartCheck, B200HarnessCheck,
+	"check-reviewer-prompts", "check-agents-md", "test-scripts", ChartCheck, MetalAgentRBACCheck,
+	B200HarnessCheck,
 }
 
 // ChartCheck is the make target that lints and unit-tests the Helm charts.
 // Named because the Job has to know whether to install helm before running
 // the checks: the gate image is a plain golang image with no helm in it.
 const ChartCheck = "test-chart"
+
+// MetalAgentRBACCheck is the make target that compares the chart's metal-agent
+// identity with deployment/macos/metal-agent-rbac.yaml (#2152). It renders the
+// chart, so like ChartCheck it needs helm on PATH.
+const MetalAgentRBACCheck = "check-metal-agent-rbac"
 
 // B200HarnessCheck is the make target that runs the B200 validation harness
 // self-test (#1376). Named because the Job has to know whether to install jq
@@ -127,7 +133,7 @@ func helmVersionFor(checks []string) string {
 // needsHelm reports whether any requested check requires helm on PATH.
 func needsHelm(checks []string) bool {
 	for _, c := range checks {
-		if c == ChartCheck {
+		if c == ChartCheck || c == MetalAgentRBACCheck {
 			return true
 		}
 	}

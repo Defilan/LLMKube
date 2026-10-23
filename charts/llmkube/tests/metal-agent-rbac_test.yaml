@@ -1,0 +1,306 @@
+suite: metal agent RBAC
+# The macOS metal-agent runs outside the cluster and authenticates with a
+# kubeconfig minted from a ServiceAccount. deployment/macos/metal-agent-rbac.yaml
+# creates that identity by hand; this suite pins the chart's opt-in copy of it
+# (#2152). cmd/check-metal-agent-rbac keeps the rules identical to the
+# standalone manifest; these cases pin the shape, the namespaces and the
+# branches that must refuse to render.
+templates:
+  - metal-agent-rbac.yaml
+
+tests:
+  - it: renders nothing by default
+    release:
+      name: rel
+      namespace: llmkube-system
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: installs the agent identity into each listed namespace
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.namespaces:
+        - ml
+        - team-b
+    asserts:
+      - hasDocuments:
+          count: 6
+      - isKind:
+          of: ServiceAccount
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: llmkube-metal-agent
+        documentIndex: 0
+      - equal:
+          path: metadata.namespace
+          value: ml
+        documentIndex: 0
+      - isKind:
+          of: Role
+        documentIndex: 1
+      - equal:
+          path: metadata.name
+          value: llmkube-metal-agent
+        documentIndex: 1
+      - equal:
+          path: metadata.namespace
+          value: ml
+        documentIndex: 1
+      - equal:
+          path: metadata.labels["app.kubernetes.io/component"]
+          value: metal-agent
+        documentIndex: 1
+      - isKind:
+          of: RoleBinding
+        documentIndex: 2
+      - equal:
+          path: metadata.namespace
+          value: ml
+        documentIndex: 2
+      - equal:
+          path: roleRef
+          value:
+            apiGroup: rbac.authorization.k8s.io
+            kind: Role
+            name: llmkube-metal-agent
+        documentIndex: 2
+      - equal:
+          path: subjects
+          value:
+            - kind: ServiceAccount
+              name: llmkube-metal-agent
+              namespace: ml
+        documentIndex: 2
+      - equal:
+          path: metadata.namespace
+          value: team-b
+        documentIndex: 3
+      - equal:
+          path: metadata.namespace
+          value: team-b
+        documentIndex: 4
+      - equal:
+          path: subjects[0].namespace
+          value: team-b
+        documentIndex: 5
+      # The foreground audit grants: InferenceService get/list, its status, the
+      # referenced Model, Service/EndpointSlice publication, legacy Endpoints
+      # reaping, Events, the relay token Secret.
+      - contains:
+          path: rules
+          content:
+            apiGroups: ["inference.llmkube.dev"]
+            resources: ["inferenceservices/status"]
+            verbs: ["update"]
+        documentIndex: 1
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+        documentIndex: 1
+      - lengthEqual:
+          path: rules
+          count: 8
+        documentIndex: 1
+
+  - it: installs the identity into every occurrence of a namespace only once
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.namespaces:
+        - ml
+        - ml
+    asserts:
+      - hasDocuments:
+          count: 3
+
+  - it: refuses to render without a namespace to install into
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "metalAgent.rbac.namespaces"
+
+  - it: refuses to render for an unknown scope
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.scope: everywhere
+      metalAgent.rbac.namespaces:
+        - ml
+    asserts:
+      - failedTemplate:
+          errorPattern: "metalAgent.rbac.scope"
+
+  # values.schema.json cannot express "namespaces is unused under cluster"
+  # (scope's enum admits both values and namespaces has no cross-field rule),
+  # so this template guard is the only one and it runs on every install.
+  - it: refuses a namespace list under cluster scope
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.scope: cluster
+      metalAgent.rbac.namespaces:
+        - ml
+    asserts:
+      - failedTemplate:
+          errorPattern: "metalAgent.rbac.namespaces is unused"
+
+  - it: grants the same rules cluster-wide with scope cluster
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.scope: cluster
+    asserts:
+      - hasDocuments:
+          count: 3
+      - isKind:
+          of: ServiceAccount
+        documentIndex: 0
+      - equal:
+          path: metadata.namespace
+          value: llmkube-system
+        documentIndex: 0
+      - isKind:
+          of: ClusterRole
+        documentIndex: 1
+      - notExists:
+          path: metadata.namespace
+        documentIndex: 1
+      - isKind:
+          of: ClusterRoleBinding
+        documentIndex: 2
+      - equal:
+          path: roleRef.kind
+          value: ClusterRole
+        documentIndex: 2
+      - equal:
+          path: subjects
+          value:
+            - kind: ServiceAccount
+              name: llmkube-metal-agent
+              namespace: llmkube-system
+        documentIndex: 2
+      - lengthEqual:
+          path: rules
+          count: 8
+        documentIndex: 1
+
+  # create: false must not render a ServiceAccount in either scope, and must
+  # still grant: an agent watching all namespaces that gets no ClusterRole is
+  # Forbidden on every call.
+  - it: binds a pre-existing ServiceAccount cluster-wide without creating it
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.scope: cluster
+      metalAgent.rbac.serviceAccount.create: false
+      metalAgent.rbac.serviceAccount.name: metal-agent-prod
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ClusterRole
+        documentIndex: 0
+      - isKind:
+          of: ClusterRoleBinding
+        documentIndex: 1
+      - equal:
+          path: roleRef
+          value:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: metal-agent-prod
+        documentIndex: 1
+      - equal:
+          path: subjects[0].name
+          value: metal-agent-prod
+        documentIndex: 1
+      - equal:
+          path: subjects[0].namespace
+          value: llmkube-system
+        documentIndex: 1
+
+  - it: pins the Secret read to the listed names
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.namespaces:
+        - ml
+      metalAgent.rbac.secretNames:
+        - llmkube-metal-relay
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+            resourceNames: ["llmkube-metal-relay"]
+        documentIndex: 1
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get"]
+        documentIndex: 1
+
+  - it: binds a pre-existing ServiceAccount when asked not to create one
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.namespaces:
+        - ml
+      metalAgent.rbac.serviceAccount.create: false
+      metalAgent.rbac.serviceAccount.name: metal-agent-prod
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: Role
+        documentIndex: 0
+      - equal:
+          path: subjects
+          value:
+            - kind: ServiceAccount
+              name: metal-agent-prod
+              namespace: ml
+        documentIndex: 1
+
+  - it: refuses to bind nothing when create is false and no name is given
+    release:
+      name: rel
+      namespace: llmkube-system
+    set:
+      metalAgent.rbac.enabled: true
+      metalAgent.rbac.namespaces:
+        - ml
+      metalAgent.rbac.serviceAccount.create: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "metalAgent.rbac.serviceAccount.name"

@@ -1,0 +1,116 @@
+{{- /*
+The macOS metal-agent's least-privilege identity, opt-in (#2152). The agent runs
+outside the cluster and authenticates with a kubeconfig minted from this
+ServiceAccount, so the chart installs the identity and never the credential:
+no token Secret is rendered.
+
+The rules come from llmkube.metalAgent.rules and must stay identical to
+deployment/macos/metal-agent-rbac.yaml. cmd/check-metal-agent-rbac renders this
+template and fails CI when the two drift.
+
+scope namespaced renders into each listed namespace, which must already exist:
+the agent watches one namespace (its --namespace flag), and unlike the release
+namespace Helm does not create these. scope cluster renders one ClusterRole and
+binding for an agent watching all namespaces (--namespace "").
+*/ -}}
+{{- if .Values.metalAgent.rbac.enabled }}
+{{- $rbac := .Values.metalAgent.rbac }}
+{{- $scope := $rbac.scope }}
+{{- $saName := include "llmkube.metalAgent.serviceAccountName" . }}
+{{- $component := dict "app.kubernetes.io/component" "metal-agent" }}
+{{- if not (or (eq $scope "namespaced") (eq $scope "cluster")) }}
+{{- fail (printf "metalAgent.rbac.scope must be \"namespaced\" or \"cluster\", got %q" $scope) }}
+{{- end }}
+{{- if and (not $rbac.serviceAccount.create) (not $rbac.serviceAccount.name) }}
+{{- fail "metalAgent.rbac.serviceAccount.name is required when metalAgent.rbac.serviceAccount.create is false" }}
+{{- end }}
+{{- if and (eq $scope "cluster") $rbac.namespaces }}
+{{- fail "metalAgent.rbac.namespaces is unused when metalAgent.rbac.scope is cluster: the ClusterRole covers every namespace, so remove the list or set scope namespaced" }}
+{{- end }}
+{{- if eq $scope "cluster" }}
+{{- if $rbac.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $saName }}
+  namespace: {{ include "llmkube.namespace" . }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+    {{- toYaml $component | nindent 4 }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+    {{- toYaml $component | nindent 4 }}
+rules:
+{{ include "llmkube.metalAgent.rules" . | indent 0 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "llmkube.labels" . | nindent 4 }}
+    {{- toYaml $component | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $saName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ include "llmkube.namespace" . }}
+{{- else }}
+{{- $namespaces := uniq ($rbac.namespaces | default list) }}
+{{- if not $namespaces }}
+{{- fail "metalAgent.rbac.namespaces is required when metalAgent.rbac.enabled is true and metalAgent.rbac.scope is namespaced: list the namespace(s) the agent watches (e.g. [default]), or set scope cluster for an agent watching all namespaces" }}
+{{- end }}
+{{- range $i, $ns := $namespaces }}
+{{- if $i }}
+---
+{{- end }}
+{{- if $rbac.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $saName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "llmkube.labels" $ | nindent 4 }}
+    {{- toYaml $component | nindent 4 }}
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $saName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "llmkube.labels" $ | nindent 4 }}
+    {{- toYaml $component | nindent 4 }}
+rules:
+{{ include "llmkube.metalAgent.rules" $ | indent 0 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $saName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "llmkube.labels" $ | nindent 4 }}
+    {{- toYaml $component | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $saName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ $ns }}
+{{- end }}
+{{- end }}
+{{- end }}

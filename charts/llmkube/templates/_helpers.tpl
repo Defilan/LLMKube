@@ -262,3 +262,57 @@ is found and reused.
 {{- dict "ca" ($ca.Cert | b64enc) "cert" ($cert.Cert | b64enc) "key" ($cert.Key | b64enc) | toYaml -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Name of the metal-agent ServiceAccount. Empty in values means the name
+deployment/macos/metal-agent-rbac.yaml and its `kubectl create token` recipe use.
+*/}}
+{{- define "llmkube.metalAgent.serviceAccountName" -}}
+{{- default "llmkube-metal-agent" .Values.metalAgent.rbac.serviceAccount.name -}}
+{{- end }}
+
+{{/*
+The metal-agent's RBAC rules, the single copy both the Role and the ClusterRole
+render. Kept identical to deployment/macos/metal-agent-rbac.yaml by
+cmd/check-metal-agent-rbac, which fails CI when the two drift.
+*/}}
+{{- define "llmkube.metalAgent.rules" -}}
+{{- $secretNames := .Values.metalAgent.rbac.secretNames | default list }}
+# Discover Metal InferenceServices and report their phase.
+- apiGroups: ["inference.llmkube.dev"]
+  resources: ["inferenceservices"]
+  verbs: ["get", "list"]
+- apiGroups: ["inference.llmkube.dev"]
+  resources: ["inferenceservices/status"]
+  verbs: ["update"]
+- apiGroups: ["inference.llmkube.dev"]
+  resources: ["models"]
+  verbs: ["get"]
+# Publish each native server to the cluster as a selector-less Service plus
+# an EndpointSlice pointing at this Mac, and clean them up afterwards.
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "create", "update", "delete"]
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "create", "update", "delete"]
+# Remove the legacy Endpoints object older agents created.
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "delete"]
+# Memory-pressure, eviction and startup events on InferenceServices.
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch"]
+# The per-namespace relay token Secret and Model.spec.sourceSecretRef
+# credentials, unless metalAgent.rbac.secretNames narrows the read.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+{{- with $secretNames }}
+  resourceNames:
+{{- range . }}
+    - {{ . | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

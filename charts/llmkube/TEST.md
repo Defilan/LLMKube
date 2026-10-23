@@ -69,7 +69,11 @@ helm template llmkube charts/llmkube \
   --set crds.install=false | \
   grep -q "kind: CustomResourceDefinition" && echo "❌ CRDs should be disabled" || echo "✅ CRDs disabled OK"
 
-# 7. Package
+# 7. sync the chart's metal-agent identity with the standalone manifest
+echo "Checking chart metal-agent RBAC against deployment/macos/metal-agent-rbac.yaml..."
+make check-metal-agent-rbac
+
+# 8. Package
 echo "Packaging chart..."
 helm package charts/llmkube -d /tmp
 
