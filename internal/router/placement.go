@@ -120,8 +120,8 @@ func (d *Dispatcher) place(backend *Backend, headers http.Header) (string, picke
 	// pickers accept any int, so a wrapped conversion is fine.
 	tie := int(d.endpointCursor(backend.Name).Add(1) - 1) //nolint:gosec // wraps harmlessly, the pickers take any int
 	if key := sessionKey(headers, bal.SessionHeaders); key != "" {
-		ep, res, reason := d.sessionsFor(backend.Name, bal).Place(
-			picker.SessionHash(key), cands, now, tie, d.ringFor(backend.Name, eps).Home(key))
+		ep, res, reason, _ := d.sessionsFor(backend.Name, bal).Place(
+			picker.SessionHash(key), cands, now, tie, d.ringFor(backend.Name, eps).Home(key), 0)
 		return ep, res, reason
 	}
 	ep, res := picker.PickLeastLoaded(picker.Eligible(cands, now), now, tie)
