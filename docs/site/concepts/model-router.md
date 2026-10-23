@@ -61,7 +61,9 @@ Since every spec change re-rolls the pods, set `spec.proxy.revisionHistoryLimit`
 
 ### Exposing the proxy and sandboxing its pod
 
-`spec.endpoint` shapes the data-plane `Service` in front of the proxy. `type: NodePort` or `LoadBalancer` exposes it beyond the cluster, and on a `NodePort` router `spec.endpoint.nodePort` pins the node port. When `nodePort` is unset, the port Kubernetes allocated stays the same across reconciles.
+These `spec.endpoint` and `spec.proxy` options apply to `dataPlane: Proxy`, the default.
+
+`spec.endpoint` shapes the data-plane `Service` in front of the proxy. `type: NodePort` or `LoadBalancer` exposes it beyond the cluster. `spec.endpoint.nodePort` pins the node port and applies only to `type: NodePort`; it is ignored for `LoadBalancer`, as on `InferenceService`. When `nodePort` is unset, the port Kubernetes allocated stays the same across reconciles. Removing a previously pinned `nodePort` also keeps that port; to get a new one, change `type` or recreate the `Service`.
 
 `spec.endpoint.externalTrafficPolicy` (`Cluster` or `Local`, only with `type` NodePort or LoadBalancer) is applied to that `Service`. `Local` preserves the client source IP, but traffic only reaches nodes that run a proxy replica, so pair it with `spec.proxy.nodeSelector` or enough replicas. `spec.endpoint.apiKeySecretRef` is not supported on a `ModelRouter`.
 

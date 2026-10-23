@@ -18,6 +18,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -26,9 +27,6 @@ import (
 
 // allocatedNodePort stands in for the port the apiserver allocated.
 const allocatedNodePort int32 = 31555
-
-func ptrInt32Opt(v int32) *int32 { return &v }
-func ptrStrOpt(v string) *string { return &v }
 
 // routerWithEndpoint returns the canonical router with spec.endpoint set.
 func routerWithEndpoint(ep *inferencev1alpha1.EndpointSpec) *inferencev1alpha1.ModelRouter {
@@ -42,7 +40,7 @@ func routerWithEndpoint(ep *inferencev1alpha1.EndpointSpec) *inferencev1alpha1.M
 // allocate) when unset.
 func TestRouterServiceNodePort(t *testing.T) {
 	svc := newRouterService(routerWithEndpoint(&inferencev1alpha1.EndpointSpec{
-		Type: "NodePort", NodePort: ptrInt32Opt(30801),
+		Type: "NodePort", NodePort: ptr.To[int32](30801),
 	}))
 	if got := svc.Spec.Ports[0].NodePort; got != 30801 {
 		t.Errorf("NodePort = %d, want 30801", got)
@@ -128,7 +126,7 @@ func TestReconcileRouterServicePreservesAllocatedNodePort(t *testing.T) {
 func TestReconcileRouterServiceAppliesChangedNodePort(t *testing.T) {
 	mr := routerWithEndpoint(&inferencev1alpha1.EndpointSpec{Type: "NodePort"})
 	rec, c, key := seededRouterService(t, mr)
-	mr.Spec.Endpoint.NodePort = ptrInt32Opt(30801)
+	mr.Spec.Endpoint.NodePort = ptr.To[int32](30801)
 	got := reconcileAndGetService(t, rec, c, mr, key)
 	if np := got.Spec.Ports[0].NodePort; np != 30801 {
 		t.Errorf("NodePort after update = %d, want 30801", np)
@@ -170,7 +168,7 @@ func TestReconcileRouterServiceAppliesExternalTrafficPolicy(t *testing.T) {
 // the pod spec when set.
 func TestRouterDeploymentBuilderRuntimeClassName(t *testing.T) {
 	mr := canonicalModelRouter()
-	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{RuntimeClassName: ptrStrOpt("gvisor")}
+	mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{RuntimeClassName: ptr.To("gvisor")}
 	r := &ModelRouterReconciler{RouterProxyImage: "img"}
 	got := r.newRouterDeployment(mr, "hash", false).Spec.Template.Spec.RuntimeClassName
 	if got == nil || *got != "gvisor" {
@@ -178,16 +176,15 @@ func TestRouterDeploymentBuilderRuntimeClassName(t *testing.T) {
 	}
 }
 
-// TestRouterDeploymentBuilderRuntimeClassNameUnsetIsByteIdentical pins that an
-// unset field leaves the pod template exactly as it was before the field
-// existed (so existing routers do not re-roll on upgrade): nil, and equal to
-// the output for a router with no proxy block at all.
-func TestRouterDeploymentBuilderRuntimeClassNameUnsetIsByteIdentical(t *testing.T) {
+// TestRouterDeploymentBuilderRuntimeClassNameUnset checks only that the field
+// is nil when unset, and that a proxy block without the field produces the same
+// pod template as no proxy block at all.
+func TestRouterDeploymentBuilderRuntimeClassNameUnset(t *testing.T) {
 	r := &ModelRouterReconciler{RouterProxyImage: "img"}
 	base := r.newRouterDeployment(canonicalModelRouter(), "hash", false)
 
 	withProxy := canonicalModelRouter()
-	withProxy.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{Replicas: ptrInt32Opt(1)}
+	withProxy.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{Replicas: ptr.To[int32](1)}
 	got := r.newRouterDeployment(withProxy, "hash", false)
 
 	if base.Spec.Template.Spec.RuntimeClassName != nil || got.Spec.Template.Spec.RuntimeClassName != nil {
@@ -213,7 +210,7 @@ func TestReconcileRouterDeploymentAppliesRuntimeClassName(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"gvisor", "kata"} {
-		mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{RuntimeClassName: ptrStrOpt(want)}
+		mr.Spec.Proxy = &inferencev1alpha1.RouterProxySpec{RuntimeClassName: ptr.To(want)}
 		if err := rec.reconcileRouterDeployment(ctx, mr, "hash", false); err != nil {
 			t.Fatal(err)
 		}
@@ -225,5 +222,17 @@ func TestReconcileRouterDeploymentAppliesRuntimeClassName(t *testing.T) {
 		if got == nil || *got != want {
 			t.Errorf("live RuntimeClassName = %v, want %s", got, want)
 		}
+	}
+
+	mr.Spec.Proxy.RuntimeClassName = nil
+	if err := rec.reconcileRouterDeployment(ctx, mr, "hash", false); err != nil {
+		t.Fatal(err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := c.Get(ctx, key, dep); err != nil {
+		t.Fatal(err)
+	}
+	if got := dep.Spec.Template.Spec.RuntimeClassName; got != nil {
+		t.Errorf("live RuntimeClassName after removal = %q, want nil", *got)
 	}
 }
