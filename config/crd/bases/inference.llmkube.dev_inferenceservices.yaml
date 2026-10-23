@@ -5663,10 +5663,11 @@ spec:
                       ToolCallParser selects the tool-call extraction format. For foreman
                       tool-loop workloads. Maps to SGLang --tool-call-parser flag.
 
-                      glm is the GLM-4.5/4.7 MoE detector; SGLang v0.5.15 rewrites a passed
-                      glm45 to glm with a deprecation warning, so both spellings work.
-                      qwen3 and functionary are kept for objects written against earlier
-                      releases even though the pinned image no longer registers them.
+                      glm and glm45 both select the GLM-4.5/4.7 MoE detector; SGLang also
+                      logs a deprecation warning for a passed glm45 and rewrites it to glm
+                      (server_args.py), so either spelling works. qwen3 and functionary are
+                      kept for objects written against earlier releases even though the
+                      pinned image no longer registers them.
                     enum:
                     - llama3
                     - qwen3
