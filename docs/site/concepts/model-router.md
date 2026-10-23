@@ -414,10 +414,15 @@ histogram are planned for Phase 2 (issue [#433](https://github.com/defilantech/L
 
 Outbound responses stream chunk-by-chunk; **inbound requests are
 fully buffered** before routing (up to a 32 MiB cap, enough for
-~128K-token prompts). For 50 concurrent long-context requests that
-is around 25 MB of resident memory in the proxy pod, comfortable on
-a default 256 MiB pod but not zero. True request-side streaming is
-planned for Phase 2.
+~128K-token prompts). A request's body is released once it has been
+sent upstream, so a reply that streams for minutes does not keep its
+prompt in memory. While a request is being sent, the proxy holds
+about two to three times its body size when it rewrites the model
+name. A long-context agent prompt of 75K tokens is about 300 KB of
+JSON, so a few hundred such requests arriving together need a few
+hundred MiB. The default limit is 1 GiB (request 64 MiB); raise
+`spec.proxy.resources` for larger bursts. True request-side
+streaming is planned for Phase 2.
 
 ## Comparison to alternatives
 
