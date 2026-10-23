@@ -446,12 +446,19 @@ func (d *Dispatcher) Dispatch(
 	// guard can abort a body that went silent without touching the caller's
 	// context.
 	reqCtx, reqCancel := context.WithCancel(ctx)
-	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody)) //nolint:gosec // G704: url is the configured backend address or a pod from the controller-managed endpoint set; the session header is only hashed onto the ring
+	req, err := http.NewRequestWithContext(reqCtx, method, url, newSentOnceBody(outboundBody)) //nolint:gosec // G704: url is the configured backend address or a pod from the controller-managed endpoint set; the session header is only hashed onto the ring
 	if err != nil {
 		reqCancel()
 		release()
 		return nil, fmt.Errorf("build request: %w", err)
 	}
+	// The transport keeps the request until the response body is done, so a
+	// bytes.Reader body (and the GetBody closure NewRequest builds for one)
+	// would hold the whole prompt for the length of the stream (#2194).
+	// sentOnceBody drops it once written; the length is set explicitly so
+	// the request is not sent chunked.
+	req.ContentLength = int64(len(outboundBody))
+	req.GetBody = nil
 
 	d.copyForwardedHeaders(headers, req.Header)
 	if err := d.applyCredentials(backend, req); err != nil {
@@ -741,4 +748,36 @@ func PipeBody(dst io.Writer, src io.Reader, flush func()) (int64, error) {
 			return total, err
 		}
 	}
+}
+
+// sentOnceBody is a request body that releases its bytes once they have been
+// read to the end or the body is closed, so a long streamed response does not
+// keep the request it answered in memory.
+type sentOnceBody struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func newSentOnceBody(b []byte) io.ReadCloser { return &sentOnceBody{buf: b} }
+
+func (s *sentOnceBody) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.buf) == 0 {
+		s.buf = nil
+		return 0, io.EOF
+	}
+	n := copy(p, s.buf)
+	s.buf = s.buf[n:]
+	if len(s.buf) == 0 {
+		s.buf = nil
+	}
+	return n, nil
+}
+
+func (s *sentOnceBody) Close() error {
+	s.mu.Lock()
+	s.buf = nil
+	s.mu.Unlock()
+	return nil
 }
