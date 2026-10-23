@@ -75,8 +75,8 @@ func (d *Dispatcher) sessionsFor(backend string, bal *Balancing) *picker.Session
 func (d *Dispatcher) SweepSessions(now time.Time) {
 	d.sessions.Range(func(k, v any) bool {
 		tbl := v.(*picker.Sessions)
-		tbl.Sweep(now)
-		prommetrics.RouterSessionBindings.WithLabelValues(d.routerName, k.(string)).Set(float64(tbl.Len()))
+		n := tbl.Sweep(now)
+		prommetrics.RouterSessionBindings.WithLabelValues(d.routerName, k.(string)).Set(float64(n))
 		return true
 	})
 }

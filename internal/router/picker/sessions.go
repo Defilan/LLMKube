@@ -51,6 +51,12 @@ type Sessions struct {
 	bindings map[uint64]binding
 	idle     time.Duration
 	capacity int
+	// oldest is a lower bound on every binding's lastSeen. Refreshed and new
+	// bindings only raise lastSeen, so it stays valid until a scan recomputes
+	// it. The zero value makes the first scan run.
+	oldest time.Time
+	// scans counts full-table expiry scans, for tests.
+	scans int
 }
 
 // NewSessions returns an empty table. An idle of zero or less means
@@ -66,13 +72,21 @@ func (s *Sessions) expired(b binding, now time.Time) bool {
 	return now.Sub(b.lastSeen) > s.idle
 }
 
-// dropExpiredLocked removes expired bindings. The caller holds s.mu.
+// dropExpiredLocked removes expired bindings and recomputes the oldest bound
+// from the survivors. The caller holds s.mu.
 func (s *Sessions) dropExpiredLocked(now time.Time) {
+	s.scans++
+	var oldest time.Time
 	for k, b := range s.bindings {
 		if s.expired(b, now) {
 			delete(s.bindings, k)
+			continue
+		}
+		if oldest.IsZero() || b.lastSeen.Before(oldest) {
+			oldest = b.lastSeen
 		}
 	}
+	s.oldest = oldest
 }
 
 // Place decides which pod serves one request of a session. cands are the
@@ -94,7 +108,8 @@ func (s *Sessions) Place(key uint64, cands []Candidate, now time.Time, tieStart 
 	}
 
 	if !known {
-		if len(s.bindings) >= s.capacity {
+		// Nothing can be expired unless the oldest binding is past idle.
+		if len(s.bindings) >= s.capacity && now.Sub(s.oldest) > s.idle {
 			s.dropExpiredLocked(now)
 		}
 		if len(s.bindings) >= s.capacity {
@@ -107,6 +122,9 @@ func (s *Sessions) Place(key uint64, cands []Candidate, now time.Time, tieStart 
 			return ep, Fallback, ReasonNone
 		}
 		ep, _ := PickLeastLoaded(Eligible(cands, now), now, tieStart)
+		if len(s.bindings) == 0 {
+			s.oldest = now
+		}
 		s.bindings[key] = binding{endpoint: ep, lastSeen: now}
 		return ep, LeastLoaded, ReasonNone
 	}
@@ -176,9 +194,10 @@ func pressure(bound Candidate, cands []Candidate, now time.Time, tieStart int) (
 	if full {
 		reason = ReasonKVFull
 	}
-	// A full pod sheds at any gap, but only to a pod known to have KV room;
-	// otherwise it needs the load gap like any queued pod.
-	if ls := freshSample(least, now); full && ls != nil && ls.KVUsage < KVFullThreshold {
+	// A full pod sheds at any gap, but only to a pod known to have KV room
+	// that is no busier than itself; otherwise it needs the load gap like any
+	// queued pod.
+	if ls := freshSample(least, now); full && ls != nil && gap >= 0 {
 		return leastEP, reason
 	}
 	if gap >= PressureMargin {

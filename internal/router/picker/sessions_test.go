@@ -268,3 +268,111 @@ func TestSessionsQueuedNotKVFullNeverTargetsFullPod(t *testing.T) {
 	cands := []Candidate{pod("a", 15, 5, 0.5), pod("b", 1, 0, 0.95), pod("c", 15, 0, 0.5)}
 	place(t, s, 1, cands, t0, "c", Spill, ReasonWaiting)
 }
+
+func TestSessionsFullTableSkipsScanWhenNothingCanExpire(t *testing.T) {
+	s := NewSessions(10*time.Minute, 3)
+	cands := []Candidate{pod("a", 0, 0, 0.1), pod("b", 5, 0, 0.1)}
+	for k := uint64(1); k <= 3; k++ {
+		place(t, s, k, cands, t0, "a", LeastLoaded, ReasonNone)
+	}
+	before := s.scans
+	now := t0.Add(5 * time.Minute)
+	c := []Candidate{pod("a", 0, 0, 0.1), pod("b", 5, 0, 0.1)}
+	c[0].Sample.At, c[1].Sample.At = now, now
+	for k := uint64(100); k < 200; k++ {
+		ep, res, _ := s.Place(k, c, now, 0, "")
+		if ep != "a" || res != Fallback {
+			t.Fatalf("key %d: got (%q, %q), want (a, fallback)", k, ep, res)
+		}
+	}
+	if s.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", s.Len())
+	}
+	if s.scans != before {
+		t.Fatalf("scans = %d, want %d (no scan when nothing can expire)", s.scans, before)
+	}
+}
+
+func TestSessionsFullTableScansWhenSomeExpire(t *testing.T) {
+	s := NewSessions(10*time.Minute, 3)
+	one := []Candidate{pod("a", 0, 0, 0.1)}
+	place(t, s, 1, one, t0, "a", LeastLoaded, ReasonNone)
+	later := t0.Add(8 * time.Minute)
+	for k := uint64(2); k <= 3; k++ {
+		c := pod("a", 0, 0, 0.1)
+		c.Sample.At = later
+		place(t, s, k, []Candidate{c}, later, "a", LeastLoaded, ReasonNone)
+	}
+	now := t0.Add(11 * time.Minute)
+	c := pod("a", 0, 0, 0.1)
+	c.Sample.At = now
+	// Key 1 is expired, keys 2 and 3 are live: the scan frees one slot.
+	place(t, s, 4, []Candidate{c}, now, "a", LeastLoaded, ReasonNone)
+	if s.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", s.Len())
+	}
+	// The table is full of live keys again and the oldest bound moved up.
+	ep, res, _ := s.Place(5, []Candidate{c}, now, 0, "")
+	if ep != "a" || res != Fallback {
+		t.Fatalf("got (%q, %q), want (a, fallback)", ep, res)
+	}
+	if s.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", s.Len())
+	}
+	// Keys 2 and 3 expire later; the recomputed bound lets the scan run.
+	later2 := t0.Add(19 * time.Minute)
+	c.Sample.At = later2
+	place(t, s, 6, []Candidate{c}, later2, "a", LeastLoaded, ReasonNone)
+}
+
+func TestSessionsKVFullDoesNotMoveOntoBusierPod(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	place(t, s, 1, []Candidate{pod("a", 14, 1, 0.95), pod("b", 17, 0, 0.5)}, t0, "a", Sticky, ReasonNone)
+}
+
+func TestSessionsKVFullSpillRespectsCooldown(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	place(t, s, 1, []Candidate{pod("a", 4, 1, 0.95), pod("b", 5, 0, 0.4)}, t0, "b", Spill, ReasonKVFull)
+	mk := func(d time.Duration) []Candidate {
+		now := t0.Add(d)
+		a, b := pod("a", 5, 0, 0.4), pod("b", 5, 2, 0.95)
+		a.Sample.At, b.Sample.At = now, now
+		return []Candidate{a, b}
+	}
+	place(t, s, 1, mk(30*time.Second), t0.Add(30*time.Second), "b", Sticky, ReasonNone)
+	place(t, s, 1, mk(61*time.Second), t0.Add(61*time.Second), "a", Spill, ReasonKVFull)
+}
+
+func TestSessionsKVFullHerdSelfLimits(t *testing.T) {
+	s := NewSessions(0, 100)
+	const sessions = 48
+	for k := uint64(1); k <= sessions; k++ {
+		place(t, s, k, []Candidate{pod("p0", 15, 1, 0.95)}, t0, "p0", LeastLoaded, ReasonNone)
+	}
+	cands := make([]Candidate, 0, 8)
+	cands = append(cands, pod("p0", 15, 1, 0.95))
+	for i, running := range []float64{14, 15, 16, 17, 14, 15, 16} {
+		cands = append(cands, pod("p"+string(rune('1'+i)), running, 0, 0.6))
+	}
+	moved := 0
+	for k := uint64(1); k <= sessions; k++ {
+		ep, res, _ := s.Place(k, cands, t0, 0, "")
+		if res != Spill {
+			continue
+		}
+		moved++
+		for i := range cands {
+			if cands[i].Endpoint == ep {
+				cands[i].InFlight++
+				if got, limit := Load(cands[i], t0), Load(cands[0], t0)+1; got > limit {
+					t.Fatalf("session %d: target %s load %d exceeds pod 0 load+1 = %d", k, ep, got, limit)
+				}
+			}
+		}
+	}
+	if moved == 0 || moved == sessions {
+		t.Fatalf("moved = %d of %d, want some but not all", moved, sessions)
+	}
+}
