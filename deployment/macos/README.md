@@ -357,7 +357,8 @@ leaving them to a file someone applied by hand:
 metalAgent:
   rbac:
     enabled: true
-    scope: namespaced        # cluster for an agent watching all namespaces
+    scope: namespaced        # cluster here means "all namespaces", and the
+                             # namespaces list must then be removed
     namespaces: [default]    # the namespace(s) the agent watches; must exist
     secretNames: [llmkube-metal-relay]  # pin the Secret read; omit to read all
 ```
@@ -435,9 +436,9 @@ removed have their ServiceAccount, Role and RoleBinding deleted on upgrade,
 because Helm removes everything that leaves the release manifest. Adding a
 namespace back creates a fresh ServiceAccount with a new UID, so the token
 minted for the previous one stops working: re-run `kubectl create token` and
-`set-credentials` for that namespace. Namespaces
-the chart installs into must exist: Helm creates only the release namespace,
-not the ones the chart names.
+`set-credentials` for that namespace. The namespaces the chart installs into
+must exist: Helm creates only the release namespace, not the ones the chart
+names.
 
 The agent's client also looks up API groups through the API server's
 discovery endpoints (`/api`, `/apis`), which any authenticated identity can

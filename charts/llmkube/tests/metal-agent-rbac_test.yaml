@@ -146,9 +146,9 @@ tests:
       - failedTemplate:
           errorPattern: "metalAgent.rbac.scope"
 
-  # The schema enum already rejects this, so the same render reaches the
-  # template only through a values file applied without schema validation.
-  # The template still refuses rather than silently dropping the list.
+  # values.schema.json cannot express "namespaces is unused under cluster"
+  # (scope's enum admits both values and namespaces has no cross-field rule),
+  # so this template guard is the only one and it runs on every install.
   - it: refuses a namespace list under cluster scope
     release:
       name: rel
