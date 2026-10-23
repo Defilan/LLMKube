@@ -290,20 +290,12 @@ func createPurgePodForPVC(
 		purgePodKind, runID, "", nil)
 }
 
-// ensurePurgePod returns a running purge pod, creating it when absent. A purge
-// pod is never pinned, so the only guard before creating one is a claim that
-// cannot be mounted a second time while a pod holds it.
-func ensurePurgePod(
-	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
-	namespace string, target purgeTarget,
-) (string, error) {
-	return ensurePurgePodReleasing(ctx, k8sClient, clientset, namespace, target, nil)
-}
-
-// ensurePurgePodReleasing is ensurePurgePod with the caller's rule for a
-// holder that is already going away: `delete --purge-cache` passes one so the
-// pod its own InferenceService delete is tearing down does not refuse the
-// purge, and waits for the drain instead.
+// ensurePurgePodReleasing returns a running purge pod, creating it when absent,
+// with the caller's rule for a holder that is already going away:
+// `delete --purge-cache` passes one so the pod its own InferenceService delete
+// is tearing down does not refuse the purge, and waits for the drain instead.
+// A purge pod is never pinned, so the holder check is the only guard before
+// creating one.
 func ensurePurgePodReleasing(
 	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace string, target purgeTarget, releasing func(*corev1.Pod) bool,
