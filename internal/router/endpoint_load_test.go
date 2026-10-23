@@ -21,6 +21,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -111,5 +113,251 @@ func TestRecordSampleStampsInFlightAndClearsOnLeave(t *testing.T) {
 	d.SetEndpoints("qwen", []string{"http://10.0.0.2:8000"})
 	if s := d.loadFor("qwen", "http://10.0.0.1:8000").sample.Load(); s != nil {
 		t.Errorf("a departed endpoint kept its sample: %+v", s)
+	}
+}
+
+func loadAwareBackend(url string) (*Config, *Backend) {
+	cfg, b := singleEndpointBackend(url)
+	b.Balancing = &Balancing{Mode: BalancingLoadAware}
+	return cfg, b
+}
+
+func prefill(d *Dispatcher, ep string) int64 { return d.loadFor("qwen", ep).prefill.Load() }
+
+// promptBody returns a valid chat body of exactly n bytes.
+func promptBody(n int) []byte {
+	head, tail := `{"model":"qwen","messages":[{"role":"user","content":"`, `"}]}`
+	return []byte(head + strings.Repeat("a", n-len(head)-len(tail)) + tail)
+}
+
+func TestDispatchHoldsPrefillUntilFirstByte(t *testing.T) {
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush() // headers go out before prefill, as vLLM's do
+		<-unblock
+		_, _ = io.WriteString(w, "data: {}\n\n")
+		w.(http.Flusher).Flush()
+	}))
+	defer srv.Close()
+	var once sync.Once
+	finish := func() { once.Do(func() { close(unblock) }) }
+	defer finish() // a failed assertion must not leave the handler blocked
+	cfg, b := loadAwareBackend(srv.URL)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{srv.URL})
+
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := prefill(d, srv.URL); got != 1000 {
+		t.Fatalf("prefill after headers, before the first byte = %d, want 1000", got)
+	}
+	finish()
+	if n, err := resp.Body.Read(make([]byte, 64)); n == 0 {
+		t.Fatalf("first read returned no bytes: %v", err)
+	}
+	if got := prefill(d, srv.URL); got != 0 {
+		t.Errorf("prefill after the first byte = %d, want 0", got)
+	}
+}
+
+func TestDispatchReleasesPrefillOnCloseWithoutRead(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cfg, b := loadAwareBackend(srv.URL)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{srv.URL})
+
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	_ = resp.Body.Close()
+	if got := prefill(d, srv.URL); got != 0 {
+		t.Errorf("prefill after Close = %d, want 0", got)
+	}
+}
+
+func TestDispatchReleasesPrefillOnFailures(t *testing.T) {
+	body := promptBody(4000)
+
+	dead := "http://127.0.0.1:1"
+	cfg, b := loadAwareBackend(dead)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{dead})
+	if resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/x", http.Header{}, body); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("dispatch to a closed port succeeded")
+	}
+	if got := prefill(d, dead); got != 0 {
+		t.Errorf("prefill after a connect error = %d, want 0", got)
+	}
+
+	errSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer errSrv.Close()
+	cfg, b = loadAwareBackend(errSrv.URL)
+	d = NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{errSrv.URL})
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/x", http.Header{}, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if got := prefill(d, errSrv.URL); got != 0 {
+		t.Errorf("prefill after a 5xx = %d, want 0", got)
+	}
+
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body) // lets the server notice the client leave
+		<-r.Context().Done()               // never sends headers
+	}))
+	defer hang.Close()
+	cfg, b = loadAwareBackend(hang.URL)
+	d = NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{hang.URL})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if resp, err := d.Dispatch(ctx, b, http.MethodPost, "/x", http.Header{}, body); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("dispatch past its deadline succeeded")
+	}
+	if got := prefill(d, hang.URL); got != 0 {
+		t.Errorf("prefill after a cancel before headers = %d, want 0", got)
+	}
+}
+
+func TestDispatchRoundRobinCountsNoPrefill(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cfg, b := singleEndpointBackend(srv.URL)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{srv.URL})
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := prefill(d, srv.URL); got != 0 {
+		t.Errorf("round-robin prefill = %d, want 0", got)
+	}
+	if got := d.ExpirePrefill(time.Now().Add(24 * time.Hour)); got != 0 {
+		t.Errorf("round-robin ledger entries = %d, want 0", got)
+	}
+}
+
+func TestDispatchEmptyBodyCountsNoPrefill(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cfg, b := loadAwareBackend(srv.URL)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{srv.URL})
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if got := prefill(d, srv.URL); got != 0 {
+		t.Errorf("empty-body prefill = %d, want 0", got)
+	}
+	if got := d.ExpirePrefill(time.Now().Add(24 * time.Hour)); got != 0 {
+		t.Errorf("empty-body ledger entries = %d, want 0", got)
+	}
+}
+
+func TestPrefillReleasesAfterEndpointLeaves(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cfg, b := loadAwareBackend(srv.URL)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{srv.URL})
+	resp, err := d.Dispatch(context.Background(), b, http.MethodPost, "/v1/chat/completions", http.Header{}, promptBody(4000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := d.loadFor("qwen", srv.URL)
+	d.SetEndpoints("qwen", nil)
+	_ = resp.Body.Close()
+	if got := held.prefill.Load(); got != 0 {
+		t.Errorf("prefill on the departed endpoint's record = %d, want 0", got)
+	}
+	if got := prefill(d, srv.URL); got < 0 {
+		t.Errorf("prefill went negative: %d", got)
+	}
+}
+
+func TestPrefillJanitorExpiresOnlyOldEntries(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	cfg, _ := loadAwareBackend("http://unused")
+	d := NewDispatcher(cfg, WithNowFunc(func() time.Time { return now }))
+	releaseOld := d.trackPrefill("qwen", "ep", 1000)
+	start := now
+	now = now.Add(10 * time.Minute)
+	releaseNew := d.trackPrefill("qwen", "ep", 2000)
+	defer releaseNew()
+
+	if got := d.ExpirePrefill(start.Add(d.prefillTTL() + time.Second)); got != 1 {
+		t.Fatalf("expired = %d, want 1 (only the old entry)", got)
+	}
+	if got := d.loadFor("qwen", "ep").prefill.Load(); got != 2000 {
+		t.Fatalf("prefill after expiry = %d, want 2000", got)
+	}
+	releaseOld() // the real release after the janitor's must not subtract again
+	if got := d.loadFor("qwen", "ep").prefill.Load(); got != 2000 {
+		t.Errorf("prefill after a late release = %d, want 2000", got)
+	}
+}
+
+func TestPrefillJanitorTTLWithIdleGuardOff(t *testing.T) {
+	cfg, _ := loadAwareBackend("http://unused")
+	d := NewDispatcher(cfg, WithStreamIdleTimeout(0))
+	if got, want := d.prefillTTL(), defaultResponseHeaderTimeout+defaultStreamIdleTimeout; got != want {
+		t.Errorf("prefillTTL with the idle guard off = %s, want %s", got, want)
+	}
+}
+
+func TestPrefillConcurrentDispatchEndsAtZero(t *testing.T) {
+	cfg, _ := loadAwareBackend("http://unused")
+	d := NewDispatcher(cfg)
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			release := d.trackPrefill("qwen", "ep", 1000)
+			release()
+			if i%2 == 0 {
+				release()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := d.loadFor("qwen", "ep").prefill.Load(); got != 0 {
+		t.Errorf("prefill after 1000 concurrent dispatches = %d, want 0", got)
+	}
+	if got := d.ExpirePrefill(time.Now().Add(24 * time.Hour)); got != 0 {
+		t.Errorf("ledger entries left = %d, want 0", got)
 	}
 }
