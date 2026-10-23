@@ -194,8 +194,8 @@ func inspectSinglePVC(
 	}
 	holder := claimHolder(pods.Items, pvcInfo.Name)
 	runID := purgeRunID()
-	if err := secondMountBlocker(claim, holder, pvcInfo.Name, inspectorPodName(pvcInfo.Name),
-		inspectorPodKind, runID); err != nil {
+	if err := secondMountBlocker(holder, pvcInfo.Name, inspectorPodName(pvcInfo.Name),
+		inspectorPodKind, runID, claimSinglePodNow(ctx, k8sClient, namespace, pvcInfo.Name)); err != nil {
 		return nil, err
 	}
 	// A shareable claim is attached wherever it is needed, so pinning the
@@ -359,12 +359,9 @@ func newCacheAccessPodOnNode(
 	tolerations []corev1.Toleration,
 ) *corev1.Pod {
 	pod := newCacheAccessPodForRun(podName, pvcName, component, containerName, readOnly, runID)
-	if node == "" {
-		// Unpinned: the tolerations still apply, there is just no node to pin.
-		pod.Spec.Tolerations = tolerations
-	}
+	// Unpinned pods still take the tolerations; they just have no node to pin to.
+	pod.Spec.Tolerations = tolerations
 	if node != "" {
-		pod.Spec.Tolerations = tolerations
 		pod.Spec.Affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{

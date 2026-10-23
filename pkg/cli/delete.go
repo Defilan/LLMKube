@@ -112,6 +112,11 @@ func runDelete(opts *deleteOptions) error {
 		} else if cacheKey = cachekey.EffectiveKey(purgeModel); cacheKey != "" {
 			modelClaim, stagedClaims = modelCacheClaimName(purgeModel), prefetchedClaims(purgeModel)
 			cacheTargets, cacheSvcs, cacheResolveErr = resolvePurgeTargets(ctx, k8sClient, opts.namespace)
+			// The targets and their access modes come from state read before the
+			// deletes below: the service one of them removes may be what
+			// collects the claim.
+			cacheTargets = stagedPurgeClaims(ctx, k8sClient, opts.namespace, opts.name,
+				modelClaim, stagedClaims, cacheTargets, cacheSvcs)
 		}
 	}
 
@@ -150,10 +155,11 @@ func runDelete(opts *deleteOptions) error {
 	// deletion (issued above) is what frees a strict RWO claim for the purge.
 	if opts.purgeCache && cacheKey != "" {
 		if cacheResolveErr != nil {
+			clearSecondMountSnapshot()
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", cacheResolveErr, opts.namespace)
 		}
-		targets := targetedClaims(cacheTargets, cacheSvcs, opts.name, modelClaim, stagedClaims)
+		targets := cacheTargets
 		var owned, purged []purgeTarget
 		for _, target := range targets {
 			// The operator garbage-collects a claim owner-ref'd to the service
@@ -170,6 +176,7 @@ func runDelete(opts *deleteOptions) error {
 				target.Name, opts.name)
 		}
 		if len(purged) == 0 {
+			clearSecondMountSnapshot()
 			if len(owned) == 0 {
 				fmt.Printf("⚠️  No model cache PVC found in namespace '%s'; nothing to purge\n", opts.namespace)
 			}
@@ -181,7 +188,10 @@ func runDelete(opts *deleteOptions) error {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w", err)
 		}
 		fmt.Printf("🗑️  Purging model cache (cache key: %s)...\n", cacheKey)
-		if err := purgeDeleteTargets(ctx, cfg, k8sClient, clientset, opts.namespace, cacheKey, purged); err != nil {
+		err = purgeDeleteTargets(ctx, cfg, k8sClient, clientset, opts.namespace, cacheKey, purged)
+		// The snapshot covers this run's deletes only.
+		clearSecondMountSnapshot()
+		if err != nil {
 			return fmt.Errorf("deployment deleted, but purging the cache failed: %w; "+
 				"run 'llmkube cache clear -n %s' to clear what remains", err, opts.namespace)
 		}

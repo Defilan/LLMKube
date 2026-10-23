@@ -18,6 +18,7 @@ package cli
 
 import (
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -141,6 +142,24 @@ func mountedPod(name string) *corev1.Pod {
 	return pod
 }
 
+// setHolderStatus records a pod's status as the kubelet would leave it. envtest
+// drops a client-set deletionTimestamp, so the delete has to go through the API
+// server first, and that also drops the status.
+func (e *cacheCommandEnv) setHolderStatus(t *testing.T, name string, status corev1.PodStatus) {
+	t.Helper()
+	pod := &corev1.Pod{}
+	if err := e.cr.Get(context.Background(), client.ObjectKey{Name: name, Namespace: e.namespace}, pod); err != nil {
+		t.Fatalf("get holder %s: %v", name, err)
+	}
+	if pod.DeletionTimestamp == nil {
+		t.Fatal("the holder is not being deleted; the fixture expected a pod in its grace period")
+	}
+	pod.Status = status
+	if err := e.cr.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("record holder status: %v", err)
+	}
+}
+
 // getCreatedPod reads a pod the command created, failing when it does not
 // exist.
 func getCreatedPod(t *testing.T, clientset kubernetes.Interface, namespace, name string) *corev1.Pod {
@@ -176,7 +195,10 @@ func runCacheCommand(t *testing.T, args ...string) error {
 func modelWithCacheKey() *inferencev1alpha1.Model {
 	return &inferencev1alpha1.Model{
 		ObjectMeta: metav1.ObjectMeta{Name: "a-model"},
-		Spec:       inferencev1alpha1.ModelSpec{Source: "https://example.com/model.gguf"},
+		Spec: inferencev1alpha1.ModelSpec{
+			Source: "https://example.com/model.gguf",
+			Files:  []string{"model.gguf", "model-00001-of-00002.gguf"},
+		},
 	}
 }
 
@@ -378,6 +400,74 @@ func TestCacheListProceedsWhenTheHolderOfAReadWriteOncePodClaimIsTerminated(t *t
 	}
 }
 
+// A holder inside its termination grace period still mounts the claim, so the
+// pod cannot start yet, but it releases the claim on its own: the command waits
+// as it always did. delete --purge-cache depends on this, because its own
+// InferenceService delete leaves exactly this holder behind.
+func TestCacheListWaitsForAMidGraceHolderOfAReadWriteOncePodClaim(t *testing.T) {
+	// An InferenceService pod, not a cache-access pod of ours: llmkube deletes
+	// only its own pods at the deterministic names.
+	holder := mountedPod("a-model-7d9f4")
+	holder.Finalizers = []string{"test/hold"}
+	env := cache2155Env(t, "cache-2155-rwop-midgrace", dynamicClaim(corev1.ReadWriteOncePod),
+		[]*corev1.Pod{holder}, modelWithCacheKey())
+	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+	grace := int64(30)
+	if err := env.clientset.CoreV1().Pods(env.namespace).Delete(context.Background(), holder.Name,
+		metav1.DeleteOptions{GracePeriodSeconds: &grace}); err != nil {
+		t.Fatalf("delete the holder: %v", err)
+	}
+	// envtest has no kubelet to report the container stopping, and the apiserver
+	// does not keep a status set before the delete, so record the mid-grace
+	// state the way the kubelet would leave it.
+	env.setHolderStatus(t, holder.Name, corev1.PodStatus{
+		Phase: corev1.PodRunning,
+		ContainerStatuses: []corev1.ContainerStatus{{
+			Name: "manager", State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}},
+	})
+
+	if err := runCacheCommand(t, "list", "-n", env.namespace); err != nil {
+		t.Fatalf("a holder that is being deleted releases the claim, so the run must wait for it: %v", err)
+	}
+	if err := runCacheCommand(t, "clear", "--force", "-n", env.namespace); err != nil {
+		t.Fatalf("cache clear must wait for a holder that is being deleted: %v", err)
+	}
+}
+
+// delete --purge-cache deletes the InferenceService and then purges, and the
+// service delete may be what collects the claim, so the mode has to be read
+// before it.
+func TestDeletePurgeRefusesAHeldReadWriteOncePodClaim(t *testing.T) {
+	env := cache2155Env(t, "cache-2155-delete-rwop", dynamicClaim(corev1.ReadWriteOncePod),
+		[]*corev1.Pod{mountedPod("serving")}, modelWithCacheKey())
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "a-model"},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:   "a-model",
+			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
+		},
+	}
+	isvc.Namespace = env.namespace
+	if err := env.cr.Create(context.Background(), isvc); err != nil {
+		t.Fatalf("create InferenceService: %v", err)
+	}
+	// Another command in this process must not answer for this run's claims.
+	forgetSecondMountSnapshot()
+	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+	err := runDeleteCommandFor2155(t, "a-model", env.namespace)
+	if err == nil {
+		t.Fatal("delete --purge-cache succeeded; want the ReadWriteOncePod refusal")
+	}
+	if !strings.Contains(err.Error(), "ReadWriteOncePod") {
+		t.Errorf("error = %q, want it to name the access mode", err)
+	}
+	if podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
+		t.Error("a purge pod was created for a claim it cannot mount")
+	}
+}
+
 // Parity: a cache pod this run may replace is not a reason to refuse: it is
 // cleared and the claim becomes free.
 func TestCacheListReplacesItsOwnStaleInspectorOnAReadWriteOncePodClaim(t *testing.T) {
@@ -400,6 +490,9 @@ func TestCacheListReplacesItsOwnStaleInspectorOnAReadWriteOncePodClaim(t *testin
 // Parity: a claim that cannot be read tells nothing about its access mode, and
 // an unpinned strict claim stalls on Multi-Attach, so base's pin is kept.
 func TestCacheListKeepsTheBasePinWhenTheClaimReadIsRefused(t *testing.T) {
+	// No snapshot by a caller's own delete: the mode comes from this read.
+	forgetSecondMountSnapshot()
+
 	pvc := dynamicClaim(corev1.ReadWriteOnce)
 	holder := mountedPod("serving")
 	c := fake.NewClientBuilder().WithScheme(cacheListScheme()).
@@ -507,3 +600,20 @@ var (
 	// caller without RBAC on persistentvolumeclaims gets.
 	forbidClaimGet bool
 )
+
+// runDeleteCommandFor2155 executes delete with --purge-cache.
+func runDeleteCommandFor2155(t *testing.T, name, namespace string) error {
+	t.Helper()
+	t.Helper()
+	cmd := NewDeleteCommand()
+	cmd.SetArgs([]string{name, "--purge-cache", "-n", namespace})
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	return cmd.Execute()
+}
+
+// forgetSecondMountSnapshot is test-cleanup only: base keeps no snapshot, so
+// there is nothing to drop and the file compiles on both trees.
+func forgetSecondMountSnapshot() {}

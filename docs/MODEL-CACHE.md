@@ -821,8 +821,10 @@ that cannot pull that image, pass `--cache-image <ref>` (or set
 --purge-cache`; the flag wins over the variable.
 
 A `ReadWriteOncePod` claim another pod holds cannot be mounted a second time
-on any node, so both commands refuse it at once and name the access mode and
-the holding pod, instead of waiting for a pod that can never start. `cache
+on any node, so `cache list`, `cache clear` and `delete --purge-cache` refuse
+it at once, naming the access mode and the holding pod, instead of waiting for
+a pod that can never start. A pod that is already being deleted releases the
+claim, so it is waited for, not refused. `cache
 list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
 claim: a `ReadWriteMany` or `ReadOnlyMany` claim is never pinned.
 
