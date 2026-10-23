@@ -100,7 +100,12 @@ type backendHealth struct {
 type Dispatcher struct {
 	cfg    *Config
 	client *http.Client
-	health sync.Map // healthKey -> *backendHealth
+	// freshClient shares client's settings with keep-alives off, so each
+	// request it sends dials a new connection. Only the stale-connection
+	// retry uses it: setting Request.Close does not stop the transport
+	// handing out another pooled connection.
+	freshClient *http.Client
+	health      sync.Map // healthKey -> *backendHealth
 
 	// endpoints holds the per-pod addresses for backends that balance across
 	// them, keyed by backend name, so IsHealthy can decide from the endpoint
@@ -216,18 +221,22 @@ func NewDispatcher(cfg *Config, opts ...DispatcherOption) *Dispatcher {
 	for _, opt := range opts {
 		opt(d)
 	}
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       defaultIdleConnTimeout,
+		ResponseHeaderTimeout: d.responseHeaderTimeout,
+	}
 	d.client = &http.Client{
 		// Streaming requests can be long-lived. The per-request
 		// context is the real deadline; this caps idle and connect
 		// phases to prevent leaking goroutines on dead backends.
-		Timeout: 0,
-		Transport: &http.Transport{
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       defaultIdleConnTimeout,
-			ResponseHeaderTimeout: d.responseHeaderTimeout,
-		},
+		Timeout:   0,
+		Transport: transport,
 	}
+	fresh := transport.Clone()
+	fresh.DisableKeepAlives = true
+	d.freshClient = &http.Client{Timeout: 0, Transport: fresh}
 	for _, b := range cfg.Backends {
 		h := &backendHealth{}
 		h.healthy.Store(true)
@@ -497,8 +506,9 @@ func (d *Dispatcher) Dispatch(
 			release()
 			return nil, rerr
 		}
-		req.Close = true             // never hand the retry another pooled connection
-		resp, err = d.client.Do(req) //nolint:gosec // G704: same destination as above
+		// A client with keep-alives off: the pool may hold more connections
+		// the upstream has already closed.
+		resp, err = d.freshClient.Do(req) //nolint:gosec // G704: same destination as above
 	}
 	if err != nil {
 		// A per-attempt context deadline (caller's

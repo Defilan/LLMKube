@@ -180,3 +180,49 @@ func TestAllBackendsFailedAuditCarriesTheErrorAndQuarantineIsLogged(t *testing.T
 		t.Errorf("no Warn log for the quarantine:\n%s", out)
 	}
 }
+
+// With several idle connections to the pod, all reaped by the upstream, the
+// retry must not take another pooled one: it needs a connection of its own.
+func TestDispatchStaleRetryUsesAFreshConnection(t *testing.T) {
+	// Two first requests are held until both have arrived, so the pool ends
+	// up with two idle connections to the pod.
+	var arrived atomic.Int32
+	both := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.Context().Value(connCountKey{}).(*atomic.Int32).Add(1) >= 2 {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		if arrived.Add(1) == 2 {
+			close(both)
+		}
+		select {
+		case <-both:
+		case <-time.After(5 * time.Second):
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	srv.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+		return context.WithValue(ctx, connCountKey{}, new(atomic.Int32))
+	}
+	srv.Start()
+	defer srv.Close()
+	cfg, b := singleEndpointBackend(srv.URL)
+	d := NewDispatcher(cfg)
+	d.SetEndpoints("qwen", []string{srv.URL})
+
+	done := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() { defer func() { done <- struct{}{} }(); dispatchOK(t, d, b) }()
+	}
+	<-done
+	<-done
+
+	dispatchOK(t, d, b) // reuses one idle connection; the retry must not take the other
+}
