@@ -191,8 +191,8 @@ func abandonedSwapAuditLine(log string, start time.Time) bool {
 // auditLineTime returns the wall-clock time slog's TextHandler stamped on line,
 // truncated to the millisecond the handler prints. The truncation makes the
 // comparison lenient by up to a millisecond, which the second request's held
-// wait covers. The zone offset carries no colon, so the stamp parses as
-// RFC3339Nano.
+// wait covers. The handler prints the zone offset with its colon (-07:00),
+// which is what RFC 3339 requires and what RFC3339Nano parses.
 func auditLineTime(line string) (time.Time, bool) {
 	for _, field := range strings.Fields(line) {
 		stamp, ok := strings.CutPrefix(field, "time=")
