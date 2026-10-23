@@ -102,6 +102,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 	var revisionHistoryLimit *int32 // nil: use the default
 	var nodeSelector map[string]string
 	var tolerations []corev1.Toleration
+	var runtimeClassName *string
 
 	if mr.Spec.Proxy != nil {
 		if mr.Spec.Proxy.Replicas != nil {
@@ -117,6 +118,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 		imagePullSecrets = mr.Spec.Proxy.ImagePullSecrets
 		nodeSelector = mr.Spec.Proxy.NodeSelector
 		tolerations = mr.Spec.Proxy.Tolerations
+		runtimeClassName = mr.Spec.Proxy.RuntimeClassName
 	}
 	// A pooled router must run exactly one proxy replica: ModelPool activation
 	// serializes swaps through a single in-process lock, so a second replica
@@ -170,6 +172,7 @@ func (r *ModelRouterReconciler) newRouterDeployment(
 					ImagePullSecrets:   imagePullSecrets,
 					NodeSelector:       nodeSelector,
 					Tolerations:        tolerations,
+					RuntimeClassName:   runtimeClassName,
 					Containers: []corev1.Container{
 						{
 							Name:            routerProxyContainerName,

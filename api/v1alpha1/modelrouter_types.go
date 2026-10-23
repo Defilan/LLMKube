@@ -80,7 +80,7 @@ const (
 // required capabilities, request headers, or model name, and the router
 // supports fail-closed semantics for sensitive-data routes so PII never
 // escapes the cluster boundary.
-// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || (!has(self.endpoint.apiKeySecretRef) && !has(self.endpoint.externalTrafficPolicy))",message="endpoint.apiKeySecretRef and endpoint.externalTrafficPolicy are InferenceService fields; ModelRouter does not support them"
+// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef)",message="endpoint.apiKeySecretRef is an InferenceService field; ModelRouter does not support it"
 type ModelRouterSpec struct {
 	// DataPlane selects how this ModelRouter serves traffic.
 	//
@@ -705,6 +705,15 @@ type RouterProxySpec struct {
 	// +kubebuilder:validation:Minimum=0
 	// +optional
 	RevisionHistoryLimit *int32 `json:"revisionHistoryLimit,omitempty"`
+
+	// RuntimeClassName selects a Kubernetes RuntimeClass for the router-proxy
+	// pod, for example a sandboxed runtime such as gVisor or Kata. Maps
+	// directly to PodSpec.RuntimeClassName. A RuntimeClass with a scheduling
+	// section has its node selector and tolerations merged into the pod by the
+	// RuntimeClass admission controller, so no separate fields are needed.
+	// Unset leaves the pod spec unchanged.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 
 	// Image overrides the default router-proxy container image. Useful
 	// for air-gapped clusters that pin to an internal registry digest.

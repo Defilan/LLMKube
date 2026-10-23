@@ -2158,6 +2158,11 @@ func (in *RouterProxySpec) DeepCopyInto(out *RouterProxySpec) {
 		*out = new(int32)
 		**out = **in
 	}
+	if in.RuntimeClassName != nil {
+		in, out := &in.RuntimeClassName, &out.RuntimeClassName
+		*out = new(string)
+		**out = **in
+	}
 	if in.Resources != nil {
 		in, out := &in.Resources, &out.Resources
 		*out = new(corev1.ResourceRequirements)

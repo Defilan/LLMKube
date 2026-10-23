@@ -498,8 +498,7 @@ spec:
                       ExternalTrafficPolicy sets the Service's externalTrafficPolicy. Local
                       preserves the client source IP on a NodePort or LoadBalancer, which an IP
                       allowlist (NetworkPolicy) needs. Unset keeps the Kubernetes default
-                      (Cluster). Requires endpoint.type NodePort or LoadBalancer. Not supported
-                      on ModelRouter.
+                      (Cluster). Requires endpoint.type NodePort or LoadBalancer.
                     enum:
                     - Cluster
                     - Local
@@ -997,6 +996,15 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  runtimeClassName:
+                    description: |-
+                      RuntimeClassName selects a Kubernetes RuntimeClass for the router-proxy
+                      pod, for example a sandboxed runtime such as gVisor or Kata. Maps
+                      directly to PodSpec.RuntimeClassName. A RuntimeClass with a scheduling
+                      section has its node selector and tolerations merged into the pod by the
+                      RuntimeClass admission controller, so no separate fields are needed.
+                      Unset leaves the pod spec unchanged.
+                    type: string
                   streamIdleTimeout:
                     description: |-
                       StreamIdleTimeout caps how long a response body may go without a
@@ -1198,10 +1206,9 @@ spec:
             - backends
             type: object
             x-kubernetes-validations:
-            - message: endpoint.apiKeySecretRef and endpoint.externalTrafficPolicy
-                are InferenceService fields; ModelRouter does not support them
-              rule: '!has(self.endpoint) || (!has(self.endpoint.apiKeySecretRef) &&
-                !has(self.endpoint.externalTrafficPolicy))'
+            - message: endpoint.apiKeySecretRef is an InferenceService field; ModelRouter
+                does not support it
+              rule: '!has(self.endpoint) || !has(self.endpoint.apiKeySecretRef)'
           status:
             description: status defines the observed state of ModelRouter
             properties:

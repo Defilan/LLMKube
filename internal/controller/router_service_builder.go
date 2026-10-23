@@ -39,8 +39,8 @@ func (r *ModelRouterReconciler) reconcileRouterService(
 
 // reconcileServiceObject creates the Service if absent and otherwise syncs the
 // mutable fields. The selector is immutable in the K8s API; it is set once at
-// creation and never mutated. Ports and service-type are the only mutable bits
-// worth syncing.
+// creation and never mutated. Ports, service-type and externalTrafficPolicy
+// are the only mutable bits worth syncing.
 func (r *ModelRouterReconciler) reconcileServiceObject(
 	ctx context.Context,
 	mr *inferencev1alpha1.ModelRouter,
@@ -63,7 +63,12 @@ func (r *ModelRouterReconciler) reconcileServiceObject(
 	}
 
 	existing.Spec.Type = desired.Spec.Type
-	existing.Spec.Ports = desired.Spec.Ports
+	// Carry the allocated node port over when the spec does not pin one, so an
+	// update never sends nodePort 0 and lets the apiserver reassign it.
+	existing.Spec.Ports = mergeServicePorts(existing.Spec.Ports, desired.Spec.Ports, desired.Spec.Type)
+	// Empty is safe to send: the apiserver re-defaults it to Cluster on
+	// NodePort/LoadBalancer, so removing the field reverts to the default.
+	existing.Spec.ExternalTrafficPolicy = desired.Spec.ExternalTrafficPolicy
 	existing.Labels = desired.Labels
 	if err := setControllerReferenceUnblocked(mr, existing, r.Scheme); err != nil {
 		return fmt.Errorf("set owner ref on existing router Service %s: %w", desired.Name, err)
@@ -76,6 +81,8 @@ func (r *ModelRouterReconciler) reconcileServiceObject(
 func newRouterService(mr *inferencev1alpha1.ModelRouter) *corev1.Service {
 	port := routerProxyPort
 	serviceType := corev1.ServiceTypeClusterIP
+	var nodePort int32
+	var etp corev1.ServiceExternalTrafficPolicy
 	if mr.Spec.Endpoint != nil {
 		if mr.Spec.Endpoint.Port > 0 {
 			port = mr.Spec.Endpoint.Port
@@ -86,6 +93,12 @@ func newRouterService(mr *inferencev1alpha1.ModelRouter) *corev1.Service {
 		case "LoadBalancer":
 			serviceType = corev1.ServiceTypeLoadBalancer
 		}
+		if serviceType == corev1.ServiceTypeNodePort && mr.Spec.Endpoint.NodePort != nil {
+			nodePort = *mr.Spec.Endpoint.NodePort
+		}
+		if mr.Spec.Endpoint.ExternalTrafficPolicy != "" && serviceType != corev1.ServiceTypeClusterIP {
+			etp = corev1.ServiceExternalTrafficPolicy(mr.Spec.Endpoint.ExternalTrafficPolicy)
+		}
 	}
 
 	return &corev1.Service{
@@ -95,12 +108,14 @@ func newRouterService(mr *inferencev1alpha1.ModelRouter) *corev1.Service {
 			Labels:    routerProxyLabels(mr),
 		},
 		Spec: corev1.ServiceSpec{
-			Type:     serviceType,
-			Selector: routerProxySelectorLabels(mr),
+			Type:                  serviceType,
+			Selector:              routerProxySelectorLabels(mr),
+			ExternalTrafficPolicy: etp,
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "http",
 					Port:       port,
+					NodePort:   nodePort,
 					TargetPort: intstr.FromInt(int(port)),
 					Protocol:   corev1.ProtocolTCP,
 				},
