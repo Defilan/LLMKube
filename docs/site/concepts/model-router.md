@@ -235,6 +235,7 @@ Without a session header, each request goes to the least-loaded pod. With one, t
 
 - **A new session** goes to the least-loaded pod and is remembered there.
 - **A known session stays on its pod** unless one of three things moves it. With fresh engine metrics, it moves if its pod has requests waiting and carries at least 4 more requests than the least-loaded pod. Without fresh metrics, it moves on an in-flight gap of 8 or more alone, with no waiting requests needed. It also moves if its pod is KV-full and queuing and the target has a fresh sample showing KV room, as long as the target is no busier than the full pod; a KV-full pod sheds only to a pod no busier than itself, so a herd cannot pile onto one target. If the target has no such sample, the gap of 4 still applies. A pod whose fresh sample is KV-full is never a spill target. When every pod is KV-full, a session whose pod left can still land on a full pod.
+- **On a backend with fewer than 3 dispatchable pods, only a KV-full pod sheds sessions.** A queue and a load gap alone never move a session there, because with one or two pods every move lands on a cold prefix cache. Moving off a pod that left the candidate set is unchanged.
 - **A session that moved stays on its new pod.** It cannot move again for pressure for 60 seconds, and after that it can.
 - **A session whose pod left** (not ready, or quarantined by the circuit breaker) moves at once.
 - **KV-full alone does not move a session.** Only new sessions avoid KV-full pods.

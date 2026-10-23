@@ -78,7 +78,7 @@ func TestSessionsSpillsOnQueueAndMargin(t *testing.T) {
 	for _, c := range cases {
 		s := NewSessions(0, 10)
 		bindToA(t, s, t0)
-		cands := []Candidate{pod("a", 20, 2, 0.1), pod("b", c.leastRunning, 0, 0.1)}
+		cands := []Candidate{pod("a", 20, 2, 0.1), pod("b", c.leastRunning, 0, 0.1), pod("z", 50, 0, 0.1)}
 		place(t, s, 1, cands, t0, c.want, c.res, c.reason)
 	}
 }
@@ -86,22 +86,23 @@ func TestSessionsSpillsOnQueueAndMargin(t *testing.T) {
 func TestSessionsDoesNotReturnHomeAfterSpill(t *testing.T) {
 	s := NewSessions(0, 10)
 	bindToA(t, s, t0)
-	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 15, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
-	place(t, s, 1, []Candidate{pod("a", 0, 0, 0.1), pod("b", 15, 0, 0.1)}, t0.Add(time.Second), "b", Sticky, ReasonNone)
+	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 15, 0, 0.1), pod("z", 50, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
+	place(t, s, 1, []Candidate{pod("a", 0, 0, 0.1), pod("b", 15, 0, 0.1), pod("z", 50, 0, 0.1)}, t0.Add(time.Second), "b", Sticky, ReasonNone)
 }
 
 func TestSessionsCooldown(t *testing.T) {
 	s := NewSessions(0, 10)
 	bindToA(t, s, t0)
-	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
+	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1), pod("z", 50, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
 	// b is now under pressure with a gap of 6.
 	at := func(d time.Duration) time.Time { return t0.Add(d) }
 	mk := func(d time.Duration) []Candidate {
 		now := at(d)
 		a := pod("a", 0, 0, 0.1)
 		b := pod("b", 3, 3, 0.1)
-		a.Sample.At, b.Sample.At = now, now
-		return []Candidate{a, b}
+		z := pod("z", 50, 0, 0.1)
+		a.Sample.At, b.Sample.At, z.Sample.At = now, now, now
+		return []Candidate{a, b, z}
 	}
 	place(t, s, 1, mk(30*time.Second), at(30*time.Second), "b", Sticky, ReasonNone)
 	place(t, s, 1, mk(61*time.Second), at(61*time.Second), "a", Spill, ReasonWaiting)
@@ -110,7 +111,7 @@ func TestSessionsCooldown(t *testing.T) {
 func TestSessionsMigratesWhenPodLeaves(t *testing.T) {
 	s := NewSessions(0, 10)
 	bindToA(t, s, t0)
-	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
+	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1), pod("z", 50, 0, 0.1)}, t0, "b", Spill, ReasonWaiting)
 	// b leaves inside the cooldown.
 	now := t0.Add(5 * time.Second)
 	c := pod("c", 1, 0, 0.1)
@@ -148,8 +149,8 @@ func TestSessionsSinglePodNeverSpills(t *testing.T) {
 func TestSessionsNoSampleUsesInFlightMargin(t *testing.T) {
 	s := NewSessions(0, 10)
 	bindToA(t, s, t0)
-	place(t, s, 1, []Candidate{bare("a", 12), bare("b", 5)}, t0, "a", Sticky, ReasonNone)
-	place(t, s, 1, []Candidate{bare("a", 13), bare("b", 5)}, t0, "b", Spill, ReasonWaiting)
+	place(t, s, 1, []Candidate{bare("a", 12), bare("b", 5), bare("z", 50)}, t0, "a", Sticky, ReasonNone)
+	place(t, s, 1, []Candidate{bare("a", 13), bare("b", 5), bare("z", 50)}, t0, "b", Spill, ReasonWaiting)
 }
 
 func TestSessionsExpiredKeyIsNew(t *testing.T) {
@@ -375,4 +376,43 @@ func TestSessionsKVFullHerdSelfLimits(t *testing.T) {
 	if moved == 0 || moved == sessions {
 		t.Fatalf("moved = %d of %d, want some but not all", moved, sessions)
 	}
+}
+
+// On a pool under MinPodsForLoadMoves, every move lands on a cold prefix
+// cache, so a queue and a load gap alone keep the session where it is.
+func TestSessionsSmallPoolGapAloneStays(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	place(t, s, 1, []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1)}, t0, "a", Sticky, ReasonNone)
+}
+
+func TestSessionsSmallPoolNoSampleGapStays(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	place(t, s, 1, []Candidate{bare("a", 30), bare("b", 0)}, t0, "a", Sticky, ReasonNone)
+}
+
+func TestSessionsSmallPoolKVFullStillSheds(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), pod("b", 0, 0, 0.4)}, t0, "b", Spill, ReasonKVFull)
+}
+
+func TestSessionsSmallPoolKVFullShedsToStaleTargetByGap(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	place(t, s, 1, []Candidate{pod("a", 20, 10, 0.95), bare("b", 0)}, t0, "b", Spill, ReasonKVFull)
+}
+
+func TestSessionsSmallPoolMigratesWhenPodLeaves(t *testing.T) {
+	s := NewSessions(0, 10)
+	place(t, s, 1, []Candidate{pod("a", 0, 0, 0.1), pod("b", 3, 0, 0.1)}, t0, "a", LeastLoaded, ReasonNone)
+	place(t, s, 1, []Candidate{pod("b", 3, 0, 0.1)}, t0.Add(time.Second), "b", Migrated, ReasonNotReady)
+}
+
+func TestSessionsThreePodsGapMoves(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	cands := []Candidate{pod("a", 20, 2, 0.1), pod("b", 0, 0, 0.1), pod("c", 30, 0, 0.1)}
+	place(t, s, 1, cands, t0, "b", Spill, ReasonWaiting)
 }
