@@ -513,3 +513,25 @@ func TestSessionsTokensAloneDoNotMoveASession(t *testing.T) {
 		t.Fatalf("request gap 3: got (%q, %q), want (a, sticky)", ep, res)
 	}
 }
+
+// Prefill tokens choose the spill target, and the gap and KV rules are then
+// measured to that target. Here the token-light target has a fresh sample with
+// KV room, so a KV-full pod sheds where, without tokens, the stale pod would
+// have been the target and the session would have stayed.
+func TestSessionsTokensPickTheTargetTheKVRuleMeasures(t *testing.T) {
+	s := NewSessions(0, 10)
+	bindToA(t, s, t0)
+	x := bare("x", 3)
+	x.Prefill = 100000
+	ep, res, reason, _ := s.Place(1, []Candidate{pod("a", 5, 1, 0.95), x, pod("y", 5, 0, 0.5)}, t0, 0, "", 0)
+	if ep != "y" || res != Spill || reason != ReasonKVFull {
+		t.Fatalf("got (%q, %q, %q), want (y, spill, kv_full)", ep, res, reason)
+	}
+	x.Prefill = 0
+	s2 := NewSessions(0, 10)
+	bindToA(t, s2, t0)
+	ep, res, _, _ = s2.Place(1, []Candidate{pod("a", 5, 1, 0.95), x, pod("y", 5, 0, 0.5)}, t0, 0, "", 0)
+	if ep != "a" || res != Sticky {
+		t.Fatalf("without tokens: got (%q, %q), want (a, sticky)", ep, res)
+	}
+}
