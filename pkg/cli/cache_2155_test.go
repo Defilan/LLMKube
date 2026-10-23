@@ -21,7 +21,9 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -146,6 +148,20 @@ func mountedPod(name string) *corev1.Pod {
 // setHolderStatus records a pod's status as the kubelet would leave it. envtest
 // drops a client-set deletionTimestamp, so the delete has to go through the API
 // server first, and that also drops the status.
+// replicaSetClient is the CR client with apps/v1 in its scheme, for the
+// ownership chain a purge walks.
+func (e *cacheCommandEnv) replicaSetClient() client.Client {
+	scheme := cacheListEnvScheme()
+	if err := appsv1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	c, err := client.New(e.cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
 func (e *cacheCommandEnv) setHolderStatus(t *testing.T, name string, status corev1.PodStatus) {
 	t.Helper()
 	pod := &corev1.Pod{}
@@ -444,27 +460,50 @@ func TestCacheListWaitsForAMidGraceHolderOfAReadWriteOncePodClaim(t *testing.T) 
 func TestDeletePurgeWaitsForTheServingPodItIsTearingDown(t *testing.T) {
 	env := cache2155Env(t, "cache-2155-delete-serving", dynamicClaim(corev1.ReadWriteOncePod),
 		nil, modelWithCacheKey())
-	// The serving pod one controller hop from the InferenceService, named as
-	// the deployment controller names its replicaset.
-	serving := mountedPod("a-model-7d9f4")
-	serving.Namespace = env.namespace
-	serving.OwnerReferences = []metav1.OwnerReference{{
-		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "a-model-7d9f4",
-		UID: "0b9c4e1a-0000-4000-8000-000000000000", Controller: boolPtr(true),
-	}}
-	if _, err := env.clientset.CoreV1().Pods(env.namespace).Create(context.Background(), serving,
-		metav1.CreateOptions{}); err != nil {
-		t.Fatalf("create the serving pod: %v", err)
-	}
-	isvc := &inferencev1alpha1.InferenceService{
+	// The serving pod and the ReplicaSet that owns it, the ownership chain the
+	// deployment controller builds under the InferenceService.
+	owner := &inferencev1alpha1.InferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "a-model", Namespace: env.namespace},
 		Spec: inferencev1alpha1.InferenceServiceSpec{
 			ModelRef:   "a-model",
 			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
 		},
 	}
-	if err := env.cr.Create(context.Background(), isvc); err != nil {
+	if err := env.cr.Create(context.Background(), owner); err != nil {
 		t.Fatalf("create InferenceService: %v", err)
+	}
+	// The ReplicaSet is read by the purge through the CR client, whose scheme
+	// has to know the type; it needs no pods of its own to own one.
+	labels := map[string]string{"app": "a-model", "inference.llmkube.dev/service": "a-model"}
+	set := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "a-model-7d9f4",
+			Namespace: env.namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "inference.llmkube.dev/v1alpha1", Kind: "InferenceService",
+				Name: "a-model", UID: owner.UID, Controller: boolPtr(true),
+			}},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
+			},
+		},
+	}
+	if err := env.replicaSetClient().Create(context.Background(), set); err != nil {
+		t.Fatalf("create the serving ReplicaSet: %v", err)
+	}
+	serving := mountedPod("a-model-7d9f4-pod")
+	serving.Namespace = env.namespace
+	serving.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: set.Name, UID: set.UID, Controller: boolPtr(true),
+	}}
+	if _, err := env.clientset.CoreV1().Pods(env.namespace).Create(context.Background(), serving,
+		metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create the serving pod: %v", err)
 	}
 	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
 
@@ -473,6 +512,68 @@ func TestDeletePurgeWaitsForTheServingPodItIsTearingDown(t *testing.T) {
 	}
 	if !podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
 		t.Error("no purge pod was created, so the purge never ran")
+	}
+}
+
+// A pod of another service whose name merely starts with the deleted one is not
+// the pod this run is tearing down: the name is not proof, the owner chain is.
+func TestDeletePurgeRefusesAPodOfAServiceWhoseNameStartsWithIt(t *testing.T) {
+	env := cache2155Env(t, "cache-2155-delete-prefix", dynamicClaim(corev1.ReadWriteOncePod),
+		nil, modelWithCacheKey())
+	other := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "a-model-v2", Namespace: env.namespace},
+		Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "a-model"},
+	}
+	if err := env.cr.Create(context.Background(), other); err != nil {
+		t.Fatalf("create the other InferenceService: %v", err)
+	}
+	labels := map[string]string{"app": "a-model-v2", "inference.llmkube.dev/service": "a-model-v2"}
+	set := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "a-model-v2-8b6c1", Namespace: env.namespace, Labels: labels,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "inference.llmkube.dev/v1alpha1", Kind: "InferenceService",
+				Name: "a-model-v2", UID: other.UID, Controller: boolPtr(true),
+			}},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "serving", Image: "busybox"}}},
+			},
+		},
+	}
+	if err := env.replicaSetClient().Create(context.Background(), set); err != nil {
+		t.Fatalf("create the other ReplicaSet: %v", err)
+	}
+	serving := mountedPod("a-model-v2-8b6c1-pod")
+	serving.Namespace = env.namespace
+	serving.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: set.Name, UID: set.UID, Controller: boolPtr(true),
+	}}
+	if _, err := env.clientset.CoreV1().Pods(env.namespace).Create(context.Background(), serving,
+		metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create the other service's pod: %v", err)
+	}
+	target := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "a-model", Namespace: env.namespace},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:   "a-model",
+			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
+		},
+	}
+	if err := env.cr.Create(context.Background(), target); err != nil {
+		t.Fatalf("create the deleted InferenceService: %v", err)
+	}
+	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+	err := runDeleteCommandFor2155(t, "a-model", env.namespace)
+	if err == nil || !strings.Contains(err.Error(), "ReadWriteOncePod") {
+		t.Fatalf("another service's pod is not exempt as this run's own pod: err = %v", err)
+	}
+	if podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
+		t.Error("a purge pod was created for a claim it cannot mount")
 	}
 }
 
@@ -602,6 +703,24 @@ func TestPurgeRefusesAReadWriteOncePodClaimFromItsResolvedTarget(t *testing.T) {
 	}
 	if podExists(t, clientset, "test-ns", purgePodName(modelCachePVCName)) {
 		t.Error("a purge pod was created for a claim it cannot mount")
+	}
+}
+
+// A leaked cache-access pod of the other kind is llmkube's own and outlived the
+// run that made it, so the refusal names nothing the run would not itself
+// delete: it is replaced as any stale cache pod is.
+func TestCacheClearReplacesALeakedInspectorOnAReadWriteOncePodClaim(t *testing.T) {
+	leaked := mountedPod(inspectorPodName(modelCachePVCName))
+	leaked.Labels = map[string]string{managedByLabel: managedByValue, modelCacheLabel: "cache-inspector"}
+	created := metav1.NewTime(time.Now().Add(-time.Hour))
+	leaked.CreationTimestamp = created
+	env := cache2155Env(t, "cache-2155-cross-kind", dynamicClaim(corev1.ReadWriteOncePod),
+		[]*corev1.Pod{leaked}, nil)
+	// Not kept: the leaked pod is deleted so the purge pod can replace it.
+	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, false)
+
+	if err := runCacheCommand(t, "clear", "--force", "-n", env.namespace); err != nil {
+		t.Fatalf("a stale inspector pod is not a reason to refuse the purge: %v", err)
 	}
 }
 
