@@ -2050,11 +2050,11 @@ type SGLangConfig struct {
 	// ToolCallParser selects the tool-call extraction format. For foreman
 	// tool-loop workloads. Maps to SGLang --tool-call-parser flag.
 	//
-	// glm and glm45 both select the GLM-4.5/4.7 MoE detector; SGLang also
-	// logs a deprecation warning for a passed glm45 and rewrites it to glm
-	// (server_args.py), so either spelling works. qwen3 and functionary are
-	// kept for objects written against earlier releases even though the
-	// pinned image no longer registers them.
+	// glm and glm45 both select the GLM-4.5/4.7 MoE detector; SGLang
+	// v0.5.15.post1 also logs a deprecation warning for a passed glm45 and
+	// rewrites it to glm (server_args.py), so either spelling works. qwen3 and
+	// functionary are kept for objects written against earlier releases even
+	// though the pinned image no longer registers them.
 	// +kubebuilder:validation:Enum=llama3;qwen3;qwen25;hermes;functionary;mistral;glm;glm45;glm47
 	// +optional
 	ToolCallParser string `json:"toolCallParser,omitempty"`
