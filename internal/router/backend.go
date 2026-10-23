@@ -93,6 +93,7 @@ type Dispatcher struct {
 	// them, keyed by backend name, so IsHealthy can decide from the endpoint
 	// set without the caller passing the Backend.
 	endpoints sync.Map // backendName -> []string
+	loads     sync.Map // healthKey -> *endpointLoad
 
 	// cursors is the round-robin position per endpoint backend. Consecutive
 	// requests advance it so a keep-alive client spreads across pods.
@@ -300,6 +301,7 @@ func (d *Dispatcher) SetEndpoints(name string, endpoints []string) {
 	for _, ep := range prev {
 		if !keep[ep] {
 			d.health.Delete(healthKey(name, ep))
+			d.loads.Delete(healthKey(name, ep))
 		}
 	}
 	d.endpoints.Store(name, next)
@@ -413,6 +415,7 @@ func (d *Dispatcher) Dispatch(
 		return nil, fmt.Errorf("dispatch: backend is nil")
 	}
 	endpoint := d.pickEndpoint(backend)
+	release := d.track(backend.Name, endpoint)
 	url := joinURL(dispatchTarget(backend, endpoint), path)
 
 	// Send the model name this backend actually serves, not the
@@ -426,12 +429,14 @@ func (d *Dispatcher) Dispatch(
 	req, err := http.NewRequestWithContext(reqCtx, method, url, bytes.NewReader(outboundBody))
 	if err != nil {
 		reqCancel()
+		release()
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 
 	d.copyForwardedHeaders(headers, req.Header)
 	if err := d.applyCredentials(backend, req); err != nil {
 		reqCancel()
+		release()
 		return nil, err
 	}
 
@@ -469,6 +474,7 @@ func (d *Dispatcher) Dispatch(
 			d.markUnhealthy(backend.Name, endpoint)
 		}
 		reqCancel()
+		release()
 		return nil, fmt.Errorf("upstream request: %w", err)
 	}
 	if resp.StatusCode >= 500 {
@@ -490,6 +496,7 @@ func (d *Dispatcher) Dispatch(
 	} else {
 		resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: reqCancel}
 	}
+	resp.Body = &releaseOnCloseBody{ReadCloser: resp.Body, release: release}
 	return resp, nil
 }
 
