@@ -436,6 +436,46 @@ func TestCacheListWaitsForAMidGraceHolderOfAReadWriteOncePodClaim(t *testing.T) 
 	}
 }
 
+// The pod delete --purge-cache tears down is not a reason to refuse. The
+// InferenceService delete cascades asynchronously, so its serving pod is still
+// running and still has no deletion timestamp when the purge looks: refusing it
+// would fail every purge of a ReadWriteOncePod claim in the default shared
+// mode, which is the sequence the issue reports.
+func TestDeletePurgeWaitsForTheServingPodItIsTearingDown(t *testing.T) {
+	env := cache2155Env(t, "cache-2155-delete-serving", dynamicClaim(corev1.ReadWriteOncePod),
+		nil, modelWithCacheKey())
+	// The serving pod one controller hop from the InferenceService, named as
+	// the deployment controller names its replicaset.
+	serving := mountedPod("a-model-7d9f4")
+	serving.Namespace = env.namespace
+	serving.OwnerReferences = []metav1.OwnerReference{{
+		APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "a-model-7d9f4",
+		UID: "0b9c4e1a-0000-4000-8000-000000000000", Controller: boolPtr(true),
+	}}
+	if _, err := env.clientset.CoreV1().Pods(env.namespace).Create(context.Background(), serving,
+		metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create the serving pod: %v", err)
+	}
+	isvc := &inferencev1alpha1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "a-model", Namespace: env.namespace},
+		Spec: inferencev1alpha1.InferenceServiceSpec{
+			ModelRef:   "a-model",
+			ModelCache: &inferencev1alpha1.ModelCacheSpec{ClaimName: modelCachePVCName},
+		},
+	}
+	if err := env.cr.Create(context.Background(), isvc); err != nil {
+		t.Fatalf("create InferenceService: %v", err)
+	}
+	stubCacheCommandPods(t, func([]string) (string, error) { return "", nil }, true)
+
+	if err := runDeleteCommandFor2155(t, "a-model", env.namespace); err != nil {
+		t.Fatalf("the serving pod this run deletes must be waited for, not refused: %v", err)
+	}
+	if !podExists(t, env.clientset, env.namespace, purgePodName(modelCachePVCName)) {
+		t.Error("no purge pod was created, so the purge never ran")
+	}
+}
+
 // delete --purge-cache deletes the InferenceService and then purges, and the
 // service delete may be what collects the claim, so the mode has to be read
 // before it.

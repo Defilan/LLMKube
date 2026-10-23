@@ -297,6 +297,17 @@ func ensurePurgePod(
 	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace string, target purgeTarget,
 ) (string, error) {
+	return ensurePurgePodReleasing(ctx, k8sClient, clientset, namespace, target, nil)
+}
+
+// ensurePurgePodReleasing is ensurePurgePod with the caller's rule for a
+// holder that is already going away: `delete --purge-cache` passes one so the
+// pod its own InferenceService delete is tearing down does not refuse the
+// purge, and waits for the drain instead.
+func ensurePurgePodReleasing(
+	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
+	namespace string, target purgeTarget, releasing func(*corev1.Pod) bool,
+) (string, error) {
 	runID := purgeRunID()
 	pods := &corev1.PodList{}
 	if err := k8sClient.List(ctx, pods, client.InNamespace(namespace)); err != nil {
@@ -304,7 +315,7 @@ func ensurePurgePod(
 		pods = &corev1.PodList{}
 	}
 	if err := secondMountBlocker(claimHolder(pods.Items, target.Name), target.Name,
-		purgePodName(target.Name), purgePodKind, runID, target.SinglePod); err != nil {
+		purgePodName(target.Name), purgePodKind, runID, target.SinglePod, releasing); err != nil {
 		return "", err
 	}
 	return ensureCacheAccessPod(ctx, clientset, namespace, target.Name, purgePodName(target.Name),
@@ -433,7 +444,17 @@ func withPurgePod(
 	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace string, target purgeTarget, fn func(ctx context.Context, podName string) error,
 ) error {
-	podName, err := ensurePurgePod(ctx, k8sClient, clientset, namespace, target)
+	return withPurgePodReleasing(ctx, k8sClient, clientset, namespace, target, nil, fn)
+}
+
+// withPurgePodReleasing is withPurgePod with the caller's rule for a holder
+// that is already going away.
+func withPurgePodReleasing(
+	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
+	namespace string, target purgeTarget, releasing func(*corev1.Pod) bool,
+	fn func(ctx context.Context, podName string) error,
+) error {
+	podName, err := ensurePurgePodReleasing(ctx, k8sClient, clientset, namespace, target, releasing)
 	if err != nil {
 		return err
 	}
@@ -565,6 +586,15 @@ func purgeCacheKeys(
 	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace string, target purgeTarget, keys []string,
 ) (purgeOutcome, error) {
+	return purgeCacheKeysReleasing(ctx, cfg, k8sClient, clientset, namespace, target, nil, keys)
+}
+
+// purgeCacheKeysReleasing is purgeCacheKeys with the caller's rule for a holder
+// that is already going away.
+func purgeCacheKeysReleasing(
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
+	namespace string, target purgeTarget, releasing func(*corev1.Pod) bool, keys []string,
+) (purgeOutcome, error) {
 	for _, key := range keys {
 		if err := validateCacheKey(key); err != nil {
 			return purgeOutcome{PVC: target.Name}, err
@@ -577,7 +607,7 @@ func purgeCacheKeys(
 	}
 
 	outcome := purgeOutcome{PVC: target.Name}
-	err := withPurgePod(ctx, k8sClient, clientset, namespace, target,
+	err := withPurgePodReleasing(ctx, k8sClient, clientset, namespace, target, releasing,
 		func(ctx context.Context, podName string) error {
 			removed, absent, err := deleteCachePaths(ctx, cfg, clientset, namespace, podName, paths)
 			outcome.Removed = removed
