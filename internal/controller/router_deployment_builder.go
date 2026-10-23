@@ -253,6 +253,11 @@ func credentialsEnvFrom(mr *inferencev1alpha1.ModelRouter) []corev1.EnvFromSourc
 	return out
 }
 
+// defaultRouterProxyResources keeps the request small (an idle proxy sits
+// near 14Mi) and gives the limit room for a few hundred long-context agent
+// streams arriving together: each request is buffered while it is sent
+// upstream, at roughly two to three times its body size during a model
+// rewrite (#2194).
 func defaultRouterProxyResources() corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{
@@ -261,7 +266,7 @@ func defaultRouterProxyResources() corev1.ResourceRequirements {
 		},
 		Limits: corev1.ResourceList{
 			corev1.ResourceCPU:    resource.MustParse("500m"),
-			corev1.ResourceMemory: resource.MustParse("256Mi"),
+			corev1.ResourceMemory: resource.MustParse("1Gi"),
 		},
 	}
 }
