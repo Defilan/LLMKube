@@ -202,10 +202,10 @@ spec:
 
 - **Load** for a vLLM backend is the pod's own running plus waiting requests, read from its `/metrics` once a second, plus the requests this proxy sent since. A pod whose KV cache is 90% full or more takes no new work while another pod has room. Other runtimes, and any pod whose metrics are more than 5 seconds old, use this proxy's in-flight count.
 - **Without a session header**, each request goes to the least-loaded pod.
-- **With one**, the first header present names the session; only its hash is used. The session stays on its pod until that pod's load passes `maxLoadPercent` of the average, then spills to the next pod, and returns once its pod has room again. Every proxy replica places a session on the same pod.
+- **With one**, the first header present names the session; only its hash is used. The session stays on its pod until that pod's load passes `maxLoadPercent` of the average, then spills to the next pod, and returns once its pod has room again. Proxy replicas agree on a session's home pod; near the spill bound, where each replica also counts its own in-flight requests, they may briefly place it differently.
 - `mode: RoundRobin` (the default) with `sessionAffinity` keeps sessions sticky using in-flight counts only.
 
-Decisions are visible as `llmkube_router_placements_total{result}` (`least_loaded`, `sticky`, `spill`, `fallback`), with `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` per pod.
+Decisions are visible as `llmkube_router_placements_total{result}` (`least_loaded`, `sticky`, `spill`, `fallback`), with `llmkube_router_endpoint_load` and `llmkube_router_endpoint_metrics_fresh` per pod for `LoadAware` backends with a metrics profile (vLLM today).
 
 ## Several models on dataPlane: AgentGateway
 
