@@ -287,12 +287,19 @@ func createPurgePodForPVC(
 		purgePodKind, runID, "", nil)
 }
 
-// ensurePurgePod returns a running purge pod, creating it when absent.
+// ensurePurgePod returns a running purge pod, creating it when absent. A purge
+// pod is never pinned, so the only guard before creating one is a claim that
+// cannot be mounted a second time while a pod holds it.
 func ensurePurgePod(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface,
+	namespace, pvcName string,
 ) (string, error) {
+	runID := purgeRunID()
+	if err := purgeSecondMountBlocker(ctx, k8sClient, namespace, pvcName, runID); err != nil {
+		return "", err
+	}
 	return ensureCacheAccessPod(ctx, clientset, namespace, pvcName, purgePodName(pvcName),
-		purgePodKind, purgeRunID(),
+		purgePodKind, runID,
 		func(runID string) (string, error) {
 			return createPurgePodForPVC(ctx, clientset, namespace, pvcName, runID)
 		})
@@ -364,14 +371,13 @@ func replaceStaleCacheAccessPod(
 	if err != nil {
 		return fmt.Errorf("failed to read existing %s pod %s: %w", kind.noun, podName, err)
 	}
-	if existing.Labels[managedByLabel] != managedByValue ||
-		existing.Labels[modelCacheLabel] != kind.component {
+	if !cacheAccessPodOurs(existing, kind) {
 		return fmt.Errorf("refusing to delete pod %s: it is not an llmkube cache %s pod", podName, kind.noun)
 	}
 	// A pod stamped by a live run is in use: it waits at that claim and is
 	// deleted when the run ends. Only a pod from a run that never cleaned up
 	// (no stamp at all) or this run's own leftover is replaced.
-	if stamp := existing.Labels[cachePurgeRunLabel]; stamp != "" && stamp != runID && !purgePodAbandoned(existing) {
+	if cacheAccessPodInUse(existing, runID) {
 		return fmt.Errorf("refusing to delete pod %s: another llmkube cache %s run is using it", podName, kind.noun)
 	}
 	deleteCacheAccessPod(ctx, clientset, namespace, podName)
@@ -415,10 +421,10 @@ func purgePodAbandoned(pod *corev1.Pod) bool {
 // mounts the claim read-only and may have no shell at all, and a strict RWO
 // claim cannot be double-attached while that pod runs.
 func withPurgePod(
-	ctx context.Context, clientset kubernetes.Interface, namespace, pvcName string,
+	ctx context.Context, k8sClient client.Client, clientset kubernetes.Interface, namespace, pvcName string,
 	fn func(ctx context.Context, podName string) error,
 ) error {
-	podName, err := ensurePurgePod(ctx, clientset, namespace, pvcName)
+	podName, err := ensurePurgePod(ctx, k8sClient, clientset, namespace, pvcName)
 	if err != nil {
 		return err
 	}
@@ -518,11 +524,11 @@ func verifyCachePathsGone(
 
 // purgeListed removes what choose selects from the claim's cache directories.
 func purgeListed(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace, pvcName string, choose func(entries []string) (del, skip []string),
 ) (purgeOutcome, error) {
 	outcome := purgeOutcome{PVC: pvcName}
-	err := withPurgePod(ctx, clientset, namespace, pvcName,
+	err := withPurgePod(ctx, k8sClient, clientset, namespace, pvcName,
 		func(ctx context.Context, podName string) error {
 			entries, err := listCacheDirs(ctx, cfg, clientset, namespace, podName)
 			if err != nil {
@@ -547,7 +553,7 @@ func purgeListed(
 // there is reported, not failed: the entry is already gone. Every key is
 // validated before a pod is created.
 func purgeCacheKeys(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace, pvcName string, keys []string,
 ) (purgeOutcome, error) {
 	for _, key := range keys {
@@ -562,7 +568,7 @@ func purgeCacheKeys(
 	}
 
 	outcome := purgeOutcome{PVC: pvcName}
-	err := withPurgePod(ctx, clientset, namespace, pvcName,
+	err := withPurgePod(ctx, k8sClient, clientset, namespace, pvcName,
 		func(ctx context.Context, podName string) error {
 			removed, absent, err := deleteCachePaths(ctx, cfg, clientset, namespace, podName, paths)
 			outcome.Removed = removed
@@ -578,10 +584,10 @@ func purgeCacheKeys(
 // a user-owned one alike: the operator writes nothing else, and a directory
 // name with a quote or a space cannot be passed to the pod's shell safely.
 func purgeAllEntries(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace, pvcName string,
 ) (purgeOutcome, error) {
-	return purgeListed(ctx, cfg, clientset, namespace, pvcName,
+	return purgeListed(ctx, cfg, k8sClient, clientset, namespace, pvcName,
 		func(entries []string) (del, skip []string) {
 			for _, name := range entries {
 				if !cacheKeyDirRe.MatchString(name) {
@@ -597,10 +603,10 @@ func purgeAllEntries(
 // purgeOrphanedEntries removes the cache-key directories on a claim that no
 // Model references.
 func purgeOrphanedEntries(
-	ctx context.Context, cfg *rest.Config, clientset kubernetes.Interface,
+	ctx context.Context, cfg *rest.Config, k8sClient client.Client, clientset kubernetes.Interface,
 	namespace, pvcName string, active map[string]bool,
 ) (purgeOutcome, error) {
-	return purgeListed(ctx, cfg, clientset, namespace, pvcName,
+	return purgeListed(ctx, cfg, k8sClient, clientset, namespace, pvcName,
 		func(entries []string) (del, skip []string) {
 			for _, name := range entries {
 				if !cacheKeyDirRe.MatchString(name) {

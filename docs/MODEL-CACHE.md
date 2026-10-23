@@ -742,8 +742,17 @@ llmkube cache clear
 llmkube cache clear --force
 ```
 
-Entries are removed by a short-lived `busybox` pod that mounts the cache claim
-read-write, one pod per claim, deleted as soon as it is done.
+Entries are removed by a short-lived `busybox:1.37.0` pod that mounts the cache
+claim read-write, one pod per claim, deleted as soon as it is done. On a cluster
+that cannot pull that image, pass `--cache-image <ref>` (or set
+`LLMKUBE_CACHE_IMAGE`) to `cache list`, `cache clear` and `delete
+--purge-cache`; the flag wins over the variable.
+
+A `ReadWriteOncePod` claim another pod holds cannot be mounted a second time
+on any node, so both commands refuse it at once and name the access mode and
+the holding pod, instead of waiting for a pod that can never start. `cache
+list` pins its inspector pod only for a `ReadWriteOnce` or `ReadWriteOncePod`
+claim: a `ReadWriteMany` or `ReadOnlyMany` claim is never pinned.
 
 `cache clear` with no flag and `cache clear --orphaned` act on the claims
 `cache list` discovers: `llmkube-model-cache` and the labeled per-service
