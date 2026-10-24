@@ -125,9 +125,10 @@ const (
 	// Succeeded and the Model Ready meanwhile; only a failed check changes
 	// them.
 	ReasonPrefetchReverifying = "PrefetchReverifying"
-	// ReasonPrefetchStalled: the Job's pod was scheduled but has not started
-	// within prefetchPodStartGrace (an image pull, a volume that cannot
-	// attach); the entry names the pod's waiting reason.
+	// ReasonPrefetchStalled: the Job's pod was scheduled, none of its
+	// containers is running, and it has stayed Pending past
+	// prefetchPodStartGrace (an image pull, a volume that cannot attach); the
+	// entry names the container that is waiting.
 	ReasonPrefetchStalled = "PrefetchStalled"
 )
 
@@ -153,6 +154,12 @@ const (
 // prefetchPodStartGrace is how long a scheduled Job pod may stay Pending
 // before the entry names it as stalled. A variable so a test can shrink it.
 var prefetchPodStartGrace = 5 * time.Minute
+
+// podInitializingWaitingReason is the kubelet's default waiting state for a
+// container it has not reached yet when the pod has init containers
+// (pkg/kubelet/kubelet_pods.go, defaultWaitingState): it names a position in
+// the init sequence, never a cause that placement can fix.
+const podInitializingWaitingReason = "PodInitializing"
 
 // maxPrefetchJobNameLength is the longest Job name whose pods' job-name
 // label is still valid.
@@ -917,11 +924,12 @@ func (r *ModelReconciler) singleWriterClaimHolder(ctx context.Context, namespace
 }
 
 // prefetchJobBlocked reports a Job pod that is Pending and cannot be
-// scheduled (the scheduler's message), or was scheduled and has not started
-// within prefetchPodStartGrace (the waiting reason of its first container),
-// as a reason and a description, or "" when the pods are progressing. The
-// pods are read through the cache the InferenceService controller's Pod
-// watch already fills.
+// scheduled (the scheduler's message), or was scheduled with no container
+// running and stays Pending past prefetchPodStartGrace (the waiting reason of
+// the container that blocks), as a reason and a description, or "" when the
+// pods are progressing. A container that is running is the download at work,
+// whatever the pod phase says. The pods are read through the cache the
+// InferenceService controller's Pod watch already fills.
 func (r *ModelReconciler) prefetchJobBlocked(ctx context.Context, job *batchv1.Job) (string, string) {
 	pods := &corev1.PodList{}
 	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{"batch.kubernetes.io/job-name": job.Name}); err != nil {
@@ -945,15 +953,30 @@ func (r *ModelReconciler) prefetchJobBlocked(ctx context.Context, job *batchv1.J
 		if !scheduled || time.Since(pod.CreationTimestamp.Time) < prefetchPodStartGrace {
 			continue
 		}
-		waiting := "no container has started"
-		for _, cs := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
-			if cs.State.Waiting != nil {
-				waiting = cs.Name + " is waiting: " + cs.State.Waiting.Reason
-				if cs.State.Waiting.Message != "" {
-					waiting += " (" + cs.State.Waiting.Message + ")"
-				}
+		statuses := append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...)
+		running := false
+		for _, cs := range statuses {
+			if cs.State.Running != nil {
+				running = true
 				break
 			}
+		}
+		// The kubelet holds a pod at Pending while any regular init container
+		// runs (getPhase counts them as pending), so Pending with a Running
+		// container is a download in progress, not one that never started.
+		if running {
+			continue
+		}
+		waiting := "no container has started"
+		for _, cs := range statuses {
+			if cs.State.Waiting == nil || cs.State.Waiting.Reason == podInitializingWaitingReason {
+				continue
+			}
+			waiting = cs.Name + " is waiting: " + cs.State.Waiting.Reason
+			if cs.State.Waiting.Message != "" {
+				waiting += " (" + cs.State.Waiting.Message + ")"
+			}
+			break
 		}
 		// No elapsed time: the message is written to status and sent as an
 		// event only when it changes.

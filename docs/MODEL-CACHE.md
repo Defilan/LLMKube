@@ -373,8 +373,11 @@ condition carry the scheduler's message (reason `PrefetchUnschedulable`, for
 example `volume node affinity conflict`), and a `PrefetchUnschedulable`
 warning event is recorded. A pod that was scheduled but has not started
 within five minutes (an image pull, a volume that cannot attach) is reported
-the same way as `PrefetchStalled`, with the container's waiting reason. Fix
-the placement or the claim, then delete the Job to retry.
+as `PrefetchStalled`, with the waiting reason of the container that blocks.
+A downloader init container that is running is not a stall: Kubernetes keeps
+a pod with init containers in phase `Pending` until all of them finish, so a
+download in progress reads as downloading. Fix the placement or the claim,
+then delete the Job to retry.
 
 Limitations:
 

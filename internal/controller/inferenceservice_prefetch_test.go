@@ -39,6 +39,111 @@ import (
 	inferencev1alpha1 "github.com/defilantech/llmkube/api/v1alpha1"
 )
 
+// pendingPrefetchPod is the pod a prefetch Job's controller would create,
+// scheduled but not started, with the Job's own container names, volumes and
+// mounts so a builder change cannot leave the fixture describing another pod.
+// NodeName is set here: a Pod's nodeName is immutable after create.
+func pendingPrefetchPod(model *inferencev1alpha1.Model, tag string) *corev1.Pod {
+	job := &batchv1.Job{}
+	Expect(k8sClient.Get(context.Background(), types.NamespacedName{Name: prefetchJobName(model), Namespace: model.Namespace}, job)).To(Succeed())
+	spec := job.Spec.Template.Spec
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      prefetchJobName(model) + "-" + tag,
+			Namespace: model.Namespace,
+			Labels:    map[string]string{"batch.kubernetes.io/job-name": job.Name},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:       "worker-1",
+			InitContainers: append([]corev1.Container(nil), spec.InitContainers...),
+			Containers:     append([]corev1.Container(nil), spec.Containers...),
+			Volumes:        append([]corev1.Volume(nil), spec.Volumes...),
+		},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodPending,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+}
+
+// terminatedPrefetchInitStatuses reports the pod's first n init containers as
+// exited 0, in spec order. The slice it returns is fresh: append to it rather
+// than mutating it, or the appended status lands in a discarded copy.
+func terminatedPrefetchInitStatuses(pod *corev1.Pod, n int) []corev1.ContainerStatus {
+	out := make([]corev1.ContainerStatus, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, corev1.ContainerStatus{
+			Name:  pod.Spec.InitContainers[i].Name,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}},
+		})
+	}
+	return out
+}
+
+// waitingPrefetchInitStatuses reports every init container waiting on reason.
+func waitingPrefetchInitStatuses(pod *corev1.Pod, reason string) []corev1.ContainerStatus {
+	out := make([]corev1.ContainerStatus, 0, len(pod.Spec.InitContainers))
+	for _, c := range pod.Spec.InitContainers {
+		out = append(out, corev1.ContainerStatus{
+			Name:  c.Name,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+		})
+	}
+	return out
+}
+
+// waitingPrefetchMainStatuses reports the pod's containers waiting on reason.
+func waitingPrefetchMainStatuses(pod *corev1.Pod, reason string) []corev1.ContainerStatus {
+	out := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+	for _, c := range pod.Spec.Containers {
+		out = append(out, corev1.ContainerStatus{
+			Name:  c.Name,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+		})
+	}
+	return out
+}
+
+// assertNotStalled checks that a pass left the Model downloading its entry and
+// holds nothing but a blocked verdict off Progressing.
+func assertNotStalled(model *inferencev1alpha1.Model, result reconcile.Result) {
+	Expect(model.Status.Prefetch).NotTo(BeEmpty())
+	Expect(model.Status.Prefetch[0].Phase).To(Equal(inferencev1alpha1.PrefetchPhaseRunning))
+	Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("downloading into"))
+	Expect(model.Status.Prefetch[0].Message).NotTo(ContainSubstring("has been Pending"))
+	Expect(model.Status.Prefetch[0].Message).NotTo(ContainSubstring("PodInitializing"))
+	progressing := meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing)
+	Expect(progressing).NotTo(BeNil())
+	Expect(progressing.Reason).NotTo(Equal(ReasonPrefetchStalled))
+	Expect(result.RequeueAfter).To(Equal(prefetchPollInterval))
+}
+
+// prefetchPodStatus writes the pod's status and reads it back, so a spec fails
+// on what the cluster stored rather than on what it meant to send. The caller
+// fills pod.Status first; this reads the live object, applies that status and
+// keeps the two apart so a lost condition or container status fails loudly.
+func prefetchPodStatus(pod *corev1.Pod, phase corev1.PodPhase, initStatuses, mainStatuses []corev1.ContainerStatus) {
+	ctx := context.Background()
+	key := types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}
+	Expect(k8sClient.Get(ctx, key, pod)).To(Succeed())
+	pod.Status.Phase = phase
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}}
+	pod.Status.InitContainerStatuses = initStatuses
+	pod.Status.ContainerStatuses = mainStatuses
+	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+
+	Expect(k8sClient.Get(ctx, key, pod)).To(Succeed())
+	Expect(pod.Status.Phase).To(Equal(phase))
+	Expect(pod.Status.Conditions).To(HaveLen(1))
+	Expect(pod.Status.Conditions[0].Type).To(Equal(corev1.PodScheduled))
+	Expect(pod.Status.Conditions[0].Status).To(Equal(corev1.ConditionTrue))
+	Expect(pod.Status.InitContainerStatuses).To(HaveLen(len(initStatuses)))
+	Expect(pod.Status.ContainerStatuses).To(HaveLen(len(mainStatuses)))
+	for i, want := range initStatuses {
+		Expect(pod.Status.InitContainerStatuses[i].Name).To(Equal(want.Name))
+	}
+}
+
 // createCachePVC makes a user-owned cache claim a prefetch can target, and
 // removes it with the spec.
 func createCachePVC(ctx context.Context, ns, name string) {
