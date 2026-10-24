@@ -330,8 +330,16 @@ rc=$?
 assert_eq "$rc" "0" "a stubbed live row passes"
 assert_contains "$(cat "$stub/applied.yaml" 2>/dev/null)" "name: hf-mirror" "the live row applies the site rendering"
 assert_contains "$(cat "$stub/kubectl.args" 2>/dev/null)" "-n serving" "the live row waits in the run namespace"
+assert_contains "$(cat "$stub/kubectl.args" 2>/dev/null)" "--timeout=1800s" "the live row waits 1800s for Ready by default"
 assert_eq "$(cat "$stub/llmkube.args" 2>/dev/null)" "benchmark b200-row-01 -n serving -o json --port-forward --iterations 3" "the benchmark gets the run namespace and B200_BENCHMARK_ARGS"
 assert_eq "$(jq -r '.status' "$tmp/live/1.json" 2>/dev/null)" "pass" "the stubbed live row records a pass"
+: > "$stub/kubectl.args"
+mkdir -p "$tmp/live-timeout"
+(
+  PATH="$stub/bin:$PATH" B200_DRY_RUN=0 B200_OUT="$tmp/live-timeout" B200_DOC="$tmp/live/matrix.md" B200_NS=default B200_READY_TIMEOUT=7200s \
+    b200_standard_row 1 b200-row-01 "$m1" 5
+) >/dev/null 2>&1
+assert_contains "$(cat "$stub/kubectl.args" 2>/dev/null)" "--timeout=7200s" "B200_READY_TIMEOUT sets the Ready wait"
 
 # Live row path: a row that never becomes Ready (a download still running, no
 # free GPU) is an infrastructure outcome, not a measurement. It returns

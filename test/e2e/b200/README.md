@@ -90,6 +90,7 @@ overrides and nothing about them is published:
 | `B200_MODEL_SPEC_FILE` | Lines spliced into the top of each Model's `spec`, such as `prefetchNodeSelector`. |
 | `B200_ISVC_SPEC_FILE` | Lines spliced into the top of each InferenceService's `spec`, such as `nodeSelector`, `tolerations` and `modelCache`. |
 | `B200_BENCHMARK_ARGS` | Extra `llmkube benchmark` flags. Pass `--port-forward` when the harness runs outside the cluster. |
+| `B200_READY_TIMEOUT` | How long a row waits for its InferenceService to be Ready (default `1800s`), for a large model that loads slowly from network storage. |
 
 `--namespace` moves both objects of every row to that namespace. A spec file's
 lines are indented two spaces, as under `spec:`, and it may not set a field the

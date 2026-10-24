@@ -251,9 +251,12 @@ b200_standard_row() {
     b200_log "row $row: apply failed; nothing published"
     return 1
   fi
+  # B200_READY_TIMEOUT stretches the Ready wait for a large model whose weights
+  # load slowly from network storage.
+  local ready_timeout="${B200_READY_TIMEOUT:-1800s}"
   if ! kubectl wait --for=jsonpath='{.status.phase}'=Ready "inferenceservice/$isvc" \
-    -n "$B200_NS" --timeout=1800s; then
-    b200_log "row $row: not Ready within 1800s; nothing published, re-run to retry"
+    -n "$B200_NS" --timeout="$ready_timeout"; then
+    b200_log "row $row: not Ready within $ready_timeout; nothing published, re-run to retry"
     return 1
   fi
   # B200_BENCHMARK_ARGS adds benchmark flags, such as --port-forward when the
