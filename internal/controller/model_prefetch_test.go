@@ -1009,6 +1009,238 @@ var _ = Describe("Model Prefetch", func() {
 			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
 		})
 
+		// #2189: the kubelet holds a pod at Pending until every init container
+		// has finished, so a multi-file download spends its whole run there.
+		// Seen at the Downloading transition, the pod is progressing.
+		It("keeps a Pending pod whose downloader init container is running as downloading", func() {
+			model := newPrefetchModel("model-prefetch-downloading")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			r := prefetchReconciler()
+			recorder := events.NewFakeRecorder(20)
+			r.Recorder = recorder
+
+			previous := prefetchPodStartGrace
+			prefetchPodStartGrace = 0
+			defer func() { prefetchPodStartGrace = previous }()
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+
+			pod := pendingPrefetchPod(model, "downloading")
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			prefetchPodStatus(pod, corev1.PodPending, append(terminatedPrefetchInitStatuses(pod, 1), corev1.ContainerStatus{
+				Name:  pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1].Name,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+			}), waitingPrefetchMainStatuses(pod, "PodInitializing"))
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, result, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			assertNotStalled(model, result)
+			Expect(drainEvents(recorder)).NotTo(ContainElement(HavePrefix("Warning " + ReasonPrefetchStalled)))
+		})
+
+		// The same pod on the ordering the issue describes: the Model is
+		// already Downloading when the downloader starts, so the verdict is
+		// recomputed every poll with no transition to carry it.
+		It("keeps downloading when the downloader starts after the Downloading transition", func() {
+			model := newPrefetchModel("model-prefetch-late-running")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			r := prefetchReconciler()
+			recorder := events.NewFakeRecorder(20)
+			r.Recorder = recorder
+
+			previous := prefetchPodStartGrace
+			prefetchPodStartGrace = 0
+			defer func() { prefetchPodStartGrace = previous }()
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseDownloading), "fixture: Downloading is set before the pod appears")
+
+			pod := pendingPrefetchPod(model, "late")
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			prefetchPodStatus(pod, corev1.PodPending, append(terminatedPrefetchInitStatuses(pod, 1), corev1.ContainerStatus{
+				Name:  pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1].Name,
+				State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.Now()}},
+			}), waitingPrefetchMainStatuses(pod, "PodInitializing"))
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, result, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			assertNotStalled(model, result)
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStarted))
+			Expect(drainEvents(recorder)).NotTo(ContainElement(HavePrefix("Warning " + ReasonPrefetchStalled)))
+		})
+
+		// Past the grace with nothing running, the only waiting status can be
+		// the kubelet's placeholder for a container behind one it has not
+		// reached: that names a position in the init sequence, not a cause.
+		It("does not name PodInitializing as the cause for a Pending pod that has not started", func() {
+			model := newPrefetchModel("model-prefetch-initializing")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			r := prefetchReconciler()
+
+			previous := prefetchPodStartGrace
+			prefetchPodStartGrace = 0
+			defer func() { prefetchPodStartGrace = previous }()
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+
+			pod := pendingPrefetchPod(model, "initializing")
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			prefetchPodStatus(pod, corev1.PodPending, terminatedPrefetchInitStatuses(pod, len(pod.Spec.InitContainers)),
+				waitingPrefetchMainStatuses(pod, "PodInitializing"))
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("no container has started"))
+			Expect(model.Status.Prefetch[0].Message).NotTo(ContainSubstring("PodInitializing"))
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
+		})
+
+		// The stalled classes the fix keeps: a real waiting reason, in an init
+		// container or in the job's own container, and no report inside the
+		// grace period.
+		DescribeTable("still names the container that is actually waiting",
+			func(slug string, stage func(pod *corev1.Pod), grace time.Duration, wantContainer string) {
+				model := newPrefetchModel("model-prefetch-" + slug)
+				Expect(k8sClient.Create(ctx, model)).To(Succeed())
+				defer func() { _ = k8sClient.Delete(ctx, model) }()
+				modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+				r := prefetchReconciler()
+
+				previous := prefetchPodStartGrace
+				prefetchPodStartGrace = grace
+				defer func() { prefetchPodStartGrace = previous }()
+
+				_, _, err := r.reconcilePrefetch(ctx, model)
+				Expect(err).NotTo(HaveOccurred())
+
+				pod := pendingPrefetchPod(model, "waiting")
+				Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+				defer func() { _ = k8sClient.Delete(ctx, pod) }()
+				stage(pod)
+				prefetchPodStatus(pod, corev1.PodPending, pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses)
+
+				Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+				_, _, err = r.reconcilePrefetch(ctx, model)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+				if wantContainer == "" {
+					Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("downloading into"),
+						"a pod inside the grace period has not stalled")
+					return
+				}
+				Expect(model.Status.Prefetch[0].Message).To(ContainSubstring(wantContainer + " is waiting"))
+				Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
+			},
+			Entry("the first init container cannot attach its volume", "waiting-first-init",
+				func(pod *corev1.Pod) {
+					pod.Status.InitContainerStatuses = waitingPrefetchInitStatuses(pod, "ContainerCreating")
+					pod.Status.InitContainerStatuses[0].State.Waiting.Message = "Multi-Attach error for volume pvc-1: Volume is already used by pod(s) serving-0"
+				}, time.Duration(0), "model-cache-prep"),
+			Entry("a later init container cannot pull its image", "waiting-later-init",
+				func(pod *corev1.Pod) {
+					pod.Status.InitContainerStatuses = append(terminatedPrefetchInitStatuses(pod, 1), corev1.ContainerStatus{
+						Name:  pod.Spec.InitContainers[len(pod.Spec.InitContainers)-1].Name,
+						State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ErrImagePull", Message: "pull access denied"}},
+					})
+				}, time.Duration(0), "model-downloader"),
+			Entry("every init container finished but the job's container cannot start", "waiting-main",
+				func(pod *corev1.Pod) {
+					pod.Status.InitContainerStatuses = terminatedPrefetchInitStatuses(pod, len(pod.Spec.InitContainers))
+					pod.Status.ContainerStatuses = waitingPrefetchMainStatuses(pod, "ContainerCreating")
+				}, time.Duration(0), "prefetch-done"),
+			Entry("inside the grace period", "waiting-within-grace",
+				func(pod *corev1.Pod) {
+					pod.Status.InitContainerStatuses = waitingPrefetchInitStatuses(pod, "ContainerCreating")
+				}, time.Hour, ""),
+		)
+
+		It("clears PrefetchStalled when the pod leaves Pending", func() {
+			model := newPrefetchModel("model-prefetch-cleared")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			r := prefetchReconciler()
+
+			previous := prefetchPodStartGrace
+			prefetchPodStartGrace = 0
+			defer func() { prefetchPodStartGrace = previous }()
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+
+			pod := pendingPrefetchPod(model, "cleared")
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			prefetchPodStatus(pod, corev1.PodPending, waitingPrefetchInitStatuses(pod, "ContainerCreating"), nil)
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
+
+			prefetchPodStatus(pod, corev1.PodRunning, waitingPrefetchInitStatuses(pod, "ContainerCreating"), nil)
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("downloading into"))
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchRunning))
+		})
+
+		// A stalled pod observed after the Model is already Downloading still
+		// reports the stall, on the entry and on Progressing. The fix must not
+		// change this class: nothing in the pod is Running there.
+		It("reports the stall when a stalled pod is observed after Downloading", func() {
+			model := newPrefetchModel("model-prefetch-late-stall")
+			Expect(k8sClient.Create(ctx, model)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, model) }()
+			modelKey := types.NamespacedName{Name: model.Name, Namespace: ns}
+			r := prefetchReconciler()
+
+			previous := prefetchPodStartGrace
+			prefetchPodStartGrace = 0
+			defer func() { prefetchPodStartGrace = previous }()
+
+			_, _, err := r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Phase).To(Equal(PhaseDownloading), "fixture: the Model has reached Downloading before the pod appears")
+
+			pod := pendingPrefetchPod(model, "late")
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, pod) }()
+			prefetchPodStatus(pod, corev1.PodPending, waitingPrefetchInitStatuses(pod, "ErrImagePull"), nil)
+
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			_, _, err = r.reconcilePrefetch(ctx, model)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, modelKey, model)).To(Succeed())
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("has been Pending"))
+			Expect(model.Status.Prefetch[0].Message).To(ContainSubstring("model-cache-prep is waiting"))
+			Expect(meta.FindStatusCondition(model.Status.Conditions, ConditionProgressing).Reason).To(Equal(ReasonPrefetchStalled))
+		})
+
 		// The Job name is deterministic, so a user's Job can sit at it. It is
 		// neither adopted as the prefetch nor deleted to make room.
 		It("neither adopts nor deletes a Job at the prefetch name that the Model does not own", func() {
