@@ -433,31 +433,57 @@ func (r *InferenceServiceReconciler) getModelForInferenceService(ctx context.Con
 	return model, modelReady, nil, nil
 }
 
-// draftModelRefFor returns the name of the draft Model this InferenceService
-// actually resolves, or "" when it configures none (no speculativeDecoding
-// block, a spec type that carries its own speculation, or an empty ref).
+// draftWeightsRefFor returns the name of the draft Model this InferenceService
+// actually resolves, and the spec path that named it, or "" and "" when it
+// configures none (no speculative block, a method that carries its own
+// speculation, or an empty ref).
+//
+// Both runtime surfaces answer here so the mount and the arguments cannot
+// disagree: the llama.cpp block resolves for the spec types that need weights,
+// and the vLLM block for an enabled block that names a draft Model. A vLLM
+// service's draft rides the same storage path and the same fail-closed
+// readiness gate as llama.cpp's, which is why it must also ride the same Model
+// watch mapping: a draft that is not yet Ready blocks serving, and nothing else
+// re-enqueues the service before the resync (#1528).
 //
 // Single source of truth for the resolver below and for the Model watch
 // mapping. They MUST agree: the resolver fails closed on a draft that is not
 // yet Ready, so a mapping that does not enqueue on that same draft leaves the
 // service Pending until the next full resync.
-func draftModelRefFor(isvc *inferencev1alpha1.InferenceService) string {
+func draftWeightsRefFor(isvc *inferencev1alpha1.InferenceService) (string, string) {
 	if isvc == nil {
-		return ""
+		return "", ""
 	}
 	sd := isvc.Spec.SpeculativeDecoding
-	if sd == nil || !specTypeNeedsDraftWeights(sd.Type) {
-		return ""
+	if sd != nil && specTypeNeedsDraftWeights(sd.Type) && sd.DraftModelRef != "" {
+		return sd.DraftModelRef, "spec.speculativeDecoding.draftModelRef"
 	}
-	return sd.DraftModelRef
+	if isvc.Spec.Runtime == RuntimeVLLM {
+		cfg := isvc.Spec.VLLMConfig
+		if cfg != nil && cfg.Speculative != nil && cfg.Speculative.Enabled != nil &&
+			*cfg.Speculative.Enabled && cfg.Speculative.Model != "" {
+			return cfg.Speculative.Model, "spec.vllmConfig.speculative.model"
+		}
+	}
+	return "", ""
 }
 
-// getDraftModelForInferenceService resolves spec.speculativeDecoding.draftModelRef
-// the same way getModelForInferenceService resolves spec.modelRef, and fails
-// closed for the same reasons: a draft that is missing or not Ready must block
-// serving rather than silently degrade to unspeculated decoding. Silent
-// performance loss is the failure mode we are least able to notice; on GB10
-// the difference is 18% of decode throughput (#1423).
+// draftModelRefFor is the llama.cpp half of draftWeightsRefFor, kept so the
+// callers that only ever spoke about speculativeDecoding.draftModelRef read
+// the same.
+func draftModelRefFor(isvc *inferencev1alpha1.InferenceService) string {
+	ref, _ := draftWeightsRefFor(isvc)
+	return ref
+}
+
+// getDraftModelForInferenceService resolves the draft weights the service
+// names (spec.speculativeDecoding.draftModelRef, or
+// spec.vllmConfig.speculative.model for a vLLM service) the same way
+// getModelForInferenceService resolves spec.modelRef, and fails closed for the
+// same reasons: a draft that is missing or not Ready must block serving rather
+// than silently degrade to unspeculated decoding. Silent performance loss is
+// the failure mode we are least able to notice; on GB10 the difference is 18%
+// of decode throughput (#1423).
 //
 // Returns (nil, true, nil, nil) when the service configures no draft weights,
 // which is the common case.
@@ -466,7 +492,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 ) (*inferencev1alpha1.Model, bool, *ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	ref := draftModelRefFor(isvc)
+	ref, field := draftWeightsRefFor(isvc)
 	if ref == "" {
 		return nil, true, nil, nil
 	}
@@ -475,10 +501,10 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 	name := types.NamespacedName{Name: ref, Namespace: isvc.Namespace}
 	if err := r.Get(ctx, name, draft); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("Referenced draft Model not found", "draftModel", ref)
+			log.Info("Referenced draft Model not found", "draftModel", ref, "field", field)
 			result, updateErr := r.updateStatusWithSchedulingInfo(
 				ctx, isvc, PhaseFailed, false, 0, isvc.Status.Replicas, 0, "",
-				fmt.Sprintf("Draft model %q not found", ref), nil)
+				fmt.Sprintf("Draft model %q not found (%s)", ref, field), nil)
 			return nil, false, &result, updateErr
 		}
 		log.Error(err, "Failed to get draft Model")
@@ -489,7 +515,7 @@ func (r *InferenceServiceReconciler) getDraftModelForInferenceService(
 		log.Info("Draft Model not ready yet", "draftModel", draft.Name, "phase", draft.Status.Phase)
 		result, updateErr := r.updateStatusWithSchedulingInfo(
 			ctx, isvc, "Pending", false, 0, isvc.Status.Replicas, 0, "",
-			fmt.Sprintf("Waiting for draft model %q to be Ready", draft.Name), nil)
+			fmt.Sprintf("Waiting for draft model %q to be Ready (%s)", draft.Name, field), nil)
 		return nil, false, &result, updateErr
 	}
 

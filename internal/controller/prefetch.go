@@ -66,6 +66,7 @@ const (
 // request can be honoured. isvc must already carry its effective modelCache.
 func classifyPrefetchRequest(isvc *inferencev1alpha1.InferenceService, model *inferencev1alpha1.Model, modelCachePath string) (prefetchApplicability, string) {
 	memberNode, memberClaim := multiNodeMemberClaim(isvc)
+	draftRef, draftField := draftWeightsRefFor(isvc)
 	switch {
 	case isMetalModel(model):
 		return prefetchNotApplicable, "a Metal service mounts no cache claim; the host metal-agent fetches the model itself"
@@ -77,8 +78,8 @@ func classifyPrefetchRequest(isvc *inferencev1alpha1.InferenceService, model *in
 		return prefetchUnsupported, "model caching is disabled on the operator (--model-cache-path unset, chart modelCache.enabled=false), so the pods would download into an emptyDir on the serving node"
 	case !operatorStagesModel(isvc, resolveBackend(isvc)):
 		return prefetchUnsupported, fmt.Sprintf("runtime %q fetches the model itself on the serving node (skipModelInit, or a runtime that stages only with spec.stageModel); a prefetched claim cannot be put in front of it", resolveServingRuntime(isvc))
-	case draftModelRefFor(isvc) != "":
-		return prefetchUnsupported, fmt.Sprintf("speculativeDecoding.draftModelRef %q is not prefetched and its downloader would run on the serving node", draftModelRefFor(isvc))
+	case draftRef != "":
+		return prefetchUnsupported, fmt.Sprintf("%s %q is not prefetched and its downloader would run on the serving node", draftField, draftRef)
 	case memberClaim != "":
 		return prefetchUnsupported, fmt.Sprintf("multiNode member on node %q mounts its own cache claim %q, which no prefetch stages; the prefetch covers the service-level claim only", memberNode, memberClaim)
 	case !prefetchableSource(model):
