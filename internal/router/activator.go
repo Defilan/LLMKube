@@ -385,13 +385,8 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 				// Scale the abandoned target back down. Done while still holding
 				// mu, so a waiter that is about to start a fresh swap for the
 				// same member cannot have its Activate undone by this patch.
-				// Bounded: this call runs under mu, which every request for the
-				// pool contends on.
 				if a.ctrl != nil {
-					derCtx, derCancel := context.WithTimeout(a.baseCtx, failureDeactivateTimeout)
-					derr := a.ctrl.Deactivate(derCtx, pr.namespace, target)
-					derCancel()
-					if derr != nil {
+					if derr := a.ctrl.Deactivate(a.baseCtx, pr.namespace, target); derr != nil {
 						a.logger.Warn("model pool deactivate after abandoned swap failed",
 							"pool", pr.pool, "member", target, "error", derr)
 					}
@@ -408,14 +403,12 @@ func (a *Activator) startSwap(pr *poolRuntime, incumbent, target string, holdSta
 			// The target may already be scaled up: Activate patches replicas
 			// before WaitReady runs. Nothing cancels the swap any more, so a
 			// failed swap whose callers have all left would keep the slot with
-			// no traffic. Scale it back down here rather than leaving it to a
-			// waiter: every waiter now returns the recorded failure instead of
-			// giving up, so none of them reliably schedules a deactivate.
+			// no traffic. Scale it back down here, symmetric with the deadline
+			// branch above, and because this is the call that is guaranteed to
+			// land: the scale-down a waiter schedules when it leaves is skipped
+			// whenever another caller registers for the member in between.
 			if a.ctrl != nil {
-				derCtx, derCancel := context.WithTimeout(a.baseCtx, failureDeactivateTimeout)
-				derr := a.ctrl.Deactivate(derCtx, pr.namespace, target)
-				derCancel()
-				if derr != nil {
+				if derr := a.ctrl.Deactivate(a.baseCtx, pr.namespace, target); derr != nil {
 					a.logger.Warn("model pool deactivate after failed swap failed",
 						"pool", pr.pool, "member", target, "error", derr)
 				}
@@ -450,10 +443,6 @@ func resolveSwapDeadline(budget time.Duration) time.Duration {
 
 // defaultSwapDeadline bounds a swap for a pool that declares no swapBudget.
 const defaultSwapDeadline = 2 * defaultResponseHeaderTimeout
-
-// failureDeactivateTimeout bounds the scale-down a failed swap issues while it
-// still holds a.mu, so a stalled API call cannot block every request on the pool.
-const failureDeactivateTimeout = 10 * time.Second
 
 // deactivateIfUnwanted scales member back to zero unless the pool has since
 // decided it wants that member after all: a new waiter arrived, the member

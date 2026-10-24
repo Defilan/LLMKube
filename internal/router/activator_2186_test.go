@@ -72,14 +72,14 @@ func TestIssue2186EveryWaiterSeesActivationError(t *testing.T) {
 	// before it can fail.
 	fake.activateGate = make(chan struct{})
 	fake.activateFail = map[string]bool{"coder": true}
-	var held atomic.Int64
-	deact := &gatedDeactivate{fakeMemberController: fake, held: &held}
+	var returned atomic.Bool
+	deact := &gatedDeactivate{fakeMemberController: fake, returned: &returned}
 	a := NewActivator(context.Background(), deact, routerIssue2186, nil)
 	failures := prommetrics.ModelPoolSwapFailuresTotal.
 		WithLabelValues(routerIssue2186, "heavy-slot", "coder", "error")
 	before := testutil.ToFloat64(failures)
 
-	errs := acquireWithWaiters(t, a, 5*time.Second, &held, func() { close(fake.activateGate) })
+	errs := acquireWithWaiters(t, a, 5*time.Second, &returned, func() { close(fake.activateGate) })
 
 	for i, err := range errs {
 		if err == nil {
@@ -98,46 +98,43 @@ func TestIssue2186EveryWaiterSeesActivationError(t *testing.T) {
 	if got := testutil.ToFloat64(failures) - before; got != 1 {
 		t.Errorf("swap_failures_total{reason=error} delta = %v, want 1", got)
 	}
-	// The failed swap has to scale its own target down: every waiter returns the
-	// recorded failure instead of giving up, so none of them reaches the
-	// deferred deactivate. Assert it happened while waiters were still
-	// registered; after they return the deferred path scales the target down
-	// anyway, and a final-state check would pass for the wrong reason.
-	if deact.seenAt == 0 {
-		t.Error("the failed swap never scaled its target down while its waiters were still registered")
+	// The failed swap has to scale its own target down before any waiter
+	// returns, not leave it to them: a waiter's deferred deactivate is skipped
+	// whenever another caller registers for the member in the meantime, so only
+	// the swap's own call is guaranteed. A final-state check cannot tell the
+	// two apart, because the deferred path eventually scales it down as well.
+	if !deact.beforeFirstReturn.Load() {
+		t.Error("the failed swap never scaled its target down before a waiter returned")
 	}
 	waitFor(t, "the failed target to be scaled back down", func() bool {
 		return fake.replicaCount("coder") == 0
 	})
 }
 
-// gatedDeactivate records, on the first Deactivate for a member, the value of a
-// counter the test keeps of callers registered on the pool and not yet returned.
+// gatedDeactivate records whether a Deactivate for a member arrived before any
+// caller of the swap returned. The failed swap issues its own scale-down under
+// the activator's lock, ahead of the notify() that wakes its waiters, so that
+// call strictly precedes every return; one a returning waiter schedules follows
+// its own return. The ordering therefore tells the two apart without a race.
 type gatedDeactivate struct {
 	*fakeMemberController
-	held   *atomic.Int64
-	mu     sync.Mutex
-	seenAt int64
+	returned          *atomic.Bool
+	beforeFirstReturn atomic.Bool
 }
 
 func (g *gatedDeactivate) Deactivate(ctx context.Context, namespace, isvc string) error {
-	// Sample before touching the fake and without any fake lock: the swap path
-	// calls this with the activator's lock held.
-	n := g.held.Load()
-	g.mu.Lock()
-	if g.seenAt == 0 && n > 0 {
-		g.seenAt = n
+	if !g.returned.Load() {
+		g.beforeFirstReturn.Store(true)
 	}
-	g.mu.Unlock()
 	return g.fakeMemberController.Deactivate(ctx, namespace, isvc)
 }
 
 // acquireWithWaiters runs three Acquire calls that share one swap and returns
 // their errors. The first caller starts the swap, the other two join it while it
 // is in flight, and release runs only once all three are registered, so no
-// caller can have seen the swap's outcome before the last one joined. held, when
-// non-nil, counts the callers registered and not yet returned.
-func acquireWithWaiters(t *testing.T, a *Activator, budget time.Duration, held *atomic.Int64, release func()) []error {
+// caller can have seen the swap's outcome before the last one joined. returned,
+// when non-nil, is set by the first caller as it returns from Acquire.
+func acquireWithWaiters(t *testing.T, a *Activator, budget time.Duration, returned *atomic.Bool, release func()) []error {
 	t.Helper()
 	const calls = 3
 	errs := make(chan error, calls)
@@ -148,15 +145,12 @@ func acquireWithWaiters(t *testing.T, a *Activator, budget time.Duration, held *
 		// not a caller's own timer, decides the result.
 		ctx, cancel := context.WithTimeout(context.Background(), budget+10*time.Second)
 		defer cancel()
-		if held != nil {
-			held.Add(1)
-		}
 		rel, err := a.Acquire(ctx, budgetPool("coder", budget))
+		if returned != nil {
+			returned.Store(true)
+		}
 		if err == nil {
 			rel()
-		}
-		if held != nil {
-			held.Add(-1)
 		}
 		errs <- err
 	}
