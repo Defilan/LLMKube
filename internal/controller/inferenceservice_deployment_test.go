@@ -3258,7 +3258,7 @@ var _ = Describe("constructDeployment additional cases", func() {
 			Spec:       inferencev1alpha1.InferenceServiceSpec{ModelRef: "m"},
 		}
 		deployment := reconciler.constructDeployment(isvc, model, nil, 1, "", "")
-		Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/ggml-org/llama.cpp:server"))
+		Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal(llamaCppCPUImage))
 	})
 
 	It("should use custom endpoint port", func() {
@@ -3749,7 +3749,7 @@ var _ = Describe("RuntimeBackend interface", func() {
 
 		It("should return correct defaults", func() {
 			Expect(backend.ContainerName()).To(Equal("llama-server"))
-			Expect(backend.DefaultImage()).To(Equal("ghcr.io/ggml-org/llama.cpp:server"))
+			Expect(backend.DefaultImage()).To(Equal(llamaCppCPUImage))
 			Expect(backend.DefaultPort()).To(Equal(int32(8080)))
 			Expect(backend.NeedsModelInit()).To(BeTrue())
 		})
@@ -4559,7 +4559,7 @@ var _ = Describe("constructDeployment Regression Tests", func() {
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
 			container := deployment.Spec.Template.Spec.Containers[0]
 			Expect(container.Name).To(Equal("llama-server"))
-			Expect(container.Image).To(Equal("ghcr.io/ggml-org/llama.cpp:server"))
+			Expect(container.Image).To(Equal(llamaCppCPUImage))
 
 			By("verifying default port is 8080")
 			Expect(container.Ports).To(HaveLen(1))

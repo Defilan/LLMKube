@@ -164,7 +164,7 @@ and the NVIDIA developer forum thread
 
 Either way, set the image explicitly on the `InferenceService`. A GPU Model
 with no `image` set does not fall back to a CPU tag: the operator substitutes
-`ghcr.io/ggml-org/llama.cpp:server-cuda-b10068` for NVIDIA Models. That build
+`ghcr.io/ggml-org/llama.cpp:server-cuda-b11854` for NVIDIA Models. That build
 carries no `sm_121` cubins, so on GB10 it works but pays a one-time JIT
 compile on first load. Pinning `image` yourself is how you choose a build that
 targets `sm_121` directly:

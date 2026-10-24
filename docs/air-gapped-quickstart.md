@@ -239,19 +239,20 @@ Pin by **digest** so the served model is immutable. A raw model artifact (an
 ```bash
 # Pull images
 docker pull ghcr.io/defilantech/llmkube-controller:v0.9.19
-docker pull ghcr.io/ggml-org/llama.cpp:server-cuda-b10068
-docker pull ghcr.io/ggml-org/llama.cpp:server
+docker pull ghcr.io/ggml-org/llama.cpp:server-cuda-b11854
+docker pull ghcr.io/ggml-org/llama.cpp:server-b11854
 
 # Save to tar files
 docker save ghcr.io/defilantech/llmkube-controller:v0.9.19 > llmkube-controller.tar
-docker save ghcr.io/ggml-org/llama.cpp:server-cuda-b10068 > llama-server-cuda.tar
-docker save ghcr.io/ggml-org/llama.cpp:server > llama-server-cpu.tar
+docker save ghcr.io/ggml-org/llama.cpp:server-cuda-b11854 > llama-server-cuda.tar
+docker save ghcr.io/ggml-org/llama.cpp:server-b11854 > llama-server-cpu.tar
 ```
 
-`server-cuda-b10068` is the tag the operator substitutes for NVIDIA GPU Models
+`server-cuda-b11854` is the tag the operator substitutes for NVIDIA GPU Models
 when the InferenceService sets no `image`, so a YAML-driven GPU deploy fails to
-pull without it. `:server` is the CPU-only default for Models with no GPU
-section. AMD and Intel tiers pull different images again: see
+pull without it. `server-b11854` is the CPU-only default for Models with no GPU
+section. Both come from the same llama.cpp build, which changes only when the
+operator is upgraded. AMD and Intel tiers pull different images again: see
 [amd-rocm-quickstart.md](amd-rocm-quickstart.md) and
 [intel-gpu-quickstart.md](intel-gpu-quickstart.md).
 

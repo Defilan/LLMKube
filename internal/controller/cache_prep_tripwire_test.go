@@ -61,6 +61,10 @@ func cachePrepTripwireIsvc() *inferencev1alpha1.InferenceService {
 		Spec: inferencev1alpha1.InferenceServiceSpec{
 			ModelRef: "tripwire-model",
 			Runtime:  "llamacpp",
+			// The image the hashes were recorded with, set explicitly so a
+			// default-image bump (#2214) does not move a tripwire that guards
+			// the cache-prep policy.
+			Image: "ghcr.io/ggml-org/llama.cpp:server",
 		},
 	}
 }

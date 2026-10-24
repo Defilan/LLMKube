@@ -32,17 +32,31 @@ const llamaCppVulkanImage = "ghcr.io/defilantech/llmkube-llama-vulkan@sha256:cba
 // promoter smokes the candidate on real hardware. See #701.
 const llamaCppROCmImage = "ghcr.io/defilantech/llmkube-llama-rocm@sha256:8da16041a18b4f03f0be4de5e064be97ba8937149091d6693ee09711da362849"
 
+// llamaCppBuild is the upstream llama.cpp build every default llama.cpp image
+// comes from: the CPU default, the NVIDIA image and router mode. One build
+// means a service accepts the same flags whether or not its Model declares a
+// GPU, and an immutable tag means two rollouts of the same service run the
+// same server (#2214). Upstream does not publish images for every build, so
+// a bump picks a build that has both server-<build> and server-cuda-<build>
+// on GHCR. b11854 has both (checked 2026-10-24), and it served chat on a GB10
+// on CPU and CUDA.
+const llamaCppBuild = "b11854"
+
+// llamaCppCPUImage is the CPU-only default: correct for CPU serving and for
+// Models with no GPU section.
+const llamaCppCPUImage = "ghcr.io/ggml-org/llama.cpp:server-" + llamaCppBuild
+
 // llamaCppCUDAImage is the upstream CUDA llama.cpp server image the operator
-// substitutes for the CPU-only :server default when the Model declares an
-// NVIDIA GPU (see resolveRuntimeImage). Pinned to an immutable per-build tag
-// (verified 2026-07-21 via the GHCR tags API; CUDA 12.8.1 base). CAVEAT for
+// substitutes for the CPU-only default when the Model declares an NVIDIA GPU
+// (see resolveRuntimeImage). Same build as llamaCppCPUImage, CUDA 12.8.1 base
+// (llama.cpp's .devops/cuda.Dockerfile at b11854). CAVEAT for
 // Blackwell: upstream's prebuilt CUDA images ship no native sm_100 codegen
 // (ggml's CMAKE_CUDA_ARCHITECTURES covers 50..90-virtual plus consumer
 // 120a/121a only), so a B200 runs via PTX JIT from the 90-virtual target:
 // functional, with first-run JIT cost and no sm_100-tuned kernels. Fleets
 // serious about llama.cpp-on-B200 should build with CUDA_DOCKER_ARCH=100a-real
 // and point runtimeImages.llamacpp (or spec.image) at it.
-const llamaCppCUDAImage = "ghcr.io/ggml-org/llama.cpp:server-cuda-b10068"
+const llamaCppCUDAImage = "ghcr.io/ggml-org/llama.cpp:server-cuda-" + llamaCppBuild
 
 // LlamaCppBackend generates container configuration for the llama.cpp inference server.
 type LlamaCppBackend struct{}
@@ -51,12 +65,11 @@ func (b *LlamaCppBackend) ContainerName() string {
 	return "llama-server"
 }
 
-// DefaultImage is the upstream CPU-only tag: correct for CPU serving and for
-// Models with no GPU section. GPU Models never see it: AMD diverts to the
-// hardware-validated Vulkan/ROCm digests and NVIDIA diverts to
+// DefaultImage is the CPU-only image. GPU Models never see it: AMD diverts to
+// the hardware-validated Vulkan/ROCm digests and NVIDIA diverts to
 // llamaCppCUDAImage (resolveRuntimeImage).
 func (b *LlamaCppBackend) DefaultImage() string {
-	return "ghcr.io/ggml-org/llama.cpp:server"
+	return llamaCppCPUImage
 }
 
 func (b *LlamaCppBackend) DefaultPort() int32 {

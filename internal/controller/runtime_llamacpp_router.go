@@ -52,8 +52,9 @@ func (b *LlamaCppRouterBackend) ContainerName() string {
 	return "llama-server"
 }
 
+// DefaultImage is the same pinned build as the single-model llama.cpp default.
 func (b *LlamaCppRouterBackend) DefaultImage() string {
-	return "ghcr.io/ggml-org/llama.cpp:server"
+	return llamaCppCPUImage
 }
 
 func (b *LlamaCppRouterBackend) DefaultPort() int32 {
